@@ -1682,7 +1682,7 @@ def test_scan_dispatches_local_ci_when_policy_requires_it_despite_hosted_actions
     ledger.close()
 
 
-def test_scan_dispatches_local_ci_newest_pull_request_first(tmp_path: Path) -> None:
+def test_scan_dispatches_local_ci_oldest_backlog_first(tmp_path: Path) -> None:
     local_path, sha = initialized_repository(tmp_path)
     older = PullRequest(
         17, "OPEN", "acme/widgets", "acme/widgets", "owner", "codex/older", sha
@@ -1705,7 +1705,7 @@ def test_scan_dispatches_local_ci_newest_pull_request_first(tmp_path: Path) -> N
     assert result.created == 1
     assert result.skipped["local_ci_dispatch_cap"] == 1
     assert [task.title for task in kanban.tasks] == [
-        "Local PR CI audit: acme/widgets#18",
+        "Local PR CI audit: acme/widgets#17",
     ]
     ledger.close()
 
@@ -1752,8 +1752,124 @@ def test_scan_bounds_newest_first_per_pr_reads_for_local_ci(tmp_path: Path) -> N
 
     assert result.created == 1
     assert result.skipped["local_ci_open_pr_scan_cap"] == 1
-    assert github.feedback_calls == [("acme/widgets", 18)]
-    assert github.current_calls == [("acme/widgets", 18)]
+    assert github.feedback_calls == [("acme/widgets", 17), ("acme/widgets", 18)]
+    assert github.current_calls == [("acme/widgets", 17)]
+    ledger.close()
+
+
+def test_local_ci_catalogue_selects_oldest_missing_head_beyond_freshness_window(
+    tmp_path: Path,
+) -> None:
+    local_path, sha = initialized_repository(tmp_path)
+    policy = configured_policy(
+        local_path,
+        not_before="2026-08-24T00:00:00Z",
+        local_ci_audit=True,
+        max_open_prs_per_scan=12,
+    )
+    pulls = tuple(
+        PullRequest(
+            number,
+            "OPEN",
+            "acme/widgets",
+            "acme/widgets",
+            "owner",
+            f"codex/pr-{number}",
+            sha,
+            updated_at=datetime(2026, 8, 25, 12, number - 700, tzinfo=UTC),
+        )
+        for number in range(700, 714)
+    )
+    # #715 is deliberately outside the ordinary newest-PR read window.
+    oldest = PullRequest(
+        715,
+        "OPEN",
+        "acme/widgets",
+        "acme/widgets",
+        "owner",
+        "codex/old-backlog",
+        "b" * 40,
+        updated_at=datetime(2026, 8, 24, 0, 0, tzinfo=UTC),
+    )
+    github = FakeGitHub(pulls[0], (), pull_requests=(*pulls, oldest))
+    github.actions_are_enabled = False
+    kanban = RecordingKanban()
+    ledger = FeedbackLedger(tmp_path / "ledger.sqlite3")
+
+    result = ScanController(policy, ledger, github, kanban, RecordingLocalGit()).scan()
+
+    assert result.created == 1
+    assert [task.evidence["pr_number"] for task in kanban.tasks] == [715]
+    assert result.skipped["local_ci_open_pr_scan_cap"] == 3
+    ledger.close()
+
+
+def test_failed_local_ci_dispatch_due_is_reclaimed_without_duplicate(tmp_path: Path) -> None:
+    local_path, sha = initialized_repository(tmp_path)
+    now = datetime(2026, 8, 25, 12, 0, tzinfo=UTC)
+    policy = configured_policy(
+        local_path, not_before="2026-08-24T00:00:00Z", local_ci_audit=True
+    )
+    pull = admitted_pull_request(sha)
+    github = FakeGitHub(pull, ())
+    github.actions_are_enabled = False
+    kanban = RecordingKanban()
+    ledger = FeedbackLedger(tmp_path / "ledger.sqlite3")
+    receipt = FeedbackReceipt(
+        "acme/widgets", 17, "pr_local_ci", LOCAL_CI_FEEDBACK_ID, sha
+    )
+    lease = ledger.claim(
+        receipt,
+        owner="previous-dispatch",
+        claimed_at=now - timedelta(minutes=10),
+        stale_before=now - timedelta(minutes=15),
+    )
+    assert lease is not None
+    ledger.fail(receipt, "worktree pool was temporarily full", lease)
+
+    result = ScanController(
+        policy, ledger, github, kanban, RecordingLocalGit(), clock=lambda: now
+    ).scan()
+
+    assert result.created == 1
+    assert result.skipped.get("duplicate", 0) == 0
+    assert len(kanban.tasks) == 1
+    assert ledger.exact_receipt_status(receipt) == "completed"
+    ledger.close()
+
+
+def test_failed_local_ci_dispatch_backoff_is_visible_and_does_not_consume_slot(
+    tmp_path: Path,
+) -> None:
+    local_path, sha = initialized_repository(tmp_path)
+    now = datetime(2026, 8, 25, 12, 0, tzinfo=UTC)
+    policy = configured_policy(
+        local_path, not_before="2026-08-24T00:00:00Z", local_ci_audit=True
+    )
+    pull = admitted_pull_request(sha)
+    github = FakeGitHub(pull, ())
+    github.actions_are_enabled = False
+    ledger = FeedbackLedger(tmp_path / "ledger.sqlite3")
+    receipt = FeedbackReceipt(
+        "acme/widgets", 17, "pr_local_ci", LOCAL_CI_FEEDBACK_ID, sha
+    )
+    lease = ledger.claim(
+        receipt,
+        owner="previous-dispatch",
+        claimed_at=now,
+        stale_before=now - timedelta(minutes=5),
+    )
+    assert lease is not None
+    ledger.fail(receipt, "transient dispatch failure", lease)
+
+    result = ScanController(
+        policy, ledger, github, RecordingKanban(), RecordingLocalGit(), clock=lambda: now
+    ).scan()
+
+    assert result.created == 0
+    assert result.skipped["retry_backoff"] == 1
+    assert result.skipped.get("local_ci_dispatch_cap", 0) == 0
+    assert ledger.exact_receipt_status(receipt) == "failed"
     ledger.close()
 
 
@@ -1821,8 +1937,8 @@ def test_required_local_ci_backlog_signal_counts_missing_receipts_below_read_cap
 
     assert getattr(result, "required_local_ci_backlog", 0) == 2
     assert result.skipped.get("local_ci_open_pr_scan_cap", 0) == 0
-    assert github.feedback_calls == [("acme/widgets", 18), ("acme/widgets", 17)]
-    assert github.current_calls == [("acme/widgets", 18)]
+    assert github.feedback_calls == [("acme/widgets", 17), ("acme/widgets", 18)]
+    assert github.current_calls == [("acme/widgets", 17)]
     ledger.close()
 
 
@@ -1912,7 +2028,7 @@ def test_required_local_ci_backlog_signal_ignores_read_cap_when_receipts_are_cur
     ).scan()
 
     assert getattr(result, "required_local_ci_backlog", 0) == 0
-    assert result.skipped["local_ci_open_pr_scan_cap"] == 1
+    assert result.skipped.get("local_ci_open_pr_scan_cap", 0) == 0
     assert github.feedback_calls == [("acme/widgets", 18)]
     assert github.current_calls == []
     ledger.close()
@@ -2252,7 +2368,7 @@ def test_duplicate_local_ci_receipts_do_not_starve_a_new_head_after_comment_fixe
     result = ScanController(policy, ledger, github, kanban, RecordingLocalGit()).scan()
 
     assert result.created == 1
-    assert result.skipped["local_ci_exact_head_seen"] == MAX_ADMISSIONS_PER_SCAN
+    assert result.skipped["local_ci_exact_head_deferred"] == MAX_ADMISSIONS_PER_SCAN
     assert result.skipped.get("admission_cap", 0) == 0
     assert [task.evidence["pr_number"] for task in kanban.tasks] == [repaired.number]
     ledger.close()
@@ -3654,6 +3770,7 @@ def configured_policy(
     auto_dispatch: bool = False,
     local_ci_audit: bool = False,
     merge_maintainer: bool = False,
+    max_open_prs_per_scan: int | None = None,
 ):
     raw = {
             "enabled": True,
@@ -3681,6 +3798,8 @@ def configured_policy(
             "assignee": "pr-local-ci-auditor",
             "post_results": True,
         }
+        if max_open_prs_per_scan is not None:
+            raw["local_ci_audit"]["max_open_prs_per_scan"] = max_open_prs_per_scan
         raw["routing_rules"] = [
             {
                 "assignee": "ci-static-fixer",

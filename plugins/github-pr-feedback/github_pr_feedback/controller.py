@@ -46,6 +46,7 @@ LOCAL_CI_FEEDBACK_ID = "local-ci-audit-v2"
 _ADDITIONAL_GOVERNED_VENV_ROOTS = (Path("/Users/mikedemott/TradingBotV18/.venv"),)
 _SHA = re.compile(r"^[0-9a-fA-F]{40,64}$")
 DEFAULT_CLAIM_LEASE = timedelta(minutes=5)
+LOCAL_CI_RETRY_BACKOFF = timedelta(minutes=5)
 _SELF_RESOLUTION_PREFIXES = (
     "addressed ",
     "implemented in ",
@@ -260,14 +261,24 @@ def _claim_with_orphan_recovery(
     claimed_at: datetime,
     stale_before: datetime,
     exact_dispatch_only: bool = False,
+    retry_failed: bool = False,
 ):
     """Claim normally, or reclaim an exact dispatch whose card is gone/archived."""
 
-    lease = ledger.claim(
-        receipt,
-        owner=owner,
-        claimed_at=claimed_at,
-        stale_before=stale_before,
+    lease = (
+        ledger.retry(
+            receipt,
+            owner=owner,
+            claimed_at=claimed_at,
+            not_before=claimed_at,
+        )
+        if retry_failed
+        else ledger.claim(
+            receipt,
+            owner=owner,
+            claimed_at=claimed_at,
+            stale_before=stale_before,
+        )
     )
     if lease is not None:
         return lease
@@ -886,6 +897,64 @@ class ScanController:
         self._clock = clock or (lambda: datetime.now(UTC))
         self._claim_lease = claim_lease
 
+    def _select_local_ci_candidates(
+        self,
+        target: RepositoryTarget,
+        pull_requests: tuple[PullRequest, ...],
+    ) -> tuple[tuple[PullRequest, ...], int, int]:
+        """Select an aged, bounded local-CI slice from the whole catalogue.
+
+        The GitHub listing is one cheap API call, so applying the read cap to
+        that listing is unnecessary and caused old PRs to starve behind a
+        freshness window.  Only the selected slice is read in detail.  A
+        failed dispatch is eligible again after its bounded backoff; a
+        backoff row is not allowed to consume this scan's capacity.
+        """
+
+        audit_policy = self._policy.local_ci_audit
+        if audit_policy is None or not audit_policy.applies_to(target.base_repository):
+            return (), 0, 0
+        now = self._clock()
+        candidates: list[tuple[int, datetime, int, PullRequest]] = []
+        retry_backoff_count = 0
+        for pull in pull_requests:
+            if not self._policy.admit_pull_request(pull).admitted:
+                continue
+            receipt = FeedbackReceipt(
+                repository=pull.base_repository,
+                pr_number=pull.number,
+                feedback_kind="pr_local_ci",
+                feedback_id=_local_ci_feedback_id(pull),
+                head_sha=pull.head_sha,
+            )
+            status = self._ledger.exact_receipt_status(receipt)
+            if status in {"claimed", "completed"}:
+                # A completed dispatch can still have a failed exact-head CI
+                # receipt; that state needs a typed fixer, not a fresh audit.
+                latest = self._ledger.latest_ci_receipt_for_head(
+                    pull.base_repository, pull.number, pull.head_sha
+                )
+                if getattr(latest, "status", None) == "failed":
+                    candidates.append((0, _pull_updated_at(pull), pull.number, pull))
+                continue
+            if status == "failed":
+                retry_state = self._ledger.failed_retry_state(
+                    receipt, now=now, backoff=LOCAL_CI_RETRY_BACKOFF
+                )
+                if retry_state != "due":
+                    retry_backoff_count += 1
+                    continue
+                candidates.append((0, _pull_updated_at(pull), pull.number, pull))
+                continue
+            # Missing exact-head evidence is the normal backlog.  Oldest
+            # updated PR first gives every admitted head a deterministic turn.
+            candidates.append((1, _pull_updated_at(pull), pull.number, pull))
+        candidates.sort(key=lambda item: (item[0], item[1], item[2]))
+        selected = tuple(
+            item[3] for item in candidates[: audit_policy.max_open_prs_per_scan]
+        )
+        return selected, max(0, len(candidates) - len(selected)), retry_backoff_count
+
     def scan(self) -> ScanResult:
         skipped: Counter[str] = Counter()
         created = 0
@@ -917,38 +986,67 @@ class ScanController:
             except Exception:  # noqa: BLE001 - an adapter failure must not admit work.
                 skipped["github_error"] += 1
                 continue
-            # GitHub's list order is not a freshness contract.  A PR comment,
-            # review, or synchronize event advances updated_at, so newest-first
-            # keeps the bounded scanner on the changes that can actually need
-            # work instead of replaying hundreds of historical open PRs.
-            pull_requests = tuple(
+            # Keep ordinary feedback reads fresh, but select local-CI work from
+            # the complete one-call catalogue.  The latter must not be capped
+            # before aging/backlog state is considered or old PRs starve.
+            newest_pull_requests = tuple(
                 sorted(
                     pull_requests,
                     key=lambda pull: (
-                        pull.updated_at or datetime.min.replace(tzinfo=UTC),
+                        _pull_updated_at(pull),
                         pull.number,
                     ),
                     reverse=True,
                 )
             )
-            if (
+            local_ci_active = (
                 self._policy.local_ci_audit is not None
                 and self._policy.local_ci_audit.applies_to(repository)
-                and len(pull_requests)
-                > self._policy.local_ci_audit.max_open_prs_per_scan
-            ):
-                skipped["local_ci_open_pr_scan_cap"] += (
-                    len(pull_requests)
-                    - self._policy.local_ci_audit.max_open_prs_per_scan
+            )
+            local_ci_selected: set[tuple[str, int, str]] = set()
+            if local_ci_active:
+                local_ci_pull_requests, local_ci_omitted, local_ci_backoff = (
+                    self._select_local_ci_candidates(target, pull_requests)
                 )
-                pull_requests = pull_requests[
+                skipped["local_ci_open_pr_scan_cap"] += local_ci_omitted
+                skipped["retry_backoff"] += local_ci_backoff
+                local_ci_selected = {
+                    (pull.base_repository, pull.number, pull.head_sha.casefold())
+                    for pull in local_ci_pull_requests
+                }
+                feedback_window = newest_pull_requests[
                     : self._policy.local_ci_audit.max_open_prs_per_scan
                 ]
+                by_key = {
+                    (pull.base_repository, pull.number, pull.head_sha.casefold()): pull
+                    for pull in (*feedback_window, *local_ci_pull_requests)
+                }
+                # Give the bounded local-CI queue first processing priority so
+                # its oldest selected head cannot be displaced by the fresh
+                # feedback window. Ordinary comments are still included in
+                # the same snapshot pass without duplicate reads.
+                pull_requests = tuple(
+                    by_key[key]
+                    for key in dict.fromkeys(
+                        [
+                            (pull.base_repository, pull.number, pull.head_sha.casefold())
+                            for pull in local_ci_pull_requests
+                        ]
+                        + [
+                            (pull.base_repository, pull.number, pull.head_sha.casefold())
+                            for pull in feedback_window
+                        ]
+                    )
+                )
+            else:
+                pull_requests = newest_pull_requests[:]
+                if len(newest_pull_requests) > MAX_PARALLEL_PR_READS:
+                    pull_requests = newest_pull_requests
             required_local_ci_backlog += _required_local_ci_backlog_count(
                 self._policy,
                 self._ledger,
                 target,
-                pull_requests,
+                tuple(newest_pull_requests),
             )
             if actions_enabled and pull_requests:
                 # actions_enabled is only the repo-level Actions on/off toggle;
@@ -1027,6 +1125,11 @@ class ScanController:
                 if (
                     self._policy.local_ci_audit is not None
                     and self._policy.local_ci_audit.applies_to(repository)
+                    and (
+                        pull_request.base_repository,
+                        pull_request.number,
+                        pull_request.head_sha.casefold(),
+                    ) in local_ci_selected
                 ):
                     local_ci_receipt_status = self._ledger.exact_receipt_status(
                         FeedbackReceipt(
@@ -1142,11 +1245,34 @@ class ScanController:
                     self._policy.local_ci_audit is not None
                     and self._policy.local_ci_audit.applies_to(repository)
                 ):
+                    local_ci_key = (
+                        pull_request.base_repository,
+                        pull_request.number,
+                        pull_request.head_sha.casefold(),
+                    )
+                    local_ci_candidate = local_ci_key in local_ci_selected
+                    latest_local_ci_audit = (
+                        self._ledger.latest_ci_receipt_for_head(
+                            pull_request.base_repository,
+                            pull_request.number,
+                            pull_request.head_sha,
+                        )
+                        if local_ci_candidate
+                        else None
+                    )
+                    failed_local_ci_audit = (
+                        getattr(latest_local_ci_audit, "status", None) == "failed"
+                    )
                     if base_refresh_pending:
                         pass
                     elif feedback_pending:
                         skipped["feedback_pending"] += 1
-                    elif local_ci_receipt_status is not None:
+                    elif not local_ci_candidate:
+                        skipped["local_ci_exact_head_deferred"] += 1
+                    elif (
+                        local_ci_receipt_status in {"claimed", "completed"}
+                        and not failed_local_ci_audit
+                    ):
                         skipped["local_ci_exact_head_seen"] += 1
                     elif actions_state_unavailable:
                         skipped["github_ci_state_unavailable"] += 1
@@ -1158,9 +1284,15 @@ class ScanController:
                         skipped["admission_cap"] += 1
                     else:
                         audit_error = self._dispatch_local_ci(
-                            pull_request, current=current
+                            pull_request,
+                            current=current,
+                            retry_failed=local_ci_receipt_status == "failed",
                         )
-                        if audit_error != "duplicate":
+                        if audit_error not in {
+                            "duplicate",
+                            "retry_backoff",
+                            "retry_unavailable",
+                        }:
                             attempted += 1
                         if audit_error is None:
                             created += 1
@@ -1372,7 +1504,11 @@ class ScanController:
 
 
     def _dispatch_local_ci(
-        self, listed: PullRequest, *, current: PullRequest | None = None
+        self,
+        listed: PullRequest,
+        *,
+        current: PullRequest | None = None,
+        retry_failed: bool = False,
     ) -> str | None:
         audit_policy = self._policy.local_ci_audit
         if audit_policy is None:
@@ -1414,9 +1550,10 @@ class ScanController:
             claimed_at=claimed_at,
             stale_before=claimed_at - self._claim_lease,
             exact_dispatch_only=True,
+            retry_failed=retry_failed,
         )
         if lease is None:
-            return "duplicate"
+            return "retry_unavailable" if retry_failed else "duplicate"
         self._ledger.record_expected_head(receipt, lease, receipt.head_sha)
         try:
             prepared = _prepare_receipt_worktree_with_overflow(
@@ -2106,6 +2243,17 @@ def _local_ci_feedback_id(pull_request: PullRequest) -> str:
     if pull_request.base_sha is None:
         return LOCAL_CI_FEEDBACK_ID
     return f"{LOCAL_CI_FEEDBACK_ID}:{pull_request.base_sha.casefold()}"
+
+
+def _pull_updated_at(pull_request: PullRequest) -> datetime:
+    """Return a comparable timestamp for deterministic catalogue aging."""
+
+    updated_at = pull_request.updated_at
+    if updated_at is None:
+        return datetime.min.replace(tzinfo=UTC)
+    if updated_at.tzinfo is None or updated_at.utcoffset() is None:
+        return datetime.min.replace(tzinfo=UTC)
+    return updated_at.astimezone(UTC)
 
 
 def _required_local_ci_backlog_count(

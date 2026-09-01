@@ -8433,6 +8433,11 @@ _RESPAWN_BLOCKER_RE = re.compile(
     re.IGNORECASE,
 )
 
+_PROVIDER_EGRESS_BLOCK_RE = re.compile(
+    r"LLM\s+egress\s+blocked\s*:\s*([A-Za-z0-9_.-]+)",
+    re.IGNORECASE,
+)
+
 # Within this window a completed run counts as "recent proof"; don't re-spawn.
 _RESPAWN_GUARD_SUCCESS_WINDOW = 3600  # 1 hour
 
@@ -9357,6 +9362,23 @@ def _error_fingerprint(error_text: str) -> str:
     return fp.lower().strip()
 
 
+def _provider_egress_error_text(task_id: str) -> str | None:
+    """Classify the known provider egress failure before ordinary retry logic."""
+
+    try:
+        log_path = worker_log_path(task_id)
+        with log_path.open("rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            handle.seek(max(0, handle.tell() - 16_384))
+            tail = handle.read().decode("utf-8", "replace")
+    except (OSError, ValueError):
+        return None
+    match = _PROVIDER_EGRESS_BLOCK_RE.search(tail)
+    if match is None or match.group(1).casefold() != "base64_payload":
+        return None
+    return "provider egress blocked: LLM egress blocked: base64_payload"
+
+
 # Empirically ~96% of "clean exit without a terminal tool call" tasks complete
 # on a later run (a goal-mode finalize nudge, or the model simply emitting the
 # tool call next time), so a protocol violation is NOT deterministic — give it a
@@ -9464,8 +9486,8 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     # clean-exit-but-still-running case, which is accounted against its
     # own bounded violation streak instead of the unified failure
     # counter (see the post-txn loop below).
-    crash_details: list[tuple[str, int, str, bool, str]] = []
-    # (task_id, pid, claimer, protocol_violation, error_text)
+    crash_details: list[tuple[str, int, str, bool, str, bool]] = []
+    # (task_id, pid, claimer, protocol_violation, error_text, terminal_blocker)
     # Worker-exit observer payloads (RFC #58548), collected inside the main
     # txn and fired only after every reclaim/accounting txn has committed.
     exited_hook_payloads: list[dict] = []
@@ -9495,7 +9517,19 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
             pid = int(row["worker_pid"])
             kind, code = _classify_worker_exit(pid)
             rate_limited_exit = False
-            if kind == "clean_exit":
+            provider_egress_error = _provider_egress_error_text(row["id"])
+            if provider_egress_error is not None:
+                protocol_violation = False
+                error_text = provider_egress_error
+                event_kind = "needs_attention"
+                event_payload = {
+                    "pid": pid,
+                    "claimer": row["claim_lock"],
+                    "exit_code": code,
+                    "failure_class": "provider_egress_blocked",
+                    "terminal": True,
+                }
+            elif kind == "clean_exit":
                 # Worker subprocess returned 0 but its task is still
                 # ``running`` in the DB — it exited without calling
                 # ``kanban_complete`` / ``kanban_block``. Overwhelmingly the
@@ -9566,6 +9600,11 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                     event_payload["exit_kind"] = kind
                     event_payload["exit_code"] = code
 
+            terminal_blocker = provider_egress_error is not None
+            # Leave the task in its source phase until the common failure
+            # accounting below records the terminal blocker and its exact
+            # error.  Setting ``blocked`` here would make that accounting
+            # skip the row and lose the diagnostic.
             retry_status = _retry_status_for_run(conn, row["id"])
             event_payload["retry_status"] = retry_status
             cur = conn.execute(
@@ -9628,7 +9667,7 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                     crashed.append(row["id"])
                     crash_details.append(
                         (row["id"], pid, row["claim_lock"],
-                         protocol_violation, error_text)
+                         protocol_violation, error_text, terminal_blocker)
                     )
     # Outside the main txn: account each crashed task and maybe trip the
     # breaker (the retried task transitions to blocked with a ``gave_up`` event
@@ -9653,10 +9692,29 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     if crash_details:
         # Fingerprint errors to detect systemic failures.
         _fp_counts: dict[str, int] = {}
-        for _, _, _, _, err_text in crash_details:
+        for _, _, _, _, err_text, _ in crash_details:
             fp = _error_fingerprint(err_text)
             _fp_counts[fp] = _fp_counts.get(fp, 0) + 1
-        for tid, pid, claimer, protocol_violation, error_text in crash_details:
+        for tid, pid, claimer, protocol_violation, error_text, terminal_blocker in crash_details:
+            if terminal_blocker:
+                tripped = _record_task_failure(
+                    conn,
+                    tid,
+                    error=error_text,
+                    outcome="needs_attention",
+                    force_trip=True,
+                    release_claim=False,
+                    end_run=False,
+                    event_payload_extra={
+                        "pid": pid,
+                        "claimer": claimer,
+                        "failure_class": "provider_egress_blocked",
+                        "next_action": "configure a permitted provider or governed fallback",
+                    },
+                )
+                if tripped:
+                    auto_blocked.append(tid)
+                continue
             if protocol_violation:
                 streak = _protocol_violation_streak(conn, tid)
                 trow = conn.execute(

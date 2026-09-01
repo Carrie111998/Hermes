@@ -334,7 +334,40 @@ def test_rate_limit_exit_requeues_without_counting_failure(
         assert "crashed" not in outcomes
 
 
+def test_provider_egress_block_is_terminal_needs_attention(
+    kanban_home, monkeypatch,
+):
+    """A known provider egress firewall failure must not respawn forever."""
+    import hermes_cli.kanban_db as _kb
 
+    monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+    monkeypatch.setattr(
+        _kb,
+        "_provider_egress_error_text",
+        lambda _task_id: "provider egress blocked: LLM egress blocked: base64_payload",
+    )
+
+    with kb.connect() as conn:
+        host = _kb._claimer_id().split(":", 1)[0]
+        tid = kb.create_task(conn, title="egress", assignee="a")
+        assert kb.claim_task(conn, tid, claimer=f"{host}:egress") is not None
+        pid = 71001
+        kb._set_worker_pid(conn, tid, pid)
+        _kb._record_worker_exit(pid, _exited_status(1))
+
+        crashed = _kb.detect_crashed_workers(conn)
+
+        assert crashed == [tid]
+        task = kb.get_task(conn, tid)
+        assert task.status == "blocked"
+        assert "base64_payload" in (task.last_failure_error or "")
+        events = kb.list_events(conn, tid)
+        assert any(
+            event.kind == "needs_attention"
+            and event.payload.get("failure_class") == "provider_egress_blocked"
+            for event in events
+        )
 
 def test_respawn_guard_defers_rate_limited_within_cooldown(
     kanban_home, monkeypatch,

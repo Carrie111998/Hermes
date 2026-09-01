@@ -9,7 +9,7 @@ import sqlite3
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from .policy import FeedbackReceipt
@@ -787,6 +787,7 @@ class FeedbackLedger:
         *,
         owner: str,
         claimed_at: datetime,
+        not_before: datetime | None = None,
     ) -> ClaimLease | None:
         """Atomically retry a receipt after an explicitly recorded dispatch failure."""
 
@@ -794,14 +795,24 @@ class FeedbackLedger:
         if not owner:
             raise ValueError("claim owner must be a non-empty string")
         claimed_at = _aware_utc(claimed_at, "claimed_at")
+        if not_before is not None:
+            not_before = _aware_utc(not_before, "not_before")
         with self._transaction():
             row = self._connection.execute(
-                "SELECT lease_version FROM feedback_receipts WHERE repository = ? AND pr_number = ? "
+                "SELECT lease_version, claimed_at FROM feedback_receipts WHERE repository = ? AND pr_number = ? "
                 "AND feedback_kind = ? AND feedback_id = ? AND head_sha = ? AND status = 'failed'",
                 receipt.key,
             ).fetchone()
             if row is None:
                 return None
+            if not_before is not None and row[1] is not None:
+                try:
+                    if datetime.fromisoformat(str(row[1])).astimezone(UTC) > not_before:
+                        return None
+                except (TypeError, ValueError):
+                    # A malformed timestamp is conservative: it is eligible for
+                    # one bounded retry, which can repair the row's timestamp.
+                    pass
             version = int(row[0] or 0) + 1
             result = self._connection.execute(
                 "UPDATE feedback_receipts SET status = 'claimed', last_error = NULL, attempts = attempts + 1, "
@@ -813,6 +824,40 @@ class FeedbackLedger:
             return (
                 ClaimLease(owner, claimed_at, version) if result.rowcount == 1 else None
             )
+
+    def failed_retry_state(
+        self,
+        receipt: FeedbackReceipt,
+        *,
+        now: datetime,
+        backoff: timedelta,
+    ) -> str:
+        """Classify a failed dispatch without mutating the receipt.
+
+        The scanner uses this to keep a failed row's backoff separate from a
+        duplicate.  In particular, a not-yet-due row must not consume the
+        bounded local-CI admission slot or prevent older backlog from being
+        considered.
+        """
+
+        if backoff < timedelta(0):
+            raise ValueError("backoff must be non-negative")
+        now = _aware_utc(now, "now")
+        row = self._connection.execute(
+            "SELECT status, claimed_at FROM feedback_receipts "
+            "WHERE repository = ? AND pr_number = ? AND feedback_kind = ? "
+            "AND feedback_id = ? AND head_sha = ?",
+            receipt.key,
+        ).fetchone()
+        if row is None or row[0] != "failed":
+            return "not_failed"
+        if row[1] is None:
+            return "due"
+        try:
+            failed_at = datetime.fromisoformat(str(row[1])).astimezone(UTC)
+        except (TypeError, ValueError):
+            return "due"
+        return "due" if now >= failed_at + backoff else "backoff"
 
     def finalize(
         self, receipt: FeedbackReceipt, task_id: str, lease: ClaimLease
