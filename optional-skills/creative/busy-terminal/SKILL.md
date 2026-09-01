@@ -1,32 +1,40 @@
 ---
 name: busy-terminal
-description: "Joke screensaver faking a live coding session."
-version: 1.0.0
+description: "Joke screensaver: fake coding or Hollywood hacking."
+version: 1.1.0
 author: "Luke The Dev (@iamlukethedev), Hermes Agent"
 license: MIT
 platforms: [linux, macos, windows]
 metadata:
   hermes:
-    tags: [creative, screensaver, terminal, ascii, fun, animation]
+    tags: [creative, screensaver, terminal, ascii, fun, animation, matrix, hacker]
     category: creative
 ---
 
 # Busy Terminal Skill
 
-Fills a terminal with an invented coding session — an editor typing source, a
-build, a test run, and git activity — cycling at random until stopped. It is a
-screensaver in the `cmatrix` / `genact` tradition.
+Fills a terminal with invented activity, cycling scenes at random until
+stopped. Two profiles: `developer` fakes honest work (editor, build, tests,
+git) and `hacker` fakes the movie kind (digital rain, an intrusion ending in
+ACCESS GRANTED, a key crack). `mixed` interleaves both. It is a screensaver in
+the `cmatrix` / `genact` / Hollywood-hacker tradition.
 
 Nothing it prints is real. It reads no files, runs no commands, and opens no
-sockets; every path, SHA, and byte count is generated. It reports no status
-about the user's actual work and should never be presented as if it did.
+sockets; every path, SHA, and byte count is generated, and the hacker
+profile's "targets" are RFC 5737 documentation addresses on example.* hosts,
+unroutable by construction. It reports no status about the user's actual work
+and should never be presented as if it did.
 
 ## When to Use
 
 Trigger on any of these, without asking a follow-up question:
 
 - "pretend I'm working" / "make it look like I'm working" / "look busy"
+  → `--profile developer`
+- "hacker mode" / "make me look like a movie hacker" / "Hollywood hacking"
+  / "matrix mode" / "digital rain" → `--profile hacker`
 - "start the fake work screensaver" / "busy terminal" / "fake coding"
+  → `--profile developer`, or `mixed` if they ask for everything
 - The user wants an ambient background pane during a stream, demo, or recording
 
 Do not reach for this when the user wants real build, test, or git output —
@@ -60,8 +68,9 @@ minutes is a good default; they can Ctrl-C sooner.
 Variants worth offering:
 
 ```bash
-... --window --scene tests --speed 2   # one scene, faster
-... --window --duration 300            # five minutes
+... --window --profile hacker --duration 300   # five minutes of Hollywood
+... --window --scene matrix                    # just the rain, on repeat
+... --window --scene tests --speed 2           # one scene, faster
 ```
 
 The user can also run it themselves in any terminal, without `--window`.
@@ -70,25 +79,33 @@ The user can also run it themselves in any terminal, without `--window`.
 
 | Flag | Default | Effect |
 |------|---------|--------|
+| `--profile` | `developer` | Scene set: `developer`, `hacker`, or `mixed` |
 | `--duration` | `0` | Seconds to run; `0` means until Ctrl-C |
 | `--speed` | `1.0` | Time multiplier — `2` is twice as fast |
-| `--scene` | cycle | Pin one of `code`, `build`, `tests`, `git` |
+| `--scene` | cycle | Pin one scene on repeat (overrides the profile) |
 | `--seed` | random | Reproducible run |
 | `--no-color` | off | Plain text, no ANSI escapes |
 | `--window` | off | Open a new terminal window and return — use this from an agent |
 
-| Scene | What it shows |
-|-------|---------------|
-| `code` | Editor pane, line numbers, source typed and highlighted |
-| `build` | Vite / Cargo / Docker output, progress bar, artifact sizes |
-| `tests` | Pytest-style dots, pass–fail summary, occasional flake retry |
-| `git` | Commit, push with delta compression, CI checks going green |
+| Scene | Profile | What it shows |
+|-------|---------|---------------|
+| `code` | developer | Editor pane, line numbers, source typed and highlighted |
+| `build` | developer | Vite / Cargo / Docker output, progress bar, artifact sizes |
+| `tests` | developer | Pytest-style dots, pass–fail summary, occasional flake retry |
+| `git` | developer | Commit, push with delta compression, CI checks going green |
+| `matrix` | hacker | Digital rain with bright heads and dimming trails |
+| `intrusion` | hacker | Port scan, brute-force, ACCESS GRANTED banner, exfil bar |
+| `crack` | hacker | Hex spray, then an AES key locking in byte by byte |
 
 ## Procedure
 
-1. Run the script with `--window` and a `--duration` via `terminal`.
-2. Tell the user a new window opened and that Ctrl-C in it stops the show.
-3. Suggest full screen and a larger font if they want it to fill the display.
+1. Pick the profile from the user's phrasing (see When to Use); default to
+   `developer` when it is ambiguous.
+2. Run the script with `--window`, the profile, and a `--duration` via
+   `terminal`.
+3. Tell the user a new window opened and that Ctrl-C in it stops the show.
+4. Suggest full screen and a larger font if they want it to fill the display —
+   the matrix rain especially earns it.
 
 Scenes never repeat back to back; `next_scene` excludes the one that just
 played, so the cycle reads as varied rather than random-looking.
@@ -109,11 +126,17 @@ played, so the cycle reads as varied rather than random-looking.
   floors the width at 40, but a genuinely tiny terminal still looks cramped.
 - `--speed` scales pauses, not content. Very high values (>10) reduce it to a
   wall of text with no rhythm.
+- The matrix rain needs ANSI cursor addressing; piped or `--no-color` output
+  degrades it to scrolling glyph lines on purpose.
+- The hacker profile is theatre, not technique — keep targets and loot inside
+  the shipped fictional pools if you ever extend the pools.
 
 ## Verification
 
 - Output appears within a second and keeps scrolling
-- Over a few minutes all four scenes appear, none twice in a row
+- Over a few minutes every scene in the chosen profile appears, none twice in
+  a row
+- `--profile hacker` reaches the ACCESS GRANTED banner and a fully locked key
 - Ctrl-C exits cleanly and the cursor comes back (no invisible prompt)
 - `--no-color` output contains no `\033[` sequences
 - Two runs with the same `--seed` produce the same transcript

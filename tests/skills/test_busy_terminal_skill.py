@@ -269,10 +269,120 @@ class TestRunLoop:
         runners = {name: (lambda c, r, n=name: seen.append(n)) for name in busy_terminal.SCENES}
 
         with mock.patch.object(busy_terminal, "SCENE_RUNNERS", runners):
-            busy_terminal.run(console, random.Random(7), duration=40.0, now=ticking_clock(1.0))
+            busy_terminal.run(
+                console,
+                random.Random(7),
+                scenes=busy_terminal.SCENES,
+                duration=60.0,
+                now=ticking_clock(1.0),
+            )
 
         assert set(seen) == set(busy_terminal.SCENES)
         assert all(a != b for a, b in zip(seen, seen[1:]))
+
+    @pytest.mark.parametrize("profile", sorted(busy_terminal.PROFILES))
+    def test_a_profile_only_plays_its_own_scenes(self, profile):
+        console, _ = make_console()
+        seen: list[str] = []
+        runners = {name: (lambda c, r, n=name: seen.append(n)) for name in busy_terminal.SCENES}
+
+        with mock.patch.object(busy_terminal, "SCENE_RUNNERS", runners):
+            busy_terminal.run(
+                console,
+                random.Random(8),
+                scenes=busy_terminal.PROFILES[profile],
+                duration=60.0,
+                now=ticking_clock(1.0),
+            )
+
+        assert set(seen) == set(busy_terminal.PROFILES[profile])
+
+    def test_the_default_rotation_is_the_developer_profile(self):
+        """'Pretend I'm working' must not open with digital rain."""
+        console, _ = make_console()
+        seen: list[str] = []
+        runners = {name: (lambda c, r, n=name: seen.append(n)) for name in busy_terminal.SCENES}
+
+        with mock.patch.object(busy_terminal, "SCENE_RUNNERS", runners):
+            busy_terminal.run(console, random.Random(9), duration=60.0, now=ticking_clock(1.0))
+
+        assert set(seen) == set(busy_terminal.PROFILES["developer"])
+
+
+class TestProfiles:
+    def test_every_profile_is_a_non_empty_subset_of_the_catalog(self):
+        for name, scenes in busy_terminal.PROFILES.items():
+            assert scenes, name
+            assert set(scenes) <= set(busy_terminal.SCENES), name
+
+    def test_every_scene_in_the_catalog_has_a_runner(self):
+        assert set(busy_terminal.SCENE_RUNNERS) == set(busy_terminal.SCENES)
+
+    def test_mixed_covers_the_union_of_all_profiles(self):
+        union = set().union(*busy_terminal.PROFILES.values())
+        assert set(busy_terminal.PROFILES["mixed"]) == union
+
+
+class TestRain:
+    def test_a_fresh_drop_starts_above_the_screen(self):
+        rng = random.Random(20)
+        for _ in range(100):
+            drop = busy_terminal.spawn_drop(col=5, height=30, rng=rng)
+            assert drop.row <= 0
+            assert drop.trail >= 4
+            assert 0 < drop.speed <= 1.0, "faster than a cell per tick leaves trail holes"
+
+    def test_a_step_advances_every_drop_by_its_own_speed(self):
+        rng = random.Random(21)
+        drops = [busy_terminal.spawn_drop(col, 30, rng) for col in (1, 3, 5)]
+        before = [(drop.row, drop.speed) for drop in drops]
+        busy_terminal.rain_step(drops, height=30, rng=rng)
+        for drop, (row, speed) in zip(drops, before):
+            assert drop.row == pytest.approx(row + speed)
+
+    def test_a_frame_is_one_write_and_never_scrolls(self):
+        rng = random.Random(22)
+        drops = [busy_terminal.spawn_drop(col, 30, rng) for col in range(1, 60, 2)]
+        for _ in range(80):
+            frame = busy_terminal.rain_step(drops, height=30, rng=rng)
+            assert "\n" not in frame
+
+    def test_a_drop_that_left_the_screen_respawns_above_it(self):
+        rng = random.Random(23)
+        drops = [busy_terminal.Drop(col=1, row=100.0, speed=1.0, trail=4)]
+        busy_terminal.rain_step(drops, height=30, rng=rng)
+        assert drops[0].row < 1
+
+
+class TestSceneArcs:
+    """Each hacker scene must reach its climax — that IS the scene."""
+
+    def test_the_intrusion_always_gets_in_and_always_gets_out(self):
+        console, rec = make_console()
+        busy_terminal.scene_intrusion(console, random.Random(30))
+        assert "ACCESS GRANTED" in rec.text
+        assert "connection closed by remote host." in rec.text
+        assert rec.text.index("ACCESS GRANTED") < rec.text.index("connection closed")
+
+    def test_the_intrusion_only_ever_touches_documentation_targets(self):
+        for seed in range(12):
+            console, rec = make_console()
+            busy_terminal.scene_intrusion(console, random.Random(seed))
+            assert any(host in rec.text for host, _addr in busy_terminal.TARGETS)
+            assert ".example." in rec.text
+
+    def test_the_crack_locks_all_sixteen_bytes(self):
+        console, rec = make_console()
+        busy_terminal.scene_crack(console, random.Random(31))
+        assert "16/16" in rec.text
+        assert "key recovered" in rec.text
+
+    def test_the_matrix_fallback_fits_the_terminal_width(self):
+        console, rec = make_console(color=False)
+        busy_terminal.scene_matrix(console, random.Random(32))
+        lines = [line for line in rec.text.splitlines() if line]
+        assert lines
+        assert all(len(line) <= console.width for line in lines)
 
 
 # ── Launching a visible window ───────────────────────────────────────────────
@@ -389,14 +499,28 @@ class TestColorDetection:
 
 
 class TestCli:
-    def test_defaults_run_forever_and_cycle(self):
+    def test_defaults_run_forever_on_the_developer_profile(self):
         args = busy_terminal.build_parser().parse_args([])
         assert args.duration == 0.0
         assert args.scene == ""
+        assert args.profile == "developer"
 
     def test_scene_is_restricted_to_known_scenes(self):
         with pytest.raises(SystemExit):
             busy_terminal.build_parser().parse_args(["--scene", "nope"])
+
+    def test_profile_is_restricted_to_known_profiles(self):
+        with pytest.raises(SystemExit):
+            busy_terminal.build_parser().parse_args(["--profile", "villain"])
+
+    def test_a_bounded_hacker_run_exits_zero_and_prints(self, capsys):
+        code = busy_terminal.main(
+            ["--profile", "hacker", "--duration", "0.001", "--speed", "5000", "--no-color"]
+        )
+        out = capsys.readouterr().out
+        assert code == 0
+        assert out.strip()
+        assert not ANSI.search(out)
 
     def test_a_bounded_run_exits_zero_and_prints(self, capsys):
         code = busy_terminal.main(

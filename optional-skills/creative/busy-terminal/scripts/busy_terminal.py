@@ -1,15 +1,19 @@
 #!/usr/bin/env python3
 """Fake a busy coding session in the terminal.
 
-Four scenes cycle in random order: an editor typing source, a build, a test
-run, and git activity. Every byte the scenes print is invented — no file is
-read or written, no command runs, nothing touches the network. This is a joke
-screensaver in the `cmatrix` tradition, not a tool.
+Scenes cycle in random order, grouped into profiles: `developer` fakes honest
+work (an editor typing source, a build, a test run, git activity) and `hacker`
+fakes the movie kind (digital rain, an intrusion, a key crack). Every byte the
+scenes print is invented — no file is read or written, no command runs,
+nothing touches the network. The "targets" are RFC 5737 documentation
+addresses and example.* hosts, so the theatre cannot point at anything real.
+This is a joke screensaver in the `cmatrix` tradition, not a tool.
 
-    python3 busy_terminal.py                 # until Ctrl-C
-    python3 busy_terminal.py --duration 120  # two minutes, then exit
-    python3 busy_terminal.py --scene tests   # one scene on repeat
-    python3 busy_terminal.py --window        # open a new terminal, return now
+    python3 busy_terminal.py                   # developer profile, until Ctrl-C
+    python3 busy_terminal.py --profile hacker  # full Hollywood
+    python3 busy_terminal.py --duration 120    # two minutes, then exit
+    python3 busy_terminal.py --scene matrix    # one scene on repeat
+    python3 busy_terminal.py --window          # open a new terminal, return now
 
 `--window` is the one thing here that starts a process: it re-launches this
 script inside a fresh terminal window and exits. An agent needs it, because a
@@ -27,10 +31,17 @@ import shutil
 import subprocess
 import sys
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Sequence, TextIO
 
-SCENES = ("code", "build", "tests", "git")
+SCENES = ("code", "build", "tests", "git", "matrix", "intrusion", "crack")
+
+PROFILES: dict[str, tuple[str, ...]] = {
+    "developer": ("code", "build", "tests", "git"),
+    "hacker": ("matrix", "intrusion", "crack"),
+    "mixed": SCENES,
+}
 
 RESET = "\033[0m"
 BOLD = "\033[1m"
@@ -377,6 +388,37 @@ CI_CHECKS = (
     "supply-chain / audit",
 )
 
+# The hacker profile's props. Hosts are RFC 2606 example domains and the
+# addresses RFC 5737 reserves for documentation — unroutable by construction.
+MATRIX_GLYPHS = "ﾊﾐﾋｰｳｼﾅﾓﾆｻﾜﾂｵﾘｱﾎﾃﾏｹﾒｴｶｷﾑﾕﾗｾﾈｽﾀﾇ0123456789Z:･.=*+-<>"
+MATRIX_HEAD = "\033[1m\033[38;5;157m"
+MATRIX_BODY = "\033[38;5;41m"
+
+TARGETS = (
+    ("vault.example.net", "203.0.113.42"),
+    ("mainframe.example.org", "198.51.100.17"),
+    ("archive.example.com", "203.0.113.208"),
+)
+
+PORTS = (
+    (22, "ssh"),
+    (25, "smtp"),
+    (80, "http"),
+    (443, "https"),
+    (3306, "mysql"),
+    (5432, "postgres"),
+    (6379, "redis"),
+    (8443, "https-alt"),
+)
+
+USERS = ("admin", "root", "operator", "dispatch", "jmoriarty", "svc_legacy")
+
+LOOT = (
+    "/srv/vault/blueprints.tar.gz",
+    "/srv/vault/ledger-2026.db",
+    "/opt/mainframe/schematics.zip",
+)
+
 
 # ── Scenes ───────────────────────────────────────────────────────────────────
 
@@ -561,11 +603,217 @@ def scene_git(console: Console, rng: random.Random) -> None:
     console.pause(1.4)
 
 
+# ── Hacker profile scenes ────────────────────────────────────────────────────
+
+
+def move_to(row: int, col: int) -> str:
+    """ANSI cursor move, 1-based."""
+    return f"\033[{row};{col}H"
+
+
+@dataclass
+class Drop:
+    """One falling column of digital rain."""
+
+    col: int
+    row: float
+    speed: float
+    trail: int
+
+
+def spawn_drop(col: int, height: int, rng: random.Random) -> Drop:
+    """A fresh drop, staggered above the screen so columns trickle in.
+
+    Speed stays at or below one cell per tick — faster drops skip rows and
+    leave holes in their own trail.
+    """
+    return Drop(
+        col=col,
+        row=-rng.uniform(0.0, height),
+        speed=rng.uniform(0.35, 1.0),
+        trail=rng.randint(4, max(5, height // 2)),
+    )
+
+
+def rain_step(drops: list[Drop], height: int, rng: random.Random) -> str:
+    """Advance every drop one tick and return the whole frame as one string.
+
+    One write per frame is the point: per-cell writes flicker and swamp the
+    terminal with flushes.
+    """
+    parts = [MATRIX_BODY]
+    for index, drop in enumerate(drops):
+        prev = int(drop.row)
+        drop.row += drop.speed
+        head = int(drop.row)
+
+        if head != prev:
+            if 1 <= head <= height:
+                parts.append(
+                    move_to(head, drop.col)
+                    + MATRIX_HEAD + rng.choice(MATRIX_GLYPHS) + RESET + MATRIX_BODY
+                )
+            # The old head dims into the trail body.
+            if 1 <= prev <= height:
+                parts.append(move_to(prev, drop.col) + rng.choice(MATRIX_GLYPHS))
+            tail = head - drop.trail
+            if 1 <= tail <= height:
+                parts.append(move_to(tail, drop.col) + " ")
+
+        if drop.row - drop.trail > height:
+            drops[index] = spawn_drop(drop.col, height, rng)
+
+    parts.append(RESET)
+
+    return "".join(parts)
+
+
+def scene_matrix(console: Console, rng: random.Random) -> None:
+    """Digital rain, then a word from the machine."""
+    if not console.color:
+        # No ANSI means no cursor addressing — degrade to scrolling glyphs.
+        for _ in range(rng.randint(24, 40)):
+            line = "".join(
+                rng.choice(MATRIX_GLYPHS) if rng.random() < 0.28 else " "
+                for _ in range(console.width - 2)
+            )
+            console.line(line)
+            console.pause(0.05)
+
+        return
+
+    console.clear()
+    drops = [spawn_drop(col, console.height, rng) for col in range(1, console.width, 2)]
+    for _ in range(rng.randint(150, 230)):
+        console.paint(rain_step(drops, console.height, rng))
+        console.pause(0.045)
+
+    console.clear()
+    console.pause(0.7)
+    console.paint(MATRIX_BODY + BOLD)
+    for message in ("wake up…", "your build finished hours ago"):
+        console.paint("  ")
+        for char in message:
+            console.paint(char)
+            console.pause(rng.uniform(0.05, 0.14))
+        console.line()
+        console.pause(0.9)
+    console.paint(RESET)
+    console.pause(1.2)
+
+
+def scene_intrusion(console: Console, rng: random.Random) -> None:
+    """The movie hack: scan, brute-force, ACCESS GRANTED, exfiltrate."""
+    host, addr = rng.choice(TARGETS)
+
+    console.line()
+    prompt(console, f"./ghost --target {addr} --stealth", rng)
+    console.line(console.tint(f"[ghost] resolving target… {host} ({addr})", GREY))
+    console.pause(0.6)
+
+    console.paint(console.tint("[ghost] mapping 1024 ports ", GREY))
+    for _ in range(rng.randint(18, 30)):
+        console.paint(console.tint(".", CYAN))
+        console.pause(rng.uniform(0.02, 0.09))
+    console.line()
+
+    for port, service in sorted(rng.sample(PORTS, k=rng.randint(3, 5))):
+        console.line(
+            f"  {port:>5}/tcp  " + console.tint("open", GREEN) + f"   {service}"
+        )
+        console.pause(0.18)
+    console.line(console.tint("[ghost] stack: nginx/1.27 · openssh 9.8 · debian 13", GREY))
+    console.pause(0.7)
+
+    console.line(console.tint("[ghost] trying credentials", GREY))
+    attempt = rng.randint(120, 400)
+    for _ in range(rng.randint(4, 7)):
+        attempt += rng.randint(7, 60)
+        user = rng.choice(USERS)
+        console.paint(
+            f"\r  attempt {attempt:04d}  {user:<12} {'•' * 10}  "
+            + console.tint("DENIED  ", RED)
+        )
+        console.pause(rng.uniform(0.2, 0.5))
+    attempt += rng.randint(7, 60)
+    console.paint(
+        f"\r  attempt {attempt:04d}  {'svc_backup':<12} {'•' * 10}  "
+        + console.tint("ACCEPTED", GREEN) + "\n"
+    )
+    console.pause(0.5)
+
+    inner = "   ACCESS GRANTED   "
+    console.line()
+    console.line(console.tint("  ╔" + "═" * len(inner) + "╗", GREEN))
+    console.line(console.tint("  ║" + inner + "║", BOLD + GREEN))
+    console.line(console.tint("  ╚" + "═" * len(inner) + "╝", GREEN))
+    console.line()
+    console.pause(0.9)
+
+    total = rng.uniform(6e6, 9e7)
+    done = 0.0
+    console.line(console.tint(f"[ghost] pulling {rng.choice(LOOT)}", GREY))
+    while done < total:
+        done = min(total, done + total * rng.uniform(0.04, 0.12))
+        console.paint(
+            "\r  " + console.tint(progress_bar(done, total), CYAN)
+            + f" {human_bytes(done):>9} / {human_bytes(total)}"
+        )
+        console.pause(rng.uniform(0.08, 0.2))
+    console.line()
+    console.line(console.tint("[ghost] wiping session logs… done", GREY))
+    console.line(console.tint("connection closed by remote host.", GREY))
+    console.pause(1.4)
+
+
+def scene_crack(console: Console, rng: random.Random) -> None:
+    """Hollywood decryption: hex spray, then the key locks in byte by byte."""
+    console.line()
+    prompt(console, "./decrypt blueprints.tar.gz.aes --gpu", rng)
+    console.line(console.tint("[decrypt] cipher: aes-256-gcm · key schedule unknown", GREY))
+    console.pause(0.4)
+
+    pairs = min(24, (console.width - 6) // 3)
+    for _ in range(rng.randint(4, 8)):
+        dump = " ".join(f"{rng.randrange(256):02x}" for _ in range(pairs))
+        console.line(console.tint(f"  {dump}", GREY))
+        console.pause(rng.uniform(0.05, 0.15))
+
+    console.line(console.tint("[decrypt] brute-forcing key segments", GREY))
+    key = [f"{rng.randrange(256):02X}" for _ in range(16)]
+    locked = [False] * 16
+    order = list(range(16))
+    rng.shuffle(order)
+    for step, target in enumerate(order, start=1):
+        # The trope itself: unlocked bytes flicker, then one locks in.
+        for _ in range(rng.randint(2, 5)):
+            cells = [
+                console.tint(key[i], GREEN) if locked[i]
+                else console.tint(f"{rng.randrange(256):02X}", GREY)
+                for i in range(16)
+            ]
+            console.paint("\r  KEY ▸ " + " ".join(cells) + f"  {step - 1:>2}/16")
+            console.pause(rng.uniform(0.03, 0.09))
+        locked[target] = True
+    console.paint(
+        "\r  KEY ▸ " + " ".join(console.tint(byte, GREEN) for byte in key) + "  16/16"
+    )
+    console.line()
+    console.pause(0.5)
+
+    console.line(console.tint("[decrypt] key recovered · verifying MAC… ok", GREEN))
+    console.line(console.tint("[decrypt] plaintext written to ./blueprints.tar.gz", GREY))
+    console.pause(1.4)
+
+
 SCENE_RUNNERS: dict[str, Callable[[Console, random.Random], None]] = {
     "code": scene_code,
     "build": scene_build,
     "tests": scene_tests,
     "git": scene_git,
+    "matrix": scene_matrix,
+    "intrusion": scene_intrusion,
+    "crack": scene_crack,
 }
 
 
@@ -574,20 +822,22 @@ def run(
     rng: random.Random,
     *,
     scene: str = "",
+    scenes: Sequence[str] = PROFILES["developer"],
     duration: float = 0.0,
     now: Callable[[], float] = time.monotonic,
 ) -> int:
-    """Cycle scenes until `duration` elapses. Returns how many ran.
+    """Cycle `scenes` until `duration` elapses. Returns how many ran.
 
-    `duration <= 0` means forever, so the caller (not this loop) owns the exit
-    condition — Ctrl-C in the CLI, a fixed scene count in a test.
+    A pinned `scene` beats the profile's rotation. `duration <= 0` means
+    forever, so the caller (not this loop) owns the exit condition — Ctrl-C in
+    the CLI, a fixed scene count in a test.
     """
     started = now()
     played = 0
     last = ""
 
     while True:
-        last = scene or next_scene(rng, last)
+        last = scene or next_scene(rng, last, scenes)
         SCENE_RUNNERS[last](console, rng)
         played += 1
 
@@ -714,8 +964,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Time multiplier. 2 is twice as fast, 0.5 half.",
     )
     parser.add_argument(
+        "--profile", choices=sorted(PROFILES), default="developer",
+        help="Scene set: developer (fake work), hacker (full Hollywood), mixed (both).",
+    )
+    parser.add_argument(
         "--scene", choices=SCENES, default="",
-        help="Play one scene on repeat instead of cycling.",
+        help="Play one scene on repeat instead of cycling the profile.",
     )
     parser.add_argument("--seed", type=int, default=None, help="Seed for a reproducible run.")
     parser.add_argument("--no-color", action="store_true", help="Plain text, no ANSI escapes.")
@@ -748,7 +1002,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     if console.color:
         console.paint(HIDE_CURSOR)
     try:
-        run(console, rng, scene=args.scene, duration=args.duration)
+        run(
+            console,
+            rng,
+            scene=args.scene,
+            scenes=PROFILES[args.profile],
+            duration=args.duration,
+        )
     except KeyboardInterrupt:
         pass
     finally:
