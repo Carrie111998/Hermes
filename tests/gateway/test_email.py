@@ -487,6 +487,76 @@ class TestConnectDisconnect(unittest.TestCase):
                 adapter._poll_task.cancel()
 
 
+class TestConnectDoesNotBlockEventLoop(unittest.TestCase):
+    """connect()'s IMAP/SMTP work must run off the event loop.
+
+    Regression test: connect() used to call imaplib.IMAP4_SSL(...) and
+    _connect_smtp() directly (blocking stdlib clients, 30s socket
+    timeouts) in-line in an async method. A slow/unreachable mail server
+    froze the entire shared gateway event loop for the length of the
+    timeout, starving unrelated concurrent work (observed: QQBot
+    heartbeats firing 30+s late and getting RST'd by the QQ gateway,
+    which had already timed out the session and closed it).
+    """
+
+    def _make_adapter(self):
+        from gateway.config import PlatformConfig
+        with patch.dict(os.environ, {
+            "EMAIL_ADDRESS": "hermes@test.com",
+            "EMAIL_PASSWORD": "secret",
+            "EMAIL_IMAP_HOST": "imap.test.com",
+            "EMAIL_SMTP_HOST": "smtp.test.com",
+        }):
+            from plugins.platforms.email.adapter import EmailAdapter
+            adapter = EmailAdapter(PlatformConfig(enabled=True))
+        return adapter
+
+    def test_slow_imap_connect_does_not_stall_other_tasks(self):
+        """A slow IMAP4_SSL() call must not freeze concurrently scheduled tasks."""
+        import asyncio
+        import time
+
+        adapter = self._make_adapter()
+        ticks = []
+
+        def slow_imap4_ssl(*args, **kwargs):
+            # Simulate a stalled/unreachable server hitting its socket
+            # timeout: real, synchronous blocking sleep — same as
+            # imaplib/smtplib actually do on a hung connect().
+            time.sleep(0.3)
+            raise OSError("simulated IMAP connect timeout")
+
+        async def ticker():
+            # Runs concurrently with connect(). If connect() blocks the
+            # loop in-line, this never gets scheduled until connect()
+            # returns, so `ticks` stays (near) empty.
+            while True:
+                ticks.append(time.monotonic())
+                await asyncio.sleep(0.02)
+
+        async def scenario():
+            with patch("imaplib.IMAP4_SSL", side_effect=slow_imap4_ssl):
+                task = asyncio.create_task(ticker())
+                result = await adapter.connect()
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+                return result
+
+        result = asyncio.run(scenario())
+
+        self.assertFalse(result)  # IMAP connect failed, as simulated
+        # A blocked event loop would let the ticker run 0-1 times in
+        # 0.3s; a healthy one runs it roughly every 20ms (~10+ times).
+        self.assertGreater(
+            len(ticks), 5,
+            f"event loop appears blocked during connect() — ticker only "
+            f"ran {len(ticks)} time(s) while a slow IMAP connect was in flight",
+        )
+
+
 class TestFetchNewMessages(unittest.TestCase):
     """Test IMAP message fetching logic."""
 
