@@ -195,7 +195,12 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
 
       const isActiveEvent = !!sessionId && sessionId === activeSessionIdRef.current
 
-      const replaySessionId = approvalReplaySessionId(event.type, activeSessionIdRef.current, sessionId)
+      const replaySessionId = approvalReplaySessionId(
+        event.type,
+        activeSessionIdRef.current,
+        sessionId,
+        fromActiveSource()
+      )
 
       if (replaySessionId) {
         void replayPendingApproval($gateway.get(), replaySessionId).catch(() => undefined)

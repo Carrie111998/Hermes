@@ -1120,7 +1120,7 @@ export interface UnknownRuntimeReconnectScope {
 
 export function resetTileRuntimeBindings(
   reconnectedScope?: null | string | RuntimeReconnectScope | UnknownRuntimeReconnectScope
-) {
+): Set<string> {
   const tiles = $sessionTiles.get()
 
   const liveConnectionIds =
@@ -1167,9 +1167,17 @@ export function resetTileRuntimeBindings(
 
   sessionTileDelegate()?.invalidateRuntimeBindings?.(preservedStoredIds)
 
-  if (tiles.some(tile => tile.runtimeId && !preservedStoredIds.has(tile.storedSessionId))) {
+  const invalidatedRuntimeIds = new Set(
+    tiles
+      .filter(tile => tile.runtimeId && !preservedStoredIds.has(tile.storedSessionId))
+      .map(tile => tile.runtimeId!)
+  )
+
+  if (invalidatedRuntimeIds.size > 0) {
     $sessionTiles.set(tiles.map(tile => (preservedStoredIds.has(tile.storedSessionId) ? tile : toStored(tile))))
   }
+
+  return invalidatedRuntimeIds
 }
 
 /** Unbind ONE reclaimed runtime from whichever tile holds it — the targeted

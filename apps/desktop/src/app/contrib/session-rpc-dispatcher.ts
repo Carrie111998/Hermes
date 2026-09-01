@@ -33,6 +33,7 @@
  */
 import type { MutableRefObject } from 'react'
 
+import { withSessionNotFoundResume } from '@/app/session/hooks/use-prompt-actions/utils'
 import { resolveSessionOwner } from '@/app/session/hooks/use-session-actions/utils'
 import type { ClientSessionState } from '@/app/types'
 import { getSessionOwnerHint, knownSessionOwner, ownerLookupSessionRows } from '@/store/session'
@@ -54,6 +55,14 @@ export interface SessionRpcDispatcherDeps {
   runtimeIdByStoredSessionIdRef: MutableRefObject<Map<string, string>>
   selectedStoredSessionIdRef: MutableRefObject<null | string>
   sessionStateByRuntimeIdRef: MutableRefObject<Map<string, ClientSessionState>>
+}
+
+function isSafeStaleRuntimeReplay(method: string, params: Record<string, unknown>): boolean {
+  if (method === 'approval.pending' || method === 'process.list') {
+    return true
+  }
+
+  return method === 'slash.exec' && params.command === 'goal status'
 }
 
 export function createSessionRpcDispatcher(deps: SessionRpcDispatcherDeps): AmbientGatewayRequest {
@@ -97,6 +106,27 @@ export function createSessionRpcDispatcher(deps: SessionRpcDispatcherDeps): Ambi
     // backend "session not found" on a backend that never held the runtime.
     assertSessionOwnerResolved(owner, { method, sessionId: paramSessionId ? routingSessionId : null })
 
-    return requestForSessionProfile<T>(owner, ambientRequest, method, params ?? {}, timeoutMs, signal)
+    const requestParams = params ?? {}
+
+    const dispatch = <R>(rpcMethod: string, rpcParams: Record<string, unknown>, rpcTimeoutMs = timeoutMs) =>
+      requestForSessionProfile<R>(owner, ambientRequest, rpcMethod, rpcParams, rpcTimeoutMs, signal)
+
+    if (!paramSessionId || !routingSessionId || !isSafeStaleRuntimeReplay(method, requestParams)) {
+      return dispatch<T>(method, requestParams)
+    }
+
+    const recovered = await withSessionNotFoundResume(
+      paramSessionId,
+      routingSessionId,
+      liveSessionId => dispatch<T>(method, { ...requestParams, session_id: liveSessionId }),
+      {
+        requestGateway: (rpcMethod, rpcParams = {}, rpcTimeoutMs) => dispatch(rpcMethod, rpcParams, rpcTimeoutMs),
+        resolveProfile: async () => (typeof owner === 'string' ? owner : owner?.profile),
+        onRecovered: liveSessionId => runtimeIdByStoredSessionIdRef.current.set(routingSessionId, liveSessionId),
+        driftReason: () => (signal?.aborted ? 'request aborted' : null)
+      }
+    )
+
+    return recovered.result
   }
 }

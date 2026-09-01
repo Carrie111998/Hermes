@@ -173,7 +173,7 @@ describe('resetTileRuntimeBindings', () => {
       { runtimeId: 'runtime-session-dead', storedSessionId: 'stored-session' }
     ])
 
-    resetTileRuntimeBindings({ connectionId: 'barry', profile: 'oxcoder' })
+    const invalidatedRuntimeIds = resetTileRuntimeBindings({ connectionId: 'barry', profile: 'oxcoder' })
 
     const [barryBot, barrySibling, workBot, ordinarySession] = $sessionTiles.get()
 
@@ -187,6 +187,7 @@ describe('resetTileRuntimeBindings', () => {
     expect(ordinarySession).toMatchObject({ storedSessionId: 'stored-session' })
     expect(ordinarySession).not.toHaveProperty('runtimeId')
     expect(invalidateRuntimeBindings).toHaveBeenCalledWith(new Set(['stored-barry-sibling-bot', 'stored-work-bot']))
+    expect(invalidatedRuntimeIds).toEqual(new Set(['runtime-barry-dead', 'runtime-session-dead']))
   })
 
   it('unknown restarted identity preserves only Bot runtimes owned by provably-live connections', () => {

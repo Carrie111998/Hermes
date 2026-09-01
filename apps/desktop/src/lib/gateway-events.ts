@@ -83,8 +83,16 @@ export interface GatewayEventSessionRoute {
 export function approvalReplaySessionId(
   eventType: string | undefined,
   activeSessionId: null | string,
-  routedSessionId: null | string
+  routedSessionId: null | string,
+  fromActiveSource = true
 ): null | string {
+  // The replay requester is the active gateway. A background profile's ready
+  // or session.info event cannot authorize sending its runtime id there: that
+  // cross-binds the poll to another backend and manufactures a 4001 loop.
+  if (!fromActiveSource) {
+    return null
+  }
+
   if (eventType === 'gateway.ready') {
     return activeSessionId
   }

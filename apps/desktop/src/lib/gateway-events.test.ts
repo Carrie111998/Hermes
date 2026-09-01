@@ -9,6 +9,11 @@ describe('gateway event routing', () => {
     expect(approvalReplaySessionId('message.delta', 'active-1', 'routed-1')).toBeNull()
   })
 
+  it('does not cross-bind approval replay from a background gateway to the active socket', () => {
+    expect(approvalReplaySessionId('gateway.ready', 'active-1', null, false)).toBeNull()
+    expect(approvalReplaySessionId('session.info', 'active-1', 'background-runtime', false)).toBeNull()
+  })
+
   it('drops only unscoped subagent events (genuinely background work)', () => {
     expect(gatewayEventRequiresSessionId('subagent.progress')).toBe(true)
     expect(gatewayEventRequiresSessionId('subagent.start')).toBe(true)

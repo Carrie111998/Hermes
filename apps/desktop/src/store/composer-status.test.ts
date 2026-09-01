@@ -7,7 +7,8 @@ import {
   isSessionGoneForBackgroundPolling,
   reconcileBackgroundProcesses,
   refreshBackgroundProcesses,
-  resetBackgroundPollingGuard
+  resetBackgroundPollingGuard,
+  resetBackgroundPollingGuardForRuntimeIds
 } from './composer-status'
 import { $gateway } from './gateway'
 
@@ -294,7 +295,7 @@ describe('refreshBackgroundProcesses dead-session guard hardenings', () => {
     expect(isSessionGoneForBackgroundPolling(new JsonRpcGatewayError('session not found'))).toBe(true)
   })
 
-  it('a full guard reset (runtime re-mint) resumes polling every latched session', async () => {
+  it('a scoped runtime re-mint only resumes polling for that connection runtime', async () => {
     const request = vi.fn(async () => {
       throw new JsonRpcGatewayError('session not found', { code: 4001 })
     })
@@ -307,12 +308,13 @@ describe('refreshBackgroundProcesses dead-session guard hardenings', () => {
     await refreshBackgroundProcesses('sess-2')
     expect(request).toHaveBeenCalledTimes(2)
 
-    // Gateway reconnect re-mints runtimes: the no-arg reset (wired at the
-    // reconnect seams) must clear every latched id, not just one.
-    resetBackgroundPollingGuard()
+    // A secondary reconnect must only clear ids invalidated for that exact
+    // runtime scope. Clearing the whole set lets an unrelated reconnect wake
+    // every dead-session poller in the window.
+    resetBackgroundPollingGuardForRuntimeIds([SID])
     await refreshBackgroundProcesses(SID)
     await refreshBackgroundProcesses('sess-2')
 
-    expect(request).toHaveBeenCalledTimes(4)
+    expect(request).toHaveBeenCalledTimes(3)
   })
 })

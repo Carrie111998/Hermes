@@ -422,6 +422,15 @@ export function resetBackgroundPollingGuard(sid?: string): void {
   goneSessions.clear()
 }
 
+/** Re-enable polls only for runtime ids invalidated by the reconnecting
+ * gateway. A secondary reconnect must not wake dead pollers owned by every
+ * other connection in the window. */
+export function resetBackgroundPollingGuardForRuntimeIds(runtimeIds: Iterable<string>): void {
+  for (const runtimeId of runtimeIds) {
+    goneSessions.delete(runtimeId)
+  }
+}
+
 /** Pull the session's live process snapshot from the gateway. */
 export async function refreshBackgroundProcesses(sid: string): Promise<void> {
   const gateway = $gateway.get()

@@ -194,3 +194,52 @@ describe('createSessionRpcDispatcher: exact owner rungs', () => {
     })
   })
 })
+
+describe('createSessionRpcDispatcher: stale-runtime replay', () => {
+  beforeEach(() => {
+    setSessions([makeSessionInfo({ connection_id: 'local', id: 'stored-omar', profile: 'omar' })])
+  })
+
+  it('resumes and replays an idempotent goal-status RPC on the same owner route', async () => {
+    gatewayMocks.requestGatewayForAgent.mockImplementation(
+      (async (_connectionId: string, _profile: string, method: string, params: Record<string, unknown>) => {
+        if (method === 'slash.exec' && params.session_id === 'rt-omar') {
+          throw new Error('session not found')
+        }
+
+        if (method === 'session.resume') {
+          return { session_id: 'rt-fresh' }
+        }
+
+        return { output: 'goal status' }
+      }) as never
+    )
+
+    const { request } = dispatcher()
+
+    await expect(request('slash.exec', { command: 'goal status', session_id: 'rt-omar' })).resolves.toEqual({
+      output: 'goal status'
+    })
+
+    const routedCalls = gatewayMocks.requestGatewayForAgent.mock.calls as unknown as Array<
+      [string, string, string, Record<string, unknown>]
+    >
+
+    expect(routedCalls.map(call => [call[2], call[3].session_id])).toEqual([
+      ['slash.exec', 'rt-omar'],
+      ['session.resume', 'stored-omar'],
+      ['slash.exec', 'rt-fresh']
+    ])
+  })
+
+  it('does not replay a state-changing slash command', async () => {
+    gatewayMocks.requestGatewayForAgent.mockRejectedValue(new Error('session not found'))
+
+    const { request } = dispatcher()
+
+    await expect(request('slash.exec', { command: 'model local/new-model', session_id: 'rt-omar' })).rejects.toThrow(
+      'session not found'
+    )
+    expect(gatewayMocks.requestGatewayForAgent).toHaveBeenCalledTimes(1)
+  })
+})

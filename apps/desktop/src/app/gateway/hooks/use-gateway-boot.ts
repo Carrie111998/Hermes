@@ -17,7 +17,7 @@ import {
   resumeDesktopBootForRetry,
   setDesktopBootStep
 } from '@/store/boot'
-import { resetBackgroundPollingGuard } from '@/store/composer-status'
+import { resetBackgroundPollingGuardForRuntimeIds } from '@/store/composer-status'
 import {
   $gateway,
   activeGatewayConnectionId,
@@ -363,19 +363,22 @@ export function useGatewayBoot({
 
         reconnectAttempt = 0
         reconnectFailingSince = null
+
         // A respawned backend re-mints (recycles) runtime ids, so any tile's
         // bound runtime id is now stale — drop them so each tile re-resumes.
         // A legacy remote primary has no registry identity to scope by; fall
         // back to preserving only Bot runtimes owned by provably-live
         // secondaries so the restarted backend's own tiles still rebind.
-        resetTileRuntimeBindings(
+        const invalidatedRuntimeIds = resetTileRuntimeBindings(
           primaryRuntimeConnectionId(conn) ?? { liveConnectionIds: liveSecondaryConnectionIds() }
         )
+
         // The status-stack poll guard latches session ids the OLD runtime
         // reported gone (4001). A respawned backend re-mints runtimes, so
         // those ids may be live again after re-resume — clear the latch with
         // the same lifetime as the runtime bindings it shadows.
-        resetBackgroundPollingGuard()
+        resetBackgroundPollingGuardForRuntimeIds(invalidatedRuntimeIds)
+
         // Same staleness, other half: pre-reconnect busy flags are keyed by
         // those dead runtime ids and would never receive their terminal
         // busy:false — clear them or the sidebar running arc lies forever
