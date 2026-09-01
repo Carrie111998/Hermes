@@ -2344,6 +2344,8 @@ def test_session_status_exposes_only_sanitized_sidebar_observability(
     sidebar = status["sidebar"]
     assert set(sidebar) == {
         "eligible_by_provider",
+        "lane_state",
+        "enabled",
         "counts",
         "blocking_failed_count",
         "terminally_resolved_failed_count",
@@ -2502,7 +2504,7 @@ def test_sidebar_status_preserves_all_fixed_terminal_resolution_codes() -> None:
             },
         },
         "execution_blockers": [],
-    })
+    }, enabled=True)
 
     assert status["terminal_resolution_ledger_valid"] is True
     assert status["terminal_resolutions"]["by_resolution_code"] == {
@@ -2520,7 +2522,7 @@ def test_sidebar_status_canonicalizes_needs_attention_without_mutating_payload()
     }
     original = json.dumps(payload, sort_keys=True)
 
-    status = _sidebar_status(payload)
+    status = _sidebar_status(payload, enabled=True)
 
     assert status["counts"]["needs_attention"] == status["blocking_failed_count"] == 2
     assert json.dumps(payload, sort_keys=True) == original
@@ -2530,10 +2532,95 @@ def test_sidebar_status_accepts_immutable_counts_without_mutating_them() -> None
     counts = MappingProxyType({"sidebar_failed": 3, "needs_attention": 1})
     payload = {"counts": counts, "blocking_failed_count": 2}
 
-    status = _sidebar_status(payload)
+    status = _sidebar_status(payload, enabled=True)
 
     assert status["counts"]["needs_attention"] == status["blocking_failed_count"] == 2
     assert payload["counts"] == counts
+
+
+def _retired_lane_source() -> dict[str, object]:
+    """A retired lane's real shape: parked rows, dead broker, both liveness flags."""
+    return {
+        "counts": {"sidebar_pending": 517, "sidebar_retry": 9, "sidebar_failed": 0},
+        "blocking_failed_count": 0,
+        "execution_blockers": [],
+        "heartbeat_stale": True,
+        "oldest_job_overdue": True,
+        "degraded_reasons": ["broker_heartbeat_stale", "oldest_pending_stale"],
+    }
+
+
+@pytest.mark.parametrize(
+    ("enabled", "expected_reasons", "expected_lane_state"),
+    (
+        (True, ["broker_heartbeat_stale", "oldest_pending_stale"], "active"),
+        (False, [], "retired"),
+    ),
+)
+def test_sidebar_status_suppresses_liveness_reasons_only_when_retired(
+    enabled: bool,
+    expected_reasons: list[str],
+    expected_lane_state: str,
+) -> None:
+    # 2026-09-01: a retired lane (sidebar.enabled=false) is DEFINED by a dead
+    # broker and a queue head that stops moving, so reporting those two liveness
+    # codes as degradation makes a deliberate retirement look like a fault whose
+    # age climbs forever. Suppressed only when retired; identical input with the
+    # lane active must still report both.
+    status = _sidebar_status(_retired_lane_source(), enabled=enabled)
+
+    assert status["degraded_reasons"] == expected_reasons
+    assert status["lane_state"] == expected_lane_state
+    assert status["enabled"] is enabled
+
+
+def test_retired_lane_keeps_raw_liveness_measurements_factual() -> None:
+    # The suppression is a REPORTING decision about the reasons list, not a claim
+    # that the broker is beating. The raw measurements stay true so they remain
+    # usable as audit evidence about the parked rows.
+    status = _sidebar_status(_retired_lane_source(), enabled=False)
+
+    assert status["degraded_reasons"] == []
+    assert status["heartbeat_stale"] is True
+    assert status["oldest_job_overdue"] is True
+    assert status["counts"]["sidebar_pending"] == 517
+
+
+def test_retired_lane_does_not_silence_durable_outcomes() -> None:
+    # A config flag may hide liveness noise; it must never hide a durable failure
+    # or a ledger fact. Pins the boundary so a later widening of the suppression
+    # cannot quietly swallow these.
+    source = _retired_lane_source()
+    source["counts"] = {"sidebar_pending": 517, "sidebar_failed": 3}
+    source["blocking_failed_count"] = 3
+    source["execution_blockers"] = ["sidebar_terminal_resolution_mismatch"]
+
+    status = _sidebar_status(source, enabled=False)
+
+    assert status["degraded_reasons"] == []
+    assert status["blocking_failed_count"] == 3
+    assert status["counts"]["sidebar_failed"] == 3
+    # Membership, not equality: the shaper independently appends its own ledger
+    # blocker for this input. What this test pins is that retirement REMOVES
+    # nothing from execution_blockers.
+    assert "sidebar_terminal_resolution_mismatch" in status["execution_blockers"]
+    assert status["execution_blockers"] == _sidebar_status(
+        source, enabled=True
+    )["execution_blockers"]
+
+
+def test_retired_lane_suppression_does_not_invent_reasons() -> None:
+    # An active lane with nothing wrong must not gain reasons, and a retired lane
+    # with no liveness flags must stay empty -- the filter only ever removes.
+    quiet = {
+        "counts": {"sidebar_pending": 0},
+        "blocking_failed_count": 0,
+        "execution_blockers": [],
+        "degraded_reasons": [],
+    }
+
+    assert _sidebar_status(quiet, enabled=True)["degraded_reasons"] == []
+    assert _sidebar_status(quiet, enabled=False)["degraded_reasons"] == []
 
 
 @pytest.mark.parametrize(
@@ -2573,7 +2660,7 @@ def test_sidebar_status_rejects_unknown_or_mismatched_resolution_counts(
             "by_resolution_code": by_resolution_code,
         },
         "execution_blockers": [],
-    })
+    }, enabled=True)
 
     assert status["terminal_resolution_ledger_valid"] is False
     assert status["terminal_resolutions"]["by_resolution_code"] == {
@@ -2648,7 +2735,7 @@ def test_sidebar_status_shapes_placement_without_secret_identity_fields() -> Non
                 "canary_identity_digest": "a" * 64,
             },
         },
-    })
+    }, enabled=True)
 
     assert status["placement"] == {
         "inbox_cwd": "C:\\Users\\diego\\.hermes",
@@ -2690,7 +2777,7 @@ def test_sidebar_status_shapes_bounded_reconciliation_health() -> None:
         "signed_marker": "HERMES_SESSION_BRIDGE_V1:secret",
         "proof_digest": "a" * 64,
         "reconciliation_generation": "private-generation",
-    })
+    }, enabled=True)
 
     assert status["reconciliation_counts"] == {
         "recovered": 1,
@@ -2727,7 +2814,7 @@ def test_sidebar_status_omits_placement_with_unsafe_inbox_path(unsafe: str) -> N
             "mismatch_count": 0,
             "canary": {"status": "passed", "verified_at": 1234.0},
         },
-    })
+    }, enabled=True)
 
     assert "placement" not in status
     assert unsafe not in json.dumps(status)
@@ -2753,7 +2840,7 @@ def test_sidebar_status_preserves_only_broker_thresholds_and_identity() -> None:
             "lease_token": "private token",
         },
         "messages": ["private source payload"],
-    })
+    }, enabled=True)
 
     assert status["heartbeat_stale"] is True
     assert status["oldest_job_overdue"] is True
@@ -2784,7 +2871,7 @@ def test_sidebar_status_drops_unsafe_broker_identity_text(
     }
     broker[field] = unsafe
 
-    status = _sidebar_status({"counts": {}, "broker": broker})
+    status = _sidebar_status({"counts": {}, "broker": broker}, enabled=True)
 
     assert field not in status["broker"]
 
@@ -2799,7 +2886,7 @@ def test_sidebar_status_sanitizes_negative_canary_verified_at() -> None:
             "mismatch_count": 0,
             "canary": {"status": "passed", "verified_at": -0.001},
         },
-    })
+    }, enabled=True)
 
     assert status["placement"]["canary"] == {
         "status": "not_run",
@@ -2943,6 +3030,7 @@ def test_session_status_adds_evidence_from_one_sequential_composite_observation(
         raw_catalog,
         raw_sidebar,
         raw_hydration,
+        sidebar_enabled=config.sidebar.enabled,
         hydration_enabled=config.sidebar.legacy_hydration_enabled,
     )
     assert observed_sources == [

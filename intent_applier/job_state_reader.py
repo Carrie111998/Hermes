@@ -26,7 +26,12 @@ from typing import Optional
 
 logger = logging.getLogger(__name__)
 
-_DEFAULT_DSN = "postgres://jobflow:jobflow@127.0.0.1:5432/jobflow"
+# No password: the loopback server authenticates this user without one, so an
+# embedded credential bought nothing and shipped to a PUBLIC fork
+# (github.com/daragao3/hermes-agent) where a 2026-09-01 exposure sweep had to
+# read and clear it by hand. A deployment that genuinely needs a password
+# supplies the whole DSN through HERMES_JOBFLOW_PG_DSN below.
+_DEFAULT_DSN = "postgres://jobflow@127.0.0.1:5432/jobflow"
 
 # An intent's job_id is the value the applier POSTs to :4100 as /jobs/<id> --
 # that is jobs.id. It is NOT jobs.external_job_key: those two columns disagree on

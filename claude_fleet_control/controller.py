@@ -164,58 +164,177 @@ class SingletonLock:
 
 # ---------------------------------------------------------------- live adapters
 
-def live_snapshot() -> ProcessSnapshot:
-    """Whole-box census via psutil, in two phases.
+def _live_ppid_map() -> Optional[Dict[int, Optional[int]]]:
+    """The whole pid->ppid table in one call, or None to fall back.
 
-    Phase 1 reads only CHEAP fields (pid/ppid/name/create_time) for every
-    process. Phase 2 enriches ONLY the Claude-named processes and their trees
-    (``planner.enrichment_pids``) with the expensive fields
-    (cmdline/exe/username/rss). Each expensive field opens a per-process
-    handle on Windows, so fetching them for all ~600 processes cost tens of
-    seconds — worst during the very churn storm P6 exists to act on. Every
-    process the planner actually classifies or protects is Claude-named or a
-    descendant of one, so the un-enriched majority never needs those fields.
+    psutil exposes this only as a private platform helper, so it is looked up
+    defensively: a psutil upgrade that moves or drops it degrades to the
+    per-process ppid path (correct, just slow) instead of raising. An empty
+    result is also treated as unavailable -- a real box always has processes,
+    so empty means the call did not work, and believing it would hand the
+    planner a census with no ancestry at all.
+    """
+    try:
+        from psutil import _psutil_windows as _pw  # type: ignore
+    except Exception:
+        try:
+            from psutil import _psplatform as _pw  # type: ignore
+        except Exception:
+            return None
+    fn = getattr(_pw, "ppid_map", None)
+    if fn is None:
+        return None
+    try:
+        m = fn()
+    except Exception:
+        return None
+    if not m:
+        return None
+    try:
+        return {int(k): (int(v) if v is not None else None) for k, v in m.items()}
+    except Exception:
+        return None
+
+
+def live_snapshot() -> ProcessSnapshot:
+    """Whole-box census via psutil, in three phases.
+
+    Phase 1 reads pid/name for every process and takes the whole pid->ppid
+    table in ONE call. Phase 1b fills in ``create_time`` for
+    ``planner.census_ctime_pids`` only. Phase 2 enriches ONLY the
+    Claude-named processes and their trees (``planner.enrichment_pids``) with
+    the remaining expensive fields (cmdline/exe/username/rss). Every one of
+    those opens a per-process handle on Windows, so fetching them across the
+    whole table costs tens of seconds — worst during the very churn storm P6
+    exists to act on. Every process the planner actually classifies or
+    protects is Claude-named or a descendant of one, so the majority never
+    needs any of them.
+
+    PPID WAS THE MISSED FIELD (2026-09-01), and it is not intuitive: ppid
+    looks as cheap as pid or name, but psutil's Windows implementation has no
+    per-process ppid — it takes a WHOLE-SYSTEM Toolhelp snapshot to answer
+    each call, so asking every process is quadratic. Measured on this box,
+    each the FIRST enumeration in a fresh interpreter (the scheduled task is
+    always a fresh interpreter, so only first-call numbers are honest here):
+
+        process_iter(pid)                          0.14s
+        process_iter(pid, name)                    0.20s
+        process_iter(pid, ppid, name)             56.48s
+        _psutil_windows.ppid_map()                 0.06s   <- whole table, one call
+
+    That is the same map, ~800x cheaper. Phase 1 now costs well under a
+    second where it had grown to ~50s, which drove the controller's pass from
+    a steady 15s past the task's PT4M30S ExecutionTimeLimit — killed by Task
+    Scheduler (event 329) every cycle, so fleet growth disabled the guard
+    that exists to contain fleet growth and its silence watchdog with it. See
+    loops claim tray-329-kills-fleet-controller-20260901.
+
+    BEWARE THE WARM/COLD TRAP that hid this: a SECOND process_iter in the
+    same interpreter costs ~1-3s because psutil caches, so an A/B run inside
+    one script credits whichever field set ran first with the entire cold
+    cost. That mismeasurement first blamed create_time here. Compare field
+    sets only across separate interpreters.
 
     A process that could not be enriched (access denied, recycled between
     phases) is marked incomplete, which protects its whole tree — fail-safe.
-    Non-enriched, non-Claude processes keep empty expensive fields; they are
-    never tree members, so those fields are never read for them."""
+    A process whose create_time could not be READ is marked incomplete for
+    the same reason -- but one that has EXITED between phases is dropped from
+    the census instead, because the old single-phase census would never have
+    listed it and an incomplete member protects its whole tree, so keeping
+    dead rows would let ordinary churn quietly veto every cull. A process OUTSIDE the
+    create_time closure keeps create_time 0.0 and stays complete, because it
+    is never a tree member or an ancestor and so that field is never read for
+    it; non-enriched, non-Claude processes keep empty expensive fields on the
+    same argument."""
     import psutil
 
-    # Phase 1 — cheap whole-table census.
+    # Phase 1 — genuinely cheap whole-table census: pid/name from
+    # process_iter, and the entire pid->ppid table from ONE snapshot call.
+    # Neither ppid nor create_time is asked of process_iter here; see the
+    # docstring for why ppid in particular is not the cheap field it looks
+    # like. An empty/failed map degrades to the per-process path rather than
+    # inventing an ancestry-free census, because a record with no ppid is not
+    # linkable to its tree.
+    ppid_map = _live_ppid_map()
+
     cheap: List[ProcessRecord] = []
     complete = True
     try:
-        for proc in psutil.process_iter(["pid", "ppid", "name", "create_time"]):
+        for proc in psutil.process_iter(["pid", "name"]):
             try:
                 info = proc.info
+                pid = int(info["pid"])
+                if ppid_map is not None and pid in ppid_map:
+                    ppid, ppid_ok = ppid_map[pid], True
+                else:
+                    # Either no map at all, or this pid was BORN between the
+                    # map call and this enumeration. Ask it directly: that is
+                    # a handful of processes, not the whole table, so it keeps
+                    # the fix's win while still answering correctly.
+                    #
+                    # It must not simply be marked incomplete. An incomplete
+                    # member protects its WHOLE tree (planner's default-deny),
+                    # so quietly failing every process that raced the snapshot
+                    # would bias the enforce lane toward never acting -- a
+                    # behaviour change wearing a fail-safe's clothes.
+                    try:
+                        ppid, ppid_ok = proc.ppid(), True
+                    except psutil.NoSuchProcess:
+                        continue          # exited mid-enumeration; not a row
+                    except Exception:
+                        ppid, ppid_ok = None, False
                 cheap.append(
                     ProcessRecord(
-                        pid=int(info["pid"]),
-                        ppid=info.get("ppid"),
+                        pid=pid,
+                        ppid=ppid,
                         name=str(info.get("name") or ""),
                         exe=None,
                         cmdline=(),
-                        create_time=float(info.get("create_time") or 0.0),
+                        create_time=0.0,
                         rss=0,
                         username=None,
                         # Cheap records are complete for how they are USED
                         # (name + ancestry only); they are never tree members.
-                        complete=(
-                            info.get("name") is not None
-                            and info.get("create_time") is not None
-                        ),
+                        complete=(info.get("name") is not None and ppid_ok),
                     )
                 )
+                if not ppid_ok:
+                    complete = False
             except Exception:
                 complete = False
                 continue
     except Exception:
         complete = False
 
-    # Phase 2 — enrich only Claude processes and their trees.
-    targets = planner.enrichment_pids(cheap)
     by_pid = {r.pid: r for r in cheap}
+
+    # Phase 1b — create_time for the ppid closure around Claude-named seeds.
+    # A failed read marks the record incomplete; it must NOT silently leave
+    # the 0.0 behind, because 0.0 reads as "older than everything" to
+    # collect_tree's recycled-ppid guard, which decides tree membership.
+    gone: set = set()
+    for pid in planner.census_ctime_pids(cheap):
+        base = by_pid.get(pid)
+        if base is None:
+            continue
+        try:
+            ctime = float(psutil.Process(pid).create_time())
+        except psutil.NoSuchProcess:
+            # EXITED between phases. Drop it rather than mark it incomplete:
+            # a single-phase census would never have listed it at all, and an
+            # incomplete member protects its WHOLE tree, so retaining dead
+            # processes would let ordinary churn quietly veto every cull.
+            gone.add(pid)
+            continue
+        except Exception:
+            by_pid[pid] = dataclasses.replace(base, complete=False)
+            complete = False
+            continue
+        by_pid[pid] = dataclasses.replace(base, create_time=ctime)
+
+    # Phase 2 — enrich only Claude processes and their trees.
+    cheap = [by_pid[r.pid] for r in cheap if r.pid not in gone]
+    targets = planner.enrichment_pids(cheap)
     for pid in targets:
         base = by_pid.get(pid)
         if base is None:

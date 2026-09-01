@@ -522,6 +522,7 @@ def create_app(
             catalog_status,
             sidebar_status,
             hydration_status,
+            sidebar_enabled=config.sidebar.enabled,
             hydration_enabled=config.sidebar.legacy_hydration_enabled,
         )
         observation_completed_at = time.time()
@@ -1464,9 +1465,10 @@ def _status_payload(
     raw_sidebar: object,
     raw_hydration: object,
     *,
+    sidebar_enabled: bool,
     hydration_enabled: bool,
 ) -> dict[str, Any]:
-    sidebar = _sidebar_status(raw_sidebar)
+    sidebar = _sidebar_status(raw_sidebar, enabled=sidebar_enabled)
     sidebar["hydration"] = _hydration_status(
         raw_hydration,
         enabled=hydration_enabled,
@@ -1601,7 +1603,7 @@ def _catalog_status(value: object) -> dict[str, Any]:
     }
 
 
-def _sidebar_status(value: object) -> dict[str, Any]:
+def _sidebar_status(value: object, *, enabled: bool) -> dict[str, Any]:
     source = _status_mapping(value)
     providers = source.get("eligible_by_provider")
     provider_counts = _status_mapping(providers)
@@ -1723,11 +1725,25 @@ def _sidebar_status(value: object) -> dict[str, Any]:
         if is_canonical_sidebar_string(value)
     }
     raw_degraded_reasons = source.get("degraded_reasons")
+    # 2026-09-01: broker_heartbeat_stale and oldest_pending_stale are LIVENESS
+    # reasons -- they say the broker stopped beating and the queue head stopped
+    # moving. Both are the DEFINED state of a retired lane
+    # (session_bridge.sidebar.enabled=false short-circuits the delivery claim at
+    # coordinator.py:1375), so reporting them as degradation makes a deliberate
+    # retirement look like a fault with an age that climbs forever. Suppressed
+    # here, at the public boundary, mirroring _public_sidebar_status in cli.py.
+    #
+    # Deliberately narrow: ONLY these two codes, and ONLY the reasons list.
+    # sidebar_failed and execution_blockers are durable outcomes and must never be
+    # silenced by a config flag, and the raw measurements below
+    # (heartbeat_stale, oldest_job_overdue, last_heartbeat_at) stay FACTUAL --
+    # they remain true about the parked rows and are the audit evidence.
+    liveness_reasons = {"broker_heartbeat_stale", "oldest_pending_stale"}
     degraded_reasons = (
         [
             code
             for code in raw_degraded_reasons
-            if code in {"broker_heartbeat_stale", "oldest_pending_stale"}
+            if code in liveness_reasons and enabled
         ]
         if isinstance(raw_degraded_reasons, (list, tuple))
         else []
@@ -1783,6 +1799,11 @@ def _sidebar_status(value: object) -> dict[str, Any]:
         "heartbeat_stale": source.get("heartbeat_stale") is True,
         "oldest_job_overdue": source.get("oldest_job_overdue") is True,
         "degraded_reasons": degraded_reasons,
+        # Without these an empty degraded_reasons on a retired lane is
+        # indistinguishable from a healthy active one -- green but blind, the
+        # same defect the evidence axis carried before optional_feature_disabled.
+        "lane_state": "active" if enabled else "retired",
+        "enabled": enabled,
         "broker": broker,
         "last_visible_task_id": task_id,
         "recent_error_codes": (
