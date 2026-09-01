@@ -411,10 +411,41 @@ def append_entry(
         path.parent.mkdir(parents=True, exist_ok=True)
         with open(path, "a", encoding="utf-8") as fh:
             fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+        # Optional GuardClaw cryptographic verification hook (GEF-SPEC-1.0)
+        if os.environ.get("HERMES_AUDIT_SIGNING"):
+            try:
+                import importlib
+                gc = importlib.import_module("guardclaw")
+                gef_dir = path.parent / ".guardclaw_curator_vault"
+                key_mgr = gc.Ed25519KeyManager.generate()
+                gef_ledger = gc.GEFLedger(
+                    key_manager=key_mgr,
+                    agent_id=f"hermes-{entry['actor']}",
+                    ledger_path=str(gef_dir),
+                )
+                gef_ledger.emit(
+                    record_type=gc.RecordType.TOOL_RESULT,
+                    payload={"action": action, "skill": skill, "entry_id": entry["id"], "actor": entry["actor"]},
+                )
+            except Exception:
+                pass
+
         return entry["id"]
     except Exception as e:
         logger.warning("skill_ledger: failed to append entry (%s) — mutation unaffected", e)
         return None
+
+
+def verify_skill_ledger_integrity() -> Dict[str, Any]:
+    """Verify cryptographic integrity of the skill mutation ledger if signing is active."""
+    try:
+        import importlib
+        gc = importlib.import_module("guardclaw")
+        gef_dir = ledger_path().parent / ".guardclaw_curator_vault"
+        return gc.verify_ledger(str(gef_dir))
+    except Exception as exc:
+        return {"chain_valid": False, "error": str(exc)}
 
 
 def record_mutation(
