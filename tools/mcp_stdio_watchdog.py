@@ -55,7 +55,30 @@ _TERM_GRACE_S = 3.0
 
 
 def _is_orphaned(original_ppid: int, getppid=os.getppid) -> bool:
-    """Return whether this process no longer has its original POSIX parent."""
+    """Return whether this process no longer has its original parent."""
+    if sys.platform == "win32":
+        # On Windows os.getppid() does not reliably return the spawning
+        # parent's PID — the PEB value can differ from the actual creator
+        # PID. Actively probe whether the parent PID is still alive.
+        try:
+            import ctypes
+            from ctypes import wintypes
+            _kernel32 = ctypes.windll.kernel32
+            _PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+            _STILL_ACTIVE = 259
+            handle = _kernel32.OpenProcess(
+                _PROCESS_QUERY_LIMITED_INFORMATION, False, original_ppid
+            )
+            if not handle:
+                return True
+            try:
+                code = wintypes.DWORD()
+                _kernel32.GetExitCodeProcess(handle, ctypes.byref(code))
+                return code.value != _STILL_ACTIVE
+            finally:
+                _kernel32.CloseHandle(handle)
+        except Exception:
+            return False
     return getppid() != original_ppid
 
 
