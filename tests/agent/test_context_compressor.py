@@ -373,6 +373,72 @@ class TestCompress:
     def _make_messages(self, n):
         return [{"role": "user" if i % 2 == 0 else "assistant", "content": f"msg {i}"} for i in range(n)]
 
+    def test_late_success_rechecks_before_shared_state_publication(self):
+        from agent.auxiliary_client import AuxiliaryExplicitCancellation
+        from agent.compression_attempt_context import compression_cancelled_check
+
+        with patch(
+            "agent.context_compressor.get_model_context_length", return_value=100000
+        ):
+            c = ContextCompressor(model="test/model", quiet_mode=True)
+        c._previous_summary = "successor-owned summary"
+        c._summary_failure_cooldown_until = 123.0
+        c._last_summary_error = "successor-owned error"
+        checks = 0
+
+        def cancelled_after_response_processing():
+            nonlocal checks
+            checks += 1
+            # Start, telemetry-finally, and immediate post-call checks pass.
+            # Cancellation wins only at the final shared-state boundary.
+            return checks >= 4
+
+        response = {
+            "choices": [
+                {
+                    "message": {
+                        "content": (
+                            "## Active Task\nUser asked: 'keep context'\n\n"
+                            "## Goal\nContinue the session."
+                        )
+                    }
+                }
+            ]
+        }
+        with (
+            patch("agent.context_compressor.call_llm", return_value=response),
+            compression_cancelled_check(cancelled_after_response_processing),
+            pytest.raises(AuxiliaryExplicitCancellation),
+        ):
+            c._generate_summary(
+                [{"role": "user", "content": "keep context"}]
+            )
+
+        assert c._previous_summary == "successor-owned summary"
+        assert c._summary_failure_cooldown_until == 123.0
+        assert c._last_summary_error == "successor-owned error"
+
+    def test_cooldown_clear_uses_attempt_local_cancellation(self):
+        from agent.compression_attempt_context import compression_cancelled_check
+
+        with patch(
+            "agent.context_compressor.get_model_context_length", return_value=100000
+        ):
+            c = ContextCompressor(model="test/model", quiet_mode=True)
+        c._summary_failure_cooldown_until = 123.0
+        c._last_summary_error = "successor-owned error"
+        c._consecutive_timeout_failures = 2
+        # Simulate the shared attribute having already been replaced by the
+        # uncancelled successor attempt.
+        c._compression_cancelled_check = lambda: False
+
+        with compression_cancelled_check(lambda: True):
+            c._clear_compression_failure_cooldown()
+
+        assert c._summary_failure_cooldown_until == 123.0
+        assert c._last_summary_error == "successor-owned error"
+        assert c._consecutive_timeout_failures == 2
+
     def test_forced_static_fallback_skips_remote_summary(self):
         from agent.context_compressor import static_summary_fallback
 

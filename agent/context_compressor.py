@@ -3074,19 +3074,12 @@ class ContextCompressor(ContextEngine):
         # not undo that cooldown when its summary eventually succeeds. The
         # hook is installed by compress_context for the duration of the
         # fenced call; when it reports cancellation, keep the host's cooldown.
-        cancelled_check = getattr(self, "_compression_cancelled_check", None)
-        if callable(cancelled_check):
-            try:
-                if cancelled_check():
-                    logger.info(
-                        "Skipping compression cooldown clear: host already "
-                        "cancelled this compression attempt"
-                    )
-                    return
-            except Exception:
-                logger.debug(
-                    "compression cancellation check failed", exc_info=True
-                )
+        if self._compression_cancelled():
+            logger.info(
+                "Skipping compression cooldown clear: host already cancelled "
+                "this compression attempt"
+            )
+            return
         self._summary_failure_cooldown_until = 0.0
         self._last_summary_error = None
         self._consecutive_timeout_failures = 0
@@ -5427,6 +5420,11 @@ This compaction should PRIORITISE preserving all information related to the focu
             summary = self._ground_historical_task_snapshot(summary, turns_to_summarize)
             summary = self._augment_summary_lean(summary, turns_to_summarize)
             self._validate_summary_user_provenance(summary, has_user_turn)
+            # Response processing can itself outlive the host budget. Re-check
+            # at the shared-state publication boundary so a stale successful
+            # attempt cannot overwrite the deterministic fallback's state.
+            if self._compression_cancelled():
+                raise AuxiliaryExplicitCancellation()
             # Store for iterative updates on next compaction
             self._previous_summary = summary
             self._clear_compression_failure_cooldown()
