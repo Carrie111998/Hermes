@@ -20828,8 +20828,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # began processing if the gateway died while it was still waiting.
         await self._mark_durable_active_turn(event, session_entry.session_key)
 
-        # Load conversation history from transcript
-        history = await self.async_session_store.load_transcript(session_entry.session_id)
+        # Load conversation history from the routed profile's transcript.
+        # The outer platform handler may have entered its scope before channel
+        # routing attached ``source.profile``. Resolve the scope again here,
+        # after routing is final, so a multiplexed specialist never reads the
+        # default profile's empty state.db and starts a follow-up with history=0.
+        if getattr(getattr(self, "config", None), "multiplex_profiles", False):
+            with _profile_runtime_scope(self._resolve_profile_home_for_source(source)):
+                history = await self.async_session_store.load_transcript(
+                    session_entry.session_id
+                )
+        else:
+            history = await self.async_session_store.load_transcript(
+                session_entry.session_id
+            )
         
         # -----------------------------------------------------------------
         # Session hygiene: auto-compress pathologically large transcripts
