@@ -1666,6 +1666,23 @@ def _classify_400(
             should_fallback=False,
         )
 
+    # Invalid reasoning configuration is a deterministic request-validation
+    # failure, not context overflow. Some OpenAI-compatible Responses
+    # providers return only structured fields (no message), so the generic
+    # large-request heuristic below otherwise treats the empty message as a
+    # bare overflow and enters a compression loop that cannot repair the
+    # rejected parameter.
+    error_param_lower = _extract_error_param(body).lower()
+    if (
+        error_code_lower == "invalid_reasoning_effort"
+        or error_param_lower in {"reasoning.effort", "reasoning_effort"}
+    ):
+        return result_fn(
+            FailoverReason.format_error,
+            retryable=False,
+            should_fallback=True,
+        )
+
     # Server-injected parameter rejection: a 400 blaming a request field the
     # client never sent.  MUST be checked BEFORE the request-validation branch
     # below, which would otherwise class it as a deterministic format_error and
@@ -2145,7 +2162,13 @@ def _extract_error_code(body: dict) -> str:
 
     error_obj = body.get("error", {})
     if isinstance(error_obj, dict):
-        code = error_obj.get("code") or error_obj.get("type") or ""
+        code = (
+            error_obj.get("code")
+            or error_obj.get("error_code")
+            or error_obj.get("errorCode")
+            or error_obj.get("type")
+            or ""
+        )
         if isinstance(code, str) and code.strip() and code.strip() != "400":
             return code.strip()
 
@@ -2170,6 +2193,16 @@ def _extract_error_code(body: dict) -> str:
         if text and text != "400":
             return text
     return ""
+
+
+def _extract_error_param(body: dict) -> str:
+    """Extract a request parameter name from flat or nested error bodies."""
+    if not isinstance(body, dict):
+        return ""
+    error_obj = body.get("error")
+    payload = error_obj if isinstance(error_obj, dict) else body
+    param = payload.get("param")
+    return param.strip() if isinstance(param, str) else ""
 
 
 def _extract_message(error: Exception, body: dict) -> str:
