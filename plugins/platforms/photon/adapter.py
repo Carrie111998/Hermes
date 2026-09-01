@@ -2584,7 +2584,11 @@ class PhotonAdapter(BasePlatformAdapter):
         except Exception as e:
             return SendResult(success=False, error=f"{type(e).__name__}: {e}")
         self._record_sent_message(data.get("messageId"))
-        return SendResult(success=True, message_id=data.get("messageId"))
+        msg_id = data.get("messageId")
+        logger.info(
+            "[photon] outbound sent: message_id=%s", msg_id or "none"
+        )
+        return SendResult(success=True, message_id=msg_id)
 
     async def _sidecar_send(
         self,
@@ -2630,7 +2634,11 @@ class PhotonAdapter(BasePlatformAdapter):
         except Exception as e:
             return SendResult(success=False, error=f"{type(e).__name__}: {e}")
         self._record_sent_message(data.get("messageId"))
-        return SendResult(success=True, message_id=data.get("messageId"))
+        msg_id = data.get("messageId")
+        logger.info(
+            "[photon] outbound sent: message_id=%s", msg_id or "none"
+        )
+        return SendResult(success=True, message_id=msg_id)
 
     async def _sidecar_send_poll(
         self, space_id: str, title: str, options: list,
@@ -2656,7 +2664,11 @@ class PhotonAdapter(BasePlatformAdapter):
         except Exception as e:
             return SendResult(success=False, error=f"{type(e).__name__}: {e}")
         self._record_sent_message(data.get("messageId"))
-        return SendResult(success=True, message_id=data.get("messageId"))
+        msg_id = data.get("messageId")
+        logger.info(
+            "[photon] outbound sent: message_id=%s", msg_id or "none"
+        )
+        return SendResult(success=True, message_id=msg_id)
 
     async def _sidecar_send_attachment(
         self,
@@ -2715,7 +2727,11 @@ class PhotonAdapter(BasePlatformAdapter):
         except Exception as e:
             return SendResult(success=False, error=f"{type(e).__name__}: {e}")
         self._record_sent_message(data.get("messageId"))
-        return SendResult(success=True, message_id=data.get("messageId"))
+        msg_id = data.get("messageId")
+        logger.info(
+            "[photon] outbound sent: message_id=%s", msg_id or "none"
+        )
+        return SendResult(success=True, message_id=msg_id)
 
     async def _sidecar_call(self, path: str, body: Dict[str, Any]) -> Dict[str, Any]:
         # Guard: adapter not yet connected (no sidecar address known).
