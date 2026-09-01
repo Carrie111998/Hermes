@@ -570,7 +570,80 @@ def _provider_preferences_for_agent(agent) -> Dict[str, Any]:
         preferences["require_parameters"] = True
     if agent.provider_data_collection:
         preferences["data_collection"] = agent.provider_data_collection
-    return preferences
+    try:
+        from agent.sticky_provider_order import (
+            apply_sticky_order_to_preferences,
+            maybe_warn_nitro_floor_order,
+        )
+
+        preferences = apply_sticky_order_to_preferences(agent, preferences)
+        maybe_warn_nitro_floor_order(agent, preferences)
+        return preferences
+    except Exception:
+        return preferences
+
+
+def _effective_request_overrides(agent) -> Dict[str, Any]:
+    """Return request overrides with the agent's service tier applied.
+
+    Baseline order: explicit ``request_overrides`` (``service_tier`` /
+    ``speed``) win over ``agent.service_tier`` mapped through
+    ``resolve_service_tier_overrides``. Per-turn TTFT escalation overlays
+    last and may replace or omit ``service_tier`` for this request; it
+    never mutates the canonical ``agent.request_overrides`` /
+    ``agent.service_tier`` baseline. While an outer-retry of the same
+    logical request is in flight, the overlay uses the pre-attempt
+    snapshot rather than a not-yet-accepted climb.
+    """
+    overrides = dict(getattr(agent, "request_overrides", {}) or {})
+    if "service_tier" not in overrides and "speed" not in overrides:
+        try:
+            from hermes_cli.models import resolve_service_tier_overrides
+
+            tier_overrides = resolve_service_tier_overrides(
+                getattr(agent, "model", None),
+                getattr(agent, "service_tier", None),
+                provider=getattr(agent, "provider", None),
+                base_url=getattr(agent, "base_url", None),
+            )
+        except Exception:
+            tier_overrides = None
+        if tier_overrides:
+            overrides.update(tier_overrides)
+    try:
+        from agent.service_tier_escalation import apply_escalation_to_overrides
+
+        return apply_escalation_to_overrides(agent, overrides)
+    except Exception:
+        return overrides
+
+
+def _apply_effective_overrides_to_summary_kwargs(agent, summary_kwargs: dict) -> None:
+    """Copy main-loop request overrides onto the iteration-limit summary call.
+
+    There is no separate ``auxiliary.summary`` tier. The summary is still
+    part of the same turn, so it must carry the effective
+    ``service_tier`` (including a TTFT climb) the conversation loop uses.
+
+    Chat-completions only. ``anthropic_messages`` does not put
+    ``service_tier`` on the wire (main loop maps overrides to
+    ``fast_mode`` only); its summary ``_ant_kw`` is built the same way.
+    """
+    try:
+        overrides = _effective_request_overrides(agent)
+    except Exception:
+        return
+    if not overrides:
+        return
+    extra_override = overrides.get("extra_body")
+    if isinstance(extra_override, dict):
+        merged = dict(summary_kwargs.get("extra_body") or {})
+        merged.update(extra_override)
+        if merged:
+            summary_kwargs["extra_body"] = merged
+    for key, value in overrides.items():
+        if key != "extra_body":
+            summary_kwargs[key] = value
 
 
 def _prompt_cache_scope_for_agent(agent) -> "str | None":
@@ -1830,6 +1903,7 @@ def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = Non
     """Build the keyword arguments dict for the active API mode."""
     if tools_for_api is None:
         tools_for_api = agent.tools
+    request_overrides = _effective_request_overrides(agent)
 
     if agent.api_mode == "anthropic_messages":
         _transport = agent._get_transport()
@@ -1849,7 +1923,7 @@ def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = Non
             preserve_dots=agent._anthropic_preserve_dots(),
             context_length=ctx_len,
             base_url=getattr(agent, "_anthropic_base_url", None),
-            fast_mode=(agent.request_overrides or {}).get("speed") == "fast",
+            fast_mode=request_overrides.get("speed") == "fast",
             drop_context_1m_beta=bool(getattr(agent, "_oauth_1m_beta_disabled", False)),
         )
         # Nous Portal reads ``tags`` and ``session_id`` as top-level body fields
@@ -1942,7 +2016,7 @@ def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = Non
             base_url=agent.base_url,
             max_tokens=agent.max_tokens,
             timeout=agent._resolved_api_call_timeout(),
-            request_overrides=agent.request_overrides,
+            request_overrides=request_overrides,
             provider=getattr(agent, "provider", None),
             is_github_responses=is_github_responses,
             is_codex_backend=is_codex_backend,
@@ -2094,7 +2168,7 @@ def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = Non
             ephemeral_max_output_tokens=_ephemeral_out,
             max_tokens_param_fn=agent._max_tokens_param,
             reasoning_config=agent.reasoning_config,
-            request_overrides=agent.request_overrides,
+            request_overrides=request_overrides,
             session_id=getattr(agent, "session_id", None),
             cache_scope_id=_cache_scope_id,
             provider_profile=_profile,
@@ -2127,7 +2201,7 @@ def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = Non
         ephemeral_max_output_tokens=_ephemeral_out,
         max_tokens_param_fn=agent._max_tokens_param,
         reasoning_config=agent.reasoning_config,
-        request_overrides=agent.request_overrides,
+        request_overrides=request_overrides,
         session_id=getattr(agent, "session_id", None),
         cache_scope_id=_cache_scope_id,
         model_lower=(agent.model or "").lower(),
@@ -2950,6 +3024,19 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
                 "Failed to resolve extra_body for fallback %s; keeping current: %s",
                 agent.model, _eb_err,
             )
+        # * Overlay routing + effective tier for the model that will actually
+        #   go on the wire. Do not call switch_model (it would reset the
+        #   TTFT escalation ladder).
+        try:
+            from agent.agent_runtime_helpers import resync_per_model_routing_and_tier
+
+            resync_per_model_routing_and_tier(agent)
+        except Exception:
+            logger.debug(
+                "Fallback %s: per-model routing/tier resync failed",
+                agent.model,
+                exc_info=True,
+            )
 
         # Keep the prompt's self-identity in sync with the model actually
         # answering, so "what model are you?" doesn't report the primary.
@@ -3024,6 +3111,15 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
 
     def _managed_summary_call(request, callback, *, retry_count: int):
         from agent import relay_llm
+
+        # * Summary retries reuse frozen extra_body — tick the pin
+        # timestamp on every attempt, including empty-content retries.
+        try:
+            from agent.sticky_provider_order import note_sticky_attempt
+
+            note_sticky_attempt(agent)
+        except Exception:
+            pass
 
         return relay_llm.execute_current(
             request,
@@ -3184,6 +3280,14 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
 
             # Merge the profile's canonical body even when routing is unset:
             # profiles may always emit required metadata such as Portal tags.
+            # * Summary is its own logical request: apply idle TTL (and
+            # reset the per-request rotation budget) before prefs rebuild.
+            try:
+                from agent.sticky_provider_order import begin_sticky_logical_request
+
+                begin_sticky_logical_request(agent)
+            except Exception:
+                pass
             provider_preferences = _provider_preferences_for_agent(agent)
             profile_extra_body = {}
             try:
@@ -3232,8 +3336,13 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
 
             if summary_extra_body:
                 summary_kwargs["extra_body"] = summary_extra_body
+            _apply_effective_overrides_to_summary_kwargs(agent, summary_kwargs)
 
             if agent.api_mode == "anthropic_messages":
+                # * No _apply_effective_overrides_to_summary_kwargs: the
+                # main anthropic_messages path does not send service_tier
+                # (OpenRouter chat_completions only). TTFT escalation
+                # overlays that key only on an OpenRouter route.
                 _tsum = agent._get_transport()
                 _ant_kw = _tsum.build_kwargs(
                     model=agent.model,
@@ -3286,6 +3395,8 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
                 _cnr_retry = _ct_retry.normalize_response(retry_response)
                 final_response = (_cnr_retry.content or "").strip()
             elif agent.api_mode == "anthropic_messages":
+                # * Same as the first summary call: no OpenRouter
+                # service_tier overlay on anthropic_messages.
                 _tretry = agent._get_transport()
                 _ant_kw2 = _tretry.build_kwargs(
                     model=agent.model,
@@ -3318,6 +3429,7 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
                     summary_kwargs["reasoning_effort"] = _lm_reasoning_effort
                 if summary_extra_body:
                     summary_kwargs["extra_body"] = summary_extra_body
+                _apply_effective_overrides_to_summary_kwargs(agent, summary_kwargs)
 
                 summary_client = agent._ensure_primary_openai_client(
                     reason="iteration_limit_summary_retry"
@@ -3346,6 +3458,21 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
 
     except Exception as e:
         logger.warning("Failed to get summary response: %s", e)
+        # * Rotate the pin on timeout/overloaded/server_error so the
+        # next request leaves the unhealthy slug. rate_limit/empty/
+        # invalid keep the pin. Fail-open: never break the summary path.
+        try:
+            from agent.error_classifier import classify_api_error
+            from agent.sticky_provider_order import rotate_sticky_on_classified_error
+
+            classified = classify_api_error(
+                e,
+                provider=str(getattr(agent, "provider", "") or ""),
+                model=str(getattr(agent, "model", "") or ""),
+            )
+            rotate_sticky_on_classified_error(agent, classified.reason)
+        except Exception:
+            pass
         final_response = f"I reached the maximum iterations ({agent.max_iterations}) but couldn't summarize. Error: {str(e)}"
     finally:
         from agent import relay_llm
@@ -4006,6 +4133,12 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             )
 
     def _fire_first_delta():
+        try:
+            from agent.service_tier_escalation import mark_ttft_first_delta
+
+            mark_ttft_first_delta(agent)
+        except Exception:
+            pass
         if not first_delta_fired["done"] and on_first_delta:
             first_delta_fired["done"] = True
             try:
@@ -4106,6 +4239,12 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             attempt_request_client["value"] = request_client
             last_chunk_time["t"] = time.time()
             agent._touch_activity("waiting for provider response (streaming)")
+            try:
+                from agent.service_tier_escalation import mark_ttft_send
+
+                mark_ttft_send(agent)
+            except Exception:
+                pass
             return request_client.chat.completions.create(**stream_kwargs)
 
         def _stream_created(raw_stream: Any) -> None:
@@ -4464,6 +4603,12 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                         function_arguments = getattr(tc_function, "arguments", None)
                         if function_arguments:
                             entry["function"]["arguments"] += function_arguments
+                            try:
+                                from agent.service_tier_escalation import mark_ttft_first_delta
+
+                                mark_ttft_first_delta(agent)
+                            except Exception:
+                                pass
                     extra = getattr(tc_delta, "extra_content", None)
                     if extra is None and hasattr(tc_delta, "model_extra"):
                         extra = (tc_delta.model_extra if isinstance(tc_delta.model_extra, dict) else {}).get("extra_content")

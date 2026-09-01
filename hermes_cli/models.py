@@ -3587,6 +3587,23 @@ def _openrouter_variant_base(model_id: str) -> Optional[str]:
         return base
     return None
 
+
+def _requested_has_unknown_variant_suffix(model_id: str) -> bool:
+    """True when *model_id* is ``vendor/model:suffix`` and not a routing variant.
+
+    Fuzzy auto-correction (``get_close_matches`` cutoff 0.9) silently
+    rewrites the request to the closest catalog id. A short typo such as
+    ``x-ai/grok-4.6:x`` is closer than 0.9 to ``x-ai/grok-4.6`` and would
+    be accepted as that base. Catalog SKUs (``:free``) match by exact
+    membership before this runs; remaining unknown suffixes are invalid.
+    """
+    from hermes_constants import strip_model_variant_suffix
+
+    raw = str(model_id or "").strip()
+    if strip_model_variant_suffix(raw) == raw:
+        return False
+    return _openrouter_variant_base(raw) is None
+
 # Subscription/OAuth providers whose catalogs RE-EXPOSE other vendors' models
 # would be listed here (tried only as a last resort for bare short-alias
 # resolution, after every native-vendor catalog, so they never hijack an alias
@@ -4002,6 +4019,59 @@ def resolve_fast_mode_overrides(model_id: Optional[str]) -> dict[str, Any] | Non
     if _is_anthropic_fast_model(model_id):
         return {"speed": "fast"}
     return {"service_tier": "priority"}
+
+
+def resolve_service_tier_overrides(
+    model_id: Optional[str],
+    service_tier: Optional[str],
+    *,
+    provider: Optional[str] = None,
+    base_url: Optional[str] = None,
+) -> dict[str, Any] | None:
+    """Return request overrides for a normalized service-tier preference.
+
+    OpenRouter accepts both ``flex`` and ``priority`` as top-level request
+    fields for every supported model. Elsewhere, ``priority`` retains the
+    existing model-aware /fast mapping: OpenAI models receive
+    ``service_tier`` while supported Anthropic models receive ``speed``.
+    """
+    from hermes_constants import parse_service_tier
+
+    tier = parse_service_tier(service_tier)
+    if tier == "flex":
+        return {"service_tier": "flex"}
+    if tier == "priority" and _is_openrouter_service_tier_route(
+        provider, base_url
+    ):
+        return {"service_tier": "priority"}
+    if tier == "priority":
+        return resolve_fast_mode_overrides(model_id)
+    return None
+
+
+def _is_openrouter_service_tier_route(
+    provider: Optional[str], base_url: Optional[str]
+) -> bool:
+    """Return whether a request route uses OpenRouter's service-tier API."""
+    provider_name = str(provider or "").strip()
+    if provider_name and normalize_provider(provider_name) == "openrouter":
+        return True
+    if not base_url:
+        return False
+    from utils import base_url_host_matches
+
+    return base_url_host_matches(base_url, "openrouter.ai")
+
+
+def _catalog_matches_requested_model(requested: str, catalog: list[str]) -> bool:
+    """Return whether *catalog* lists the requested model id exactly.
+
+    OpenRouter routing variants (``:nitro``, ``:floor``, ``:exacto``,
+    ``:online``) are accepted by :func:`_openrouter_variant_base` on the
+    OpenRouter path, not by stripping an arbitrary ``:suffix`` here.
+    ``:free`` is a catalog SKU and matches only via direct membership.
+    """
+    return requested in set(catalog)
 
 
 def _resolve_copilot_catalog_api_key() -> str:
@@ -6885,7 +6955,7 @@ def validate_requested_model(
                     f"Load `{requested}` in LM Studio (Developer tab → Load Model) and try again."
                 ),
             }
-        if requested_for_lookup in set(models):
+        if _catalog_matches_requested_model(requested_for_lookup, models):
             return {"accepted": True, "persist": True, "recognized": True, "message": None}
         return {
             "accepted": False, "persist": False, "recognized": False,
@@ -6993,7 +7063,7 @@ def validate_requested_model(
             )
         api_models = probe.get("models")
         if api_models is not None:
-            if requested_for_lookup in set(api_models):
+            if _catalog_matches_requested_model(requested_for_lookup, api_models):
                 return {
                     "accepted": True,
                     "persist": True,
@@ -7100,7 +7170,7 @@ def validate_requested_model(
                     ),
                 }
         if catalog_models:
-            if requested_for_lookup in set(catalog_models):
+            if _catalog_matches_requested_model(requested_for_lookup, catalog_models):
                 return {
                     "accepted": True,
                     "persist": True,
@@ -7221,7 +7291,7 @@ def validate_requested_model(
             api_key=api_key or None,
         )
         if anthropic_models is not None:
-            if requested_for_lookup in set(anthropic_models):
+            if _catalog_matches_requested_model(requested_for_lookup, anthropic_models):
                 return {
                     "accepted": True,
                     "persist": True,
@@ -7262,7 +7332,7 @@ def validate_requested_model(
     if api_mode == "anthropic_messages":
         api_models = fetch_api_models(api_key, base_url, api_mode=api_mode)
         if api_models is not None:
-            if requested_for_lookup in set(api_models):
+            if _catalog_matches_requested_model(requested_for_lookup, api_models):
                 return {
                     "accepted": True,
                     "persist": True,
@@ -7306,7 +7376,7 @@ def validate_requested_model(
                 m[len("models/"):] if isinstance(m, str) and m.startswith("models/") else m
                 for m in api_models
             ]
-        if requested_for_lookup in set(api_models):
+        if _catalog_matches_requested_model(requested_for_lookup, api_models):
             # API confirmed the model exists
             return {
                 "accepted": True,
@@ -7338,8 +7408,17 @@ def validate_requested_model(
             # listing (e.g. Z.AI Pro/Max plans can use glm-5 on coding
             # endpoints even though it's not in /models).  Warn but allow.
 
-            # Auto-correct if the top match is very similar (e.g. typo)
-            auto = get_close_matches(requested_for_lookup, api_models, n=1, cutoff=0.9)
+            # Auto-correct if the top match is very similar (e.g. typo).
+            # * Unknown vendor/model:suffix must not collapse to the base —
+            # get_close_matches(cutoff=0.9) treats ``:x`` as a typo of the
+            # listed slug and would silently persist the stripped id.
+            auto = (
+                []
+                if _requested_has_unknown_variant_suffix(requested_for_lookup)
+                else get_close_matches(
+                    requested_for_lookup, api_models, n=1, cutoff=0.9
+                )
+            )
             if auto:
                 corrected = _with_preset_suffix(auto[0])
                 return {
@@ -7375,9 +7454,18 @@ def validate_requested_model(
                 from hermes_cli.providers import is_official_openai_host
 
                 _openai_listing_is_authoritative = is_official_openai_host(base_url)
-            if not _openai_listing_is_authoritative and _model_in_provider_catalog(
-                (_variant_base or requested_for_lookup).lower(),
-                _provider_keys(normalized),
+            # * Known OpenRouter routing variants use _variant_base (the
+            # listed slug). Arbitrary :suffix values must not collapse to
+            # that base or a typo like :bogus is accepted as the catalog id.
+            catalog_model = (_variant_base or requested_for_lookup).lower()
+            if not _openai_listing_is_authoritative and (
+                _model_in_provider_catalog(
+                    catalog_model,
+                    _provider_keys(normalized),
+                )
+                or _model_in_provider_catalog(
+                    requested_for_lookup.lower(), _provider_keys(normalized)
+                )
             ):
                 return {
                     "accepted": True,
@@ -7511,8 +7599,12 @@ def validate_requested_model(
                     "message": None,
                 }
         catalog_lower_list = list(catalog_lower.keys())
-        auto = get_close_matches(
-            requested_for_lookup.lower(), catalog_lower_list, n=1, cutoff=0.9
+        auto = (
+            []
+            if _requested_has_unknown_variant_suffix(requested_for_lookup)
+            else get_close_matches(
+                requested_for_lookup.lower(), catalog_lower_list, n=1, cutoff=0.9
+            )
         )
         if auto:
             corrected = catalog_lower[auto[0]]

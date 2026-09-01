@@ -378,6 +378,19 @@ DEFAULT_CONFIG = {
         # Edit directly in config.yaml (no CLI support due to dots in keys).
         "reasoning_overrides": {},
 
+        # Per-model service-tier overlay (exact API model id). Takes
+        # precedence over agent.service_tier; a session /fast pin still wins.
+        # Edit directly in config.yaml (no CLI support due to dots in keys).
+        "service_tier_overrides": {},
+
+        # Opt-in per-turn OpenRouter service-tier climb on slow TTFT.
+        # Off by default. Does not persist; resets at each user turn.
+        "service_tier_escalation": {
+            "enabled": False,
+            "ttft_threshold_seconds": 8.0,
+            "consecutive_slow_requests": 1,
+        },
+
         # Per-provider opt-in to preserve assistant ``reasoning_content``
         # when replaying history.  The built-in echo families (DeepSeek,
         # Kimi/Moonshot, Xiaomi MiMo) are auto-detected by provider name
@@ -1185,6 +1198,8 @@ DEFAULT_CONFIG = {
             "api_key": "",         # API key for base_url (falls back to OPENAI_API_KEY)
             "timeout": 120,        # seconds — LLM API call timeout; vision payloads need generous timeout
             "extra_body": {},      # OpenAI-compatible provider-specific request fields
+            "service_tier": "",   # * OpenRouter/OpenAI-compatible service tier: flex | priority
+            "providers": [],       # * Ordered OpenRouter upstream provider IDs for this task
             "reasoning_effort": "",  # per-task thinking level: none|minimal|low|medium|high|xhigh|max|ultra (empty = provider default)
             "download_timeout": 30,  # seconds — image HTTP download timeout; increase for slow connections
         },

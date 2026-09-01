@@ -51,7 +51,12 @@ from agent.tool_guardrails import (
 from hermes_cli.config import cfg_get
 from hermes_cli.route_identity import normalize_route_base_url
 from hermes_cli.timeouts import get_provider_request_timeout
-from hermes_constants import get_hermes_home
+from hermes_constants import (
+    get_hermes_home,
+    parse_service_tier,
+    resolve_provider_routing_for_model,
+    strip_model_variant_suffix,
+)
 from utils import base_url_host_matches, is_truthy_value
 
 # Use the same logger name as run_agent so tests patching ``run_agent.logger``
@@ -405,6 +410,7 @@ def _normalized_custom_base_url(value: Any) -> str:
 
 def _custom_provider_model_matches(agent_model: str, entry: Dict[str, Any]) -> bool:
     agent_model_norm = str(agent_model or "").strip().lower()
+    base_model_norm = strip_model_variant_suffix(agent_model_norm).lower()
     # Multi-model entries (v12+ `providers.<name>.models` mapping / legacy
     # `models:` list): the agent's model matching ANY catalog entry counts.
     # Without this, a provider whose `model`/`default_model` differs from the
@@ -423,7 +429,13 @@ def _custom_provider_model_matches(agent_model: str, entry: Dict[str, Any]) -> b
     provider_model = str(entry.get("model", "") or "").strip().lower()
     if not provider_model and not catalog:
         return True
-    return provider_model == agent_model_norm
+    if provider_model == agent_model_norm:
+        return True
+    if base_model_norm != agent_model_norm:
+        if catalog and base_model_norm in catalog:
+            return True
+        return provider_model == base_model_norm
+    return False
 
 
 def _custom_provider_extra_body_for_agent(
@@ -586,6 +598,7 @@ def init_agent(
     max_tokens: int = None,
     reasoning_config: Dict[str, Any] = None,
     service_tier: str = None,
+    service_tier_escalation: Dict[str, Any] = None,
     request_overrides: Dict[str, Any] = None,
     prefill_messages: List[Dict[str, Any]] = None,
     platform: str = None,
@@ -967,7 +980,27 @@ def init_agent(
     # Read once at init; switch_model / try_activate_fallback / restore
     # keep it in sync with the active provider.
     agent._reasoning_echo_flag = agent._read_reasoning_echo_from_config()
-    agent.service_tier = service_tier
+    agent.service_tier = parse_service_tier(service_tier)
+    # * Session /fast (or surface) pin; per-model overlay must not replace it.
+    agent._service_tier_session_pinned = False
+    # * Opt-in: fallback/restore may re-apply config routing/tier. Surfaces
+    #   that resolve from config.yaml set this True after construction.
+    #   Programmatic / SDK AIAgent() stays False (constructor values win).
+    agent._config_managed_routing_tier = False
+    # * Turn-local TTFT ladder; never mutates service_tier / request_overrides.
+    from agent.service_tier_escalation import bind_service_tier_escalation
+
+    bind_service_tier_escalation(agent, service_tier_escalation)
+    # * Batch runner and gateway background tasks set this True so an
+    # accidentally enabled escalation config cannot climb the ladder.
+    agent._block_service_tier_escalation = False
+    # * Raw provider_routing (including models:) and agent: section for
+    #   switch_model / fallback re-resolve without a full switch_model.
+    #   Filled after load_config_readonly() below so multiplex turns that
+    #   construct the agent inside _profile_runtime_scope snapshot THIS
+    #   profile, and resync does not need a later unscoped load_config().
+    agent._provider_routing_config = None
+    agent._agent_config = None
     agent.request_overrides = dict(request_overrides or {})
     agent.prefill_messages = prefill_messages or []  # Prefilled conversation turns
     agent._force_ascii_payload = False
@@ -1817,6 +1850,31 @@ def init_agent(
         _agent_cfg = _load_agent_config()
     except Exception:
         _agent_cfg = {}
+    if isinstance(_agent_cfg, dict):
+        _agent_section = _agent_cfg.get("agent")
+        if isinstance(_agent_section, dict):
+            agent._agent_config = _agent_section
+        _pr_section = _agent_cfg.get("provider_routing")
+        if isinstance(_pr_section, dict):
+            agent._provider_routing_config = _pr_section
+
+    # * Opt-in sticky pin from provider_routing. Constructors that pass
+    # providers_order without apply_provider_routing_to_agent (cron,
+    # subagent, CLI background, batch) still get the feature. apply()
+    # rebinds on /model and fallback resync; same-order bind keeps
+    # active_index.
+    try:
+        from agent.sticky_provider_order import bind_sticky_order
+
+        bind_sticky_order(
+            agent,
+            resolve_provider_routing_for_model(
+                getattr(agent, "_provider_routing_config", None),
+                getattr(agent, "model", "") or "",
+            ),
+        )
+    except Exception:
+        pass
 
     # Codex commentary visibility (display.show_commentary, default true).
     # When true, completed Codex phase=commentary messages are delivered as
