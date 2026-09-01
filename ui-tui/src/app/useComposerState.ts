@@ -301,7 +301,9 @@ export function useComposerState({ gw, submitRef, sys }: UseComposerStateOptions
 
           setComposerTokens(prev => prev.map(t => (t.label === label ? { ...t, path } : t)))
         })
-        .catch(() => {})
+        .catch(err => {
+          sys(`warning: paste.collapse failed — token content may not survive submit (${err?.message ?? err})`)
+        })
 
       return inserted
     },

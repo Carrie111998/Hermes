@@ -20,8 +20,8 @@ const DOUBLE_ENTER_MS = 450
 const spliceMatches = (text: string, matches: RegExpMatchArray[], results: string[]) =>
   matches.reduceRight((acc, m, i) => acc.slice(0, m.index!) + results[i] + acc.slice(m.index! + m[0].length), text)
 
-export const expandPasteTokens = (tokens: ComposerToken[]) =>
-  expandTokens(tokens.filter(token => token.kind === 'paste'))
+export const expandPasteTokens = (tokens: ComposerToken[]) => (value: string) =>
+  expandTokens(tokens.filter(token => token.kind === 'paste'))(value).expanded
 
 const slashArgument = (command: string) => /^\/\S+\s+([\s\S]+)$/.exec(command)?.[1] ?? ''
 
@@ -35,10 +35,15 @@ export const queueItemFromSlash = (displayCommand: string, expandedCommand: stri
   return queueItem(slashArgument(expandedCommand), display)
 }
 
-export const prepareSubmission = (display: string, tokens: ComposerToken[]) => ({
-  display,
-  text: expandTokens(tokens)(display)
-})
+export const prepareSubmission = (display: string, tokens: ComposerToken[]) => {
+  const result = expandTokens(tokens)(display)
+
+  return {
+    display,
+    text: result.expanded,
+    unresolved: result.unresolved
+  }
+}
 
 export const shouldInterpolateSubmission = (display: string) => hasInterpolation(display)
 
@@ -88,7 +93,7 @@ export function useSubmission(opts: UseSubmissionOptions) {
     ) => {
       // Read tokens off the ref, not render state: a paste immediately followed
       // by Enter submits before React has re-rendered with the new token.
-      const expand = expandOverride ?? expandTokens(composerRefs.tokensRef.current)
+      const expand = expandOverride ?? ((v: string) => expandTokens(composerRefs.tokensRef.current)(v).expanded)
 
       submitPrompt(
         text,
@@ -245,6 +250,15 @@ export function useSubmission(opts: UseSubmissionOptions) {
       const submissionTokens = [...composerRefs.tokensRef.current]
       const submission = prepareSubmission(full, submissionTokens)
       const toHistory = submission.text
+
+      if (submission.unresolved.length > 0) {
+        sys(
+          `cannot submit: ${submission.unresolved.length} collapsed paste token${submission.unresolved.length > 1 ? 's' : ''} missing — their text was lost before submission (${submission.unresolved.map(s => s.slice(0, 60)).join(', ')}). The composer still has what you typed, so nothing is lost.`
+        )
+
+        return
+      }
+
       const queuePayload = expandPasteTokens(submissionTokens)(full)
 
       if (looksLikeSlashCommand(full)) {
@@ -318,9 +332,17 @@ export function useSubmission(opts: UseSubmissionOptions) {
       if (shouldInterpolateSubmission(full)) {
         patchUiState({ busy: true })
 
-        return interpolate(full, text =>
-          send(prepareSubmission(text, submissionTokens).text, true, text, value => value)
-        )
+        return interpolate(full, text => {
+          const result = prepareSubmission(text, submissionTokens)
+
+          if (result.unresolved.length > 0) {
+            return sys(
+              `cannot submit: ${result.unresolved.length} collapsed paste token${result.unresolved.length > 1 ? 's' : ''} missing after interpolation — their text was lost (${result.unresolved.map(s => s.slice(0, 60)).join(', ')})`
+            )
+          }
+
+          send(result.text, true, text, value => value)
+        })
       }
 
       send(submission.text, true, submission.display, value => value)
