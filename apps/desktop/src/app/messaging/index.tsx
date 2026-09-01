@@ -110,7 +110,23 @@ const FIELD_COPY: Record<string, { advanced?: boolean }> = {
   QQBOT_HOME_CHANNEL: { advanced: true },
   QQBOT_HOME_CHANNEL_NAME: { advanced: true },
   WHATSAPP_ENABLED: { advanced: true },
-  WHATSAPP_MODE: { advanced: true }
+  WHATSAPP_MODE: { advanced: true },
+  ZULIP_ALLOW_ALL_USERS: { advanced: true },
+  ZULIP_HOME_TOPIC: { advanced: true },
+  ZULIP_HOME_CHANNEL: { advanced: true },
+  ZULIP_HOME_CHANNEL_NAME: { advanced: true },
+  ZULIP_CERT_BUNDLE: { advanced: true },
+  ZULIP_ALLOW_INSECURE: { advanced: true },
+  ZULIP_REQUIRE_MENTION: { advanced: true },
+  ZULIP_FREE_RESPONSE_STREAMS: { advanced: true },
+  ZULIP_CONTEXT_DEPTH: { advanced: true },
+  ZULIP_CATCHUP: { advanced: true },
+  ZULIP_CATCHUP_MAX_MESSAGES: { advanced: true },
+  ZULIP_CONVERT_MATH: { advanced: true }
+}
+
+function isZulipEnvKey(key: string) {
+  return key.startsWith('ZULIP_')
 }
 
 function fieldCopy(field: MessagingEnvVarInfo, m: Translations['messaging']) {
@@ -905,6 +921,7 @@ function MessagingField({
         </div>
       }
       description={copy.help}
+      hint={isZulipEnvKey(field.key) ? field.key : undefined}
       title={
         <span className="flex flex-wrap items-center gap-2">
           <label htmlFor={fieldId}>{copy.label}</label>
