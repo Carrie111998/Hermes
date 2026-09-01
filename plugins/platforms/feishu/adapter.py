@@ -2791,15 +2791,21 @@ class FeishuAdapter(BasePlatformAdapter):
         future.add_done_callback(self._log_background_failure)
         return True
 
-    def _is_interactive_operator_authorized(self, open_id: str) -> bool:
-        """Return whether this card-action operator may answer gated prompts."""
-        normalized = str(open_id or "").strip()
-        if not normalized:
+    def _is_interactive_operator_authorized(self, open_id: str, user_id: str = "") -> bool:
+        """Return whether this card-action operator may answer gated prompts.
+
+        Feishu allowlists may be configured with either ``ou_*`` open IDs or
+        ``u_*`` user IDs, so an operator is identified by both IDs the callback
+        carries. Matching on only one of them rejects operators listed under
+        the other form. A callback with neither ID fails closed.
+        """
+        operator_ids = {str(open_id or "").strip(), str(user_id or "").strip()} - {""}
+        if not operator_ids:
             return False
         allowed_ids = set(self._admins) | set(self._allowed_group_users)
         if not allowed_ids:
             return True
-        return "*" in allowed_ids or normalized in allowed_ids
+        return "*" in allowed_ids or bool(operator_ids & allowed_ids)
 
     def _handle_approval_card_action(self, *, event: Any, action_value: Dict[str, Any], loop: Any) -> Any:
         """Schedule approval resolution and build the synchronous callback response."""
@@ -2815,8 +2821,9 @@ class FeishuAdapter(BasePlatformAdapter):
 
         operator = getattr(event, "operator", None)
         open_id = str(getattr(operator, "open_id", "") or "")
-        if not self._is_interactive_operator_authorized(open_id):
-            logger.warning("[Feishu] Unauthorized approval click by %s", open_id or "<unknown>")
+        user_id = str(getattr(operator, "user_id", "") or "")
+        if not self._is_interactive_operator_authorized(open_id, user_id):
+            logger.warning("[Feishu] Unauthorized approval click by %s", open_id or user_id or "<unknown>")
             return P2CardActionTriggerResponse() if P2CardActionTriggerResponse else None
 
         callback_chat_id = str(getattr(getattr(event, "context", None), "open_chat_id", "") or "")
@@ -2841,6 +2848,7 @@ class FeishuAdapter(BasePlatformAdapter):
                 choice=choice,
                 user_name=user_name,
                 open_id=open_id,
+                user_id=user_id,
                 chat_id=chat_id,
             ),
         ):
@@ -2874,8 +2882,9 @@ class FeishuAdapter(BasePlatformAdapter):
 
         operator = getattr(event, "operator", None)
         open_id = str(getattr(operator, "open_id", "") or "")
-        if not self._is_interactive_operator_authorized(open_id):
-            logger.warning("[Feishu] Unauthorized update prompt click by %s", open_id or "<unknown>")
+        user_id = str(getattr(operator, "user_id", "") or "")
+        if not self._is_interactive_operator_authorized(open_id, user_id):
+            logger.warning("[Feishu] Unauthorized update prompt click by %s", open_id or user_id or "<unknown>")
             return P2CardActionTriggerResponse() if P2CardActionTriggerResponse else None
 
         callback_chat_id = str(getattr(getattr(event, "context", None), "open_chat_id", "") or "")
@@ -2897,6 +2906,7 @@ class FeishuAdapter(BasePlatformAdapter):
                 answer,
                 user_name,
                 open_id=open_id,
+                user_id=user_id,
                 chat_id=callback_chat_id,
             ),
         ):
@@ -2919,6 +2929,7 @@ class FeishuAdapter(BasePlatformAdapter):
         user_name: str,
         *,
         open_id: str = "",
+        user_id: str = "",
         chat_id: str = "",
     ) -> None:
         """Pop approval state and unblock the waiting agent thread."""
@@ -2926,8 +2937,12 @@ class FeishuAdapter(BasePlatformAdapter):
         if not state:
             logger.debug("[Feishu] Approval %s already resolved or unknown", approval_id)
             return
-        if not self._is_interactive_operator_authorized(open_id):
-            logger.warning("[Feishu] Unauthorized approval click by %s for approval %s", open_id or "<unknown>", approval_id)
+        if not self._is_interactive_operator_authorized(open_id, user_id):
+            logger.warning(
+                "[Feishu] Unauthorized approval click by %s for approval %s",
+                open_id or user_id or "<unknown>",
+                approval_id,
+            )
             return
         expected_chat_id = str(state.get("chat_id", "") or "")
         if expected_chat_id and chat_id and expected_chat_id != chat_id:
@@ -2973,6 +2988,7 @@ class FeishuAdapter(BasePlatformAdapter):
         user_name: str,
         *,
         open_id: str = "",
+        user_id: str = "",
         chat_id: str = "",
     ) -> None:
         """Persist an update prompt answer for the detached update process."""
@@ -2980,8 +2996,12 @@ class FeishuAdapter(BasePlatformAdapter):
         if not state:
             logger.debug("[Feishu] Update prompt %s already resolved or unknown", prompt_id)
             return
-        if not self._is_interactive_operator_authorized(open_id):
-            logger.warning("[Feishu] Unauthorized update prompt click by %s for prompt %s", open_id, prompt_id)
+        if not self._is_interactive_operator_authorized(open_id, user_id):
+            logger.warning(
+                "[Feishu] Unauthorized update prompt click by %s for prompt %s",
+                open_id or user_id or "<unknown>",
+                prompt_id,
+            )
             return
         expected_chat_id = str(state.get("chat_id", "") or "")
         if expected_chat_id and chat_id and expected_chat_id != chat_id:
