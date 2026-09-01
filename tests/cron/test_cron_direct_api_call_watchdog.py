@@ -143,6 +143,77 @@ def test_healthy_call_is_untouched_by_the_watchdog():
     )
 
 
+def test_reasoning_subagent_can_finish_after_direct_stale_budget():
+    """Reasoning before a non-stream response is not provider staleness.
+
+    The delegation owner has its own overall child lifetime; the direct-call
+    stale watchdog must not kill a recognized reasoning model merely because
+    its first response byte arrives after the generic stale budget.
+    """
+    agent = _make_agent(stale_timeout=0.05, platform="subagent")
+    agent.model = "openai/o3-mini"
+    fake_client = MagicMock()
+
+    def _reasoning_wait(**_kwargs):
+        time.sleep(0.2)  # beyond stale budget, within the child lifetime
+        return SimpleNamespace(id="reasoned")
+
+    fake_client.chat.completions.create.side_effect = _reasoning_wait
+    agent._create_request_openai_client.return_value = fake_client
+
+    assert direct_api_call(
+        agent, {"model": agent.model, "messages": []}
+    ).id == "reasoned"
+    agent._abort_request_openai_client.assert_not_called()
+
+
+def test_non_reasoning_subagent_still_kills_a_silent_provider():
+    """Reasoning exceptions must not weaken the normal silent-hang bound."""
+    agent = _make_agent(stale_timeout=0.05, platform="subagent")
+    agent.model = "openai/gpt-4o"
+    _stalling_client(agent, aborted=[], release_after=1.0)
+
+    with pytest.raises(TimeoutError):
+        direct_api_call(
+            agent, {"model": agent.model, "messages": []}
+        )
+
+
+def test_reasoning_child_has_finite_owner_bound_without_global_child_cap(monkeypatch):
+    from tools import delegate_tool
+
+    monkeypatch.setattr(delegate_tool, "_load_config", lambda: {})
+    monkeypatch.delenv("DELEGATION_CHILD_TIMEOUT_SECONDS", raising=False)
+    child = SimpleNamespace(platform="subagent", model="openai/o3-mini")
+
+    assert delegate_tool._resolve_child_timeout(child) == 1800.0
+
+
+def test_reasoning_child_honors_explicit_timeout_override_or_opt_out(monkeypatch):
+    from tools import delegate_tool
+
+    child = SimpleNamespace(platform="subagent", model="openai/o3-mini")
+    monkeypatch.setattr(
+        delegate_tool, "_load_config", lambda: {"child_timeout_seconds": 90}
+    )
+    assert delegate_tool._resolve_child_timeout(child) == 90.0
+
+    monkeypatch.setattr(
+        delegate_tool, "_load_config", lambda: {"child_timeout_seconds": 0}
+    )
+    assert delegate_tool._resolve_child_timeout(child) is None
+
+
+def test_non_reasoning_child_keeps_unconfigured_timeout_behavior(monkeypatch):
+    from tools import delegate_tool
+
+    monkeypatch.setattr(delegate_tool, "_load_config", lambda: {})
+    monkeypatch.delenv("DELEGATION_CHILD_TIMEOUT_SECONDS", raising=False)
+    child = SimpleNamespace(platform="subagent", model="openai/gpt-4o")
+
+    assert delegate_tool._resolve_child_timeout(child) is None
+
+
 def test_local_endpoint_infinite_budget_leaves_the_watchdog_disarmed():
     """``_compute_non_stream_stale_timeout`` returns inf for a local endpoint
     on the implicit default — that opt-out must survive on this path too."""

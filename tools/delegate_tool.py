@@ -992,13 +992,10 @@ def _get_child_timeout() -> Optional[float]:
     before being cut off, or ``None`` when no wall-clock cap applies.
 
     Default: ``None`` (no timeout). Subagents doing legitimate heavy work
-    (deep code review, large research fan-outs, slow reasoning models) were
-    routinely killed mid-task by the old blanket cap even though they were
-    making steady progress. Failures should come from what the child is
-    actually doing — API errors, tool errors, iteration budget — not from a
-    generic delegation-level stopwatch. Stuck-child protection is handled
-    separately by the heartbeat staleness monitor, which stops refreshing
-    parent activity so the gateway inactivity timeout can fire.
+    (deep code review, large research fan-outs, slow reasoning models) are not
+    globally killed by a generic delegation stopwatch. Reasoning children are
+    given a separate generous bound at the execution seam below, because
+    their direct provider watchdog is intentionally deferred.
 
     Set ``delegation.child_timeout_seconds`` to a positive number to opt back
     in to a hard cap (floor 30 s); ``0`` or a negative value means disabled.
@@ -1025,6 +1022,53 @@ def _get_child_timeout() -> Optional[float]:
         else:
             return None if parsed <= 0 else max(30.0, parsed)
     return DEFAULT_CHILD_TIMEOUT
+
+
+# Reasoning models can legitimately spend several minutes before a
+# non-streaming response produces its first byte.  Keep their overall owner
+# bound generous while leaving ordinary child behavior unchanged.
+DEFAULT_REASONING_CHILD_TIMEOUT = 1800.0
+
+
+def _child_timeout_explicitly_disabled() -> bool:
+    """Return True when config explicitly opts out of the child cap."""
+    cfg = _load_config()
+    raw = cfg.get("child_timeout_seconds")
+    if raw is not None:
+        try:
+            return float(raw) <= 0
+        except (TypeError, ValueError):
+            pass
+    raw = os.getenv("DELEGATION_CHILD_TIMEOUT_SECONDS")
+    if raw:
+        try:
+            return float(raw) <= 0
+        except (TypeError, ValueError):
+            pass
+    return False
+
+
+def _is_reasoning_child(child: Any) -> bool:
+    """Use the shared reasoning classification for a delegated child."""
+    if getattr(child, "platform", None) != "subagent":
+        return False
+    model = getattr(child, "model", None)
+    try:
+        from agent.reasoning_timeouts import get_reasoning_stale_timeout_floor
+
+        return get_reasoning_stale_timeout_floor(model) is not None
+    except Exception:
+        return False
+
+
+def _resolve_child_timeout(child: Any) -> Optional[float]:
+    """Resolve the owner bound without changing ordinary child semantics."""
+    configured = _get_child_timeout()
+    if configured is not None:
+        return configured
+    if _child_timeout_explicitly_disabled() or not _is_reasoning_child(child):
+        return None
+    return DEFAULT_REASONING_CHILD_TIMEOUT
 
 
 def _get_max_spawn_depth() -> int:
@@ -1159,11 +1203,10 @@ _SUMMARY_HEADROOM_FRACTION = 0.5
 # Floor so a single summary always gets a usable slice even when the parent is
 # already nearly full — below this we'd be truncating to noise.
 _MIN_SUMMARY_CHARS = 2000
-# No default wall-clock cap on child agents: legitimate heavy subagent work
-# (deep reviews, research fan-outs, slow reasoning models) was being killed
-# mid-task. Errors should come from what the child actually does; stuck-child
-# detection lives in the heartbeat staleness monitor below. Users can opt back
-# in via delegation.child_timeout_seconds.
+# No default wall-clock cap on ordinary child agents. Recognized reasoning
+# children use DEFAULT_REASONING_CHILD_TIMEOUT only at their execution seam,
+# where the direct non-stream watchdog is deferred. Users can override that
+# with delegation.child_timeout_seconds, or explicitly disable it with <= 0.
 DEFAULT_CHILD_TIMEOUT: Optional[float] = None
 _HEARTBEAT_INTERVAL = 30  # seconds between parent activity heartbeats during delegation
 # Stale-heartbeat thresholds. A child with no observable progress is either:
@@ -1179,7 +1222,8 @@ _HEARTBEAT_INTERVAL = 30  # seconds between parent activity heartbeats during de
 # no activity doesn't mask the gateway timeout. The in-tool ceiling is much
 # higher so legit long-running tools get time to finish;
 # delegation.child_timeout_seconds (off by default) remains an optional hard
-# cap for users who want one.
+# cap for users who want one; reasoning children receive a finite default
+# because their provider stale watchdog is deferred.
 _HEARTBEAT_STALE_CYCLES_IDLE = 15  # 15 * 30s = 450s idle between turns → stale
 _HEARTBEAT_STALE_CYCLES_IN_TOOL = 40  # 40 * 30s = 1200s stuck on same tool → stale
 DEFAULT_TOOLSETS = ["terminal", "file", "web"]
@@ -2914,10 +2958,11 @@ def _run_single_child(
             list(file_state.known_reads(parent_task_id)) if parent_task_id else []
         )
 
-        # Run child with an optional hard timeout (off by default —
-        # result(timeout=None) blocks until the child finishes). Stuck-child
-        # protection comes from the heartbeat staleness monitor instead.
-        child_timeout = _get_child_timeout()
+        # Run ordinary children with the optional configured hard timeout;
+        # recognized reasoning children receive the finite default resolved
+        # above because their direct provider watchdog is deferred. Stuck-
+        # child protection for all other cases remains the heartbeat monitor.
+        child_timeout = _resolve_child_timeout(child)
         # Daemon worker (tools.daemon_pool): a timed-out child is abandoned
         # below; a stdlib non-daemon worker would then block interpreter
         # exit at atexit-join time if the child never unwinds.

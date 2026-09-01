@@ -1080,6 +1080,27 @@ def _resolve_direct_stale_timeout(agent, api_kwargs: dict) -> float:
     return float(value)
 
 
+def _is_reasoning_subagent(agent, api_kwargs: dict) -> bool:
+    """Return whether a delegated child is doing pre-response reasoning.
+
+    A non-streaming reasoning request has no observable bytes while the model
+    thinks.  The direct-call watchdog measures that silence, so it cannot
+    distinguish healthy reasoning from a hung provider.  Keep this exception
+    scoped to delegated children: their owner controls the child lifetime,
+    while cron and interactive calls retain the existing stale bound.
+    """
+    if getattr(agent, "platform", None) != "subagent":
+        return False
+    model = api_kwargs.get("model") or getattr(agent, "model", None)
+    try:
+        from agent.reasoning_timeouts import get_reasoning_stale_timeout_floor
+
+        return get_reasoning_stale_timeout_floor(model) is not None
+    except Exception:
+        # A classification failure must not silently weaken the watchdog.
+        return False
+
+
 def _inline_nonstream_hard_timeout(stale_timeout: float):
     """Socket-level backstop for inline non-streaming calls (#85252).
 
@@ -1246,6 +1267,16 @@ def direct_api_call(agent, api_kwargs: dict):
     # stalls from the stall monitor.
     call_start = time.time()
     stale_timeout = _resolve_direct_stale_timeout(agent, api_kwargs)
+    if _is_reasoning_subagent(agent, api_kwargs):
+        # Non-streaming reasoning is silent by design until the complete
+        # response arrives.  Its delegated owner supplies the overall child
+        # lifetime; this watchdog is only valid for provider silence that can
+        # be observed as a stale response on non-reasoning calls.
+        logger.debug(
+            "Deferring direct stale watchdog for delegated reasoning model %s",
+            api_kwargs.get("model") or getattr(agent, "model", ""),
+        )
+        stale_timeout = float("inf")
     # Do not override an explicit per-call timeout (provider config /
     # transport already set one). Otherwise pin read=stale_timeout so a
     # no-op stranger-thread abort cannot leave the keepalive client's
