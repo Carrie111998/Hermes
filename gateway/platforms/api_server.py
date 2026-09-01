@@ -150,6 +150,7 @@ from gateway.platforms.base import (
 )
 # Re-exported here for existing imports and constructor monkeypatches.
 from gateway.platforms.api_server_run_idempotency import RunIdempotencyStore
+from agent.conversation_loop import INTERRUPT_WAITING_FOR_MODEL_PREFIX
 from agent.redact import redact_sensitive_text
 from agent.interrupt_compat import request_hard_interrupt
 from gateway.readiness import collect_runtime_readiness
@@ -1211,6 +1212,92 @@ def _resolve_media_to_data_urls(text: str) -> str:
         return MEDIA_TAG_CLEANUP_RE.sub(_repl, text)
     except Exception:
         return text
+
+
+def _is_api_interrupt_text(text: Any) -> bool:
+    """Match only Hermes' complete internal API-wait timer status."""
+    if not isinstance(text, str):
+        return False
+    value = text.strip()
+    if not value.startswith(INTERRUPT_WAITING_FOR_MODEL_PREFIX):
+        return False
+    suffix = value[len(INTERRUPT_WAITING_FOR_MODEL_PREFIX):]
+    return re.fullmatch(r"\d+(?:\.\d+)?s elapsed\)\.", suffix) is not None
+
+
+def _is_api_interrupt_text_prefix(text: Any) -> bool:
+    """Match a complete sentinel or a prefix split across stream deltas."""
+    if not isinstance(text, str):
+        return False
+    value = text.strip()
+    if not value.startswith(INTERRUPT_WAITING_FOR_MODEL_PREFIX):
+        return False
+    suffix = value[len(INTERRUPT_WAITING_FOR_MODEL_PREFIX):]
+    return (
+        re.fullmatch(
+            r"\d+(?:\.\d*)?(?:s(?: e(?:lapsed(?:\)\.?)?)?)?)?", suffix
+        )
+        is not None
+        or suffix == ""
+    )
+
+
+def _is_api_interrupt_history_message(message: Dict[str, Any]) -> bool:
+    """Return true only for a pure assistant interrupt row.
+
+    Session history has no result envelope from which to recover the
+    ``interrupted`` flag, so keep the text match narrowly scoped to the row
+    shape emitted by the agent. In particular, user messages and assistant
+    messages carrying tool calls are legitimate transcript content.
+    """
+    return (
+        message.get("role") == "assistant"
+        and not message.get("tool_calls")
+        and _is_api_interrupt_text(message.get("content"))
+    )
+
+
+def _is_api_interrupt_sentinel(result: Dict[str, Any], text: Any) -> bool:
+    """Require interrupt metadata before suppressing a live API response."""
+    return bool(result.get("interrupted")) and _is_api_interrupt_text(text)
+
+
+def _api_interrupt_status(result: Dict[str, Any]) -> tuple[bool, bool, bool]:
+    """Expose status for interrupted turns without changing legacy success events."""
+    interrupted = bool(result.get("interrupted"))
+    if not interrupted:
+        return bool(result.get("completed", True)), False, bool(result.get("partial"))
+    return (
+        bool(result.get("completed", False)),
+        True,
+        bool(result.get("partial")),
+    )
+
+
+def _api_final_response_text(result: Dict[str, Any]) -> str:
+    """Return user-facing text while keeping interrupt sentinels as metadata."""
+    text = result.get("final_response", "") or ""
+    if _is_api_interrupt_sentinel(result, text):
+        return ""
+    return _resolve_media_to_data_urls(text)
+
+
+def _remove_terminal_api_interrupt_message(
+    messages: list[Dict[str, Any]], result: Dict[str, Any]
+) -> list[Dict[str, Any]]:
+    """Remove only the terminal pure-assistant interrupt sentinel."""
+    terminal_index = -1
+    for index, message in enumerate(messages):
+        if (
+            isinstance(message, dict)
+            and message.get("role") == "assistant"
+            and not message.get("tool_calls")
+            and _is_api_interrupt_sentinel(result, message.get("content"))
+        ):
+            terminal_index = index
+    if terminal_index < 0:
+        return list(messages)
+    return [message for index, message in enumerate(messages) if index != terminal_index]
 
 
 def _redact_api_error_text(value: Any, *, limit: int | None = None) -> str:
@@ -4650,13 +4737,35 @@ class APIServerAdapter(BasePlatformAdapter):
         default_page = requested_limit is None
         latest_page = order == "latest" or (order is None and default_page)
         limit = 500 if default_page else min(requested_limit, 500)
-        messages = await asyncio.to_thread(
-            db.get_messages,
-            resolved_id,
-            limit=limit,
-            offset=offset,
-            latest=latest_page,
-        )
+        # Fetch bounded raw pages until enough visible messages remain. Internal
+        # interrupt rows must not consume the client's offset/limit budget.
+        # Keep only the requested visible page: a deep offset must not
+        # materialize the whole transcript or trigger an O(n^2) recount.
+        fetch_offset = 0
+        fetch_limit = 500
+        visible_seen = 0
+        page_messages: list[Dict[str, Any]] = []
+        while len(page_messages) < limit:
+            chunk = await asyncio.to_thread(
+                db.get_messages,
+                resolved_id,
+                limit=fetch_limit,
+                offset=fetch_offset,
+                latest=latest_page,
+            )
+            if not chunk:
+                break
+            fetch_offset += len(chunk)
+            chunk_iter = reversed(chunk) if latest_page else iter(chunk)
+            for message in chunk_iter:
+                if _is_api_interrupt_history_message(message):
+                    continue
+                if visible_seen >= offset and len(page_messages) < limit:
+                    page_messages.append(message)
+                visible_seen += 1
+            if len(page_messages) >= limit or len(chunk) < fetch_limit:
+                break
+        messages = list(reversed(page_messages)) if latest_page else page_messages
         return web.json_response({
             "object": "list",
             "session_id": resolved_id,
@@ -4801,7 +4910,10 @@ class APIServerAdapter(BasePlatformAdapter):
             **agent_overrides,
         )
         effective_session_id = result.get("session_id") if isinstance(result, dict) else session_id
-        final_response = _resolve_media_to_data_urls(result.get("final_response", "") if isinstance(result, dict) else "")
+        final_response = _api_final_response_text(result) if isinstance(result, dict) else ""
+        completed, interrupted, partial = (
+            _api_interrupt_status(result) if isinstance(result, dict) else (True, False, False)
+        )
         headers = {"X-Hermes-Session-Id": effective_session_id or session_id}
         if gateway_session_key:
             headers["X-Hermes-Session-Key"] = gateway_session_key
@@ -4827,6 +4939,9 @@ class APIServerAdapter(BasePlatformAdapter):
                 "object": "hermes.session.chat.completion",
                 "session_id": effective_session_id or session_id,
                 "message": {"role": "assistant", "content": final_response},
+                "completed": completed,
+                "interrupted": interrupted,
+                "partial": partial,
                 "usage": usage,
                 "runtime": runtime,
             },
@@ -4938,7 +5053,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 pass
 
         def _delta(delta: str) -> None:
-            if delta:
+            if delta and not _is_api_interrupt_text(delta):
                 _enqueue("assistant.delta", {"message_id": message_id, "delta": delta})
 
         def _tool_progress(event_type: str, tool_name: str = None, preview: str = None, args=None, **kwargs) -> None:
@@ -4973,8 +5088,11 @@ class APIServerAdapter(BasePlatformAdapter):
                     confirmed_runtime_lock=lock_active,
                     **agent_overrides,
                 )
-                final_response = _resolve_media_to_data_urls(result.get("final_response", "") if isinstance(result, dict) else "")
+                final_response = _api_final_response_text(result) if isinstance(result, dict) else ""
                 effective_session_id = result.get("session_id", session_id) if isinstance(result, dict) else session_id
+                completed, interrupted, partial = (
+                    _api_interrupt_status(result) if isinstance(result, dict) else (True, False, False)
+                )
                 turn_messages = self._turn_transcript_messages(history, user_message, result) if isinstance(result, dict) else []
                 effective_runtime = {}
                 if isinstance(result, dict):
@@ -4997,9 +5115,9 @@ class APIServerAdapter(BasePlatformAdapter):
                     "session_id": effective_session_id,
                     "message_id": message_id,
                     "content": final_response,
-                    "completed": True,
-                    "partial": False,
-                    "interrupted": False,
+                    "completed": completed,
+                    "partial": partial,
+                    "interrupted": interrupted,
                     "runtime": effective_runtime,
                 }))
                 # A steer accepted after the final assistant response is drained
@@ -5010,7 +5128,9 @@ class APIServerAdapter(BasePlatformAdapter):
                 completed_payload = {
                     "session_id": effective_session_id,
                     "message_id": message_id,
-                    "completed": True,
+                    "completed": completed,
+                    "interrupted": interrupted,
+                    "partial": partial,
                     "messages": turn_messages,
                     "usage": usage,
                     "runtime": effective_runtime,
@@ -5455,10 +5575,11 @@ class APIServerAdapter(BasePlatformAdapter):
                     status=500,
                 )
 
-        final_response = _resolve_media_to_data_urls(result.get("final_response") or "")
+        final_response = _api_final_response_text(result)
         is_partial = bool(result.get("partial"))
         is_failed = bool(result.get("failed"))
         completed = bool(result.get("completed", True))
+        interrupted = bool(result.get("interrupted"))
         raw_err_msg = result.get("error")
         err_msg = _redact_api_error_text(raw_err_msg) if raw_err_msg else raw_err_msg
 
@@ -5520,10 +5641,11 @@ class APIServerAdapter(BasePlatformAdapter):
                 "total_tokens": usage.get("total_tokens", 0),
             },
         }
-        if is_partial or is_failed or not completed:
+        if is_partial or is_failed or interrupted or not completed:
             response_data["hermes"] = {
                 "completed": completed,
                 "partial": is_partial,
+                "interrupted": interrupted,
                 "failed": is_failed,
                 "error": err_msg,
                 "error_code": "output_truncated" if finish_reason == "length" else "agent_error",
@@ -5576,17 +5698,29 @@ class APIServerAdapter(BasePlatformAdapter):
             await response.write(_sse_frame(role_chunk))
             last_activity = time.monotonic()
 
-            # Helper — route a queue item to the correct SSE event.
-            async def _emit(item):
-                """Write a single queue item to the SSE stream.
+            # Hold text that could be the internal interrupt sentinel until the
+            # result metadata is available. The sentinel may arrive split across
+            # several deltas, and normal completion must preserve literal text.
+            pending_interrupt_text = ""
 
-                Plain strings are sent as normal ``delta.content`` chunks.
-                Tagged tuples ``("__tool_progress__", payload)`` are sent
-                as a custom ``event: hermes.tool.progress`` SSE event so
-                frontends can display them without storing the markers in
-                conversation history.  See #6972 for the original event,
-                #16588 for the ``toolCallId``/``status`` lifecycle fields.
-                """
+            # Helper — route a queue item to the correct SSE event.
+            async def _emit(item, *, force=False):
+                """Write one queue item, deferring ambiguous interrupt text."""
+                nonlocal pending_interrupt_text
+                if isinstance(item, str) and not force:
+                    candidate = pending_interrupt_text + item
+                    if _is_api_interrupt_text_prefix(candidate):
+                        pending_interrupt_text = candidate
+                        return time.monotonic()
+                    if pending_interrupt_text:
+                        buffered = pending_interrupt_text
+                        pending_interrupt_text = ""
+                        await _emit(buffered, force=True)
+                        return await _emit(item)
+                elif pending_interrupt_text:
+                    buffered = pending_interrupt_text
+                    pending_interrupt_text = ""
+                    await _emit(buffered, force=True)
                 if isinstance(item, tuple) and len(item) == 2 and item[0] == "__tool_progress__":
                     await response.write(_sse_frame(item[1], event="hermes.tool.progress"))
                 else:
@@ -5651,10 +5785,19 @@ class APIServerAdapter(BasePlatformAdapter):
             is_partial = bool(result.get("partial")) if isinstance(result, dict) else False
             is_failed = bool(result.get("failed")) if isinstance(result, dict) else False
             completed = bool(result.get("completed", True)) if isinstance(result, dict) else True
+            interrupted = bool(result.get("interrupted")) if isinstance(result, dict) else False
             err_msg = result.get("error") if isinstance(result, dict) else None
             if agent_error is not None:
                 is_failed = True
                 err_msg = err_msg or str(agent_error)
+
+            # Resolve any text held because it could be a split sentinel only
+            # after the result envelope tells us whether the turn interrupted.
+            if pending_interrupt_text:
+                buffered = pending_interrupt_text
+                pending_interrupt_text = ""
+                if not (interrupted and _is_api_interrupt_text(buffered)):
+                    last_activity = await _emit(buffered, force=True)
 
             # Decide finish_reason, matching the non-streaming logic: "length"
             # for truncation, "error" for failure, "stop" for normal completion.
@@ -5676,7 +5819,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     "total_tokens": usage.get("total_tokens", 0),
                 },
             }
-            if finish_reason != "stop":
+            if finish_reason != "stop" or interrupted:
                 finish_chunk["choices"][0]["delta"] = {}
                 if err_msg:
                     finish_chunk["error"] = {
@@ -5686,6 +5829,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 finish_chunk["hermes"] = {
                     "completed": completed,
                     "partial": is_partial,
+                    "interrupted": interrupted,
                     "failed": is_failed,
                     "error": err_msg,
                     "error_code": "output_truncated" if finish_reason == "length" else "agent_error",
@@ -5923,6 +6067,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 })
 
             async def _emit_text_delta(delta_text: str) -> None:
+                if _is_api_interrupt_text(delta_text):
+                    return
                 await _open_message_item()
                 final_text_parts.append(delta_text)
                 await _write_event("response.output_text.delta", {
@@ -6134,11 +6280,14 @@ class APIServerAdapter(BasePlatformAdapter):
             try:
                 result, agent_usage = await agent_task
                 usage = agent_usage or usage
+                completed = bool(result.get("completed", True)) if isinstance(result, dict) else True
+                interrupted = bool(result.get("interrupted")) if isinstance(result, dict) else False
+                partial = bool(result.get("partial")) if isinstance(result, dict) else False
                 # If the agent produced a final_response but no text
                 # deltas were streamed (e.g. some providers only emit
                 # the full response at the end), emit a single fallback
                 # delta so Responses clients still receive a live text part.
-                agent_final = result.get("final_response", "") if isinstance(result, dict) else ""
+                agent_final = _api_final_response_text(result) if isinstance(result, dict) else ""
                 if agent_final and not final_text_parts:
                     await _emit_text_delta(agent_final)
                 if agent_final and not final_response_text:
@@ -6245,6 +6394,11 @@ class APIServerAdapter(BasePlatformAdapter):
                     "input_tokens": usage.get("input_tokens", 0),
                     "output_tokens": usage.get("output_tokens", 0),
                     "total_tokens": usage.get("total_tokens", 0),
+                }
+                completed_env["hermes"] = {
+                    "completed": completed,
+                    "interrupted": interrupted,
+                    "partial": partial,
                 }
                 full_history = self._build_response_conversation_history(
                     conversation_history,
@@ -6609,8 +6763,11 @@ class APIServerAdapter(BasePlatformAdapter):
                     status=500,
                 )
 
-        final_response = _resolve_media_to_data_urls(result.get("final_response", ""))
-        if not final_response:
+        final_response = _api_final_response_text(result)
+        completed = bool(result.get("completed", True))
+        interrupted = bool(result.get("interrupted"))
+        partial = bool(result.get("partial"))
+        if not final_response and not interrupted:
             final_response = _redact_api_error_text(result.get("error", "(No response generated)"))
 
         response_id = f"resp_{uuid.uuid4().hex[:28]}"
@@ -6657,7 +6814,14 @@ class APIServerAdapter(BasePlatformAdapter):
                 "output_tokens": usage.get("output_tokens", 0),
                 "total_tokens": usage.get("total_tokens", 0),
             },
+            "hermes": {
+                "completed": completed,
+                "interrupted": interrupted,
+                "partial": partial,
+            } if (interrupted or partial or not completed) else None,
         }
+        if response_data["hermes"] is None:
+            del response_data["hermes"]
 
         # Store the complete response object for future chaining / GET retrieval
         if store:
@@ -7156,7 +7320,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 result,
             )
             if turn_start:
-                return list(agent_messages)
+                return _remove_terminal_api_interrupt_message(agent_messages, result)
 
             # turn_start == 0: agent_messages does not start with prior.
             # This can happen because compression rewrote the transcript
@@ -7166,11 +7330,11 @@ class APIServerAdapter(BasePlatformAdapter):
             # distinguishes — skip the concatenation and use the compressed
             # transcript directly.
             if result.get("_compressed"):
-                return list(agent_messages)
+                return _remove_terminal_api_interrupt_message(agent_messages, result)
 
             full_history = prior
             full_history.append(current_user)
-            full_history.extend(agent_messages)
+            full_history.extend(_remove_terminal_api_interrupt_message(agent_messages, result))
             return full_history
 
         full_history = prior
@@ -7227,18 +7391,24 @@ class APIServerAdapter(BasePlatformAdapter):
             conversation_history, user_message, result
         )
         turn = agent_messages[start:]
+        terminal_interrupt_index = -1
+        for index, msg in enumerate(turn):
+            if not isinstance(msg, dict) or msg.get("role") != "assistant":
+                continue
+            if msg.get("tool_calls"):
+                continue
+            if _is_api_interrupt_sentinel(result, msg.get("content")):
+                terminal_interrupt_index = index
         out: List[Dict[str, Any]] = []
-        for msg in turn:
+        for index, msg in enumerate(turn):
             if not isinstance(msg, dict):
                 continue
             if msg.get("role") not in {"assistant", "tool"}:
                 continue
-            # _message_response projects compaction scaffolding itself and
-            # marks pure handoffs display_kind == "hidden"; classifying here
-            # first would re-run the content classifier (a full content
-            # flatten + prefix scan) a second time per message.
             projected = cls._message_response(msg)
             if projected.get("display_kind") == "hidden":
+                continue
+            if index == terminal_interrupt_index:
                 continue
             out.append(projected)
         return out
@@ -7257,8 +7427,19 @@ class APIServerAdapter(BasePlatformAdapter):
         messages = result.get("messages", [])
         if start_index > 0:
             messages = messages[start_index:]
+        terminal_interrupt_index = -1
+        for index, msg in enumerate(messages):
+            if (
+                isinstance(msg, dict)
+                and msg.get("role") == "assistant"
+                and not msg.get("tool_calls")
+                and _is_api_interrupt_sentinel(result, msg.get("content"))
+            ):
+                terminal_interrupt_index = index
 
-        for msg in messages:
+        for index, msg in enumerate(messages):
+            if index == terminal_interrupt_index:
+                continue
             role = msg.get("role")
             if role == "assistant" and msg.get("tool_calls"):
                 for tc in msg["tool_calls"]:
@@ -7286,8 +7467,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 })
 
         # Final assistant message
-        final = result.get("final_response", "")
-        if not final:
+        final = _api_final_response_text(result)
+        if not final and not result.get("interrupted"):
             final = _redact_api_error_text(result.get("error", "(No response generated)"))
 
         items.append({
