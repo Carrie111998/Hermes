@@ -360,3 +360,73 @@ class TestCheckFnTransientFailureSuppression:
 
         assert "terminal" not in names
         assert "execute_code" not in names
+
+
+class TestUnscopedSecretReadLogging:
+    """#100697: with multiplexing on, boot-time check_fns run before any
+    profile secret scope exists, so get_secret fails closed with
+    UnscopedSecretError. That expected signal must not be logged like a
+    crashed check_fn (WARNING + traceback); an unscoped read reported while
+    the scope was *resolved* is a genuinely lost scope and stays loud."""
+
+    @pytest.fixture(autouse=True)
+    def _reset(self):
+        from tools.registry import invalidate_check_fn_cache
+
+        invalidate_check_fn_cache()
+        yield
+        invalidate_check_fn_cache()
+
+    def test_unresolved_scope_unscoped_read_logs_debug_without_traceback(
+        self, caplog
+    ):
+        import logging
+
+        import tools.registry as reg
+        from agent.secret_scope import get_secret, set_multiplex_active
+
+        def probe():
+            return bool(get_secret("REGISTRY_LOG_PROBE_TOKEN", ""))
+
+        set_multiplex_active(True)
+        try:
+            with caplog.at_level(logging.DEBUG, logger="tools.registry"):
+                assert reg._run_check_fn_uncached(probe, unresolved_scope=True) is False
+        finally:
+            set_multiplex_active(False)
+
+        registry_records = [
+            r for r in caplog.records if r.name == "tools.registry"
+        ]
+        assert not [
+            r for r in registry_records if r.levelno >= logging.WARNING
+        ], "expected fail-closed probe must not be logged as a check_fn crash"
+        quiet = [
+            r
+            for r in registry_records
+            if r.levelno == logging.DEBUG and "fail-closed path" in r.getMessage()
+        ]
+        assert quiet, "the fail-closed probe should leave a debug breadcrumb"
+        assert all(r.exc_info is None for r in quiet)
+
+    def test_resolved_scope_unscoped_read_stays_loud(self, caplog):
+        import logging
+
+        import tools.registry as reg
+        from agent.secret_scope import UnscopedSecretError
+
+        def probe():
+            raise UnscopedSecretError(
+                "get_secret('REGISTRY_LOG_PROBE_TOKEN') called with no "
+                "profile secret scope active"
+            )
+
+        with caplog.at_level(logging.DEBUG, logger="tools.registry"):
+            assert reg._run_check_fn_uncached(probe, unresolved_scope=False) is False
+
+        loud = [
+            r for r in caplog.records
+            if r.name == "tools.registry" and r.levelno >= logging.WARNING
+        ]
+        assert loud, "a resolved-scope unscoped read is a lost scope and must warn"
+        assert any(r.exc_info for r in loud), "the lost-scope warning keeps its traceback"
