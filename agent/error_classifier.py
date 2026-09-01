@@ -625,6 +625,13 @@ _CONTENT_POLICY_BLOCKED_PATTERNS = [
     # filter name and is narrow enough that billing / format / auth error
     # strings will not collide. See #32421.
     "new_sensitive",
+    # AgentRouter / new-api gateways return HTTP 500 "sensitive words detected"
+    # when their local word-filter rejects a request. Classify as
+    # content_policy_blocked so the loop skips retries and can jump to a
+    # configured fallback. See #100113.
+    "sensitive words detected",
+    "sensitive word detected",
+    "sensitive content",
 ]
 
 # Auth patterns (non-status-code signals)
