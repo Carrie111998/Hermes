@@ -2,7 +2,7 @@ import { atom } from 'nanostores'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { NO_PROJECT_ID, type SidebarProjectTree } from '@/app/chat/sidebar/projects/workspace-groups'
-import { $sidebarAgentsGrouped, setSidebarAgentsGrouped } from '@/store/layout'
+import { $pinnedSessionIds, $sidebarAgentsGrouped, pinSession, setSidebarAgentsGrouped } from '@/store/layout'
 import { $activeGatewayProfile, setShowAllProfiles } from '@/store/profile'
 import { $currentCwd, $selectedStoredSessionId, $sessions, applyConfiguredDefaultProjectDir } from '@/store/session'
 
@@ -22,6 +22,7 @@ import {
   enterProject,
   exitProjectScope,
   fetchProjectSessions,
+  followActiveSessionCwd,
   openProjectCreate,
   pickProjectFolder,
   projectIdForCwd,
@@ -31,6 +32,7 @@ import {
   refreshWorktrees,
   resolveNewSessionCwd,
   scanAndRecordRepos,
+  shouldEnterFollowedProject,
   startWorkInRepo,
   tombstoneSessions
 } from './projects'
@@ -913,5 +915,59 @@ describe('tombstone pruning', () => {
     await refreshProjectTree()
 
     expect($removedSessionIds.get().has('sess-1')).toBe(false)
+  })
+})
+
+describe('followActiveSessionCwd pin lock', () => {
+  const treeNode = (
+    over: Partial<SidebarProjectTree> & Pick<SidebarProjectTree, 'id' | 'label' | 'path'>
+  ): SidebarProjectTree => ({
+    repos: [],
+    sessionCount: 0,
+    ...over
+  })
+
+  beforeEach(() => {
+    window.localStorage.clear()
+    $projectScope.set('p1')
+    $projectTree.set([
+      treeNode({ id: 'p1', label: 'Project 1', path: '/work/proj1' }),
+      treeNode({ id: 'p2', label: 'Project 2', path: '/work/proj2' })
+    ])
+    $selectedStoredSessionId.set('sess-1')
+    $sessions.set([{ id: 'sess-1', cwd: '/work/proj1' } as never])
+    $pinnedSessionIds.set([])
+    setSidebarAgentsGrouped(true)
+  })
+
+  afterEach(() => {
+    $projectScope.set(ALL_PROJECTS)
+    $projectTree.set([])
+    $selectedStoredSessionId.set(null)
+    $sessions.set([])
+    $pinnedSessionIds.set([])
+  })
+
+  it('refuses to drill into another project when the conversation is pinned', () => {
+    expect(shouldEnterFollowedProject('p2', true)).toBe(false)
+    expect(shouldEnterFollowedProject('p2', false)).toBe(true)
+    expect(shouldEnterFollowedProject(null, false)).toBe(false)
+  })
+
+  it('keeps the sidebar on the original project when a pinned session cwd moves', async () => {
+    pinSession('sess-1')
+    setSidebarAgentsGrouped(false)
+
+    await followActiveSessionCwd('/work/proj2')
+
+    expect($projectScope.get()).toBe('p1')
+    expect($sidebarAgentsGrouped.get()).toBe(false)
+  })
+
+  it('still follows an unpinned session into the project that now owns its cwd', async () => {
+    await followActiveSessionCwd('/work/proj2')
+
+    expect($projectScope.get()).toBe('p2')
+    expect($sidebarAgentsGrouped.get()).toBe(true)
   })
 })

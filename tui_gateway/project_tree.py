@@ -494,6 +494,15 @@ def _project_for_session(session: dict, index: _FolderIndex, resolve: Optional[R
     cwd = (session.get("cwd") or "").strip()
     if not cwd:
         return None
+    # A pin is a keep-here mark. Group by the persisted workspace root — not a
+    # later cwd visit, and not a live git probe of that visit — so creating a
+    # nested Project 2 (or an agent stepping into it) cannot steal a pinned
+    # chat from the project it was nailed to.
+    if session.get("pinned"):
+        persisted = (session.get("git_repo_root") or "").strip()
+        pinned_match, _ = index.match(persisted or cwd)
+        if pinned_match:
+            return pinned_match
     repo_root = _session_repo_root(session, resolve)
     candidates = [cwd, repo_root] if repo_root and repo_root != cwd else [cwd]
 
