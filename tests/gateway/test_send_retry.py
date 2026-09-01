@@ -206,3 +206,54 @@ class TestSendWithRetryAfter:
         second_sleep = mock_sleep.call_args_list[1][0][0]
         assert second_sleep >= 29.0  # 30 - 1 (max jitter)
 
+
+# ---------------------------------------------------------------------------
+# _send_with_retry — rate-limited sends (flood control) without retry_after
+# ---------------------------------------------------------------------------
+# Platforms like Weixin surface a rate limit as a bare error with NO retry_after
+# field.  These must still be treated as transient (back off / retry) rather than
+# falling through to the truncating plain-text fallback, which would re-enter the
+# server ban and drop the tail of the message.
+
+class TestSendWithRetryRateLimited:
+    @pytest.mark.asyncio
+    async def test_rate_limited_no_retry_after_backs_off_and_retries(self):
+        """A flood/rate-limit error WITHOUT retry_after still counts as network
+        (retryable) because classify_send_error == 'rate_limited', so it retries
+        and succeeds instead of falling through to plain-text fallback."""
+        adapter = _StubAdapter()
+        adapter._send_results = [
+            SendResult(success=False, error="flood control exceeded, timeout 30 seconds"),
+            SendResult(success=True, message_id="ok"),
+        ]
+        with patch("asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
+            result = await adapter._send_with_retry("chat1", "hello", max_retries=2, base_delay=1.0)
+        # Must have slept (backoff), i.e. treated as transient — NOT immediate fallback
+        assert mock_sleep.called
+        assert result.success
+        assert len(adapter._send_calls) == 2
+        # No plain-text fallback content on either call
+        assert all("plain text" not in c[1].lower() for c in adapter._send_calls)
+
+    @pytest.mark.asyncio
+    async def test_rate_limited_exhausted_returns_typed_failure_not_fallback(self):
+        """When retries on a rate-limited send are exhausted, return the typed
+        failure for ledger redelivery — never the truncating plain-text fallback
+        (which would re-enter the ban and clip the message)."""
+        adapter = _StubAdapter()
+        flood = SendResult(success=False, error="flood control exceeded, retry in 60 seconds")
+        adapter._send_results = [flood, flood, flood]
+        with patch("asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
+            result = await adapter._send_with_retry("chat1", "hello", max_retries=2, base_delay=0)
+        assert not result.success
+        # Notice attempt counts as one send; the fallback must NOT have been used.
+        # 1 initial + 2 retries + 1 delivery-failure notice = 4
+        assert len(adapter._send_calls) == 4
+        # The only extra send beyond the retries is the delivery-failure notice,
+        # NOT a truncating "plain text" fallback.
+        for chat_id, content in adapter._send_calls:
+            assert "plain text" not in content.lower(), \
+                f"rate-limited send must not fall through to plain-text fallback, got: {content[:40]!r}"
+        assert "delivery failed" in adapter._send_calls[-1][1].lower() or \
+               "Message delivery failed" in adapter._send_calls[-1][1]
+

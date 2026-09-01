@@ -5759,7 +5759,19 @@ class BasePlatformAdapter(ABC):
             return result
 
         error_str = result.error or ""
-        is_network = result.retryable or self._is_retryable_error(error_str)
+        # A rate-limited / flood-capped send is transient: it should back off
+        # (honoring the server's retry_after when present) rather than fall
+        # through to the plain-text fallback, which re-enters the ban and can
+        # truncate content.  Gate on the platform-neutral classifier as well so
+        # platforms that surface a rate limit without a retry_after field
+        # (e.g. Weixin raising a bare RuntimeError) get the same treatment.
+        is_rate_limited = classify_send_error(None, error_str) == "rate_limited"
+        is_network = (
+            result.retryable
+            or is_rate_limited
+            or result.retry_after is not None
+            or self._is_retryable_error(error_str)
+        )
 
         # Timeout errors are not safe to retry (message may have been
         # delivered) and not formatting errors — return the failure as-is.
@@ -5794,7 +5806,12 @@ class BasePlatformAdapter(ABC):
                 error_str = result.error or ""
                 if result.retry_after is not None:
                     server_retry_after = result.retry_after
-                if not (result.retryable or self._is_retryable_error(error_str)):
+                if not (
+                    result.retryable
+                    or is_rate_limited
+                    or result.retry_after is not None
+                    or self._is_retryable_error(error_str)
+                ):
                     break  # error switched to non-transient — fall through to plain-text fallback
             else:
                 # All retries exhausted (loop completed without break) — notify user
@@ -5809,7 +5826,18 @@ class BasePlatformAdapter(ABC):
                     logger.debug("[%s] Could not send delivery-failure notice: %s", self.name, notify_err)
                 return result
 
-        # Non-network / post-retry formatting failure: try plain text as fallback
+        # Non-network / post-retry formatting failure: try plain text as fallback.
+        # Never attempt a truncating plain-text fallback for a rate-limited /
+        # flood-capped send: it re-enters the server ban and would drop the tail
+        # of the message.  Return the typed failure so the delivery ledger owns
+        # redelivery after the cooldown instead.
+        if classify_send_error(None, error_str) == "rate_limited":
+            logger.error(
+                "[%s] Rate-limited send not retried via plain-text fallback; "
+                "returning typed failure for redelivery: %s",
+                self.name, error_str,
+            )
+            return result
         logger.warning("[%s] Send failed: %s — trying plain-text fallback", self.name, error_str)
         fallback_result = await self.send(
             chat_id=chat_id,
