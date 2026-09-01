@@ -1317,6 +1317,7 @@ class ProductionBackend:
             broker_thread_id=self.config.sidebar.broker_thread_id,
             broker_project_id=self.config.sidebar.broker_project_id,
             broker_cwd=self.config.sidebar.broker_cwd,
+            enabled=self.config.sidebar.enabled,
         )
 
     def configure_sidebar_broker(
@@ -5310,8 +5311,11 @@ def _public_sidebar_status(
     broker_thread_id: str | None,
     broker_project_id: str | None,
     broker_cwd: str | None,
+    enabled: bool,
 ) -> dict[str, Any]:
     status_time = _finite_status_number(now)
+    if type(enabled) is not bool:
+        raise ConfigurationFailure("invalid_sidebar_status")
     if (
         type(heartbeat_interval_seconds) is not int
         or heartbeat_interval_seconds < 0
@@ -5493,9 +5497,20 @@ def _public_sidebar_status(
         and oldest_eligible_age is not None
         and oldest_eligible_age > oldest_job_alert_seconds
     )
-    if heartbeat_stale:
+    # 2026-09-01: the custom sidebar delivery lane was retired (root config.yaml
+    # session_bridge.sidebar.enabled=false, superseded by the official Codex
+    # importer). coordinator.py returns no delivery claim while that flag is
+    # false, so the broker never heartbeats again and the parked rows -- kept
+    # deliberately as audit history -- can never drain. Both liveness reasons
+    # below assert that a worker WHICH IS SUPPOSED TO RUN has fallen behind, so
+    # on a retired lane they are not findings; they are the flag being off,
+    # restated once per poll with an age that climbs forever. Suppress the
+    # liveness reasons only. `sidebar_failed` and the execution blockers stay:
+    # those are durable recorded outcomes and ledger-integrity facts, not
+    # staleness artifacts, and they must not be silenced by a config flag.
+    if heartbeat_stale and enabled:
         degraded_reasons.append("broker_heartbeat_stale")
-    if overdue_work:
+    if overdue_work and enabled:
         degraded_reasons.append("oldest_pending_stale")
     degraded_reasons.extend(
         blocker for blocker in execution_blockers if blocker not in degraded_reasons
@@ -5618,6 +5633,13 @@ def _public_sidebar_status(
     result = {
         "healthy": not degraded_reasons,
         "degraded_reasons": degraded_reasons,
+        "enabled": enabled,
+        # "retired" is the lane-level verdict a reader should branch on. The raw
+        # measurements below (heartbeat_age_seconds, heartbeat_stale,
+        # oldest_pending_age_seconds, oldest_job_overdue) are left factual and
+        # untouched on a retired lane -- they are still true statements about the
+        # parked rows, and erasing them would destroy audit evidence.
+        "lane_state": "active" if enabled else "retired",
         "eligible_by_provider": eligible_by_provider,
         "counts": state_counts,
         "blocking_failed_count": blocking_failed_count,
