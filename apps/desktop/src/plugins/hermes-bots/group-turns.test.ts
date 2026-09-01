@@ -670,3 +670,50 @@ describe('room record', () => {
     expect('Gone' in durable).toBe(false)
   })
 })
+
+describe('extendGroupTurnDeadline', () => {
+  it('does not clamp a busy member when no cap is set', async () => {
+    const { turns } = await loadRoom()
+    const started = 1_000
+
+    expect(
+      turns.extendGroupTurnDeadline({
+        awaitingUser: false,
+        busy: true,
+        deadline: started + 180_000,
+        now: started + 20 * 60_000,
+        started
+      })
+    ).toBe(started + 20 * 60_000 + 180_000)
+  })
+
+  it('clamps when hardCapMs is set', async () => {
+    const { turns } = await loadRoom()
+    const started = 1_000
+
+    expect(
+      turns.extendGroupTurnDeadline({
+        awaitingUser: false,
+        busy: true,
+        deadline: started + 180_000,
+        hardCapMs: 90_000,
+        now: started + 200_000,
+        started
+      })
+    ).toBe(started + 90_000)
+  })
+
+  it('leaves an idle deadline alone', async () => {
+    const { turns } = await loadRoom()
+
+    expect(
+      turns.extendGroupTurnDeadline({
+        awaitingUser: false,
+        busy: false,
+        deadline: 5_000,
+        now: 4_000,
+        started: 1_000
+      })
+    ).toBe(5_000)
+  })
+})

@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import type * as groupActivity from './group-activity'
 import type * as groupChat from './group-chat'
@@ -853,5 +853,83 @@ describe('stopGroupThread (#91868/#94569)', () => {
     const reply = await room.turns.runGroupChatMemberTurn('Room', { name: 'helper', title: '' }, 'long task', 't1', [])
 
     expect(reply).toBe('finished anyway')
+  })
+})
+
+// A member still working past the old 20-minute hard cap must keep its
+// slot. The next member waits for the real reply instead of speaking into
+// a room that already declared the worker dead.
+describe('busy turn past the old 20-minute hard cap', () => {
+  afterEach(() => {
+    vi.restoreAllMocks()
+  })
+
+  it('keeps the working member and only then seats the next speaker', async () => {
+    let now = 1_700_000_000_000
+    const startedAt = now
+    vi.spyOn(Date, 'now').mockImplementation(() => now)
+
+    let jumped = false
+    const room = await loadRoom({
+      onResumePoll: polls => {
+        if (!jumped && polls === 1) {
+          now = startedAt + 20 * 60_000 + 7_000
+          jumped = true
+        }
+      },
+      pollsBusy: 2,
+      turn: ({ profile }) => (profile === 'developer' ? 'deployed the change' : 'looks good')
+    })
+
+    const members: GroupMember[] = [
+      { name: 'developer', title: '' },
+      { name: 'architect', title: '' }
+    ]
+
+    room.rounds.sendToGroupChat('Ship', members, '@developer @architect ship the change')
+    await settle(room, 'Ship')
+
+    const events = (room.activity.$groupActivity.get().Ship?.events || []).map(event => event.kind)
+    const replies = log(room, 'Ship').filter(entry => entry.from.kind === 'member')
+
+    expect(room.chat.$groupChats.get().Ship.stranded?.developer).toBeUndefined()
+    expect(events).not.toContain('timed-out')
+    expect(replies.some(entry => entry.from.name === 'developer' && entry.text === 'deployed the change')).toBe(
+      true
+    )
+    expect(
+      room.gateway.calls.some(call => call.profile === 'architect' && call.prompt.includes('deployed the change'))
+    ).toBe(true)
+    expect(events).toContain('settled')
+  })
+
+  it('an explicit room cap still times out a member that stays busy', async () => {
+    let now = 1_700_000_000_000
+    const startedAt = now
+    vi.spyOn(Date, 'now').mockImplementation(() => now)
+
+    const room = await loadRoom({
+      onResumePoll: () => {
+        now = startedAt + 200_000
+      },
+      pollsBusy: 10_000,
+      turn: () => 'still going'
+    })
+
+    room.chat.updateGroupChat('Cap', current => {
+      current.turnHardCapMs = 90_000
+
+      return current
+    })
+
+    const reply = await room.turns.runGroupChatMemberTurn(
+      'Cap',
+      { name: 'helper', title: '' },
+      'finish quickly or not at all',
+      'legacy'
+    )
+
+    expect(reply).toBeNull()
+    expect(room.chat.$groupChats.get().Cap.stranded?.helper).toBeDefined()
   })
 })

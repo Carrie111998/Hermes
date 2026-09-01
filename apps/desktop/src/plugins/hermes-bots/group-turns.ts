@@ -230,8 +230,39 @@ export async function ensureGroupChatSession(group: string, member: GroupMember)
   }
 }
 
-const GROUP_TURN_TIMEOUT_MS = 180000
+export const GROUP_TURN_TIMEOUT_MS = 180000
 const GROUP_TURN_POLL_MS = 2000
+
+/** Last-resort ceiling for a room that opts into `turnHardCapMs`. The
+ *  previous shipped default (20 min) cut off members that were still
+ *  producing — 44% of turns in a local-model room. Idle members still
+ *  expire at `GROUP_TURN_TIMEOUT_MS`; a busy member is not a hang. */
+export const GROUP_TURN_HARD_CAP_MS = 180 * 60000
+
+/** Slide the poll deadline while the member is visibly working or waiting
+ *  on the user. An explicit `hardCapMs` clamps that slide; omitting it
+ *  (the default) never cuts off a busy turn. */
+export function extendGroupTurnDeadline(args: {
+  awaitingUser: boolean
+  busy: boolean
+  deadline: number
+  hardCapMs?: number
+  now: number
+  started: number
+}): number {
+  if (!args.busy && !args.awaitingUser) {
+    return args.deadline
+  }
+
+  const extended = Math.max(args.deadline, args.now + GROUP_TURN_TIMEOUT_MS)
+  const cap = args.hardCapMs
+
+  if (typeof cap === 'number' && Number.isFinite(cap) && cap > 0) {
+    return Math.min(args.started + cap, extended)
+  }
+
+  return extended
+}
 
 // --- group-turn session-lease helpers (#93602) ------------------------------
 // A member turn is a session-scoped RPC SEQUENCE (resume → attach → submit →
@@ -338,13 +369,6 @@ async function submitGroupTurnPrompt(
     return fresh
   }
 }
-
-// A member turn that is VISIBLY still working (session reports
-// inflight/running) keeps its slot alive up to this hard cap. The base
-// timeout alone silently dropped long real turns: a 7-minute research run
-// timed out at 3 minutes, read as a pass, and its finished result never
-// reached the room (db's Aug 2026 report).
-const GROUP_TURN_HARD_CAP_MS = 20 * 60000
 
 /** Mirror a member's pending prompt — clarify question OR command approval —
  *  from its resume snapshot into the room store, keyed
@@ -511,10 +535,10 @@ export async function answerGroupClarify(
 /** One member turn, gateway-native: submit the room delta as a prompt into
  *  the member's per-group session, then poll the session until a NEW
  *  assistant message lands (or timeout → pass). While the session visibly
- *  reports work in flight the deadline extends (bounded by the hard cap),
- *  so slow models aren't cut off mid-run. A turn that still times out
- *  records a stranded marker so the finished reply can be harvested into
- *  the room at the member's next turn instead of being lost. */
+ *  reports work in flight the deadline keeps sliding by the idle timeout,
+ *  so a long real turn is not declared dead. A turn that still times out
+ *  (idle, or a room that set `turnHardCapMs`) records a stranded marker so
+ *  the finished reply can be harvested into the room instead of being lost. */
 export async function runGroupChatMemberTurn(
   group: string,
   member: GroupMember,
@@ -685,11 +709,21 @@ async function runGroupChatMemberTurnLeased(
     }
 
     // Still visibly working — or waiting on the user's answer to a clarify:
-    // extend the deadline (never past the hard cap). A pending question must
-    // outlive the base turn timeout or it dies unanswered at 3 minutes.
-    if (busy || awaitingUser) {
-      deadline = Math.min(started + GROUP_TURN_HARD_CAP_MS, Math.max(deadline, Date.now() + GROUP_TURN_TIMEOUT_MS))
-    }
+    // slide the deadline. A pending question must outlive the base turn
+    // timeout or it dies unanswered at 3 minutes. Do not clamp a busy
+    // member to a wall-clock cap: that is what stranded 44% of working
+    // turns in a local-model room (the member kept running; the room
+    // moved on). A hang that stops reporting busy expires on the idle
+    // timeout. An explicit per-room `turnHardCapMs` is the opt-in ceiling.
+    const roomCap = ($groupChats.get()[group] || {}).turnHardCapMs
+    deadline = extendGroupTurnDeadline({
+      awaitingUser,
+      busy,
+      deadline,
+      ...(typeof roomCap === 'number' ? { hardCapMs: roomCap } : {}),
+      now: Date.now(),
+      started
+    })
   }
 
   // Timeout — clear any still-mirrored question card (the server-side
