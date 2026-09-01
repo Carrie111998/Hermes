@@ -477,6 +477,8 @@ export interface SessionCreateResponse {
 export interface SessionInfo {
   archived?: boolean
   cwd?: null | string
+  /** Monotonic revision of this lineage's user-visible transcript. */
+  display_revision?: number
   /** Git branch checked out in {@link cwd} when the session started/resumed.
    *  The sidebar groups main-checkout sessions by this so feature-branch work
    *  doesn't collapse under a single directory-named "main" row. Null for
@@ -607,6 +609,8 @@ export interface SessionMessage {
 }
 
 export interface SessionMessagesResponse {
+  display_revision?: number
+  lineage_root_id?: string
   messages: SessionMessage[]
   pagination?: {
     limit: number
@@ -614,7 +618,9 @@ export interface SessionMessagesResponse {
     order: 'latest' | 'oldest'
     returned: number
   }
+  resolved_tip_id?: string
   session_id: string
+  unchanged?: boolean
 }
 
 export interface SessionResumeResponse {

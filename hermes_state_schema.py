@@ -29,6 +29,7 @@ from hermes_state_common import (
     FTS_TRIGRAM_SQL,
     LEGACY_FTS_SQL,
     LEGACY_FTS_TRIGRAM_SQL,
+    MESSAGE_CLONE_LINEAGE_LEGACY_CEILING_KEY,
     SCHEMA_SQL,
     SCHEMA_VERSION,
     _FTS_CJK_TRIGGERS,
@@ -987,7 +988,41 @@ class SessionSchemaMixin:
 
         cursor = self._conn.cursor()
 
+        # Capture the exact compatibility boundary before SCHEMA_SQL creates
+        # message_clone_lineage. Existing rows were written by code that could
+        # only collapse protected-tail copies by payload equality. Future rows
+        # must never inherit that heuristic: their identity is explicit.
+        had_clone_lineage_table = cursor.execute(
+            "SELECT 1 FROM sqlite_master "
+            "WHERE type = 'table' AND name = 'message_clone_lineage'"
+        ).fetchone() is not None
+        legacy_clone_ceiling: Optional[int] = None
+        if not had_clone_lineage_table:
+            had_messages_table = cursor.execute(
+                "SELECT 1 FROM sqlite_master "
+                "WHERE type = 'table' AND name = 'messages'"
+            ).fetchone() is not None
+            legacy_clone_ceiling = (
+                int(
+                    cursor.execute(
+                        "SELECT COALESCE(MAX(id), 0) FROM messages"
+                    ).fetchone()[0]
+                )
+                if had_messages_table
+                else 0
+            )
+
         cursor.executescript(SCHEMA_SQL)
+
+        if legacy_clone_ceiling is not None:
+            cursor.execute(
+                "INSERT INTO state_meta (key, value) VALUES (?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                (
+                    MESSAGE_CLONE_LINEAGE_LEGACY_CEILING_KEY,
+                    str(legacy_clone_ceiling),
+                ),
+            )
 
         # ── Declarative column reconciliation ──────────────────────────
         # Diff live tables against SCHEMA_SQL and ADD any missing columns.
