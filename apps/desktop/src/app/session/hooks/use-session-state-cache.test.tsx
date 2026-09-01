@@ -1,8 +1,9 @@
-import { act, cleanup, render } from '@testing-library/react'
-import { type MutableRefObject, useLayoutEffect } from 'react'
+import { act, cleanup, render, waitFor } from '@testing-library/react'
+import { type MutableRefObject, useLayoutEffect, useRef } from 'react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import type { ChatMessage } from '@/lib/chat-messages'
+import { $activeGatewayProfile } from '@/store/profile'
 import {
   $activeSessionStoredIdRotation,
   $currentFastMode,
@@ -11,6 +12,7 @@ import {
   $currentReasoningEffort,
   $currentServiceTier,
   $messages,
+  $selectedStoredSessionId,
   $turnStartedAt,
   setActiveSessionId,
   setActiveSessionStoredIdRotation,
@@ -19,16 +21,21 @@ import {
   setCurrentProvider,
   setCurrentReasoningEffort,
   setCurrentServiceTier,
+  setSelectedStoredSessionId,
   setTurnStartedAt
 } from '@/store/session'
 import {
   $sessionStates,
+  $sessionTiles,
   clearAllSessionStates,
+  closeSessionTile,
+  openSessionTile,
   reconcileBusyStatesOnReconnect,
   type SessionTileDelegate,
   setSessionTileDelegate
 } from '@/store/session-states'
 
+import { useSessionActions } from './use-session-actions'
 import { useSessionStateCache } from './use-session-state-cache'
 
 type Cache = ReturnType<typeof useSessionStateCache>
@@ -42,8 +49,11 @@ interface HarnessProps {
 describe('useSessionStateCache — stored-id rotation provenance', () => {
   afterEach(() => {
     cleanup()
+    clearAllSessionStates()
     setActiveSessionId(null)
     setActiveSessionStoredIdRotation(null)
+    setSelectedStoredSessionId(null)
+    $sessionTiles.set([])
   })
 
   it('emits the previous, next, and runtime ids and removes the stale reverse mapping', () => {
@@ -85,6 +95,128 @@ describe('useSessionStateCache — stored-id rotation provenance', () => {
     expect(cache.runtimeIdByStoredSessionIdRef.current.has('stored-A')).toBe(false)
     expect(cache.runtimeIdByStoredSessionIdRef.current.get('stored-A-next')).toBe('runtime-A')
   })
+
+  it('re-homes an open tile on a cache-path rotation even when the runtime is background (#98622)', () => {
+    let cache!: Cache
+
+    // Background runtime: the rotation atom stays null, but the tile keyed on
+    // the pre-rotation id must still re-home to the new tip.
+    setActiveSessionId('runtime-B')
+    render(
+      <Harness activeSessionId="runtime-B" onReady={value => (cache = value)} selectedStoredSessionId="stored-B" />
+    )
+
+    act(() => {
+      $sessionTiles.set([{ storedSessionId: 'stored-A' }])
+      cache.updateSessionState('runtime-A', state => state, 'stored-A')
+      cache.updateSessionState('runtime-A', state => state, 'stored-A-next')
+    })
+
+    const tiles = $sessionTiles.get()
+    expect(tiles.find(t => t.storedSessionId === 'stored-A')).toBeUndefined()
+    expect(tiles.find(t => t.storedSessionId === 'stored-A-next')).toBeDefined()
+  })
+
+  it('rekeys the persisted owner profile when its runtime rotates while another profile is visible', () => {
+    let cache!: Cache
+    const profileA = 'rotation-profile-a-98622'
+    const profileB = 'rotation-profile-b-98622'
+    const previousStoredSessionId = 'stored-profile-previous'
+    const nextStoredSessionId = 'stored-profile-next'
+
+    try {
+      act(() => {
+        $activeGatewayProfile.set(profileA)
+        closeSessionTile(previousStoredSessionId)
+        closeSessionTile(nextStoredSessionId)
+        openSessionTile(previousStoredSessionId)
+        $activeGatewayProfile.set(profileB)
+      })
+
+      setActiveSessionId('runtime-visible-b')
+      render(
+        <Harness activeSessionId="runtime-visible-b" onReady={value => (cache = value)} selectedStoredSessionId={null} />
+      )
+
+      act(() => {
+        cache.updateSessionState('runtime-a', state => state, previousStoredSessionId)
+        cache.updateSessionState('runtime-a', state => state, nextStoredSessionId)
+      })
+
+      act(() => {
+        $activeGatewayProfile.set(profileA)
+      })
+      expect($sessionTiles.get().map(tile => tile.storedSessionId)).toEqual([nextStoredSessionId])
+    } finally {
+      act(() => {
+        $activeGatewayProfile.set(profileA)
+        closeSessionTile(previousStoredSessionId)
+        closeSessionTile(nextStoredSessionId)
+        $activeGatewayProfile.set('default')
+      })
+    }
+  })
+
+  it('leaves only the rotated main session when ensureSessionState publishes before route-follow', async () => {
+    let cache!: Cache
+
+    setActiveSessionId('runtime-cache-ordering')
+    setSelectedStoredSessionId('stored-cache-previous')
+    $sessionTiles.set([{ storedSessionId: 'stored-cache-previous' }])
+    render(
+      <RotationHarness
+        activeSessionId="runtime-cache-ordering"
+        onReady={value => (cache = value)}
+        selectedStoredSessionId="stored-cache-previous"
+      />
+    )
+
+    act(() => {
+      cache.updateSessionState('runtime-cache-ordering', state => state, 'stored-cache-previous')
+      cache.updateSessionState('runtime-cache-ordering', state => state, 'stored-cache-next')
+    })
+
+    await waitFor(() => expect($selectedStoredSessionId.get()).toBe('stored-cache-next'))
+    expect($sessionTiles.get()).toEqual([])
+  })
+
+  it('preserves the old tile when a cache update detaches its stored session id', () => {
+    let cache!: Cache
+
+    setActiveSessionId('runtime-detach')
+    $sessionTiles.set([{ storedSessionId: 'stored-detach-old' }])
+    render(
+      <Harness activeSessionId="runtime-detach" onReady={value => (cache = value)} selectedStoredSessionId={null} />
+    )
+
+    act(() => {
+      cache.updateSessionState('runtime-detach', state => state, 'stored-detach-old')
+      cache.updateSessionState('runtime-detach', state => state, null)
+    })
+
+    expect($sessionTiles.get()).toEqual([{ storedSessionId: 'stored-detach-old' }])
+  })
+
+  it('drops the stale tile on a cache-path rotation when the new tip is the main selection (#98622)', () => {
+    let cache!: Cache
+
+    setActiveSessionId('runtime-A')
+    render(
+      <Harness activeSessionId="runtime-A" onReady={value => (cache = value)} selectedStoredSessionId="stored-A-next" />
+    )
+
+    act(() => {
+      // The drop decision reads the GLOBAL selection atom, not the harness prop.
+      setSelectedStoredSessionId('stored-A-next')
+      $sessionTiles.set([{ storedSessionId: 'stored-A' }])
+      cache.updateSessionState('runtime-A', state => state, 'stored-A')
+      cache.updateSessionState('runtime-A', state => state, 'stored-A-next')
+    })
+
+    // Main already shows the conversation on the new tip: the tile is dropped
+    // entirely (main OR tile — never both).
+    expect($sessionTiles.get()).toHaveLength(0)
+  })
 })
 
 function Harness({ activeSessionId, onReady, selectedStoredSessionId }: HarnessProps) {
@@ -97,6 +229,44 @@ function Harness({ activeSessionId, onReady, selectedStoredSessionId }: HarnessP
     setAwaitingResponse: () => undefined,
     setBusy: () => undefined,
     setMessages: () => undefined
+  })
+
+  onReady(cache)
+
+  return null
+}
+
+function RotationHarness({ activeSessionId, onReady, selectedStoredSessionId }: HarnessProps) {
+  const busyRef = useRef(false)
+  const activeSessionIdRef = useRef<string | null>(activeSessionId)
+  const selectedStoredSessionIdRef = useRef<string | null>(selectedStoredSessionId)
+
+  const cache = useSessionStateCache({
+    activeSessionId,
+    busyRef,
+    selectedStoredSessionId,
+    setAwaitingResponse: () => undefined,
+    setBusy: () => undefined,
+    setMessages: () => undefined
+  })
+
+  useSessionActions({
+    activeSessionId,
+    activeSessionIdRef,
+    busyRef,
+    creatingSessionRef: useRef(false),
+    ensureSessionState: cache.ensureSessionState,
+    getRouteToken: () => 'rotation-test',
+    getRoutedStoredSessionId: () => selectedStoredSessionId,
+    navigate: vi.fn() as never,
+    requestGateway: async () => ({}) as never,
+    resetViewSync: cache.resetViewSync,
+    runtimeIdByStoredSessionIdRef: cache.runtimeIdByStoredSessionIdRef,
+    selectedStoredSessionId,
+    selectedStoredSessionIdRef,
+    sessionStateByRuntimeIdRef: cache.sessionStateByRuntimeIdRef,
+    syncSessionStateToView: cache.syncSessionStateToView,
+    updateSessionState: cache.updateSessionState
   })
 
   onReady(cache)
