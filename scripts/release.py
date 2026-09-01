@@ -2606,6 +2606,52 @@ def main():
             "--notes-file", str(changelog_file),
         ]
 
+        # Attach a freshly-built macOS bootstrap DMG when one is present in the
+        # Tauri bundle directory (#85422).  Every revalidation of the stale
+        # public artifact — across v0.20.2, v0.20.4, v0.20.5, v0.20.6 and
+        # v2026.8.31 — notes the GitHub release carries NO attached assets,
+        # leaving users no alternate official macOS artifact while the CDN
+        # serves the June-6 bootstrap that predates Desktop's remote-client
+        # onboarding (#60489).  The CDN upload is external infra; the release
+        # attachment is in-tree and this is the step that closes that gap.
+        #
+        # The DMG must be built on macOS BEFORE running release.py --publish:
+        #   cd apps/bootstrap-installer && npm run tauri:build
+        # Tauri emits to src-tauri/target/release/bundle/dmg/.  Both
+        # architectures are attached when present; a missing DMG is a skip
+        # (with a warning), not a release failure — releases cut from hosts
+        # without a macOS build must keep working.
+        _bundle_dmg_dir = (
+            REPO_ROOT / "apps" / "bootstrap-installer" / "src-tauri"
+            / "target" / "release" / "bundle" / "dmg"
+        )
+        _dmg_attachments: list[str] = []
+        if _bundle_dmg_dir.is_dir():
+            for _dmg in sorted(_bundle_dmg_dir.glob("*.dmg")):
+                _age_hours = 72
+                _mtime = _dmg.stat().st_mtime
+                import time as _time
+                _hours_old = (_time.time() - _mtime) / 3600.0
+                if _hours_old > _age_hours:
+                    print(
+                        f"  ⚠ Skipping stale DMG {_dmg.name} "
+                        f"({int(_hours_old)}h old — older than {_age_hours}h; "
+                        f"rebuild with `npm run tauri:build` before publishing)"
+                    )
+                    continue
+                _dmg_attachments.append(str(_dmg))
+        if _dmg_attachments:
+            gh_cmd.extend(_dmg_attachments)
+            for _p in _dmg_attachments:
+                print(f"  📎 Attaching macOS bootstrap DMG: {Path(_p).name}")
+        else:
+            print(
+                "  ⚠ No fresh macOS DMG found in "
+                f"{_bundle_dmg_dir} — GitHub release will have no macOS asset "
+                "again (#85422).  Build on macOS first: "
+                "`cd apps/bootstrap-installer && npm run tauri:build`"
+            )
+
         gh_bin = shutil.which("gh")
         if gh_bin:
             result = subprocess.run(
