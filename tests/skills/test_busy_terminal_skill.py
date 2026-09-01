@@ -297,8 +297,8 @@ class TestRunLoop:
 
         assert set(seen) == set(busy_terminal.PROFILES[profile])
 
-    def test_the_default_rotation_is_the_developer_profile(self):
-        """'Pretend I'm working' must not open with digital rain."""
+    def test_the_default_rotation_is_the_hacker_profile(self):
+        """A bare launch must open the Hollywood set, not fake pytest."""
         console, _ = make_console()
         seen: list[str] = []
         runners = {name: (lambda c, r, n=name: seen.append(n)) for name in busy_terminal.SCENES}
@@ -306,7 +306,25 @@ class TestRunLoop:
         with mock.patch.object(busy_terminal, "SCENE_RUNNERS", runners):
             busy_terminal.run(console, random.Random(9), duration=60.0, now=ticking_clock(1.0))
 
-        assert set(seen) == set(busy_terminal.PROFILES["developer"])
+        assert set(seen) == set(busy_terminal.PROFILES["hacker"])
+        assert seen[0] == "warroom"
+
+    def test_developer_does_not_open_on_the_war_room(self):
+        console, _ = make_console()
+        seen: list[str] = []
+        runners = {name: (lambda c, r, n=name: seen.append(n)) for name in busy_terminal.SCENES}
+
+        with mock.patch.object(busy_terminal, "SCENE_RUNNERS", runners):
+            busy_terminal.run(
+                console,
+                random.Random(9),
+                scenes=busy_terminal.PROFILES["developer"],
+                duration=8.0,
+                now=ticking_clock(1.0),
+            )
+
+        assert seen[0] != "warroom"
+        assert set(seen) <= set(busy_terminal.PROFILES["developer"])
 
 
 class TestProfiles:
@@ -560,9 +578,12 @@ class TestApplescriptString:
 class TestWindowArgv:
     def test_macos_drives_terminal_app_and_brings_it_forward(self):
         argv = busy_terminal.window_argv("run me", "darwin")
+        script = " ".join(argv)
         assert argv[0] == "osascript"
-        assert any("do script" in part for part in argv)
-        assert any("activate" in part for part in argv)
+        assert "do script" in script
+        assert "activate" in script
+        assert "number of columns of front window to 140" in script
+        assert "number of rows of front window to 42" in script
 
     def test_macos_embeds_the_command_as_an_escaped_applescript_literal(self):
         argv = busy_terminal.window_argv('say "hi"', "darwin")
@@ -657,11 +678,11 @@ class TestColorDetection:
 
 
 class TestCli:
-    def test_defaults_run_forever_on_the_developer_profile(self):
+    def test_defaults_run_forever_on_the_hacker_profile(self):
         args = busy_terminal.build_parser().parse_args([])
         assert args.duration == 0.0
         assert args.scene == ""
-        assert args.profile == "developer"
+        assert args.profile == "hacker"
 
     def test_scene_is_restricted_to_known_scenes(self):
         with pytest.raises(SystemExit):

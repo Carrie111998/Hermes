@@ -9,11 +9,11 @@ nothing touches the network. The "targets" are RFC 5737 documentation
 addresses and example.* hosts, so the theatre cannot point at anything real.
 This is a joke screensaver in the `cmatrix` tradition, not a tool.
 
-    python3 busy_terminal.py                   # developer profile, until Ctrl-C
-    python3 busy_terminal.py --profile hacker  # full Hollywood
-    python3 busy_terminal.py --duration 120    # two minutes, then exit
-    python3 busy_terminal.py --scene matrix    # one scene on repeat
-    python3 busy_terminal.py --window          # open a new terminal, return now
+    python3 busy_terminal.py                      # hacker profile, until Ctrl-C
+    python3 busy_terminal.py --profile developer  # fake coding session
+    python3 busy_terminal.py --duration 120       # two minutes, then exit
+    python3 busy_terminal.py --scene warroom      # the multi-window poster
+    python3 busy_terminal.py --window             # open a new terminal, return now
 
 `--window` is the one thing here that starts a process: it re-launches this
 script inside a fresh terminal window and exits. An agent needs it, because a
@@ -1180,7 +1180,7 @@ def run(
     rng: random.Random,
     *,
     scene: str = "",
-    scenes: Sequence[str] = PROFILES["developer"],
+    scenes: Sequence[str] = PROFILES["hacker"],
     duration: float = 0.0,
     now: Callable[[], float] = time.monotonic,
 ) -> int:
@@ -1193,9 +1193,18 @@ def run(
     started = now()
     played = 0
     last = ""
+    # Open on the war room when it is in the rotation — that is the
+    # multi-window poster, and a random first pick often hides it for minutes.
+    pending_opener = "warroom" if (not scene and "warroom" in scenes) else ""
 
     while True:
-        last = scene or next_scene(rng, last, scenes)
+        if scene:
+            last = scene
+        elif pending_opener:
+            last = pending_opener
+            pending_opener = ""
+        else:
+            last = next_scene(rng, last, scenes)
         SCENE_RUNNERS[last](console, rng)
         played += 1
 
@@ -1236,10 +1245,18 @@ def window_argv(
     branches are checkable from one host.
     """
     if platform == "darwin":
+        # Size the new window for the war room (panes + four dialogs). A
+        # default 80x24 Terminal clips the corners and looks like one pane.
+        quoted = applescript_string(command)
         return [
             "osascript",
-            "-e", f"tell application \"Terminal\" to do script {applescript_string(command)}",
-            "-e", 'tell application "Terminal" to activate',
+            "-e",
+            "tell application \"Terminal\"\n"
+            f"  set w to do script {quoted}\n"
+            "  set number of columns of front window to 140\n"
+            "  set number of rows of front window to 42\n"
+            "  activate\n"
+            "end tell",
         ]
 
     if platform == "win32":
@@ -1322,8 +1339,8 @@ def build_parser() -> argparse.ArgumentParser:
         help="Time multiplier. 2 is twice as fast, 0.5 half.",
     )
     parser.add_argument(
-        "--profile", choices=sorted(PROFILES), default="developer",
-        help="Scene set: developer (fake work), hacker (full Hollywood), mixed (both).",
+        "--profile", choices=sorted(PROFILES), default="hacker",
+        help="Scene set: hacker (Hollywood, default), developer (fake work), mixed (both).",
     )
     parser.add_argument(
         "--scene", choices=SCENES, default="",

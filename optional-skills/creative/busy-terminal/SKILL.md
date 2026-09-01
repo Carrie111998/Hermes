@@ -1,7 +1,7 @@
 ---
 name: busy-terminal
 description: "Joke screensaver: fake coding or Hollywood hacking."
-version: 1.3.0
+version: 1.4.0
 author: "Luke The Dev (@iamlukethedev), Hermes Agent"
 license: MIT
 platforms: [linux, macos, windows]
@@ -31,12 +31,13 @@ and should never be presented as if it did.
 Trigger on any of these, without asking a follow-up question:
 
 - "pretend I'm working" / "make it look like I'm working" / "look busy"
-  → `--profile developer`
+  / "fake coding" → `--profile developer`
 - "hacker mode" / "make me look like a movie hacker" / "Hollywood hacking"
-  / "matrix mode" / "digital rain" → `--profile hacker`
-- "start the fake work screensaver" / "busy terminal" / "fake coding"
-  → `--profile developer`, or `mixed` if they ask for everything
-- The user wants an ambient background pane during a stream, demo, or recording
+  / "matrix mode" / "digital rain" / "several windows" / "the screensaver"
+  / "busy terminal" → `--profile hacker`
+- Ambiguous, or the user is testing the feature → `--profile hacker` (the
+  war room opens first). Never launch a bare `--window --duration` and rely
+  on an old default — always pass `--profile` explicitly.
 
 Do not reach for this when the user wants real build, test, or git output —
 run the real thing with `terminal` instead. Never describe its output as if it
@@ -55,7 +56,7 @@ Always pass `--window`. Run it through the `terminal` tool:
 
 ```bash
 python3 ~/.hermes/skills/creative/busy-terminal/scripts/busy_terminal.py \
-  --window --duration 600
+  --window --profile hacker --duration 600
 ```
 
 `--window` opens a fresh terminal window on the user's screen, then returns
@@ -69,9 +70,9 @@ minutes is a good default; they can Ctrl-C sooner.
 Variants worth offering:
 
 ```bash
-... --window --profile hacker --duration 300   # five minutes of Hollywood
-... --window --scene matrix                    # just the rain, on repeat
-... --window --scene tests --speed 2           # one scene, faster
+... --window --profile developer --duration 600   # fake coding, no rain
+... --window --scene warroom --duration 180       # just the multi-window poster
+... --window --scene matrix                       # just the rain
 ```
 
 The user can also run it themselves in any terminal, without `--window`.
@@ -80,7 +81,7 @@ The user can also run it themselves in any terminal, without `--window`.
 
 | Flag | Default | Effect |
 |------|---------|--------|
-| `--profile` | `developer` | Scene set: `developer`, `hacker`, or `mixed` |
+| `--profile` | `hacker` | Scene set: `hacker`, `developer`, or `mixed` |
 | `--duration` | `0` | Seconds to run; `0` means until Ctrl-C |
 | `--speed` | `1.0` | Time multiplier — `2` is twice as fast |
 | `--scene` | cycle | Pin one scene on repeat (overrides the profile) |
@@ -102,9 +103,10 @@ The user can also run it themselves in any terminal, without `--window`.
 ## Procedure
 
 1. Pick the profile from the user's phrasing (see When to Use); default to
-   `developer` when it is ambiguous.
+   `hacker` when it is ambiguous. Always pass `--profile` on the command
+   line — do not omit it.
 2. Run the script with `--window`, the profile, and a `--duration` via
-   `terminal`.
+   `terminal`. The war room opens first on the hacker rotation.
 3. Tell the user a new window opened and that Ctrl-C in it stops the show.
 4. Suggest full screen and a larger font if they want it to fill the display —
    the matrix rain especially earns it.
