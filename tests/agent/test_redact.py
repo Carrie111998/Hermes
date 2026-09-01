@@ -1081,3 +1081,87 @@ class TestMaskSecretControlStripping:
     def test_all_control_value_returns_empty_fallback(self):
         assert mask_secret("\n\x85\u200b") == ""
         assert mask_secret("\n\x85\u200b", empty="(not set)") == "(not set)"
+
+
+class TestForcedFileContentRedaction:
+    """File-content mode must cover opaque structured credential values."""
+
+    def test_file_read_redacts_opaque_assignment_and_nested_json(self):
+        assignment = "opaqueassignment123456789"
+        nested_json = "nestedjsonsecret987654321"
+        content = (
+            f"SERVICE_API_KEY={assignment}\n"
+            f'{{"credentials": {{"apiKey": "{nested_json}"}}}}'
+        )
+
+        result = redact_sensitive_text(content, force=True, file_read=True)
+
+        assert assignment not in result
+        assert nested_json not in result
+
+    def test_file_read_forces_redaction_when_global_opt_out_is_set(self, monkeypatch):
+        monkeypatch.setattr("agent.redact._REDACT_ENABLED", False)
+        secret = "opaque-file-secret-123456789"
+
+        result = redact_sensitive_text(
+            f"SERVICE_API_KEY={secret}", file_read=True
+        )
+
+        assert secret not in result
+
+    def test_code_file_only_skips_source_like_values(self):
+        secret = "opaque-structured-secret-123456789"
+        content = (
+            "MAX_TOKENS=100\n"
+            f"SERVICE_API_KEY={secret}\n"
+            '{"apiKey": "test"}'
+        )
+
+        result = redact_sensitive_text(content, force=True, code_file=True)
+
+        assert "MAX_TOKENS=100" in result
+        assert secret not in result
+        assert '"apiKey": "test"' in result
+
+    def test_terminal_output_redacts_structured_values_for_unknown_commands(self):
+        from agent.redact import redact_terminal_output
+
+        assignment = "opaque-terminal-secret-123456789"
+        nested = "opaque-json-secret-987654321"
+        output = (
+            f"SERVICE_API_KEY={assignment}\n"
+            f"password: {nested}\n"
+            f'{{"apiKey": "{nested}"}}'
+        )
+
+        result = redact_terminal_output(output, "python app.py", force=True)
+
+        assert assignment not in result
+        assert nested not in result
+
+    def test_control_and_format_characters_cannot_split_prefix_tokens(self):
+        from agent.redact import redact_sensitive_text
+
+        token = "sk-" + "a" * 30
+        for separator in ("\n", "\r", "\x85", "\u2061", "\u2064"):
+            split = token[:15] + separator + token[15:]
+            result = redact_sensitive_text(split, force=True, file_read=True)
+            assert "a" * 15 not in result, repr(separator)
+
+    def test_quoted_yaml_env_and_escaped_json_values_are_redacted(self):
+        import json
+
+        yaml_secret = "quoted-yaml-secret-123456789"
+        env_secret = "quoted env secret 123456789"
+        json_secret = 'escaped"json-secret-987654321'
+        content = (
+            f'password: "{yaml_secret}"\n'
+            f'SERVICE_API_KEY="{env_secret}"\n'
+            + json.dumps({"credentials": {"apiKey": json_secret}})
+        )
+
+        result = redact_sensitive_text(content, force=True, file_read=True)
+
+        assert yaml_secret not in result
+        assert env_secret not in result
+        assert json_secret not in result
