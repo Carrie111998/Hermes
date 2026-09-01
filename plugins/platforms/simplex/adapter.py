@@ -75,6 +75,21 @@ from gateway.platforms.base import (
     MessageType,
     SendResult,
 )
+from plugins.platforms.simplex.approvals import SimplexApprovalMixin
+from plugins.platforms.simplex.batching import prepend_cancelled_batch
+from plugins.platforms.simplex.config import (
+    profile_scoped as _profile_scoped,
+    profile_simplex_extra as _profile_simplex_extra,
+    scoped_platform_setting as _scoped_platform_setting,
+)
+from plugins.platforms.simplex.media import SimplexMediaMixin
+from plugins.platforms.simplex.messaging import SimplexMessagingMixin
+from plugins.platforms.simplex.protocol import (
+    response_error as _response_error,
+    response_item_ids as _response_item_ids,
+    response_type as _response_type,
+    simplex_payload_len as _simplex_payload_len,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -149,11 +164,6 @@ def _sanitize_filename(name: str) -> str:
     return cleaned[:120] or "file"
 
 
-def _simplex_payload_len(text: str) -> int:
-    """Measure a string as it appears inside the ensure_ascii=False JSON body."""
-    return len(json.dumps(text, ensure_ascii=False).encode("utf-8")) - 2
-
-
 def _delivered_source_prefix(content: str, chunks: List[str]) -> str:
     """Map formatted overflow chunks back to a monotonic source prefix."""
     cursor = 0
@@ -179,51 +189,16 @@ def _delivered_source_prefix(content: str, chunks: List[str]) -> str:
     return content[:cursor]
 
 
-def _response_type(resp: Optional[dict]) -> str:
-    return str((resp or {}).get("type") or "") if isinstance(resp, dict) else ""
-
-
-def _response_error(resp: Optional[dict]) -> Optional[str]:
-    """Return a bounded diagnostic string for a daemon error response."""
-    if not isinstance(resp, dict):
-        return "SimpleX daemon did not answer"
-    resp_type = _response_type(resp)
-    if resp_type in {"localCommandOutcomeUnknown", "localCommandNotSubmitted"}:
-        return str(resp.get("error") or "SimpleX command outcome is unknown")[:1000]
-    if resp_type not in {"chatCmdError", "chatError", "chatErrors"}:
-        return None
-    detail = resp.get("chatError") or resp.get("chatErrors") or resp
-    try:
-        rendered = json.dumps(detail, ensure_ascii=False, sort_keys=True)
-    except (TypeError, ValueError):
-        rendered = str(detail)
-    return f"{resp_type}: {rendered[:1000]}"
-
-
-def _response_item_ids(resp: Optional[dict]) -> List[str]:
-    """Extract stable daemon chat-item IDs from a command response."""
-    if not isinstance(resp, dict):
-        return []
-    wrappers: List[dict] = []
-    if isinstance(resp.get("chatItems"), list):
-        wrappers.extend(item for item in resp["chatItems"] if isinstance(item, dict))
-    if isinstance(resp.get("chatItem"), dict):
-        wrappers.append(resp["chatItem"])
-    ids: List[str] = []
-    for wrapper in wrappers:
-        inner = wrapper.get("chatItem", {}) if isinstance(wrapper, dict) else {}
-        meta = inner.get("meta", {}) if isinstance(inner, dict) else {}
-        item_id = meta.get("itemId") if isinstance(meta, dict) else None
-        if item_id is not None:
-            ids.append(str(item_id))
-    return ids
-
-
 # ---------------------------------------------------------------------------
 # SimpleX Adapter
 # ---------------------------------------------------------------------------
 
-class SimplexAdapter(BasePlatformAdapter):
+class SimplexAdapter(
+    SimplexMessagingMixin,
+    SimplexMediaMixin,
+    SimplexApprovalMixin,
+    BasePlatformAdapter,
+):
     """SimpleX Chat adapter using the simplex-chat daemon WebSocket API.
 
     Instantiated by the ``adapter_factory`` passed to
@@ -252,17 +227,25 @@ class SimplexAdapter(BasePlatformAdapter):
         # Contact-request auto-accept (on by default — matches the way most
         # bot deployments expect to behave). Read from env first, then fall
         # back to the value seeded by ``_env_enablement``.
-        env_auto = os.getenv("SIMPLEX_AUTO_ACCEPT")
-        if env_auto is not None:
-            self.auto_accept = env_auto.strip().lower() not in {"0", "false", "no", ""}
-        else:
-            self.auto_accept = bool(extra.get("auto_accept", True))
+        env_auto = _scoped_platform_setting(
+            "SIMPLEX_AUTO_ACCEPT", extra, "auto_accept"
+        )
+        auto_value = extra.get("auto_accept", True) if env_auto is None else env_auto
+        self.auto_accept = str(auto_value).strip().lower() not in {
+            "0",
+            "false",
+            "no",
+            "",
+        }
 
         # The daemon reports received paths relative to --files-folder and
         # exposes only a setter, not a query API. Mirror the non-secret path in
         # config so downstream media consumers always receive openable paths.
-        files_folder = os.getenv("SIMPLEX_FILES_FOLDER", "").strip() or str(
-            extra.get("files_folder", "") or ""
+        env_files_folder = _scoped_platform_setting(
+            "SIMPLEX_FILES_FOLDER", extra, "files_folder"
+        )
+        files_folder = str(
+            env_files_folder or extra.get("files_folder", "")
         ).strip()
         expanded_files_folder = os.path.expanduser(files_folder)
         if expanded_files_folder and not os.path.isabs(expanded_files_folder):
@@ -281,7 +264,10 @@ class SimplexAdapter(BasePlatformAdapter):
             60.0, float(extra.get("media_cleanup_timeout", 3600.0))
         )
 
-        allow_entries = _parse_comma_list(os.getenv("SIMPLEX_ALLOWED_USERS", ""))
+        env_allowed_users = _scoped_platform_setting(
+            "SIMPLEX_ALLOWED_USERS", extra, "allowed_users"
+        )
+        allow_entries = _parse_comma_list(str(env_allowed_users or ""))
         ignored_allow_entries = [
             entry for entry in allow_entries if entry != "*" and not entry.isdigit()
         ]
@@ -297,9 +283,10 @@ class SimplexAdapter(BasePlatformAdapter):
         # Group allowlist. Without ``SIMPLEX_GROUP_ALLOWED``, group messages
         # are ignored entirely (safer default — a bot in a group otherwise
         # processes every member's traffic). Use ``*`` to accept any group.
-        group_allowed_str = os.getenv("SIMPLEX_GROUP_ALLOWED", "") or extra.get(
-            "group_allowed", ""
+        env_group_allowed = _scoped_platform_setting(
+            "SIMPLEX_GROUP_ALLOWED", extra, "group_allowed"
         )
+        group_allowed_str = env_group_allowed or extra.get("group_allowed", "")
         self.group_allow_from = set(_parse_comma_list(group_allowed_str))
 
         # Running state
@@ -310,6 +297,7 @@ class SimplexAdapter(BasePlatformAdapter):
         self._last_ws_activity = 0.0
         self._ws_ready = asyncio.Event()
         self._connect_timeout = float(extra.get("connect_timeout", 10.0))
+        self._listener_lock_acquired = False
 
         # Track sent correlation IDs to filter echoes
         self._pending_corr_ids: set = set()
@@ -392,16 +380,32 @@ class SimplexAdapter(BasePlatformAdapter):
         if self._running and self._ws is not None and self._ws_ready.is_set():
             return True
 
-        self._running = True
-        self._ws_ready.clear()
-        self._ws_task = asyncio.create_task(self._ws_listener())
+        try:
+            if not self._acquire_platform_lock(
+                "simplex-ws", self.ws_url, "SimpleX daemon URL"
+            ):
+                return False
+        except Exception as exc:
+            logger.error("SimpleX: could not acquire daemon URL lock: %s", exc)
+            return False
+        self._listener_lock_acquired = True
 
         try:
+            self._running = True
+            self._ws_ready.clear()
+            self._ws_task = asyncio.create_task(self._ws_listener())
             await asyncio.wait_for(
                 self._ws_ready.wait(), timeout=max(self._connect_timeout, 0.1)
             )
         except asyncio.TimeoutError:
             logger.error("SimpleX: listener did not become ready before timeout")
+            await self.disconnect()
+            return False
+        except asyncio.CancelledError:
+            await self.disconnect()
+            raise
+        except Exception:
+            logger.exception("SimpleX: listener startup failed")
             await self.disconnect()
             return False
 
@@ -442,10 +446,16 @@ class SimplexAdapter(BasePlatformAdapter):
                 pass
             self._ws = None
 
-        # Cancel pending text-batch flush timers
-        for task in list(self._pending_text_batch_tasks.values()):
+        # Cancel and drain pending text-batch flush timers before clearing the
+        # buffers. A flush cancelled after popping its event re-buffers it;
+        # draining first prevents that recovery path from creating ghost state
+        # after disconnect has already cleared the dictionaries.
+        text_batch_tasks = list(self._pending_text_batch_tasks.values())
+        for task in text_batch_tasks:
             if not task.done():
                 task.cancel()
+        if text_batch_tasks:
+            await asyncio.gather(*text_batch_tasks, return_exceptions=True)
         self._pending_text_batch_tasks.clear()
         self._pending_text_batches.clear()
 
@@ -492,6 +502,10 @@ class SimplexAdapter(BasePlatformAdapter):
         self._approval_prompts_by_item.clear()
         self._approval_prompt_by_session.clear()
         self._approval_typed_only_until.clear()
+
+        if self._listener_lock_acquired:
+            self._release_platform_lock()
+            self._listener_lock_acquired = False
 
         if hasattr(self, "_mark_disconnected"):
             self._mark_disconnected()
@@ -871,281 +885,24 @@ class SimplexAdapter(BasePlatformAdapter):
         if resp_type:
             logger.debug("SimpleX: unhandled event type: %s", resp_type)
 
-    @staticmethod
-    def _normalize_chat_item_wrapper(payload: dict) -> dict:
-        """Normalize SimpleX AChatItem payload variants to {chatInfo, chatItem}.
 
-        Depending on daemon version and event type, the chat item wrapper
-        arrives in one of several shapes:
 
-        * ``{"chatInfo": ..., "chatItem": ...}`` — already normalized
-          (the usual ``newChatItems`` array element).
-        * ``{"type": "newChatItem", "chatItem": {"chatInfo": ...,
-          "chatItem": ...}}`` — the singular event nests the AChatItem one
-          level down.
-        * ``{"chatInfo": ..., "item": ...}`` — some responses name the item
-          field ``item`` instead of ``chatItem``.
 
-        ``_handle_chat_item`` only reads ``chatInfo``/``chatItem`` at the top
-        level, so anything not normalized here would be silently dropped.
-        """
-        if not isinstance(payload, dict):
-            return {}
 
-        nested = payload.get("chatItem")
-        if isinstance(nested, dict):
-            # Nested AChatItem: {type: newChatItem, chatItem: {chatInfo, chatItem}}
-            if isinstance(nested.get("chatInfo"), dict) and isinstance(
-                nested.get("chatItem"), dict
-            ):
-                return nested
-            # Already normalized: {chatInfo: ..., chatItem: {content/meta/...}}
-            if isinstance(payload.get("chatInfo"), dict):
-                return payload
 
-        if isinstance(payload.get("chatInfo"), dict) and isinstance(
-            payload.get("item"), dict
-        ):
-            return {"chatInfo": payload["chatInfo"], "chatItem": payload["item"]}
 
-        return payload
 
-    @staticmethod
-    def _file_id_from_wrapper(wrapper: dict) -> Optional[int]:
-        normalized = SimplexAdapter._normalize_chat_item_wrapper(wrapper)
-        inner = normalized.get("chatItem", {}) if normalized else {}
-        file_info = inner.get("file", {}) if isinstance(inner, dict) else {}
-        raw_id = file_info.get("fileId") if isinstance(file_info, dict) else None
-        try:
-            return int(raw_id) if raw_id is not None else None
-        except (TypeError, ValueError):
-            return None
 
-    @staticmethod
-    def _item_id_from_wrapper(wrapper: dict) -> Optional[str]:
-        normalized = SimplexAdapter._normalize_chat_item_wrapper(wrapper)
-        inner = normalized.get("chatItem", {}) if normalized else {}
-        meta = inner.get("meta", {}) if isinstance(inner, dict) else {}
-        item_id = meta.get("itemId") if isinstance(meta, dict) else None
-        return str(item_id) if item_id is not None else None
 
-    def _file_sender_context(
-        self, wrapper: dict
-    ) -> tuple[Optional[str], Optional[str], Optional[str]]:
-        """Return ``(user_id, chat_type, chat_id)`` for an attachment event."""
-        normalized = self._normalize_chat_item_wrapper(wrapper)
-        chat_info = normalized.get("chatInfo", {}) if normalized else {}
-        inner = normalized.get("chatItem", {}) if normalized else {}
-        chat_dir = inner.get("chatDir", {}) if isinstance(inner, dict) else {}
-        chat_type = chat_info.get("type") if isinstance(chat_info, dict) else None
-        if chat_type == "direct":
-            contact = chat_info.get("contact", {}) or {}
-            contact_id = contact.get("contactId")
-            user_id = str(contact_id) if contact_id is not None else None
-            return user_id, "dm", user_id
-        if chat_type == "group":
-            group = chat_info.get("groupInfo", {}) or {}
-            group_id = group.get("groupId")
-            member = chat_dir.get("groupMember", {}) if isinstance(chat_dir, dict) else {}
-            member_contact_id = (
-                member.get("memberContactId") if isinstance(member, dict) else None
-            )
-            member_id = member.get("memberId") if isinstance(member, dict) else None
-            stable_member_id = (
-                member_contact_id if member_contact_id is not None else member_id
-            )
-            user_id = (
-                str(stable_member_id) if stable_member_id is not None else None
-            )
-            chat_id = f"group:{group_id}" if group_id is not None else None
-            if (
-                group_id is None
-                or not self.group_allow_from
-                or (
-                    "*" not in self.group_allow_from
-                    and str(group_id) not in self.group_allow_from
-                )
-            ):
-                return user_id, "group", None
-            return user_id, "group", chat_id
-        return None, None, None
 
-    def _file_sender_is_authorized(self, wrapper: dict) -> bool:
-        user_id, chat_type, chat_id = self._file_sender_context(wrapper)
-        if not user_id or not chat_id:
-            return False
-        return self._is_sender_authorized(user_id, chat_type, chat_id) is True
 
-    def _cancel_file_timeout(self, file_id: int) -> None:
-        task = self._file_transfer_tasks.pop(file_id, None)
-        if task and not task.done() and task is not asyncio.current_task():
-            task.cancel()
 
-    def _prune_terminal_files(self) -> None:
-        now = time.monotonic()
-        for file_id, terminal in list(self._terminal_file_transfers.items()):
-            if float(terminal.get("expires_at", 0.0)) <= now:
-                self._terminal_file_transfers.pop(file_id, None)
-        while len(self._terminal_file_transfers) > 4096:
-            self._terminal_file_transfers.pop(next(iter(self._terminal_file_transfers)))
 
-    def _mark_file_terminal(self, file_id: int, reason: str) -> Optional[str]:
-        """Remember a terminal transfer long enough to reject late duplicates."""
-        self._file_receive_started.discard(file_id)
-        target = self._file_receive_targets.pop(file_id, None)
-        prior = self._terminal_file_transfers.get(file_id, {})
-        if target is None:
-            target = prior.get("target")
-        self._terminal_file_transfers[file_id] = {
-            "target": target,
-            "reason": reason,
-            "expires_at": time.monotonic() + 86400.0,
-        }
-        self._prune_terminal_files()
-        return target
 
-    def _terminal_file_target(self, file_id: int) -> Optional[str]:
-        self._prune_terminal_files()
-        terminal = self._terminal_file_transfers.get(file_id)
-        if terminal:
-            return terminal.get("target")
-        return self._file_receive_targets.get(file_id)
 
-    def _cleanup_owned_media_path(self, path: str) -> None:
-        """Remove only an exact temporary path minted by this adapter."""
-        normalized = os.path.abspath(path)
-        task = self._owned_media_cleanup_tasks.pop(normalized, None)
-        if task and task is not asyncio.current_task() and not task.done():
-            task.cancel()
-        try:
-            if os.path.isfile(normalized) or os.path.islink(normalized):
-                os.remove(normalized)
-        except OSError as exc:
-            self._diagnostics["media_cleanup_failures"] += 1
-            logger.warning(
-                "SimpleX: failed to remove owned temporary media %s (%s)",
-                os.path.basename(normalized),
-                type(exc).__name__,
-            )
 
-    async def _expire_owned_media_path(self, path: str) -> None:
-        try:
-            await asyncio.sleep(self._media_cleanup_timeout)
-            self._cleanup_owned_media_path(path)
-        except asyncio.CancelledError:
-            return
 
-    def _schedule_owned_media_cleanup(self, path: str, *, reset: bool = False) -> None:
-        """Install a TTL backstop for an adapter-created media path."""
-        normalized = os.path.abspath(path)
-        existing = self._owned_media_cleanup_tasks.get(normalized)
-        if existing and not existing.done():
-            if not reset:
-                return
-            existing.cancel()
-        task = asyncio.create_task(self._expire_owned_media_path(normalized))
-        self._owned_media_cleanup_tasks[normalized] = task
 
-        def _done(done: asyncio.Task) -> None:
-            if self._owned_media_cleanup_tasks.get(normalized) is done:
-                self._owned_media_cleanup_tasks.pop(normalized, None)
-            if not done.cancelled():
-                try:
-                    done.result()
-                except Exception:
-                    logger.exception("SimpleX: temporary media cleanup failed")
-
-        task.add_done_callback(_done)
-
-    def _track_pending_file(self, file_id: int, wrapper: dict) -> None:
-        self._pending_file_transfers[file_id] = wrapper
-        existing = self._file_transfer_tasks.get(file_id)
-        if existing and not existing.done():
-            return
-        task = asyncio.create_task(self._expire_file_transfer(file_id))
-        self._file_transfer_tasks[file_id] = task
-
-        def _done(done: asyncio.Task) -> None:
-            if self._file_transfer_tasks.get(file_id) is done:
-                self._file_transfer_tasks.pop(file_id, None)
-            if not done.cancelled():
-                try:
-                    done.result()
-                except Exception:
-                    logger.exception("SimpleX: file-transfer expiry task failed")
-
-        task.add_done_callback(_done)
-
-    async def _dispatch_file_fallback(self, wrapper: dict, reason: str) -> None:
-        """Deliver an authorized file caption without an unavailable attachment."""
-        fallback = copy.deepcopy(self._normalize_chat_item_wrapper(wrapper))
-        inner = fallback.get("chatItem", {}) if fallback else {}
-        if not isinstance(inner, dict):
-            return
-        inner.pop("file", None)
-        content = inner.get("content", {}) or {}
-        msg_content = content.get("msgContent", {}) if isinstance(content, dict) else {}
-        text = msg_content.get("text", "") if isinstance(msg_content, dict) else ""
-        if not text:
-            if not isinstance(content, dict):
-                content = {}
-                inner["content"] = content
-            content["msgContent"] = {
-                "type": "text",
-                "text": f"[Attachment unavailable: {reason}]",
-            }
-        logger.info("SimpleX: delivering file caption without attachment (%s)", reason)
-        await self._handle_chat_item(fallback)
-
-    async def _expire_file_transfer(self, file_id: int) -> None:
-        await asyncio.sleep(self._file_transfer_timeout)
-        wrapper = self._pending_file_transfers.pop(file_id, None)
-        if not wrapper:
-            return
-        target = self._mark_file_terminal(file_id, "transfer timed out")
-        if target:
-            self._cleanup_owned_media_path(target)
-        self._diagnostics["file_timeouts"] += 1
-        await self._dispatch_file_fallback(wrapper, "transfer timed out")
-
-    async def _fail_file_transfer(self, file_id: int, reason: str) -> None:
-        wrapper = self._pending_file_transfers.pop(file_id, None)
-        self._cancel_file_timeout(file_id)
-        target = self._mark_file_terminal(file_id, reason)
-        if target:
-            self._cleanup_owned_media_path(target)
-        self._diagnostics["file_failures"] += 1
-        if wrapper:
-            await self._dispatch_file_fallback(wrapper, reason)
-
-    async def _accept_contact_request(self, request_id: str) -> None:
-        resp = await self._send_command(f"/_accept {request_id}", timeout=30.0)
-        error = _response_error(resp)
-        if error:
-            self._diagnostics["command_errors"] += 1
-            logger.warning("SimpleX: contact request acceptance failed: %s", error)
-
-    async def _receive_file(self, file_id: int, target: Optional[str]) -> None:
-        command = f"/freceive {file_id} approved_relays=on"
-        if target:
-            command += f" {target}"
-        resp = await self._send_command(command, timeout=30.0)
-        error = _response_error(resp)
-        if error or _response_type(resp) == "rcvFileAcceptedSndCancelled":
-            self._diagnostics["command_errors"] += 1
-            logger.warning(
-                "SimpleX: file %s receive failed: %s",
-                file_id,
-                error or "sender cancelled",
-            )
-            await self._fail_file_transfer(
-                file_id, error or "sender cancelled during acceptance"
-            )
-
-    def _resolve_file_path(self, file_path: str) -> str:
-        if file_path and not os.path.isabs(file_path) and self.files_folder:
-            return os.path.join(self.files_folder, file_path)
-        return file_path
 
     async def _handle_chat_item(self, chat_item: dict, is_edit: bool = False) -> None:
         """Process one received item or correlated item update."""
@@ -1397,6 +1154,11 @@ class SimplexAdapter(BasePlatformAdapter):
             user_id=sender_id,
             user_name=sender_name or sender_id,
             message_id=message_id,
+            # Reaching this point for a group proves it passed the explicit
+            # SIMPLEX_GROUP_ALLOWED intake gate. Carry that decision across
+            # the generic gateway boundary; DM senders remain subject to the
+            # separate SIMPLEX_ALLOWED_USERS/pairing policy.
+            role_authorized=is_group,
         )
 
         # Message type
@@ -1533,11 +1295,24 @@ class SimplexAdapter(BasePlatformAdapter):
                 existing.media_types.extend(event.media_types)
 
         prior_task = self._pending_text_batch_tasks.get(key)
-        if prior_task and not prior_task.done():
-            prior_task.cancel()
         self._pending_text_batch_tasks[key] = asyncio.create_task(
-            self._flush_text_batch(key)
+            self._restart_text_batch_flush(key, prior_task)
         )
+
+    async def _restart_text_batch_flush(
+        self, key: str, prior_task: Optional[asyncio.Task]
+    ) -> None:
+        """Cancel and drain the prior timer before starting its replacement.
+
+        Draining serializes the old flush's cancellation recovery with the new
+        flush, so the replacement cannot pop the newer event before the old
+        in-flight event has been restored ahead of it.
+        """
+        if prior_task is not None:
+            if not prior_task.done():
+                prior_task.cancel()
+            await asyncio.gather(prior_task, return_exceptions=True)
+        await self._flush_text_batch(key)
 
     def _replace_pending_batch_edit(self, event: MessageEvent) -> bool:
         """Supersede a SimpleX text item still inside the quiet-period batch."""
@@ -1579,7 +1354,14 @@ class SimplexAdapter(BasePlatformAdapter):
                 key,
                 len(event.text or ""),
             )
-            await self.handle_message(event)
+            try:
+                await self.handle_message(event)
+            except asyncio.CancelledError:
+                newer = self._pending_text_batches.get(key)
+                self._pending_text_batches[key] = prepend_cancelled_batch(
+                    event, newer
+                )
+                raise
         finally:
             if self._pending_text_batch_tasks.get(key) is current_task:
                 self._pending_text_batch_tasks.pop(key, None)
@@ -1588,651 +1370,36 @@ class SimplexAdapter(BasePlatformAdapter):
     # Command interface
     # ------------------------------------------------------------------
 
-    def _make_corr_id(self) -> str:
-        """Mint a new correlation ID and remember it for echo-filtering.
 
-        We add every minted id to ``_pending_corr_ids`` so the inbound
-        event loop can drop the daemon's echo of our own commands without
-        ever invoking ``_handle_chat_item``. The set is bounded — when
-        it grows past ``_max_pending_corr``, the oldest entries are
-        evicted in a single sweep.
-        """
-        self._corr_counter += 1
-        corr_id = f"{_CORR_PREFIX}{self._corr_counter}-{int(time.time() * 1000)}"
-        self._pending_corr_ids.add(corr_id)
-        if len(self._pending_corr_ids) > self._max_pending_corr:
-            overflow = len(self._pending_corr_ids) - self._max_pending_corr
-            for _ in range(overflow):
-                try:
-                    self._pending_corr_ids.pop()
-                except KeyError:
-                    break
-        return corr_id
 
-    async def _send_ws(self, payload: dict) -> bool:
-        """Send one JSON payload over the active WebSocket.
 
-        Returns True on success, False if the socket is unavailable or an
-        error occurs so callers can surface failures instead of silently
-        reporting success.
-        """
-        ws = self._ws
-        if not ws:
-            logger.debug("SimpleX: WS send rejected (not connected)")
-            return False
-        try:
-            await ws.send(json.dumps(payload))
-            return True
-        except Exception as e:
-            logger.warning("SimpleX: WS send error: %s", e)
-            return False
 
-    async def _send_command(
-        self,
-        command: str,
-        timeout: float = 30.0,
-    ) -> Optional[dict]:
-        """Send a command and await the correlated response."""
-        ws = self._ws
-        if not ws or not self._ws_ready.is_set():
-            logger.warning("SimpleX: command rejected while WebSocket is not ready")
-            return None
 
-        corr_id = self._make_corr_id()
-        payload = json.dumps({"corrId": corr_id, "cmd": command})
 
-        loop = asyncio.get_running_loop()
-        fut: asyncio.Future = loop.create_future()
-        self._pending_responses[corr_id] = fut
 
-        try:
-            await ws.send(payload)
-        except Exception as e:
-            logger.warning(
-                "SimpleX: command was not submitted: %s — %s",
-                command.split(" ", 1)[0],
-                e,
-            )
-            self._pending_responses.pop(corr_id, None)
-            self._pending_corr_ids.discard(corr_id)
-            if not fut.done():
-                fut.cancel()
-            return {
-                "type": "localCommandNotSubmitted",
-                "error": "SimpleX command was not submitted to the daemon",
-            }
 
-        try:
-            result = await asyncio.wait_for(fut, timeout=timeout)
-            return result
-        except asyncio.TimeoutError:
-            logger.warning("SimpleX: command timed out: %s", command.split(" ", 1)[0])
-            return {
-                "type": "localCommandOutcomeUnknown",
-                "error": "SimpleX daemon confirmation timed out; delivery may have occurred",
-            }
-        except Exception as e:
-            logger.warning(
-                "SimpleX: command failed: %s — %s",
-                command.split(" ", 1)[0],
-                e,
-            )
-            return {
-                "type": "localCommandOutcomeUnknown",
-                "error": "SimpleX connection failed after command submission; delivery outcome is unknown",
-            }
-        finally:
-            self._pending_responses.pop(corr_id, None)
-            self._pending_corr_ids.discard(corr_id)
 
-    def _spawn_command_task(self, coroutine) -> asyncio.Task:
-        """Run a correlated command outside the WebSocket reader task."""
-        task = asyncio.create_task(coroutine)
-        self._command_tasks.add(task)
 
-        def _done(done: asyncio.Task) -> None:
-            self._command_tasks.discard(done)
-            if done.cancelled():
-                return
-            try:
-                done.result()
-            except Exception:
-                logger.exception("SimpleX: background command task failed")
-
-        task.add_done_callback(_done)
-        return task
-
-    def _spawn_dispatch_task(self, coroutine) -> asyncio.Task:
-        """Dispatch inbound work without ever blocking the WebSocket reader."""
-        task = asyncio.create_task(coroutine)
-        self._dispatch_tasks.add(task)
-
-        def _done(done: asyncio.Task) -> None:
-            self._dispatch_tasks.discard(done)
-            if done.cancelled():
-                return
-            try:
-                done.result()
-            except Exception:
-                logger.exception("SimpleX: background message dispatch failed")
-
-        task.add_done_callback(_done)
-        return task
-
-    async def _send_fire_and_forget(self, command: str) -> None:
-        """Send without blocking the reader; explicit errors remain logged."""
-        corr_id = self._make_corr_id()
-        ok = await self._send_ws({"corrId": corr_id, "cmd": command})
-        if not ok:
-            self._pending_corr_ids.discard(corr_id)
-            self._diagnostics["send_failures"] += 1
-
-    @staticmethod
-    def _chat_ref(chat_id: str) -> str:
-        """Return the structured daemon ChatRef for a stable Hermes chat id."""
-        raw = str(chat_id or "")
-        if raw.startswith("group:"):
-            return f"#{raw[6:].split('|', 1)[0]}"
-        return f"@{raw.split('|', 1)[0]}"
-
-    @staticmethod
-    def _error_kind(error: str) -> tuple[str, bool]:
-        lowered = (error or "").lower()
-        if "largemsg" in lowered or "large compressed message" in lowered:
-            return "too_long", False
-        if "notfound" in lowered or "not found" in lowered:
-            return "not_found", False
-        if "forbidden" in lowered or "permission" in lowered:
-            return "forbidden", False
-        if any(token in lowered for token in ("timeout", "closed", "network", "broker")):
-            return "transient", True
-        return "unknown", False
-
-    def _send_result_from_response(
-        self,
-        resp: Optional[dict],
-        *,
-        expected: set[str],
-    ) -> SendResult:
-        error = _response_error(resp)
-        if error:
-            self._diagnostics["command_errors"] += 1
-            if _response_type(resp) == "localCommandOutcomeUnknown":
-                return SendResult(
-                    success=False,
-                    error=error,
-                    error_kind="delivery_unknown",
-                    retryable=False,
-                    raw_response=resp,
-                )
-            if _response_type(resp) == "localCommandNotSubmitted":
-                return SendResult(
-                    success=False,
-                    error=error,
-                    error_kind="transient",
-                    retryable=True,
-                    raw_response=resp,
-                )
-            kind, retryable = self._error_kind(error)
-            return SendResult(
-                success=False,
-                error=error,
-                error_kind=kind,
-                retryable=retryable,
-                raw_response=resp,
-            )
-        if resp is None:
-            self._diagnostics["send_failures"] += 1
-            return SendResult(
-                success=False,
-                error="SimpleX daemon did not confirm the command",
-                error_kind="transient",
-                retryable=True,
-            )
-        resp_type = _response_type(resp)
-        if resp_type not in expected:
-            self._diagnostics["send_failures"] += 1
-            return SendResult(
-                success=False,
-                error=f"Unexpected SimpleX response: {resp_type or '<missing>'}",
-                error_kind="unknown",
-                raw_response=resp,
-            )
-        item_ids = _response_item_ids(resp)
-        return SendResult(
-            success=True,
-            message_id=item_ids[-1] if item_ids else None,
-            continuation_message_ids=tuple(item_ids[:-1]),
-            raw_response=resp,
-        )
-
-    async def _send_composed(
-        self,
-        chat_id: str,
-        msg_content: dict,
-        *,
-        reply_to: Optional[str] = None,
-        file_source: Optional[str] = None,
-        live: bool = False,
-        timeout: float = 30.0,
-    ) -> SendResult:
-        composed: Dict[str, Any] = {
-            "msgContent": msg_content,
-            "mentions": {},
-        }
-        if reply_to is not None:
-            try:
-                composed["quotedItemId"] = int(reply_to)
-            except (TypeError, ValueError):
-                logger.debug("SimpleX: ignoring non-numeric reply item id")
-        if file_source:
-            composed["fileSource"] = {"filePath": file_source}
-
-        live_flag = " live=on" if live else ""
-        command = (
-            f"/_send {self._chat_ref(chat_id)}{live_flag} json "
-            f"{json.dumps([composed], ensure_ascii=False)}"
-        )
-        resp = await self._send_command(command, timeout=timeout)
-        return self._send_result_from_response(resp, expected={"newChatItems"})
-
-    @staticmethod
-    def _split_utf8_payload(
-        text: str, byte_budget: int = MAX_MESSAGE_LENGTH
-    ) -> List[str]:
-        """Split by serialized UTF-8 bytes, never through a code point.
-
-        ``simplex-chat`` limits the encoded command envelope rather than
-        Python character count.  A margin below the protocol ceiling leaves
-        room for the JSON wrapper, chat reference, and quoting expansion.
-        """
-        if not text:
-            return [""]
-        chunks: List[str] = []
-        start = 0
-        while start < len(text):
-            used = 0
-            end = start
-            last_break: Optional[int] = None
-            while end < len(text):
-                char_cost = _simplex_payload_len(text[end])
-                if used + char_cost > byte_budget and end > start:
-                    break
-                used += char_cost
-                end += 1
-                if text[end - 1].isspace():
-                    last_break = end
-            if end < len(text) and last_break and last_break > start:
-                end = last_break
-            if end == start:
-                end += 1
-            chunks.append(text[start:end])
-            start = end
-        return chunks
 
     # ------------------------------------------------------------------
     # Outbound — text
     # ------------------------------------------------------------------
 
-    async def send(
-        self,
-        chat_id: str,
-        content: str,
-        reply_to: Optional[str] = None,
-        metadata: Optional[Dict[str, Any]] = None,
-    ) -> SendResult:
-        """Deliver text and embedded media with daemon-confirmed results."""
-        _voice_exts = {".ogg", ".mp3", ".wav", ".m4a", ".opus"}
-        media_paths = re.findall(r"MEDIA:(\S+)", content)
-        if media_paths:
-            content = re.sub(r"MEDIA:\S+", "", content).strip()
-
-        delivered_ids: List[str] = []
-        if content:
-            initial_chunks: List[str] = []
-            for logical_chunk in self.truncate_message(
-                content, MAX_MESSAGE_LENGTH, len_fn=self.message_len_fn
-            ):
-                initial_chunks.extend(self._split_utf8_payload(logical_chunk))
-            queue = [
-                (chunk, index == 0)
-                for index, chunk in enumerate(initial_chunks)
-            ]
-            while queue:
-                chunk, carries_reply = queue.pop(0)
-                result = await self._send_composed(
-                    chat_id,
-                    {"type": "text", "text": chunk},
-                    reply_to=reply_to if carries_reply else None,
-                    live=bool((metadata or {}).get("expect_edits")),
-                )
-                if (
-                    not result.success
-                    and result.error_kind == "too_long"
-                    and len(chunk) > 512
-                ):
-                    retry_chunks = self.truncate_message(
-                        chunk, max(256, len(chunk) // 2)
-                    )
-                    queue = [
-                        (retry_chunk, carries_reply and index == 0)
-                        for index, retry_chunk in enumerate(retry_chunks)
-                    ] + queue
-                    continue
-                if not result.success:
-                    result.message_id = delivered_ids[-1] if delivered_ids else None
-                    if delivered_ids:
-                        result.error_kind = "partial_delivery"
-                        result.retryable = False
-                        result.raw_response = {
-                            "partial_delivery": True,
-                            "delivered_message_ids": tuple(delivered_ids),
-                            "daemon_response": result.raw_response,
-                        }
-                    return result
-                if result.message_id:
-                    delivered_ids.append(result.message_id)
-
-        for path in media_paths:
-            is_voice = os.path.splitext(path)[1].lower() in _voice_exts
-            if is_voice:
-                media_result = await self.send_voice(chat_id, path)
-            else:
-                media_result = await self.send_document(chat_id, path)
-            if not media_result.success:
-                if delivered_ids:
-                    media_result.message_id = delivered_ids[-1]
-                    media_result.error_kind = "partial_delivery"
-                    media_result.retryable = False
-                    media_result.raw_response = {
-                        "partial_delivery": True,
-                        "delivered_message_ids": tuple(delivered_ids),
-                        "daemon_response": media_result.raw_response,
-                    }
-                return media_result
-            if media_result.message_id:
-                delivered_ids.append(media_result.message_id)
-        return SendResult(
-            success=True,
-            message_id=delivered_ids[-1] if delivered_ids else None,
-            continuation_message_ids=tuple(delivered_ids[:-1]),
-        )
 
     # ------------------------------------------------------------------
     # Channel directory enumeration
     # ------------------------------------------------------------------
 
-    async def list_channels(self) -> Optional[List[Dict[str, Any]]]:
-        """Enumerate contacts and allowed groups for the channel directory.
-
-        Called by ``gateway.channel_directory.build_channel_directory()``
-        every refresh cycle. Uses the daemon's ``/contacts`` and ``/groups``
-        commands over the live WebSocket. Returns ``None`` (not ``[]``) when
-        the WebSocket is down so the directory falls back to session-history
-        discovery instead of wiping previously known targets.
-
-        Entry ``id`` values use immutable numeric contact/group IDs. Display
-        names remain labels only and never become authorization or routing
-        identities.
-        """
-        if not self._ws:
-            return None
-
-        channels: List[Dict[str, Any]] = []
-
-        resp = await self._send_command("/contacts", timeout=10.0)
-        if resp is None or _response_error(resp):
-            # Daemon unresponsive — keep whatever the directory already has.
-            return None
-        for contact in resp.get("contacts") or []:
-            if not isinstance(contact, dict):
-                continue
-            contact_id = contact.get("contactId")
-            name = (
-                contact.get("localDisplayName", "")
-                or (contact.get("profile", {}) or {}).get("displayName", "")
-            )
-            if contact_id is None:
-                continue
-            channels.append({
-                "id": str(contact_id),
-                "name": str(name or contact_id),
-                "type": "dm",
-            })
-
-        resp = await self._send_command("/groups", timeout=10.0)
-        if resp is not None and not _response_error(resp):
-            for group in resp.get("groups") or []:
-                # The daemon returns each group as either a groupInfo dict
-                # or a [groupInfo, groupSummary] pair depending on version.
-                if isinstance(group, list) and group:
-                    group = group[0]
-                if not isinstance(group, dict):
-                    continue
-                group_id = group.get("groupId")
-                if group_id is None:
-                    continue
-                name = (
-                    group.get("localDisplayName", "")
-                    or (group.get("groupProfile", {}) or {}).get("displayName", "")
-                    or str(group_id)
-                )
-                channels.append({
-                    "id": f"group:{group_id}",
-                    "name": str(name),
-                    "type": "group",
-                })
-
-        return channels
 
     # ------------------------------------------------------------------
     # Outbound — media
     # ------------------------------------------------------------------
 
-    @staticmethod
-    def _prepare_image(file_path: str) -> tuple[str, str]:
-        """Ensure *file_path* is a PNG and return ``(png_path, thumb_data_uri)``.
 
-        SimpleX clients can't display WebP and a few other formats inline.
-        This converts to PNG when needed and generates a small JPEG thumbnail
-        for the ``image`` field in the ``/_send`` payload so the chat shows
-        an inline preview. Uses Pillow when available, falls back to
-        ImageMagick ``convert``.
-        """
-        import subprocess
-        p = Path(file_path)
-        png_path = file_path
-        thumb_uri = ""
 
-        def _temp_path(suffix: str) -> str:
-            fd, path = tempfile.mkstemp(prefix="hermes-simplex-", suffix=suffix)
-            os.close(fd)
-            return path
 
-        try:
-            from PIL import Image
 
-            img = Image.open(file_path)
-            if p.suffix.lower() not in (".png", ".jpg", ".jpeg"):
-                png_path = _temp_path(".png")
-                img.save(png_path, "PNG")
-            thumb = img.copy()
-            thumb.thumbnail((128, 128))
-            import io
 
-            buf = io.BytesIO()
-            thumb.save(buf, "JPEG", quality=70)
-            thumb_uri = (
-                "data:image/jpg;base64,"
-                + base64.b64encode(buf.getvalue()).decode()
-            )
-        except ImportError:
-            try:
-                if p.suffix.lower() not in (".png", ".jpg", ".jpeg"):
-                    png_path = _temp_path(".png")
-                    subprocess.run(
-                        ["convert", file_path, png_path],
-                        check=True,
-                        capture_output=True,
-                        timeout=30,
-                    )
-                with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
-                    tmp_path = tmp.name
-                subprocess.run(
-                    [
-                        "convert",
-                        file_path,
-                        "-resize",
-                        "128x128",
-                        "-quality",
-                        "70",
-                        tmp_path,
-                    ],
-                    check=True,
-                    capture_output=True,
-                    timeout=30,
-                )
-                with open(tmp_path, "rb") as f:
-                    thumb_uri = (
-                        "data:image/jpg;base64," + base64.b64encode(f.read()).decode()
-                    )
-                os.remove(tmp_path)
-            except (FileNotFoundError, subprocess.SubprocessError) as exc:
-                logger.warning("SimpleX: image conversion unavailable: %s", exc)
-
-        return png_path, thumb_uri
-
-    async def send_image(
-        self,
-        chat_id: str,
-        image_url: str,
-        caption: Optional[str] = None,
-        **kwargs,
-    ) -> SendResult:
-        """Send an image. Supports ``file://`` URLs and ``http(s)://`` URLs."""
-        from urllib.parse import unquote
-
-        if image_url.startswith("file://"):
-            file_path = unquote(image_url[7:])
-        else:
-            try:
-                from gateway.platforms.base import cache_image_from_url
-
-                file_path = await cache_image_from_url(image_url)
-            except Exception as e:
-                logger.warning("SimpleX: failed to download image: %s", e)
-                return SendResult(success=False, error=str(e))
-
-        if not file_path or not Path(file_path).exists():
-            return SendResult(success=False, error="Image file not found")
-
-        png_path, thumb_uri = self._prepare_image(file_path)
-        owned_temp = (
-            os.path.abspath(png_path) != os.path.abspath(file_path)
-        )
-        if owned_temp:
-            self._schedule_owned_media_cleanup(png_path)
-
-        result = await self._send_composed(
-            chat_id,
-            {
-                "type": "image",
-                "image": thumb_uri,
-                "text": caption or "",
-            },
-            reply_to=kwargs.get("reply_to"),
-            file_source=png_path,
-        )
-        if owned_temp:
-            if result.success and result.message_id:
-                self._outbound_temp_by_item[str(result.message_id)] = png_path
-            elif result.error_kind != "delivery_unknown":
-                self._cleanup_owned_media_path(png_path)
-        return result
-
-    async def send_image_file(
-        self,
-        chat_id: str,
-        image_path: str,
-        caption: Optional[str] = None,
-        reply_to: Optional[str] = None,
-        **kwargs,
-    ) -> SendResult:
-        """Send a local image file via SimpleX."""
-        return await self.send_image(
-            chat_id,
-            f"file://{image_path}",
-            caption=caption,
-            reply_to=reply_to,
-            **kwargs,
-        )
-
-    async def send_video(
-        self,
-        chat_id: str,
-        video_path: str,
-        caption: Optional[str] = None,
-        reply_to: Optional[str] = None,
-        **kwargs,
-    ) -> SendResult:
-        """Send a video file via SimpleX (as a file attachment)."""
-        return await self.send_document(
-            chat_id,
-            video_path,
-            caption=caption,
-            reply_to=reply_to,
-            **kwargs,
-        )
-
-    async def send_document(
-        self,
-        chat_id: str,
-        file_path: str,
-        caption: Optional[str] = None,
-        filename: Optional[str] = None,
-        reply_to: Optional[str] = None,
-        **kwargs,
-    ) -> SendResult:
-        """Send a document/file attachment."""
-        if not Path(file_path).exists():
-            return SendResult(success=False, error="File not found")
-
-        return await self._send_composed(
-            chat_id,
-            {"type": "file", "text": caption or ""},
-            reply_to=reply_to,
-            file_source=file_path,
-        )
-
-    async def send_voice(
-        self,
-        chat_id: str,
-        audio_path: str,
-        caption: Optional[str] = None,
-        reply_to: Optional[str] = None,
-        duration: int = 0,
-        **kwargs,
-    ) -> SendResult:
-        """Send an audio file as a SimpleX voice note (plays inline).
-
-        SimpleX distinguishes a generic file attachment (``type: "file"``)
-        from an inline voice note (``type: "voice"``). ``/f`` would deliver
-        a downloadable file; the structured ``/_send`` form with
-        ``msgContent.type == "voice"`` produces the voice-note player.
-        """
-        if not Path(audio_path).exists():
-            return SendResult(success=False, error="Voice file not found")
-
-        return await self._send_composed(
-            chat_id,
-            {
-                "type": "voice",
-                "text": caption or "",
-                "duration": duration,
-            },
-            reply_to=reply_to,
-            file_source=audio_path,
-        )
 
     async def edit_message(
         self,
@@ -2315,270 +1482,16 @@ class SimplexAdapter(BasePlatformAdapter):
             resp, expected={"chatItemsDeleted"}
         ).success
 
-    async def _set_reaction(
-        self,
-        chat_id: str,
-        message_id: str,
-        emoji: str,
-        *,
-        added: bool,
-    ) -> SendResult:
-        reaction = json.dumps(
-            {"type": "emoji", "emoji": emoji}, ensure_ascii=False
-        )
-        toggle = "on" if added else "off"
-        resp = await self._send_command(
-            f"/_reaction {self._chat_ref(chat_id)} {message_id} {toggle} {reaction}",
-            timeout=10.0,
-        )
-        return self._send_result_from_response(
-            resp, expected={"chatItemReaction"}
-        )
 
-    @staticmethod
-    def _approval_timeout() -> float:
-        try:
-            from tools.approval import _get_approval_timeout
 
-            return max(1.0, float(_get_approval_timeout()))
-        except Exception:
-            return 300.0
 
-    def _approval_text(
-        self,
-        command: str,
-        description: str,
-        *,
-        allow_session: bool,
-        allow_permanent: bool,
-        smart_denied: bool,
-        reactions: bool,
-    ) -> str:
-        prefix = self.typed_command_prefix
-        lines = [self._format_exec_approval(command, description, smart_denied)]
-        choices = [f"Reply `{prefix}approve` to run once"]
-        if not smart_denied and allow_session:
-            choices.append(f"`{prefix}approve session` for this session")
-        if not smart_denied and allow_permanent:
-            choices.append(f"`{prefix}approve always` to persist the pattern")
-        choices.append(f"`{prefix}deny` to cancel")
-        lines.append(", or ".join(choices) + ".")
-        if reactions:
-            taps = ["✅ = run once"]
-            if not smart_denied and allow_session:
-                taps.append("🚀 = allow for this session")
-            taps.append("👎 = deny")
-            lines.append("Tap a reaction: " + "; ".join(taps) + ".")
-        return "\n\n".join(lines)
 
-    async def send_exec_approval(
-        self,
-        chat_id: str,
-        command: str,
-        session_key: str,
-        description: str = "dangerous command",
-        metadata: Optional[dict] = None,
-        allow_permanent: bool = True,
-        allow_session: bool = True,
-        smart_denied: bool = False,
-    ) -> SendResult:
-        """Offer unambiguous direct-message reaction approvals with typed fallback."""
-        now = time.monotonic()
-        self._sweep_approval_prompts(now)
-        is_dm = not str(chat_id).startswith("group:")
-        existing_id = self._approval_prompt_by_session.get(session_key)
-        superseded_prior = bool(existing_id)
-        typed_only = self._approval_typed_only_until.get(session_key, 0.0) > now
 
-        if existing_id:
-            self._retire_approval_prompt(existing_id)
-            self._approval_typed_only_until[session_key] = now + self._approval_timeout()
-            typed_only = True
 
-        reaction_lane = is_dm and not typed_only
-        text = self._approval_text(
-            command,
-            description,
-            allow_session=allow_session,
-            allow_permanent=allow_permanent,
-            smart_denied=smart_denied,
-            reactions=reaction_lane,
-        )
-        if superseded_prior:
-            text = (
-                "The earlier approval prompt was superseded; its reactions no "
-                "longer apply. Use the typed choices below.\n\n" + text
-            )
-        result = await self.send(chat_id, text, metadata=metadata)
-        if not result.success or not result.message_id or not reaction_lane:
-            if not result.success or not result.message_id:
-                self._approval_typed_only_until[session_key] = (
-                    now + self._approval_timeout()
-                )
-            return result
 
-        choices = {"✅": "once", "👎": "deny"}
-        seeds = ["👎", "✅"]
-        if not smart_denied and allow_session:
-            choices["🚀"] = "session"
-            seeds.insert(1, "🚀")
-        prompt = {
-            "session_key": session_key,
-            "chat_id": str(chat_id),
-            "item_id": str(result.message_id),
-            "choices": choices,
-            "seeded": [],
-            "expires_at": now + self._approval_timeout(),
-        }
-        self._approval_prompts_by_item[prompt["item_id"]] = prompt
-        self._approval_prompt_by_session[session_key] = prompt["item_id"]
-        self._spawn_command_task(self._seed_approval_reactions(prompt, seeds))
-        self._spawn_command_task(self._expire_approval_prompt(prompt["item_id"]))
-        return result
 
-    async def _seed_approval_reactions(self, prompt: dict, seeds: List[str]) -> None:
-        for emoji in seeds[:3]:
-            if self._approval_prompts_by_item.get(prompt["item_id"]) is not prompt:
-                return
-            result = await self._set_reaction(
-                prompt["chat_id"], prompt["item_id"], emoji, added=True
-            )
-            if not result.success:
-                logger.info(
-                    "SimpleX: reaction seed unavailable; typed approval remains active"
-                )
-                return
-            prompt["seeded"].append(emoji)
 
-    async def _expire_approval_prompt(self, item_id: str) -> None:
-        prompt = self._approval_prompts_by_item.get(item_id)
-        if not prompt:
-            return
-        await asyncio.sleep(max(0.0, prompt["expires_at"] - time.monotonic()))
-        if self._approval_prompts_by_item.get(item_id) is prompt:
-            self._retire_approval_prompt(item_id)
 
-    def _sweep_approval_prompts(self, now: Optional[float] = None) -> None:
-        current = time.monotonic() if now is None else now
-        for item_id, prompt in list(self._approval_prompts_by_item.items()):
-            if prompt["expires_at"] <= current:
-                self._retire_approval_prompt(item_id)
-        for session_key, expiry in list(self._approval_typed_only_until.items()):
-            if expiry <= current:
-                self._approval_typed_only_until.pop(session_key, None)
-
-    def _retire_approval_prompt(self, item_id: str) -> None:
-        prompt = self._approval_prompts_by_item.pop(str(item_id), None)
-        if not prompt:
-            return
-        if self._approval_prompt_by_session.get(prompt["session_key"]) == str(item_id):
-            self._approval_prompt_by_session.pop(prompt["session_key"], None)
-        if prompt["seeded"]:
-            self._spawn_command_task(self._clear_approval_reactions(prompt))
-
-    async def _clear_approval_reactions(self, prompt: dict) -> None:
-        for emoji in list(prompt["seeded"]):
-            await self._set_reaction(
-                prompt["chat_id"], prompt["item_id"], emoji, added=False
-            )
-
-    @staticmethod
-    def _reaction_context(resp: dict) -> Optional[dict]:
-        wrapper = resp.get("reaction", {}) or {}
-        if not isinstance(wrapper, dict):
-            return None
-        chat_info = wrapper.get("chatInfo", {}) or {}
-        reaction = wrapper.get("chatReaction", {}) or {}
-        if not isinstance(chat_info, dict) or not isinstance(reaction, dict):
-            return None
-        chat_item = reaction.get("chatItem", {}) or {}
-        meta = chat_item.get("meta", {}) if isinstance(chat_item, dict) else {}
-        item_id = meta.get("itemId") if isinstance(meta, dict) else None
-        msg_reaction = reaction.get("reaction", {}) or {}
-        emoji = (
-            msg_reaction.get("emoji", "")
-            if isinstance(msg_reaction, dict)
-            else ""
-        ).replace("\ufe0f", "")
-        chat_type = chat_info.get("type", "")
-        chat_dir = reaction.get("chatDir", {}) or {}
-        if chat_type == "direct":
-            if not isinstance(chat_dir, dict) or chat_dir.get("type") != "directRcv":
-                return None
-            contact = chat_info.get("contact", {}) or {}
-            chat_id = str(contact.get("contactId", ""))
-            user_id = chat_id
-            user_name = contact.get("localDisplayName", "")
-        elif chat_type == "group":
-            if not isinstance(chat_dir, dict) or chat_dir.get("type") != "groupRcv":
-                return None
-            group = chat_info.get("groupInfo", {}) or {}
-            chat_id = f"group:{group.get('groupId', '')}"
-            member = chat_dir.get("groupMember", {}) if isinstance(chat_dir, dict) else {}
-            member_identity = member.get("memberContactId")
-            if member_identity is None:
-                member_identity = member.get("memberId", "")
-            user_id = str(member_identity)
-            user_name = member.get("localDisplayName", "")
-        else:
-            return None
-        return {
-            "item_id": str(item_id) if item_id is not None else "",
-            "chat_id": chat_id,
-            "user_id": user_id,
-            "user_name": user_name,
-            "emoji": emoji,
-            "added": bool(resp.get("added", False)),
-            "raw": resp,
-        }
-
-    async def _handle_reaction_event(self, resp: dict) -> None:
-        ctx = self._reaction_context(resp)
-        if not ctx:
-            return
-        hook = getattr(self, "_reaction_handler", None)
-        if hook is not None:
-            await hook(
-                {
-                    "event_name": (
-                        "reaction:added" if ctx["added"] else "reaction:removed"
-                    ),
-                    "platform": "simplex",
-                    **ctx,
-                }
-            )
-
-        if not ctx["added"]:
-            return
-        prompt = self._approval_prompts_by_item.get(ctx["item_id"])
-        if not prompt or prompt["chat_id"] != ctx["chat_id"]:
-            return
-        if not prompt["chat_id"].startswith("group:") and ctx["user_id"] != prompt["chat_id"]:
-            logger.warning("SimpleX: ignored approval reaction from another contact")
-            return
-        if time.monotonic() >= prompt["expires_at"]:
-            self._retire_approval_prompt(prompt["item_id"])
-            return
-        choice = prompt["choices"].get(ctx["emoji"])
-        if not choice:
-            return
-
-        try:
-            from tools.approval import resolve_gateway_approval
-
-            count = int(resolve_gateway_approval(prompt["session_key"], choice) or 0)
-        except Exception:
-            logger.exception("SimpleX: failed to resolve reaction approval")
-            return
-        self._retire_approval_prompt(prompt["item_id"])
-        acknowledgement = {
-            "once": "Approved — running this once.",
-            "session": "Approved for this session.",
-            "deny": "Denied — the command will not run.",
-        }[choice]
-        if count <= 0:
-            acknowledgement = "That approval is no longer pending. Nothing ran."
-        self._spawn_command_task(self.send(prompt["chat_id"], acknowledgement))
 
     def get_runtime_diagnostics(self) -> Dict[str, Any]:
         """Return bounded transport state for status/incident tooling."""
@@ -2616,7 +1529,10 @@ def check_requirements() -> bool:
     so the gateway never instantiates the adapter when the dependency is
     missing or no daemon URL is configured.
     """
-    if not os.getenv("SIMPLEX_WS_URL"):
+    if _profile_scoped():
+        if not str(_profile_simplex_extra().get("ws_url", "")).strip():
+            return False
+    elif not os.getenv("SIMPLEX_WS_URL"):
         return False
     try:
         import websockets  # noqa: F401
@@ -2628,14 +1544,16 @@ def check_requirements() -> bool:
 def validate_config(config) -> bool:
     """Validate that the platform config has enough info to connect."""
     extra = getattr(config, "extra", {}) or {}
-    ws_url = os.getenv("SIMPLEX_WS_URL") or extra.get("ws_url", "")
+    env_ws_url = _scoped_platform_setting("SIMPLEX_WS_URL", extra, "ws_url")
+    ws_url = env_ws_url or extra.get("ws_url", "")
     return bool(ws_url)
 
 
 def is_connected(config) -> bool:
     """Check whether SimpleX is configured (env or config.yaml)."""
     extra = getattr(config, "extra", {}) or {}
-    ws_url = os.getenv("SIMPLEX_WS_URL") or extra.get("ws_url", "")
+    env_ws_url = _scoped_platform_setting("SIMPLEX_WS_URL", extra, "ws_url")
+    ws_url = env_ws_url or extra.get("ws_url", "")
     return bool(ws_url)
 
 
@@ -2651,6 +1569,8 @@ def _env_enablement() -> Optional[dict]:
     becomes a proper ``HomeChannel`` dataclass on the ``PlatformConfig``
     rather than being merged into ``extra``.
     """
+    if _profile_scoped():
+        return None
     ws_url = os.getenv("SIMPLEX_WS_URL", "").strip()
     if not ws_url:
         return None
@@ -2702,9 +1622,8 @@ async def _standalone_send(
         return {"error": "websockets not installed. Run: pip install websockets"}
 
     extra = getattr(pconfig, "extra", {}) or {}
-    ws_url = os.getenv("SIMPLEX_WS_URL") or extra.get(
-        "ws_url", "ws://127.0.0.1:5225"
-    )
+    env_ws_url = _scoped_platform_setting("SIMPLEX_WS_URL", extra, "ws_url")
+    ws_url = env_ws_url or extra.get("ws_url", "ws://127.0.0.1:5225")
     if not ws_url:
         return {"error": "SimpleX standalone send: SIMPLEX_WS_URL is required"}
 
