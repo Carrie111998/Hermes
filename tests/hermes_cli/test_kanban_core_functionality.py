@@ -314,10 +314,57 @@ def test_max_runtime_terminates_overrun_worker(kanban_home):
         _kb._pid_alive = original_alive
 
 
+def test_terminal_timeout_events_are_adjacent_and_correlated(kanban_home, monkeypatch):
+    """The notifier correlation keys match the real timeout producer."""
+    monkeypatch.setattr(kb, "_pid_alive", lambda _pid: False)
 
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="terminal timeout event batch",
+            assignee="worker",
+            max_runtime_seconds=1,
+            max_retries=2,
+        )
 
+        for attempt in range(2):
+            claimed = kb.claim_task(conn, tid)
+            assert claimed is not None
+            pid = 9100 + attempt
+            kb._set_worker_pid(conn, tid, pid)
+            with kb.write_txn(conn):
+                conn.execute(
+                    "UPDATE task_runs SET started_at = ? "
+                    "WHERE id = (SELECT current_run_id FROM tasks WHERE id = ?)",
+                    (int(time.time()) - 30, tid),
+                )
+            assert tid in kb.enforce_max_runtime(
+                conn,
+                signal_fn=lambda *_args: None,
+            )
 
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        assert task.status == "blocked"
 
+        events = [
+            event
+            for event in kb.list_events(conn, tid)
+            if event.kind in {"timed_out", "gave_up"}
+        ]
+
+    terminal_timeout, gave_up = events[-2:]
+    assert [terminal_timeout.kind, gave_up.kind] == ["timed_out", "gave_up"]
+    assert gave_up.id == terminal_timeout.id + 1
+    assert terminal_timeout.run_id is not None
+    assert gave_up.run_id is None
+    assert terminal_timeout.payload is not None
+    assert gave_up.payload is not None
+    assert gave_up.payload["trigger_outcome"] == "timed_out"
+    assert gave_up.payload["failures"] == 2
+    assert gave_up.payload["effective_limit"] == 2
+    assert gave_up.payload["pid"] == terminal_timeout.payload["pid"]
+    assert gave_up.payload["retry_status"] == terminal_timeout.payload["retry_status"]
 
 
 # ---------------------------------------------------------------------------

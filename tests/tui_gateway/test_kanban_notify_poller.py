@@ -138,6 +138,46 @@ class TestCollectKanbanNotifications:
         assert len(rows) == 1
         assert rows[0]["last_event_id"] > pre_cursor
 
+    def test_terminal_timeout_batch_coalesces_to_blocked_alert(self):
+        tid = _create_subscribed_task()
+        conn = kb.connect()
+        try:
+            with kb.write_txn(conn):
+                kb._append_event(
+                    conn,
+                    tid,
+                    "timed_out",
+                    {
+                        "pid": 4242,
+                        "elapsed_seconds": 1800,
+                        "limit_seconds": 1800,
+                        "retry_status": "ready",
+                    },
+                    run_id=41,
+                )
+                kb._append_event(
+                    conn,
+                    tid,
+                    "gave_up",
+                    {
+                        "failures": 2,
+                        "effective_limit": 2,
+                        "trigger_outcome": "timed_out",
+                        "retry_status": "ready",
+                        "pid": 4242,
+                        "error": "elapsed 1800s > limit 1800s",
+                    },
+                )
+        finally:
+            conn.close()
+
+        texts = _collect_kanban_notifications(_session())
+
+        assert len(texts) == 1
+        assert "timed out after 2 attempts and is blocked" in texts[0]
+        assert "will retry" not in texts[0]
+        assert "spawn failures" not in texts[0]
+
     def test_non_tui_subscription_does_not_open_board_writable(self):
         tid = _create_subscribed_task(platform="telegram", chat_id="chat-1")
         # New subs start caught up at creation time (issue #29905); record the
@@ -260,7 +300,9 @@ class TestFormatKanbanEventText:
     def test_timed_out_with_bad_payload_does_not_raise(self):
         ev = SimpleNamespace(kind="timed_out", payload={"limit_seconds": "not-a-number"})
         text = _format_kanban_event_text(self.SUB, self.TASK, ev, "")
+        assert text is not None
         assert "timed out" in text
+        assert "will retry" in text
 
 
 class TestNotificationPollerLoopKanbanWiring:

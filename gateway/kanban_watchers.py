@@ -21,6 +21,10 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 
 from agent.i18n import t
+from hermes_cli.kanban_notifications import (
+    coalesce_notification_events,
+    format_gave_up_notification,
+)
 
 # Match the logger run.py uses (logging.getLogger(__name__) where __name__ ==
 # "gateway.run") so extracted log records keep their original logger name.
@@ -55,17 +59,12 @@ def _format_gave_up_message(
     task_id: str,
     payload: Optional[dict[str, Any]],
 ) -> str:
-    """Render a truthful circuit-breaker notification.
-
-    ``gave_up`` covers more than spawn failures: iteration exhaustion,
-    timeouts, crashes, and other repeated failures all share this terminal
-    event. Never invent a more specific cause than the event supplies.
-    """
-    error = str((payload or {}).get("error") or "").strip()
-    detail = error[:200] if error else "failure limit reached"
-    return (
-        f"✖ {board_tag}{assignee_tag}Kanban {task_id} gave up\n"
-        f"{detail}"
+    """Compatibility wrapper for the shared Kanban notifier formatter."""
+    return format_gave_up_notification(
+        board_tag,
+        assignee_tag,
+        task_id,
+        payload,
     )
 
 
@@ -591,7 +590,8 @@ class GatewayKanbanWatchersMixin:
                     # exists on the board.
                     wake_handoff = ""
                     wake_review_detail = ""
-                    for ev in d["events"]:
+                    notification_events = coalesce_notification_events(d["events"])
+                    for ev in notification_events:
                         kind = ev.kind
                         # Identity prefix: attribute terminal pings to the
                         # worker that did the work. Makes fleets (where one
@@ -864,7 +864,7 @@ class GatewayKanbanWatchersMixin:
                             "block_loop_detected",
                         )
                         _wake_kinds = (
-                            {ev.kind for ev in d["events"] if ev.kind in _WAKE_KINDS}
+                            {ev.kind for ev in notification_events if ev.kind in _WAKE_KINDS}
                             if wake_agent
                             else set()
                         )

@@ -32,6 +32,10 @@ from hermes_constants import (
     set_hermes_home_override,
 )
 from hermes_cli.env_loader import load_hermes_dotenv
+from hermes_cli.kanban_notifications import (
+    coalesce_notification_events,
+    format_gave_up_notification,
+)
 from utils import is_truthy_value
 from tools.environments.local import hermes_subprocess_env
 from agent.replay_cleanup import sanitize_replay_history
@@ -12162,8 +12166,7 @@ def _format_kanban_event_text(sub: dict, task, ev, board_slug: str) -> Optional[
         reason = f": {str(payload.get('reason'))[:160]}" if payload.get("reason") else ""
         return f"⏸ {board_tag}{tag}Kanban {task_id} blocked{reason}"
     if kind == "gave_up":
-        err = f"\n{str(payload.get('error'))[:200]}" if payload.get("error") else ""
-        return f"✖ {board_tag}{tag}Kanban {task_id} gave up after repeated spawn failures{err}"
+        return format_gave_up_notification(board_tag, tag, task_id, payload)
     if kind == "crashed":
         return f"✖ {board_tag}{tag}Kanban {task_id} worker crashed (pid gone); dispatcher will retry"
     if kind == "timed_out":
@@ -12263,7 +12266,7 @@ def _collect_kanban_notifications(session: dict) -> list:
                 if not events:
                     continue
                 task = _kb.get_task(conn, sub["task_id"])
-                for ev in events:
+                for ev in coalesce_notification_events(events):
                     text = _format_kanban_event_text(sub, task, ev, slug)
                     if text:
                         texts.append(text)

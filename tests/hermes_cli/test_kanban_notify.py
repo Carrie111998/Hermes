@@ -538,7 +538,10 @@ async def test_notifier_unsubs_after_abnormal_events(kind, kanban_home):
 
     # The user is notified about the abnormal event...
     fake_adapter.send.assert_called_once()
-    assert kind.replace('_', ' ') in fake_adapter.send.call_args[0][1]
+    delivered_message = fake_adapter.send.call_args[0][1]
+    assert kind.replace('_', ' ') in delivered_message
+    if kind == "timed_out":
+        assert "will retry" in delivered_message
 
     # ...but the subscription survives so a respawn-then-same-event cycle
     # reaches the user too. The cursor (last_event_id) advanced inside
@@ -564,6 +567,78 @@ async def test_notifier_unsubs_after_abnormal_events(kind, kanban_home):
 
 
 
+
+
+@pytest.mark.asyncio
+async def test_notifier_coalesces_terminal_timeout_batch(kanban_home):
+    """One timeout that trips the breaker produces one truthful alert."""
+    from gateway.config import Platform
+    from gateway.run import GatewayRunner
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="terminal timeout", assignee="worker1")
+        kb.add_notify_sub(
+            conn,
+            task_id=task_id,
+            platform="telegram",
+            chat_id="chat1",
+        )
+        with kb.write_txn(conn):
+            kb._append_event(
+                conn,
+                task_id,
+                "timed_out",
+                {
+                    "pid": 4242,
+                    "elapsed_seconds": 1800,
+                    "limit_seconds": 1800,
+                    "retry_status": "ready",
+                },
+                run_id=41,
+            )
+            kb._append_event(
+                conn,
+                task_id,
+                "gave_up",
+                {
+                    "failures": 2,
+                    "effective_limit": 2,
+                    "trigger_outcome": "timed_out",
+                    "retry_status": "ready",
+                    "pid": 4242,
+                    "error": "elapsed 1800s > limit 1800s",
+                },
+            )
+
+    runner = object.__new__(GatewayRunner)
+    runner._owns_kanban_dispatcher_lock = lambda: True
+    runner._running = True
+    runner._kanban_sub_fail_counts = {}
+    delivered: list[str] = []
+
+    async def _send(_chat_id, message, metadata=None):
+        delivered.append(message)
+        runner._running = False
+
+    adapter = MagicMock()
+    adapter.send = AsyncMock(side_effect=_send)
+    runner.adapters = {Platform.TELEGRAM: adapter}
+
+    real_sleep = asyncio.sleep
+
+    async def _fast_sleep(_seconds):
+        await real_sleep(0)
+
+    with patch("gateway.run.asyncio.sleep", side_effect=_fast_sleep):
+        await asyncio.wait_for(
+            runner._kanban_notifier_watcher(interval=1),
+            timeout=10.0,
+        )
+
+    assert len(delivered) == 1
+    assert "timed out after 2 attempts and is blocked" in delivered[0]
+    assert "will retry" not in delivered[0]
+    assert "spawn failures" not in delivered[0]
 
 
 # ---------------------------------------------------------------------------
