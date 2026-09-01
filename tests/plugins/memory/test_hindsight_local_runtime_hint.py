@@ -10,7 +10,38 @@ disable warning should point the user at the fix rather than just echoing
 import sys
 
 import plugins.memory.hindsight as hs
-from plugins.memory.hindsight import HindsightMemoryProvider, _local_runtime_hint
+from plugins.memory.hindsight import (
+    HindsightMemoryProvider,
+    _check_local_runtime,
+    _local_runtime_hint,
+)
+
+
+def test_fastmcp_mcp_conflict_detected():
+    """_check_local_runtime detects the fastmcp/mcp 1.x vs mcp 2.0 conflict.
+
+    #95855: When fastmcp cannot import 'request_ctx' from mcp 2.0.0, the probe
+    surfaces actionable guidance about the incompatibility instead of a generic
+    'No module named' hint.
+    """
+    # Mock the exact ImportError pattern fastmcp emits when mcp 2.0.0 is pinned.
+    exc = ImportError(
+        "cannot import name 'request_ctx' from 'mcp.server.lowlevel.server'"
+    )
+    hs.importlib.import_module = lambda name, package=None: (_ for _ in ()).throw(exc)
+    try:
+        available, reason = _check_local_runtime()
+        assert not available
+        assert reason is not None
+        assert "fastmcp" in reason.lower()
+        assert "mcp 1.x" in reason
+        assert "mcp 2.0.0" in reason
+        assert "local_embedded mode cannot run in the same venv" in reason
+    finally:
+        # Restore original importlib.
+        import importlib
+
+        hs.importlib = importlib
 
 
 def test_hint_for_missing_hindsight_all():
@@ -37,7 +68,9 @@ def test_no_hint_for_unrelated_runtime_error():
 
 def test_unavailable_reason_surfaces_hint_for_local_embedded(monkeypatch):
     monkeypatch.setattr(hs, "_load_config", lambda: {"mode": "local_embedded"})
-    monkeypatch.setattr(hs, "_check_local_runtime", lambda: (False, "No module named 'hindsight'"))
+    monkeypatch.setattr(
+        hs, "_check_local_runtime", lambda: (False, "No module named 'hindsight'")
+    )
     reason = HindsightMemoryProvider().unavailable_reason()
     assert "hindsight-all" in reason
     assert reason == reason.strip()  # no leading/trailing whitespace
@@ -46,7 +79,11 @@ def test_unavailable_reason_surfaces_hint_for_local_embedded(monkeypatch):
 def test_unavailable_reason_empty_for_cloud(monkeypatch):
     monkeypatch.setattr(hs, "_load_config", lambda: {"mode": "cloud"})
     # Should not even probe the runtime for a cloud provider.
-    monkeypatch.setattr(hs, "_check_local_runtime", lambda: (_ for _ in ()).throw(AssertionError("probed")))
+    monkeypatch.setattr(
+        hs,
+        "_check_local_runtime",
+        lambda: (_ for _ in ()).throw(AssertionError("probed")),
+    )
     assert HindsightMemoryProvider().unavailable_reason() == ""
 
 
