@@ -203,6 +203,24 @@ def test_state_round_trip_is_atomic_and_aligned_with_plugin_data(
     assert not list(state_path.parent.glob("*.tmp"))
 
 
+def test_state_delete_removes_key_and_last_value_file(isolated_home: Path) -> None:
+    ctx = _context()
+    ctx.state.set("keep", 1)
+    ctx.state.set("remove", 2)
+    assert set(ctx.state.keys()) == {"keep", "remove"}
+
+    ctx.state.delete("remove")
+
+    assert ctx.state.get("remove") is None
+    assert ctx.state.get("keep") == 1
+    assert json.loads(ctx.state.path.read_text(encoding="utf-8")) == {"keep": 1}
+
+    ctx.state.delete("keep")
+    ctx.state.delete("already_missing")
+
+    assert not ctx.state.path.exists()
+
+
 def test_native_state_namespace_is_windows_safe_and_cannot_traverse(
     isolated_home: Path,
 ) -> None:

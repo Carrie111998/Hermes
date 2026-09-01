@@ -1433,6 +1433,11 @@ class PluginState:
         with _locked_plugin_state(self.path):
             return self._read_unlocked().get(key, default)
 
+    def keys(self) -> tuple[str, ...]:
+        """Return a stable snapshot of stored keys for bounded plugin GC."""
+        with _locked_plugin_state(self.path):
+            return tuple(self._read_unlocked().keys())
+
     def set(self, key: str, value: Any) -> None:
         """Atomically set one JSON value without dropping concurrent updates."""
         self._validate_key(key)
@@ -1450,6 +1455,24 @@ class PluginState:
                     f"Plugin state quota exceeded: {len(encoded)} bytes is greater "
                     f"than the {self.quota_bytes}-byte per-plugin quota"
                 )
+            from utils import atomic_json_write
+
+            atomic_json_write(self.path, data, mode=0o600)
+
+    def delete(self, key: str) -> None:
+        """Atomically remove one key; remove the state file when it becomes empty."""
+        self._validate_key(key)
+        with _locked_plugin_state(self.path):
+            data = self._read_unlocked()
+            if key not in data:
+                return
+            del data[key]
+            if not data:
+                try:
+                    self.path.unlink()
+                except FileNotFoundError:
+                    pass
+                return
             from utils import atomic_json_write
 
             atomic_json_write(self.path, data, mode=0o600)

@@ -556,7 +556,14 @@ than placing runtime bookkeeping in `config.yaml`:
 def register(ctx):
     cursor = ctx.state.get("cursor", default={"page": 0})
     ctx.state.set("cursor", {"page": cursor["page"] + 1})
+    stale_keys = [key for key in ctx.state.keys() if key.startswith("expired:")]
+    for key in stale_keys:
+        ctx.state.delete(key)
 ```
+
+`get()` reads one value, `set()` atomically replaces one value, `keys()` returns
+a stable key snapshot for bounded garbage collection, and `delete()` atomically
+removes a key. Deleting the last key also removes the empty `state.json` file.
 
 State is profile-scoped, atomically replaced, safe across concurrent writers,
 and limited to 10 MiB per plugin. Portable packages share the same directory as
