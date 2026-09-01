@@ -2229,6 +2229,15 @@ async def _send_matrix_via_adapter(pconfig, chat_id, message, media_files=None, 
         )
 
     # --- Fallback: ephemeral adapter (standalone / cron context) ---
+    # An ephemeral MatrixAdapter runs a full OlmMachine on the same crypto
+    # store + device id the live gateway uses. The split-brain guard is no
+    # longer a liveness probe here (the old ``_gateway_process_running()``
+    # blast wall was a TOCTOU probe that could not catch a gateway starting
+    # between the probe and the connect). Instead, ``MatrixAdapter.connect()``
+    # acquires an inter-process crypto lease BEFORE opening the crypto DB and
+    # returns False (fail-closed) if the gateway — or any other live process
+    # — holds it. The ``if not connected`` check below surfaces that refusal
+    # as a connect failure, and the adapter logs the split-brain reason.
     try:
         from plugins.platforms.matrix.adapter import MatrixAdapter
     except ImportError:
@@ -2238,6 +2247,9 @@ async def _send_matrix_via_adapter(pconfig, chat_id, message, media_files=None, 
     try:
         connected = await adapter.connect()
         if not connected:
+            reason = getattr(adapter, "connect_refusal_reason", None)
+            if reason:
+                return _error(f"Matrix connect failed: {reason}")
             return _error("Matrix connect failed")
         return await _matrix_send_core(
             adapter, chat_id, message, media_files, metadata
