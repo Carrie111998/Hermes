@@ -1,6 +1,8 @@
 """Contract tests for the public plugin subagent lifecycle API."""
 
+import threading
 import time
+from concurrent.futures import Future
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -27,6 +29,7 @@ class FakeChild:
         self.interrupt_kind = None
         self.interrupt_message = None
         self.tool_reason = None
+        self.closed = False
 
     def interrupt(self, _reason):
         self.interrupted = True
@@ -37,6 +40,9 @@ class FakeChild:
         self.interrupt_kind = "hard"
         self.interrupt_message = reason
         self.tool_reason = tool_reason
+
+    def close(self):
+        self.closed = True
 
 
 @pytest.fixture
@@ -97,6 +103,327 @@ def test_cancel_uses_explicit_hard_interrupt(lifecycle):
     assert "explicit user cancel" in record.agent.interrupt_message
     assert record.agent.tool_reason == "subagent cancellation requested"
     lifecycle.wait(handle, timeout_seconds=1)
+
+
+def test_retry_recovers_visible_child_while_first_launch_response_waits(
+    lifecycle, monkeypatch
+):
+    """A lost launch acknowledgement must not strand or duplicate the child.
+
+    ``Executor.submit`` may have accepted and started the worker before its
+    caller receives the returned Future.  Model that exact boundary by
+    starting the child and then withholding the submit response.  The first
+    caller consequently times out waiting for its response even though the
+    child is live and globally listable; a correlation-id retry must recover
+    that child's handle immediately.
+    """
+    from agent import subagent_lifecycle as lifecycle_module
+    from tools import delegate_tool
+
+    child_started = threading.Event()
+    child_release = threading.Event()
+    submit_response_release = threading.Event()
+    build_calls = []
+
+    def build_child(**_kwargs):
+        child = FakeChild(f"sa-{len(build_calls)}")
+        build_calls.append(child)
+        return child
+
+    def run_visible_child(_index, goal, child, parent):
+        subagent_id = child._subagent_id
+        delegate_tool._register_subagent(
+            {
+                "subagent_id": subagent_id,
+                "parent_id": None,
+                "depth": 0,
+                "goal": goal,
+                "model": child.model,
+                "started_at": time.time(),
+                "status": "running",
+                "tool_count": 0,
+                "agent": child,
+                "owner_agent_session_id": parent.session_id,
+            }
+        )
+        child_started.set()
+        try:
+            assert child_release.wait(timeout=5), "test did not release child"
+            return {
+                "status": "completed",
+                "summary": "safe summary",
+                "api_calls": 1,
+                "duration_seconds": 0.01,
+            }
+        finally:
+            delegate_tool._unregister_subagent(subagent_id, agent=child)
+
+    class SubmitResponseGate:
+        def submit(self, callback, *args):
+            future = Future()
+
+            def run():
+                try:
+                    future.set_result(callback(*args))
+                except BaseException as exc:  # mirror Future worker capture
+                    future.set_exception(exc)
+
+            threading.Thread(target=run, daemon=True).start()
+            assert submit_response_release.wait(timeout=5), (
+                "test did not release the simulated submit response"
+            )
+            return future
+
+    monkeypatch.setattr(
+        delegate_tool, "_build_child_preserving_parent_tools", build_child
+    )
+    monkeypatch.setattr(delegate_tool, "_run_child_lifecycle", run_visible_child)
+    monkeypatch.setattr(lifecycle_module, "_EXECUTOR", SubmitResponseGate())
+
+    request = SubagentLaunchRequest(
+        goal="recover a lost launch response",
+        correlation_id="lost-launch-ack",
+    )
+    first_outcome = {}
+    first_returned = threading.Event()
+
+    def first_launch():
+        try:
+            first_outcome["handle"] = lifecycle.launch(request)
+        except BaseException as exc:
+            first_outcome["error"] = exc
+        finally:
+            first_returned.set()
+
+    first_thread = threading.Thread(target=first_launch, daemon=True)
+    first_thread.start()
+    try:
+        assert child_started.wait(timeout=2), "child was not started"
+        assert not first_returned.is_set(), (
+            "first launch unexpectedly received its submit response"
+        )
+        listed_ids = {
+            item["subagent_id"] for item in delegate_tool.list_active_subagents()
+        }
+        assert "sa-0" in listed_ids
+
+        retry_handle = lifecycle.launch(request)
+
+        assert retry_handle.subagent_id == "sa-0"
+        assert not first_returned.is_set()
+        assert len(build_calls) == 1
+
+        submit_response_release.set()
+        assert first_returned.wait(timeout=2)
+        assert first_outcome == {"handle": retry_handle}
+        assert lifecycle.status(retry_handle).state is SubagentState.RUNNING
+        assert "sa-0" in {
+            item["subagent_id"] for item in delegate_tool.list_active_subagents()
+        }
+
+        child_release.set()
+        assert lifecycle.wait(retry_handle, timeout_seconds=2).state is (
+            SubagentState.SUCCEEDED
+        )
+    finally:
+        submit_response_release.set()
+        child_release.set()
+        first_thread.join(timeout=2)
+
+    assert not first_thread.is_alive()
+    assert len(build_calls) == 1
+
+
+def test_launch_returns_handle_while_child_continues_in_background(
+    lifecycle, monkeypatch
+):
+    from tools import delegate_tool
+
+    child_started = threading.Event()
+    child_release = threading.Event()
+
+    def gated_run(_index, _goal, _child, _parent):
+        child_started.set()
+        assert child_release.wait(timeout=5), "test did not release child"
+        return {
+            "status": "completed",
+            "summary": "finished later",
+            "api_calls": 1,
+            "duration_seconds": 0.01,
+        }
+
+    monkeypatch.setattr(delegate_tool, "_run_child_lifecycle", gated_run)
+    handle = lifecycle.launch(
+        SubagentLaunchRequest(goal="continue later", correlation_id="background-id")
+    )
+    try:
+        assert handle.subagent_id == "sa-0"
+        assert child_started.wait(timeout=2)
+        assert lifecycle.status(handle).state is SubagentState.RUNNING
+        assert not lifecycle.result(handle).ready
+    finally:
+        child_release.set()
+
+    assert lifecycle.wait(handle, timeout_seconds=2).state is SubagentState.SUCCEEDED
+    assert lifecycle.result(handle).summary == "finished later"
+
+
+def test_same_correlation_is_idempotent_but_payload_change_is_rejected(lifecycle):
+    request = SubagentLaunchRequest(goal="same work", correlation_id="retry-key")
+
+    first = lifecycle.launch(request)
+    retry = lifecycle.launch(request)
+
+    assert retry == first
+    with pytest.raises(SubagentLifecycleError, match="different request"):
+        lifecycle.launch(
+            SubagentLaunchRequest(
+                goal="different work",
+                correlation_id="retry-key",
+            )
+        )
+
+
+def test_overlapping_same_correlation_builds_and_runs_only_one_child(monkeypatch):
+    from tools import delegate_tool
+
+    parent = SimpleNamespace(session_id="parent-overlap", enabled_toolsets=["file"])
+    retry_resolved_parent = threading.Event()
+    first_build_started = threading.Event()
+    duplicate_build_started = threading.Event()
+    build_calls = []
+    run_calls = []
+
+    def resolve_parent():
+        if threading.current_thread().name == "lifecycle-retry":
+            retry_resolved_parent.set()
+        return parent
+
+    def build_child(**_kwargs):
+        index = len(build_calls)
+        build_calls.append(index)
+        if index == 0:
+            first_build_started.set()
+            assert retry_resolved_parent.wait(timeout=2), "retry never entered launch"
+            # A broken check-then-build implementation lets the retry reach a
+            # second build here. The idempotent admission lock keeps it parked
+            # until this first build publishes its record instead.
+            duplicate_build_started.wait(timeout=2)
+        else:
+            duplicate_build_started.set()
+        return FakeChild(f"sa-overlap-{index}")
+
+    def run_child(_index, _goal, _child, _parent):
+        run_calls.append(True)
+        return {
+            "status": "completed",
+            "summary": "ran once",
+            "api_calls": 1,
+            "duration_seconds": 0.01,
+        }
+
+    monkeypatch.setattr(
+        delegate_tool, "_build_child_preserving_parent_tools", build_child
+    )
+    monkeypatch.setattr(delegate_tool, "_run_child_lifecycle", run_child)
+    service = SubagentLifecycleService(resolve_parent)
+    request = SubagentLaunchRequest(
+        goal="one logical launch",
+        correlation_id="overlapping-retry-key",
+    )
+    outcomes = []
+
+    def launch():
+        try:
+            outcomes.append(service.launch(request))
+        except BaseException as exc:
+            outcomes.append(exc)
+
+    first = threading.Thread(target=launch, daemon=True, name="lifecycle-first")
+    retry = threading.Thread(target=launch, daemon=True, name="lifecycle-retry")
+    first.start()
+    assert first_build_started.wait(timeout=2), "first launch never reached build"
+    retry.start()
+    first.join(timeout=2)
+    retry.join(timeout=2)
+
+    assert not first.is_alive() and not retry.is_alive()
+    assert not duplicate_build_started.is_set()
+    assert build_calls == [0]
+    assert len(outcomes) == 2
+    assert all(not isinstance(outcome, BaseException) for outcome in outcomes)
+    assert outcomes[0] == outcomes[1]
+    assert service.wait(outcomes[0], timeout_seconds=2).state is (
+        SubagentState.SUCCEEDED
+    )
+    assert run_calls == [True]
+
+
+def test_failed_submit_rolls_back_correlation_and_allows_retry(monkeypatch):
+    from agent import subagent_lifecycle as lifecycle_module
+    from tools import delegate_tool
+
+    parent = SimpleNamespace(
+        session_id="parent-submit-failure",
+        enabled_toolsets=["file"],
+        _active_children=[],
+        _active_children_lock=None,
+    )
+    service = SubagentLifecycleService(lambda: parent)
+    built_children = []
+
+    def build_child(**_kwargs):
+        child = FakeChild(f"sa-submit-{len(built_children)}")
+        built_children.append(child)
+        parent._active_children.append(child)
+        return child
+
+    def run_child(_index, _goal, child, _parent):
+        try:
+            return {
+                "status": "completed",
+                "summary": "retry ran",
+                "api_calls": 1,
+                "duration_seconds": 0.01,
+            }
+        finally:
+            parent._active_children.remove(child)
+            child.close()
+
+    real_executor = lifecycle_module._EXECUTOR
+
+    class RejectOnceExecutor:
+        def __init__(self):
+            self.calls = 0
+
+        def submit(self, callback, *args):
+            self.calls += 1
+            if self.calls == 1:
+                raise RuntimeError("executor rejected launch")
+            return real_executor.submit(callback, *args)
+
+    executor = RejectOnceExecutor()
+    monkeypatch.setattr(
+        delegate_tool, "_build_child_preserving_parent_tools", build_child
+    )
+    monkeypatch.setattr(delegate_tool, "_run_child_lifecycle", run_child)
+    monkeypatch.setattr(lifecycle_module, "_EXECUTOR", executor)
+    request = SubagentLaunchRequest(
+        goal="retry after definite failure",
+        correlation_id="submit-retry-key",
+    )
+
+    with pytest.raises(SubagentLifecycleError, match="Failed to schedule"):
+        service.launch(request)
+
+    assert built_children[0].closed
+    assert built_children[0] not in parent._active_children
+
+    handle = service.launch(request)
+    assert handle.subagent_id == "sa-submit-1"
+    assert service.wait(handle, timeout_seconds=2).state is SubagentState.SUCCEEDED
+    assert len(built_children) == 2
+    assert executor.calls == 2
 
 
 

@@ -12,6 +12,7 @@ half-open / cooldown / reconnect-resets-breaker behavior that fixes
 that.
 """
 import json
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
@@ -99,6 +100,89 @@ def _cleanup(mcp_tool_module, name: str) -> None:
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
+
+
+def test_rendered_tool_errors_do_not_open_healthy_transport_circuit(
+    monkeypatch, tmp_path,
+):
+    """Application/input errors are responses from a reachable backend.
+
+    Three invalid calls must not prevent a fourth, valid call from using the
+    same healthy MCP session. The rendered ``{"error": ...}`` shape is a tool
+    result contract, not evidence that the transport is unreachable.
+    """
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    from tools import mcp_tool
+    from tools.mcp_tool import _make_tool_handler
+
+    calls = []
+
+    async def _call_tool(_name, arguments):
+        calls.append(arguments)
+        if arguments.get("expression") != "1 + 1":
+            return SimpleNamespace(
+                is_error=True,
+                content=[SimpleNamespace(text="invalid expression")],
+            )
+        return SimpleNamespace(
+            is_error=False,
+            content=[SimpleNamespace(text="2")],
+        )
+
+    _install_stub_server(mcp_tool, "renderer", _call_tool)
+    mcp_tool._ensure_mcp_loop()
+
+    try:
+        handler = _make_tool_handler("renderer", "evaluate", 10.0)
+
+        for _ in range(mcp_tool._CIRCUIT_BREAKER_THRESHOLD):
+            parsed = json.loads(handler({"expression": "invalid"}))
+            assert parsed == {"error": "invalid expression"}
+            assert mcp_tool._server_error_counts.get("renderer", 0) == 0
+
+        parsed = json.loads(handler({"expression": "1 + 1"}))
+        assert parsed == {"result": "2"}
+        assert len(calls) == mcp_tool._CIRCUIT_BREAKER_THRESHOLD + 1
+    finally:
+        _cleanup(mcp_tool, "renderer")
+
+
+@pytest.mark.parametrize(
+    "failure_type",
+    [EOFError, TimeoutError, ConnectionError],
+)
+def test_transport_failures_still_open_backend_circuit(
+    monkeypatch, tmp_path, failure_type,
+):
+    """Raised EOF/timeout/connectivity failures remain breaker strikes."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    from tools import mcp_tool
+    from tools.mcp_tool import _make_tool_handler
+
+    calls = {"n": 0}
+
+    async def _call_tool(*_args, **_kwargs):
+        calls["n"] += 1
+        raise failure_type("backend transport failed")
+
+    _install_stub_server(mcp_tool, "offline", _call_tool)
+    mcp_tool._ensure_mcp_loop()
+
+    try:
+        handler = _make_tool_handler("offline", "evaluate", 10.0)
+
+        for expected_count in range(1, mcp_tool._CIRCUIT_BREAKER_THRESHOLD + 1):
+            parsed = json.loads(handler({}))
+            assert "error" in parsed
+            assert mcp_tool._server_error_counts["offline"] == expected_count
+
+        parsed = json.loads(handler({}))
+        assert "unreachable" in parsed["error"].lower()
+        assert calls["n"] == mcp_tool._CIRCUIT_BREAKER_THRESHOLD
+    finally:
+        _cleanup(mcp_tool, "offline")
 
 
 def test_circuit_breaker_half_opens_after_cooldown(monkeypatch, tmp_path):

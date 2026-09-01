@@ -145,6 +145,7 @@ class _Record:
     started_at: Optional[float] = None
     completed_at: Optional[float] = None
     result: Optional[SubagentResult] = None
+    request_fingerprint: Optional[str] = None
 
 
 class _Registry:
@@ -152,6 +153,7 @@ class _Registry:
 
     def __init__(self) -> None:
         self.lock = threading.RLock()
+        self.launch_lock = threading.RLock()
         self.records: dict[str, _Record] = {}
         self.correlations: dict[tuple[Optional[str], str], str] = {}
 
@@ -208,55 +210,109 @@ class SubagentLifecycleService:
                 "parent_session_id does not match the active session."
             )
         correlation_key = (parent_session_id, request.correlation_id or "")
-        with _REGISTRY.lock:
-            self._cleanup_locked()
-            if request.correlation_id and correlation_key in _REGISTRY.correlations:
-                raise SubagentLifecycleError(
-                    "Duplicate correlation_id for this parent session."
+        request_fingerprint = self._request_fingerprint(request)
+
+        # Child construction is already serialized by delegate_tool so it
+        # cannot leak the child's resolved toolset into its parent. Keep the
+        # correlation check and record insertion in that same logical launch
+        # window: two overlapping retries must not both pass the check and
+        # construct separate children. The registry lock itself stays narrow,
+        # so status/cancel/result calls remain available during construction.
+        with _REGISTRY.launch_lock:
+            with _REGISTRY.lock:
+                self._cleanup_locked()
+                existing_id = (
+                    _REGISTRY.correlations.get(correlation_key)
+                    if request.correlation_id
+                    else None
                 )
+                existing = (
+                    _REGISTRY.records.get(existing_id) if existing_id else None
+                )
+                if existing is not None:
+                    if existing.request_fingerprint != request_fingerprint:
+                        raise SubagentLifecycleError(
+                            "correlation_id was already used for a different request."
+                        )
+                    return existing.handle
+                if existing_id:
+                    # Defensive repair for an impossible/dangling index entry.
+                    _REGISTRY.correlations.pop(correlation_key, None)
 
-        # Delegate construction remains internal so plugin code never imports
-        # private delegation helpers or manipulates the active-child registry.
-        from tools.delegate_tool import (
-            _build_child_preserving_parent_tools,
-            DEFAULT_MAX_ITERATIONS,
-        )
+            # Delegate construction remains internal so plugin code never
+            # imports private delegation helpers or manipulates the
+            # active-child registry.
+            from tools.delegate_tool import (
+                _build_child_preserving_parent_tools,
+                DEFAULT_MAX_ITERATIONS,
+            )
 
-        child = _build_child_preserving_parent_tools(
-            task_index=0,
-            goal=request.goal,
-            context=request.context,
-            toolsets=list(request.allowed_toolsets)
-            if request.allowed_toolsets
-            else None,
-            model=request.model,
-            max_iterations=DEFAULT_MAX_ITERATIONS,
-            task_count=1,
-            parent_agent=parent,
-            role=request.role,
-        )
-        subagent_id = str(getattr(child, "_subagent_id", "") or "")
-        if not subagent_id:
-            raise SubagentLifecycleError("Hermes failed to assign a child identity.")
-        created = time.time()
-        handle = SubagentHandle(
-            PUBLIC_CONTRACT_VERSION,
-            subagent_id,
-            parent_session_id,
-            request.correlation_id,
-            created,
-            getattr(child, "provider", None),
-            getattr(child, "model", None),
-            getattr(child, "_delegate_role", request.role),
-            int(getattr(child, "_delegate_depth", 1) or 1),
-            self._capability(subagent_id, parent_session_id, created),
-        )
-        record = _Record(handle, SubagentState.PENDING, created, agent=child)
+            child = _build_child_preserving_parent_tools(
+                task_index=0,
+                goal=request.goal,
+                context=request.context,
+                toolsets=list(request.allowed_toolsets)
+                if request.allowed_toolsets
+                else None,
+                model=request.model,
+                max_iterations=DEFAULT_MAX_ITERATIONS,
+                task_count=1,
+                parent_agent=parent,
+                role=request.role,
+            )
+            subagent_id = str(getattr(child, "_subagent_id", "") or "")
+            if not subagent_id:
+                self._discard_unstarted_child(child, parent)
+                raise SubagentLifecycleError(
+                    "Hermes failed to assign a child identity."
+                )
+            created = time.time()
+            handle = SubagentHandle(
+                PUBLIC_CONTRACT_VERSION,
+                subagent_id,
+                parent_session_id,
+                request.correlation_id,
+                created,
+                getattr(child, "provider", None),
+                getattr(child, "model", None),
+                getattr(child, "_delegate_role", request.role),
+                int(getattr(child, "_delegate_depth", 1) or 1),
+                self._capability(subagent_id, parent_session_id, created),
+            )
+            record = _Record(
+                handle,
+                SubagentState.PENDING,
+                created,
+                agent=child,
+                request_fingerprint=request_fingerprint,
+            )
+            with _REGISTRY.lock:
+                _REGISTRY.records[subagent_id] = record
+                if request.correlation_id:
+                    _REGISTRY.correlations[correlation_key] = subagent_id
+
+        # Publish the identity before submitting. If the acknowledgement from
+        # submit is delayed after acceptance, an exact correlation-id retry
+        # can recover this handle immediately while the original child keeps
+        # running. A definite submit failure is rolled back so a later retry
+        # can perform a fresh launch instead of recovering a ghost record.
+        try:
+            future = _EXECUTOR.submit(self._run, record, request.goal, parent)
+        except Exception as exc:
+            with _REGISTRY.lock:
+                if _REGISTRY.records.get(subagent_id) is record:
+                    _REGISTRY.records.pop(subagent_id, None)
+                if (
+                    request.correlation_id
+                    and _REGISTRY.correlations.get(correlation_key) == subagent_id
+                ):
+                    _REGISTRY.correlations.pop(correlation_key, None)
+            self._discard_unstarted_child(child, parent)
+            raise SubagentLifecycleError(
+                f"Failed to schedule subagent launch: {exc}"
+            ) from exc
         with _REGISTRY.lock:
-            _REGISTRY.records[subagent_id] = record
-            if request.correlation_id:
-                _REGISTRY.correlations[correlation_key] = subagent_id
-        record.future = _EXECUTOR.submit(self._run, record, request.goal, parent)
+            record.future = future
         return handle
 
     def status(self, handle: SubagentHandle) -> SubagentStatus:
@@ -406,6 +462,37 @@ class SubagentLifecycleService:
                     (record.handle.parent_session_id, record.handle.correlation_id),
                     None,
                 )
+
+    @staticmethod
+    def _discard_unstarted_child(child: Any, parent: Any) -> None:
+        """Release a constructed child that never reached its worker."""
+        children = getattr(parent, "_active_children", None)
+        if isinstance(children, list):
+            lock = getattr(parent, "_active_children_lock", None)
+            try:
+                if lock is not None:
+                    with lock:
+                        children.remove(child)
+                else:
+                    children.remove(child)
+            except Exception:
+                pass
+        try:
+            close = getattr(child, "close", None)
+            if callable(close):
+                close()
+        except Exception:
+            pass
+
+    @staticmethod
+    def _request_fingerprint(request: SubagentLaunchRequest) -> str:
+        payload = json.dumps(
+            dataclasses.asdict(request),
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode()
+        return hashlib.sha256(payload).hexdigest()
 
     def _run(self, record: _Record, goal: str, parent: Any) -> None:
         with _REGISTRY.lock:

@@ -33,6 +33,9 @@ def launch_review(ctx):
 `SubagentHandle` is serializable and carries a versioned, opaque capability.
 Pass it back to `status`, `wait`, `cancel`, `result`, or `reconnect`; malformed
 or forged handles return `UNKNOWN`/`UNKNOWN_HANDLE` and cannot access a child.
+`correlation_id` is an idempotency key scoped to the parent session: retrying
+the same request returns the original handle without launching a duplicate,
+while reusing the key for a different request is rejected.
 
 The stable states are `PENDING`, `STARTING`, `RUNNING`, `SUCCEEDED`, `FAILED`,
 `INTERRUPTED`, `CANCEL_REQUESTED`, `CANCELLED`, and `UNKNOWN`.
