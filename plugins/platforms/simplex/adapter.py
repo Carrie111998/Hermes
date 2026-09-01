@@ -1020,12 +1020,12 @@ class SimplexAdapter(BasePlatformAdapter):
         try:
             if os.path.isfile(normalized) or os.path.islink(normalized):
                 os.remove(normalized)
-        except OSError:
+        except OSError as exc:
             self._diagnostics["media_cleanup_failures"] += 1
             logger.warning(
-                "SimpleX: failed to remove owned temporary media %s",
+                "SimpleX: failed to remove owned temporary media %s (%s)",
                 os.path.basename(normalized),
-                exc_info=True,
+                type(exc).__name__,
             )
 
     async def _expire_owned_media_path(self, path: str) -> None:
