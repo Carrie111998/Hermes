@@ -36,6 +36,7 @@ import { PetKitty, PetSprite } from './petSprite.js'
 import { QueuedMessages } from './queuedMessages.js'
 import { LiveTodoPanel, StreamingAssistant } from './streamingAssistant.js'
 import { TextInput, type TextInputMouseApi } from './textInput.js'
+import { VoiceVisualizer } from './voiceVisualizer.js'
 
 // Box geometry, kept here so the transcript's reservation math matches the
 // rendered overlay exactly.
@@ -279,6 +280,7 @@ const ComposerPane = memo(function ComposerPane({
   const ui = useStore($uiState)
   const isBlocked = useStore($isBlocked)
   const sh = (composer.inputBuf[0] ?? composer.input).startsWith('!')
+  const voiceMode = status.voiceRecording ? 'listening' : status.voiceProcessing ? 'thinking' : null
 
   const promptText = composerPromptText(
     ui.theme.brand.prompt,
@@ -382,67 +384,70 @@ const ComposerPane = memo(function ComposerPane({
 
         {composer.input === '?' && !composer.inputBuf.length && <HelpHint t={ui.theme} />}
 
-        {!isBlocked && (
-          <>
-            {composer.inputBuf.map((line, i) => (
-              <Box key={i}>
+        {!isBlocked &&
+          (voiceMode ? (
+            <VoiceVisualizer columns={composer.cols} mode={voiceMode} t={ui.theme} />
+          ) : (
+            <>
+              {composer.inputBuf.map((line, i) => (
+                <Box key={i}>
+                  <Box width={promptWidth}>
+                    {i === 0 ? (
+                      <PromptPrefix color={ui.theme.color.muted} promptText={promptText} width={promptWidth} />
+                    ) : (
+                      <Text color={ui.theme.color.muted}>{promptBlank}</Text>
+                    )}
+                  </Box>
+
+                  <Text color={ui.theme.color.text}>{line || ' '}</Text>
+                </Box>
+              ))}
+
+              <Box
+                onMouseDown={captureInputDrag}
+                onMouseDrag={dragFromPromptRow}
+                onMouseUp={endInputDrag}
+                position="relative"
+                width={Math.max(1, composer.cols - 2)}
+              >
                 <Box width={promptWidth}>
-                  {i === 0 ? (
-                    <PromptPrefix color={ui.theme.color.muted} promptText={promptText} width={promptWidth} />
+                  {sh ? (
+                    <PromptPrefix color={ui.theme.color.shellDollar} promptText={promptText} width={promptWidth} />
+                  ) : composer.inputBuf.length ? (
+                    <Text color={ui.theme.color.prompt}>{promptBlank}</Text>
                   ) : (
-                    <Text color={ui.theme.color.muted}>{promptBlank}</Text>
+                    <PromptPrefix bold color={ui.theme.color.prompt} promptText={promptText} width={promptWidth} />
                   )}
                 </Box>
 
-                <Text color={ui.theme.color.text}>{line || ' '}</Text>
-              </Box>
-            ))}
+                <Box flexGrow={0} flexShrink={0} height={inputHeight} width={inputColumns}>
+                  {/* Reserve the transcript scrollbar gutter too so typing never rewraps when the scrollbar column repaints. */}
+                  <TextInput
+                    accentColor={ui.theme.color.accent}
+                    color={ui.theme.color.text}
+                    columns={inputColumns}
+                    mouseApiRef={inputMouseRef}
+                    onChange={composer.updateInput}
+                    onPaste={composer.handleTextPaste}
+                    onSubmit={composer.submit}
+                    placeholder={composer.empty ? PLACEHOLDER : ui.busy ? 'Ctrl+C to interrupt…' : ''}
+                    // Exactly the "(and N more toolsets…)" tone. `muted` is a
+                    // MID-luminance family tone, so it reads receded on both
+                    // poles even when polarity detection is wrong (transparent
+                    // terminals lie about their background); anything blended
+                    // toward the resolved surface inherits that wrong polarity.
+                    placeholderColor={ui.theme.color.muted}
+                    value={composer.input}
+                    voiceRecordKey={composer.voiceRecordKey}
+                  />
+                </Box>
 
-            <Box
-              onMouseDown={captureInputDrag}
-              onMouseDrag={dragFromPromptRow}
-              onMouseUp={endInputDrag}
-              position="relative"
-              width={Math.max(1, composer.cols - 2)}
-            >
-              <Box width={promptWidth}>
-                {sh ? (
-                  <PromptPrefix color={ui.theme.color.shellDollar} promptText={promptText} width={promptWidth} />
-                ) : composer.inputBuf.length ? (
-                  <Text color={ui.theme.color.prompt}>{promptBlank}</Text>
-                ) : (
-                  <PromptPrefix bold color={ui.theme.color.prompt} promptText={promptText} width={promptWidth} />
-                )}
+                <Box position="absolute" right={0}>
+                  <GoodVibesHeart t={ui.theme} tick={status.goodVibesTick} />
+                </Box>
               </Box>
-
-              <Box flexGrow={0} flexShrink={0} height={inputHeight} width={inputColumns}>
-                {/* Reserve the transcript scrollbar gutter too so typing never rewraps when the scrollbar column repaints. */}
-                <TextInput
-                  accentColor={ui.theme.color.accent}
-                  color={ui.theme.color.text}
-                  columns={inputColumns}
-                  mouseApiRef={inputMouseRef}
-                  onChange={composer.updateInput}
-                  onPaste={composer.handleTextPaste}
-                  onSubmit={composer.submit}
-                  placeholder={composer.empty ? PLACEHOLDER : ui.busy ? 'Ctrl+C to interrupt…' : ''}
-                  // Exactly the "(and N more toolsets…)" tone. `muted` is a
-                  // MID-luminance family tone, so it reads receded on both
-                  // poles even when polarity detection is wrong (transparent
-                  // terminals lie about their background); anything blended
-                  // toward the resolved surface inherits that wrong polarity.
-                  placeholderColor={ui.theme.color.muted}
-                  value={composer.input}
-                  voiceRecordKey={composer.voiceRecordKey}
-                />
-              </Box>
-
-              <Box position="absolute" right={0}>
-                <GoodVibesHeart t={ui.theme} tick={status.goodVibesTick} />
-              </Box>
-            </Box>
-          </>
-        )}
+            </>
+          ))}
       </Box>
 
       {!composer.empty && !ui.sid && <Text color={ui.theme.color.muted}>⚕ {ui.status}</Text>}

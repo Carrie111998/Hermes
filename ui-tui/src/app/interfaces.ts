@@ -608,6 +608,8 @@ export interface AppLayoutStatusProps {
   stickyPrompt: string
   turnStartedAt: null | number
   voiceLabel: string
+  voiceProcessing: boolean
+  voiceRecording: boolean
 }
 
 export interface AppLayoutTranscriptProps {
