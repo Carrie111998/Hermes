@@ -78,12 +78,16 @@ def test_closure_ignores_validation_that_collect_tree_would_apply():
 # ------------------------------------------------------- live_snapshot wiring
 
 class _FakeProc:
-    def __init__(self, pid, ctime, boom=False):
+    def __init__(self, pid, ctime, boom=False, dead=False):
         self.pid = pid
         self._ctime = ctime
         self._boom = boom
+        self._dead = dead
 
     def create_time(self):
+        if self._dead:
+            import psutil as _real
+            raise _real.NoSuchProcess(self.pid)
         if self._boom:
             raise OSError("access denied")
         return self._ctime
@@ -114,7 +118,7 @@ class _FakeProc:
         return "BOX\\diego"
 
 
-def _install_fake_psutil(monkeypatch, table, boom_pids=(), ppid_boom_pids=()):
+def _install_fake_psutil(monkeypatch, table, boom_pids=(), ppid_boom_pids=(), dead_pids=()):
     """table: list of (pid, ppid, name, create_time)."""
 
     ppids = {pid: pp for pid, pp, _, _ in table}
@@ -138,9 +142,12 @@ def _install_fake_psutil(monkeypatch, table, boom_pids=(), ppid_boom_pids=()):
             asked.append(tuple(fields))
             return [_Iter(p, pp, n) for p, pp, n, _ in table]
 
+        NoSuchProcess = __import__("psutil").NoSuchProcess
+
         @staticmethod
         def Process(pid):
-            return _FakeProc(pid, ctimes[pid], boom=(pid in boom_pids))
+            return _FakeProc(pid, ctimes[pid], boom=(pid in boom_pids),
+                             dead=(pid in dead_pids))
 
     import sys
     monkeypatch.setitem(sys.modules, "psutil", _FakePsutil)
@@ -293,3 +300,19 @@ def test_unreadable_create_time_marks_incomplete_not_zero(monkeypatch):
     # and every record incomplete under this fake -- proving nothing.
     assert by_pid[-2].create_time == NOW - 50.0
     assert by_pid[-2].complete is True
+
+
+def test_process_that_exits_between_phases_is_dropped_not_incomplete(monkeypatch):
+    # Ordinary churn. The pre-split single-phase census never listed a process
+    # that died mid-pass; the split one can. Keeping it as an INCOMPLETE row
+    # would protect its whole tree (planner default-deny), so on a busy box
+    # normal churn would quietly veto every cull -- a behaviour change, not a
+    # safety win. Measured on this box: the extra incompleteness the split
+    # introduced was 100% already-dead processes.
+    table = [(-2, None, "claude.exe", NOW - 50.0), (-3, -2, "bash.exe", NOW - 40.0)]
+    _install_fake_psutil(monkeypatch, table, dead_pids={-3})
+    snap = controller.live_snapshot()
+    by_pid = {r.pid: r for r in snap.records}
+    assert -3 not in by_pid, "dead process should not appear in the census"
+    assert by_pid[-2].complete is True
+    assert snap.complete is True

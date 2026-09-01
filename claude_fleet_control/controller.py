@@ -237,8 +237,11 @@ def live_snapshot() -> ProcessSnapshot:
 
     A process that could not be enriched (access denied, recycled between
     phases) is marked incomplete, which protects its whole tree — fail-safe.
-    A process missing from the ppid map, or whose create_time could not be
-    read, is marked incomplete for the same reason. A process OUTSIDE the
+    A process whose create_time could not be READ is marked incomplete for
+    the same reason -- but one that has EXITED between phases is dropped from
+    the census instead, because the old single-phase census would never have
+    listed it and an incomplete member protects its whole tree, so keeping
+    dead rows would let ordinary churn quietly veto every cull. A process OUTSIDE the
     create_time closure keeps create_time 0.0 and stays complete, because it
     is never a tree member or an ancestor and so that field is never read for
     it; non-enriched, non-Claude processes keep empty expensive fields on the
@@ -276,6 +279,8 @@ def live_snapshot() -> ProcessSnapshot:
                     # behaviour change wearing a fail-safe's clothes.
                     try:
                         ppid, ppid_ok = proc.ppid(), True
+                    except psutil.NoSuchProcess:
+                        continue          # exited mid-enumeration; not a row
                     except Exception:
                         ppid, ppid_ok = None, False
                 cheap.append(
@@ -307,12 +312,20 @@ def live_snapshot() -> ProcessSnapshot:
     # A failed read marks the record incomplete; it must NOT silently leave
     # the 0.0 behind, because 0.0 reads as "older than everything" to
     # collect_tree's recycled-ppid guard, which decides tree membership.
+    gone: set = set()
     for pid in planner.census_ctime_pids(cheap):
         base = by_pid.get(pid)
         if base is None:
             continue
         try:
             ctime = float(psutil.Process(pid).create_time())
+        except psutil.NoSuchProcess:
+            # EXITED between phases. Drop it rather than mark it incomplete:
+            # a single-phase census would never have listed it at all, and an
+            # incomplete member protects its WHOLE tree, so retaining dead
+            # processes would let ordinary churn quietly veto every cull.
+            gone.add(pid)
+            continue
         except Exception:
             by_pid[pid] = dataclasses.replace(base, complete=False)
             complete = False
@@ -320,7 +333,7 @@ def live_snapshot() -> ProcessSnapshot:
         by_pid[pid] = dataclasses.replace(base, create_time=ctime)
 
     # Phase 2 — enrich only Claude processes and their trees.
-    cheap = [by_pid[r.pid] for r in cheap]
+    cheap = [by_pid[r.pid] for r in cheap if r.pid not in gone]
     targets = planner.enrichment_pids(cheap)
     for pid in targets:
         base = by_pid.get(pid)
