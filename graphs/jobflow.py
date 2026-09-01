@@ -135,9 +135,9 @@ def main_inbox_path() -> Path:
 class ScoreBreakdown(BaseModel):
     title_match: float = Field(description="0-10; seniority/role shape fit", ge=0, le=10)
     skills_overlap: float = Field(description="0-10; technical+domain coverage", ge=0, le=10)
-    industry_fit: float = Field(description="0-10; finance/fintech primary; non-finance<=2", ge=0, le=10)
-    location: float = Field(description="0-10; remote > FL/NY etc > non-remote", ge=0, le=10)
-    comp_alignment: float = Field(description="0-10; $260K sweet spot", ge=0, le=10)
+    industry_fit: float = Field(description="0-10; vs profile industries; avoid-list<=2", ge=0, le=10)
+    location: float = Field(description="0-10; vs profile geography preference", ge=0, le=10)
+    comp_alignment: float = Field(description="0-10; vs profile comp anchor", ge=0, le=10)
     growth: float = Field(description="0-10; trajectory + scope expansion", ge=0, le=10)
     culture: float = Field(description="0-10; team/values/impact signals", ge=0, le=10)
 
