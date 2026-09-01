@@ -55,14 +55,20 @@ def test_load_policy_missing_file_is_hard_error(tmp_path):
     assert policy is None
 
 
-def test_tracked_config_ships_shadow():
-    """The shipped default must be shadow with no enforce approval — this is
-    the deploy-time guarantee that the change cannot terminate anything."""
+def test_tracked_config_is_coherently_gated():
+    """The tracked config was cut over to enforce on 2026-09-01. The
+    load-bearing invariant is now COHERENCE, not shadowness: a config in
+    enforce mode MUST carry a digest equal to its own policy.digest(), or the
+    controller disarms it (config gate never opens). A shadow config must
+    carry no approval. This stays green across a rollback to shadow."""
     policy, notes = load_policy(ctrl.default_config_path())
     assert policy is not None
-    assert policy.mode == "shadow"
-    assert policy.approved_enforce_digest is None
     assert notes == []
+    assert policy.mode in ("shadow", "enforce")
+    if policy.mode == "enforce":
+        assert policy.approved_enforce_digest == policy.digest()
+    else:
+        assert policy.approved_enforce_digest is None
 
 
 # ---------------------------------------------------------------- harness

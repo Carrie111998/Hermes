@@ -48,34 +48,62 @@ def test_task_xml_is_well_formed_and_shadow_bounded():
 
 
 @requires_task
-def test_task_action_never_enables_enforcement_or_the_legacy_culler():
+def test_task_never_references_the_legacy_culler():
     text = _TASK.read_text(encoding="utf-8")
-    args = ET.parse(_TASK).getroot().find(".//t:Actions/t:Exec/t:Arguments", _NS).text
-    assert "--allow-enforce" not in args
     assert "cull-claude-sessions" not in text
     assert "cull-idle-claude-sessions" not in text
+    # The task opens gate 2 via the -AllowEnforce SWITCH, never the raw
+    # --allow-enforce (that belongs only inside the runner's guarded branch).
+    args = ET.parse(_TASK).getroot().find(".//t:Actions/t:Exec/t:Arguments", _NS).text
+    assert "--allow-enforce" not in args
 
 
 @requires_runner
-def test_runner_omits_enforce_flag_and_legacy_culler():
-    # Comment lines may EXPLAIN why the flag is absent; the contract is that no
-    # executable line ever passes it. Strip comment-only lines before checking.
+def test_runner_gates_enforce_behind_the_switch():
+    """Post-cutover the runner CAN pass --allow-enforce, but only inside the
+    -AllowEnforce guard, so an ad-hoc run stays shadow-safe. Pin that
+    structure and the absence of the legacy culler."""
     code_lines = [
         ln for ln in _RUNNER.read_text(encoding="utf-8").splitlines()
         if not ln.lstrip().startswith("#")
     ]
     code = "\n".join(code_lines)
-    assert "--allow-enforce" not in code
+    assert "param([switch]$AllowEnforce)" in code       # declares the switch
+    assert "if ($AllowEnforce)" in code                 # the flag is guarded
+    assert "$Py $Script --allow-enforce" in code        # the enforce branch
+    assert "& $Py $Script 2>&1" in code                 # the shadow-default branch (no flag)
     assert "cull-claude-sessions" not in code
     assert "cull-idle-claude-sessions" not in code
     assert "run_claude_fleet_controller.py" in code
 
 
-def test_tracked_config_is_shadow_with_no_enforce_approval():
+def test_tracked_config_enforce_is_coherently_pinned():
+    import json
+    import re
+
+    cfg = json.loads(_CONFIG.read_text(encoding="utf-8"))
+    assert cfg["mode"] in ("shadow", "enforce")
+    if cfg["mode"] == "enforce":
+        assert re.fullmatch(r"[0-9a-f]{64}", cfg.get("approved_enforce_digest") or "")
+    else:
+        assert cfg["approved_enforce_digest"] is None
+    assert cfg["fleet_min_roots"] == 30
+    assert cfg["max_trees_per_pass"] == 1
+
+
+@requires_task
+def test_config_and_task_enforce_state_are_consistent():
+    """Both gates must agree: config in enforce mode (with a digest) iff the
+    task opens gate 2 with -AllowEnforce. A half-applied cutover or half
+    rollback (one gate flipped, not the other) fails here. The controller
+    stays safe either way (both gates required for any kill), but an
+    inconsistent deployment is worth catching."""
     import json
 
     cfg = json.loads(_CONFIG.read_text(encoding="utf-8"))
-    assert cfg["mode"] == "shadow"
-    assert cfg["approved_enforce_digest"] is None
-    assert cfg["fleet_min_roots"] == 30
-    assert cfg["max_trees_per_pass"] == 1
+    config_enforce = cfg["mode"] == "enforce" and bool(cfg.get("approved_enforce_digest"))
+    args = ET.parse(_TASK).getroot().find(".//t:Actions/t:Exec/t:Arguments", _NS).text
+    task_enforce = "-AllowEnforce" in args
+    assert config_enforce == task_enforce, (
+        f"gate mismatch: config_enforce={config_enforce} task_enforce={task_enforce}"
+    )
