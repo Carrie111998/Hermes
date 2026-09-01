@@ -1061,9 +1061,10 @@ def _resolve_direct_stale_timeout(agent, api_kwargs: dict) -> float:
     Same derivation the interrupt-worker path uses for its stale-call
     detector (provider ``stale_timeout_seconds`` →
     ``HERMES_API_CALL_STALE_TIMEOUT`` → reasoning-model floor → context-size
-    scaling, ``inf`` for a local endpoint on the implicit default), so cron and
-    delegated turns get exactly the patience every other non-streaming request
-    already gets.
+    scaling, ``inf`` for a local endpoint on the implicit default). Delegated
+    reasoning turns also resolve to ``inf`` because a non-streaming request has
+    no progress signal before its complete response arrives; the request/run
+    timeout remains their hard bound.
 
     A non-numeric result — an agent stub that never implements the resolver —
     leaves the watchdog disarmed rather than arming it on a bogus budget.
@@ -1077,6 +1078,29 @@ def _resolve_direct_stale_timeout(agent, api_kwargs: dict) -> float:
     value = resolver(api_kwargs)
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return float("inf")
+
+    # A delegated reasoning turn cannot expose byte-level liveness through a
+    # non-streaming Chat Completions request: thinking and tool synthesis both
+    # happen before the one complete response becomes observable. Treating its
+    # TTFB as provider silence therefore kills healthy children at exactly the
+    # configured stale threshold (#100260). Keep the stale watchdog for cron
+    # and non-reasoning subagents, where a zero-byte wait remains useful, while
+    # reasoning children fall back to the request timeout / optional child run
+    # timeout as their hard bound.
+    delegated_child = getattr(agent, "platform", None) == "subagent"
+    if not delegated_child:
+        try:
+            from agent.delegation_context import is_delegated_child_context
+
+            delegated_child = is_delegated_child_context()
+        except Exception:
+            delegated_child = False
+    if delegated_child:
+        from agent.reasoning_timeouts import get_reasoning_stale_timeout_floor
+
+        model = api_kwargs.get("model") or getattr(agent, "model", None)
+        if get_reasoning_stale_timeout_floor(model) is not None:
+            return float("inf")
     return float(value)
 
 

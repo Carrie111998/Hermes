@@ -143,6 +143,42 @@ def test_healthy_call_is_untouched_by_the_watchdog():
     )
 
 
+def test_reasoning_subagent_wait_is_not_treated_as_provider_staleness():
+    """A non-streaming reasoning turn has no observable progress before the
+    complete response arrives, so its TTFB is not a stale-provider signal."""
+    agent = _make_agent(stale_timeout=0.05, platform="subagent")
+    fake_client = MagicMock()
+
+    def _reason_then_reply(**_kwargs):
+        time.sleep(0.2)
+        return SimpleNamespace(id="reasoned")
+
+    fake_client.chat.completions.create.side_effect = _reason_then_reply
+    agent._create_request_openai_client.return_value = fake_client
+
+    response = direct_api_call(
+        agent,
+        {
+            "model": "glm-5.3-flash",
+            "messages": [{"role": "user", "content": "work"}],
+        },
+    )
+
+    assert response.id == "reasoned"
+    agent._abort_request_openai_client.assert_not_called()
+
+
+def test_non_reasoning_subagent_still_aborts_a_silent_provider():
+    agent = _make_agent(stale_timeout=0.05, platform="subagent")
+    aborted: list[str] = []
+    _stalling_client(agent, aborted=aborted)
+
+    with pytest.raises(TimeoutError):
+        direct_api_call(agent, {"model": "gpt-4o-mini", "messages": []})
+
+    assert aborted == ["stale_call_kill"]
+
+
 def test_local_endpoint_infinite_budget_leaves_the_watchdog_disarmed():
     """``_compute_non_stream_stale_timeout`` returns inf for a local endpoint
     on the implicit default — that opt-out must survive on this path too."""

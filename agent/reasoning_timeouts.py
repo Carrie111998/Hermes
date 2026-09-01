@@ -74,6 +74,11 @@ _REASONING_STALE_TIMEOUT_FLOORS: tuple[tuple[str, int], ...] = (
     ("deepseek-reasoner", 600),
     ("deepseek-v4-flash", 600),
     ("deepseek-v4-pro", 600),
+    # Z.AI GLM-5.2/5.3 — reasoning is server-enabled by default and the
+    # non-streaming coding-plan endpoint may spend several minutes thinking
+    # before the complete response becomes observable.
+    ("glm-5.2", 600),
+    ("glm-5.3", 600),
     # Qwen — QwQ reasoning + Qwen3 thinking variants.  QwQ-32B
     # preview is the stable slug; ``qwen3`` covers the family of
     # thinking-mode Qwen3 models (qwen3-235b-a22b, qwen3-32b, etc.)
