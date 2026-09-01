@@ -243,6 +243,7 @@ class GatewayStreamConsumer:
         on_before_finalize: Optional[Callable[[], Any]] = None,
         initial_reply_to_id: Optional[str] = None,
         run_still_current: Optional[Callable[[], bool]] = None,
+        hook_context: Optional[dict] = None,
     ):
         self.adapter = adapter
         self.chat_id = chat_id
@@ -353,6 +354,12 @@ class GatewayStreamConsumer:
         # /stop), the run() loop will abandon the stream early instead of
         # continuing to edit and deliver stale deltas.
         self._run_still_current = run_still_current or (lambda: True)
+
+        # Optional hook context for pre_gateway_send plugin interception.
+        self._hook_gateway = (hook_context or {}).get("gateway") if hook_context else None
+        self._hook_source = (hook_context or {}).get("source") if hook_context else None
+        self._hook_chat_type = (hook_context or {}).get("chat_type") if hook_context else None
+        self._hook_session_store = (hook_context or {}).get("session_store") if hook_context else None
 
         # Think-block filter state (mirrors CLI's _stream_delta tag suppression)
         self._in_think_block = False
@@ -2054,6 +2061,64 @@ class GatewayStreamConsumer:
         text = self._clean_for_display(text)
         if not text.strip():
             return reply_to_id
+
+        # Fire pre_gateway_send plugin hook (outbound gate).
+        if self._hook_gateway is not None:
+            try:
+                from hermes_cli.lifecycle import invoke_hook as _invoke_hook
+                _hook_results = _invoke_hook(
+                    "pre_gateway_send",
+                    content=text,
+                    platform=getattr(self.adapter, '_platform', getattr(self.adapter, 'platform', None)),
+                    chat_id=self.chat_id,
+                    source=self._hook_source,
+                    chat_type=self._hook_chat_type,
+                    gateway=self._hook_gateway,
+                    session_store=self._hook_session_store,
+                )
+            except Exception as _hook_exc:
+                logger.warning("pre_gateway_send invocation failed: %s", _hook_exc)
+                _hook_results = []
+
+            for _result in _hook_results:
+                if not isinstance(_result, dict):
+                    continue
+                _action = _result.get("action")
+                if _action == "block":
+                    logger.info(
+                        "pre_gateway_send block: reason=%s chat=%s",
+                        _result.get("reason"), self.chat_id,
+                    )
+                    return reply_to_id  # silently drop
+                if _action == "redirect":
+                    _new_target = _result.get("target")
+                    if isinstance(_new_target, str) and _new_target:
+                        # Parse platform:chat_id format
+                        _parts = _new_target.split(":", 1)
+                        if len(_parts) == 2:
+                            _redirect_platform, _redirect_chat = _parts
+                            # Find adapter for redirect platform
+                            if self._hook_gateway is not None:
+                                try:
+                                    from gateway.config import Platform as _Platform
+                                    _rp = _Platform(str(_redirect_platform))
+                                    _redirect_adapter = self._hook_gateway.adapters.get(_rp)
+                                    if _redirect_adapter:
+                                        result = await _redirect_adapter.send(
+                                            chat_id=str(_redirect_chat),
+                                            content=text,
+                                            reply_to=None,
+                                            metadata=self._metadata_for_send(final=final, expect_edits=False),
+                                        )
+                                        if result.success:
+                                            logger.info("pre_gateway_send redirected to %s", _new_target)
+                                            return reply_to_id
+                                except Exception as _redir_err:
+                                    logger.warning("pre_gateway_send redirect failed: %s", _redir_err)
+                    # Fall through to normal send if redirect failed
+                if _action == "allow":
+                    break
+
         try:
             result = await self.adapter.send(
                 chat_id=self.chat_id,

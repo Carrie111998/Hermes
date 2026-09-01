@@ -5906,6 +5906,12 @@ class TurnRunner:
                         on_before_finalize=_pause_typing_before_finalize,
                         initial_reply_to_id=ctx.event_message_id,
                         run_still_current=ctx._run_still_current,
+                        hook_context={
+                            "gateway": self._runner,
+                            "source": ctx.source,
+                            "chat_type": ctx.source.chat_type,
+                            "session_store": getattr(self._runner, "session_store", None),
+                        },
                     )
                     if _want_stream_deltas:
                         def _stream_delta_cb(text: str) -> None:
@@ -29824,6 +29830,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         on_before_finalize=_pause_typing_before_finalize,
                         initial_reply_to_id=event_message_id,
                         run_still_current=_run_still_current,
+                        hook_context={
+                            "gateway": self,
+                            "source": source,
+                            "chat_type": getattr(source, "chat_type", None),
+                            "session_store": getattr(self, "session_store", None),
+                        },
                     )
             except Exception as _sc_err:
                 logger.debug("Proxy: could not set up stream consumer: %s", _sc_err)
