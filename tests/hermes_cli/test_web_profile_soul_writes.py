@@ -13,6 +13,7 @@ small and focused on this one endpoint pair.
 from __future__ import annotations
 
 import contextlib
+import json
 import os
 import stat
 import sys
@@ -700,3 +701,243 @@ class TestIsolatedAggregateScope:
         assert all_ok.status_code == 200, all_ok.text
         assert sibling.status_code == 403, sibling.text
         assert msg_sibling.status_code == 403, msg_sibling.text
+
+    def test_status_omitted_and_current_pin_to_scoped_profile(self, tmp_path, monkeypatch):
+        """An isolated server's /api/status with an omitted or ``current``
+        profile must pin to the scoped profile, not fall through to the
+        machine-level topology aggregation that enumerates sibling gateway
+        state (#91381 review, consolidation owner)."""
+        profiles_root = self._seed(tmp_path)
+        alice = profiles_root / "alice"
+
+        with self._client(monkeypatch, isolated=True, hermes_home=str(alice)) as c:
+            omitted = c.get("/api/status")
+            current = c.get("/api/status?profile=current")
+            whitespace = c.get("/api/status?profile=%20%20")
+
+        # All three resolve to the pinned profile (200) rather than erroring
+        # or fanning out machine-wide; the sibling selector still 403s. The
+        # whitespace form is the same class as omitted: the clamp would strip
+        # it to "" and fall into the machine-wide branch, so the pin must
+        # treat it as omitted too (#91381 review).
+        assert omitted.status_code == 200, omitted.text
+        assert current.status_code == 200, current.text
+        assert whitespace.status_code == 200, whitespace.text
+
+    def test_env_config_sibling_403_via_shared_scope(self, tmp_path, monkeypatch):
+        """Sibling selectors on env/config/skills routes 403 through the
+        shared ``_resolve_profile_dir`` seam — the policy owner, not a
+        per-handler bolt-on (#91381 review, consolidation owner)."""
+        profiles_root = self._seed(tmp_path)
+        alice = profiles_root / "alice"
+        (profiles_root / "bob" / ".env").write_text("BOB_SECRET=1\n", encoding="utf-8")
+
+        with self._client(monkeypatch, isolated=True, hermes_home=str(alice)) as c:
+            env = c.get("/api/env?profile=bob")
+            cfg = c.get("/api/config?profile=bob")
+            update = c.put("/api/config?profile=bob", json={"config": {}})
+
+        assert env.status_code == 403, env.text
+        assert cfg.status_code == 403, cfg.text
+        assert update.status_code == 403, update.text
+
+    def test_cron_aggregation_pinned_only_and_sibling_403(self, tmp_path, monkeypatch):
+        """The cron aggregation seam narrows ``profile=all`` to the pinned
+        profile and rejects explicit siblings before any cron I/O."""
+        profiles_root = self._seed(tmp_path)
+        alice = profiles_root / "alice"
+        bob = profiles_root / "bob"
+
+        with self._client(monkeypatch, isolated=True, hermes_home=str(alice)) as c:
+            all_ok = c.get("/api/cron/jobs?profile=all")
+            sibling = c.get("/api/cron/jobs?profile=bob")
+
+        assert all_ok.status_code == 200, all_ok.text
+        assert isinstance(all_ok.json(), list)
+        # Bottleneck check: the aggregation seam must never enumerate Bob.
+        assert sibling.status_code == 403, sibling.text
+
+    def test_status_without_profile_pinned_not_machinewide(self, tmp_path, monkeypatch):
+        """An isolated backend must NOT fall into the machine-level status
+        topology aggregation when the profile param is omitted — it pins to
+        its scoped profile instead (#91381 review, P1)."""
+        profiles_root = self._seed(tmp_path)
+        alice = profiles_root / "alice"
+        (alice / "gateway_state.json").write_text(
+            '{"gateway_state": "running", "platforms": {}}', encoding="utf-8"
+        )
+
+        with self._client(monkeypatch, isolated=True, hermes_home=str(alice)) as c:
+            bare = c.get("/api/status")
+            explicit = c.get("/api/status?profile=alice")
+            sibling = c.get("/api/status?profile=bob")
+
+        assert bare.status_code == 200, bare.text
+        assert explicit.status_code == 200, explicit.text
+        # The sibling selector must fail before any sibling runtime read.
+        assert sibling.status_code == 403, sibling.text
+
+    def test_cron_ticker_pinned_only_when_isolated(self, monkeypatch, tmp_path):
+        """The desktop cron ticker on an isolated backend ticks only the
+        pinned profile — never sibling stores (#91381 review, P1)."""
+        import threading
+
+        from hermes_cli import web_server
+
+        profiles_root = tmp_path / ".hermes" / "profiles"
+        alice = profiles_root / "alice"
+        alice.mkdir(parents=True, exist_ok=True)
+        bob_sentinel = profiles_root / "bob"
+        bob_sentinel.mkdir(parents=True, exist_ok=True)
+        # The ticker resolves the pinned profile name against the profiles
+        # root, so HERMES_HOME must point at the seeded home or the canonical
+        # scope never matches and the ticker is disabled.
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+        monkeypatch.setenv("HERMES_DASHBOARD_SESSION_TOKEN", "soul-test-token")
+
+        from cron import scheduler_provider
+        from hermes_cli import profiles as profiles_mod
+
+        multiplex_served = []
+
+        def fake_profiles_to_serve(*a, **k):
+            multiplex_served.append(list(profiles_mod._raw_profiles_to_serve(*a, **k)))
+            return multiplex_served[-1]
+
+        events = []
+        real_resolve = scheduler_provider.resolve_cron_scheduler
+
+        class _FakeProvider:
+            name = "fake"
+
+            def __init__(self, *a, **k):
+                pass
+
+            def start(self, stop_event, **kwargs):
+                events.append(("start", kwargs.get("interval")))
+                if kwargs.get("profile_homes"):
+                    events.append(("homes", [str(h) for h in kwargs["profile_homes"]]))
+
+        def fake_resolve(*a, **k):
+            return _FakeProvider()
+
+        monkeypatch.setattr(
+            profiles_mod, "profiles_to_serve", fake_profiles_to_serve
+        )
+        monkeypatch.setattr(scheduler_provider, "resolve_cron_scheduler", fake_resolve)
+        monkeypatch.setattr(
+            scheduler_provider, "InProcessCronScheduler", _FakeProvider
+        )
+
+        prev = getattr(web_server.app.state, "isolated", None)
+        had = hasattr(web_server.app.state, "isolated")
+        prev_scope = getattr(web_server.app.state, "isolated_scope_dir", None)
+        had_scope = hasattr(web_server.app.state, "isolated_scope_dir")
+        web_server.app.state.isolated = True
+        web_server.app.state.isolated_scope_dir = alice.resolve()
+        try:
+            stop = threading.Event()
+            web_server._start_desktop_cron_ticker(stop)
+        finally:
+            if had:
+                web_server.app.state.isolated = prev
+            else:
+                delattr(web_server.app.state, "isolated")
+            if had_scope:
+                web_server.app.state.isolated_scope_dir = prev_scope
+            else:
+                delattr(web_server.app.state, "isolated_scope_dir")
+
+        assert len(multiplex_served) == 0, "isolated ticker must not enumerate siblings"
+        homes = [h for e, h in events if e == "homes"]
+        assert homes, f"ticker never started with homes: {events}"
+        all_homes = [str(h) for lst in homes for h in lst[0]] if homes and isinstance(homes[0][0], list) else [h for lst in homes for h in lst]
+        assert any("alice" in h for h in all_homes), f"alice missing from ticker homes: {all_homes}"
+        assert not any("bob" in h for h in all_homes), f"bob leaked into ticker homes: {all_homes}"
+
+    def test_single_session_sibling_403_via_db_seam(self, tmp_path, monkeypatch):
+        """Single-session routes resolve through ``_cron_profile_home`` —
+        an explicit sibling selector 403s there before any state.db open."""
+        profiles_root = self._seed(tmp_path)
+        alice = profiles_root / "alice"
+        opened = self._opened_db_paths(monkeypatch, tmp_path)
+
+        with self._client(monkeypatch, isolated=True, hermes_home=str(alice)) as c:
+            r = c.get("/api/sessions/whatever-id?profile=bob")
+
+        assert r.status_code == 403, r.text
+        assert not any("bob" in p for p in opened), f"Bob's DB opened: {opened}"
+
+    def test_status_no_query_isolated_scopes_topology(self, tmp_path, monkeypatch):
+        """Unit-level witness for the post-collection scope filter: even when
+        the machine-wide topology collector runs, a plain no-query /api/status
+        on an isolated server must publish only the pinned profile's names,
+        ports, and platforms (#91381 review)."""
+        from hermes_cli import web_server
+
+        def _machine_wide_topology():
+            return {
+                "profiles": ["alice", "bob", "default"],
+                "gateway_mode": "multiple",
+                "gateways": [
+                    {"profile": "alice", "ports": [4000]},
+                    {"profile": "bob", "ports": [4001]},
+                    {"profile": "default", "ports": [4002]},
+                ],
+                "profile_platforms": {
+                    "alice": {"telegram": {"state": "connected"}},
+                    "bob": {"discord": {"state": "connected"}},
+                },
+            }
+
+        profiles_root = self._seed(tmp_path)
+        alice = profiles_root / "alice"
+        monkeypatch.setattr(
+            web_server, "_collect_profile_gateway_topology", _machine_wide_topology
+        )
+
+        with self._client(monkeypatch, isolated=True, hermes_home=str(alice)) as c:
+            r = c.get("/api/status")
+
+        assert r.status_code == 200, r.text
+        body = r.json()
+        # Only the pinned profile's name/ports/platforms surface.
+        assert body["profiles"] == ["alice"], f"leaked: {body['profiles']}"
+        assert body["gateways"] == [{"profile": "alice", "ports": [4000]}]
+        assert "bob" not in json.dumps(body), f"bob leaked into /api/status: {body}"
+        leaked_platforms = [
+            k for k in body.get("gateway_platforms", {}) if "bob" in str(k)
+        ]
+        assert not leaked_platforms, f"bob platforms leaked: {leaked_platforms}"
+        assert "default" not in body["profiles"]
+
+    def test_status_no_query_non_isolated_machine_wide(self, tmp_path, monkeypatch):
+        """Control: with isolation off, plain /api/status keeps reporting the
+        full machine-wide topology (the unified machine dashboard is
+        intentionally cross-profile)."""
+        from hermes_cli import web_server
+
+        def _machine_wide_topology():
+            return {
+                "profiles": ["alice", "bob", "default"],
+                "gateway_mode": "multiple",
+                "gateways": [
+                    {"profile": "alice", "ports": [4000]},
+                    {"profile": "bob", "ports": [4001]},
+                ],
+                "profile_platforms": {},
+            }
+
+        profiles_root = self._seed(tmp_path)
+        alice = profiles_root / "alice"
+        monkeypatch.setattr(
+            web_server, "_collect_profile_gateway_topology", _machine_wide_topology
+        )
+
+        with self._client(monkeypatch, isolated=False, hermes_home=str(alice)) as c:
+            r = c.get("/api/status")
+
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["profiles"] == ["alice", "bob", "default"], body["profiles"]
+        assert len(body["gateways"]) == 2
