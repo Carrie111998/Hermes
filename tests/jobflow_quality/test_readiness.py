@@ -21,15 +21,15 @@ from jobflow_quality.qc import CandidateIdentity
 from jobflow_quality.readiness import submission_block_reason
 
 IDENTITY = CandidateIdentity(
-    full_name="Diego De Aragao", email="diegodearagao@gmail.com"
+    full_name="Alex Morgan Reyes", email="alex.reyes@example.invalid"
 )
 
-RESUME = """# Diego De Aragao, CFA
-> Contact: diegodearagao@gmail.com
+RESUME = """# Alex Morgan Reyes, CFA
+> Contact: alex.reyes@example.invalid
 Executive summary.
 """
-COVER = """Diego De Aragao
-diegodearagao@gmail.com
+COVER = """Alex Morgan Reyes
+alex.reyes@example.invalid
 
 Hiring Manager
 Acme Bank
@@ -56,7 +56,7 @@ class TestCleanPackagesSubmit:
 
 class TestDefectsBlockSubmission:
     def test_a_fabricated_name_blocks(self, tmp_path):
-        d = _pkg(tmp_path, resume=RESUME.replace("Diego De Aragao", "Diego Rodrigues"))
+        d = _pkg(tmp_path, resume=RESUME.replace("Alex Morgan Reyes", "Alex Delgado"))
         reason = submission_block_reason(d, IDENTITY)
         assert reason is not None
         assert "identity_mismatch" in reason
@@ -69,7 +69,7 @@ class TestDefectsBlockSubmission:
 
     def test_the_reason_distinguishes_blocked_from_revise(self, tmp_path):
         blocked = submission_block_reason(
-            _pkg(tmp_path, resume=RESUME.replace("Diego De Aragao", "Diego Rodrigues")),
+            _pkg(tmp_path, resume=RESUME.replace("Alex Morgan Reyes", "Alex Delgado")),
             IDENTITY)
         revise = submission_block_reason(
             _pkg(tmp_path / "b", cover=COVER.replace("Acme Bank", "[Company Name]")),
@@ -100,17 +100,17 @@ class TestFailsClosed:
 
 class TestReasonShape:
     def test_the_reason_is_short_enough_for_a_summary_row(self, tmp_path):
-        d = _pkg(tmp_path, resume=RESUME.replace("Diego De Aragao", "Diego Rodrigues"))
+        d = _pkg(tmp_path, resume=RESUME.replace("Alex Morgan Reyes", "Alex Delgado"))
         assert len(submission_block_reason(d, IDENTITY)) <= 80
 
     def test_the_reason_carries_no_document_text(self, tmp_path):
-        secret = "Diego Rodrigues confidential 450000 package"
-        d = _pkg(tmp_path, resume=RESUME.replace("Diego De Aragao", secret))
+        secret = "Alex Delgado confidential 450000 package"
+        d = _pkg(tmp_path, resume=RESUME.replace("Alex Morgan Reyes", secret))
         assert "450000" not in submission_block_reason(d, IDENTITY)
 
     def test_multiple_defects_report_the_blocking_one_first(self, tmp_path):
         d = _pkg(tmp_path,
-                 resume=RESUME.replace("Diego De Aragao", "Diego Rodrigues"),
+                 resume=RESUME.replace("Alex Morgan Reyes", "Alex Delgado"),
                  cover=COVER.replace("Acme Bank", "[Company Name]"))
         assert submission_block_reason(d, IDENTITY).startswith("qc_blocked:")
 
@@ -121,12 +121,12 @@ class TestIdentityLoading:
 
         master = tmp_path / "master-resume.md"
         master.write_text(
-            "# Master Resume — Diego De Aragao, CFA\n"
-            "> **Contact:** diegodearagao@gmail.com • +1 (929) 381-8907\n",
+            "# Master Resume — Alex Morgan Reyes, CFA\n"
+            "> **Contact:** alex.reyes@example.invalid • +1 (555) 010-1234\n",
             encoding="utf-8")
         ident = load_default_identity(master)
-        assert ident.full_name == "Diego De Aragao"
-        assert ident.email == "diegodearagao@gmail.com"
+        assert ident.full_name == "Alex Morgan Reyes"
+        assert ident.email == "alex.reyes@example.invalid"
 
     def test_a_missing_master_resume_returns_none_rather_than_guessing(self, tmp_path):
         from jobflow_quality.readiness import load_default_identity
@@ -246,7 +246,7 @@ class TestSemanticFindingsBlockSubmission:
         from jobflow_quality.readiness import submission_block_reason
 
         calls = []
-        d = _pkg(tmp_path, resume=RESUME.replace("Diego De Aragao", "Diego Rodrigues"))
+        d = _pkg(tmp_path, resume=RESUME.replace("Alex Morgan Reyes", "Alex Delgado"))
         reason = submission_block_reason(
             d, IDENTITY, invoke=lambda p: calls.append(p) or '{"findings": []}',
             cache_path=tmp_path / "c.json")

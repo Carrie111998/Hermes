@@ -28,9 +28,9 @@ from jobflow_quality.semantic_qc import (
     review,
 )
 
-MASTER = "# Diego De Aragao\nVP Data at Acme Bank 2019-2024. CFA charterholder."
+MASTER = "# Alex Morgan Reyes\nVP Data at Acme Bank 2019-2024. CFA charterholder."
 JD = "Director of Analytics. Requires 10 years in financial services."
-RESUME = "# Diego De Aragao\nVP Data at Acme Bank. Led a team of 12."
+RESUME = "# Alex Morgan Reyes\nVP Data at Acme Bank. Led a team of 12."
 COVER = "Dear Hiring Manager,\nI led analytics at Acme Bank."
 
 

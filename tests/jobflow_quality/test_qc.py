@@ -2,9 +2,9 @@
 
 This is the last gate before a document reaches an employer, and the failure it
 exists to stop is already in the historical data. Three of 428 packages carry a
-fabricated surname across BOTH the resume and the cover letter — "Diego
-Rodrigues", "Diego Resende" — two of them with placeholder emails
-(`diego@email.com`). One cover letter is addressed to `[Company Name]`.
+fabricated surname across BOTH the resume and the cover letter — a wrong
+surname on an otherwise correct first name — two of them with placeholder emails
+(`alex@example.invalid`). One cover letter is addressed to `[Company Name]`.
 
 None of that needs a model to catch. The candidate's name and email are facts,
 and a document that contradicts them is wrong however well written it is. So
@@ -31,18 +31,18 @@ from jobflow_quality.qc import (
 )
 
 IDENTITY = CandidateIdentity(
-    full_name="Diego De Aragao",
-    email="diegodearagao@gmail.com",
+    full_name="Alex Morgan Reyes",
+    email="alex.reyes@example.invalid",
 )
 
-GOOD_RESUME = """# Diego De Aragao, CFA, CTP, FDP
-> Contact: diegodearagao@gmail.com
+GOOD_RESUME = """# Alex Morgan Reyes, CFA, CTP, FDP
+> Contact: alex.reyes@example.invalid
 ## Professional Summary
 Executive with a track record in financial technology.
 """
 
-GOOD_COVER = """Diego De Aragao
-diegodearagao@gmail.com
+GOOD_COVER = """Alex Morgan Reyes
+alex.reyes@example.invalid
 
 Hiring Manager
 Acme Bank
@@ -85,30 +85,30 @@ class TestFabricatedIdentityIsBlocked:
     """The defect actually found in production. Not revisable — blocked."""
 
     def test_a_wrong_surname_blocks(self, tmp_path):
-        bad = GOOD_RESUME.replace("Diego De Aragao", "Diego Rodrigues")
+        bad = GOOD_RESUME.replace("Alex Morgan Reyes", "Alex Delgado")
         r = check_application(_package(tmp_path, resume=bad), IDENTITY)
         assert r.status is QCStatus.BLOCKED
         assert any(f.code is QCFinding.IDENTITY_MISMATCH for f in r.findings)
 
     def test_a_placeholder_email_blocks(self, tmp_path):
-        bad = GOOD_RESUME.replace("diegodearagao@gmail.com", "diego@email.com")
+        bad = GOOD_RESUME.replace("alex.reyes@example.invalid", "alex@example.invalid")
         r = check_application(_package(tmp_path, resume=bad), IDENTITY)
         assert r.status is QCStatus.BLOCKED
 
     def test_a_wrong_identity_in_the_cover_letter_alone_still_blocks(self, tmp_path):
-        bad = GOOD_COVER.replace("Diego De Aragao", "Diego Resende")
+        bad = GOOD_COVER.replace("Alex Morgan Reyes", "Alex Fontaine")
         r = check_application(_package(tmp_path, cover=bad), IDENTITY)
         assert r.status is QCStatus.BLOCKED
 
     def test_the_finding_names_the_offending_artifact(self, tmp_path):
-        bad = GOOD_COVER.replace("Diego De Aragao", "Diego Resende")
+        bad = GOOD_COVER.replace("Alex Morgan Reyes", "Alex Fontaine")
         r = check_application(_package(tmp_path, cover=bad), IDENTITY)
         finding = next(f for f in r.findings if f.code is QCFinding.IDENTITY_MISMATCH)
         assert finding.artifact == "cover-letter.md"
 
     def test_identity_matching_tolerates_credentials_and_case(self, tmp_path):
-        """`DIEGO DE ARAGAO, CFA` is the same person. Blocking that is a false alarm."""
-        ok = GOOD_RESUME.replace("Diego De Aragao, CFA, CTP, FDP", "DIEGO DE ARAGAO, CFA")
+        """`ALEX MORGAN REYES, CFA` is the same person. Blocking that is a false alarm."""
+        ok = GOOD_RESUME.replace("Alex Morgan Reyes, CFA, CTP, FDP", "ALEX MORGAN REYES, CFA")
         r = check_application(_package(tmp_path, resume=ok), IDENTITY)
         assert r.status is QCStatus.PASS
 
@@ -133,7 +133,7 @@ class TestFabricatedIdentityIsBlocked:
 
     def test_a_foreign_email_inside_the_identity_block_still_blocks(self, tmp_path):
         """The other side of the same boundary — the header is authoritative."""
-        bad = GOOD_COVER.replace("diegodearagao@gmail.com", "recruiter@agency.com")
+        bad = GOOD_COVER.replace("alex.reyes@example.invalid", "recruiter@agency.com")
         r = check_application(_package(tmp_path, cover=bad), IDENTITY)
         assert r.status is QCStatus.BLOCKED
 
@@ -187,7 +187,7 @@ class TestStaleRendering:
 
 class TestSeverityOrdering:
     def test_a_block_outranks_a_revise(self, tmp_path):
-        bad_resume = GOOD_RESUME.replace("Diego De Aragao", "Diego Rodrigues")
+        bad_resume = GOOD_RESUME.replace("Alex Morgan Reyes", "Alex Delgado")
         bad_cover = GOOD_COVER.replace("Acme Bank", "[Company Name]")
         r = check_application(_package(tmp_path, resume=bad_resume, cover=bad_cover),
                               IDENTITY)
@@ -215,7 +215,7 @@ class TestReadinessIsBoundToTheBytesThatWereChecked:
         assert is_ready(result, d) is False
 
     def test_a_failing_verdict_is_never_ready(self, tmp_path):
-        bad = GOOD_RESUME.replace("Diego De Aragao", "Diego Rodrigues")
+        bad = GOOD_RESUME.replace("Alex Morgan Reyes", "Alex Delgado")
         d = _package(tmp_path, resume=bad)
         assert is_ready(check_application(d, IDENTITY), d) is False
 
@@ -228,7 +228,7 @@ class TestReadinessIsBoundToTheBytesThatWereChecked:
 
 class TestContract:
     def test_findings_are_bounded_codes(self, tmp_path):
-        bad = GOOD_RESUME.replace("Diego De Aragao", "Diego Rodrigues")
+        bad = GOOD_RESUME.replace("Alex Morgan Reyes", "Alex Delgado")
         r = check_application(_package(tmp_path, resume=bad), IDENTITY)
         assert all(isinstance(f.code, QCFinding) for f in r.findings)
 
@@ -243,9 +243,9 @@ class TestContract:
 
     def test_no_artifact_body_leaks_into_a_finding(self, tmp_path):
         """Findings travel in messages; the resume must not travel with them."""
-        secret = "Diego Rodrigues negotiated a confidential 450000 package"
+        secret = "Alex Delgado negotiated a confidential 450000 package"
         r = check_application(_package(tmp_path, resume=GOOD_RESUME.replace(
-            "Diego De Aragao", secret)), IDENTITY)
+            "Alex Morgan Reyes", secret)), IDENTITY)
         assert all("450000" not in f.detail for f in r.findings)
 
 
@@ -260,18 +260,18 @@ class TestNameMayLiveInTheSignOff:
 
     def test_a_name_only_in_the_sign_off_passes(self, tmp_path):
         cover = (
-            "St. Petersburg, FL | diegodearagao@gmail.com\n\n"
+            "Springfield, IL | alex.reyes@example.invalid\n\n"
             "Hiring Manager\nAcme Bank\n\n"
             + ("I am a strong fit for this role. " * 60)
-            + "\n\nSincerely,\nDiego De Aragao\n"
+            + "\n\nSincerely,\nAlex Morgan Reyes\n"
         )
         r = check_application(_package(tmp_path, cover=cover), IDENTITY)
         assert r.status is QCStatus.PASS
 
     def test_a_name_absent_everywhere_still_blocks(self, tmp_path):
         cover = (
-            "St. Petersburg, FL | diegodearagao@gmail.com\n\n"
-            "Hiring Manager\nAcme Bank\n\nSincerely,\nDiego Rodrigues\n"
+            "Springfield, IL | alex.reyes@example.invalid\n\n"
+            "Hiring Manager\nAcme Bank\n\nSincerely,\nAlex Delgado\n"
         )
         r = check_application(_package(tmp_path, cover=cover), IDENTITY)
         assert r.status is QCStatus.BLOCKED
