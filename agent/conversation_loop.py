@@ -101,6 +101,10 @@ from agent.prompt_caching import (
     strip_anthropic_tool_cache_control,
 )
 from agent.turn_response import normalize_turn_response
+from agent.tool_call_validation import (
+    normalize_and_validate_tool_arguments,
+    validate_tool_call_names,
+)
 from agent.retry_utils import (
     adaptive_rate_limit_backoff,
     is_zai_coding_overload_error,
@@ -6183,26 +6187,10 @@ def run_conversation(
                         args_preview = raw_args[:200] if isinstance(raw_args, str) else repr(raw_args)[:200]
                         logging.debug("Tool call: %s with args: %s...", tc.function.name, args_preview)
                 
-                # Uniquify duplicate tool-call ids BEFORE any downstream
-                # consumer (validation error paths, dispatch, history build,
-                # Responses item-id derivation). Models that reuse one id for
-                # different calls in a batch otherwise lose the later call's
-                # result: the pre-API sanitizer keeps only the first
-                # call/result pair per id. See _uniquify_tool_call_ids.
-                agent._uniquify_tool_call_ids(assistant_message.tool_calls)
-
-                # Validate tool call names - detect model hallucinations
-                # Repair mismatched tool names before validating
-                for tc in assistant_message.tool_calls:
-                    if tc.function.name not in agent.valid_tool_names:
-                        repaired = agent._repair_tool_call(tc.function.name)
-                        if repaired:
-                            print(f"{agent.log_prefix}🔧 Auto-repaired tool name: '{tc.function.name}' -> '{repaired}'")
-                            tc.function.name = repaired
-                invalid_tool_calls = [
-                    tc.function.name for tc in assistant_message.tool_calls
-                    if tc.function.name not in agent.valid_tool_names
-                ]
+                name_validation = validate_tool_call_names(
+                    agent, assistant_message.tool_calls
+                )
+                invalid_tool_calls = name_validation.invalid_names
                 # Mixed batch: at least one valid call alongside the invalid
                 # one(s). Degrading models (observed with gpt-5.6 at very
                 # large context) emit batches like 6 named calls + 1
@@ -6214,10 +6202,7 @@ def run_conversation(
                 # when a turn contains NO valid call, so a fully-degenerate
                 # model still halts at 3 while a mostly-coherent one keeps
                 # working.
-                _mixed_invalid_batch = bool(invalid_tool_calls) and any(
-                    tc.function.name in agent.valid_tool_names
-                    for tc in assistant_message.tool_calls
-                )
+                _mixed_invalid_batch = name_validation.mixed_invalid_batch
                 if _mixed_invalid_batch:
                     agent._invalid_tool_retries = 0
                     invalid_name = invalid_tool_calls[0]
@@ -6281,33 +6266,12 @@ def run_conversation(
                 # Reset retry counter on successful tool call validation
                 agent._invalid_tool_retries = 0
                 
-                # Validate tool call arguments are valid JSON
-                # Handle empty strings as empty objects (common model quirk)
-                invalid_json_args = []
-                for tc in assistant_message.tool_calls:
-                    args = tc.function.arguments
-                    if isinstance(args, (dict, list)):
-                        tc.function.arguments = json.dumps(args)
-                        continue
-                    if args is not None and not isinstance(args, str):
-                        tc.function.arguments = str(args)
-                        args = tc.function.arguments
-                    # Treat empty/whitespace strings as empty object
-                    if not args or not args.strip():
-                        tc.function.arguments = "{}"
-                        continue
-                    try:
-                        json.loads(args)
-                    except json.JSONDecodeError as e:
-                        if (
-                            _mixed_invalid_batch
-                            and tc.function.name not in agent.valid_tool_names
-                        ):
-                            # This call never executes — it gets an
-                            # invalid-name error result below. Don't let its
-                            # broken args trigger the whole-turn JSON retry.
-                            continue
-                        invalid_json_args.append((tc.function.name, str(e)))
+                argument_validation = normalize_and_validate_tool_arguments(
+                    assistant_message.tool_calls,
+                    valid_tool_names=agent.valid_tool_names,
+                    mixed_invalid_batch=_mixed_invalid_batch,
+                )
+                invalid_json_args = argument_validation.invalid_arguments
                 
                 if invalid_json_args:
                     # Check if the invalid JSON is due to truncation rather
@@ -6316,11 +6280,7 @@ def run_conversation(
                     # hiding the truncation from the length handler above.
                     # Detect truncation: args that don't end with } or ]
                     # (after stripping whitespace) are cut off mid-stream.
-                    _truncated = any(
-                        not (tc.function.arguments or "").rstrip().endswith(("}", "]"))
-                        for tc in assistant_message.tool_calls
-                        if tc.function.name in {n for n, _ in invalid_json_args}
-                    )
+                    _truncated = argument_validation.truncated
                     if _truncated:
                         agent._vprint(
                             f"{agent.log_prefix}⚠️  Truncated tool call arguments detected "
