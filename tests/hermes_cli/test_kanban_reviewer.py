@@ -40,8 +40,18 @@ def test_valid_correction_is_idempotent_and_linked(conn):
     second = submit_reviewer_result(conn, tid, valid())
     assert first["correction_task_id"] == second["correction_task_id"]
     child = first["correction_task_id"]
-    assert kb.parent_ids(conn, child) == [tid]
-    assert len([e for e in kb.list_events(conn, tid) if e.kind == "reviewer_correction_created"]) == 2
+    assert kb.parent_ids(conn, child) == []
+    child_task = kb.get_task(conn, child)
+    assert child_task is not None and child_task.status == "ready"
+    created = [e for e in kb.list_events(conn, tid) if e.kind == "reviewer_correction_created"]
+    reused = [e for e in kb.list_events(conn, tid) if e.kind == "reviewer_correction_reused"]
+    assert len(created) == 1 and (created[0].payload or {})["correction_task_id"] == child
+    assert len(reused) == 1 and (reused[0].payload or {})["correction_task_id"] == child
+    assert all(
+        "payload" not in (e.payload or {})
+        for e in kb.list_events(conn, tid)
+        if e.kind.startswith("reviewer_")
+    )
 
 
 def test_invalid_result_only_audits_and_does_not_mutate_graph(conn):
@@ -83,4 +93,6 @@ def test_injected_audit_failure_recovers_idempotently(conn, monkeypatch):
         submit_reviewer_result(conn, tid, valid())
     retry = submit_reviewer_result(conn, tid, valid())
     assert retry["correction_task_id"] is not None
-    assert len(kb.child_ids(conn, tid)) == 1
+    child = kb.get_task(conn, retry["correction_task_id"])
+    assert child is not None and child.status == "ready"
+    assert not kb.parent_ids(conn, child.id)

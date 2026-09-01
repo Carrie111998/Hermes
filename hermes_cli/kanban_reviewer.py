@@ -104,7 +104,15 @@ def submit_reviewer_result(conn, task_id: str, payload: Mapping[str, Any], *, re
         return {"accepted": False, "reason": "unknown task", "verdict": result.verdict}
     canonical = _canonical(result)
     digest = hashlib.sha256(canonical.encode()).hexdigest()[:24]
-    base = {"schema_version": 1, "verdict": result.verdict, "reviewer": reviewer, "payload": json.loads(canonical), "payload_digest": digest}
+    # Keep the durable audit record to the digest and routing metadata.  The
+    # reviewer's canonical payload can contain arbitrary free-form text and is
+    # not needed to prove what was submitted.
+    base = {
+        "schema_version": 1,
+        "verdict": result.verdict,
+        "reviewer": reviewer,
+        "payload_digest": digest,
+    }
     if result.verdict == "APPROVED":
         if task.status != "done":
             kb.complete_task(conn, task_id, summary=result.summary, result="approved")
@@ -115,13 +123,31 @@ def submit_reviewer_result(conn, task_id: str, payload: Mapping[str, Any], *, re
             kb.block_task(conn, task_id, reason=result.ambiguity_or_blocker_reason or result.summary, kind="needs_input")
         _audit(conn, task_id, "reviewer_result_blocked", base)
         return {"accepted": True, "verdict": result.verdict, "task_id": task_id, "correction_task_id": None}
+    key = f"reviewer-correction:{task_id}:{digest}"
+    existing = conn.execute(
+        "SELECT id FROM tasks WHERE idempotency_key = ? AND status != 'archived' ORDER BY created_at DESC LIMIT 1",
+        (key,),
+    ).fetchone()
+    if existing:
+        _audit(conn, task_id, "reviewer_correction_reused", {**base, "correction_task_id": existing["id"]})
+        return {
+            "accepted": True,
+            "verdict": result.verdict,
+            "task_id": task_id,
+            "correction_task_id": existing["id"],
+            "cycle": None,
+            "reused": True,
+        }
     prior = conn.execute("SELECT COUNT(*) AS n FROM task_events WHERE task_id = ? AND kind = 'reviewer_correction_created'", (task_id,)).fetchone()["n"]
     if prior >= MAX_CORRECTION_CYCLES:
         kb.block_task(conn, task_id, reason="maximum reviewer correction cycles reached", kind="needs_input")
         _audit(conn, task_id, "reviewer_result_escalated", {**base, "cycle": prior})
         return {"accepted": True, "verdict": result.verdict, "task_id": task_id, "correction_task_id": None, "escalated": True}
-    key = f"reviewer-correction:{task_id}:{digest}"
-    correction = kb.create_task(conn, title=f"Correction for {task.title}", body=result.summary, assignee=task.assignee or "builder", parents=[task_id], idempotency_key=key)
+    # This is an independently runnable correction.  The reviewed task is
+    # deliberately not a gating parent: CHANGES_REQUESTED is submitted while
+    # that task is still open.  The reviewed-task -> correction reference is
+    # retained in the audit event below.
+    correction = kb.create_task(conn, title=f"Correction for {task.title}", body=result.summary, assignee=task.assignee or "builder", idempotency_key=key)
     _audit(conn, task_id, "reviewer_correction_created", {**base, "cycle": prior + 1, "correction_task_id": correction})
     return {"accepted": True, "verdict": result.verdict, "task_id": task_id, "correction_task_id": correction, "cycle": prior + 1}
 
