@@ -873,6 +873,55 @@ def _pip_install(
     venv_root = Path(sys.executable).parent.parent
     uv_env = {**os.environ, "VIRTUAL_ENV": str(venv_root)}
 
+    # Durable-target mode (immutable images): when HERMES_LAZY_INSTALL_TARGET
+    # is set (e.g. /opt/data/lazy-packages on the Docker image) the agent
+    # venv itself is read-only — installs must go to the writable data-volume
+    # dir via --target. Without this, post-setup hooks like `hermes tools
+    # post-setup ddgs` try to write into the sealed venv and fail with a
+    # read-only filesystem error, and even a manual install elsewhere would
+    # not be on sys.path (see #100610).
+    lazy_target: Optional[Path] = None
+    lazy_target_args: List[str] = []
+    constraint_args: List[str] = []
+    constraints_file: Optional[Path] = None
+    raw_target = os.environ.get("HERMES_LAZY_INSTALL_TARGET", "").strip()
+    if raw_target:
+        lazy_target = Path(raw_target)
+        # Reuse the canonical helpers from tools.lazy_deps so ABI stamps,
+        # dir creation, and constraint pinning stay in one place.
+        try:
+            from tools.lazy_deps import (
+                _core_constraints_file,
+                _ensure_target_ready,
+                _activate_target_on_syspath,
+            )
+
+            err = _ensure_target_ready(lazy_target)
+            if err:
+                return subprocess.CompletedProcess(
+                    [sys.executable, "-m", "pip"],
+                    returncode=1,
+                    stdout="",
+                    stderr=err,
+                )
+            lazy_target_args = ["--target", str(lazy_target)]
+            # Pin shared deps to the core venv so the durable store stays
+            # minimal and resolver conflicts surface loudly.
+            try:
+                constraints_file = _core_constraints_file()
+                if constraints_file is not None:
+                    constraint_args = ["--constraint", str(constraints_file)]
+            except Exception:
+                pass
+        except Exception:
+            # If lazy_deps helpers unavailable, fall back to a minimal
+            # --target install without constraints.
+            try:
+                lazy_target.mkdir(parents=True, exist_ok=True)
+            except Exception:
+                pass
+            lazy_target_args = ["--target", str(lazy_target)]
+
     # Managed uv first: $HERMES_HOME/bin is never on PATH, so a bare which()
     # misses the uv Hermes installed and prefers a system one when both exist.
     # ensure_uv() rather than a pure lookup because this runs during setup,
@@ -885,7 +934,7 @@ def _pip_install(
     if uv_bin:
         try:
             result = subprocess.run(
-                [uv_bin, "pip", "install", *args],
+                [uv_bin, "pip", "install", *lazy_target_args, *constraint_args, *args],
                 capture_output=capture_output, text=True, encoding="utf-8", errors="replace", timeout=timeout,
                 env=uv_env,
                 creationflags=_post_setup_no_window_flags(
@@ -893,6 +942,13 @@ def _pip_install(
                 ),
             )
             if result.returncode == 0:
+                if lazy_target is not None:
+                    try:
+                        from tools.lazy_deps import _activate_target_on_syspath
+
+                        _activate_target_on_syspath(lazy_target)
+                    except Exception:
+                        pass
                 return result
             # Fall through to pip — uv may have failed for an unrelated reason
             # (resolution conflict, network), and pip might handle it.
@@ -923,13 +979,27 @@ def _pip_install(
                 stderr=f"pip not available and ensurepip failed: {e}",
             )
 
-    return subprocess.run(
-        pip_cmd + ["install", *args],
+    result = subprocess.run(
+        pip_cmd + ["install", *lazy_target_args, *constraint_args, *args],
         capture_output=capture_output, text=True, encoding="utf-8", errors="replace", timeout=timeout,
         creationflags=_post_setup_no_window_flags(
             streams_to_console=not capture_output
         ),
     )
+    if result.returncode == 0 and lazy_target is not None:
+        try:
+            from tools.lazy_deps import _activate_target_on_syspath
+
+            _activate_target_on_syspath(lazy_target)
+        except Exception:
+            pass
+    # Clean up temporary constraints file if we created one.
+    if constraints_file is not None:
+        try:
+            constraints_file.unlink(missing_ok=True)
+        except Exception:
+            pass
+    return result
 
 
 
