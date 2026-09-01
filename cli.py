@@ -22030,6 +22030,9 @@ def main(
         # takes the deterministic approvals.single_query_mode path instead of
         # waiting the full timeout. See #86878.
         os.environ["HERMES_SINGLE_QUERY_SESSION"] = "1"
+        from gateway.session_context import declare_stateless_channel
+
+        declare_stateless_channel()
         if not cli._claim_active_session("cli", stderr=bool(quiet)):
             sys.exit(1)
         try:

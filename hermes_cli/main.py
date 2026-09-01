@@ -3151,15 +3151,16 @@ def _resolve_use_tui(args) -> bool:
     Precedence (highest first):
       1. ``--cli`` flag         → always classic REPL
       2. ``--tui`` flag         → always TUI (explicit ask)
-      3. no TTY                 → always classic (ambient prefs don't apply)
-      4. ``HERMES_TUI=1`` env   → TUI
-      5. ``display.interface`` config value ("cli" | "tui")
-      6. default → classic REPL
+      3. ``--query-file``       → always classic single-query
+      4. no TTY                 → always classic (ambient prefs don't apply)
+      5. ``HERMES_TUI=1`` env   → TUI
+      6. ``display.interface`` config value ("cli" | "tui")
+      7. default → classic REPL
 
     Explicit flags always win over config so muscle memory and scripts keep
     working regardless of the configured default.
 
-    The TTY gate (3) is load-bearing: ambient TUI preferences (env var or
+    The TTY gate (4) is load-bearing: ambient TUI preferences (env var or
     config default) must never hijack a NON-interactive invocation. Kanban
     workers, cron jobs, and pipelines run ``hermes … chat -q`` with stdout
     on a pipe; booting the Ink TUI there hits its no-TTY bail-out, which
@@ -3172,6 +3173,8 @@ def _resolve_use_tui(args) -> bool:
         return False
     if getattr(args, "tui", False):
         return True
+    if getattr(args, "query_file", None):
+        return False
     try:
         if not (sys.stdin.isatty() and sys.stdout.isatty()):
             return False
@@ -3500,7 +3503,7 @@ def cmd_chat(args):
         "verbose": getattr(args, "verbose", None),
         "quiet": getattr(args, "quiet", False),
         "query": args.query,
-        "oneshot": bool(getattr(args, "oneshot_exit", False)),
+        "oneshot": bool(_qfile or getattr(args, "oneshot_exit", False)),
         "image": getattr(args, "image", None),
         "resume": getattr(args, "resume", None),
         "worktree": getattr(args, "worktree", False),

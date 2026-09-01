@@ -378,9 +378,9 @@ def build_top_level_parser():
         # prompt. `oneshot_exit` keeps the surfaces independent.
         default=False,
         help=(
-            "With -q/--query-file: answer the query and exit (legacy "
-            "single-query behavior) instead of seeding an interactive "
-            "session. Implied on non-TTY stdio and by -Q/--quiet."
+            "With -q: answer the query and exit (legacy single-query "
+            "behavior) instead of seeding an interactive session. Implied "
+            "by --query-file, non-TTY stdio, and -Q/--quiet."
         ),
     )
     chat_parser.add_argument(
