@@ -1473,16 +1473,32 @@ clone_repo() {
             # every ref, and this repo carries thousands of auto-generated
             # branches — on a non-single-branch checkout that turns each update
             # into a multi-minute download that can stall the installer.
+            #
+            # `git fetch origin <name>` stores the result ONLY in FETCH_HEAD;
+            # for a TAG it does not create refs/tags/<name>, so the checkout
+            # below then dies with "pathspec '<tag>' did not match any file(s)
+            # known to git" when updating an existing clone to a tag it does
+            # not already hold (#100222). Detect the tag case up front and
+            # fetch it with an explicit refspec so the local ref exists.
             git remote set-branches origin "$BRANCH" 2>/dev/null || true
-            git fetch origin "$BRANCH"
-            git checkout "$BRANCH"
-            # Managed installs should follow origin/$BRANCH exactly. If the
-            # checkout has diverged (or has local-only commits), ff-only pull
-            # cannot succeed — mirror ``hermes update`` and reset to the
-            # fetched remote so bootstrap/install can recover.
-            if ! git pull --ff-only origin "$BRANCH"; then
-                log_warn "Fast-forward not possible; resetting managed install to origin/$BRANCH..."
-                git reset --hard "origin/$BRANCH"
+            if git ls-remote --exit-code --tags origin "refs/tags/$BRANCH" >/dev/null 2>&1; then
+                # Target is a tag: materialize refs/tags/<tag> locally.
+                # --force so a moved tag (retagged release) still updates.
+                git fetch --force origin "refs/tags/${BRANCH}:refs/tags/${BRANCH}"
+                git checkout --detach "refs/tags/${BRANCH}"
+                # A tag is a fixed point — no pull/reset follow-up (the
+                # branch-tracking block below would fail on origin/<tag>).
+            else
+                git fetch origin "$BRANCH"
+                git checkout "$BRANCH"
+                # Managed installs should follow origin/$BRANCH exactly. If the
+                # checkout has diverged (or has local-only commits), ff-only pull
+                # cannot succeed — mirror ``hermes update`` and reset to the
+                # fetched remote so bootstrap/install can recover.
+                if ! git pull --ff-only origin "$BRANCH"; then
+                    log_warn "Fast-forward not possible; resetting managed install to origin/$BRANCH..."
+                    git reset --hard "origin/$BRANCH"
+                fi
             fi
 
             if [ -n "$autostash_ref" ]; then
