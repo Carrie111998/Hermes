@@ -12307,6 +12307,13 @@ def _default_spawn(
 
     prompt = f"work kanban task {task.id}"
     env = dict(os.environ)
+    # The target checkout is intentionally the worker's cwd so terminal and
+    # file operations act on the assigned PR worktree.  Python otherwise puts
+    # that cwd ahead of Hermes' installed source, allowing a target-repo
+    # module such as ``utils.py`` to shadow Hermes' own absolute imports.
+    # Safe-path mode preserves the cwd for tools while keeping Python imports
+    # on the Hermes runtime path (PEP 安全-path / PYTHONSAFEPATH).
+    env["PYTHONSAFEPATH"] = "1"
     # The dispatcher is detached from every conversation. Its worker must never
     # inherit routing mirrored by a previous gateway turn, even before the first
     # session binds ContextVars in this process.
