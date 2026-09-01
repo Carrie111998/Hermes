@@ -1300,11 +1300,17 @@ def _resolve_named_custom_runtime(
         matched_provider = _find_custom_provider_by_base_url(base_url)
         _da_is_openai_url   = base_url_host_matches(base_url, "openai.com") or base_url_host_matches(base_url, "openai.azure.com")
         _da_is_openrouter   = base_url_host_matches(base_url, "openrouter.ai")
+        _da_is_ollama_url   = base_url_host_matches(base_url, "ollama.com")
         api_key_candidates = [
             (explicit_api_key or "").strip(),
             str((matched_provider or {}).get("api_key", "") or "").strip(),
             os.getenv(str((matched_provider or {}).get("key_env", "") or "").strip(), "").strip(),
             # Gate env key fallbacks on authoritative hosts (#28660)
+            # OLLAMA_API_KEY needs its own gate here: _host_derived_api_key
+            # deliberately skips it, expecting an explicit host-matched path
+            # like this one (GHSA-76xc-57q6-vm5m). Without it a `model_aliases:`
+            # entry pointing at Ollama Cloud resolved no key at all.
+            (_getenv("OLLAMA_API_KEY", "").strip()     if _da_is_ollama_url else ""),
             (_getenv("OPENAI_API_KEY", "").strip()     if _da_is_openai_url else ""),
             (_getenv("OPENROUTER_API_KEY", "").strip() if _da_is_openrouter  else ""),
             # Bonus (#28660): derive `<VENDOR>_API_KEY` from the host so users
