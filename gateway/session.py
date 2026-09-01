@@ -817,10 +817,10 @@ class SessionEntry:
     reset_had_activity: bool = False  # whether the expired session had any messages
 
     # When this session was created by an auto-reset, the session_id of the
-    # session it replaced.  Used to give Slack/Discord channels/threads a
-    # lightweight continuity hint (see build_channel_continuity_note) so the
-    # agent recalls the prior same-channel session via session_search instead
-    # of binding the request to an unrelated recent session.
+    # session it replaced. Used to give messaging conversations a lightweight
+    # continuity hint (see build_channel_continuity_note) so the agent recalls
+    # the prior same-origin session via session_search instead of binding the
+    # request to an unrelated recent session.
     prev_session_id: Optional[str] = None
 
     # Set by reset_session() when the user explicitly sends /new or /reset.
@@ -1010,32 +1010,32 @@ def build_channel_continuity_note(
     entry: "SessionEntry",
     source: SessionSource,
 ) -> Optional[str]:
-    """Build a lightweight session-continuity hint for Slack/Discord channels.
+    """Build a lightweight continuity hint after an automatic session reset.
 
-    Slack and Discord channels/threads are long-lived: when the daily/idle
-    reset policy starts a fresh session, the agent loses the thread's prior
-    context and can mistakenly bind a new request to an unrelated recent
-    session.  This deterministic one-line hint points the agent at the
-    specific prior session in *this* channel/thread so it recalls that
-    context via ``session_search`` before acting.
+    Messaging conversations are long-lived even when their backing Hermes
+    sessions rotate.  This deterministic one-line hint points the agent at
+    the specific prior session for the same conversation so it can recall
+    that context via ``session_search`` before acting.
 
     Returns ``None`` (and the caller adds nothing) unless **all** hold:
-      - the source platform is Slack or Discord,
       - this session was created by an auto-reset that had real activity,
       - the previous session_id was recorded on the entry.
 
     No LLM calls, no extra API/DB lookups — the previous session id is
     already known from :meth:`SessionStore.get_or_create_session`.
     """
-    if source.platform not in (Platform.SLACK, Platform.DISCORD):
-        return None
     if not getattr(entry, "reset_had_activity", False):
         return None
     prev = getattr(entry, "prev_session_id", None)
     if not prev:
         return None
 
-    where = "thread" if source.thread_id else "channel"
+    if source.thread_id:
+        where = "thread"
+    elif source.chat_type == "dm":
+        where = "conversation"
+    else:
+        where = "channel"
     return (
         f"[System note: This {where} had an earlier Hermes session "
         f"(session_id: {prev}) that was auto-reset. If the user refers to "
@@ -2608,6 +2608,25 @@ class SessionStore:
                     "Session DB promote_to_session_reset failed for %s: %s",
                     entry.session_id, exc,
                 )
+
+    def finalize_expired_session(
+        self, entry: SessionEntry, *, clear_model_override: bool = True
+    ) -> Optional[SessionEntry]:
+        """Finalize *entry* and publish its live routing successor.
+
+        The expiry watcher previously ended the SQLite row but left the
+        routing entry pointing at it.  Out-of-band deliveries then fell back
+        to that stale sessions.json entry until the next inbound message
+        lazily created a successor.  Rotate immediately so delivery mirrors
+        resolve to a live row during that gap.  Legacy entries without an
+        origin cannot be recreated safely and retain the old behavior.
+        """
+        self.set_expiry_finalized(
+            entry, clear_model_override=clear_model_override
+        )
+        if entry.origin is None:
+            return None
+        return self.get_or_create_session(entry.origin, touch_activity=False)
     
     def _is_session_expired(self, entry: SessionEntry) -> bool:
         """Check if a session has expired based on its reset policy.

@@ -15132,11 +15132,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         self._clear_conversation_scope(
                             key, reason="expiry_finalized"
                         )
-                        # Persist the finalized flag to sessions.json AND
-                        # state.db (single write-path, #9006) — also drops
-                        # the persisted /model override, since finalization
-                        # is a conversation boundary.
-                        await self.async_session_store.set_expiry_finalized(entry)
+                        # Persist the finalization boundary and immediately
+                        # publish the successor routing row. Otherwise cron /
+                        # send_message mirrors keep targeting the ended row
+                        # until a later inbound message lazily rotates it.
+                        await self.async_session_store.finalize_expired_session(entry)
                         logger.debug(
                             "Session expiry finalized for %s",
                             entry.session_id,
@@ -15151,7 +15151,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 "Marking as finalized to prevent infinite retry loop.",
                                 failures, entry.session_id, e,
                             )
-                            await self.async_session_store.set_expiry_finalized(
+                            await self.async_session_store.finalize_expired_session(
                                 entry, clear_model_override=False
                             )
                             _finalize_failures.pop(entry.session_id, None)
@@ -20682,11 +20682,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 context_note = "[System note: The previous gateway session could not be recovered after a restart (API recovery timed out). This is a fresh conversation — use /resume to restore history if needed.]"
             else:
                 context_note = "[System note: The user's previous session expired due to inactivity. This is a fresh conversation with no prior context.]"
-            # Slack/Discord channels/threads are long-lived: point the agent at
-            # the specific prior same-channel session so it recalls that context
-            # via session_search instead of an unrelated recent session.  Returns
-            # None (appends nothing) for other platforms or when there's no prior
-            # activity to recall.  Deterministic — no extra API/DB calls (#36220).
+            # Messaging surfaces outlive their backing Hermes sessions. Point
+            # the agent at the specific prior conversation so it can recover
+            # referenced context via session_search. Deterministic — no extra
+            # API/DB calls (#36220).
             try:
                 continuity_note = build_channel_continuity_note(session_entry, source)
             except Exception:

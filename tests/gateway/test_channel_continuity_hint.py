@@ -1,12 +1,13 @@
-"""Tests for the lightweight Slack/Discord channel session-continuity hint.
+"""Tests for automatic-reset routing and session-continuity hints.
 
 Salvaged from PR #36220 (metamon-p), ported onto the current SessionStore.
 
 Covers:
 - SessionStore records the previous session_id on auto-reset (and only then).
 - prev_session_id survives a to_dict() → from_dict() roundtrip (gateway restart).
-- build_channel_continuity_note() emits a hint only for Slack/Discord sessions
-  that were auto-reset with real prior activity, and stays silent otherwise.
+- Expiry finalization immediately publishes a live routing successor.
+- build_channel_continuity_note() covers messaging surfaces that were
+  auto-reset with real prior activity, and stays silent otherwise.
 """
 
 from datetime import datetime, timedelta
@@ -48,6 +49,15 @@ def _slack_source(thread_id=None):
     )
 
 
+def _telegram_source():
+    return SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="12345",
+        chat_type="dm",
+        user_id="12345",
+    )
+
+
 # ---------------------------------------------------------------------------
 # SessionStore records prev_session_id on auto-reset
 # ---------------------------------------------------------------------------
@@ -68,6 +78,30 @@ class TestPrevSessionIdCapture:
         assert entry2.was_auto_reset is True
         assert entry2.reset_had_activity is True
         assert entry2.prev_session_id == entry1.session_id
+
+    def test_expiry_finalization_rotates_to_live_successor(
+        self, _isolated_db, tmp_path
+    ):
+        from gateway.mirror import _find_session_id
+
+        store = _make_store(
+            tmp_path, SessionResetPolicy(mode="idle", idle_minutes=1)
+        )
+        source = _telegram_source()
+        expired = store.get_or_create_session(source)
+        expired.last_prompt_tokens = 4000
+        expired.updated_at = datetime.now() - timedelta(minutes=5)
+        store._save()
+
+        successor = store.finalize_expired_session(expired)
+
+        assert successor is not None
+        assert successor.session_id != expired.session_id
+        assert successor.prev_session_id == expired.session_id
+        assert successor.was_auto_reset is True
+        assert store._db.get_session(expired.session_id)["ended_at"] is not None
+        assert store._db.get_session(successor.session_id)["ended_at"] is None
+        assert _find_session_id("telegram", "12345") == successor.session_id
 
 
 # ---------------------------------------------------------------------------
@@ -96,6 +130,14 @@ class TestBuildChannelContinuityNote:
         assert "session_search" in note
         assert entry.prev_session_id in note
         assert "channel" in note
+
+    def test_telegram_dm_emits_hint(self):
+        entry = _reset_entry(Platform.TELEGRAM)
+        note = build_channel_continuity_note(entry, _telegram_source())
+        assert note is not None
+        assert "session_search" in note
+        assert entry.prev_session_id in note
+        assert "conversation" in note
 
 
     def test_no_activity_returns_none(self):

@@ -148,6 +148,9 @@ async def test_idle_expiry_fires_finalize_hook(mock_invoke_hook):
         f"on_session_finalize was not fired during idle expiry; "
         f"got session_ids={session_ids} (regression of #14981)"
     )
+    runner.session_store.finalize_expired_session.assert_called_once_with(
+        expired_entry
+    )
 
 
 @pytest.mark.asyncio
