@@ -8602,7 +8602,44 @@ _DEFAULT_AUX_TIMEOUT = 30.0
 # per-call ``timeout=``.  A floor is harmless for fast compression models
 # (they finish before the deadline) and is a minimum, so a higher config value
 # is kept unchanged.
+#
+# The flat floor covers connect + prompt ingestion + reasoning before the first
+# summary token, but NOT the summary itself: the compressor asks for up to
+# ``_SUMMARY_TOKENS_CEILING`` (10K) output tokens, and a slow reasoning
+# summariser cannot emit that inside a size-blind deadline.  A measured
+# gpt-5.6 class model on the ChatGPT/Codex route sustains ~18 tok/s, so a 10K
+# target needs ~9 minutes of generation and times out on EVERY attempt — the
+# session then never compacts, grows past its window, and each failure arms a
+# longer summary cooldown while the transcript keeps growing.  So the floor is
+# scaled by the output the caller says it will request; see
+# :func:`_compression_timeout_floor`.
 _COMPRESSION_TIMEOUT_FLOOR_SECONDS = 300.0
+# Slowest sustained summary output rate we still treat as "alive", in tokens
+# per second.  Anything slower is not merely slow — the host's own idle
+# watchdog (``compression.context_timeout_seconds``) aborts a stream that
+# stops producing tokens, so this only has to bound a *streaming* call.
+_COMPRESSION_MIN_SUMMARY_TOKENS_PER_SECOND = 15.0
+# Absolute cap so a pathological budget can't produce an unbounded deadline.
+_COMPRESSION_TIMEOUT_CEILING_SECONDS = 1800.0
+
+
+def _compression_timeout_floor(expected_output_tokens: Optional[int]) -> float:
+    """Return the compression deadline floor for a summary of that size.
+
+    ``expected_output_tokens`` is the summary budget the caller is about to
+    request (``None``/0 when unknown, which keeps the historical flat floor).
+    The result is base + generation time at the slowest rate we consider
+    healthy, capped by :data:`_COMPRESSION_TIMEOUT_CEILING_SECONDS`.
+    """
+    base = _COMPRESSION_TIMEOUT_FLOOR_SECONDS
+    try:
+        budget = int(expected_output_tokens or 0)
+    except (TypeError, ValueError):
+        return base
+    if budget <= 0:
+        return base
+    generation = budget / _COMPRESSION_MIN_SUMMARY_TOKENS_PER_SECOND
+    return min(base + generation, _COMPRESSION_TIMEOUT_CEILING_SECONDS)
 
 
 def _get_auxiliary_task_config(task: str) -> Dict[str, Any]:
@@ -8783,7 +8820,11 @@ def _get_task_timeout(task: str, default: float = _DEFAULT_AUX_TIMEOUT) -> float
     return default
 
 
-def _effective_aux_timeout(task: str, timeout: Optional[float]) -> float:
+def _effective_aux_timeout(
+    task: str,
+    timeout: Optional[float],
+    expected_output_tokens: Optional[int] = None,
+) -> float:
     """Resolve the effective timeout for an auxiliary LLM call.
 
     Uses the caller-provided ``timeout`` when given; otherwise reads
@@ -8793,10 +8834,16 @@ def _effective_aux_timeout(task: str, timeout: Optional[float]) -> float:
     (#54915).  The floor is intentionally skipped when the caller passes an
     explicit ``timeout=`` — explicit per-call deadlines are always honoured —
     and it is a minimum (``max``), so a config value already above it is kept.
+
+    ``expected_output_tokens`` lets the caller declare how large a response it
+    is about to ask for; the compression floor scales with it so a large
+    summary budget is not handed a deadline it provably cannot meet.
     """
     effective = timeout if timeout is not None else _get_task_timeout(task)
     if timeout is None and task == "compression":
-        effective = max(effective, _COMPRESSION_TIMEOUT_FLOOR_SECONDS)
+        effective = max(
+            effective, _compression_timeout_floor(expected_output_tokens)
+        )
     return effective
 
 
@@ -9933,6 +9980,7 @@ def call_llm(
     stream_options: dict = None,
     route_info: Optional[Dict[str, str]] = None,
     latency_info: Optional[Dict[str, int]] = None,
+    expected_output_tokens: Optional[int] = None,
 ) -> Any:
     """Run an auxiliary LLM request, applying the configured task limit."""
     queue_started_at = time.monotonic()
@@ -9987,6 +10035,7 @@ def call_llm(
                 stream=stream,
                 stream_options=stream_options,
                 route_info=route_info,
+                expected_output_tokens=expected_output_tokens,
             )
         if stream and semaphore is not None:
             stream_semaphore = semaphore
@@ -10037,6 +10086,7 @@ def _call_llm_impl(
     stream: bool = False,
     stream_options: dict = None,
     route_info: Optional[Dict[str, str]] = None,
+    expected_output_tokens: Optional[int] = None,
 ) -> Any:
     """Centralized synchronous LLM call.
 
@@ -10068,6 +10118,10 @@ def _call_llm_impl(
             output can stream to the user.
         stream_options: Passed through to the request when stream is True
             (e.g. {"include_usage": True}).
+        expected_output_tokens: How many output tokens this call will ask the
+            model to produce. Only used to size the compression deadline floor
+            (see :func:`_compression_timeout_floor`); it is never sent on the
+            wire and never caps the response.
 
     Returns:
         Response object with .choices[0].message.content, OR — when stream=True —
@@ -10168,7 +10222,9 @@ def _call_llm_impl(
                 f"No LLM provider configured for task={task} provider={resolved_provider}. "
                 f"Run: hermes setup")
 
-    effective_timeout = _effective_aux_timeout(task, timeout)
+    effective_timeout = _effective_aux_timeout(
+        task, timeout, expected_output_tokens
+    )
     request_provider = effective_provider or resolved_provider
     compression_config = (
         _get_auxiliary_task_config("compression") if task == "compression" else {}
@@ -10887,6 +10943,7 @@ async def async_call_llm(
     extra_body: dict = None,
     reasoning_config: Optional[dict] = None,
     route_info: Optional[Dict[str, str]] = None,
+    expected_output_tokens: Optional[int] = None,
 ) -> Any:
     """Run an asynchronous auxiliary LLM request under the configured limit."""
     semaphore = _acquire_async_aux_semaphore(task)
@@ -10908,6 +10965,7 @@ async def async_call_llm(
             extra_body=extra_body,
             reasoning_config=reasoning_config,
             route_info=route_info,
+            expected_output_tokens=expected_output_tokens,
         )
     finally:
         if semaphore is not None:
@@ -10930,6 +10988,7 @@ async def _async_call_llm_impl(
     extra_body: dict = None,
     reasoning_config: Optional[dict] = None,
     route_info: Optional[Dict[str, str]] = None,
+    expected_output_tokens: Optional[int] = None,
 ) -> Any:
     """Centralized asynchronous LLM call.
 
@@ -11019,7 +11078,9 @@ async def _async_call_llm_impl(
                 f"No LLM provider configured for task={task} provider={resolved_provider}. "
                 f"Run: hermes setup")
 
-    effective_timeout = _effective_aux_timeout(task, timeout)
+    effective_timeout = _effective_aux_timeout(
+        task, timeout, expected_output_tokens
+    )
     request_provider = effective_provider or resolved_provider
     _set_relay_auxiliary_route(
         request_provider,

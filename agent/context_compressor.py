@@ -5153,6 +5153,14 @@ Spend up to ~{_LEAN_SESSION_LOG_BUDGET_TOKENS} tokens here — this section is t
         else:
             _session_log_section = ""
 
+        # Total output this prompt asks for. Used both in the visible "Target
+        # ~N tokens" directive and to size the auxiliary deadline, so the two
+        # can never drift apart (a deadline smaller than the ask times out on
+        # every attempt).
+        _requested_summary_tokens = summary_budget + (
+            _LEAN_SESSION_LOG_BUDGET_TOKENS if _session_log_section else 0
+        )
+
         _template_sections = f"""{HISTORICAL_TASK_HEADING}
 {_historical_task_instructions}
 
@@ -5205,7 +5213,7 @@ repeat each one verbatim here — copy the exact text, do NOT paraphrase, summar
 or describe them. These markers tell the agent which skills must be reloaded before
 use. If none appear, omit this section entirely.]
 
-Target ~{summary_budget + (_LEAN_SESSION_LOG_BUDGET_TOKENS if _session_log_section else 0)} tokens. Be CONCRETE — include file paths, command outputs, error messages, line numbers, and specific values. Avoid vague descriptions like "made some changes" — say exactly what changed.
+Target ~{_requested_summary_tokens} tokens. Be CONCRETE — include file paths, command outputs, error messages, line numbers, and specific values. Avoid vague descriptions like "made some changes" — say exactly what changed.
 {_temporal_anchoring_rule}
 Write only the summary body. Do not include any preamble or prefix."""
 
@@ -5275,6 +5283,15 @@ This compaction should PRIORITISE preserving all information related to the focu
                 # summaries and compaction loops. Omitting lets the adapter
                 # fall back to the model's native output ceiling.
                 # timeout resolved from auxiliary.compression.timeout config by call_llm
+                #
+                # Declare how much output the prompt above asks for so the
+                # deadline can be sized to it. Without this the compression
+                # timeout floor is size-blind: a slow reasoning summariser
+                # asked for a 10K-token handoff exhausts a flat deadline on
+                # every attempt, so the session never compacts and grows past
+                # its own context window. Advisory only — never sent on the
+                # wire, never a cap (see the max_tokens note above).
+                "expected_output_tokens": _requested_summary_tokens,
             }
             if self.summary_model:
                 call_kwargs["model"] = self.summary_model
