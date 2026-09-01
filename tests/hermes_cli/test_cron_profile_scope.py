@@ -2,6 +2,8 @@
 
 from unittest.mock import patch
 
+import pytest
+
 
 def test_cron_list_names_inspected_profile_when_empty(capsys):
     import hermes_cli.cron as cron_cli
@@ -44,3 +46,14 @@ def test_top_level_help_documents_profile_selector():
     assert "--profile PROFILE" in parser.format_help()
     assert {"--profile", "-p"} <= required
     assert {"--profile", "-p"}.isdisjoint(optional)
+
+
+def test_top_level_parser_rejects_unconsumed_profile_selector():
+    from hermes_cli._parser import build_top_level_parser
+
+    parser, _subparsers, _chat_parser = build_top_level_parser()
+
+    with pytest.raises(SystemExit) as exc_info:
+        parser.parse_args(["--profile", "bad:name"])
+
+    assert exc_info.value.code == 2

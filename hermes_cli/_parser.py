@@ -46,6 +46,15 @@ _VALUE_FLAGS_FALLBACK: frozenset[str] = frozenset(
 _OPTIONAL_VALUE_FLAGS_FALLBACK: frozenset[str] = frozenset({"-c", "--continue"})
 
 
+class _PreparsedProfileAction(argparse.Action):
+    """Expose the bootstrap-only profile selector without accepting it here."""
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        parser.error(
+            f"{option_string or '--profile'} must be processed before argument parsing"
+        )
+
+
 @lru_cache(maxsize=1)
 def top_level_value_flag_sets() -> tuple[frozenset[str], frozenset[str]]:
     """(required-value, optional-value) top-level flags, derived from the
@@ -156,6 +165,7 @@ def build_top_level_parser():
         "--profile",
         "-p",
         metavar="PROFILE",
+        action=_PreparsedProfileAction,
         default=argparse.SUPPRESS,
         help="Run this command against the named profile.",
     )
