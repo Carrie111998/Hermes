@@ -30,6 +30,8 @@ Nothing in this module touches the agent's system prompt or toolset.
 from __future__ import annotations
 
 import asyncio
+from contextlib import contextmanager
+from functools import wraps
 import hashlib
 import json
 import logging
@@ -38,6 +40,7 @@ import re
 import subprocess
 import threading
 import time
+import uuid
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
@@ -591,6 +594,13 @@ class GoalState:
     waiting_until: float = 0.0
     waiting_reason: Optional[str] = None
     waiting_since: float = 0.0
+    # Structured acceptance criteria supplied through model goal control.
+    # Persist them with the goal so a later status call can return the exact
+    # authoritative readback rather than reconstructing evidence in prose.
+    acceptance_evidence: List[Dict[str, str]] = field(default_factory=list)
+    # Opaque state identity returned by model-callable readbacks. It is
+    # generated only by canonical persistence and rotates on each mutation.
+    receipt_token: Optional[str] = None
     # Optional structured completion contract (outcome / verification /
     # constraints / boundaries / stop_when). Empty by default; a goal with
     # no contract behaves exactly like the original free-form goal.
@@ -630,6 +640,16 @@ class GoalState:
             waiting_until=float(data.get("waiting_until", 0.0) or 0.0),
             waiting_reason=data.get("waiting_reason"),
             waiting_since=float(data.get("waiting_since", 0.0) or 0.0),
+            acceptance_evidence=[
+                {str(key): str(value) for key, value in item.items()}
+                for item in (data.get("acceptance_evidence") or [])
+                if isinstance(item, dict)
+            ],
+            receipt_token=(
+                str(data["receipt_token"])
+                if re.fullmatch(r"[0-9a-f]{32}", str(data.get("receipt_token") or ""))
+                else None
+            ),
             contract=GoalContract.from_dict(data.get("contract")),
             gates=[
                 GoalGate.from_dict(g)
@@ -653,6 +673,17 @@ class GoalState:
         return "\n".join(f"- {i}. {text}" for i, text in enumerate(self.subgoals, start=1))
 
 
+def goal_state_payload(state: Optional[GoalState]) -> Dict[str, Any]:
+    """Project persisted goal identity for model and live UI consumers."""
+    if state is None:
+        return {"exists": False, "status": None, "condition": None}
+    return {
+        "exists": True,
+        "status": str(state.status or "") or None,
+        "condition": state.goal,
+    }
+
+
 # ──────────────────────────────────────────────────────────────────────
 # Persistence (SessionDB state_meta)
 # ──────────────────────────────────────────────────────────────────────
@@ -665,6 +696,166 @@ def _meta_key(session_id: str) -> str:
 _DB_CACHE: Dict[str, Any] = {}
 _DB_BOOTSTRAP_LOCK = threading.Lock()
 _DB_BOOTSTRAP_INFLIGHT: Dict[str, threading.Event] = {}
+_GOAL_GENERATION_LOCK = threading.Lock()
+_GOAL_GENERATIONS: Dict[Tuple[str, str], int] = {}
+_GOAL_STATE_LOCKS_GUARD = threading.Lock()
+_GOAL_STATE_LOCKS: Dict[Tuple[str, str], Any] = {}
+_GOAL_FILE_LOCK_LOCAL = threading.local()
+_GOAL_FILE_LOCK_TIMEOUT_S = 5.0
+
+
+def _goal_generation_key(session_id: str) -> Tuple[str, str]:
+    """Return the profile-scoped key for process-local goal invalidation."""
+    try:
+        from hermes_constants import get_hermes_home
+
+        home = str(get_hermes_home())
+    except Exception:  # pragma: no cover - defensive import fallback
+        home = ""
+    return home, session_id
+
+
+def _goal_generation(session_id: str) -> int:
+    with _GOAL_GENERATION_LOCK:
+        return _GOAL_GENERATIONS.get(_goal_generation_key(session_id), 0)
+
+
+def _bump_goal_generation(session_id: str) -> int:
+    key = _goal_generation_key(session_id)
+    with _GOAL_GENERATION_LOCK:
+        generation = _GOAL_GENERATIONS.get(key, 0) + 1
+        _GOAL_GENERATIONS[key] = generation
+        return generation
+
+
+def _goal_state_lock(session_id: str):
+    """Return the profile- and session-scoped re-entrant goal lock."""
+    key = _goal_generation_key(session_id)
+    with _GOAL_STATE_LOCKS_GUARD:
+        lock = _GOAL_STATE_LOCKS.get(key)
+        if lock is None:
+            lock = threading.RLock()
+            _GOAL_STATE_LOCKS[key] = lock
+        return lock
+
+
+def _goal_file_lock_path(session_id: str):
+    """Return a profile-scoped, filesystem-safe lock path for one session."""
+    from hermes_constants import get_hermes_home
+
+    digest = hashlib.sha256(session_id.encode("utf-8")).hexdigest()
+    return get_hermes_home() / "locks" / "goals" / f"{digest}.lock"
+
+
+def _acquire_goal_file_lock(handle) -> None:
+    """Acquire one byte/file lock without blocking the event loop forever."""
+    deadline = time.monotonic() + _GOAL_FILE_LOCK_TIMEOUT_S
+    while True:
+        try:
+            if os.name == "nt":
+                import msvcrt
+
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return
+        except OSError:
+            if time.monotonic() >= deadline:
+                raise RuntimeError("timed out acquiring cross-process goal lock")
+            time.sleep(0.01)
+
+
+def _release_goal_file_lock(handle) -> None:
+    if os.name == "nt":
+        import msvcrt
+
+        handle.seek(0)
+        msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+    else:
+        import fcntl
+
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+@contextmanager
+def _cross_process_goal_lock(session_id: str):
+    """Serialize one session across CLI, gateway, and model-tool processes."""
+    key = _goal_generation_key(session_id)
+    held = getattr(_GOAL_FILE_LOCK_LOCAL, "held", None)
+    if held is None:
+        held = {}
+        _GOAL_FILE_LOCK_LOCAL.held = held
+    if key in held:
+        held[key][0] += 1
+        try:
+            yield
+        finally:
+            held[key][0] -= 1
+        return
+
+    lock_path = _goal_file_lock_path(session_id)
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    handle = lock_path.open("a+b")
+    try:
+        if handle.seek(0, os.SEEK_END) == 0:
+            handle.write(b"\0")
+            handle.flush()
+        _acquire_goal_file_lock(handle)
+        held[key] = [1, handle]
+        try:
+            yield
+        finally:
+            held.pop(key, None)
+            _release_goal_file_lock(handle)
+    finally:
+        handle.close()
+
+
+@contextmanager
+def goal_state_transaction(session_id: str):
+    """Serialize one session's goal read/transition/write sequences."""
+    with _goal_state_lock(session_id):
+        with _cross_process_goal_lock(session_id):
+            yield
+
+
+def _serialized_goal_mutation(method):
+    """Keep one manager transition atomic with same-session controls."""
+    @wraps(method)
+    def locked(self, *args, **kwargs):
+        key = _goal_generation_key(self.session_id)
+        held = getattr(_GOAL_FILE_LOCK_LOCAL, "held", {})
+        outermost_transaction = key not in held
+        with goal_state_transaction(self.session_id):
+            # Reload persisted state exactly once at the outer process-lock
+            # boundary. Nested decorated calls must keep the same state object
+            # because their caller may hold a reference to it.
+            if not outermost_transaction:
+                pass
+            elif method.__name__ == "set":
+                self.refresh_if_stale()
+            else:
+                authoritative = load_goal_authoritative(self.session_id)
+                if (
+                    authoritative is not None
+                    and (
+                        self._state is None
+                        or authoritative.receipt_token != self._state.receipt_token
+                    )
+                ):
+                    self._state = authoritative
+                self._seen_generation = _goal_generation(self.session_id)
+            result = method(self, *args, **kwargs)
+            # A successful mutation can bump this session's generation. Mark
+            # the manager current before releasing the lock so its own
+            # in-memory state is not mistaken for stale on the next call.
+            self._seen_generation = _goal_generation(self.session_id)
+            return result
+
+    return locked
 
 # How long a loop-thread caller waits for an ALREADY-RUNNING bootstrap
 # before degrading to None. Normal SessionDB init is ~10-100ms, so a call
@@ -848,6 +1039,32 @@ def load_goal(session_id: str) -> Optional[GoalState]:
         return None
 
 
+def load_goal_authoritative(session_id: str) -> Optional[GoalState]:
+    """Read persisted goal state, raising when persistence is unavailable.
+
+    Human-facing goal paths intentionally degrade when ``state.db`` is
+    unavailable. Model-callable control cannot treat that ambiguity as a
+    successful read-back, because an acknowledgement could otherwise claim a
+    mutation that never persisted.
+    """
+    session_id = (session_id or "").strip()
+    if not session_id:
+        raise ValueError("session identity is required")
+    db = _get_session_db()
+    if db is None:
+        raise RuntimeError("session goal storage is unavailable")
+    try:
+        raw = db.get_meta(_meta_key(session_id))
+    except Exception as exc:
+        raise RuntimeError("persisted goal read failed") from exc
+    if not raw:
+        return None
+    try:
+        return GoalState.from_json(raw)
+    except Exception as exc:
+        raise RuntimeError("persisted goal state is invalid") from exc
+
+
 def save_goal(session_id: str, state: GoalState) -> None:
     """Persist a goal to SessionDB. No-op if DB unavailable."""
     if not session_id:
@@ -857,18 +1074,21 @@ def save_goal(session_id: str, state: GoalState) -> None:
         _warn_dropped_write("GoalManager", "goal", session_id)
         return
     try:
+        state.receipt_token = uuid.uuid4().hex
         db.set_meta(_meta_key(session_id), state.to_json())
+        _bump_goal_generation(session_id)
     except Exception as exc:
         logger.debug("GoalManager: set_meta failed: %s", exc)
 
 
 def clear_goal(session_id: str) -> None:
     """Mark a goal cleared in the DB (preserved for audit, status=cleared)."""
-    state = load_goal(session_id)
-    if state is None:
-        return
-    state.status = "cleared"
-    save_goal(session_id, state)
+    with goal_state_transaction(session_id):
+        state = load_goal_authoritative(session_id)
+        if state is None:
+            return
+        state.status = "cleared"
+        save_goal(session_id, state)
 
 
 def migrate_goal_to_session(old_session_id: str, new_session_id: str, *, reason: str = "") -> bool:
@@ -889,16 +1109,21 @@ def migrate_goal_to_session(old_session_id: str, new_session_id: str, *, reason:
     if not old_session_id or not new_session_id or old_session_id == new_session_id:
         return False
     try:
-        state = load_goal(old_session_id)
-        if state is None or getattr(state, "status", None) == "cleared":
-            return False
-        # Don't clobber a goal already set on the child (e.g. a resumed
-        # lineage that re-established its own goal).
-        if load_goal(new_session_id) is not None:
-            return False
-        save_goal(new_session_id, state)
-        # Archive the parent's row so it isn't double-counted as active.
-        clear_goal(old_session_id)
+        first_session, second_session = sorted((old_session_id, new_session_id))
+        with goal_state_transaction(first_session):
+            with goal_state_transaction(second_session):
+                state = load_goal_authoritative(old_session_id)
+                if state is None or getattr(state, "status", None) == "cleared":
+                    return False
+                # Don't clobber a goal already set on the child (e.g. a resumed
+                # lineage that re-established its own goal).
+                if load_goal_authoritative(new_session_id) is not None:
+                    return False
+                child_state = GoalState.from_json(state.to_json())
+                save_goal(new_session_id, child_state)
+                # Archive the parent's row so it isn't double-counted as active.
+                state.status = "cleared"
+                save_goal(old_session_id, state)
         logger.debug(
             "GoalManager: migrated goal %s -> %s (%s)",
             old_session_id, new_session_id, reason or "rotation",
@@ -1427,6 +1652,24 @@ class GoalManager:
         self.session_id = session_id
         self.default_max_turns = int(default_max_turns or DEFAULT_MAX_TURNS)
         self._state: Optional[GoalState] = load_goal(session_id)
+        self._seen_generation = _goal_generation(session_id)
+
+    def refresh_if_stale(self) -> bool:
+        """Reload after another manager persisted this session's goal.
+
+        The CLI retains a manager across turns, while model tools and gateway
+        controls may construct another manager for the same session. A cheap
+        process-local generation check keeps that retained manager from
+        continuing with, or writing back, stale state. Persistence failures
+        leave its current state intact and are retried on the next lookup.
+        """
+        target_generation = _goal_generation(self.session_id)
+        if target_generation == self._seen_generation:
+            return False
+        state = load_goal_authoritative(self.session_id)
+        self._state = state
+        self._seen_generation = target_generation
+        return True
 
     # --- introspection ------------------------------------------------
 
@@ -1473,7 +1716,15 @@ class GoalManager:
 
     # --- mutation -----------------------------------------------------
 
-    def set(self, goal: str, *, max_turns: Optional[int] = None, contract: Optional[GoalContract] = None) -> GoalState:
+    @_serialized_goal_mutation
+    def set(
+        self,
+        goal: str,
+        *,
+        max_turns: Optional[int] = None,
+        contract: Optional[GoalContract] = None,
+        acceptance_evidence: Optional[List[Dict[str, str]]] = None,
+    ) -> GoalState:
         goal = (goal or "").strip()
         if not goal:
             raise ValueError("goal text is empty")
@@ -1484,12 +1735,14 @@ class GoalManager:
             max_turns=int(max_turns) if max_turns else self.default_max_turns,
             created_at=time.time(),
             last_turn_at=0.0,
+            acceptance_evidence=list(acceptance_evidence or []),
             contract=contract if contract is not None else GoalContract(),
         )
         self._state = state
         save_goal(self.session_id, state)
         return state
 
+    @_serialized_goal_mutation
     def set_contract(self, contract: GoalContract) -> Optional[GoalState]:
         """Attach or replace the completion contract on the active goal.
 
@@ -1501,6 +1754,7 @@ class GoalManager:
         save_goal(self.session_id, self._state)
         return self._state
 
+    @_serialized_goal_mutation
     def pause(self, reason: str = "user-paused") -> Optional[GoalState]:
         if not self._state:
             return None
@@ -1515,6 +1769,7 @@ class GoalManager:
         save_goal(self.session_id, self._state)
         return self._state
 
+    @_serialized_goal_mutation
     def resume(self, *, reset_budget: bool = True) -> Optional[GoalState]:
         if not self._state:
             return None
@@ -1531,6 +1786,7 @@ class GoalManager:
         save_goal(self.session_id, self._state)
         return self._state
 
+    @_serialized_goal_mutation
     def clear(self) -> None:
         if self._state is None:
             return
@@ -1538,6 +1794,7 @@ class GoalManager:
         save_goal(self.session_id, self._state)
         self._state = None
 
+    @_serialized_goal_mutation
     def mark_done(self, reason: str) -> None:
         if not self._state:
             return
@@ -1548,6 +1805,7 @@ class GoalManager:
 
     # --- /subgoal user controls ---------------------------------------
 
+    @_serialized_goal_mutation
     def add_subgoal(self, text: str) -> str:
         """Append a user-added criterion to the active goal. Requires
         ``has_goal()``; raises ``RuntimeError`` otherwise.
@@ -1563,6 +1821,7 @@ class GoalManager:
         save_goal(self.session_id, self._state)
         return text
 
+    @_serialized_goal_mutation
     def remove_subgoal(self, index_1based: int) -> str:
         """Remove a subgoal by 1-based index. Returns the removed text."""
         if self._state is None or not self.has_goal():
@@ -1576,6 +1835,7 @@ class GoalManager:
         save_goal(self.session_id, self._state)
         return removed
 
+    @_serialized_goal_mutation
     def clear_subgoals(self) -> int:
         """Wipe all subgoals. Returns the previous count."""
         if self._state is None or not self.has_goal():
@@ -1595,6 +1855,7 @@ class GoalManager:
 
     # --- /goal gate quality gates ---------------------------------------
 
+    @_serialized_goal_mutation
     def add_gate(
         self,
         command: str,
@@ -1621,6 +1882,7 @@ class GoalManager:
         save_goal(self.session_id, self._state)
         return gate
 
+    @_serialized_goal_mutation
     def remove_gate(self, index_1based: int) -> str:
         """Remove a gate by 1-based index. Returns the removed command."""
         if self._state is None or not self.has_goal():
@@ -1632,6 +1894,7 @@ class GoalManager:
         save_goal(self.session_id, self._state)
         return removed.command
 
+    @_serialized_goal_mutation
     def clear_gates(self) -> int:
         """Remove all gates. Returns the previous count."""
         if self._state is None or not self.has_goal():
@@ -1657,7 +1920,7 @@ class GoalManager:
             lines.append(f"- {i}. $ {g.command}{status}")
         return "\n".join(lines)
 
-    def _check_gates(self) -> Optional[Dict[str, Any]]:
+    def _check_gates(self, *, persist: bool = True) -> Optional[Dict[str, Any]]:
         """Run quality gates in order; return a decision dict on failure.
 
         Returns ``None`` when there are no gates or every gate passes —
@@ -1702,7 +1965,8 @@ class GoalManager:
                 state.paused_reason = (
                     f"quality gate exhausted {gate.attempts - 1} retries: $ {gate.command}"
                 )
-                save_goal(self.session_id, state)
+                if persist:
+                    save_goal(self.session_id, state)
                 return {
                     "status": "paused",
                     "should_continue": False,
@@ -1717,7 +1981,8 @@ class GoalManager:
                     ),
                 }
 
-            save_goal(self.session_id, state)
+            if persist:
+                save_goal(self.session_id, state)
             prompt = CONTINUATION_PROMPT_GATE_FAILED_TEMPLATE.format(
                 goal=state.goal,
                 command=gate.command,
@@ -1738,11 +2003,13 @@ class GoalManager:
                 ),
             }
 
-        save_goal(self.session_id, state)
+        if persist:
+            save_goal(self.session_id, state)
         return None
 
     # --- /goal wait barrier -------------------------------------------
 
+    @_serialized_goal_mutation
     def wait_on(self, pid: int, reason: str = "") -> GoalState:
         """Park the goal loop on a background process PID.
 
@@ -1767,6 +2034,7 @@ class GoalManager:
         save_goal(self.session_id, self._state)
         return self._state
 
+    @_serialized_goal_mutation
     def wait_on_session(self, session_id: str, reason: str = "") -> GoalState:
         """Park the goal loop on a process_registry session's OWN trigger.
 
@@ -1789,6 +2057,7 @@ class GoalManager:
         save_goal(self.session_id, self._state)
         return self._state
 
+    @_serialized_goal_mutation
     def wait_for_seconds(self, seconds: int, reason: str = "") -> GoalState:
         """Park the goal loop until ``seconds`` from now have elapsed.
 
@@ -1810,6 +2079,7 @@ class GoalManager:
         save_goal(self.session_id, self._state)
         return self._state
 
+    @_serialized_goal_mutation
     def stop_waiting(self) -> bool:
         """Clear any active wait barrier (pid / session / time). Returns True
         if one was cleared."""
@@ -1829,6 +2099,7 @@ class GoalManager:
         save_goal(self.session_id, self._state)
         return True
 
+    @_serialized_goal_mutation
     def is_waiting(self) -> bool:
         """True iff a barrier is set AND not yet satisfied.
 
@@ -1886,6 +2157,19 @@ class GoalManager:
           - ``reason``: str
           - ``message``: user-visible one-liner to print/send
         """
+        # Refresh under a short persisted-state transaction. Slow gate and
+        # judge calls must not hold the cross-process control lock.
+        with goal_state_transaction(self.session_id):
+            authoritative = load_goal_authoritative(self.session_id)
+            if (
+                authoritative is not None
+                and (
+                    self._state is None
+                    or authoritative.receipt_token != self._state.receipt_token
+                )
+            ):
+                self._state = authoritative
+            self._seen_generation = _goal_generation(self.session_id)
         state = self._state
         if state is None or state.status != "active":
             return {
@@ -1918,6 +2202,56 @@ class GoalManager:
                 "message": f"⏳ Goal parked — waiting on {tgt}: {reason}",
             }
 
+        # Snapshot the active goal under lock. When slow evaluation completes,
+        # its receipt token proves whether a concurrent control changed state.
+        with goal_state_transaction(self.session_id):
+            authoritative = load_goal_authoritative(self.session_id)
+            if (
+                authoritative is not None
+                and (
+                    self._state is None
+                    or authoritative.receipt_token != self._state.receipt_token
+                )
+            ):
+                self._state = authoritative
+            if self._state is None or self._state.status != "active":
+                self._seen_generation = _goal_generation(self.session_id)
+                return {
+                    "status": self._state.status if self._state else None,
+                    "should_continue": False,
+                    "continuation_prompt": None,
+                    "verdict": "inactive",
+                    "reason": "no active goal",
+                    "message": "",
+                }
+            state = GoalState.from_json(self._state.to_json())
+            self._state = state
+            evaluation_token = state.receipt_token
+
+        def commit_evaluation(decision: Dict[str, Any]) -> Dict[str, Any]:
+            """Persist only if no control changed the evaluated snapshot."""
+            with goal_state_transaction(self.session_id):
+                current = load_goal_authoritative(self.session_id)
+                if (
+                    current is None
+                    or current.status != "active"
+                    or current.receipt_token != evaluation_token
+                ):
+                    self._state = current
+                    self._seen_generation = _goal_generation(self.session_id)
+                    return {
+                        "status": current.status if current else None,
+                        "should_continue": False,
+                        "continuation_prompt": None,
+                        "verdict": "inactive",
+                        "reason": "goal changed during evaluation",
+                        "message": "",
+                    }
+                self._state = state
+                save_goal(self.session_id, state)
+                self._seen_generation = _goal_generation(self.session_id)
+                return decision
+
         # Count the turn that just finished.
         state.turns_used += 1
         state.last_turn_at = time.time()
@@ -1926,13 +2260,12 @@ class GoalManager:
         # deterministic evidence the goal is not done, so the judge call is
         # skipped entirely and the gate's output drives the next turn. Gate
         # continuations respect the same turn budget as judge continuations.
-        gate_decision = self._check_gates()
+        gate_decision = self._check_gates(persist=False)
         if gate_decision is not None:
             if gate_decision.get("should_continue") and state.turns_used >= state.max_turns:
                 state.status = "paused"
                 state.paused_reason = f"turn budget exhausted ({state.turns_used}/{state.max_turns})"
-                save_goal(self.session_id, state)
-                return {
+                return commit_evaluation({
                     "status": "paused",
                     "should_continue": False,
                     "continuation_prompt": None,
@@ -1943,8 +2276,8 @@ class GoalManager:
                         f"(a quality gate is still failing). "
                         "Use /goal resume to keep going, or /goal clear to stop."
                     ),
-                }
-            return gate_decision
+                })
+            return commit_evaluation(gate_decision)
 
         verdict, reason, parse_failed, wait_directive, transport_failed = judge_goal(
             state.goal,
@@ -1981,35 +2314,42 @@ class GoalManager:
         # exits or the deadline passes (next evaluate_after_turn falls through
         # the is_waiting() short-circuit once the barrier clears).
         if verdict == "wait" and wait_directive:
+            state.waiting_reason = (reason or "").strip() or None
+            state.waiting_since = time.time()
             if wait_directive.get("session_id"):
-                self.wait_on_session(str(wait_directive["session_id"]), reason=reason)
+                state.waiting_on_session = str(wait_directive["session_id"])
+                state.waiting_on_pid = None
+                state.waiting_until = 0.0
                 tgt = f"session {wait_directive['session_id']}"
             elif wait_directive.get("pid"):
-                self.wait_on(int(wait_directive["pid"]), reason=reason)
+                state.waiting_on_session = None
+                state.waiting_on_pid = int(wait_directive["pid"])
+                state.waiting_until = 0.0
                 tgt = f"pid {wait_directive['pid']}"
             else:
-                self.wait_for_seconds(int(wait_directive["seconds"]), reason=reason)
+                state.waiting_on_session = None
+                state.waiting_on_pid = None
+                state.waiting_until = time.time() + int(wait_directive["seconds"])
                 tgt = f"{wait_directive['seconds']}s"
-            return {
+            return commit_evaluation({
                 "status": "active",
                 "should_continue": False,
                 "continuation_prompt": None,
                 "verdict": "wait",
                 "reason": reason,
                 "message": f"⏳ Goal parked (judge) — waiting on {tgt}: {reason}",
-            }
+            })
 
         if verdict == "done":
             state.status = "done"
-            save_goal(self.session_id, state)
-            return {
+            return commit_evaluation({
                 "status": "done",
                 "should_continue": False,
                 "continuation_prompt": None,
                 "verdict": "done",
                 "reason": reason,
                 "message": f"✓ Goal achieved: {reason}",
-            }
+            })
 
         # Auto-pause when the judge cannot reach the API at all N turns in a
         # row (401 auth, DNS failure, timeout).  Persistent transport failures
@@ -2022,8 +2362,7 @@ class GoalManager:
                 f"judge API unreachable {state.consecutive_transport_failures} turns in a row "
                 f"(check auxiliary.goal_judge provider/key in config.yaml)"
             )
-            save_goal(self.session_id, state)
-            return {
+            return commit_evaluation({
                 "status": "paused",
                 "should_continue": False,
                 "continuation_prompt": None,
@@ -2039,7 +2378,7 @@ class GoalManager:
                     "      model: deepseek-v4-flash\n"
                     "Then /goal resume to continue."
                 ),
-            }
+            })
 
         # Auto-pause when the judge model can't produce the expected JSON
         # verdict N turns in a row. Points the user at the goal_judge config
@@ -2052,8 +2391,7 @@ class GoalManager:
             state.paused_reason = (
                 f"judge model returned unparseable output {state.consecutive_parse_failures} turns in a row"
             )
-            save_goal(self.session_id, state)
-            return {
+            return commit_evaluation({
                 "status": "paused",
                 "should_continue": False,
                 "continuation_prompt": None,
@@ -2069,13 +2407,12 @@ class GoalManager:
                     "      model: google/gemini-3-flash-preview\n"
                     "Then /goal resume to continue."
                 ),
-            }
+            })
 
         if state.turns_used >= state.max_turns:
             state.status = "paused"
             state.paused_reason = f"turn budget exhausted ({state.turns_used}/{state.max_turns})"
-            save_goal(self.session_id, state)
-            return {
+            return commit_evaluation({
                 "status": "paused",
                 "should_continue": False,
                 "continuation_prompt": None,
@@ -2085,10 +2422,9 @@ class GoalManager:
                     f"⏸ Goal paused — {state.turns_used}/{state.max_turns} turns used. "
                     "Use /goal resume to keep going, or /goal clear to stop."
                 ),
-            }
+            })
 
-        save_goal(self.session_id, state)
-        return {
+        return commit_evaluation({
             "status": "active",
             "should_continue": True,
             "continuation_prompt": self.next_continuation_prompt(),
@@ -2097,7 +2433,7 @@ class GoalManager:
             "message": (
                 f"↻ Continuing toward goal ({state.turns_used}/{state.max_turns}): {reason}"
             ),
-        }
+        })
 
     def next_continuation_prompt(self) -> Optional[str]:
         if not self._state or self._state.status != "active":
