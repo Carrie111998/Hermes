@@ -863,6 +863,51 @@ def _migrate_to_39(results: Dict[str, Any], quiet: bool) -> None:
             )
 
 
+def _migrate_to_40(results: Dict[str, Any], quiet: bool) -> None:
+    # ── Version 39 → 40: strip the unwired `smart_model_routing` placeholder ──
+    # The setup wizard has long seeded ``smart_model_routing: {enabled: False}``
+    # into Blank-Slate configs and the structure-validator's
+    # ``_EXTRA_KNOWN_ROOT_KEYS`` allowed it on disk, but no runtime consumer
+    # ever reads the value. Users setting ``smart_model_routing.enabled: true``
+    # (per the AGENTS.md root-section list) get a silent no-op contract —
+    # the agent's model selection ignores the flag entirely (#98835).
+    #
+    # Strip the root-level key on first migration so the file no longer
+    # advertises a feature that doesn't exist. ``_persist_migration`` writes
+    # via the default-stripping invariant so the absence of the key after
+    # migration means it disappears from disk (rather than materialising
+    # an empty dict at read time). The doctor failure-closed check covers
+    # installations that disable auto-migration or hand-edit the file back
+    # between the migration and the upgrade: the next ``hermes doctor`` run
+    # reports the dead key as a configuration warning instead of silently
+    # accepting it, so any future consumer landing is observable.
+    _c = _cfg()
+    read_raw_config = _c.read_raw_config
+    _persist_migration = _c._persist_migration
+
+    config = read_raw_config()
+    if "smart_model_routing" not in config:
+        return
+    removed_value = config.pop("smart_model_routing", None)
+    _persist_migration(config)
+    # Don't echo the value — it can be a small dict with no secrets, but
+    # mirroring the relay/bfl cutover's policy of a short, specific message
+    # keeps the migration log scannable for human reviewers.
+    message = (
+        "Removed unwired 'smart_model_routing' from config.yaml — no "
+        "runtime consumer reads this placeholder; tracked by #98835."
+    )
+    results["warnings"].append(message)
+    # Quiet mode hides migrations from non-interactive flows; the entry on
+    # ``results['warnings']`` still surfaces to any caller that introspects
+    # the return value (e.g. tests).
+    if not quiet:
+        if removed_value is not None:
+            print(f"  ⚠ {message}")
+        else:
+            print(f"  ⚠ {message}")
+
+
 #: Registry of (target_version, migration_fn), strictly ascending. The driver
 #: applies every entry whose target version is greater than the on-disk
 #: observe earlier steps' writes via read_raw_config() (filesystem state).
@@ -890,6 +935,7 @@ MIGRATIONS: Tuple[Tuple[int, Callable[[Dict[str, Any], bool], None]], ...] = (
     (37, _migrate_to_37),
     (38, _migrate_to_38),
     (39, _migrate_to_39),
+    (40, _migrate_to_40),
 )
 
 
