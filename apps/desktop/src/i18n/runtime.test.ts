@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 
 import { fieldCopyForSchemaKey } from '@/app/settings/field-copy'
 
-import { TRANSLATIONS } from './catalog'
+import { getTranslations, loadTranslations } from './catalog'
 import { setRuntimeI18nLocale, translateNow } from './runtime'
 import { zh } from './zh'
 
@@ -15,7 +15,9 @@ describe('desktop i18n runtime translator', () => {
     setRuntimeI18nLocale('en')
   })
 
-  it('translates string paths for the active runtime locale', () => {
+  it('translates string paths for the active runtime locale', async () => {
+    await loadTranslations('zh')
+
     setRuntimeI18nLocale('zh')
 
     expect(translateNow('boot.ready')).toBe('Hermes 桌面版已就绪')
@@ -28,7 +30,9 @@ describe('desktop i18n runtime translator', () => {
     expect(translateNow('notifications.updateReadyMessage', 2)).toBe('2 new changes available.')
   })
 
-  it('translates migrated overlap keys for newly supported locales', () => {
+  it('translates migrated overlap keys for newly supported locales', async () => {
+    await Promise.all([loadTranslations('ja'), loadTranslations('zh-hant')])
+
     setRuntimeI18nLocale('ja')
     expect(translateNow('common.save')).toBe('保存')
 
@@ -36,7 +40,9 @@ describe('desktop i18n runtime translator', () => {
     expect(translateNow('cron.promptPlaceholder')).toBe('代理每次執行時應做什麼？')
   })
 
-  it('translates settings copy for newly supported locales', () => {
+  it('translates settings copy for newly supported locales', async () => {
+    await Promise.all([loadTranslations('ar'), loadTranslations('ja'), loadTranslations('zh-hant')])
+
     setRuntimeI18nLocale('ja')
     expect(translateNow('settings.appearance.title')).toBe('外観')
     expect(translateNow('settings.nav.providers')).toBe('プロバイダー')
@@ -59,8 +65,10 @@ describe('desktop i18n runtime translator', () => {
     expect(fieldCopyForSchemaKey(zh.settings.fieldDescriptions, field)).toBe('当后端提供推理内容时予以显示。')
   })
 
-  it('falls back to English when the active locale cannot resolve a key', () => {
-    const boot = TRANSLATIONS.ja.boot as { ready?: string }
+  it('falls back to English when the active locale cannot resolve a key', async () => {
+    await loadTranslations('ja')
+
+    const boot = getTranslations('ja').boot as { ready?: string }
     const originalReady = boot.ready
 
     try {
