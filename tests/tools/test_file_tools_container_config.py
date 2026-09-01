@@ -54,6 +54,23 @@ class TestFileToolsContainerConfig:
         cc = self._run(_make_env_config(docker_mount_cwd_to_workspace=True), "t1").get("container_config", {})
         assert cc.get("docker_mount_cwd_to_workspace") is True
 
+    def test_docker_env_passed(self):
+        """docker_env is forwarded to container_config (#100019).
+
+        Containers created through the file-tools path silently lost every
+        configured terminal.docker_env entry because this call site never
+        supplied the key, unlike the terminal tool's own bring-up path."""
+        cc = self._run(
+            _make_env_config(docker_env={"JAVA_HOME": "/usr/lib/jvm", "GITHUB_ACTOR": "octocat"}),
+            "t1",
+        ).get("container_config", {})
+        assert cc.get("docker_env") == {"JAVA_HOME": "/usr/lib/jvm", "GITHUB_ACTOR": "octocat"}
+
+    def test_docker_env_defaults_to_empty_dict(self):
+        """An unset docker_env still forwards the shared empty-dict default."""
+        cc = self._run(_make_env_config(), "t1").get("container_config", {})
+        assert cc.get("docker_env") == {}
+
 
     def test_cwd_only_raw_task_override_reaches_file_environment(self):
         """CWD-only task overrides collapse to default but must keep their cwd."""
