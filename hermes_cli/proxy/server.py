@@ -72,6 +72,22 @@ def _filter_request_headers(headers: "aiohttp.typedefs.LooseHeaders") -> dict:
     return out
 
 
+def _apply_upstream_headers(forwarded: dict, overrides: dict) -> dict:
+    """Apply adapter-declared provider headers over the filtered client set.
+
+    With no overrides the client's headers pass through unchanged. Declared
+    keys are matched case-insensitively — a client may send ``user-agent``
+    in any casing, and a plain ``dict.update`` would forward both case
+    variants upstream as duplicate headers.
+    """
+    if not overrides:
+        return forwarded
+    overridden = {key.lower() for key in overrides}
+    out = {k: v for k, v in forwarded.items() if k.lower() not in overridden}
+    out.update(overrides)
+    return out
+
+
 def _filter_response_headers(headers) -> dict:
     """Strip hop-by-hop headers from the upstream response."""
     out = {}
@@ -142,6 +158,7 @@ def create_app(adapter: UpstreamAdapter) -> "web.Application":
                 upstream_url = f"{upstream_url}?{request.query_string}"
 
             fwd_headers = _filter_request_headers(request.headers)
+            fwd_headers = _apply_upstream_headers(fwd_headers, adapter.upstream_headers)
             fwd_headers["Authorization"] = f"{active_cred.token_type} {active_cred.bearer}"
 
             logger.debug(
