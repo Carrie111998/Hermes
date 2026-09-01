@@ -1,6 +1,4 @@
 import {
-  SiApple,
-  SiBilibili,
   SiDiscord,
   SiGmail,
   SiGooglechat,
@@ -65,9 +63,10 @@ function WeComIcon(props: React.SVGProps<SVGSVGElement>) {
 }
 
 // We render simpleicons.org brand glyphs for platforms whose owners publish a
-// usable mark (telegram, discord, matrix, ...). A few brands — Slack, Dingtalk,
-// Feishu, WeCom — have been removed from Simple Icons at the brand owner's
-// request, so we fall back to a colored letter monogram for those.
+// usable mark (telegram, discord, matrix, ...). A few brands — Slack, Feishu,
+// WeCom, BlueBubbles, and Yuanbao — use a compact monogram when we do not have
+// a suitable, license-auditable glyph. This avoids showing an unrelated brand
+// icon as a substitute.
 //
 // `iconColor` is the brand's hex from simpleicons.org so we can paint each
 // glyph in its native color on top of a soft tint. Locally curated marks use
@@ -91,7 +90,7 @@ const PLATFORM_ICONS: Record<string, PlatformIconSpec> = {
   matrix: { Icon: SiMatrix, color: '#0DBD8B', kind: 'brand' },
   signal: { Icon: SiSignal, color: '#3A76F0', kind: 'brand' },
   whatsapp: { Icon: SiWhatsapp, color: '#25D366', kind: 'brand' },
-  bluebubbles: { Icon: SiApple, color: '#0BD318', kind: 'brand' },
+  bluebubbles: { color: '#27AE60', kind: 'brand', monogram: 'BB' },
   photon: { Icon: PhotonIcon, color: '#6366F1', kind: 'brand' },
   homeassistant: { Icon: SiHomeassistant, color: '#18BCF2', kind: 'brand' },
   google_chat: { Icon: SiGooglechat, color: '#34A853', kind: 'brand' },
@@ -110,7 +109,7 @@ const PLATFORM_ICONS: Record<string, PlatformIconSpec> = {
   wecom_callback: { Icon: WeComIcon, color: '#2BAD13', kind: 'brand' },
   dingtalk: { Icon: DingTalkIcon, color: '#0089FF', kind: 'brand' },
   qqbot: { Icon: SiQq, color: '#EB1923', kind: 'brand' },
-  yuanbao: { Icon: SiBilibili, color: '#FB7299', kind: 'brand' }
+  yuanbao: { color: '#F59E0B', kind: 'brand', monogram: 'YB' }
 }
 
 interface PlatformAvatarProps extends Omit<ComponentPropsWithoutRef<'span'>, 'children'> {

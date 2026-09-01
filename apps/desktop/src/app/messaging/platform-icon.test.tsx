@@ -25,7 +25,9 @@ describe('PlatformAvatar brand glyphs', () => {
   it.each([
     ['irc', 'IRC', 'IRC'],
     ['raft', 'Raft', 'R'],
-    ['teams', 'Microsoft Teams', 'T']
+    ['teams', 'Microsoft Teams', 'T'],
+    ['bluebubbles', 'BlueBubbles', 'BB'],
+    ['yuanbao', 'Yuanbao', 'YB']
   ])('renders a stable brand monogram for %s', (platformId, platformName, monogram) => {
     const { container } = render(<PlatformAvatar platformId={platformId} platformName={platformName} />)
 
