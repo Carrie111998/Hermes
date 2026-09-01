@@ -691,7 +691,7 @@ Once upstream is healthy, `/platform resume <name>` clears the breaker and re-ar
 
 ### Restart notifications
 
-When the gateway restarts (or is shut down with in-flight sessions), it can send a direct completion/interruption message to the chat that initiated `/restart`, plus a generic "Gateway online" announcement to each configured home channel. Both controls default to `true`:
+When the gateway restarts (or is shut down with in-flight sessions), it can send a direct completion/interruption message to the chat that initiated `/restart`, plus a generic "Gateway online" announcement to each configured home channel. Both controls default to `true`. For backward compatibility, an existing explicit `gateway_restart_notification: false` also suppresses the generic home announcement unless `home_channel_startup_notification` is set explicitly:
 
 ```yaml
 gateway:
@@ -705,7 +705,7 @@ gateway:
       # both notification settings omitted → default to true
 ```
 
-Set `home_channel_startup_notification: false` on noisy or low-priority platforms while keeping direct restart completion messages. Set `gateway_restart_notification: false` when you also want to suppress direct restart and shutdown lifecycle messages for that platform. The generic home-channel announcement is sent once per planned restart, regardless of how many sessions were in flight.
+Set `home_channel_startup_notification: false` on noisy or low-priority platforms while keeping direct restart completion messages. Set both controls explicitly when separating the two behaviors. The generic home-channel announcement is sent once per planned restart, regardless of how many sessions were in flight.
 
 ### Typing indicators
 

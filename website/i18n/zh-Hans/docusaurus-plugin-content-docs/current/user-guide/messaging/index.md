@@ -490,7 +490,7 @@ launchd plist 是静态的——如果你在配置网关后安装了新工具（
 
 ### 重启通知
 
-当网关重启（或在有进行中会话时关闭）时，它可以向发起 `/restart` 的聊天发送直接的完成/中断消息，并向每个已配置的主频道发送通用的“Gateway online”公告。两个控制项默认都为 `true`：
+当网关重启（或在有进行中会话时关闭）时，它可以向发起 `/restart` 的聊天发送直接的完成/中断消息，并向每个已配置的主频道发送通用的“Gateway online”公告。两个控制项默认都为 `true`。为保持向后兼容，现有的显式 `gateway_restart_notification: false` 也会关闭通用主频道公告，除非明确设置 `home_channel_startup_notification`：
 
 ```yaml
 gateway:
@@ -504,7 +504,7 @@ gateway:
       # 两个通知设置均未设置 → 默认为 true
 ```
 
-在嘈杂或低优先级平台上设置 `home_channel_startup_notification: false`，同时保留直接重启完成消息。如果还要关闭该平台的直接重启和关闭生命周期消息，请设置 `gateway_restart_notification: false`。通用主频道公告每次计划重启只发送一次，无论有多少会话在运行。
+在嘈杂或低优先级平台上设置 `home_channel_startup_notification: false`，同时保留直接重启完成消息。需要区分两种行为时，请明确设置两个控制项。通用主频道公告每次计划重启只发送一次，无论有多少会话在运行。
 
 ### 正在输入指示器
 

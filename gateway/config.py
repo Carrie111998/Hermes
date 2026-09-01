@@ -740,6 +740,12 @@ class PlatformConfig:
         _hcsn = data.get("home_channel_startup_notification")
         if _hcsn is None:
             _hcsn = extra.get("home_channel_startup_notification")
+        if _hcsn is None and _grn is not None:
+            # Backward compatibility: before this setting existed,
+            # gateway_restart_notification controlled both direct restart
+            # replies and generic home-channel announcements. Preserve an
+            # existing explicit opt-out unless the new setting overrides it.
+            _hcsn = _grn
 
         # typing_indicator mirrors gateway_restart_notification: it may arrive
         # top-level or bridged into extra by the shared-key loop in

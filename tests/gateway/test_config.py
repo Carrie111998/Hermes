@@ -90,6 +90,23 @@ class TestPlatformConfigRoundtrip:
         assert restored.home_channel_startup_notification is False
         assert PlatformConfig.from_dict({}).home_channel_startup_notification is True
 
+    def test_old_restart_notification_opt_out_still_suppresses_home_announcement(self):
+        restored = PlatformConfig.from_dict({"gateway_restart_notification": False})
+
+        assert restored.gateway_restart_notification is False
+        assert restored.home_channel_startup_notification is False
+
+    def test_new_home_setting_can_override_old_restart_setting(self):
+        restored = PlatformConfig.from_dict(
+            {
+                "gateway_restart_notification": False,
+                "home_channel_startup_notification": True,
+            }
+        )
+
+        assert restored.gateway_restart_notification is False
+        assert restored.home_channel_startup_notification is True
+
     def test_typing_status_text_resolved_from_extra(self):
         # Same bridge route as typing_indicator: the shared-key loop copies a
         # nested platforms.<plat> value into extra.
