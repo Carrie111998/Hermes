@@ -154,7 +154,7 @@ def test_identity_rotation_is_atomic_with_org_activation(tmp_path: Path):
     assert store.active_org_id() == "org-2"
 
 
-def test_schema_v6_tracks_profile_local_usage_and_telegram_delivery(tmp_path: Path):
+def test_schema_v7_tracks_profile_local_usage_and_surface_delivery(tmp_path: Path):
     store = WisdomStore(tmp_path / "wisdom")
     with store.transaction() as db:
         snapshot_columns = {
@@ -177,10 +177,42 @@ def test_schema_v6_tracks_profile_local_usage_and_telegram_delivery(tmp_path: Pa
     assert {"day_local", "timezone_name"} <= usage_columns
     assert "day_utc" not in usage_columns
     assert "telegram_delivered_at" in event_columns
-    assert version == "6"
+    assert version == "7"
 
 
-def test_schema_v6_preserves_v4_usage_in_an_explicit_utc_bucket(tmp_path: Path):
+def test_candidate_delivery_is_independent_per_surface(tmp_path: Path):
+    store = WisdomStore(tmp_path / "wisdom")
+    skill_path = tmp_path / "skill"
+    skill_path.mkdir()
+    (skill_path / "SKILL.md").write_text("hello", encoding="utf-8")
+    skill_id = store.register_skill(
+        skill_path, content_hash="sha256:source", source_kind="local"
+    )
+    event_id = store.emit_local_event(
+        kind="wisdom.candidate",
+        skill_id=skill_id,
+        content_hash="sha256:source",
+        payload={"skill_name": "skill"},
+        session_id="session-1",
+        task_id="task-1",
+        qualification="manual_selection",
+    )
+    assert event_id
+
+    store.mark_surface_delivered([event_id], surface="slack")
+
+    assert store.pending_surface_events(
+        kind="wisdom.candidate", session_id="session-1", surface="slack"
+    ) == []
+    assert [
+        event["id"]
+        for event in store.pending_surface_events(
+            kind="wisdom.candidate", session_id="session-1", surface="telegram"
+        )
+    ] == [event_id]
+
+
+def test_schema_v7_preserves_v4_usage_in_an_explicit_utc_bucket(tmp_path: Path):
     root = tmp_path / "wisdom"
     root.mkdir()
     with sqlite3.connect(root / "wisdom.db") as db:
@@ -257,3 +289,64 @@ def test_telegram_delivery_is_session_scoped_without_consuming_candidate(tmp_pat
             kind="wisdom.candidate", session_id="telegram-session"
         )
     ] == [event_id]
+
+
+def test_v7_seeds_legacy_telegram_delivery_into_surface_ledger(tmp_path: Path):
+    root = tmp_path / "wisdom"
+    store = WisdomStore(root)
+    skill_path = tmp_path / "skill"
+    skill_path.mkdir()
+    (skill_path / "SKILL.md").write_text("hello", encoding="utf-8")
+    skill_id = store.register_skill(
+        skill_path, content_hash="sha256:source", source_kind="local"
+    )
+    event_id = store.emit_local_event(
+        kind="wisdom.candidate",
+        skill_id=skill_id,
+        content_hash="sha256:source",
+        payload={"skill_name": "skill"},
+        session_id="session-1",
+        task_id="task-1",
+        qualification="high_usage",
+    )
+    with store.transaction() as db:
+        db.execute("DELETE FROM local_event_delivery")
+        db.execute(
+            "UPDATE local_event SET telegram_delivered_at='2026-08-01T00:00:00Z' "
+            "WHERE id=?",
+            (event_id,),
+        )
+
+    migrated = WisdomStore(root)
+
+    assert migrated.pending_surface_events(
+        kind="wisdom.candidate", session_id="session-1", surface="telegram"
+    ) == []
+    assert [
+        item["id"]
+        for item in migrated.pending_surface_events(
+            kind="wisdom.candidate", session_id="session-1", surface="slack"
+        )
+    ] == [event_id]
+
+
+def test_feed_delivery_is_independent_per_surface(tmp_path: Path):
+    store = WisdomStore(tmp_path / "wisdom")
+    assert store.persist_local_notice(
+        event_id="feed-1",
+        kind="new",
+        skill_id="skill-1",
+        payload={"version": 1},
+    )
+
+    store.mark_feed_surface_delivered(["feed-1"], surface="slack")
+
+    assert store.feed_events(
+        surface="slack", surface_due_at="2999-01-01T00:00:00+00:00"
+    ) == []
+    assert [
+        item["event_id"]
+        for item in store.feed_events(
+            surface="telegram", surface_due_at="2999-01-01T00:00:00+00:00"
+        )
+    ] == ["feed-1"]

@@ -385,6 +385,153 @@ def send_telegram_notification_pane(
         return _error(f"Telegram notification failed: {exc}")
 
 
+def send_slack_wisdom_notification_pane(
+    *,
+    message: str,
+    button_rows: list[list[dict[str, str]]],
+    items: list[dict[str, object]],
+) -> dict:
+    """Send a trusted Collective Wisdom Block Kit pane to Slack's home chat.
+
+    This internal surface deliberately accepts only Wisdom's compact managed
+    callback grammar and HTTPS Portal links. It is not exposed through the
+    model-facing ``send_message`` tool.
+    """
+    prepare_send_message_platforms()
+    try:
+        from gateway.config import Platform, load_gateway_config
+        from model_tools import _run_async
+
+        config = load_gateway_config()
+        pconfig = config.platforms.get(Platform.SLACK)
+        if not pconfig or not pconfig.enabled:
+            return _error("Slack is not configured")
+        home = config.get_home_channel(Platform.SLACK)
+        if not home:
+            return _error("Slack has no configured home channel")
+
+        blocks: list[dict[str, object]] = [
+            {
+                "type": "header",
+                "text": {
+                    "type": "plain_text",
+                    "text": "Hermes Collective Wisdom",
+                    "emoji": True,
+                },
+            },
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": (
+                        f"{len(items[:8])} new "
+                        f"{'update' if len(items[:8]) == 1 else 'updates'}"
+                    ),
+                },
+            },
+        ]
+        for item_index, (item, row) in enumerate(
+            zip(items[:8], button_rows[:8])
+        ):
+            heading = str(item.get("heading") or "").strip()[:150]
+            detail = str(item.get("detail") or "").strip()[:2600]
+            if not heading or not detail:
+                continue
+            safe_heading = heading.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+            safe_detail = detail.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+            blocks.append(
+                {
+                    "type": "section",
+                    "text": {
+                        "type": "mrkdwn",
+                        "text": f"*{safe_heading}*\n{safe_detail}",
+                    },
+                }
+            )
+            buttons: list[dict[str, object]] = []
+            for button_index, button in enumerate(row[:2]):
+                label = str(button.get("label") or "").strip()[:75]
+                if not label:
+                    continue
+                element: dict[str, object] = {
+                    "type": "button",
+                    "text": {"type": "plain_text", "text": label, "emoji": True},
+                    "action_id": (
+                        f"hermes_wisdom_feed_{item_index}_{button_index}"
+                    ),
+                }
+                url = str(button.get("url") or "").strip()
+                if re.fullmatch(r"https://[^\s]+", url):
+                    element["url"] = url
+                    element["value"] = "wisdom:portal"
+                else:
+                    callback_data = str(button.get("callback_data") or "").strip()
+                    if not re.fullmatch(
+                        r"wi:plan:(?:install|update):[A-Za-z0-9_-]+",
+                        callback_data,
+                    ):
+                        continue
+                    element["value"] = callback_data
+                    element["style"] = "primary"
+                buttons.append(element)
+            if buttons:
+                blocks.append({"type": "actions", "elements": buttons})
+
+        async def send() -> dict:
+            try:
+                from slack_sdk.web.async_client import AsyncWebClient
+            except ImportError:
+                return _error("slack_sdk is not installed")
+            raw_token = getattr(pconfig, "token", None) or get_secret(
+                "SLACK_BOT_TOKEN", ""
+            )
+            tokens = [
+                token.strip()
+                for token in str(raw_token or "").split(",")
+                if token.strip()
+            ]
+            if not tokens:
+                return _error("Slack bot token is not configured")
+            last_error = "unknown"
+            for token in tokens:
+                try:
+                    client = AsyncWebClient(token=token)
+                    if home.thread_id:
+                        response = await client.chat_postMessage(
+                            channel=home.chat_id,
+                            text=message[:39000],
+                            blocks=blocks[:50],
+                            unfurl_links=False,
+                            unfurl_media=False,
+                            thread_ts=str(home.thread_id),
+                        )
+                    else:
+                        response = await client.chat_postMessage(
+                            channel=home.chat_id,
+                            text=message[:39000],
+                            blocks=blocks[:50],
+                            unfurl_links=False,
+                            unfurl_media=False,
+                        )
+                    payload = getattr(response, "data", response)
+                    if isinstance(payload, dict) and payload.get("ok", True):
+                        return {
+                            "success": True,
+                            "message_id": payload.get("ts"),
+                            "private": str(home.chat_id).startswith("D"),
+                        }
+                    if isinstance(payload, dict):
+                        last_error = str(payload.get("error") or last_error)
+                except Exception as exc:
+                    last_error = str(exc)
+            return _error(f"Slack notification failed: {last_error}")
+
+        result = _run_async(send())
+        return result if isinstance(result, dict) else {"success": bool(result)}
+    except Exception as exc:
+        return _error(f"Slack notification failed: {exc}")
+
+
 def _handle_list():
     """Return formatted list of available messaging targets."""
     try:

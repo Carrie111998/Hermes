@@ -1,0 +1,158 @@
+"""Slack-specific Collective Wisdom cards and delivery behavior."""
+
+from __future__ import annotations
+
+from unittest.mock import AsyncMock, MagicMock
+
+import pytest
+
+from gateway.config import PlatformConfig
+from gateway.wisdom_command import (
+    WisdomAction,
+    WisdomCommandContext,
+    WisdomItem,
+    WisdomView,
+)
+from plugins.platforms.slack.adapter import SlackAdapter
+from plugins.platforms.slack.wisdom_blocks import render_wisdom_blocks
+
+
+def _adapter() -> SlackAdapter:
+    adapter = SlackAdapter(PlatformConfig(enabled=True, token="xoxb-test"))
+    adapter._app = MagicMock()
+    adapter._team_clients = {"T1": AsyncMock()}
+    adapter._channel_team = {"D1": "T1", "C1": "T1"}
+    return adapter
+
+
+def test_wisdom_blocks_render_details_and_inline_actions():
+    view = WisdomView(
+        "Collective Wisdom",
+        "Browse team skills",
+        items=[
+            WisdomItem(
+                "release-helper · v3",
+                "Coordinates a safe release and reports compatibility.",
+                actions=[
+                    WisdomAction(
+                        "Install", callback_data="wi:cmd:opaque", primary=True
+                    ),
+                    WisdomAction("View in Portal ↗", url="https://portal.test/s/1"),
+                ],
+            )
+        ],
+    )
+
+    blocks = render_wisdom_blocks(view)
+
+    assert [block["type"] for block in blocks] == [
+        "header",
+        "section",
+        "section",
+        "actions",
+    ]
+    assert "Coordinates a safe release" in blocks[2]["text"]["text"]
+    buttons = blocks[3]["elements"]
+    assert buttons[0]["value"] == "wi:cmd:opaque"
+    assert buttons[0]["style"] == "primary"
+    assert buttons[1]["url"] == "https://portal.test/s/1"
+
+
+def test_wisdom_blocks_escape_untrusted_skill_text_and_limit_items():
+    view = WisdomView(
+        "Collective <Wisdom>",
+        items=[WisdomItem(f"skill-{index} <here>") for index in range(8)],
+    )
+
+    blocks = render_wisdom_blocks(view)
+
+    assert len([block for block in blocks if block["type"] == "section"]) == 5
+    assert "&lt;here&gt;" in str(blocks)
+
+
+@pytest.mark.asyncio
+async def test_group_private_action_becomes_user_bound_dm_continuation():
+    adapter = _adapter()
+    view = WisdomView(
+        "Collective Wisdom",
+        actions=[
+            WisdomAction(
+                "Continue in DM",
+                "continue_dm",
+                {"raw_args": "installed"},
+                primary=True,
+            )
+        ],
+    )
+    context = WisdomCommandContext(
+        user_id="U1",
+        chat_id="C1",
+        profile="demo",
+        organization_id="org-1",
+        is_group=True,
+    )
+
+    await adapter._prepare_wisdom_view(view, context, team_id="T1", channel_id="C1")
+
+    action = view.actions[0]
+    assert action.operation is None
+    assert isinstance(action.callback_data, str)
+    assert action.callback_data.startswith("wi:continue:")
+    assert (
+        adapter._wisdom_callback_profile(
+            team_id="T1", channel_id="C1", value=action.callback_data
+        )
+        == "demo"
+    )
+
+
+@pytest.mark.asyncio
+async def test_completed_feed_action_preserves_card_and_portal_link():
+    adapter = _adapter()
+    client = adapter._team_clients["T1"]
+    client.chat_update = AsyncMock()
+    body = {
+        "team": {"id": "T1"},
+        "channel": {"id": "D1"},
+        "message": {
+            "ts": "1.2",
+            "text": "Collective Wisdom update",
+            "blocks": [
+                {
+                    "type": "section",
+                    "text": {"type": "mrkdwn", "text": "*Update available*\nskill v2"},
+                },
+                {
+                    "type": "actions",
+                    "elements": [
+                        {
+                            "type": "button",
+                            "action_id": "hermes_wisdom_feed_0_0",
+                            "value": "wi:plan:update:skill-1",
+                            "text": {"type": "plain_text", "text": "Update"},
+                        },
+                        {
+                            "type": "button",
+                            "action_id": "hermes_wisdom_feed_0_1",
+                            "value": "wisdom:portal",
+                            "url": "https://portal.test/skill-1",
+                            "text": {"type": "plain_text", "text": "View"},
+                        },
+                    ],
+                },
+            ],
+        },
+    }
+
+    changed = await adapter._mark_wisdom_interaction_complete(
+        body,
+        callback_value="wi:plan:update:skill-1",
+        completed_label="Updated v2",
+    )
+
+    assert changed is True
+    blocks = client.chat_update.call_args.kwargs["blocks"]
+    assert "Update available" in str(blocks)
+    assert "https://portal.test/skill-1" in str(blocks)
+    assert "wi:plan:update:skill-1" not in str(blocks)
+    assert "Updated v2" in str(blocks)

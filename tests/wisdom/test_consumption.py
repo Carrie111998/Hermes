@@ -775,3 +775,83 @@ def test_off_cadence_suppresses_local_and_telegram_delivery(
     assert manager.poll_feed()["inserted"] == 1
     assert manager.notifications()["events"] == []
     assert manager.dispatch_telegram() == {"attempted": False, "delivered": 0}
+
+
+def test_slack_public_home_only_emits_collective_publication_links(
+    monkeypatch, tmp_path: Path
+):
+    from gateway.config import Platform, PlatformConfig
+
+    client = Client(_files(2))
+    client.discovery = [
+        SimpleNamespace(
+            id="remote-skill",
+            slug="team-runbook",
+            latest_version=3,
+            model_dump=lambda **_kwargs: {
+                "id": "remote-skill",
+                "slug": "team-runbook",
+                "latest_version": 3,
+            },
+        )
+    ]
+    manager, _target = _manager(monkeypatch, tmp_path, client=client)
+    manager.store.persist_local_notice(
+        event_id="event-new-slack",
+        kind="new",
+        skill_id="remote-skill",
+        payload={"version": 3},
+    )
+    home = SimpleNamespace(chat_id="C_PUBLIC", thread_id=None)
+    config = SimpleNamespace(
+        platforms={Platform.SLACK: PlatformConfig(enabled=True, token="xoxb")},
+        get_home_channel=lambda platform: home if platform == Platform.SLACK else None,
+    )
+    monkeypatch.setattr("gateway.config.load_gateway_config", lambda: config)
+    calls = []
+    monkeypatch.setattr(
+        "tools.send_message_tool.send_slack_wisdom_notification_pane",
+        lambda **kwargs: calls.append(kwargs) or {"success": True},
+    )
+
+    assert manager.dispatch_slack() == {"attempted": True, "delivered": 1}
+    assert calls[0]["button_rows"] == [
+        [
+            {
+                "label": "View in Portal ↗",
+                "url": "https://portal.nousresearch.com/orgs/org-1/wisdom/skills/remote-skill?version=3",
+            }
+        ]
+    ]
+
+
+def test_slack_dm_home_offers_verified_update_action(
+    monkeypatch, tmp_path: Path
+):
+    from gateway.config import Platform, PlatformConfig
+
+    client = Client(_files(2))
+    manager, _target = _manager(monkeypatch, tmp_path, client=client)
+    manager.store.persist_local_notice(
+        event_id="event-update-slack",
+        kind="updated",
+        skill_id="skill-1",
+        payload={"version": 2, "update_mode": "MANUAL"},
+    )
+    home = SimpleNamespace(chat_id="D_PRIVATE", thread_id=None)
+    config = SimpleNamespace(
+        platforms={Platform.SLACK: PlatformConfig(enabled=True, token="xoxb")},
+        get_home_channel=lambda platform: home if platform == Platform.SLACK else None,
+    )
+    monkeypatch.setattr("gateway.config.load_gateway_config", lambda: config)
+    calls = []
+    monkeypatch.setattr(
+        "tools.send_message_tool.send_slack_wisdom_notification_pane",
+        lambda **kwargs: calls.append(kwargs) or {"success": True},
+    )
+
+    assert manager.dispatch_slack() == {"attempted": True, "delivered": 1}
+    assert calls[0]["button_rows"][0][0] == {
+        "label": "Update",
+        "callback_data": "wi:plan:update:skill-1",
+    }

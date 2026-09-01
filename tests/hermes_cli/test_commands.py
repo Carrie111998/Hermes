@@ -255,6 +255,12 @@ class TestSlackNativeSlashes:
     COMMAND_REGISTRY entry as a first-class Slack slash, matching Discord
     and Telegram."""
 
+    def test_wisdom_is_native_and_low_value_start_ping_is_via_hermes(self):
+        names = {name for name, _description, _hint in slack_native_slashes()}
+
+        assert "wisdom" in names
+        assert "start" not in names
+
 
 
     def test_names_respect_slack_limits(self):

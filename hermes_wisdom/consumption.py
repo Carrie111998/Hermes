@@ -399,12 +399,14 @@ class WisdomConsumption:
                     "plan": plan,
                 })
         telegram = self.dispatch_telegram()
+        slack = self.dispatch_slack()
         return {
             "installations": results,
             "qualification_events": qualification_events,
             "feed": feed,
             "owner_decisions": decisions,
             "telegram": telegram,
+            "slack": slack,
         }
 
     def update_plan(
@@ -1155,7 +1157,7 @@ class WisdomConsumption:
             f"{len(selected)} new {'update' if len(selected) == 1 else 'updates'}",
         ]
         button_rows: list[list[dict[str, str]]] = []
-        rich_items: list[dict[str, str]] = []
+        rich_items: list[dict[str, object]] = []
         for event in selected:
             heading, detail = self._telegram_notification_text(event)
             lines.extend(["", f"<b>{escape(heading)}</b>", escape(detail)])
@@ -1204,4 +1206,109 @@ class WisdomConsumption:
         ]
         ids.extend(ignored)
         self.store.mark_feed_telegram_delivered(ids)
+        return {"attempted": True, "delivered": len(selected)}
+
+    def dispatch_slack(self) -> dict[str, Any]:
+        """Deliver due Wisdom feed items to Slack's configured home chat.
+
+        A public home channel receives only collective publication notices and
+        Portal links. Device-local install/update state and mutation controls
+        are emitted only when the configured home is a DM.
+        """
+        try:
+            from gateway.config import Platform, load_gateway_config
+
+            config = load_gateway_config()
+            platform_config = config.platforms.get(Platform.SLACK)
+            home = config.get_home_channel(Platform.SLACK)
+            if not platform_config or not platform_config.enabled or not home:
+                return {"attempted": False, "delivered": 0}
+            private_home = str(home.chat_id).startswith("D")
+        except Exception:
+            return {"attempted": False, "delivered": 0}
+
+        now = datetime.now(timezone.utc).isoformat()
+        due = self.store.feed_events(
+            surface="slack", surface_due_at=now
+        )
+        if not due:
+            return {"attempted": False, "delivered": 0}
+        notifications, ignored = self._notification_projection(due)
+        excluded: list[str] = []
+        if not private_home:
+            public_notifications: list[dict[str, Any]] = []
+            for event in notifications:
+                public_safe = event["category"] == "new_skill" or (
+                    event["category"] == "publication_decision"
+                    and event.get("state") in {"published", "approved"}
+                )
+                if public_safe:
+                    public_notifications.append(event)
+                else:
+                    excluded.extend(
+                        str(event_id) for event_id in event["source_event_ids"]
+                    )
+            notifications = public_notifications
+        selected = notifications[:8]
+        if not selected:
+            self.store.mark_feed_surface_delivered(
+                [*ignored, *excluded], surface="slack"
+            )
+            return {"attempted": False, "delivered": 0}
+
+        lines = [
+            "Collective Wisdom",
+            f"{len(selected)} new {'update' if len(selected) == 1 else 'updates'}",
+        ]
+        button_rows: list[list[dict[str, str]]] = []
+        items: list[dict[str, object]] = []
+        for event in selected:
+            heading, detail = self._telegram_notification_text(event)
+            lines.extend(["", heading, detail])
+            items.append({"heading": heading, "detail": detail})
+            row: list[dict[str, str]] = []
+            if private_home and event["category"] == "new_skill":
+                row.append(
+                    {
+                        "label": "Install",
+                        "callback_data": f"wi:plan:install:{event['skill_id']}",
+                    }
+                )
+            elif private_home and event["category"] == "update_available":
+                row.append(
+                    {
+                        "label": "Update",
+                        "callback_data": f"wi:plan:update:{event['skill_id']}",
+                    }
+                )
+            portal_url = event.get("portal_url")
+            if isinstance(portal_url, str) and portal_url:
+                row.append({"label": "View in Portal ↗", "url": portal_url})
+            button_rows.append(row)
+        try:
+            from tools.send_message_tool import send_slack_wisdom_notification_pane
+
+            result = send_slack_wisdom_notification_pane(
+                message="\n".join(lines),
+                button_rows=button_rows,
+                items=items,
+            )
+        except Exception as exc:
+            return {"attempted": True, "delivered": 0, "error": str(exc)}
+        if not isinstance(result, dict) or not result.get("success"):
+            return {
+                "attempted": True,
+                "delivered": 0,
+                "error": str(
+                    result.get("error") if isinstance(result, dict) else result
+                ),
+            }
+        delivered_ids = [
+            str(event_id)
+            for item in selected
+            for event_id in item["source_event_ids"]
+        ]
+        self.store.mark_feed_surface_delivered(
+            [*delivered_ids, *ignored, *excluded], surface="slack"
+        )
         return {"attempted": True, "delivered": len(selected)}

@@ -15,7 +15,7 @@ from typing import Any, Iterator
 from hermes_constants import get_hermes_home
 
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 
 
 def utc_now() -> str:
@@ -182,6 +182,13 @@ class WisdomStore:
                   UNIQUE(kind, skill_id, content_hash, qualification),
                   FOREIGN KEY(skill_id) REFERENCES local_skill(id) ON DELETE CASCADE
                 );
+                CREATE TABLE IF NOT EXISTS local_event_delivery (
+                  event_id TEXT NOT NULL,
+                  surface TEXT NOT NULL,
+                  delivered_at TEXT NOT NULL,
+                  PRIMARY KEY(event_id, surface),
+                  FOREIGN KEY(event_id) REFERENCES local_event(id) ON DELETE CASCADE
+                );
                 CREATE TABLE IF NOT EXISTS feed_state (
                   singleton INTEGER PRIMARY KEY CHECK(singleton=1),
                   cursor TEXT,
@@ -200,6 +207,13 @@ class WisdomStore:
                   local_seen_at TEXT,
                   telegram_delivered_at TEXT,
                   created_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS feed_event_delivery (
+                  event_id TEXT NOT NULL,
+                  surface TEXT NOT NULL,
+                  delivered_at TEXT NOT NULL,
+                  PRIMARY KEY(event_id, surface),
+                  FOREIGN KEY(event_id) REFERENCES feed_event(event_id) ON DELETE CASCADE
                 );
                 CREATE TABLE IF NOT EXISTS operation_lock (
                   entity_id TEXT PRIMARY KEY,
@@ -314,6 +328,20 @@ class WisdomStore:
                 db.execute(
                     "ALTER TABLE local_event ADD COLUMN telegram_delivered_at TEXT"
                 )
+            # Seed the transport-neutral delivery ledger from pre-v7 Telegram
+            # timestamps. Keeping the legacy columns during the migration
+            # window preserves older readers while Slack gains independent
+            # delivery state.
+            db.execute(
+                "INSERT OR IGNORE INTO local_event_delivery(event_id,surface,delivered_at) "
+                "SELECT id,'telegram',telegram_delivered_at FROM local_event "
+                "WHERE telegram_delivered_at IS NOT NULL"
+            )
+            db.execute(
+                "INSERT OR IGNORE INTO feed_event_delivery(event_id,surface,delivered_at) "
+                "SELECT event_id,'telegram',telegram_delivered_at FROM feed_event "
+                "WHERE telegram_delivered_at IS NOT NULL"
+            )
             journal_sql = str(
                 db.execute(
                     "SELECT sql FROM sqlite_master WHERE type='table' AND name='operation_journal'"
@@ -649,14 +677,24 @@ class WisdomStore:
         candidate must remain available to Desktop and Dashboard until the
         owner dismisses it or advances its exact bytes into publication.
         """
+        return self.pending_surface_events(
+            kind=kind, session_id=session_id, surface="telegram"
+        )
+
+    def pending_surface_events(
+        self, *, kind: str, session_id: str, surface: str
+    ) -> list[dict[str, Any]]:
+        """Return unread session events not yet delivered to one surface."""
         with self.transaction() as db:
             rows = [
                 dict(row)
                 for row in db.execute(
-                    "SELECT * FROM local_event WHERE kind=? AND session_id=? "
-                    "AND state='unread' AND telegram_delivered_at IS NULL "
-                    "ORDER BY created_at",
-                    (kind, session_id),
+                    "SELECT e.* FROM local_event e WHERE e.kind=? AND e.session_id=? "
+                    "AND e.state='unread' AND NOT EXISTS ("
+                    "SELECT 1 FROM local_event_delivery d "
+                    "WHERE d.event_id=e.id AND d.surface=?"
+                    ") ORDER BY e.created_at",
+                    (kind, session_id, surface),
                 ).fetchall()
             ]
         for row in rows:
@@ -664,6 +702,7 @@ class WisdomStore:
         return rows
 
     def mark_telegram_delivered(self, event_ids: list[str]) -> None:
+        self.mark_surface_delivered(event_ids, surface="telegram")
         if not event_ids:
             return
         placeholders = ",".join("?" for _ in event_ids)
@@ -672,6 +711,19 @@ class WisdomStore:
                 f"UPDATE local_event SET telegram_delivered_at=? "
                 f"WHERE id IN ({placeholders}) AND telegram_delivered_at IS NULL",
                 (utc_now(), *event_ids),
+            )
+
+    def mark_surface_delivered(
+        self, event_ids: list[str], *, surface: str
+    ) -> None:
+        if not event_ids:
+            return
+        delivered_at = utc_now()
+        with self.transaction() as db:
+            db.executemany(
+                "INSERT OR IGNORE INTO local_event_delivery "
+                "(event_id,surface,delivered_at) VALUES(?,?,?)",
+                [(event_id, surface, delivered_at) for event_id in event_ids],
             )
 
     def dismiss_candidate(self, skill_id: str, content_hash: str) -> None:
@@ -1097,19 +1149,33 @@ class WisdomStore:
         return inserted
 
     def feed_events(
-        self, *, unseen_only: bool = False, telegram_due_at: str | None = None
+        self,
+        *,
+        unseen_only: bool = False,
+        telegram_due_at: str | None = None,
+        surface: str | None = None,
+        surface_due_at: str | None = None,
     ) -> list[dict[str, Any]]:
-        query = "SELECT * FROM feed_event WHERE 1=1"
+        query = "SELECT e.* FROM feed_event e WHERE 1=1"
         params: list[str] = []
         if unseen_only:
-            query += " AND local_seen_at IS NULL AND cadence!='off' AND due_at<=?"
+            query += " AND e.local_seen_at IS NULL AND e.cadence!='off' AND e.due_at<=?"
             params.append(utc_now())
         if telegram_due_at is not None:
             query += (
-                " AND telegram_delivered_at IS NULL AND cadence!='off' AND due_at<=?"
+                " AND NOT EXISTS (SELECT 1 FROM feed_event_delivery d "
+                "WHERE d.event_id=e.event_id AND d.surface='telegram') "
+                "AND e.cadence!='off' AND e.due_at<=?"
             )
             params.append(telegram_due_at)
-        query += " ORDER BY created_at,event_id"
+        if surface is not None and surface_due_at is not None:
+            query += (
+                " AND NOT EXISTS (SELECT 1 FROM feed_event_delivery d "
+                "WHERE d.event_id=e.event_id AND d.surface=?) "
+                "AND e.cadence!='off' AND e.due_at<=?"
+            )
+            params.extend([surface, surface_due_at])
+        query += " ORDER BY e.created_at,e.event_id"
         with self.transaction() as db:
             rows = [dict(row) for row in db.execute(query, params).fetchall()]
         for row in rows:
@@ -1172,6 +1238,7 @@ class WisdomStore:
             )
 
     def mark_feed_telegram_delivered(self, event_ids: list[str]) -> None:
+        self.mark_feed_surface_delivered(event_ids, surface="telegram")
         if not event_ids:
             return
         placeholders = ",".join("?" for _ in event_ids)
@@ -1179,4 +1246,17 @@ class WisdomStore:
             db.execute(
                 f"UPDATE feed_event SET telegram_delivered_at=? WHERE event_id IN ({placeholders})",
                 [utc_now(), *event_ids],
+            )
+
+    def mark_feed_surface_delivered(
+        self, event_ids: list[str], *, surface: str
+    ) -> None:
+        if not event_ids:
+            return
+        delivered_at = utc_now()
+        with self.transaction() as db:
+            db.executemany(
+                "INSERT OR IGNORE INTO feed_event_delivery "
+                "(event_id,surface,delivered_at) VALUES(?,?,?)",
+                [(event_id, surface, delivered_at) for event_id in event_ids],
             )

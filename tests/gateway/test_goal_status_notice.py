@@ -117,3 +117,47 @@ async def test_wisdom_candidate_notice_defers_in_the_originating_telegram_sessio
     assert adapter.wisdom_calls[0]["chat_id"] == "telegram-chat"
     assert adapter.wisdom_calls[0]["session_id"] == "exact-session-id"
     assert adapter.wisdom_calls[0]["metadata"]["thread_id"] == "topic-7"
+
+
+@pytest.mark.asyncio
+async def test_wisdom_candidate_notice_defers_to_slack_with_private_routing_identity():
+    runner = GatewayRunner.__new__(GatewayRunner)
+    adapter = FakeAdapter()
+    runner.adapters = {Platform.SLACK: adapter}
+    runner._profile_adapters = {
+        "collective-demo": {Platform.SLACK: adapter},
+    }
+    runner.config = SimpleNamespace(
+        group_sessions_per_user=True, thread_sessions_per_user=False
+    )
+    source = SessionSource(
+        platform=Platform.SLACK,
+        chat_id="C_TEAM",
+        thread_id="1720000000.0001",
+        user_id="U_OWNER",
+        scope_id="T_TEAM",
+        profile="collective-demo",
+    )
+
+    await runner._defer_wisdom_candidate_notice_after_delivery(
+        source, "exact-session-id"
+    )
+
+    assert adapter.wisdom_calls == []
+    _, callback = next(iter(adapter.callbacks.values()))
+    result = callback()
+    if hasattr(result, "__await__"):
+        await result
+    assert adapter.wisdom_calls == [
+        {
+            "chat_id": "C_TEAM",
+            "session_id": "exact-session-id",
+            "metadata": {
+                "thread_id": "1720000000.0001",
+                "slack_team_id": "T_TEAM",
+                "scope_id": "T_TEAM",
+                "user_id": "U_OWNER",
+                "profile": "collective-demo",
+            },
+        }
+    ]

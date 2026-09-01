@@ -22745,9 +22745,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     async def _defer_wisdom_candidate_notice_after_delivery(
         self, source: Any, session_id: str
     ) -> None:
-        """Surface local qualification after the originating Telegram reply."""
-        if getattr(source, "platform", None) != Platform.TELEGRAM:
-            return
+        """Surface local qualification after the originating client reply."""
         adapter = self._adapter_for_source(source)
         sender = getattr(adapter, "send_wisdom_candidate_notifications", None)
         if adapter is None or not callable(sender):
@@ -22767,7 +22765,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
             except Exception as exc:
                 logger.warning(
-                    "Wisdom candidate Telegram delivery failed: %s", exc, exc_info=True
+                    "Wisdom candidate %s delivery failed: %s",
+                    getattr(source, "platform", "platform"),
+                    exc,
+                    exc_info=True,
                 )
 
         try:
@@ -25013,13 +25014,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # restart/synthetic-send fallback.
             team_id = getattr(source, "scope_id", None)
             user_id = getattr(source, "user_id", None)
-            if team_id or user_id:
+            profile = getattr(source, "profile", None)
+            if team_id or user_id or profile:
                 metadata = dict(metadata or {})
                 if team_id:
                     metadata["slack_team_id"] = str(team_id)
                     metadata.setdefault("scope_id", str(team_id))
                 if user_id:
                     metadata.setdefault("user_id", str(user_id))
+                if profile:
+                    metadata.setdefault("profile", str(profile))
         return metadata
 
     def _thread_metadata_for_target(
