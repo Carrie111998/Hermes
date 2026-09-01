@@ -2272,6 +2272,8 @@ export const ar = defineLocale({
       openCommandCenter: 'فتح مركز الأوامر',
       showTerminal: 'إظهار الطرفية',
       hideTerminal: 'إخفاء الطرفية',
+      showBrowser: 'فتح المتصفح',
+      hideBrowser: 'فتح المتصفح',
       gateway: 'البوابة',
       gatewayReady: 'البوابة جاهزة',
       gatewayNeedsSetup: 'البوابة تحتاج إعدادا',
