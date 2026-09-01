@@ -83,19 +83,26 @@ def _getenv(name: str, default: str = "") -> str:
     read ``os.environ``. Keeps the ``(name, default) -> str`` contract every
     call site here already relies on.
 
-    Falls back to ``~/.hermes/.env`` when the process environment has no
-    usable value — the same policy ``hermes_cli.config.get_env_value``
-    already applies for the gateway/CLI/auth paths. The desktop SSH backend
+    Lookup order is process environment → ``~/.hermes/.env`` → ``default``
+    (the same policy ``hermes_cli.config.get_env_value`` already applies for
+    the gateway/CLI/auth paths). The desktop SSH backend
     is spawned with a stripped environment (``setsid env HERMES_DESKTOP=1 …
     serve --isolated``), so any key that lives only in ``.env`` is invisible
     to a raw ``os.environ`` read and every model call fails with "API key
     not set" even though ``hermes chat`` on the same box works (#99604).
     Under multiplexing the scoped miss above stays authoritative — the
     shared ``.env`` file may hold another profile's value, so no fallback
-    happens there.
+    happens there. A variable that is set but empty counts as set: exporting
+    ``KEY=""`` keeps disabling the provider instead of borrowing the ``.env``
+    value, matching the pre-fallback ``os.getenv`` semantics.
     """
-    val = _get_secret(name, default)
-    if val is not None and str(val).strip():
+    val = _get_secret(name, None)
+    if val is not None:
+        # An explicitly-set (even empty) value is authoritative — exporting
+        # KEY="" disables the provider rather than borrowing the .env value.
+        # A None here means the variable is genuinely absent (get_secret
+        # passes the default through on every miss path), and only that may
+        # borrow from the .env fallback.
         return val
     if _is_multiplex_active():
         return default

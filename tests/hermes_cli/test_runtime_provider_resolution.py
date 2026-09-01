@@ -846,6 +846,30 @@ def test_named_custom_provider_process_env_wins_over_dotenv(monkeypatch):
     assert resolved["api_key"] == "env-secret"
 
 
+def test_named_custom_provider_explicit_empty_env_disables_dotenv_fallback(monkeypatch):
+    """A variable exported as empty is an explicit value, not a miss.
+
+    Exporting ``KEY=""`` is a common way to disable a provider; borrowing the
+    ``.env`` value for it would silently re-enable it. The empty value must
+    flow through so the inline api_key fallback (not the .env file) wins,
+    matching the pre-.env-fallback os.getenv semantics.
+    """
+    key_env_name = "OPENCODE" + "_GO_API_KEY"
+    monkeypatch.setenv(key_env_name, "")
+    monkeypatch.setattr(
+        "hermes_cli.config.load_env",
+        lambda: {key_env_name: "dotenv-placeholder"},
+    )
+    config = _opencode_go_config()
+    config["providers"]["opencode-go"]["api_key"] = "inline-placeholder"
+    monkeypatch.setattr(rp, "load_config", lambda: config)
+    _forbid_builtin_resolution(monkeypatch)
+
+    resolved = rp.resolve_runtime_provider(requested="custom:opencode-go")
+
+    assert resolved["api_key"] == "inline-placeholder"
+
+
 def test_named_custom_provider_dotenv_fallback_fail_closed_under_multiplex(monkeypatch):
     """Under multiplexing a scoped miss must not borrow the shared .env value.
 
