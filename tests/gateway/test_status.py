@@ -327,6 +327,103 @@ class TestGatewayRuntimeStatus:
                 == 139
             ), cmdline
 
+    def test_start_times_match_tolerates_wall_clock_step(self):
+        """A small start-time delta is a clock correction, not a different process.
+
+        On platforms without ``/proc`` the fingerprint is
+        ``psutil.create_time()`` — an absolute UNIX epoch derived from a wall
+        clock that NTP steps.  A single correction re-dates every live process
+        at once, so exact equality declares healthy gateways dead.  Deltas far
+        larger than any plausible NTP step must still be rejected.
+        """
+        base = 178822529997
+
+        # Clock corrections — same process.
+        assert status._start_times_match(base, base)
+        assert status._start_times_match(base, base - 200)  # the observed 2.00s step
+        assert status._start_times_match(base, base + 200)  # and the other direction
+        assert status._start_times_match(base, base - status._START_TIME_MATCH_TOLERANCE)
+
+        # Beyond tolerance — a genuinely different process.
+        assert not status._start_times_match(
+            base, base - status._START_TIME_MATCH_TOLERANCE - 1
+        )
+        assert not status._start_times_match(base, base - 22500)  # PID reuse, ~225s apart
+
+    def test_start_times_match_treats_unusable_fingerprints_as_no_objection(self):
+        """An absent or corrupt fingerprint is not evidence of a mismatch.
+
+        Callers corroborate identity with argv + HERMES_HOME; a missing
+        start_time must not by itself veto a live gateway.
+        """
+        assert status._start_times_match(None, 178822529997)
+        assert status._start_times_match(178822529997, None)
+        assert status._start_times_match(None, None)
+        assert status._start_times_match("not-a-number", 178822529997)
+
+    def test_runtime_status_running_pid_survives_wall_clock_step(self, monkeypatch):
+        """Regression (macOS, live): NTP re-dated a running gateway to death.
+
+        ``hermes profile list`` and the dashboard reported a profile stopped
+        while its cron ticker kept firing seconds earlier.  The state file held
+        the same fingerprint twice, written by one ``_build_pid_record()`` call,
+        and they disagreed by exactly 2.00s — the top-level ``start_time`` had
+        been stamped either side of a clock correction.  The argv + HERMES_HOME
+        identity check passed; only the exact start-time comparison objected.
+        """
+        coder_home = Path("/opt/data/profiles/coder")
+        payload = {
+            "pid": 139,
+            "gateway_state": "running",
+            "kind": "hermes-gateway",
+            "argv": ["hermes", "-p", "coder", "gateway", "run"],
+            "start_time": 178822529997,
+        }
+
+        monkeypatch.setattr(status, "_pid_exists", lambda pid: True)
+        monkeypatch.setattr(
+            status, "_read_process_cmdline", lambda pid: "hermes -p coder gateway run"
+        )
+        # The live process reads back 2.00s earlier than the recorded stamp.
+        monkeypatch.setattr(status, "_get_process_start_time", lambda pid: 178822529797)
+
+        assert (
+            status.get_runtime_status_running_pid(payload, expected_home=coder_home)
+            == 139
+        )
+        assert status.runtime_status_pid_is_live(payload)
+
+    def test_runtime_status_running_pid_still_rejects_pid_reuse_after_clock_step(
+        self, monkeypatch
+    ):
+        """The clock tolerance must not blunt the PID-reuse guard.
+
+        A recycled PID belongs to a process started at a wholly different time,
+        far outside any NTP step, and must still be rejected even though its
+        command line would otherwise satisfy the profile check.
+        """
+        coder_home = Path("/opt/data/profiles/coder")
+        payload = {
+            "pid": 139,
+            "gateway_state": "running",
+            "kind": "hermes-gateway",
+            "argv": ["hermes", "-p", "coder", "gateway", "run"],
+            "start_time": 178822529997,
+        }
+
+        monkeypatch.setattr(status, "_pid_exists", lambda pid: True)
+        monkeypatch.setattr(
+            status, "_read_process_cmdline", lambda pid: "hermes -p coder gateway run"
+        )
+        # Same PID, but this process started ~225s later: a different process.
+        monkeypatch.setattr(status, "_get_process_start_time", lambda pid: 178822552497)
+
+        assert (
+            status.get_runtime_status_running_pid(payload, expected_home=coder_home)
+            is None
+        )
+        assert not status.runtime_status_pid_is_live(payload)
+
 
     def test_command_line_belongs_to_profile_normalizes_separators(self):
         """A Windows argv renders HERMES_HOME with backslashes while the
