@@ -145,7 +145,7 @@ def _warn_if_gateway_not_running() -> None:
 
     profile = _cron_profile_name()
     print(color(
-        f"  ⚠  Gateway for profile '{profile}' is not running — "
+        f"  ⚠  Gateway is not running for profile '{profile}' — "
         "jobs won't fire automatically.",
         Colors.YELLOW,
     ))
@@ -416,7 +416,6 @@ def cron_status():
     from cron.jobs import list_jobs
     from hermes_cli.gateway import find_gateway_pids
 
-    print()
     profile = _print_cron_profile()
     print()
 
@@ -545,7 +544,7 @@ def cron_status():
             print("  Check the gateway log for 'Cron tick error'.")
         else:
             print(color(
-                f"✓ Gateway for profile '{profile}' is running — "
+                f"✓ Gateway is running for profile '{profile}' — "
                 "cron jobs will fire automatically",
                 Colors.GREEN,
             ))
@@ -555,7 +554,7 @@ def cron_status():
                 print(f"  Ticker heartbeat: {int(hb_age)}s ago")
     else:
         print(color(
-            f"✗ Gateway for profile '{profile}' is not running — "
+            f"✗ Gateway is not running for profile '{profile}' — "
             "cron jobs will NOT fire",
             Colors.RED,
         ))

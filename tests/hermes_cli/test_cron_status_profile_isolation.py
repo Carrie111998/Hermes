@@ -76,7 +76,7 @@ class TestCronStatusHeartbeatGuard:
 
         stdout = capsys.readouterr().out
         assert (
-            "✓ Gateway for profile 'default' is running — "
+            "✓ Gateway is running for profile 'default' — "
             "cron jobs will fire automatically"
         ) in stdout
         assert "⚠" not in stdout

@@ -31,13 +31,16 @@ def test_cron_status_scopes_negative_gateway_claim_to_profile(capsys):
 
     output = capsys.readouterr().out
     assert "Profile: default" in output
-    assert "Gateway for profile 'default' is not running" in output
+    assert "Gateway is not running for profile 'default'" in output
     assert "Gateway is not running — cron jobs will NOT fire" not in output
 
 
 def test_top_level_help_documents_profile_selector():
-    from hermes_cli._parser import build_top_level_parser
+    from hermes_cli._parser import build_top_level_parser, top_level_value_flag_sets
 
     parser, _subparsers, _chat_parser = build_top_level_parser()
+    required, optional = top_level_value_flag_sets()
 
     assert "--profile PROFILE" in parser.format_help()
+    assert {"--profile", "-p"} <= required
+    assert {"--profile", "-p"}.isdisjoint(optional)
