@@ -7701,6 +7701,12 @@ def _rebuild_desktop_after_update(
     to rebuild, up to date, build succeeded, Desktop never installed —
     returns ``True``.
     """
+    # The detached updater replaces the AppImage separately, so there is no
+    # local desktop bundle to rebuild here.
+    if sys.platform == "linux" and os.environ.get("APPIMAGE") and os.environ.get("HERMES_APPIMAGE_UPDATE") == "1":
+        print("→ Desktop AppImage update is handled separately")
+        return True
+
     # The release tree is ignored by git and can disappear during an update.
     # Its pre-update presence is enough to restore it; do not make people who
     # have never used Desktop pay for an Electron build.

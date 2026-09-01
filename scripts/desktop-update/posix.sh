@@ -118,6 +118,15 @@ json_escape() { # minimal JSON string escape: \ " and control whitespace
   printf '%s' "$s"
 }
 
+appimage_arch() {
+  case "$(uname -m)" in
+    x86_64|amd64) echo x64 ;;
+    aarch64|arm64) echo arm64 ;;
+    armv7l|armv7|armhf) echo armv7l ;;
+    *) return 1 ;;
+  esac
+}
+
 notify_fallback() { # status message — renderer-free recovery surface.
   # Fires only when there is no shim window. BEST-EFFORT immediate channel:
   # each rung requires EXECUTION acceptance, not existence — notify-send's
@@ -308,6 +317,14 @@ stop_ui() { # error/manual outcomes keep the window up briefly so a watching
 GATE="" GATE_MSG=""
 linux_gate() {
   local unpacked="$INSTALL_ROOT/apps/desktop/release/linux-unpacked" sb arg
+  # An AppImage is updated in place below. Its mounted process path is not
+  # under the source checkout, so the unpacked-app proof used by source/deb/
+  # rpm installs does not apply here.
+  if [ "$(uname)" = "Linux" ] && [ -n "${APPIMAGE:-}" ] \
+      && [ "$RELAUNCH_TARGET" = "$APPIMAGE" ] && [ -x "$RELAUNCH_TARGET" ]; then
+    GATE=relaunch
+    return
+  fi
   case "$RELAUNCH_TARGET" in
     "$unpacked"/*) ;;
     *) GATE=skew GATE_MSG="Backend updated, but the desktop app package (AppImage/deb/rpm) was not changed. Update or reinstall it to match."; return ;;
@@ -568,6 +585,11 @@ start_ui
 HERMES_BIN="$INSTALL_ROOT/venv/bin/hermes"
 [ -x "$HERMES_BIN" ] || { FINAL_CODE=3 FINAL_MSG="Update aborted: $HERMES_BIN is missing. The install needs repair (run the Hermes installer or hermes doctor)."; log "$FINAL_MSG"; exit 3; }
 
+APPIMAGE_MODE=0
+if [ "$(uname)" = "Linux" ] && [ -n "${APPIMAGE:-}" ] && [ -x "$APPIMAGE" ]; then
+  APPIMAGE_MODE=1
+fi
+
 # Run FROM the install root: `hermes update` resolves the tree it mutates
 # from the working directory, and we inherit the Desktop's cwd (which can be
 # an unrelated repo — updating THAT instead of the install is the failure
@@ -588,6 +610,11 @@ if "$HERMES_BIN" update --help 2>/dev/null | grep -q -- '--keep-stash'; then
   KEEP_STASH="--keep-stash"
 else
   log "installed hermes predates --keep-stash; running without it"
+fi
+if [ "$APPIMAGE_MODE" -eq 1 ]; then
+  # The AppImage replaces the desktop build. Keep updating the backend and
+  # dependencies, but skip the local unpacked-app build.
+  export HERMES_APPIMAGE_UPDATE=1
 fi
 log "running: hermes update --yes --gateway $KEEP_STASH --branch $BRANCH"
 publish_stage "Updating code and dependencies"
@@ -629,6 +656,31 @@ if [ "$CODE" -eq 0 ] && printf '%s' "$OUT" | grep -q "Desktop build failed"; the
     FINAL_CODE=6 FINAL_MSG="Code and dependencies updated, but the Desktop app rebuild failed - you are running the previous build. Run hermes desktop --force-build from a terminal to retry."
     exit 6
   }
+fi
+
+if [ "$CODE" -eq 0 ] && [ "$APPIMAGE_MODE" -eq 1 ]; then
+  APPIMAGE_PYTHON="$INSTALL_ROOT/venv/bin/python3"
+  [ -x "$APPIMAGE_PYTHON" ] || APPIMAGE_PYTHON="$(command -v python3 2>/dev/null || true)"
+  if [ ! -x "${APPIMAGE_PYTHON:-/nonexistent}" ] || [ ! -f "$SCRIPT_DIR/appimage_update.py" ]; then
+    FINAL_CODE=7 FINAL_MSG="Code updated, but the AppImage updater is unavailable. The existing desktop app was kept."
+    log "$FINAL_MSG"
+    exit 7
+  fi
+  publish_stage "Installing the latest desktop AppImage"
+  APPIMAGE_ARGS=("--target" "$APPIMAGE" "--arch" "$(appimage_arch 2>/dev/null || true)")
+  if [ -n "${HERMES_APPIMAGE_RELEASE_API:-}" ]; then
+    APPIMAGE_ARGS+=("--release-api" "$HERMES_APPIMAGE_RELEASE_API")
+  fi
+  if [ -z "${APPIMAGE_ARGS[3]:-}" ]; then
+    FINAL_CODE=7 FINAL_MSG="Code updated, but this Linux architecture has no AppImage release. The existing desktop app was kept."
+    log "$FINAL_MSG"
+    exit 7
+  fi
+  if ! "$APPIMAGE_PYTHON" "$SCRIPT_DIR/appimage_update.py" "${APPIMAGE_ARGS[@]}" >> "$LOG" 2>&1; then
+    FINAL_CODE=7 FINAL_MSG="Code updated, but the latest AppImage could not be downloaded or verified. The existing desktop app was kept."
+    log "$FINAL_MSG"
+    exit 7
+  fi
 fi
 
 if [ "$CODE" -eq 0 ]; then FINAL_CODE=0 FINAL_MSG="Update complete."
