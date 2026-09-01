@@ -717,12 +717,13 @@ def resolve_skill_command_key(
 ) -> Optional[str]:
     """Resolve a user-typed /command to its canonical skill_cmds key.
 
-    Skills are always stored with hyphens — ``scan_skill_commands`` normalizes
-    spaces and underscores to hyphens when building the key. Hyphens and
-    underscores are treated interchangeably in user input: this matches
-    ``_check_unavailable_skill`` and accommodates Telegram bot-command names
-    (which disallow hyphens, so ``/claude-code`` is registered as
-    ``/claude_code`` and comes back in the underscored form).
+    Filesystem skills are stored with hyphens — ``scan_skill_commands``
+    normalizes spaces and underscores when building the key. Qualified plugin
+    keys preserve their registered spelling, so an exact lowercase match is
+    tried before filesystem underscore-to-hyphen normalization. The fallback
+    accommodates Telegram bot-command names (which disallow hyphens, so
+    ``/claude-code`` is registered as ``/claude_code`` and comes back in the
+    underscored form).
 
     Interactive callers also resolve namespaced plugin skills. Native messaging
     gateways pass ``interactive=False`` because ``:`` is not a portable command
