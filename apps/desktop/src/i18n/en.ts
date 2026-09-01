@@ -3023,7 +3023,8 @@ export const en: Translations = {
     terminalNew: 'New terminal',
     terminalCloseOthers: 'Close others',
     terminalCloseAll: 'Close all',
-    addToChat: 'Add to chat'
+    addToChat: 'Add to chat',
+    showHiddenFiles: 'Show hidden files'
   },
 
   preview: {
