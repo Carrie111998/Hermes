@@ -218,9 +218,8 @@ class TestFallbackChainAdvancement:
     def test_nous_anthropic_fallback_uses_the_messages_wire(self):
         """Portal Claude fallbacks must not stay on chat_completions.
 
-        ``resolve_provider_client`` still returns an OpenAI client for Nous;
-        activation has to re-derive api_mode from the model and rebuild the
-        Anthropic client — otherwise the turn POSTs /chat/completions.
+        ``resolve_provider_client`` returns the already-built Messages client;
+        activation must install that client rather than reconstructing it.
         """
         portal = "https://inference-api.nousresearch.com/v1"
         fbs = [
@@ -230,13 +229,15 @@ class TestFallbackChainAdvancement:
             }
         ]
         agent = _make_agent(fallback_model=fbs)
-        rebuilt = {"count": 0}
+        request_client = MagicMock(name="anthropic-request-client")
+        from agent.auxiliary_client import AnthropicAuxiliaryClient
 
-        def _fake_build(api_key, base_url, timeout=None, **kwargs):
-            rebuilt["count"] += 1
-            rebuilt["api_key"] = api_key
-            rebuilt["base_url"] = base_url
-            return MagicMock(name="anthropic-client")
+        resolved_client = AnthropicAuxiliaryClient(
+            request_client,
+            "anthropic/claude-opus-4.8",
+            "portal-jwt",
+            portal,
+        )
 
         with (
             patch(
@@ -246,7 +247,7 @@ class TestFallbackChainAdvancement:
             patch(
                 "agent.auxiliary_client.resolve_provider_client",
                 return_value=(
-                    _mock_client(base_url=portal, api_key="portal-jwt"),
+                    resolved_client,
                     "anthropic/claude-opus-4.8",
                 ),
             ),
@@ -256,7 +257,9 @@ class TestFallbackChainAdvancement:
             ),
             patch(
                 "agent.anthropic_adapter.build_anthropic_client",
-                side_effect=_fake_build,
+                side_effect=AssertionError(
+                    "fallback must not rebuild the resolved client"
+                ),
             ),
         ):
             assert agent._try_activate_fallback() is True
@@ -265,10 +268,91 @@ class TestFallbackChainAdvancement:
         assert agent.provider == "nous"
         assert agent.model == "anthropic/claude-opus-4.8"
         assert agent.client is None
-        assert rebuilt["count"] == 1
-        assert rebuilt["api_key"] == "portal-jwt"
-        assert rebuilt["base_url"] == portal
-        assert agent._anthropic_client is not None
+        assert agent._anthropic_client is request_client
+
+    def test_named_custom_anthropic_fallback_reuses_headered_resolved_client(
+        self, tmp_path, monkeypatch,
+    ):
+        """A Messages fallback must install the resolver's complete client.
+
+        The named-provider entry's headers and request timeout are part of the
+        wire contract.  Rebuilding from ``api_key`` / ``base_url`` after
+        resolution drops the headers even though the first client was correct.
+        """
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        (hermes_home / "config.yaml").write_text(
+            """
+model:
+  default: primary-model
+custom_providers:
+  - name: headered-anthropic
+    base_url: https://messages.example.test/v1
+    api_key: fallback-key
+    api_mode: anthropic_messages
+    extra_headers:
+      x-routing-key: tenant-42
+""".lstrip(),
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+        agent = _make_agent(
+            fallback_model={
+                "provider": "headered-anthropic",
+                "model": "claude-opus-4-8",
+            },
+        )
+        built_clients = []
+
+        class _RequestClient:
+            def __init__(self, default_headers):
+                self.default_headers = dict(default_headers or {})
+
+            def close(self):
+                pass
+
+        def _fake_build(
+            api_key, base_url, *, timeout=None, default_headers=None, **_kwargs,
+        ):
+            client = _RequestClient(default_headers)
+            built_clients.append(
+                {
+                    "client": client,
+                    "api_key": api_key,
+                    "base_url": base_url,
+                    "timeout": timeout,
+                    "default_headers": dict(default_headers or {}),
+                }
+            )
+            return client
+
+        with (
+            patch(
+                "agent.chat_completion_helpers._fallback_entry_unavailable_without_network",
+                return_value=None,
+            ),
+            patch(
+                "agent.chat_completion_helpers.get_provider_request_timeout",
+                return_value=37.0,
+            ),
+            patch(
+                "agent.anthropic_adapter.build_anthropic_client",
+                side_effect=_fake_build,
+            ),
+            patch(
+                "agent.model_metadata.get_model_context_length",
+                return_value=200_000,
+            ),
+        ):
+            assert agent._try_activate_fallback() is True
+
+        assert len(built_clients) == 1
+        assert agent.api_mode == "anthropic_messages"
+        assert built_clients[0]["timeout"] == 37.0
+        assert built_clients[0]["default_headers"]["x-routing-key"] == "tenant-42"
+        assert agent._anthropic_client is built_clients[0]["client"]
+        assert agent._anthropic_client.default_headers["x-routing-key"] == "tenant-42"
 
     def test_nous_non_anthropic_fallback_stays_on_chat_completions(self):
         portal = "https://inference-api.nousresearch.com/v1"

@@ -2303,12 +2303,22 @@ class AnthropicAuxiliaryClient:
 
     def __init__(self, real_client: Any, model: str, api_key: str, base_url: str, is_oauth: bool = False):
         self._real_client = real_client
+        self._is_oauth = is_oauth
         adapter = _AnthropicCompletionsAdapter(
             real_client, model, is_oauth=is_oauth, base_url=base_url,
         )
         self.chat = _AnthropicChatShim(adapter)
         self.api_key = api_key
         self.base_url = base_url
+
+    @property
+    def request_client(self) -> Any:
+        """Return the already-built native request client."""
+        return self._real_client
+
+    @property
+    def is_oauth(self) -> bool:
+        return self._is_oauth
 
     def close(self):
         close_fn = getattr(self._real_client, "close", None)
@@ -2475,6 +2485,7 @@ def _maybe_wrap_anthropic(
     api_key: str,
     base_url: str,
     api_mode: Optional[str] = None,
+    timeout: Optional[float] = None,
 ) -> Any:
     """Rewrap a plain OpenAI client in ``AnthropicAuxiliaryClient`` when
     the endpoint actually speaks Anthropic Messages.
@@ -2540,7 +2551,8 @@ def _maybe_wrap_anthropic(
         return client_obj
 
     try:
-        real_client = build_anthropic_client(api_key, base_url)
+        build_kwargs = {"timeout": timeout} if timeout is not None else {}
+        real_client = build_anthropic_client(api_key, base_url, **build_kwargs)
     except Exception as exc:
         logger.warning(
             "Failed to build Anthropic client for %s (%s) — falling back to "
@@ -3999,7 +4011,10 @@ def _try_azure_foundry(
     return client, final_model
 
 
-def _try_anthropic(explicit_api_key: str = None) -> Tuple[Optional[Any], Optional[str]]:
+def _try_anthropic(
+    explicit_api_key: str = None,
+    timeout: Optional[float] = None,
+) -> Tuple[Optional[Any], Optional[str]]:
     try:
         from agent.anthropic_adapter import build_anthropic_client, resolve_anthropic_token
     except ImportError:
@@ -4057,7 +4072,8 @@ def _try_anthropic(explicit_api_key: str = None) -> Tuple[Optional[Any], Optiona
         return _AuxProbeClientStub(api_key="", base_url=base_url), model
     logger.debug("Auxiliary client: Anthropic native (%s) at %s (oauth=%s)", model, base_url, is_oauth)
     try:
-        real_client = build_anthropic_client(token, base_url)
+        build_kwargs = {"timeout": timeout} if timeout is not None else {}
+        real_client = build_anthropic_client(token, base_url, **build_kwargs)
     except ImportError:
         # The anthropic_adapter module imports fine but the SDK itself is
         # missing — build_anthropic_client raises ImportError at call time
@@ -6372,6 +6388,7 @@ def resolve_provider_client(
     main_runtime: Optional[Dict[str, Any]] = None,
     is_vision: bool = False,
     task: Optional[str] = None,
+    timeout: Optional[float] = None,
 ) -> Tuple[Optional[Any], Optional[str]]:
     """Central router: given a provider name and optional model, return a
     configured client with the correct auth, base URL, and API format.
@@ -6399,6 +6416,8 @@ def resolve_provider_client(
             "codex_responses", or None (auto-detect).  When set to
             "codex_responses", the client is wrapped in
             CodexAuxiliaryClient to route through the Responses API.
+        timeout: Optional request timeout forwarded to a native Anthropic
+            client built by this resolution.
 
     Returns:
         (client, resolved_model) or (None, None) if auth is unavailable.
@@ -6533,7 +6552,12 @@ def resolve_provider_client(
         # Anthropic-wire endpoints: rewrap plain OpenAI clients so
         # chat.completions.create() is translated to /v1/messages.
         return _maybe_wrap_anthropic(
-            client_obj, final_model_str, api_key_str, base_url_str, api_mode,
+            client_obj,
+            final_model_str,
+            api_key_str,
+            base_url_str,
+            api_mode,
+            timeout=timeout,
         )
 
     # ── Auto: try all providers in priority order ────────────────────
@@ -6601,7 +6625,12 @@ def resolve_provider_client(
         api_key_str = str(getattr(client, "api_key", "") or "")
         base_url_str = str(getattr(client, "base_url", "") or "")
         client = _maybe_wrap_anthropic(
-            client, final_model, api_key_str, base_url_str, portal_mode,
+            client,
+            final_model,
+            api_key_str,
+            base_url_str,
+            portal_mode,
+            timeout=timeout,
         )
         return (_to_async_client(client, final_model, is_vision=is_vision) if async_mode
                 else (client, final_model))
@@ -6839,6 +6868,7 @@ def resolve_provider_client(
                     bundle = build_client_bundle(
                         wire_runtime,
                         openai_builder=_build_openai,
+                        timeout=timeout,
                     )
                 except ImportError:
                     if entry_api_mode != "anthropic_messages":
@@ -6861,6 +6891,7 @@ def resolve_provider_client(
                     bundle = build_client_bundle(
                         wire_runtime,
                         openai_builder=_build_openai,
+                        timeout=timeout,
                     )
 
                 if bundle.anthropic_client is not None:
@@ -6949,7 +6980,10 @@ def resolve_provider_client(
 
     if pconfig.auth_type == "api_key":
         if provider == "anthropic":
-            client, default_model = _try_anthropic(explicit_api_key=explicit_api_key)
+            client, default_model = _try_anthropic(
+                explicit_api_key=explicit_api_key,
+                timeout=timeout,
+            )
             if client is None:
                 logger.warning("resolve_provider_client: anthropic requested but no Anthropic credentials found")
                 return None, None

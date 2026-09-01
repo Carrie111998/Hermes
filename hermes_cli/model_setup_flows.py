@@ -1618,6 +1618,8 @@ def _model_flow_named_custom(config, provider_info):
             native_catalog_provider, base_url, headers=candidate_headers or None
         )
         native_headers_arg = candidate_headers or None if use_native else (extra_headers or None)
+        if native_headers_arg:
+            fetch_kwargs["headers"] = native_headers_arg
         explicit_allowlist = explicit_catalog
         if use_native:
             if explicit_catalog and configured_models:
@@ -1634,14 +1636,11 @@ def _model_flow_named_custom(config, provider_info):
                     live_models = fetch_api_models(
                         api_key,
                         _normalize_openai_base_url(base_url),
-                        headers=native_headers_arg,
                         **fetch_kwargs,
                     )
                     native_catalog_empty = False
         else:
-            live_models = fetch_api_models(
-                api_key, base_url, headers=native_headers_arg, **fetch_kwargs
-            )
+            live_models = fetch_api_models(api_key, base_url, **fetch_kwargs)
             native_catalog_empty = False
         models = (
             configured_models
