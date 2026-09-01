@@ -206,10 +206,14 @@ def _get_available_providers() -> list:
 
     Returns list of (name, description, provider_instance) tuples.
     """
+    import logging
+    _logger = logging.getLogger(__name__)
     try:
         from plugins.memory import discover_memory_providers, load_memory_provider
         raw = discover_memory_providers()
-    except Exception:
+    except Exception as e:
+        _logger.warning("memory provider discovery failed: %s", e, exc_info=True)
+        print(f"\n  Warning: memory provider discovery failed: {e}", file=sys.stderr)
         raw = []
 
     results = []
@@ -217,8 +221,11 @@ def _get_available_providers() -> list:
         try:
             provider = load_memory_provider(name)
             if not provider:
+                _logger.debug("memory provider %r returned None, skipping", name)
                 continue
-        except Exception:
+        except Exception as e:
+            _logger.warning("memory provider %r failed to load: %s", name, e, exc_info=True)
+            print(f"  Warning: memory provider '{name}' failed to load: {e}", file=sys.stderr)
             continue
 
         schema = provider.get_config_schema() if hasattr(provider, "get_config_schema") else []
