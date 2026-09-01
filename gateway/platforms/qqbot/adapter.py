@@ -1183,11 +1183,34 @@ class QQAdapter(BasePlatformAdapter):
                 from tools.clarify_gateway import (
                     mark_awaiting_text,
                     resolve_gateway_clarify,
+                    session_key_for_clarify,
                 )
             except Exception as exc:
                 logger.error(
                     "[%s] clarify dispatch: cannot import clarify_gateway: %s",
                     self._log_tag, exc,
+                )
+                return
+
+            # Authorize the click: resolve the session the clarify was
+            # sent to and require the operator to be the same party the
+            # session was opened with (mirrors approval/update-prompt
+            # callback handling). Without this, any button recipient in a
+            # group could answer someone else's pending clarify.
+            clarify_session = session_key_for_clarify(clarify_id)
+            if clarify_session is None:
+                logger.warning(
+                    "[%s] clarify dispatch: unknown clarify_id %s "
+                    "(expired or already resolved)",
+                    self._log_tag, clarify_id,
+                )
+                return
+            if not self._is_authorized_interaction_for_session(
+                    event, clarify_session):
+                logger.warning(
+                    "[%s] clarify dispatch: unauthorized operator=%s "
+                    "for clarify_id=%s",
+                    self._log_tag, event.operator_openid, clarify_id,
                 )
                 return
 
@@ -1200,6 +1223,12 @@ class QQAdapter(BasePlatformAdapter):
                     "(operator=%s)",
                     self._log_tag, clarify_id, ok, event.operator_openid,
                 )
+                if not ok:
+                    logger.warning(
+                        "[%s] clarify dispatch: mark_awaiting_text failed "
+                        "for already-resolved clarify_id=%s",
+                        self._log_tag, clarify_id,
+                    )
                 return
 
             try:
@@ -1224,6 +1253,15 @@ class QQAdapter(BasePlatformAdapter):
                 self._log_tag, idx, response, ok, clarify_id,
                 event.operator_openid,
             )
+            if not ok:
+                # Expired / already resolved / never existed: do NOT report
+                # a fake success to the user (the gateway's resolve already
+                # returned False, so the agent never received this answer).
+                logger.warning(
+                    "[%s] clarify dispatch: resolve returned False for "
+                    "clarify_id=%s (expired or stale click)",
+                    self._log_tag, clarify_id,
+                )
             return
 
         approval = parse_approval_button_data(button_data)

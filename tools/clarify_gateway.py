@@ -104,6 +104,20 @@ def register(
     return entry
 
 
+def session_key_for_clarify(clarify_id: str) -> Optional[str]:
+    """Return the gateway session key bound to ``clarify_id``, or None.
+
+    Lets platform adapters authorize button clicks against the session the
+    clarify was originally sent to — mirrors how approval/update-prompt
+    callbacks bind ``event.operator`` to the session key before acting.
+    """
+    with _lock:
+        entry = _entries.get(clarify_id)
+        if entry is None:
+            return None
+        return entry.session_key
+
+
 def wait_for_response(clarify_id: str, timeout: float) -> Optional[str]:
     """Block on the entry's event until resolved or timeout fires.
 
