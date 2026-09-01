@@ -561,11 +561,14 @@ install_uv() {
 
     # Contain uv python writes inside Hermes' own tree, whatever uv ENGINE is
     # used (tier-1: possibly the user's own uv).  Root FHS installs already
-    # pin this in resolve_install_layout (world-readable /usr/local/share);
-    # everyone else gets $HERMES_HOME/python so `uv python install` and
-    # `uv venv --python` never write into the user's uv python store,
-    # ~/.local/bin shims, or the Windows registry.
-    if [ -z "${UV_PYTHON_INSTALL_DIR:-}" ]; then
+    # pin this in resolve_install_layout (world-readable /usr/local/share —
+    # keep that pin); everyone else OVERRIDES any inherited value with
+    # $HERMES_HOME/python, so `uv python install` and `uv venv --python`
+    # never write into the user's uv python store, ~/.local/bin shims, or the
+    # Windows registry.  Same contract as install.ps1's
+    # Set-UvPythonIsolationEnv: Hermes must never write into a directory the
+    # user configured for their own toolchain, even when they exported one.
+    if [ "$ROOT_FHS_LAYOUT" != "true" ]; then
         export UV_PYTHON_INSTALL_DIR="$HERMES_HOME/python"
     fi
     export UV_PYTHON_INSTALL_BIN=0

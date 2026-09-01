@@ -23,7 +23,6 @@ in main.py, which runs right after import succeeds.
 
 from __future__ import annotations
 
-import importlib
 import os
 import shutil
 import subprocess
@@ -281,7 +280,7 @@ def _probe_broken_packages() -> list[str]:
     broken: list[str] = []
     for mod_name, attr in LAZY_REFRESH_IMPORT_PROBES:
         try:
-            mod = importlib.import_module(mod_name)
+            mod = __import__(mod_name)
             if not hasattr(mod, attr):
                 raise ImportError(f"{mod_name} missing {attr}")
             if mod_name == "certifi" and _certifi_bundle_broken():
@@ -302,10 +301,22 @@ def _find_uv_binary() -> str | None:
     (``~/.hermes/uv/uv.exe``) or the user has on PATH.  Stdlib-only.
     """
     exe = "uv.exe" if sys.platform == "win32" else "uv"
+
+    hermes_env = os.environ.get("HERMES_HOME", "").strip()
+    if hermes_env:
+        hermes_home = Path(hermes_env)
+    elif sys.platform == "win32":
+        local_appdata = os.environ.get("LOCALAPPDATA", "").strip()
+        base = Path(local_appdata) if local_appdata else Path.home() / "AppData" / "Local"
+        hermes_home = base / "hermes"
+    else:
+        hermes_home = Path.home() / ".hermes"
+
     candidates = [
-        Path.home() / ".hermes" / "uv" / exe,
+        # Private uv in Hermes home (custom HERMES_HOME, %LOCALAPPDATA%/hermes on Windows, ~/.hermes on POSIX)
+        hermes_home / "uv" / exe,
         # Legacy pre-isolation layout; migrated to the private dir on use.
-        Path.home() / ".hermes" / "bin" / exe,
+        hermes_home / "bin" / exe,
         Path.home() / ".local" / "bin" / exe,
         Path.home() / ".cargo" / "bin" / exe,
     ]

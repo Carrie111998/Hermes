@@ -741,6 +741,72 @@ class TestRuntimeRepair:
         assert fresh_backup.exists(), "fresh backup may be an in-flight repair"
         assert sentinel.read_text(encoding="utf-8") == "live"
 
+    def test_repair_uses_user_uv_read_only(self, tmp_path):
+        """Tier-1 red line: with the USER's uv as the repair engine, the
+        repair still runs to completion, but the engine itself is never
+        mutated and every uv write is env-pinned inside Hermes' own
+        checkout-scoped directories."""
+        from hermes_cli.managed_uv import repair_vulnerable_runtime
+
+        root, live, _ = _make_runtime_install(tmp_path)
+        (root / "uv.lock").write_text("# lock\n", encoding="utf-8")
+        current = _runtime_info(live / "bin" / "python", (3, 50, 4))
+        fixed = _runtime_info(root / "generation" / "bin" / "python", (3, 53, 1))
+        user_uv = "/usr/local/bin/uv"
+
+        calls: list[tuple[list, dict]] = []
+
+        def fake_run(argv, **kwargs):
+            calls.append((list(argv), kwargs.get("env") or {}))
+            if argv[:1] == [user_uv] and argv[1:3] == ["python", "find"]:
+                # The resolved interpreter must live inside the generation dir
+                # that this invocation's env pins (managed_python_env).
+                generation = Path(kwargs["env"]["UV_PYTHON_INSTALL_DIR"])
+                python = generation / "bin" / "python"
+                python.parent.mkdir(parents=True, exist_ok=True)
+                python.write_text("candidate interpreter", encoding="utf-8")
+                return MagicMock(returncode=0, stdout=str(python))
+            if argv[:1] == [user_uv] and argv[1] == "venv":
+                # The real `uv venv` creates the candidate dir; the cutover
+                # renames it into place, so it must exist.
+                Path(argv[2]).mkdir(parents=True, exist_ok=True)
+            return MagicMock(returncode=0)
+
+        with patch(
+                 "hermes_cli.managed_uv.probe_sqlite_runtime",
+                 side_effect=[current, current, fixed],
+             ), \
+             patch(
+                 "hermes_cli.managed_uv._smoke_candidate_venv",
+                 return_value=(True, "", fixed),
+             ), \
+             patch("hermes_cli.managed_uv.subprocess.run", side_effect=fake_run), \
+             patch("hermes_cli.managed_uv._macos_sign_managed_python", return_value=False):
+            result = repair_vulnerable_runtime(user_uv, project_root=root)
+
+        assert result.status == "repaired", result.detail
+
+        uv_calls = [c for c in calls if c[0][:1] == [user_uv]]
+        assert uv_calls, "repair must have driven the user's uv engine"
+
+        # Never mutate the engine: no `uv self update`, no `uv tool *`.
+        mutating = [
+            argv for argv, _ in uv_calls
+            if argv[1:3] == ["self", "update"] or argv[1] == "tool"
+        ]
+        assert mutating == [], f"user uv must never be mutated: {mutating}"
+
+        # Every write is env-pinned inside the checkout's .hermes-runtime.
+        hermes_runtime = str((root / ".hermes-runtime").resolve())
+        for argv, env in uv_calls:
+            assert env["UV_PYTHON_INSTALL_DIR"].startswith(hermes_runtime), argv
+            assert env["UV_PYTHON_INSTALL_BIN"] == "0"
+            assert env["UV_PYTHON_INSTALL_REGISTRY"] == "0"
+        # The old venv was cut over and parked backup reclaimed — the repair
+        # completed through the real rename pipeline.
+        assert result.backup_venv is not None
+        assert not result.backup_venv.exists()
+
     def test_successful_repair_removes_parked_backup(self, tmp_path):
         """After a successful cutover the parked venv is removed instead of
         leaking ~1 GB at the project root forever (issue #73109)."""
@@ -1322,6 +1388,22 @@ class TestRefreshManagedUvCatalog:
             uv_path = managed_uv.managed_uv_path()
             _make_executable(uv_path)
             assert managed_uv._refresh_managed_uv_catalog(str(uv_path)) is False
+
+
+    def test_refresh_refuses_foreign_binary(self, tmp_path):
+        """Ownership red line: catalog refresh re-bootstraps the engine, so a
+        foreign (user's) uv is refused — the user's toolchain is never
+        re-bootstrapped, even when provisioning failed and a retry would
+        otherwise want a fresh catalog."""
+        import hermes_cli.managed_uv as managed_uv
+
+        with patch("hermes_cli.managed_uv.get_hermes_home", return_value=tmp_path), \
+             patch("hermes_cli.managed_uv._install_uv") as mock_install, \
+             patch("hermes_cli.managed_uv._uv_version_string") as mock_version:
+            assert managed_uv._refresh_managed_uv_catalog("/usr/local/bin/uv") is False
+
+        mock_install.assert_not_called()
+        mock_version.assert_not_called()
 
 
 @pytest.mark.skipif(sys.platform == "win32",

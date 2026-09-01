@@ -112,6 +112,11 @@ def _uv_runs(path: str) -> bool:
     *depends* on one: a uv that is on PATH yet cannot even report its version
     (broken install, wrong arch, quarantined binary) is not "suitable" and
     falls through to the managed fallback.
+
+    Worst case is a bounded 15s: a *hung* PATH uv (network-sandboxed or
+    quarantined binary that never answers) stalls resolution for 15s before
+    falling through.  Resolution runs only at update/install/bootstrap time
+    — never on a per-turn hot path — so the bound is deliberate.
     """
     try:
         result = subprocess.run(
@@ -124,6 +129,23 @@ def _uv_runs(path: str) -> bool:
     except (OSError, subprocess.SubprocessError):
         return False
     return result.returncode == 0
+
+
+def _is_managed_uv(uv_bin: str | Path) -> bool:
+    """True when *uv_bin* is Hermes' own private managed uv binary.
+
+    Comparison is case-insensitive on Windows (``os.path.normcase`` lowercases
+    there and is a no-op on POSIX) — the same rule :func:`resolve_uv_engine`
+    applies so a PATH hit that IS our binary is never mistaken for the user's.
+    This is the ownership gate: engine-mutating operations (catalog refresh,
+    self-update) may only run against the managed binary, never the user's.
+    """
+    try:
+        return os.path.normcase(str(Path(uv_bin).resolve())) == os.path.normcase(
+            str(managed_uv_path().resolve())
+        )
+    except OSError:
+        return False
 
 
 @dataclass
@@ -1306,15 +1328,21 @@ def _refresh_managed_uv_catalog(uv_bin: str) -> bool:
     provisioning retry can now see a different catalog.  ``False`` means a
     retry would resolve identically and is not worth the download cycle.
     """
-    managed = managed_uv_path()
-    try:
-        if Path(uv_bin).resolve() != managed.resolve():
-            return False
-    except OSError:
+    # Ownership red line: this re-bootstraps the engine (the only supported
+    # refresh path for UV_UNMANAGED_INSTALL binaries), so it may only ever
+    # run against Hermes' own managed binary.  A foreign engine — typically
+    # the user's own uv under tier-1 — is used strictly read-only here and
+    # never re-bootstrapped.
+    if not _is_managed_uv(uv_bin):
+        logger.debug(
+            "refusing to refresh uv catalog for foreign binary %s "
+            "(read-only: the user's uv is never re-bootstrapped)",
+            uv_bin,
+        )
         return False
     before = _uv_version_string(uv_bin)
     try:
-        _install_uv(managed)
+        _install_uv(managed_uv_path())
     except Exception as exc:
         logger.warning("managed uv refresh failed: %s", exc)
         return False
@@ -1402,6 +1430,22 @@ def repair_vulnerable_runtime(
     root = Path(project_root) if project_root is not None else _PROJECT_ROOT
     live = Path(venv_dir) if venv_dir is not None else _default_live_venv(root)
     live_python = _venv_python(live)
+
+    # Ownership red line: the repair may run with the USER's own uv as the
+    # engine (tier-1 — there is often no managed binary at all), but that
+    # engine is strictly read-only.  Every uv invocation below writes only
+    # into Hermes' own directories: managed_python_env() pins the python
+    # install dir, shims and registry, and the venv/sync target the
+    # checkout-scoped candidate.  The only engine-mutating operation in this
+    # path (_refresh_managed_uv_catalog) refuses a foreign binary.  A future
+    # edit that adds any engine-mutating call (``uv self update``,
+    # ``uv tool install``, ...) MUST gate it on _is_managed_uv(uv_bin) first.
+    if not _is_managed_uv(uv_bin):
+        logger.info(
+            "runtime repair engine is the user's uv (%s) — used strictly "
+            "read-only; all writes stay inside Hermes' own directories",
+            uv_bin,
+        )
     if not (root / "pyproject.toml").is_file() or not live_python.is_file():
         return RuntimeRepairResult("not-applicable")
 
