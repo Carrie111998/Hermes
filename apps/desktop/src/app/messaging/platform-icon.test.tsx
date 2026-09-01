@@ -57,4 +57,17 @@ describe('PlatformAvatar brand glyphs', () => {
     expect(matrix.querySelector('span')?.getAttribute('style')).toContain('background-color: rgb(247, 247, 245)')
     expect(matrix.querySelector('span')?.getAttribute('style')).toContain('color: rgb(0, 0, 0)')
   })
+
+  it('keeps the real brand glyphs as SVGs instead of replacing them with text', () => {
+    for (const [platformId, platformName] of [
+      ['telegram', 'Telegram'],
+      ['discord', 'Discord'],
+      ['matrix', 'Matrix'],
+      ['dingtalk', 'DingTalk']
+    ]) {
+      const { container } = render(<PlatformAvatar platformId={platformId} platformName={platformName} />)
+      expect(container.querySelector('svg')).toBeTruthy()
+      cleanup()
+    }
+  })
 })

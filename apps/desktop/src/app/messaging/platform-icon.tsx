@@ -14,6 +14,7 @@ import {
   SiWechat,
   SiWhatsapp
 } from '@icons-pack/react-simple-icons'
+import { IconBrandDingtalk } from '@tabler/icons-react'
 import type { ComponentPropsWithoutRef, ComponentType, SVGProps } from 'react'
 import { forwardRef, memo } from 'react'
 
@@ -39,13 +40,7 @@ function PhotonIcon(props: React.SVGProps<SVGSVGElement>) {
 // DingTalk's compact list mark is the middle, swept-wing silhouette from the
 // product mark. It needs a solid blue field at 24px; reducing it to a ring or
 // tint makes the wing disappear.
-function DingTalkIcon(props: React.SVGProps<SVGSVGElement>) {
-  return (
-    <svg fill="currentColor" viewBox="0 0 24 24" {...props}>
-      <path d="M5.04 5.37c2.9.52 5.85 1.37 8.72 2.6 1.08.47 2.1 1.06 3.03 1.77l1.7-2.3c.3-.4.92-.18.9.32l-.12 3.22 2.35.95c.48.2.42.9-.09 1l-2.45.5c-.22 2.1-1.16 3.83-2.82 5.18-.82.66-1.78 1.12-2.8 1.35l1.08-3.03c-1.47-.04-2.86-.48-4.12-1.3-1.68-1.1-2.78-2.6-3.3-4.52l2.92.6c-.68-1.28-1.52-2.45-2.53-3.48L5.04 5.37Z" />
-    </svg>
-  )
-}
+const DingTalkIcon = IconBrandDingtalk
 
 function WeComIcon(props: React.SVGProps<SVGSVGElement>) {
   return (
