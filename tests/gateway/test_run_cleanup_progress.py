@@ -10,7 +10,6 @@ Failed runs skip cleanup so the bubbles remain as breadcrumbs.
 Adapters without ``delete_message`` silently no-op.
 """
 
-import asyncio
 import importlib
 import inspect as _inspect
 import sys
@@ -286,12 +285,7 @@ async def test_cleanup_chains_with_existing_callback(monkeypatch, tmp_path):
     cb = adapter.pop_post_delivery_callback(session_key)
     assert callable(cb)
     await _fire_post_delivery_cb(cb)
-    for _ in range(20):
-        await asyncio.sleep(0.01)
-        if adapter.deleted:
-            break
 
-    # Both effects land: the pre-existing callback fires AND the cleanup
-    # deletes at least one progress bubble.
+    # Both effects are complete at the post-delivery callback boundary.
     assert pre_existing_fired == [True]
     assert len(adapter.deleted) >= 1

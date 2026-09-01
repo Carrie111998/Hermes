@@ -31995,25 +31995,31 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _ids_snapshot = list(_cleanup_msg_ids)
             _chat_id_snapshot = source.chat_id
             _adapter_snapshot = _cleanup_adapter
-            _loop_snapshot = asyncio.get_running_loop()
 
-            def _cleanup_temp_bubbles() -> None:
-                async def _delete_all() -> None:
-                    for _mid in _ids_snapshot:
-                        try:
-                            await _adapter_snapshot.delete_message(
-                                _chat_id_snapshot, _mid
-                            )
-                        except Exception:
-                            pass
-                try:
-                    safe_schedule_threadsafe(
-                        _delete_all(), _loop_snapshot,
-                        logger=logger,
-                        log_message="Temp bubble cleanup scheduling error",
-                    )
-                except Exception:
-                    pass
+            async def _cleanup_temp_bubbles() -> None:
+                _deleted = 0
+                _rejected = 0
+                _errors = 0
+                for _mid in _ids_snapshot:
+                    try:
+                        if await _adapter_snapshot.delete_message(
+                            _chat_id_snapshot, _mid
+                        ):
+                            _deleted += 1
+                        else:
+                            _rejected += 1
+                    except Exception:
+                        _errors += 1
+
+                _log_cleanup = (
+                    logger.warning if _rejected or _errors else logger.debug
+                )
+                _log_cleanup(
+                    "Temp bubble cleanup complete: deleted=%d rejected=%d errors=%d",
+                    _deleted,
+                    _rejected,
+                    _errors,
+                )
 
             try:
                 _cleanup_adapter.register_post_delivery_callback(
