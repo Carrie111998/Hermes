@@ -1947,6 +1947,16 @@ class FeishuAdapter(BasePlatformAdapter):
     # Outbound — send / edit / send_image / send_voice / …
     # =========================================================================
 
+    @staticmethod
+    def _thread_anchor_error(
+        reply_to: Optional[str], metadata: Optional[Dict[str, Any]]
+    ) -> Optional[str]:
+        thread_id = (metadata or {}).get("thread_id")
+        reply_anchor = reply_to or (metadata or {}).get("reply_to_message_id")
+        if thread_id and not reply_anchor:
+            return f"Feishu thread {thread_id} requires reply_to_message_id"
+        return None
+
     async def send(
         self,
         chat_id: str,
@@ -1957,6 +1967,9 @@ class FeishuAdapter(BasePlatformAdapter):
         """Send a Feishu message."""
         if not self._client:
             return SendResult(success=False, error="Not connected")
+        thread_error = self._thread_anchor_error(reply_to, metadata)
+        if thread_error:
+            return SendResult(success=False, error=thread_error)
 
         formatted = self.format_message(content)
         chunks = self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH)
@@ -2329,6 +2342,9 @@ class FeishuAdapter(BasePlatformAdapter):
         """Send a local image file to Feishu."""
         if not self._client:
             return SendResult(success=False, error="Not connected")
+        thread_error = self._thread_anchor_error(reply_to, metadata)
+        if thread_error:
+            return SendResult(success=False, error=thread_error)
         if not os.path.exists(image_path):
             return SendResult(success=False, error=f"Image file not found: {image_path}")
 
@@ -4724,6 +4740,9 @@ class FeishuAdapter(BasePlatformAdapter):
     ) -> SendResult:
         if not self._client:
             return SendResult(success=False, error="Not connected")
+        thread_error = self._thread_anchor_error(reply_to, metadata)
+        if thread_error:
+            return SendResult(success=False, error=thread_error)
         if not os.path.exists(file_path):
             return SendResult(success=False, error=f"File not found: {file_path}")
 
@@ -4774,62 +4793,10 @@ class FeishuAdapter(BasePlatformAdapter):
                     reply_to=reply_to,
                     metadata=metadata,
                 )
-                # Audio messages may fail with 99992402 when using thread_id routing.
-                # Try replying to the last message in the thread, then fall back to chat_id.
-                if (not self._response_succeeded(message_response)
-                        and getattr(message_response, "code", None) == 99992402
-                        and resolved_message_type == "audio"
-                        and (metadata or {}).get("thread_id")):
-                    # Try reply API with thread_id as reply anchor
-                    thread_msg_id = (metadata or {}).get("reply_to_message_id")
-                    if not thread_msg_id:
-                        thread_msg_id = await self._fetch_last_message_in_thread(
-                            (metadata or {}).get("thread_id")
-                        )
-                    if thread_msg_id:
-                        logger.info("[Feishu] Audio: retrying via reply API in thread")
-                        message_response = await self._feishu_send_with_retry(
-                            chat_id=chat_id,
-                            msg_type=resolved_message_type,
-                            payload=json.dumps({"file_key": file_key}, ensure_ascii=False),
-                            reply_to=thread_msg_id,
-                            metadata=metadata,
-                        )
-                    if not self._response_succeeded(message_response):
-                        logger.warning("[Feishu] Audio send failed in thread, retrying with chat_id")
-                        message_response = await self._feishu_send_with_retry(
-                            chat_id=chat_id,
-                            msg_type=resolved_message_type,
-                            payload=json.dumps({"file_key": file_key}, ensure_ascii=False),
-                            reply_to=None,
-                            metadata=None,
-                        )
             return self._finalize_send_result(message_response, "file send failed")
         except Exception as exc:
             logger.error("[Feishu] Failed to send file %s: %s", file_path, exc, exc_info=True)
             return SendResult(success=False, error=str(exc))
-
-    async def _fetch_last_message_in_thread(self, thread_id: str) -> Optional[str]:
-        """Fetch the last message_id in a thread for reply-based routing."""
-        if not self._client or not thread_id:
-            return None
-        try:
-            from lark_oapi.api.im.v1 import ListMessageRequest
-            request = (
-                ListMessageRequest.builder()
-                .container_id_type("thread")
-                .container_id(thread_id)
-                .page_size(1)
-                .build()
-            )
-            response = await asyncio.to_thread(self._client.im.v1.message.list, request)
-            if response and getattr(response, "success", lambda: False)():
-                items = getattr(getattr(response, "data", None), "items", None)
-                if items and len(items) > 0:
-                    return getattr(items[0], "message_id", None)
-        except Exception as exc:
-            logger.debug("[Feishu] Failed to fetch last message in thread %s: %s", thread_id, exc)
-        return None
 
     async def _send_raw_message(
         self,
@@ -4840,6 +4807,10 @@ class FeishuAdapter(BasePlatformAdapter):
         reply_to: Optional[str],
         metadata: Optional[Dict[str, Any]],
     ) -> Any:
+        thread_error = self._thread_anchor_error(reply_to, metadata)
+        if thread_error:
+            raise ValueError(thread_error)
+
         effective_reply_to = reply_to
         if not effective_reply_to and metadata and metadata.get("thread_id"):
             effective_reply_to = metadata.get("reply_to_message_id")
@@ -4854,34 +4825,21 @@ class FeishuAdapter(BasePlatformAdapter):
             request = self._build_reply_message_request(effective_reply_to, body)
             return await self._run_blocking(self._client.im.v1.message.reply, request)
 
-        # For topic/thread messages that fell back from reply→create, use
-        # thread_id as receive_id so the message lands in the topic instead of
-        # the main chat.
-        _thread_id = (metadata or {}).get("thread_id")
-        if _thread_id:
-            body = self._build_create_message_body(
-                receive_id=_thread_id,
-                msg_type=msg_type,
-                content=payload,
-                uuid_value=str(uuid.uuid4()),
-            )
-            request = self._build_create_message_request("thread_id", body)
-        else:
-            receive_id = chat_id
-            receive_id_type = "chat_id"
-            if chat_id.startswith("feishu_user_id:"):
-                receive_id = chat_id.split(":", 1)[1]
-                receive_id_type = "user_id"
-            elif chat_id.startswith("ou_"):
-                receive_id_type = "open_id"
+        receive_id = chat_id
+        receive_id_type = "chat_id"
+        if chat_id.startswith("feishu_user_id:"):
+            receive_id = chat_id.split(":", 1)[1]
+            receive_id_type = "user_id"
+        elif chat_id.startswith("ou_"):
+            receive_id_type = "open_id"
 
-            body = self._build_create_message_body(
-                receive_id=receive_id,
-                msg_type=msg_type,
-                content=payload,
-                uuid_value=str(uuid.uuid4()),
-            )
-            request = self._build_create_message_request(receive_id_type, body)
+        body = self._build_create_message_body(
+            receive_id=receive_id,
+            msg_type=msg_type,
+            content=payload,
+            uuid_value=str(uuid.uuid4()),
+        )
+        request = self._build_create_message_request(receive_id_type, body)
         return await self._run_blocking(self._client.im.v1.message.create, request)
 
     @staticmethod
@@ -5635,6 +5593,7 @@ async def _standalone_send(
     message,
     *,
     thread_id=None,
+    reply_to_message_id=None,
     media_files=None,
     force_document=False,
 ):
@@ -5654,7 +5613,12 @@ async def _standalone_send(
         domain_name = getattr(adapter, "_domain_name", "feishu")
         domain = FEISHU_DOMAIN if domain_name != "lark" else LARK_DOMAIN
         adapter._client = adapter._build_lark_client(domain)
-        metadata = {"thread_id": thread_id} if thread_id else None
+        metadata = {}
+        if thread_id:
+            metadata["thread_id"] = thread_id
+        if reply_to_message_id:
+            metadata["reply_to_message_id"] = reply_to_message_id
+        metadata = metadata or None
 
         last_result = None
         if message.strip():

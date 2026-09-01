@@ -1246,6 +1246,223 @@ class TestAdapterBehavior(unittest.TestCase):
         self.assertTrue(result.success)
         self.assertTrue(captured["request"].request_body.reply_in_thread)
 
+    @patch.dict(os.environ, {}, clear=True)
+    def test_explicit_reply_anchor_precedes_metadata_anchor_in_thread(self):
+        from gateway.config import PlatformConfig
+        from plugins.platforms.feishu.adapter import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        calls = []
+
+        class _MessageAPI:
+            def reply(self, request):
+                calls.append(("reply", request))
+                return SimpleNamespace(
+                    success=lambda: True,
+                    data=SimpleNamespace(message_id="om_reply"),
+                )
+
+            def create(self, request):
+                calls.append(("create", request))
+                return SimpleNamespace(success=lambda: True)
+
+        adapter._client = SimpleNamespace(
+            im=SimpleNamespace(v1=SimpleNamespace(message=_MessageAPI()))
+        )
+
+        async def _direct(func, *args, **kwargs):
+            return func(*args, **kwargs)
+
+        with patch("plugins.platforms.feishu.adapter.asyncio.to_thread", side_effect=_direct):
+            result = asyncio.run(
+                adapter.send(
+                    chat_id="oc_chat",
+                    content="thread reply",
+                    reply_to="om_explicit",
+                    metadata={
+                        "thread_id": "omt_topic",
+                        "reply_to_message_id": "om_metadata",
+                    },
+                )
+            )
+
+        self.assertTrue(result.success)
+        self.assertEqual([kind for kind, _request in calls], ["reply"])
+        request = calls[0][1]
+        self.assertEqual(request.message_id, "om_explicit")
+        self.assertTrue(request.request_body.reply_in_thread)
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_thread_without_reply_anchor_fails_closed_without_message_api_calls(self):
+        from gateway.config import PlatformConfig
+        from plugins.platforms.feishu.adapter import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        calls = []
+
+        class _MessageAPI:
+            def list(self, request):
+                calls.append("list")
+                return SimpleNamespace(success=lambda: False)
+
+            def reply(self, request):
+                calls.append("reply")
+                return SimpleNamespace(success=lambda: True)
+
+            def create(self, request):
+                calls.append("create")
+                return SimpleNamespace(
+                    success=lambda: True,
+                    data=SimpleNamespace(message_id="om_wrong_lane"),
+                )
+
+        adapter._client = SimpleNamespace(
+            im=SimpleNamespace(v1=SimpleNamespace(message=_MessageAPI()))
+        )
+
+        async def _direct(func, *args, **kwargs):
+            return func(*args, **kwargs)
+
+        with patch("plugins.platforms.feishu.adapter.asyncio.to_thread", side_effect=_direct):
+            result = asyncio.run(
+                adapter.send(
+                    chat_id="oc_chat",
+                    content="thread reply",
+                    metadata={"thread_id": "omt_topic"},
+                )
+            )
+
+        self.assertFalse(result.success)
+        self.assertIn("requires reply_to_message_id", result.error)
+        self.assertEqual(calls, [])
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_anchorless_thread_media_fails_without_message_calls(self):
+        from gateway.config import PlatformConfig
+        from plugins.platforms.feishu.adapter import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        calls = []
+
+        class _FileAPI:
+            def create(self, request):
+                return SimpleNamespace(
+                    success=lambda: True,
+                    data=SimpleNamespace(file_key="file_key"),
+                )
+
+        class _MessageAPI:
+            def list(self, request):
+                calls.append("message.list")
+                return SimpleNamespace(success=lambda: False)
+
+            def reply(self, request):
+                calls.append("message.reply")
+                return SimpleNamespace(success=lambda: True)
+
+            def create(self, request):
+                calls.append("message.create")
+                return SimpleNamespace(success=lambda: True)
+
+        adapter._client = SimpleNamespace(
+            im=SimpleNamespace(
+                v1=SimpleNamespace(file=_FileAPI(), message=_MessageAPI())
+            )
+        )
+
+        with tempfile.NamedTemporaryFile("wb", suffix=".ogg") as temp_file:
+            result = asyncio.run(
+                adapter.send_voice(
+                    chat_id="oc_chat",
+                    audio_path=temp_file.name,
+                    metadata={"thread_id": "omt_topic"},
+                )
+            )
+
+        self.assertFalse(result.success)
+        self.assertIn("requires reply_to_message_id", result.error)
+        self.assertEqual(calls, [])
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_non_thread_create_routing_remains_unchanged(self):
+        from gateway.config import PlatformConfig
+        from plugins.platforms.feishu.adapter import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        requests = []
+
+        class _MessageAPI:
+            def create(self, request):
+                requests.append(request)
+                return SimpleNamespace(
+                    success=lambda: True,
+                    data=SimpleNamespace(message_id="om_created"),
+                )
+
+        adapter._client = SimpleNamespace(
+            im=SimpleNamespace(v1=SimpleNamespace(message=_MessageAPI()))
+        )
+
+        async def _direct(func, *args, **kwargs):
+            return func(*args, **kwargs)
+
+        cases = (
+            ("oc_chat", "chat_id", "oc_chat"),
+            ("feishu_user_id:u_123", "user_id", "u_123"),
+            ("ou_123", "open_id", "ou_123"),
+        )
+        with patch("plugins.platforms.feishu.adapter.asyncio.to_thread", side_effect=_direct):
+            for chat_id, expected_type, expected_id in cases:
+                with self.subTest(chat_id=chat_id):
+                    requests.clear()
+                    result = asyncio.run(adapter.send(chat_id, "ordinary message"))
+                    self.assertTrue(result.success)
+                    self.assertEqual(len(requests), 1)
+                    self.assertEqual(requests[0].receive_id_type, expected_type)
+                    self.assertEqual(requests[0].request_body.receive_id, expected_id)
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_standalone_text_and_media_preserve_cron_topic_anchor(self):
+        from plugins.platforms.feishu import adapter as feishu_module
+
+        adapter = Mock()
+        adapter._domain_name = "feishu"
+        adapter._build_lark_client.return_value = Mock()
+        adapter.send = AsyncMock(
+            return_value=SimpleNamespace(success=True, message_id="om_text")
+        )
+        adapter.send_document = AsyncMock(
+            return_value=SimpleNamespace(success=True, message_id="om_media")
+        )
+
+        with tempfile.NamedTemporaryFile("wb", suffix=".pdf") as temp_file:
+            with (
+                patch.object(feishu_module, "_load_lark_oapi", return_value=True),
+                patch.object(feishu_module, "FeishuAdapter", return_value=adapter),
+            ):
+                result = asyncio.run(
+                    feishu_module._standalone_send(
+                        Mock(),
+                        "oc_chat",
+                        "scheduled report",
+                        thread_id="omt_topic",
+                        reply_to_message_id="om_trigger",
+                        media_files=[(temp_file.name, False)],
+                    )
+                )
+
+        expected_metadata = {
+            "thread_id": "omt_topic",
+            "reply_to_message_id": "om_trigger",
+        }
+        self.assertTrue(result["success"])
+        adapter.send.assert_awaited_once_with(
+            "oc_chat", "scheduled report", metadata=expected_metadata,
+        )
+        adapter.send_document.assert_awaited_once_with(
+            "oc_chat", temp_file.name, metadata=expected_metadata,
+        )
+
 
     @patch.dict(os.environ, {}, clear=True)
     def test_send_uses_post_for_every_chunk_of_multi_chunk_markdown(self):
@@ -2465,5 +2682,4 @@ class TestChatLockEviction(unittest.TestCase):
 
         adapter = self._make_adapter()
         self.assertIsInstance(adapter._chat_locks, _collections.OrderedDict)
-
 

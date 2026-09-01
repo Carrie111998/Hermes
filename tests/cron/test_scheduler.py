@@ -197,6 +197,24 @@ class TestResolveDeliveryTarget:
             "_resolved_from": "origin",
         }
 
+    def test_feishu_origin_delivery_preserves_reply_anchor(self):
+        job = {
+            "deliver": "origin",
+            "origin": {
+                "platform": "feishu",
+                "chat_id": "oc_chat",
+                "thread_id": "omt_topic",
+                "message_id": "om_trigger",
+            },
+        }
+
+        assert _resolve_delivery_target(job) == {
+            "platform": "feishu",
+            "chat_id": "oc_chat",
+            "thread_id": "omt_topic",
+            "reply_to_message_id": "om_trigger",
+        }
+
 
     def test_bare_platform_delivery_uses_home_root_instead_of_origin_thread(self, monkeypatch):
         monkeypatch.setenv("DISCORD_HOME_CHANNEL", "home-parent")
@@ -380,6 +398,116 @@ class TestDeliverResultWrapping:
         assert "-------------" in sent_content
         assert "Here is today's summary." in sent_content
         assert "To stop or manage this job" in sent_content
+
+    def test_feishu_standalone_delivery_forwards_reply_anchor(self):
+        from gateway.config import Platform
+
+        pconfig = MagicMock()
+        pconfig.enabled = True
+        mock_cfg = MagicMock()
+        mock_cfg.platforms = {Platform.FEISHU: pconfig}
+        job = {
+            "id": "feishu-topic-job",
+            "deliver": "origin",
+            "origin": {
+                "platform": "feishu",
+                "chat_id": "oc_chat",
+                "thread_id": "omt_topic",
+                "message_id": "om_trigger",
+            },
+        }
+
+        with (
+            patch("gateway.config.load_gateway_config", return_value=mock_cfg),
+            patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}),
+            patch(
+                "tools.send_message_tool._send_to_platform",
+                new=AsyncMock(return_value={"success": True}),
+            ) as send_mock,
+        ):
+            result = _deliver_result(job, "hello")
+
+        assert result is None
+        send_mock.assert_awaited_once()
+        assert send_mock.call_args.kwargs["thread_id"] == "omt_topic"
+        assert send_mock.call_args.kwargs["reply_to_message_id"] == "om_trigger"
+
+    def test_feishu_live_text_and_media_use_anchor_without_sdk_dict_access(
+        self, tmp_path, monkeypatch,
+    ):
+        from concurrent.futures import Future
+        from types import SimpleNamespace
+
+        from gateway.config import Platform
+        from gateway.platforms.base import SendResult
+
+        media_path = self._safe_media_path(tmp_path, monkeypatch, "report.pdf")
+        adapter = AsyncMock()
+        adapter.send.return_value = SendResult(
+            success=True,
+            message_id="om_delivery",
+            raw_response=SimpleNamespace(code=0),
+        )
+        adapter.send_document.return_value = SendResult(
+            success=True,
+            message_id="om_media",
+            raw_response=SimpleNamespace(code=0),
+        )
+
+        pconfig = MagicMock()
+        pconfig.enabled = True
+        mock_cfg = MagicMock()
+        mock_cfg.platforms = {Platform.FEISHU: pconfig}
+        loop = MagicMock()
+        loop.is_running.return_value = True
+        job = {
+            "id": "feishu-live-topic-job",
+            "deliver": "origin",
+            "origin": {
+                "platform": "feishu",
+                "chat_id": "oc_chat",
+                "thread_id": "omt_topic",
+                "message_id": "om_trigger",
+            },
+        }
+
+        def fake_run_coro(coro, _loop):
+            import asyncio as _asyncio
+
+            future = Future()
+            try:
+                future.set_result(_asyncio.run(coro))
+            except BaseException as exc:  # noqa: BLE001
+                future.set_exception(exc)
+            return future
+
+        standalone_send = AsyncMock(return_value={"success": True})
+        with (
+            patch("gateway.config.load_gateway_config", return_value=mock_cfg),
+            patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}),
+            patch("asyncio.run_coroutine_threadsafe", side_effect=fake_run_coro),
+            patch("tools.send_message_tool._send_to_platform", new=standalone_send),
+        ):
+            result = _deliver_result(
+                job,
+                f"status update\nMEDIA:{media_path}",
+                adapters={Platform.FEISHU: adapter},
+                loop=loop,
+            )
+
+        assert result is None
+        standalone_send.assert_not_awaited()
+        adapter.send.assert_awaited_once()
+        assert adapter.send.await_args.kwargs["metadata"] == {
+            "job_id": "feishu-live-topic-job",
+            "thread_id": "omt_topic",
+            "reply_to_message_id": "om_trigger",
+        }
+        adapter.send_document.assert_awaited_once()
+        assert adapter.send_document.await_args.kwargs["metadata"] == {
+            "thread_id": "omt_topic",
+            "reply_to_message_id": "om_trigger",
+        }
 
 
     def test_relay_fronted_home_uses_relay_config_and_live_adapter(self, monkeypatch, tmp_path):

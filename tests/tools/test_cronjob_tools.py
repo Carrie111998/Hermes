@@ -646,6 +646,53 @@ class TestLocalDeliveryNotice:
         assert "local-only cron job" not in created["message"]
 
 
+class TestOriginFromEnv:
+    def test_feishu_origin_captures_triggering_message_anchor(self):
+        from gateway.session_context import clear_session_vars, set_session_vars
+        from tools.cronjob_tools import _origin_from_env
+
+        tokens = set_session_vars(
+            platform="feishu",
+            chat_id="oc_chat",
+            thread_id="omt_topic",
+            message_id="om_trigger",
+        )
+        try:
+            assert _origin_from_env() == {
+                "platform": "feishu",
+                "chat_id": "oc_chat",
+                "chat_name": None,
+                "thread_id": "omt_topic",
+                "user_id": None,
+                "scope_id": None,
+                "message_id": "om_trigger",
+            }
+        finally:
+            clear_session_vars(tokens)
+
+    def test_non_feishu_origin_shape_is_unchanged(self):
+        from gateway.session_context import clear_session_vars, set_session_vars
+        from tools.cronjob_tools import _origin_from_env
+
+        tokens = set_session_vars(
+            platform="telegram",
+            chat_id="-1001",
+            thread_id="42",
+            message_id="999",
+        )
+        try:
+            assert _origin_from_env() == {
+                "platform": "telegram",
+                "chat_id": "-1001",
+                "chat_name": None,
+                "thread_id": "42",
+                "user_id": None,
+                "scope_id": None,
+            }
+        finally:
+            clear_session_vars(tokens)
+
+
 class TestValidateCronBaseUrl:
     """The cron base_url guard must not let a NAMED custom provider's stored
     credential be sent to an off-host endpoint (CWE-200/CWE-522)."""

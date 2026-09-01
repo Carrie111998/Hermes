@@ -752,6 +752,67 @@ class TestSendToPlatformWhatsapp:
         assert _call.args[2] == "hello from hermes"
 
 
+class TestSendToPlatformFeishuCronAnchor:
+    @pytest.mark.parametrize(
+        ("message", "media_files"),
+        [
+            ("scheduled text", []),
+            ("scheduled report", [("/tmp/report.pdf", False)]),
+        ],
+    )
+    def test_feishu_text_and_media_propagate_keyword_only_reply_anchor(
+        self, message, media_files,
+    ):
+        import inspect
+
+        from gateway.platform_registry import platform_registry
+        from hermes_cli.plugins import discover_plugins
+        from tools.send_message_tool import _registry_standalone_send
+
+        discover_plugins()
+        entry = platform_registry.get("feishu")
+        original_sender = entry.standalone_sender_fn
+        sender = AsyncMock(
+            return_value={
+                "success": True,
+                "platform": "feishu",
+                "message_id": "om_delivery",
+            }
+        )
+        entry.standalone_sender_fn = sender
+        try:
+            result = asyncio.run(
+                _send_to_platform(
+                    Platform.FEISHU,
+                    SimpleNamespace(enabled=True, token=None, extra={}),
+                    "oc_chat",
+                    message,
+                    thread_id="omt_topic",
+                    media_files=media_files,
+                    reply_to_message_id="om_trigger",
+                )
+            )
+        finally:
+            entry.standalone_sender_fn = original_sender
+
+        assert result["success"] is True
+        sender.assert_awaited_once()
+        assert sender.await_args.kwargs["thread_id"] == "omt_topic"
+        assert sender.await_args.kwargs["reply_to_message_id"] == "om_trigger"
+        assert (
+            inspect.signature(_send_to_platform)
+            .parameters["reply_to_message_id"]
+            .kind
+            is inspect.Parameter.KEYWORD_ONLY
+        )
+        assert (
+            inspect.signature(_registry_standalone_send)
+            .parameters["reply_to_message_id"]
+            .kind
+            is inspect.Parameter.KEYWORD_ONLY
+        )
+
+
 class TestSendTelegramHtmlDetection:
     """Verify that messages containing HTML tags are sent with parse_mode=HTML
     and that plain / markdown messages use MarkdownV2."""

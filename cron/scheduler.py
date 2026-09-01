@@ -2507,7 +2507,7 @@ def _resolve_single_delivery_target(job: dict, deliver_value: str) -> Optional[d
 
     if deliver_value == "origin":
         if origin:
-            return {
+            target = {
                 "platform": origin["platform"],
                 "chat_id": str(origin["chat_id"]),
                 "thread_id": _origin_delivery_thread(origin),
@@ -2515,6 +2515,12 @@ def _resolve_single_delivery_target(job: dict, deliver_value: str) -> Optional[d
                 # _target_mirror_eligible): this IS the origin conversation.
                 "_resolved_from": "origin",
             }
+            if (
+                str(origin["platform"]).lower() == "feishu"
+                and origin.get("message_id")
+            ):
+                target["reply_to_message_id"] = str(origin["message_id"])
+            return target
         # Origin missing (e.g. job created via API/script) — try each
         # platform's home channel as a fallback instead of silently dropping.
         for platform_name in _iter_home_target_platforms():
@@ -2592,11 +2598,14 @@ def _resolve_single_delivery_target(job: dict, deliver_value: str) -> Optional[d
                 "chat_id": chat_id,
                 "thread_id": _get_home_target_thread_id(platform_name),
             }
-        return {
+        target = {
             "platform": platform_name,
             "chat_id": str(origin["chat_id"]),
             "thread_id": origin.get("thread_id"),
         }
+        if platform_name.lower() == "feishu" and origin.get("message_id"):
+            target["reply_to_message_id"] = str(origin["message_id"])
+        return target
 
     if not _is_known_delivery_platform(platform_name):
         return None
@@ -3181,6 +3190,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
         platform_name = target["platform"]
         chat_id = target["chat_id"]
         thread_id = target.get("thread_id")
+        reply_to_message_id = target.get("reply_to_message_id")
 
         # bot-chat targets don't ride a gateway adapter: the output becomes a
         # real inbound turn in the target profile's canonical Bot Chat via the
@@ -3499,7 +3509,16 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 route_metadata = {"job_id": job["id"]}
                 if route_thread_id:
                     route_metadata["thread_id"] = route_thread_id
-                media_metadata = {"thread_id": thread_id} if thread_id else None
+                if reply_to_message_id:
+                    route_metadata["reply_to_message_id"] = str(
+                        reply_to_message_id
+                    )
+                media_metadata = {"thread_id": thread_id} if thread_id else {}
+                if reply_to_message_id:
+                    media_metadata["reply_to_message_id"] = str(
+                        reply_to_message_id
+                    )
+                media_metadata = media_metadata or None
 
             # Relay egress needs a tenant discriminator on the frame: the
             # connector's fail-closed guard resolves the workspace/guild from
@@ -3656,7 +3675,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                                 target_errors.append(msg)
                                 adapter_ok = False  # fall through to standalone path
                             elif (
-                                send_raw_response
+                                isinstance(send_raw_response, dict)
                                 and thread_id
                                 and send_raw_response.get("thread_fallback")
                             ):
@@ -3826,7 +3845,15 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 delivery_errors.extend(target_errors)
                 continue
             # Standalone path: run the async send in a fresh event loop (safe from any thread)
-            coro = _send_to_platform(platform, pconfig, chat_id, cleaned_delivery_content, thread_id=thread_id, media_files=media_files)
+            coro = _send_to_platform(
+                platform,
+                pconfig,
+                chat_id,
+                cleaned_delivery_content,
+                thread_id=thread_id,
+                media_files=media_files,
+                reply_to_message_id=reply_to_message_id,
+            )
             try:
                 result = asyncio.run(coro)
             except RuntimeError as run_err:
@@ -3855,7 +3882,18 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 try:
                     pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
                     try:
-                        future = pool.submit(asyncio.run, _send_to_platform(platform, pconfig, chat_id, cleaned_delivery_content, thread_id=thread_id, media_files=media_files))
+                        future = pool.submit(
+                            asyncio.run,
+                            _send_to_platform(
+                                platform,
+                                pconfig,
+                                chat_id,
+                                cleaned_delivery_content,
+                                thread_id=thread_id,
+                                media_files=media_files,
+                                reply_to_message_id=reply_to_message_id,
+                            ),
+                        )
                         result = future.result(timeout=30)
                     finally:
                         pool.shutdown(wait=False)
