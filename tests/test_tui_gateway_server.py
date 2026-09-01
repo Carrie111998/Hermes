@@ -4918,10 +4918,10 @@ def test_session_resume_does_not_rebind_after_client_gone_interrupt_claim(monkey
         server._sessions.pop("live-sid", None)
 
 
-def test_ws_orphan_reap_defers_running_turn_for_active_delegation(monkeypatch):
+def test_ws_orphan_reap_interrupts_running_turn_with_active_delegation(monkeypatch):
     callbacks = []
     interrupted = []
-    delegation_active = iter((True, False, False))
+    delegation_active = iter((True, True, False))
 
     class _Timer:
         def __init__(self, _delay, callback):
@@ -4936,7 +4936,6 @@ def test_ws_orphan_reap_defers_running_turn_for_active_delegation(monkeypatch):
 
     def _interrupt():
         interrupted.append("interrupted")
-        session["running"] = False
 
     session = _session(
         agent=types.SimpleNamespace(interrupt=_interrupt),
@@ -4959,7 +4958,8 @@ def test_ws_orphan_reap_defers_running_turn_for_active_delegation(monkeypatch):
         server._schedule_ws_orphan_reap("delegating-turn")
         callbacks.pop(0)()
 
-        assert interrupted == []
+        assert interrupted == ["interrupted"]
+        assert session["_client_gone_interrupt_requested"] is True
         assert len(callbacks) == 1
 
         callbacks.pop(0)()
@@ -4967,10 +4967,13 @@ def test_ws_orphan_reap_defers_running_turn_for_active_delegation(monkeypatch):
         assert interrupted == ["interrupted"]
         assert len(callbacks) == 1
 
+        session["running"] = False
         callbacks.pop(0)()
         assert "delegating-turn" not in server._sessions
     finally:
         server._sessions.pop("delegating-turn", None)
+        server._pending_ws_reaps.pop("delegating-turn", None)
+        server._ws_orphan_reap_polls.pop("delegating-turn", None)
 
 
 def test_ws_orphan_reap_interrupts_in_process_turn(monkeypatch):
@@ -5012,6 +5015,61 @@ def test_ws_orphan_reap_interrupts_in_process_turn(monkeypatch):
         assert len(callbacks) == 1
     finally:
         server._sessions.pop("inline-sid", None)
+
+
+def test_ws_orphan_reap_interrupts_before_zero_poll_bound(monkeypatch):
+    callbacks = []
+    interrupted = []
+    torn_down = []
+
+    class _Timer:
+        def __init__(self, _delay, callback):
+            callbacks.append(callback)
+
+        def start(self):
+            return None
+
+    class _Supervisor:
+        def interrupt(self, sid, *, request_id=None):
+            interrupted.append((sid, request_id))
+
+    session = _session(
+        agent=None,
+        transport=server._detached_ws_transport,
+        running=True,
+        _compute_host_active=True,
+    )
+    sid = "zero-bound-sid"
+    server._sessions[sid] = session
+    monkeypatch.setattr(server, "_WS_ORPHAN_REAP_GRACE_S", 0.01)
+    monkeypatch.setattr(server, "_WS_ORPHAN_INTERRUPT_REAP_MAX_POLLS", 0)
+    monkeypatch.setattr(server.threading, "Timer", _Timer)
+    monkeypatch.setattr(server, "_load_cfg", lambda: {"dashboard": {"turn_isolation": True}})
+    monkeypatch.setattr(server, "_get_compute_host_supervisor", lambda _cfg=None: _Supervisor())
+    monkeypatch.setattr(server, "_session_has_active_delegations", lambda *_a, **_k: False)
+    monkeypatch.setattr(
+        server,
+        "_teardown_popped_session",
+        lambda claimed, *, end_reason: torn_down.append((claimed, end_reason)) or True,
+    )
+
+    try:
+        server._schedule_ws_orphan_reap(sid)
+        callbacks.pop(0)()
+
+        assert interrupted == [(sid, f"client-gone-{sid}")]
+        assert sid in server._sessions
+        assert sid not in server._ws_orphan_reap_polls
+        assert len(callbacks) == 1
+
+        callbacks.pop(0)()
+
+        assert sid not in server._sessions
+        assert torn_down == [(session, "ws_orphan_reap")]
+    finally:
+        server._sessions.pop(sid, None)
+        server._pending_ws_reaps.pop(sid, None)
+        server._ws_orphan_reap_polls.pop(sid, None)
 
 
 def test_ws_disconnect_running_sidecar_still_closes_without_orphan_timer(monkeypatch):

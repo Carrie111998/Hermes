@@ -12775,6 +12775,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 )
                 all_rows = cursor.fetchall()
             seen: dict = {}
+            first_id: dict = {}
             for row in all_rows:
                 dedupe_content = row["content"]
                 if row["role"] == "user":
@@ -12805,10 +12806,17 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     row["tool_calls"],
                     row["tool_name"],
                 )
+                first_id[key] = min(first_id.get(key, row["id"]), row["id"])
                 cur = seen.get(key)
                 if cur is None or (row["active"], row["id"]) > (cur["active"], cur["id"]):
                     seen[key] = row
-            rows = sorted(seen.values(), key=lambda r: r["id"])
+            # Keep the preferred representative, but order logical messages by
+            # their first-ever row. A protected-tail copy can have a newer id
+            # than messages emitted after the original row.
+            rows = [
+                row
+                for key, row in sorted(seen.items(), key=lambda item: first_id[item[0]])
+            ]
             if latest:
                 rows = rows[::-1]
             rows = rows[offset:]

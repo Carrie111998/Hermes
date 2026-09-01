@@ -1372,6 +1372,7 @@ def _session_has_active_delegations(sid: str, session: dict | None = None) -> bo
 # broadcast session.reclaimed, and trigger the client's auto-re-resume — a
 # reap->broadcast->resume feedback storm. Guarded by _sessions_lock.
 _pending_ws_reaps: dict[str, threading.Timer] = {}
+_ws_orphan_reap_polls: dict[str, int] = {}
 
 
 def _cancel_ws_orphan_reap(sid: str) -> None:
@@ -1386,6 +1387,7 @@ def _cancel_ws_orphan_reap(sid: str) -> None:
     """
     with _sessions_lock:
         timer = _pending_ws_reaps.pop(sid, None)
+        _ws_orphan_reap_polls.pop(sid, None)
     if timer is not None:
         try:
             timer.cancel()
@@ -1402,6 +1404,9 @@ def _schedule_ws_orphan_reap(sid: str, *, delay_s: float | None = None) -> None:
     """
     if _WS_ORPHAN_REAP_GRACE_S <= 0:
         return
+    if delay_s is None:
+        with _sessions_lock:
+            _ws_orphan_reap_polls.pop(sid, None)
 
     def _reap() -> None:
         # Serialize the orphan re-check against session.resume (which re-binds a
@@ -1417,44 +1422,61 @@ def _schedule_ws_orphan_reap(sid: str, *, delay_s: float | None = None) -> None:
         reschedule_delay = None
         interrupt_session = None
         session = None
+        try:
+            max_polls = max(0, int(_WS_ORPHAN_INTERRUPT_REAP_MAX_POLLS))
+        except (TypeError, ValueError, OverflowError):
+            max_polls = 0
         with _session_resume_lock:
-            # This Timer is running: drop its registration so a concurrent
-            # _cancel_ws_orphan_reap doesn't cancel a dead Timer object while
-            # a rescheduled one (registered below) is the live owner.
             with _sessions_lock:
+                # This Timer is running: drop its registration so a concurrent
+                # _cancel_ws_orphan_reap doesn't cancel a dead Timer object while
+                # a rescheduled one (registered below) is the live owner.
                 _pending_ws_reaps.pop(sid, None)
-            current = _sessions.get(sid)
-            if current is None or not _ws_session_is_detached(current):
-                return
-            if _session_has_active_delegations(sid, current):
-                reschedule_delay = _WS_ORPHAN_REAP_GRACE_S
-            elif current.get("running"):
-                # Mid-turn detached sessions must never drop the single
-                # Timer (#85578): after the reconnect grace the turn is
-                # interrupted once, then the reap keeps polling until the
-                # normal turn-finalization path settles.
-                polls = int(current.get("_client_gone_interrupt_polls") or 0) + 1
-                current["_client_gone_interrupt_polls"] = polls
-                if polls > _WS_ORPHAN_INTERRUPT_REAP_MAX_POLLS:
-                    # The interrupted turn never settled inside the budget —
-                    # force-reap rather than parking the session + a timer
-                    # chain forever. Loud by design: this only fires when a
-                    # turn is genuinely stuck past interrupt.
-                    logger.error(
-                        "client_gone sid=%s: turn did not settle after %d "
-                        "interrupt polls (%.0fs) — force-reaping detached "
-                        "session",
-                        sid, polls - 1,
-                        (polls - 1) * _WS_ORPHAN_INTERRUPT_REAP_POLL_S,
-                    )
-                    session = _pop_session_by_id(sid)
-                else:
+                current = _sessions.get(sid)
+                if current is None or not _ws_session_is_detached(current):
+                    _ws_orphan_reap_polls.pop(sid, None)
+                    return
+
+                has_active_delegations = _session_has_active_delegations(sid, current)
+                if current.get("running"):
+                    # The first expiry is a state transition, not a settlement
+                    # poll. A zero/invalid bound must still issue the one
+                    # client-gone interrupt first.
                     if not current.get("_client_gone_interrupt_requested"):
                         current["_client_gone_interrupt_requested"] = True
                         interrupt_session = current
-                    reschedule_delay = _WS_ORPHAN_INTERRUPT_REAP_POLL_S
-            else:
-                session = _pop_session_by_id(sid)
+                        reschedule_delay = _WS_ORPHAN_INTERRUPT_REAP_POLL_S
+                    else:
+                        try:
+                            polls = int(_ws_orphan_reap_polls.get(sid, 0)) + 1
+                        except (TypeError, ValueError, OverflowError):
+                            polls = 1
+                        if polls > max_polls:
+                            _ws_orphan_reap_polls.pop(sid, None)
+                            # The interrupted turn never settled inside the
+                            # budget — force-reap rather than parking the
+                            # session and timer chain forever.
+                            logger.error(
+                                "client_gone sid=%s: turn did not settle after %d "
+                                "interrupt polls (%.0fs) — force-reaping detached "
+                                "session",
+                                sid,
+                                polls - 1,
+                                (polls - 1) * _WS_ORPHAN_INTERRUPT_REAP_POLL_S,
+                            )
+                            session = _pop_session_by_id(sid)
+                        else:
+                            _ws_orphan_reap_polls[sid] = polls
+                            reschedule_delay = _WS_ORPHAN_INTERRUPT_REAP_POLL_S
+                elif has_active_delegations:
+                    # Delegation owns the return address independently of the
+                    # client. It may keep the session parked indefinitely, but
+                    # must never consume the running-turn settlement budget.
+                    _ws_orphan_reap_polls.pop(sid, None)
+                    reschedule_delay = _WS_ORPHAN_REAP_GRACE_S
+                else:
+                    _ws_orphan_reap_polls.pop(sid, None)
+                    session = _pop_session_by_id(sid)
 
         if interrupt_session is not None:
             try:
@@ -1470,11 +1492,8 @@ def _schedule_ws_orphan_reap(sid: str, *, delay_s: float | None = None) -> None:
                 )
             except Exception:
                 logger.exception("client_gone interrupt failed sid=%s", sid)
-                with _sessions_lock:
-                    if _sessions.get(sid) is interrupt_session:
-                        interrupt_session.pop(
-                            "_client_gone_interrupt_requested", None
-                        )
+                # Keep the transition guard set: the interrupt was attempted
+                # once, so subsequent callbacks belong to settlement.
 
         if reschedule_delay is not None:
             _schedule_ws_orphan_reap(sid, delay_s=reschedule_delay)
@@ -1523,6 +1542,7 @@ def _close_sessions_for_transport(
     for sid, session in owned:
         claimed_for_teardown = None
         should_schedule_reap = False
+        should_cancel_reap = False
         # A session.resume fast-path rebinds its live session while holding
         # _session_resume_lock. Take that lock before re-checking the snapshot
         # so a reconnect cannot move the transport between this check and the
@@ -1564,13 +1584,18 @@ def _close_sessions_for_transport(
                     if remaining:
                         remaining.sort(key=lambda item: item[0])
                         current["transport"] = remaining[-1][1]
+                        should_cancel_reap = True
                     else:
                         current["transport"] = _detached_ws_transport
+                        _ws_orphan_reap_polls.pop(sid, None)
+                        current.pop("_client_gone_interrupt_polls", None)
                         current.pop("_client_gone_interrupt_requested", None)
                         should_schedule_reap = True
         if claimed_for_teardown is not None:
             if _teardown_popped_session(claimed_for_teardown, end_reason=end_reason):
                 reaped += 1
+        elif should_cancel_reap:
+            _cancel_ws_orphan_reap(sid)
         elif should_schedule_reap:
             detached += 1
             try:
@@ -10670,8 +10695,14 @@ def _claim_or_reuse_live(
                 lease.release()
             # The winner is being reattached by this resume: any pending
             # ws-orphan reap for it must not fire against the reclaimed
-            # client (storm killer — see _cancel_ws_orphan_reap).
-            _cancel_ws_orphan_reap(live[0])
+            # client (storm killer — see _cancel_ws_orphan_reap). Keep the
+            # timer while a client-gone interrupt is still settling so the
+            # caller receives the retryable 4009 response from _reuse_live_response.
+            if not (
+                live[1].get("_client_gone_interrupt_requested")
+                and live[1].get("running")
+            ):
+                _cancel_ws_orphan_reap(live[0])
             return live
         with _sessions_lock:
             _sessions[sid] = record
@@ -11040,6 +11071,9 @@ def _live_session_payload(
                 # A live transport rebind means the client is back — any
                 # pending ws-orphan reap must not fire (storm killer).
                 _cancel_ws_orphan_reap(sid)
+                if not session.get("running"):
+                    session.pop("_client_gone_interrupt_requested", None)
+                    session.pop("_client_gone_interrupt_polls", None)
         if touch:
             session["last_active"] = time.time()
         in_memory_history = list(session.get("display_history_prefix") or []) + list(
