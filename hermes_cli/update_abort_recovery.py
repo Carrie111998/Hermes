@@ -32,6 +32,24 @@ def _serve_unit_recovery_available() -> bool:
     return sys.platform == "linux" and bool(shutil.which("systemctl"))
 
 
+def _plan_has_serve_runtimes(plan) -> bool:
+    """Does the pre-update plan record any serve/dashboard runtime?
+
+    The serve-unit recovery pass costs a fresh child spawn and a systemd
+    scan; hosts whose inventory saw no serve/dashboard runtime (e.g. a
+    manual-only gateway fleet) must keep the pre-#92145 contract of not
+    spawning anything. Capability alone (``systemctl`` on Linux) is not
+    evidence a serve backend exists.
+    """
+    try:
+        for runtime in getattr(plan, "runtimes", ()) or ():
+            if getattr(runtime, "kind", None) in ("serve", "dashboard"):
+                return True
+    except Exception as exc:
+        logger.debug("Could not scan plan for serve runtimes: %s", exc)
+    return False
+
+
 def _surviving_pre_update_serve_runtimes(plan) -> list[dict]:
     """Pre-update serve/dashboard runtimes that are STILL the same process.
 
@@ -181,7 +199,7 @@ def _recover_gateway_restart_after_abort(
         plan, skip_profiles=skip_profiles
     )
     profiles = sorted(candidates)
-    recover_serve = _serve_unit_recovery_available()
+    recover_serve = _serve_unit_recovery_available() and _plan_has_serve_runtimes(plan)
     _empty_serve: dict[str, list] = {"verified": [], "failed": []}
     if not profiles and not recover_serve:
         return {

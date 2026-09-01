@@ -246,8 +246,16 @@ class TestKillStaleDashboardPosix:
                 return MagicMock(returncode=0, stdout="", stderr="")
             raise AssertionError(f"unexpected subprocess.run call: {args}")
 
+        # Since #96235 the managed-unit restart no longer short-circuits the
+        # stale-process scan (the scan must still find serve backends the
+        # unit restart didn't cover). The dashboard's own PID is excluded
+        # via already_restarted_units, so nothing is killed — but the scan
+        # DOES run now, and its per-PID probes must be stubbed so the
+        # strict subprocess mock above only sees the systemctl ladder.
         with patch("subprocess.run", side_effect=fake_run), \
              patch("hermes_cli.main._find_stale_dashboard_pids", return_value=[12345]) as find_pids, \
+             patch("hermes_cli.main._get_pid_cgroup_path", return_value=None), \
+             patch("hermes_cli.main._get_systemd_service_for_pid", return_value="hermes-dashboard.service"), \
              patch("os.kill") as kill:
             _kill_stale_dashboard_processes(restart_managed=True)
 
@@ -258,7 +266,7 @@ class TestKillStaleDashboardPosix:
             ["systemctl", "--user", "restart", "hermes-dashboard.service"],
         ]
         assert all(call[:1] != ["sudo"] and call[:2] != ["systemctl"] for call in calls)
-        find_pids.assert_not_called()
+        find_pids.assert_called_once()
         kill.assert_not_called()
         assert "✓ restarted hermes-dashboard.service" in capsys.readouterr().out
 

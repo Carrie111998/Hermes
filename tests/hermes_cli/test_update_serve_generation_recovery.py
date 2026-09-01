@@ -761,6 +761,7 @@ def test_already_restarted_units_are_forwarded_as_skips(monkeypatch):
 def test_unreadable_serve_block_from_the_child_reads_as_failure(monkeypatch):
     """A child that answers with a broken serve block has proven nothing."""
     monkeypatch.setattr(abort_recovery, "_serve_unit_recovery_available", lambda: True)
+    monkeypatch.setattr(abort_recovery, "_plan_has_serve_runtimes", lambda plan: True)
 
     def fake_run(argv, **kwargs):
         return _Completed(
