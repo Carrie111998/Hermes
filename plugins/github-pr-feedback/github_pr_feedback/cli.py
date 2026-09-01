@@ -881,6 +881,20 @@ def _reusable_ci_receipt(
     return receipt if receipt.manifest_digest == manifest_digest else None
 
 
+class _ThreadOwnedCIRunner:
+    """Close a per-worker ledger after one grouped exact-head audit."""
+
+    def __init__(self, runner: LocalCIRunner, ledger: FeedbackLedger) -> None:
+        self._runner = runner
+        self._ledger = ledger
+
+    def run(self, identity: CIAuditIdentity, worktree: Path) -> CIAuditReceipt:
+        try:
+            return self._runner.run(identity, worktree)
+        finally:
+            self._ledger.close()
+
+
 def _run_grouped_exact_head_audit(
     github: GitHubClient,
     ledger: FeedbackLedger,
@@ -904,16 +918,24 @@ def _run_grouped_exact_head_audit(
         worktree=worktree,
         failure_lanes=_required_lanes(manifest_path.read_bytes()),
     )
-    grouped_ledger = FeedbackLedger.for_current_profile()
-    try:
-        outcome = GroupedCICoordinator(
-            lambda: LocalCIRunner(github, grouped_ledger),
-            max_parallel=4,
-        ).run((job,))[0]
-    finally:
-        grouped_ledger.close()
+    def runner_factory() -> _ThreadOwnedCIRunner:
+        # The coordinator invokes this factory inside its worker thread. Each
+        # SQLite connection must therefore be opened and closed in that same
+        # thread; sharing one grouped connection would fail immediately with
+        # sqlite3.ProgrammingError and lose a typed failed receipt.
+        worker_ledger = FeedbackLedger.for_current_profile()
+        return _ThreadOwnedCIRunner(
+            LocalCIRunner(github, worker_ledger),
+            worker_ledger,
+        )
+
+    outcome = GroupedCICoordinator(
+        runner_factory,
+        max_parallel=4,
+    ).run((job,))[0]
     if outcome.error is not None or outcome.receipt is None:
-        raise CIValidationError("grouped exact-head CI audit was unavailable")
+        reason = outcome.error or "no receipt returned"
+        raise CIValidationError(f"grouped exact-head CI audit was unavailable: {reason}")
     return outcome.receipt
 
 
@@ -965,8 +987,13 @@ def _audit_pr(ctx: Any, args: argparse.Namespace) -> int:
             worktree,
             force_fresh=bool(getattr(args, "fresh", False)),
         )
-    except (CIValidationError, GitHubClientError, LedgerStateError):
-        print(json.dumps({"status": "audit_unavailable"}, sort_keys=True))
+    except (CIValidationError, GitHubClientError, LedgerStateError) as error:
+        print(
+            json.dumps(
+                {"status": "audit_unavailable", "reason": str(error)},
+                sort_keys=True,
+            )
+        )
         return_code = 1
     else:
         # Receipt persistence is the audit boundary. Render it before the
