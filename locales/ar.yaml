@@ -29,7 +29,7 @@ gateway:
   provider_auth_failed: '⚠️ فشل مصادقة المزوّد. تحقق من بيانات الاعتماد المكوّنة؛ توجد تفاصيل المزوّد الخام في سجلات البوابة.'
   provider_rejected: '⚠️ رفض مزوّد النموذج الطلب. أبقيت خطأ المزوّد الخام خارج المحادثة؛ راجع سجلات البوابة للتفاصيل أو حاول إعادة الصياغة.'
   provider_rate_limited: '⏱️ يقيّد مزوّد النموذج الطلبات حاليًا. يُرجى الانتظار لحظة ثم إعادة المحاولة.'
-  provider_connection_error: '⚠️ The model server is not responding — it looks like the configured model endpoint is not running or is unreachable.'
+  provider_connection_error: '⚠️ خادم النموذج لا يستجيب — يبدو أن نقطة نهاية النموذج المُهيأة غير قيد التشغيل أو يتعذر الوصول إليها.'
   provider_failed: '⚠️ فشل مزوّد النموذج بعد عدة محاولات. أبقيت تفاصيل المزوّد الخام خارج المحادثة؛ راجع سجلات البوابة للتشخيص.'
   learn_start_failed: 'تعذّر بدء /learn — يُرجى المحاولة مرة أخرى.'
   init_start_failed: 'تعذّر بدء /init — يُرجى المحاولة مرة أخرى.'

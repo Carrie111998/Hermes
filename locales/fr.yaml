@@ -24,7 +24,7 @@ gateway:
   provider_auth_failed: "⚠️ L'authentification du fournisseur a échoué. Vérifiez les identifiants configurés ; les détails bruts du fournisseur sont dans les logs du gateway."
   provider_rejected: "⚠️ Le fournisseur du modèle a rejeté la requête. J'ai conservé l'erreur brute du fournisseur hors du chat ; consultez les logs du gateway pour plus de détails ou reformulez votre demande."
   provider_rate_limited: '⏱️ Le fournisseur du modèle limite le débit des requêtes. Veuillez patienter un instant et réessayer.'
-  provider_connection_error: '⚠️ The model server is not responding — it looks like the configured model endpoint is not running or is unreachable.'
+  provider_connection_error: '⚠️ Le serveur du modèle ne répond pas — il semble que le point de terminaison du modèle configuré ne soit pas actif ou soit injoignable.'
   provider_failed: "⚠️ Le fournisseur du modèle a échoué après plusieurs tentatives. J'ai conservé les détails bruts du fournisseur hors du chat ; consultez les logs du gateway pour le diagnostic."
   learn_start_failed: 'Impossible de démarrer /learn — veuillez réessayer.'
   init_start_failed: 'Impossible de démarrer /init — veuillez réessayer.'

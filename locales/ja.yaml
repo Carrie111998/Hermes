@@ -24,7 +24,7 @@ gateway:
   provider_auth_failed: '⚠️ プロバイダーの認証に失敗しました。設定された認証情報を確認してください。プロバイダーの詳細はゲートウェイのログに記録されています。'
   provider_rejected: '⚠️ モデルプロバイダーがリクエストを拒否しました。エラーの詳細はチャットには表示しないようにしています。ゲートウェイのログで詳細を確認するか、別の言い回しでお試しください。'
   provider_rate_limited: '⏱️ モデルプロバイダーがリクエストを制限しています。しばらく待ってからもう一度お試しください。'
-  provider_connection_error: '⚠️ The model server is not responding — it looks like the configured model endpoint is not running or is unreachable.'
+  provider_connection_error: '⚠️ モデルサーバーが応答していません — 設定されたモデルのエンドポイントが起動していないか、到達できないようです。'
   provider_failed: '⚠️ モデルプロバイダーはリトライ後も失敗しました。プロバイダーの詳細はチャットには表示しないようにしています。診断情報はゲートウェイのログを確認してください。'
   learn_start_failed: '/learn を開始できませんでした — もう一度お試しください。'
   init_start_failed: '/init を開始できませんでした — もう一度お試しください。'

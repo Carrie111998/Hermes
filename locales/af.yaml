@@ -24,7 +24,7 @@ gateway:
   provider_auth_failed: '⚠️ Verskaffer-verifikasie het misluk. Gaan die gekonfigureerde geloofsbriewe na; rou verskafferbesonderhede is in die gateway-loglae.'
   provider_rejected: '⚠️ Die modelverskaffer het die versoek van die hand gewys. Ek het die rou verskafferfout buite die klets gehou; kyk die gateway-loglae na vir besonderhede of probeer om die versoek te herformuleer.'
   provider_rate_limited: '⏱️ Die modelverskaffer pas tans tariefperke op versoeke toe. Wag asseblief ''n oomblik en probeer weer.'
-  provider_connection_error: '⚠️ The model server is not responding — it looks like the configured model endpoint is not running or is unreachable.'
+  provider_connection_error: '⚠️ Die modelbediener reageer nie — dit lyk of die gekonfigureerde modeleindpunt nie loop nie of onbereikbaar is.'
   provider_failed: '⚠️ Die modelverskaffer het ná herpogings misluk. Ek het rou verskafferbesonderhede buite die klets gehou; raadpleeg die gateway-loglae vir diagnostiek.'
   learn_start_failed: 'Kon nie /learn begin nie — probeer asseblief weer.'
   init_start_failed: 'Kon nie /init begin nie — probeer asseblief weer.'

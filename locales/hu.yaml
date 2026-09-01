@@ -24,7 +24,7 @@ gateway:
   provider_auth_failed: '⚠️ A szolgáltató hitelesítése sikertelen. Ellenőrizze a beállított hitelesítő adatokat; a nyers szolgáltatói adatok az átjáró naplóiban találhatók.'
   provider_rejected: '⚠️ A modellszolgáltató elutasította a kérést. A nyers szolgáltatói hiba nem került a csevegésbe; a részletekért nézze meg az átjáró naplóit, vagy próbálja átfogalmazni.'
   provider_rate_limited: '⏱️ A modellszolgáltató korlátozza a kérések gyakoriságát. Kérjük, várjon egy pillanatot, és próbálja újra.'
-  provider_connection_error: '⚠️ The model server is not responding — it looks like the configured model endpoint is not running or is unreachable.'
+  provider_connection_error: '⚠️ A modellkiszolgáló nem válaszol — úgy tűnik, a beállított modellvégpont nem fut vagy nem érhető el.'
   provider_failed: '⚠️ A modellszolgáltató az újrapróbálkozások ellenére sem működött. A nyers szolgáltatói adatok nem kerültek a csevegésbe; a diagnosztikához nézze meg az átjáró naplóit.'
   learn_start_failed: 'Nem sikerült elindítani a /learn parancsot — próbálja újra.'
   init_start_failed: 'Nem sikerült elindítani a /init parancsot — próbálja újra.'

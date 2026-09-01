@@ -24,7 +24,7 @@ gateway:
   provider_auth_failed: '⚠️ 提供方驗證失敗。請檢查已設定的憑證；原始提供方詳細資訊位於閘道記錄中。'
   provider_rejected: '⚠️ 模型提供方拒絕了此請求。我未將原始提供方錯誤顯示於聊天中；請查看閘道記錄以取得詳細資訊，或嘗試重新措辭。'
   provider_rate_limited: '⏱️ 模型提供方正在限制請求速率。請稍候片刻，然後再試一次。'
-  provider_connection_error: '⚠️ The model server is not responding — it looks like the configured model endpoint is not running or is unreachable.'
+  provider_connection_error: '⚠️ 模型伺服器沒有回應 — 設定的模型端點似乎未執行或無法連線。'
   provider_failed: '⚠️ 模型提供方在重試後仍失敗。我未將原始提供方詳細資訊顯示於聊天中；請查看閘道記錄以進行診斷。'
   learn_start_failed: '無法啟動 /learn — 請再試一次。'
   init_start_failed: '無法啟動 /init — 請再試一次。'

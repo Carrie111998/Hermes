@@ -24,7 +24,7 @@ gateway:
   provider_auth_failed: '⚠️ Sağlayıcı kimlik doğrulaması başarısız oldu. Yapılandırılmış kimlik bilgilerini kontrol edin; ham sağlayıcı ayrıntıları gateway günlüklerinde yer alır.'
   provider_rejected: '⚠️ Model sağlayıcısı isteği reddetti. Ham sağlayıcı hatasını sohbete dahil etmedim; ayrıntılar için gateway günlüklerine bakın veya yeniden ifade etmeyi deneyin.'
   provider_rate_limited: '⏱️ Model sağlayıcısı isteklere hız sınırı uyguluyor. Lütfen bir an bekleyin ve tekrar deneyin.'
-  provider_connection_error: '⚠️ The model server is not responding — it looks like the configured model endpoint is not running or is unreachable.'
+  provider_connection_error: '⚠️ Model sunucusu yanıt vermiyor — yapılandırılan model uç noktası çalışmıyor veya erişilemiyor gibi görünüyor.'
   provider_failed: '⚠️ Model sağlayıcısı yeniden denemelerin ardından başarısız oldu. Ham sağlayıcı ayrıntılarını sohbete dahil etmedim; tanılama için gateway günlüklerine bakın.'
   learn_start_failed: '/learn başlatılamadı — lütfen tekrar deneyin.'
   init_start_failed: '/init başlatılamadı — lütfen tekrar deneyin.'

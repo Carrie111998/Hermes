@@ -24,7 +24,7 @@ gateway:
   provider_auth_failed: '⚠️ Authentifizierung beim Provider fehlgeschlagen. Überprüfen Sie die konfigurierten Zugangsdaten; die Rohdaten des Providers finden Sie in den Gateway-Logs.'
   provider_rejected: '⚠️ Der Modell-Provider hat die Anfrage abgelehnt. Die rohe Provider-Fehlermeldung wurde nicht im Chat angezeigt; Details finden Sie in den Gateway-Logs, oder versuchen Sie es mit einer anderen Formulierung.'
   provider_rate_limited: '⏱️ Der Modell-Provider begrenzt derzeit die Anzahl der Anfragen. Bitte warten Sie einen Moment und versuchen Sie es erneut.'
-  provider_connection_error: '⚠️ The model server is not responding — it looks like the configured model endpoint is not running or is unreachable.'
+  provider_connection_error: '⚠️ Der Modellserver antwortet nicht — der konfigurierte Modell-Endpunkt läuft anscheinend nicht oder ist nicht erreichbar.'
   provider_failed: '⚠️ Der Modell-Provider ist auch nach mehreren Versuchen fehlgeschlagen. Die rohen Provider-Details wurden nicht im Chat angezeigt; die Diagnose finden Sie in den Gateway-Logs.'
   learn_start_failed: 'Konnte /learn nicht starten — bitte versuchen Sie es erneut.'
   init_start_failed: 'Konnte /init nicht starten — bitte versuchen Sie es erneut.'

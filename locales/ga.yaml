@@ -28,7 +28,7 @@ gateway:
   provider_auth_failed: '⚠️ Theip ar fhíordheimhniú an tsoláthraí. Seiceáil na dintiúir chumraithe; tá sonraí amha an tsoláthraí i logaí an gateway.'
   provider_rejected: '⚠️ Dhiúltaigh soláthraí an mhúnla don iarratas. Choinnigh mé earráid amh an tsoláthraí as an gcomhrá; seiceáil logaí an gateway le haghaidh sonraí nó déan iarracht é a athfhocail.'
   provider_rate_limited: '⏱️ Tá soláthraí an mhúnla ag teorannú iarratas. Fan nóiméad, le do thoil, agus bain triail eile as.'
-  provider_connection_error: '⚠️ The model server is not responding — it looks like the configured model endpoint is not running or is unreachable.'
+  provider_connection_error: '⚠️ Níl an freastalaí múnla ag freagairt — is cosúil nach bhfuil an críochphointe múnla cumraithe ar siúl nó nach féidir teacht air.'
   provider_failed: '⚠️ Theip ar sholáthraí an mhúnla tar éis roinnt iarrachtaí. Choinnigh mé sonraí amha an tsoláthraí as an gcomhrá; seiceáil logaí an gateway le haghaidh diagnóise.'
   learn_start_failed: 'Níorbh fhéidir /learn a thosú — bain triail eile as, le do thoil.'
   init_start_failed: 'Níorbh fhéidir /init a thosú — bain triail eile as, le do thoil.'
