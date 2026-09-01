@@ -68,6 +68,12 @@ afterEach(() => {
 })
 
 describe('PluginsSettings', () => {
+  it('states the backend restart boundary for agent plugin toggles', () => {
+    renderSettings()
+
+    expect(screen.getByText('Changes take effect after the backend restarts.', { exact: false })).toBeTruthy()
+  })
+
   it('renders and searches plugin rows returned without a canonical key', () => {
     renderSettings()
 
