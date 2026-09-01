@@ -183,7 +183,7 @@ function isInjectedSystemNote(text: string): boolean {
 const SS_SESSION_KEY = "hermes.m.activeSession";
 const SS_TITLE_KEY = "hermes.m.activeTitle";
 const SS_MOBILE_SESSION_KEY = "hermes.m.mobileSession";
-const BUILD_TAG = "build 2026-08-31.5 · drawer-all-fix";
+const BUILD_TAG = "build 2026-08-31.6 · send-recovery";
 
 function ssGet(key: string): string {
   try {
@@ -223,9 +223,11 @@ function cleanPreview(raw: string | undefined | null): string {
 
 function BubbleShell({
   role,
+  failed = false,
   children,
 }: {
   role: MsgRole;
+  failed?: boolean;
   children: ReactNode;
 }) {
   if (role === "system" || role === "error") {
@@ -244,15 +246,22 @@ function BubbleShell({
   }
 
   const isUser = role === "user";
+  const userFailed = isUser && failed;
   // User bubble: Nous-blue-tinted bubble, LIGHT text (matches the desktop
   // app's `userBubble: #07162c`). The message body renders through <Markdown>,
   // whose root sets `text-foreground` → `color:var(--midground)` (accent blue).
   // On the dark bubble that's fine, but we still override `--midground` to the
   // light foreground so Markdown text reads as plain light gray like on
   // desktop. The bubble background/border come from the mobile palette vars.
+  // A FAILED send desaturates the fill and takes a red border so it can't be
+  // mistaken for a delivered message.
   const userStyle = {
-    background: "var(--mobile-user-bubble, var(--midground-base))",
-    border: "1px solid var(--mobile-user-bubble-border, transparent)",
+    background: userFailed
+      ? "color-mix(in srgb, #f85149 14%, var(--background-base, #0d1117))"
+      : "var(--mobile-user-bubble, var(--midground-base))",
+    border: userFailed
+      ? "1px solid color-mix(in srgb, #f85149 55%, transparent)"
+      : "1px solid var(--mobile-user-bubble-border, transparent)",
     color: "var(--foreground-base, #e6edf3)",
     ["--midground" as string]: "var(--foreground-base, #e6edf3)",
   };
@@ -317,6 +326,10 @@ export default function MobileChatPage() {
   const reconnectAttemptsRef = useRef(0);
 
   const [state, setState] = useState<ConnectionState>("idle");
+  // Server-side reap (ws_orphan_reap) can leave the WS "open" while the
+  // session underneath is gone. "live" then lies; show a warning state
+  // until a send/reattach mints a fresh session id.
+  const [sessionDetached, setSessionDetached] = useState(false);
   const [model, setModel] = useState("");
   const [provider, setProvider] = useState("");
   const [modelPickerOpen, setModelPickerOpen] = useState(false);
@@ -889,19 +902,96 @@ const prevSid = ssGet(SS_MOBILE_SESSION_KEY);
           /* fall back to body */
         }
       }
-      await gw.request("prompt.submit", { session_id: sid, text: submitText });
+      await gw.request("prompt.submit", { session_id: sid, text: submitText }).catch(
+        async (firstErr: unknown) => {
+          // Server-side reap (ws_orphan_reap) can leave the WS "open" while
+          // the session underneath is gone. One silent recovery: re-attach
+          // (session.resume mints a fresh live id), then retry once.
+          const storedSid = ssGet(SS_SESSION_KEY) || sid;
+          await gw.request("session.resume", { session_id: storedSid, cols: 80 });
+          const res = await gw.request<{ session_id?: string }>(
+            "session.resume",
+            { session_id: storedSid, cols: 80 },
+          );
+          const newSid = res?.session_id || storedSid;
+          sessionIdRef.current = newSid;
+          ssSet(SS_SESSION_KEY, newSid);
+          setSessionDetached(false);
+          await gw.request("prompt.submit", { session_id: newSid, text: submitText });
+          void firstErr; // recovered — surface nothing
+        },
+      );
     } catch (e) {
       const err = e as Error;
+      setSessionDetached(true);
       patchLastAssistant((m) => ({
         ...m,
         inProgress: false,
         status: "error",
         role: "error",
-        text: `send failed: ${err.message}`,
+        text: `Send failed — tap your message to retry. (${err.message})`,
       }));
+      // Mark the user bubble failed + tappable for one-tap resend.
+      setMessages((prev) => {
+        const next = [...prev];
+        for (let i = next.length - 1; i >= 0; i--) {
+          if (next[i].role === "user") {
+            next[i] = { ...next[i], status: "error" };
+            failedUserMsgRef.current = { id: next[i].id, body };
+            break;
+          }
+        }
+        return next;
+      });
       setBusy(false);
     }
   }, [composer, pendingImages, busy, activeTitle, appendMsg, patchLastAssistant]);
+
+  // One-tap retry: tapping a failed user bubble resends its original body.
+  const failedUserMsgRef = useRef<{ id: string; body: string } | null>(null);
+  const retryFailedSend = useCallback(
+    async (msgId: string) => {
+      const failed = failedUserMsgRef.current;
+      if (!failed || failed.id !== msgId || busy) return;
+      failedUserMsgRef.current = null;
+      const gw = gwRef.current;
+      const sid = sessionIdRef.current;
+      if (!gw || !sid) return;
+      setMessages((prev) =>
+        prev.map((m) =>
+          m.id === msgId ? { ...m, status: "complete" as const } : m,
+        ),
+      );
+      setBusy(true);
+      const aid = uid("assistant");
+      lastAssistantIdRef.current = aid;
+      setMessages((prev) => [
+        ...prev,
+        { id: aid, role: "assistant", text: "", inProgress: true, status: "streaming" },
+      ]);
+      try {
+        await gw.request("prompt.submit", { session_id: sid, text: failed.body });
+      } catch (e) {
+        const err = e as Error;
+        setSessionDetached(true);
+        patchLastAssistant((m) => ({
+          ...m,
+          inProgress: false,
+          status: "error",
+          role: "error",
+          text: `Send failed — tap your message to retry. (${err.message})`,
+        }));
+        setMessages((prev) =>
+          prev.map((m) =>
+            m.id === msgId ? { ...m, status: "error" as const } : m,
+          ),
+        );
+        failedUserMsgRef.current = { id: msgId, body: failed.body };
+        setBusy(false);
+      }
+    },
+    [busy, patchLastAssistant],
+  );
 
   const onAttach = useCallback(
     async (file: File | null) => {
@@ -1178,9 +1268,15 @@ ssSet(SS_MOBILE_SESSION_KEY, id);
           </button>
         )}
         {state === "open" && (
-          <span className="flex items-center gap-1.5 rounded-full px-2 py-0.5 text-[0.72rem] text-success">
-            <span className="h-1.5 w-1.5 rounded-full bg-success" />
-            live
+          <span
+            className="flex items-center gap-1.5 rounded-full px-2 py-0.5 text-[0.72rem]"
+            style={{ color: sessionDetached ? "var(--warning, #d29922)" : "var(--success, #3fb950)" }}
+          >
+            <span
+              className="h-1.5 w-1.5 rounded-full"
+              style={{ backgroundColor: sessionDetached ? "var(--warning, #d29922)" : "var(--success, #3fb950)" }}
+            />
+            {sessionDetached ? "reattach…" : "live"}
           </span>
         )}
         <button
@@ -1269,7 +1365,16 @@ ssSet(SS_MOBILE_SESSION_KEY, id);
                 !!m.reasoning;
               return (
                 <div key={m.id} className="flex flex-col">
-                  <BubbleShell role={m.role}>
+                  <BubbleShell role={m.role} failed={m.status === "error"}>
+                    {m.role === "user" && m.status === "error" && (
+                      <button
+                        type="button"
+                        onClick={() => void retryFailedSend(m.id)}
+                        className="mb-1 w-full text-left text-[0.7rem] font-medium text-destructive"
+                      >
+                        not delivered — tap to retry ↻
+                      </button>
+                    )}
                     {m.role === "assistant" && m.reasoning && (
                       <details
                         className="mb-2"
