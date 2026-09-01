@@ -4546,6 +4546,18 @@ def sanitize_api_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]
             "Pre-call sanitizer: removed %d duplicate tool_call_id reference(s)",
             removed_dupes,
         )
+
+    # --- Re-run repair after dedup: dedup can empty a previously payload-
+    # bearing assistant message (when every tool_call was a duplicate).
+    # repair_empty_non_final_messages runs before dedup so the placeholder
+    # check ("_msg_has_payload") sees tool_calls present and skips the
+    # message; dedup then strips tool_calls (dropping the key entirely,
+    # per #64335) and leaves an empty-content turn that strict
+    # non-empty-content providers (Anthropic native, litellm/Bedrock)
+    # reject. Re-run repair now so the post-dedup shape also gets the
+    # "[response interrupted]" placeholder injected.
+    messages = repair_empty_non_final_messages(messages)
+
     return messages
 
 
