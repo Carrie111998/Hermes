@@ -1393,6 +1393,18 @@ def _(rid, params: dict) -> dict:
     session, err = _sess_nowait(params, rid)
     if err:
         return err
+
+    def _sync_live_title(value: str) -> None:
+        normalized = str(value or "").strip()
+        agent = session.get("agent")
+        if agent is not None:
+            agent._session_title_hint = normalized
+        # Title is part of the compatibility identity for older Bot clients.
+        # A rename must invalidate both verdicts; the already-adopted detach
+        # flag remains monotone for this live runtime.
+        session.pop("_bot_identity_checked", None)
+        session.pop("_canonical_bot_chat", None)
+
     with _session_db(session) as db:
         if db is None:
             return _db_unavailable_error(rid, code=5007)
@@ -1417,6 +1429,8 @@ def _(rid, params: dict) -> dict:
                     session["pending_title"] = None
             except Exception:
                 resolved_title = fallback
+            if resolved_title:
+                _sync_live_title(resolved_title)
             _emit_session_info_for_session(params.get("session_id", ""), session)
             return _ok(
                 rid,
@@ -1431,18 +1445,21 @@ def _(rid, params: dict) -> dict:
         try:
             if db.set_session_title(key, title):
                 session["pending_title"] = None
+                _sync_live_title(title)
                 _emit_session_info_for_session(params.get("session_id", ""), session)
                 return _ok(rid, {"pending": False, "title": title})
             # rowcount == 0 can mean "same value" as well as "missing row".
             existing_row = db.get_session(key)
             if existing_row:
                 session["pending_title"] = None
+                stored_title = (existing_row.get("title") or title)
+                _sync_live_title(stored_title)
                 _emit_session_info_for_session(params.get("session_id", ""), session)
                 return _ok(
                     rid,
                     {
                         "pending": False,
-                        "title": (existing_row.get("title") or title),
+                        "title": stored_title,
                     },
                 )
             # No row yet (the DB write is deferred to the first prompt so empty
@@ -1459,11 +1476,13 @@ def _(rid, params: dict) -> dict:
             with _session_db(session) as scoped_db:
                 if scoped_db is not None and scoped_db.set_session_title(key, title):
                     session["pending_title"] = None
+                    _sync_live_title(title)
                     _emit_session_info_for_session(params.get("session_id", ""), session)
                     return _ok(rid, {"pending": False, "title": title})
             # Row creation didn't take (DB unavailable, or a concurrent writer) —
             # fall back to queuing so the post-turn apply block can still recover.
             session["pending_title"] = title
+            _sync_live_title(title)
             _emit_session_info_for_session(params.get("session_id", ""), session)
             return _ok(rid, {"pending": True, "title": title})
         except ValueError as e:

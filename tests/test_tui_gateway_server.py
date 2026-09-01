@@ -8061,6 +8061,77 @@ def test_session_title_clears_pending_after_persist(monkeypatch):
         server._sessions.pop("sid", None)
 
 
+def test_session_title_invalidates_live_bot_identity_cache(monkeypatch):
+    class _FakeDB:
+        def __init__(self):
+            self.title = "Research"
+
+        def get_session_title(self, _key):
+            return self.title
+
+        def get_session(self, _key):
+            return {"id": _key, "title": self.title}
+
+        def set_session_title(self, _key, title):
+            self.title = title
+            return True
+
+        def get_compression_lineage(self, key):
+            return [key]
+
+    db = _FakeDB()
+    agent = types.SimpleNamespace(
+        _session_db=db,
+        _session_title_hint="Research",
+    )
+    session = _session(
+        agent=agent,
+        preserve_running_on_disconnect=False,
+        session_key="title-cache",
+    )
+    session["_bot_identity_checked"] = ("title-cache", "Research")
+    server._sessions["sid-title-cache"] = session
+    monkeypatch.setattr(server, "_get_db", lambda: db)
+    monkeypatch.setattr(
+        "tools.bot_mode_probe.capability_fingerprint",
+        lambda _home=None: "unavailable",
+    )
+    try:
+        renamed = server.handle_request(
+            {
+                "id": "rename-bot",
+                "method": "session.title",
+                "params": {"session_id": "sid-title-cache", "title": "Bot Chat"},
+            }
+        )
+        assert "error" not in renamed
+        assert agent._session_title_hint == "Bot Chat"
+        assert session.get("_bot_identity_checked") is None
+
+        server._sync_bot_capabilities("sid-title-cache", session)
+        assert session["preserve_running_on_disconnect"] is True
+        assert session["_canonical_bot_chat"] is True
+
+        renamed_back = server.handle_request(
+            {
+                "id": "rename-ordinary",
+                "method": "session.title",
+                "params": {"session_id": "sid-title-cache", "title": "Research"},
+            }
+        )
+        assert "error" not in renamed_back
+        assert agent._session_title_hint == "Research"
+        assert session.get("_canonical_bot_chat") is None
+
+        server._sync_bot_capabilities("sid-title-cache", session)
+        assert session["_bot_identity_checked"] == ("title-cache", "Research")
+        # The live runtime remains monotone after adopting the policy; a new
+        # resume will classify the persisted non-Bot title normally.
+        assert session["preserve_running_on_disconnect"] is True
+    finally:
+        server._sessions.pop("sid-title-cache", None)
+
+
 def test_session_title_does_not_queue_noop_when_row_exists(monkeypatch):
     class _FakeDB:
         def __init__(self):
@@ -12196,6 +12267,57 @@ def test_compression_rotation_during_queued_claim_restores_prompt(monkeypatch):
     assert session.get("_queued_prompt_claimed") is not True
     assert session["running"] is False
     assert session.get("_turn_cancel_requested") is not True
+
+
+@pytest.mark.parametrize("boundary", ["close", "shutdown"])
+def test_close_boundaries_cancel_claimed_prompt_before_dispatch(monkeypatch, boundary):
+    session = _session(
+        queued_prompt={"text": "must not dispatch", "transport": None},
+        preserve_running_on_disconnect=True,
+        running=False,
+    )
+    base_lock = threading.RLock()
+
+    class _ClaimInterlock:
+        entries = 0
+
+        def __enter__(self):
+            base_lock.acquire()
+            self.entries += 1
+            return self
+
+        def __exit__(self, exc_type, exc, traceback):
+            base_lock.release()
+            if self.entries == 1:
+                if boundary == "close":
+                    server._pop_session_by_id("queue-close")
+                else:
+                    server._shutdown_sessions()
+            return False
+
+    session["history_lock"] = _ClaimInterlock()
+    server._sessions["queue-close"] = session
+    monkeypatch.setattr(server, "_session_uses_compute_host", lambda _session: True)
+    monkeypatch.setattr(
+        server,
+        "_submit_prompt_to_compute_host",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("closed prompt must not dispatch")
+        ),
+    )
+    monkeypatch.setattr(
+        server,
+        "_teardown_popped_session",
+        lambda *args, **kwargs: True,
+    )
+    try:
+        assert server._drain_queued_prompt("rid", "queue-close", session) is True
+        assert "queue-close" not in server._sessions
+        assert session["_closing"] is True
+        assert session.get("_queued_prompt_claimed") is not True
+        assert session["running"] is False
+    finally:
+        server._sessions.pop("queue-close", None)
 
 
 def test_session_redirect_queues_during_agent_build_window(monkeypatch):

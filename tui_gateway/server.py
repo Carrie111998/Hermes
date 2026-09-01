@@ -10406,32 +10406,32 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
         session["running"] = True
         if queued.get("transport") is not None:
             session["transport"] = queued["transport"]
+    use_compute_host = _session_uses_compute_host(session)
     with session["history_lock"]:
+        if session.get("_closing") or session.get("_turn_cancel_requested"):
+            # Close/shutdown and explicit Stop own cancellation even when they
+            # do not need to bump the queue generation. Never dispatch a
+            # claimed envelope after the live-session owner was removed.
+            session.pop("_queued_prompt_claimed", None)
+            session["running"] = False
+            return True
         if int(session.get("_queued_prompt_generation", 0)) != queue_generation:
             # Compression re-anchors a legitimate follow-up and therefore
-            # restores it at the head. Explicit Stop/close owns cancellation:
-            # restoring after its generation bump lets a later submit clear
-            # the latch and resurrect work the user stopped.
-            cancelled = bool(
-                session.get("_turn_cancel_requested")
-                or session.get("_closing")
-            )
-            if not cancelled:
-                rest: list = []
-                advanced = session.get("queued_prompt")
-                if advanced:
-                    rest.append(advanced)
-                rest.extend(session.get("queued_prompts") or [])
-                session["queued_prompt"] = queued
-                if rest:
-                    session["queued_prompts"] = rest
-                else:
-                    session.pop("queued_prompts", None)
+            # restores it at the head. Stop/close returned above.
+            rest: list = []
+            advanced = session.get("queued_prompt")
+            if advanced:
+                rest.append(advanced)
+            rest.extend(session.get("queued_prompts") or [])
+            session["queued_prompt"] = queued
+            if rest:
+                session["queued_prompts"] = rest
+            else:
+                session.pop("queued_prompts", None)
             session.pop("_queued_prompt_claimed", None)
             session["running"] = False
             return True
         session.pop("_queued_prompt_claimed", None)
-    use_compute_host = _session_uses_compute_host(session)
     dispatch_failed = False
     try:
         if use_compute_host:
