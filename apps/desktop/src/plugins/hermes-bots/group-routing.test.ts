@@ -20,9 +20,7 @@ function names(members: GroupMember[]): string[] {
 
 describe('resolveGroupResponders — routing by relevance', () => {
   it('still sends an @-mentioned member alone', () => {
-    expect(names(resolveGroupResponders(userSays('@notion-expert check this'), MEMBERS))).toEqual([
-      'notion-expert'
-    ])
+    expect(names(resolveGroupResponders(userSays('@notion-expert check this'), MEMBERS))).toEqual(['notion-expert'])
   })
 
   it('still wakes everyone for @everyone', () => {
@@ -47,13 +45,45 @@ describe('resolveGroupResponders — routing by relevance', () => {
     // Relevance is a heuristic over words. The coordinator is what makes a miss
     // recoverable: it can hand the task to whoever actually owns it, so a bad
     // guess costs a round rather than an unanswered question.
-    const responders = resolveGroupResponders(
-      userSays('quanto rendeu meu FGTS este mes?'),
-      MEMBERS
-    )
+    const responders = resolveGroupResponders(userSays('quanto rendeu meu FGTS este mes?'), MEMBERS)
 
     expect(names(responders)).toContain('lifeos-coordinator')
     expect(names(responders)).toContain('finance-coordinator')
+  })
+
+  it('keeps deliberate domain stems without matching arbitrary substrings', () => {
+    expect(names(resolveGroupResponders(userSays('preciso revisar o relatório financeiro'), MEMBERS))).toContain(
+      'finance-coordinator'
+    )
+  })
+
+  it('recognises a domain-neutral coordinator without requiring one profile name', () => {
+    const members: GroupMember[] = [
+      { connectionId: 'local', name: 'room-coordinator' },
+      { connectionId: 'local', name: 'finance-coordinator' },
+      { connectionId: 'local', name: 'health-coordinator' }
+    ]
+
+    expect(names(resolveGroupResponders(userSays('quanto rendeu meu FGTS?'), members))).toEqual([
+      'room-coordinator',
+      'finance-coordinator'
+    ])
+  })
+
+  it('does not route on a domain term embedded inside another word', () => {
+    const members: GroupMember[] = [
+      { connectionId: 'local', name: 'notion-expert' },
+      { connectionId: 'local', name: 'travel-planner' }
+    ]
+
+    expect(names(resolveGroupResponders(userSays('travel planner, please review my itinerary'), members))).toEqual([
+      'notion-expert',
+      'travel-planner'
+    ])
+  })
+
+  it('does not route Notion from one ambiguous word', () => {
+    expect(resolveGroupResponders(userSays('the mountain view was beautiful'), MEMBERS)).toHaveLength(4)
   })
 
   it('falls back to everyone when no domain is recognisable', () => {
