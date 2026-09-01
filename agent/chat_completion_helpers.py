@@ -53,6 +53,7 @@ _OPENROUTER_PROVIDER_SORT_VALUES = {"throughput", "latency", "price"}
 _PROVIDER_STREAM_ERROR_FINISH_REASONS = {"error", "error_finish"}
 _PROVIDER_STREAM_SSE_FIELDS = {"event", "data", "id", "retry"}
 _PROVIDER_STREAM_ERROR_TEXT_LIMIT = 4096
+_TTFB_STALE_MARGIN_SECONDS = 1.0
 
 # When the fallback chain is fully exhausted on a non-rate-limit failure
 # (e.g. every provider returns a non-retryable client error like HTTP 400),
@@ -623,6 +624,82 @@ def _env_float(name: str, default: float) -> float:
         return default
 
 
+def _normalise_timeout_seconds(value: object, default: float) -> float:
+    """Normalise a timeout value for the TTFB watchdog only.
+
+    Missing, empty, malformed, and NaN values use ``default``.  Zero,
+    negative values, and either infinity explicitly disable the watchdog.
+    This is intentionally not used by ``_env_float``: its existing callers,
+    including the separate Codex watchdog, retain their exact semantics.
+    """
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return default
+    try:
+        normalised = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return default
+    if math.isnan(normalised):
+        return default
+    if math.isinf(normalised) or normalised <= 0:
+        return float("inf")
+    return normalised
+
+
+def resolve_stream_ttfb_timeout(
+    base_url: str | None,
+    est_tokens: int,
+    stale_timeout: float,
+    env_value: str | None = None,
+) -> float:
+    """Resolve the generic stream no-first-byte cutoff in one place.
+
+    The TTFB watchdog gets an independent window.  When stale detection has a
+    finite positive deadline, leave it the named margin so both detectors
+    cannot claim the same poll interval.  A finite stale deadline at or below
+    that margin disables TTFB deliberately: stale detection owns the only
+    available recovery window.  An infinite stale deadline leaves a finite
+    cloud TTFB candidate uncapped.
+    """
+    configured = _normalise_timeout_seconds(env_value, 120.0)
+    if configured == float("inf"):
+        return float("inf")
+    if base_url and is_local_endpoint(base_url):
+        return float("inf")
+    if est_tokens > 100_000:
+        timeout = max(configured, 300.0)
+    elif est_tokens > 50_000:
+        timeout = max(configured, 240.0)
+    else:
+        timeout = configured
+    if stale_timeout is None:
+        return timeout
+    try:
+        stale = float(stale_timeout)
+    except (TypeError, ValueError, OverflowError):
+        return float("inf")
+    if math.isinf(stale):
+        return timeout if stale > 0 else float("inf")
+    if not math.isfinite(stale):
+        return float("inf")
+    available_window = stale - _TTFB_STALE_MARGIN_SECONDS
+    if available_window <= 0:
+        return float("inf")
+    return min(timeout, available_window)
+
+
+def ttfb_kill_should_fire(
+    first_event_seen: bool, elapsed: float, ttfb_timeout: float
+) -> bool:
+    """Return whether a no-first-byte stream should be killed now."""
+    timeout = _normalise_timeout_seconds(ttfb_timeout, float("inf"))
+    return (
+        not first_event_seen
+        and math.isfinite(timeout)
+        and timeout > 0
+        and elapsed > timeout
+    )
+
+
 def _estimate_chunk_bytes(chunk: Any) -> int:
     """Cheap per-chunk size estimate for the stream diagnostic counters.
 
@@ -720,6 +797,18 @@ def _bump_stale_streak(agent) -> None:
         pass
 
 
+def _set_stream_ttfb_window(
+    first_stream_event_seen: dict[str, bool],
+    last_chunk_time: dict[str, float],
+    *,
+    first_event_seen: bool,
+    now: float,
+) -> None:
+    """Set the TTFB event state and timestamp for one stream window."""
+    first_stream_event_seen["yes"] = first_event_seen
+    last_chunk_time["t"] = now
+
+
 def _reset_stale_streak(agent) -> None:
     try:
         agent._consecutive_stale_streams = 0
@@ -815,27 +904,58 @@ def _check_stale_giveup(agent) -> None:
 
 
 def _derive_stream_stale_timeout(agent, api_kwargs: dict) -> float:
-    """Stale-stream patience for a provider that is never a local endpoint.
+    """Derive the single stale-stream patience budget for a request.
 
-    Mirrors the main streaming path's derivation — provider config → env base
-    → context-size scaling → reasoning-model floor — minus the local-endpoint
-    ``float('inf')``/900s disable branch, which cannot apply to Bedrock (its
-    endpoint is always the AWS cloud). Factored so the Bedrock streaming
-    watchdog shares the exact same patience budget as the OpenAI/Anthropic
-    stale-stream detector below.
+    Provider config, environment defaults, local-provider policy, context-size
+    scaling, and the reasoning-model floor all belong here so the generic and
+    Bedrock streaming paths cannot drift.  The reasoning floor applies only to
+    stale detection; the TTFB resolver receives the resulting stale deadline as
+    an upper-window boundary and never receives the floor itself.
     """
     _cfg_stale = get_provider_stale_timeout(agent.provider, agent.model)
     if _cfg_stale is not None:
-        _base = _cfg_stale
+        _stream_stale_timeout_base = _cfg_stale
     else:
-        _base = env_float("HERMES_STREAM_STALE_TIMEOUT", 180.0)
-    _est_tokens = estimate_request_context_tokens(api_kwargs)
-    if _est_tokens > 100_000:
-        _timeout = max(_base, 300.0)
-    elif _est_tokens > 50_000:
-        _timeout = max(_base, 240.0)
+        _stream_stale_timeout_base = env_float("HERMES_STREAM_STALE_TIMEOUT", 180.0)
+
+    _base_url = getattr(agent, "base_url", None)
+    if (
+        _stream_stale_timeout_base == 180.0
+        and _base_url
+        and is_local_endpoint(_base_url)
+    ):
+        # Local providers can take minutes for prefill, but a dead server must
+        # still be bounded.  Config and the documented environment override
+        # retain the existing local-stream timeout policy.
+        _local_default = 900.0
+        try:
+            from hermes_cli.config import load_config_readonly
+
+            _cfg = load_config_readonly()
+            _agent_cfg = _cfg.get("agent") if isinstance(_cfg, dict) else None
+            if isinstance(_agent_cfg, dict):
+                _value = _agent_cfg.get("local_stream_stale_timeout")
+                if isinstance(_value, (int, float)):
+                    _local_default = float(_value)
+        except Exception:
+            pass
+        _stream_stale_timeout = env_float(
+            "HERMES_LOCAL_STREAM_STALE_TIMEOUT", _local_default
+        )
+        logger.debug(
+            "Local provider detected (%s) — stale stream timeout set to %.0fs",
+            agent.base_url,
+            _stream_stale_timeout,
+        )
     else:
-        _timeout = _base
+        _est_tokens = estimate_request_context_tokens(api_kwargs)
+        if _est_tokens > 100_000:
+            _stream_stale_timeout = max(_stream_stale_timeout_base, 300.0)
+        elif _est_tokens > 50_000:
+            _stream_stale_timeout = max(_stream_stale_timeout_base, 240.0)
+        else:
+            _stream_stale_timeout = _stream_stale_timeout_base
+
     from agent.reasoning_timeouts import get_reasoning_stale_timeout_floor
     # Resolve the model id from BOTH the OpenAI/Anthropic key (``model``) and
     # the Bedrock key (``modelId``). OpenAI/Anthropic wins first via the ``or``
@@ -848,8 +968,8 @@ def _derive_stream_stale_timeout(agent, api_kwargs: dict) -> float:
     if _reasoning_floor is None and api_kwargs.get("modelId"):
         _reasoning_floor = _bedrock_reasoning_stale_floor(api_kwargs["modelId"])
     if _reasoning_floor is not None:
-        _timeout = max(_timeout, _reasoning_floor)
-    return _timeout
+        _stream_stale_timeout = max(_stream_stale_timeout, _reasoning_floor)
+    return _stream_stale_timeout
 
 
 def _bedrock_reasoning_stale_floor(model_id: object) -> "float | None":
@@ -3912,6 +4032,13 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
     # poll loop uses this to detect stale connections that keep receiving
     # SSE keep-alive pings but no actual data.
     last_chunk_time = {"t": time.time()}
+    # No-first-byte tracking for the TTFB watchdog: set the moment the
+    # provider delivers ANY stream event (chunk or SSE frame). Until
+    # then the poll loop applies the shorter TTFB cutoff instead of the
+    # full stale patience, so a connection the provider accepted but
+    # that never delivers a byte is reconnected promptly instead of
+    # waiting out the reasoning floor (up to 600s).
+    first_stream_event_seen = {"yes": False}
     # Stale-stream patience, shared between the httpx socket read timeout
     # (built in ``_call_chat_completions`` below) and the stale-stream detector
     # (computed further down, before the worker thread starts).  Initialized
@@ -3949,6 +4076,14 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             stream_attempt_state["current"] += 1
             attempt_id = int(stream_attempt_state["current"])
         provider_tool_in_flight["yes"] = False
+        # Per-attempt TTFB budget: a retry that connects but never
+        # delivers a byte gets its own no-first-byte cutoff.
+        _set_stream_ttfb_window(
+            first_stream_event_seen,
+            last_chunk_time,
+            first_event_seen=False,
+            now=time.time(),
+        )
         return attempt_id
 
     def _cancel_current_stream_attempt(reason: str) -> None:
@@ -4142,6 +4277,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             # an interceptor or codec is still handling an already-received
             # event.
             last_chunk_time["t"] = time.time()
+            first_stream_event_seen["yes"] = True
             return True
 
         def _relay_final_response() -> dict[str, Any]:
@@ -4219,6 +4355,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             response=lambda: attempt_stream_response["value"],
         ):
             last_chunk_time["t"] = time.time()
+            first_stream_event_seen["yes"] = True
             agent._touch_activity("receiving stream response")
 
             # Update per-attempt diagnostic counters.  Best-effort —
@@ -4746,6 +4883,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             for event in stream:
                 saw_stream_event = True
                 last_chunk_time["t"] = time.time()
+                first_stream_event_seen["yes"] = True
                 agent._touch_activity("receiving stream response")
                 try:
                     _diag["chunks"] = int(_diag.get("chunks", 0)) + 1
@@ -5204,65 +5342,17 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 else "stream_error_cleanup"
             )
 
-    # Provider-configured stale timeout takes priority over env default.
-    _cfg_stale = get_provider_stale_timeout(agent.provider, agent.model)
-    if _cfg_stale is not None:
-        _stream_stale_timeout_base = _cfg_stale
-    else:
-        _stream_stale_timeout_base = env_float("HERMES_STREAM_STALE_TIMEOUT", 180.0)
-    # Local providers (Ollama, oMLX, llama-cpp) can take 300+ seconds
-    # for prefill on large contexts, so tolerate far longer silence than
-    # the cloud default — but a wedged local server must EVENTUALLY trip the
-    # detector rather than hang forever (an infinite timeout meant a crashed
-    # or deadlocked local endpoint stalled the session indefinitely).  900s
-    # tolerates slow prefill while still bounding a hung endpoint.  Applies
-    # unless the user explicitly set HERMES_STREAM_STALE_TIMEOUT; override the
-    # local ceiling with HERMES_LOCAL_STREAM_STALE_TIMEOUT (documented in
-    # website/docs/reference/environment-variables.md).
-    if _stream_stale_timeout_base == 180.0 and agent.base_url and is_local_endpoint(agent.base_url):
-        # Read config.yaml ``agent.local_stream_stale_timeout`` (default 900),
-        # env var ``HERMES_LOCAL_STREAM_STALE_TIMEOUT`` overrides for escape-hatch.
-        _local_default = 900.0
-        try:
-            from hermes_cli.config import load_config_readonly
+    # Keep one owner for provider/local/context/reasoning stale derivation.
+    _stream_stale_timeout = _derive_stream_stale_timeout(agent, api_kwargs)
 
-            _cfg = load_config_readonly()  # read-only consumer — no deepcopy
-            _agent_cfg = _cfg.get("agent") if isinstance(_cfg, dict) else None
-            if isinstance(_agent_cfg, dict):
-                _v = _agent_cfg.get("local_stream_stale_timeout")
-                if isinstance(_v, (int, float)):
-                    _local_default = float(_v)
-        except Exception:
-            pass
-        _stream_stale_timeout = env_float("HERMES_LOCAL_STREAM_STALE_TIMEOUT", _local_default)
-        logger.debug(
-            "Local provider detected (%s) — stale stream timeout set to %.0fs",
-            agent.base_url, _stream_stale_timeout,
-        )
-    else:
-        # Scale the stale timeout for large contexts: slow models (like Opus)
-        # can legitimately think for minutes before producing the first token
-        # when the context is large.  Without this, the stale detector kills
-        # healthy connections during the model's thinking phase, producing
-        # spurious RemoteProtocolError ("peer closed connection").
-        _est_tokens = estimate_request_context_tokens(api_kwargs)
-        if _est_tokens > 100_000:
-            _stream_stale_timeout = max(_stream_stale_timeout_base, 300.0)
-        elif _est_tokens > 50_000:
-            _stream_stale_timeout = max(_stream_stale_timeout_base, 240.0)
-        else:
-            _stream_stale_timeout = _stream_stale_timeout_base
-        # Reasoning-model floor: known reasoning models (Nemotron 3 Ultra,
-        # OpenAI o1/o3, Anthropic Opus 4.x thinking, DeepSeek R1, Qwen QwQ,
-        # xAI Grok reasoning, etc.) routinely exceed the default 180s chat-
-        # model threshold during their thinking phase.  The cloud gateway
-        # upstream kills the socket first, surfacing as BrokenPipeError.
-        # Raises the floor only — never overrides explicit user config
-        # (handled by get_provider_stale_timeout above).
-        from agent.reasoning_timeouts import get_reasoning_stale_timeout_floor
-        _reasoning_floor = get_reasoning_stale_timeout_floor(api_kwargs.get("model"))
-        if _reasoning_floor is not None:
-            _stream_stale_timeout = max(_stream_stale_timeout, _reasoning_floor)
+    # ── No-first-byte TTFB watchdog (generic streaming path) ──────────
+    # A provider can accept a connection without emitting a stream event.
+    _ttfb_timeout = resolve_stream_ttfb_timeout(
+        agent.base_url,
+        estimate_request_context_tokens(api_kwargs),
+        _stream_stale_timeout,
+        os.environ.get("HERMES_STREAM_TTFB_TIMEOUT_SECONDS"),
+    )
 
     t = threading.Thread(target=_context_thread_target(_call), daemon=True)
     t.start()
@@ -5305,6 +5395,51 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 # leave the live display alone.
                 agent._touch_activity(
                     f"waiting for stream response ({_waiting_secs}s, no chunks yet)"
+                )
+
+        # No-first-byte TTFB watchdog: the provider accepted the
+        # connection but has not delivered a single stream event. Kill it
+        # so the inner retry loop reconnects promptly instead of waiting
+        # out the (possibly 600s) stale patience on a dead connection.
+        if not first_stream_event_seen["yes"] and _ttfb_timeout != float("inf"):
+            _ttfb_elapsed = time.time() - last_chunk_time["t"]
+            if ttfb_kill_should_fire(
+                first_stream_event_seen["yes"], _ttfb_elapsed, _ttfb_timeout
+            ):
+                logger.warning(
+                    "Stream produced no first byte for %.0fs (TTFB threshold "
+                    "%.0fs) — no stream events received. model=%s. Killing "
+                    "connection so the retry loop can reconnect.",
+                    _ttfb_elapsed, _ttfb_timeout,
+                    api_kwargs.get("model", "unknown"),
+                )
+                agent._buffer_status(
+                    f"⚠️ No first byte from provider in {int(_ttfb_elapsed)}s "
+                    f"(model: {api_kwargs.get('model', 'unknown')}). "
+                    f"Reconnecting."
+                )
+                try:
+                    _cancel_current_stream_attempt("stream_ttfb_kill")
+                    _close_request_client_once("stream_ttfb_kill")
+                except Exception:
+                    pass
+                # Count this no-first-byte kill like the ordinary stale kill.
+                # Reset both guards so we don't kill repeatedly while the
+                # inner thread processes the closure. The next attempt resets
+                # them again when it actually starts.
+                _bump_stale_streak(agent)
+                _set_stream_ttfb_window(
+                    first_stream_event_seen,
+                    last_chunk_time,
+                    first_event_seen=True,
+                    now=time.time(),
+                )
+                agent._emit_wait_notice(
+                    f"⚠ no first byte from provider in {int(_ttfb_elapsed)}s — "
+                    f"reconnecting..."
+                )
+                agent._touch_activity(
+                    f"stream killed after {int(_ttfb_elapsed)}s with no first byte"
                 )
 
         # Detect stale streams: connections kept alive by SSE pings
