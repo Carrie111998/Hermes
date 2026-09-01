@@ -535,21 +535,22 @@ async def loop_heartbeat_forever(
     # #90502 incident environment — is Linux and arms the socket normally.)
     tick_server = None
     tick_socket_path = None
+    tick_tcp_port = None
     try:
-        tick_socket_path = get_loop_tick_socket_path(home)
-        tick_socket_path.parent.mkdir(parents=True, exist_ok=True)
-        # Re-bind over a leftover node from a dead process (os._exit(75) /
-        # SIGKILL skip the finally-unlink; PID reuse re-lands on this
-        # PID-suffixed path) is handled by asyncio itself:
-        # create_unix_server os.remove()s an existing socket node before
-        # binding — guarded by test_producer_rebinds_over_stale_socket_node.
-        # What asyncio does NOT do is clean up SIBLING nodes from other
-        # dead PIDs, so sweep those to keep state/ from accumulating
-        # gateway.loop-tick.*.sock nodes across crash-restart cycles.
-        # POSIX-only: os.kill(pid, 0) is a liveness probe here, but on
-        # Windows os.kill calls TerminateProcess for non-CTRL signals —
-        # and AF_UNIX server nodes are never created there anyway.
         if os.name == "posix":
+            tick_socket_path = get_loop_tick_socket_path(home)
+            tick_socket_path.parent.mkdir(parents=True, exist_ok=True)
+            # Re-bind over a leftover node from a dead process (os._exit(75) /
+            # SIGKILL skip the finally-unlink; PID reuse re-lands on this
+            # PID-suffixed path) is handled by asyncio itself:
+            # create_unix_server os.remove()s an existing socket node before
+            # binding — guarded by test_producer_rebinds_over_stale_socket_node.
+            # What asyncio does NOT do is clean up SIBLING nodes from other
+            # dead PIDs, so sweep those to keep state/ from accumulating
+            # gateway.loop-tick.*.sock nodes across crash-restart cycles.
+            # POSIX-only: os.kill(pid, 0) is a liveness probe here, but on
+            # Windows os.kill calls TerminateProcess for non-CTRL signals —
+            # and AF_UNIX server nodes are never created there anyway.
             try:
                 for _stale in tick_socket_path.parent.glob(
                     "gateway.loop-tick.*.sock"
@@ -569,11 +570,33 @@ async def loop_heartbeat_forever(
                 logger.debug(
                     "stale loop-tick socket sweep failed", exc_info=True
                 )
-        tick_server = await asyncio.start_unix_server(
-            _tick_socket_handler, path=str(tick_socket_path)
-        )
+            tick_server = await asyncio.start_unix_server(
+                _tick_socket_handler, path=str(tick_socket_path)
+            )
+        else:
+            # Windows / non-POSIX: no AF_UNIX support, so use a TCP loopback
+            # server on 127.0.0.1 as the loop-scheduling witness instead.
+            # Same protocol (connect → read one byte "1"), same semantics
+            # (pure in-memory, zero disk I/O, answered only when the loop
+            # is dispatching). Port is dynamic (assigned by the OS) and
+            # published via the heartbeat payload so external probes know
+            # where to connect.
+            tick_server = await asyncio.start_server(
+                _tick_socket_handler, host="127.0.0.1", port=0
+            )
+            # Get the actual port assigned by the OS
+            _sock_addrs = tick_server.sockets if hasattr(tick_server, "sockets") else []
+            for _s in _sock_addrs:
+                try:
+                    _sname = _s.getsockname()
+                    if isinstance(_sname, tuple) and len(_sname) >= 2:
+                        tick_tcp_port = int(_sname[1])
+                        break
+                except Exception:
+                    pass
     except Exception:
         tick_server = None
+        tick_tcp_port = None
         logger.warning(
             "Loop tick socket unavailable — liveness probes will have no "
             "loop-scheduling witness and will not escalate on a stale heartbeat",
@@ -588,7 +611,10 @@ async def loop_heartbeat_forever(
                 write_loop_heartbeat,
                 start_time=start_time,
                 home=home,
-                extra={"loop_tick_socket": tick_server is not None},
+                extra={
+                    "loop_tick_socket": tick_server is not None,
+                    "loop_tick_tcp_port": tick_tcp_port,
+                },
             )
         except asyncio.CancelledError:
             raise
