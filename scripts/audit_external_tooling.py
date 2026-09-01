@@ -8,6 +8,7 @@ from collections import Counter
 from collections.abc import Sequence
 import hashlib
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -26,6 +27,9 @@ from hermes_constants import get_hermes_home
 
 
 _MAX_CAPTURE_CHARS = 200_000
+_LOCKFILE_NAME = ".audit-tool-lock.json"
+_ZIZMOR_SEVERITIES = {"High", "Medium", "Low", "Informational"}
+_ZIZMOR_CONFIDENCES = {"High", "Medium", "Low"}
 
 
 @dataclass(frozen=True)
@@ -113,12 +117,13 @@ def build_commands(
 
 
 def build_uv_export_command(
-    *, requirements_path: Path, cache_path: Path | None = None
+    *, requirements_path: Path, cache_path: Path | None = None,
+    uv_path: Path | None = None,
 ) -> tuple[str, ...]:
     """Export the existing uv lock without resolving or modifying dependencies."""
     cache_path = cache_path or Path(tempfile.gettempdir()) / "hermes-uv-audit-cache"
     return (
-        shutil.which("uv") or "uv",
+        str(uv_path) if uv_path is not None else (shutil.which("uv") or "uv"),
         "export",
         "--locked",
         "--cache-dir",
@@ -163,6 +168,48 @@ def _sha256(text: str) -> str:
     return f"sha256:{hashlib.sha256(text.encode('utf-8')).hexdigest()}"
 
 
+def _file_sha256(path: Path) -> str | None:
+    """Hash the exact executable bytes used for an audit."""
+    try:
+        digest = hashlib.sha256()
+        with path.open("rb") as stream:
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return f"sha256:{digest.hexdigest()}"
+    except (OSError, ValueError):
+        return None
+
+
+def _resolve_executable(path: str | Path) -> Path | None:
+    candidate = Path(path).expanduser()
+    try:
+        candidate = candidate.resolve()
+    except OSError:
+        return None
+    if candidate.is_file() and os.access(candidate, os.X_OK):
+        return candidate
+    return None
+
+
+def _load_tool_lock(repo_root: Path) -> tuple[dict[str, Any] | None, str | None]:
+    """Load and validate repository-owned executable/version pins."""
+    path = repo_root / _LOCKFILE_NAME
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        return None, f"unable to read {_LOCKFILE_NAME}: {exc}"
+    if not isinstance(payload, dict) or payload.get("schema_version") != 1:
+        return None, f"invalid {_LOCKFILE_NAME} schema"
+    tools = payload.get("tools")
+    uv = payload.get("uv")
+    if not isinstance(tools, dict) or not isinstance(uv, dict):
+        return None, f"invalid {_LOCKFILE_NAME} entries"
+    for entry in [uv, *[tools.get(name) for name in ("zizmor", "import-linter", "pip-audit")]]:
+        if not isinstance(entry, dict) or not isinstance(entry.get("version"), str) or not isinstance(entry.get("sha256"), str):
+            return None, f"invalid {_LOCKFILE_NAME} pin"
+    return payload, None
+
+
 def _bounded_output(text: str) -> str:
     if len(text) <= _MAX_CAPTURE_CHARS:
         return text
@@ -182,7 +229,18 @@ def _summarize_json_output(name: str, stdout: str) -> dict[str, Any] | None:
         return None
 
     if name == "zizmor" and isinstance(payload, list):
-        determinations = [row.get("determinations", {}) for row in payload]
+        if any(
+            not isinstance(row, dict)
+            or not isinstance(row.get("ident"), str)
+            or not isinstance(row.get("determinations"), dict)
+            or not isinstance(row.get("locations"), list)
+            or row["determinations"].get("severity") not in _ZIZMOR_SEVERITIES
+            or row["determinations"].get("confidence") not in _ZIZMOR_CONFIDENCES
+            or any(not isinstance(location, dict) for location in row["locations"])
+            for row in payload
+        ):
+            return None
+        determinations = [row["determinations"] for row in payload]
         return {
             "finding_groups": len(payload),
             "locations": sum(len(row.get("locations", [])) for row in payload),
@@ -206,7 +264,16 @@ def _summarize_json_output(name: str, stdout: str) -> dict[str, Any] | None:
             ),
         }
     if name == "pip-audit" and isinstance(payload, dict):
-        dependencies = payload.get("dependencies", [])
+        dependencies = payload.get("dependencies")
+        if not isinstance(dependencies, list) or any(
+            not isinstance(row, dict)
+            or not isinstance(row.get("name"), str)
+            or not isinstance(row.get("version"), str)
+            or not isinstance(row.get("vulns"), list)
+            or any(not isinstance(vulnerability, dict) for vulnerability in row["vulns"])
+            for row in dependencies
+        ):
+            return None
         return {
             "dependencies": len(dependencies),
             "vulnerabilities": sum(len(row.get("vulns", [])) for row in dependencies),
@@ -232,18 +299,34 @@ def run_audits(
     repo_root: Path,
     tool_root: Path,
     runner: Callable[..., Any] = subprocess.run,
+    uv_path: Path | None = None,
 ) -> dict[str, Any]:
     repo_root = repo_root.resolve()
     head = _git_value(runner, repo_root, "rev-parse", "HEAD")
     branch = _git_value(runner, repo_root, "branch", "--show-current")
     status = _git_value(runner, repo_root, "status", "--porcelain")
+    lock, lock_error = _load_tool_lock(repo_root)
 
     audits: list[dict[str, Any]] = []
     preparations: list[dict[str, Any]] = []
     with tempfile.TemporaryDirectory(prefix="hermes-external-audit-") as temp_dir:
         requirements_path = Path(temp_dir) / "requirements.txt"
-        export_command = build_uv_export_command(requirements_path=requirements_path)
-        export_result = _run(runner, export_command, repo_root=repo_root, timeout=120)
+        resolved_uv = _resolve_executable(uv_path or (shutil.which("uv") or ""))
+        uv_pin = lock.get("uv", {}) if lock else {}
+        uv_digest = _file_sha256(resolved_uv) if resolved_uv else None
+        uv_version_result: AuditProcessResult = SkippedAuditResult(1, "", "uv executable unavailable")
+        if resolved_uv is not None:
+            uv_version_result = _run(runner, (str(resolved_uv), "--version"), repo_root=repo_root, timeout=30)
+        uv_version_stdout = str(uv_version_result.stdout or "")
+        uv_version_stderr = str(uv_version_result.stderr or "")
+        uv_observed_version = _extract_version(uv_version_stdout, uv_version_stderr)
+        uv_version_matches = uv_version_result.returncode == 0 and uv_observed_version == uv_pin.get("version")
+        uv_realization_ok = bool(resolved_uv and uv_digest == uv_pin.get("sha256") and uv_version_matches)
+        export_command = build_uv_export_command(requirements_path=requirements_path, uv_path=resolved_uv)
+        if uv_realization_ok:
+            export_result = _run(runner, export_command, repo_root=repo_root, timeout=120)
+        else:
+            export_result = SkippedAuditResult(1, "", "uv realization is not locked; export was not run")
         export_stdout = str(export_result.stdout or "")
         export_stderr = str(export_result.stderr or "")
         preparations.append({
@@ -254,6 +337,18 @@ def run_audits(
             "stderr_sha256": _sha256(export_stderr),
             "stdout": _bounded_output(export_stdout),
             "stderr": _bounded_output(export_stderr),
+            "executable_path": str(resolved_uv) if resolved_uv else None,
+            "executable_sha256": uv_digest,
+            "expected_sha256": uv_pin.get("sha256"),
+            "expected_version": uv_pin.get("version"),
+            "observed_version": uv_observed_version,
+            "version_matches": uv_version_matches,
+            "realization_ok": uv_realization_ok,
+            "version_command": [str(resolved_uv), "--version"] if resolved_uv else [],
+            "version_returncode": int(uv_version_result.returncode),
+            "version_stdout_sha256": _sha256(uv_version_stdout),
+            "version_stderr_sha256": _sha256(uv_version_stderr),
+            "requirements_sha256": _file_sha256(requirements_path) if requirements_path.exists() else None,
         })
 
         for command in build_commands(
@@ -261,9 +356,13 @@ def run_audits(
             tool_root=tool_root,
             requirements_path=requirements_path,
         ):
-            version_result = _run(
-                runner, command.version_argv, repo_root=repo_root, timeout=30
-            )
+            resolved_executable = _resolve_executable(command.argv[0])
+            executable_digest = _file_sha256(resolved_executable) if resolved_executable else None
+            pin = lock.get("tools", {}).get(command.name, {}) if lock else {}
+            if resolved_executable is None:
+                version_result: AuditProcessResult = SkippedAuditResult(1, "", "executable unavailable")
+            else:
+                version_result = _run(runner, command.version_argv, repo_root=repo_root, timeout=30)
             version_stdout = str(version_result.stdout or "")
             version_stderr = str(version_result.stderr or "")
             observed_version = _extract_version(version_stdout, version_stderr)
@@ -271,11 +370,22 @@ def run_audits(
                 version_result.returncode == 0
                 and observed_version == command.expected_version
             )
+            realization_ok = bool(
+                resolved_executable
+                and executable_digest == pin.get("sha256")
+                and version_matches
+            )
             if command.name == "pip-audit" and export_result.returncode != 0:
                 result: AuditProcessResult = SkippedAuditResult(
                     returncode=1,
                     stdout="",
                     stderr="uv lock export failed; pip-audit was not run",
+                )
+            elif not realization_ok:
+                result = SkippedAuditResult(
+                    returncode=1,
+                    stdout="",
+                    stderr="tool realization is not locked; audit was not run",
                 )
             else:
                 result = _run(runner, command.argv, repo_root=repo_root, timeout=600)
@@ -287,6 +397,11 @@ def run_audits(
                 "expected_version": command.expected_version,
                 "observed_version": observed_version,
                 "version_matches": version_matches,
+                "realization_ok": realization_ok,
+                "audit_invoked": realization_ok and not (command.name == "pip-audit" and export_result.returncode != 0),
+                "executable_path": str(resolved_executable) if resolved_executable else None,
+                "executable_sha256": executable_digest,
+                "expected_sha256": pin.get("sha256"),
                 "version_command": list(command.version_argv),
                 "version_returncode": int(version_result.returncode),
                 "version_stdout_sha256": _sha256(version_stdout),
@@ -315,10 +430,16 @@ def run_audits(
         },
         "read_only": True,
         "auto_fix": False,
-        "ok": all(row["returncode"] == 0 for row in preparations)
-        and all(row["version_matches"] and row["policy_ok"] for row in audits),
+        "ok": not status
+        and lock_error is None
+        and all(row["returncode"] == 0 and row["realization_ok"] for row in preparations)
+        and all(
+            row["realization_ok"] and row["version_matches"] and row["policy_ok"]
+            for row in audits
+        ),
         "preparations": preparations,
         "audits": audits,
+        "lock_error": lock_error,
     }
 
 

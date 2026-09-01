@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 import json
+import hashlib
 import os
 import subprocess
 import sys
@@ -16,6 +17,36 @@ from scripts.audit_external_tooling import (
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
+
+
+def _fixture(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    tool_root = tmp_path / "bin"
+    tool_root.mkdir()
+    versions = {
+        "zizmor": "1.30.0",
+        "lint-imports": "2.14",
+        "pip-audit": "2.10.1",
+    }
+    pins = {}
+    for name, version in versions.items():
+        executable = tool_root / name
+        executable.write_text(f"#!/bin/sh\n# {name}\n", encoding="utf-8")
+        executable.chmod(0o755)
+        pins["import-linter" if name == "lint-imports" else name] = {
+            "version": version,
+            "sha256": f"sha256:{hashlib.sha256(executable.read_bytes()).hexdigest()}",
+        }
+    uv = tmp_path / "uv"
+    uv.write_text("#!/bin/sh\n# uv\n", encoding="utf-8")
+    uv.chmod(0o755)
+    lock = {"schema_version": 1, "tools": pins, "uv": {
+        "version": "0.12.6",
+        "sha256": f"sha256:{hashlib.sha256(uv.read_bytes()).hexdigest()}",
+    }}
+    (repo / ".audit-tool-lock.json").write_text(json.dumps(lock), encoding="utf-8")
+    return repo, tool_root, uv
 
 
 def test_zizmor_summary_preserves_counts_when_raw_capture_is_bounded():
@@ -71,9 +102,7 @@ def test_commands_are_pinned_read_only_and_offline_where_supported(tmp_path):
 
 
 def test_receipt_binds_results_to_exact_git_identity(tmp_path):
-    repo = tmp_path / "repo"
-    repo.mkdir()
-    tool_root = tmp_path / "bin"
+    repo, tool_root, uv = _fixture(tmp_path)
     head = "a" * 40
 
     def fake_runner(argv, **kwargs):
@@ -90,6 +119,7 @@ def test_receipt_binds_results_to_exact_git_identity(tmp_path):
                 "zizmor": "zizmor 1.30.0\n",
                 "lint-imports": "import-linter 2.14\n",
                 "pip-audit": "pip-audit 2.10.1\n",
+                "uv": "uv 0.12.6\n",
             }
             return SimpleNamespace(returncode=0, stdout=versions[executable], stderr="")
         if Path(command[0]).name == "zizmor":
@@ -100,23 +130,24 @@ def test_receipt_binds_results_to_exact_git_identity(tmp_path):
             )
         return SimpleNamespace(returncode=0, stdout="", stderr="")
 
-    receipt = run_audits(repo_root=repo, tool_root=tool_root, runner=fake_runner)
+    receipt = run_audits(repo_root=repo, tool_root=tool_root, runner=fake_runner, uv_path=uv)
 
     assert receipt["repository"]["head"] == head
     assert receipt["repository"]["branch"] == "feature/audit"
     assert receipt["repository"]["dirty"] is True
-    assert receipt["ok"] is True
+    assert receipt["ok"] is False
     assert len(receipt["audits"]) == 3
     assert all(row["stdout_sha256"].startswith("sha256:") for row in receipt["audits"])
 
 
 def test_receipt_fails_when_observed_tool_version_differs(tmp_path):
-    repo = tmp_path / "repo"
-    repo.mkdir()
-    tool_root = tmp_path / "bin"
+    repo, tool_root, uv = _fixture(tmp_path)
+
+    calls = []
 
     def fake_runner(argv, **kwargs):
         command = tuple(str(part) for part in argv)
+        calls.append(command)
         if command[:2] == ("git", "rev-parse"):
             return SimpleNamespace(returncode=0, stdout=f"{'b' * 40}\n", stderr="")
         if command[:2] == ("git", "branch"):
@@ -129,6 +160,7 @@ def test_receipt_fails_when_observed_tool_version_differs(tmp_path):
                 "zizmor": "zizmor 9.9.9\n",
                 "lint-imports": "import-linter 2.14\n",
                 "pip-audit": "pip-audit 2.10.1\n",
+                "uv": "uv 0.12.6\n",
             }
             return SimpleNamespace(returncode=0, stdout=versions[executable], stderr="")
         if Path(command[0]).name == "zizmor":
@@ -139,18 +171,26 @@ def test_receipt_fails_when_observed_tool_version_differs(tmp_path):
             )
         return SimpleNamespace(returncode=0, stdout="", stderr="")
 
-    receipt = run_audits(repo_root=repo, tool_root=tool_root, runner=fake_runner)
+    receipt = run_audits(repo_root=repo, tool_root=tool_root, runner=fake_runner, uv_path=uv)
 
     zizmor = receipt["audits"][0]
     assert zizmor["observed_version"] == "9.9.9"
     assert zizmor["version_matches"] is False
+    assert zizmor["audit_invoked"] is False
+    assert not any(call and Path(call[0]).name == "zizmor" and "--offline" in call for call in calls)
     assert receipt["ok"] is False
 
 
+def test_malformed_scanner_payloads_fail_closed():
+    assert _summarize_json_output("pip-audit", "{}") is None
+    assert _summarize_json_output(
+        "pip-audit", '{"dependencies": [{"name": "demo", "version": "1.0"}]}'
+    ) is None
+    assert _summarize_json_output("zizmor", "[{}]") is None
+
+
 def test_zizmor_high_confidence_high_severity_finding_fails_policy(tmp_path):
-    repo = tmp_path / "repo"
-    repo.mkdir()
-    tool_root = tmp_path / "bin"
+    repo, tool_root, uv = _fixture(tmp_path)
     finding = json.dumps(
         [
             {
@@ -175,6 +215,7 @@ def test_zizmor_high_confidence_high_severity_finding_fails_policy(tmp_path):
                 "zizmor": "zizmor 1.30.0\n",
                 "lint-imports": "import-linter 2.14\n",
                 "pip-audit": "pip-audit 2.10.1\n",
+                "uv": "uv 0.12.6\n",
             }
             return SimpleNamespace(returncode=0, stdout=versions[executable], stderr="")
         if Path(command[0]).name == "zizmor":
@@ -185,7 +226,7 @@ def test_zizmor_high_confidence_high_severity_finding_fails_policy(tmp_path):
             )
         return SimpleNamespace(returncode=0, stdout="", stderr="")
 
-    receipt = run_audits(repo_root=repo, tool_root=tool_root, runner=fake_runner)
+    receipt = run_audits(repo_root=repo, tool_root=tool_root, runner=fake_runner, uv_path=uv)
 
     zizmor = receipt["audits"][0]
     assert zizmor["returncode"] == 0
