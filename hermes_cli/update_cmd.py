@@ -9031,21 +9031,91 @@ def _cmd_update_impl(args, gateway_mode: bool):
                         print("  Then re-run the update. Local work is untouched.")
                         sys.exit(1)
                 else:
-                    print(
-                        "  ⚠ Fast-forward not possible (history diverged); "
-                        "checking for locally carried commits..."
+                    # Preserve the upstream orphan-history recovery path: when
+                    # there is no common ancestor at all, park HEAD behind a
+                    # rescue ref before resetting. For ordinary rewritten
+                    # history, recover only the locally carried range proven by
+                    # the remote-tracking reflog.
+                    merge_base_result = subprocess.run(
+                        git_cmd + ["merge-base", "HEAD", f"origin/{branch}"],
+                        cwd=_m().PROJECT_ROOT,
+                        capture_output=True,
+                        text=True, encoding="utf-8", errors="replace",
                     )
-                    recovered, recovery_detail = _recover_diverged_update(
-                        git_cmd, _m().PROJECT_ROOT, f"origin/{branch}"
+                    has_common_ancestor = bool(
+                        merge_base_result.returncode == 0
+                        and merge_base_result.stdout.strip()
                     )
-                    if not recovered:
-                        print("✗ Update stopped to preserve locally carried commits.")
-                        if recovery_detail:
-                            print(f"  {recovery_detail.splitlines()[0]}")
+                    if not has_common_ancestor:
+                        if pre_pull_sha:
+                            from datetime import datetime as _dt, timezone
+
+                            rescue_ref = (
+                                f"refs/hermes-update-backups/orphan-{branch}-"
+                                f"{_dt.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}"
+                                f"-{pre_pull_sha[:12]}"
+                            )
+                            update_ref_result = subprocess.run(
+                                git_cmd + ["update-ref", rescue_ref, pre_pull_sha],
+                                cwd=_m().PROJECT_ROOT,
+                                capture_output=True,
+                                text=True, encoding="utf-8", errors="replace",
+                            )
+                            if update_ref_result.returncode == 0:
+                                print(
+                                    "  ⚠ Local history shares no common ancestor with "
+                                    f"origin/{branch} (orphan divergence) — backed up "
+                                    f"current HEAD to {rescue_ref} before resetting. "
+                                    f"This backup expires after "
+                                    f"{_ORPHAN_RESCUE_REF_MAX_AGE_DAYS} days."
+                                )
+                            else:
+                                print(
+                                    "  ⚠ Local history shares no common ancestor with "
+                                    f"origin/{branch} (orphan divergence) — attempted "
+                                    f"to back up current HEAD to {rescue_ref} before "
+                                    "resetting, but the backup write failed "
+                                    f"(pre-reset SHA was {pre_pull_sha})."
+                                )
+                            _prune_orphan_rescue_refs(
+                                git_cmd, _m().PROJECT_ROOT, branch
+                            )
                         print(
-                            "  Resolve/rebase the local commits, then run `hermes update` again."
+                            "  ⚠ Fast-forward not possible (history diverged), "
+                            "resetting to match remote..."
                         )
-                        sys.exit(1)
+                        reset_result = subprocess.run(
+                            git_cmd + ["reset", "--hard", f"origin/{branch}"],
+                            cwd=_m().PROJECT_ROOT,
+                            capture_output=True,
+                            text=True, encoding="utf-8", errors="replace",
+                        )
+                        if reset_result.returncode != 0:
+                            print(f"✗ Failed to reset to origin/{branch}.")
+                            if reset_result.stderr.strip():
+                                print(f"  {reset_result.stderr.strip()}")
+                            print(
+                                f"  Try manually: git fetch origin && "
+                                f"git reset --hard origin/{branch}"
+                            )
+                            sys.exit(1)
+                    else:
+                        print(
+                            "  ⚠ Fast-forward not possible (history diverged); "
+                            "checking for locally carried commits..."
+                        )
+                        recovered, recovery_detail = _recover_diverged_update(
+                            git_cmd, _m().PROJECT_ROOT, f"origin/{branch}"
+                        )
+                        if not recovered:
+                            print("✗ Update stopped to preserve locally carried commits.")
+                            if recovery_detail:
+                                print(f"  {recovery_detail.splitlines()[0]}")
+                            print(
+                                "  Resolve/rebase the local commits, then run "
+                                "`hermes update` again."
+                            )
+                            sys.exit(1)
 
             # Post-pull syntax guard: validate critical-path files actually
             # parse before declaring the update successful. If a bad commit
