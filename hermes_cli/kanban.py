@@ -1943,13 +1943,15 @@ def _cmd_show(args: argparse.Namespace) -> int:
         print()
         print(f"Events ({len(events)}):")
         shown = events if getattr(args, "all_events", False) else events[-20:]
-        if len(shown) < len(events):
-            print(f"  … {len(events) - len(shown)} earlier events not shown "
-                  f"(use --all-events to list them)")
         for e in shown:
             pl = f" {e.payload}" if e.payload else ""
             run_tag = f" [run {e.run_id}]" if e.run_id else ""
             print(f"  [{_fmt_ts(e.created_at)}]{run_tag} {e.kind}{pl}")
+        if len(shown) < len(events):
+            # Trailing notice: the header count (22) already frames the list,
+            # so the reader hits the ellipsis after seeing what was rendered.
+            print(f"  … {len(events) - len(shown)} earlier events not shown "
+                  f"(use --all-events to list them)")
     if runs:
         print()
         print(f"Runs ({len(runs)}):")
