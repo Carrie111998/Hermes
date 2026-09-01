@@ -588,13 +588,22 @@ export class JsonRpcGatewayClient {
       )
 
       for (const [index, result] of results.entries()) {
-        if (result.status !== 'fulfilled' || !Array.isArray(result.value?.events)) {
-          continue
-        }
-
         const sid = entries[index]?.[0]
 
         if (!sid) {
+          hold.clear()
+          replayRecoveryFailed = true
+
+          continue
+        }
+
+        if (result.status !== 'fulfilled' || !Array.isArray(result.value?.events)) {
+          // A rejected, timed-out, or malformed replay response leaves the
+          // requested gap unresolved. Discard raced frames for this session
+          // and preserve its watermark so the reconnect owner can retry it.
+          hold.delete(sid)
+          replayRecoveryFailed = true
+
           continue
         }
 
@@ -633,7 +642,10 @@ export class JsonRpcGatewayClient {
           // A retained tail is not a valid transcript. Rebuild from the
           // authoritative history before releasing live frames that raced the
           // request, then advance to the server snapshot that history covers.
-          const recoveries = await Promise.allSettled([...this.replayGapHandlers].map(handler => handler(sid)))
+          const recoveries = await Promise.allSettled(
+            [...this.replayGapHandlers].map(handler => Promise.resolve().then(() => handler(sid)))
+          )
+
           const recovered =
             recoveries.length > 0 &&
             recoveries.every(recovery => recovery.status === 'fulfilled' && recovery.value === true)
@@ -663,10 +675,16 @@ export class JsonRpcGatewayClient {
         }
       }
     } catch {
-      // Replay is an optimization over lossy-reconnect; never surface errors.
+      // A synchronous recovery failure must not release frames parked above
+      // an unresolved gap. Invalidate the socket so reconnect can retry.
+
+      hold.clear()
+
+      replayRecoveryFailed = true
     } finally {
       this.flushReplayHold()
       this.replayInFlight = false
+
       if (replayRecoveryFailed) {
         this.invalidate('Replay history recovery failed')
       }
