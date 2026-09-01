@@ -774,3 +774,68 @@ class TestEdgeCases:
         assert "Unknown" in text
 
 
+# ── Malformed-timestamp robustness (#99959) ─────────────────────────────
+
+
+class TestMalformedTimestampRobustness:
+    """One corrupt historical row must never abort the whole report.
+
+    A session with ``started_at`` of ~8.4e252 (observed in the wild) made
+    ``hermes insights`` crash with ``OverflowError: timestamp out of range
+    for platform time_t`` at the activity-patterns stage, killing every
+    analytics window (30d, 365d) until the row was manually repaired.
+    """
+
+    BAD_TS = 8.4e252
+
+    def test_generate_survives_out_of_range_started_at(self, db):
+        db.create_session(session_id="good", source="cli", model="test")
+        db.create_session(session_id="bad", source="cli", model="test")
+        db._conn.execute(
+            "UPDATE sessions SET started_at = ? WHERE id = 'bad'",
+            (self.BAD_TS,),
+        )
+        db._conn.commit()
+
+        engine = InsightsEngine(db)
+        report = engine.generate(days=30)  # must not raise
+
+        assert report is not None
+        assert report["overview"]["total_sessions"] == 2
+        # The good session still contributes to activity analytics.
+        assert report["overview"]["total_sessions"] >= 1
+
+    def test_format_terminal_renders_with_corrupt_row(self, db):
+        db.create_session(session_id="good", source="cli", model="test")
+        db.create_session(session_id="bad", source="cli", model="test")
+        db._conn.execute(
+            "UPDATE sessions SET started_at = ? WHERE id = 'bad'",
+            (self.BAD_TS,),
+        )
+        db._conn.execute(
+            "UPDATE sessions SET ended_at = ? WHERE id = 'bad'",
+            (self.BAD_TS + 3600,),
+        )
+        db.update_token_counts("bad", input_tokens=999, output_tokens=999)
+        db._conn.commit()
+
+        engine = InsightsEngine(db)
+        report = engine.generate(days=30)
+        text = engine.format_terminal(report)  # must not raise
+
+        # If the corrupt session wins a "top" slot, its date renders as
+        # unknown rather than crashing the strftime.
+        assert "Hermes Insights" in text
+
+    def test_safe_dt_from_ts_guards_all_edge_shapes(self):
+        from agent.insights import _safe_dt_from_ts
+
+        assert _safe_dt_from_ts(8.4e252) is None  # overflow
+        assert _safe_dt_from_ts(-8.4e252) is None  # negative overflow
+        assert _safe_dt_from_ts(float("nan")) is None
+        assert _safe_dt_from_ts(None) is None
+        assert _safe_dt_from_ts("not-a-ts") is None
+        assert _safe_dt_from_ts(0) is not None
+        assert _safe_dt_from_ts(1_700_000_000) is not None
+
+
