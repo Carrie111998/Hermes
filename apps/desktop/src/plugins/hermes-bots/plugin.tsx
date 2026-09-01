@@ -58,8 +58,9 @@ import { groupWorkspaceOwnerKey } from './group-membership'
 import { annotateOrphanedGroupChatMembers } from './hygiene'
 import { BOTS_LOCALES } from './i18n'
 import { displayName } from './labels'
+import { hydrateLastViewed, LAST_VIEWED_STORAGE_KEY } from './last-viewed'
 import { startBotRelay, stopBotRelay } from './relay'
-import { $activityToasts } from './roster-actions'
+import { $activityToasts, refreshRosterPresence } from './roster-actions'
 import {
   botChatOwnsWorkspace,
   BotsPane,
@@ -213,6 +214,18 @@ export default {
         .catch(() => undefined)
     } catch {
       /* no storage — default (silent) stays */
+    }
+
+    // Hydrate last-viewed stamps before the roster poll badges activity.
+    // A failed or missing read still flips hydrated so we seed rather than
+    // wait forever (same settle-on-every-path rule as selected-roster-bot).
+    try {
+      // @ts-expect-error TODO(bot-mode-types): PluginStorage.get requires a fallback argument.
+      Promise.resolve(ctx.storage?.get?.(LAST_VIEWED_STORAGE_KEY))
+        .then(value => hydrateLastViewed(value))
+        .catch(() => hydrateLastViewed(null))
+    } catch {
+      hydrateLastViewed(null)
     }
 
     // Hydrate persisted group-chat room logs (epoch/running are runtime-only
@@ -462,6 +475,12 @@ export default {
         $botsPaneVisible.set(Boolean(visible))
 
         if (visible) {
+          // Headless / relay-driven Bot Chat writes land in each profile's
+          // state.db without a desktop-native turn edge. Refresh the roster
+          // the moment the pane is shown so preview + last_active + unread
+          // catch up instead of waiting out the 5s poll / 90s Active-now window.
+          refreshRosterPresence()
+
           const group = $groupChatWorkspace.get()
           const selected = selectedRosterBot($lastRoster.get(), $selectedRosterKey.get())
 

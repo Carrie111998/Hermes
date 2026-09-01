@@ -62,6 +62,7 @@ import { groupChatMemberBots, groupChatNames, groupLastActivity } from './group-
 import { $groupMainTabsRev, shouldRenderGroupChatInPane } from './group-panes'
 import { $showHiddenBots, isBotHidden, isBotPinned } from './hidden-bots'
 import { useBots } from './i18n'
+import { $lastViewedHydrated } from './last-viewed'
 import { deleteBot, mergeServerMeta, pullServerAvatars } from './profile-ops'
 import { $activityToasts, setActivityToasts, trackInboundActivity } from './roster-actions'
 import {
@@ -268,6 +269,7 @@ export function BotsPane() {
   const groupNeedsYou = useValue($groupNeedsYou)
   const groupRooms = useValue($groupChats)
   const rememberedSources = useValue($lastSources)
+  const lastViewedHydrated = useValue($lastViewedHydrated)
   const rosterHydrated = useValue($rosterHydrated)
   const selectionHydrated = useValue($selectedRosterHydrated)
   const selectedRosterKey = useValue($selectedRosterKey)
@@ -485,12 +487,18 @@ export function BotsPane() {
 
     mergeServerMeta(activeSourceRoster, data?.fetchedAt || 0)
     pullServerAvatars(activeSourceRoster)
-    trackInboundActivity(roster)
+
+    if (lastViewedHydrated) {
+      trackInboundActivity(roster)
+    }
+
     backfillMessagingProtocol(activeSourceRoster)
     // React Query owns the stable server snapshot; derived arrays intentionally
     // follow that snapshot rather than retriggering on their own atom writes.
+    // lastViewedHydrated is required: the first snapshot must not seed
+    // last-viewed before persisted stamps load.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [data])
+  }, [data, lastViewedHydrated])
 
   // The roster has ANSWERED once data or a terminal error exists — that, not
   // row count, is what lets this pane stop showing its loading state (an empty
