@@ -55,6 +55,44 @@ class TestBlueBubblesHelpers:
         assert check_bluebubbles_requirements() is True
 
 
+class TestBlueBubblesSendOnlyMode:
+    """connect_send_only skips the webhook bind + register/unregister cycle.
+
+    The standalone cron delivery path builds a one-shot adapter to POST a
+    message while the gateway's live adapter already holds the webhook port.
+    A second bind there raises EADDRINUSE and kills delivery before send()
+    ever runs; its disconnect() would also delete the live adapter's webhook
+    registration (same URL), silently breaking inbound events.
+    """
+
+    def test_send_only_flag_from_extra(self, monkeypatch):
+        adapter = _make_adapter(monkeypatch, connect_send_only=True)
+        assert adapter.connect_send_only is True
+
+    def test_send_only_flag_defaults_off(self, monkeypatch):
+        adapter = _make_adapter(monkeypatch)
+        assert adapter.connect_send_only is False
+
+    def test_send_only_flag_from_env(self, monkeypatch):
+        monkeypatch.setenv("BLUEBUBBLES_CONNECT_SEND_ONLY", "1")
+        adapter = _make_adapter(monkeypatch)
+        assert adapter.connect_send_only is True
+
+    @pytest.mark.asyncio
+    async def test_send_only_disconnect_skips_webhook_unregister(self, monkeypatch):
+        """A send-only adapter must never unregister the live webhook."""
+        adapter = _make_adapter(monkeypatch, connect_send_only=True)
+        calls = []
+
+        async def _fake_unregister(self):
+            calls.append(1)
+            return True
+
+        monkeypatch.setattr(type(adapter), "_unregister_webhook", _fake_unregister)
+        await adapter.disconnect()
+        assert calls == []
+
+
     def test_format_message_preserves_underscores_in_identifiers(self, monkeypatch):
         adapter = _make_adapter(monkeypatch)
         text = "Use /api_v2 with FEATURE_FLAG_NAME and config_file.json"
@@ -323,14 +361,27 @@ class TestBlueBubblesAttachmentSend:
 
 
 class TestBlueBubblesWebhookUrl:
-    """_webhook_url property normalises local hosts to 'localhost'."""
+    """_webhook_url property normalises wildcard hosts to a routable literal.
+
+    The listener binds IPv4 127.0.0.1 only. On macOS ``localhost`` resolves to
+    ::1 (IPv6) first, so registering a ``localhost`` URL makes BlueBubbles
+    POST events to a dead port and inbound iMessage silently vanishes. The
+    literal 127.0.0.1 must survive normalisation (BB runs on the same host).
+    """
 
     def test_default_host(self, monkeypatch):
         adapter = _make_adapter(monkeypatch)
-        # Default webhook_host is 0.0.0.0 → normalized to localhost
-        assert "localhost" in adapter._webhook_url
+        # Default webhook_host is 0.0.0.0 → normalized to literal 127.0.0.1
+        assert "127.0.0.1" in adapter._webhook_url
+        assert "localhost" not in adapter._webhook_url
         assert str(adapter.webhook_port) in adapter._webhook_url
         assert adapter.webhook_path in adapter._webhook_url
+
+    def test_explicit_loopback_survives_normalisation(self, monkeypatch):
+        """An explicitly configured 127.0.0.1 must NOT be rewritten to localhost."""
+        monkeypatch.setenv("BLUEBUBBLES_WEBHOOK_HOST", "127.0.0.1")
+        adapter = _make_adapter(monkeypatch)
+        assert adapter._webhook_url.startswith("http://127.0.0.1:")
 
 
     def test_register_url_omits_query_when_no_password(self, monkeypatch):

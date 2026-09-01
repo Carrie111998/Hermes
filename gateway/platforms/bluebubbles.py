@@ -170,6 +170,11 @@ class BlueBubblesAdapter(BasePlatformAdapter):
     def __init__(self, config: PlatformConfig):
         super().__init__(config, Platform.BLUEBUBBLES)
         extra = config.extra or {}
+        # Extra may legitimately be empty when DeliveryRouter constructs an
+        # ad-hoc send-only adapter (cron delivery path: the live adapter in
+        # gateway.run is already connected, so this instance only needs the
+        # REST client to call /api/v1/message/text). Fall back to env vars so
+        # those ad-hoc instances still get server_url + password.
         self.server_url = _normalize_server_url(
             extra.get("server_url") or os.getenv("BLUEBUBBLES_SERVER_URL", "")
         )
@@ -186,6 +191,17 @@ class BlueBubblesAdapter(BasePlatformAdapter):
             extra.get("webhook_path")
             or os.getenv("BLUEBUBBLES_WEBHOOK_PATH", DEFAULT_WEBHOOK_PATH)
         )
+        # Cron / send-only path: when this adapter instance is only being used
+        # to POST a message, skip the webhook bind entirely. Otherwise the
+        # second instance (constructed for delivery) collides on 8645 with the
+        # gateway's already-connected live adapter. Triggered by passing
+        # connect_send_only=True or by setting the env var
+        # BLUEBUBBLES_CONNECT_SEND_ONLY=1 — a safety hatch for when the
+        # caller forgot to thread the flag through.
+        _send_only = extra.get("connect_send_only")
+        if _send_only is None:
+            _send_only = os.getenv("BLUEBUBBLES_CONNECT_SEND_ONLY", "")
+        self.connect_send_only = str(_send_only).strip().lower() in {"1", "true", "yes", "on"}
         if not str(self.webhook_path).startswith("/"):
             self.webhook_path = f"/{self.webhook_path}"
         self.send_read_receipts = bool(extra.get("send_read_receipts", True))
@@ -294,6 +310,20 @@ class BlueBubblesAdapter(BasePlatformAdapter):
                 self.client = None
             return False
 
+        # Send-only path: cron / delegated jobs reuse a live adapter but on a
+        # reconnect or hot reload the scheduler may hand us a fresh instance
+        # that only needs to POST outbound messages. Skip the webhook bind so
+        # we don't collide on 127.0.0.1:8645 with the gateway's already-bound
+        # listener — EADDRINUSE there is what was breaking cron delivery.
+        if getattr(self, "connect_send_only", False):
+            self._mark_connected()
+            logger.info(
+                "[bluebubbles] send-only mode: skipping webhook bind on %s:%s",
+                self.webhook_host, self.webhook_port,
+            )
+            self._wire_plugin_handlers(None)
+            return True
+
         # Explicit body cap: BlueBubbles webhook events are small JSON (or
         # form-encoded) payloads. client_max_size makes aiohttp enforce the
         # cap on every read path — including chunked requests that carry no
@@ -325,8 +355,14 @@ class BlueBubblesAdapter(BasePlatformAdapter):
         return True
 
     async def disconnect(self) -> None:
-        # Unregister webhook before cleaning up
-        await self._unregister_webhook()
+        # Unregister webhook before cleaning up — but NOT for send-only
+        # adapters: they never registered a webhook, and the URL they'd match
+        # is byte-identical to the LIVE gateway adapter's registration, so
+        # unregistering here deletes the gateway's entry from BlueBubbles and
+        # silently kills inbound iMessage events (outbound REST keeps working,
+        # so nothing looks broken). Every cron/one-shot send would wipe it.
+        if not getattr(self, "connect_send_only", False):
+            await self._unregister_webhook()
 
         if self.client:
             await self.client.aclose()
@@ -338,10 +374,17 @@ class BlueBubblesAdapter(BasePlatformAdapter):
 
     @property
     def _webhook_url(self) -> str:
-        """Compute the external webhook URL for BlueBubbles registration."""
+        """Compute the external webhook URL for BlueBubbles registration.
+
+        NOTE: do NOT normalize 127.0.0.1 to localhost here (upstream does).
+        The listener binds IPv4 127.0.0.1 only — macOS resolves localhost to
+        ::1 (IPv6) first, so a localhost URL makes BlueBubbles POST to a dead
+        port and inbound iMessage events silently vanish. Register the
+        literal 127.0.0.1 address; BB runs on the same Mac.
+        """
         host = self.webhook_host
-        if host in {"0.0.0.0", "127.0.0.1", "localhost", "::"}:
-            host = "localhost"
+        if host == "0.0.0.0":
+            host = "127.0.0.1"
         return f"http://{host}:{self.webhook_port}{self.webhook_path}"
 
     @property

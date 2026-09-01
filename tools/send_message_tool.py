@@ -2330,7 +2330,15 @@ async def _send_bluebubbles(extra, chat_id, message):
 
     try:
         from gateway.config import PlatformConfig
-        pconfig = PlatformConfig(extra=extra)
+        # _send_bluebubbles is the standalone cron-fallback path: it builds a
+        # one-shot adapter just to POST /api/v1/message/text, then disconnects.
+        # The gateway's live adapter already holds 127.0.0.1:8645 for the
+        # webhook, so this instance must NOT try to bind the same port —
+        # otherwise the connect() call raises EADDRINUSE and delivery dies
+        # before send() ever runs (#115298 et al.).
+        bb_extra = dict(extra or {})
+        bb_extra.setdefault("connect_send_only", True)
+        pconfig = PlatformConfig(extra=bb_extra)
         adapter = BlueBubblesAdapter(pconfig)
         connected = await adapter.connect()
         if not connected:
