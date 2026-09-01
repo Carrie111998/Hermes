@@ -24,7 +24,11 @@ from __future__ import annotations
 import pytest
 
 from gateway.config import Platform, PlatformConfig
-from gateway.platforms.base import MessageEvent, MessageType
+from gateway.platforms.base import (
+    MessageEvent,
+    MessageType,
+    strict_machine_thread_metadata,
+)
 from gateway.relay.adapter import RelayAdapter
 from gateway.relay.descriptor import CONTRACT_VERSION, CapabilityDescriptor
 from gateway.session import SessionSource
@@ -118,6 +122,129 @@ async def test_slack_dm_reply_with_real_thread_keeps_anchor():
     frame = stub.sent[0]
     assert frame["reply_to"] == "1700.0002"
     assert frame["metadata"]["thread_id"] == "1699.9000"
+
+
+@pytest.mark.asyncio
+async def test_strict_machine_slack_send_without_anchor_is_suppressed():
+    adapter, stub = _wire("D1", "dm")
+
+    result = await adapter.send(
+        "D1", "machine update", metadata=strict_machine_thread_metadata()
+    )
+
+    assert result.success is False
+    assert "exact thread anchor" in (result.error or "")
+    assert stub.sent == []
+
+
+@pytest.mark.asyncio
+async def test_strict_machine_slack_send_keeps_reply_anchor_in_flat_mode():
+    adapter, stub = _wire("D1", "dm")
+    adapter.config.extra = {"reply_in_thread": False}
+
+    result = await adapter.send(
+        "D1",
+        "machine update",
+        reply_to="1700.0001",
+        metadata=strict_machine_thread_metadata(),
+    )
+
+    assert result.success is True
+    assert stub.sent[0]["reply_to"] == "1700.0001"
+    assert stub.sent[0]["metadata"]["thread_id"] == "1700.0001"
+
+
+@pytest.mark.asyncio
+async def test_strict_machine_slack_explicit_send_without_anchor_is_suppressed():
+    adapter, stub = _wire("D1", "dm")
+
+    result = await adapter.send_for_platform(
+        Platform.SLACK,
+        "D1",
+        "machine update",
+        metadata=strict_machine_thread_metadata(),
+    )
+
+    assert result.success is False
+    assert "exact thread anchor" in (result.error or "")
+    assert stub.sent == []
+
+
+@pytest.mark.asyncio
+async def test_strict_machine_slack_send_for_platform_promotes_reply_anchor():
+    adapter, stub = _wire("D123", "dm")
+
+    result = await adapter.send_for_platform(
+        Platform.SLACK,
+        "D123",
+        "machine",
+        reply_to="1788217797.757469",
+        metadata=strict_machine_thread_metadata(),
+    )
+
+    assert result.success is True
+    assert stub.sent[-1]["metadata"]["thread_id"] == "1788217797.757469"
+
+
+@pytest.mark.asyncio
+async def test_strict_machine_slack_draft_without_anchor_is_suppressed():
+    desc = _slack_desc(
+        supports_draft_streaming=True,
+        supported_ops=("send", "edit", "typing", "draft"),
+    )
+    stub = StubConnector(desc)
+    adapter = RelayAdapter(PlatformConfig(), desc, transport=stub)
+    adapter._capture_scope(
+        MessageEvent(
+            text="hi",
+            source=SessionSource(
+                platform=Platform.SLACK,
+                chat_id="D1",
+                chat_type="dm",
+                user_id="U1",
+            ),
+            message_type=MessageType.TEXT,
+        )
+    )
+
+    result = await adapter.send_draft(
+        "D1", 1, "machine update", metadata=strict_machine_thread_metadata()
+    )
+
+    assert result.success is False
+    assert "exact thread anchor" in (result.error or "")
+    assert stub.sent == []
+
+
+@pytest.mark.asyncio
+async def test_strict_machine_slack_media_without_anchor_is_suppressed():
+    desc = _slack_desc(supported_ops=("send", "edit", "typing", "send_media"))
+    stub = StubConnector(desc)
+    adapter = RelayAdapter(
+        PlatformConfig(), desc, transport=stub  # type: ignore[arg-type]
+    )
+    adapter._capture_scope(
+        MessageEvent(
+            text="hi",
+            source=SessionSource(
+                platform=Platform.SLACK,
+                chat_id="D1",
+                chat_type="dm",
+                user_id="U1",
+            ),
+            message_type=MessageType.TEXT,
+        )
+    )
+
+    result = await adapter.send_image(
+        "D1",
+        "https://example.com/image.png",
+        metadata=strict_machine_thread_metadata(),
+    )
+
+    assert result.success is False
+    assert "exact thread anchor" in (result.error or "")
+    assert stub.sent == []
 
 
 @pytest.mark.asyncio

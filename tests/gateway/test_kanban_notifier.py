@@ -1,15 +1,18 @@
 import asyncio
 import sqlite3
 from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock
 
 
-from gateway.config import Platform
+from gateway.config import Platform, PlatformConfig
 from gateway.kanban_watchers import (
     _acquire_singleton_lock,
     _release_singleton_lock,
 )
+from gateway.platforms.base import _thread_metadata_for_source
 from gateway.run import GatewayRunner
 from hermes_cli import kanban_db as kb
+from plugins.platforms.slack.adapter import SlackAdapter
 
 
 class RecordingAdapter:
@@ -44,15 +47,112 @@ async def _run_one_notifier_tick(monkeypatch, runner):
     await runner._kanban_notifier_watcher(interval=1)
 
 
-def _make_runner(adapter):
+def _make_runner(adapter, platform=Platform.TELEGRAM):
     runner = GatewayRunner.__new__(GatewayRunner)
     runner._running = True
-    runner.adapters = {Platform.TELEGRAM: adapter}
+    runner.adapters = {platform: adapter}
     runner._kanban_sub_fail_counts = {}
     # Most tests model the default gateway after its dispatcher acquired the
     # singleton lock. Tests for startup or non-owner gateways clear this.
     runner._kanban_dispatcher_lock_handle = object()
     return runner
+
+
+class ImmediateSlackAdapter(SlackAdapter):
+    """Real Slack egress with synchronous synthetic-wake completion for tests."""
+
+    def __init__(self):
+        super().__init__(PlatformConfig(enabled=True, token="xoxb-fake"))
+        self._app = MagicMock()
+        self.client = AsyncMock()
+        self.client.chat_postMessage = AsyncMock(return_value={"ts": "999.111"})
+        self._get_client = MagicMock(return_value=self.client)
+        self.stop_typing = AsyncMock()
+        self.handled = []
+        self.wake_result = None
+
+    async def handle_message(self, event):
+        self.handled.append(event)
+        reply_to = event.reply_to_message_id or event.message_id
+        self.wake_result = await self.send(
+            event.source.chat_id,
+            "Wake final",
+            reply_to=reply_to,
+            metadata=_thread_metadata_for_source(event.source, reply_to),
+        )
+
+
+def _create_completed_slack_subscription(db_path, *, thread_id):
+    kb.init_db(db_path)
+    conn = kb.connect(db_path)
+    try:
+        task_id = kb.create_task(
+            conn,
+            title="strict Slack delivery",
+            assignee="worker",
+            session_id="agent:main:slack:thread:C0BTQQX0SLC",
+        )
+        kb.add_notify_sub(
+            conn,
+            task_id=task_id,
+            platform="slack",
+            chat_id="C0BTQQX0SLC",
+            thread_id=thread_id,
+            chat_type="thread",
+            delivery_mode="notify+wake",
+        )
+        kb.complete_task(conn, task_id, summary="done")
+        return task_id
+    finally:
+        conn.close()
+
+
+def test_slack_notifier_passive_and_wake_final_use_exact_thread(
+    tmp_path, monkeypatch,
+):
+    db_path = tmp_path / "strict-slack-thread.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    _create_completed_slack_subscription(
+        db_path,
+        thread_id="1788217797.757469",
+    )
+    adapter = ImmediateSlackAdapter()
+
+    asyncio.run(
+        _run_one_notifier_tick(
+            monkeypatch,
+            _make_runner(adapter, Platform.SLACK),
+        )
+    )
+
+    assert len(adapter.handled) == 1
+    assert adapter.handled[0].source.chat_type == "thread"
+    assert adapter.handled[0].source.thread_id == "1788217797.757469"
+    assert adapter.handled[0].source.strict_machine_thread_affinity is True
+    assert adapter.client.chat_postMessage.await_count == 2
+    assert {
+        call.kwargs["thread_ts"]
+        for call in adapter.client.chat_postMessage.await_args_list
+    } == {"1788217797.757469"}
+
+
+def test_slack_notifier_without_anchor_suppresses_passive_and_wake(
+    tmp_path, monkeypatch,
+):
+    db_path = tmp_path / "strict-slack-unanchored.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    _create_completed_slack_subscription(db_path, thread_id=None)
+    adapter = ImmediateSlackAdapter()
+
+    asyncio.run(
+        _run_one_notifier_tick(
+            monkeypatch,
+            _make_runner(adapter, Platform.SLACK),
+        )
+    )
+
+    adapter.client.chat_postMessage.assert_not_awaited()
+    assert adapter.handled == []
 
 
 def _create_completed_subscription(summary="done once"):

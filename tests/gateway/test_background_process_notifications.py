@@ -11,12 +11,14 @@ import asyncio
 import queue
 import threading
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from gateway.config import GatewayConfig, Platform
+from gateway.config import GatewayConfig, Platform, PlatformConfig
+from gateway.platforms.base import _thread_metadata_for_source
 from gateway.run import GatewayRunner, _parse_session_key
+from plugins.platforms.slack.adapter import SlackAdapter
 
 
 # ---------------------------------------------------------------------------
@@ -77,6 +79,51 @@ def _watch_event(session_id="proc_watch", thread_id="42"):
         "command": "build",
         "output": "READY\n",
     }
+
+
+class _ImmediateSlackAdapter(SlackAdapter):
+    """Real Slack egress with synchronous synthetic completion handling."""
+
+    def __init__(self):
+        super().__init__(PlatformConfig(enabled=True, token="xoxb-fake"))
+        self._app = MagicMock()
+        self.client = AsyncMock()
+        self.client.chat_postMessage = AsyncMock(return_value={"ts": "999.111"})
+        self._get_client = MagicMock(return_value=self.client)
+        self.stop_typing = AsyncMock()
+        self.handled = []
+
+    async def handle_message(self, event):
+        self.handled.append(event)
+        reply_to = event.reply_to_message_id or event.message_id
+        await self.send(
+            event.source.chat_id,
+            "Synthetic completion final",
+            reply_to=reply_to,
+            metadata=_thread_metadata_for_source(event.source, reply_to),
+        )
+
+
+def _slack_runner(monkeypatch, tmp_path, mode):
+    runner = _build_runner(monkeypatch, tmp_path, mode)
+    adapter = _ImmediateSlackAdapter()
+    runner.adapters = {Platform.SLACK: adapter}
+    return runner, adapter
+
+
+def _slack_watcher(*, thread_id=None, notify_on_complete=False):
+    watcher = {
+        "session_id": "proc_slack",
+        "check_interval": 0,
+        "session_key": "agent:main:slack:thread:C0BTQQX0SLC",
+        "platform": "slack",
+        "chat_id": "C0BTQQX0SLC",
+        "chat_type": "thread" if thread_id else "channel",
+        "notify_on_complete": notify_on_complete,
+    }
+    if thread_id:
+        watcher["thread_id"] = thread_id
+    return watcher
 
 
 # ---------------------------------------------------------------------------
@@ -366,6 +413,121 @@ async def test_inject_watch_notification_ignores_foreground_event_source(monkeyp
     # Must route to thread 42 (process origin), NOT some other thread
     assert synth_event.source.thread_id == "42"
     assert synth_event.source.user_id == "proc_owner"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("notify_on_complete", [False, True], ids=["direct", "agent"])
+async def test_process_completion_uses_exact_slack_thread(
+    monkeypatch, tmp_path, notify_on_complete,
+):
+    import tools.process_registry as pr_module
+
+    session = SimpleNamespace(
+        output_buffer="done\n",
+        exited=True,
+        exit_code=0,
+        command="echo done",
+        started_at=None,
+    )
+    monkeypatch.setattr(
+        pr_module,
+        "process_registry",
+        _FakeRegistry([session], consumed=False),
+    )
+
+    async def _instant_sleep(*_a, **_kw):
+        pass
+
+    monkeypatch.setattr(asyncio, "sleep", _instant_sleep)
+    runner, adapter = _slack_runner(monkeypatch, tmp_path, "concise")
+
+    await runner._run_process_watcher(
+        _slack_watcher(
+            thread_id="1788217797.757469",
+            notify_on_complete=notify_on_complete,
+        )
+    )
+
+    adapter.client.chat_postMessage.assert_awaited_once()
+    assert adapter.client.chat_postMessage.await_args.kwargs["thread_ts"] == (
+        "1788217797.757469"
+    )
+
+
+@pytest.mark.asyncio
+async def test_all_mode_interim_and_final_use_exact_slack_thread(
+    monkeypatch, tmp_path,
+):
+    import tools.process_registry as pr_module
+
+    running = SimpleNamespace(
+        output_buffer="still running\n",
+        exited=False,
+        exit_code=None,
+        command="make build",
+        started_at=None,
+    )
+    done = SimpleNamespace(
+        output_buffer="still running\ndone\n",
+        exited=True,
+        exit_code=0,
+        command="make build",
+        started_at=None,
+    )
+    monkeypatch.setattr(
+        pr_module,
+        "process_registry",
+        _FakeRegistry([running, done], consumed=False),
+    )
+
+    async def _instant_sleep(*_a, **_kw):
+        pass
+
+    monkeypatch.setattr(asyncio, "sleep", _instant_sleep)
+    runner, adapter = _slack_runner(monkeypatch, tmp_path, "all")
+
+    await runner._run_process_watcher(
+        _slack_watcher(thread_id="1788217797.757469")
+    )
+
+    assert adapter.client.chat_postMessage.await_count == 2
+    assert {
+        call.kwargs["thread_ts"]
+        for call in adapter.client.chat_postMessage.await_args_list
+    } == {"1788217797.757469"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("notify_on_complete", [False, True], ids=["direct", "agent"])
+async def test_unanchored_process_completion_never_posts_slack_root(
+    monkeypatch, tmp_path, notify_on_complete,
+):
+    import tools.process_registry as pr_module
+
+    session = SimpleNamespace(
+        output_buffer="done\n",
+        exited=True,
+        exit_code=0,
+        command="echo done",
+        started_at=None,
+    )
+    monkeypatch.setattr(
+        pr_module,
+        "process_registry",
+        _FakeRegistry([session], consumed=False),
+    )
+
+    async def _instant_sleep(*_a, **_kw):
+        pass
+
+    monkeypatch.setattr(asyncio, "sleep", _instant_sleep)
+    runner, adapter = _slack_runner(monkeypatch, tmp_path, "concise")
+
+    await runner._run_process_watcher(
+        _slack_watcher(notify_on_complete=notify_on_complete)
+    )
+
+    adapter.client.chat_postMessage.assert_not_awaited()
 
 
 # ---------------------------------------------------------------------------

@@ -185,6 +185,14 @@ class SessionSource:
     # Transport-local fail-closed signal for an explicit profile route whose
     # target is not served. Excluded from repr/equality and wire serialization.
     profile_route_rejected: bool = field(default=False, repr=False, compare=False)
+    # Internal, wire-invisible policy for synthetic machine updates. When set,
+    # Slack egress must have an exact parent-thread anchor or suppress the send.
+    # Direct human events never set this flag and retain ordinary root delivery.
+    strict_machine_thread_affinity: bool = field(
+        default=False,
+        repr=False,
+        compare=False,
+    )
 
     # Discord auto-thread metadata.  Newly auto-created Discord threads start
     # with a fast placeholder title from the raw message, then the gateway can

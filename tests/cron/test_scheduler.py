@@ -445,15 +445,10 @@ class TestDeliverResultWrapping:
                 loop=loop,
             )
 
-        assert result is None
-        relay.send_for_platform.assert_awaited_once()
-        args = relay.send_for_platform.await_args.args
-        assert args[:3] == (Platform.SLACK, "D123", "scheduled result")
-        assert relay.send_for_platform.await_args.kwargs["metadata"]["user_id"] == "U123"
-        relay.send_voice.assert_awaited_once()
-        media_metadata = relay.send_voice.await_args.kwargs["metadata"]
-        assert media_metadata["_relay_logical_platform"] == "slack"
-        assert media_metadata["user_id"] == "U123"
+        assert result is not None
+        assert "strict machine Slack delivery requires an exact thread anchor" in result
+        relay.send_for_platform.assert_not_awaited()
+        relay.send_voice.assert_not_awaited()
         standalone_send.assert_not_awaited()
 
 
@@ -2392,10 +2387,14 @@ class TestCronContinuableSurfaceInChannel:
             "id": "brief-job",
             "name": "Daily Brief",
             "deliver": "origin",
-            # Channel origin: no thread_id (flat channel message scheduled it).
-            # Carries the scheduling user's id — the in_channel seed must key
-            # the flat channel session to THIS user (see build_session_key).
-            "origin": origin or {"platform": "slack", "chat_id": "C123", "user_id": "U_HUMAN"},
+            # Slack machine output must remain on this exact parent thread even
+            # when the legacy in_channel surface is configured.
+            "origin": origin or {
+                "platform": "slack",
+                "chat_id": "C123",
+                "user_id": "U_HUMAN",
+                "thread_id": "1787188000.000100",
+            },
             # Opt into the continuable mirror (parameterized: the seed must
             # NOT depend on this — see the no-attach regression test).
             "attach_to_session": attach_to_session,
@@ -2480,17 +2479,8 @@ class TestCronContinuableSurfaceInChannel:
         assert mirror_mock.call_args.kwargs.get("thread_id") is None
         assert mirror_mock.call_args.kwargs.get("user_id") == "U_HUMAN"
 
-    def test_in_channel_seed_fires_without_attach_to_session(self):
-        """REGRESSION (live, Alice 2026-08-19): the in_channel seed was gated on
-        mirror_this_target (mirror_enabled AND origin match), so a continuable
-        in_channel cron created WITHOUT attach_to_session (and with the
-        cron.mirror_delivery global at its default False) delivered the brief
-        flat but never seeded the flat session — the next plain reply hit a
-        blank session and the agent had no idea about its own delivery message.
-
-        in_channel IS the continuation surface: the seed must fire on origin
-        match alone. attach_to_session stays the opt-in for the SEPARATE
-        default-surface mirror behavior; it must not be required here."""
+    def test_slack_machine_delivery_does_not_seed_flat_session(self):
+        """Strict Slack machine output cannot create a channel-root surface."""
         from cron.scheduler import _deliver_result  # noqa: F401 (driven via helper)
 
         adapter = self._slack_adapter(supports_inchannel=True)
@@ -2499,20 +2489,10 @@ class TestCronContinuableSurfaceInChannel:
                 {"slack": {"cron_continuable_surface": "in_channel"}}, adapter,
                 attach_to_session=False,
             )
-        seed_mock.assert_called_once()
-        # user_id must ride along even without the mirror opt-in — the flat
-        # session key includes it on per-user-isolated chats.
-        assert seed_mock.call_args.kwargs.get("user_id") == "U_HUMAN"
+        seed_mock.assert_not_called()
 
-    def test_in_channel_flattens_thread_without_attach_to_session(self):
-        """REGRESSION: the thread-id-clearing gate was `mirror_this_target`
-        while the seed below had been decoupled to origin-match alone. With
-        the default knobs off (attach_to_session=False, cron.mirror_delivery
-        unset) and an origin carrying a REAL thread_id, the brief still
-        delivered INTO the origin thread while the flat (thread_id=None)
-        session got seeded — brief and continuation surface in different
-        places. The flatten must use the same gate as the seed: origin_target.
-        Asserts on the routed DeliveryTarget, not just that the seed ran."""
+    def test_in_channel_setting_preserves_exact_slack_thread(self):
+        """The legacy flat setting cannot erase a machine delivery anchor."""
         captured = {}
 
         class _SpyRouter:
@@ -2535,12 +2515,8 @@ class TestCronContinuableSurfaceInChannel:
                 {"slack": {"cron_continuable_surface": "in_channel"}}, adapter,
                 attach_to_session=False, origin=origin_with_thread,
             )
-        seed_mock.assert_called_once()
-        assert captured["target"].thread_id is None, (
-            "in_channel delivery routed into the origin thread "
-            f"({captured['target'].thread_id}) — the flat seeded session "
-            "does not match where the brief actually landed"
-        )
+        seed_mock.assert_not_called()
+        assert captured["target"].thread_id == "1787188000.000100"
 
     def test_origin_scope_id_rides_delivery_metadata(self):
         """REGRESSION (restart-shaped): the connector's fail-closed tenant
@@ -2568,6 +2544,7 @@ class TestCronContinuableSurfaceInChannel:
             # Persisted workspace scope (captured at job creation). C123 is
             # not any configured home channel in this harness.
             "scope_id": "T0AAAA111",
+            "thread_id": "1787188000.000100",
         }
         with patch("gateway.delivery.DeliveryRouter", _SpyRouter), \
              patch("cron.scheduler._seed_cron_channel_session", return_value=True):
@@ -2667,12 +2644,8 @@ class TestCronContinuableSurfaceInChannel:
         # heuristics (and their populated-chat bail-out) are out of the path.
         assert mirror_mock.call_args.kwargs.get("session_id") == "sess-flat-exact"
 
-    def test_in_channel_also_seeds_thread_surface_of_delivered_brief(self):
-        """REGRESSION (live, Alice 2026-08-19 19:19): the user replied IN THE
-        BRIEF'S THREAD (Slack's natural affordance on a flat message). That
-        reply keys to (chat, thread=<brief ts>) — a session in_channel mode
-        never seeded, so the agent had no idea about its own brief. The flat
-        delivery's message_id must anchor a companion thread-surface seed."""
+    def test_exact_slack_thread_needs_no_flat_companion_seed(self):
+        """An exact thread delivery must not create a root-derived thread."""
         adapter = self._slack_adapter(supports_inchannel=True)
         with patch("cron.scheduler._seed_cron_channel_session", return_value=True), \
              patch("cron.scheduler._seed_cron_thread_session") as thread_seed_mock:
@@ -2680,9 +2653,7 @@ class TestCronContinuableSurfaceInChannel:
                 {"slack": {"cron_continuable_surface": "in_channel"}}, adapter,
                 attach_to_session=False,
             )
-        thread_seed_mock.assert_called_once()
-        # Anchored on the delivered message id (the router's SendResult).
-        assert thread_seed_mock.call_args.args[4] == "msg_1"
+        thread_seed_mock.assert_not_called()
 
 
 class TestMultiTargetDeliveryContinuesOnFailure:

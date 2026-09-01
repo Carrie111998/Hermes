@@ -16,16 +16,19 @@ Two related defects on relay-fronted Slack deployments:
    would have delivered it. Preflight must consult the relay's fronted set.
 """
 
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from cron import scheduler as sched
 from cron.scheduler import (
+    _deliver_result,
     _preflight_check_delivery,
     _resolve_single_delivery_target,
     cron_delivery_targets,
 )
+from gateway.config import GatewayConfig, Platform, PlatformConfig
+from plugins.platforms.slack.adapter import SlackAdapter
 
 
 def _slack_home(monkeypatch, chat_id="D0BJTDCSR7C", thread_id=None):
@@ -124,6 +127,123 @@ class TestPreflightRelayFronted:
             reason = _preflight_check_delivery({"deliver": "discord:12345"})
             assert reason is not None
             assert "discord" in reason
+
+
+class TestStrictSlackMachineDelivery:
+    @staticmethod
+    def _config():
+        return GatewayConfig(
+            platforms={Platform.SLACK: PlatformConfig(enabled=True)}
+        )
+
+    @pytest.mark.parametrize(
+        "job",
+        [
+            {
+                "id": "bare-origin",
+                "deliver": "origin",
+                "origin": {"platform": "slack", "chat_id": "C0BTQQX0SLC"},
+            },
+            {"id": "bare-explicit", "deliver": "slack:C0BTQQX0SLC"},
+        ],
+    )
+    def test_unanchored_slack_cron_delivery_is_suppressed(self, job):
+        standalone_send = AsyncMock(return_value={"success": True})
+
+        with (
+            patch("gateway.config.load_gateway_config", return_value=self._config()),
+            patch(
+                "cron.scheduler.load_config",
+                return_value={"cron": {"wrap_response": False}},
+            ),
+            patch("tools.send_message_tool._send_to_platform", new=standalone_send),
+        ):
+            result = _deliver_result(job, "scheduled result")
+
+        assert result is not None
+        assert "strict machine Slack delivery requires an exact thread anchor" in result
+        standalone_send.assert_not_awaited()
+
+    def test_exact_slack_cron_thread_is_preserved(self):
+        standalone_send = AsyncMock(return_value={"success": True})
+        job = {
+            "id": "thread-origin",
+            "deliver": "origin",
+            "origin": {
+                "platform": "slack",
+                "chat_id": "C0BTQQX0SLC",
+                "chat_type": "thread",
+                "thread_id": "1788217797.757469",
+            },
+        }
+
+        with (
+            patch("gateway.config.load_gateway_config", return_value=self._config()),
+            patch(
+                "cron.scheduler.load_config",
+                return_value={"cron": {"wrap_response": False}},
+            ),
+            patch("tools.send_message_tool._send_to_platform", new=standalone_send),
+        ):
+            result = _deliver_result(job, "scheduled result")
+
+        assert result is None
+        standalone_send.assert_awaited_once()
+        assert standalone_send.await_args.kwargs["thread_id"] == "1788217797.757469"
+
+    def test_live_slack_cron_delivery_posts_to_the_exact_thread(self):
+        import asyncio
+        from concurrent.futures import Future
+
+        adapter = SlackAdapter(PlatformConfig(enabled=True))
+        adapter._app = MagicMock()
+        client = MagicMock()
+        client.chat_postMessage = AsyncMock(
+            return_value={"ok": True, "ts": "1788217798.000001"}
+        )
+        adapter._get_client = MagicMock(return_value=client)
+        loop = MagicMock()
+        loop.is_running.return_value = True
+        job = {
+            "id": "live-thread-origin",
+            "deliver": "origin",
+            "origin": {
+                "platform": "slack",
+                "chat_id": "C0BTQQX0SLC",
+                "chat_type": "thread",
+                "thread_id": "1788217797.757469",
+            },
+        }
+
+        def run_on_loop(coro, _loop):
+            future = Future()
+            try:
+                future.set_result(asyncio.run(coro))
+            except BaseException as exc:  # noqa: BLE001
+                future.set_exception(exc)
+            return future
+
+        with (
+            patch("gateway.config.load_gateway_config", return_value=self._config()),
+            patch(
+                "cron.scheduler.load_config",
+                return_value={"cron": {"wrap_response": False}},
+            ),
+            patch("asyncio.run_coroutine_threadsafe", side_effect=run_on_loop),
+        ):
+            result = _deliver_result(
+                job,
+                "scheduled result",
+                adapters={Platform.SLACK: adapter},
+                loop=loop,
+            )
+
+        assert result is None
+        client.chat_postMessage.assert_awaited_once()
+        assert (
+            client.chat_postMessage.await_args.kwargs["thread_ts"]
+            == "1788217797.757469"
+        )
 
     def test_native_strictness_without_relay(self, monkeypatch):
         """No relay configured: the native credential check is unchanged."""

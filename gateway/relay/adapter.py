@@ -27,7 +27,13 @@ from collections import OrderedDict
 from typing import Any, Callable, Dict, Optional, Tuple, cast
 
 from gateway.config import Platform, PlatformConfig
-from gateway.platforms.base import BasePlatformAdapter, MessageEvent, SendResult
+from gateway.platforms.base import (
+    BasePlatformAdapter,
+    MessageEvent,
+    SendResult,
+    is_strict_machine_thread_delivery,
+    strict_machine_thread_affinity_error,
+)
 from gateway.relay.descriptor import CapabilityDescriptor
 from gateway.relay.media import RelayMediaClient
 from gateway.relay.transport import RelayTransport
@@ -560,6 +566,17 @@ class RelayAdapter(BasePlatformAdapter):
         content: str,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
+        draft_platform = self._platform_by_chat.get(str(chat_id)) or getattr(
+            self.descriptor, "platform", None
+        )
+        affinity_error = strict_machine_thread_affinity_error(
+            draft_platform,
+            metadata,
+            (metadata or {}).get("thread_id") or (metadata or {}).get("thread_ts"),
+        )
+        if affinity_error:
+            logger.warning("Relay draft suppressed: %s (chat=%s)", affinity_error, chat_id)
+            return SendResult(success=False, error=affinity_error)
         if not self.supports_draft_streaming(chat_id=str(chat_id)):
             raise NotImplementedError(
                 "connector does not advertise the 'draft' relay op"
@@ -1818,6 +1835,28 @@ class RelayAdapter(BasePlatformAdapter):
                 error=f"relay does not front platform {platform_value}",
             )
         _sfp_metadata = dict(metadata or {})
+        if (
+            is_strict_machine_thread_delivery(_sfp_metadata)
+            and platform_value == Platform.SLACK.value
+            and reply_to
+            and not (_sfp_metadata.get("thread_id") or _sfp_metadata.get("thread_ts"))
+        ):
+            _sfp_metadata["thread_id"] = str(reply_to)
+        affinity_error = strict_machine_thread_affinity_error(
+            platform_value,
+            _sfp_metadata,
+            _sfp_metadata.get("thread_id")
+            or _sfp_metadata.get("thread_ts")
+            or reply_to,
+        )
+        if affinity_error:
+            logger.warning(
+                "Relay send suppressed: %s (platform=%s chat=%s)",
+                affinity_error,
+                platform_value,
+                chat_id,
+            )
+            return SendResult(success=False, error=affinity_error)
         # Gateway-internal interim marker (see send()): strip before the
         # wire; an interim send through this door also skips interception.
         _interim = bool(_sfp_metadata.pop("_interim_send", False))
@@ -1978,6 +2017,31 @@ class RelayAdapter(BasePlatformAdapter):
     ) -> SendResult:
         send_metadata = dict(metadata or {})
         explicit_platform = send_metadata.pop("_relay_logical_platform", None)
+        logical_platform = (
+            explicit_platform
+            or self._platform_by_chat.get(str(chat_id))
+            or getattr(self.descriptor, "platform", None)
+        )
+        if (
+            is_strict_machine_thread_delivery(send_metadata)
+            and str(getattr(logical_platform, "value", logical_platform)).lower()
+            == Platform.SLACK.value
+            and reply_to
+            and not (send_metadata.get("thread_id") or send_metadata.get("thread_ts"))
+        ):
+            # Machine replies retain the exact originating parent regardless of
+            # the operator's ordinary DM reply_in_thread preference.
+            send_metadata["thread_id"] = str(reply_to)
+        affinity_error = strict_machine_thread_affinity_error(
+            logical_platform,
+            send_metadata,
+            send_metadata.get("thread_id")
+            or send_metadata.get("thread_ts")
+            or reply_to,
+        )
+        if affinity_error:
+            logger.warning("Relay send suppressed: %s (chat=%s)", affinity_error, chat_id)
+            return SendResult(success=False, error=affinity_error)
         # Consumer-declared interim send (commentary, tail flush): NOT the
         # turn-final, so it must never trigger seal-interception — sealing
         # the live stream with interim text orphans the true final into a
@@ -2219,6 +2283,18 @@ class RelayAdapter(BasePlatformAdapter):
         returned. Non-Slack and non-DM chats are untouched by (1), and (3) is
         Slack-only, so other fronted platforms keep their existing behaviour.
         """
+        if (
+            is_strict_machine_thread_delivery(metadata)
+            and (
+                self._platform_by_chat.get(str(chat_id))
+                or str(getattr(self.descriptor.platform, "value", self.descriptor.platform))
+            )
+            == Platform.SLACK.value
+            and reply_to is not None
+        ):
+            metadata.setdefault("thread_id", str(reply_to))
+            return reply_to
+
         effective_reply_to = self._resolve_reply_to_for_send(
             chat_id, reply_to, metadata
         )
@@ -2552,6 +2628,24 @@ class RelayAdapter(BasePlatformAdapter):
         """
         if self._transport is None or not self.descriptor.supports_op("send_media"):
             return None
+        media_metadata: Dict[str, Any] = dict(metadata or {})
+        effective_reply_to = self._apply_slack_thread_anchor(
+            chat_id, reply_to, media_metadata
+        )
+        media_platform = self._platform_by_chat.get(str(chat_id)) or getattr(
+            self.descriptor, "platform", None
+        )
+        affinity_error = strict_machine_thread_affinity_error(
+            media_platform,
+            media_metadata,
+            media_metadata.get("thread_id")
+            or media_metadata.get("thread_ts")
+            or effective_reply_to,
+        )
+        if affinity_error:
+            logger.warning("Relay media suppressed: %s (chat=%s)", affinity_error, chat_id)
+            return SendResult(success=False, error=affinity_error)
+
         source_url = source
         if source_is_path:
             client = self._get_media_client()
@@ -2566,10 +2660,6 @@ class RelayAdapter(BasePlatformAdapter):
         # unresolved anchor threads an image under the user's DM message in
         # flat mode, and loses the per-message thread entirely in thread mode
         # (threadTs() reads metadata only). Route through the shared helper.
-        media_metadata: Dict[str, Any] = dict(metadata or {})
-        effective_reply_to = self._apply_slack_thread_anchor(
-            chat_id, reply_to, media_metadata
-        )
         _media_unfurl = self._slack_unfurl_hints(
             self._platform_by_chat.get(str(chat_id))
             or getattr(self.descriptor, "platform", None)

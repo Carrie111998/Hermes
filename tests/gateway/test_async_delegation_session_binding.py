@@ -8,6 +8,8 @@ Three invariants on the messaging-gateway surface, mirroring the TUI rules:
 3. /new interrupts the old conversation's in-flight async delegations.
 """
 
+import queue
+import time
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -33,6 +35,140 @@ def _seed_record(delegation_id, session_key="", parent_session_id="", status="ru
             "interrupt_fn": fn,
         }
     return fn
+
+
+SLACK_ROUTE = {
+    "platform": "slack",
+    "chat_id": "C0BTQQX0SLC",
+    "chat_type": "thread",
+    "thread_id": "1788217797.757469",
+    "message_id": "1788217900.000001",
+}
+
+
+def test_capture_routing_origin_includes_exact_slack_parent(monkeypatch):
+    env = {
+        "HERMES_SESSION_PLATFORM": "slack",
+        "HERMES_SESSION_CHAT_ID": "C0BTQQX0SLC",
+        "HERMES_SESSION_CHAT_TYPE": "thread",
+        "HERMES_SESSION_THREAD_ID": "1788217797.757469",
+        "HERMES_SESSION_MESSAGE_ID": "1788217900.000001",
+    }
+    monkeypatch.setattr(
+        "gateway.session_context.get_session_env",
+        lambda name, default="": env.get(name, default),
+    )
+
+    assert ad._capture_routing_origin() == SLACK_ROUTE
+
+
+@pytest.mark.parametrize("is_batch", [False, True], ids=["single", "batch"])
+def test_completion_and_restart_replay_preserve_exact_slack_thread(
+    monkeypatch, is_batch,
+):
+    from tools.process_registry import process_registry
+
+    now = time.time()
+    record = {
+        "delegation_id": f"d-{'batch' if is_batch else 'single'}",
+        "goal": "check routing",
+        "goals": ["check routing"] if is_batch else None,
+        "context": None,
+        "toolsets": None,
+        "role": "researcher",
+        "model": "test-model",
+        "is_batch": is_batch,
+        "session_key": "agent:main:slack:thread:C0BTQQX0SLC:1788217797.757469",
+        "origin_ui_session_id": "",
+        "origin_session_id": "origin-session",
+        "parent_session_id": "parent-session",
+        "status": "running",
+        "dispatched_at": now,
+        "completed_at": now,
+        **SLACK_ROUTE,
+    }
+    ad._persist_dispatch(record)
+    live_queue = queue.Queue()
+    monkeypatch.setattr(process_registry, "completion_queue", live_queue)
+
+    if is_batch:
+        ad._push_batch_completion_event(
+            record,
+            {"results": [{"status": "completed", "summary": "done"}]},
+            "completed",
+        )
+    else:
+        ad._push_completion_event(
+            record,
+            {"status": "completed", "summary": "done"},
+            "completed",
+        )
+
+    live_event = live_queue.get_nowait()
+    assert {key: live_event.get(key) for key in SLACK_ROUTE} == SLACK_ROUTE
+
+    restarted_queue = queue.Queue()
+    assert ad.restore_undelivered_completions(restarted_queue) == 1
+    restored_event = restarted_queue.get_nowait()
+    assert restored_event["restored"] is True
+    assert {key: restored_event.get(key) for key in SLACK_ROUTE} == SLACK_ROUTE
+
+
+def _source_runner(session_key, origin=None):
+    from gateway.run import GatewayRunner
+
+    runner = object.__new__(GatewayRunner)
+    runner.session_store = MagicMock()
+    runner.session_store._entries = (
+        {session_key: MagicMock(origin=origin)} if origin is not None else {}
+    )
+    runner._get_cached_session_source = MagicMock(return_value=None)
+    return runner
+
+
+def test_persisted_async_route_overrides_stale_session_origin():
+    from gateway.config import Platform
+    from gateway.session import SessionSource
+
+    session_key = "agent:main:slack:thread:C0BTQQX0SLC:stale"
+    stale_origin = SessionSource(
+        platform=Platform.SLACK,
+        chat_id="C0BTQQX0SLC",
+        chat_type="channel",
+        thread_id=None,
+    )
+    source = _source_runner(session_key, stale_origin)._build_process_event_source(
+        {"session_key": session_key, **SLACK_ROUTE}
+    )
+
+    assert source is not None
+    assert source is not stale_origin
+    assert source.chat_type == "thread"
+    assert source.thread_id == "1788217797.757469"
+    assert source.message_id == "1788217900.000001"
+    assert source.strict_machine_thread_affinity is True
+
+
+def test_unanchored_async_route_is_still_marked_fail_closed():
+    from gateway.config import Platform
+    from gateway.platforms.base import strict_machine_thread_affinity_error
+
+    source = _source_runner("")._build_process_event_source(
+        {
+            "platform": "slack",
+            "chat_id": "C0BTQQX0SLC",
+            "chat_type": "channel",
+        }
+    )
+
+    assert source is not None
+    assert source.thread_id is None
+    assert source.message_id is None
+    assert source.strict_machine_thread_affinity is True
+    metadata = _source_runner("")._thread_metadata_for_source(source)
+    assert strict_machine_thread_affinity_error(
+        Platform.SLACK, metadata, None
+    ) is not None
 
 
 class TestInterruptForSessionByParentId:

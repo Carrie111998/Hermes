@@ -90,6 +90,18 @@ _MAX_DELIVERY_ATTEMPTS = 8
 _MAX_COMPLETION_REPLAY_AGE_S = 48 * 3600.0
 _DB_LOCK = threading.Lock()
 
+_ROUTING_ORIGIN_ENV = (
+    ("platform", "HERMES_SESSION_PLATFORM"),
+    ("chat_id", "HERMES_SESSION_CHAT_ID"),
+    ("chat_type", "HERMES_SESSION_CHAT_TYPE"),
+    ("thread_id", "HERMES_SESSION_THREAD_ID"),
+    ("message_id", "HERMES_SESSION_MESSAGE_ID"),
+    ("scope_id", "HERMES_SESSION_SCOPE_ID"),
+    ("user_id", "HERMES_SESSION_USER_ID"),
+    ("user_name", "HERMES_SESSION_USER_NAME"),
+)
+_ROUTING_ORIGIN_FIELDS = tuple(key for key, _env_name in _ROUTING_ORIGIN_ENV)
+
 # ---------------------------------------------------------------------------
 # Stale-delegation detection (progress-based, on by default)
 # ---------------------------------------------------------------------------
@@ -228,11 +240,7 @@ def _capture_routing_origin() -> Dict[str, Any]:
     try:
         from gateway.session_context import get_session_env
 
-        for evt_key, env_name in (
-            ("scope_id", "HERMES_SESSION_SCOPE_ID"),
-            ("user_id", "HERMES_SESSION_USER_ID"),
-            ("user_name", "HERMES_SESSION_USER_NAME"),
-        ):
+        for evt_key, env_name in _ROUTING_ORIGIN_ENV:
             value = get_session_env(env_name, "")
             if value:
                 origin[evt_key] = value
@@ -252,10 +260,9 @@ def _persist_dispatch(record: Dict[str, Any]) -> None:
         key: record.get(key)
         for key in (
             "goal", "goals", "context", "toolsets", "role", "model", "is_batch",
-            # Routing origin (scope_id/user_id/user_name): persisted so a
-            # restart-recovered completion can reconstruct a full
-            # SessionSource — see _capture_routing_origin.
-            "scope_id", "user_id", "user_name",
+            # Exact routing origin: persisted so restart-recovered completions
+            # reconstruct the same parent thread and workspace identity.
+            *_ROUTING_ORIGIN_FIELDS,
         )
         if key in record
     }
@@ -380,10 +387,8 @@ def recover_abandoned_delegations() -> int:
                 "error": "Delegation owner exited before recording a terminal result; outcome unknown.",
                 "dispatched_at": dispatched_at, "completed_at": now,
             }
-            # Routing origin persisted at dispatch (see _capture_routing_origin):
-            # restores scope_id/user_id for the reconstructed SessionSource so
-            # relay egress priming works after a restart.
-            for _k in ("scope_id", "user_id", "user_name"):
+            # Routing origin persisted at dispatch (see _capture_routing_origin).
+            for _k in _ROUTING_ORIGIN_FIELDS:
                 if task.get(_k):
                     event[_k] = task[_k]
             result = {"status": "unknown", "summary": None, "error": event["error"]}
@@ -993,10 +998,8 @@ def _push_completion_event(
         "completed_at": completed_at,
         "exit_reason": result.get("exit_reason"),
     }
-    # Routing origin captured at dispatch (see _capture_routing_origin):
-    # additive, lets the gateway reconstruct a full SessionSource (incl.
-    # scope_id for relay tenant egress) when its own caches are cold.
-    for _k in ("scope_id", "user_id", "user_name"):
+    # Exact routing origin captured at dispatch (see _capture_routing_origin).
+    for _k in _ROUTING_ORIGIN_FIELDS:
         if record.get(_k):
             evt[_k] = record[_k]
     # Structured stall metadata (#51690) — additive, present only on
@@ -1209,8 +1212,8 @@ def _push_batch_completion_event(
         "dispatched_at": dispatched_at,
         "completed_at": completed_at,
     }
-    # Routing origin captured at dispatch (see _capture_routing_origin).
-    for _k in ("scope_id", "user_id", "user_name"):
+    # Exact routing origin captured at dispatch (see _capture_routing_origin).
+    for _k in _ROUTING_ORIGIN_FIELDS:
         if event_record.get(_k):
             evt[_k] = event_record[_k]
     # Structured stall metadata (#51690) — additive, present only on

@@ -3199,6 +3199,25 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 delivery_errors.append(bot_chat_error)
             continue
 
+        from gateway.platforms.base import (
+            strict_machine_thread_affinity_error,
+            strict_machine_thread_metadata,
+        )
+
+        affinity_metadata = strict_machine_thread_metadata(
+            {"thread_id": str(thread_id)} if thread_id else None
+        )
+        affinity_error = strict_machine_thread_affinity_error(
+            platform_name,
+            affinity_metadata,
+            str(thread_id) if thread_id else None,
+        )
+        if affinity_error:
+            msg = f"delivery to {platform_name}:{chat_id} suppressed: {affinity_error}"
+            logger.warning("Job '%s': %s", job["id"], msg)
+            delivery_errors.append(msg)
+            continue
+
         # Diagnostic: log thread_id for topic-aware delivery debugging
         origin = _resolve_origin(job) or {}
         origin_thread = origin.get("thread_id")
@@ -3342,6 +3361,11 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
         # consumer; "first consumer ≠ definition").
         surface_mode = _resolve_cron_surface_mode(pconfig, platform_name)
         in_channel_surface = surface_mode == "in_channel"
+        if platform == Platform.SLACK and in_channel_surface:
+            # Cron output is machine-generated and therefore cannot use Slack's
+            # channel-root continuation surface.  Keep an explicit thread
+            # anchor intact; unanchored targets were suppressed above.
+            in_channel_surface = False
         if in_channel_surface and runtime_adapter is not None:
             # Per-platform capability first: one RelayAdapter fronts N
             # platforms and the connector advertises the bit per platform at
@@ -3522,6 +3546,10 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 route_metadata.setdefault("scope_id", str(origin["scope_id"]))
                 media_metadata = dict(media_metadata or {})
                 media_metadata.setdefault("scope_id", str(origin["scope_id"]))
+
+            if platform == Platform.SLACK:
+                route_metadata = strict_machine_thread_metadata(route_metadata)
+                media_metadata = strict_machine_thread_metadata(media_metadata)
 
             try:
                 # Send cleaned text (MEDIA tags stripped) — not the raw content.

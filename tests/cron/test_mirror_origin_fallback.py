@@ -174,30 +174,33 @@ class TestFallbackMirrorEndToEnd:
         return {"send": send_calls, "mirror": mirror_calls}
 
     def test_origin_fallback_job_mirrors_brief(self, slack_env):
-        """The field repro: managed cron, deliver=origin, no origin captured.
-        The brief must be mirrored into the home-channel session."""
+        """A bare home-channel fallback is suppressed rather than root-posted."""
         job = {"id": "j1", "name": "brief", "deliver": "origin", "origin": None}
         err = _deliver_result(job, "Risk-off close brief", adapters=None, loop=None)
-        assert err is None
-        assert len(slack_env["send"]) == 1
-        assert len(slack_env["mirror"]) == 1, (
-            "origin-fallback delivery must mirror the brief into the "
-            "home-channel session (the reply-continuity bug)"
-        )
-        assert slack_env["mirror"][0]["chat_id"] == "D0HOME"
-        assert slack_env["mirror"][0]["role"] == "user"
+        assert err is not None
+        assert "exact thread anchor" in err
+        assert slack_env["send"] == []
+        assert slack_env["mirror"] == []
 
     def test_all_broadcast_does_not_mirror(self, slack_env):
         job = {"id": "j2", "name": "cast", "deliver": "all", "origin": None}
         err = _deliver_result(job, "broadcast text", adapters=None, loop=None)
-        assert err is None
-        assert len(slack_env["send"]) == 1
-        assert len(slack_env["mirror"]) == 0
+        assert err is not None
+        assert "exact thread anchor" in err
+        assert slack_env["send"] == []
+        assert slack_env["mirror"] == []
 
-    def test_explicit_target_with_attach_mirrors(self, slack_env):
+    def test_exact_origin_with_attach_mirrors(self, slack_env):
         job = {
-            "id": "j3", "name": "managed-dm", "deliver": "slack:D0USER7",
-            "origin": None, "attach_to_session": True,
+            "id": "j3", "name": "managed-dm",
+            "deliver": "origin",
+            "origin": {
+                "platform": "slack",
+                "chat_id": "D0USER7",
+                "chat_type": "dm",
+                "thread_id": "1788217797.757469",
+            },
+            "attach_to_session": True,
         }
         err = _deliver_result(job, "managed brief", adapters=None, loop=None)
         assert err is None
@@ -206,18 +209,26 @@ class TestFallbackMirrorEndToEnd:
 
     def test_explicit_target_without_attach_does_not_mirror(self, slack_env):
         job = {
-            "id": "j4", "name": "plain-explicit", "deliver": "slack:D0USER8",
+            "id": "j4", "name": "plain-explicit",
+            "deliver": "slack:D0USER8",
             "origin": None,
         }
         err = _deliver_result(job, "plain text", adapters=None, loop=None)
-        assert err is None
-        assert len(slack_env["mirror"]) == 0
+        assert err is not None
+        assert "exact thread anchor" in err
+        assert slack_env["send"] == []
+        assert slack_env["mirror"] == []
 
     def test_origin_job_still_mirrors_unchanged(self, slack_env):
         """Regression control: the June origin-scoped behavior is untouched."""
         job = {
             "id": "j5", "name": "origin-job", "deliver": "origin",
-            "origin": {"platform": "slack", "chat_id": "D0AAA", "chat_type": "dm"},
+            "origin": {
+                "platform": "slack",
+                "chat_id": "D0AAA",
+                "chat_type": "dm",
+                "thread_id": "1788217797.757469",
+            },
         }
         err = _deliver_result(job, "origin brief", adapters=None, loop=None)
         assert err is None
