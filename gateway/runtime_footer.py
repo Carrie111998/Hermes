@@ -12,13 +12,22 @@ Config (``~/.hermes/config.yaml``)::
         fields: [model, context_pct, cwd]   # order shown; drop any to hide
 
 Available fields:
-    model        — bare model id, vendor prefix dropped (``gpt-5.4``)
-    context_pct  — last-call context occupancy as a percent (``5%``)
-    latency      — wall-clock duration of the turn (``22s``, ``1m05s``)
-    cwd          — home-relative working dir (``~``)
+    model             — final active model, vendor prefix dropped (``gpt-5.4``)
+    context_pct       — last-call context occupancy as a percent (``5%``)
+    latency           — wall-clock duration of the turn (``22s``, ``1m05s``)
+    cwd               — home-relative working dir (``~``)
+    tokens_turn       — labelled known usage (``tokens(reported):15.9k in/1.2k out``)
+    reasoning_effort  — active model's request intent (``effort(req):max``)
 
-``latency`` is opt-in: it is NOT in the default field set, so a footer whose
-``fields`` are unset renders exactly as before.
+``latency``, ``tokens_turn``, and ``reasoning_effort`` are opt-in: they are NOT
+in the default field set, so a footer whose ``fields`` are unset renders
+exactly as before.
+
+Token fields are provider-reported accounting, not local estimates. A turn
+whose provider reports usage for only some logical calls is labelled
+``reported,partial``; a turn with no usable report omits token fields instead
+of rendering a synthetic zero. ``reasoning_effort`` describes Hermes' request
+intent for the active model, not reasoning tokens actually consumed.
 
 Per-platform overrides live under ``display.platforms.<platform>.runtime_footer``.
 Users can toggle the global setting with ``/footer on|off`` from both the CLI
@@ -108,6 +117,15 @@ def _format_latency(seconds: float) -> str:
     return f"{m}m{sec:02d}s"
 
 
+def _format_token_count(value: int) -> str:
+    """Render a compact, stable token count for the footer."""
+    if value >= 1_000_000:
+        return f"{value / 1_000_000:.1f}M"
+    if value >= 1_000:
+        return f"{value / 1_000:.1f}k"
+    return str(value)
+
+
 def format_runtime_footer(
     *,
     model: Optional[str],
@@ -115,6 +133,10 @@ def format_runtime_footer(
     context_length: Optional[int],
     cwd: Optional[str] = None,
     turn_seconds: Optional[float] = None,
+    tokens_in: Optional[int] = None,
+    tokens_out: Optional[int] = None,
+    token_usage_status: Optional[str] = None,
+    reasoning_effort: Optional[str] = None,
     fields: Iterable[str] = _DEFAULT_FIELDS,
 ) -> str:
     """Render the footer line, or return "" if no fields have data.
@@ -141,6 +163,30 @@ def format_runtime_footer(
             rel = _home_relative_cwd(cwd or os.environ.get("TERMINAL_CWD", ""))
             if rel:
                 parts.append(rel)
+        elif field == "tokens_turn":
+            reported: list[str] = []
+            if (
+                isinstance(tokens_in, int)
+                and not isinstance(tokens_in, bool)
+                and tokens_in >= 0
+            ):
+                reported.append(f"{_format_token_count(tokens_in)} in")
+            if (
+                isinstance(tokens_out, int)
+                and not isinstance(tokens_out, bool)
+                and tokens_out >= 0
+            ):
+                reported.append(f"{_format_token_count(tokens_out)} out")
+            if reported and token_usage_status in {"reported", "reported_partial"}:
+                label = (
+                    "tokens(reported,partial)"
+                    if token_usage_status == "reported_partial"
+                    else "tokens(reported)"
+                )
+                parts.append(f"{label}:{'/'.join(reported)}")
+        elif field == "reasoning_effort":
+            if reasoning_effort:
+                parts.append(f"effort(req):{reasoning_effort}")
         # Unknown field names are silently ignored.
 
     if not parts:
@@ -157,6 +203,10 @@ def build_footer_line(
     context_length: Optional[int],
     cwd: Optional[str] = None,
     turn_seconds: Optional[float] = None,
+    tokens_in: Optional[int] = None,
+    tokens_out: Optional[int] = None,
+    token_usage_status: Optional[str] = None,
+    reasoning_effort: Optional[str] = None,
 ) -> str:
     """Top-level entry point used by gateway/run.py.
 
@@ -177,5 +227,9 @@ def build_footer_line(
         context_length=context_length,
         cwd=cwd,
         turn_seconds=turn_seconds,
+        tokens_in=tokens_in,
+        tokens_out=tokens_out,
+        token_usage_status=token_usage_status,
+        reasoning_effort=reasoning_effort,
         fields=cfg.get("fields") or _DEFAULT_FIELDS,
     )

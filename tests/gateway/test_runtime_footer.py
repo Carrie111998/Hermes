@@ -4,10 +4,12 @@ appended to final gateway replies."""
 from __future__ import annotations
 
 import os
+from types import SimpleNamespace
 
 import pytest
 
 from gateway.runtime_footer import (
+    _format_token_count,
     _home_relative_cwd,
     _model_short,
     build_footer_line,
@@ -74,6 +76,143 @@ def test_format_footer_skips_missing_context_length():
     assert "/tmp/wd" in out
 
 
+@pytest.mark.parametrize(
+    "value,expected",
+    [
+        (0, "0"),
+        (999, "999"),
+        (1_000, "1.0k"),
+        (15_932, "15.9k"),
+        (1_000_000, "1.0M"),
+    ],
+)
+def test_format_token_count(value, expected):
+    assert _format_token_count(value) == expected
+
+
+def test_gateway_turn_metadata_uses_final_state_and_reported_turn_delta():
+    from gateway.run import _gateway_turn_runtime_metadata
+
+    agent = SimpleNamespace(
+        model="final-model",
+        reasoning_config={"enabled": True, "effort": "HIGH"},
+        session_prompt_tokens=12_500,
+        session_completion_tokens=900,
+        session_usage_report_calls=3,
+        context_compressor=SimpleNamespace(
+            last_prompt_tokens=50_000,
+            context_length=1_000_000,
+        ),
+    )
+
+    metadata = _gateway_turn_runtime_metadata(
+        agent,
+        prompt_tokens_start=10_000,
+        completion_tokens_start=500,
+        usage_report_calls_start=2,
+        result_api_calls=1,
+    )
+
+    assert metadata == {
+        "last_prompt_tokens": 50_000,
+        "input_tokens": 12_500,
+        "output_tokens": 900,
+        "usage_report_calls": 3,
+        "turn_input_tokens": 2_500,
+        "turn_output_tokens": 400,
+        "token_usage_status": "reported",
+        "reasoning_effort": "high",
+        "model": "final-model",
+        "context_length": 1_000_000,
+    }
+
+
+@pytest.mark.parametrize(
+    "prompt_now,completion_now,usage_now,result_calls,expected_tokens,expected_status",
+    [
+        (10_000, 500, 2, 1, (None, None), None),
+        (12_500, 900, 3, 2, (2_500, 400), "reported_partial"),
+        (9_000, 900, 3, 1, (None, None), None),
+    ],
+)
+def test_gateway_turn_metadata_labels_or_hides_incomplete_usage(
+    prompt_now,
+    completion_now,
+    usage_now,
+    result_calls,
+    expected_tokens,
+    expected_status,
+):
+    from gateway.run import _gateway_turn_runtime_metadata
+
+    agent = SimpleNamespace(
+        model="example-model",
+        reasoning_config={"enabled": False},
+        session_prompt_tokens=prompt_now,
+        session_completion_tokens=completion_now,
+        session_usage_report_calls=usage_now,
+        context_compressor=SimpleNamespace(
+            last_prompt_tokens=50_000,
+            context_length=1_000_000,
+        ),
+    )
+    metadata = _gateway_turn_runtime_metadata(
+        agent,
+        prompt_tokens_start=10_000,
+        completion_tokens_start=500,
+        usage_report_calls_start=2,
+        result_api_calls=result_calls,
+    )
+
+    assert (
+        metadata["turn_input_tokens"],
+        metadata["turn_output_tokens"],
+    ) == expected_tokens
+    assert metadata["token_usage_status"] == expected_status
+    assert metadata["reasoning_effort"] == "none"
+
+
+def test_format_footer_turn_tokens_and_requested_effort():
+    out = format_runtime_footer(
+        model="example-model",
+        context_tokens=0,
+        context_length=None,
+        tokens_in=15_932,
+        tokens_out=678,
+        token_usage_status="reported",
+        reasoning_effort="max",
+        fields=("model", "reasoning_effort", "tokens_turn"),
+    )
+    assert out == (
+        "example-model · effort(req):max · "
+        "tokens(reported):15.9k in/678 out"
+    )
+
+
+@pytest.mark.parametrize(
+    "status,expected",
+    [
+        ("reported", "tokens(reported):15.9k in/678 out"),
+        (
+            "reported_partial",
+            "tokens(reported,partial):15.9k in/678 out",
+        ),
+        (None, ""),
+    ],
+)
+def test_format_footer_labels_provider_reported_tokens(status, expected):
+    out = format_runtime_footer(
+        model="example-model",
+        context_tokens=0,
+        context_length=None,
+        tokens_in=15_932,
+        tokens_out=678,
+        token_usage_status=status,
+        fields=("tokens_turn",),
+    )
+    assert out == expected
+
+
 # ---------------------------------------------------------------------------
 # resolve_footer_config
 # ---------------------------------------------------------------------------
@@ -131,6 +270,28 @@ def test_build_footer_per_platform_off_suppresses():
         cwd="/tmp",
     )
     assert out == ""
+
+
+def test_build_footer_threads_turn_usage_and_requested_effort():
+    out = build_footer_line(
+        user_config={
+            "display": {
+                "runtime_footer": {
+                    "enabled": True,
+                    "fields": ["reasoning_effort", "tokens_turn"],
+                }
+            }
+        },
+        platform_key="telegram",
+        model="example-model",
+        context_tokens=0,
+        context_length=None,
+        tokens_in=2_500,
+        tokens_out=400,
+        token_usage_status="reported",
+        reasoning_effort="high",
+    )
+    assert out == "effort(req):high · tokens(reported):2.5k in/400 out"
 
 
 
@@ -258,10 +419,14 @@ def test_build_footer_line_threads_turn_seconds(monkeypatch):
 _LEGACY_DEFAULT_FIELDS = ["model", "context_pct", "cwd"]
 
 
-def test_latency_not_in_default_fields():
+def test_new_fields_not_in_default_fields():
     from gateway.runtime_footer import _DEFAULT_FIELDS
 
-    assert "latency" not in _DEFAULT_FIELDS
+    assert {
+        "latency",
+        "tokens_turn",
+        "reasoning_effort",
+    }.isdisjoint(_DEFAULT_FIELDS)
     assert list(_DEFAULT_FIELDS) == _LEGACY_DEFAULT_FIELDS
 
 

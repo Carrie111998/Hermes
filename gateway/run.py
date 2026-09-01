@@ -4581,6 +4581,101 @@ def _preserve_queued_followup_history_offset(
     return merged
 
 
+def _counter_delta(current: Any, baseline: Any) -> Optional[int]:
+    """Return a monotonic counter delta, or ``None`` on invalid rollback."""
+    if isinstance(current, bool) or isinstance(baseline, bool):
+        return None
+    try:
+        current_int = int(current)
+        baseline_int = int(baseline)
+    except (TypeError, ValueError):
+        return None
+    if current_int < 0 or baseline_int < 0 or current_int < baseline_int:
+        return None
+    return current_int - baseline_int
+
+
+def _requested_reasoning_effort(reasoning_config: Any) -> str:
+    """Describe Hermes' active request intent without provider inference."""
+    if not isinstance(reasoning_config, dict):
+        return "default"
+    if reasoning_config.get("enabled") is False:
+        return "none"
+    effort = str(reasoning_config.get("effort") or "").strip().lower()
+    return effort or "default"
+
+
+def _gateway_turn_runtime_metadata(
+    agent: Any,
+    *,
+    prompt_tokens_start: Any,
+    completion_tokens_start: Any,
+    usage_report_calls_start: Any,
+    result_api_calls: Any,
+) -> dict[str, Any]:
+    """Snapshot final runtime identity and honest reported per-turn usage.
+
+    Cached-agent counters are cumulative, so usage is the delta from the
+    baseline captured immediately before ``run_conversation()``. A logical
+    call without usable provider usage makes the known sum explicitly partial;
+    no usable report hides token fields instead of inventing ``0 / 0``.
+    """
+    if agent is None:
+        return {}
+
+    compressor = getattr(agent, "context_compressor", None)
+    last_prompt_tokens = getattr(compressor, "last_prompt_tokens", 0) or 0
+    context_length = getattr(compressor, "context_length", 0) or 0
+    input_tokens = getattr(agent, "session_prompt_tokens", 0) or 0
+    output_tokens = getattr(agent, "session_completion_tokens", 0) or 0
+    usage_report_calls = getattr(agent, "session_usage_report_calls", 0) or 0
+
+    turn_input_tokens = _counter_delta(input_tokens, prompt_tokens_start)
+    turn_output_tokens = _counter_delta(output_tokens, completion_tokens_start)
+    turn_usage_report_calls = _counter_delta(
+        usage_report_calls, usage_report_calls_start
+    )
+    try:
+        expected_api_calls = (
+            None if isinstance(result_api_calls, bool) else int(result_api_calls)
+        )
+    except (TypeError, ValueError):
+        expected_api_calls = None
+
+    token_usage_status = None
+    if (
+        isinstance(turn_usage_report_calls, int)
+        and turn_usage_report_calls > 0
+        and turn_input_tokens is not None
+        and turn_output_tokens is not None
+    ):
+        token_usage_status = "reported"
+        if (
+            expected_api_calls is None
+            or expected_api_calls < 0
+            or turn_usage_report_calls != expected_api_calls
+        ):
+            token_usage_status = "reported_partial"
+    else:
+        turn_input_tokens = None
+        turn_output_tokens = None
+
+    return {
+        "last_prompt_tokens": last_prompt_tokens,
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "usage_report_calls": usage_report_calls,
+        "turn_input_tokens": turn_input_tokens,
+        "turn_output_tokens": turn_output_tokens,
+        "token_usage_status": token_usage_status,
+        "reasoning_effort": _requested_reasoning_effort(
+            getattr(agent, "reasoning_config", None)
+        ),
+        "model": getattr(agent, "model", None),
+        "context_length": context_length,
+    }
+
+
 async def _dispose_unused_adapter(adapter: "BasePlatformAdapter | None") -> None:
     """Best-effort dispose for an adapter that never made it onto ``self.adapters``.
 
@@ -6904,6 +6999,17 @@ class TurnRunner:
                 ),
             )
 
+        # Cached agents keep cumulative counters across turns. Snapshot them
+        # immediately before this turn's model loop so footer usage is a turn
+        # delta rather than the full session total.
+        _turn_prompt_tokens_start = getattr(agent, "session_prompt_tokens", 0) or 0
+        _turn_completion_tokens_start = (
+            getattr(agent, "session_completion_tokens", 0) or 0
+        )
+        _turn_usage_report_calls_start = (
+            getattr(agent, "session_usage_report_calls", 0) or 0
+        )
+
         _approval_session_key = ctx.session_key or ""
         _approval_session_token = set_current_session_key(_approval_session_key)
         register_gateway_notify(_approval_session_key, _approval_notify_sync)
@@ -7045,18 +7151,27 @@ class TurnRunner:
         # Return final response, or a message if something went wrong
         final_response = result.get("final_response")
 
-        # Extract actual token counts from the agent instance used for this run
-        _last_prompt_toks = 0
-        _input_toks = 0
-        _output_toks = 0
-        _context_length = 0
+        # Extract final runtime identity and this logical turn's reported
+        # usage from the exact cached-agent baselines captured above.
         _agent = ctx.agent_holder[0]
-        if _agent and hasattr(_agent, "context_compressor"):
-            _last_prompt_toks = getattr(_agent.context_compressor, "last_prompt_tokens", 0)
-            _input_toks = getattr(_agent, "session_prompt_tokens", 0)
-            _output_toks = getattr(_agent, "session_completion_tokens", 0)
-            _context_length = getattr(_agent.context_compressor, "context_length", 0) or 0
-        _resolved_model = getattr(_agent, "model", None) if _agent else None
+        _runtime_metadata = _gateway_turn_runtime_metadata(
+            _agent,
+            prompt_tokens_start=_turn_prompt_tokens_start,
+            completion_tokens_start=_turn_completion_tokens_start,
+            usage_report_calls_start=_turn_usage_report_calls_start,
+            result_api_calls=(
+                result.get("api_calls") if isinstance(result, dict) else None
+            ),
+        )
+        _last_prompt_toks = _runtime_metadata.get("last_prompt_tokens", 0)
+        _input_toks = _runtime_metadata.get("input_tokens", 0)
+        _output_toks = _runtime_metadata.get("output_tokens", 0)
+        _context_length = _runtime_metadata.get("context_length", 0)
+        _turn_input_toks = _runtime_metadata.get("turn_input_tokens")
+        _turn_output_toks = _runtime_metadata.get("turn_output_tokens")
+        _token_usage_status = _runtime_metadata.get("token_usage_status")
+        _reasoning_effort = _runtime_metadata.get("reasoning_effort")
+        _resolved_model = _runtime_metadata.get("model")
 
         # Sync session_id immediately after run_conversation(). Compression
         # can rotate before a follow-up model call fails; the failure return
@@ -7191,6 +7306,10 @@ class TurnRunner:
                 "last_prompt_tokens": _last_prompt_toks,
                 "input_tokens": _input_toks,
                 "output_tokens": _output_toks,
+                "turn_input_tokens": _turn_input_toks,
+                "turn_output_tokens": _turn_output_toks,
+                "token_usage_status": _token_usage_status,
+                "reasoning_effort": _reasoning_effort,
                 "model": _resolved_model,
                 "context_length": _context_length,
             }
@@ -7272,6 +7391,10 @@ class TurnRunner:
             "last_prompt_tokens": _last_prompt_toks,
             "input_tokens": _input_toks,
             "output_tokens": _output_toks,
+            "turn_input_tokens": _turn_input_toks,
+            "turn_output_tokens": _turn_output_toks,
+            "token_usage_status": _token_usage_status,
+            "reasoning_effort": _reasoning_effort,
             "model": _resolved_model,
             "context_length": _context_length,
             "session_id": effective_session_id,
@@ -22445,6 +22568,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     context_length=agent_result.get("context_length") or None,
                     cwd=os.environ.get("TERMINAL_CWD", ""),
                     turn_seconds=_turn_seconds,
+                    tokens_in=agent_result.get("turn_input_tokens"),
+                    tokens_out=agent_result.get("turn_output_tokens"),
+                    token_usage_status=agent_result.get("token_usage_status"),
+                    reasoning_effort=agent_result.get("reasoning_effort"),
                 )
             except Exception as _footer_err:
                 logger.debug("runtime_footer build failed: %s", _footer_err)

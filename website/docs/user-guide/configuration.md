@@ -2007,32 +2007,34 @@ Notes:
 
 ### Runtime-metadata footer (gateway only)
 
-When `display.runtime_footer.enabled: true`, Hermes appends a small runtime-context footer to the **final** message of each gateway turn. The current footer can show the model, context-window percentage, and current working directory. Off by default; opt in per-gateway if your team wants every reply to include this provenance.
+When `display.runtime_footer.enabled: true`, Hermes appends a small runtime-context footer to the **final** message of each gateway turn. It can show the final active model, context-window percentage, turn latency, provider-reported per-turn token usage, Hermes' active reasoning-effort request, and current working directory. Off by default; opt in per-gateway if your team wants every reply to include this provenance.
 
 ```yaml
 display:
   runtime_footer:
     enabled: true
-    fields: ["model", "context_pct", "cwd"]   # order shown; drop any to hide
+    fields: ["model", "reasoning_effort", "tokens_turn", "context_pct", "latency"]
 ```
 
 Supported fields:
 
 | Field | Renders | Example |
 | --- | --- | --- |
-| `model` | Bare model id, vendor prefix dropped | `gpt-5.4` |
+| `model` | Final active model, vendor prefix dropped | `gpt-5.4` |
 | `context_pct` | Last-call context occupancy as a percent | `5%` |
 | `latency` | Wall-clock duration of the turn | `22s`, `1m05s` |
 | `cwd` | Home-relative working directory | `~` |
+| `tokens_turn` | Labelled known provider usage for this turn | `tokens(reported):15.9k in/1.2k out` |
+| `reasoning_effort` | Hermes' active request intent | `effort(req):max` |
 
-The default field set is `["model", "context_pct", "cwd"]`. `latency` is opt-in — add it to `fields` to use it. Fields whose data is unavailable are skipped silently rather than rendering an empty slot.
+The default field set remains `["model", "context_pct", "cwd"]`; all other fields are opt-in. `tokens_turn` labels known provider-reported usage as `reported` or `reported,partial`. If no usable usage report exists, the field is omitted rather than shown as `0 / 0`. `reasoning_effort` is request intent, not a claim about reasoning tokens consumed. Any field whose data is unavailable is skipped silently rather than rendering an empty slot.
 
 The `/footer` slash command toggles this at runtime in any session.
 
 Example footer appended to a Telegram/Discord/Slack reply:
 
 ```
-— claude-opus-4.7 · 12 tool calls · 2m 14s · $0.042
+gpt-5.4 · effort(req):high · tokens(reported):15.9k in/1.2k out · 68% · 42s
 ```
 
 Only the **final** message of a turn gets the footer; interim updates stay clean.

@@ -3017,6 +3017,10 @@ def init_agent(
     agent.session_completion_tokens = 0
     agent.session_total_tokens = 0
     agent.session_api_calls = 0
+    # Counts provider calls that supplied usable token usage. This stays
+    # separate from session_api_calls because some runtimes count completed
+    # calls even when the provider omits usage metadata.
+    agent.session_usage_report_calls = 0
     agent.session_input_tokens = 0
     agent.session_output_tokens = 0
     agent.session_cache_read_tokens = 0
