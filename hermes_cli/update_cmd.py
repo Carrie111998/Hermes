@@ -2390,7 +2390,10 @@ def _update_via_zip(args, *, had_desktop_app_before_update: bool = False) -> boo
 
     from hermes_cli.managed_uv import ensure_uv, update_managed_uv
 
-    # Keep managed uv current — runs `uv self update` if we already have one.
+    # Keep the managed uv current (self-update is refused for unmanaged
+    # installs; the binary is refreshed by re-running the installer when
+    # provisioning needs it — see managed_uv._refresh_managed_uv_catalog).
+    # Runs the vulnerable-runtime repair probe regardless.
     update_managed_uv()
 
     uv_bin = ensure_uv()
@@ -4173,7 +4176,7 @@ def _ensure_uv_for_termux(pip_cmd: list[str]) -> str | None:
     """Best-effort uv bootstrap on Termux for faster update installs.
 
     The normal path (``ensure_uv()`` in managed_uv) installs the managed
-    standalone uv into ``$HERMES_HOME/bin/uv``, but on Termux the official
+    standalone uv into ``$HERMES_HOME/uv/uv``, but on Termux the official
     installer may not work (glibc vs bionic).  Prefer a uv already on PATH
     (e.g. ``pkg install uv``); only if there is none do we fall back to a
     wheel-only ``pip install uv`` so we never source-build the Rust crate.
@@ -4202,7 +4205,12 @@ def _ensure_uv_for_termux(pip_cmd: list[str]) -> str | None:
             return None
     except Exception:
         pass
-    # After pip install, check managed path first, then PATH
+    # After pip install, the wheel lands in the venv Scripts/bin dir, which
+    # neither resolve_uv() (private managed dir) nor a bare which() on PATH
+    # sees during an update (venv/bin is not on PATH) — so this usually falls
+    # back to None and the update proceeds on the pip tier.  Historical quirk,
+    # preserved: forcing the venv on PATH as a third probe would shadow a
+    # user's own uv for the cost of a fast tier, which isolation forbids.
     return resolve_uv() or shutil.which("uv")
 
 def _npm_manifest_paths() -> tuple[Path, ...]:
@@ -9384,7 +9392,9 @@ def _cmd_update_impl(args, gateway_mode: bool):
             print("→ Updating Python dependencies...")
         from hermes_cli.managed_uv import ensure_uv, update_managed_uv
 
-        # Keep managed uv current — runs `uv self update` if we already have one.
+        # Keep the managed uv current (self-update is refused for unmanaged
+        # installs; the binary is refreshed by re-running the installer when
+        # provisioning needs it — see managed_uv._refresh_managed_uv_catalog).
         update_managed_uv()
 
         uv_bin = ensure_uv()
@@ -9746,7 +9756,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
             logger.debug("hermes-acp launcher self-heal failed: %s", e)
 
         # Migrate the Windows hermes launchers to the managed binary dir
-        # (the default Hermes root's bin, next to the managed uv) and repair
+        # (the default Hermes root's bin) and repair
         # them if they are missing. Earlier layouts put them inside the git
         # checkout (hermes-agent\bin) or put venv\Scripts itself on PATH; the
         # in-checkout copies were swept by this command's own pre-update

@@ -552,6 +552,30 @@ detect_os() {
 # Dependency checks
 # ============================================================================
 
+# Migrate pre-isolation managed uv/uvx from $HERMES_HOME/bin into the private
+# $MANAGED_UV_DIR (never on PATH). The astral installer always drops BOTH uv
+# and uvx into the target dir, so a legacy install leaves both in bin — and on
+# Windows bin is a persisted User PATH entry, so a stale bin/uvx shadows the
+# user's own uvx exactly like bin/uv does. Both must be migrated. Best effort:
+# a locked or busy legacy binary simply stays put; the next bootstrap retries.
+# If the private copy already exists, the old managed name is removed so it
+# cannot shadow a user's binary through a persisted bin/ PATH entry. Pure and
+# self-contained (reads $HERMES_HOME, writes only the two dirs) — so a
+# behavior test can lift it into a bash harness (see
+# tests/test_install_sh_uv_isolation.py).
+migrate_managed_uv_binaries() {
+    for _legacy_name in uv uvx; do
+        _legacy_uv="$HERMES_HOME/bin/$_legacy_name"
+        _priv_uv="$HERMES_HOME/uv/$_legacy_name"
+        if [ -f "$_legacy_uv" ] && [ ! -e "$_priv_uv" ]; then
+            mkdir -p "$HERMES_HOME/uv"
+            mv "$_legacy_uv" "$_priv_uv" 2>/dev/null || true
+        elif [ -f "$_legacy_uv" ] && [ -e "$_priv_uv" ]; then
+            rm -f "$_legacy_uv" 2>/dev/null || true
+        fi
+    done
+}
+
 install_uv() {
     if [ "$DISTRO" = "termux" ]; then
         log_info "Termux detected — using Python's stdlib venv + pip instead of uv"
@@ -559,12 +583,36 @@ install_uv() {
         return 0
     fi
 
-    # Hermes owns its own uv at $HERMES_HOME/bin/uv.  Always install there —
-    # no PATH probing, no conda guards, no multi-location resolution chains.
-    # The runtime update path (hermes_cli/managed_uv.py) looks in the same
-    # place, so install.sh and `hermes update` stay in sync.
-    local _managed_uv="$HERMES_HOME/bin/uv"
+    # Contain uv python writes inside Hermes' own tree. Root FHS installs
+    # already pin this in resolve_install_layout (world-readable
+    # /usr/local/share — keep that pin intact, including the bin shim dir);
+    # everyone else OVERRIDES any inherited value with $HERMES_HOME/python so
+    # `uv python install` and `uv venv --python` never write into the user's
+    # uv python store, ~/.local/bin shims, or the Windows registry. Same
+    # contract as install.ps1's Set-UvPythonIsolationEnv: Hermes must never
+    # write into a directory the user configured for their own toolchain, even
+    # when they exported one. UV_CACHE_DIR / UV_TOOL_DIR get the same
+    # treatment — `uv tool install` / `uvx` and every download cache must stay
+    # inside HERMES_HOME, so the user's own `uv tool list` and ~/.cache/uv
+    # never gain Hermes entries.
+    if [ "$ROOT_FHS_LAYOUT" != "true" ]; then
+        export UV_PYTHON_INSTALL_DIR="$HERMES_HOME/python"
+        export UV_PYTHON_INSTALL_BIN=0
+        export UV_PYTHON_INSTALL_REGISTRY=0
+        export UV_CACHE_DIR="$HERMES_HOME/cache/uv"
+        export UV_TOOL_DIR="$HERMES_HOME/uv/tools"
+    fi
 
+    # Migrate the old managed binaries before resolving uv. The old bin/
+    # location may be persisted on PATH by previous installers, and the
+    # astral installer always dropped BOTH uv and uvx there — a leftover
+    # bin/uvx would keep shadowing the user's uvx exactly like bin/uv did.
+    local _managed_uv="$HERMES_HOME/uv/uv"
+    migrate_managed_uv_binaries
+
+    # Managed binary lives in a private directory that is never registered on
+    # PATH.  The runtime update path (hermes_cli/managed_uv.py) looks in the
+    # same place, so install.sh and `hermes update` stay in sync.
     if [ -x "$_managed_uv" ]; then
         UV_CMD="$_managed_uv"
         UV_VERSION=$($UV_CMD --version 2>/dev/null)
@@ -572,8 +620,8 @@ install_uv() {
         return 0
     fi
 
-    log_info "Installing managed uv into $HERMES_HOME/bin ..."
-    mkdir -p "$HERMES_HOME/bin"
+    log_info "Installing managed uv into $HERMES_HOME/uv ..."
+    mkdir -p "$HERMES_HOME/uv"
 
     # Two-stage: download the installer, then run it.  Piping
     # `curl | sh` masks curl failures (sh exits 0 on empty stdin)
@@ -589,9 +637,13 @@ install_uv() {
         rm -f "$_uv_install_log" "$_uv_installer"
         exit 1
     fi
-    # UV_UNMANAGED_INSTALL tells the astral installer to place the binary
-    # directly into $HERMES_HOME/bin instead of ~/.local/bin.
-    if UV_UNMANAGED_INSTALL="$HERMES_HOME/bin" sh "$_uv_installer" >>"$_uv_install_log" 2>&1; then
+    # UV_UNMANAGED_INSTALL is load-bearing TWICE here: it forces the install
+    # dir to $HERMES_HOME/uv (instead of ~/.local/bin) AND it suppresses the
+    # installer's shell-profile PATH write (install.sh maps it to
+    # NO_MODIFY_PATH=1).  Do not replace it with UV_INSTALL_DIR alone -- the
+    # Windows installer must set the same switch (see Install-Uv) or the
+    # astral installer prepends the managed dir to the user PATH.
+    if UV_UNMANAGED_INSTALL="$HERMES_HOME/uv" sh "$_uv_installer" >>"$_uv_install_log" 2>&1; then
         rm -f "$_uv_installer"
         if [ -x "$_managed_uv" ]; then
             UV_CMD="$_managed_uv"
@@ -2824,8 +2876,9 @@ install_browser_use_cli() {
     if [ "$DISTRO" = "termux" ]; then
         return 0
     fi
-    if [ -z "$UV_CMD" ]; then
-        log_info "Skipping Browser Use CLI install (uv unavailable)"
+    local _browser_uv="$HERMES_HOME/uv/uv"
+    if [ ! -x "$_browser_uv" ]; then
+        log_info "Skipping Browser Use CLI install (Hermes-managed uv unavailable)"
         return 0
     fi
     # MANAGED-FIRST: only Hermes' managed copy short-circuits. A browser-use
@@ -2839,12 +2892,16 @@ install_browser_use_cli() {
     log_info "Installing Browser Use CLI (default browser backend)..."
     # UV_TOOL_BIN_DIR keeps the binary inside Hermes' managed bin dir, where
     # the browser tool resolves it — no reliance on the user's PATH.
+    # UV_CACHE_DIR / UV_TOOL_DIR keep the tool store and download cache out
+    # of the user's uv dirs (the tool must not show up in the user's own
+    # `uv tool list`).
     if run_with_timeout 600 env UV_NO_CONFIG=1 UV_TOOL_BIN_DIR="$HERMES_HOME/bin" \
-        "$UV_CMD" tool install browser-use >/dev/null 2>&1; then
+        UV_CACHE_DIR="$HERMES_HOME/cache/uv" UV_TOOL_DIR="$HERMES_HOME/uv/tools" \
+        "$_browser_uv" tool install browser-use >/dev/null 2>&1; then
         log_success "Browser Use CLI installed"
     else
         log_warn "Browser Use CLI install failed — browser automation falls back to built-in tools."
-        log_info "Install later with: $UV_CMD tool install browser-use  (or via 'hermes tools')"
+        log_info "Install later with: hermes tools  (or use uvx browser-use)"
     fi
 }
 

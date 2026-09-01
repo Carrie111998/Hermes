@@ -26,7 +26,7 @@ class TestSilentWhenHealthy:
         monkeypatch.setattr(env_probe, "_has_pip_module", lambda b: True)
         monkeypatch.setattr(env_probe, "_detect_pep668", lambda b: False)
         monkeypatch.setattr(env_probe, "_pip_python_version", lambda: "3.13")
-        monkeypatch.setattr(env_probe.shutil, "which", lambda name: None)
+        monkeypatch.setattr(env_probe.shutil, "which", lambda name, path=None: None)
         assert env_probe.get_environment_probe_line() == ""
 
     def test_pep668_with_uv_returns_empty(self, monkeypatch):
@@ -38,7 +38,36 @@ class TestSilentWhenHealthy:
         monkeypatch.setattr(env_probe, "_detect_pep668", lambda b: True)
         monkeypatch.setattr(env_probe, "_pip_python_version", lambda: "3.12")
         monkeypatch.setattr(env_probe.shutil, "which",
-                            lambda name: "/usr/local/bin/uv" if name == "uv" else None)
+                            lambda name, path=None: "/usr/local/bin/uv" if name == "uv" else None)
+        assert env_probe.get_environment_probe_line() == ""
+
+    @pytest.mark.skipif(
+        sys.platform == "win32",
+        reason="Windows terminal PATH is not augmented with the managed dirs "
+        "(local._append_missing_sane_path_entries is a no-op), so a managed-only "
+        "uv is not visible to the probe there — the assertion is POSIX-only.",
+    )
+    def test_managed_only_uv_is_detected(self, monkeypatch, tmp_path):
+        """A managed-only install keeps uv in $HERMES_HOME/uv, which is on the
+        terminal subshell PATH (local.py appends it to the Hermes sandbox shell)
+        but NOT on the agent-process PATH. The probe must ask the terminal PATH,
+        so PEP 668 with a managed uv stays silent instead of claiming uv is
+        missing. POSIX only: Windows leaves the terminal PATH and the probe on
+        the process PATH, so both stay consistent there."""
+        home = tmp_path / "home"
+        uv_dir = home / "uv"
+        uv_dir.mkdir(parents=True)
+        uv = uv_dir / "uv"
+        uv.write_text("#!/bin/sh\n")
+        uv.chmod(uv.stat().st_mode | 0o111)
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        monkeypatch.setenv("PATH", str(tmp_path / "empty"))
+        monkeypatch.setattr(env_probe, "_python_version_of",
+                            lambda b: "3.12.4" if b == "python3" else None)
+        monkeypatch.setattr(env_probe, "_has_pip_module", lambda b: True)
+        monkeypatch.setattr(env_probe, "_detect_pep668", lambda b: True)
+        monkeypatch.setattr(env_probe, "_pip_python_version", lambda: "3.12")
+        # Real which() against the terminal PATH built by local.py.
         assert env_probe.get_environment_probe_line() == ""
 
 
@@ -55,7 +84,7 @@ class TestEmitsOnRealProblems:
         monkeypatch.setattr(env_probe, "_detect_pep668", lambda b: True)
         monkeypatch.setattr(env_probe, "_pip_python_version", lambda: "3.12")
         monkeypatch.setattr(env_probe.shutil, "which",
-                            lambda name: None if name == "uv" else "/usr/bin/" + name)
+                            lambda name, path=None: None if name == "uv" else "/usr/bin/" + name)
 
         line = env_probe.get_environment_probe_line()
         assert line  # not silent
@@ -79,7 +108,7 @@ class TestEmitsOnRealProblems:
         monkeypatch.setattr(env_probe, "_detect_pep668", lambda b: True)
         monkeypatch.setattr(env_probe, "_pip_python_version", lambda: "3.12")
         monkeypatch.setattr(env_probe.shutil, "which",
-                            lambda name: None if name == "uv" else "/usr/bin/" + name)
+                            lambda name, path=None: None if name == "uv" else "/usr/bin/" + name)
 
         line = env_probe.get_environment_probe_line()
         # `python=missing` only matters in the non-silent path; PEP 668 (without
@@ -119,7 +148,7 @@ class TestCaching:
         monkeypatch.setattr(env_probe, "_has_pip_module", lambda b: True)
         monkeypatch.setattr(env_probe, "_detect_pep668", lambda b: False)
         monkeypatch.setattr(env_probe, "_pip_python_version", lambda: "3.12")
-        monkeypatch.setattr(env_probe.shutil, "which", lambda name: None)
+        monkeypatch.setattr(env_probe.shutil, "which", lambda name, path=None: None)
 
         env_probe.get_environment_probe_line()
         env_probe.get_environment_probe_line()

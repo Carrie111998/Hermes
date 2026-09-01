@@ -243,12 +243,12 @@ class TestFindCli:
         )
         assert bu_cli._find_cli_unpatched() == ["/usr/local/bin/browser-use"]
 
-    def test_falls_back_to_uvx(self, monkeypatch):
+    def test_does_not_use_user_path_uvx(self, monkeypatch):
         monkeypatch.setattr(
             bu_cli.shutil, "which",
             lambda name, path=None: "/usr/local/bin/uvx" if name == "uvx" and path is None else None,
         )
-        assert bu_cli._find_cli_unpatched() == ["/usr/local/bin/uvx", "browser-use"]
+        assert bu_cli._find_cli_unpatched() is None
 
     def test_none_when_neither_available(self, monkeypatch):
         monkeypatch.setattr(bu_cli.shutil, "which", lambda name, path=None: None)
@@ -918,7 +918,43 @@ class TestFindCliManagedBin:
         uvx.chmod(uvx.stat().st_mode | stat.S_IXUSR)
         assert bu_cli._find_cli_unpatched() == [str(uvx), "browser-use"]
 
+    def test_managed_uv_dir_uvx_found(self, tmp_path, monkeypatch):
+        """The managed uvx lives next to the managed uv in the private uv/
+        dir (post-isolation layout) — the zero-install probe must find it
+        there even though it is never on PATH."""
+        uv_dir = tmp_path / "home" / "uv"
+        uv_dir.mkdir(parents=True)
+        uvx = uv_dir / "uvx"
+        uvx.write_text("#!/bin/sh\n")
+        uvx.chmod(uvx.stat().st_mode | stat.S_IXUSR)
+        assert bu_cli._find_cli_unpatched() == [str(uvx), "browser-use"]
+
+    def test_managed_uv_dir_uvx_precedes_legacy_bin(self, tmp_path, monkeypatch):
+        """Current layout wins: the private uv/ copy is probed before the
+        pre-isolation bin/ copy."""
+        uv_dir = tmp_path / "home" / "uv"
+        uv_dir.mkdir(parents=True)
+        uvx = uv_dir / "uvx"
+        uvx.write_text("#!/bin/sh\n")
+        uvx.chmod(uvx.stat().st_mode | stat.S_IXUSR)
+        legacy = tmp_path / "home" / "bin"
+        legacy.mkdir(parents=True)
+        legacy_uvx = legacy / "uvx"
+        legacy_uvx.write_text("#!/bin/sh\n")
+        legacy_uvx.chmod(legacy_uvx.stat().st_mode | stat.S_IXUSR)
+        assert bu_cli._find_cli_unpatched() == [str(uvx), "browser-use"]
+
     def test_nothing_found(self, tmp_path, monkeypatch):
+        assert bu_cli._find_cli_unpatched() is None
+
+    def test_user_path_uvx_is_not_used(self, tmp_path, monkeypatch):
+        """Browser Use must not silently adopt the user's internal uvx."""
+        user_dir = tmp_path / "user-uvx"
+        user_dir.mkdir()
+        uvx = user_dir / "uvx"
+        uvx.write_text("#!/bin/sh\n")
+        uvx.chmod(uvx.stat().st_mode | stat.S_IXUSR)
+        monkeypatch.setenv("PATH", str(user_dir))
         assert bu_cli._find_cli_unpatched() is None
 
     def test_user_local_bin_browser_use_found(self, tmp_path, monkeypatch):
@@ -964,13 +1000,13 @@ class TestFindCliManagedBin:
         managed_cli.chmod(managed_cli.stat().st_mode | stat.S_IXUSR)
         assert bu_cli._find_cli_unpatched() == [str(managed_cli)]
 
-    def test_user_local_bin_uvx_fallback(self, tmp_path, monkeypatch):
+    def test_does_not_use_user_local_bin_uvx(self, tmp_path, monkeypatch):
         cli_dir = tmp_path / "userhome" / ".local" / "bin"
         cli_dir.mkdir(parents=True)
         uvx = cli_dir / "uvx"
         uvx.write_text("#!/bin/sh\n")
         uvx.chmod(uvx.stat().st_mode | stat.S_IXUSR)
-        assert bu_cli._find_cli_unpatched() == [str(uvx), "browser-use"]
+        assert bu_cli._find_cli_unpatched() is None
 
 
 class TestInstallCli:
@@ -985,6 +1021,7 @@ class TestInstallCli:
         import types as _types
         fake = _types.ModuleType("hermes_cli.managed_uv")
         fake.ensure_uv = lambda **kw: None
+        fake.managed_uv_env = lambda **kw: dict(os.environ)
         monkeypatch.setitem(_sys.modules, "hermes_cli.managed_uv", fake)
         ok, msg = bu_cli.install_cli()
         # No uv available in this fixture, so the attempted managed install
@@ -1011,6 +1048,7 @@ class TestInstallCli:
         import types as _types
         fake = _types.ModuleType("hermes_cli.managed_uv")
         fake.ensure_uv = lambda **kw: None
+        fake.managed_uv_env = lambda **kw: dict(os.environ)
         monkeypatch.setitem(_sys.modules, "hermes_cli.managed_uv", fake)
         ok, msg = bu_cli.install_cli()
         assert ok is False
@@ -1039,6 +1077,10 @@ class TestInstallCli:
         import types as _types
         fake = _types.ModuleType("hermes_cli.managed_uv")
         fake.ensure_uv = lambda **kw: str(uv)
+        fake.managed_uv_env = lambda **kw: {
+            **dict(os.environ),
+            "UV_TOOL_BIN_DIR": str(kw.get("tool_bin_dir") or ""),
+        }
         monkeypatch.setitem(_sys.modules, "hermes_cli.managed_uv", fake)
         ok, msg = bu_cli.install_cli()
         assert ok is True, msg
@@ -1055,6 +1097,7 @@ class TestInstallCli:
         import types as _types
         fake = _types.ModuleType("hermes_cli.managed_uv")
         fake.ensure_uv = lambda **kw: str(uv)
+        fake.managed_uv_env = lambda **kw: dict(os.environ)
         monkeypatch.setitem(_sys.modules, "hermes_cli.managed_uv", fake)
         ok, msg = bu_cli.install_cli()
         assert ok is False
