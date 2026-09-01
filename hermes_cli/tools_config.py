@@ -2315,17 +2315,24 @@ def _run_post_setup(post_setup_key: str):
             _print_info("    Run manually: hermes auth spotify")
 
     elif post_setup_key == "langfuse":
-        # Install the langfuse SDK.
+        # Install the langfuse SDK. Keep this requirement in sync with
+        # plugins/observability/langfuse/plugin.yaml's python_dependencies —
+        # the plugin imports `propagate_attributes`, added in langfuse 3.9.0.
+        langfuse_req = "langfuse>=3.9.0,<5"
         try:
-            __import__("langfuse")
+            # Probe the symbol the plugin actually needs, not just the package:
+            # an older SDK (<3.9.0) imports fine but fails at plugin load.
+            mod = __import__("langfuse")
+            if not hasattr(mod, "propagate_attributes"):
+                raise ImportError("langfuse too old (needs >=3.9.0)")
             _print_success("    langfuse SDK already installed")
         except ImportError:
             _print_info("    Installing langfuse SDK...")
-            result = _pip_install(["langfuse", "--quiet"], timeout=120)
+            result = _pip_install([langfuse_req, "--quiet"], timeout=120)
             if result.returncode == 0:
                 _print_success("    langfuse SDK installed")
             else:
-                _print_warning("    langfuse SDK install failed — run manually: uv pip install langfuse")
+                _print_warning(f"    langfuse SDK install failed — run manually: uv pip install '{langfuse_req}'")
         # Opt the bundled observability/langfuse plugin into plugins.enabled.
         # The plugin ships in the repo but doesn't load until the user enables
         # it (standalone plugins are opt-in).

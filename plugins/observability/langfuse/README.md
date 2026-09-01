@@ -12,7 +12,7 @@ Pick one:
 hermes tools  # → Langfuse Observability
 
 # Manual
-pip install langfuse
+pip install 'langfuse>=3.9.0,<5'
 hermes plugins enable observability/langfuse
 ```
 
