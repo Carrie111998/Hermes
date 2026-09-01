@@ -13,8 +13,17 @@ working directory before it reaches ``docker run -w``:
      host prefixes but only ever ran against ``config["cwd"]``, so the override
      bypassed the one guard that would have caught it.
 
-Both paths now share ``_is_unusable_container_cwd()``; these tests pin its
-behaviour so neither path can regress.
+  3. ``register_task_env_overrides()`` writes a freshly registered ``cwd``
+     onto the ALREADY-LIVE environment. That write was raw too, and it is the
+     one that breaks file tools rather than container startup:
+     ``ShellFileOperations`` reads ``env.cwd`` for every operation and the
+     command wrapper emits ``builtin cd -- <cwd> || exit 126``, so a host cwd
+     made ``read_file``/``patch``/``search_files`` fail with "File not found"
+     and "rg is not installed" for files that plainly exist — intermittently,
+     because the next terminal command rewrote the cwd back to a usable one.
+
+All three paths now share ``_is_unusable_container_cwd()``; these tests pin
+their behaviour so none can regress.
 """
 
 import tools.terminal_tool as tt
@@ -212,3 +221,79 @@ class TestFileOpsCwdSanitizedAtCallSite:
         cwd = self._run_and_capture_cwd(
             monkeypatch, "/Users/me/workspace", env_type="modal")
         assert cwd == "/workspace"
+
+
+class TestLiveEnvCwdSanitizedOnRegistration:
+    """E2E pin for path #3: registering a host cwd must not poison the cwd of
+    an environment that is already running on a container backend.
+    """
+
+    class _FakeDockerEnvironment:
+        """Stands in for a live container env (recognized by class name)."""
+
+        def __init__(self, cwd="/root"):
+            self.cwd = cwd
+
+    class _FakeLocalEnvironment:
+        def __init__(self, cwd="/root"):
+            self.cwd = cwd
+
+    def _register(self, monkeypatch, env, cwd, task_id="sess-live-cwd"):
+        monkeypatch.setattr(tt, "_active_environments", {task_id: env})
+        monkeypatch.setattr(tt, "_session_cwd", {})
+        tt.register_task_env_overrides(task_id, {"cwd": cwd})
+        try:
+            return tt.get_session_cwd(task_id)
+        finally:
+            tt.clear_task_env_overrides(task_id)
+
+    def test_host_cwd_does_not_reach_live_container_env(self, monkeypatch):
+        env = self._FakeDockerEnvironment(cwd="/root")
+        recorded = self._register(monkeypatch, env, "/Users/me")
+        assert env.cwd == "/root", (
+            f"Host cwd leaked onto the live container env: {env.cwd!r}. Every "
+            "file operation would then run `cd /Users/me` inside the sandbox "
+            "and fail with a phantom 'File not found'."
+        )
+        # The session RECORD still keeps the host path — its readers guard it,
+        # and host-side surfaces need to know where the user actually is.
+        assert recorded == "/Users/me"
+
+    def test_windows_host_cwd_does_not_reach_live_container_env(self, monkeypatch):
+        env = self._FakeDockerEnvironment(cwd="/workspace")
+        self._register(monkeypatch, env, r"C:\Users\someuser")
+        assert env.cwd == "/workspace"
+
+    def test_container_cwd_still_applies_immediately(self, monkeypatch):
+        # An in-sandbox path is the case the assignment exists for (an ACP
+        # client switching project root mid-session); it must still take
+        # effect on the live env.
+        env = self._FakeDockerEnvironment(cwd="/root")
+        self._register(monkeypatch, env, "/workspace/task42")
+        assert env.cwd == "/workspace/task42"
+
+    def test_local_backend_keeps_host_cwd(self, monkeypatch):
+        # On a local backend a host path IS the working directory.
+        env = self._FakeLocalEnvironment(cwd="/tmp")
+        self._register(monkeypatch, env, "/Users/me")
+        assert env.cwd == "/Users/me"
+
+
+class TestEnvInstanceBackendName:
+    def test_docker_class(self):
+        class DockerEnvironment:
+            pass
+
+        assert tt._env_instance_backend_name(DockerEnvironment()) == "docker"
+
+    def test_stamp_wins_over_class_name(self):
+        class SomePluginEnv:
+            _hermes_backend_name = "e2b"
+
+        assert tt._env_instance_backend_name(SomePluginEnv()) == "e2b"
+
+    def test_unrecognized_returns_empty(self):
+        class Mystery:
+            pass
+
+        assert tt._env_instance_backend_name(Mystery()) == ""

@@ -1005,10 +1005,56 @@ class ShellFileOperations(FileOperations):
             exit_code=exit_code
         )
     
+    def _unusable_cwd_error(self, result: ExecuteResult) -> Optional[str]:
+        """Explain a failure that happened BEFORE the command ran, else None.
+
+        Every command goes out wrapped as ``builtin cd -- <cwd> || exit 126``
+        (BaseEnvironment._wrap_command), and container backends additionally
+        chdir via ``docker exec -w``. When that cwd doesn't exist inside the
+        sandbox — a host workspace path registered onto a container env, or a
+        directory deleted underneath a live session — the wrapper exits
+        126/127 and the real command never executes. Every probe in this
+        class reads that as "the path isn't there", which is how a working
+        directory problem gets reported as "File not found: <file>" for files
+        that plainly exist, and as "rg is not installed" for a sandbox that
+        has ripgrep. Callers use this to report what actually happened
+        instead, and to skip caching the bogus answer.
+        """
+        if result.exit_code not in (126, 127):
+            return None
+        output = result.stdout or ""
+        if not any(m in output for m in ("cd:", "chdir to cwd")):
+            return None
+        cwd = getattr(self.env, "cwd", None) or self.cwd
+        return (
+            f"Cannot run file operations: the session's working directory "
+            f"{cwd!r} does not exist in the execution environment, so the "
+            f"command never ran and the path was never checked. Run any "
+            f"terminal command first (the terminal tool resets an unusable "
+            f"working directory), then retry."
+        )
+
+    def _cwd_failure_error(self) -> Optional[str]:
+        """Re-probe the environment and explain an unusable cwd, else None.
+
+        For error paths that only know "the command didn't work" (a tool
+        that reports as missing, say): one no-op exec distinguishes a real
+        absence from a session whose working directory no longer exists, so
+        the caller can name the actual problem.
+        """
+        return self._unusable_cwd_error(self._exec("true"))
+
     def _has_command(self, cmd: str) -> bool:
         """Check if a command exists in the environment (cached)."""
         if cmd not in self._command_cache:
             result = self._exec(f"command -v {cmd} >/dev/null 2>&1 && echo 'yes'")
+            # Never cache a "missing" verdict the probe could not establish:
+            # a wrapper-level failure (unusable cwd) answers nothing, and the
+            # cache lives as long as the file_ops instance — one poisoned
+            # probe would keep claiming rg/find are absent for the rest of
+            # the session, long after the cwd was repaired.
+            if self._unusable_cwd_error(result) is not None:
+                return False
             self._command_cache[cmd] = result.stdout.strip() == 'yes'
         return self._command_cache[cmd]
     
@@ -1525,6 +1571,9 @@ class ShellFileOperations(FileOperations):
         stat_result = self._exec(self._size_probe_cmd(path))
 
         if stat_result.exit_code != 0:
+            cwd_error = self._unusable_cwd_error(stat_result)
+            if cwd_error:
+                return ReadResult(error=cwd_error)
             # File not found. Before failing, try unicode-equivalent
             # spellings — NFC/NFD, narrow no-break space, curly quotes
             # render identically in a terminal, so the model retyping a
@@ -1809,6 +1858,9 @@ class ShellFileOperations(FileOperations):
         path = self._expand_path(path)
         stat_result = self._exec(self._size_probe_cmd(path))
         if stat_result.exit_code != 0:
+            cwd_error = self._unusable_cwd_error(stat_result)
+            if cwd_error:
+                return ReadResult(error=cwd_error)
             return self._suggest_similar_files(path)
         stat_output = _strip_terminal_fence_leaks(stat_result.stdout)
         if stat_output.strip() == NOT_REGULAR_SENTINEL:
@@ -1851,6 +1903,9 @@ class ShellFileOperations(FileOperations):
         path = self._expand_path(path)
         stat_result = self._exec(self._size_probe_cmd(path))
         if stat_result.exit_code != 0:
+            cwd_error = self._unusable_cwd_error(stat_result)
+            if cwd_error:
+                return ReadResult(error=cwd_error)
             return ReadResult(error=f"File not found: {path}")
         stat_output = _strip_terminal_fence_leaks(stat_result.stdout)
         if stat_output.strip() == NOT_REGULAR_SENTINEL:
@@ -2260,6 +2315,9 @@ class ShellFileOperations(FileOperations):
         read_result = self._exec(read_cmd)
         
         if read_result.exit_code != 0:
+            cwd_error = self._unusable_cwd_error(read_result)
+            if cwd_error:
+                return PatchResult(error=cwd_error)
             return PatchResult(error=f"Failed to read file: {path}")
         
         content = read_result.stdout
@@ -3057,6 +3115,9 @@ class ShellFileOperations(FileOperations):
 
         # Fallback: find (slower, no .gitignore awareness)
         if not self._has_command('find'):
+            cwd_error = self._cwd_failure_error()
+            if cwd_error:
+                return SearchResult(error=cwd_error)
             return SearchResult(
                 error="File search requires 'rg' (ripgrep) or 'find'. "
                       "Install ripgrep for best results: "
@@ -3201,6 +3262,9 @@ class ShellFileOperations(FileOperations):
                                             output_mode, context)
         else:
             # Neither rg nor grep available (Windows without Git Bash, etc.)
+            cwd_error = self._cwd_failure_error()
+            if cwd_error:
+                return SearchResult(error=cwd_error)
             return SearchResult(
                 error="Content search requires ripgrep (rg) or grep. "
                       "Install ripgrep: https://github.com/BurntSushi/ripgrep#installation"
