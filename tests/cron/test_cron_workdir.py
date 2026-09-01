@@ -6,13 +6,14 @@ Covers:
   - jobs.update_job: set, clear, re-validate
   - tools.cronjob_tools.cronjob: create + update JSON round-trip, schema
     includes workdir, _format_job exposes it when set
-  - scheduler.tick(): partitions workdir jobs off the thread pool, restores
-    TERMINAL_CWD in finally, honours the env override during run_job
+  - scheduler.tick(): workdir jobs stay on the parallel pool and do not
+    serialize unrelated executions through process-global TERMINAL_CWD
 """
 
 from __future__ import annotations
 
 import json
+import threading
 
 import pytest
 
@@ -209,6 +210,12 @@ class TestRunJobTerminalCwd:
                 observed["terminal_cwd_during_run"] = os.environ.get(
                     "TERMINAL_CWD", "_UNSET_"
                 )
+                barrier = observed.get("barrier")
+                if barrier is not None:
+                    barrier.wait(timeout=5)
+                observed.setdefault("runs", []).append(
+                    (task_id, get_session_cwd(task_id))
+                )
                 return {"final_response": "done", "messages": []}
 
             def get_activity_summary(self):
@@ -316,3 +323,53 @@ class TestRunJobTerminalCwd:
         assert observed["terminal_cwd_during_run"] == baseline
         assert os.environ["TERMINAL_CWD"] == baseline
         assert get_session_cwd(observed["task_id"]) is None
+
+    def test_slow_workdir_run_does_not_block_unrelated_job(self, monkeypatch, tmp_path):
+        """Regression for #100226: workdirs must not share a process lock.
+
+        A job stalled while entering or using a CloudStorage workdir must not
+        make a staggered job without a workdir wait for the stalled job's
+        entire inactivity budget.  The two executions use independent session
+        CWD records and therefore enter the agent concurrently.
+        """
+        import cron.scheduler as sched
+
+        workdir = tmp_path / "cloud-storage-workdir"
+        workdir.mkdir()
+        observed: dict = {"barrier": threading.Barrier(2)}
+        self._install_stubs(monkeypatch, observed)
+
+        jobs = [
+            {
+                "id": "slow-workdir",
+                "name": "slow-workdir",
+                "workdir": str(workdir),
+                "schedule_display": "manual",
+            },
+            {
+                "id": "unrelated",
+                "name": "unrelated",
+                "workdir": None,
+                "schedule_display": "manual",
+            },
+        ]
+        results = []
+        errors = []
+
+        def run(job):
+            try:
+                results.append(sched.run_job(job))
+            except BaseException as exc:  # pragma: no cover - assertion below
+                errors.append(exc)
+
+        threads = [threading.Thread(target=run, args=(job,)) for job in jobs]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=5)
+
+        assert not errors
+        assert all(not thread.is_alive() for thread in threads)
+        assert len(results) == 2
+        assert all(result[0] is True for result in results)
+        assert {cwd for _task_id, cwd in observed["runs"]} == {str(workdir), None}
