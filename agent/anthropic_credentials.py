@@ -729,11 +729,9 @@ def _prefer_refreshable_claude_code_token(env_token: str, creds: Optional[Dict[s
 def _resolve_anthropic_pool_token() -> Optional[str]:
     """Return the first available Anthropic OAuth token from credential_pool.
 
-    Read-only: enumerates with ``clear_expired=False, refresh=False`` so a bare
-    token *resolve* (which runs from diagnostic/read-only call sites such as
-    ``account_usage`` and ``hermes models``) never mutates ``~/.hermes/auth.json``
-    or makes a network refresh call. Refresh-on-expiry is owned by the API call
-    path's pool recovery, not the resolver.
+    Read-only for unexpired tokens: enumerates with ``clear_expired=False, refresh=False``.
+    When only expired OAuth entries exist in the pool, triggers refresh so agent init
+    can proceed rather than failing with AuthError (#100339).
     """
     try:
         from agent.credential_pool import AUTH_TYPE_OAUTH, load_pool
@@ -743,9 +741,8 @@ def _resolve_anthropic_pool_token() -> Optional[str]:
     try:
         pool = load_pool("anthropic")
         # Enumerate read-only (clear_expired=False, refresh=False): never persist
-        # to auth.json or trigger a network refresh from a bare resolve. select()
-        # is deliberately NOT used — it runs clear_expired=True, refresh=True,
-        # which would violate this read-only contract.
+        # to auth.json or trigger a network refresh from a bare resolve when unexpired
+        # tokens are present.
         entries, _pending = pool._available_entries(clear_expired=False, refresh=False)
     except Exception:
         logger.debug("Failed to read Anthropic credential_pool", exc_info=True)
@@ -781,7 +778,30 @@ def _resolve_anthropic_pool_token() -> Optional[str]:
                 getattr(entry, "id", "?"),
             )
             continue
+        if hasattr(pool, "_entry_needs_refresh") and pool._entry_needs_refresh(entry):
+            continue
         return token
+
+    # Fallback when all unexpired tokens were absent or skipped (#100339):
+    # check for expired-but-refreshable OAuth entries in the pool so agent
+    # init doesn't hard-fail with AuthError.
+    try:
+        for entry in pool.entries():
+            if getattr(entry, "auth_type", None) != AUTH_TYPE_OAUTH:
+                continue
+            refresh_token = (getattr(entry, "refresh_token", None) or "").strip()
+            if not refresh_token:
+                continue
+            entry_source_path = spent_rotation_source_path(getattr(entry, "source", None))
+            if is_rotation_consumed_uncommitted(
+                refresh_token, source_path=entry_source_path
+            ):
+                continue
+            refreshed = pool._refresh_entry(entry, force=True)
+            if refreshed and (getattr(refreshed, "access_token", None) or "").strip():
+                return refreshed.access_token.strip()
+    except Exception:
+        logger.debug("Failed to refresh expired Anthropic pool entry during token resolution", exc_info=True)
 
     return None
 

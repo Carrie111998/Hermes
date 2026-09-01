@@ -427,3 +427,139 @@ def test_manual_hermes_pkce_refresh_does_not_create_duplicate_singleton(
     assert matching[0].source == "manual:hermes_pkce"
     assert matching[0].refresh_token == "manual-rt-1"
 
+
+def test_anthropic_pool_refresh_writes_through_to_global_root(profile_and_root, monkeypatch):
+    """When a profile pool refreshes an Anthropic OAuth entry, the rotated tokens
+    must land in the global root auth.json credential_pool (#100339).
+    """
+    profile_path, root_path = profile_and_root
+    _write_store(root_path, {"version": 1, "credential_pool": {"anthropic": []}})
+    _write_store(profile_path, {"version": 1, "credential_pool": {"anthropic": []}})
+
+    monkeypatch.setattr(CP, "_global_auth_file_path", lambda: root_path)
+    monkeypatch.setattr(A, "_global_auth_file_path", lambda: root_path)
+    monkeypatch.setattr(CP, "_same_path", lambda a, b: a == b)
+    monkeypatch.setattr(A, "_same_path", lambda a, b: a == b)
+    monkeypatch.setattr("agent.anthropic_credentials.read_claude_code_credentials", lambda: None)
+    monkeypatch.setattr(
+        "agent.anthropic_credentials.refresh_anthropic_oauth_pure",
+        lambda refresh_token, use_json=False: {
+            "access_token": "rotated-at-1",
+            "refresh_token": "rotated-rt-1",
+            "expires_at_ms": int(time.time() * 1000) + 3_600_000,
+        },
+    )
+
+    entry = PooledCredential(
+        provider="anthropic",
+        id="profile-pkce-1",
+        label="cred",
+        auth_type=AUTH_TYPE_OAUTH,
+        priority=0,
+        source="manual:hermes_pkce",
+        access_token="initial-at-0",
+        refresh_token="initial-rt-0",
+        expires_at_ms=0,
+    )
+    pool = CredentialPool("anthropic", [entry])
+    refreshed = pool._refresh_entry(entry, force=True)
+
+    assert refreshed is not None
+    assert refreshed.access_token == "rotated-at-1"
+    assert refreshed.refresh_token == "rotated-rt-1"
+
+    # Verify global root received the rotated entry
+    root_store = _read_store(root_path)
+    anthropic_entries = root_store.get("credential_pool", {}).get("anthropic", [])
+    assert len(anthropic_entries) == 1
+    assert anthropic_entries[0]["id"] == "profile-pkce-1"
+    assert anthropic_entries[0]["access_token"] == "rotated-at-1"
+    assert anthropic_entries[0]["refresh_token"] == "rotated-rt-1"
+
+
+def test_sync_anthropic_entry_adopts_rotated_tokens_from_global_root(profile_and_root, monkeypatch):
+    """A sibling profile pool must adopt Anthropic OAuth tokens rotated by root/sibling (#100339)."""
+    profile_path, root_path = profile_and_root
+    _write_store(
+        root_path,
+        {
+            "version": 1,
+            "credential_pool": {
+                "anthropic": [
+                    {
+                        "id": "shared-pkce-1",
+                        "provider": "anthropic",
+                        "auth_type": AUTH_TYPE_OAUTH,
+                        "source": "manual:hermes_pkce",
+                        "access_token": "freshest-root-at",
+                        "refresh_token": "freshest-root-rt",
+                        "priority": 0,
+                    }
+                ]
+            },
+        },
+    )
+    _write_store(profile_path, {"version": 1, "credential_pool": {"anthropic": []}})
+
+    monkeypatch.setattr(CP, "_global_auth_file_path", lambda: root_path)
+    monkeypatch.setattr(A, "_global_auth_file_path", lambda: root_path)
+
+    stale_entry = PooledCredential(
+        provider="anthropic",
+        id="shared-pkce-1",
+        label="cred",
+        auth_type=AUTH_TYPE_OAUTH,
+        priority=0,
+        source="manual:hermes_pkce",
+        access_token="stale-profile-at",
+        refresh_token="stale-profile-rt",
+        expires_at_ms=0,
+    )
+    pool = CredentialPool("anthropic", [stale_entry])
+    synced = pool._sync_anthropic_entry_from_pool_store(stale_entry)
+
+    assert synced.access_token == "freshest-root-at"
+    assert synced.refresh_token == "freshest-root-rt"
+
+
+def test_resolve_anthropic_pool_token_refreshes_expired_entry_on_init(tmp_path, monkeypatch):
+    """When only expired OAuth pool entries exist, _resolve_anthropic_pool_token must
+    refresh rather than returning None and causing agent init AuthError (#100339).
+    """
+    from agent import anthropic_credentials as AC
+
+    hermes_home = tmp_path / "hermes"
+    hermes_home.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.setattr("hermes_cli.auth.is_provider_explicitly_configured", lambda pid: True)
+    monkeypatch.setattr("agent.anthropic_credentials.read_claude_code_credentials", lambda: None)
+    monkeypatch.setattr(
+        "agent.anthropic_credentials.refresh_anthropic_oauth_pure",
+        lambda refresh_token, use_json=False: {
+            "access_token": "fresh-init-at",
+            "refresh_token": "fresh-init-rt",
+            "expires_at_ms": int(time.time() * 1000) + 3_600_000,
+        },
+    )
+
+    expired_entry = PooledCredential(
+        provider="anthropic",
+        id="expired-pool-1",
+        label="cred",
+        auth_type=AUTH_TYPE_OAUTH,
+        priority=0,
+        source="manual:hermes_pkce",
+        access_token="expired-at",
+        refresh_token="valid-rt",
+        expires_at_ms=1000,  # Far in the past
+    )
+    _write_store(
+        hermes_home / "auth.json",
+        {
+            "version": 1,
+            "credential_pool": {"anthropic": [expired_entry.to_dict()]},
+        },
+    )
+
+    token = AC._resolve_anthropic_pool_token()
+    assert token == "fresh-init-at"

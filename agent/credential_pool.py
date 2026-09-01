@@ -807,6 +807,50 @@ def _write_through_provider_state_to_global_root(
         )
 
 
+def _write_through_pool_entry_to_global_root(
+    provider_id: str, entry: PooledCredential
+) -> None:
+    """Persist a rotated OAuth pool entry into the global-root auth.json credential_pool.
+
+    Best-effort write-through for the multi-profile rotation hazard (#100339):
+    When a profile pool instance rotates a single-use OAuth token pair (such as Anthropic
+    hermes_pkce / dashboard_pkce), the rotated pair must land in the global root auth.json
+    credential_pool as well. Otherwise sibling profiles and root keep the old already-consumed
+    refresh token and fail with invalid_grant on their next turn.
+    """
+    try:
+        global_path = auth_mod._global_auth_file_path()
+    except Exception:
+        return
+    if global_path is None:
+        return
+    if os.environ.get("PYTEST_CURRENT_TEST"):
+        real_home_env = os.environ.get("HOME", "")
+        if real_home_env:
+            real_root = Path(real_home_env) / ".hermes" / "auth.json"
+            try:
+                if global_path.resolve(strict=False) == real_root.resolve(strict=False):
+                    return
+            except Exception:
+                return
+    try:
+        with auth_mod._auth_store_lock(target_path=global_path):
+            store = auth_mod._load_auth_store(global_path)
+            pool_dict = store.setdefault("credential_pool", {})
+            entries = pool_dict.setdefault(provider_id, [])
+            updated = False
+            for i, p in enumerate(entries):
+                if isinstance(p, dict) and p.get("id") == entry.id:
+                    entries[i] = entry.to_dict()
+                    updated = True
+                    break
+            if not updated:
+                entries.append(entry.to_dict())
+            auth_mod._save_auth_store(store, target_path=global_path)
+    except Exception as exc:
+        logger.debug("%s pool entry write-through to global root failed: %s", provider_id, exc)
+
+
 class CredentialPool:
     def __init__(self, provider: str, entries: List[PooledCredential]):
         self.provider = provider
@@ -1108,6 +1152,30 @@ class CredentialPool:
                 ),
                 None,
             )
+            # When running inside a profile, also check the global root store
+            # so rotated tokens written through by a sibling profile are adopted (#100339).
+            if not persisted or not (
+                (persisted.get("access_token") or "").strip()
+                or (persisted.get("refresh_token") or "").strip()
+            ):
+                try:
+                    global_path = auth_mod._global_auth_file_path()
+                    if global_path and global_path.exists():
+                        root_store = auth_mod._load_auth_store(global_path)
+                        root_entries = root_store.get("credential_pool", {}).get(self.provider, [])
+                        root_persisted = next(
+                            (
+                                p
+                                for p in root_entries
+                                if isinstance(p, dict) and p.get("id") == entry.id
+                            ),
+                            None,
+                        )
+                        if root_persisted:
+                            persisted = root_persisted
+                except Exception:
+                    pass
+
             if not isinstance(persisted, dict):
                 return entry
             stored = PooledCredential.from_dict(self.provider, persisted)
@@ -2152,6 +2220,8 @@ class CredentialPool:
         )
         self._replace_entry(entry, updated)
         self._persist()
+        if self.provider == "anthropic":
+            _write_through_pool_entry_to_global_root(self.provider, updated)
         # Sync refreshed tokens back to auth.json providers so that
         # _seed_from_singletons() on the next load_pool() sees fresh state
         # instead of re-seeding stale/consumed tokens.
