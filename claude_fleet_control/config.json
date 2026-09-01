@@ -1,6 +1,6 @@
 {
-  "_comment": "P6 Claude fleet controller policy. SHADOW BY DESIGN: enforcement additionally requires approved_enforce_digest to equal FleetPolicy.digest() AND an --allow-enforce invocation flag. Changing mode to enforce without fresh explicit Diego approval is prohibited (storm-recovery board row 41).",
-  "mode": "shadow",
+  "_comment": "P6 Claude fleet controller policy. ENFORCE requires approved_enforce_digest to equal FleetPolicy.digest() AND an --allow-enforce invocation flag. This file was flipped to enforce under Diego's explicit cutover approval on 2026-09-01 (Diego approved in chat); the reaper was retired in the same change. To roll back: set mode to shadow OR null approved_enforce_digest (either disarms enforcement on the next pass).",
+  "mode": "enforce",
   "policy_version": "p6-2026-08-31-1",
   "fleet_min_roots": 30,
   "d7_max_age_seconds": 360,
@@ -11,5 +11,5 @@
   "max_tree_processes": 24,
   "max_tree_rss_bytes": 2147483648,
   "cooldown_seconds": 1800,
-  "approved_enforce_digest": null
+  "approved_enforce_digest": "5014226198956ff3cc0bd393b77f063fd33454bc46c32faf2d4de5918a67b36c"
 }
