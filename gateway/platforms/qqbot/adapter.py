@@ -1240,11 +1240,12 @@ class QQAdapter(BasePlatformAdapter):
                 )
                 return
 
-            # The user picked choice idx+1 (1-based, as exposed to the user
-            # in the button label "1. xxx"). We resolve with the numeric
-            # answer — the gateway's text-intercept logic understands
-            # numeric replies, and the same fallback path also handles
-            # the case where the user later types free text.
+            # The user picked choice idx+1 (letters are 0-based in the
+            # payload; the user-facing label is "B. xxx" at index 1). We
+            # resolve with the numeric answer — the gateway's text-intercept
+            # logic understands numeric replies AND letter replies ("B" →
+            # same choice), so the fallback path also handles the case where
+            # the user later types free text.
             response = str(idx + 1)
             ok = resolve_gateway_clarify(clarify_id, response)
             logger.info(
@@ -2816,7 +2817,11 @@ class QQAdapter(BasePlatformAdapter):
             return SendResult(success=False, error="question is empty")
 
         # Open-ended: just send the question, gateway captures next msg.
+        # register() already arms text-capture for empty choices, but call
+        # mark_awaiting_text explicitly so the intent survives if the
+        # register default ever changes.
         if not choices:
+            mark_awaiting_text(clarify_id)
             return await self.send_with_keyboard(
                 chat_id=chat_id,
                 content=f"❓ {question}",
