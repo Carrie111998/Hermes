@@ -20,7 +20,6 @@ import {
 import { resetBackgroundPollingGuard } from '@/store/composer-status'
 import {
   $gateway,
-  activeGatewayConnectionId,
   closeLegacySecondaryGateways,
   closeSecondaryGateways,
   configureGatewayRegistry,
@@ -29,6 +28,7 @@ import {
   gatewayActivationEpoch,
   isActivePrimary,
   liveSecondaryConnectionIds,
+  primaryGatewaySource,
   pruneSecondaryGateways,
   reconnectSecondaryGateways,
   type ReplayGapSource,
@@ -833,15 +833,13 @@ export function useGatewayBoot({
       }
     })
 
-    const sourceProfile = normalizeProfileKey($activeGatewayProfile.get())
-
     const offEvent = gateway.onEvent(event => {
-      const connectionId = activeGatewayConnectionId()
+      const source = primaryGatewaySource()
 
       const scopedEvent = {
         ...event,
-        profile: sourceProfile,
-        ...(connectionId ? { connectionId } : {})
+        profile: source.profile,
+        ...(source.connectionId ? { connectionId: source.connectionId } : {})
       }
 
       recordSessionEventScope(scopedEvent)
@@ -850,10 +848,7 @@ export function useGatewayBoot({
 
     const offReplayGap =
       gateway.onReplayGap?.(sessionId =>
-        callbacksRef.current.resyncReplaySession(sessionId, {
-          connectionId: activeGatewayConnectionId(),
-          profile: sourceProfile
-        })
+        callbacksRef.current.resyncReplaySession(sessionId, primaryGatewaySource())
       ) ?? (() => {})
 
     // Wake signals: power resume (macOS/Windows), network coming back, and the

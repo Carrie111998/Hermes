@@ -400,6 +400,14 @@ export function activeGatewayConnectionId(): null | string {
   return g.secondaries.get(g.activeKey)?.connectionId ?? null
 }
 
+/** Exact registry source served by the window-owned primary socket. */
+export function primaryGatewaySource(): ReplayGapSource {
+  return {
+    connectionId: g.primaryConnectionId,
+    profile: g.primaryProfile
+  }
+}
+
 /**
  * Registry connections currently served by a live (open-socket) secondary.
  * Used by the reconnect path when the restarted primary's own registry
