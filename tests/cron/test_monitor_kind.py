@@ -336,6 +336,137 @@ def test_changed_output_injects_diff(hermes_env, monkeypatch):
     assert "state B" in prompt  # new output included verbatim
 
 
+# ---------------------------------------------------------------------------
+# Manual force-run vs monitor suppression (#100282)
+#
+# An explicit `hermes cron run <id>` was still suppressed by unchanged
+# monitor output: it returned [SILENT] without invoking the agent, and with
+# cron.silent_fallback configured it delivered the fallback instead — which
+# reads as "the research found nothing" rather than "the run never happened".
+#
+# These stub check_monitor() rather than running a real monitor script, so
+# they exercise the gate itself and stay platform-independent (the
+# script-driven tests above need a POSIX shell).
+# ---------------------------------------------------------------------------
+
+
+def _stub_unchanged_monitor(monkeypatch):
+    """Force check_monitor() to report a healthy, UNCHANGED source.
+
+    run_job imports check_monitor from cron.monitor at call time, so the
+    patch has to land on the source module.
+    """
+    import cron.monitor as monitor_mod
+    from cron.monitor import MonitorOutcome
+
+    monkeypatch.setattr(
+        monitor_mod,
+        "check_monitor",
+        lambda _job: MonitorOutcome(
+            ok=True, changed=False, context_block="MONITOR OUTPUT\nstate A"
+        ),
+    )
+
+
+def _plain_monitor_job(hermes_env):
+    """A monitor job record — the monitor source itself is stubbed out."""
+    from cron.jobs import create_job
+
+    _write_script(hermes_env, "mon.sh", "echo 'state A'\n")
+    return create_job(
+        prompt="Summarize what changed",
+        schedule="every 5m",
+        monitor_script="mon.sh",
+        deliver="local",
+    )
+
+
+def test_scheduled_tick_still_suppressed_when_unchanged(hermes_env, monkeypatch):
+    """Control: without a manual marker, unchanged output still suppresses."""
+    from cron.scheduler import SILENT_MARKER, run_job
+
+    job = _plain_monitor_job(hermes_env)
+    observed: dict = {}
+    _install_agent_stubs(monkeypatch, observed)
+    _stub_unchanged_monitor(monkeypatch)
+
+    success, doc, final, error = run_job(job)
+
+    assert success is True
+    assert error is None
+    assert final == SILENT_MARKER
+    assert "no_change" in doc
+    assert observed["agent_runs"] == 0
+
+
+def test_manual_run_at_bypasses_unchanged_suppression(hermes_env, monkeypatch):
+    """trigger_job() stamps manual_run_at; run_job must honor it (#100282)."""
+    from cron.scheduler import SILENT_MARKER, run_job
+
+    job = dict(_plain_monitor_job(hermes_env))
+    job["manual_run_at"] = "2026-09-01T12:00:00"
+    observed: dict = {}
+    _install_agent_stubs(monkeypatch, observed)
+    _stub_unchanged_monitor(monkeypatch)
+
+    success, doc, final, error = run_job(job)
+
+    assert success is True
+    assert error is None
+    assert final != SILENT_MARKER
+    assert "no_change" not in doc
+    assert observed["agent_runs"] == 1, (
+        "an explicit manual run must invoke the agent despite unchanged output"
+    )
+
+
+def test_manual_run_still_injects_monitor_context(hermes_env, monkeypatch):
+    """A forced run should still see the monitor output in its prompt."""
+    from cron.scheduler import run_job
+
+    job = dict(_plain_monitor_job(hermes_env))
+    job["manual_run_at"] = "2026-09-01T12:00:00"
+    observed: dict = {}
+    _install_agent_stubs(monkeypatch, observed)
+    _stub_unchanged_monitor(monkeypatch)
+
+    run_job(job)
+
+    assert observed["agent_runs"] == 1
+    assert "state A" in observed["prompts"][0]
+
+
+def test_trigger_job_stamps_the_marker_run_job_reads(hermes_env):
+    """Wiring: the field trigger_job() writes is the one the gate checks."""
+    from cron.jobs import get_job, trigger_job
+
+    job = _plain_monitor_job(hermes_env)
+    trigger_job(job["id"])
+
+    assert get_job(job["id"]).get("manual_run_at"), (
+        "trigger_job must stamp manual_run_at for the monitor gate to honor"
+    )
+
+
+def test_direct_run_path_passes_an_ephemeral_manual_marker():
+    """The cronjob(action='run') path must mark the fire WITHOUT persisting.
+
+    Persisting it would make every later scheduled tick bypass suppression
+    too, so the marker is applied to a shallow copy only.
+    """
+    import inspect
+
+    from tools import cronjob_tools
+
+    source = inspect.getsource(cronjob_tools._run_claimed_job)
+    assert "_manual_job = dict(job)" in source, "must copy, not mutate the claim"
+    assert '"manual_run_at"' in source
+    # The copy — not the original claim — is what gets executed.
+    assert "run_one_job(\n                    _manual_job" in source or (
+        "run_one_job(" in source and "_manual_job," in source
+    )
+
+
 def test_hash_persists_across_scheduler_restart(hermes_env, monkeypatch):
     """Suppression state must survive a scheduler restart (module reload)."""
     import importlib
