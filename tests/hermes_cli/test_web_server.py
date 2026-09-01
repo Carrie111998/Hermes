@@ -864,7 +864,7 @@ class TestWebServerEndpoints:
         import hermes_cli.web_server as web_server
         from tools import lazy_deps as ld
 
-        # honcho declares pip_dependencies: [honcho-ai]; force it missing.
+        # mem0 declares pip_dependencies: [mem0ai>=2.0.10,<3]; force it missing.
         monkeypatch.setattr(web_server, "_dependency_importable", lambda dep: False)
 
         installed = []
@@ -872,7 +872,7 @@ class TestWebServerEndpoints:
         def fake_install_specs(specs, *, timeout=300):
             installed.append(tuple(specs))
             return ld.InstallSpecsResult(
-                ok=True, command="uv pip install --target /opt/data/lazy-packages honcho-ai",
+                ok=True, command="uv pip install --target /opt/data/lazy-packages mem0ai",
                 stdout="ok", stderr="",
             )
 
@@ -890,14 +890,14 @@ class TestWebServerEndpoints:
 
         monkeypatch.setattr(web_server.subprocess, "run", guarded_run)
 
-        resp = self.client.post("/api/memory/providers/honcho/setup", json={"values": {}})
+        resp = self.client.post("/api/memory/providers/mem0/setup", json={"values": {}})
 
         assert resp.status_code == 200
         data = resp.json()
         pip_rows = [row for row in data["results"] if row["kind"] == "pip"]
         assert pip_rows and pip_rows[0]["status"] == "installed"
         assert "--target /opt/data/lazy-packages" in pip_rows[0]["command"]
-        assert installed == [("honcho-ai",)]
+        assert installed and installed[0][0].startswith("mem0ai")
 
 
 
@@ -956,95 +956,6 @@ class TestWebServerEndpoints:
         assert fields["api_key"]["is_set"] is True
         assert fields["api_key"]["value"] == ""
         assert "secret-value" not in json.dumps(data)
-
-
-
-
-    # ── Memory provider config (Honcho host-block backend) ──────────────
-
-    @pytest.fixture(autouse=True)
-    def _isolate_honcho_config(self):
-        # Honcho tests write the suite-wide HERMES_HOME honcho.json; snapshot and
-        # restore it so provider status/config state never leaks across tests.
-        from hermes_constants import get_hermes_home
-
-        path = get_hermes_home() / "honcho.json"
-        before = path.read_bytes() if path.exists() else None
-        yield
-        if before is None:
-            path.unlink(missing_ok=True)
-        else:
-            path.write_bytes(before)
-
-    @staticmethod
-    def _seed_local_honcho(cfg=None):
-        from hermes_constants import get_hermes_home
-
-        path = get_hermes_home() / "honcho.json"
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(cfg if cfg is not None else {}), encoding="utf-8")
-        return path
-
-
-    def test_put_honcho_writes_host_block_root_and_secret(self, monkeypatch, tmp_path):
-        monkeypatch.setenv("HOME", str(tmp_path))
-        monkeypatch.setenv("HONCHO_API_KEY", "guard")
-        monkeypatch.delenv("HONCHO_API_KEY")
-        self._seed_local_honcho()
-        from hermes_constants import get_hermes_home
-        from hermes_cli.config import load_config, load_env
-
-        resp = self.client.put(
-            "/api/memory/providers/honcho/config?surface=declared",
-            json={
-                "values": {
-                    "apiKey": "hch-test-key",
-                    "baseUrl": "https://honcho.example.dev",
-                    "environment": "local",
-                    "workspace": "myws",
-                    "peerName": "eri",
-                    "aiPeer": "hermes",
-                    "sessionStrategy": "per-repo",
-                }
-            },
-        )
-
-        assert resp.status_code == 200
-        assert resp.json() == {"ok": True}
-        assert load_config()["memory"]["provider"] == "honcho"
-        assert load_env()["HONCHO_API_KEY"] == "hch-test-key"
-
-        cfg = json.loads((get_hermes_home() / "honcho.json").read_text(encoding="utf-8"))
-        # baseUrl is root-scoped; the rest live in the active host block.
-        assert cfg["baseUrl"] == "https://honcho.example.dev"
-        assert cfg["hosts"]["hermes"]["workspace"] == "myws"
-        assert cfg["hosts"]["hermes"]["peerName"] == "eri"
-        assert cfg["hosts"]["hermes"]["environment"] == "local"
-        assert cfg["hosts"]["hermes"]["sessionStrategy"] == "per-repo"
-        # The key lands where the client reads first; GET keeps it write-only.
-        assert cfg["hosts"]["hermes"]["apiKey"] == "hch-test-key"
-
-
-    def test_get_honcho_config_does_not_return_secret(self, monkeypatch, tmp_path):
-        monkeypatch.setenv("HOME", str(tmp_path))
-        monkeypatch.setenv("HONCHO_API_KEY", "guard")
-        monkeypatch.delenv("HONCHO_API_KEY")
-        self._seed_local_honcho()
-
-        self.client.put(
-            "/api/memory/providers/honcho/config?surface=declared",
-            json={"values": {"apiKey": "secret-value"}},
-        )
-
-        resp = self.client.get("/api/memory/providers/honcho/config?surface=declared")
-
-        assert resp.status_code == 200
-        data = resp.json()
-        fields = self._provider_field_map(data)
-        assert fields["apiKey"]["is_set"] is True
-        assert fields["apiKey"]["value"] == ""
-        assert "secret-value" not in json.dumps(data)
-
 
 
 

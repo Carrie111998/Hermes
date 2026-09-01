@@ -646,7 +646,7 @@ class _ProviderCollector:
 def _get_active_memory_provider() -> Optional[str]:
     """Read the active memory provider name from config.yaml.
 
-    Returns the provider name (e.g. ``"honcho"``) or None if no
+    Returns the provider name (e.g. ``"hindsight"``) or None if no
     external provider is configured.  Lightweight — only reads config,
     no plugin loading.
     """
@@ -761,8 +761,7 @@ def discover_plugin_cli_commands() -> List[dict]:
             except Exception:
                 pass
 
-        handler_fn = getattr(cli_mod, f"{active_provider}_command", None) or \
-                     getattr(cli_mod, "honcho_command", None)
+        handler_fn = getattr(cli_mod, f"{active_provider}_command", None)
 
         results.append({
             "name": active_provider,
