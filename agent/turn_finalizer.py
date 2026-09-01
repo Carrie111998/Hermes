@@ -143,6 +143,7 @@ def finalize_turn(
     _turn_exit_reason,
     _pending_verification_response=None,
     _pending_verification_response_previewed=False,
+    system_message=None,
 ):
     """Run the post-loop finalization and return the turn ``result`` dict.
 
@@ -462,6 +463,25 @@ def finalize_turn(
                 logger.info("Micro-compaction failed: %s", _mc_err)
 
         agent._persist_session(messages, conversation_history)
+
+        # Schedule after the finalized assistant row is durable. The worker
+        # receives a private snapshot and returns immediately; SessionDB's
+        # compression watermark preserves later turns for splice adoption.
+        if not interrupted and not failed and final_response:
+            try:
+                from agent.background_compression import (
+                    maybe_start_background_compression,
+                )
+
+                maybe_start_background_compression(
+                    agent,
+                    messages,
+                    system_message,
+                )
+            except Exception:
+                logger.warning(
+                    "Background compression scheduling failed", exc_info=True
+                )
     except Exception as _persist_err:
         _cleanup_errors.append(f"persist_session: {_persist_err}")
         logger.error("finalize_turn: _persist_session failed: %s", _persist_err, exc_info=True)

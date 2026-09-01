@@ -89,6 +89,8 @@ compression:
   tail_mode: lean            # Tail retention policy: lean | legacy (default: lean)
   protect_last_n: 20         # Minimum protected tail messages (default: 20)
   min_tail_user_messages: 1  # Real user messages guaranteed in the tail (default: 1)
+  background_compact: false  # Summarize a stable snapshot before the foreground threshold
+  background_compact_start_ratio: 0.80  # Start at 80% of the normal trigger
   codex_gpt55_autoraise: true  # gpt-5.5 on Codex OAuth: raise trigger to 85% (default: true)
   codex_gpt55_autoraise_notice: true  # Show the one-time autoraise notice (default: true)
   codex_app_server_auto: native  # native|hermes|off for Codex app-server thread compaction
@@ -116,6 +118,8 @@ auxiliary:
 | `min_tail_user_messages` | `1` | ≥1 | Minimum number of REAL (actionable) user messages guaranteed to survive in the uncompressed tail. `1` = the existing single last-user anchor (behavior-preserving default). Raise to e.g. `3` to keep the last 3 real user turns verbatim even when bulky tool outputs fill the tail token budget. Blank platform echoes, compaction handoffs, and synthetic continuation rows never count toward N. The guarantee wins over the tail token budget — the tail may exceed the budget when the anchor pulls the cut back |
 | `protect_first_n` | `3` | (hardcoded) | System prompt + first exchange always preserved |
 | `idle_compact_after_seconds` | `0` | ≥0 seconds | Opt-in: compact up front when a session resumes after this many seconds idle (0 = disabled). Skips when context ≤ threshold × target_ratio; honors cooldown/anti-thrash/lock guards |
+| `background_compact` | `false` | bool | Opt in to full compaction on a daemon worker while foreground turns continue. Available for the built-in in-place compressor; disabled for legacy rotation, checkpoint-required, persistence-isolated, and external-engine paths |
+| `background_compact_start_ratio` | `0.80` | 0.10-0.99 | Start background work when prompt usage reaches this fraction of the resolved foreground compression threshold |
 | `codex_gpt55_autoraise` | `true` | bool | Raise the trigger to 85% for gpt-5.5 on the ChatGPT Codex OAuth route (see below). Set `false` to keep the global `threshold` |
 | `codex_gpt55_autoraise_notice` | `true` | bool | Show the one-time Codex gpt-5.5 autoraise notice. Set `false` to keep the 85% autoraise but suppress the banner |
 | `codex_app_server_auto` | `native` | `native`, `hermes`, `off` | Thread-compaction mode for Codex app-server sessions (see below) |
@@ -133,6 +137,27 @@ Consumers observe the mode rather than diffing session ids:
 - The gateway re-baselines transcript handling from the agent's rotation-independent `_last_compaction_in_place` flag, not from an id-change diff.
 
 Set `in_place: false` to restore the legacy rotating path, where each compaction commits a new session id linked to the previous one via `parent_session_id`.
+
+### Background splice-merge compaction
+
+With `compression.background_compact: true`, Hermes starts a full compaction
+after a successful turn once prompt usage reaches
+`background_compact_start_ratio × threshold_tokens`. The worker owns a deep
+snapshot of the finalized transcript, so the next user turn can continue on the
+existing context without waiting for the summary request.
+
+Publication reuses the in-place compressor's SessionDB watermark transaction.
+Rows appended after the snapshot watermark are cloned byte-for-byte after the
+compacted handoff in the same transaction; failure or lost lock ownership leaves
+the old active transcript untouched. A live agent adopts the committed active
+rows only at the next turn boundary, then raises the normal in-place compaction
+signal so gateway transcript caches re-baseline instead of concatenating stale
+history. An unfinished job is never awaited by a user turn, and a completed job
+for a session that was reset or switched is not adopted into the new session.
+
+The feature is opt-in because it may spend an auxiliary-model request on a
+conversation that does not continue. It requires `compression.in_place: true`
+and is suppressed when `compression.checkpoint_required` is enabled.
 
 ### Per-model threshold overrides
 
