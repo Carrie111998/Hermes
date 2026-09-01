@@ -12454,37 +12454,47 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             print("  Messaging Platform Configuration:")
             print("  " + "-" * 55)
             
-            platform_status = {
-                Platform.TELEGRAM: ("Telegram", "TELEGRAM_BOT_TOKEN"),
-                Platform.DISCORD: ("Discord", "DISCORD_BOT_TOKEN"),
-                Platform.SLACK: ("Slack", "SLACK_BOT_TOKEN"),
-                Platform.WHATSAPP: ("WhatsApp", "WHATSAPP_ENABLED"),
-                Platform.SIGNAL: ("Signal", "SIGNAL_SIGNALING_KEY"),
+            from gateway.config import PLATFORM_TOKEN_ENV_NAMES
+
+            _DISPLAY_OVERRIDES = {
+                Platform.WHATSAPP: "WhatsApp",
+                Platform.WHATSAPP_CLOUD: "WhatsApp Cloud",
+                Platform.SIGNAL: "Signal",
+                Platform.HOMEASSISTANT: "Home Assistant",
+                Platform.API_SERVER: "API Server",
+                Platform.MSGRAPH_WEBHOOK: "MSGraph Webhook",
+                Platform.WECOM_CALLBACK: "WeCom Callback",
             }
 
-            # Show all configured platforms first (including Signal, A2A, and
-            # any plugin adapter), then fall back to listing the well-known
-            # four for users who have nothing configured yet.
-            seen = set()
-            for platform, pconfig in config.platforms.items():
-                entry = platform_status.get(platform)
-                if entry:
-                    pname = entry[0]
-                else:
-                    pname = platform.value.upper() if len(platform.value) <= 6 else platform.value.title()
+            def _platform_display_name(platform: Platform) -> str:
+                if platform in _DISPLAY_OVERRIDES:
+                    return _DISPLAY_OVERRIDES[platform]
+                return platform.value.replace("_", " ").title()
+
+            def _platform_env_var(platform: Platform) -> str:
+                return PLATFORM_TOKEN_ENV_NAMES.get(platform, "")
+
+            # All platforms the gateway knows about: static members plus any
+            # plugin platforms actually configured (dynamic members via
+            # Platform._missing_).  Signal/A2A appear here; the panel is
+            # driven from the platform registry, not a hardcoded subset.
+            known_platforms = list(config.platforms.keys())
+            for p in Platform:
+                if p.value != "local" and p not in known_platforms:
+                    known_platforms.append(p)
+            known_platforms.sort(key=lambda p: p.value)
+
+            for platform in known_platforms:
+                pconfig = config.platforms.get(platform)
+                pname = _platform_display_name(platform)
+                env_var = _platform_env_var(platform)
                 if pconfig and pconfig.enabled:
                     home = config.get_home_channel(platform)
                     home_str = f" → {home.name}" if home else ""
                     print(f"    ✓ {pname:<12} Enabled{home_str}")
                 else:
-                    label = f" ({entry[1]})" if entry else ""
+                    label = f" ({env_var})" if env_var else ""
                     print(f"    ○ {pname:<12} Not configured{label}")
-                seen.add(platform)
-
-            # Show well-known platforms not in config.platforms
-            for platform, (pname, env_var) in platform_status.items():
-                if platform not in seen:
-                    print(f"    ○ {pname:<12} Not configured ({env_var})")
             
             print()
             print("  Session Reset Policy:")
