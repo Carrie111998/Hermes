@@ -8,8 +8,10 @@ import hashlib
 from itertools import islice
 import json
 import math
+import os
 from pathlib import Path
 import re
+import shutil
 import time
 from typing import Any, Protocol
 
@@ -32,6 +34,7 @@ from .claude_adapter import (
     PlaceholderCreationError,
     PlaceholderResult,
     _same_filesystem_location,
+    _single_line_required_text,
 )
 from .sidebar import VerifiedSidebarThread
 from .sidebar_placement import (
@@ -63,6 +66,90 @@ _MARKER_CANDIDATE_RE = re.compile(
     r"HERMES_SESSION_BRIDGE_V1:[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+"
     r"(?![A-Za-z0-9_-])"
 )
+
+
+_SHELL_SHIM_SUFFIXES = frozenset({".cmd", ".ps1", ".bat"})
+
+
+def _desktop_shipped_codex() -> Path | None:
+    """Locate the Desktop-app-shipped native ``codex.exe``.
+
+    The Desktop install keeps per-component hash directories under
+    ``%LOCALAPPDATA%/OpenAI/Codex/bin/<hash>/`` and only the current codex
+    build carries a ``codex.exe``. The hash names carry no version, so when
+    more than one candidate exists they rank by the executable's mtime (the
+    updater's install stamp) -- never lexically. ``HERMES_CODEX_DESKTOP_ROOT``
+    overrides the root for tests.
+    """
+
+    root_override = os.environ.get("HERMES_CODEX_DESKTOP_ROOT")
+    if root_override:
+        root = Path(root_override)
+    else:
+        local_appdata = os.environ.get("LOCALAPPDATA")
+        if not local_appdata:
+            return None
+        root = Path(local_appdata) / "OpenAI" / "Codex" / "bin"
+    best: tuple[float, Path] | None = None
+    try:
+        entries = list(root.iterdir())
+    except OSError:
+        return None
+    for entry in entries:
+        exe = entry / "codex.exe"
+        try:
+            if not exe.is_file():
+                continue
+            modified = exe.stat().st_mtime
+        except OSError:
+            continue
+        if best is None or modified > best[0]:
+            best = (modified, exe)
+    return best[1] if best is not None else None
+
+
+def resolve_codex_command(
+    value: str,
+    *,
+    which: Callable[[str], str | None] | None = None,
+) -> tuple[str, ...]:
+    """Return a shell-free Codex argv prefix safe for direct subprocess use.
+
+    A path (any directory separator) is EXPLICIT operator configuration and is
+    never substituted. A bare ``codex`` name is a PATH lookup, and the PATH
+    copy (the npm global) is NOT authoritative for this bridge: the Desktop
+    app writes thread items an older npm CLI cannot deserialize (2026-09-01:
+    npm codex-cli 0.147.0 failed ``thread/read`` with -32603 ``unknown
+    variant `functionCallOutput``` on threads written by Desktop
+    0.151.0-alpha, so search returned empty inventories and bound sidebar
+    jobs proved absent against readable threads). The bridge reads what the
+    Desktop writes, so the Desktop-shipped binary wins whenever it exists;
+    the PATH resolution is the fallback.
+    """
+
+    normalized = _single_line_required_text(value, label="Codex executable")
+    bare_name = "/" not in normalized and "\\" not in normalized
+    if not bare_name:
+        candidate = Path(normalized).expanduser()
+        suffix = candidate.suffix.casefold()
+        if suffix in _SHELL_SHIM_SUFFIXES:
+            if suffix == ".cmd" and candidate.is_file():
+                return (str(candidate.resolve()),)
+            raise RuntimeError("unsupported_shell_shim")
+        return (str(candidate.resolve()) if candidate.exists() else normalized,)
+    desktop = _desktop_shipped_codex()
+    if desktop is not None:
+        return (str(desktop.resolve()),)
+    find = which or shutil.which
+    found = find(normalized)
+    resolved = str(found or normalized)
+    candidate = Path(resolved).expanduser()
+    suffix = candidate.suffix.casefold()
+    if suffix in _SHELL_SHIM_SUFFIXES:
+        if suffix == ".cmd" and candidate.is_file():
+            return (str(candidate.resolve()),)
+        raise RuntimeError("unsupported_shell_shim")
+    return (str(candidate.resolve()) if candidate.exists() else resolved,)
 
 
 class _RequestClient(Protocol):

@@ -5938,7 +5938,7 @@ def test_live_characterization_keeps_native_executable_as_single_argv_prefix() -
 
 
 def test_codex_resolver_preserves_launchable_absolute_npm_cmd_over_windowsapps_exe(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     npm_root = tmp_path / "npm & literal"
     npm_root.mkdir()
@@ -5947,6 +5947,8 @@ def test_codex_resolver_preserves_launchable_absolute_npm_cmd_over_windowsapps_e
     inaccessible_native = tmp_path / "WindowsApps" / "codex.exe"
     inaccessible_native.parent.mkdir()
     inaccessible_native.write_bytes(b"")
+    # Without a Desktop-shipped codex to prefer, PATH resolution stands.
+    monkeypatch.setenv("HERMES_CODEX_DESKTOP_ROOT", str(tmp_path / "no-desktop"))
 
     resolved = resolve_cli_executable(
         "codex",
@@ -5954,6 +5956,65 @@ def test_codex_resolver_preserves_launchable_absolute_npm_cmd_over_windowsapps_e
     )
 
     assert resolved == (str(shim.resolve()),)
+
+
+def test_codex_resolver_prefers_desktop_shipped_binary_for_bare_name(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    npm_root = tmp_path / "npm"
+    npm_root.mkdir()
+    shim = npm_root / "codex.CMD"
+    shim.write_text("@echo off\r\necho codex-cli 0.147.0\r\n", encoding="utf-8")
+    desktop_root = tmp_path / "OpenAI" / "Codex" / "bin"
+    older = desktop_root / "34ab3e1324cc55b5" / "codex.exe"
+    newer = desktop_root / "b99306303521e97e" / "codex.exe"
+    older.parent.mkdir(parents=True)
+    newer.parent.mkdir(parents=True)
+    older.write_bytes(b"")
+    newer.write_bytes(b"")
+    os.utime(older, (1_000_000_000, 1_000_000_000))
+    os.utime(newer, (2_000_000_000, 2_000_000_000))
+    # A non-codex component dir must never be selected.
+    other = desktop_root / "82e11f77bc7dfcc8" / "rg.exe"
+    other.parent.mkdir(parents=True)
+    other.write_bytes(b"")
+    monkeypatch.setenv("HERMES_CODEX_DESKTOP_ROOT", str(desktop_root))
+
+    resolved = resolve_cli_executable("codex", which=lambda _name: str(shim))
+
+    assert resolved == (str(newer.resolve()),)
+
+
+def test_codex_resolver_never_substitutes_explicit_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    desktop_root = tmp_path / "OpenAI" / "Codex" / "bin"
+    desktop = desktop_root / "b99306303521e97e" / "codex.exe"
+    desktop.parent.mkdir(parents=True)
+    desktop.write_bytes(b"")
+    monkeypatch.setenv("HERMES_CODEX_DESKTOP_ROOT", str(desktop_root))
+    explicit = tmp_path / "pinned" / "codex.exe"
+    explicit.parent.mkdir()
+    explicit.write_bytes(b"")
+
+    resolved = resolve_cli_executable(str(explicit), which=lambda _name: None)
+
+    assert resolved == (str(explicit.resolve()),)
+
+
+@pytest.mark.parametrize("suffix", [".ps1", ".bat"])
+def test_codex_resolver_rejects_non_cmd_shell_shims(
+    tmp_path: Path, suffix: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    shim = tmp_path / f"codex{suffix}"
+    shim.write_text("invoke arbitrary shell content", encoding="utf-8")
+    monkeypatch.setenv("HERMES_CODEX_DESKTOP_ROOT", str(tmp_path / "no-desktop"))
+
+    with pytest.raises(RuntimeError, match="unsupported_shell_shim"):
+        resolve_cli_executable(
+            "codex",
+            which=lambda name: str(shim) if name == "codex" else None,
+        )
 
 
 def test_live_characterization_aborts_before_sessions_when_cli_preflight_fails(
