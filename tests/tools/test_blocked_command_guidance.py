@@ -20,7 +20,7 @@ class TestParserLimitRecovery:
         from pathlib import Path
         saved = Path(m.group(1))
         assert saved.exists()
-        body = saved.read_text()
+        body = saved.read_text(encoding="utf-8")
         assert cmd in body
         assert body.startswith("#!/bin/bash")
         assert f"bash {saved}" in r["message"]
@@ -55,7 +55,7 @@ class TestParserLimitRecovery:
         d = tmp_path / ".hermes" / "cache" / "blocked-scripts"
         d.mkdir(parents=True)
         stale = d / "blocked-1-dead.sh"
-        stale.write_text("old")
+        stale.write_text("old", encoding="utf-8")
         os.utime(stale, (1, 1))
         _hardline_block_result(_PARSER_LIMIT_DESCRIPTION, "python3 -c 'y'")
         assert not stale.exists()
