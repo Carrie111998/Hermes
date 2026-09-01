@@ -8444,6 +8444,26 @@ def _block_until_terminated() -> None:
         threading.Event().wait()
 
 
+def _clear_stale_drain_request_before_start(*, all_profiles: bool) -> None:
+    """Resume gateways after a desktop drain marker survived shutdown.
+
+    Desktop shutdown requests a drain before stopping supervised gateways. If
+    the stop helper is interrupted after writing its marker, the next launch
+    must treat ``gateway start`` as the explicit resume operation; otherwise a
+    healthy supervisor starts in ``draining`` forever and desktop readiness
+    falsely reports Kanban offline.
+    """
+    from gateway.drain_control import clear_drain_request
+
+    homes = (get_hermes_home(),)
+    if all_profiles:
+        from hermes_cli.gateway_desktop_drain import desktop_profile_homes
+
+        homes = tuple(dict.fromkeys((*desktop_profile_homes(), *homes)))
+    for home in homes:
+        clear_drain_request(home=home)
+
+
 def _gateway_command_inner(args):
     subcmd = getattr(args, "gateway_command", None)
 
@@ -8631,6 +8651,8 @@ def _gateway_command_inner(args):
     elif subcmd == "start":
         system = getattr(args, "system", False)
         start_all = getattr(args, "all", False)
+
+        _clear_stale_drain_request_before_start(all_profiles=start_all)
 
         # Phase 4: inside a container with s6, dispatch via the service
         # manager instead of falling through to systemd/launchd/windows.
