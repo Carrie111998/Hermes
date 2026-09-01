@@ -2419,7 +2419,10 @@ def _current_max_iterations() -> int:
     return _resolve_turn_limit(os.getenv("HERMES_MAX_ITERATIONS"))
 
 
-from contextlib import contextmanager as _contextmanager
+from contextlib import (
+    asynccontextmanager as _asynccontextmanager,
+    contextmanager as _contextmanager,
+)
 
 
 # Platforms that bind a host TCP port (HTTP/webhook listeners). In a profile
@@ -2542,8 +2545,24 @@ async def _reclaim_stale(runner: object) -> None:
         )
 
 
+def _load_profile_secret_scope(profile_home: "Path") -> dict:
+    """Hydrate and load one profile's secrets under its home override."""
+    from hermes_constants import set_hermes_home_override, reset_hermes_home_override
+    from agent.secret_scope import build_profile_secret_scope
+    from hermes_cli.env_loader import hydrate_profile_secret_sources
+
+    home_token = set_hermes_home_override(str(profile_home))
+    try:
+        hydrate_profile_secret_sources(Path(profile_home))
+        return build_profile_secret_scope(Path(profile_home))
+    finally:
+        reset_hermes_home_override(home_token)
+
+
 @_contextmanager
-def _profile_runtime_scope(profile_home: "Path"):
+def _profile_runtime_scope(
+    profile_home: "Path", prepared_secret_scope: Optional[dict] = None,
+):
     """Scope config/skills/memory AND credentials to a profile for one turn.
 
     Combines the two seams the multiplexer needs:
@@ -2563,20 +2582,30 @@ def _profile_runtime_scope(profile_home: "Path"):
     """
     from hermes_constants import set_hermes_home_override, reset_hermes_home_override
     from agent.secret_scope import (
-        build_profile_secret_scope,
         set_secret_scope,
         reset_secret_scope,
     )
-    from hermes_cli.env_loader import hydrate_profile_secret_sources
 
     home_token = set_hermes_home_override(str(profile_home))
-    hydrate_profile_secret_sources(Path(profile_home))
-    secret_token = set_secret_scope(build_profile_secret_scope(Path(profile_home)))
+    secrets = (
+        prepared_secret_scope
+        if prepared_secret_scope is not None
+        else _load_profile_secret_scope(Path(profile_home))
+    )
+    secret_token = set_secret_scope(secrets)
     try:
         yield
     finally:
         reset_secret_scope(secret_token)
         reset_hermes_home_override(home_token)
+
+
+@_asynccontextmanager
+async def _async_profile_runtime_scope(profile_home: "Path"):
+    """Enter a profile scope without loading secret files on the event loop."""
+    secrets = await asyncio.to_thread(_load_profile_secret_scope, Path(profile_home))
+    with _profile_runtime_scope(Path(profile_home), secrets):
+        yield
 
 
 def load_gateway_config_for_runner() -> "GatewayConfig":
@@ -14720,7 +14749,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 if _phome is None:
                     await _reclaim_stale(self)
                 else:
-                    with _profile_runtime_scope(_phome):
+                    async with _async_profile_runtime_scope(_phome):
                         await _reclaim_stale(self)
             except Exception:
                 logger.debug("Stale-handoff reclaim failed", exc_info=True)
@@ -14732,7 +14761,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         if profile_home is None:
                             await _tick(profile_name)
                         else:
-                            with _profile_runtime_scope(profile_home):
+                            async with _async_profile_runtime_scope(profile_home):
                                 await _tick(profile_name)
                 except asyncio.CancelledError:
                     raise
