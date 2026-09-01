@@ -857,10 +857,22 @@ class ProcessRegistry:
             session.exited = True
             # Recovered sessions no longer have a waitable handle, so the real
             # exit code is unavailable once the original process object is gone.
+            # This is a supervision loss, not a collected process exit.
             session.exit_code = None
+            session.completion_reason = "lost"
+            session.termination_source = "backend_lost"
 
         self._move_to_finished(session)
         return session
+
+    @staticmethod
+    def _session_status(session: ProcessSession) -> str:
+        """Return an honest public status for a tracked session."""
+        if not session.exited:
+            return "running"
+        if session.completion_reason == "lost":
+            return "lost"
+        return "exited"
 
     @staticmethod
     def _proc_alive(proc) -> bool:
@@ -2137,7 +2149,7 @@ class ProcessRegistry:
         result = {
             "session_id": session.id,
             "command": session.command,
-            "status": "exited" if session.exited else "running",
+            "status": self._session_status(session),
             "pid": session.pid,
             "uptime_seconds": int(time.time() - session.started_at),
             "output_preview": output_preview,
@@ -2195,13 +2207,17 @@ class ProcessRegistry:
         result = {
             "session_id": session.id,
             "command": session.command,
-            "status": "exited" if session.exited else "running",
+            "status": self._session_status(session),
             "output": "\n".join(selected),
             "total_lines": total_lines,
             "showing": f"{len(selected)} lines",
         }
         if session.exited and observed_completion_output:
             self._completion_consumed.add(session_id)
+        if session.exited:
+            result["exit_code"] = session.exit_code
+            result["completion_reason"] = session.completion_reason
+            result["termination_source"] = session.termination_source
         return result
 
     def wait(self, session_id: str, timeout: int = None) -> dict:
@@ -2264,7 +2280,7 @@ class ProcessRegistry:
             if session.exited:
                 self._completion_consumed.add(session_id)
                 result = {
-                    "status": "exited",
+                    "status": self._session_status(session),
                     "command": session.command,
                     "exit_code": session.exit_code,
                     "completion_reason": session.completion_reason,
@@ -2604,7 +2620,7 @@ class ProcessRegistry:
                 "pid": s.pid,
                 "started_at": time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(s.started_at)),
                 "uptime_seconds": int(time.time() - s.started_at),
-                "status": "exited" if s.exited else "running",
+                "status": self._session_status(s),
                 "output_preview": s.output_buffer[-200:] if s.output_buffer else "",
             }
             # Flag processes surfaced only because they share the gateway
@@ -2622,6 +2638,8 @@ class ProcessRegistry:
                 entry["notify_on_complete"] = True
             if s.exited:
                 entry["exit_code"] = s.exit_code
+                entry["completion_reason"] = s.completion_reason
+                entry["termination_source"] = s.termination_source
             if s.detached:
                 entry["detached"] = True
             result.append(entry)
@@ -3334,10 +3352,16 @@ def format_process_notification(evt: dict) -> "str | None":
         _status = "completed normally"
     else:
         _status = "exited"
-    text = (
-        f"[IMPORTANT: Background process {_sid} {_status} "
-        f"(exit code {_exit}{_signal}).\n"
-    )
+    if _reason == "lost":
+        text = (
+            f"[IMPORTANT: Background process {_sid} {_status}; "
+            "no exit status was collected.\n"
+        )
+    else:
+        text = (
+            f"[IMPORTANT: Background process {_sid} {_status} "
+            f"(exit code {_exit}{_signal}).\n"
+        )
     if _attribution:
         text += f"{_attribution}\n"
         # A subagent-owned process's full output belongs in the child's

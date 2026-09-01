@@ -798,3 +798,34 @@ class TestContractAndBackgroundCompose:
         assert verdict == "wait"
         assert wait_directive and wait_directive.get("pid") == 4242
 
+
+def test_lost_background_process_is_not_exposed_to_goal_judge():
+    from hermes_cli import goals
+    from tools.process_registry import process_registry
+
+    sessions = [
+        {
+            "session_id": "lost-build",
+            "pid": 4101,
+            "status": "lost",
+            "command": "build.sh",
+            "uptime_seconds": 9,
+        },
+        {
+            "session_id": "live-build",
+            "pid": 4102,
+            "status": "running",
+            "command": "test.sh",
+            "uptime_seconds": 3,
+        },
+    ]
+
+    with patch.object(process_registry, "list_sessions", return_value=sessions):
+        gathered = goals.gather_background_processes(task_id="goal-task")
+
+    assert [item["session_id"] for item in gathered] == ["live-build"]
+
+    rendered = goals._render_background_block(sessions)
+    assert "live-build" in rendered
+    assert "lost-build" not in rendered
+

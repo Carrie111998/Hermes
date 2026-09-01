@@ -408,6 +408,19 @@ class TestConciseFormatter:
         assert "…" in text
         assert len(text) < 200
 
+    def test_lost_supervision_is_not_reported_as_finished(self):
+        from gateway.run import _format_concise_process_notification
+        text = _format_concise_process_notification(
+            "proc_abc",
+            "python worker.py",
+            None,
+            "",
+            completion_reason="lost",
+        )
+        assert text.startswith("⚠️ Background task supervision lost")
+        assert "finished" not in text
+        assert "exit" not in text
+
 
 @pytest.mark.asyncio
 async def test_concise_mode_sends_pretty_message_not_raw_dump(monkeypatch, tmp_path):
@@ -438,6 +451,41 @@ async def test_concise_mode_sends_pretty_message_not_raw_dump(monkeypatch, tmp_p
     assert sent_text.startswith("✅ Background task finished")
     assert "Here's the final output" not in sent_text
     assert "5000" not in sent_text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["concise", "error"])
+async def test_lost_supervision_warns_instead_of_sending_completion(
+    monkeypatch, tmp_path, mode
+):
+    import tools.process_registry as pr_module
+
+    lost = SimpleNamespace(
+        output_buffer="last captured line\n",
+        exited=True,
+        exit_code=None,
+        completion_reason="lost",
+        command="python worker.py",
+        started_at=None,
+    )
+    monkeypatch.setattr(
+        pr_module, "process_registry", _FakeRegistry([lost], consumed=False)
+    )
+
+    async def _instant_sleep(*_a, **_kw):
+        pass
+
+    monkeypatch.setattr(asyncio, "sleep", _instant_sleep)
+    runner = _build_runner(monkeypatch, tmp_path, mode)
+    adapter = runner.adapters[Platform.TELEGRAM]
+
+    await runner._run_process_watcher(_watcher_dict())
+
+    adapter.send.assert_awaited_once()
+    sent_text = adapter.send.await_args.args[1]
+    assert "supervision" in sent_text
+    assert "finished" not in sent_text
+    assert "exit code None" not in sent_text
 
 
 @pytest.mark.asyncio

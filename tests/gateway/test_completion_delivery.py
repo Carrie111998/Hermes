@@ -366,6 +366,36 @@ def test_concurrent_process_watchers_coalesce_one_session_completion_turn(monkey
         assert f"proc_batch_{index}" in delivered.text
 
 
+def test_lost_process_watchers_coalesce_without_claiming_completion():
+    adapter = SimpleNamespace(handle_message=AsyncMock())
+    runner = _runner(adapter)
+    events = [
+        _completion_event(started_at=float(index), session_id=f"proc_lost_{index}")
+        for index in range(2)
+    ]
+    for event in events:
+        event["exit_code"] = None
+        event["completion_reason"] = "lost"
+        event["output"] = "last captured output\n"
+
+    async def _exercise():
+        return await asyncio.gather(*(
+            runner._enqueue_process_completion_notification(
+                "supervision lost", event
+            )
+            for event in events
+        ))
+
+    assert asyncio.run(_exercise()) == [True, True]
+    adapter.handle_message.assert_awaited_once()
+    delivered = adapter.handle_message.await_args.args[0]
+    assert "background process status updates" in delivered.text
+    assert "supervision lost; no exit status was collected" in delivered.text
+    assert "last captured output" in delivered.text
+    assert "processes completed" not in delivered.text
+    assert "exit_code=None" not in delivered.text
+
+
 def test_completion_arriving_during_batch_delivery_schedules_next_flush():
     """A new event cannot be stranded behind an in-flight batch for its route."""
     first_delivery_entered = asyncio.Event()
@@ -492,6 +522,25 @@ def test_coalesced_format_bounds_details_and_reports_omitted_count():
     assert "proc_bound_10" not in text
     assert "proc_bound_11" not in text
     assert "and 2 more completion(s)" in text
+
+
+def test_coalesced_format_calls_omitted_lost_events_status_updates():
+    async def _format():
+        loop = asyncio.get_running_loop()
+        entries = []
+        for index in range(11):
+            event = _completion_event(
+                started_at=float(index), session_id=f"proc_lost_{index}"
+            )
+            event["exit_code"] = None
+            event["completion_reason"] = "lost"
+            entries.append((f"event-{index}", event, loop.create_future()))
+        return GatewayRunner._format_coalesced_process_completions(entries)
+
+    text = asyncio.run(_format())
+
+    assert "and 1 more status update(s)" in text
+    assert "completion(s)" not in text
 
 
 def test_coalesced_format_force_redacts_output_when_redaction_disabled(monkeypatch):

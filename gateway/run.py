@@ -4283,6 +4283,7 @@ def _format_concise_process_notification(
     exit_code,
     output: str,
     duration_seconds=None,
+    completion_reason: str = "exited",
 ) -> str:
     """One-line "pretty" completion message for the ``concise`` display mode.
 
@@ -4290,9 +4291,14 @@ def _format_concise_process_notification(
     the user can see what went wrong without the full raw dump. The full
     output always remains available to the agent via process(log/wait).
     """
-    ok = exit_code in {0, None}
-    icon = "✅" if ok else "❌"
-    verb = "finished" if ok else f"failed (exit {exit_code})"
+    lost = completion_reason == "lost"
+    ok = not lost and exit_code == 0
+    icon = "⚠️" if lost else ("✅" if ok else "❌")
+    verb = (
+        "supervision lost"
+        if lost
+        else ("finished" if ok else f"failed (exit {exit_code})")
+    )
     parts = [f"{icon} Background task {verb}"]
     short_cmd = _shorten_command_for_display(command)
     if short_cmd:
@@ -27493,9 +27499,24 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     @staticmethod
     def _format_coalesced_process_completions(entries: list[tuple[str, dict, asyncio.Future]]) -> str:
         """Build one bounded synthetic event from several redacted completions."""
+        has_supervision_loss = any(
+            evt.get("completion_reason") == "lost" for _text, evt, _future in entries
+        )
+        if has_supervision_loss:
+            header = (
+                f"[IMPORTANT: {len(entries)} background process status updates "
+                "for this session."
+            )
+            batch_description = "status-update"
+        else:
+            header = (
+                f"[IMPORTANT: {len(entries)} background processes completed "
+                "for this session."
+            )
+            batch_description = "completion"
         lines = [
-            f"[IMPORTANT: {len(entries)} background processes completed for this session.",
-            "Treat these results as one completion batch and send at most one "
+            header,
+            f"Treat these results as one {batch_description} batch and send at most one "
             "consolidated user-facing response.",
         ]
         shown = entries[:10]
@@ -27514,15 +27535,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             ).strip()
             if len(output) > 800:
                 output = f"[… truncated …]\n{output[-800:]}"
-            lines.append(
-                f"\n- {session_id}: exit_code={exit_code}, reason={reason}"
-            )
+            if reason == "lost":
+                lines.append(
+                    f"\n- {session_id}: supervision lost; no exit status was collected"
+                )
+            else:
+                lines.append(
+                    f"\n- {session_id}: exit_code={exit_code}, reason={reason}"
+                )
             if output:
                 lines.append(output)
         omitted = len(entries) - len(shown)
         if omitted:
+            omitted_description = (
+                "status update" if has_supervision_loss else "completion"
+            )
             lines.append(
-                f"\n- … and {omitted} more completion(s); inspect them with "
+                f"\n- … and {omitted} more {omitted_description}(s); inspect them with "
                 "the process tool if they affect the conclusion."
             )
         lines.append(
@@ -28029,7 +28058,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     break
                 # Decide whether to notify based on mode
                 should_notify = (
-                    notify_mode in {"concise", "all", "result"}
+                    getattr(session, "completion_reason", "exited") == "lost"
+                    or notify_mode in {"concise", "all", "result"}
                     or (notify_mode == "error" and session.exit_code not in {0, None})
                 )
                 if should_notify:
@@ -28058,12 +28088,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             session.exit_code,
                             new_output,
                             duration_seconds=_dur,
+                            completion_reason=getattr(
+                                session, "completion_reason", "exited"
+                            ),
                         )
                     else:
-                        message_text = (
-                            f"[Background process {session_id} finished with exit code {session.exit_code}~ "
-                            f"Here's the final output:\n{new_output}]"
-                        )
+                        if getattr(session, "completion_reason", "exited") == "lost":
+                            message_text = (
+                                f"[Background process {session_id} supervision was lost; "
+                                "no exit status was collected. Verify OS liveness before "
+                                f"restarting it. Last captured output:\n{new_output}]"
+                            )
+                        else:
+                            message_text = (
+                                f"[Background process {session_id} finished with exit code {session.exit_code}~ "
+                                f"Here's the final output:\n{new_output}]"
+                            )
                     adapter = None
                     for p, a in self.adapters.items():
                         if p.value == platform_name:

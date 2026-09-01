@@ -961,6 +961,39 @@ class TestCheckpoint:
             recovered = registry.recover_from_checkpoint()
             assert recovered == 0
 
+    def test_recovered_process_disappearance_is_lost_not_exited(
+        self, registry, tmp_path, monkeypatch
+    ):
+        checkpoint = tmp_path / "procs.json"
+        checkpoint.write_text(json.dumps([{
+            "session_id": "proc_recovered",
+            "command": "long-running-agent",
+            "pid": 424242,
+            "pid_scope": "host",
+            "host_start_time": 123.0,
+            "notify_on_complete": True,
+        }]))
+        alive = True
+        monkeypatch.setattr(
+            registry,
+            "_host_pid_is_ours",
+            lambda *_args: alive,
+        )
+
+        with patch("tools.process_registry.CHECKPOINT_PATH", checkpoint):
+            assert registry.recover_from_checkpoint() == 1
+            alive = False
+            result = registry.poll("proc_recovered")
+
+        assert result["status"] == "lost"
+        assert result["completion_reason"] == "lost"
+        assert result["termination_source"] == "backend_lost"
+        assert result["exit_code"] is None
+
+        event = registry.completion_queue.get_nowait()
+        assert event["completion_reason"] == "lost"
+        assert event["termination_source"] == "backend_lost"
+
     def test_recover_dead_wrapper_retries_unreaped_systemd_scope(
         self, registry, tmp_path, monkeypatch
     ):
