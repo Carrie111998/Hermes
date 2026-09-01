@@ -167,6 +167,10 @@ export interface GroupChat {
   sessionOwners?: Record<string, Partial<RosterRow>>
   sessions?: Record<string, string | true>
   stranded?: Record<string, number | { before: number; thread?: string }>
+  /** Opt-in busy-turn ceiling in ms. Absent = no wall-clock cap while the
+   *  member is still working or waiting on the user. Idle turns still expire
+   *  at `GROUP_TURN_TIMEOUT_MS`. Runtime-only until a room editor lands. */
+  turnHardCapMs?: number
   syncRevision?: number
   /** Left behind when a room is disbanded, so sync can't resurrect it. */
   tombstone?: boolean
