@@ -36,7 +36,8 @@ from hermes_state import (
 
 
 @pytest.fixture
-def db(tmp_path):
+def db(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_TRIGRAM_FTS", "1")
     d = SessionDB(db_path=tmp_path / "state.db")
     yield d
     try:
@@ -82,13 +83,40 @@ def _meta_value(db_path, key):
 
 def _base_fts_triggers(db_path):
     raw = sqlite3.connect(str(db_path))
-    rows = raw.execute(
-        "SELECT name FROM sqlite_master WHERE type = 'trigger' "
-        f"AND name IN ({','.join('?' for _ in _FTS_TRIGGERS)})",
-        _FTS_TRIGGERS,
-    ).fetchall()
-    raw.close()
-    return {row[0] for row in rows}
+    try:
+        rows = raw.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'trigger' "
+            f"AND name IN ({','.join('?' for _ in _FTS_TRIGGERS)})",
+            _FTS_TRIGGERS,
+        ).fetchall()
+        return {row[0] for row in rows}
+    finally:
+        raw.close()
+
+
+def _expected_fts_triggers(db_path):
+    raw = sqlite3.connect(str(db_path))
+    try:
+        has_trigram = raw.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+            ("messages_fts_trigram",),
+        ).fetchone() is not None
+    finally:
+        raw.close()
+    triggers = {
+        "messages_fts_insert",
+        "messages_fts_delete",
+        "messages_fts_update",
+    }
+    if has_trigram:
+        triggers.update(
+            {
+                "messages_fts_trigram_insert",
+                "messages_fts_trigram_delete",
+                "messages_fts_trigram_update",
+            }
+        )
+    return triggers
 
 
 class TestRuntimeFtsRebuild:
@@ -336,7 +364,7 @@ class TestRuntimeFtsRebuild:
         assert rebuild_called is False
         assert db._fts_stale is False
         assert _meta_value(tmp_path / "state.db", FTS_STALE_KEY) is None
-        assert _base_fts_triggers(tmp_path / "state.db") == set(_FTS_TRIGGERS)
+        assert _expected_fts_triggers(tmp_path / "state.db") == set(_FTS_TRIGGERS)
 
     def test_fts_looking_constraint_error_does_not_mutate_fts(
         self, db, tmp_path, monkeypatch
@@ -365,7 +393,7 @@ class TestRuntimeFtsRebuild:
         assert rebuild_called is False
         assert db._fts_stale is False
         assert _meta_value(tmp_path / "state.db", FTS_STALE_KEY) is None
-        assert _base_fts_triggers(tmp_path / "state.db") == set(_FTS_TRIGGERS)
+        assert _expected_fts_triggers(tmp_path / "state.db") == set(_FTS_TRIGGERS)
 
     def test_append_defers_rebuild_after_fts_corruption(
         self, db, tmp_path, monkeypatch
@@ -493,7 +521,7 @@ class TestRuntimeFtsRebuild:
         try:
             assert reopened._fts_stale is False
             assert _meta_value(db_path, FTS_STALE_KEY) is None
-            assert _base_fts_triggers(db_path) == set(_FTS_TRIGGERS)
+            assert _base_fts_triggers(db_path) == _expected_fts_triggers(db_path)
             results = reopened.search_messages("corruption survives")
             assert results
         finally:
@@ -836,7 +864,7 @@ class TestPhysicalCorruptionAcceptance:
 
         # Fail-closed also means non-destructive: triggers untouched, no
         # stale-FTS marker persisted for a structural (non-FTS) failure.
-        assert _base_fts_triggers(db_path) == set(_FTS_TRIGGERS)
+        assert _base_fts_triggers(db_path) == _expected_fts_triggers(db_path)
         assert _meta_value(db_path, FTS_STALE_KEY) is None
 
     def test_fts_only_corruption_still_self_heals(self, db, tmp_path):

@@ -22,8 +22,9 @@ from hermes_state import SessionDB, collect_state_db_stats, count_db_holders
 
 
 @pytest.fixture()
-def populated_db(tmp_path):
+def populated_db(tmp_path, monkeypatch):
     """A real state.db built through SessionDB's public API, then closed."""
+    monkeypatch.setenv("HERMES_TRIGRAM_FTS", "1")
     db_path = tmp_path / "state.db"
     db = SessionDB(db_path=db_path)
     db.create_session("sess-alpha", "cli")

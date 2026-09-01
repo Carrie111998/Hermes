@@ -23,6 +23,7 @@ from hermes_state_common import (
     FTS_STALE_KEY,
     FTS_STORAGE_VERSION,
     FTS_TRIGRAM_SQL,
+    trigram_fts_config_enabled,
     MAX_FTS5_QUERY_CHARS,
     SCHEMA_VERSION,
     _FTS_CJK_TRIGGERS,
@@ -1962,6 +1963,7 @@ class SessionSearchMixin:
                 and cjk_count >= 3
                 and not _any_short_cjk
                 and self._trigram_available
+                and trigram_fts_config_enabled()
                 and not _wants_tool_rows
             ):
                 # Trigram FTS5 path — quote each non-operator token to handle
@@ -2342,14 +2344,16 @@ class SessionSearchMixin:
         index internally, then VACUUM returns the freed pages to the OS.
 
         Skips any FTS table that does not exist (e.g. the trigram index when
-        disabled via ``HERMES_DISABLE_FTS_TRIGRAM`` or not yet created), so
-        it is safe to call unconditionally.
+        disabled via the per-profile ``sessions.trigram_fts: false`` setting or
+        not yet created), so it is safe to call unconditionally.
 
         Returns the number of FTS indexes that were optimized.
         """
         optimized = 0
         with self._lock:
             for tbl in self._FTS_TABLES:
+                if tbl == "messages_fts_trigram" and not trigram_fts_config_enabled():
+                    continue
                 if not self._fts_table_exists(tbl):
                     continue
                 try:
@@ -2397,6 +2401,8 @@ class SessionSearchMixin:
                 return 0
             with self._lock:
                 for tbl in self._FTS_TABLES:
+                    if tbl == "messages_fts_trigram" and not trigram_fts_config_enabled():
+                        continue
                     if not self._fts_table_exists(tbl):
                         continue
                     try:

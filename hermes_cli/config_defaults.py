@@ -3466,6 +3466,15 @@ DEFAULT_CONFIG = {
         # setting is inert when it isn't. False: never load the extension or
         # serve the cjk index. Bridged to HERMES_CJK_FTS (internal carrier).
         "cjk_fts": True,
+        # Trigram message search index (messages_fts_trigram, SQLite trigram
+        # tokenizer). Covers CJK substrings and Latin substring fallback for
+        # queries that the standard unicode61 FTS5 index cannot answer.
+        # False (default): do not create, populate, update, or query the trigram
+        # table or its shadow structures; searches fall back to LIKE when they
+        # previously depended on trigram semantics. True: keep the trigram
+        # index in sync when the tokenizer is available. Bridged to
+        # HERMES_TRIGRAM_FTS (internal carrier).
+        "trigram_fts": False,
         # Slow session-search log threshold in milliseconds: searches at or
         # above it log one INFO line with the routing path taken (fts_cjk /
         # fts5 / trigram / like_scan) so latency regressions stay

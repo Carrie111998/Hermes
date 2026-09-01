@@ -2402,6 +2402,8 @@ def _bridge_max_turns_from_config(home: "Path") -> None:
     if isinstance(sessions_cfg, dict):
         if "cjk_fts" in sessions_cfg:
             os.environ["HERMES_CJK_FTS"] = str(sessions_cfg["cjk_fts"])
+        if "trigram_fts" in sessions_cfg:
+            os.environ["HERMES_TRIGRAM_FTS"] = str(sessions_cfg["trigram_fts"])
         if "search_slow_ms" in sessions_cfg:
             os.environ["HERMES_SEARCH_SLOW_MS"] = str(sessions_cfg["search_slow_ms"])
 

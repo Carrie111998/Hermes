@@ -371,6 +371,18 @@ FTS_STORAGE_VERSION = 1
 # sanitizer/runtime behavior predictable under adversarial input.
 MAX_FTS5_QUERY_CHARS = 2_048
 
+TRIGRAM_FTS_ENV = "HERMES_TRIGRAM_FTS"
+
+
+def trigram_fts_config_enabled() -> bool:
+    """Return the bridged config-authoritative trigram FTS toggle."""
+    return os.getenv(TRIGRAM_FTS_ENV, "0").strip().lower() not in (
+        "0",
+        "false",
+        "off",
+        "no",
+    )
+
 
 _FTS_TRIGGERS = (
     "messages_fts_insert",

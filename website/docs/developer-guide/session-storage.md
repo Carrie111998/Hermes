@@ -15,7 +15,7 @@ Source file: `hermes_state.py`
 ├── messages              — Full message history per session
 ├── session_model_usage   — Per-model/per-task usage attribution rows
 ├── messages_fts          — FTS5 virtual table (content + tool_name + tool_calls)
-├── messages_fts_trigram  — FTS5 virtual table with trigram tokenizer (CJK / substring search)
+├── messages_fts_trigram  — Optional FTS5 trigram table for CJK / substring search (gated by `sessions.trigram_fts`, default off)
 ├── messages_fts_cjk      — FTS5 virtual table with cjk_unicode61 tokenizer
 ├── state_meta            — Key/value metadata table
 ├── gateway_routing       — Gateway routing metadata

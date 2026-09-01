@@ -31,6 +31,8 @@ import tempfile
 from pathlib import Path
 from typing import Any, Optional
 
+from hermes_state_common import trigram_fts_config_enabled
+
 # Hermes session ids are timestamps: 20260812_135332_ab12cd. This is the
 # strongest sentinel available for classifying schema-less rows.
 SESSION_ID_PATTERN = re.compile(r"^\d{8}_\d{6}_")
@@ -572,7 +574,11 @@ def rebuild_fts_indexes(dest: sqlite3.Connection) -> dict[str, str]:
     """Rebuild derived FTS indexes from the salvaged canonical rows."""
 
     results: dict[str, str] = {}
-    for table in ("messages_fts", "messages_fts_trigram", "messages_fts_cjk"):
+    tables = ["messages_fts"]
+    if trigram_fts_config_enabled():
+        tables.append("messages_fts_trigram")
+    tables.append("messages_fts_cjk")
+    for table in tables:
         if not _table_columns(dest, table):
             continue
         try:

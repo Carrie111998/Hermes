@@ -72,8 +72,9 @@ class _NoTrigramConnection(sqlite3.Connection):
 
 
 @pytest.fixture()
-def db(tmp_path):
+def db(tmp_path, monkeypatch):
     """Create a SessionDB with a temp database file."""
+    monkeypatch.setenv("HERMES_TRIGRAM_FTS", "1")
     db_path = tmp_path / "test_state.db"
     session_db = SessionDB(db_path=db_path)
     yield session_db
@@ -512,9 +513,100 @@ class TestSessionLifecycle:
             db.close()
 
 
-# =========================================================================
-# Message storage
-# =========================================================================
+class TestTrigramConfigControl:
+    @staticmethod
+    def _set_search_env(monkeypatch, *, trigram: bool, cjk: bool = False):
+        monkeypatch.setenv("HERMES_TRIGRAM_FTS", "1" if trigram else "0")
+        monkeypatch.setenv("HERMES_CJK_FTS", "1" if cjk else "0")
+
+    @staticmethod
+    def _count_rows(conn, table: str) -> int:
+        return conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+
+    def test_trigram_disabled_defaults_to_like_and_skips_index_creation(
+        self, tmp_path, monkeypatch
+    ):
+        db_path = tmp_path / "state.db"
+        self._set_search_env(monkeypatch, trigram=False, cjk=False)
+
+        db = SessionDB(db_path=db_path)
+        try:
+            db.create_session(session_id="s1", source="cli")
+            db.append_message("s1", role="user", content="大别山项目计划书")
+
+            row = db._conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?",
+                ("messages_fts_trigram",),
+            ).fetchone()
+            assert row is None
+
+            results = db.search_messages("大别山")
+            assert len(results) == 1
+            assert "大别山" in results[0]["snippet"]
+        finally:
+            db.close()
+
+    def test_trigram_enabled_creates_and_updates_index(self, tmp_path, monkeypatch):
+        db_path = tmp_path / "state.db"
+        self._set_search_env(monkeypatch, trigram=True, cjk=False)
+
+        db = SessionDB(db_path=db_path)
+        try:
+            db.create_session(session_id="s1", source="cli")
+            assert (
+                db._conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?",
+                    ("messages_fts_trigram",),
+                ).fetchone()
+                is not None
+            )
+            assert self._count_rows(db._conn, "messages_fts_trigram") == 0
+
+            db.append_message("s1", role="user", content="大别山项目计划书")
+            assert self._count_rows(db._conn, "messages_fts_trigram") == 1
+            db.append_message("s1", role="user", content="大别山第二版")
+            assert self._count_rows(db._conn, "messages_fts_trigram") == 2
+        finally:
+            db.close()
+
+    def test_trigram_disabled_reopen_leaves_existing_table_inert(
+        self, tmp_path, monkeypatch
+    ):
+        db_path = tmp_path / "state.db"
+        self._set_search_env(monkeypatch, trigram=True, cjk=False)
+
+        db = SessionDB(db_path=db_path)
+        try:
+            db.create_session(session_id="s1", source="cli")
+            db.append_message("s1", role="user", content="大别山项目计划书")
+            assert self._count_rows(db._conn, "messages_fts_trigram") == 1
+        finally:
+            db.close()
+
+        self._set_search_env(monkeypatch, trigram=False, cjk=False)
+        reopened = SessionDB(db_path=db_path)
+        try:
+            assert (
+                reopened._conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?",
+                    ("messages_fts_trigram",),
+                ).fetchone()
+                is not None
+            )
+            assert (
+                reopened._conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'trigger' "
+                    "AND name LIKE 'messages_fts_trigram_%'"
+                ).fetchall()
+                == []
+            )
+            reopened.append_message("s1", role="user", content="大别山第三版")
+            results = reopened.search_messages("大别山第三版")
+            assert len(results) == 1
+            assert "大别山第三版" in results[0]["snippet"]
+        finally:
+            reopened.close()
+
 
 class TestMessageStorage:
     def test_append_and_get_messages(self, db):

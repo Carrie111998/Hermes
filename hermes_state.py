@@ -69,6 +69,7 @@ from hermes_state_common import (  # noqa: F401  (re-exported for back-compat)
     _RECOVERABLE_END_REASONS_SQL,
     is_automatic_end_reason,
     _RESET_END_REASONS,
+    trigram_fts_config_enabled,
     _RESET_END_REASONS_SQL,
     _ephemeral_child_sql,
     _legacy_reset_child_sql,
@@ -3320,7 +3321,11 @@ def _db_opens_cleanly(db_path: Path) -> Optional[str]:
         # Catch the full sqlite3 exception hierarchy (not just
         # OperationalError) so the malformed-shadow-table class is reported
         # rather than letting it crash the caller.
-        for fts_table in ("messages_fts", "messages_fts_trigram", "messages_fts_cjk"):
+        fts_tables = ["messages_fts"]
+        if trigram_fts_config_enabled():
+            fts_tables.append("messages_fts_trigram")
+        fts_tables.append("messages_fts_cjk")
+        for fts_table in fts_tables:
             try:
                 # No-op queries against the actual FTS5 APIs the search
                 # tools use. The trigram table is included because it backs
@@ -3865,9 +3870,11 @@ def _run_repair_strategies(
             # The cjk index can only be rebuilt with its tokenizer loaded;
             # best-effort (a tokenizer-less host skips it at the probe below).
             load_fts5_cjk_extension(conn)
-            for table_name in (
-                "messages_fts", "messages_fts_trigram", "messages_fts_cjk"
-            ):
+            table_names = ["messages_fts"]
+            if trigram_fts_config_enabled():
+                table_names.append("messages_fts_trigram")
+            table_names.append("messages_fts_cjk")
+            for table_name in table_names:
                 try:
                     conn.execute(
                         f"INSERT INTO {table_name}({table_name}) VALUES('rebuild')"
@@ -4474,18 +4481,33 @@ def collect_state_db_stats(db_path: Path) -> Dict[str, Any]:
         # FTS table presence via sqlite_master (never SELECTs from the
         # virtual tables themselves — a corrupt index must not fail stats).
         try:
-            names = {
-                row[0]
-                for row in conn.execute(
-                    "SELECT name FROM sqlite_master WHERE type = 'table' "
-                    "AND name IN (?, ?, ?)",
-                    ("messages_fts", "messages_fts_trigram", "messages_fts_cjk"),
-                ).fetchall()
-            }
-            stats["fts_tables"] = {
-                t: (t in names)
-                for t in ("messages_fts", "messages_fts_trigram", "messages_fts_cjk")
-            }
+            if trigram_fts_config_enabled():
+                names = {
+                    row[0]
+                    for row in conn.execute(
+                        "SELECT name FROM sqlite_master WHERE type = 'table' "
+                        "AND name IN (?, ?, ?)",
+                        ("messages_fts", "messages_fts_trigram", "messages_fts_cjk"),
+                    ).fetchall()
+                }
+                stats["fts_tables"] = {
+                    t: (t in names)
+                    for t in ("messages_fts", "messages_fts_trigram", "messages_fts_cjk")
+                }
+            else:
+                names = {
+                    row[0]
+                    for row in conn.execute(
+                        "SELECT name FROM sqlite_master WHERE type = 'table' "
+                        "AND name IN (?, ?)",
+                        ("messages_fts", "messages_fts_cjk"),
+                    ).fetchall()
+                }
+                stats["fts_tables"] = {
+                    "messages_fts": ("messages_fts" in names),
+                    "messages_fts_trigram": False,
+                    "messages_fts_cjk": ("messages_fts_cjk" in names),
+                }
         except Exception:
             pass
 
@@ -4934,7 +4956,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     self._fts_enabled = (
                         self._fts_table_probe(cursor, "messages_fts") is True
                     )
-                    if self._fts_enabled:
+                    if self._fts_enabled and trigram_fts_config_enabled():
                         self._trigram_available = (
                             self._fts_table_probe(
                                 cursor,
@@ -4942,6 +4964,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                             )
                             is True
                         )
+                    else:
+                        self._trigram_available = False
                 except BaseException:
                     conn, self._conn = self._conn, None
                     try:

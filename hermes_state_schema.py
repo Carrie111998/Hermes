@@ -27,6 +27,7 @@ from hermes_state_common import (
     FTS_STORAGE_VERSION,
     FTS_TRIGRAM_SQL,
     LEGACY_FTS_SQL,
+    trigram_fts_config_enabled,
     LEGACY_FTS_TRIGRAM_SQL,
     SCHEMA_SQL,
     SCHEMA_VERSION,
@@ -166,6 +167,21 @@ class SessionSchemaMixin:
                 cursor.execute(f"DROP TRIGGER IF EXISTS {trigger}")
             except sqlite3.OperationalError:
                 pass
+
+    def _drop_trigram_fts_artifacts(self, cursor: sqlite3.Cursor) -> None:
+        for trigger in (
+            "messages_fts_trigram_insert",
+            "messages_fts_trigram_delete",
+            "messages_fts_trigram_update",
+        ):
+            try:
+                cursor.execute(f"DROP TRIGGER IF EXISTS {trigger}")
+            except sqlite3.OperationalError:
+                pass
+        try:
+            cursor.execute("DROP VIEW IF EXISTS messages_fts_trigram_src")
+        except sqlite3.OperationalError:
+            pass
 
     @staticmethod
     def _fts_trigger_count(
@@ -521,15 +537,23 @@ class SessionSchemaMixin:
             # A corrupt vtable may fail even a LIMIT 0 probe. It still needs
             # to be included in the drop-and-recreate recovery below.
             trigram_status = True
-        include_trigram = trigram_status is True
+        include_trigram = trigram_status is True and trigram_fts_config_enabled()
 
         drop_sql = "".join(
             f"DROP TRIGGER IF EXISTS {trigger};" for trigger in _FTS_TRIGGERS
         )
-        if include_trigram:
-            drop_sql += "DROP TABLE IF EXISTS messages_fts_trigram;"
         drop_sql += "DROP VIEW IF EXISTS messages_fts_trigram_src;"
         drop_sql += "DROP TABLE IF EXISTS messages_fts;"
+        drop_sql += "".join(
+            f"DROP TABLE IF EXISTS messages_fts_{suffix};"
+            for suffix in ("data", "idx", "docsize", "config", "content")
+        )
+        if include_trigram:
+            drop_sql += "DROP TABLE IF EXISTS messages_fts_trigram;"
+            drop_sql += "".join(
+                f"DROP TABLE IF EXISTS messages_fts_trigram_{suffix};"
+                for suffix in ("data", "idx", "docsize", "config", "content")
+            )
 
         if legacy:
             schema_sql = LEGACY_FTS_SQL
@@ -580,8 +604,11 @@ class SessionSchemaMixin:
             + f"('{FTS_STALE_KEY}', '{FTS_REBUILD_DEFERRAL_KEY}');"
             + "COMMIT;"
         )
-        try:
+        def _run_recovery_sql() -> None:
             cursor.executescript(recovery_sql)
+
+        try:
+            _run_recovery_sql()
         except sqlite3.DatabaseError as exc:
             try:
                 self._conn.rollback()
@@ -590,13 +617,40 @@ class SessionSchemaMixin:
             # Stale indexes must remain detached even on SQLite builds whose
             # DDL transaction behavior differs.
             self._drop_all_fts_triggers(cursor)
-            self._conn.commit()
-            logger.error(
-                "Automatic rebuild of stale FTS indexes failed (%s); "
-                "canonical writes remain enabled with FTS detached.",
-                exc,
-            )
-            return False
+
+            # Some corrupt shadow-table states make DROP TABLE / rebuild choke on
+            # the vtable constructor before the damaged entries are fully
+            # detached. As a last resort, remove the FTS schema entries from
+            # sqlite_master, bump the schema cookie, and retry the same
+            # drop-and-recreate rebuild against a clean catalog.
+            try:
+                self._conn.execute("PRAGMA writable_schema=ON")
+                self._conn.execute(
+                    "DELETE FROM sqlite_master WHERE name LIKE 'messages_fts%'"
+                )
+                current_schema_version = self._conn.execute(
+                    "PRAGMA schema_version"
+                ).fetchone()[0]
+                self._conn.execute(
+                    f"PRAGMA schema_version = {int(current_schema_version) + 1}"
+                )
+                self._conn.execute("PRAGMA writable_schema=OFF")
+                self._conn.commit()
+                cursor = self._conn.cursor()
+                _run_recovery_sql()
+            except sqlite3.DatabaseError as retry_exc:
+                try:
+                    self._conn.rollback()
+                except sqlite3.Error:
+                    pass
+                self._drop_all_fts_triggers(cursor)
+                self._conn.commit()
+                logger.error(
+                    "Automatic rebuild of stale FTS indexes failed (%s); "
+                    "canonical writes remain enabled with FTS detached.",
+                    retry_exc,
+                )
+                return False
 
         self._fts_stale = False
         self._fts_enabled = True
@@ -1391,6 +1445,9 @@ class SessionSchemaMixin:
             # v23 view/external tables entirely. Fresh installs and opted-in
             # DBs have no legacy inline FTS, so they get the v23 DDL.
             legacy_fts = self._db_has_legacy_inline_fts(cursor)
+            trigram_config_enabled = trigram_fts_config_enabled()
+            if not trigram_config_enabled:
+                self._drop_trigram_fts_artifacts(cursor)
             if self._fts_stale:
                 if self._recover_stale_fts(cursor, legacy=legacy_fts):
                     # CJK was detached alongside the corrupt base indexes and
@@ -1417,20 +1474,28 @@ class SessionSchemaMixin:
                 self._fts_enabled = self._ensure_fts_schema(
                     cursor, "messages_fts", LEGACY_FTS_SQL
                 )
-                if self._fts_enabled:
+                trigram_enabled = False
+                if self._fts_enabled and trigram_config_enabled:
                     trigram_enabled = self._ensure_fts_schema(
                         cursor, "messages_fts_trigram", LEGACY_FTS_TRIGRAM_SQL
                     )
                     self._trigram_available = trigram_enabled
-                    if base_triggers_missing or (
-                        trigram_enabled and trigram_triggers_missing
-                    ):
-                        self._run_admitted_startup_rebuild(
+                else:
+                    self._trigram_available = False
+                if self._fts_enabled and (
+                    base_triggers_missing or (
+                        trigram_config_enabled and trigram_enabled and trigram_triggers_missing
+                    )
+                ):
+                    self._run_admitted_startup_rebuild(
+                        cursor,
+                        lambda: self._rebuild_legacy_fts_indexes(
                             cursor,
-                            lambda: self._rebuild_legacy_fts_indexes(
-                                cursor, include_trigram=trigram_enabled
+                            include_trigram=(
+                                trigram_enabled if trigram_config_enabled else False
                             ),
-                        )
+                        ),
+                    )
             else:
                 # Same split as the legacy branch above, same reason.
                 base_triggers_missing = (
@@ -1448,21 +1513,29 @@ class SessionSchemaMixin:
                 # Trigram FTS5 for CJK/substring search. This is optional
                 # relative to the main FTS table; if it cannot be created,
                 # CJK search falls back to LIKE.
-                if self._fts_enabled:
+                trigram_enabled = False
+                if self._fts_enabled and trigram_config_enabled:
                     trigram_enabled = self._ensure_fts_schema(
                         cursor, "messages_fts_trigram", FTS_TRIGRAM_SQL
                     )
                     self._trigram_available = trigram_enabled
-                    if base_triggers_missing or (
-                        trigram_enabled and trigram_triggers_missing
-                    ):
-                        self._run_admitted_startup_rebuild(
+                else:
+                    self._trigram_available = False
+                if self._fts_enabled and (
+                    base_triggers_missing or (
+                        trigram_config_enabled and trigram_enabled and trigram_triggers_missing
+                    )
+                ):
+                    self._run_admitted_startup_rebuild(
+                        cursor,
+                        lambda: self._rebuild_fts_indexes(
                             cursor,
-                            lambda: self._rebuild_fts_indexes(
-                                cursor,
-                                include_trigram=trigram_enabled,
+                            include_trigram=(
+                                trigram_enabled if trigram_config_enabled else False
                             ),
-                        )
+                        ),
+                    )
+                if self._fts_enabled and trigram_config_enabled:
                     # CJK-bigram index (cjk_unicode61). Strictly additive to
                     # the surfaces above and gated on the loadable tokenizer:
                     self._ensure_fts_cjk_schema(cursor)

@@ -27,6 +27,8 @@ from hermes_state import (
     _db_opens_cleanly,
 )
 
+from hermes_state_common import trigram_fts_config_enabled
+
 
 ProgressCallback = Callable[[dict[str, Any]], None]
 
@@ -1321,7 +1323,11 @@ def _verify_recovered_database(
                 verification["loss_detected"] = True
 
         fts_checks: dict[str, str] = {}
-        for table in ("messages_fts", "messages_fts_trigram", "messages_fts_cjk"):
+        fts_tables = ["messages_fts"]
+        if trigram_fts_config_enabled():
+            fts_tables.append("messages_fts_trigram")
+        fts_tables.append("messages_fts_cjk")
+        for table in fts_tables:
             if not _table_columns(conn, table):
                 continue
             try:
@@ -1355,11 +1361,22 @@ def _finalize_derived_metadata(destination: sqlite3.Connection) -> dict[str, Any
         str(row[0])
         for row in destination.execute(
             "SELECT name FROM sqlite_master "
-            "WHERE type='table' AND name IN ('messages_fts', 'messages_fts_trigram')"
+            "WHERE type='table' AND name IN ('messages_fts')"
         ).fetchall()
     }
+    if trigram_fts_config_enabled():
+        fts_tables.update(
+            str(row[0])
+            for row in destination.execute(
+                "SELECT name FROM sqlite_master "
+                "WHERE type='table' AND name IN ('messages_fts_trigram')"
+            ).fetchall()
+        )
     result: dict[str, Any] = {"fts_tables": sorted(fts_tables), "finalized": False}
-    if fts_tables != {"messages_fts", "messages_fts_trigram"}:
+    required = {"messages_fts"}
+    if trigram_fts_config_enabled():
+        required.add("messages_fts_trigram")
+    if fts_tables != required:
         result["error"] = "fresh destination is missing required FTS tables"
         return result
 
