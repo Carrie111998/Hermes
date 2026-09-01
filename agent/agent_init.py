@@ -1370,7 +1370,11 @@ def init_agent(
             # No explicit creds — use the centralized provider router
             from agent.auxiliary_client import resolve_provider_client
             _routed_client, _ = resolve_provider_client(
-                agent.provider or "auto", model=agent.model, raw_codex=True)
+                agent.provider or "auto",
+                model=agent.model,
+                raw_codex=True,
+                enforce_auxiliary_free_only=False,
+            )
             if _routed_client is not None:
                 client_kwargs = {
                     "api_key": _routed_client.api_key,
@@ -1417,6 +1421,7 @@ def init_agent(
                             _fb["provider"], model=_fb["model"], raw_codex=True,
                             explicit_base_url=_fb.get("base_url"),
                             explicit_api_key=_fb_explicit_key,
+                            enforce_auxiliary_free_only=False,
                         )
                     except Exception as _fb_exc:
                         logger.debug(

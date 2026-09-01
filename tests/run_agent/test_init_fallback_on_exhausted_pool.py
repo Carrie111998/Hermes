@@ -22,9 +22,11 @@ def test_init_tries_fallback_when_primary_returns_none():
     """When resolve_provider_client returns None for primary but succeeds for
     a fallback entry, __init__ should NOT raise RuntimeError."""
     fb = _mock_client()
+    calls = []
 
     def fake_resolve(provider, model=None, raw_codex=False,
-                     explicit_base_url=None, explicit_api_key=None):
+                     explicit_base_url=None, explicit_api_key=None, **kwargs):
+        calls.append((provider, kwargs.get("enforce_auxiliary_free_only")))
         if provider == "tencent-token-plan":
             return fb, "kimi2.5"
         return None, None  # primary exhausted
@@ -47,6 +49,10 @@ def test_init_tries_fallback_when_primary_returns_none():
         assert agent.provider == "tencent-token-plan"
         assert agent.model == "kimi2.5"
         assert agent._fallback_activated is True
+        assert calls == [
+            ("alibaba-coding-plan", False),
+            ("tencent-token-plan", False),
+        ]
 
 
 def test_init_raises_when_no_fallback_configured():
@@ -82,7 +88,7 @@ def test_init_tries_fallback_when_openrouter_pool_exhausted():
                       base_url="http://127.0.0.1:11434/v1")
 
     def fake_resolve(provider, model=None, raw_codex=False,
-                     explicit_base_url=None, explicit_api_key=None):
+                     explicit_base_url=None, explicit_api_key=None, **kwargs):
         if provider == "custom" and explicit_base_url:
             return fb, "qwen3.5:4b"
         return None, None  # openrouter pool exhausted
