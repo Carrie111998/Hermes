@@ -5150,20 +5150,72 @@ def apply_pending_steer_to_tool_results(agent, messages: list, num_tool_msgs: in
             existing = getattr(agent, "_pending_steer", None)
             agent._pending_steer = (existing + "\n" + steer_text) if existing else steer_text
         return
+    target = messages[target_idx]
+    # Capture whether this tool result was already flushed to the DB.
+    # _flush_messages_to_session_db stamps _DB_PERSISTED_MARKER and skips
+    # re-writing it — a later in-place append would otherwise be lost
+    # silently (#99569). We detect that case and update the row in place.
+    try:
+        from agent.context_compressor import _DB_PERSISTED_MARKER as _persist_marker
+    except Exception:
+        _persist_marker = "_db_persisted"
+    was_persisted = bool(target.get(_persist_marker))
     marker = format_steer_marker(steer_text)
-    existing_content = messages[target_idx].get("content", "")
+    existing_content = target.get("content", "")
     if not isinstance(existing_content, str):
         # Anthropic multimodal content blocks — preserve them and append
         # a text block at the end.
         try:
             blocks = list(existing_content) if existing_content else []
             blocks.append({"type": "text", "text": marker.lstrip()})
-            messages[target_idx]["content"] = blocks
+            target["content"] = blocks
         except Exception:
             # Fall back to string replacement if content shape is unexpected.
-            messages[target_idx]["content"] = f"{existing_content}{marker}"
+            target["content"] = f"{existing_content}{marker}"
     else:
-        messages[target_idx]["content"] = existing_content + marker
+        target["content"] = existing_content + marker
+    # If the target row was already persisted, the incremental flush will
+    # skip it (idempotency marker). Persist the amended content immediately
+    # so delivery and durability are all-or-nothing.
+    if was_persisted:
+        try:
+            db = getattr(agent, "_session_db", None)
+            session_id = getattr(agent, "session_id", None)
+            row_id = target.get("_row_id")
+            if db is not None and session_id and isinstance(row_id, int):
+                encoded = db._encode_content(target.get("content"))
+                def _do(conn):
+                    conn.execute(
+                        "UPDATE messages SET content = ? WHERE id = ? AND session_id = ?",
+                        (encoded, row_id, session_id),
+                    )
+                db._execute_write(_do)
+                logger.info("Persisted steered content to already-flushed tool row %s", row_id)
+            elif db is not None and session_id:
+                # No _row_id yet (e.g. marker was seeded without sync). Fall
+                # back to updating the newest matching tool row for this turn
+                # so the steer is not silently lost.
+                encoded = db._encode_content(target.get("content"))
+                tool_call_id = target.get("tool_call_id")
+                def _fallback(conn):
+                    if tool_call_id:
+                        cur = conn.execute(
+                            "SELECT id FROM messages WHERE session_id = ? AND role = 'tool' AND tool_call_id = ? AND active = 1 ORDER BY id DESC LIMIT 1",
+                            (session_id, tool_call_id),
+                        )
+                        row = cur.fetchone()
+                        if row is not None:
+                            conn.execute(
+                                "UPDATE messages SET content = ? WHERE id = ?",
+                                (encoded, int(row[0])),
+                            )
+                            target["_row_id"] = int(row[0])
+                try:
+                    db._execute_write(_fallback)
+                except Exception:
+                    logger.debug("steer fallback persist failed", exc_info=True)
+        except Exception:
+            logger.warning("Failed to persist steered tool content in place", exc_info=True)
     _ra().logger.info(
         "Delivered /steer to agent after tool batch (%d chars): %s",
         len(steer_text),
