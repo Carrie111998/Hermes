@@ -1092,9 +1092,16 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<str>,
 {
+    // The argument is an install request, not authority to choose a product
+    // location. Older Desktop builds passed their currently-running bundle,
+    // which made release/worktree artifacts become permanent installations.
+    // Accept only a syntactically valid app request, then converge it on the
+    // one stable per-user target.
     arg_value_from_args(args, "--target-app")
         .map(PathBuf::from)
         .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("app"))
+        .and_then(|_| dirs::home_dir())
+        .map(|home| home.join("Applications").join("Hermes.app"))
 }
 
 fn arg_value_from_args<I, S>(args: I, name: &str) -> Option<String>
@@ -1802,9 +1809,21 @@ mod tests {
 
     #[test]
     fn parses_only_app_targets() {
+        let canonical = dirs::home_dir()
+            .unwrap()
+            .join("Applications")
+            .join("Hermes.app");
         assert_eq!(
             target_app_from_args(["--update", "--target-app", "/Applications/Hermes.app"]),
-            Some(PathBuf::from("/Applications/Hermes.app"))
+            Some(canonical.clone())
+        );
+        assert_eq!(
+            target_app_from_args([
+                "--update",
+                "--target-app",
+                "/tmp/worktree/release/mac-arm64/Hermes.app",
+            ]),
+            Some(canonical)
         );
         assert_eq!(target_app_from_args(["--target-app", "/tmp/not-an-app"]), None);
     }

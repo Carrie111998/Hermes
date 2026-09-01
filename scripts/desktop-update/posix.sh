@@ -331,39 +331,45 @@ linux_gate() {
 }
 
 mac_swap() {
-  local rebuilt="" c
+  local rebuilt="" c canonical="$HOME/Applications/Hermes.app"
   for c in "$INSTALL_ROOT/apps/desktop/release/mac-arm64/Hermes.app" \
            "$INSTALL_ROOT/apps/desktop/release/mac/Hermes.app"; do
     [ -d "$c" ] && { rebuilt="$c"; break; }
   done
 
-  # Transactional swap: stage a full copy, move the old bundle aside, move
-  # the copy in. Every step checked; a failed final move ROLLS BACK so the
-  # user always has a launchable app, and the result file tells the truth.
-  if [ "$FINAL_CODE" -eq 0 ] && [ -n "$rebuilt" ] && [ -d "$RELAUNCH_TARGET" ] && [ "$rebuilt" != "$RELAUNCH_TARGET" ]; then
-    publish_stage "Installing the new app"
-    rm -rf "$RELAUNCH_TARGET.new" "$RELAUNCH_TARGET.old" 2>/dev/null || true
-    if ! /usr/bin/ditto "$rebuilt" "$RELAUNCH_TARGET.new"; then
-      rm -rf "$RELAUNCH_TARGET.new" 2>/dev/null || true
-      DONE_NOTE="Update complete, but the new app could not be staged; the previous version was kept. Run the update again."
-      log "WARNING: bundle copy failed; keeping existing app"
-    elif ! mv "$RELAUNCH_TARGET" "$RELAUNCH_TARGET.old"; then
-      rm -rf "$RELAUNCH_TARGET.new" 2>/dev/null || true
-      DONE_NOTE="Update complete, but the new app could not replace the old one; the previous version was kept. Run the update again."
-      log "WARNING: could not move old bundle aside; keeping existing app"
-    elif ! mv "$RELAUNCH_TARGET.new" "$RELAUNCH_TARGET"; then
-      if mv "$RELAUNCH_TARGET.old" "$RELAUNCH_TARGET"; then
-        rm -rf "$RELAUNCH_TARGET.new" 2>/dev/null || true
-        DONE_NOTE="Update complete, but the new app could not be installed; the previous version was restored. Run the update again."
-        log "WARNING: bundle install failed; rolled back to the previous app"
-      else
-        FINAL_CODE=7 FINAL_MSG="The update finished but installing the new app failed and the previous app could not be restored. Reinstall Hermes (the rebuilt app is at $rebuilt)."
-        log "ERROR: bundle install failed AND rollback failed"
-      fi
-    else
-      rm -rf "$RELAUNCH_TARGET.old" 2>/dev/null || true
-      log "swapped app bundle"
-    fi
+  [ "$FINAL_CODE" -eq 0 ] || return 0
+  if [ "$RELAUNCH_TARGET" != "$canonical" ]; then
+    FINAL_CODE=8
+    FINAL_MSG="Update refused: Hermes must run from the stable install at $canonical; build and artifact copies cannot self-update."
+    log "ERROR: unstable macOS relaunch target refused: $RELAUNCH_TARGET"
+    return 0
+  fi
+  if [ -L "$canonical" ]; then
+    FINAL_CODE=8
+    FINAL_MSG="Update refused: the stable Hermes install is a symlink at $canonical. Run 'hermes desktop' to repair it."
+    log "ERROR: canonical macOS install is symlinked: $canonical"
+    return 0
+  fi
+  if [ -z "$rebuilt" ]; then
+    FINAL_CODE=7
+    FINAL_MSG="The update built no macOS Hermes.app artifact; the installed app was kept."
+    log "ERROR: rebuilt macOS app artifact missing"
+    return 0
+  fi
+  if [ ! -x "$INSTALL_ROOT/venv/bin/python" ]; then
+    FINAL_CODE=7
+    FINAL_MSG="The update could not install the new app because the managed Python runtime is missing; the installed app was kept."
+    log "ERROR: managed Python missing for stable app install"
+    return 0
+  fi
+
+  publish_stage "Installing the new app"
+  if HERMES_HOME="$HERMES_HOME" "$INSTALL_ROOT/venv/bin/python" -m hermes_cli.desktop_install --source "$rebuilt" >>"$LOG" 2>&1; then
+    log "atomically replaced stable app bundle: $canonical"
+  else
+    FINAL_CODE=7
+    FINAL_MSG="The update finished building, but the stable app install failed. The previous app was kept or restored. Run the update again."
+    log "ERROR: stable macOS app install failed"
   fi
 }
 
@@ -619,16 +625,21 @@ if [ "$CODE" -ne 0 ] && [ "$CODE" -ne 2 ]; then
 fi
 trap 'on_signal TERM' TERM
 
-# Truthful completion: `hermes update` calls a GUI build failure non-fatal
-# (exit 0). For a Desktop-driven update that would relaunch the OLD build
-# and call it success -- retry the build once, propagate honestly.
-if [ "$CODE" -eq 0 ] && printf '%s' "$OUT" | grep -q "Desktop build failed"; then
-  log "desktop build failed inside hermes update; retrying build"
+# A successful code update does not prove the release/ app matches the checked
+# out source. In particular, the "Already up to date" path skips the Desktop
+# build check entirely, yet mac_swap would still install whatever stale bundle
+# happened to be under release/. Always drive the content-stamp gate before the
+# install. It is fast when current and rebuilds when stale; one forced retry
+# covers a corrupt/partial artifact without ever shipping it.
+if [ "$CODE" -eq 0 ]; then
   publish_stage "Rebuilding Desktop"
-  "$HERMES_BIN" desktop --force-build --build-only >> "$LOG" 2>&1 || {
-    FINAL_CODE=6 FINAL_MSG="Code and dependencies updated, but the Desktop app rebuild failed - you are running the previous build. Run hermes desktop --force-build from a terminal to retry."
-    exit 6
-  }
+  if ! "$HERMES_BIN" desktop --build-only >> "$LOG" 2>&1; then
+    log "desktop artifact check/build failed; retrying forced build"
+    "$HERMES_BIN" desktop --force-build --build-only >> "$LOG" 2>&1 || {
+      FINAL_CODE=6 FINAL_MSG="Code and dependencies updated, but the Desktop app rebuild failed - the installed app was kept. Run hermes desktop --force-build from a terminal to retry."
+      exit 6
+    }
+  fi
 fi
 
 if [ "$CODE" -eq 0 ]; then FINAL_CODE=0 FINAL_MSG="Update complete."

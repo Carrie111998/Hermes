@@ -3629,6 +3629,23 @@ PYEOF
         fi
     fi
 
+    # macOS build output is an artifact, not an application install. First
+    # install and repair atomically publish that artifact to the single stable
+    # per-user product path used by Finder, Dock, `hermes desktop`, and updates.
+    if [ "$OS" = "macos" ]; then
+        local install_python="$INSTALL_DIR/venv/bin/python"
+        if [ ! -x "$install_python" ]; then
+            log_error "Cannot install Hermes Desktop: managed Python is missing at $install_python"
+            return 1
+        fi
+        if ! HERMES_HOME="$HERMES_HOME" "$install_python" -m hermes_cli.desktop_install --source "$app"; then
+            log_error "Could not atomically install Hermes Desktop at ~/Applications/Hermes.app"
+            return 1
+        fi
+        app="$HOME/Applications/Hermes.app"
+        log_success "Desktop app installed: $app"
+    fi
+
     # `npm install` + `npm run pack` rewrite lockfiles; restore them so the
     # checkout stays clean for the next `hermes update`.
     restore_dirty_lockfiles "$INSTALL_DIR"

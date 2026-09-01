@@ -6995,6 +6995,22 @@ def _write_desktop_build_stamp(project_root: Path, *, source_mode: bool) -> None
         logger.debug("Failed to write desktop build stamp: %s", exc)
 
 
+def _desktop_macos_install_artifact(packaged_executable: Path) -> Path:
+    """Install a built macOS artifact at the one stable per-user app path."""
+    if sys.platform != "darwin":
+        return packaged_executable
+    from hermes_cli.desktop_install import DesktopInstallError, install_macos_app
+
+    artifact_app = packaged_executable.parents[2]
+    try:
+        result = install_macos_app(artifact_app)
+    except DesktopInstallError as exc:
+        print(f"✗ Could not install Hermes Desktop at ~/Applications/Hermes.app: {exc}")
+        raise SystemExit(1) from exc
+    print(f"✓ Hermes Desktop installed: {result.target}")
+    return result.executable
+
+
 def _desktop_packaged_executable(desktop_dir: Path) -> Optional[Path]:
     """Return the current platform's unpacked Electron app executable."""
     release_dir = desktop_dir / "release"
@@ -8670,6 +8686,7 @@ def cmd_gui(args: argparse.Namespace):
         print("  Expected an unpacked Electron app for the current OS.")
         sys.exit(1)
 
+    packaged_executable = _desktop_macos_install_artifact(packaged_executable)
     launch_command = [str(packaged_executable)]
     if not _desktop_linux_sandbox_fixup(packaged_executable):
         if _desktop_linux_needs_no_sandbox() and _desktop_linux_sandbox_helper_is_regular_file(packaged_executable):

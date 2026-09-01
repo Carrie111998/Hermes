@@ -32,6 +32,12 @@ def _isolate_xdg_data_home(tmp_path, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _isolate_macos_product_install(monkeypatch):
+    """Unit tests exercise launch wiring without writing ~/Applications."""
+    monkeypatch.setattr(cli_main, "_desktop_macos_install_artifact", lambda executable: executable)
+
+
+@pytest.fixture(autouse=True)
 def _stable_keychain_detection(monkeypatch):
     """Pin Linux keychain detection to the fast GNOME env path.
 

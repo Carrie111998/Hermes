@@ -380,6 +380,7 @@ import { isOfficialSshRemote, OFFICIAL_REPO_HTTPS_URL } from './update-remote'
 import {
   collectRelaunchArgs,
   observeUpdaterHandoff,
+  resolveMacUpdateTarget,
   resolvePosixScriptHandoff,
   resolveStagedUpdaterBinary,
   resolveUpdateScriptHandoff,
@@ -3797,7 +3798,22 @@ async function applyUpdates(opts: { stopSafeBlockers?: boolean } = {}) {
     const { branch: configuredBranch } = readDesktopUpdateConfig()
     const branch = await resolveHealedBranch(updateRoot, configuredBranch || DEFAULT_UPDATE_BRANCH)
     const updaterArgs = ['--update', '--branch', branch]
-    const targetApp = IS_MAC ? runningAppBundle() : null
+    let targetApp: string | null = null
+
+    if (IS_MAC) {
+      const resolution = resolveMacUpdateTarget(runningAppBundle(), app.getPath('home'))
+
+      if (resolution.ok === false) {
+        const message = 'Update refused because the macOS home directory could not be resolved safely.'
+
+        rememberLog(`[updates] ${message} (${resolution.reason})`)
+        emitUpdateProgress({ stage: 'error', message, percent: null })
+
+        return { ok: false, error: 'invalid-home-directory', message }
+      }
+
+      targetApp = resolution.target
+    }
 
     if (targetApp) {
       updaterArgs.push('--target-app', targetApp)
@@ -4309,17 +4325,27 @@ async function applyUpdatesPosixHandoff(opts: any) {
   const args = [...handoff.args, '--install-root', updateRoot, '--branch', branch, '--desktop-pid', String(process.pid)]
   const updateStartedAt = Math.floor(Date.now() / 1000)
 
-  // Relaunch target: the running .app bundle on mac (script swaps the
-  // rebuilt bundle over it), the running binary elsewhere. The script's gate
-  // (an exact port of update-relaunch.ts's decideRelaunchOutcome) relaunches
-  // only a binary the rebuild replaced with a launchable sandbox helper —
-  // replaying the original launch context (filtered args, cwd, sandbox
-  // opt-out) so a deep-link or --no-sandbox launch survives the update.
-  const targetApp = IS_MAC ? runningAppBundle() : process.execPath
+  // macOS has one installed product path. Build/release/worktree bundles are
+  // artifacts and must never become update targets just because they happen to
+  // be running. Old artifact launches migrate into the stable per-user app.
+  let targetApp = process.execPath
 
-  if (targetApp) {
-    args.push('--relaunch-target', targetApp)
+  if (IS_MAC) {
+    const resolution = resolveMacUpdateTarget(runningAppBundle(), app.getPath('home'))
+
+    if (resolution.ok === false) {
+      const message = 'Update refused because the macOS home directory could not be resolved safely.'
+
+      rememberLog(`[updates] ${message} (${resolution.reason})`)
+      emitUpdateProgress({ stage: 'error', message, percent: null })
+
+      return { ok: false, error: 'invalid-home-directory', message }
+    }
+
+    targetApp = resolution.target
   }
+
+  args.push('--relaunch-target', targetApp)
 
   const relaunchArgs = collectRelaunchArgs(process.argv.slice(1))
 
