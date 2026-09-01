@@ -230,8 +230,12 @@ class TestKillStaleDashboardPosix:
 
 
 
-    def test_user_scope_restart_never_falls_back_to_system_or_sudo(self, capsys):
+    def test_user_scope_restart_never_falls_back_to_system_or_sudo(self, capsys, monkeypatch):
         """A user unit is discovered and restarted through ``systemctl --user``."""
+        # This test exercises the systemd branch; pin Linux so hosts running
+        # the suite on macOS take the launchd branch (their own tests live in
+        # test_update_dashboard_launchd.py).
+        monkeypatch.setattr(sys, "platform", "linux")
         calls: list[list[str]] = []
 
         def fake_run(args, *a, **kw):
