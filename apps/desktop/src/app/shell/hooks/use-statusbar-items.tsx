@@ -4,6 +4,7 @@ import { useNavigate } from 'react-router'
 
 import { ConnectionSwitcher } from '@/app/chat/sidebar/connection-switcher'
 import type { CommandCenterSection } from '@/app/command-center'
+import { useAccountQuotaStatusbarItem } from '@/app/shell/hooks/use-account-quota-item'
 import { useApprovalModeStatusbarItem } from '@/app/shell/approval-mode-menu'
 import { ContextUsagePanel } from '@/app/shell/context-usage-panel'
 import { GatewayMenuPanel } from '@/app/shell/gateway-menu-panel'
@@ -268,6 +269,7 @@ export function useStatusbarItems({
   const contextBar = useMemo(() => contextBarLabel(gaugeUsage), [gaugeUsage])
 
   const approvalModeItem = useApprovalModeStatusbarItem(activeGatewayProfile, requestGateway)
+  const quotaItem = useAccountQuotaStatusbarItem()
 
   const gatewayMenuContent = useMemo(
     () => (close: () => void) => (
@@ -466,6 +468,7 @@ export function useStatusbarItems({
         toggleLabel: copy.toggleWorkspace,
         variant: 'menu'
       },
+      quotaItem,
       {
         className: cn(
           agentsOpen && 'bg-accent/55 text-foreground',
@@ -526,6 +529,7 @@ export function useStatusbarItems({
       inferenceStatus?.reason,
       openAgents,
       projectName,
+      quotaItem,
       sessionsShowing,
       subagentsFailed,
       subagentsRunning,

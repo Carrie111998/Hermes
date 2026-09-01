@@ -3110,6 +3110,7 @@ export const zh: Translations = {
       toggleTerminal: '终端',
       toggleVersion: '版本与更新',
       toggleWorkspace: '工作区',
+      toggleQuota: '额度',
       agents: '代理',
       closeAgents: '关闭代理',
       openAgents: '打开代理',

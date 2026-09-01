@@ -2947,6 +2947,7 @@ export const en: Translations = {
       toggleTerminal: 'Terminal',
       toggleVersion: 'Version & updates',
       toggleWorkspace: 'Workspace',
+      toggleQuota: 'Quota',
       agents: 'Agents',
       closeAgents: 'Close agents',
       openAgents: 'Open agents',

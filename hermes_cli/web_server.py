@@ -15914,6 +15914,21 @@ async def get_usage_analytics(
     return await asyncio.to_thread(_get_usage_analytics, days, profile)
 
 
+@app.get("/api/account-usage")
+async def get_account_usage(provider: Optional[str] = None):
+    """Official OAuth quota windows (Codex / Claude / OpenRouter / Nous).
+
+    Fail-open: missing creds or upstream errors become ``unavailable``.
+    SuperGrok is listed as unsupported — there is no first-party quota API.
+
+    Sits on the same ``/api/`` auth gate as ``/api/analytics/*`` (not on
+    the public_paths allowlist).
+    """
+    from hermes_cli.usage_cmd import account_usage_payload
+
+    return await asyncio.to_thread(account_usage_payload, provider)
+
+
 def _get_models_analytics(days: int = 30, profile: Optional[str] = None):
     """Rich per-model analytics for the Models dashboard page.
 
