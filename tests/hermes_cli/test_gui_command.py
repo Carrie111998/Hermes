@@ -1273,3 +1273,59 @@ def test_gui_password_store_bridge_is_linux_only(tmp_path, monkeypatch):
     mock_detect.assert_not_called()
     launch_env = mock_run.call_args_list[1].kwargs["env"]
     assert "HERMES_DESKTOP_PASSWORD_STORE" not in launch_env
+
+
+def test_linux_wayland_needs_vulkan_disabled_matches_ozone_backend():
+    wayland = {
+        "XDG_SESSION_TYPE": "wayland",
+        "WAYLAND_DISPLAY": "wayland-0",
+        "DISPLAY": ":0",
+    }
+    assert cli_main._linux_wayland_needs_vulkan_disabled(wayland, platform="linux") is True
+    assert cli_main._linux_wayland_needs_vulkan_disabled(wayland, platform="darwin") is False
+    assert (
+        cli_main._linux_wayland_needs_vulkan_disabled(
+            {**wayland, "ELECTRON_OZONE_PLATFORM_HINT": "x11"},
+            platform="linux",
+        )
+        is False
+    )
+    assert (
+        cli_main._linux_wayland_needs_vulkan_disabled(
+            {"DISPLAY": ":0"},
+            platform="linux",
+            argv=["--ozone-platform=wayland"],
+        )
+        is True
+    )
+    assert cli_main._linux_wayland_needs_vulkan_disabled({"DISPLAY": ":0"}, platform="linux") is False
+
+
+def test_desktop_electron_argv_adds_vulkan_on_linux_wayland(monkeypatch):
+    wayland = {
+        "XDG_SESSION_TYPE": "wayland",
+        "WAYLAND_DISPLAY": "wayland-0",
+        "DISPLAY": ":0",
+    }
+    monkeypatch.setattr(cli_main.sys, "platform", "linux")
+    assert cli_main._desktop_electron_argv([], wayland) == ["--disable-features=Vulkan"]
+    assert cli_main._desktop_electron_argv(["--disable-features=Foo"], wayland) == [
+        "--disable-features=Foo,Vulkan"
+    ]
+    assert cli_main._desktop_electron_argv(["--ozone-platform=x11"], wayland) == [
+        "--ozone-platform=x11"
+    ]
+    monkeypatch.setattr(cli_main.sys, "platform", "darwin")
+    assert cli_main._desktop_electron_argv([], wayland) == []
+
+
+def test_merge_electron_disable_features_appends_or_extends():
+    assert cli_main._merge_electron_disable_features([], "Vulkan") == ["--disable-features=Vulkan"]
+    assert cli_main._merge_electron_disable_features(
+        ["--ozone-platform-hint=auto", "--disable-features=Foo"],
+        "Vulkan",
+    ) == ["--ozone-platform-hint=auto", "--disable-features=Foo,Vulkan"]
+    assert cli_main._merge_electron_disable_features(
+        ["--disable-features=Vulkan"],
+        "Vulkan",
+    ) == ["--disable-features=Vulkan"]
