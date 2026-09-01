@@ -116,3 +116,43 @@ def test_cli_entrypoint_end_to_end(tmp_path):
     assert proc.returncode == 0, proc.stderr
     out = (tmp_path / "contributors" / "emails" / "cli@example.com").read_text(encoding="utf-8")
     assert out.splitlines()[0] == "cliperson"
+
+
+# ── case-collision normalization (#99966) ─────────────────────────────
+
+
+def test_add_normalizes_email_filename_to_lowercase(emails_dir):
+    """Windows/NTFS and macOS/APFS are case-insensitive: two filenames
+    differing only in letter case map to ONE file while git tracks two
+    paths, permanently flapping checkout state and failing every rebase
+    (#99966). The writer must canonicalize to lowercase."""
+    assert add_contributor("agent@Agents-Mac-mini.local", "momomojo") == 0
+    # The canonical (lowercase) path exists...
+    assert (emails_dir / "agent@agents-mac-mini.local").is_file()
+    # ...and it is the ONLY file the write created. On case-INSENSITIVE
+    # hosts (NTFS/APFS) a case-variant path stat resolves to the same file,
+    # so the meaningful check is the directory listing: exactly one entry,
+    # spelled lowercase.
+    entries = [p.name for p in emails_dir.iterdir()]
+    assert entries == ["agent@agents-mac-mini.local"]
+
+    # Re-adding the same mapping through the OTHER case spelling is
+    # idempotent — it hits the same canonical file.
+    assert add_contributor("agent@agents-Mac-mini.local", "momomojo") == 0
+
+
+def test_loader_lowercases_keys_for_release_lookup(tmp_path):
+    """Email hosts case-flap in commit metadata; the release-time lookup
+    must resolve any spelling to one canonical entry."""
+    d = tmp_path / "emails"
+    d.mkdir()
+    (d / "jane@example.com").write_text("janedoe\n")
+    mapping = release._load_contributor_dir(d)
+    assert mapping == {"jane@example.com": "janedoe"}
+
+    # A mixed-case filename in the store still loads as lowercase, so a
+    # commit carrying the uppercase spelling resolves at release time.
+    (d / "Agent@Example.COM").write_text("someone\n")
+    mapping2 = release._load_contributor_dir(d)
+    assert "agent@example.com" in mapping2
+    assert "Agent@Example.COM" not in mapping2

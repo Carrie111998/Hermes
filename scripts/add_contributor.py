@@ -57,6 +57,12 @@ def _legacy_login(email: str) -> str | None:
 
 def add_contributor(email: str, login: str, comment: str = "") -> int:
     email = email.strip()
+    # Filenames are case-insensitive on Windows/NTFS and macOS/APFS: two
+    # emails differing only in letter case map to ONE file on disk while git
+    # tracks two paths — every checkout flaps the content and every rebase
+    # onto the branch fails with unstaged changes (#99966). Normalize the
+    # FILENAME to lowercase so one email = one path on every filesystem.
+    path = EMAILS_DIR / email.lower()
     login = login.strip().lstrip("@")
 
     if not _EMAIL_RE.match(email):
@@ -66,7 +72,6 @@ def add_contributor(email: str, login: str, comment: str = "") -> int:
         print(f"error: {login!r} is not a valid GitHub login", file=sys.stderr)
         return 2
 
-    path = EMAILS_DIR / email
     existing = read_mapping_file(path) if path.is_file() else None
     if existing is None:
         existing = _legacy_login(email)
@@ -86,7 +91,7 @@ def add_contributor(email: str, login: str, comment: str = "") -> int:
     if comment:
         body += f"# {comment}\n"
     path.write_text(body, encoding="utf-8")
-    print(f"added: contributors/emails/{email} -> {login}")
+    print(f"added: contributors/emails/{email.lower()} -> {login}")
     return 0
 
 
