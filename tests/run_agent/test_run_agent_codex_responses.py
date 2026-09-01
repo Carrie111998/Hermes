@@ -2223,7 +2223,47 @@ def test_chat_messages_to_responses_input_reasoning_only_has_following_item(monk
     assert following.get("role") == "assistant"
 
 
+def test_chat_messages_to_responses_input_reasoning_with_tool_calls_skips_empty_stub(monkeypatch):
+    """A reasoning-only assistant turn that ALSO carries tool calls must not
+    emit an empty assistant message. The function_call items already satisfy
+    the Responses API 'following item' rule, and gateways that translate the
+    Responses input to Anthropic Messages reject the empty stub with
+    HTTP 400 'messages: text content blocks must be non-empty'."""
+    agent = _build_agent(monkeypatch)
+    messages = [
+        {"role": "user", "content": "run a command"},
+        {
+            "role": "assistant",
+            "content": "",
+            "reasoning": None,
+            "codex_reasoning_items": [
+                {"type": "reasoning", "id": "rs_001", "encrypted_content": "enc_abc", "summary": []},
+            ],
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "terminal", "arguments": "{\"command\": \"ls\"}"},
+                }
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call_1", "name": "terminal", "content": "file.txt"},
+    ]
+    from agent.codex_responses_adapter import _chat_messages_to_responses_input
+    items = _chat_messages_to_responses_input(messages)
 
+    types = [it.get("type") or f"message:{it.get('role')}" for it in items]
+    assert types == ["message:user", "reasoning", "function_call", "function_call_output"], types
+
+    empty_assistant = [
+        it for it in items
+        if it.get("role") == "assistant" and not it.get("type") and it.get("content") == ""
+    ]
+    assert not empty_assistant, "empty assistant stub must be skipped when tool calls follow"
+
+    # The reasoning item is still followed by an item (the function_call).
+    ri_idx = types.index("reasoning")
+    assert items[ri_idx + 1]["type"] == "function_call"
 
 def test_duplicate_detection_distinguishes_different_codex_reasoning(monkeypatch):
     """Two consecutive reasoning-only responses with different encrypted content
