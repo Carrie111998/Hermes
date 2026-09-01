@@ -40,6 +40,38 @@ def _patch_managed_uv(request):
         yield
 
 
+@pytest.fixture(autouse=True)
+def _patch_gateway_discovery(monkeypatch):
+    """Keep cmd_update's gateway auto-restart phase off this machine's gateways.
+
+    Tests in this file that reach the full success path (e.g. the #87694
+    orphan-history rescue-ref tests) would otherwise hit real gateway
+    discovery: an unmocked ``find_gateway_pids`` on a box with a live gateway
+    reaches the conftest live-system guard and turns into a spurious
+    ``sys.exit(1)`` (#78574). Discovery returning nothing makes the phase a
+    clean no-op — none of the tests here assert on gateway restarts.
+
+    ``_purge_stale_hermes_modules`` must also be neutralized: it evicts
+    hermes_cli.gateway from sys.modules mid-run, which silently discards
+    every patch below and lets the restart phase touch the REAL launchd
+    service on a dev machine.
+    """
+    monkeypatch.setattr(hermes_main, "_purge_stale_hermes_modules", lambda: None)
+    with patch("hermes_cli.gateway.find_gateway_pids", return_value=[]), \
+         patch("hermes_cli.gateway.supports_systemd_services", return_value=False), \
+         patch("hermes_cli.gateway.find_profile_gateway_processes", return_value=[]), \
+         patch("hermes_cli.gateway.is_macos", return_value=False), \
+         patch(
+             "hermes_cli.gateway.get_launchd_plist_path",
+             return_value=Path("/nonexistent/hermes-test/launchd.plist"),
+         ), \
+         patch(
+             "hermes_cli.update_inventory.collect_runtime_inventory",
+             return_value=SimpleNamespace(runtimes=[], to_dict=lambda: {}),
+         ):
+        yield
+
+
 
 
 
