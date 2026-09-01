@@ -23,6 +23,7 @@ from tools.tool_result_storage import (
     generate_preview,
     get_spillover_dir,
     maybe_persist_tool_result,
+    preserve_raw_tool_result,
 )
 
 
@@ -262,6 +263,20 @@ class TestMaybePersistToolResult:
         )
         # Any non-empty content with threshold=0 should be persisted
         assert PERSISTED_OUTPUT_TAG in result
+
+
+class TestPreserveRawToolResult:
+    def test_persists_receipt_with_hash_and_reader(self, monkeypatch, tmp_path):
+        monkeypatch.setattr("tools.tool_result_storage.get_spillover_dir", lambda: tmp_path)
+        receipt = preserve_raw_tool_result("x" * 12_000, "call/1")
+        assert receipt is not None
+        assert receipt["raw_chars"] == 12_000
+        assert len(receipt["raw_sha256"]) == 64
+        assert receipt["detail_reader"]["tool"] == "read_file"
+        assert open(receipt["result_ref"], encoding="utf-8").read() == "x" * 12_000
+
+    def test_skips_small_result(self):
+        assert preserve_raw_tool_result("small", "call") is None
 
 
 # ── enforce_turn_budget ───────────────────────────────────────────────

@@ -99,7 +99,9 @@ class TestSchema:
             "sort",
             "profile",
         ]
-        assert parameters == [*historical_prefix, "detail"]
+        assert parameters == [
+            *historical_prefix, "detail", "message_id", "content_offset", "max_chars",
+        ]
 
 
 class TestFormatTimestamp:
@@ -453,6 +455,21 @@ class TestReadShape:
         assert result["message_count"] == 50
         assert result["truncated"] is True
         assert len(result["messages"]) == 30  # head 20 + tail 10
+
+    def test_read_abbreviates_one_oversized_message_with_exact_page_route(self, db):
+        db.create_session("s_large_message", source="cli")
+        message_id = db.append_message("s_large_message", role="assistant", content="x" * 12_000)
+        result = json.loads(session_search(session_id="s_large_message", db=db))
+        message = result["messages"][0]
+        assert message["content_truncated"] is True
+        assert message["original_content_chars"] == 12_000
+        page = json.loads(session_search(
+            session_id="s_large_message", message_id=message_id,
+            content_offset=4_000, max_chars=8_000, db=db,
+        ))
+        assert page["mode"] == "message_page"
+        assert page["returned_chars"] == 8_000
+        assert page["has_more"] is False
 
 
 # =========================================================================
@@ -1143,4 +1160,3 @@ class TestNewResetLineageBrowse:
         result = json.loads(session_search(db=db, current_session_id="s_other"))
         sids = [r["session_id"] for r in result["results"]]
         assert "s_legacy_child" in sids
-
