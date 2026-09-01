@@ -30,15 +30,22 @@ jobs:
       - name: Typecheck desktop
         working-directory: apps/desktop
         run: npm run typecheck
-      - name: Build unsigned macOS app
+      - name: Build unpacked macOS app
         working-directory: apps/desktop
-        run: npm run dist:mac:zip -- --${{ matrix.arch }}
-      - name: Ad-hoc sign and repackage for local installation
+        # Keep the staged native modules on the real filesystem. node-pty's
+        # runtime loader uses relative require() paths that don't reliably
+        # cross Electron's app.asar → app.asar.unpacked boundary.
+        run: npm run dist:mac:zip -- --${{ matrix.arch }} -c.asar=false
+      - name: Verify native PTY payload, ad-hoc sign, and repackage
         working-directory: apps/desktop
         shell: bash
         run: |
           APP_DIR="$(find release -maxdepth 2 -type d -name Hermes.app -print -quit)"
           test -n "$APP_DIR"
+          PTY="$APP_DIR/Contents/Resources/app/dist/node_modules/node-pty/prebuilds/darwin-${{ matrix.arch }}/pty.node"
+          test -f "$PTY"
+          file "$PTY"
+          lipo -archs "$PTY" | grep -F "${{ matrix.arch }}"
           codesign --force --deep --sign - "$APP_DIR"
           codesign --verify --deep --strict --verbose=2 "$APP_DIR"
           rm -f release/*.zip
