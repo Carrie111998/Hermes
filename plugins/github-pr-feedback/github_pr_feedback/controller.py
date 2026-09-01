@@ -1209,7 +1209,12 @@ class ScanController:
                             current=current,
                             retry_failed=local_ci_receipt_status == "failed",
                         )
-                        if audit_error != "duplicate":
+                        if audit_error not in {
+                            "duplicate",
+                            "retry_backoff",
+                            "retry_exhausted",
+                            "retry_unavailable",
+                        }:
                             attempted += 1
                         if audit_error is None:
                             created += 1
@@ -1373,7 +1378,11 @@ class ScanController:
         )
         if not isinstance(latest, CIAuditReceipt) or latest.receipt_id != audit.receipt_id:
             return "superseded_ci_receipt"
-        if audit.actions_state.actions_enabled and not audit.actions_state.billing_blocked:
+        if (
+            audit.actions_state.actions_enabled
+            and not audit.actions_state.billing_blocked
+            and audit.actions_state.check_count > 0
+        ):
             return "github_ci_enabled"
         assignee = _ci_failure_assignee(audit)
         if assignee is None:
@@ -1521,6 +1530,17 @@ class ScanController:
                 retry_after=LOCAL_CI_RETRY_BACKOFF,
                 max_attempts=LOCAL_CI_RETRY_MAX_ATTEMPTS,
             )
+            if lease is None:
+                retry_state = self._ledger.failed_receipt_retry_state(
+                    receipt,
+                    claimed_at=claimed_at,
+                    retry_after=LOCAL_CI_RETRY_BACKOFF,
+                    max_attempts=LOCAL_CI_RETRY_MAX_ATTEMPTS,
+                )
+                return {
+                    "backoff": "retry_backoff",
+                    "exhausted": "retry_exhausted",
+                }.get(retry_state, "retry_unavailable")
         else:
             lease = _claim_with_orphan_recovery(
                 self._ledger,
@@ -2316,7 +2336,7 @@ def _select_local_ci_candidates(
     if len(pull_requests) <= limit:
         return pull_requests
 
-    backlog: list[tuple[PullRequest, int, int]] = []
+    backlog: list[tuple[PullRequest, int, datetime, int]] = []
     for pull in pull_requests:
         if not policy.admit_pull_request(pull).admitted:
             continue
@@ -2334,15 +2354,17 @@ def _select_local_ci_candidates(
         if state is not None and state[0] in {"claimed", "completed"}:
             continue
         status_rank = 0 if state is not None and state[0] == "failed" else 1
+        age = pull.updated_at or datetime.min.replace(tzinfo=UTC)
         attempts = 0 if state is None else state[1]
-        backlog.append((pull, status_rank, attempts))
+        backlog.append((pull, status_rank, age, attempts))
     backlog = tuple(
         sorted(
             backlog,
             key=lambda item: (
                 item[1],
-                item[0].number,
                 item[2],
+                item[0].number,
+                item[3],
             ),
         )
     )

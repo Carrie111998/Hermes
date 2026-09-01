@@ -933,6 +933,7 @@ def _audit_pr(ctx: Any, args: argparse.Namespace) -> int:
     handoff_blocked = False
     handoff_blockers: list[str] = []
     merge_handoff: dict[str, object] | None = None
+    repair_status: str | None = None
     try:
         policy = _load_policy_from_context(ctx)
         if policy.local_ci_audit is None:
@@ -1016,13 +1017,18 @@ def _audit_pr(ctx: Any, args: argparse.Namespace) -> int:
                     )
                 except RuntimeError:
                     pass
+            handoff_reason = repair_status or str(error) or "transient_handoff_failure"
+            retryable_payload: dict[str, object] = {
+                "status": "audit_handoff_retryable",
+                "receipt_id": receipt.receipt_id,
+                "retryable": True,
+                "handoff_reason": handoff_reason,
+            }
+            if repair_status is not None:
+                retryable_payload["repair_status"] = repair_status
             print(
                 json.dumps(
-                    {
-                        "status": "audit_handoff_retryable",
-                        "receipt_id": receipt.receipt_id,
-                        "retryable": True,
-                    },
+                    retryable_payload,
                     sort_keys=True,
                 ),
                 flush=True,
