@@ -207,7 +207,8 @@ export function useComposerMetrics({
         // clearance disappears with the terminal event, the browser clamps a
         // bottom-following transcript upward by the same amount. Remember the
         // largest dock from this run so the settled turn keeps its visual
-        // anchor; the run-start effect below releases the floor deliberately.
+        // anchor. A new run releases the floor deliberately; an idle composer
+        // reflow below also releases it once that retained geometry is stale.
         lastRunningDockHeightRef.current = Math.max(lastRunningDockHeightRef.current, bucket)
       }
 
@@ -238,6 +239,28 @@ export function useComposerMetrics({
   useEffect(() => {
     syncComposerMetrics()
   }, [poppedOut, running, surfaceKey, syncComposerMetrics])
+
+  // A hard newline expands through React before layout settles, and emptying the
+  // draft collapses through the same path. Neither transition depends on a
+  // ResizeObserver delivery, so measure the committed layout explicitly. Once
+  // an idle user deliberately reshapes the composer, the previous run's floor
+  // no longer owns the geometry; release it instead of preserving stale space.
+  const syncExpandedComposerMetrics = useCallback(() => {
+    if (!runningRef.current) {
+      lastRunningDockHeightRef.current = 0
+
+      if (lastSettledClearanceRef.current !== 0) {
+        lastSettledClearanceRef.current = 0
+        setSurfaceVar(composerRef.current, THREAD_SETTLED_CLEARANCE_VAR, '0px')
+      }
+    }
+
+    syncComposerMetrics()
+  }, [composerRef, syncComposerMetrics])
+
+  useEffect(() => {
+    syncExpandedComposerMetrics()
+  }, [expanded, syncExpandedComposerMetrics])
 
   useEffect(() => {
     // Resolve the owning surface while the composer is still attached; the

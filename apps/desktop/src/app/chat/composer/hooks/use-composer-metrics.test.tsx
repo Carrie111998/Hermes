@@ -4,11 +4,12 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import { useComposerMetrics } from './use-composer-metrics'
 
+let composerText = ''
 let dockHeight = 320
 let syncMetrics: (() => void) | undefined
 
 vi.mock('@assistant-ui/react', () => ({
-  useAuiState: (select: (state: { composer: { text: string } }) => unknown) => select({ composer: { text: '' } })
+  useAuiState: (select: (state: { composer: { text: string } }) => unknown) => select({ composer: { text: composerText } })
 }))
 
 vi.mock('@/hooks/use-resize-observer', () => ({
@@ -50,6 +51,7 @@ const renderHarness = (running: boolean) => render(<MetricsHarness running={runn
 
 describe('useComposerMetrics', () => {
   afterEach(() => {
+    composerText = ''
     dockHeight = 320
     syncMetrics = undefined
     vi.restoreAllMocks()
@@ -89,6 +91,29 @@ describe('useComposerMetrics', () => {
 
     view.rerender(<MetricsHarness running />)
 
+    expect(surface?.style.getPropertyValue('--thread-settled-clearance-height')).toBe('0px')
+  })
+
+  it('releases stale settled clearance when an idle hard newline expands without a resize delivery', () => {
+    vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockImplementation(function (this: HTMLElement) {
+      return rect(this.dataset.slot === 'composer-dock' ? dockHeight : 72, 480)
+    })
+
+    const view = renderHarness(true)
+    const surface = view.container.querySelector<HTMLElement>('[data-chat-surface]')
+
+    act(() => syncMetrics?.())
+    dockHeight = 120
+    view.rerender(<MetricsHarness running={false} />)
+    act(() => syncMetrics?.())
+
+    expect(surface?.style.getPropertyValue('--thread-settled-clearance-height')).toBe('320px')
+
+    dockHeight = 200
+    composerText = 'first line\nsecond line'
+    view.rerender(<MetricsHarness running={false} />)
+
+    expect(surface?.style.getPropertyValue('--composer-measured-height')).toBe('200px')
     expect(surface?.style.getPropertyValue('--thread-settled-clearance-height')).toBe('0px')
   })
 
