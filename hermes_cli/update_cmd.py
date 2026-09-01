@@ -20,6 +20,14 @@ from pathlib import Path
 from typing import Optional
 
 from hermes_cli.config import get_hermes_home
+from hermes_cli.update_abort_recovery import (
+    _abort_recovery_is_complete,
+    _qualified_serve_skips,
+    _recover_gateway_restart_after_abort,
+    _serve_unit_recovery_available,
+    _surviving_pre_update_serve_runtimes,
+    _warn_stale_serve_runtimes,
+)
 from hermes_constants import get_default_hermes_root, venv_python_path
 
 logger = logging.getLogger(__name__)
@@ -277,6 +285,7 @@ _COMPAT_CONSUMERS = {
     '_ZIP_PRESERVED_TOP_LEVEL': (_update_zip,),
     '_ZIP_STAGING_ARTIFACT_SUFFIXES': (_update_zip,),
     '_abort_dependency_sync_if_self_locked': (_update_process_guard,),
+    '_abort_recovery_is_complete': (_update_fleet_restart,),
     '_abort_zip_update_if_dirty_tree': (_update_zip,),
     '_add_upstream_remote': (_update_source,),
     '_apply_pending_fleet_restart_catchup': (_update_orchestrator, _update_reconciliation),
@@ -384,6 +393,7 @@ _COMPAT_CONSUMERS = {
     '_receipt_looks_unfinished': (_update_reconciliation,),
     '_receipt_reports_stale_runtime': (_update_reconciliation,),
     '_record_npm_lockfile_hash': (_update_dependencies,),
+    '_recover_gateway_restart_after_abort': (_update_fleet_restart,),
     '_refresh_active_lazy_features': (_update_dependencies,),
     '_refresh_active_memory_provider_dependencies': (_update_dependencies,),
     '_refresh_bootstrap_cache_scripts': (_update_gateway_windows,),
@@ -427,6 +437,7 @@ _COMPAT_CONSUMERS = {
     '_stop_process_trees': (_update_process_guard,),
     '_stop_windows_gateway_service': (_update_gateway_windows,),
     '_surviving_gateway_pids_after_failed_restart': (_update_fleet_restart, _update_orchestrator, _update_reconciliation),
+    '_surviving_pre_update_serve_runtimes': (_update_fleet_restart,),
     '_sync_fork_with_upstream': (_update_source,),
     '_sync_with_upstream_if_needed': (_update_source,),
     '_time': (_update_backup, _update_fleet_restart, _update_gateway_windows, _update_notices, _update_orchestrator, _update_process_guard, _update_reconciliation),
@@ -449,6 +460,7 @@ _COMPAT_CONSUMERS = {
     '_warn_orphaned_update_autostashes': (_update_source,),
     '_warn_pending_fleet_restart': (_update_reconciliation,),
     '_warn_pending_fleet_restart_on_startup': (_update_reconciliation,),
+    '_warn_stale_serve_runtimes': (_update_fleet_restart,),
     '_web_build_toolchain_ready': (_update_dependencies, _update_notices),
     '_web_toolchain_roots': (_update_dependencies, _update_notices),
     '_write_fleet_restart_pending_marker': (_update_orchestrator, _update_reconciliation),
