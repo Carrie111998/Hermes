@@ -9,6 +9,7 @@ liveness. Without a hook, behavior is byte-for-byte the old non-streaming call.
 
 import threading
 import time
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -286,6 +287,71 @@ class TestAggregateChatStream:
 
         assert time.monotonic() - started < 0.5
         assert aborted == [request_client]
+
+    @pytest.mark.windows_only
+    def test_no_progress_watchdog_interrupts_real_openai_socket(self, monkeypatch):
+        """The watchdog must wake the actual Windows SDK receive, not a mock."""
+        peer_release = threading.Event()
+
+        class _StalledSSE(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def do_POST(self):
+                length = int(self.headers.get("Content-Length", "0"))
+                self.rfile.read(length)
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Connection", "close")
+                self.end_headers()
+                self.wfile.flush()
+                peer_release.wait(timeout=2.0)
+
+            def log_message(self, format, *args):
+                pass
+
+        server = HTTPServer(("127.0.0.1", 0), _StalledSSE)
+        server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+        server_thread.start()
+        monkeypatch.setattr(
+            "agent.auxiliary_client._AUX_STREAM_NO_PROGRESS_TIMEOUT_SECONDS", 0.1
+        )
+
+        from openai import OpenAI
+
+        client = OpenAI(
+            api_key="test",
+            base_url=f"http://127.0.0.1:{server.server_address[1]}/v1",
+            max_retries=0,
+        )
+        result = []
+        started = time.monotonic()
+
+        def _request():
+            try:
+                with aux_progress_hook(lambda: None):
+                    _create_with_progress(
+                        client,
+                        {"model": "m1", "messages": [], "timeout": 5.0},
+                    )
+            except Exception as exc:
+                result.append(exc)
+
+        worker = threading.Thread(target=_request)
+        worker.start()
+        worker.join(timeout=1.0)
+        elapsed = time.monotonic() - started
+        peer_release.set()
+        worker.join(timeout=3.0)
+        client.close()
+        server.shutdown()
+        server.server_close()
+        server_thread.join(timeout=1.0)
+
+        assert not worker.is_alive(), "stalled SDK receive ignored the watchdog"
+        assert elapsed < 1.0
+        assert len(result) == 1
+        assert isinstance(result[0], TimeoutError)
+        assert "no-progress timeout" in str(result[0])
 
     def test_substantive_chunks_rearm_no_progress_watchdog(self, monkeypatch):
         monkeypatch.setattr(
@@ -578,10 +644,8 @@ class TestContentBearingProgress:
             for _ in range(5):
                 accumulator.feed(keepalive)
                 accumulator.feed(empty_role_chunk)
-        # No substantive payload arrived: the fence must have stayed stale.
-        # Let coarse Windows monotonic clocks advance before observing age.
-        time.sleep(0.01)
-        assert fence.seconds_since_progress() > 0.0
+        # No substantive payload arrived: the fence must not report progress.
+        assert fence.progress_observed is False
 
         with aux_progress_hook(fence.touch_progress):
             accumulator.feed(_chunk(content="token"))

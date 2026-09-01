@@ -9665,10 +9665,15 @@ def _create_with_progress_once(
     stream_kwargs["stream_options"] = {"include_usage": True}
     stream_client, owns_stream_client = _copy_request_local_streaming_client(client)
     try:
+        if owns_stream_client:
+            return _consume_request_local_stream(
+                stream_client,
+                stream_kwargs,
+                model=str(kwargs.get("model") or ""),
+                total_ceiling=total_ceiling,
+            )
         chunks = stream_client.chat.completions.create(**stream_kwargs)
     except Exception as exc:
-        if owns_stream_client:
-            _close_cached_client(stream_client)
         # Genuine provider failures (auth, credit, rate limit, network) are
         # not streaming's fault — surface them unchanged so the existing
         # recovery chains (credential refresh, pool rotation, provider
@@ -9700,19 +9705,12 @@ def _create_with_progress_once(
     # as provider response progress (TTFP) and forward progress alike.
     if hasattr(chunks, "choices"):
         _notify_aux_provider_response()
-        if owns_stream_client:
-            _close_cached_client(stream_client)
         return chunks
-    try:
-        return _aggregate_chat_stream(
-            chunks,
-            model=str(kwargs.get("model") or ""),
-            total_ceiling=total_ceiling,
-            request_client=stream_client if owns_stream_client else None,
-        )
-    finally:
-        if owns_stream_client:
-            _close_cached_client(stream_client)
+    return _aggregate_chat_stream(
+        chunks,
+        model=str(kwargs.get("model") or ""),
+        total_ceiling=total_ceiling,
+    )
 
 
 def _copy_request_local_streaming_client(client: Any) -> Tuple[Any, bool]:
@@ -9725,8 +9723,15 @@ def _copy_request_local_streaming_client(client: Any) -> Tuple[Any, bool]:
     Non-OpenAI adapters do not expose the required copy seam and retain their
     transport-specific ownership logic.
     """
+    # ``MagicMock`` and other dynamic adapters fabricate arbitrary attributes;
+    # only use the copy seam when the concrete object or its class declares it.
+    if (
+        inspect.getattr_static(client, "copy", None) is None
+        or inspect.getattr_static(client, "_client", None) is None
+    ):
+        return client, False
     copy_fn = getattr(client, "copy", None)
-    if not callable(copy_fn) or not hasattr(client, "_client"):
+    if not callable(copy_fn):
         return client, False
     base_url = str(getattr(client, "base_url", "") or "")
     http_client = _openai_http_client_kwargs(base_url).get("http_client")
@@ -9743,12 +9748,123 @@ def _copy_request_local_streaming_client(client: Any) -> Tuple[Any, bool]:
         return client, False
 
 
+def _consume_request_local_stream(
+    client: Any,
+    stream_kwargs: Dict[str, Any],
+    *,
+    model: str,
+    total_ceiling: float,
+) -> Any:
+    """Consume an isolated stream on its socket-owning daemon thread.
+
+    Windows cannot reliably wake httpx's blocked receive via a stranger-thread
+    socket shutdown. The caller therefore enforces the substantive-progress
+    deadline independently while this worker remains the sole owner of stream
+    iteration and client close. A timed-out worker can finish unwinding later,
+    but its request-local pool cannot poison retries or sibling tasks.
+    """
+    condition = threading.Condition()
+    state: Dict[str, Any] = {
+        "done": False,
+        "last_progress": time.monotonic(),
+        "result": None,
+        "error": None,
+    }
+    cancelled = threading.Event()
+    progress_hook = getattr(_aux_progress, "hook", None)
+    response_hook = getattr(_aux_provider_response, "hook", None)
+
+    def _progress() -> None:
+        with condition:
+            state["last_progress"] = time.monotonic()
+            condition.notify_all()
+        if progress_hook is not None:
+            progress_hook()
+
+    def _run() -> None:
+        if progress_hook is not None:
+            _aux_progress.hook = _progress
+        if response_hook is not None:
+            _aux_provider_response.hook = response_hook
+        try:
+            chunks = client.chat.completions.create(**stream_kwargs)
+            if hasattr(chunks, "choices"):
+                _notify_aux_provider_response()
+                result = chunks
+            else:
+                result = _aggregate_chat_stream(
+                    chunks,
+                    model=model,
+                    total_ceiling=total_ceiling,
+                    cancel_event=cancelled,
+                )
+            with condition:
+                state["result"] = result
+        except BaseException as exc:
+            with condition:
+                state["error"] = exc
+        finally:
+            _close_cached_client(client)
+            with condition:
+                state["done"] = True
+                condition.notify_all()
+
+    started = time.monotonic()
+    worker = threading.Thread(target=_run, daemon=True)
+    worker.start()
+    while True:
+        with condition:
+            if state["done"]:
+                break
+            now = time.monotonic()
+            idle_deadline = state["last_progress"] + _AUX_STREAM_NO_PROGRESS_TIMEOUT_SECONDS
+            hard_deadline = started + total_ceiling
+            deadline = min(idle_deadline, hard_deadline)
+            remaining = deadline - now
+            if remaining > 0:
+                condition.wait(timeout=remaining)
+                continue
+            elapsed = now - started
+            saw_progress = state["last_progress"] > started
+            hard_expired = now >= hard_deadline
+        cancelled.set()
+        try:
+            from agent.agent_runtime_helpers import force_close_tcp_sockets
+
+            force_close_tcp_sockets(client)
+        except Exception:
+            logger.debug(
+                "Auxiliary stream: socket abort on no-progress timeout failed",
+                exc_info=True,
+            )
+        if hard_expired:
+            raise TimeoutError(
+                f"Auxiliary streamed call timed out after {total_ceiling:.0f}s hard ceiling"
+            )
+        if not saw_progress:
+            raise TimeoutError(
+                "Auxiliary streamed call produced no output within "
+                f"{_AUX_STREAM_NO_PROGRESS_TIMEOUT_SECONDS:.1f}s "
+                f"(no-progress timeout, {elapsed:.1f}s elapsed)"
+            )
+        raise TimeoutError(
+            "Auxiliary streamed call stalled with no new output for "
+            f"{_AUX_STREAM_NO_PROGRESS_TIMEOUT_SECONDS:.1f}s "
+            f"({elapsed:.1f}s elapsed)"
+        )
+
+    if state["error"] is not None:
+        raise state["error"]
+    return state["result"]
+
+
 def _aggregate_chat_stream(
     chunks: Any,
     *,
     model: str = "",
     total_ceiling: Optional[float] = None,
     request_client: Any = None,
+    cancel_event: Optional[threading.Event] = None,
 ) -> Any:
     """Consume a chat.completions chunk stream into a complete response.
 
@@ -9838,6 +9954,8 @@ def _aggregate_chat_stream(
     try:
         for chunk in chunks:
             made_progress = acc.feed(chunk)
+            if cancel_event is not None and cancel_event.is_set():
+                raise TimeoutError("Auxiliary streamed call cancelled after caller timeout")
             if watchdog_expired.is_set():
                 raise TimeoutError(_timeout_message())
             if made_progress:

@@ -106,9 +106,11 @@ def test_summary_model_override_is_certified_against_the_effective_model():
 def test_compression_latency_records_delayed_first_provider_chunk():
     from agent.auxiliary_client import _notify_aux_progress, call_llm
 
+    now = [100.0]
+
     class _DelayedSemaphore:
         def acquire(self):
-            time.sleep(0.01)
+            now[0] += 0.01
 
         def release(self):
             pass
@@ -119,7 +121,7 @@ def test_compression_latency_records_delayed_first_provider_chunk():
     client.base_url = "http://127.0.0.1:11434/v1"
 
     def _chunks():
-        time.sleep(0.02)
+        now[0] += 0.02
         yield SimpleNamespace(
             id="chunk-1",
             model="qwen3:8b",
@@ -140,6 +142,7 @@ def test_compression_latency_records_delayed_first_provider_chunk():
     client.chat.completions.create.side_effect = lambda **_kwargs: _chunks()
 
     with (
+        patch("agent.auxiliary_client.time.monotonic", side_effect=lambda: now[0]),
         patch("agent.auxiliary_client._acquire_sync_aux_semaphore", return_value=_DelayedSemaphore()),
         patch("agent.auxiliary_client._get_cached_client", side_effect=_resolve_client),
     ):
