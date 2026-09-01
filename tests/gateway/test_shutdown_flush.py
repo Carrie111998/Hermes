@@ -5,10 +5,14 @@ import os
 import stat
 import time
 from pathlib import Path
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+import gateway.shutdown_flush as shutdown_flush
+from gateway.config import Platform
+from gateway.platforms.base import MessageEvent, MessageType
+from gateway.session import SessionSource
 from gateway.shutdown_flush import (
     _serialise_value,
     flush_pending_to_file,
@@ -63,6 +67,134 @@ def test_flush_writes_message_event_to_file(tmp_path, monkeypatch):
     payload = json.loads(files[0].read_text(encoding="utf-8"))
     assert payload["data"]["text"] == "user message"
     assert payload["data"]["session_id"] == "20260728_120000_abc"
+
+
+@pytest.mark.asyncio
+async def test_recover_reinjects_internal_event_and_deletes_file(
+    tmp_path, monkeypatch
+):
+    """A queued synthetic wake must resume as an event, not inert transcript text."""
+    flush_dir = _make_flush_dir(tmp_path)
+    monkeypatch.setattr(
+        "gateway.shutdown_flush._get_flush_dir", lambda: flush_dir
+    )
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="chat-1",
+        chat_type="dm",
+        user_id="owner-1",
+        thread_id="topic-7",
+        profile="operator",
+    )
+    event = MessageEvent(
+        text="[kanban] Task t_test completed.",
+        message_type=MessageType.TEXT,
+        source=source,
+        message_id="wake-1",
+        internal=True,
+        metadata={
+            "gateway_session_key": "agent:operator:telegram:dm:chat-1:topic-7",
+            "kanban_task_id": "t_test",
+        },
+        allow_gateway_control=False,
+    )
+    assert flush_pending_to_file({"session-key": event}, reason="shutdown") == 1
+
+    adapter = MagicMock()
+    adapter.handle_message = AsyncMock()
+    replayed, remaining = await shutdown_flush.recover_pending_internal_events(
+        {Platform.TELEGRAM: adapter}
+    )
+
+    assert (replayed, remaining) == (1, 0)
+    adapter.handle_message.assert_awaited_once()
+    await_args = adapter.handle_message.await_args
+    assert await_args is not None
+    recovered = await_args.args[0]
+    assert recovered.text == event.text
+    assert recovered.message_type is MessageType.TEXT
+    assert recovered.internal is True
+    assert recovered.allow_gateway_control is False
+    assert recovered.message_id == "wake-1"
+    assert recovered.source == source
+    assert recovered.metadata == event.metadata
+    assert list(flush_dir.glob("*.json")) == []
+
+
+@pytest.mark.asyncio
+async def test_recover_keeps_internal_event_when_adapter_rejects_it(
+    tmp_path, monkeypatch
+):
+    flush_dir = _make_flush_dir(tmp_path)
+    monkeypatch.setattr(
+        "gateway.shutdown_flush._get_flush_dir", lambda: flush_dir
+    )
+    event = MessageEvent(
+        text="[kanban] Task t_retry completed.",
+        source=SessionSource(platform=Platform.TELEGRAM, chat_id="chat-1"),
+        internal=True,
+        allow_gateway_control=False,
+    )
+    assert flush_pending_to_file({"session-key": event}, reason="shutdown") == 1
+
+    adapter = MagicMock()
+    adapter.handle_message = AsyncMock(side_effect=RuntimeError("not ready"))
+    replayed, remaining = await shutdown_flush.recover_pending_internal_events(
+        {Platform.TELEGRAM: adapter}
+    )
+
+    assert (replayed, remaining) == (0, 1)
+    assert len(list(flush_dir.glob("*.json"))) == 1
+
+
+@pytest.mark.asyncio
+async def test_recover_skips_malformed_entry_and_replays_later_event(
+    tmp_path, monkeypatch
+):
+    flush_dir = _make_flush_dir(tmp_path)
+    monkeypatch.setattr(
+        "gateway.shutdown_flush._get_flush_dir", lambda: flush_dir
+    )
+    (flush_dir / "000-poison.json").write_text(
+        json.dumps({"data": ["not", "an", "object"]}),
+        encoding="utf-8",
+    )
+    event = MessageEvent(
+        text="[kanban] Task t_after_poison completed.",
+        source=SessionSource(platform=Platform.TELEGRAM, chat_id="chat-1"),
+        internal=True,
+        allow_gateway_control=False,
+    )
+    assert flush_pending_to_file({"session-key": event}, reason="shutdown") == 1
+
+    adapter = MagicMock()
+    adapter.handle_message = AsyncMock()
+    replayed, remaining = await shutdown_flush.recover_pending_internal_events(
+        {Platform.TELEGRAM: adapter}
+    )
+
+    assert (replayed, remaining) == (1, 1)
+    adapter.handle_message.assert_awaited_once()
+    assert (flush_dir / "000-poison.json").exists()
+
+
+def test_transcript_recovery_does_not_consume_internal_event(tmp_path, monkeypatch):
+    flush_dir = _make_flush_dir(tmp_path)
+    monkeypatch.setattr(
+        "gateway.shutdown_flush._get_flush_dir", lambda: flush_dir
+    )
+    event = MessageEvent(
+        text="[kanban] Task t_pending completed.",
+        source=SessionSource(platform=Platform.TELEGRAM, chat_id="chat-1"),
+        internal=True,
+        allow_gateway_control=False,
+    )
+    assert flush_pending_to_file({"session-key": event}, reason="shutdown") == 1
+
+    mock_db = MagicMock()
+    assert recover_pending_to_db(mock_db) == 0
+    mock_db.append_message.assert_not_called()
+    assert len(list(flush_dir.glob("*.json"))) == 1
 
 
 def test_recover_inserts_via_append_message_and_deletes_file(tmp_path, monkeypatch):

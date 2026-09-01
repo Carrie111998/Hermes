@@ -5,7 +5,7 @@ accumulates messages in ``_pending_messages`` (memory-only) and the live
 ``agent._session_messages`` cannot be flushed via ``_flush_messages_to_session_db``.
 On shutdown, ``.clear()`` discards the only surviving copy — permanent user data loss.
 
-This module provides three hooks:
+This module provides four hooks:
 
 1. ``flush_pending_to_file()`` — called BEFORE ``_pending_messages.clear()``
    during shutdown.  Serialises any non-empty pending slots to a JSON file
@@ -16,7 +16,11 @@ This module provides three hooks:
    (so FTS indexing, session metadata, and display_kind are handled correctly),
    then deletes the flush file on success.
 
-3. ``flush_agent_history_to_file()`` — called from ``_finalize_shutdown_agents``
+3. ``recover_pending_internal_events()`` — called after gateway adapters start.
+   Re-injects queued synthetic events so they resume as turns instead of inert
+   transcript rows.
+
+4. ``flush_agent_history_to_file()`` — called from ``_finalize_shutdown_agents``
    when ``_flush_messages_to_session_db`` raises.  Dumps the live
    ``agent._session_messages`` to the same atomic JSON recovery directory.
 
@@ -35,6 +39,8 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 logger = logging.getLogger(__name__)
+
+PENDING_INTERNAL_EVENT_KIND = "pending_internal_event_v1"
 
 
 def _get_flush_dir():
@@ -256,8 +262,29 @@ def drain_transcript_spool(session_id: str, replay) -> tuple[int, int]:
 
 def _serialise_value(value: Any) -> Optional[dict]:
     """Convert a pending message value to a JSON-serialisable dict."""
-    # MessageEvent objects have a .text attribute and other fields
+    # MessageEvent objects have a .text attribute and other fields.
     if hasattr(value, "text"):
+        source = getattr(value, "source", None)
+        source_to_dict = getattr(source, "to_dict", None)
+        if getattr(value, "internal", False) is True and callable(source_to_dict):
+            message_type = getattr(value, "message_type", None)
+            return {
+                "kind": PENDING_INTERNAL_EVENT_KIND,
+                "text": getattr(value, "text", ""),
+                "message_type": getattr(message_type, "value", "text"),
+                "source": source_to_dict(),
+                "user_id": getattr(value, "user_id", None),
+                "user_name": getattr(value, "user_name", None),
+                "message_id": getattr(value, "message_id", None),
+                "media_urls": list(getattr(value, "media_urls", None) or []),
+                "media_types": list(getattr(value, "media_types", None) or []),
+                "reply_to_message_id": getattr(value, "reply_to_message_id", None),
+                "reply_to_text": getattr(value, "reply_to_text", None),
+                "metadata": dict(getattr(value, "metadata", None) or {}),
+                "allow_gateway_control": bool(
+                    getattr(value, "allow_gateway_control", False)
+                ),
+            }
         result: Dict[str, Any] = {"text": getattr(value, "text", "")}
         # Preserve additional fields if present
         for attr in ("session_id", "platform", "sender_id", "sender_name",
@@ -281,6 +308,94 @@ def _serialise_value(value: Any) -> Optional[dict]:
         except (TypeError, ValueError):
             return {"text": str(value)}
     return {"text": str(value)}
+
+
+async def recover_pending_internal_events(adapters: Dict[Any, Any]) -> tuple[int, int]:
+    """Re-inject shutdown-flushed synthetic events into live adapters.
+
+    Files are removed only after the adapter accepts the event. Missing
+    adapters, malformed payloads, and delivery failures leave the recovery
+    file intact for the next gateway startup.
+    """
+    from gateway.platforms.base import MessageEvent, MessageType
+    from gateway.session import SessionSource
+
+    flush_dir = _get_flush_dir()
+    replayed = 0
+    remaining = 0
+
+    for path in sorted(flush_dir.glob("*.json")):
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(payload, dict):
+                raise ValueError("recovery payload must be an object")
+            data = payload.get("data")
+            # Other recovery schemas (for example agent-history snapshots)
+            # intentionally have no data member and are not internal events.
+            if data is None:
+                continue
+            if not isinstance(data, dict):
+                raise ValueError("recovery payload data must be an object")
+        except Exception as exc:
+            remaining += 1
+            logger.warning(
+                "Cannot inspect malformed recovery file %s; keeping it and "
+                "continuing with later events: %s",
+                path,
+                exc,
+            )
+            continue
+        if data.get("kind") != PENDING_INTERNAL_EVENT_KIND:
+            continue
+
+        try:
+            source_data = data.get("source")
+            if not isinstance(source_data, dict):
+                raise ValueError("internal event source must be an object")
+            source = SessionSource.from_dict(source_data)
+            adapter = adapters.get(source.platform)
+            if adapter is None:
+                remaining += 1
+                logger.warning(
+                    "Cannot replay pending internal event from %s: adapter %s "
+                    "is not active; keeping recovery file",
+                    path,
+                    source.platform.value,
+                )
+                continue
+            event = MessageEvent(
+                text=str(data.get("text") or ""),
+                message_type=MessageType(data.get("message_type", "text")),
+                source=source,
+                user_id=data.get("user_id"),
+                user_name=data.get("user_name"),
+                message_id=data.get("message_id"),
+                media_urls=list(data.get("media_urls") or []),
+                media_types=list(data.get("media_types") or []),
+                reply_to_message_id=data.get("reply_to_message_id"),
+                reply_to_text=data.get("reply_to_text"),
+                internal=True,
+                metadata=dict(data.get("metadata") or {}),
+                allow_gateway_control=bool(data.get("allow_gateway_control", False)),
+            )
+            await adapter.handle_message(event)
+            path.unlink(missing_ok=True)
+            replayed += 1
+        except Exception as exc:
+            remaining += 1
+            logger.warning(
+                "Failed to replay pending internal event from %s; keeping "
+                "recovery file: %s",
+                path,
+                exc,
+            )
+
+    if replayed:
+        logger.info(
+            "Replayed %d pending internal event(s) after gateway startup",
+            replayed,
+        )
+    return replayed, remaining
 
 
 def recover_pending_to_db(
@@ -356,8 +471,13 @@ def recover_pending_to_db(
                 recovered += 1
                 path.unlink(missing_ok=True)
                 continue
-            session_key = payload.get("session_key", "")
             data = payload.get("data", {})
+            # Synthetic events must resume through their platform adapter. Do
+            # not degrade them into inert transcript rows when replay is
+            # temporarily unavailable.
+            if data.get("kind") == PENDING_INTERNAL_EVENT_KIND:
+                continue
+            session_key = payload.get("session_key", "")
             text = data.get("text", "")
             if not text or not session_key:
                 logger.warning(
