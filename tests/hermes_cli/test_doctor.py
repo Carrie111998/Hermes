@@ -340,6 +340,42 @@ class TestDoctorMemoryProviderSection:
         assert "Memory Provider" in out
         assert "Built-in memory active" not in out
 
+    def test_mem0_oss_mode_shows_ok_without_api_key(self, monkeypatch, tmp_path):
+        """OSS (local) mode needs no API key — doctor must not flag it."""
+        import json
+        home = self._make_hermes_home(tmp_path, provider="mem0")
+        (home / "mem0.json").write_text(json.dumps({
+            "mode": "oss",
+            "user_id": "hermes-user",
+            "agent_id": "hermes",
+            "oss": {
+                "llm": {"provider": "ollama", "config": {"model": "qwen3:4b"}},
+                "embedder": {"provider": "ollama", "config": {"model": "nomic-embed-text", "embedding_dims": 768}},
+                "vector_store": {"provider": "qdrant", "config": {"path": "mem0_qdrant"}},
+            },
+        }))
+        # _load_config reads $HERMES_HOME/mem0.json — not the doctor_mod attribute
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        out = self._run_doctor_and_capture(monkeypatch, tmp_path, provider="mem0")
+        assert "Memory Provider" in out
+        assert "Mem0 OSS (local) mode configured" in out
+        assert "API key not set" not in out
+
+    def test_mem0_oss_mode_without_vector_store_shows_fail(self, monkeypatch, tmp_path):
+        """OSS mode without a vector store is incomplete and must fail."""
+        import json
+        home = self._make_hermes_home(tmp_path, provider="mem0")
+        (home / "mem0.json").write_text(json.dumps({"mode": "oss", "oss": {}}))
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        out = self._run_doctor_and_capture(monkeypatch, tmp_path, provider="mem0")
+        assert "Mem0 OSS mode incomplete" in out
+
+    def test_mem0_platform_mode_without_key_shows_fail(self, monkeypatch, tmp_path):
+        """Cloud (platform) mode without a key still fails loudly."""
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        out = self._run_doctor_and_capture(monkeypatch, tmp_path, provider="mem0")
+        assert "Mem0 API key not set" in out
+
 
 def test_run_doctor_termux_treats_docker_and_browser_warnings_as_expected(monkeypatch, tmp_path):
     helper = TestDoctorMemoryProviderSection()
