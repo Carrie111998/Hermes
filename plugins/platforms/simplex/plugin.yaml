@@ -31,6 +31,12 @@ optional_env:
     description: "Auto-accept incoming contact requests (default: true)"
     prompt: "Auto-accept contact requests? (true/false)"
     password: false
+  - name: SIMPLEX_FILES_FOLDER
+    description: >-
+      Absolute path passed to simplex-chat via --files-folder. Required for
+      reliable inbound attachment paths and same-filesystem XFTP moves.
+    prompt: "SimpleX daemon files folder (absolute path)"
+    password: false
   - name: SIMPLEX_GROUP_ALLOWED
     description: >-
       Comma-separated SimpleX group IDs the bot should participate in, or

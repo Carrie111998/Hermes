@@ -43,6 +43,7 @@ hermes gateway setup
 
 ```
 SIMPLEX_WS_URL=ws://127.0.0.1:5225
+SIMPLEX_FILES_FOLDER=/simplex-chat/使用的绝对路径
 SIMPLEX_ALLOWED_USERS=<contact-id-1>,<contact-id-2>
 SIMPLEX_HOME_CHANNEL=<contact-id>
 ```
@@ -50,6 +51,7 @@ SIMPLEX_HOME_CHANNEL=<contact-id>
 | 变量 | 是否必填 | 说明 |
 |---|---|---|
 | `SIMPLEX_WS_URL` | 是 | simplex-chat 守护进程的 WebSocket URL |
+| `SIMPLEX_FILES_FOLDER` | 接收入站文件时必填 | 传给 `simplex-chat --files-folder` 的同一绝对路径；应与守护进程的 `--temp-folder` 位于同一文件系统。 |
 | `SIMPLEX_ALLOWED_USERS` | 建议填写 | 允许使用 Agent 的联系人 ID，以逗号分隔 |
 | `SIMPLEX_ALLOW_ALL_USERS` | 可选 | 设为 `true` 以允许所有联系人（请谨慎使用） |
 | `SIMPLEX_HOME_CHANNEL` | 可选 | cron 任务投递的默认联系人 ID |

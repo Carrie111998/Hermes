@@ -27,6 +27,9 @@ Optional environment variables:
     SIMPLEX_ALLOW_ALL_USERS    Set 'true' to allow all contacts
     SIMPLEX_AUTO_ACCEPT        Set 'false' to disable contact-request auto-accept
                                (default: 'true')
+    SIMPLEX_FILES_FOLDER       Absolute path passed to simplex-chat via
+                               --files-folder. Required for reliable inbound
+                               attachment paths and same-filesystem XFTP moves.
     SIMPLEX_GROUP_ALLOWED      Comma-separated group IDs to monitor, or '*'
                                for any group. Omit to disable groups entirely.
     SIMPLEX_HOME_CHANNEL       Default contact/group ID for cron delivery
@@ -258,7 +261,14 @@ class SimplexAdapter(BasePlatformAdapter):
         # The daemon reports received paths relative to --files-folder and
         # exposes only a setter, not a query API. Mirror the non-secret path in
         # config so downstream media consumers always receive openable paths.
-        self.files_folder = str(extra.get("files_folder", "") or "")
+        files_folder = os.getenv("SIMPLEX_FILES_FOLDER", "").strip() or str(
+            extra.get("files_folder", "") or ""
+        ).strip()
+        self.files_folder = (
+            os.path.abspath(os.path.expanduser(files_folder))
+            if files_folder
+            else ""
+        )
         self._file_transfer_timeout = max(
             1.0, float(extra.get("file_transfer_timeout", 300.0))
         )
@@ -667,19 +677,28 @@ class SimplexAdapter(BasePlatformAdapter):
                     if isinstance(file_info, dict)
                     else ""
                 ) or rcv_file.get("fileName", "")
-                target_dir = self.files_folder or tempfile.gettempdir()
-                target = os.path.join(
-                    target_dir,
-                    f"simplex-rcv-{uuid.uuid4().hex}-{_sanitize_filename(file_name)}",
-                )
-                while os.path.exists(target):
+                target: Optional[str] = None
+                if self.files_folder:
                     target = os.path.join(
-                        target_dir,
+                        self.files_folder,
                         f"simplex-rcv-{uuid.uuid4().hex}-{_sanitize_filename(file_name)}",
                     )
-                self._file_receive_targets[file_id] = target
-                if not self.retain_received_files:
-                    self._schedule_owned_media_cleanup(target)
+                while target and os.path.exists(target):
+                    target = os.path.join(
+                        self.files_folder,
+                        f"simplex-rcv-{uuid.uuid4().hex}-{_sanitize_filename(file_name)}",
+                    )
+                if target:
+                    self._file_receive_targets[file_id] = target
+                    if not self.retain_received_files:
+                        self._schedule_owned_media_cleanup(target)
+                else:
+                    logger.warning(
+                        "SimpleX: SIMPLEX_FILES_FOLDER is not configured; "
+                        "receiving file %s to the daemon-managed folder without "
+                        "claiming cleanup ownership",
+                        file_id,
+                    )
                 logger.debug(
                     "SimpleX: rcvFileDescrReady for fileId=%s — accepting transfer",
                     file_id,
@@ -802,6 +821,14 @@ class SimplexAdapter(BasePlatformAdapter):
                     self._pending_file_transfers.pop(file_id, None)
                     self._cancel_file_timeout(file_id)
                     file_path = self._resolve_file_path(file_path)
+                    if not os.path.isabs(file_path):
+                        self._pending_file_transfers[file_id] = pending
+                        await self._fail_file_transfer(
+                            file_id,
+                            "SIMPLEX_FILES_FOLDER is required to resolve the "
+                            "daemon's relative attachment path",
+                        )
+                        return
                     pending_item_data = pending.get("chatItem", {}) or {}
                     pending_file = pending_item_data.setdefault("file", {})
                     pending_file["fileSource"] = {"filePath": file_path}
@@ -1080,10 +1107,11 @@ class SimplexAdapter(BasePlatformAdapter):
             self._diagnostics["command_errors"] += 1
             logger.warning("SimpleX: contact request acceptance failed: %s", error)
 
-    async def _receive_file(self, file_id: int, target: str) -> None:
-        resp = await self._send_command(
-            f"/freceive {file_id} approved_relays=on {target}", timeout=30.0
-        )
+    async def _receive_file(self, file_id: int, target: Optional[str]) -> None:
+        command = f"/freceive {file_id} approved_relays=on"
+        if target:
+            command += f" {target}"
+        resp = await self._send_command(command, timeout=30.0)
         error = _response_error(resp)
         if error or _response_type(resp) == "rcvFileAcceptedSndCancelled":
             self._diagnostics["command_errors"] += 1
@@ -2595,6 +2623,10 @@ def _env_enablement() -> Optional[dict]:
     group_allowed = os.getenv("SIMPLEX_GROUP_ALLOWED", "").strip()
     if group_allowed:
         seed["group_allowed"] = group_allowed
+
+    files_folder = os.getenv("SIMPLEX_FILES_FOLDER", "").strip()
+    if files_folder:
+        seed["files_folder"] = files_folder
 
     home = os.getenv("SIMPLEX_HOME_CHANNEL", "").strip()
     if home:

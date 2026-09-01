@@ -45,6 +45,7 @@ Add these to `~/.hermes/.env`:
 
 ```
 SIMPLEX_WS_URL=ws://127.0.0.1:5225
+SIMPLEX_FILES_FOLDER=/absolute/path/used/by/simplex-chat
 SIMPLEX_ALLOWED_USERS=<contact-id-1>,<contact-id-2>
 SIMPLEX_HOME_CHANNEL=<contact-id>
 SIMPLEX_AUTO_ACCEPT=false
@@ -53,6 +54,7 @@ SIMPLEX_AUTO_ACCEPT=false
 | Variable | Required | Description |
 |---|---|---|
 | `SIMPLEX_WS_URL` | Yes | WebSocket URL of the simplex-chat daemon |
+| `SIMPLEX_FILES_FOLDER` | Required for inbound files | Exact absolute path passed to `simplex-chat --files-folder`. Keep it on the same filesystem as the daemon's `--temp-folder`; SimpleX completes XFTP downloads with a filesystem rename. |
 | `SIMPLEX_ALLOWED_USERS` | Recommended | Comma-separated numeric `contactId` allowlist. Display names are mutable labels and are not authorization identities. |
 | `SIMPLEX_ALLOW_ALL_USERS` | Optional | Set `true` to allow every contact (use carefully) |
 | `SIMPLEX_AUTO_ACCEPT` | Optional | Auto-accept incoming contact requests (default: `true`). Keep this `false` for production identities unless unattended enrollment is intentional. |
@@ -60,7 +62,7 @@ SIMPLEX_AUTO_ACCEPT=false
 | `SIMPLEX_HOME_CHANNEL` | Optional | Default contact/group ID for cron job delivery |
 | `SIMPLEX_HOME_CHANNEL_NAME` | Optional | Human label for the home channel |
 | `HERMES_SIMPLEX_TEXT_BATCH_DELAY` | Optional | Quiet-period seconds (default: `0.8`) used to concatenate rapid-fire inbound text messages into one event |
-| `platforms.simplex.extra.files_folder` | Optional | Absolute daemon `--files-folder` path used to resolve relative received-file paths |
+| `platforms.simplex.extra.files_folder` | Alternative to `SIMPLEX_FILES_FOLDER` | Absolute daemon `--files-folder` path used to resolve relative received-file paths |
 | `platforms.simplex.extra.file_transfer_timeout` | Optional | Seconds before a stalled inbound transfer is discarded and its caption is delivered without the attachment (default: `300`) |
 | `platforms.simplex.extra.retain_received_files` | Optional | Keep adapter-created inbound transfer files after the turn. Defaults to `false`; unrelated daemon/user files are never removed. |
 | `platforms.simplex.extra.media_cleanup_timeout` | Optional | TTL backstop for adapter-created inbound files and converted outbound previews (default: `3600`, minimum: `60`) |

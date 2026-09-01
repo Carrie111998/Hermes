@@ -116,6 +116,15 @@ def test_env_enablement_seeds_home_channel(monkeypatch):
     assert seed["home_channel"] == {"chat_id": "42", "name": "Personal"}
 
 
+def test_env_enablement_seeds_files_folder(monkeypatch, tmp_path):
+    monkeypatch.setenv("SIMPLEX_WS_URL", "ws://127.0.0.1:5225")
+    monkeypatch.setenv("SIMPLEX_FILES_FOLDER", str(tmp_path))
+
+    seed = _env_enablement()
+
+    assert seed["files_folder"] == str(tmp_path)
+
+
 # ---------------------------------------------------------------------------
 # 4. Adapter init
 # ---------------------------------------------------------------------------
@@ -930,6 +939,82 @@ async def test_receive_file_enables_approved_relays():
         "/freceive 9 approved_relays=on /tmp/safe-name.pdf",
         timeout=30.0,
     )
+
+
+@pytest.mark.asyncio
+async def test_receive_file_without_folder_uses_daemon_managed_path():
+    from gateway.config import PlatformConfig
+
+    adapter = SimplexAdapter(
+        PlatformConfig(enabled=True, extra={"ws_url": "ws://localhost:5225"})
+    )
+    adapter._send_command = AsyncMock(return_value={"type": "rcvFileAccepted"})
+
+    await adapter._receive_file(9, None)
+
+    adapter._send_command.assert_awaited_once_with(
+        "/freceive 9 approved_relays=on",
+        timeout=30.0,
+    )
+
+
+@pytest.mark.asyncio
+async def test_descriptor_without_files_folder_never_targets_system_tmp():
+    from gateway.config import PlatformConfig
+
+    adapter = SimplexAdapter(
+        PlatformConfig(enabled=True, extra={"ws_url": "ws://localhost:5225"})
+    )
+    adapter._receive_file = AsyncMock()
+    adapter.set_authorization_check(lambda *_args: True)
+    wrapper = _make_file_chat_item("", "report.pdf")
+    wrapper["chatItem"]["file"].pop("fileSource")
+
+    await adapter._handle_event(
+        {
+            "resp": {
+                "type": "rcvFileDescrReady",
+                "rcvFileTransfer": {"fileId": 7, "fileName": "report.pdf"},
+                "chatItem": wrapper,
+            }
+        }
+    )
+    await asyncio.gather(*list(adapter._command_tasks))
+
+    adapter._receive_file.assert_awaited_once_with(7, None)
+    assert adapter._file_receive_targets == {}
+    assert adapter._owned_media_cleanup_tasks == {}
+
+
+@pytest.mark.asyncio
+async def test_relative_completion_without_files_folder_falls_back_to_caption():
+    from gateway.config import PlatformConfig
+
+    adapter = SimplexAdapter(
+        PlatformConfig(enabled=True, extra={"ws_url": "ws://localhost:5225"})
+    )
+    adapter.set_authorization_check(lambda *_args: True)
+    adapter._text_batch_delay = 0
+    captured = []
+
+    async def capture(event):
+        captured.append(event)
+
+    adapter.handle_message = capture
+    pending = _make_file_chat_item("", "report.pdf")
+    pending["chatItem"]["file"].pop("fileSource")
+    adapter._pending_file_transfers[7] = pending
+    complete = _make_file_chat_item("report.pdf", "report.pdf")
+
+    await adapter._handle_event(
+        {"resp": {"type": "rcvFileComplete", "chatItem": complete}}
+    )
+    if adapter._pending_text_batch_tasks:
+        await asyncio.gather(*list(adapter._pending_text_batch_tasks.values()))
+
+    assert [event.text for event in captured] == ["here you go"]
+    assert captured[0].media_urls == []
+    assert adapter.get_runtime_diagnostics()["file_failures"] == 1
 
 
 @pytest.mark.asyncio
