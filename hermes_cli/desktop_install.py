@@ -75,7 +75,14 @@ def _production_copy(source: Path, destination: Path) -> None:
 def _remove_owned_bundle(path: Path) -> None:
     if not path.exists() and not path.is_symlink():
         return
-    if path.is_symlink() or not path.is_dir():
+    # These are exact transaction-owned names (installing / rollback, or the
+    # canonical target after a failed final rename). Removing a symlink here
+    # unlinks only the directory entry; it never follows or deletes its target.
+    # This is also how a legacy versioned-app symlink is migrated safely.
+    if path.is_symlink():
+        path.unlink()
+        return
+    if not path.is_dir():
         raise DesktopInstallError(f"refusing to remove unexpected updater path: {path}")
     shutil.rmtree(path)
 
@@ -111,7 +118,7 @@ def install_macos_app(
 
     # Recover a transaction interrupted after the old app moved aside.
     if rollback.exists() and not canonical.exists():
-        if rollback.is_symlink() or not rollback.is_dir():
+        if not rollback.is_symlink() and not rollback.is_dir():
             raise DesktopInstallError(f"refusing unexpected rollback path: {rollback}")
         move(rollback, canonical)
     elif rollback.exists() or rollback.is_symlink():
@@ -131,11 +138,12 @@ def install_macos_app(
         raise DesktopInstallError(f"could not stage Hermes app from {source}") from exc
 
     replaced_existing = canonical.exists()
-    if replaced_existing:
-        if canonical.is_symlink() or not canonical.is_dir():
+    if replaced_existing or canonical.is_symlink():
+        if not canonical.is_symlink() and not canonical.is_dir():
             _remove_owned_bundle(stage)
             raise DesktopInstallError(f"canonical Hermes install is not a real app directory: {canonical}")
         move(canonical, rollback)
+        replaced_existing = True
 
     try:
         move(stage, canonical)

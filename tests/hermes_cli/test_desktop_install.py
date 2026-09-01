@@ -104,6 +104,23 @@ class DesktopInstallContractTests(unittest.TestCase):
         with self.assertRaisesRegex(DesktopInstallError, "artifact source"):
             install_macos_app(canonical, home=home, copy_bundle=_copytree)
 
+    def test_migrates_legacy_versioned_app_symlink_without_deleting_target(self) -> None:
+        source = _bundle(self.root / "release", "2")
+        home = self.root / "user"
+        applications = home / "Applications"
+        legacy_staged = _bundle(self.root / "legacy", "1")
+        applications.mkdir(parents=True)
+        legacy = applications / "Hermes-0.17.0-old.app"
+        legacy_staged.rename(legacy)
+        canonical = canonical_macos_app(home)
+        canonical.symlink_to(legacy.name)
+
+        result = install_macos_app(source, home=home, copy_bundle=_copytree)
+
+        self.assertFalse(canonical.is_symlink())
+        self.assertEqual(result.executable.read_text(encoding="utf-8"), "2")
+        self.assertEqual(macos_app_executable(legacy).read_text(encoding="utf-8"), "1")
+
     def test_refuses_wrong_bundle_identity(self) -> None:
         source = _bundle(self.root / "release", "1")
         info = source / "Contents" / "Info.plist"
