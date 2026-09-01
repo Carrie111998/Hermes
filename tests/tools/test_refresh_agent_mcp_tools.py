@@ -224,3 +224,116 @@ def test_wait_returns_instantly_when_no_discovery_thread(monkeypatch):
     t0 = time.time()
     mcp_startup.wait_for_mcp_discovery()
     assert time.time() - t0 < 0.2  # never blocks on the bound when nothing's pending
+
+
+# ---------------------------------------------------------------------------
+# preserve_prefix: the tool array is a cached request prefix (#100336)
+# ---------------------------------------------------------------------------
+
+
+def _registered(monkeypatch, names):
+    """Make the registry report exactly *names* as still registered."""
+    from tools import registry as registry_mod
+
+    entries = [types.SimpleNamespace(name=n) for n in names]
+    monkeypatch.setattr(
+        registry_mod.registry, "get_all_entries", lambda: entries, raising=False
+    )
+
+
+def _serve(monkeypatch, defs):
+    import model_tools
+
+    monkeypatch.setattr(model_tools, "get_tool_definitions", lambda **kw: list(defs))
+
+
+def test_preserve_prefix_carries_a_flapping_tool_forward(monkeypatch):
+    """A check_fn flip must not shrink a live session's tool prefix.
+
+    ``browser_navigate``'s availability probe fails this turn (headless box,
+    expired credential, docker blip) so ``get_tool_definitions`` omits it. The
+    tool is still *registered* — only its probe flapped — so the snapshot must
+    keep it, byte-for-byte, instead of forking the cached prefix.
+    """
+    agent = _agent(["read_file", "browser_navigate", "terminal"])
+    before = list(agent.tools)
+
+    _serve(monkeypatch, [_tool("read_file"), _tool("terminal")])
+    _registered(monkeypatch, ["read_file", "browser_navigate", "terminal"])
+
+    added = mcp_tool.refresh_agent_mcp_tools(agent, preserve_prefix=True)
+
+    assert added == set()
+    assert agent.tools == before
+    assert "browser_navigate" in agent.valid_tool_names
+
+
+def test_preserve_prefix_still_drops_a_deregistered_tool(monkeypatch):
+    """A server that genuinely went away still loses its schemas.
+
+    Carrying an unregistered name forward would advertise a tool whose handler
+    no longer exists — dispatch would answer "Unknown tool".
+    """
+    agent = _agent(["read_file", "mcp_granola_list", "terminal"])
+
+    _serve(monkeypatch, [_tool("read_file"), _tool("terminal")])
+    _registered(monkeypatch, ["read_file", "terminal"])
+
+    mcp_tool.refresh_agent_mcp_tools(agent, preserve_prefix=True)
+
+    assert [t["function"]["name"] for t in agent.tools] == ["read_file", "terminal"]
+    assert "mcp_granola_list" not in agent.valid_tool_names
+
+
+def test_preserve_prefix_appends_late_arrivals_at_the_tail(monkeypatch):
+    """``get_definitions`` sorts by name, so a late tool can splice in at 0.
+
+    Under ``preserve_prefix`` the live order is authoritative and the new tool
+    extends the array, leaving every earlier byte where the provider cached it.
+    """
+    agent = _agent(["read_file", "terminal"])
+
+    # Sorted order would put the new tool first.
+    _serve(monkeypatch, [_tool("aaa_mcp_late"), _tool("read_file"), _tool("terminal")])
+    _registered(monkeypatch, ["aaa_mcp_late", "read_file", "terminal"])
+
+    added = mcp_tool.refresh_agent_mcp_tools(agent, preserve_prefix=True)
+
+    assert added == {"aaa_mcp_late"}
+    assert [t["function"]["name"] for t in agent.tools] == [
+        "read_file", "terminal", "aaa_mcp_late",
+    ]
+
+
+def test_preserve_prefix_takes_the_fresh_schema_for_an_existing_slot(monkeypatch):
+    """Dynamic schema overrides still land — only the *position* is pinned.
+
+    Content changes reach the snapshot through the ``content_aware`` diff (the
+    compaction boundary); ``preserve_prefix`` must not turn that into a reorder.
+    """
+    agent = _agent(["read_file", "delegate_task"])
+
+    fresh = _tool("delegate_task")
+    fresh["function"]["description"] = "max_concurrent_children=4"
+    # Sorted order would move delegate_task ahead of read_file.
+    _serve(monkeypatch, [fresh, _tool("read_file")])
+    _registered(monkeypatch, ["read_file", "delegate_task"])
+
+    mcp_tool.refresh_agent_mcp_tools(
+        agent, preserve_prefix=True, content_aware=True,
+    )
+
+    assert [t["function"]["name"] for t in agent.tools] == ["read_file", "delegate_task"]
+    assert agent.tools[1]["function"]["description"] == "max_concurrent_children=4"
+
+
+def test_refresh_without_preserve_prefix_keeps_rebuilding(monkeypatch):
+    """Default (explicit /reload-mcp, compaction) behaviour is unchanged."""
+    agent = _agent(["read_file", "browser_navigate", "terminal"])
+
+    _serve(monkeypatch, [_tool("read_file"), _tool("terminal")])
+    _registered(monkeypatch, ["read_file", "browser_navigate", "terminal"])
+
+    mcp_tool.refresh_agent_mcp_tools(agent)
+
+    assert [t["function"]["name"] for t in agent.tools] == ["read_file", "terminal"]
