@@ -36,6 +36,11 @@ _WEIXIN_TARGET_RE = re.compile(r"^\s*((?:wxid|gh|v\d+|wm|wb)_[A-Za-z0-9_-]+|[A-Z
 _YUANBAO_TARGET_RE = re.compile(r"^\s*((?:group|direct):[^:]+)\s*$")
 # Discord snowflake IDs are numeric, same regex pattern as Telegram topic targets.
 _NUMERIC_TOPIC_RE = _TELEGRAM_TOPIC_TARGET_RE
+# Discord user targets must be written explicitly. A Discord user ID and a
+# channel ID are both snowflakes, so unlike Slack's "U..." IDs there is no way
+# to tell them apart by shape. A bare number therefore stays a channel, exactly
+# as before; only these unambiguous forms address a person.
+_DISCORD_USER_TARGET_RE = re.compile(r"^\s*(?:user:\s*(\d+)|<@!?(\d+)>)\s*$", re.IGNORECASE)
 # Platforms that address recipients by phone number and accept E.164 format
 # (with a leading '+'). Without this, "+15551234567" fails the isdigit() check
 # below and falls through to channel-name resolution, which has no way to
@@ -487,6 +492,19 @@ def _handle_send(args):
                 return json.dumps(_resolve_err)
             chat_id = _resolved
 
+    # Discord: resolve user targets to DM channel IDs before sending.
+    # _parse_target_ref emits ``user:<id>`` only for the explicit forms; a bare
+    # snowflake is deliberately left as a channel, since guessing wrong would
+    # deliver a private message to a channel.
+    if platform_name == "discord" and chat_id and str(chat_id).startswith("user:"):
+        from model_tools import _run_async
+        _resolved, _resolve_err = _run_async(
+            _resolve_discord_user_target(pconfig.token, str(chat_id))
+        )
+        if _resolve_err:
+            return json.dumps(_resolve_err)
+        chat_id = _resolved
+
     try:
         from model_tools import _run_async
         send_kwargs = {
@@ -554,6 +572,9 @@ def _parse_target_ref(platform_name: str, target_ref: str):
         if match:
             return match.group(1), match.group(2), True
     if platform_name == "discord":
+        match = _DISCORD_USER_TARGET_RE.fullmatch(target_ref)
+        if match:
+            return f"user:{match.group(1) or match.group(2)}", None, True
         match = _NUMERIC_TOPIC_RE.fullmatch(target_ref)
         if match:
             return match.group(1), match.group(2), True
@@ -1898,6 +1919,63 @@ async def _registry_standalone_send(platform_name, pconfig, chat_id, message, th
 
 # _send_whatsapp moved to plugins/platforms/whatsapp/adapter.py::_standalone_send,
 # wired via standalone_sender_fn and reached through _registry_standalone_send. #41112.
+
+
+async def _resolve_discord_user_target(token, chat_id):
+    """Resolve a Discord user target to a DM channel ID.
+
+    ``chat_id`` may be a channel ID -- returned unchanged -- or an internal
+    ``user:<snowflake>`` target emitted by :func:`_parse_target_ref`. Discord's
+    message endpoint only accepts channel IDs, so a user target is opened as a
+    DM through ``POST /users/@me/channels``. Discord returns the already-open
+    DM channel when one exists, so this is safe to call repeatedly and needs no
+    cached directory of prior conversations.
+
+    Returns ``(chat_id, None)`` on success or ``(None, error_dict)`` on failure.
+    """
+    if not str(chat_id).startswith("user:"):
+        return chat_id, None
+    user_id = str(chat_id)[len("user:"):].strip()
+    if not user_id.isdigit():
+        return None, {
+            "error": f"Invalid Discord user target '{chat_id}': expected a numeric user ID."
+        }
+    try:
+        import aiohttp
+    except ImportError:
+        return None, {"error": "aiohttp not installed. Run: pip install aiohttp"}
+    try:
+        from gateway.platforms.base import resolve_proxy_url, proxy_kwargs_for_aiohttp
+        _proxy = resolve_proxy_url()
+        _sess_kw, _req_kw = proxy_kwargs_for_aiohttp(_proxy)
+        headers = {
+            "Authorization": f"Bot {token}",
+            "Content-Type": "application/json",
+        }
+        async with aiohttp.ClientSession(**_sess_kw) as session:
+            async with session.post(
+                "https://discord.com/api/v10/users/@me/channels",
+                headers=headers,
+                json={"recipient_id": user_id},
+                **_req_kw,
+            ) as resp:
+                if resp.status >= 400:
+                    body = (await resp.text())[:200]
+                    return None, {
+                        "error": (
+                            f"Discord could not open a DM with user {user_id} "
+                            f"(HTTP {resp.status}): {body}"
+                        )
+                    }
+                data = await resp.json()
+        dm_channel_id = str((data or {}).get("id") or "")
+        if not dm_channel_id:
+            return None, {
+                "error": f"Discord returned no DM channel id for user {user_id}."
+            }
+        return dm_channel_id, None
+    except Exception as e:
+        return None, {"error": f"Failed to open Discord DM with user {user_id}: {e}"}
 
 
 async def _resolve_slack_user_target(token, chat_id):
