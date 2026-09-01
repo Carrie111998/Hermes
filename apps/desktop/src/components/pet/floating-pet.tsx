@@ -18,6 +18,7 @@ import {
   mergePetInfoMeta,
   type PetInfo,
   type PetInfoMeta,
+  petOwnerUsesAmbientGateway,
   requestPetForOwner,
   setPetInfo
 } from '@/store/pet'
@@ -113,6 +114,7 @@ export function FloatingPet() {
   const atRest = useStore($petAtRest)
   const roamDir = useStore($petRoamDir)
   const routeOverlayOpen = useRouteOverlayActive()
+  const usesAmbientGateway = petOwnerUsesAmbientGateway(owner)
 
   const requestPetGateway = useCallback(
     <T,>(method: string, params: Record<string, unknown> = {}) =>
@@ -153,7 +155,7 @@ export function FloatingPet() {
   // Older backends (no change_events) keep the legacy fast-while-inactive poll.
   const active = info.enabled && Boolean(info.spritesheetBase64)
   useEffect(() => {
-    if (gatewayState !== 'open') {
+    if (usesAmbientGateway && gatewayState !== 'open') {
       return
     }
 
@@ -163,7 +165,12 @@ export function FloatingPet() {
     // broadcast clears the mascot with zero round-trips, and an unchanged
     // revision (scale-only move still changes the sig) short-circuits below
     // via hasPetSpriteForMeta + mergePetInfoMeta.
-    if (changeEventsAvailable && petChange.tick > 0 && petChange.meta?.enabled === false) {
+    if (
+      usesAmbientGateway &&
+      changeEventsAvailable &&
+      petChange.tick > 0 &&
+      petChange.meta?.enabled === false
+    ) {
       setPetInfo({ enabled: false })
 
       return
@@ -280,7 +287,7 @@ export function FloatingPet() {
 
       window.clearInterval(timer)
     }
-  }, [gatewayState, active, changeEventsAvailable, petChange, requestPetGateway])
+  }, [gatewayState, active, changeEventsAvailable, petChange, requestPetGateway, usesAmbientGateway])
 
   // Pets follow the exact Bot owner as well as ordinary profile switches. Drop
   // the prior sprite immediately so a slow remote dial never leaves the default

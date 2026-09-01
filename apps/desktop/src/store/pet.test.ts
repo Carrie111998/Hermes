@@ -14,6 +14,7 @@ import {
   mergePetInfoMeta,
   type PetInfo,
   petOwner,
+  petOwnerUsesAmbientGateway,
   petProfile,
   requestPetForOwner,
   setPetActivity
@@ -38,6 +39,7 @@ describe('pet owner routing', () => {
       profile: 'scout',
       targetProfile: 'scout'
     })
+    expect(petOwnerUsesAmbientGateway(petOwner())).toBe(false)
 
     setWorkspaceScope('sessions')
   })
@@ -71,6 +73,7 @@ describe('pet owner routing', () => {
 
     expect(petProfile()).toBe('nightwatch')
     expect(petOwner()).toEqual({ profile: 'nightwatch', targetProfile: 'nightwatch' })
+    expect(petOwnerUsesAmbientGateway(petOwner())).toBe(true)
 
     setWorkspaceScope('sessions')
     $activeGatewayProfile.set('default')

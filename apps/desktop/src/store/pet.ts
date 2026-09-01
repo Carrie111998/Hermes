@@ -181,6 +181,11 @@ export function petOwner(): PetOwner {
   return $petOwner.get()
 }
 
+/** Ambient gateway state/events apply only when no exact Bot owner route exists. */
+export function petOwnerUsesAmbientGateway(owner: PetOwner): boolean {
+  return !owner.connectionId
+}
+
 /** Profile whose config + pet store should answer pet RPCs. */
 export function petProfile(): string {
   return petOwner().targetProfile
