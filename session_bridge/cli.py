@@ -7,6 +7,7 @@ import asyncio
 import hashlib
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict, replace
+from datetime import datetime, timezone
 import json
 import logging
 import math
@@ -15,8 +16,10 @@ from pathlib import Path
 import re
 import stat
 import subprocess
+import sys
 import threading
 import time
+import traceback
 from typing import Any, NamedTuple, Protocol, cast
 
 from agent.transports.codex_app_server import CodexAppServerClient
@@ -4484,7 +4487,10 @@ def _main_unscoped(
     if args.command == "install-sidebar-skill":
         try:
             installed = install_sidebar_skill()
-        except Exception:
+        except Exception as exc:
+            _log_suppressed_exception(
+                "install_sidebar_skill", exc, command=args.command
+            )
             _emit({"error": "configuration_error"})
             return EXIT_CONFIG
         _emit({"status": "installed", "path": str(installed)})
@@ -4492,7 +4498,10 @@ def _main_unscoped(
     if args.command == "install-claude-skill":
         try:
             installed = install_claude_skill()
-        except Exception:
+        except Exception as exc:
+            _log_suppressed_exception(
+                "install_claude_skill", exc, command=args.command
+            )
             _emit({"error": "configuration_error"})
             return EXIT_CONFIG
         _emit({"status": "installed", "path": str(installed)})
@@ -4512,7 +4521,8 @@ def _main_unscoped(
             backend = ProductionBackend(config, db_path=state_db)
         else:
             backend = backend_factory(config)
-    except Exception:
+    except Exception as exc:
+        _log_suppressed_exception("startup", exc, command=args.command)
         _emit({"error": "configuration_error"})
         return EXIT_CONFIG
 
@@ -4792,16 +4802,20 @@ def _main_unscoped(
     except RolloutGateBlocked as exc:
         _emit({"error": "rollout_gate_blocked", "gate": exc.gate})
         return EXIT_ROLLOUT_GATE
-    except ConfigurationFailure:
+    except ConfigurationFailure as exc:
+        _log_suppressed_exception("dispatch.configuration", exc, command=args.command)
         _emit({"error": "configuration_error"})
         return EXIT_CONFIG
-    except ProviderDegraded:
+    except ProviderDegraded as exc:
+        _log_suppressed_exception("dispatch.provider", exc, command=args.command)
         _emit({"error": "provider_degraded"})
         return EXIT_DEGRADED
-    except (OSError, PermissionError, TypeError, ValueError):
+    except (OSError, PermissionError, TypeError, ValueError) as exc:
+        _log_suppressed_exception("dispatch.runtime", exc, command=args.command)
         _emit({"error": "configuration_error"})
         return EXIT_CONFIG
-    except Exception:
+    except Exception as exc:
+        _log_suppressed_exception("dispatch.unexpected", exc, command=args.command)
         _emit({"error": "provider_degraded"})
         return EXIT_DEGRADED
     finally:
@@ -5866,6 +5880,40 @@ def _sanitize(value: Any, *, key: str | None = None) -> Any:
     if value is None or isinstance(value, (bool, int, float, str)):
         return value
     return str(value)
+
+
+def _log_suppressed_exception(
+    site: str,
+    exc: BaseException,
+    *,
+    command: str | None = None,
+) -> None:
+    """Record on stderr the exception behind a sanitized stdout payload.
+
+    The public payloads (``configuration_error`` / ``provider_degraded``) are
+    deliberately opaque, but they are also the only artifact a crashed child
+    leaves behind, so this failure class used to be impossible to investigate
+    after the fact -- the launcher's captured stderr was empty and stdout held
+    nothing but the sanitized dict.  This writes the exception type, message
+    and traceback to stderr, which the launcher captures to service.stderr.log.
+
+    Best effort: never raises, never writes to stdout, never changes the
+    public payload or the exit code.
+    """
+    try:
+        stamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+        stream = sys.stderr
+        stream.write(
+            f"[{stamp}] session-bridge-cli pid={os.getpid()} site={site} "
+            f"command={command or '-'} "
+            f"exception={type(exc).__name__}: {exc}\n"
+        )
+        stream.write(
+            "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+        )
+        stream.flush()
+    except Exception:
+        pass
 
 
 def _emit(payload: Mapping[str, Any]) -> None:

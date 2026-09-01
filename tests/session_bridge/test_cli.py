@@ -722,6 +722,101 @@ def test_sidebar_skill_cli_sanitizes_install_failure(
     assert "private destination" not in rendered
 
 
+def test_install_failure_records_cause_on_stderr(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr(
+        "session_bridge.cli.install_sidebar_skill",
+        lambda: (_ for _ in ()).throw(PermissionError("private destination")),
+    )
+
+    assert main(["install-sidebar-skill"]) == 2
+    captured = capsys.readouterr()
+    assert json.loads(captured.out) == {"error": "configuration_error"}
+    assert "private destination" not in captured.out
+    assert "site=install_sidebar_skill" in captured.err
+    assert "command=install-sidebar-skill" in captured.err
+    assert "PermissionError: private destination" in captured.err
+    assert "Traceback (most recent call last)" in captured.err
+
+
+def test_startup_failure_records_cause_on_stderr(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    def _explode() -> BridgeConfig:
+        raise OSError("state db is unreachable")
+
+    assert (
+        main(
+            ["status"],
+            config_loader=_explode,
+            backend_factory=lambda _config: FakeBackend(),
+        )
+        == 2
+    )
+    captured = capsys.readouterr()
+    assert json.loads(captured.out) == {"error": "configuration_error"}
+    assert "state db is unreachable" not in captured.out
+    assert "site=startup" in captured.err
+    assert "command=status" in captured.err
+    assert "OSError: state db is unreachable" in captured.err
+    assert "Traceback (most recent call last)" in captured.err
+
+
+def test_dispatch_configuration_failure_records_code_on_stderr(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    backend = FakeBackend()
+    monkeypatch.setattr(
+        backend,
+        "serve",
+        lambda: (_ for _ in ()).throw(
+            ConfigurationFailure("service_authorization_failed")
+        ),
+    )
+
+    assert _run(["serve"], backend) == 2
+    captured = capsys.readouterr()
+    assert json.loads(captured.out) == {"error": "configuration_error"}
+    assert "service_authorization_failed" not in captured.out
+    assert "site=dispatch.configuration" in captured.err
+    assert "command=serve" in captured.err
+    assert "ConfigurationFailure: service_authorization_failed" in captured.err
+
+
+def test_dispatch_runtime_failure_records_cause_on_stderr(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    backend = FakeBackend()
+    monkeypatch.setattr(
+        backend,
+        "serve",
+        lambda: (_ for _ in ()).throw(PermissionError("marker key ACL unverifiable")),
+    )
+
+    assert _run(["serve"], backend) == 2
+    captured = capsys.readouterr()
+    assert json.loads(captured.out) == {"error": "configuration_error"}
+    assert "marker key ACL unverifiable" not in captured.out
+    assert "site=dispatch.runtime" in captured.err
+    assert "PermissionError: marker key ACL unverifiable" in captured.err
+
+
+def test_suppressed_exception_logger_never_escapes(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    class Unprintable(RuntimeError):
+        def __str__(self) -> str:
+            raise RuntimeError("message rendering failed")
+
+    assert cli_module._log_suppressed_exception("probe", Unprintable()) is None
+    captured = capsys.readouterr()
+    assert captured.out == ""
+
+
 def test_claude_skill_cli_installs_without_loading_bridge_runtime(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
