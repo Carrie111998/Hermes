@@ -1687,6 +1687,135 @@ def is_runtime_provider_routable(provider_id: str) -> bool:
     return True
 
 
+# Refresh tokens for these pool providers are single-use. Forking the same
+# grant into a named-profile auth.json (clone-all, desktop credential
+# mirroring, or load_pool persist-on-seed) means the first profile to rotate
+# consumes the token and every sibling copy dies with invalid_grant
+# (#100339, same class as #48415 / #43589).
+SINGLE_USE_REFRESH_POOL_PROVIDERS = frozenset({
+    "anthropic",
+    "openai-codex",
+    "xai-oauth",
+})
+
+
+def _pool_entry_freshness_ms(entry: Dict[str, Any]) -> int:
+    """Best-effort recency for choosing between cloned OAuth rows."""
+    ms = entry.get("expires_at_ms")
+    if isinstance(ms, (int, float)):
+        return int(ms)
+    last_refresh = entry.get("last_refresh")
+    if isinstance(last_refresh, (int, float)):
+        value = float(last_refresh)
+        return int(value * 1000) if value < 10_000_000_000 else int(value)
+    if isinstance(last_refresh, str) and last_refresh.strip():
+        try:
+            parsed = datetime.fromisoformat(last_refresh.replace("Z", "+00:00"))
+            return int(parsed.timestamp() * 1000)
+        except (TypeError, ValueError, OSError):
+            return 0
+    return 0
+
+
+def _is_oauth_pool_payload(entry: Dict[str, Any]) -> bool:
+    auth_type = str(entry.get("auth_type") or "").strip().lower()
+    if auth_type == "oauth":
+        return True
+    token = str(entry.get("access_token") or "")
+    return token.startswith("sk-ant-oat")
+
+
+def _merge_pool_entries_prefer_fresh(
+    local_entries: List[Dict[str, Any]],
+    global_entries: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Per-id merge: keep unique local rows, pick the fresher copy of a shared id.
+
+    Does not import global-only ids — a profile that independently added
+    credentials must not suddenly lease the root grant. Shared ids are the
+    clone/fallback case: the rotated chain must win regardless of which
+    auth.json still holds the stale copy.
+    """
+    global_by_id = {
+        entry.get("id"): entry
+        for entry in global_entries
+        if isinstance(entry, dict) and entry.get("id")
+    }
+    merged: List[Dict[str, Any]] = []
+    for entry in local_entries:
+        if not isinstance(entry, dict):
+            continue
+        entry_id = entry.get("id")
+        other = global_by_id.get(entry_id) if entry_id else None
+        if not isinstance(other, dict):
+            merged.append(entry)
+            continue
+        if _is_oauth_pool_payload(entry) or _is_oauth_pool_payload(other):
+            if _pool_entry_freshness_ms(entry) >= _pool_entry_freshness_ms(other):
+                merged.append(entry)
+            else:
+                merged.append(other)
+        else:
+            merged.append(entry)
+    return merged
+
+
+def strip_cloned_single_use_oauth_grants(auth_path: Path) -> None:
+    """Drop forked single-use OAuth grants from a cloned auth.json.
+
+    API-key pool rows stay so a clone can keep static keys. OAuth rows for
+    Anthropic / Codex / xAI are removed so the new profile reads them through
+    the global-root fallback instead of holding a duplicate refresh token.
+    """
+    if not auth_path.is_file():
+        return
+    try:
+        store = json.loads(auth_path.read_text(encoding="utf-8-sig"))
+    except (OSError, json.JSONDecodeError):
+        return
+    if not isinstance(store, dict):
+        return
+    changed = False
+    pool = store.get("credential_pool")
+    if isinstance(pool, dict):
+        for provider_id in list(pool):
+            if provider_id not in SINGLE_USE_REFRESH_POOL_PROVIDERS:
+                continue
+            entries = pool.get(provider_id)
+            if not isinstance(entries, list):
+                continue
+            kept = [
+                entry
+                for entry in entries
+                if isinstance(entry, dict) and not _is_oauth_pool_payload(entry)
+            ]
+            if len(kept) != len(entries):
+                changed = True
+                if kept:
+                    pool[provider_id] = kept
+                else:
+                    del pool[provider_id]
+        if not pool and "credential_pool" in store:
+            store.pop("credential_pool", None)
+            changed = True
+    providers = store.get("providers")
+    if isinstance(providers, dict):
+        for provider_id in ("openai-codex", "xai-oauth"):
+            if provider_id in providers:
+                del providers[provider_id]
+                changed = True
+    if not changed:
+        return
+    try:
+        _save_auth_store(store, target_path=auth_path)
+    except Exception:
+        logger.debug(
+            "Failed to strip cloned single-use OAuth grants from %s",
+            auth_path,
+            exc_info=True,
+        )
+
+
 def read_credential_pool(provider_id: Optional[str] = None) -> Dict[str, Any]:
     """Return the persisted credential pool, or one provider slice.
 
@@ -1700,7 +1829,14 @@ def read_credential_pool(provider_id: Optional[str] = None) -> Dict[str, Any]:
     ``hermes auth add <provider>`` inside the profile, profile entries
     fully shadow global for that provider on the next read.
 
-    Writes always go to the profile (``write_credential_pool`` is unchanged).
+    Single-use OAuth providers (Anthropic, Codex, xAI) are the exception:
+    a cloned row with the same entry id as root is the *same grant*, not an
+    independent credential. Those rows merge per-id and the fresher copy
+    wins so a rotation written through to root is visible to sibling
+    profiles that still hold a stale clone (#100339).
+
+    Writes always go to the profile (``write_credential_pool`` is unchanged)
+    except for the dedicated global write-through on rotation.
     See issue #18594 follow-up.
     """
     auth_store = _load_auth_store()
@@ -1719,19 +1855,38 @@ def read_credential_pool(provider_id: Optional[str] = None) -> Dict[str, Any]:
         for gp_key, gp_entries in global_pool.items():
             if not isinstance(gp_entries, list) or not gp_entries:
                 continue
-            # Per-provider shadowing: profile wins whenever it has ANY entries.
             existing = merged.get(gp_key)
+            if (
+                gp_key in SINGLE_USE_REFRESH_POOL_PROVIDERS
+                and isinstance(existing, list)
+                and existing
+            ):
+                merged[gp_key] = _merge_pool_entries_prefer_fresh(
+                    existing, list(gp_entries)
+                )
+                continue
+            # Per-provider shadowing: profile wins whenever it has ANY entries.
             if isinstance(existing, list) and existing:
                 continue
             merged[gp_key] = list(gp_entries)
         return merged
 
     provider_entries = pool.get(provider_id)
-    if isinstance(provider_entries, list) and provider_entries:
-        return list(provider_entries)
-    # Profile has no entries for this provider — fall back to global.
+    local_entries = (
+        list(provider_entries) if isinstance(provider_entries, list) else []
+    )
     global_entries = global_pool.get(provider_id)
-    return list(global_entries) if isinstance(global_entries, list) else []
+    global_list = list(global_entries) if isinstance(global_entries, list) else []
+    if (
+        provider_id in SINGLE_USE_REFRESH_POOL_PROVIDERS
+        and local_entries
+        and global_list
+    ):
+        return _merge_pool_entries_prefer_fresh(local_entries, global_list)
+    if local_entries:
+        return local_entries
+    # Profile has no entries for this provider — fall back to global.
+    return global_list
 
 
 _POOL_STATUS_FIELDS = (

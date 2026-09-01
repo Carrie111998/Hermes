@@ -36,7 +36,7 @@ from collections import OrderedDict
 from pathlib import Path
 from typing import Any, Dict, Optional
 
-from hermes_constants import get_hermes_home
+from hermes_constants import get_default_hermes_root, get_hermes_home
 from agent.secret_scope import get_secret as _get_secret
 
 logger = logging.getLogger(__name__)
@@ -726,50 +726,29 @@ def _prefer_refreshable_claude_code_token(env_token: str, creds: Optional[Dict[s
     return None
 
 
-def _resolve_anthropic_pool_token() -> Optional[str]:
+def _resolve_anthropic_pool_token(*, refresh_expired: bool = False) -> Optional[str]:
     """Return the first available Anthropic OAuth token from credential_pool.
 
-    Read-only: enumerates with ``clear_expired=False, refresh=False`` so a bare
-    token *resolve* (which runs from diagnostic/read-only call sites such as
-    ``account_usage`` and ``hermes models``) never mutates ``~/.hermes/auth.json``
-    or makes a network refresh call. Refresh-on-expiry is owned by the API call
-    path's pool recovery, not the resolver.
+    By default this is read-only: it enumerates with ``clear_expired=False,
+    refresh=False`` so diagnostic/read-only call sites can inspect the pool
+    without mutating ``auth.json`` or making a network refresh call.
+
+    Agent init / runtime resolution pass ``refresh_expired=True`` because an
+    expired pool-owned OAuth row can still be recovered via its refresh
+    token, and init happens before the API-call path's pool recovery can run
+    (#100339).
     """
     try:
         from agent.credential_pool import AUTH_TYPE_OAUTH, load_pool
     except Exception:
         return None
 
-    try:
-        pool = load_pool("anthropic")
-        # Enumerate read-only (clear_expired=False, refresh=False): never persist
-        # to auth.json or trigger a network refresh from a bare resolve. select()
-        # is deliberately NOT used — it runs clear_expired=True, refresh=True,
-        # which would violate this read-only contract.
-        entries, _pending = pool._available_entries(clear_expired=False, refresh=False)
-    except Exception:
-        logger.debug("Failed to read Anthropic credential_pool", exc_info=True)
-        return None
-
-    for entry in entries:
+    def _usable_oauth_token(entry: Any) -> Optional[str]:
         if getattr(entry, "auth_type", None) != AUTH_TYPE_OAUTH:
-            continue
-        # access_token is a declared field but a persisted entry can carry an
-        # explicit null (or a partially-written OAuth entry), so coerce before
-        # strip — a bare None.strip() here would escape the try/excepts above
-        # and crash the whole resolver, taking down the source #5 fallback too.
-        # Matches the aux-client analog (auxiliary_client.py: str(key or "")).
+            return None
         token = (getattr(entry, "access_token", None) or "").strip()
         if not token:
-            continue
-        # ``load_pool()`` re-seeds pool rows from the singleton files, so a
-        # rotation that was consumed upstream but never committed comes back
-        # here looking healthy.  Enumeration is deliberately read-only
-        # (refresh=False), which means nothing on this path would otherwise
-        # notice that the credential is spent.  Singleton-backed sources also
-        # consult the durable sidecar registry: the failed commit may have
-        # happened in a DIFFERENT process, whose process-local verdict this
-        # interpreter never saw.
+            return None
         entry_source_path = spent_rotation_source_path(getattr(entry, "source", None))
         if is_rotation_consumed_uncommitted(
             token, source_path=entry_source_path
@@ -780,8 +759,38 @@ def _resolve_anthropic_pool_token() -> Optional[str]:
                 "Skipping Anthropic pool entry %s: rotated-but-uncommitted credential",
                 getattr(entry, "id", "?"),
             )
-            continue
+            return None
         return token
+
+    try:
+        pool = load_pool("anthropic")
+        if refresh_expired:
+            selected = getattr(pool, "select", None)
+            if callable(selected):
+                try:
+                    entry = selected()
+                except Exception:
+                    logger.debug(
+                        "Anthropic credential_pool select() failed during resolve",
+                        exc_info=True,
+                    )
+                    entry = None
+                token = _usable_oauth_token(entry) if entry is not None else None
+                if token:
+                    return token
+        # Enumerate read-only (clear_expired=False, refresh=False): never persist
+        # to auth.json or trigger a network refresh from a bare resolve. select()
+        # is deliberately NOT used here — it runs clear_expired=True, refresh=True,
+        # which would violate this read-only contract.
+        entries, _pending = pool._available_entries(clear_expired=False, refresh=False)
+    except Exception:
+        logger.debug("Failed to read Anthropic credential_pool", exc_info=True)
+        return None
+
+    for entry in entries:
+        token = _usable_oauth_token(entry)
+        if token:
+            return token
 
     return None
 
@@ -837,7 +846,7 @@ def resolve_anthropic_token() -> Optional[str]:
         return resolved_claude_token
 
     # 5. Hermes credential_pool OAuth entry.
-    resolved_pool_token = _resolve_anthropic_pool_token()
+    resolved_pool_token = _resolve_anthropic_pool_token(refresh_expired=True)
     if resolved_pool_token:
         return resolved_pool_token
 
@@ -913,8 +922,64 @@ _OAUTH_TOKEN_URL = _OAUTH_TOKEN_URLS[0]
 _OAUTH_TOKEN_USER_AGENT = "axios/1.7.9"
 _OAUTH_REDIRECT_URI = "https://console.anthropic.com/oauth/code/callback"
 _OAUTH_SCOPES = "org:create_api_key user:profile user:inference"
+
+
 def _get_hermes_oauth_file() -> Path:
     return get_hermes_home() / ".anthropic_oauth.json"
+
+
+def _global_hermes_oauth_file() -> Optional[Path]:
+    """Return the root-profile .anthropic_oauth.json when running in a named profile."""
+    try:
+        root = get_default_hermes_root()
+        profile = get_hermes_home()
+        if root.resolve(strict=False) == profile.resolve(strict=False):
+            return None
+        return root / ".anthropic_oauth.json"
+    except Exception:
+        return None
+
+
+def _oauth_file_expires_at(data: Dict[str, Any]) -> int:
+    raw = data.get("expiresAt")
+    if isinstance(raw, (int, float)):
+        return int(raw)
+    return 0
+
+
+def _read_oauth_file(path: Path) -> Optional[Dict[str, Any]]:
+    if not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError, IOError) as e:
+        logger.debug("Failed to read Hermes OAuth credentials from %s: %s", path, e)
+        return None
+    if isinstance(data, dict) and data.get("accessToken"):
+        return data
+    return None
+
+
+def _write_oauth_file(oauth_file: Path, oauth_data: Dict[str, Any]) -> None:
+    oauth_file.parent.mkdir(parents=True, exist_ok=True)
+    _tmp_oauth = oauth_file.with_suffix(f".tmp.{os.getpid()}.{secrets.token_hex(4)}")
+    try:
+        fd = os.open(
+            str(_tmp_oauth),
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+            stat.S_IRUSR | stat.S_IWUSR,
+        )
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(oauth_data, fh, indent=2)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(_tmp_oauth, oauth_file)
+    except OSError:
+        try:
+            _tmp_oauth.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
 
 
 def _generate_pkce() -> tuple:
@@ -1062,15 +1127,14 @@ def run_hermes_oauth_login_pure() -> Optional[Dict[str, Any]]:
 
 def read_hermes_oauth_credentials() -> Optional[Dict[str, Any]]:
     """Read Hermes-managed OAuth credentials from ~/.hermes/.anthropic_oauth.json."""
-    oauth_file = _get_hermes_oauth_file()
-    if oauth_file.exists():
-        try:
-            data = json.loads(oauth_file.read_text(encoding="utf-8"))
-            if data.get("accessToken"):
-                return data
-        except (json.JSONDecodeError, OSError, IOError) as e:
-            logger.debug("Failed to read Hermes OAuth credentials: %s", e)
-    return None
+    local = _read_oauth_file(_get_hermes_oauth_file())
+    global_path = _global_hermes_oauth_file()
+    shared = _read_oauth_file(global_path) if global_path is not None else None
+    if local and shared:
+        if _oauth_file_expires_at(shared) > _oauth_file_expires_at(local):
+            return shared
+        return local
+    return local or shared
 
 
 def _write_hermes_oauth_credentials(
@@ -1089,36 +1153,41 @@ def _write_hermes_oauth_credentials(
     Raises ``CredentialPersistError`` when the rotated pair does not reach the
     file, for the same reason ``_write_claude_code_credentials`` does: this is
     the commit step of the refresh transaction.
+
+    When a named profile rotates a grant that also lives at the global root,
+    the same pair is write-through to the root singleton so sibling profiles
+    seeding from that file do not replay the consumed refresh token (#100339).
     """
     oauth_file = _get_hermes_oauth_file()
+    oauth_data = {
+        "accessToken": access_token,
+        "refreshToken": refresh_token,
+        "expiresAt": expires_at_ms,
+    }
     try:
-        oauth_data = {
-            "accessToken": access_token,
-            "refreshToken": refresh_token,
-            "expiresAt": expires_at_ms,
-        }
-        oauth_file.parent.mkdir(parents=True, exist_ok=True)
-        _tmp_oauth = oauth_file.with_suffix(f".tmp.{os.getpid()}.{secrets.token_hex(4)}")
-        try:
-            fd = os.open(
-                str(_tmp_oauth),
-                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
-                stat.S_IRUSR | stat.S_IWUSR,
-            )
-            with os.fdopen(fd, "w", encoding="utf-8") as fh:
-                json.dump(oauth_data, fh, indent=2)
-                fh.flush()
-                os.fsync(fh.fileno())
-            os.replace(_tmp_oauth, oauth_file)
-        except OSError:
-            try:
-                _tmp_oauth.unlink(missing_ok=True)
-            except OSError:
-                pass
-            raise
+        _write_oauth_file(oauth_file, oauth_data)
     except (OSError, IOError, ValueError) as e:
         logger.error(
             "Failed to write refreshed Hermes OAuth credentials to %s: %s", oauth_file, e
         )
         raise CredentialPersistError(oauth_file, e) from e
+    global_path = _global_hermes_oauth_file()
+    if global_path is None:
+        return
+    if os.environ.get("PYTEST_CURRENT_TEST"):
+        real_home_env = os.environ.get("HOME", "")
+        if real_home_env:
+            real_root = Path(real_home_env) / ".hermes" / ".anthropic_oauth.json"
+            try:
+                if global_path.resolve(strict=False) == real_root.resolve(strict=False):
+                    return
+            except Exception:
+                return
+    try:
+        _write_oauth_file(global_path, oauth_data)
+    except Exception:
+        logger.debug(
+            "hermes_pkce refresh: write-through to global singleton failed",
+            exc_info=True,
+        )
 

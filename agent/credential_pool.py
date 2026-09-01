@@ -26,6 +26,7 @@ import hermes_cli.auth as auth_mod
 from hermes_cli.auth import (
     CODEX_ACCESS_TOKEN_REFRESH_SKEW_SECONDS,
     PROVIDER_REGISTRY,
+    SINGLE_USE_REFRESH_POOL_PROVIDERS,
     _auth_store_lock,
     _codex_access_token_is_expiring,
     _decode_jwt_claims,
@@ -719,6 +720,123 @@ def _write_through_provider_state_to_global_root(
         )
 
 
+def _should_refuse_real_user_global_auth(global_path: Path) -> bool:
+    """Pytest seat belt: never write the developer's real ~/.hermes/auth.json."""
+    if not os.environ.get("PYTEST_CURRENT_TEST"):
+        return False
+    real_home_env = os.environ.get("HOME", "")
+    if not real_home_env:
+        return False
+    real_root = Path(real_home_env) / ".hermes" / "auth.json"
+    try:
+        return global_path.resolve(strict=False) == real_root.resolve(strict=False)
+    except Exception:
+        return True
+
+
+def _profile_owns_pool_provider(provider: str) -> bool:
+    """True when the active (profile) auth.json already has rows for *provider*."""
+    try:
+        pool = _load_auth_store().get("credential_pool")
+    except Exception:
+        return False
+    entries = pool.get(provider) if isinstance(pool, dict) else None
+    return isinstance(entries, list) and bool(entries)
+
+
+def _global_has_pool_provider(provider: str) -> bool:
+    try:
+        global_store = auth_mod._load_global_auth_store()
+    except Exception:
+        return False
+    pool = global_store.get("credential_pool") if isinstance(global_store, dict) else None
+    entries = pool.get(provider) if isinstance(pool, dict) else None
+    return isinstance(entries, list) and bool(entries)
+
+
+def _write_through_pool_entries_to_global_root(
+    provider_id: str,
+    entries: List[Dict[str, Any]],
+    *,
+    removed_ids: Optional[Set[str]] = None,
+) -> None:
+    """Merge rotated pool rows into the global-root credential_pool by id.
+
+    Only updates ids that already exist in root (or writes the slice when
+    root has none and this profile is borrowing that grant). Never appends a
+    profile-only credential into root — that would leak an independent
+    login into every other profile.
+    """
+    if provider_id not in SINGLE_USE_REFRESH_POOL_PROVIDERS:
+        return
+    try:
+        global_path = auth_mod._global_auth_file_path()
+    except Exception:
+        return
+    if global_path is None:
+        return
+    if _should_refuse_real_user_global_auth(global_path):
+        return
+    removed = {rid for rid in (removed_ids or ()) if rid}
+    incoming_by_id = {
+        entry.get("id"): entry
+        for entry in entries
+        if isinstance(entry, dict) and entry.get("id")
+    }
+    if not incoming_by_id and not removed:
+        return
+    try:
+        with _auth_store_lock(target_path=global_path):
+            store = _load_auth_store(global_path)
+            pool = store.get("credential_pool")
+            if not isinstance(pool, dict):
+                pool = {}
+                store["credential_pool"] = pool
+            existing = pool.get(provider_id)
+            existing_list = existing if isinstance(existing, list) else []
+            if not existing_list:
+                # Root has no slice: only materialize when this profile is
+                # borrowing (no local rows) so we don't fork a unique login.
+                if _profile_owns_pool_provider(provider_id):
+                    return
+                pool[provider_id] = [
+                    dict(entry) for entry in entries if isinstance(entry, dict)
+                ]
+                _save_auth_store(store, target_path=global_path)
+                return
+            merged: List[Dict[str, Any]] = []
+            changed = False
+            for entry in existing_list:
+                if not isinstance(entry, dict):
+                    merged.append(entry)
+                    continue
+                entry_id = entry.get("id")
+                if entry_id in removed:
+                    changed = True
+                    continue
+                incoming = incoming_by_id.get(entry_id) if entry_id else None
+                if incoming is not None:
+                    if (
+                        auth_mod._pool_entry_freshness_ms(incoming)
+                        >= auth_mod._pool_entry_freshness_ms(entry)
+                    ):
+                        merged.append(dict(incoming))
+                        changed = True
+                    else:
+                        merged.append(entry)
+                else:
+                    merged.append(entry)
+            if changed:
+                pool[provider_id] = merged
+                _save_auth_store(store, target_path=global_path)
+    except Exception as exc:  # pragma: no cover - best effort
+        logger.debug(
+            "%s pool refresh: write-through to global credential_pool failed: %s",
+            provider_id,
+            exc,
+        )
+
+
 class CredentialPool:
     def __init__(self, provider: str, entries: List[PooledCredential]):
         self.provider = provider
@@ -850,10 +968,28 @@ class CredentialPool:
         # Self-locking (RLock): snapshotting self._entries must not race a
         # concurrent rotation when called from the deferred refresh path.
         with self._lock:
-            write_credential_pool(
+            payloads = [entry.to_dict() for entry in self._entries]
+            removed = list(removed_ids or [])
+            # A named profile that only sees this provider via the global-root
+            # fallback must not materialize a local credential_pool copy.
+            # That copy forks single-use refresh tokens: the first rotation
+            # commits only to the profile file and every sibling dies
+            # (#100339). Write through to root instead.
+            borrowing = (
+                self.provider in SINGLE_USE_REFRESH_POOL_PROVIDERS
+                and not _profile_owns_pool_provider(self.provider)
+                and _global_has_pool_provider(self.provider)
+            )
+            if not borrowing:
+                write_credential_pool(
+                    self.provider,
+                    payloads,
+                    removed_ids=removed,
+                )
+            _write_through_pool_entries_to_global_root(
                 self.provider,
-                [entry.to_dict() for entry in self._entries],
-                removed_ids=removed_ids,
+                payloads,
+                removed_ids=set(removed),
             )
 
     def _is_terminal_auth_failure(
@@ -2780,6 +2916,20 @@ def _upsert_entry(entries: List[PooledCredential], provider: str, source: str, p
         return True
 
     existing = entries[existing_idx]
+    incoming_exp = payload.get("expires_at_ms")
+    if (
+        incoming_exp is not None
+        and existing.expires_at_ms is not None
+        and existing.access_token
+    ):
+        try:
+            if int(incoming_exp) < int(existing.expires_at_ms):
+                # A stale singleton or cloned .anthropic_oauth.json must not
+                # overwrite a fresher pool row (the rotation another profile
+                # just write-through to root / this pool).
+                return bool(duplicate_indices)
+        except (TypeError, ValueError):
+            pass
     field_updates = {}
     extra_updates = {}
     _field_names = {f.name for f in fields(existing)}
@@ -3590,9 +3740,18 @@ def load_pool(provider: str) -> CredentialPool:
 
     if changed:
         new_ids = {entry.id for entry in entries}
-        write_credential_pool(
-            provider,
-            [entry.to_dict() for entry in sorted(entries, key=lambda item: item.priority)],
-            removed_ids=disk_ids - new_ids,
+        # Same fork hazard as CredentialPool._persist: seeding a named
+        # profile from the global-root fallback must not copy single-use
+        # OAuth rows into the profile store.
+        borrowing = (
+            provider in SINGLE_USE_REFRESH_POOL_PROVIDERS
+            and not _profile_owns_pool_provider(provider)
+            and _global_has_pool_provider(provider)
         )
+        if not borrowing:
+            write_credential_pool(
+                provider,
+                [entry.to_dict() for entry in sorted(entries, key=lambda item: item.priority)],
+                removed_ids=disk_ids - new_ids,
+            )
     return CredentialPool(provider, entries)

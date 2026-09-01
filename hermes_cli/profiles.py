@@ -90,6 +90,7 @@ _CLONE_ALL_STRIP: list[str] = [
     "gateway.pid",
     "gateway_state.json",
     "processes.json",
+    ".anthropic_oauth.json",  # single-use Anthropic refresh token; fall back to root
 ]
 
 # Infrastructure artifacts excluded from --clone-all when the source is the
@@ -1261,6 +1262,10 @@ def create_profile(
         # Strip runtime files
         for stale in _CLONE_ALL_STRIP:
             (profile_dir / stale).unlink(missing_ok=True)
+        # Forking single-use OAuth refresh tokens into the clone strands
+        # every sibling after the first rotation (#100339). API keys stay.
+        from hermes_cli.auth import strip_cloned_single_use_oauth_grants
+        strip_cloned_single_use_oauth_grants(profile_dir / "auth.json")
     else:
         # Bootstrap directory structure
         profile_dir.mkdir(parents=True, exist_ok=True)
