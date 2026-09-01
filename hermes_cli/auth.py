@@ -85,6 +85,7 @@ from hermes_cli.config import (
     get_hermes_home,
     get_config_path,
     read_raw_config,
+    read_user_config_raw,
     require_readable_config_before_write,
 )
 from hermes_constants import OPENROUTER_BASE_URL, secure_parent_dir
@@ -1252,6 +1253,114 @@ def _auth_lock_holder_for(target_path: Path) -> threading.local:
         return _auth_target_lock_holders.setdefault(key, threading.local())
 
 
+@dataclass(frozen=True)
+class CodexAuthStore:
+    """Secret-free authorization boundary for descriptor-bound Codex reads."""
+
+    path: Optional[Path]
+    shared: bool = False
+    isolated: bool = False
+    denied: bool = False
+    legacy: bool = False
+
+    @property
+    def lock_path(self) -> Optional[Path]:
+        return self.path.with_suffix(".lock") if self.path is not None else None
+
+
+def _named_profile_root(home: Path) -> Optional[Path]:
+    """Return the root only for an exact ``<root>/profiles/<name>`` home."""
+    try:
+        resolved = home.expanduser().resolve(strict=False)
+        if resolved.parent.name != "profiles" or not resolved.name:
+            return None
+        return resolved.parent.parent
+    except (OSError, RuntimeError, ValueError):
+        return None
+
+
+def resolve_codex_auth_store(home: Optional[Path] = None) -> CodexAuthStore:
+    """Resolve named-profile Codex policy without widening legacy fallback.
+
+    A legacy descriptor intentionally leaves the existing generic fallback
+    untouched. Explicit local/shared descriptors select one physical store;
+    isolated and malformed policy is pathless and therefore fail-closed.
+    """
+    active_home = Path(home or get_hermes_home()).expanduser().resolve(strict=False)
+    root = _named_profile_root(active_home)
+    if root is None:
+        return CodexAuthStore(active_home / "auth.json", legacy=True)
+    try:
+        config = read_user_config_raw(active_home / "config.yaml")
+    except Exception:
+        return CodexAuthStore(None, denied=True)
+    if not isinstance(config, dict):
+        return CodexAuthStore(None, denied=True)
+
+    codex_config = config.get("openai_codex")
+    if codex_config is not None:
+        if not isinstance(codex_config, dict) or "shared_auth_store" not in codex_config:
+            return CodexAuthStore(None, denied=True)
+        canonical = (root / "auth.json").resolve(strict=False)
+        candidate = codex_config.get("shared_auth_store")
+        if not isinstance(candidate, str) or not candidate.strip():
+            return CodexAuthStore(None, denied=True)
+        configured = Path(candidate).expanduser()
+        if not configured.is_absolute() or configured != canonical:
+            return CodexAuthStore(None, denied=True)
+        return CodexAuthStore(canonical, shared=True)
+
+    auth_config = config.get("auth")
+    if auth_config is None:
+        return CodexAuthStore(active_home / "auth.json", legacy=True)
+    if not isinstance(auth_config, dict):
+        return CodexAuthStore(None, denied=True)
+    if "isolated_providers" not in auth_config:
+        return CodexAuthStore(active_home / "auth.json", legacy=True)
+    providers = auth_config.get("isolated_providers")
+    if not isinstance(providers, list) or any(
+        not isinstance(provider, str) or not provider.strip() for provider in providers
+    ):
+        return CodexAuthStore(None, denied=True)
+    if any(provider.strip().lower() == "openai-codex" for provider in providers):
+        return CodexAuthStore(None, isolated=True)
+    return CodexAuthStore(active_home / "auth.json", legacy=True)
+
+
+def _require_codex_auth_store(store: CodexAuthStore) -> Path:
+    if store.path is None or store.denied or store.isolated:
+        raise AuthError(
+            "Codex auth-store policy does not authorize credential access.",
+            provider="openai-codex",
+            code="codex_auth_store_denied",
+            relogin_required=True,
+        )
+    return store.path
+
+
+@contextmanager
+def _codex_effective_store_lock(
+    store: CodexAuthStore,
+    timeout_seconds: float = AUTH_LOCK_TIMEOUT_SECONDS,
+):
+    """Lock one already-resolved Codex store without policy fallback."""
+    path = _require_codex_auth_store(store)
+    lock_path = store.lock_path
+    assert lock_path is not None
+    with _file_lock(
+        lock_path,
+        _auth_lock_holder_for(path),
+        timeout_seconds,
+        "Timed out waiting for Codex auth store lock",
+    ):
+        yield path
+
+
+def _load_effective_codex_auth_store(store: CodexAuthStore) -> Dict[str, Any]:
+    """Load exactly the descriptor-selected store; never generic fallback."""
+    return _load_auth_store(_require_codex_auth_store(store))
+
+
 @contextmanager
 def _file_lock(
     lock_path: Path,
@@ -1687,7 +1796,11 @@ def is_runtime_provider_routable(provider_id: str) -> bool:
     return True
 
 
-def read_credential_pool(provider_id: Optional[str] = None) -> Dict[str, Any]:
+def read_credential_pool(
+    provider_id: Optional[str] = None,
+    *,
+    codex_store: Optional[CodexAuthStore] = None,
+) -> Dict[str, Any] | List[Any]:
     """Return the persisted credential pool, or one provider slice.
 
     In profile mode, the profile's credential pool is authoritative. If a
@@ -1703,6 +1816,17 @@ def read_credential_pool(provider_id: Optional[str] = None) -> Dict[str, Any]:
     Writes always go to the profile (``write_credential_pool`` is unchanged).
     See issue #18594 follow-up.
     """
+    if provider_id == "openai-codex":
+        store = codex_store or resolve_codex_auth_store()
+        if not store.legacy:
+            if store.path is None or store.denied or store.isolated:
+                return []
+            with _codex_effective_store_lock(store):
+                auth_store = _load_effective_codex_auth_store(store)
+            pool = auth_store.get("credential_pool")
+            entries = pool.get(provider_id) if isinstance(pool, dict) else None
+            return list(entries) if isinstance(entries, list) else []
+
     auth_store = _load_auth_store()
     pool = auth_store.get("credential_pool")
     if not isinstance(pool, dict):
@@ -1949,6 +2073,17 @@ def get_provider_auth_state(provider_id: str) -> Optional[Dict[str, Any]]:
     global-scope provider state (e.g. a globally-authenticated Anthropic
     OAuth or Nous device-code session). See issue #18594 follow-up.
     """
+    if provider_id == "openai-codex":
+        store = resolve_codex_auth_store()
+        if not store.legacy:
+            if store.path is None or store.denied or store.isolated:
+                return None
+            with _codex_effective_store_lock(store):
+                auth_store = _load_effective_codex_auth_store(store)
+            providers = auth_store.get("providers")
+            state = providers.get(provider_id) if isinstance(providers, dict) else None
+            return dict(state) if isinstance(state, dict) else None
+
     auth_store = _load_auth_store()
     return _load_provider_state(auth_store, provider_id)
 

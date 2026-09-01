@@ -64,6 +64,15 @@ def _load_config_safe() -> Optional[dict]:
         return None
 
 
+def _load_descriptor_codex_provider_state(auth_store: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Return only the Codex singleton physically in an effective store."""
+    providers = auth_store.get("providers")
+    if not isinstance(providers, dict):
+        return None
+    state = providers.get("openai-codex")
+    return state if isinstance(state, dict) else None
+
+
 # --- Status and type constants ---
 
 STATUS_OK = "ok"
@@ -808,8 +817,19 @@ def _write_through_provider_state_to_global_root(
 
 
 class CredentialPool:
-    def __init__(self, provider: str, entries: List[PooledCredential]):
+    def __init__(
+        self,
+        provider: str,
+        entries: List[PooledCredential],
+        *,
+        codex_store: Optional[Any] = None,
+    ):
         self.provider = provider
+        self.codex_store = (
+            codex_store or auth_mod.resolve_codex_auth_store()
+            if provider == "openai-codex"
+            else None
+        )
         self._entries = sorted(entries, key=lambda entry: entry.priority)
         self._current_id: Optional[str] = None
         self._strategy = get_pool_strategy(provider)
@@ -2954,10 +2974,21 @@ def _normalize_pool_priorities(provider: str, entries: List[PooledCredential]) -
     return changed
 
 
-def _seed_from_singletons(provider: str, entries: List[PooledCredential]) -> Tuple[bool, Set[str]]:
+def _seed_from_singletons(
+    provider: str,
+    entries: List[PooledCredential],
+    *,
+    codex_store: Optional[Any] = None,
+) -> Tuple[bool, Set[str]]:
     changed = False
     active_sources: Set[str] = set()
-    auth_store = _load_auth_store()
+    if provider == "openai-codex" and codex_store is not None and not codex_store.legacy:
+        if codex_store.path is None or codex_store.denied or codex_store.isolated:
+            return changed, active_sources
+        with auth_mod._codex_effective_store_lock(codex_store):
+            auth_store = auth_mod._load_effective_codex_auth_store(codex_store)
+    else:
+        auth_store = _load_auth_store()
 
     # Shared suppression gate — used at every upsert site so
     # `hermes auth remove <provider> <N>` is stable across all source types.
@@ -3266,7 +3297,7 @@ def _seed_from_singletons(provider: str, entries: List[PooledCredential]) -> Tup
         if _is_suppressed(provider, "device_code"):
             return changed, active_sources
 
-        state = _load_provider_state(auth_store, "openai-codex")
+        state = _load_descriptor_codex_provider_state(auth_store)
         tokens = state.get("tokens") if isinstance(state, dict) else None
         # Hermes owns its own Codex auth state — we do NOT auto-import from
         # ~/.codex/auth.json at pool-load time.  OAuth refresh tokens are
@@ -3629,9 +3660,14 @@ def _seed_custom_pool(pool_key: str, entries: List[PooledCredential]) -> Tuple[b
     return changed, active_sources
 
 
-def load_pool(provider: str) -> CredentialPool:
+def load_pool(provider: str, *, codex_store: Optional[Any] = None) -> CredentialPool:
     provider = (provider or "").strip().lower()
-    raw_entries = read_credential_pool(provider)
+    if provider == "openai-codex":
+        codex_store = codex_store or auth_mod.resolve_codex_auth_store()
+        raw_entries = read_credential_pool(provider, codex_store=codex_store)
+    else:
+        codex_store = None
+        raw_entries = read_credential_pool(provider)
     disk_ids = {
         entry.get("id")
         for entry in raw_entries
@@ -3652,7 +3688,11 @@ def load_pool(provider: str) -> CredentialPool:
         ) != payload.get("auth_type", AUTH_TYPE_API_KEY)
         for payload in raw_entries
     )
-    if raw_needs_auth_normalization:
+    if raw_needs_auth_normalization and not (
+        provider == "openai-codex"
+        and codex_store is not None
+        and not codex_store.legacy
+    ):
         # A profile may be reading this provider from the global-root fallback.
         # Keep that fallback read-only: only the store that owns these rows may
         # rewrite them. Loading the default/root profile will heal global rows.
@@ -3666,7 +3706,11 @@ def load_pool(provider: str) -> CredentialPool:
         changed = raw_needs_sanitization or raw_needs_auth_normalization or custom_changed
         changed |= _prune_stale_seeded_entries(entries, custom_sources)
     else:
-        singleton_changed, singleton_sources = _seed_from_singletons(provider, entries)
+        singleton_changed, singleton_sources = _seed_from_singletons(
+            provider,
+            entries,
+            codex_store=codex_store,
+        )
         env_changed, env_sources = _seed_from_env(provider, entries)
         changed = (
             raw_needs_sanitization
@@ -3685,11 +3729,21 @@ def load_pool(provider: str) -> CredentialPool:
         )
         changed |= _normalize_pool_priorities(provider, entries)
 
-    if changed:
+    # The explicit descriptor branch is deliberately read-only in the first
+    # effective-store slice.  ``load_pool()`` otherwise persists seeded or
+    # normalized rows, which would turn a read-boundary PR into an unreviewed
+    # auth-store mutation path.  Persistence/refresh binding follows in a
+    # separate lifecycle slice.
+    descriptor_read_only = bool(
+        provider == "openai-codex"
+        and codex_store is not None
+        and not codex_store.legacy
+    )
+    if changed and not descriptor_read_only:
         new_ids = {entry.id for entry in entries}
         write_credential_pool(
             provider,
             [entry.to_dict() for entry in sorted(entries, key=lambda item: item.priority)],
             removed_ids=disk_ids - new_ids,
         )
-    return CredentialPool(provider, entries)
+    return CredentialPool(provider, entries, codex_store=codex_store)
