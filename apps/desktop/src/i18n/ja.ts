@@ -719,6 +719,9 @@ export const ja = defineLocale({
       bundleOutOfSyncDesc:
         'Hermes ランタイムは更新されましたが、デスクトップアプリ自体は古いビルドのままです。アプリを更新するまで、新しいインターフェース機能(Bot Mode など)は表示されません。下の更新を実行してアプリを再ビルドしてください。それでもこの警告が消えない場合は、最新のデスクトップインストーラーから再インストールしてください。',
       bundleOutOfSyncAction: 'インストーラーを入手',
+      bundleOutOfSyncRestart: 'Hermes を再起動',
+      bundleOutOfSyncRestartDesc:
+        '更新されたアプリはすでにインストール済みです。Hermes を再起動するだけで新しいビルドが読み込まれます。チャットや設定はそのまま保持されます。',
       updates: '更新',
       checkNow: '今すぐ確認',
       checking: '確認中…',

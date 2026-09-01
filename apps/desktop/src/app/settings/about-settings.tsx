@@ -107,27 +107,47 @@ export function AboutSettings() {
             {version?.appVersion ? a.version(version.appVersion) : a.versionUnavailable}
           </p>
         </div>
-        {version?.bundleOutOfSync && (
+        {(version?.bundleOutOfSync || version?.bundleSwapPending) && (
           <div className="mx-auto w-full max-w-2xl rounded-xl border border-amber-500/40 bg-amber-500/10 px-4 py-3 text-left text-sm">
             <div className="flex items-start gap-2">
               <AlertTriangle className="mt-0.5 size-4 shrink-0 text-amber-600 dark:text-amber-400" />
               <div className="min-w-0">
                 <p className="font-medium">{a.bundleOutOfSync}</p>
-                <p className="mt-1 text-xs text-muted-foreground">{a.bundleOutOfSyncDesc}</p>
-                <Button asChild className="mt-2" size="sm" variant="textStrong">
-                  <a
-                    href={INSTALLER_URL}
-                    onClick={event => {
-                      event.preventDefault()
-                      void window.hermesDesktop?.openExternal?.(INSTALLER_URL)
-                    }}
-                    rel="noreferrer"
-                    target="_blank"
-                  >
-                    <ExternalLink className="size-3" />
-                    {a.bundleOutOfSyncAction}
-                  </a>
-                </Button>
+                {version?.bundleSwapPending ? (
+                  // The updated bundle is already on disk (the updater swapped
+                  // it under this running process) — a one-click restart loads
+                  // it. No rebuild, no installer.
+                  <>
+                    <p className="mt-1 text-xs text-muted-foreground">{a.bundleOutOfSyncRestartDesc}</p>
+                    <Button
+                      className="mt-2"
+                      onClick={() => void window.hermesDesktop?.relaunchApp?.()}
+                      size="sm"
+                      variant="textStrong"
+                    >
+                      <RefreshCw className="size-3" />
+                      {a.bundleOutOfSyncRestart}
+                    </Button>
+                  </>
+                ) : (
+                  <>
+                    <p className="mt-1 text-xs text-muted-foreground">{a.bundleOutOfSyncDesc}</p>
+                    <Button asChild className="mt-2" size="sm" variant="textStrong">
+                      <a
+                        href={INSTALLER_URL}
+                        onClick={event => {
+                          event.preventDefault()
+                          void window.hermesDesktop?.openExternal?.(INSTALLER_URL)
+                        }}
+                        rel="noreferrer"
+                        target="_blank"
+                      >
+                        <ExternalLink className="size-3" />
+                        {a.bundleOutOfSyncAction}
+                      </a>
+                    </Button>
+                  </>
+                )}
               </div>
             </div>
           </div>

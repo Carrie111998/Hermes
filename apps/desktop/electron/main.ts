@@ -87,6 +87,7 @@ import {
   buildBrowserWindowUrl
 } from './browser-windows'
 import { detectBundleSkew } from './bundle-skew'
+import { detectBundleSwap } from './bundle-swap'
 import { applyConnectionChange, sshQuitShouldBlock, teardownSshState } from './connection-apply'
 import {
   apiRequestRegistryConnectionId,
@@ -2151,6 +2152,48 @@ function updateGateDeps() {
   }
 }
 
+// One-shot guard for the automatic bundle-swap relaunch below: the relaunched
+// instance carries this flag so a stamp that still mismatches (unreadable
+// resources, exotic packaging) can never produce a relaunch loop.
+const BUNDLE_SWAP_RELAUNCH_FLAG = '--hermes-bundle-swap-relaunched'
+
+// The detached updater swaps the packaged bundle on disk AFTER `hermes update`
+// exits (posix.sh mac_swap / windows.ps1). An instance reopened mid-update —
+// the #50238 gesture the gate above exists for — was launched from the
+// PRE-swap bundle, and its `open`/relaunch leg then merely focuses us (single
+// instance), so no process ever loads the new build. Letting boot proceed here
+// runs the new runtime under the old renderer: exactly the skew
+// detectRendererSkew() warns about, except the Updates card already says
+// "latest", so the warning's own remedy has nothing to run. Relaunch instead —
+// the fresh process loads the swapped bundle and the stamps agree again.
+// Returns true when the relaunch was scheduled (the process exits underneath
+// the caller, which should park rather than continue booting).
+function relaunchIntoSwappedBundle() {
+  if (!IS_PACKAGED || process.argv.includes(BUNDLE_SWAP_RELAUNCH_FLAG)) {
+    return false
+  }
+
+  if (!detectBundleSwap(INSTALL_STAMP, loadInstallStamp())) {
+    return false
+  }
+
+  rememberLog('[updates] app bundle was swapped during the update; relaunching into the new build')
+
+  try {
+    app.relaunch({
+      args: [...buildNoSandboxRelaunchArgs(process.argv.slice(1)), BUNDLE_SWAP_RELAUNCH_FLAG]
+    })
+  } catch (err) {
+    rememberLog(`[updates] bundle-swap relaunch failed: ${err?.message || err}; continuing with the current build`)
+
+    return false
+  }
+
+  void exitAfterBackendShutdown(0)
+
+  return true
+}
+
 // Block until no live update is in progress (or we hit the wait timeout).
 // Emits a boot-progress phase so the renderer shows "Update in progress…"
 // rather than a frozen splash. Returns true if it parked at all.
@@ -2213,6 +2256,16 @@ async function waitForUpdateToFinish() {
 
   if (outcome === 'timeout') {
     rememberLog('[updates] update still in progress after wait timeout; starting backend anyway')
+  } else if (relaunchIntoSwappedBundle()) {
+    await advanceBootProgress(
+      'backend.update-restart',
+      'Restarting Hermes to load the updated app…',
+      14
+    )
+    // Park while the scheduled exit lands so this stale build never starts a
+    // backend; the failsafe below only runs if the exit somehow does not.
+    await new Promise(resolve => setTimeout(resolve, 15_000))
+    rememberLog('[updates] relaunch did not land within 15s; continuing with the current build')
   } else {
     rememberLog('[updates] update finished; proceeding with backend start')
   }
@@ -16952,8 +17005,21 @@ ipcMain.handle('hermes:version', async () => {
     platform: process.platform,
     hermesRoot: resolveUpdateRoot(),
     bundleOutOfSync: skew.outOfSync,
-    bundleCommitsBehind: skew.desktopCommitsBehind
+    bundleCommitsBehind: skew.desktopCommitsBehind,
+    // True when the bundle on disk is not the one this process loaded — a
+    // plain app restart (no rebuild, no installer) clears the skew above.
+    bundleSwapPending: detectBundleSwap(INSTALL_STAMP, loadInstallStamp())
   }
+})
+
+// The About page's "Restart Hermes" button (shown when bundleSwapPending):
+// load the already-swapped bundle without asking the user to quit manually.
+// app.relaunch() re-executes by path, so the fresh process picks up whatever
+// bundle now lives there.
+ipcMain.handle('hermes:app:relaunch', async () => {
+  rememberLog('[updates] renderer requested an app relaunch (swapped bundle pending)')
+  app.relaunch({ args: buildNoSandboxRelaunchArgs(process.argv.slice(1)) })
+  void exitAfterBackendShutdown(0)
 })
 
 // ===========================================================================

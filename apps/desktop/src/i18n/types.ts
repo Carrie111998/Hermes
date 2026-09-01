@@ -558,6 +558,8 @@ export interface Translations {
       bundleOutOfSync: string
       bundleOutOfSyncDesc: string
       bundleOutOfSyncAction: string
+      bundleOutOfSyncRestart: string
+      bundleOutOfSyncRestartDesc: string
       updates: string
       checkNow: string
       checking: string
