@@ -4752,6 +4752,11 @@ class TelegramAdapter(BasePlatformAdapter):
                 + _init_timeout * _max_connect
                 + 120.0  # extra margin for between-attempt sleeps + overhead
             )
+            # Tracks whether any attempt after the first logged a visible
+            # WARNING. If so, the success message below is promoted to WARNING
+            # too, so an operator who saw "attempt 2/8" also sees it resolve
+            # instead of being left staring at the last warning forever.
+            _connect_retry_warned = False
             for _attempt in range(_max_connect):
                 rebuild_app = False
                 try:
@@ -4767,7 +4772,21 @@ class TelegramAdapter(BasePlatformAdapter):
                             f"or set HERMES_TELEGRAM_HTTP_CONNECT_TIMEOUT / "
                             f"HERMES_TELEGRAM_INIT_TIMEOUT to a lower value."
                         )
-                    logger.warning(
+                    # Attempt 1 is the routine path, so it logs at INFO like
+                    # the rest of the startup flow. Logging it at WARNING made a
+                    # *successful* connect indistinguishable from a permanent
+                    # hang at default verbosity: the stderr handler is
+                    # WARNING-only unless -v is passed, so the console printed
+                    # "Connecting to Telegram (attempt 1/8)…" and then went
+                    # silent for the life of the process — the matching
+                    # "Connected to Telegram" below is INFO. Operators read that
+                    # silence as "wedged on attempt 1, never retries, never
+                    # times out" and SIGKILL a healthy gateway. Only a retry is
+                    # abnormal enough to earn WARNING.
+                    if _attempt > 0:
+                        _connect_retry_warned = True
+                    logger.log(
+                        logging.INFO if _attempt == 0 else logging.WARNING,
                         "[%s] Connecting to Telegram (attempt %d/%d)…",
                         self.name, _attempt + 1, _max_connect,
                     )
@@ -4997,7 +5016,12 @@ class TelegramAdapter(BasePlatformAdapter):
             
             self._mark_connected()
             mode = "webhook" if self._webhook_mode else "polling"
-            logger.info("[%s] Connected to Telegram (%s mode)", self.name, mode)
+            # Match the visibility of the loudest connect message: if a retry
+            # warning reached the console, its resolution must too.
+            logger.log(
+                logging.WARNING if _connect_retry_warned else logging.INFO,
+                "[%s] Connected to Telegram (%s mode)", self.name, mode,
+            )
 
             # Start the persistent heartbeat loop in polling mode. Webhook mode
             # receives updates via incoming pushes — there is no long-poll

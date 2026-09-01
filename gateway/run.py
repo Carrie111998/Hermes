@@ -14426,6 +14426,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # engages drain on the first tick.
         self._spawn_supervised(self._drain_control_watcher, "drain_control_watcher")
 
+        # Positive readiness confirmation on stdout. The startup banner is
+        # print()ed, but every readiness record after it ("Connected to
+        # Telegram", "✓ telegram connected", "Gateway running with N
+        # platform(s)", this line) is INFO — and the stderr log handler is
+        # WARNING-only unless -v is passed. A healthy foreground gateway was
+        # therefore indistinguishable from a wedged one: banner, then silence
+        # for the life of the process. That is how a fully-connected adapter
+        # gets diagnosed as "hung" and SIGKILLed. print()ed rather than logged
+        # at WARNING because a successful start is not a warning, and printed
+        # unconditionally to match the banner above it.
+        try:
+            print("  ⚕ Gateway ready — press Ctrl+C to stop", flush=True)
+        except Exception:  # noqa: BLE001 - console output must never block start
+            pass
         logger.info("Press Ctrl+C to stop")
         
         return True
