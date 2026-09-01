@@ -2144,33 +2144,29 @@ def _extract_error_code(body: dict) -> str:
     if not body:
         return ""
 
+    def _specific_code(payload) -> str:
+        """Return the first non-generic structured code from a payload."""
+        if not isinstance(payload, dict):
+            return ""
+        for key in ("code", "error_code", "errorCode", "type"):
+            candidate = payload.get(key)
+            if isinstance(candidate, (str, int)):
+                text = str(candidate).strip()
+                if text and text != "400":
+                    return text
+        return ""
+
     def _code_from_payload(payload) -> str:
         """Extract a code/type from a nested error payload dict (defensive)."""
         if not isinstance(payload, dict):
             return ""
-        payload_error = payload.get("error", {})
-        if isinstance(payload_error, dict):
-            nested = payload_error.get("code") or payload_error.get("type") or ""
-            if isinstance(nested, str) and nested.strip() and nested.strip() != "400":
-                return nested.strip()
-        code = payload.get("code") or payload.get("error_code") or ""
-        if isinstance(code, (str, int)):
-            text = str(code).strip()
-            if text and text != "400":
-                return text
-        return ""
+        return _specific_code(payload.get("error")) or _specific_code(payload)
 
     error_obj = body.get("error", {})
     if isinstance(error_obj, dict):
-        code = (
-            error_obj.get("code")
-            or error_obj.get("error_code")
-            or error_obj.get("errorCode")
-            or error_obj.get("type")
-            or ""
-        )
-        if isinstance(code, str) and code.strip() and code.strip() != "400":
-            return code.strip()
+        code = _specific_code(error_obj)
+        if code:
+            return code
 
         # Some providers wrap the real JSON error body as a string inside
         # error.message — peek into it for a nested code (e.g. Responses API
@@ -2186,13 +2182,7 @@ def _extract_error_code(body: dict) -> str:
             if nested_code:
                 return nested_code
 
-    # Top-level code
-    code = body.get("code") or body.get("error_code") or body.get("errorCode") or ""
-    if isinstance(code, (str, int)):
-        text = str(code).strip()
-        if text and text != "400":
-            return text
-    return ""
+    return _specific_code(body)
 
 
 def _extract_error_param(body: dict) -> str:

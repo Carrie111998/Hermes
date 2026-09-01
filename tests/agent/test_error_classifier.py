@@ -475,6 +475,11 @@ class TestClassifyApiError:
                 "retryable": False,
             },
             {
+                "code": 400,
+                "error_code": "invalid_reasoning_effort",
+                "retryable": False,
+            },
+            {
                 "param": "reasoning.effort",
                 "retryable": False,
             },
