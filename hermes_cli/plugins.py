@@ -233,6 +233,16 @@ VALID_HOOKS: Set[str] = {
     #   {"action": "allow"}  /  None             -> normal dispatch
     # Kwargs: event: MessageEvent, gateway: GatewayRunner, session_store.
     "pre_gateway_dispatch",
+    # Gateway pre-send hook. Fired once per outbound message chunk in
+    # GatewayStreamConsumer._send_new_chunk() BEFORE adapter.send().
+    # Plugins may return a dict to influence delivery:
+    #   {"action": "allow"}  /  None             -> normal delivery
+    #   {"action": "redirect", "target": "..."}  -> send to different target
+    #   {"action": "block", "reason": "..."}     -> silently drop
+    # Kwargs: content: str, platform: Platform, chat_id: str,
+    #         source: SessionSource, chat_type: str,
+    #         gateway: GatewayRunner, session_store.
+    "pre_gateway_send",
     # Approval lifecycle hooks. Fired by tools/approval.py when a dangerous
     # command needs an approval decision -- fires for CLI-interactive prompts,
     # gateway/ACP approvals, and smart-mode auxiliary-LLM decisions.
