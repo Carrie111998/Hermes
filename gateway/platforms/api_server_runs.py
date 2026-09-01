@@ -26,6 +26,256 @@ _ROOM_RETENTION_REQUEST_KEY = (
 )
 
 
+_PROGRESS_RECENT_CAP = 10
+_PROGRESS_FILES_CAP = 30
+_PROGRESS_DONE_CAP = 20
+_PROGRESS_REMAINING_CAP = 20
+_PROGRESS_SUMMARY_CAP = 400
+_PATH_ARG_KEYS = {"path", "file", "filename", "files"}
+
+
+def _empty_run_progress() -> Dict[str, Any]:
+    return {
+        "currentTool": None,
+        "recentTools": [],
+        "filesTouched": [],
+        "done": [],
+        "remaining": [],
+        "summary": "",
+    }
+
+
+def _copy_run_progress(raw: Any) -> Dict[str, Any]:
+    progress = _empty_run_progress()
+    if not isinstance(raw, dict):
+        return progress
+    current_tool = raw.get("currentTool")
+    progress["currentTool"] = (
+        current_tool if isinstance(current_tool, str) and current_tool else None
+    )
+    recent = raw.get("recentTools")
+    if isinstance(recent, list):
+        progress["recentTools"] = [item for item in recent if isinstance(item, dict)]
+    files = raw.get("filesTouched")
+    if isinstance(files, list):
+        progress["filesTouched"] = [p for p in files if isinstance(p, str)]
+    done = raw.get("done")
+    if isinstance(done, list):
+        progress["done"] = [item for item in done if isinstance(item, str)]
+    remaining = raw.get("remaining")
+    if isinstance(remaining, list):
+        progress["remaining"] = [item for item in remaining if isinstance(item, str)]
+    summary = raw.get("summary")
+    progress["summary"] = summary if isinstance(summary, str) else ""
+    return progress
+
+
+def _progress_aux(self, run_id: str) -> Dict[str, Any]:
+    aux_map = getattr(self, "_run_progress_aux", None)
+    if aux_map is None:
+        aux_map = {}
+        self._run_progress_aux = aux_map
+    slot = aux_map.get(run_id)
+    if slot is None:
+        slot = {}
+        aux_map[run_id] = slot
+    return slot
+
+
+def _forget_run_progress(self, run_id: str) -> None:
+    aux_map = getattr(self, "_run_progress_aux", None)
+    if aux_map is not None:
+        aux_map.pop(run_id, None)
+
+
+def _add_path_values(value: Any, into: List[str]) -> None:
+    if isinstance(value, str):
+        text = value.strip()
+        if text:
+            into.append(text)
+        return
+    if isinstance(value, (list, tuple)):
+        for item in value:
+            if isinstance(item, str):
+                text = item.strip()
+                if text:
+                    into.append(text)
+            elif isinstance(item, dict):
+                _extract_path_args(item, into, depth=0)
+
+
+def _extract_path_args(args: Any, into: Optional[List[str]] = None, *, depth: int = 0) -> List[str]:
+    collected = into if into is not None else []
+    if args is None or depth > 4:
+        return collected
+    if isinstance(args, dict):
+        for key, value in args.items():
+            if str(key).lower() in _PATH_ARG_KEYS:
+                _add_path_values(value, collected)
+            elif isinstance(value, (dict, list, tuple)):
+                _extract_path_args(value, collected, depth=depth + 1)
+    elif isinstance(args, (list, tuple)):
+        for item in args:
+            _extract_path_args(item, collected, depth=depth + 1)
+    return collected
+
+
+def _parse_todo_items(raw: Any) -> Optional[List[Dict[str, Any]]]:
+    todos = raw
+    if isinstance(todos, str):
+        try:
+            todos = json.loads(todos)
+        except (json.JSONDecodeError, TypeError):
+            return None
+    if not isinstance(todos, list):
+        return None
+    items: List[Dict[str, Any]] = []
+    for item in todos:
+        if isinstance(item, dict):
+            items.append(item)
+    return items
+
+
+def _merge_todo_items(
+    existing: List[Dict[str, Any]],
+    incoming: List[Dict[str, Any]],
+    merge: bool,
+) -> List[Dict[str, Any]]:
+    if not merge:
+        return list(incoming)
+    by_id: Dict[str, Dict[str, Any]] = {}
+    order: List[str] = []
+    extra: List[Dict[str, Any]] = []
+
+    def _remember(item: Dict[str, Any]) -> None:
+        item_id = item.get("id")
+        if item_id is None:
+            extra.append(item)
+            return
+        key = str(item_id)
+        if key not in by_id:
+            order.append(key)
+        by_id[key] = item
+
+    for item in existing:
+        _remember(item)
+    for item in incoming:
+        _remember(item)
+    return [by_id[key] for key in order] + extra
+
+
+def _todo_done_remaining(
+    todos: List[Dict[str, Any]],
+    redact_sensitive_text,
+) -> tuple[List[str], List[str]]:
+    done: List[str] = []
+    remaining: List[str] = []
+    for item in todos:
+        content = item.get("content") or item.get("title") or ""
+        if not isinstance(content, str):
+            content = str(content or "")
+        content = redact_sensitive_text(content, force=True).strip()
+        if not content:
+            continue
+        status = str(item.get("status") or "pending")
+        if status == "completed":
+            done.append(content)
+        elif status in {"pending", "in_progress"}:
+            remaining.append(content)
+    return done[-_PROGRESS_DONE_CAP:], remaining[-_PROGRESS_REMAINING_CAP:]
+
+
+def _compose_progress_summary(progress: Dict[str, Any], redact_sensitive_text) -> str:
+    parts: List[str] = []
+    current = progress.get("currentTool")
+    if isinstance(current, str) and current:
+        parts.append(f"Using {current}.")
+    else:
+        recent = progress.get("recentTools") or []
+        if recent:
+            last = recent[-1]
+            tool = last.get("tool") if isinstance(last, dict) else None
+            if isinstance(tool, str) and tool:
+                parts.append(f"Last tool: {tool}.")
+    files = [p for p in (progress.get("filesTouched") or []) if isinstance(p, str)]
+    if files:
+        shown = files[-5:]
+        suffix = ", ".join(shown)
+        parts.append(f"Files: {suffix}.")
+    text = " ".join(parts).strip()
+    if not text:
+        return ""
+    return redact_sensitive_text(text, force=True)[:_PROGRESS_SUMMARY_CAP]
+
+
+def _update_progress_from_event(
+    self,
+    run_id: str,
+    *,
+    event_type: str,
+    tool_name: Optional[str],
+    preview: Optional[str],
+    args: Any,
+    timestamp: float,
+    redact_sensitive_text,
+) -> Dict[str, Any]:
+    """Fold a live tool/reasoning event into the pollable progress object."""
+    current = self._run_statuses.get(run_id, {})
+    progress = _copy_run_progress(current.get("progress"))
+    aux = _progress_aux(self, run_id)
+    name = tool_name.strip() if isinstance(tool_name, str) and tool_name.strip() else None
+
+    if event_type in {"tool.started", "tool.completed"}:
+        paths = _extract_path_args(args)
+        if paths:
+            files = list(progress["filesTouched"])
+            seen = set(files)
+            for path in paths:
+                if path not in seen:
+                    files.append(path)
+                    seen.add(path)
+            progress["filesTouched"] = files[-_PROGRESS_FILES_CAP:]
+
+        if name:
+            recent = list(progress["recentTools"])
+            recent.append({"tool": name, "event": event_type, "at": timestamp})
+            progress["recentTools"] = recent[-_PROGRESS_RECENT_CAP:]
+            if event_type == "tool.started":
+                progress["currentTool"] = name
+            elif progress.get("currentTool") == name:
+                progress["currentTool"] = None
+
+        if name == "todo" and isinstance(args, dict) and args.get("todos") is not None:
+            incoming = _parse_todo_items(args.get("todos"))
+            if incoming is not None:
+                merge = bool(args.get("merge"))
+                aux["todos"] = _merge_todo_items(aux.get("todos") or [], incoming, merge)
+
+        if aux.get("todos") is not None:
+            progress["done"], progress["remaining"] = _todo_done_remaining(
+                aux["todos"], redact_sensitive_text
+            )
+        elif event_type == "tool.completed" and name:
+            line = f"{name} {paths[0]}" if paths else name
+            line = redact_sensitive_text(str(line), force=True).strip()
+            if line:
+                done = list(progress["done"])
+                done.append(line)
+                progress["done"] = done[-_PROGRESS_DONE_CAP:]
+
+    elif event_type == "reasoning.available" and preview:
+        redacted = redact_sensitive_text(str(preview), force=True).strip()
+        if redacted:
+            aux["reasoning"] = redacted[:_PROGRESS_SUMMARY_CAP]
+
+    if aux.get("reasoning"):
+        progress["summary"] = aux["reasoning"]
+    else:
+        progress["summary"] = _compose_progress_summary(progress, redact_sensitive_text)
+    return progress
+
+
+
 def _remember_room_retention(request: "web.Request", claims: dict[str, Any]) -> None:
     value = float(claims.get("status_expires_at") or claims.get("expires_at") or 0)
     try:
@@ -75,6 +325,9 @@ def _initialize_run_state(self, *, store_factory) -> None:
     self._stopping_run_ids: set[str] = set()
     # Pollable run status for dashboards and external control-plane UIs.
     self._run_statuses: Dict[str, Dict[str, Any]] = {}
+    # Private progress auxiliaries (todo snapshots / last reasoning). Not
+    # serialized on GET /v1/runs/{id}.
+    self._run_progress_aux: Dict[str, Dict[str, Any]] = {}
     # Active approval session key for each run_id. The approval core resolves
     # requests by session key, while API clients address them by run_id.
     self._run_approval_sessions: Dict[str, str] = {}
@@ -132,6 +385,8 @@ def _set_run_status(
     })
     current.setdefault("created_at", fields.pop("created_at", now))
     current.update(fields)
+    if not isinstance(current.get("progress"), dict):
+        current["progress"] = _empty_run_progress()
     if status != "waiting_for_approval":
         current.pop("approval", None)
     self._run_statuses[run_id] = current
@@ -163,11 +418,14 @@ def _make_run_event_callback(
     """Return a callback that pushes structured events to the run SSE queue."""
     redact_sensitive_text = _api_server.redact_sensitive_text
 
-    def _push(event: Dict[str, Any]) -> None:
+    def _push(event: Dict[str, Any], progress: Optional[Dict[str, Any]] = None) -> None:
+        fields: Dict[str, Any] = {"last_event": event.get("event")}
+        if progress is not None:
+            fields["progress"] = progress
         self._set_run_status(
             run_id,
             self._run_statuses.get(run_id, {}).get("status", "running"),
-            last_event=event.get("event"),
+            **fields,
         )
         q = self._run_streams.get(run_id)
         if q is None:
@@ -186,14 +444,34 @@ def _make_run_event_callback(
     ):
         ts = time.time()
         if event_type == "tool.started":
+            progress = _update_progress_from_event(
+                self,
+                run_id,
+                event_type=event_type,
+                tool_name=tool_name,
+                preview=preview,
+                args=args,
+                timestamp=ts,
+                redact_sensitive_text=redact_sensitive_text,
+            )
             _push({
                 "event": "tool.started",
                 "run_id": run_id,
                 "timestamp": ts,
                 "tool": tool_name,
                 "preview": preview,
-            })
+            }, progress=progress)
         elif event_type == "tool.completed":
+            progress = _update_progress_from_event(
+                self,
+                run_id,
+                event_type=event_type,
+                tool_name=tool_name,
+                preview=preview,
+                args=args,
+                timestamp=ts,
+                redact_sensitive_text=redact_sensitive_text,
+            )
             _push({
                 "event": "tool.completed",
                 "run_id": run_id,
@@ -201,14 +479,24 @@ def _make_run_event_callback(
                 "tool": tool_name,
                 "duration": round(kwargs.get("duration", 0), 3),
                 "error": kwargs.get("is_error", False),
-            })
+            }, progress=progress)
         elif event_type == "reasoning.available":
+            progress = _update_progress_from_event(
+                self,
+                run_id,
+                event_type=event_type,
+                tool_name=tool_name,
+                preview=preview,
+                args=args,
+                timestamp=ts,
+                redact_sensitive_text=redact_sensitive_text,
+            )
             _push({
                 "event": "reasoning.available",
                 "run_id": run_id,
                 "timestamp": ts,
                 "text": preview or "",
-            })
+            }, progress=progress)
         elif event_type in {"subagent.start", "subagent.complete"}:
             event = {
                 "event": event_type,
@@ -665,6 +953,7 @@ async def _handle_runs(
             self._run_streams_created.pop(run_id, None)
             self._run_approval_sessions.pop(run_id, None)
             self._run_statuses.pop(run_id, None)
+            _forget_run_progress(self, run_id)
             self._run_owners.pop(run_id, None)
             if outcome == "conflict":
                 return web.json_response(
@@ -1066,6 +1355,8 @@ async def _handle_get_run(
             _openai_error(f"Run not found: {run_id}", code="run_not_found"),
             status=404,
         )
+    if not isinstance(status.get("progress"), dict):
+        status["progress"] = _empty_run_progress()
     return web.json_response(status)
 
 
@@ -1470,5 +1761,6 @@ def _sweep_orphaned_runs_once(self, now: Optional[float] = None) -> None:
     ]
     for run_id in stale_statuses:
         self._run_statuses.pop(run_id, None)
+        _forget_run_progress(self, run_id)
         self._run_idempotency_ids.discard(run_id)
         self._run_owners.pop(run_id, None)

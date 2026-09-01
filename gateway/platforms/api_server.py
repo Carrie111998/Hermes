@@ -3350,6 +3350,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 ),
                 "run_status": True,
                 "run_events_sse": True,
+                "run_progress": True,
                 "run_stop": True,
                 "run_steer": True,
                 "run_approval_response": True,

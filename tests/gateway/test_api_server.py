@@ -654,6 +654,55 @@ class TestRunEventCallback:
         for field in ("preview", "goal", "summary", "output_tail"):
             assert secret not in event[field], field
 
+    @pytest.mark.asyncio
+    async def test_tool_events_populate_pollable_progress(self, adapter):
+        """GET /v1/runs progress is updated from the event callback, no SSE."""
+        run_id = "run_progress_object"
+        loop = asyncio.get_running_loop()
+        adapter._run_streams[run_id] = asyncio.Queue()
+        adapter._run_statuses.pop(run_id, None)
+        adapter._set_run_status(run_id, "running")
+
+        callback = adapter._make_run_event_callback(run_id, loop)
+        callback("tool.started", "read_file", "reading src", {"path": "src/app.py"})
+        callback(
+            "tool.completed",
+            "read_file",
+            None,
+            {"path": "src/app.py"},
+        )
+        callback(
+            "tool.started",
+            "todo",
+            "plan",
+            {
+                "todos": [
+                    {"id": "1", "content": "Read the file", "status": "completed"},
+                    {"id": "2", "content": "Write tests", "status": "pending"},
+                ]
+            },
+        )
+        secret = "sk-proj-abcdef1234567890abcdef1234567890abcdef12"
+        callback("reasoning.available", "_thinking", f"will use {secret} next", None)
+
+        progress = adapter._run_statuses[run_id]["progress"]
+        assert progress["currentTool"] == "todo"
+        assert [item["tool"] for item in progress["recentTools"]] == [
+            "read_file",
+            "read_file",
+            "todo",
+        ]
+        assert [item["event"] for item in progress["recentTools"]] == [
+            "tool.started",
+            "tool.completed",
+            "tool.started",
+        ]
+        assert progress["filesTouched"] == ["src/app.py"]
+        assert progress["done"] == ["Read the file"]
+        assert progress["remaining"] == ["Write tests"]
+        assert secret not in progress["summary"]
+        assert "will use" in progress["summary"]
+
 
 # ---------------------------------------------------------------------------
 # /health endpoint
@@ -873,6 +922,7 @@ class TestCapabilitiesEndpoint:
             assert data["features"]["chat_completions"] is True
             assert data["features"]["run_status"] is True
             assert data["features"]["run_events_sse"] is True
+            assert data["features"]["run_progress"] is True
             assert data["features"]["runs_idempotency"] == {
                 "supported": True,
                 "durable": True,

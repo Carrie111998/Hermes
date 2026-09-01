@@ -346,6 +346,30 @@ class TestRunStatus:
                 assert mock_agent.run_conversation.call_args.kwargs["task_id"] == "space-session"
                 assert status["session_id"] == "space-session"
 
+    @pytest.mark.asyncio
+    async def test_get_run_returns_progress_object(self, adapter):
+        app = _create_runs_app(adapter)
+        adapter._set_run_status("run_live_progress", "running")
+        callback = adapter._make_run_event_callback(
+            "run_live_progress", asyncio.get_running_loop()
+        )
+        callback("tool.started", "write_file", None, {"path": "/tmp/out.txt"})
+        callback("tool.completed", "write_file", None, {"path": "/tmp/out.txt"})
+
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.get("/v1/runs/run_live_progress")
+            body = await resp.json()
+
+        assert resp.status == 200
+        progress = body["progress"]
+        assert progress["currentTool"] is None
+        assert progress["filesTouched"] == ["/tmp/out.txt"]
+        assert progress["done"] == ["write_file /tmp/out.txt"]
+        assert progress["remaining"] == []
+        assert progress["summary"]
+        assert progress["recentTools"][-1]["event"] == "tool.completed"
+        assert progress["recentTools"][-1]["tool"] == "write_file"
+
 
 # ---------------------------------------------------------------------------
 # GET /v1/runs/{run_id}/events — SSE event stream
