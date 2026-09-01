@@ -15,59 +15,54 @@ describe('PlatformAvatar brand glyphs', () => {
     ['line', 'LINE'],
     ['ntfy', 'ntfy'],
     ['simplex', 'SimpleX Chat'],
+    ['raft', 'Raft'],
+    ['teams', 'Microsoft Teams'],
+    ['bluebubbles', 'BlueBubbles'],
+    ['yuanbao', 'Yuanbao'],
+    ['feishu', 'Feishu / Lark'],
+    ['slack', 'Slack'],
     ['whatsapp_cloud', 'WhatsApp Cloud']
-  ])('renders a local brand glyph for %s', (platformId, platformName) => {
+  ])('renders a real mark for %s', (platformId, platformName) => {
     const { container } = render(<PlatformAvatar platformId={platformId} platformName={platformName} />)
 
-    expect(container.querySelector('svg')).toBeTruthy()
+    expect(container.querySelector('svg, img, [data-dingtalk-wing]')).toBeTruthy()
     expect(screen.queryByText(platformName.charAt(0))).toBeNull()
   })
 
   it.each([
     ['irc', 'IRC', 'IRC'],
-    ['raft', 'Raft', 'R'],
-    ['teams', 'Microsoft Teams', 'T'],
-    ['bluebubbles', 'BlueBubbles', 'BB'],
-    ['yuanbao', 'Yuanbao', 'YB'],
     ['a2a', 'A2A', 'A2A'],
     ['buzz', 'Buzz', 'B'],
-    ['feishu', 'Feishu / Lark', 'F'],
     ['relay', 'Relay', 'R'],
     ['msgraph_webhook', 'Microsoft Graph webhook', 'M']
-  ])('renders a stable brand monogram for %s', (platformId, platformName, monogram) => {
+  ])('renders a stable monogram for %s', (platformId, platformName, monogram) => {
     const { container } = render(<PlatformAvatar platformId={platformId} platformName={platformName} />)
 
-    expect(container.querySelector('svg')).toBeNull()
+    expect(container.querySelector('svg, img')).toBeNull()
     expect(screen.getByText(monogram)).toBeTruthy()
   })
 
   it('keeps the initial fallback for an unknown platform', () => {
     const { container } = render(<PlatformAvatar platformId="custom_chat" platformName="Custom Chat" />)
 
-    expect(container.querySelector('svg')).toBeNull()
+    expect(container.querySelector('svg, img')).toBeNull()
     expect(screen.getByText('C')).toBeTruthy()
   })
 
-  it('uses the compact visual treatments for DingTalk and Matrix', () => {
-    const { container: dingtalk } = render(<PlatformAvatar platformId="dingtalk" platformName="DingTalk" />)
-    expect(dingtalk.querySelector('span')?.getAttribute('style')).toContain('background-color: rgb(0, 137, 255)')
+  it('uses a solid blue field and only the DingTalk wing', () => {
+    const { container } = render(<PlatformAvatar platformId="dingtalk" platformName="DingTalk" />)
+    const chip = container.querySelector('span')
 
-    cleanup()
-    const { container: matrix } = render(<PlatformAvatar platformId="matrix" platformName="Matrix" />)
-    expect(matrix.querySelector('span')?.getAttribute('style')).toContain('background-color: rgb(247, 247, 245)')
-    expect(matrix.querySelector('span')?.getAttribute('style')).toContain('color: rgb(0, 0, 0)')
+    expect(chip?.getAttribute('style')).toContain('background-color: rgb(0, 137, 255)')
+    expect(chip?.querySelector('span')).toBeTruthy()
+    expect(chip?.querySelector('img')).toBeNull()
   })
 
-  it('keeps the real brand glyphs as SVGs instead of replacing them with text', () => {
-    for (const [platformId, platformName] of [
-      ['telegram', 'Telegram'],
-      ['discord', 'Discord'],
-      ['matrix', 'Matrix'],
-      ['dingtalk', 'DingTalk']
-    ]) {
-      const { container } = render(<PlatformAvatar platformId={platformId} platformName={platformName} />)
-      expect(container.querySelector('svg')).toBeTruthy()
-      cleanup()
-    }
+  it('uses a pale field and black Matrix mark', () => {
+    const { container } = render(<PlatformAvatar platformId="matrix" platformName="Matrix" />)
+    const chip = container.querySelector('span')
+
+    expect(chip?.getAttribute('style')).toContain('background-color: rgb(247, 247, 245)')
+    expect(chip?.querySelector('img')).toBeTruthy()
   })
 })

@@ -4,29 +4,30 @@ import {
   SiGooglechat,
   SiHomeassistant,
   SiLine,
-  SiMatrix,
   SiMattermost,
-  SiNtfy,
   SiQq,
   SiSignal,
-  SiSimplex,
   SiTelegram,
   SiWechat,
   SiWhatsapp
 } from '@icons-pack/react-simple-icons'
-import { IconBrandDingtalk } from '@tabler/icons-react'
 import type { ComponentPropsWithoutRef, ComponentType, SVGProps } from 'react'
 import { forwardRef, memo } from 'react'
 
+import bluebubblesIconUrl from '@/assets/brand/bluebubbles-icon.svg'
+import dingtalkIconUrl from '@/assets/brand/dingtalk-icon.png'
+import feishuIconUrl from '@/assets/brand/feishu-icon.png'
+import matrixIconUrl from '@/assets/brand/matrix-icon.svg'
+import ntfyIconUrl from '@/assets/brand/ntfy-icon.png'
+import raftIconUrl from '@/assets/brand/raft-icon.svg'
+import simplexIconUrl from '@/assets/brand/simplex-icon.svg'
+import slackIconUrl from '@/assets/brand/slack-logo.svg'
+import teamsIconUrl from '@/assets/brand/teams-icon.svg'
+import wecomIconUrl from '@/assets/brand/wecom-official.svg'
+import yuanbaoIconUrl from '@/assets/brand/yuanbao-official.png'
 import { AvatarChip } from '@/components/ui/avatar-chip'
 import { Globe, Link as LinkIcon, MessageSquareText } from '@/lib/icons'
 
-// ---------------------------------------------------------------------------
-// Photon brand icon — three diagonal rounded bars (the Photon logo mark).
-// Rendered at ~14 px inside the PlatformAvatar so the bars are kept thick
-// enough to stay legible. At small sizes the bars blend into a distinctive
-// silhouette; the wide triangular spacing preserves the logo's identity.
-// ---------------------------------------------------------------------------
 function PhotonIcon(props: React.SVGProps<SVGSVGElement>) {
   return (
     <svg fill="currentColor" viewBox="0 0 24 24" {...props}>
@@ -37,33 +38,13 @@ function PhotonIcon(props: React.SVGProps<SVGSVGElement>) {
   )
 }
 
-// DingTalk's compact list mark is the middle, swept-wing silhouette from the
-// product mark. It needs a solid blue field at 24px; reducing it to a ring or
-// tint makes the wing disappear.
-const DingTalkIcon = IconBrandDingtalk
-
-function WeComIcon(props: React.SVGProps<SVGSVGElement>) {
-  return (
-    <svg fill="currentColor" viewBox="0 0 24 24" {...props}>
-      <path d="M9.95 2C4.47 2 0 5.88 0 10.66c0 2.93 1.67 5.64 4.4 7.25l-.55 2.3a.7.7 0 0 0 .98.79l2.46-1.25c.86.25 1.75.38 2.66.38.71 0 1.42-.08 2.11-.22a3.28 3.28 0 0 1-.43-1.87 11.1 11.1 0 0 1-1.68.13c-.34 0-.68-.02-1.03-.06a9.1 9.1 0 0 1-1.52-.29l-.76-.22-1.23.62.21-.88-.98-.79C2.9 15.15 2 12.91 2 10.66 2 6.98 5.56 4 9.95 4c3.45 0 6.39 1.85 7.49 4.44.24.56.39 1.14.43 1.72a3.3 3.3 0 0 1 2.01.1c-.07-.91-.32-1.82-.76-2.71C17.62 4.36 14.09 2 9.95 2Z" />
-      <path d="M18.73 10.1a3.2 3.2 0 0 0-1.94 5.75 5.2 5.2 0 0 1-2.23 2.23 3.2 3.2 0 1 0 4.75 2.8 5.2 5.2 0 0 1 2.22-2.23 3.2 3.2 0 1 0-2.8-8.55Zm0 2a1.2 1.2 0 1 1 0 2.4 1.2 1.2 0 0 1 0-2.4Zm-3.04 4.76a1.2 1.2 0 1 1 0 2.4 1.2 1.2 0 0 1 0-2.4Zm6.11-1.02a1.2 1.2 0 1 1 0 2.4 1.2 1.2 0 0 1 0-2.4Z" />
-    </svg>
-  )
-}
-
-// We render simpleicons.org brand glyphs for platforms whose owners publish a
-// usable mark (telegram, discord, matrix, ...). A few brands — Slack, Feishu,
-// WeCom, BlueBubbles, and Yuanbao — use a compact monogram when we do not have
-// a suitable, license-auditable glyph. This avoids showing an unrelated brand
-// icon as a substitute.
-//
-// `iconColor` is the brand's hex from simpleicons.org so we can paint each
-// glyph in its native color on top of a soft tint. Locally curated marks use
-// the same contract, which keeps the fallback and brand paths visually aligned.
 type IconKind = 'brand' | 'generic'
 
 interface PlatformIconSpec {
   Icon?: ComponentType<SVGProps<SVGSVGElement>>
+  asset?: string
+  assetClassName?: string
+  assetMask?: boolean
   color: string
   backgroundColor?: string
   glyphColor?: string
@@ -75,50 +56,48 @@ interface PlatformIconSpec {
 const PLATFORM_ICONS: Record<string, PlatformIconSpec> = {
   telegram: { Icon: SiTelegram, color: '#26A5E4', kind: 'brand' },
   discord: { Icon: SiDiscord, color: '#5865F2', kind: 'brand' },
-  // Slack removed from Simple Icons by Salesforce request — letter monogram.
-  slack: { color: '#4A154B', kind: 'brand', monogram: 'S' },
+  slack: { asset: slackIconUrl, color: '#4A154B', kind: 'brand' },
   mattermost: { Icon: SiMattermost, color: '#0058CC', kind: 'brand' },
   matrix: {
-    Icon: SiMatrix,
-    color: '#000000',
+    asset: matrixIconUrl,
+    assetClassName: 'dark:invert',
     backgroundColor: '#F7F7F5',
-    glyphColor: '#000000',
+    color: '#000000',
     kind: 'brand',
     monochrome: true
   },
   signal: { Icon: SiSignal, color: '#3A76F0', kind: 'brand' },
   whatsapp: { Icon: SiWhatsapp, color: '#25D366', kind: 'brand' },
-  bluebubbles: { color: '#27AE60', kind: 'brand', monogram: 'BB' },
+  bluebubbles: { asset: bluebubblesIconUrl, color: '#27AE60', kind: 'brand' },
   photon: { Icon: PhotonIcon, color: '#6366F1', kind: 'brand' },
   homeassistant: { Icon: SiHomeassistant, color: '#18BCF2', kind: 'brand' },
   google_chat: { Icon: SiGooglechat, color: '#34A853', kind: 'brand' },
   irc: { color: '#64748B', kind: 'brand', monogram: 'IRC' },
   line: { Icon: SiLine, color: '#00C300', kind: 'brand' },
-  ntfy: { Icon: SiNtfy, color: '#317F6F', kind: 'brand' },
-  raft: { color: '#6366F1', kind: 'brand', monogram: 'R' },
-  simplex: { Icon: SiSimplex, color: '#111827', kind: 'brand', monochrome: true },
-  teams: { color: '#6264A7', kind: 'brand', monogram: 'T' },
+  ntfy: { asset: ntfyIconUrl, color: '#317F6F', kind: 'brand' },
+  raft: { asset: raftIconUrl, color: '#19CBD2', kind: 'brand' },
+  simplex: { asset: simplexIconUrl, color: '#111827', kind: 'brand', monochrome: true },
+  teams: { asset: teamsIconUrl, color: '#6264A7', kind: 'brand' },
   email: { Icon: SiGmail, color: '#EA4335', kind: 'brand' },
   sms: { Icon: MessageSquareText, color: '#F43F5E', kind: 'generic' },
   webhook: { Icon: LinkIcon, color: '#71717A', kind: 'generic' },
   api_server: { Icon: Globe, color: '#64748B', kind: 'generic' },
   weixin: { Icon: SiWechat, color: '#07C160', kind: 'brand' },
-  wecom: { Icon: WeComIcon, color: '#2BAD13', kind: 'brand' },
-  wecom_callback: { Icon: WeComIcon, color: '#2BAD13', kind: 'brand' },
+  wecom: { asset: wecomIconUrl, color: '#2BAD13', kind: 'brand' },
+  wecom_callback: { asset: wecomIconUrl, color: '#2BAD13', kind: 'brand' },
   dingtalk: {
-    Icon: DingTalkIcon,
-    color: '#0089FF',
+    asset: dingtalkIconUrl,
+    assetMask: true,
     backgroundColor: '#0089FF',
+    color: '#0089FF',
     glyphColor: '#FFFFFF',
     kind: 'brand'
   },
   qqbot: { Icon: SiQq, color: '#EB1923', kind: 'brand' },
-  yuanbao: { color: '#F59E0B', kind: 'brand', monogram: 'YB' },
-  // These connectors do not ship a license-auditable glyph in the current
-  // icon package. A deliberate monogram is preferable to an unrelated logo.
+  yuanbao: { asset: yuanbaoIconUrl, color: '#3370FF', kind: 'brand' },
   a2a: { color: '#64748B', kind: 'brand', monogram: 'A2A' },
   buzz: { color: '#64748B', kind: 'brand', monogram: 'B' },
-  feishu: { color: '#3370FF', kind: 'brand', monogram: 'F' },
+  feishu: { asset: feishuIconUrl, color: '#3370FF', kind: 'brand' },
   relay: { color: '#64748B', kind: 'brand', monogram: 'R' },
   whatsapp_cloud: { Icon: SiWhatsapp, color: '#25D366', kind: 'brand' },
   msgraph_webhook: { color: '#6264A7', kind: 'brand', monogram: 'M' }
@@ -129,25 +108,42 @@ interface PlatformAvatarProps extends Omit<ComponentPropsWithoutRef<'span'>, 'ch
   platformName: string
 }
 
-// forwardRef + spreading ...rest is required so a wrapping <Tip> (Radix
-// Tooltip's `asChild`) can actually attach its trigger: asChild clones this
-// component and injects a ref plus pointer/focus/aria handlers onto it. A
-// plain function component with no ref/rest forwarding drops all of that
-// silently — the tooltip renders but never opens (#67500).
 export const PlatformAvatar = memo(
   forwardRef<HTMLSpanElement, PlatformAvatarProps>(function PlatformAvatar(
     { className, platformId, platformName, ...rest },
     ref
   ) {
+    const spec = PLATFORM_ICONS[platformId]
+
     return (
-      <AvatarChip
-        aria-hidden="true"
-        brand={PLATFORM_ICONS[platformId]}
-        className={className}
-        name={platformName}
-        ref={ref}
-        {...rest}
-      />
+      <AvatarChip brand={spec} className={className} name={platformName} ref={ref} {...rest}>
+        {spec?.asset ? (
+          spec.assetMask ? (
+            <span
+              aria-hidden
+              className="size-[58%] bg-white"
+              data-dingtalk-wing=""
+              style={{
+                maskImage: `url(${spec.asset})`,
+                WebkitMaskImage: `url(${spec.asset})`,
+                maskPosition: 'center',
+                WebkitMaskPosition: 'center',
+                maskRepeat: 'no-repeat',
+                WebkitMaskRepeat: 'no-repeat',
+                maskSize: 'contain',
+                WebkitMaskSize: 'contain'
+              }}
+            />
+          ) : (
+            <img
+              alt=""
+              aria-hidden
+              className={`size-[58%] object-contain ${spec.assetClassName ?? ''}`}
+              src={spec.asset}
+            />
+          )
+        ) : undefined}
+      </AvatarChip>
     )
   })
 )
