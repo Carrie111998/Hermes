@@ -1,4 +1,5 @@
 from __future__ import annotations
+import asyncio
 
 from collections.abc import AsyncIterator
 from typing import Any
@@ -272,3 +273,71 @@ async def test_coordinator_requires_open_session_and_closes_idempotently():
     await coordinator.close()
     await coordinator.close()
     assert session.closed is True
+
+
+@pytest.mark.asyncio
+async def test_tool_dispatch_does_not_block_later_realtime_events():
+    release = asyncio.Event()
+    session = FakeSession(
+        [
+            RealtimeEvent.tool_call("call-1", "terminal", {"command": "pwd"}),
+            RealtimeEvent.transcript("still listening"),
+        ]
+    )
+
+    async def dispatch(_name: str, _arguments: dict[str, Any]) -> str:
+        await release.wait()
+        return "done"
+
+    coordinator = RealtimeVoiceCoordinator(
+        FakeProvider("fake", session), dispatch_tool=dispatch
+    )
+    await coordinator.open(instructions="", tools=[])
+    events = coordinator.events()
+
+    assert (await anext(events)).type is RealtimeEventType.TOOL_CALL
+    assert (
+        await asyncio.wait_for(anext(events), timeout=0.1)
+    ).type is RealtimeEventType.TRANSCRIPT
+    release.set()
+    with pytest.raises(StopAsyncIteration):
+        await anext(events)
+    assert session.tool_results == [("call-1", "done")]
+
+
+@pytest.mark.asyncio
+async def test_duplicate_tool_call_is_dispatched_exactly_once():
+    duplicate = RealtimeEvent.tool_call("call-1", "terminal", {"command": "pwd"})
+    session = FakeSession([duplicate, duplicate])
+    dispatched = 0
+
+    async def dispatch(_name: str, _arguments: dict[str, Any]) -> str:
+        nonlocal dispatched
+        dispatched += 1
+        return "done"
+
+    coordinator = RealtimeVoiceCoordinator(
+        FakeProvider("fake", session), dispatch_tool=dispatch
+    )
+    await coordinator.open(instructions="", tools=[])
+    assert len([event async for event in coordinator.events()]) == 2
+
+    assert dispatched == 1
+    assert session.tool_results == [("call-1", "done")]
+
+
+@pytest.mark.asyncio
+async def test_tool_call_id_reuse_with_different_arguments_fails_closed():
+    session = FakeSession(
+        [
+            RealtimeEvent.tool_call("call-1", "terminal", {"command": "pwd"}),
+            RealtimeEvent.tool_call("call-1", "terminal", {"command": "whoami"}),
+        ]
+    )
+    coordinator = RealtimeVoiceCoordinator(
+        FakeProvider("fake", session), dispatch_tool=lambda _name, _args: "done"
+    )
+    await coordinator.open(instructions="", tools=[])
+
+    with pytest.raises(ValueError, match="reused with different arguments"):
+        _ = [event async for event in coordinator.events()]
