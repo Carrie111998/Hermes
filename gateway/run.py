@@ -14227,6 +14227,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         self._running = True
         self._install_plugin_message_injector()
+        self._register_builtin_plugin_hooks()
         self._update_runtime_status("running")
 
         try:
@@ -20294,6 +20295,25 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             self,
             self._schedule_plugin_message_injection,
         )
+
+    def _register_builtin_plugin_hooks(self) -> None:
+        """Register built-in plugin hooks that are always active.
+
+        Called once during gateway startup after the plugin manager is
+        available. Registers the reference outbound gate from
+        gateway.builtin_hooks so it participates in pre_gateway_send
+        dispatch without requiring a user-installed plugin.
+        """
+        try:
+            from gateway.builtin_hooks import outbound_gate
+            from hermes_cli.plugins import get_plugin_manager
+
+            mgr = get_plugin_manager()
+            if not mgr.has_hook("pre_gateway_send"):
+                mgr.register_hook("pre_gateway_send", outbound_gate)
+                logger.info("Registered built-in outbound_gate for pre_gateway_send")
+        except Exception as exc:
+            logger.debug("Could not register built-in outbound gate: %s", exc)
 
     def _clear_plugin_message_injector(self) -> None:
         """Remove this runner's scheduler without clobbering a newer owner."""

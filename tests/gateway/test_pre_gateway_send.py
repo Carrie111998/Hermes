@@ -353,3 +353,156 @@ class TestBuiltinOutboundGate:
         assert _is_admin_content("system notification alert") is True
         assert _is_admin_content("Hello, how are you?") is False
         assert _is_admin_content("The weather is nice today") is False
+
+
+# --- Composition semantics tests ---
+
+
+@pytest.mark.asyncio
+async def test_composition_allow_then_block_blocks(monkeypatch):
+    """[allow, block] → block. Safety plugin registered after permissive one still wins."""
+    def _fake_hook(name, **kwargs):
+        if name == "pre_gateway_send":
+            return [{"action": "allow"}, {"action": "block", "reason": "safety"}]
+        return []
+
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", _fake_hook)
+
+    ctx = _make_hook_context()
+    consumer, adapter = _make_consumer(hook_context=ctx)
+
+    result = await consumer._send_new_chunk("Hello world", "reply_1", final=False)
+
+    adapter.send.assert_not_awaited()
+    assert result == "reply_1"
+
+
+@pytest.mark.asyncio
+async def test_composition_none_then_redirect_redirects(monkeypatch):
+    """[None, redirect] → redirect. First actionable result wins."""
+    redirect_adapter = AsyncMock()
+    redirect_adapter.send = AsyncMock(return_value=SimpleNamespace(success=True, message_id="redir_msg"))
+
+    gateway = SimpleNamespace(
+        config=SimpleNamespace(gate=None),
+        adapters={Platform.TELEGRAM: redirect_adapter},
+        session_store=MagicMock(),
+    )
+
+    def _fake_hook(name, **kwargs):
+        if name == "pre_gateway_send":
+            return [None, {"action": "redirect", "target": "telegram:99999"}]
+        return []
+
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", _fake_hook)
+
+    ctx = _make_hook_context(gateway=gateway)
+    consumer, adapter = _make_consumer(hook_context=ctx)
+
+    result = await consumer._send_new_chunk("Hello world", "reply_1", final=False)
+
+    adapter.send.assert_not_awaited()
+    redirect_adapter.send.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_composition_multiple_allows_delivers(monkeypatch):
+    """[allow, allow, allow] → allow (no actionable result, default allow)."""
+    def _fake_hook(name, **kwargs):
+        if name == "pre_gateway_send":
+            return [{"action": "allow"}, {"action": "allow"}, {"action": "allow"}]
+        return []
+
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", _fake_hook)
+
+    ctx = _make_hook_context()
+    consumer, adapter = _make_consumer(hook_context=ctx)
+
+    result = await consumer._send_new_chunk("Hello world", "reply_1", final=False)
+
+    adapter.send.assert_awaited_once()
+    assert result == "msg_1"
+
+
+@pytest.mark.asyncio
+async def test_composition_block_then_allow_blocks(monkeypatch):
+    """[block, allow] → block. First actionable result wins."""
+    def _fake_hook(name, **kwargs):
+        if name == "pre_gateway_send":
+            return [{"action": "block", "reason": "first"}, {"action": "allow"}]
+        return []
+
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", _fake_hook)
+
+    ctx = _make_hook_context()
+    consumer, adapter = _make_consumer(hook_context=ctx)
+
+    result = await consumer._send_new_chunk("Hello world", "reply_1", final=False)
+
+    adapter.send.assert_not_awaited()
+    assert result == "reply_1"
+
+
+@pytest.mark.asyncio
+async def test_composition_conflicting_non_allow_first_wins(monkeypatch):
+    """[block, redirect] → block. First actionable result wins."""
+    def _fake_hook(name, **kwargs):
+        if name == "pre_gateway_send":
+            return [
+                {"action": "block", "reason": "first"},
+                {"action": "redirect", "target": "telegram:99999"},
+            ]
+        return []
+
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", _fake_hook)
+
+    ctx = _make_hook_context()
+    consumer, adapter = _make_consumer(hook_context=ctx)
+
+    result = await consumer._send_new_chunk("Hello world", "reply_1", final=False)
+
+    adapter.send.assert_not_awaited()
+    assert result == "reply_1"
+
+
+# --- Real dispatch path tests ---
+
+
+@pytest.mark.asyncio
+async def test_gate_fires_on_send_or_edit_path(monkeypatch):
+    """The gate fires through _send_or_edit (the main streaming delivery path)."""
+    def _fake_hook(name, **kwargs):
+        if name == "pre_gateway_send":
+            return [{"action": "block", "reason": "gate-on-edit-path"}]
+        return []
+
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", _fake_hook)
+
+    ctx = _make_hook_context()
+    consumer, adapter = _make_consumer(hook_context=ctx)
+
+    result = await consumer._send_or_edit("Hello world", finalize=False)
+
+    # _send_or_edit returns False when blocked
+    assert result is False
+    adapter.send.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_gate_fires_on_try_fresh_final_path(monkeypatch):
+    """The gate fires through _try_fresh_final."""
+    def _fake_hook(name, **kwargs):
+        if name == "pre_gateway_send":
+            return [{"action": "block", "reason": "gate-on-fresh-final"}]
+        return []
+
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", _fake_hook)
+
+    ctx = _make_hook_context()
+    consumer, adapter = _make_consumer(hook_context=ctx)
+
+    result = await consumer._try_fresh_final("Hello world")
+
+    # _try_fresh_final returns False when blocked
+    assert result is False
+    adapter.send.assert_not_awaited()
