@@ -20,6 +20,7 @@ from agent.conversation_compression import (
     _ensure_compressed_has_user_turn,
     compress_context,
 )
+from agent.prompt_builder import format_steer_marker
 from hermes_state import SessionDB
 from tools.process_registry import format_process_notification
 from tools.todo_tool import TODO_INJECTION_HEADER
@@ -236,6 +237,39 @@ def test_real_task_wins_over_trailing_max_iterations_nudge(compressor):
     idx = compressor._find_last_user_message_idx(messages, head_end=0)
     assert idx == 0, "nudge was selected as the anchor instead of the human task"
     assert messages[idx]["content"] == human["content"]
+
+
+def test_busy_steer_replaces_historical_user_anchor_after_compression():
+    original = [
+        {"role": "user", "content": "Run the historical deployment."},
+        {
+            "role": "assistant",
+            "content": "Working on it.",
+            "tool_calls": [
+                {"id": "c1", "function": {"name": "terminal", "arguments": "{}"}}
+            ],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "c1",
+            "content": "still running" + format_steer_marker(
+                "Cancel that deployment and inspect the logs instead."
+            ),
+        },
+    ]
+    compressed = [{"role": "assistant", "content": "Compression summary."}]
+
+    outcome = _ensure_compressed_has_user_turn(original, compressed)
+
+    assert outcome == "steer_inserted"
+    user_turns = [message for message in compressed if message.get("role") == "user"]
+    assert [message["content"] for message in user_turns] == [
+        "Cancel that deployment and inspect the logs instead."
+    ]
+    assert all(
+        "historical deployment" not in str(message.get("content"))
+        for message in compressed
+    )
 
 
 @pytest.mark.parametrize(

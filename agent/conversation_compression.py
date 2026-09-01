@@ -2970,6 +2970,8 @@ def _merge_anchor_into_user_message(target: dict, anchor: dict) -> None:
 CompressedUserTurnOutcome = Literal[
     "inserted",
     "merged",
+    "steer_inserted",
+    "steer_merged",
     "already_present",
     "placeholder_appended",
 ]
@@ -3022,6 +3024,31 @@ def _insert_real_user_anchor(messages: list, anchor: dict) -> CompressedUserTurn
     return "merged"
 
 
+def _pending_steer_user_anchor(messages: list) -> Optional[dict]:
+    """Return the newest steer that has not crossed an assistant boundary."""
+    from agent.prompt_builder import STEER_MARKER_CLOSE, STEER_MARKER_OPEN
+
+    for message in reversed(messages):
+        if not isinstance(message, dict):
+            continue
+        if message.get("role") == "assistant":
+            return None
+        if message.get("role") != "tool":
+            continue
+        text = _message_text(message).rstrip()
+        if not text.endswith(STEER_MARKER_CLOSE):
+            continue
+        marker_start = text.rfind(STEER_MARKER_OPEN)
+        if marker_start == -1:
+            continue
+        steer_text = text[
+            marker_start + len(STEER_MARKER_OPEN) : -len(STEER_MARKER_CLOSE)
+        ].strip()
+        if steer_text:
+            return {"role": "user", "content": steer_text}
+    return None
+
+
 def _ensure_compressed_has_user_turn(
     original_messages: list, compressed: list
 ) -> CompressedUserTurnOutcome:
@@ -3032,6 +3059,11 @@ def _ensure_compressed_has_user_turn(
         COMPRESSION_CONTINUATION_USER_CONTENT,
         _fresh_compaction_message_copy,
     )
+
+    steer_anchor = _pending_steer_user_anchor(original_messages)
+    if steer_anchor is not None:
+        outcome = _insert_real_user_anchor(compressed, steer_anchor)
+        return "steer_merged" if outcome == "merged" else "steer_inserted"
 
     for message in reversed(original_messages):
         if _is_real_user_message(message):
