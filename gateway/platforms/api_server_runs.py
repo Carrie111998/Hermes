@@ -9,7 +9,7 @@ import time
 import uuid
 from collections import deque
 from contextlib import suppress
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 try:
     from aiohttp import web
@@ -49,6 +49,9 @@ def _uses_room_run_auth(self, request: "web.Request") -> bool:
     )
 
 
+_RUN_STREAM_SUBSCRIBER_OVERFLOW = object()
+
+
 class _RunStream:
     """Fan-out transport for one run's SSE events.
 
@@ -66,14 +69,21 @@ class _RunStream:
     """
 
     BACKLOG_LIMIT = 1000
+    # Evict a stalled live subscriber well before its oldest unseen event can
+    # fall out of the central replay window.
+    SUBSCRIBER_QUEUE_LIMIT = 256
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        on_subscribers_empty: Optional[Callable[[], None]] = None,
+    ) -> None:
         self.backlog: "deque[Tuple[int, Optional[Dict[str, Any]]]]" = deque(
             maxlen=self.BACKLOG_LIMIT
         )
         self.subscribers: "Set[asyncio.Queue]" = set()
         self.next_seq = 0
         self.terminal = False
+        self._on_subscribers_empty = on_subscribers_empty
 
     def put_nowait(self, event: Optional[Dict[str, Any]]) -> None:
         """Sequence, retain, and fan out one event. ``None`` is the terminal
@@ -86,18 +96,38 @@ class _RunStream:
         if event is None:
             self.terminal = True
         for q in list(self.subscribers):
-            q.put_nowait((seq, event))
+            try:
+                q.put_nowait((seq, event))
+            except asyncio.QueueFull:
+                # A client stalled in response.write() must not retain an
+                # unbounded live queue. Detach it immediately, discard its
+                # stale pending copies, and wake the handler so the connection
+                # closes. EventSource can then reconnect from Last-Event-ID
+                # against the bounded central backlog.
+                self.detach(q)
+                while not q.empty():
+                    q.get_nowait()
+                q.put_nowait((seq, _RUN_STREAM_SUBSCRIBER_OVERFLOW))
 
     def attach(self, last_seq: int = -1) -> "Tuple[asyncio.Queue, List[Tuple[int, Optional[Dict[str, Any]]]]]":
         """Register a subscriber queue and return the backlog entries to
         replay (those after ``last_seq``)."""
         replay = [(s, e) for (s, e) in self.backlog if s > last_seq]
-        q: "asyncio.Queue[Tuple[int, Optional[Dict[str, Any]]]]" = asyncio.Queue()
+        q: "asyncio.Queue[Tuple[int, Any]]" = asyncio.Queue(
+            maxsize=self.SUBSCRIBER_QUEUE_LIMIT
+        )
         self.subscribers.add(q)
         return q, replay
 
     def detach(self, q: "asyncio.Queue") -> None:
+        was_attached = q in self.subscribers
         self.subscribers.discard(q)
+        if (
+            was_attached
+            and not self.subscribers
+            and self._on_subscribers_empty is not None
+        ):
+            self._on_subscribers_empty()
 
 
 def _initialize_run_state(self, *, store_factory) -> None:
@@ -678,7 +708,11 @@ async def _handle_runs(
     approval_session_key = run_id
     ephemeral_system_prompt = instructions
     loop = asyncio.get_running_loop()
-    q = _RunStream()
+    q = _RunStream(
+        on_subscribers_empty=lambda: self._run_stream_subscribers.discard(
+            run_id
+        )
+    )
     created_at = time.time()
     self._run_streams[run_id] = q
     self._run_streams_created[run_id] = created_at
@@ -1202,7 +1236,6 @@ async def _handle_run_events(
             "X-Accel-Buffering": "no",
         },
     )
-    await response.prepare(request)
 
     async def _write_event(seq: int, event: Dict[str, Any]) -> None:
         payload = dict(event)
@@ -1211,31 +1244,44 @@ async def _handle_run_events(
         await response.write(frame)
 
     try:
-        if replay and last_seq >= 0 and replay[0][0] > last_seq + 1:
-            notice = f": replay truncated — oldest retained seq {replay[0][0]}\n\n"
-            await response.write(notice.encode())
-        for seq, event in replay:
-            if event is None:
-                # Run already finished — replay ends with the sentinel.
+        await response.prepare(request)
+        try:
+            if replay and last_seq >= 0 and replay[0][0] > last_seq + 1:
+                notice = f": replay truncated — oldest retained seq {replay[0][0]}\n\n"
+                await response.write(notice.encode())
+            for seq, event in replay:
+                if event is None:
+                    # Run already finished — replay ends with the sentinel.
+                    await response.write(b": stream closed\n\n")
+                    return response
+                await _write_event(seq, event)
+            if stream.terminal:
                 await response.write(b": stream closed\n\n")
                 return response
-            await _write_event(seq, event)
-        if stream.terminal:
-            await response.write(b": stream closed\n\n")
-            return response
-        while True:
-            try:
-                seq, event = await asyncio.wait_for(q.get(), timeout=30.0)
-            except asyncio.TimeoutError:
-                await response.write(b": keepalive\n\n")
-                continue
-            if event is None:
-                # Run finished — send final SSE comment and close
-                await response.write(b": stream closed\n\n")
-                break
-            await _write_event(seq, event)
-    except Exception as exc:
-        logger.debug("[api_server] SSE stream error for run %s: %s", run_id, exc)
+            while True:
+                try:
+                    seq, event = await asyncio.wait_for(q.get(), timeout=30.0)
+                except asyncio.TimeoutError:
+                    await response.write(b": keepalive\n\n")
+                    continue
+                if event is _RUN_STREAM_SUBSCRIBER_OVERFLOW:
+                    logger.debug(
+                        "[api_server] closing slow SSE subscriber for run %s "
+                        "after its queue overflowed",
+                        run_id,
+                    )
+                    break
+                if event is None:
+                    # Run finished — send final SSE comment and close
+                    await response.write(b": stream closed\n\n")
+                    break
+                await _write_event(seq, event)
+        except Exception as exc:
+            logger.debug(
+                "[api_server] SSE stream error for run %s: %s",
+                run_id,
+                exc,
+            )
     finally:
         _detach_run_stream(self, run_id, q)
 
