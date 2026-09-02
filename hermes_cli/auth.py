@@ -1993,6 +1993,10 @@ def _heal_forked_single_use_oauth_grants(provider_id: str) -> Optional[Dict[str,
         # only same-path-checks the directories, so a symlinked file slips
         # through; reading one file as both stores would match every row
         # against itself and strip the shared credential through the symlink.
+        # Best-effort guard: a TOCTOU window remains between this check and
+        # the later read/write — if the symlink is swapped in between, the
+        # open() follows the new target. Real protection against that
+        # window is filesystem permissions on the store and its parent.
         return None
     profile_home = profile_path.parent
     root_home = root_path.parent
