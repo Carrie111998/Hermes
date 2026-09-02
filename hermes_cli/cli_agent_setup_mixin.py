@@ -554,6 +554,7 @@ class CLIAgentSetupMixin:
                 openrouter_min_coding_score=self._openrouter_min_coding_score,
                 session_id=self.session_id,
                 platform="cli",
+                user_id="tui-local" if not getattr(self, "_user_id", None) else self._user_id,
                 session_db=self._session_db,
                 # A -q turn never builds the prompt_toolkit application, so
                 # the interactive modal can never be painted or answered —
