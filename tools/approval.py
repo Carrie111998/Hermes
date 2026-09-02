@@ -1667,7 +1667,16 @@ _GREP_SHORT_OPTIONS_WITH_ARG = {"A", "B", "C", "D", "d", "e", "f", "m"}
 
 
 def _quoted_grep_pattern_spans(command: str) -> tuple[list[tuple[int, int]], bool]:
-    """Structurally locate quoted grep PCRE operands.
+    """Structurally locate grep pattern operands (quoted or bare).
+
+    A grep pattern operand is DATA the tool searches for, never a command
+    that will run — so its text must not participate in dangerous-pattern
+    detection or approvals.deny glob matching. This used to hide only
+    quoted PCRE (-P) patterns; a bare `grep -n docker file.sh` still tripped
+    a '*docker *' deny rule and `grep -nE "systemctl (enable|start)"` an
+    '*systemctl*' rule, blocking read-only code review of infrastructure
+    files (#94747). The operand — positional or explicit via -e/--regexp —
+    is now hidden regardless of quoting and regex mode.
 
     The returned boolean means the grep parse was ambiguous or malformed.  In
     that case callers fail closed and, critically, use the original command:
@@ -1744,13 +1753,11 @@ def _quoted_grep_pattern_spans(command: str) -> tuple[list[tuple[int, int]], boo
                 i += 1
             if not explicit_patterns:
                 if operand_index is None:
-                    return [], bool(pcre)
+                    return [], False
                 pattern_indexes.append(operand_index)
-            if pcre:
-                for index in pattern_indexes:
-                    _, token_start, token_end, quoted = args[index]
-                    if quoted:
-                        spans.append((segment_at + token_start, segment_at + token_end))
+            for index in pattern_indexes:
+                _, token_start, token_end, _quoted = args[index]
+                spans.append((segment_at + token_start, segment_at + token_end))
     return spans, False
 
 
