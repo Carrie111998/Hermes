@@ -327,6 +327,11 @@ def install_modify_other_keys_aliases() -> int:
         if existing is not None:
             ctrl_key_map[codepoint] = existing
 
+    # Ctrl+. has no legacy C0 representation or Hermes binding.  Enhanced
+    # keyboard protocols still report it, and leaving it unmapped makes
+    # prompt_toolkit insert the tail (``[46;5u``) as literal user input.
+    ctrl_key_map[ord('.')] = Keys.Ignore
+
     changed = 0
 
     # Kitty CSI-u encodes CapsLock/NumLock state as extra modifier bits

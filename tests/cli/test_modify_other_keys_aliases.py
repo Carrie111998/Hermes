@@ -208,6 +208,12 @@ def test_ctrl_space_under_modify_other_keys():
     assert _parse("\x1b[32;5u") == _parse("\x00")
 
 
+def test_ctrl_period_does_not_leak_literal_csi_u():
+    """Unbound Ctrl+. is consumed instead of inserting ``[46;5u``."""
+    assert _parse("\x1b[27;5;46~") == [Keys.Ignore]
+    assert _parse("\x1b[46;5u") == [Keys.Ignore]
+
+
 # ---------------------------------------------------------------------------
 # Alt+letter
 # ---------------------------------------------------------------------------
