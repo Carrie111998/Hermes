@@ -104,6 +104,10 @@ def _gateway_config(connected_values):
     config.get_connected_platforms.return_value = [
         MagicMock(value=v) for v in connected_values
     ]
+    # GatewayConfig.route_only is a real bool; a bare MagicMock attribute is
+    # truthy and would silently opt these native/relay topologies into the
+    # route_only carve-out, hiding the strictness they exist to prove.
+    config.route_only = False
     return config
 
 

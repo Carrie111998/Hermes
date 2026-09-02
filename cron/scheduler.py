@@ -5362,6 +5362,13 @@ def _preflight_check_delivery(job: dict) -> Optional[str]:
     the same source `cron_delivery_targets` uses). Gateway-config load
     failures fail OPEN so a transient config hiccup never wedges delivery
     that would have worked.
+
+    A ``route_only`` deployment holds no platform credentials of its own by
+    design — ingress and egress belong to the fronting gateway — so the
+    credential half of the check is skipped there (the unknown-platform half
+    still applies). Without that carve-out every route_only profile blocks
+    every platform target, including ones whose delivery demonstrably
+    succeeds through the fronting gateway's live adapter.
     """
     deliver_value = _normalize_deliver_value(job.get("deliver", "local"))
     platform_parts: list[str] = []
@@ -5379,6 +5386,7 @@ def _preflight_check_delivery(job: dict) -> Optional[str]:
         return None
 
     connected: Optional[set] = None
+    credentials_fronted = False
     for platform_name in platform_parts:
         if not _is_known_delivery_platform(platform_name):
             return (
@@ -5386,11 +5394,28 @@ def _preflight_check_delivery(job: dict) -> Optional[str]:
                 "delivery target. Fix the job's `deliver` value or configure "
                 "the platform's gateway credentials."
             )
+        if credentials_fronted:
+            continue
         if connected is None:
             try:
                 from gateway.config import load_gateway_config
 
                 gateway_config = load_gateway_config()
+                if getattr(gateway_config, "route_only", False):
+                    # Route-only deployment: this config intentionally carries
+                    # no platform credentials — the fronting gateway owns them,
+                    # and fire-time delivery resolves through ITS live adapter
+                    # (`resolve_delivery_transport`). get_connected_platforms()
+                    # is empty here for every platform, so the credential check
+                    # can only produce false blocks. Same carve-out rationale
+                    # as the relay-fronted set below.
+                    logger.debug(
+                        "preflight: route_only deployment — delivery "
+                        "credentials belong to the fronting gateway; "
+                        "skipping the credential check"
+                    )
+                    credentials_fronted = True
+                    continue
                 connected = {
                     p.value for p in gateway_config.get_connected_platforms()
                 }
