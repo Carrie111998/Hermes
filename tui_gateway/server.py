@@ -161,6 +161,9 @@ _profile_ui_meta_lock = threading.Lock()
 _sessions_lock = threading.RLock()  # reentrant: _close_session_by_id may run under callers that already hold it
 _prompt_lock = threading.Lock()
 _cfg_cache: dict | None = None
+_cfg_stat_key: tuple[int, int] | None = None
+# Legacy test/integration invalidation knob; the nanosecond+size key is
+# authoritative, but keeping this alias avoids breaking existing reset hooks.
 _cfg_mtime: float | None = None
 _cfg_path = None
 _session_resume_lock = threading.Lock()
@@ -4663,7 +4666,7 @@ def _load_cfg_raw() -> dict:
     save. Behavioral reads must use :func:`_load_cfg`, which layers the
     managed overlay + env expansion on top of this raw read.
     """
-    global _cfg_cache, _cfg_mtime, _cfg_path
+    global _cfg_cache, _cfg_stat_key, _cfg_mtime, _cfg_path
     try:
         # Honor a per-session profile override (see session.resume) so a resumed
         # remote profile loads ITS config (model, skills, prompt); otherwise the
@@ -4672,9 +4675,20 @@ def _load_cfg_raw() -> dict:
         override = get_hermes_home_override()
         home = override if isinstance(override, str) and override else _hermes_home
         p = Path(home) / "config.yaml"
-        mtime = p.stat().st_mtime if p.exists() else None
+        try:
+            st = p.stat()
+            stat_key = (st.st_mtime_ns, st.st_size)
+            legacy_mtime = st.st_mtime
+        except OSError:
+            stat_key = None
+            legacy_mtime = None
         with _cfg_lock:
-            if _cfg_cache is not None and _cfg_mtime == mtime and _cfg_path == p:
+            if (
+                _cfg_cache is not None
+                and _cfg_stat_key == stat_key
+                and _cfg_mtime == legacy_mtime
+                and _cfg_path == p
+            ):
                 return copy.deepcopy(_cfg_cache)
         if p.exists():
             from hermes_cli.config import read_user_config_raw
@@ -4687,7 +4701,8 @@ def _load_cfg_raw() -> dict:
             # the user's file. The managed overlay is applied on every return
             # path instead (read-side only).
             _cfg_cache = copy.deepcopy(data)
-            _cfg_mtime = mtime
+            _cfg_stat_key = stat_key
+            _cfg_mtime = legacy_mtime
             _cfg_path = p
         return data
     except Exception:
@@ -4737,7 +4752,7 @@ def _apply_managed(cfg: dict) -> dict:
 
 
 def _save_cfg(cfg: dict):
-    global _cfg_cache, _cfg_mtime, _cfg_path
+    global _cfg_cache, _cfg_stat_key, _cfg_mtime, _cfg_path
 
     from utils import atomic_roundtrip_yaml_save
 
@@ -4757,8 +4772,11 @@ def _save_cfg(cfg: dict):
         _cfg_cache = copy.deepcopy(cfg)
         _cfg_path = path
         try:
-            _cfg_mtime = path.stat().st_mtime
-        except Exception:
+            st = path.stat()
+            _cfg_stat_key = (st.st_mtime_ns, st.st_size)
+            _cfg_mtime = st.st_mtime
+        except OSError:
+            _cfg_stat_key = None
             _cfg_mtime = None
 
 

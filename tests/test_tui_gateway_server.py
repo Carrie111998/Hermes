@@ -105,7 +105,7 @@ def test_session_slot_is_claimed_on_first_turn_not_on_create(monkeypatch, tmp_pa
 
     try:
         server._cfg_cache = None
-        server._cfg_mtime = None
+        server._cfg_stat_key = None
         server._cfg_path = None
         _clear_server_sessions()
         monkeypatch.setattr(server, "_start_agent_build", lambda *args, **kwargs: None)
@@ -139,7 +139,7 @@ def test_session_slot_is_claimed_on_first_turn_not_on_create(monkeypatch, tmp_pa
     finally:
         _clear_server_sessions()
         server._cfg_cache = None
-        server._cfg_mtime = None
+        server._cfg_stat_key = None
         server._cfg_path = None
         reset_hermes_home_override(token)
 
