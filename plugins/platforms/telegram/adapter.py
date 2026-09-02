@@ -4508,6 +4508,11 @@ class TelegramAdapter(BasePlatformAdapter):
         ))
         # Handle inline keyboard button callbacks (update prompts)
         app.add_handler(CallbackQueryHandler(self._handle_callback_query))
+        # Rich-only messages (Bot API rich_message blocks with no text/caption)
+        # match no filter above and would be silently dropped. Late catch-all:
+        # if nothing in group 0 claimed the message, flatten its rich_message
+        # blocks to plaintext and dispatch through the normal text pipeline.
+        app.add_handler(TypeHandler(Update, self._handle_rich_only_message), group=100)
         # Inline command picker (@botname <query>) — searchable, uncapped
         # access to every command/skill. Inert until the bot owner enables
         # inline mode via BotFather /setinline (Telegram never delivers
@@ -9996,6 +10001,42 @@ class TelegramAdapter(BasePlatformAdapter):
 
         event = self._build_message_event(msg, MessageType.TEXT, update_id=update.update_id)
         event.text = self._clean_bot_trigger_text(event.text)
+        await self._cache_replied_media(msg, event)
+        event = self._apply_telegram_group_observe_attribution(event)
+        self._enqueue_text_event(event)
+
+    async def _handle_rich_only_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Catch rich-only messages (group 100) that no group-0 handler claimed.
+
+        Bot API 10.1 rich messages carry their content in ``rich_message``
+        blocks instead of ``text``/``caption``. PTB 22.x does not model the
+        field, so ``filters.TEXT`` and every media filter miss them and the
+        update would be silently dropped. Flatten the blocks to plaintext
+        (formatting loss is acceptable — the content survives) and dispatch
+        through the normal text pipeline.
+        """
+        msg = self._effective_update_message(update)
+        if not msg:
+            return
+        if getattr(msg, "text", None) or getattr(msg, "caption", None):
+            return  # already claimed by a group-0 handler
+        rich_text = self._extract_rich_reply_text(msg)
+        if not rich_text:
+            return  # not a rich message (or empty) — nothing to recover
+        if not self._is_user_authorized_from_message(msg):
+            logger.warning(
+                "[Telegram] Blocked unauthorized user %s in chat %s",
+                getattr(getattr(msg, "from_user", None), "id", None),
+                getattr(getattr(msg, "chat", None), "id", None),
+            )
+            return
+        if not self._should_process_message(msg):
+            return
+        await self._ensure_forum_commands(update.message)
+
+        logger.info("[%s] Recovered rich-only message as plaintext (%d chars)", self.name, len(rich_text))
+        event = self._build_message_event(msg, MessageType.TEXT, update_id=update.update_id)
+        event.text = self._clean_bot_trigger_text(rich_text)
         await self._cache_replied_media(msg, event)
         event = self._apply_telegram_group_observe_attribution(event)
         self._enqueue_text_event(event)
