@@ -198,6 +198,69 @@ class TestClassifyApiError:
         assert result.retryable is False
         assert result.should_fallback is True
 
+    def test_401_model_not_supported_is_model_not_found(self):
+        """opencode-go returns 401 for an invalid model id, not a bad key.
+
+        The credential must NOT be rotated — only the model was wrong.
+        """
+        e = MockAPIError(
+            "Unauthorized",
+            status_code=401,
+            body={"error": {"message": "Model gpt-5-codex is not supported"}},
+        )
+        result = classify_api_error(
+            e, provider="opencode-go", model="gpt-5-codex",
+        )
+        assert result.reason == FailoverReason.model_not_found
+        assert result.reason != FailoverReason.auth
+        assert result.retryable is False
+        assert result.should_rotate_credential is False
+        assert result.should_fallback is True
+
+    def test_401_invalid_api_key_still_auth(self):
+        """Regression guard: a genuinely auth-shaped 401 is unchanged."""
+        e = MockAPIError(
+            "Unauthorized",
+            status_code=401,
+            body={"error": {"message": "Invalid API key provided"}},
+        )
+        result = classify_api_error(e, provider="opencode-go")
+        assert result.reason == FailoverReason.auth
+        assert result.retryable is False
+        assert result.should_rotate_credential is True
+        assert result.should_fallback is True
+
+    def test_401_mentioning_model_without_not_supported_is_auth(self):
+        """False-positive guard: "model" alone must not trigger the carve-out."""
+        e = MockAPIError(
+            "Unauthorized",
+            status_code=401,
+            body={
+                "error": {
+                    "message": (
+                        "Invalid API key for model gpt-5-codex — "
+                        "contact support to enable model access"
+                    )
+                }
+            },
+        )
+        result = classify_api_error(
+            e, provider="opencode-go", model="gpt-5-codex",
+        )
+        assert result.reason == FailoverReason.auth
+        assert result.should_rotate_credential is True
+
+    def test_401_region_not_supported_is_auth(self):
+        """False-positive guard: "not supported" without a model mention."""
+        e = MockAPIError(
+            "Unauthorized",
+            status_code=401,
+            body={"error": {"message": "Your region is not supported"}},
+        )
+        result = classify_api_error(e, provider="opencode-go")
+        assert result.reason == FailoverReason.auth
+        assert result.should_rotate_credential is True
+
     def test_403_classified_as_auth(self):
         e = MockAPIError("Forbidden", status_code=403)
         result = classify_api_error(e, provider="anthropic")

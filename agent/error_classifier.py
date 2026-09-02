@@ -486,6 +486,20 @@ _INVALID_MESSAGE_BODY_PATTERNS = [
     _NO_USER_QUERY_SIGNAL,
 ]
 
+# Some providers answer an *invalid model name* with HTTP 401 instead of 404 —
+# opencode-go / OpenCode Zen returns ``401`` with a body like
+# ``"Model gpt-5-codex is not supported"``.  The credential is perfectly
+# healthy; only the requested model id is wrong.  These phrases are matched
+# *in addition to* requiring the word "model" in the body so a genuine auth
+# rejection that merely happens to contain "not supported" (e.g. "your region
+# is not supported") keeps the normal auth path.
+_MODEL_NOT_SUPPORTED_401_PATTERNS = [
+    "is not supported",
+    "are not supported",
+    "not a supported model",
+    "unsupported model",
+]
+
 # Request-validation patterns — the request is malformed and will fail
 # identically on every retry. Some OpenAI-compatible gateways (notably
 # codex.nekos.me) return these as 5xx instead of the standard 4xx, which
@@ -1257,6 +1271,33 @@ def _classify_by_status(
     """Classify based on HTTP status code with message-aware refinement."""
 
     if status_code == 401:
+        # Carve-out: a 401 that is really "you asked for a model that does not
+        # exist".  opencode-go / OpenCode Zen returns HTTP 401 with a body like
+        # ``Model <name> is not supported`` when the *model id* in the request
+        # is invalid, not when the key is bad.  Classifying that as auth
+        # rotates the credential pool and benches the (healthy) key for
+        # ``EXHAUSTED_TTL_401_SECONDS`` (5 minutes, see agent/credential_pool.py),
+        # which can empty a small pool for no reason and delays the only fix
+        # that helps — trying a different model — behind a pointless
+        # auth-recovery detour.  Mirrors the 404 refinements below: require the
+        # body to mention a model AND carry an explicit "not supported" phrase
+        # so ordinary auth rejections are untouched.
+        if "model" in error_msg and any(
+            p in error_msg for p in _MODEL_NOT_SUPPORTED_401_PATTERNS
+        ):
+            logger.warning(
+                "HTTP 401 with a model-validity body classified as "
+                "model_not_found, NOT auth — the credential is healthy and is "
+                "NOT being rotated; the requested model id is invalid "
+                "(provider=%s model=%s). error=%.200s",
+                provider, model, error_msg,
+            )
+            return result_fn(
+                FailoverReason.model_not_found,
+                retryable=False,
+                should_rotate_credential=False,
+                should_fallback=True,
+            )
         # Not retryable on its own — credential pool rotation and
         # provider-specific refresh (Codex, Anthropic, Nous) run before
         # the retryability check in run_agent.py.  If those succeed, the
