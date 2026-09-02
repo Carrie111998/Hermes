@@ -2691,6 +2691,19 @@ def _scoped_key_env(name: str) -> str:
         return ""
 
 
+def _picker_key_cmd_token(entry: dict) -> str:
+    """Mint a probe credential from a provider's ``key_cmd``, or "" if absent.
+
+    Thin wrapper over ``agent.command_token_source.resolve_probe_token``,
+    which owns the credential logic for every catalog-probe caller (this
+    picker and the ``hermes model`` setup flow). Kept as a module-local name
+    so the probe sites below read in terms of the picker.
+    """
+    from agent.command_token_source import resolve_probe_token
+
+    return resolve_probe_token(entry)
+
+
 # --- Parallel prefetch for provider model catalogs -----------------------
 #
 # When the 1h disk cache lapses (or on first cold open), list_authenticated_providers()
@@ -3674,7 +3687,18 @@ def list_authenticated_providers(
             credential_identity = (
                 inline_api_key
                 if inline_api_key
-                else (f"env:{key_env}" if key_env else "")
+                else (
+                    f"env:{key_env}"
+                    if key_env
+                    # By COMMAND, not the minted token (it rotates). Two
+                    # entries on one URL with different helpers are distinct
+                    # credentials and must keep distinct rows.
+                    else (
+                        f"cmd:{str(ep_cfg.get('key_cmd', '') or '').strip()}"
+                        if str(ep_cfg.get("key_cmd", "") or "").strip()
+                        else ""
+                    )
+                )
             )
             api_url_norm = str(api_url).strip().rstrip("/").lower()
             # Per-provider extra_headers participate in the group identity
@@ -3797,6 +3821,10 @@ def list_authenticated_providers(
                     ep_cfg.get("key_env") or ep_cfg.get("api_key_env") or ""
                 ).strip()
                 api_key = _scoped_key_env(key_env) if key_env else ""
+            if not api_key:
+                # Same precedence the request path uses: a command-minted
+                # credential stands in for a static key.
+                api_key = _picker_key_cmd_token(ep_cfg)
             discover = ep_cfg.get("discover_models", True)
             if isinstance(discover, str):
                 discover = discover.lower() not in {"false", "no", "0"}
@@ -4015,6 +4043,9 @@ def list_authenticated_providers(
             inline_api_key = str(entry.get("api_key") or "").strip()
             key_env = str(entry.get("key_env") or "").strip()
             api_key = inline_api_key or _scoped_key_env(key_env)
+            key_cmd = str(entry.get("key_cmd", "") or "").strip()
+            if not api_key:
+                api_key = _picker_key_cmd_token(entry)
             api_mode = str(
                 entry.get("api_mode")
                 or entry.get("transport")
@@ -4023,7 +4054,15 @@ def list_authenticated_providers(
             credential_identity = (
                 inline_api_key
                 if inline_api_key
-                else (f"env:{key_env}" if key_env else "")
+                else (
+                    f"env:{key_env}"
+                    if key_env
+                    # Identify by the COMMAND, never the minted token: the
+                    # token rotates on every refresh, so keying on it would
+                    # change the cache fingerprint constantly and force a
+                    # re-probe on every open.
+                    else (f"cmd:{key_cmd}" if key_cmd else "")
+                )
             )
 
             # Read discover_models from the entry (same semantics as

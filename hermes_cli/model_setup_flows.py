@@ -1569,7 +1569,21 @@ def _model_flow_named_custom(config, provider_info):
     # Resolve key from env var if api_key not set directly
     if not api_key and key_env:
         api_key = os.environ.get(key_env, "")
+    # What gets PERSISTED is computed from the statically-configured key only.
+    # A key_cmd token is short-lived and must never be written back into
+    # config.yaml — it would be stale within the hour and would shadow the
+    # key_cmd that is supposed to re-mint it.
     config_api_key = _custom_provider_api_key_config_value(provider_info, api_key)
+    if not api_key:
+        # Command-minted credential (key_cmd) — same precedence as the request
+        # path and the slash-command picker: after api_key/key_env, so an
+        # explicit static key still wins. Without this the probe below sends no
+        # Authorization header, an authenticated endpoint 401s, and the flow
+        # falls back to the single saved model. Deliberately resolved AFTER
+        # config_api_key so the minted token stays in-memory for this probe.
+        from agent.command_token_source import resolve_probe_token
+
+        api_key = resolve_probe_token(provider_info)
 
     # Honor ``discover_models: false`` (default True) — when discovery is
     # disabled, use the configured ``models:`` list verbatim and skip the
