@@ -117,6 +117,12 @@ class TestGetCopilotModelContext:
         assert [item["id"] for item in first] == ["gpt-4.1"]
         assert [item["id"] for item in second] == ["gpt-4.1"]
         assert mock_urlopen.call_count == 1
+        request = mock_urlopen.call_args.args[0]
+        identity = mod.copilot_default_headers()
+        assert request.get_header("Authorization") == "Bearer token"
+        assert request.get_header("Copilot-integration-id") == "copilot-developer-cli"
+        assert request.get_header("User-agent") == identity["User-Agent"]
+        assert request.get_header("Editor-version") == identity["Editor-Version"]
 
         # Cached copies are independent — mutating the result must not
         # poison the cache.

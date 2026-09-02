@@ -49,7 +49,8 @@ class TestExchangeCopilotToken:
         call_args = mock_urlopen.call_args
         req = call_args[0][0]
         assert req.get_header("Authorization") == "token gho_test123"
-        assert "GitHubCopilotChat" in req.get_header("User-agent")
+        assert req.get_header("User-agent") == "GitHubCopilotChat/0.26.7"
+        assert req.get_header("Editor-version") == "vscode/1.104.1"
 
 
 
