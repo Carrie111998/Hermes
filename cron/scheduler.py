@@ -4288,6 +4288,38 @@ def _windows_cron_python_invocation(python_exe: str) -> tuple[str, dict[str, str
     return str(interpreter), env_overlay
 
 
+def _cron_python_invocation(python_exe: str) -> tuple[str, dict[str, str]]:
+    """Resolve a real Python interpreter for cron script subprocesses.
+
+    App-bundled macOS gateways expose the signed app launcher as
+    ``sys.executable``.  Reusing that binary as ``python script.py`` starts the
+    bundle bootstrap without its packaged Python home.  The gateway already
+    publishes its backing virtual environment, so use that interpreter when
+    it exists.  Normal POSIX and all Windows behavior remains unchanged.
+    """
+    if sys.platform == "win32":
+        return _windows_cron_python_invocation(python_exe)
+    if sys.platform != "darwin":
+        return python_exe, {}
+
+    executable_parts = Path(python_exe).parts
+    app_bundle_executable = any(
+        part.endswith(".app")
+        and executable_parts[index + 1 : index + 3] == ("Contents", "MacOS")
+        for index, part in enumerate(executable_parts[:-2])
+    )
+    if not app_bundle_executable:
+        return python_exe, {}
+
+    virtual_environment = os.environ.get("VIRTUAL_ENV", "").strip()
+    if virtual_environment:
+        for interpreter_name in ("python", "python3"):
+            interpreter = Path(virtual_environment) / "bin" / interpreter_name
+            if interpreter.is_file():
+                return str(interpreter), {}
+    return python_exe, {}
+
+
 def _terminate_cron_script_process(proc: subprocess.Popen) -> None:
     """Best-effort hard stop of a cron script and every child it spawned."""
     if proc.poll() is not None:
@@ -4574,7 +4606,7 @@ def _run_job_script(
         argv = [_bash, str(path)]
         env_overlay: dict[str, str] = {}
     else:
-        python_exe, env_overlay = _windows_cron_python_invocation(sys.executable)
+        python_exe, env_overlay = _cron_python_invocation(sys.executable)
         if env_overlay:
             # Overlay mode (Windows uv venv): PYTHONPATH alone cannot make
             # editable installs importable — .pth processing needs

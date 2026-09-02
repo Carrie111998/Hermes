@@ -277,6 +277,50 @@ class TestRunJobScript:
         assert argv == [sys.executable, str(script)]
 
 
+    def test_macos_app_bundle_uses_virtualenv_python_for_script(
+        self, cron_env, tmp_path, monkeypatch
+    ):
+        from cron import scheduler as sched_mod
+        from cron.scheduler import _run_job_script
+
+        script = cron_env / "scripts" / "probe.py"
+        script.write_text('print("ok")\n', encoding="utf-8")
+
+        app_python = tmp_path / "Jarvis.app" / "Contents" / "MacOS" / "Jarvis"
+        app_python.parent.mkdir(parents=True)
+        app_python.write_text("", encoding="utf-8")
+        venv_python = tmp_path / "venv" / "bin" / "python"
+        venv_python.parent.mkdir(parents=True)
+        venv_python.write_text("", encoding="utf-8")
+
+        captured = {}
+
+        class FakeProc:
+            def __init__(self, argv, **kwargs):
+                captured["argv"] = argv
+                captured["kwargs"] = kwargs
+                self.returncode = 0
+
+            def poll(self):
+                return self.returncode
+
+            def communicate(self, timeout=None):
+                return ("ok\n", "")
+
+            def wait(self, timeout=None):
+                return self.returncode
+
+        monkeypatch.setattr(sched_mod.sys, "platform", "darwin")
+        monkeypatch.setattr(sched_mod.sys, "executable", str(app_python))
+        monkeypatch.setenv("VIRTUAL_ENV", str(venv_python.parent.parent))
+        monkeypatch.setattr(sched_mod.subprocess, "Popen", FakeProc)
+
+        success, output = _run_job_script("probe.py")
+
+        assert success is True
+        assert output == "ok"
+        assert captured["argv"] == [str(venv_python), str(script.resolve())]
+
     @pytest.mark.skipif(
         sys.platform == "win32",
         reason="Windows always takes the overlay/creationflags branch",
