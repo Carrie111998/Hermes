@@ -161,6 +161,21 @@ class TestTerminalToolConfig:
         from tools.terminal_tool import _get_env_config
         assert _get_env_config()["ssh_persistent"] is False
 
+    def test_ssh_key_tilde_expanded_and_trimmed(self, monkeypatch):
+        """The key path is passed to `ssh -i` via subprocess with no shell,
+        so a leading ~ must be expanded (and stray whitespace stripped)
+        before OpenSSH ever sees it."""
+        monkeypatch.delenv("TERMINAL_SSH_PERSISTENT", raising=False)
+        from tools.terminal_tool import _get_env_config
+
+        monkeypatch.setenv("TERMINAL_SSH_KEY", "  ~/keys/id_ed25519  ")
+        cfg = _get_env_config()
+        assert not cfg["ssh_key"].startswith("~")
+        assert cfg["ssh_key"] == os.path.expanduser("~/keys/id_ed25519")
+
+        monkeypatch.setenv("TERMINAL_SSH_KEY", "")
+        assert _get_env_config()["ssh_key"] == ""
+
 
 class TestSSHPreflight:
     def test_ensure_ssh_available_raises_clear_error_when_missing(self, monkeypatch):

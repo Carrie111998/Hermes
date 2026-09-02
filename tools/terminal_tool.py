@@ -1850,7 +1850,10 @@ def _get_env_config() -> Dict[str, Any]:
         "ssh_host": os.getenv("TERMINAL_SSH_HOST", ""),
         "ssh_user": os.getenv("TERMINAL_SSH_USER", ""),
         "ssh_port": _parse_env_var("TERMINAL_SSH_PORT", "22"),
-        "ssh_key": os.getenv("TERMINAL_SSH_KEY", ""),
+        # expanduser: the key path is passed directly to `ssh -i` via
+        # subprocess (no shell), so a leading ~ would otherwise be handed to
+        # OpenSSH literally and silently fall back to default keys.
+        "ssh_key": os.path.expanduser(os.getenv("TERMINAL_SSH_KEY", "").strip()),
         # Persistent shell: SSH defaults to the config-level persistent_shell
         # setting (true by default for non-local backends); local is always opt-in.
         # Per-backend env vars override if explicitly set.
