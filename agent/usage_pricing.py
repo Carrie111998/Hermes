@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any, Dict, Literal, Optional
@@ -138,6 +138,50 @@ class PricingEntry:
     output_cost_per_million_above: Optional[Decimal] = None
     cache_read_cost_per_million_above: Optional[Decimal] = None
 
+    def effective_cache_write_rate(
+        self, input_rate: Optional[Decimal]
+    ) -> Optional[Decimal]:
+        """The rate cache-write tokens are actually billed at.
+
+        Cache-write tokens are *prompt* tokens (see ``CanonicalUsage.prompt_tokens``,
+        which sums input + cache-read + cache-write) that the provider also wrote
+        into its prompt cache. Only some providers charge a premium for that write:
+        Anthropic bills it at 1.25x input, and every Anthropic entry in the pricing
+        snapshot sets ``cache_write_cost_per_million`` explicitly. Providers that do
+        *not* charge a write premium -- OpenAI, DeepSeek, Google, and every
+        OpenAI-compatible models API that omits a cache-write field -- publish no
+        such rate because the tokens are simply billed as ordinary input.
+
+        So a missing ``cache_write_cost_per_million`` means "no premium", not
+        "unpriceable": fall back to the input rate. Returns ``None`` only when the
+        input rate is unknown too, i.e. when the route is genuinely unpriceable.
+
+        ``input_rate`` is passed in rather than read from
+        ``self.input_cost_per_million`` so the fallback honours whole-request
+        context-tier selection: on an above-threshold request the caller has
+        already resolved ``input_cost_per_million_above``, and billing the cache
+        write at the base rate would under-charge it.
+
+        Deliberately asymmetric with cache-*read*, which must never fall back to
+        the input rate -- a cache read is discounted (often 10x), so substituting
+        the input rate would over-bill rather than fill a gap.
+        """
+        if self.cache_write_cost_per_million is not None:
+            return self.cache_write_cost_per_million
+        return input_rate
+
+
+#: Billable component classes a :class:`CostResult` can be decomposed into.
+#: ``request`` is the per-request flat fee some provider models APIs report
+#: (OpenRouter's ``pricing.request``); the rest are per-token classes.
+COST_COMPONENTS: tuple[str, ...] = (
+    "input",
+    "output",
+    "cache_read",
+    "cache_write",
+    "request",
+)
+
 
 @dataclass(frozen=True)
 class CostResult:
@@ -148,6 +192,22 @@ class CostResult:
     fetched_at: Optional[datetime] = None
     pricing_version: Optional[str] = None
     notes: tuple[str, ...] = ()
+    #: Per-class dollar breakdown of ``amount_usd``, keyed by
+    #: :data:`COST_COMPONENTS`. Only classes that actually contributed are
+    #: present. Empty when ``amount_usd`` is ``None`` (no priced total to
+    #: decompose). When non-empty the values sum exactly to ``amount_usd`` --
+    #: both are built from the same ``Decimal`` terms, so the invariant holds
+    #: without rounding drift. Rates are the ones actually billed, i.e. the
+    #: context-tier rate on an above-threshold request.
+    components: Dict[str, Decimal] = field(default_factory=dict)
+
+    def component(self, name: str) -> Decimal:
+        """Return the dollar amount billed for ``name``, or zero.
+
+        Convenience for consumers that want a total-preserving read of one
+        class without having to special-case absent keys.
+        """
+        return self.components.get(name, _ZERO)
 
 
 _UTC_NOW = lambda: datetime.now(timezone.utc)
@@ -1183,6 +1243,32 @@ def _normalize_anthropic_model_name(model: str) -> str:
     return name
 
 
+# A release date appended to an ALREADY-VERSIONED new-scheme Anthropic id, e.g.
+# claude-haiku-4-5-20251001 → the dated alias of claude-haiku-4-5.
+#
+# The trailing "-N-N" version segment before the date is required, and that is
+# the whole point of the pattern: it distinguishes a date APPENDED to a
+# versioned name (strippable, the base entry is the same SKU) from an
+# OLD-scheme id whose date is an inseparable part of the name
+# (claude-3-5-haiku-20241022 — stripping would land on the non-existent
+# claude-3-5-haiku).  ``_normalize_bedrock_model_name`` already performs the
+# equivalent ``-\d{8}$`` strip for Bedrock inference-profile ids; this is the
+# same normalization for the direct Anthropic route, which lacked it.
+_ANTHROPIC_DATED_SUFFIX_RE = re.compile(r"^(claude-.*-\d+-\d+)-\d{8}$")
+
+
+def _strip_anthropic_release_date(name: str) -> Optional[str]:
+    """Strip a trailing -YYYYMMDD from a versioned new-scheme Anthropic id.
+
+    ``claude-haiku-4-5-20251001`` → ``claude-haiku-4-5``.  Returns None when
+    there is no such suffix to strip, including for old-scheme ids like
+    ``claude-3-5-haiku-20241022`` which lack the ``-N-N`` version tail before
+    the date and so are left intact for their own direct entry.
+    """
+    match = _ANTHROPIC_DATED_SUFFIX_RE.match(name)
+    return match.group(1) if match else None
+
+
 def _lookup_official_docs_pricing(route: BillingRoute) -> Optional[PricingEntry]:
     model = route.model.lower()
     # Direct lookup first
@@ -1194,6 +1280,18 @@ def _lookup_official_docs_pricing(route: BillingRoute) -> Optional[PricingEntry]
         normalized = _normalize_anthropic_model_name(model)
         if normalized != model:
             entry = _OFFICIAL_DOCS_PRICING.get((route.provider, normalized))
+            if entry:
+                return entry
+        # Last resort: strip a trailing -YYYYMMDD release date appended to an
+        # already-versioned id and retry on the base (claude-haiku-4-5-20251001
+        # → claude-haiku-4-5).  Runs AFTER the direct and dot-normalized
+        # lookups, so an id that has its own table entry — dated or not —
+        # always wins on its own key and this never overrides a real rate.
+        # Without it, the dated aliases Anthropic publishes (and that this repo
+        # ships in hermes_cli/models.py) record cost_usd NULL for every turn.
+        base = _strip_anthropic_release_date(normalized)
+        if base and base != normalized:
+            entry = _OFFICIAL_DOCS_PRICING.get((route.provider, base))
             if entry:
                 return entry
     # Bedrock cross-region inference profiles carry a region prefix
@@ -1469,7 +1567,6 @@ def estimate_usage_cost(
         return CostResult(amount_usd=None, status="unknown", source="none", label="n/a")
 
     notes: list[str] = []
-    amount = _ZERO
 
     # Whole-request context-tier selection (e.g. Gemini Pro >200k prompts):
     # once the prompt (input + cache read + cache write) exceeds the entry's
@@ -1502,8 +1599,12 @@ def estimate_usage_cost(
                 label="n/a",
                 notes=("cache-read pricing unavailable for route",),
             )
+    # Route through the shared effective rate so a missing cache-write premium
+    # is filled from the (tier-resolved) input rate. Only bail when that too is
+    # unknown, i.e. when the route is genuinely unpriceable.
+    cache_write_rate = entry.effective_cache_write_rate(input_rate)
     if usage.cache_write_tokens:
-        if entry.cache_write_cost_per_million is None:
+        if cache_write_rate is None:
             return CostResult(
                 amount_usd=None,
                 status="unknown",
@@ -1511,17 +1612,36 @@ def estimate_usage_cost(
                 label="n/a",
                 notes=("cache-write pricing unavailable for route",),
             )
+        if entry.cache_write_cost_per_million is None:
+            notes.append(
+                "cache-write billed at the input rate "
+                "(provider publishes no separate cache-write rate)"
+            )
 
-    if input_rate is not None:
-        amount += Decimal(usage.input_tokens) * input_rate / _ONE_MILLION
-    if output_rate is not None:
-        amount += Decimal(usage.output_tokens) * output_rate / _ONE_MILLION
-    if cache_read_rate is not None:
-        amount += Decimal(usage.cache_read_tokens) * cache_read_rate / _ONE_MILLION
-    if entry.cache_write_cost_per_million is not None:
-        amount += Decimal(usage.cache_write_tokens) * entry.cache_write_cost_per_million / _ONE_MILLION
+    # Built from the RESOLVED rate locals, so the breakdown reports what was
+    # actually billed: the context-tier rate on an above-threshold request and
+    # the cache-write fallback rate when the provider publishes no premium.
+    components: Dict[str, Decimal] = {}
+    if input_rate is not None and usage.input_tokens:
+        components["input"] = (
+            Decimal(usage.input_tokens) * input_rate / _ONE_MILLION
+        )
+    if output_rate is not None and usage.output_tokens:
+        components["output"] = (
+            Decimal(usage.output_tokens) * output_rate / _ONE_MILLION
+        )
+    if cache_read_rate is not None and usage.cache_read_tokens:
+        components["cache_read"] = (
+            Decimal(usage.cache_read_tokens) * cache_read_rate / _ONE_MILLION
+        )
+    if cache_write_rate is not None and usage.cache_write_tokens:
+        components["cache_write"] = (
+            Decimal(usage.cache_write_tokens) * cache_write_rate / _ONE_MILLION
+        )
     if entry.request_cost is not None and usage.request_count:
-        amount += Decimal(usage.request_count) * entry.request_cost
+        components["request"] = Decimal(usage.request_count) * entry.request_cost
+
+    amount = sum(components.values(), _ZERO)
 
     status: CostStatus = "estimated"
     label = format_cost_label(amount)
@@ -1541,6 +1661,7 @@ def estimate_usage_cost(
         fetched_at=entry.fetched_at,
         pricing_version=entry.pricing_version,
         notes=tuple(notes),
+        components=components,
     )
 
 
