@@ -26622,7 +26622,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 return result
             return result
 
-        _p = self._typed_command_prefix_for(event.source.platform)
+        _p = self._typed_command_prefix_for(event.source)
         prompt_message = (
             f"⚠️ **Confirm /{command}**\n\n"
             f"{detail}\n\n"

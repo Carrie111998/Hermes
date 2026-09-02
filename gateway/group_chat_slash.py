@@ -171,7 +171,7 @@ class GroupChatSlashCommandsMixin:
         ):
             return False
         chat_type = str(getattr(event.source, "chat_type", "") or "").casefold()
-        if chat_type not in {"", "dm", "direct", "private"}:
+        if chat_type not in {"dm", "direct", "private"}:
             return False
         policy = policy_for_source(self.config, event.source)
         return policy.enabled and policy.is_admin(event.source.user_id)
@@ -187,7 +187,7 @@ class GroupChatSlashCommandsMixin:
             and platform in _NATIVE_DISTINCT_DM_PLATFORMS
             and chat_type in {"dm", "direct", "private"}
         )
-        if chat_type not in {"", "dm", "direct", "private"} or not proven_private:
+        if chat_type not in {"dm", "direct", "private"} or not proven_private:
             return (
                 "Group Chat controls are private. Use your authorized one-to-one "
                 "Hermes chat."
@@ -217,9 +217,13 @@ class GroupChatSlashCommandsMixin:
             bucket_kind = "read"
 
         source = event.source
+        from gateway.hosted_room_messaging import messaging_transport_profile
+
         platform = str(getattr(getattr(source, "platform", None), "value", "") or "")
         key = (
             platform,
+            str(getattr(source, "profile", None) or "default"),
+            messaging_transport_profile(event),
             str(getattr(source, "scope_id", None) or ""),
             str(getattr(source, "chat_id", None) or ""),
             str(
@@ -265,6 +269,32 @@ class GroupChatSlashCommandsMixin:
 
         return str(get_active_profile_name() or "default")
 
+    def _can_approve_group_chats(self, event: MessageEvent) -> bool:
+        """Keep dangerous approvals with the installation owner's main chat."""
+
+        from gateway.hosted_room_messaging import messaging_transport_profile
+
+        return (
+            self._group_chat_profile(event) == "default"
+            and messaging_transport_profile(event) == "default"
+            and self._can_control_group_chats(event)
+        )
+
+    @staticmethod
+    def _group_chat_approval_denial() -> str:
+        return (
+            "Approve or deny Bot commands from the installation owner’s "
+            "authorized one-to-one Hermes chat."
+        )
+
+    @staticmethod
+    def _group_chat_command_args(event: MessageEvent) -> str:
+        """Return command arguments without rewriting free-form message text."""
+
+        command_text = str(event.text or "").lstrip()
+        parts = command_text.split(maxsplit=1)
+        return parts[1] if len(parts) > 1 else ""
+
     async def _handle_rooms_command(self, event: MessageEvent) -> Optional[str]:
         """List Bot Group Chats or show one chat's recent activity."""
 
@@ -299,8 +329,8 @@ class GroupChatSlashCommandsMixin:
         if not self._can_control_group_chats(event):
             return self._group_chat_control_denial(event)
         service = current_room_backend()
-        rooms_command = f"{self._typed_command_prefix_for(event.source.platform)}group"
-        query = event.get_command_args().strip()
+        rooms_command = f"{self._typed_command_prefix_for(event.source)}group"
+        query = self._group_chat_command_args(event).strip()
         try:
             words = query.split()
             if (
@@ -331,6 +361,8 @@ class GroupChatSlashCommandsMixin:
                 and words[0].isdecimal()
                 and words[1].casefold() == "approvals"
             ):
+                if not self._can_approve_group_chats(event):
+                    return self._group_chat_approval_denial()
                 from gateway.hosted_room_messaging_approvals import (
                     MessagingApprovalError,
                     approval_member_label,
@@ -358,8 +390,8 @@ class GroupChatSlashCommandsMixin:
                 session_key = self._session_key_for_source(source)
 
                 async def _on_approval_selected(_chat_id: str, value: str) -> str:
-                    if not self._can_control_group_chats(event):
-                        return self._group_chat_control_denial(event)
+                    if not self._can_approve_group_chats(event):
+                        return self._group_chat_approval_denial()
                     current_denial = self._group_chat_rate_limit_denial(
                         event,
                         action="approve",
@@ -392,6 +424,9 @@ class GroupChatSlashCommandsMixin:
                                 f"{str(value).replace('=', '.')}"
                             ),
                             choice=choice,
+                            installation_owner_authorized=(
+                                self._can_approve_group_chats(event)
+                            ),
                             selection=index,
                             expected_request_id=request_id,
                         )
@@ -545,6 +580,7 @@ class GroupChatSlashCommandsMixin:
                             service,
                             selected,
                             room_command=rooms_command,
+                            show_approvals=self._can_approve_group_chats(event),
                         )
                     except (RoomControlError, hosted_rooms.HostedRoomError) as exc:
                         return str(exc)
@@ -584,6 +620,7 @@ class GroupChatSlashCommandsMixin:
                     service,
                     exact_name,
                     room_command=rooms_command,
+                    show_approvals=self._can_approve_group_chats(event),
                 )
             list_parts = query.casefold().split()
             if not query or (list_parts and list_parts[0] == "list"):
@@ -606,6 +643,7 @@ class GroupChatSlashCommandsMixin:
                     service,
                     room,
                     room_command=rooms_command,
+                    show_approvals=self._can_approve_group_chats(event),
                 )
 
             return await asyncio.to_thread(_detail)
@@ -647,12 +685,17 @@ class GroupChatSlashCommandsMixin:
         if not self._can_control_group_chats(event):
             return self._group_chat_control_denial(event)
         service = current_room_backend()
-        rooms_command = f"{self._typed_command_prefix_for(event.source.platform)}group"
+        rooms_command = f"{self._typed_command_prefix_for(event.source)}group"
         try:
             command = parse_room_command(
-                event.get_command_args(),
+                self._group_chat_command_args(event),
                 command_root=rooms_command,
             )
+            if command.action in {
+                "approve",
+                "deny",
+            } and not self._can_approve_group_chats(event):
+                return self._group_chat_approval_denial()
             denial = self._group_chat_rate_limit_denial(
                 event,
                 action=command.action,
@@ -667,9 +710,10 @@ class GroupChatSlashCommandsMixin:
                 raise RoomControlError(f"Use `{rooms_command} <room number> stop`.")
 
             def _mutate() -> str:
+                profile = self._group_chat_profile(event)
                 rooms = list_messaging_rooms(
                     service,
-                    profile=self._group_chat_profile(event),
+                    profile=profile,
                 )
                 approval_command_id = f"approval:{messaging_event_id(event)}"
                 approval_receipt = None
@@ -741,6 +785,9 @@ class GroupChatSlashCommandsMixin:
                             room,
                             command_id=approval_command_id,
                             choice=("once" if command.action == "approve" else "deny"),
+                            installation_owner_authorized=(
+                                self._can_approve_group_chats(event)
+                            ),
                             selection=command.message,
                         )
                     except MessagingApprovalError as exc:

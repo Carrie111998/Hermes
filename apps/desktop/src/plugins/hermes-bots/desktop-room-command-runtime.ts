@@ -19,6 +19,9 @@ import type { GroupChat, GroupMember, ProfileRoute } from './types'
 const DESKTOP_ROOM_COMMAND_CONSUMER_KEY = 'desktop-room-command-consumer-v1'
 const DESKTOP_ROOM_COMMAND_INTERVAL_MS = 60_000
 const DESKTOP_ROOM_COMMAND_PUSH_DEBOUNCE_MS = 250
+const DESKTOP_ROOM_DRIVE_ATTEMPTS_PER_CLAIM = 2
+const DESKTOP_ROOM_MAX_CLAIMS = 2
+const DESKTOP_ROOM_DRIVE_RETRY_DELAY_MS = 250
 
 let desktopRoomStorage: null | PluginContext['storage'] = null
 let desktopRoomCommandConsumerId = ''
@@ -339,7 +342,14 @@ export async function executeDesktopRoomCommand(
     })
 
     try {
-      while (!desktopRoomCommandDisposed) {
+      const rawClaimAttempt = Number(command.attempts)
+      const claimAttempt = Number.isSafeInteger(rawClaimAttempt) && rawClaimAttempt > 0 ? rawClaimAttempt : 1
+
+      for (
+        let driveAttempt = 1;
+        driveAttempt <= DESKTOP_ROOM_DRIVE_ATTEMPTS_PER_CLAIM && !desktopRoomCommandDisposed;
+        driveAttempt += 1
+      ) {
         if (localAbort.signal.aborted) {
           throw retryableDesktopRoomCommand('The command moved to another Desktop.')
         }
@@ -367,6 +377,18 @@ export async function executeDesktopRoomCommand(
             thread_id: thread
           }
         }
+
+        if (driveAttempt < DESKTOP_ROOM_DRIVE_ATTEMPTS_PER_CLAIM) {
+          await new Promise(resolve => setTimeout(resolve, DESKTOP_ROOM_DRIVE_RETRY_DELAY_MS))
+        }
+      }
+
+      if (!desktopRoomCommandDisposed) {
+        if (claimAttempt >= DESKTOP_ROOM_MAX_CLAIMS) {
+          throw new Error('The Group Chat could not finish this command after repeated attempts. Retry it explicitly.')
+        }
+
+        throw retryableDesktopRoomCommand('The Group Chat command will retry after a short delay.')
       }
     } catch (error) {
       if (localAbort.signal.aborted) {
@@ -398,6 +420,7 @@ export async function executeDesktopRoomCommand(
     const payload = command.payload || {}
     const targetCommandId = String(payload.target_command_id || '')
     const targetThreadId = String(payload.target_thread_id || '')
+    const targetMessageId = String(payload.target_message_id || '')
 
     if (room.desktopCommandSettled?.[commandId]) {
       return {
@@ -418,6 +441,17 @@ export async function executeDesktopRoomCommand(
           room_name: group,
           stale: true,
           stopped: true
+        }
+      }
+
+      if (
+        ['completed', 'failed'].includes(String(command.target_command_state || '')) &&
+        active?.commandId !== targetCommandId
+      ) {
+        return {
+          room_name: group,
+          stale: true,
+          stopped: false
         }
       }
 
@@ -456,10 +490,20 @@ export async function executeDesktopRoomCommand(
       }
     }
 
-    const latestThread = [...room.log].reverse().find(item => item?.thread)?.thread || null
+    const latestUser = [...room.log].reverse().find(item => item?.thread && item?.from?.kind === 'user')
+    const latestThread = latestUser?.thread || null
+    const latestMessageId = String(latestUser?.eventId || latestUser?.id || '')
     const stopThread = targetCommandId ? active?.threadId || targetThreadId || latestThread : targetThreadId
 
     if (!targetCommandId && targetThreadId && latestThread && targetThreadId !== latestThread) {
+      return {
+        room_name: group,
+        stale: true,
+        stopped: false
+      }
+    }
+
+    if (!targetCommandId && (!targetMessageId || latestMessageId !== targetMessageId)) {
       return {
         room_name: group,
         stale: true,

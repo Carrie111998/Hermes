@@ -182,6 +182,35 @@ def test_expired_claim_is_recovered_by_the_registered_desktop(tmp_path):
             clock=clock,
         )
 
+    clock.value += mailbox.CLAIM_TTL_SECONDS + 1
+    assert (
+        mailbox.claim_commands(
+            db,
+            consumer_id="desktop:first",
+            room_authorities=authorities("room-1"),
+            clock=clock,
+        )
+        == []
+    )
+    exhausted = mailbox.latest_command_states(db, ["room-1"])["room-1"]
+    assert exhausted["state"] == "failed"
+    assert exhausted["result"]["code"] == "automatic_attempts_exhausted"
+
+    retried = mailbox.retry_failed_command(
+        db,
+        room_id="room-1",
+        command_id="messaging:retry",
+        clock=clock,
+    )
+    assert retried["attempts"] == 0
+    reclaimed = mailbox.claim_commands(
+        db,
+        consumer_id="desktop:first",
+        room_authorities=authorities("room-1"),
+        clock=clock,
+    )
+    assert reclaimed[0]["attempts"] == 1
+
 
 def test_completion_ack_retry_is_idempotent(tmp_path):
     db = tmp_path / "state.db"
@@ -251,6 +280,7 @@ def test_explicit_retry_requeues_one_failed_command_idempotently(tmp_path):
         command_id=claimed["command_id"],
     )
     assert retried["state"] == "pending"
+    assert retried["attempts"] == 0
     assert replay["idempotent"] is True
     reclaimed = mailbox.claim_commands(
         db,
@@ -258,6 +288,7 @@ def test_explicit_retry_requeues_one_failed_command_idempotently(tmp_path):
         room_authorities=authorities("room-1"),
     )
     assert reclaimed[0]["command_id"] == "messaging:failed"
+    assert reclaimed[0]["attempts"] == 1
 
 
 def test_reclaim_rotates_token_and_fences_a_stale_attempt(tmp_path):
@@ -776,6 +807,7 @@ def test_retry_requeues_all_bounded_expired_commands_oldest_first(tmp_path):
         clock=clock,
     )
     assert [command["payload"]["message"] for command in claimed] == ["0", "1"]
+    assert [command["attempts"] for command in claimed] == [1, 1]
 
 
 def test_pending_queue_is_bounded_per_group_chat(tmp_path, monkeypatch):
