@@ -28,7 +28,7 @@ vi.mock('./canonical-chat', () => ({
 }))
 
 const { host } = await import('@hermes/plugin-sdk')
-const { $openBotChat, $selectedBot } = await import('./bot-state')
+const { $openBotChat, $selectedBot, $selectedRosterKey } = await import('./bot-state')
 const { openRosterBot, trackInboundActivity } = await import('./roster-actions')
 const { $selectedStoredSessionId } = await import('@/store/session')
 
@@ -40,6 +40,7 @@ beforeEach(() => {
   openBotCanonicalChat.mockResolvedValue({ openedId: 'bot-chat-tip', registryId: 'bot-chat' })
   $openBotChat.set(null)
   $selectedBot.set('')
+  $selectedRosterKey.set('')
 })
 
 describe('a row click lands on the canonical chat, never a remembered side tab', () => {
@@ -53,7 +54,7 @@ describe('a row click lands on the canonical chat, never a remembered side tab',
     delete host.focusOpenWorkspaceSession
   })
 
-  it('fronts an open Bot Chat tab without a registry round-trip, side tabs excluded', async () => {
+  it('re-opens an already-open Bot Chat through the atomic canonical path, side tabs excluded', async () => {
     const focus = vi.fn((_key: string, _probe: unknown, only?: readonly string[]) =>
       only?.includes('bot-chat-tip') ? 'bot-chat-tip' : null
     )
@@ -62,8 +63,8 @@ describe('a row click lands on the canonical chat, never a remembered side tab',
 
     await expect(openRosterBot(canonicalBot)).resolves.toBe(true)
 
-    expect(focus).toHaveBeenCalledWith('bot:alpha', expect.any(Function), ['bot-chat', 'bot-chat-tip'])
-    expect(openBotCanonicalChat).not.toHaveBeenCalled()
+    expect(focus).not.toHaveBeenCalled()
+    expect(openBotCanonicalChat).toHaveBeenCalledWith(canonicalBot, expect.any(Function), expect.any(Function))
     expect($openBotChat.get()).toEqual({
       key: 'local::alpha',
       openedRegistryId: 'bot-chat',
@@ -71,6 +72,33 @@ describe('a row click lands on the canonical chat, never a remembered side tab',
     })
   })
 
+  it('keeps the previous roster owner until an already-open Bot Chat finishes reopening', async () => {
+    let releaseOpen!: (opened: { openedId: string; registryId: string }) => void
+
+    const reopened = new Promise<{ openedId: string; registryId: string }>(resolve => {
+      releaseOpen = resolve
+    })
+
+    host.focusOpenWorkspaceSession = vi.fn((_key: string, _probe: unknown, only?: readonly string[]) =>
+      only?.includes('bot-chat-tip') ? 'bot-chat-tip' : null
+    ) as never
+    openBotCanonicalChat.mockReturnValueOnce(reopened)
+    $selectedBot.set('omega')
+    $selectedRosterKey.set('local::omega')
+
+    const opening = openRosterBot(canonicalBot)
+
+    await vi.waitFor(() => expect(openBotCanonicalChat).toHaveBeenCalledOnce())
+    const ownerWhileReopening = $selectedBot.get()
+    const rosterKeyWhileReopening = $selectedRosterKey.get()
+
+    releaseOpen({ openedId: 'bot-chat-tip', registryId: 'bot-chat' })
+    await expect(opening).resolves.toBe(true)
+    expect(ownerWhileReopening).toBe('omega')
+    expect(rosterKeyWhileReopening).toBe('local::omega')
+    expect($selectedBot.get()).toBe('alpha')
+    expect($selectedRosterKey.get()).toBe('local::alpha')
+  })
   it('resolves the registry when only a side thread is open', async () => {
     // The shell would happily front 'side-thread' — the allowlist excludes it.
     host.focusOpenWorkspaceSession = vi.fn((_key: string, _probe: unknown, only?: readonly string[]) =>
@@ -79,16 +107,43 @@ describe('a row click lands on the canonical chat, never a remembered side tab',
 
     await expect(openRosterBot(canonicalBot)).resolves.toBe(true)
 
-    expect(openBotCanonicalChat).toHaveBeenCalledWith(canonicalBot, expect.any(Function))
+    expect(openBotCanonicalChat).toHaveBeenCalledWith(canonicalBot, expect.any(Function), expect.any(Function))
     expect($openBotChat.get()?.openedSessionId).toBe('bot-chat-tip')
+  })
+
+  it('commits the roster owner only after its canonical chat owns the center', async () => {
+    let releaseSource!: () => void
+
+    const sourceReady = new Promise<void>(resolve => {
+      releaseSource = resolve
+    })
+
+    prepareBotSource.mockReturnValueOnce(sourceReady)
+    $selectedBot.set('omega')
+    $selectedRosterKey.set('local::omega')
+
+    const opening = openRosterBot(canonicalBot)
+
+    await vi.waitFor(() => expect(prepareBotSource).toHaveBeenCalledOnce())
+    expect($selectedBot.get()).toBe('omega')
+    expect($selectedRosterKey.get()).toBe('local::omega')
+
+    releaseSource()
+    await expect(opening).resolves.toBe(true)
+    expect($selectedBot.get()).toBe('alpha')
+    expect($selectedRosterKey.get()).toBe('local::alpha')
   })
 
   it('a failed open records no claim', async () => {
     openBotCanonicalChat.mockRejectedValueOnce(new Error('gateway away'))
+    $selectedBot.set('omega')
+    $selectedRosterKey.set('local::omega')
 
     await expect(openRosterBot(bot)).resolves.toBe(false)
 
     expect($openBotChat.get()).toBeNull()
+    expect($selectedBot.get()).toBe('omega')
+    expect($selectedRosterKey.get()).toBe('local::omega')
   })
 })
 

@@ -3,7 +3,7 @@
 // that GlyphSpinner was rewritten to remove. It now renders GlyphSpinner, so
 // what needs pinning is that no timer comes back, that the label still survives
 // the fade-out, and that the spinner stops animating once the swap is done.
-import { cleanup, render, screen } from '@testing-library/react'
+import { act, cleanup, render, screen } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { ChatSwapOverlay } from './chat-swap-overlay'
@@ -39,6 +39,22 @@ describe('ChatSwapOverlay', () => {
     expect(screen.getByText(/turqoise/)).toBeTruthy()
   })
 
+  it('conceals the interim session shell and raw profile name in Bot Mode', () => {
+    const { container } = render(
+      <div>
+        <span>New session</span>
+        <ChatSwapOverlay botMode profile="persephone" />
+      </div>
+    )
+
+    const overlay = container.querySelector('[data-slot="chat-swap-overlay"]')
+
+    expect(overlay?.className).toContain('bg-(--ui-chat-surface-background)')
+    expect(overlay?.hasAttribute('data-glass-opaque')).toBe(true)
+    expect(screen.queryByText(/persephone/i)).toBeNull()
+    expect(screen.getByText(/Bot Chat/i)).toBeTruthy()
+  })
+
   it('keeps the last profile name through the fade-out, with the glyph frozen', () => {
     const { container, rerender } = render(<ChatSwapOverlay profile="turqoise" />)
 
@@ -50,5 +66,36 @@ describe('ChatSwapOverlay', () => {
     expect(screen.getByText(/turqoise/)).toBeTruthy()
     // ...and the spinner stops, the way clearing the interval used to stop it.
     expect(container.querySelector('.glyph-spinner')?.getAttribute('data-paused')).toBe('true')
+  })
+
+  it('keeps the Bot Mode cover opaque until a blocked transcript commit settles, including the fade', () => {
+    const { container, rerender } = render(<ChatSwapOverlay botMode profile="persephone" />)
+    const overlay = container.querySelector('[data-slot="chat-swap-overlay"]')
+
+    expect(overlay?.className).toContain('opacity-100')
+    expect(overlay?.className).not.toContain('transition-opacity')
+
+    rerender(<ChatSwapOverlay botMode profile={null} />)
+
+    // Keep the cover up long enough for a large transcript commit to begin. If
+    // that commit blocks the main thread, the timer and fade cannot run until
+    // the transcript has finished laying out.
+    expect(overlay?.className).toContain('opacity-100')
+    expect(overlay?.hasAttribute('data-glass-opaque')).toBe(true)
+
+    act(() => vi.advanceTimersByTime(499))
+    expect(overlay?.className).toContain('opacity-100')
+
+    act(() => vi.advanceTimersByTime(1))
+    expect(overlay?.className).toContain('opacity-100')
+
+    act(() => vi.advanceTimersByTime(16))
+    expect(overlay?.className).toContain('opacity-100')
+
+    act(() => vi.advanceTimersByTime(16))
+    expect(overlay?.className).toContain('opacity-0')
+    expect(overlay?.className).toContain('transition-opacity')
+    expect(overlay?.className).toContain('bg-(--ui-chat-surface-background)')
+    expect(overlay?.hasAttribute('data-glass-opaque')).toBe(true)
   })
 })

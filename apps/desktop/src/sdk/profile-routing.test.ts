@@ -19,6 +19,7 @@ vi.mock('@/store/notifications', () => ({ notify: vi.fn(), notifyError: vi.fn() 
 vi.mock('@/store/system-actions', () => ({ runGatewayRestart: vi.fn() }))
 vi.mock('@/store/session', async () => {
   const { atom } = await import('nanostores')
+  let resumeSequence = 0
 
   type LineageRow = { _lineage_root_id?: null | string; id: string }
 
@@ -32,12 +33,17 @@ vi.mock('@/store/session', async () => {
     $messages: atom([]),
     $messagingSessions: atom([]),
     $selectedStoredSessionId: atom(null),
+    $sessionResumeSettlement: atom(null),
     $sessions: atom([]),
     $unreadFinishedSessionIds: atom([]),
     lineageAliases: (storedId: string) => [storedId],
     rememberedSessionProfile: (_sessions: unknown, _sessionId: null | string, activeProfile: null | string) =>
       (activeProfile ?? '').trim() || 'default',
-    requestSessionResume: vi.fn(),
+    requestSessionResume: vi.fn((sessionId: string, ownerRoute?: unknown) => ({
+      ...(ownerRoute ? { ownerRoute } : {}),
+      sequence: ++resumeSequence,
+      sessionId
+    })),
     sessionMatchesStoredId: (session: LineageRow, storedSessionId: string) =>
       session.id === storedSessionId || session._lineage_root_id === storedSessionId,
     sessionPinId: (session: LineageRow) => session._lineage_root_id ?? session.id,
@@ -59,6 +65,7 @@ vi.mock('@/store/session-states', async () => {
     $stalledSessionIds: atom([]),
     $workingSessionIds: atom([]),
     dropTilesForProfile: vi.fn(),
+    focusWorkspaceOwnerSessionTile: vi.fn(),
     sessionTileDelegate: vi.fn(() => null)
   }
 })
@@ -151,17 +158,19 @@ const {
   $focusedStoredSessionId,
   $sessionStates,
   $sessionTiles,
+  focusWorkspaceOwnerSessionTile,
   sessionTileDelegate
 } = await import('@/store/session-states')
 
 const { dropTilesForProfile } = await import('@/store/session-states')
 
-const { setWorkspaceScope } = await import('@/components/pane-shell/workspace-scope')
+const { $workspaceOwnerKey, setWorkspaceScope } = await import('@/components/pane-shell/workspace-scope')
 
 const {
   $activeSessionId,
   $messages,
   $selectedStoredSessionId,
+  $sessionResumeSettlement,
   requestSessionResume,
   setSessionOwnerHint,
   setResumeExhaustedSessionId
@@ -194,6 +203,7 @@ afterEach(() => {
   setMockAtom($activeSessionId, null)
   setMockAtom($selectedStoredSessionId, null)
   setMockAtom($messages, [])
+  setMockAtom($sessionResumeSettlement, null)
   $profiles.set([profile('cached-only')])
   setWorkspaceScope('sessions')
   delete (window as unknown as { hermesDesktop?: unknown }).hermesDesktop
@@ -636,6 +646,76 @@ describe('profile-aware plugin session opens', () => {
     })
   })
 
+  it('keeps the current Bot owner committed while the next owner is still dialing', async () => {
+    let releaseDial: (() => void) | undefined
+    const timeline: string[] = []
+
+    vi.mocked(openGatewayForAgent).mockImplementationOnce(
+      () =>
+        new Promise<void>(resolve => {
+          releaseDial = resolve
+        })
+    )
+    vi.mocked(openSessionCore).mockImplementationOnce(() => {
+      timeline.push('open')
+    })
+    setWorkspaceScope('bots', 'bot:source-a::alpha')
+
+    const opening = host.openSession('beta-chat', {
+      route: {
+        connectionId: 'source-b',
+        mode: 'remote',
+        profile: 'beta',
+        targetProfile: 'beta'
+      },
+      onWorkspaceCommit: () => timeline.push('commit'),
+      workspaceMode: 'bots',
+      workspaceOwnerKey: 'bot:source-b::beta'
+    })
+
+    await vi.waitFor(() => expect(openGatewayForAgent).toHaveBeenCalledOnce())
+    expect($workspaceOwnerKey.get()).toBe('bot:source-a::alpha')
+    expect(timeline).toEqual([])
+
+    releaseDial?.()
+    await opening
+    expect($workspaceOwnerKey.get()).toBe('bot:source-b::beta')
+    expect(timeline).toEqual(['commit', 'open'])
+    expect(openSessionCore).toHaveBeenCalledOnce()
+  })
+
+  it('does not let a late wake steal focus after the user re-fronts the current Bot', async () => {
+    let releaseDial: (() => void) | undefined
+
+    vi.mocked(openGatewayForAgent).mockImplementationOnce(
+      () =>
+        new Promise<void>(resolve => {
+          releaseDial = resolve
+        })
+    )
+    vi.mocked(focusWorkspaceOwnerSessionTile).mockReturnValueOnce('alpha-chat')
+    setWorkspaceScope('bots', 'bot:source-a::alpha')
+
+    const opening = host.openSession('beta-chat', {
+      route: {
+        connectionId: 'source-b',
+        mode: 'remote',
+        profile: 'beta',
+        targetProfile: 'beta'
+      },
+      workspaceMode: 'bots',
+      workspaceOwnerKey: 'bot:source-b::beta'
+    })
+
+    await vi.waitFor(() => expect(openGatewayForAgent).toHaveBeenCalledOnce())
+    expect(host.focusOpenWorkspaceSession('bot:source-a::alpha')).toBe('alpha-chat')
+    releaseDial?.()
+
+    await expect(opening).rejects.toThrow(/superseded/i)
+    expect($workspaceOwnerKey.get()).toBe('bot:source-a::alpha')
+    expect(openSessionCore).not.toHaveBeenCalled()
+  })
+
   it('finishes hydration on the focused Bot tile without moving the Sessions gateway', async () => {
     const route = {
       connectionId: 'source-a',
@@ -714,6 +794,7 @@ describe('profile-aware plugin session opens', () => {
           releaseDial = resolve
         })
     )
+    setWorkspaceScope('bots', 'bot:source-a::alpha')
 
     const opening = host.openSession('late-bot-chat', {
       awaitHydration: true,
@@ -883,7 +964,7 @@ describe('profile-aware plugin session opens', () => {
     expect(requestSessionResume).not.toHaveBeenCalled()
   })
 
-  it('forces a resume on an explicit bot switch even when a cached transcript looks healthy (#93604)', async () => {
+  it('keeps a forced Bot Chat wake covered until the fresh resume settles (#93604)', async () => {
     // Bot-switch shape from the field: the previous visit left a non-empty
     // snapshot in the session-states cache, so the surface passes every
     // health check while painting STALE messages. The heuristic alone skips
@@ -893,18 +974,30 @@ describe('profile-aware plugin session opens', () => {
     setMockAtom($activeSessionId, 'runtime-stale-snapshot')
     setMockAtom($messages, [{ id: 'stale-history', parts: [], role: 'assistant' }] as never)
 
+    let resolved = false
+
     const opening = host.openSession('bot-chat', {
       profile: 'hyoseob',
       awaitHydration: true,
       expectHistory: true,
       forceResume: true,
       hydrationTimeoutMs: 1_000
+    }).then(() => {
+      resolved = true
     })
 
     await Promise.resolve()
     expect(requestSessionResume).toHaveBeenCalledWith('bot-chat', undefined)
+    expect(resolved).toBe(false)
+    expect($gatewaySwapTarget.get()).toBe('hyoseob')
+
+    const resumeRequest = vi.mocked(requestSessionResume).mock.results.at(-1)?.value
+
+    expect(resumeRequest).toBeTruthy()
+    setMockAtom($sessionResumeSettlement, resumeRequest)
 
     await opening
+    expect(resolved).toBe(true)
     expect($gatewaySwapTarget.get()).toBeNull()
   })
 

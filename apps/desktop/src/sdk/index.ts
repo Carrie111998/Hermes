@@ -35,6 +35,7 @@ import {
 import {
   $workspaceMode,
   $workspaceOwnerKey,
+  getWorkspaceScopeRevision,
   setWorkspaceScope as publishWorkspaceScope,
   setWorkspaceOwnerLabel,
   type WorkspaceNewSessionTarget
@@ -78,6 +79,7 @@ import {
   $gatewayState,
   $messages,
   $selectedStoredSessionId,
+  $sessionResumeSettlement,
   $sessions,
   getSessionOwnerHints,
   rememberedSessionProfile,
@@ -346,6 +348,11 @@ export interface PluginOpenSessionOptions {
   hydrationTimeoutMs?: number
   intent?: OpenSessionIntent
   keepAllProfilesScope?: boolean
+  /** Runs in the same synchronous commit as a Bot workspace handoff, after
+   *  the new owner scope is published and before its session navigates. A
+   *  caller with local selection stores can update them without exposing an
+   *  async frame where the sidebar and center name different owners. */
+  onWorkspaceCommit?: () => void
   profile?: null | string
   route?: PluginProfileRoute
   workspaceMode?: WorkspaceMode
@@ -388,6 +395,7 @@ function waitForFocusedSessionHydration({
   isCurrent,
   profile,
   requireActiveProfile,
+  resumeRequest,
   storedSessionId,
   timeoutMs
 }: {
@@ -396,6 +404,7 @@ function waitForFocusedSessionHydration({
   isCurrent?: () => boolean
   profile: string
   requireActiveProfile: boolean
+  resumeRequest?: null | { sequence: number; sessionId: string }
   storedSessionId: string
   timeoutMs: number
 }): Promise<void> {
@@ -448,6 +457,12 @@ function waitForFocusedSessionHydration({
 
       const runtimeReady = mainMatches ? Boolean($activeSessionId.get()) : tileMatches ? Boolean(tileRuntimeId) : false
 
+      const settlement = $sessionResumeSettlement.get()
+
+      const freshResumeSettled =
+        !resumeRequest ||
+        (settlement?.sessionId === resumeRequest.sessionId && settlement.sequence >= resumeRequest.sequence)
+
       const historyPainted = mainMatches
         ? Boolean($messages.get().length)
         : tileMatches
@@ -466,7 +481,7 @@ function waitForFocusedSessionHydration({
       // immediately. Only an expected-EMPTY chat still waits for the runtime
       // — with no transcript to paint, a bound runtime is the only proof the
       // surface is real rather than a stuck loader.
-      const hydrated = expectHistory ? historyPainted : runtimeReady
+      const hydrated = (expectHistory ? historyPainted : runtimeReady) && freshResumeSettled
 
       if ((mainMatches || tileMatches) && hydrated) {
         if (profileMatches) {
@@ -503,6 +518,7 @@ function waitForFocusedSessionHydration({
     unbinds.push($selectedStoredSessionId.listen(check))
     unbinds.push($activeSessionId.listen(check))
     unbinds.push($messages.listen(check))
+    unbinds.push($sessionResumeSettlement.listen(check))
     unbinds.push($focusedStoredSessionId.listen(check))
     unbinds.push($focusedRuntimeId.listen(check))
     unbinds.push($focusedSessionState.listen(check))
@@ -817,6 +833,8 @@ export const host = {
    *  also scope chrome onto that profile and collapse the sidebar. */
   openSession: async (storedSessionId: string, options: PluginOpenSessionOptions = {}): Promise<void> => {
     const generation = ++openSessionGeneration
+    const initialWorkspaceScopeRevision = getWorkspaceScopeRevision()
+    let workspaceScopeCommitted = options.workspaceMode !== 'bots'
 
     // A new wake owns the syncing affordance — a lingering badge from an
     // earlier paint-first wake must not survive into this one.
@@ -848,18 +866,12 @@ export const host = {
 
     const expectHistory = options.expectHistory ?? false
 
-    if (options.workspaceMode === 'bots') {
-      publishWorkspaceScope(
-        'bots',
-        options.workspaceOwnerKey ?? null,
-        ownerRoute ? { kind: 'route', route: ownerRoute } : null
-      )
-    }
-
     const openingStillCurrent = () =>
       generation === openSessionGeneration &&
       (options.workspaceMode !== 'bots' ||
-        ($workspaceMode.get() === 'bots' && $workspaceOwnerKey.get() === (options.workspaceOwnerKey ?? null)))
+        (workspaceScopeCommitted
+          ? $workspaceMode.get() === 'bots' && $workspaceOwnerKey.get() === (options.workspaceOwnerKey ?? null)
+          : getWorkspaceScopeRevision() === initialWorkspaceScopeRevision))
 
     const plan = planPluginOpenSession({
       activeProfile: $activeGatewayProfile.get(),
@@ -929,6 +941,20 @@ export const host = {
 
       if (!openingStillCurrent()) {
         throw new Error('Session open was superseded by a newer selection.')
+      }
+
+      // Commit the owner only once its backend is ready and the core open can
+      // follow synchronously. Publishing this before the dial made the Bot
+      // row, center, routines and `+` target describe two different owners
+      // for the whole remote-activation window.
+      if (options.workspaceMode === 'bots') {
+        publishWorkspaceScope(
+          'bots',
+          options.workspaceOwnerKey ?? null,
+          ownerRoute ? { kind: 'route', route: ownerRoute } : null
+        )
+        workspaceScopeCommitted = true
+        options.onWorkspaceCommit?.()
       }
 
       // Only a cross-connection (explicit route) open forces the all-profiles
@@ -1006,6 +1032,8 @@ export const host = {
           // an already-mounted tile would paint the idle snapshot and never
           // pull messages that arrived while the panel WS was down (#96183).
           // Refresh the tile transcript in place instead.
+          let resumeRequest: null | { sequence: number; sessionId: string } = null
+
           if (options.awaitHydration && (options.forceResume || !surfaceHealthy)) {
             const existingTile = $sessionTiles.get().some(tile => tile.storedSessionId === storedSessionId)
             const tileDelegate = existingTile ? sessionTileDelegate() : null
@@ -1014,10 +1042,10 @@ export const host = {
               try {
                 await tileDelegate.resumeTile(storedSessionId, { refreshTranscript: true })
               } catch {
-                requestSessionResume(storedSessionId, ownerRoute || undefined)
+                resumeRequest = requestSessionResume(storedSessionId, ownerRoute || undefined)
               }
             } else {
-              requestSessionResume(storedSessionId, ownerRoute || undefined)
+              resumeRequest = requestSessionResume(storedSessionId, ownerRoute || undefined)
             }
           }
 
@@ -1027,6 +1055,10 @@ export const host = {
               generation,
               isCurrent: openingStillCurrent,
               profile: targetProfile,
+              // A forced refresh must outlive a merely non-empty warm cache.
+              // Its receipt is published only after resumeSession finishes
+              // reconciling the persisted display transcript.
+              resumeRequest: options.forceResume ? resumeRequest : null,
               // A background dial never moves $activeGatewayProfile, so gating
               // hydration on it would wait for something that is not coming.
               requireActiveProfile: ownerRoute ? false : plan.requireActiveProfileForHydration,
@@ -1225,7 +1257,14 @@ export const host = {
     workspaceOwnerKey: string,
     isStaleTile?: (tile: { storedSessionId: string; workspaceTabTitle?: string }) => boolean,
     onlyStoredIds?: readonly string[]
-  ): null | string => focusWorkspaceOwnerSessionTile(workspaceOwnerKey, isStaleTile, onlyStoredIds),
+  ): null | string => {
+    // A direct re-front is a newer navigation intent even when it returns to
+    // the owner already committed in workspace scope. Cancel a slow wake for
+    // another bot so it cannot land after this click and steal the center.
+    openSessionGeneration += 1
+
+    return focusWorkspaceOwnerSessionTile(workspaceOwnerKey, isStaleTile, onlyStoredIds)
+  },
 
   /** Reactive on-screen visibility of a contributed pane: true while it is in
    *  the layout tree, not dismissed/hidden, its zone un-minimized, AND holding

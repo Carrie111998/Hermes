@@ -4,26 +4,67 @@ import { GlyphSpinner } from '@/components/ui/glyph-spinner'
 import { useI18n } from '@/i18n'
 import { cn } from '@/lib/utils'
 
+const BOT_MODE_SETTLE_DELAY_MS = 500
+
 // Shown over the conversation while the live gateway swaps to another profile's
 // backend (lazily spawned). Keeps the last profile name through the fade-out so
 // the label doesn't blank. Purely visual — pointer-events-none.
-export function ChatSwapOverlay({ profile }: { profile: string | null }) {
+export function ChatSwapOverlay({ botMode = false, profile }: { botMode?: boolean; profile: string | null }) {
   const { t } = useI18n()
   const [label, setLabel] = useState<null | string>(profile)
+  const [covering, setCovering] = useState(Boolean(profile))
 
   useEffect(() => {
     if (profile) {
       setLabel(profile)
+      setCovering(true)
+
+      return
     }
-  }, [profile])
+
+    if (!covering) {
+      return
+    }
+
+    // The message store can settle before React commits and scroll-restores a
+    // giant transcript. Wait long enough for that render to start, then keep
+    // one fully painted cover after the main thread becomes available again.
+    // A long transcript blocks this timer, which is intentional: the cover
+    // remains opaque until the expensive commit has actually finished.
+    let secondFrame: number | undefined
+    let firstFrame: number | undefined
+
+    const settleTimer = window.setTimeout(() => {
+      firstFrame = window.requestAnimationFrame(() => {
+        secondFrame = window.requestAnimationFrame(() => setCovering(false))
+      })
+    }, botMode ? BOT_MODE_SETTLE_DELAY_MS : 0)
+
+    return () => {
+      window.clearTimeout(settleTimer)
+
+      if (firstFrame !== undefined) {
+        window.cancelAnimationFrame(firstFrame)
+      }
+
+      if (secondFrame !== undefined) {
+        window.cancelAnimationFrame(secondFrame)
+      }
+    }
+  }, [botMode, covering, profile])
+
+  const coverVisible = Boolean(profile) || (botMode && covering)
 
   return (
     <div
       aria-hidden
       className={cn(
-        'pointer-events-none absolute inset-0 z-50 flex items-center justify-center transition-opacity duration-150 ease-out',
-        profile ? 'opacity-100' : 'opacity-0'
+        'pointer-events-none absolute inset-0 z-50 flex items-center justify-center',
+        botMode ? 'bg-(--ui-chat-surface-background)' : '',
+        coverVisible ? 'opacity-100' : 'opacity-0 transition-opacity duration-150 ease-out'
       )}
+      data-glass-opaque={botMode ? '' : undefined}
+      data-slot="chat-swap-overlay"
     >
       <div className="flex items-center gap-2 bg-[color-mix(in_srgb,var(--dt-card)_92%,transparent)] px-4 py-2 font-mono text-[0.8125rem] text-foreground shadow-composer">
         {/* Was a local 80ms setInterval + setState braille ticker — the same
@@ -34,7 +75,7 @@ export function ChatSwapOverlay({ profile }: { profile: string | null }) {
             `paused` restores the old "no ticking once the swap is done"
             behaviour while the overlay fades out still mounted. */}
         <GlyphSpinner className="w-3 justify-start text-(--ui-accent)" paused={!profile} spinner="braille" />
-        {t.composer.wakingProfile(label ?? '')}
+        {t.composer.wakingProfile(botMode ? t.composer.botChat : (label ?? ''))}
       </div>
     </div>
   )
