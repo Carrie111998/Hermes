@@ -39,6 +39,84 @@ def test_media_delivery_denies_encrypted_bitwarden_cache(tmp_path, monkeypatch):
     assert base.validate_media_delivery_path(str(path)) is None
 
 
+class TestHomeCredentialFileMediaDenial:
+    """Bare credential files in $HOME must never be auto-attached.
+
+    Regression: ``_MEDIA_DELIVERY_DENIED_HOME_SUBPATHS`` denied credential
+    DIRECTORIES (``~/.aws/credentials`` is refused because ``~/.aws`` is denied)
+    but nothing denied a bare credential FILE, so ``~/.netrc``, ``~/.pgpass``,
+    ``~/.npmrc``, ``~/.pypirc``, and ``~/.git-credentials`` were deliverable as
+    native attachments. A prompt-injected ``MEDIA:~/.netrc`` tag was enough to
+    exfiltrate them.
+
+    Four of the five are already gated on the WRITE side by
+    ``tools.approval._CREDENTIAL_FILES``, so leaving them deliverable let the
+    read/exfil side trail the write side — the invariant
+    ``_media_delivery_denied_paths`` states in its own comment.
+    """
+
+    CREDENTIAL_FILES = (
+        ".netrc",
+        ".pgpass",
+        ".npmrc",
+        ".pypirc",
+        ".git-credentials",
+    )
+
+    def test_home_credential_files_are_refused(self, tmp_path, monkeypatch):
+        import gateway.platforms.base as base
+
+        home = tmp_path / "alice"
+        home.mkdir()
+        monkeypatch.setenv("HOME", str(home))
+        for name in self.CREDENTIAL_FILES:
+            path = home / name
+            path.write_text("secret")
+            assert path in base._media_delivery_denied_paths(), name
+            assert base.validate_media_delivery_path(str(path)) is None, name
+
+    def test_ordinary_home_files_still_deliver(self, tmp_path, monkeypatch):
+        """The denylist must not swallow legitimate deliverables, including
+        near-miss names that merely resemble a credential file."""
+        import gateway.platforms.base as base
+
+        home = tmp_path / "alice"
+        home.mkdir()
+        monkeypatch.setenv("HOME", str(home))
+        for name in (
+            "report.pdf",
+            "chart.png",
+            "notes.txt",
+            ".netrcbackup",
+            "netrc",
+            "my.npmrc.example",
+            "gitcredentials.txt",
+        ):
+            path = home / name
+            path.write_bytes(b"data")
+            assert base.validate_media_delivery_path(str(path)) is not None, name
+
+    def test_credential_directories_remain_refused(self, tmp_path, monkeypatch):
+        """The pre-existing directory denials must survive this change."""
+        import gateway.platforms.base as base
+
+        home = tmp_path / "alice"
+        home.mkdir()
+        monkeypatch.setenv("HOME", str(home))
+        for rel in (
+            ".ssh/id_rsa",
+            ".aws/credentials",
+            ".gnupg/secring.gpg",
+            ".kube/config",
+            ".docker/config.json",
+            ".config/gh/hosts.yml",
+        ):
+            path = home / rel
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("secret")
+            assert base.validate_media_delivery_path(str(path)) is None, rel
+
+
 class TestInboundMediaSizeCap:
     """gateway.max_inbound_media_bytes caps inbound media buffered into RAM (#13145)."""
 

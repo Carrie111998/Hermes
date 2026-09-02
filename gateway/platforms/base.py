@@ -1327,6 +1327,23 @@ _MEDIA_DELIVERY_DENIED_HOME_SUBPATHS = (
     "Library/Keychains",  # macOS
 )
 
+# Bare credential FILES that live directly in $HOME rather than inside one of
+# the directories above. The directory list denies ``~/.aws/credentials`` but
+# nothing denied ``~/.netrc``, so these were deliverable as native attachments.
+#
+# Four of them are already classified as credentials by the terminal write
+# guard (``tools/approval._CREDENTIAL_FILES`` gates writes to netrc / pgpass /
+# npmrc / pypirc), so leaving them deliverable let the read/exfil side trail the
+# write side — the same invariant this module states below. ``.git-credentials``
+# stores ``https://user:token@host`` in cleartext and was ungated on both sides.
+_MEDIA_DELIVERY_DENIED_HOME_FILES = (
+    ".netrc",
+    ".pgpass",
+    ".npmrc",
+    ".pypirc",
+    ".git-credentials",
+)
+
 
 # Canonical cache subdirectories that hold deliverable artifacts. Used both
 # for the top-level safe roots above and to enumerate per-profile cache roots
@@ -1443,6 +1460,8 @@ def _media_delivery_denied_paths() -> List[Path]:
     home = Path(os.path.expanduser("~"))
     for sub in _MEDIA_DELIVERY_DENIED_HOME_SUBPATHS:
         denied.append(home / sub)
+    for cred_file in _MEDIA_DELIVERY_DENIED_HOME_FILES:
+        denied.append(home / cred_file)
     # The active Hermes profile and shared Hermes root both contain control
     # files and credentials. Only cache subdirectories under them are
     # explicitly allowlisted above (matched BEFORE this denylist in

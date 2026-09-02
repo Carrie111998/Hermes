@@ -470,6 +470,30 @@ class TestSensitiveCopyMovePattern:
             dangerous, key, desc = detect_dangerous_command(cmd)
             assert dangerous is False, cmd
 
+    def test_git_credentials_write_is_gated(self):
+        """``~/.git-credentials`` stores ``https://user:token@host`` in
+        cleartext, so a write plants usable push credentials — the same class as
+        ``~/.netrc``, which was already gated. It was absent from
+        ``_CREDENTIAL_FILES`` and therefore ungated on every write vector."""
+        for command in (
+            "echo 'https://u:tok@github.com' >> ~/.git-credentials",
+            "echo x > ~/.git-credentials",
+            "echo x | tee -a ~/.git-credentials",
+            "cp /tmp/evil ~/.git-credentials",
+            "mv /tmp/evil ~/.git-credentials",
+        ):
+            dangerous, key, desc = detect_dangerous_command(command)
+            assert dangerous is True, command
+            assert key is not None, command
+
+    def test_git_credentials_read_out_stays_safe(self):
+        """Only the DESTINATION is gated. Reading OUT of a credential path is
+        covered by the media/read guards, mirroring the ~/.ssh behaviour
+        asserted above."""
+        dangerous, key, desc = detect_dangerous_command("cp ~/.git-credentials /tmp/x")
+        assert dangerous is False
+        assert key is None
+
 
 class TestSensitiveInPlaceEditPattern:
     """Detect in-place edits to user startup and credential files."""
