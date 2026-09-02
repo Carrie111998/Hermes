@@ -6013,8 +6013,8 @@ class DiscordAdapter(BasePlatformAdapter):
         async def slash_reload_skills(interaction: discord.Interaction):
             await self._run_simple_slash(interaction, "/reload-skills")
 
-        @tree.command(name="voice", description="Toggle voice reply mode")
-        @discord.app_commands.describe(mode="Voice mode: join, channel, leave, on, tts, off, or status")
+        @tree.command(name="voice", description="Toggle voice reply mode or run diagnostics")
+        @discord.app_commands.describe(mode="Voice mode: join, channel, leave, on, tts, off, status, or doctor")
         @discord.app_commands.choices(mode=[
             # `join` and `channel` both route to _handle_voice_channel_join in
             # gateway/run.py — expose both in the slash UI so autocomplete
@@ -6027,8 +6027,27 @@ class DiscordAdapter(BasePlatformAdapter):
             discord.app_commands.Choice(name="tts — voice reply to all messages", value="tts"),
             discord.app_commands.Choice(name="off — text only", value="off"),
             discord.app_commands.Choice(name="status — show current mode", value="status"),
+            discord.app_commands.Choice(name="doctor — check voice readiness", value="doctor"),
         ])
         async def slash_voice(interaction: discord.Interaction, mode: str = ""):
+            if mode == "doctor":
+                # Auth gate — must run before defer() so an ephemeral rejection
+                # can be delivered on the still-unresponded interaction.
+                if not await self._check_slash_authorization(
+                    interaction, "/voice doctor",
+                ):
+                    return
+                await interaction.response.defer(ephemeral=True)
+                try:
+                    report = await self._voice_doctor_report(interaction)
+                    await interaction.followup.send(report, ephemeral=True)
+                except Exception:
+                    logger.warning("[Discord] /voice doctor failed", exc_info=True)
+                    await interaction.followup.send(
+                        "Voice doctor encountered an error — check gateway logs.",
+                        ephemeral=True,
+                    )
+                return
             await self._run_simple_slash(interaction, f"/voice {mode}".strip())
 
         @tree.command(name="update", description="Update Hermes Agent to the latest version")
@@ -8751,7 +8770,110 @@ class DiscordAdapter(BasePlatformAdapter):
                 self._pending_text_batch_tasks.pop(key, None)
 
 
-# ---------------------------------------------------------------------------
+    # ── /voice doctor diagnostics ────────────────────────────────────────
+
+    async def _voice_doctor_report(
+        self, interaction: "discord.Interaction",
+    ) -> str:
+        """Check voice-readiness and return a markdown report.
+
+        Runs on-demand when ``/voice doctor`` is invoked.  Never probes at
+        startup.  Reports presence-only for secrets (``configured`` /
+        ``not configured`` — never the key value itself).
+        """
+        lines: list[str] = ["**📋 Voice doctor**"]
+
+        # Lazy-import the voice doctor helpers from their dedicated module so
+        # adapter.py never triggers a top-level ``import discord`` just by
+        # being loaded — these helpers live in a separate module that handles
+        # the missing optional-dependency case gracefully (see voice_doctor.py).
+        try:
+            from .voice_doctor import (
+                _check_davey,
+                _check_ffmpeg,
+                _check_opus,
+                _check_pynacl,
+                _check_stt_provider,
+            )
+        except ImportError:
+            from voice_doctor import (
+                _check_davey,
+                _check_ffmpeg,
+                _check_opus,
+                _check_pynacl,
+                _check_stt_provider,
+            )
+
+        # 1. PyNaCl
+        icon, detail = _check_pynacl()
+        lines.append(f"{icon} {detail}")
+
+        # 2. Opus
+        icon, detail = _check_opus()
+        lines.append(f"{icon} {detail}")
+
+        # 3. ffmpeg / ffprobe
+        icon, detail = _check_ffmpeg()
+        lines.append(f"{icon} {detail}")
+
+        # 4. STT provider
+        icon, detail = _check_stt_provider()
+        lines.append(f"{icon} {detail}")
+
+        # 5. Bot permissions (needs live client / guild)
+        icon, detail = await self._check_voice_permissions(interaction)
+        lines.append(f"{icon} {detail}")
+
+        # 6. davey (DAVE E2EE)
+        icon, detail = _check_davey()
+        lines.append(f"{icon} {detail}")
+
+        # Summary
+        fail_count = sum(1 for l in lines if l.startswith("❌"))
+        warn_count = sum(1 for l in lines if l.startswith("⚠️"))
+        if fail_count == 0 and warn_count == 0:
+            lines.append("All checks passed — voice ready")
+        elif fail_count == 0:
+            lines.append(f"OK — {warn_count} warning(s) found")
+        else:
+            lines.append(f"{fail_count} issue(s) found")
+
+        return "\n".join(lines)
+
+    async def _check_voice_permissions(
+        self, interaction: "discord.Interaction",
+    ) -> tuple[str, str]:
+        """Check bot guild permissions (Connect, Speak, Use Voice Activity).
+
+        Guild-level check; per-channel overrides may still apply.
+        """
+        guild = getattr(interaction, "guild", None)
+        if guild is None:
+            return ("⚠️", "Bot permissions — cannot check in DMs (run /voice doctor in a server)")
+
+        try:
+            perms = guild.me.guild_permissions
+        except AttributeError:
+            return ("⚠️", "Bot permissions — could not resolve guild member")
+
+        missing: list[str] = []
+        if not perms.connect:
+            missing.append("Connect")
+        if not perms.speak:
+            missing.append("Speak")
+        if not perms.use_voice_activation:
+            missing.append("Use Voice Activity")
+
+        if missing:
+            return (
+                "❌",
+                f"Bot permissions — missing: {', '.join(missing)}. "
+                "Fix: grant these in Server Settings → Roles. "
+                "Note: per-channel overrides may still apply.",
+            )
+        return ("✅", "Bot permissions — Connect, Speak, Use Voice Activity granted (guild-level)")
+
+
 # Discord UI Components (outside the adapter class)
 # ---------------------------------------------------------------------------
 
