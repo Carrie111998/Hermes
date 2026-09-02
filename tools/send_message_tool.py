@@ -6,6 +6,7 @@ human-friendly channel names to IDs. Works in both CLI and gateway contexts.
 """
 
 import asyncio
+import contextlib
 import json
 import logging
 import os
@@ -1203,6 +1204,7 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
             thread_id=thread_id,
             disable_link_previews=disable_link_previews,
             force_document=force_document,
+            extra=getattr(pconfig, "extra", None),
         )
 
     # --- Discord: chunked delivery via the registry's standalone_sender_fn.
@@ -1556,13 +1558,21 @@ def _is_telegram_thread_not_found(error: Exception) -> bool:
     return "thread not found" in str(error).lower()
 
 
-async def _send_telegram(token, chat_id, message, media_files=None, thread_id=None, disable_link_previews=False, force_document=False):
+async def _send_telegram(token, chat_id, message, media_files=None, thread_id=None, disable_link_previews=False, force_document=False, extra=None):
     """Send via Telegram Bot API (one-shot, no polling needed).
 
     Applies markdown→MarkdownV2 formatting (same as the gateway adapter)
     so that bold, links, and headers render correctly.  If the message
     already contains HTML tags, it is sent with ``parse_mode='HTML'``
     instead, bypassing MarkdownV2 conversion.
+
+    ``extra`` is the platform's ``extra`` config block. It carries
+    ``base_url`` / ``base_file_url`` / ``local_mode``, which MUST be honoured
+    here: this standalone path builds its own ``Bot`` rather than reusing the
+    gateway adapter, so without them a deployment pointed at a self-hosted
+    ``telegram-bot-api`` silently sends via api.telegram.org instead — a
+    different server, still bound by the 50MB cloud cap, and (once the bot has
+    been ``logOut``-ed to bind locally) not even the one holding this bot.
     """
     try:
         from telegram import Bot
@@ -1596,6 +1606,40 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
             _tg_proxy = resolve_proxy_url("TELEGRAM_PROXY", target_hosts=["api.telegram.org"])
         except Exception:
             _tg_proxy = None
+        # Self-hosted telegram-bot-api (--local). The gateway adapter reads
+        # these off the same extra block; this path builds its own Bot, so it
+        # has to apply them itself or every standalone send silently goes to
+        # the cloud API instead of the configured server.
+        _extra = extra if isinstance(extra, dict) else {}
+        _base_url = (_extra.get("base_url") or "").strip()
+        _local_mode = bool(_extra.get("local_mode"))
+        try:
+            from plugins.platforms.telegram.adapter import (
+                media_read_timeout as _media_read_timeout,
+                media_upload_source as _media_upload_source,
+            )
+        except Exception:
+            # python-telegram-bot is optional here; without the adapter module
+            # fall back to cloud behaviour rather than failing the send.
+            _local_mode = False
+
+            @contextlib.contextmanager
+            def _media_upload_source(path, *, local_mode=False):
+                with open(path, "rb") as handle:
+                    yield handle, lambda: handle.seek(0)
+
+            def _media_read_timeout(local_mode=False):
+                return 60.0
+
+        _bot_kwargs = {}
+        if _base_url:
+            _bot_kwargs["base_url"] = _base_url
+            _bot_kwargs["base_file_url"] = (
+                _extra.get("base_file_url") or _base_url
+            )
+        if _local_mode:
+            _bot_kwargs["local_mode"] = True
+
         if _tg_proxy:
             try:
                 from telegram.request import HTTPXRequest
@@ -1604,12 +1648,13 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
                     token=token,
                     request=HTTPXRequest(proxy=_tg_proxy),
                     get_updates_request=HTTPXRequest(proxy=_tg_proxy),
+                    **_bot_kwargs,
                 )
             except Exception as _proxy_err:
                 logger.warning("send_message: failed to attach Telegram proxy (%s), falling back to direct connection", _proxy_err)
-                bot = Bot(token=token)
+                bot = Bot(token=token, **_bot_kwargs)
         else:
-            bot = Bot(token=token)
+            bot = Bot(token=token, **_bot_kwargs)
         from plugins.platforms.telegram.telegram_ids import (
             normalize_telegram_chat_id,
         )
@@ -1748,8 +1793,15 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
 
             ext = os.path.splitext(media_path)[1].lower()
             try:
-                with open(media_path, "rb") as f:
+                # Local mode hands PTB a path so the bytes never enter this
+                # process; cloud mode keeps the historical open handle. Shared
+                # with the gateway adapter so both paths behave identically.
+                with _media_upload_source(media_path, local_mode=_local_mode) as (f, _rewind):
                     media_kwargs = dict(thread_kwargs)
+                    # Same reason as the adapter's send sites: in local mode
+                    # this call blocks for the server's whole upload to
+                    # Telegram, which the cloud-tuned default never covers.
+                    media_kwargs["read_timeout"] = _media_read_timeout(_local_mode)
                     # Attach the MEDIA:<path> caption to the bubble itself for
                     # captionable kinds (photo/video/document). _tg_caption is
                     # only set for a single captionable file, so this never
@@ -1794,8 +1846,11 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
                                 "Thread %s not found for media send, retrying without message_thread_id",
                                 media_kwargs["message_thread_id"],
                             )
-                            # Re-seek the file since the first attempt consumed it
-                            f.seek(0)
+                            # Re-seek the file since the first attempt consumed
+                            # it. No-op in local mode, where ``f`` is a path
+                            # string and nothing was consumed.
+                            if _rewind is not None:
+                                _rewind()
                             media_kwargs.pop("message_thread_id", None)
                             if ext in _IMAGE_EXTS and not force_document:
                                 last_msg = await bot.send_photo(
@@ -1828,7 +1883,8 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
                                 "Caption parse failed for media send, retrying plain: %s",
                                 _sanitize_error_text(media_err),
                             )
-                            f.seek(0)
+                            if _rewind is not None:
+                                _rewind()
                             media_kwargs.pop("parse_mode", None)
                             if not _has_html and media_kwargs.get("caption"):
                                 try:

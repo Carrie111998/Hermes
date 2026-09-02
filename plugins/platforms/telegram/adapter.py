@@ -8,6 +8,7 @@ Uses python-telegram-bot library for:
 """
 
 import asyncio
+import contextlib
 import dataclasses
 import inspect
 import json
@@ -592,6 +593,62 @@ _POLLING_STALL_TIMEOUT = 150.0
 # dead request is still noticed quickly. Kept modest deliberately — this is
 # also how long a user waits to be told the attachment failed.
 _MEDIA_SEND_READ_TIMEOUT = 60.0
+# Local telegram-bot-api (--local) inverts the assumption above. Against the
+# cloud API this process does the uploading, so a slow send shows up as write
+# progress and 60s is only ever the post-upload transcode wait. In local mode
+# the request hands the server a path and then blocks for the WHOLE of the
+# server's own 2000MB-ceiling upload to Telegram — 1.3GB measured at ~131s on
+# a domestic link, so 60s fails every large send while the server keeps
+# uploading in the background, invisible and unreported. Sized for the ceiling
+# rather than the median: this bound only decides how long a genuinely dead
+# request goes unnoticed, and nothing else fails a large local-mode send.
+_LOCAL_MEDIA_SEND_READ_TIMEOUT = 1800.0
+
+
+def media_read_timeout(local_mode: bool) -> float:
+    """Read timeout for a media send, widened for local Bot API mode.
+
+    See ``_LOCAL_MEDIA_SEND_READ_TIMEOUT``: in local mode the call blocks for
+    the server's entire upload to Telegram, not just a transcode, so the
+    cloud-tuned budget times out every large send.
+    """
+    return _LOCAL_MEDIA_SEND_READ_TIMEOUT if local_mode else _MEDIA_SEND_READ_TIMEOUT
+
+
+@contextlib.contextmanager
+def media_upload_source(path: str, *, local_mode: bool):
+    """Yield the value to hand PTB for ``path``, plus its rewind callback.
+
+    Two very different upload paths, selected by local mode:
+
+    * Cloud Bot API (default) — yields an open binary handle. PTB reads it
+      into an ``InputFile`` and posts it as multipart. Bounded by Telegram's
+      50MB upload cap, so the whole-file read is acceptable.
+
+    * Local telegram-bot-api ``--local`` — yields the path STRING. PTB's
+      ``parse_file_input`` only applies the ``file://`` URI optimization to
+      ``str``/``Path`` inputs; a file handle falls through to
+      ``InputFile(handle)``, whose ``load_file()`` calls ``.read()`` and pulls
+      the ENTIRE file into memory. At the 2000MB local-mode ceiling that is a
+      multi-GB allocation, which OOMs small hosts. Passing the path lets the
+      server read the bytes off disk itself — the file never enters this
+      process at all.
+
+    The second element is the rewind callback for retrying callers: handles
+    must ``seek(0)`` before a retry re-reads them; a path is stateless, so it
+    is ``None``.
+
+    Module-level rather than a method so the standalone ``send_message`` path
+    — which builds its own ``Bot`` instead of reusing the adapter — gets the
+    identical behaviour instead of reimplementing it.
+    """
+    if local_mode:
+        yield os.path.abspath(path), None
+        return
+    with open(path, "rb") as handle:
+        yield handle, lambda: handle.seek(0)
+
+
 _POLLING_GENERATION_CONTEXT: ContextVar[Optional[int]] = ContextVar(
     "telegram_polling_generation", default=None
 )
@@ -854,14 +911,35 @@ class TelegramAdapter(BasePlatformAdapter):
         self._dm_topic_chat_ids: Set[str] = {
             str(e["chat_id"]) for e in self._dm_topics_config if "chat_id" in e
         }
+        # Local telegram-bot-api mode (server started with --local). Cached here
+        # because both the outbound send path and the inbound download path
+        # branch on it, and self._bot is not built until connect().
+        self._local_mode: bool = bool(self.config.extra.get("local_mode"))
         # Document size cap. Telegram's public Bot API caps getFile at 20MB; a
         # locally-hosted telegram-bot-api server (configured via extra.base_url)
         # raises that to 2GB, so the presence of base_url is the opt-in.
-        self._max_doc_bytes: int = (
-            2 * 1024 * 1024 * 1024
-            if self.config.extra.get("base_url")
-            else 20 * 1024 * 1024
-        )
+        #
+        # The 2GB ceiling is only safe to accept because the inbound path streams
+        # to disk (see _download_media_to_temp) instead of buffering the whole
+        # file in RAM. Deployments that need a tighter bound — a small VPS, a
+        # shared host — can lower it with extra.max_file_mb without giving up
+        # local mode.
+        _max_file_mb = self.config.extra.get("max_file_mb")
+        if _max_file_mb:
+            try:
+                self._max_doc_bytes: int = int(_max_file_mb) * 1024 * 1024
+            except (TypeError, ValueError):
+                logger.warning(
+                    "[%s] Ignoring non-numeric extra.max_file_mb: %r",
+                    self.name, _max_file_mb,
+                )
+                self._max_doc_bytes = 2 * 1024 * 1024 * 1024
+        else:
+            self._max_doc_bytes = (
+                2 * 1024 * 1024 * 1024
+                if self.config.extra.get("base_url")
+                else 20 * 1024 * 1024
+            )
         # Interactive model picker state per chat
         self._model_picker_state: Dict[str, dict] = {}
         self._choice_picker_state: Dict[str, dict] = {}
@@ -1831,6 +1909,86 @@ class TelegramAdapter(BasePlatformAdapter):
             if any(marker in err_lower for marker in topic_markers):
                 return True
         return False
+
+    async def _cache_inbound_file(
+        self,
+        source: Any,
+        *,
+        filename: str = "",
+        mime_type: str = "",
+        default_kind: Optional[str] = None,
+    ) -> Any:
+        """Cache an inbound Telegram attachment, streaming when possible.
+
+        Local ``telegram-bot-api`` (``--local``) answers ``getFile`` with an
+        absolute path on the server's filesystem rather than a download URL.
+        When that path is readable here (same host, or a shared mount at an
+        identical path) the file is copied straight into the cache and never
+        enters this process's memory — essential at the 2000MB local-mode
+        ceiling, where the bytes path would need a multi-GB allocation.
+
+        Falls back to the download-and-buffer path for the cloud Bot API, and
+        also whenever the reported path is not actually reachable here (a
+        remote local-mode server, a mount mismatch), so a misconfiguration
+        degrades to the old behaviour instead of dropping the attachment.
+        """
+        from gateway.platforms.base import cache_media_bytes, cache_media_path
+
+        file_obj = await source.get_file()
+        local_path = getattr(file_obj, "file_path", "") or ""
+        _local = getattr(self, "_local_mode", False)
+        if _local and local_path and os.path.isfile(local_path):
+            cached = cache_media_path(
+                local_path,
+                filename=filename,
+                mime_type=mime_type,
+                default_kind=default_kind,
+            )
+            if cached is not None:
+                return cached
+            logger.debug(
+                "[%s] Local-mode cache miss for %s; falling back to download",
+                self.name, local_path,
+            )
+        if _local and local_path and not os.path.isfile(local_path):
+            logger.warning(
+                "[%s] local_mode is on but the Bot API path %r is not readable "
+                "here — falling back to an in-memory download. Mount the "
+                "telegram-bot-api data dir at the SAME absolute path to avoid "
+                "buffering large files in RAM.",
+                self.name, local_path,
+            )
+        data = bytes(await file_obj.download_as_bytearray())
+        return cache_media_bytes(
+            data,
+            filename=filename,
+            mime_type=mime_type,
+            default_kind=default_kind,
+        )
+
+    @contextlib.contextmanager
+    def _media_upload_source(self, path: str):
+        """Yield the value to hand PTB for ``path``, plus its rewind callback.
+
+        Thin instance wrapper over :func:`media_upload_source`; see there for
+        why local mode must pass a path instead of a handle.
+
+        ``getattr``, not ``self._local_mode``: adapters are also constructed
+        via ``__new__`` (tests, and some gateway rebuild paths) which never
+        runs ``__init__``, and an ``AttributeError`` here would sink the whole
+        send. Absent attribute == cloud mode == the historical behaviour.
+        """
+        with media_upload_source(
+            path, local_mode=getattr(self, "_local_mode", False)
+        ) as pair:
+            yield pair
+
+    def _media_read_timeout(self) -> float:
+        """Read timeout for a media send, widened for local Bot API mode.
+
+        ``getattr`` for the same reason as ``_media_upload_source``.
+        """
+        return media_read_timeout(getattr(self, "_local_mode", False))
 
     async def _send_with_dm_topic_reply_anchor_retry(
         self,
@@ -8056,7 +8214,7 @@ class TelegramAdapter(BasePlatformAdapter):
             else:
                 _caption_variants.append((None, None))
 
-            with open(audio_path, "rb") as audio_file:
+            with self._media_upload_source(audio_path) as (audio_src, rewind):
                 ext = os.path.splitext(audio_path)[1].lower()
                 # .ogg / .opus files -> send as voice (round playable bubble)
                 if ext in {".ogg", ".opus"}:
@@ -8077,19 +8235,19 @@ class TelegramAdapter(BasePlatformAdapter):
                                 self._bot.send_voice,
                                 {
                                     "chat_id": normalize_telegram_chat_id(chat_id),
-                                    "voice": audio_file,
+                                    "voice": audio_src,
                                     "caption": _cap_text,
                                     "parse_mode": _cap_parse_mode,
                                     "reply_to_message_id": reply_to_id,
                                     "duration": _duration_secs,
-                                    "read_timeout": _MEDIA_SEND_READ_TIMEOUT,
+                                    "read_timeout": self._media_read_timeout(),
                                     **voice_thread_kwargs,
                                     **self._notification_kwargs(metadata),
                                 },
                                 metadata,
                                 reply_to_id,
                                 "voice",
-                                reset_media=lambda: audio_file.seek(0),
+                                reset_media=rewind,
                             )
                             break
                         except Exception as _cap_error:
@@ -8106,7 +8264,8 @@ class TelegramAdapter(BasePlatformAdapter):
                                     _redact_telegram_error_text(_cap_error),
                                 )
                                 _last_parse_error = _cap_error
-                                audio_file.seek(0)
+                                if rewind is not None:
+                                    rewind()
                                 continue
                             raise
                     if msg is None:
@@ -8128,18 +8287,18 @@ class TelegramAdapter(BasePlatformAdapter):
                         self._bot.send_audio,
                         {
                             "chat_id": normalize_telegram_chat_id(chat_id),
-                            "audio": audio_file,
+                            "audio": audio_src,
                             "caption": caption[:1024] if caption else None,
                             "reply_to_message_id": reply_to_id,
                             "duration": _duration_secs,
-                            "read_timeout": _MEDIA_SEND_READ_TIMEOUT,
+                            "read_timeout": self._media_read_timeout(),
                             **audio_thread_kwargs,
                             **self._notification_kwargs(metadata),
                         },
                         metadata,
                         reply_to_id,
                         "audio",
-                        reset_media=lambda: audio_file.seek(0),
+                        reset_media=rewind,
                     )
                 else:
                     # Formats Telegram can't play natively (.wav, .flac, ...)
@@ -8329,22 +8488,22 @@ class TelegramAdapter(BasePlatformAdapter):
                 reply_to_message_id=reply_to_id,
                 reply_to_mode=self._reply_to_mode
             )
-            with open(image_path, "rb") as image_file:
+            with self._media_upload_source(image_path) as (photo_src, rewind):
                 msg = await self._send_with_dm_topic_reply_anchor_retry(
                     self._bot.send_photo,
                     {
                         "chat_id": normalize_telegram_chat_id(chat_id),
-                        "photo": image_file,
+                        "photo": photo_src,
                         "caption": caption[:1024] if caption else None,
                         "reply_to_message_id": reply_to_id,
-                        "read_timeout": _MEDIA_SEND_READ_TIMEOUT,
+                        "read_timeout": self._media_read_timeout(),
                         **thread_kwargs,
                         **self._notification_kwargs(metadata),
                     },
                     metadata,
                     reply_to_id,
                     "photo",
-                    reset_media=lambda: image_file.seek(0),
+                    reset_media=rewind,
                 )
             return SendResult(success=True, message_id=str(msg.message_id))
         except Exception as e:
@@ -8426,23 +8585,23 @@ class TelegramAdapter(BasePlatformAdapter):
                 reply_to_mode=self._reply_to_mode
             )
 
-            with open(file_path, "rb") as f:
+            with self._media_upload_source(file_path) as (doc_src, rewind):
                 msg = await self._send_with_dm_topic_reply_anchor_retry(
                     self._bot.send_document,
                     {
                         "chat_id": normalize_telegram_chat_id(chat_id),
-                        "document": f,
+                        "document": doc_src,
                         "filename": display_name,
                         "caption": caption[:1024] if caption else None,
                         "reply_to_message_id": reply_to_id,
-                        "read_timeout": _MEDIA_SEND_READ_TIMEOUT,
+                        "read_timeout": self._media_read_timeout(),
                         **thread_kwargs,
                         **self._notification_kwargs(metadata),
                     },
                     metadata,
                     reply_to_id,
                     "document",
-                    reset_media=lambda: f.seek(0),
+                    reset_media=rewind,
                 )
             return SendResult(success=True, message_id=str(msg.message_id))
         except Exception as e:
@@ -8478,22 +8637,22 @@ class TelegramAdapter(BasePlatformAdapter):
                 reply_to_message_id=reply_to_id,
                 reply_to_mode=self._reply_to_mode
             )
-            with open(video_path, "rb") as f:
+            with self._media_upload_source(video_path) as (video_src, rewind):
                 msg = await self._send_with_dm_topic_reply_anchor_retry(
                     self._bot.send_video,
                     {
                         "chat_id": normalize_telegram_chat_id(chat_id),
-                        "video": f,
+                        "video": video_src,
                         "caption": caption[:1024] if caption else None,
                         "reply_to_message_id": reply_to_id,
-                        "read_timeout": _MEDIA_SEND_READ_TIMEOUT,
+                        "read_timeout": self._media_read_timeout(),
                         **thread_kwargs,
                         **self._notification_kwargs(metadata),
                     },
                     metadata,
                     reply_to_id,
                     "video",
-                    reset_media=lambda: f.seek(0),
+                    reset_media=rewind,
                 )
             return SendResult(success=True, message_id=str(msg.message_id))
         except Exception as e:
@@ -10471,13 +10630,22 @@ class TelegramAdapter(BasePlatformAdapter):
                     ext = image_mime_to_ext.get(doc.mime_type, "")
 
                 if ext in SUPPORTED_VIDEO_TYPES:
-                    file_obj = await doc.get_file()
-                    video_bytes = await file_obj.download_as_bytearray()
-                    cached_path = cache_video_from_bytes(bytes(video_bytes), ext=ext)
-                    event.media_urls = [cached_path]
+                    cached_video = await self._cache_inbound_file(
+                        doc,
+                        filename=original_filename or f"video{ext}",
+                        mime_type=doc_mime or SUPPORTED_VIDEO_TYPES[ext],
+                        default_kind="video",
+                    )
+                    if cached_video is None:
+                        event.text = (
+                            f"Video '{original_filename or ext}' could not be cached."
+                        )
+                        await self.handle_message(event)
+                        return
+                    event.media_urls = [cached_video.path]
                     event.media_types = [SUPPORTED_VIDEO_TYPES[ext]]
                     event.message_type = MessageType.VIDEO
-                    logger.info("[Telegram] Cached user video document at %s", cached_path)
+                    logger.info("[Telegram] Cached user video document at %s", cached_video.path)
                     await self.handle_message(event)
                     return
 
@@ -10491,13 +10659,8 @@ class TelegramAdapter(BasePlatformAdapter):
                 # to message the agent is the gate, not the file extension.
                 # Known types keep their precise MIME; unknown types are tagged
                 # application/octet-stream so the agent reaches for terminal tools.
-                file_obj = await doc.get_file()
-                doc_bytes = await file_obj.download_as_bytearray()
-                raw_bytes = bytes(doc_bytes)
-                from gateway.platforms.base import cache_media_bytes
-
-                cached = cache_media_bytes(
-                    raw_bytes,
+                cached = await self._cache_inbound_file(
+                    doc,
                     filename=original_filename or f"document{ext or '.bin'}",
                     mime_type=doc_mime,
                 )
@@ -10524,10 +10687,22 @@ class TelegramAdapter(BasePlatformAdapter):
                 # UTF-8 decode, since binary formats (PDF/zip/docx) can have
                 # decodable ASCII headers. Binary files are surfaced as a cached
                 # path only (run.py emits a path-pointing context note).
+                # Read back from the cached copy rather than holding the whole
+                # payload in memory: the cache path is the one representation
+                # that exists on both the streamed (local-mode) and buffered
+                # branches, and the cap means at most 100 KB is ever read.
                 MAX_TEXT_INJECT_BYTES = 100 * 1024
                 _is_text = ext in _TEXT_INJECT_EXTENSIONS or (doc_mime or "").startswith("text/")
-                if _is_text and len(raw_bytes) <= MAX_TEXT_INJECT_BYTES:
+                _cached_size = -1
+                if _is_text:
                     try:
+                        _cached_size = os.path.getsize(cached.local_path)
+                    except OSError:
+                        _cached_size = -1
+                if _is_text and 0 <= _cached_size <= MAX_TEXT_INJECT_BYTES:
+                    try:
+                        with open(cached.local_path, "rb") as _tf:
+                            raw_bytes = _tf.read(MAX_TEXT_INJECT_BYTES)
                         text_content = raw_bytes.decode("utf-8")
                         display_name = original_filename or f"document{ext or '.txt'}"
                         display_name = re.sub(r'[^\w.\- ]', '_', display_name)

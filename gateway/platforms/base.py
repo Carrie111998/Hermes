@@ -12,6 +12,7 @@ import logging
 import os
 import random
 import re
+import shutil
 import socket as _socket
 import subprocess
 import sys
@@ -2360,6 +2361,16 @@ class CachedMedia:
     media_type: str           # MIME type recorded on the MessageEvent
     kind: str                 # "image" | "video" | "audio" | "document"
     display_name: str         # human-readable name for transcript notes
+    # Real on-disk path in THIS process's filesystem. Usually identical to
+    # ``path``, but ``path`` is sandbox-translated for the agent (e.g. to
+    # /root/.hermes/... under the docker terminal backend) and can therefore be
+    # unreadable from the gateway. Callers that need to re-open the cached file
+    # locally — text injection, size checks — must use this, not ``path``.
+    local_path: str = ""
+
+    def __post_init__(self) -> None:
+        if not self.local_path:
+            self.local_path = self.path
 
     def context_note(self) -> str:
         """One-line transcript annotation pointing the agent at the file."""
@@ -2423,18 +2434,18 @@ def cache_media_bytes(
         except ValueError:
             return None
         out_mime = mime if mime.startswith("image/") else SUPPORTED_IMAGE_DOCUMENT_TYPES.get(img_ext, "image/jpeg")
-        return CachedMedia(to_agent_visible_cache_path(path), out_mime, "image", display)
+        return CachedMedia(to_agent_visible_cache_path(path), out_mime, "image", display, local_path=path)
 
     if is_video:
         vid_ext = ext if ext in SUPPORTED_VIDEO_TYPES else ".mp4"
         path = cache_video_from_bytes(data, ext=vid_ext)
-        return CachedMedia(to_agent_visible_cache_path(path), SUPPORTED_VIDEO_TYPES.get(vid_ext, "video/mp4"), "video", display)
+        return CachedMedia(to_agent_visible_cache_path(path), SUPPORTED_VIDEO_TYPES.get(vid_ext, "video/mp4"), "video", display, local_path=path)
 
     if is_audio:
         aud_ext = ext if ext in _AUDIO_EXTS else ".ogg"
         path = cache_audio_from_bytes(data, ext=aud_ext)
         out_mime = mime if mime.startswith("audio/") else _AUDIO_MIME_TYPES[aud_ext]
-        return CachedMedia(to_agent_visible_cache_path(path), out_mime, "audio", display)
+        return CachedMedia(to_agent_visible_cache_path(path), out_mime, "audio", display, local_path=path)
 
     # Any other file type is cached and surfaced to the agent as a local path
     # so it can be inspected with terminal / read_file / etc. Authorization to
@@ -2449,7 +2460,114 @@ def cache_media_bytes(
         out_mime = SUPPORTED_DOCUMENT_TYPES[ext]
     else:
         out_mime = mime if mime else "application/octet-stream"
-    return CachedMedia(to_agent_visible_cache_path(path), out_mime, "document", display or fallback_name)
+    return CachedMedia(to_agent_visible_cache_path(path), out_mime, "document", display or fallback_name, local_path=path)
+
+
+def cache_media_path(
+    source_path: str,
+    *,
+    filename: str = "",
+    mime_type: str = "",
+    default_kind: Optional[str] = None,
+) -> Optional[CachedMedia]:
+    """Cache an attachment that is ALREADY on this machine's filesystem.
+
+    Same classification and return shape as :func:`cache_media_bytes`, but the
+    payload never passes through memory: the file is copied chunk-by-chunk with
+    :func:`shutil.copyfile`. Callers therefore need only a constant-size buffer
+    regardless of file size.
+
+    This exists for local ``telegram-bot-api`` (``--local``) deployments, where
+    ``getFile`` returns an absolute server-side path instead of a download URL.
+    With a 2000MB upload ceiling, the ``bytes``-based path would need a
+    multi-GB allocation to cache a file that is already sitting on disk.
+
+    ``validate_inbound_media_size`` is still enforced, from ``stat()`` rather
+    than ``len(data)``, so the configured cap applies identically on both paths.
+    Images are the one exception: they are read into memory and routed through
+    :func:`cache_image_from_bytes` so the existing decode/validation still runs
+    (images are small and must be validated, not merely copied).
+    """
+    from tools.credential_files import to_agent_visible_cache_path
+
+    src = Path(source_path)
+    if not src.is_file():
+        return None
+
+    ext = _resolve_media_ext(filename or src.name, mime_type)
+    mime = (mime_type or "").lower()
+    display_source = filename or src.name
+    display = re.sub(r"[^\w.\- ]", "_", display_source) if display_source else (ext.lstrip(".") or "file")
+
+    is_image = (
+        mime.startswith("image/")
+        or ext in SUPPORTED_IMAGE_DOCUMENT_TYPES
+        or default_kind == "image"
+    )
+    is_video = mime.startswith("video/") or ext in SUPPORTED_VIDEO_TYPES or default_kind == "video"
+    is_audio = mime.startswith("audio/") or ext in _AUDIO_EXTS or default_kind == "audio"
+
+    validate_inbound_media_size(
+        src.stat().st_size,
+        media_type=("image" if is_image else "video" if is_video else "audio" if is_audio else "document"),
+    )
+
+    # Images keep the bytes path: they are bounded in size and
+    # cache_image_from_bytes performs real validation we must not skip.
+    if is_image:
+        try:
+            return cache_media_bytes(
+                src.read_bytes(),
+                filename=display_source,
+                mime_type=mime_type,
+                default_kind=default_kind,
+            )
+        except ValueError:
+            return None
+
+    if is_video:
+        vid_ext = ext if ext in SUPPORTED_VIDEO_TYPES else ".mp4"
+        dest = get_video_cache_dir() / f"video_{uuid.uuid4().hex[:12]}{vid_ext}"
+        shutil.copyfile(src, dest)
+        return CachedMedia(
+            to_agent_visible_cache_path(str(dest)),
+            SUPPORTED_VIDEO_TYPES.get(vid_ext, "video/mp4"),
+            "video",
+            display,
+            local_path=str(dest),
+        )
+
+    if is_audio:
+        aud_ext = ext if ext in _AUDIO_EXTS else ".ogg"
+        dest = get_audio_cache_dir() / f"audio_{uuid.uuid4().hex[:12]}{aud_ext}"
+        shutil.copyfile(src, dest)
+        out_mime = mime if mime.startswith("audio/") else _AUDIO_MIME_TYPES[aud_ext]
+        return CachedMedia(to_agent_visible_cache_path(str(dest)), out_mime, "audio", display, local_path=str(dest))
+
+    # Everything else: document cache, mirroring cache_document_from_bytes'
+    # sanitization so the two paths produce identically-shaped names and the
+    # same path-traversal guarantees.
+    fallback_name = display_source or (f"document{ext}" if ext else "document.bin")
+    cache_dir = get_document_cache_dir()
+    safe_name = Path(fallback_name).name if fallback_name else "document"
+    safe_name = safe_name.replace("\x00", "").strip()
+    if not safe_name or safe_name in {".", ".."}:
+        safe_name = "document"
+    dest = cache_dir / f"doc_{uuid.uuid4().hex[:12]}_{safe_name}"
+    if not dest.resolve().is_relative_to(cache_dir.resolve()):
+        raise ValueError(f"Path traversal rejected: {fallback_name!r}")
+    shutil.copyfile(src, dest)
+    if ext in SUPPORTED_DOCUMENT_TYPES:
+        out_mime = SUPPORTED_DOCUMENT_TYPES[ext]
+    else:
+        out_mime = mime if mime else "application/octet-stream"
+    return CachedMedia(
+        to_agent_visible_cache_path(str(dest)),
+        out_mime,
+        "document",
+        display or fallback_name,
+        local_path=str(dest),
+    )
 
 
 class MessageType(Enum):
