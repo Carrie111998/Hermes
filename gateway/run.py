@@ -24696,6 +24696,64 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return raw.guild.id
         return None
 
+    def _resolve_voice_playback_guild(self, event: MessageEvent, adapter) -> Optional[int]:
+        """Guild whose live voice session should receive this turn's TTS.
+
+        ``_get_guild_id`` reads the raw platform message, which only exists for
+        real inbound Discord messages and slash interactions. Finals produced by
+        a background process completion, a watch-pattern injection or an async
+        delegation are synthesised WITHOUT a ``raw_message`` (see
+        ``_inject_watch_notification``), so the guild resolved to None and
+        ``_send_voice_reply`` delivered the reply as a text-channel audio
+        attachment even while the bot was speaking in that chat's bound voice
+        channel seconds earlier.
+
+        Fall back to the adapter's voice<->text binding — the very mapping
+        ``DiscordAdapter.play_tts`` uses for the voice-origin path, and the
+        voice-ack resolver in the turn runner uses for mid-turn speech.
+        Deliberately narrow: only a guild whose bound text channel IS this
+        chat, and only while the bot is actually connected there. An unbound
+        chat, a stale binding, or a dropped connection keeps the existing
+        attachment delivery policy.
+        """
+        guild_id = self._get_guild_id(event)
+        if guild_id is not None:
+            return guild_id
+        source = getattr(event, "source", None)
+        if source is None or getattr(source, "platform", None) != Platform.DISCORD:
+            return None
+        bindings = getattr(adapter, "_voice_text_channels", None)
+        if not isinstance(bindings, dict) or not bindings:
+            return None
+        is_connected = getattr(adapter, "is_in_voice_channel", None)
+        if not callable(is_connected):
+            return None
+        chat_id = str(getattr(source, "chat_id", "") or "")
+        if not chat_id:
+            return None
+        for gid, text_ch_id in list(bindings.items()):
+            if str(text_ch_id) != chat_id:
+                continue
+            try:
+                if not is_connected(gid):
+                    continue
+                resolved = int(gid)
+            except (TypeError, ValueError):
+                continue
+            except Exception:
+                logger.debug(
+                    "Voice playback guild probe failed for guild=%r chat=%s",
+                    gid, chat_id, exc_info=True,
+                )
+                continue
+            logger.info(
+                "Auto voice reply: routing to bound live voice session "
+                "(guild=%d chat=%s) — event carried no raw platform message",
+                resolved, chat_id,
+            )
+            return resolved
+        return None
+
 
     async def _handle_voice_channel_join(self, event: MessageEvent) -> str:
         """Join the user's current Discord voice channel."""
@@ -25043,8 +25101,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             adapter = self._adapter_for_source(event.source)
 
-            # If connected to a voice channel, play there instead of sending a file
-            guild_id = self._get_guild_id(event)
+            # If connected to a voice channel, play there instead of sending a
+            # file. Resolve through the binding-aware helper so a final born
+            # from a background completion (no raw_message) still reaches the
+            # live voice session bound to this chat.
+            guild_id = self._resolve_voice_playback_guild(event, adapter)
             play_in_voice_channel = getattr(adapter, "play_in_voice_channel", None)
             is_in_voice_channel = getattr(adapter, "is_in_voice_channel", None)
             send_voice = getattr(adapter, "send_voice", None)
