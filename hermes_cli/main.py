@@ -8284,6 +8284,14 @@ def _desktop_linux_needs_no_sandbox() -> bool:
         return False
     if hasattr(os, "geteuid") and os.geteuid() == 0:
         return False
+
+    # Non-interactive launch (e.g. a systemd user service or cron): there is no
+    # TTY to prompt for the sudo password that configuring the setuid
+    # chrome-sandbox helper requires, so fall back to --no-sandbox rather than
+    # hard-failing into a restart crash-loop.
+    if sys.stdin is not None and not sys.stdin.isatty():
+        return True
+
     try:
         with open("/proc/sys/kernel/apparmor_restrict_unprivileged_userns", encoding="utf-8") as f:
             return f.read().strip() == "1"
@@ -8819,7 +8827,7 @@ def cmd_gui(args: argparse.Namespace):
     launch_command = [str(packaged_executable)]
     if not _desktop_linux_sandbox_fixup(packaged_executable):
         if _desktop_linux_needs_no_sandbox() and _desktop_linux_sandbox_helper_is_regular_file(packaged_executable):
-            print("⚠ Falling back to --no-sandbox because this Linux host restricts unprivileged user namespaces and the Electron sandbox helper could not be configured.")
+            print("⚠ Falling back to --no-sandbox because Electron's Linux setuid sandbox helper could not be configured (non-interactive launch, or this host restricts unprivileged user namespaces).")
             launch_command.append("--no-sandbox")
         else:
             sys.exit(1)

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -1049,6 +1050,57 @@ def test_gui_skips_desktop_entry_off_linux(tmp_path, monkeypatch):
         cli_main.cmd_gui(_ns())
 
     assert exc.value.code == 0
+
+
+def test_desktop_linux_needs_no_sandbox_when_stdin_not_a_tty(monkeypatch):
+    """A non-interactive launch (systemd user service / cron) cannot prompt for
+    the sudo password that configuring Electron's setuid ``chrome-sandbox``
+    helper requires, so ``hermes desktop`` must fall back to ``--no-sandbox``
+    rather than hard-failing into a restart crash-loop."""
+    monkeypatch.delenv("ELECTRON_DISABLE_SANDBOX", raising=False)
+    if hasattr(os, "geteuid"):
+        # Root users are deliberately excluded by the euid guard; pin a
+        # non-root uid so this test exercises the non-interactive branch.
+        monkeypatch.setattr(cli_main.os, "geteuid", lambda: 1000)
+    monkeypatch.setattr(
+        sys, "stdin", type("_Stdin", (), {"isatty": lambda self: False})()
+    )
+    if sys.platform in ("darwin", "win32"):
+        assert cli_main._desktop_linux_needs_no_sandbox() is False
+    else:
+        assert cli_main._desktop_linux_needs_no_sandbox() is True
+
+
+@pytest.mark.linux_only
+def test_gui_falls_back_to_no_sandbox_when_helper_cannot_be_configured(
+    tmp_path, monkeypatch, capsys
+):
+    """When Electron's setuid sandbox helper exists as a regular file but can't
+    be configured (e.g. a headless systemd service that can't ``sudo``), the
+    launcher appends ``--no-sandbox`` to the launch command instead of
+    ``sys.exit(1)``-ing into a restart crash-loop."""
+    root = _make_desktop_tree(tmp_path)
+    monkeypatch.setattr(cli_main, "PROJECT_ROOT", root)
+    packaged_exe = _make_packaged_executable(root, monkeypatch)
+    # _make_packaged_executable lays down chrome-sandbox as a regular file on
+    # Linux, satisfying _desktop_linux_sandbox_helper_is_regular_file().
+    assert (packaged_exe.parent / "chrome-sandbox").is_file()
+
+    launch_ok = subprocess.CompletedProcess([str(packaged_exe)], 0)
+
+    with patch("hermes_cli.main._desktop_build_needed", return_value=False), \
+         patch("hermes_cli.main._resolve_node_runtime_npm", return_value="/usr/bin/npm"), \
+         patch("hermes_cli.main._desktop_linux_sandbox_fixup", return_value=False), \
+         patch("hermes_cli.main._desktop_linux_needs_no_sandbox", return_value=True), \
+         patch("hermes_cli.linux_desktop_entry.is_supported", return_value=False), \
+         patch("hermes_cli.main.subprocess.run", return_value=launch_ok) as mock_run, \
+         pytest.raises(SystemExit) as exc:
+        cli_main.cmd_gui(_ns())
+
+    assert exc.value.code == 0
+    assert mock_run.call_args.args[0] == [str(packaged_exe), "--no-sandbox"]
+    out = capsys.readouterr().out
+    assert "--no-sandbox" in out
 
 @pytest.mark.parametrize(
     "raw,expected",
