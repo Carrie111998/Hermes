@@ -82,6 +82,33 @@ def test_snapshot_prunes_to_keep_count(backup_env, monkeypatch):
     assert remaining == ids[2:], f"expected newest 3, got {remaining}"
 
 
+def test_snapshot_excludes_nested_transient_dirs(backup_env):
+    """A .venv (or node_modules/__pycache__/etc.) left inside a skill dir
+    must never land in the snapshot tarball — a stray venv nested a few
+    levels deep can turn a normal multi-KB curator backup into a multi-GB
+    one and silently eat host disk."""
+    cb = backup_env["cb"]
+    skill_dir = _write_skill(backup_env["skills"], "shared-memory")
+    venv_dir = skill_dir / ".venv" / "lib"
+    venv_dir.mkdir(parents=True)
+    (venv_dir / "site-packages-stub.txt").write_text("x" * 1000, encoding="utf-8")
+    (skill_dir / "node_modules").mkdir()
+    (skill_dir / "node_modules" / "pkg.js").write_text("x", encoding="utf-8")
+    (skill_dir / "__pycache__").mkdir()
+    (skill_dir / "__pycache__" / "mod.pyc").write_text("x", encoding="utf-8")
+
+    snap = cb.snapshot_skills(reason="test")
+    assert snap is not None
+    archive = snap / "skills.tar.gz"
+    with tarfile.open(archive, "r:gz") as tf:
+        names = tf.getnames()
+    assert not any(".venv" in n for n in names), names
+    assert not any("node_modules" in n for n in names), names
+    assert not any("__pycache__" in n for n in names), names
+    # Legit skill content still present.
+    assert any(n.endswith("SKILL.md") for n in names), names
+
+
 # ---------------------------------------------------------------------------
 # list_backups / _resolve_backup
 # ---------------------------------------------------------------------------

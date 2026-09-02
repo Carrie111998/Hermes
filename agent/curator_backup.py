@@ -62,6 +62,31 @@ DEFAULT_KEEP = 5
 # invariants. .curator_backups is the backup dir itself — recursion bomb.
 _EXCLUDE_TOP_LEVEL = {".curator_backups", ".hub"}
 
+# Directory names that must never be swept into a snapshot no matter how
+# deep they appear under a skill (e.g. skills/devops/some-skill/.venv).
+# These are transient/regeneratable local artifacts, not skill content —
+# a stray venv or node_modules left under a skill dir can turn a normal
+# multi-KB snapshot into multiple GB. Skill authors should not commit
+# these, but curator must not trust that and blow up the backup dir.
+_EXCLUDE_NESTED_DIRS = {
+    ".venv", "venv", "env", ".env",
+    "node_modules", "__pycache__",
+    ".pytest_cache", ".mypy_cache", ".ruff_cache",
+    ".git",
+}
+
+
+def _tar_filter(tarinfo: "tarfile.TarInfo") -> Optional["tarfile.TarInfo"]:
+    """Drop nested transient dirs (venvs, node_modules, caches) from snapshots.
+
+    Applied per-member during ``tf.add(..., filter=...)``. Top-level
+    exclusions are still handled separately in the iterdir loop below.
+    """
+    parts = Path(tarinfo.name).parts
+    if any(p in _EXCLUDE_NESTED_DIRS for p in parts):
+        return None
+    return tarinfo
+
 # Snapshot id regex: UTC ISO with colons replaced by dashes so the filename
 # is portable (Windows-safe). An optional ``-NN`` suffix handles two
 # snapshots landing in the same wallclock second.
@@ -267,8 +292,11 @@ def snapshot_skills(reason: str = "manual", *, protect_ids: Optional[Set[str]] =
                 if entry.name in _EXCLUDE_TOP_LEVEL:
                     continue
                 # arcname: store paths relative to skills/ so extraction
-                # drops cleanly back into the skills dir.
-                tf.add(str(entry), arcname=entry.name, recursive=True)
+                # drops cleanly back into the skills dir. filter drops
+                # transient nested dirs (venvs, node_modules, caches) that
+                # skill authors shouldn't have left there but sometimes do.
+                tf.add(str(entry), arcname=entry.name, recursive=True,
+                       filter=_tar_filter)
         # Capture cron/jobs.json alongside the tarball. Never fails the
         # snapshot — the skills side is the core guarantee; cron is
         # additive. We still record in the manifest whether it was
