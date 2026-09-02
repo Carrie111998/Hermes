@@ -28,6 +28,7 @@ import asyncio
 import base64
 import json
 import logging
+import math
 import os
 import re
 import secrets
@@ -64,6 +65,7 @@ from gateway.platforms.base import (
     SendResult,
 )
 from gateway.platforms.helpers import compile_mention_patterns, strip_markdown
+from utils import atomic_json_write
 
 from .auth import load_project_credentials
 
@@ -205,6 +207,7 @@ def _sidecar_pid_alive(pid: Any) -> bool:
 # reconnect can replay, so keep at least 1k ids for ~48h.
 _DEDUP_MAX_SIZE = 4000
 _DEDUP_WINDOW_SECONDS = 48 * 3600
+_DEDUP_STATE_NAME = "photon-inbound-dedupe.json"
 
 _FFFC_WAIT_SECONDS = 15.0  # Timeout for waiting on an attachment after a U+FFFC placeholder.
 
@@ -818,9 +821,15 @@ class PhotonAdapter(BasePlatformAdapter):
         # natural traffic already proved the channel live within the interval.
         self._last_upstream_activity = 0.0
         self._respawn_lock: Optional[asyncio.Lock] = None
-        # Lightweight in-memory dedup. The gRPC stream is at-least-once, so we
-        # may see the same messageId more than once (e.g. after a reconnect).
-        self._seen_messages: Dict[str, float] = {}
+        # The gRPC stream is at-least-once, so a reconnect may replay a
+        # messageId. Keep the bounded window in this profile's durable state;
+        # process memory alone loses the claim on a sidecar/gateway restart.
+        from hermes_constants import get_hermes_home
+
+        self._dedup_state_path = (
+            get_hermes_home() / "state" / _DEDUP_STATE_NAME
+        )
+        self._seen_messages = self._load_seen_messages()
         # Ids of messages WE sent (bounded, insertion-order eviction). Inbound
         # reaction events are only routed to the agent when they target one of
         # these — a tapback on a human↔human message is not addressed to us.
@@ -1174,23 +1183,69 @@ class PhotonAdapter(BasePlatformAdapter):
             await self._dispatch_inbound(event)
         except Exception:
             logger.exception("[photon] inbound dispatch failed")
+        else:
+            if msg_id:
+                self._mark_seen_message(msg_id)
 
     def _is_duplicate(self, msg_id: str) -> bool:
         now = time.time()
+        seen_at = self._seen_messages.get(msg_id)
+        return seen_at is not None and now - seen_at < _DEDUP_WINDOW_SECONDS
+
+    def _mark_seen_message(self, msg_id: str) -> None:
+        """Persist a message ID only after inbound dispatch has succeeded."""
+        now = time.time()
         seen = self._seen_messages
-        t = seen.get(msg_id)
-        if t is not None and now - t < _DEDUP_WINDOW_SECONDS:
-            return True  # seen, unexpired
         # New or expired: record and enforce a HARD size bound (evict oldest,
         # insertion-order) so a burst of unique ids within the window can't grow
-        # the dict without limit — not just the expired-only prune.
+        # the dict without limit -- not just the expired-only prune.
         if msg_id in seen:
             del seen[msg_id]  # refresh insertion order
         seen[msg_id] = now
         if len(seen) > _DEDUP_MAX_SIZE:
             for old in list(seen.keys())[: len(seen) - _DEDUP_MAX_SIZE]:
                 del seen[old]
-        return False
+        self._persist_seen_messages()
+
+    def _load_seen_messages(self) -> Dict[str, float]:
+        """Load live provider message IDs from this profile's durable state."""
+        try:
+            raw = json.loads(self._dedup_state_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return {}
+        if not isinstance(raw, dict):
+            return {}
+
+        now = time.time()
+        live: List[tuple[str, float]] = []
+        for msg_id, seen_at in raw.items():
+            if not isinstance(msg_id, str) or not isinstance(seen_at, (int, float)):
+                continue
+            timestamp = float(seen_at)
+            if not math.isfinite(timestamp):
+                continue
+            # A wall-clock rollback must not turn a valid claim into an
+            # unbounded one. Clamp future timestamps to the current window.
+            timestamp = min(timestamp, now)
+            if now - timestamp < _DEDUP_WINDOW_SECONDS:
+                live.append((msg_id, timestamp))
+        live.sort(key=lambda item: item[1])
+        return dict(live[-_DEDUP_MAX_SIZE:])
+
+    def _persist_seen_messages(self) -> None:
+        """Atomically persist the already-bounded in-memory dedupe window."""
+        try:
+            atomic_json_write(
+                self._dedup_state_path,
+                self._seen_messages,
+                indent=0,
+                separators=(",", ":"),
+                mode=0o600,
+            )
+        except OSError as exc:
+            # Preserve existing best-effort behavior if the profile state is
+            # temporarily unwritable; in-process replay protection still works.
+            logger.warning("[photon] failed to persist inbound dedupe state: %s", exc)
 
     async def _fffc_timeout_handler(self, chat_key: str, message_id: str) -> None:
         await asyncio.sleep(_FFFC_WAIT_SECONDS)
