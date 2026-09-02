@@ -2090,6 +2090,13 @@ def init_agent(
     # single turn; the runtime already executes such batches concurrently.
     agent._parallel_tool_call_guidance = bool(_agent_section.get("parallel_tool_call_guidance", True))
 
+    # Universal secret-management guidance toggle.  Default True.  Steers
+    # the model toward `hermes secrets` / `hermes config set` instead of a
+    # terminal-tool workaround for credential/config-file edits (#94449).
+    agent._secret_management_guidance = bool(
+        _agent_section.get("secret_management_guidance", True)
+    )
+
     # Local Python toolchain probe toggle.  Default True.  When False,
     # the probe is skipped entirely (no subprocess calls, no system-prompt
     # line).  Useful for users on exotic setups where the probe heuristics

@@ -204,6 +204,13 @@ DEFAULT_CONFIG = {
         # compounds over a long conversation.  Costs ~70 tokens in the cached
         # system prompt.  Set False to disable globally.
         "parallel_tool_call_guidance": True,
+        # Universal secret-management guidance — short prompt block applied
+        # to all models that tells the model to add/update credentials via
+        # `hermes secrets ...` and config via `hermes config set`, instead
+        # of a terminal-tool workaround (direct `.env` append, or a
+        # python/sed/tee one-liner against `config.yaml`).  Set False to
+        # disable globally.
+        "secret_management_guidance": True,
         # Local-environment toolchain probe — surfaces Python/pip/uv/PEP-668
         # state in the system prompt when something non-default is detected
         # (e.g. python3 has no pip module, pip→python version mismatch, PEP

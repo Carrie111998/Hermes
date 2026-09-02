@@ -1348,6 +1348,90 @@ class TestTaskCompletionGuidance:
             assert TASK_COMPLETION_GUIDANCE not in a._build_system_prompt()
 
 
+class TestSecretManagementGuidance:
+    """Tests for the universal secret-management guidance (config.yaml
+    ``agent.secret_management_guidance``, #94449).
+
+    Steers the model toward `hermes secrets ...` / `hermes config set`
+    instead of a terminal-tool workaround (direct `.env` append, or a
+    python/sed/tee one-liner against `config.yaml`) for credential and
+    config-file changes."""
+
+    def _make_agent(self, secret_management_guidance=True):
+        agent_cfg = {"secret_management_guidance": secret_management_guidance}
+        with (
+            patch(
+                "run_agent.get_tool_definitions",
+                return_value=_make_tool_defs("terminal", "web_search"),
+            ),
+            patch("run_agent.check_toolset_requirements", return_value={}),
+            patch("run_agent.OpenAI"),
+            patch(
+                "hermes_cli.config.load_config",
+                return_value={"agent": agent_cfg},
+            ), patch(
+                "hermes_cli.config.load_config_readonly",
+                return_value={"agent": agent_cfg},
+            ),
+        ):
+            a = AIAgent(
+                model="anthropic/claude-opus-4.8",
+                api_key="test-key-1234567890",
+                base_url="https://openrouter.ai/api/v1",
+                quiet_mode=True,
+                skip_context_files=True,
+                skip_memory=True,
+            )
+            a.client = MagicMock()
+            return a
+
+    def test_default_injects_when_terminal_tool_loaded(self):
+        """The block must reach the model by default — the failure mode
+        (hand-editing .env/config.yaml via terminal) only exists when the
+        terminal tool is loaded."""
+        from agent.prompt_builder import SECRET_MANAGEMENT_GUIDANCE
+        agent = self._make_agent()
+        assert SECRET_MANAGEMENT_GUIDANCE in agent._build_system_prompt()
+
+    def test_config_false_suppresses(self):
+        from agent.prompt_builder import SECRET_MANAGEMENT_GUIDANCE
+        agent = self._make_agent(secret_management_guidance=False)
+        assert SECRET_MANAGEMENT_GUIDANCE not in agent._build_system_prompt()
+
+    def test_names_hermes_config_set_for_config_yaml(self):
+        """The block must name the sanctioned path for config.yaml changes
+        (`hermes config set`), not just forbid the terminal workaround —
+        otherwise the model is told what not to do without being told what
+        to do instead."""
+        from agent.prompt_builder import SECRET_MANAGEMENT_GUIDANCE
+        assert "hermes config set" in SECRET_MANAGEMENT_GUIDANCE
+
+    def test_no_tools_no_injection(self):
+        from agent.prompt_builder import SECRET_MANAGEMENT_GUIDANCE
+        with (
+            patch("run_agent.get_tool_definitions", return_value=[]),
+            patch("run_agent.check_toolset_requirements", return_value={}),
+            patch("run_agent.OpenAI"),
+            patch(
+                "hermes_cli.config.load_config",
+                return_value={"agent": {"secret_management_guidance": True}},
+            ), patch(
+                "hermes_cli.config.load_config_readonly",
+                return_value={"agent": {"secret_management_guidance": True}},
+            ),
+        ):
+            a = AIAgent(
+                api_key="test-key-1234567890",
+                base_url="https://openrouter.ai/api/v1",
+                quiet_mode=True,
+                skip_context_files=True,
+                skip_memory=True,
+                enabled_toolsets=[],
+            )
+            a.client = MagicMock()
+            assert SECRET_MANAGEMENT_GUIDANCE not in a._build_system_prompt()
+
+
 class TestEnvironmentProbeIntegration:
     """Tests for the local Python toolchain probe wiring (config.yaml
     ``agent.environment_probe``).  The probe itself is unit-tested in

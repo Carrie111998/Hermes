@@ -43,6 +43,7 @@ from agent.prompt_builder import (
     OPENAI_MODEL_EXECUTION_GUIDANCE,
     PARALLEL_TOOL_CALL_GUIDANCE,
     PLATFORM_HINTS,
+    SECRET_MANAGEMENT_GUIDANCE,
     SESSION_SEARCH_GUIDANCE,
     SKILLS_GUIDANCE,
     STEER_CHANNEL_NOTE,
@@ -516,6 +517,15 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     # (default True) and only injected when tools are actually loaded.
     if getattr(agent, "_parallel_tool_call_guidance", True) and agent.valid_tool_names:
         stable_parts.append(PARALLEL_TOOL_CALL_GUIDANCE)
+
+    # Universal secret-management guidance.  Steers the model toward
+    # `hermes secrets` / `hermes config set` for credential and config
+    # changes instead of a terminal-tool workaround (direct `.env` append,
+    # or a python/sed/tee one-liner against `config.yaml`).  Gated by
+    # config.yaml ``agent.secret_management_guidance`` (default True) and
+    # only injected when tools are actually loaded (see #94449).
+    if getattr(agent, "_secret_management_guidance", True) and agent.valid_tool_names:
+        stable_parts.append(SECRET_MANAGEMENT_GUIDANCE)
 
     # Tool-aware behavioral guidance: only inject when the tools are loaded
     tool_guidance = []

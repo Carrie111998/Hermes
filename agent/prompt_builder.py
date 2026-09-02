@@ -509,6 +509,34 @@ PARALLEL_TOOL_CALL_GUIDANCE = (
     "in doubt and the calls are independent, batch them."
 )
 
+# Universal secret-management guidance — applied to ALL models.
+#
+# Hermes ships built-in secret sources (Bitwarden Secrets Manager, 1Password,
+# a generic command source — see agent/secret_sources/) that are meant to be
+# the authoritative store for credentials, with `~/.hermes/.env` populated by
+# their sync mechanism. Without an explicit steer, a model asked to add a new
+# API key takes the shortest path it can see: appending straight to `.env`
+# via the terminal tool, or working around the write_file/patch guard on
+# `~/.hermes/config.yaml` (tools/file_tools.py) with a terminal one-liner
+# (python/sed/tee) instead of the CLI. That guard is enforced at the tool
+# layer only — the terminal tool has no visibility into what a script it
+# runs will write — so the model itself has to know not to reach for it.
+#
+# Short on purpose — shipped in the cached system prompt to every user, every
+# session. Token cost is paid once at install and amortised across all
+# sessions via prefix caching. Keep it tight.
+SECRET_MANAGEMENT_GUIDANCE = (
+    "# Managing credentials\n"
+    "Add or update API keys and other credentials through Hermes' secret "
+    "management (`hermes secrets ...` — e.g. Bitwarden Secrets Manager when "
+    "configured); change `~/.hermes/config.yaml` values through `hermes "
+    "config set`. Never append to `~/.hermes/.env` or hand-edit "
+    "`~/.hermes/config.yaml` from the terminal tool (python/sed/tee/etc.), "
+    "even when that looks like the fastest path. If the CLI genuinely can't "
+    "express the change, say so and ask rather than writing the file "
+    "directly."
+)
+
 # OpenAI GPT/Codex-specific execution guidance.  Addresses known failure modes
 # where GPT models abandon work on partial results, skip prerequisite lookups,
 # hallucinate instead of using tools, and declare "done" without verification.
