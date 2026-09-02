@@ -303,7 +303,7 @@ class TestWebExtractTavily:
         async def _allow_ssrf(_url: str) -> bool:
             return True
 
-        with patch("tools.web_tools._get_backend", return_value="tavily"), \
+        with patch("tools.web_tools._get_extract_backend", return_value="tavily"), \
              patch.dict(os.environ, {"TAVILY_API_KEY": "tvly-test"}), \
              patch("plugins.web.tavily.provider.httpx.post", return_value=mock_response), \
              patch("tools.web_tools.async_is_safe_url", _allow_ssrf):
@@ -315,3 +315,38 @@ class TestWebExtractTavily:
             assert len(result["results"]) == 1
             assert result["results"][0]["url"] == "https://example.com"
             assert "Extracted content" in result["results"][0]["content"]
+
+
+    def test_extract_preserves_compact_normalized_metadata(self):
+        mock_response = _ok_response({
+            "results": [{
+                "url": "https://example.com/final",
+                "raw_content": "Extracted content",
+                "title": "Visible title",
+                "author": "Example Author",
+                "published_at": "2026-05-07T10:00:00Z",
+                "description": "Short summary of the page",
+                "raw_metadata": {"huge": "payload that should not leak"},
+            }]
+        })
+
+        async def _allow_ssrf(_url: str) -> bool:
+            return True
+
+        with patch("tools.web_tools._get_extract_backend", return_value="tavily"), \
+             patch.dict(os.environ, {"TAVILY_API_KEY": "tvly-test"}), \
+             patch("plugins.web.tavily.provider.httpx.post", return_value=mock_response), \
+             patch("tools.web_tools.async_is_safe_url", _allow_ssrf), \
+             patch("tools.web_tools._get_extract_char_limit", return_value=15000):
+            from tools.web_tools import web_extract_tool
+            result = json.loads(asyncio.get_event_loop().run_until_complete(
+                web_extract_tool(["https://example.com"])
+            ))
+
+        assert result["results"][0]["metadata"] == {
+            "sourceURL": "https://example.com/final",
+            "title": "Visible title",
+            "description": "Short summary of the page",
+            "author": "Example Author",
+            "publishedAt": "2026-05-07T10:00:00Z",
+        }
