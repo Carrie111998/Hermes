@@ -212,6 +212,43 @@ def _enforce_worker_task_ownership(tid: str) -> Optional[str]:
     return None
 
 
+def _enforce_distinct_completion_actor(task: Any) -> Optional[str]:
+    """Require task-scoped completion to come from a distinct profile."""
+    if not os.environ.get("HERMES_KANBAN_TASK"):
+        return None
+    profile = (os.environ.get("HERMES_PROFILE") or "").strip()
+    if not profile:
+        return tool_error(
+            "task-scoped kanban_complete requires HERMES_PROFILE to verify "
+            "a distinct completion actor"
+        )
+    assignee = (getattr(task, "assignee", None) or "").strip()
+    if assignee and profile == assignee:
+        return tool_error(
+            f"profile {profile} is assigned to this task and cannot complete "
+            "its own work; a distinct actor must complete the handoff"
+        )
+    return None
+
+
+def _enforce_worker_create_assignee(assignee: str) -> Optional[str]:
+    """Keep task-scoped workers from injecting work into another queue."""
+    if not os.environ.get("HERMES_KANBAN_TASK"):
+        return None
+    profile = (os.environ.get("HERMES_PROFILE") or "").strip()
+    if not profile:
+        return tool_error(
+            "task-scoped kanban_create requires HERMES_PROFILE to verify "
+            "the target assignee"
+        )
+    if assignee != profile:
+        return tool_error(
+            f"task-scoped workers may only create cards assigned to their own "
+            f"profile ({profile}); refusing assignee {assignee}"
+        )
+    return None
+
+
 def _connect(board: Optional[str] = None):
     """Import + connect lazily so the module imports cleanly in non-kanban
     contexts (e.g. test rigs that import every tool module).
@@ -752,6 +789,9 @@ def _handle_complete(args: dict, **kw) -> str:
             # Only enforce when a judge is actually reachable — see
             # _goal_judge_available for why an unavailable judge fails open.
             task = kb.get_task(conn, tid)
+            actor_err = _enforce_distinct_completion_actor(task)
+            if actor_err:
+                return actor_err
             rejection = _goal_mode_handoff_rejection(
                 task,
                 (summary or result or "").strip(),
@@ -1358,6 +1398,10 @@ def _handle_create(args: dict, **kw) -> str:
             "assignee is required — name the profile that should execute this "
             "task (the dispatcher will only spawn tasks with an assignee)"
         )
+    assignee = str(assignee).strip()
+    assignee_err = _enforce_worker_create_assignee(assignee)
+    if assignee_err:
+        return assignee_err
     body = args.get("body")
     parents = args.get("parents") or []
     tenant = args.get("tenant") or os.environ.get("HERMES_TENANT")
@@ -1437,7 +1481,7 @@ def _handle_create(args: dict, **kw) -> str:
                 conn,
                 title=str(title).strip(),
                 body=body,
-                assignee=str(assignee),
+                assignee=assignee,
                 parents=tuple(parents),
                 tenant=tenant,
                 priority=int(priority) if priority is not None else 0,

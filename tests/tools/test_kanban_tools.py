@@ -111,8 +111,9 @@ def test_list_filters_tasks(monkeypatch, worker_env):
     assert tenant_ids == [c]
 
 
-def test_complete_happy_path(worker_env):
+def test_distinct_worker_can_complete_scoped_task(monkeypatch, worker_env):
     from tools import kanban_tools as kt
+    monkeypatch.setenv("HERMES_PROFILE", "reviewer")
     out = kt._handle_complete({
         "summary": "got the thing done",
         "metadata": {"files": 2},
@@ -132,12 +133,44 @@ def test_complete_happy_path(worker_env):
         conn.close()
 
 
-def test_complete_retry_with_empty_created_cards_succeeds(worker_env):
+def test_worker_cannot_complete_own_assigned_task(worker_env):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    rejected = json.loads(kt._handle_complete({"summary": "self-attested"}))
+
+    assert rejected.get("ok") is not True
+    assert "distinct actor" in rejected.get("error", "")
+    conn = kb.connect()
+    try:
+        assert kb.get_task(conn, worker_env).status == "running"
+    finally:
+        conn.close()
+
+
+def test_worker_completion_fails_closed_without_profile(monkeypatch, worker_env):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    monkeypatch.delenv("HERMES_PROFILE")
+    rejected = json.loads(kt._handle_complete({"summary": "anonymous"}))
+
+    assert rejected.get("ok") is not True
+    assert "HERMES_PROFILE" in rejected.get("error", "")
+    conn = kb.connect()
+    try:
+        assert kb.get_task(conn, worker_env).status == "running"
+    finally:
+        conn.close()
+
+
+def test_complete_retry_with_empty_created_cards_succeeds(monkeypatch, worker_env):
     """After a phantom rejection, retrying kanban_complete with
     created_cards=[] (the documented escape hatch) must complete the
     task. Regression for #22923."""
     from hermes_cli import kanban_db as kb
     from tools import kanban_tools as kt
+    monkeypatch.setenv("HERMES_PROFILE", "reviewer")
 
     # Hit the gate first.
     rejected = json.loads(kt._handle_complete({
@@ -187,6 +220,7 @@ def test_complete_goal_mode_rejected_by_judge(monkeypatch, tmp_path):
     finally:
         conn.close()
     monkeypatch.setenv("HERMES_KANBAN_TASK", goal_task_id)
+    monkeypatch.setenv("HERMES_PROFILE", "reviewer")
 
     # Mock the judge to reject the completion. The gate only runs when a
     # judge is reachable, so force the availability probe True as well.
@@ -395,11 +429,11 @@ def test_comment_ignores_caller_supplied_author(worker_env):
         conn.close()
 
 
-def test_create_happy_path(worker_env):
+def test_worker_create_same_profile_happy_path(worker_env):
     from tools import kanban_tools as kt
     out = kt._handle_create({
         "title": "child task",
-        "assignee": "peer",
+        "assignee": "test-worker",
         "parents": [worker_env],
     })
     d = json.loads(out)
@@ -411,7 +445,65 @@ def test_create_happy_path(worker_env):
     try:
         child = kb.get_task(conn, d["task_id"])
         assert child.title == "child task"
-        assert child.assignee == "peer"
+        assert child.assignee == "test-worker"
+    finally:
+        conn.close()
+
+
+def test_worker_create_rejects_cross_profile_assignee(worker_env):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    rejected = json.loads(kt._handle_create({
+        "title": "cross-queue injection",
+        "assignee": "privileged-profile",
+    }))
+
+    assert rejected.get("ok") is not True
+    assert "own profile" in rejected.get("error", "")
+    conn = kb.connect()
+    try:
+        assert all(
+            task.title != "cross-queue injection"
+            for task in kb.list_tasks(conn)
+        )
+    finally:
+        conn.close()
+
+
+def test_worker_create_fails_closed_without_profile(monkeypatch, worker_env):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    monkeypatch.delenv("HERMES_PROFILE")
+    rejected = json.loads(kt._handle_create({
+        "title": "anonymous injection",
+        "assignee": "any-profile",
+    }))
+
+    assert rejected.get("ok") is not True
+    assert "HERMES_PROFILE" in rejected.get("error", "")
+    conn = kb.connect()
+    try:
+        assert all(task.title != "anonymous injection" for task in kb.list_tasks(conn))
+    finally:
+        conn.close()
+
+
+def test_orchestrator_create_cross_profile_allowed(monkeypatch, worker_env):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    monkeypatch.delenv("HERMES_KANBAN_TASK")
+    created = json.loads(kt._handle_create({
+        "title": "orchestrated work",
+        "assignee": "peer",
+    }))
+
+    assert created.get("ok") is True
+    conn = kb.connect()
+    try:
+        assert kb.get_task(conn, created["task_id"]).assignee == "peer"
     finally:
         conn.close()
 
@@ -487,7 +579,7 @@ def test_unblock_with_pending_parents_returns_todo(monkeypatch, tmp_path):
         conn.close()
 
 
-def test_worker_lifecycle_through_tools(worker_env):
+def test_worker_lifecycle_through_tools(monkeypatch, worker_env):
     """Drive the full claim -> heartbeat -> comment -> complete lifecycle
     exclusively through the tools, then verify the DB state matches what
     the dispatcher/notifier expect."""
@@ -509,12 +601,13 @@ def test_worker_lifecycle_through_tools(worker_env):
     # 4. spawn a child task for follow-up
     child_out = json.loads(kt._handle_create({
         "title": "write integration test",
-        "assignee": "qa",
+        "assignee": "test-worker",
         "parents": [worker_env],
     }))
     assert child_out["ok"]
 
-    # 5. complete with structured handoff
+    # 5. a distinct actor completes with the worker's structured handoff
+    monkeypatch.setenv("HERMES_PROFILE", "reviewer")
     comp = json.loads(kt._handle_complete({
         "summary": "implemented + spawned QA follow-up",
         "metadata": {"child_task": child_out["task_id"]},
@@ -588,8 +681,8 @@ def test_kanban_guidance_orchestrator_decision_ownership():
 # kanban_unblock) must refuse to operate
 # on any OTHER task id, even if the caller supplies an explicit `task_id`
 # argument. Workers legitimately call kanban_show / kanban_list /
-# kanban_comment / kanban_create / kanban_link on other tasks, so those
-# are unrestricted.
+# kanban_comment / kanban_link on other tasks. kanban_create is separately
+# limited to the worker's own profile so it cannot inject another queue.
 #
 # Orchestrator profiles (no HERMES_KANBAN_TASK in env) are intentionally
 # exempt — their job is routing, and they sometimes close out child
@@ -852,7 +945,7 @@ def test_create_subscribes_gateway_session(monkeypatch, worker_env):
 
     out = kt._handle_create({
         "title": "auto-sub gateway",
-        "assignee": "peer",
+        "assignee": "test-worker",
     })
     d = json.loads(out)
     assert d["ok"] is True
@@ -886,7 +979,7 @@ def test_create_subscribes_tui_session_via_session_key(monkeypatch, worker_env):
 
     out = kt._handle_create({
         "title": "auto-sub tui",
-        "assignee": "peer",
+        "assignee": "test-worker",
     })
     d = json.loads(out)
     assert d["ok"] is True
@@ -912,7 +1005,7 @@ def test_create_does_not_subscribe_in_cli_session(monkeypatch, worker_env):
 
     out = kt._handle_create({
         "title": "no sub cli",
-        "assignee": "peer",
+        "assignee": "test-worker",
     })
     d = json.loads(out)
     assert d["ok"] is True
@@ -941,7 +1034,7 @@ def test_create_respects_auto_subscribe_on_create_false(monkeypatch, worker_env,
     from tools import kanban_tools as kt
     out = kt._handle_create({
         "title": "no sub gated",
-        "assignee": "peer",
+        "assignee": "test-worker",
     })
     d = json.loads(out)
     assert d["ok"] is True
@@ -968,7 +1061,7 @@ def test_maybe_auto_subscribe_swallows_add_notify_sub_failure(monkeypatch, worke
 
     out = kt._handle_create({
         "title": "auto-sub tolerates add_notify_sub failure",
-        "assignee": "peer",
+        "assignee": "test-worker",
     })
     d = json.loads(out)
     assert d["ok"] is True, d
