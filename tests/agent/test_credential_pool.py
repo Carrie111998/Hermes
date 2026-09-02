@@ -24,19 +24,309 @@ def _jwt_with_claims(claims: dict) -> str:
     return f"{_part({'alg': 'none', 'typ': 'JWT'})}.{_part(claims)}.sig"
 
 
+def _codex_jwt(account_id: str, *, token_id: str | None = None) -> str:
+    claims: dict[str, object] = {
+        "https://api.openai.com/auth": {
+            "chatgpt_account_id": account_id,
+        }
+    }
+    if token_id is not None:
+        claims["jti"] = token_id
+    return _jwt_with_claims(claims)
 
 
+def test_codex_manual_entry_does_not_adopt_different_account_singleton(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    monkeypatch.setattr("hermes_cli.auth._import_codex_cli_tokens", lambda: None)
+    singleton_access = _codex_jwt("synthetic-account-a")
+    manual_access = _codex_jwt("synthetic-account-b")
+    _write_auth_store(
+        tmp_path,
+        {
+            "version": 1,
+            "providers": {
+                "openai-codex": {
+                    "tokens": {
+                        "access_token": singleton_access,
+                        "refresh_token": "synthetic-refresh-a",
+                    }
+                }
+            },
+            "credential_pool": {
+                "openai-codex": [
+                    {
+                        "id": "account-b",
+                        "label": "account-b",
+                        "auth_type": "oauth",
+                        "priority": 1,
+                        "source": "manual:device_code",
+                        "access_token": manual_access,
+                        "refresh_token": "synthetic-refresh-b",
+                        "last_status": "exhausted",
+                        "last_error_code": 401,
+                        "last_error_reason": "synthetic-stale-token",
+                    }
+                ]
+            },
+        },
+    )
+
+    from agent.credential_pool import load_pool
+
+    pool = load_pool("openai-codex")
+    manual = next(entry for entry in pool.entries() if entry.id == "account-b")
+    synced = pool._sync_codex_entry_from_auth_store(manual)
+
+    assert synced is manual
+    assert synced.access_token == manual_access
+    assert synced.refresh_token == "synthetic-refresh-b"
+    assert synced.last_status == "exhausted"
+    assert synced.last_error_code == 401
+    assert synced.last_error_reason == "synthetic-stale-token"
+
+    persisted = json.loads((tmp_path / "hermes" / "auth.json").read_text())
+    persisted_manual = next(
+        entry
+        for entry in persisted["credential_pool"]["openai-codex"]
+        if entry["id"] == "account-b"
+    )
+    assert persisted_manual["access_token"] == manual_access
+    assert persisted_manual["refresh_token"] == "synthetic-refresh-b"
 
 
+def test_codex_manual_entry_with_unknown_account_does_not_adopt_singleton(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    monkeypatch.setattr("hermes_cli.auth._import_codex_cli_tokens", lambda: None)
+    singleton_access = _codex_jwt("synthetic-account-a")
+    _write_auth_store(
+        tmp_path,
+        {
+            "version": 1,
+            "providers": {
+                "openai-codex": {
+                    "tokens": {
+                        "access_token": singleton_access,
+                        "refresh_token": "synthetic-refresh-a",
+                    }
+                }
+            },
+            "credential_pool": {
+                "openai-codex": [
+                    {
+                        "id": "unknown-account",
+                        "label": "unknown-account",
+                        "auth_type": "oauth",
+                        "priority": 1,
+                        "source": "manual:device_code",
+                        "access_token": "not-a-jwt",
+                        "refresh_token": "synthetic-refresh-unknown",
+                    }
+                ]
+            },
+        },
+    )
+
+    from agent.credential_pool import load_pool
+
+    pool = load_pool("openai-codex")
+    manual = next(entry for entry in pool.entries() if entry.id == "unknown-account")
+
+    assert pool._sync_codex_entry_from_auth_store(manual) is manual
+    assert manual.access_token == "not-a-jwt"
+    assert manual.refresh_token == "synthetic-refresh-unknown"
 
 
+def test_codex_manual_entry_adopts_matching_account_singleton(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    monkeypatch.setattr("hermes_cli.auth._import_codex_cli_tokens", lambda: None)
+    stale_access = _codex_jwt("synthetic-account-a", token_id="stale")
+    singleton_access = _codex_jwt("synthetic-account-a", token_id="fresh")
+    _write_auth_store(
+        tmp_path,
+        {
+            "version": 1,
+            "providers": {
+                "openai-codex": {
+                    "tokens": {
+                        "access_token": singleton_access,
+                        "refresh_token": "synthetic-refresh-a2",
+                    }
+                }
+            },
+            "credential_pool": {
+                "openai-codex": [
+                    {
+                        "id": "account-a",
+                        "label": "account-a",
+                        "auth_type": "oauth",
+                        "priority": 1,
+                        "source": "manual:device_code",
+                        "access_token": stale_access,
+                        "refresh_token": "synthetic-refresh-a1",
+                        "last_status": "exhausted",
+                    }
+                ]
+            },
+        },
+    )
+
+    from agent.credential_pool import load_pool
+
+    pool = load_pool("openai-codex")
+    manual = next(entry for entry in pool.entries() if entry.id == "account-a")
+    synced = pool._sync_codex_entry_from_auth_store(manual)
+
+    assert synced is not manual
+    assert synced.access_token == singleton_access
+    assert synced.refresh_token == "synthetic-refresh-a2"
+    assert synced.last_status is None
 
 
+def test_codex_manual_refresh_isolated_from_different_account_singleton(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    monkeypatch.setattr("hermes_cli.auth._import_codex_cli_tokens", lambda: None)
+    singleton_access = _codex_jwt("synthetic-account-a")
+    manual_access = _codex_jwt("synthetic-account-b")
+    refreshed_manual_access = _codex_jwt("synthetic-account-b")
+    _write_auth_store(
+        tmp_path,
+        {
+            "version": 1,
+            "providers": {
+                "openai-codex": {
+                    "tokens": {
+                        "access_token": singleton_access,
+                        "refresh_token": "synthetic-refresh-a",
+                    }
+                }
+            },
+            "credential_pool": {
+                "openai-codex": [
+                    {
+                        "id": "account-b",
+                        "label": "account-b",
+                        "auth_type": "oauth",
+                        "priority": 1,
+                        "source": "manual:device_code",
+                        "access_token": manual_access,
+                        "refresh_token": "synthetic-refresh-b",
+                    }
+                ]
+            },
+        },
+    )
+    refresh_calls = []
+
+    def _refresh(access_token, refresh_token):
+        refresh_calls.append((access_token, refresh_token))
+        return {
+            "access_token": refreshed_manual_access,
+            "refresh_token": "synthetic-refresh-b2",
+            "last_refresh": "synthetic-refresh-time",
+        }
+
+    monkeypatch.setattr("hermes_cli.auth.refresh_codex_oauth_pure", _refresh)
+
+    from agent.credential_pool import load_pool
+
+    pool = load_pool("openai-codex")
+    manual = next(entry for entry in pool.entries() if entry.id == "account-b")
+    refreshed = pool._refresh_entry(manual, force=True)
+
+    assert refreshed is not None
+    assert refresh_calls == [(manual_access, "synthetic-refresh-b")]
+    assert refreshed.access_token == refreshed_manual_access
+    assert refreshed.refresh_token == "synthetic-refresh-b2"
+
+    persisted = json.loads((tmp_path / "hermes" / "auth.json").read_text())
+    singleton_tokens = persisted["providers"]["openai-codex"]["tokens"]
+    assert singleton_tokens == {
+        "access_token": singleton_access,
+        "refresh_token": "synthetic-refresh-a",
+    }
 
 
+def test_codex_manual_terminal_refresh_does_not_quarantine_different_singleton(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    monkeypatch.setattr("hermes_cli.auth._import_codex_cli_tokens", lambda: None)
+    singleton_access = _codex_jwt("synthetic-account-a")
+    manual_access = _codex_jwt("synthetic-account-b")
+    _write_auth_store(
+        tmp_path,
+        {
+            "version": 1,
+            "providers": {
+                "openai-codex": {
+                    "tokens": {
+                        "access_token": singleton_access,
+                        "refresh_token": "synthetic-refresh-a",
+                    }
+                }
+            },
+            "credential_pool": {
+                "openai-codex": [
+                    {
+                        "id": "seeded-a",
+                        "label": "seeded-a",
+                        "auth_type": "oauth",
+                        "priority": 0,
+                        "source": "device_code",
+                        "access_token": singleton_access,
+                        "refresh_token": "synthetic-refresh-a",
+                    },
+                    {
+                        "id": "manual-b",
+                        "label": "manual-b",
+                        "auth_type": "oauth",
+                        "priority": 1,
+                        "source": "manual:device_code",
+                        "access_token": manual_access,
+                        "refresh_token": "synthetic-refresh-b",
+                    },
+                ]
+            },
+        },
+    )
 
+    from hermes_cli.auth import AuthError
 
+    def _terminal_refresh(*_args, **_kwargs):
+        raise AuthError(
+            "synthetic terminal refresh failure",
+            provider="openai-codex",
+            code="refresh_token_reused",
+            relogin_required=True,
+        )
 
+    monkeypatch.setattr("hermes_cli.auth.refresh_codex_oauth_pure", _terminal_refresh)
+
+    from agent.credential_pool import load_pool
+
+    pool = load_pool("openai-codex")
+    manual = next(entry for entry in pool.entries() if entry.id == "manual-b")
+
+    assert pool._refresh_entry(manual, force=True) is None
+    entries_by_id = {entry.id: entry for entry in pool.entries()}
+    assert "seeded-a" in entries_by_id
+    assert entries_by_id["manual-b"].last_status == "dead"
+    assert entries_by_id["manual-b"].last_error_reason == "refresh_token_reused"
+
+    persisted = json.loads((tmp_path / "hermes" / "auth.json").read_text())
+    assert persisted["providers"]["openai-codex"]["tokens"] == {
+        "access_token": singleton_access,
+        "refresh_token": "synthetic-refresh-a",
+    }
+    assert "seeded-a" in {
+        entry["id"] for entry in persisted["credential_pool"]["openai-codex"]
+    }
 
 
 def test_explicit_reset_timestamp_overrides_default_429_ttl(tmp_path, monkeypatch):

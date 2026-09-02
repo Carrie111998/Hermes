@@ -807,6 +807,38 @@ def _write_through_provider_state_to_global_root(
         )
 
 
+def _codex_chatgpt_account_id(access_token: Any) -> Optional[str]:
+    claims = _decode_jwt_claims(access_token)
+    auth_claims = claims.get("https://api.openai.com/auth")
+    if not isinstance(auth_claims, dict):
+        return None
+    account_id = auth_claims.get("chatgpt_account_id")
+    if not isinstance(account_id, str):
+        return None
+    account_id = account_id.strip()
+    return account_id or None
+
+
+def _codex_entry_tracks_singleton(
+    entry: PooledCredential,
+    singleton_tokens: Dict[str, Any],
+) -> bool:
+    if entry.source == "device_code":
+        return True
+    if entry.source != SOURCE_MANUAL_DEVICE_CODE:
+        return False
+
+    entry_account = _codex_chatgpt_account_id(entry.access_token)
+    singleton_account = _codex_chatgpt_account_id(
+        singleton_tokens.get("access_token")
+    )
+    return bool(
+        entry_account
+        and singleton_account
+        and entry_account == singleton_account
+    )
+
+
 class CredentialPool:
     def __init__(self, provider: str, entries: List[PooledCredential]):
         self.provider = provider
@@ -1147,11 +1179,12 @@ class CredentialPool:
         though fresh credentials are sitting on disk — and every request
         fails with "no available entries (all exhausted or empty)".
 
-        Mirrors the Nous/Anthropic resync paths above.  Only applies to
-        device_code-sourced entries; env/API-key-sourced entries have no
-        auth.json shadow to sync from.
+        Mirrors the Nous/Anthropic resync paths above. Applies to
+        singleton-seeded entries and to manual device-code entries only when
+        both access tokens identify the same ChatGPT account. Other manual
+        entries are independent credentials and fail closed.
         """
-        if self.provider != "openai-codex" or entry.source not in ("device_code", "manual:device_code"):
+        if self.provider != "openai-codex":
             return entry
         try:
             with _auth_store_lock():
@@ -1161,6 +1194,8 @@ class CredentialPool:
                 return entry
             tokens = state.get("tokens")
             if not isinstance(tokens, dict):
+                return entry
+            if not _codex_entry_tracks_singleton(entry, tokens):
                 return entry
             store_access = tokens.get("access_token", "")
             store_refresh = tokens.get("refresh_token", "")
@@ -2022,6 +2057,34 @@ class CredentialPool:
                 # remove all singleton-seeded (device_code) entries from the
                 # in-memory pool.  Mirrors the xAI and Nous quarantine paths.
                 if auth_mod._is_terminal_codex_oauth_refresh_error(exc):
+                    if entry.source == SOURCE_MANUAL_DEVICE_CODE:
+                        try:
+                            with _auth_store_lock():
+                                auth_store = _load_auth_store()
+                                state = _load_provider_state(
+                                    auth_store, "openai-codex"
+                                )
+                            singleton_tokens = (
+                                state.get("tokens")
+                                if isinstance(state, dict)
+                                else None
+                            )
+                        except Exception:
+                            singleton_tokens = None
+                        if not isinstance(
+                            singleton_tokens, dict
+                        ) or not _codex_entry_tracks_singleton(
+                            entry, singleton_tokens
+                        ):
+                            self._mark_exhausted(
+                                entry,
+                                401,
+                                {
+                                    "reason": getattr(exc, "code", None),
+                                    "message": str(exc),
+                                },
+                            )
+                            return None
                     logger.debug(
                         "Codex OAuth refresh token is terminally invalid; clearing local token state"
                     )
