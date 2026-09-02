@@ -849,6 +849,9 @@ def test_create_subscribes_gateway_session(monkeypatch, worker_env):
     monkeypatch.setenv("HERMES_SESSION_USER_ID", "user-9")
     monkeypatch.setenv("HERMES_SESSION_USER_ID_ALT", "alt-user-9")
     monkeypatch.setenv("HERMES_SESSION_CHAT_TYPE", "forum")
+    monkeypatch.setenv("HERMES_SESSION_PROFILE", "yuki")
+    monkeypatch.setenv("HERMES_SESSION_SCOPE_ID", "guild-3")
+    monkeypatch.setenv("HERMES_SESSION_PARENT_CHAT_ID", "parent-channel-2")
 
     out = kt._handle_create({
         "title": "auto-sub gateway",
@@ -868,6 +871,14 @@ def test_create_subscribes_gateway_session(monkeypatch, worker_env):
     assert s["user_id"] == "user-9"
     assert s["user_id_alt"] == "alt-user-9"
     assert s["chat_type"] == "forum"
+    assert s["notifier_profile"] == "yuki"
+    assert s["delivery_metadata"] == {
+        "thread_id": "thread-7",
+        "chat_type": "forum",
+        "scope_id": "guild-3",
+        "guild_id": "guild-3",
+        "parent_chat_id": "parent-channel-2",
+    }
     assert s["delivery_mode"] == "notify+wake"
 
 
