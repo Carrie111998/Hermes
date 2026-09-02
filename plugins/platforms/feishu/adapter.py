@@ -5503,27 +5503,31 @@ def _init_registration(domain: str = "feishu") -> None:
 
 def _begin_registration(domain: str = "feishu") -> dict:
     """Start the device-code flow. Returns device_code, qr_url, user_code, interval, expire_in."""
-    base_url = _accounts_base_url(domain)
+    # Official Lark CLI registration bootstraps on the Feishu accounts endpoint for both brands.
+    base_url = _accounts_base_url("feishu")
     res = _post_registration(base_url, {
         "action": "begin",
         "archetype": "PersonalAgent",
         "auth_method": "client_secret",
-        "request_user_info": "open_id",
+        "request_user_info": "open_id tenant_brand",
     })
     device_code = res.get("device_code")
     if not device_code:
         raise RuntimeError("Feishu / Lark registration did not return a device_code")
-    qr_url = res.get("verification_uri_complete", "")
-    if "?" in qr_url:
-        qr_url += "&from=hermes&tp=hermes"
-    else:
-        qr_url += "?from=hermes&tp=hermes"
+    user_code = res.get("user_code", "")
+    interval = res.get("interval") or 5
+    # Protocol field is expire_in; accept legacy expires_in spelling (larksuite/cli behavior).
+    expire_in = res.get("expire_in") or res.get("expires_in") or 600
+    # Build the verification URL for the target brand as /page/cli?user_code=...
+    # (do not consume the legacy verification_uri_complete, which now points to /page/launcher).
+    open_url = _onboard_open_base_url(domain)
+    qr_url = f"{open_url}/page/cli?user_code={user_code}&from=hermes&tp=hermes"
     return {
         "device_code": device_code,
         "qr_url": qr_url,
-        "user_code": res.get("user_code", ""),
-        "interval": res.get("interval") or 5,
-        "expire_in": res.get("expire_in") or 600,
+        "user_code": user_code,
+        "interval": interval,
+        "expire_in": expire_in,
     }
 
 
