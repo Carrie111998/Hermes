@@ -1094,10 +1094,30 @@ async def auth_native_refresh(request: Request, body: _NativeRefreshBody):
         }
 
     if unreachable is not None:
+        # Dual-logging (matches the provider_unreachable audits elsewhere in
+        # this module and the middleware). The per-provider WARNING above
+        # lands in agent.log, but the 503 raise pre-empted the audit_log
+        # below, so provider-unreachable refresh failures never reached the
+        # audit trail — 66% of a refresh storm was invisible in one log
+        # (#98338). Emit the audit record before raising.
+        audit_log(
+            AuditEvent.REFRESH_FAILURE,
+            provider=unreachable,
+            reason="provider_unreachable",
+            ip=_client_ip(request),
+        )
         raise HTTPException(
             status_code=503,
             detail=f"Auth provider {unreachable!r} unreachable",
         )
+    # The all-rejected path audit_logs below; also surface it in agent.log so a
+    # clean-rejection refresh storm is visible in the primary log, not only the
+    # audit trail (the mirror of the 503 gap above, #98338).
+    _log.warning(
+        "dashboard-auth: native refresh rejected by all providers "
+        "(refresh token expired/invalid) for ip=%s",
+        _client_ip(request),
+    )
     audit_log(
         AuditEvent.REFRESH_FAILURE,
         reason="all_providers_rejected_rt",
