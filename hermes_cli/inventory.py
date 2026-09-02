@@ -206,9 +206,18 @@ def build_models_payload(
         excluded_providers=ctx.excluded_providers or [],
     )
 
-    moa_row = _moa_provider_row(ctx.current_provider)
-    if moa_row is not None:
-        rows = [moa_row] + [r for r in rows if str(r.get("slug", "")).lower() != "moa"]
+    _excluded_slugs = {
+        str(p).strip().lower() for p in (ctx.excluded_providers or []) if p
+    }
+    if "moa" in _excluded_slugs:
+        # MoA is a virtual overlay provider but still honours
+        # ``model_catalog.excluded_providers``: drop the row entirely rather
+        # than reinserting it at the front.
+        rows = [r for r in rows if str(r.get("slug", "")).lower() != "moa"]
+    else:
+        moa_row = _moa_provider_row(ctx.current_provider)
+        if moa_row is not None:
+            rows = [moa_row] + [r for r in rows if str(r.get("slug", "")).lower() != "moa"]
 
     if explicit_only:
         rows = _filter_explicit_provider_rows(rows, ctx)

@@ -117,3 +117,118 @@ def test_cli_picker_hides_excluded_provider_by_alias(config_home):
     )
 
 
+# ---------------------------------------------------------------------------
+# Virtual MoA overlay row honours excluded_providers (#1)
+# ---------------------------------------------------------------------------
+#
+# ``moa`` is an ``auth_type="virtual"`` overlay provider that the gateway
+# picker (``list_picker_providers``) and CLI inventory (``build_models_payload``)
+# reinsert at the front of the provider list. It must respect the same
+# ``model_catalog.excluded_providers`` policy as credential-backed providers.
+
+_FAKE_MOA_ROW = {
+    "slug": "moa",
+    "name": "Mixture of Agents",
+    "is_current": False,
+    "is_user_defined": False,
+    "models": ["balanced"],
+    "total_models": 1,
+    "source": "virtual",
+    "authenticated": True,
+    "auth_type": "virtual",
+}
+
+
+def test_gateway_picker_does_not_reinsert_excluded_moa(monkeypatch):
+    """``list_picker_providers(include_moa=True, excluded_providers=["moa"])``
+    must not surface the virtual MoA row, even when a stale ``moa`` row is
+    already present in the base list."""
+    from hermes_cli import model_switch
+
+    monkeypatch.setattr(
+        model_switch, "list_authenticated_providers",
+        lambda **kw: [dict(_FAKE_MOA_ROW), _make_row("openai")],
+    )
+    monkeypatch.setattr("hermes_cli.inventory._moa_provider_row",
+                        lambda *_a, **_kw: dict(_FAKE_MOA_ROW))
+    monkeypatch.setattr("hermes_cli.models.fetch_openrouter_models",
+                        lambda *a, **kw: [])
+
+    rows = model_switch.list_picker_providers(
+        include_moa=True, excluded_providers=["moa"],
+    )
+    assert "moa" not in {str(r.get("slug", "")).lower() for r in rows}
+
+
+def test_inventory_omits_moa_when_excluded(monkeypatch):
+    """``build_models_payload`` must drop the virtual MoA row when ``moa`` is
+    in ``ctx.excluded_providers``."""
+    from hermes_cli import inventory
+    from hermes_cli.inventory import ConfigContext, build_models_payload
+
+    monkeypatch.setattr(
+        "hermes_cli.model_switch.list_authenticated_providers",
+        lambda **kw: [_make_row("openai")],
+    )
+    monkeypatch.setattr(inventory, "_moa_provider_row",
+                        lambda *_a, **_kw: dict(_FAKE_MOA_ROW))
+
+    ctx = ConfigContext(
+        current_provider="openai",
+        current_model="gpt-5",
+        current_base_url="",
+        user_providers={},
+        custom_providers=[],
+        excluded_providers=["moa"],
+    )
+    payload = build_models_payload(ctx)
+    slugs = {str(r.get("slug", "")).lower() for r in payload["providers"]}
+    assert "moa" not in slugs
+
+
+def test_moa_remains_visible_when_not_excluded(monkeypatch):
+    """Sanity: with no exclusion the virtual MoA row is still prepended by both
+    the gateway picker and the CLI inventory."""
+    from hermes_cli import inventory, model_switch
+    from hermes_cli.inventory import ConfigContext, build_models_payload
+
+    monkeypatch.setattr(
+        model_switch, "list_authenticated_providers",
+        lambda **kw: [_make_row("openai")],
+    )
+    monkeypatch.setattr(
+        "hermes_cli.model_switch.list_authenticated_providers",
+        lambda **kw: [_make_row("openai")],
+    )
+    monkeypatch.setattr(inventory, "_moa_provider_row",
+                        lambda *_a, **_kw: dict(_FAKE_MOA_ROW))
+    monkeypatch.setattr("hermes_cli.models.fetch_openrouter_models",
+                        lambda *a, **kw: [])
+
+    rows = model_switch.list_picker_providers(include_moa=True, excluded_providers=[])
+    assert rows[0]["slug"] == "moa"
+
+    ctx = ConfigContext(
+        current_provider="openai",
+        current_model="gpt-5",
+        current_base_url="",
+        user_providers={},
+        custom_providers=[],
+        excluded_providers=[],
+    )
+    payload = build_models_payload(ctx)
+    assert payload["providers"][0]["slug"] == "moa"
+
+
+def _make_row(slug, models=("m1",)):
+    return {
+        "slug": slug,
+        "name": slug.title(),
+        "is_current": False,
+        "is_user_defined": False,
+        "models": list(models),
+        "total_models": len(models),
+        "source": "built-in",
+    }
+
+
