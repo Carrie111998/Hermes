@@ -86,9 +86,20 @@ def fake_core(monkeypatch, tmp_path):
     calls: list[dict] = []
     target = tmp_path / "fake-installed"
 
-    def fake(identifier, *, force, ref=None, skip_removed_check=False,
-             scan_decision_cb=None):
+    def fake(
+        identifier,
+        *,
+        force,
+        ref=None,
+        skip_removed_check=False,
+        scan_decision_cb=None,
+        metadata_extra=None,
+        catalog_entry=None,
+        enable_on_commit=False,
+    ):
         target.mkdir(parents=True, exist_ok=True)
+        if catalog_entry is not None:
+            plugins_cmd._write_catalog_sidecar(target, catalog_entry, strict=True)
         calls.append(
             {
                 "identifier": identifier,
@@ -256,7 +267,7 @@ class TestCatalogUpdate:
                 "installed_at": "2026-01-01T00:00:00Z",
             },
         )
-        plugins_cmd._save_enabled_set({"my-entry"})
+        plugins_cmd._mutate_plugin_state(enable={"my-entry"})
         plugins_cmd.cmd_update("my-entry")
         assert "my-entry" in plugins_cmd._get_enabled_set()
 

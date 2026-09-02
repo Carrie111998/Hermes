@@ -11794,29 +11794,34 @@ def _maybe_setup_dashboard_auth_interactively(args) -> None:
     secret = secrets.token_urlsafe(32)
 
     try:
-        from hermes_cli.config import load_config, save_config
+        from hermes_cli.config import config_write_lock, load_config, save_config
         from hermes_cli.plugins_cmd import ensure_basic_auth_plugin_enabled_in_config
 
-        cfg = load_config()
-        dash = cfg.setdefault("dashboard", {})
-        basic = dash.setdefault("basic_auth", {})
-        basic["username"] = username
-        basic["password_hash"] = password_hash
-        # Never persist plaintext: clear any stale plaintext password key.
-        basic["password"] = ""
-        if not str(basic.get("secret", "") or "").strip():
-            basic["secret"] = secret
-        # The bundled basic provider is a backend plugin that still honours
-        # plugins.disabled. Unblock it when we just wrote basic_auth so the
-        # discover_plugins(force=True) call below can register the provider
-        # (#54489). Surface the mutation so an operator who deliberately
-        # disabled it isn't surprised.
-        if ensure_basic_auth_plugin_enabled_in_config(cfg):
-            print(
-                "  ✓ Re-enabled the bundled 'basic' auth plugin "
-                "(was in plugins.disabled)"
+        with config_write_lock():
+            cfg = load_config()
+            dash = cfg.setdefault("dashboard", {})
+            basic = dash.setdefault("basic_auth", {})
+            basic["username"] = username
+            basic["password_hash"] = password_hash
+            # Never persist plaintext: clear any stale plaintext password key.
+            basic["password"] = ""
+            if not str(basic.get("secret", "") or "").strip():
+                basic["secret"] = secret
+            # The bundled basic provider is a backend plugin that still honours
+            # plugins.disabled. Unblock it when we just wrote basic_auth so the
+            # discover_plugins(force=True) call below can register the provider
+            # (#54489). Surface the mutation so an operator who deliberately
+            # disabled it isn't surprised.
+            if ensure_basic_auth_plugin_enabled_in_config(cfg):
+                print(
+                    "  ✓ Re-enabled the bundled 'basic' auth plugin "
+                    "(was in plugins.disabled)"
+                )
+            save_config(
+                cfg,
+                preserve_plugin_state=False,
+                preserve_platform_toolsets=False,
             )
-        save_config(cfg)
     except Exception as exc:
         print(f"  ✗ Failed to write config.yaml: {exc}")
         sys.exit(1)

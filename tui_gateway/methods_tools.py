@@ -2466,20 +2466,22 @@ def _(rid, params: dict) -> dict:
             _plugin_status,
             _read_catalog_sidecar,
         )
-
-        def _catalog_pins():
-            """{catalog_name: pinned_sha} from the live catalog (best effort)."""
-            try:
-                from hermes_cli.plugin_catalog import load_catalog_live
-
-                return {e.name: e.sha for e in load_catalog_live()}
-            except Exception:
-                return {}
+        from tui_gateway.plugin_marketplace_actions import (
+            MARKETPLACE_ACTIONS,
+            MarketplaceRequestError,
+            catalog_install_args,
+            catalog_pins,
+            manage_marketplace,
+            update_plugin,
+        )
 
         def _rows():
             enabled = _get_enabled_set()
             disabled = _get_disabled_set()
-            pins = _catalog_pins()
+            pins = catalog_pins()
+            from hermes_cli.plugins_cmd import _read_install_metadata
+
+            install_metadata = _read_install_metadata()
             out = []
             for name, version, desc, source, _dir, key in sorted(
                 _discover_all_plugins()
@@ -2499,35 +2501,65 @@ def _(rid, params: dict) -> dict:
                     "name": name,
                     # Canonical registry key (e.g. ``image_gen/fal``). Names
                     # can collide across category dirs — both fal backends
-                    # are named "fal" — so toggles must address the key.
+                    # are named "fal" — so mutations must address the key.
                     "key": key,
                     "version": str(version or ""),
                     "description": desc or "",
                     "source": source,
                     "status": status,
-                    # Agent Plugins v1 package (plugin.json — the portable
-                    # skills/MCP format) vs a native Hermes plugin.
                     "portable": _is_portable_plugin_dir(_dir),
                 }
-                # Catalog provenance (``.hermes-catalog.json`` sidecar) +
-                # whether the catalog pin has moved past the installed SHA —
-                # powers the desktop's "Update to <pin>" affordance.
-                try:
-                    sidecar = _read_catalog_sidecar(_Path(_dir)) if _dir else None
-                except Exception:
-                    sidecar = None
-                if sidecar and sidecar.get("catalog_name"):
-                    catalog_name = str(sidecar["catalog_name"])
-                    installed_sha = str(sidecar.get("sha") or "").lower()
-                    pin = pins.get(catalog_name)
-                    row["catalog_name"] = catalog_name
-                    row["catalog_tier"] = str(sidecar.get("tier") or "community")
-                    row["installed_sha"] = installed_sha
+                plugin_dir_name = _Path(_dir).name if _dir else ""
+                provenance = install_metadata.get(key) if key == plugin_dir_name else None
+                if isinstance(provenance, dict) and provenance.get("marketplace_id"):
+                    marketplace_id = str(provenance["marketplace_id"])
+                    plugin_name = str(provenance.get("marketplace_plugin_name") or name)
+                    pin = pins.get((marketplace_id, plugin_name))
+                    installed_tree = str(
+                        provenance.get("installed_tree_sha") or ""
+                    ).lower()
+                    row.update(
+                        {
+                            "marketplace_id": marketplace_id,
+                            "marketplace_name": str(
+                                provenance.get("marketplace_name") or marketplace_id
+                            ),
+                            "marketplace_plugin_name": plugin_name,
+                            "installed_repo_sha": str(
+                                provenance.get("installed_repo_sha") or ""
+                            ).lower(),
+                            "installed_tree_sha": installed_tree,
+                            "marketplace_available": pin is not None,
+                        }
+                    )
                     if pin:
-                        row["catalog_sha"] = pin
+                        current_tree = str(pin["tree_sha"]).lower()
+                        row["current_repo_sha"] = str(pin["sha"]).lower()
+                        row["current_tree_sha"] = current_tree
                         row["update_available"] = bool(
-                            installed_sha and installed_sha != pin
+                            installed_tree and current_tree and installed_tree != current_tree
                         )
+                else:
+                    # Official catalogue provenance remains in the parent PR's
+                    # in-package sidecar for backwards compatibility.
+                    try:
+                        sidecar = _read_catalog_sidecar(_Path(_dir)) if _dir else None
+                    except Exception:
+                        sidecar = None
+                    if sidecar and sidecar.get("catalog_name"):
+                        catalog_name = str(sidecar["catalog_name"])
+                        installed_sha = str(sidecar.get("sha") or "").lower()
+                        pin = pins.get(("official", catalog_name))
+                        row["catalog_name"] = catalog_name
+                        row["catalog_tier"] = str(
+                            sidecar.get("tier") or "community"
+                        )
+                        row["installed_sha"] = installed_sha
+                        if pin:
+                            row["catalog_sha"] = pin["sha"]
+                            row["update_available"] = bool(
+                                installed_sha and installed_sha != pin["sha"]
+                            )
                 out.append(row)
             return out
 
@@ -2542,6 +2574,12 @@ def _(rid, params: dict) -> dict:
                     "bundled_count": len(rows) - user_count,
                 },
             )
+
+        if action in MARKETPLACE_ACTIONS:
+            try:
+                return _ok(rid, manage_marketplace(action, params))
+            except MarketplaceRequestError as exc:
+                return _err(rid, exc.code, str(exc))
 
         if action == "toggle":
             from hermes_cli.plugins_cmd import dashboard_set_agent_plugin_enabled
@@ -2571,74 +2609,26 @@ def _(rid, params: dict) -> dict:
         if action == "install":
             from hermes_cli.plugins_cmd import dashboard_install_plugin
 
-            ident = (
-                params.get("identifier") or params.get("repo") or ""
-            ).strip()
-            # Curated-catalog install: resolve repo + pinned SHA server-side
-            # (same contract as the dashboard endpoint). ``catalog_name``
-            # alone is enough — identifier may be empty.
-            catalog_name = str(params.get("catalog_name") or "").strip()
-            if not ident and not catalog_name:
-                return _err(
-                    rid, 4019,
-                    "plugins.install requires 'identifier', 'repo', or 'catalog_name'",
-                )
+            try:
+                ident, catalog_name, catalog_source = catalog_install_args(params)
+            except MarketplaceRequestError as exc:
+                return _err(rid, exc.code, str(exc))
             result = dashboard_install_plugin(
                 ident,
                 force=bool(params.get("force")),
                 enable=params.get("enable", True),
                 catalog_name=catalog_name or None,
+                catalog_source=catalog_source,
             )
             if not result.get("ok"):
                 return _err(rid, 5026, result.get("error") or "install failed")
             return _ok(rid, result)
 
         if action == "update":
-            # Catalog installs only: re-pin to the current catalog SHA (the
-            # same semantics as `hermes plugins update <name>` for sidecar
-            # installs). Non-catalog installs keep their CLI-only flows.
-            from hermes_cli.plugins_cmd import (
-                _catalog_install_identifier,
-                _get_live_catalog_entry,
-                _install_plugin_core,
-                _plugins_dir,
-                _write_catalog_sidecar,
-                PluginOperationError,
-            )
-
-            name = (params.get("name") or "").strip()
-            if not name:
-                return _err(rid, 4019, "plugins.update requires a 'name'")
-            target = _plugins_dir() / name
-            sidecar = _read_catalog_sidecar(target) if target.is_dir() else None
-            if not sidecar or not sidecar.get("catalog_name"):
-                return _err(
-                    rid, 4020,
-                    f"'{name}' is not a catalog install — update it via the CLI",
-                )
-            entry = _get_live_catalog_entry(str(sidecar["catalog_name"]))
-            if entry is None:
-                return _err(
-                    rid, 4021,
-                    f"'{sidecar['catalog_name']}' is no longer in the catalog",
-                )
-            installed_sha = str(sidecar.get("sha") or "").lower()
-            if installed_sha == entry.sha:
-                return _ok(rid, {"ok": True, "unchanged": True, "sha": entry.sha})
-            was_enabled = _get_enabled_set()
             try:
-                new_target, _manifest, _installed = _install_plugin_core(
-                    _catalog_install_identifier(entry),
-                    force=True,
-                    ref=entry.sha,
-                )
-            except PluginOperationError as e:
-                return _err(rid, 5026, str(e))
-            _write_catalog_sidecar(new_target, entry)
-            from hermes_cli.plugins_cmd import _save_enabled_set
-
-            _save_enabled_set(was_enabled)
-            return _ok(rid, {"ok": True, "unchanged": False, "sha": entry.sha})
+                return _ok(rid, update_plugin(params))
+            except MarketplaceRequestError as exc:
+                return _err(rid, exc.code, str(exc))
 
         return _err(rid, 4017, f"unknown plugins action: {action}")
     except Exception as e:

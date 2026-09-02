@@ -108,6 +108,15 @@ def _prune_env_pool_entries(env_var: str) -> List[str]:
 
 
 def _scrub_config_yaml_mirrors(old_value: str, new_value: str | None) -> List[str]:
+    from hermes_cli.config import config_write_lock
+
+    with config_write_lock():
+        return _scrub_config_yaml_mirrors_locked(old_value, new_value)
+
+
+def _scrub_config_yaml_mirrors_locked(
+    old_value: str, new_value: str | None
+) -> List[str]:
     """Reconcile config.yaml api_key mirrors that hold ``old_value``.
 
     Value-matched on purpose: we only touch a config entry when it provably
@@ -121,12 +130,9 @@ def _scrub_config_yaml_mirrors(old_value: str, new_value: str | None) -> List[st
     """
     if not old_value:
         return []
-    from utils import atomic_yaml_write, fast_safe_load
+    from utils import fast_safe_load
 
-    from hermes_cli.config import (
-        get_config_path,
-        require_readable_config_before_write,
-    )
+    from hermes_cli.config import atomic_config_write, get_config_path
 
     config_path = get_config_path()
     if not config_path.exists():
@@ -170,8 +176,7 @@ def _scrub_config_yaml_mirrors(old_value: str, new_value: str | None) -> List[st
             _fix(entry, f"custom_providers.{name}")
 
     if touched:
-        require_readable_config_before_write(config_path)
-        atomic_yaml_write(config_path, user_config, sort_keys=False)
+        atomic_config_write(config_path, user_config, sort_keys=False)
     return touched
 
 

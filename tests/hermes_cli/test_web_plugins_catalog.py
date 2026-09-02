@@ -240,7 +240,16 @@ class TestDashboardPluginCatalog:
 
         captured = {}
 
-        def fake_core(identifier, *, force, ref=None, skip_removed_check=False):
+        def fake_core(
+            identifier,
+            *,
+            force,
+            ref=None,
+            skip_removed_check=False,
+            metadata_extra=None,
+            catalog_entry=None,
+            enable_on_commit=False,
+        ):
             captured["identifier"] = identifier
             captured["ref"] = ref
             target = get_hermes_home() / "plugins" / "alpha-plugin"
@@ -248,6 +257,8 @@ class TestDashboardPluginCatalog:
             (target / "plugin.yaml").write_text(
                 yaml.safe_dump({"name": "alpha-plugin"}), encoding="utf-8"
             )
+            if catalog_entry is not None:
+                plugins_cmd._write_catalog_sidecar(target, catalog_entry, strict=True)
             return target, {"name": "alpha-plugin"}, "alpha-plugin"
 
         monkeypatch.setattr(plugins_cmd, "_install_plugin_core", fake_core)
