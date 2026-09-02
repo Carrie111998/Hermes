@@ -922,6 +922,7 @@ class A2AAdapter(BasePlatformAdapter):
             try:
                 proc = subprocess.run(
                     cmd, capture_output=True, text=True, timeout=timeout,
+                    encoding="utf-8", errors="replace",
                     env=env, check=False, stdin=subprocess.DEVNULL,
                 )
             except subprocess.TimeoutExpired:
@@ -930,13 +931,30 @@ class A2AAdapter(BasePlatformAdapter):
                 return security.redact_outbound(f"Profile dispatch failed: {e}"), protocol.STATE_FAILED
             if proc.returncode != 0:
                 msg = (proc.stderr or proc.stdout or f"profile exited {proc.returncode}").strip()
-                return security.redact_outbound(msg[-2000:]), protocol.STATE_FAILED
+                logger.error(
+                    "a2a: profile %r exited %d; stderr tail: %s",
+                    profile, proc.returncode, msg[-2000:],
+                )
+                return security.redact_outbound(
+                    f"[profile exited {proc.returncode}; see gateway logs for details]"
+                ), protocol.STATE_FAILED
             if not session_id:
                 session_id = self._latest_a2a_session(profile, start)
                 if session_id:
                     self._profile_sessions[key] = session_id
                     self._title_forward_session(profile, session_id, session_title)
-            return security.redact_outbound((proc.stdout or "").strip()), protocol.STATE_COMPLETED
+            _out = (proc.stdout or "").strip()
+            if not _out:
+                _err = (proc.stderr or "").strip()
+                if _err:
+                    logger.error(
+                        "a2a: profile %r produced no stdout (rc=%d); stderr tail: %s",
+                        profile, proc.returncode, _err[-2000:],
+                    )
+                return security.redact_outbound(
+                    f"[profile produced no output (rc={proc.returncode})]"
+                ), protocol.STATE_FAILED
+            return security.redact_outbound(_out), protocol.STATE_COMPLETED
 
     def _finalize_task(self, pending: dict, state: str, reply: str) -> tuple[str, str]:
         """Record the outcome of a dispatched task. Returns (state, reply) after
