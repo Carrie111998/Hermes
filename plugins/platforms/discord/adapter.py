@@ -478,6 +478,7 @@ _GATE_ENV_KEYS = (
     "DISCORD_MISSED_MESSAGE_BACKFILL_CHANNELS",
     "DISCORD_ALLOW_ALL_USERS",
     "DISCORD_ALLOW_BOTS",
+    "DISCORD_DISABLE_DMS",
     "GATEWAY_ALLOW_ALL_USERS",
     "GATEWAY_ALLOWED_USERS",
 )
@@ -1385,7 +1386,7 @@ class DiscordAdapter(BasePlatformAdapter):
             # fail bots that never enabled Members Intent in the Developer Portal.
             intents = Intents.default()
             intents.message_content = True
-            intents.dm_messages = True
+            intents.dm_messages = not self._discord_disable_dms()
             intents.guild_messages = True
             intents.members = _needs_server_members_intent(
                 self._allowed_user_ids,
@@ -1611,6 +1612,8 @@ class DiscordAdapter(BasePlatformAdapter):
         elif self._dedup.contains(message_id):
             return False, False
         if message.author == self._client.user:
+            return False, False
+        if self._discord_message_is_dm(message) and self._discord_disable_dms():
             return False, False
         if message.type not in {discord.MessageType.default, discord.MessageType.reply}:
             return False, False
@@ -5240,6 +5243,8 @@ class DiscordAdapter(BasePlatformAdapter):
         """
         chan_obj = getattr(interaction, "channel", None)
         in_dm = isinstance(chan_obj, discord.DMChannel) if chan_obj is not None else False
+        if in_dm and self._discord_disable_dms():
+            return False, "dms_disabled"
 
         channel_ids: set = set()
         channel_keys: set = set()
@@ -5334,6 +5339,16 @@ class DiscordAdapter(BasePlatformAdapter):
         allowed, reason = self._evaluate_slash_authorization(interaction)
         if allowed:
             return True
+        if reason == "dms_disabled":
+            logger.info("[Discord] ignoring slash in DM (DISCORD_DISABLE_DMS)")
+            try:
+                await interaction.response.send_message(
+                    "This bot doesn't answer DMs. Please ask in a server channel.",
+                    ephemeral=True,
+                )
+            except Exception:
+                pass
+            return False
         return await self._reject_slash(
             interaction, command_text, reason=reason or "unauthorized",
         )
@@ -6754,6 +6769,27 @@ class DiscordAdapter(BasePlatformAdapter):
     def _get_no_thread_channels(self) -> set:
         """This adapter's DISCORD_NO_THREAD_CHANNELS list (per-profile)."""
         return self._gate_csv_set(self._gate_raw("no_thread_channels", "DISCORD_NO_THREAD_CHANNELS"))
+
+    def _discord_disable_dms(self) -> bool:
+        """True when incoming Discord DMs must be ignored.
+
+        Community bots often keep help in public channels. Honors profile env
+        ``DISCORD_DISABLE_DMS`` and ``discord.disable_dms`` in config.yaml.
+        """
+        raw = self._gate_raw("disable_dms", "DISCORD_DISABLE_DMS")
+        if raw is None:
+            return False
+        if isinstance(raw, str):
+            return raw.strip().lower() in {"true", "1", "yes", "on"}
+        return bool(raw)
+
+    @staticmethod
+    def _discord_message_is_dm(message: Any) -> bool:
+        channel = getattr(message, "channel", None)
+        dm_type = getattr(discord, "DMChannel", None)
+        if dm_type is not None and isinstance(channel, dm_type):
+            return True
+        return getattr(message, "guild", None) is None
 
     def _get_allowed_users(self) -> set:
         """This adapter's DISCORD_ALLOWED_USERS entries (per-profile, cleaned)."""
@@ -8177,6 +8213,8 @@ class DiscordAdapter(BasePlatformAdapter):
         recovered: bool = False,
     ) -> bool:
         """Handle one Discord message and report whether it reached dispatch."""
+        if self._discord_message_is_dm(message) and self._discord_disable_dms():
+            return False
         # In server channels (not DMs), require the bot to be @mentioned
         # UNLESS the channel is in the free-response list or the message is
         # in a thread where the bot has already participated.
@@ -10550,6 +10588,10 @@ def _apply_yaml_config(yaml_cfg: dict, discord_cfg: dict) -> dict | None:
             os.environ["DISCORD_FREE_RESPONSE_CHANNELS"] = str(frc)
     if "auto_thread" in discord_cfg and not os.getenv("DISCORD_AUTO_THREAD"):
         os.environ["DISCORD_AUTO_THREAD"] = str(discord_cfg["auto_thread"]).lower()
+    if "disable_dms" in discord_cfg:
+        seeded_extra["disable_dms"] = str(discord_cfg["disable_dms"]).lower()
+        if not _skip_env_bridge and not os.getenv("DISCORD_DISABLE_DMS"):
+            os.environ["DISCORD_DISABLE_DMS"] = str(discord_cfg["disable_dms"]).lower()
     if "reactions" in discord_cfg and not os.getenv("DISCORD_REACTIONS"):
         os.environ["DISCORD_REACTIONS"] = str(discord_cfg["reactions"]).lower()
     backfill_cfg = discord_cfg.get("missed_message_backfill")
