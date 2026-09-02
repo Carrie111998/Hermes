@@ -389,10 +389,21 @@ def _check_via_local_git(repo_dir: Path) -> Optional[int]:
             return None
         if head_rev == target_rev:
             return 0
-        # Tips differ but the shallow boundary hides the history between them.
-        # Recover the exact count from the GitHub compare API when possible
-        # (ahead_by == 0 means local-ahead ⇒ up to date); otherwise report the
-        # honest "update available, count unknown" sentinel.
+        # Tips differ, but that alone does not mean behind: a carried local
+        # commit puts HEAD *ahead* of the fetched tip. Ask git first — it can
+        # answer from the fetched objects even across the shallow boundary,
+        # and it is the only source that knows about a commit which exists
+        # nowhere but this machine. Without this, such a commit 404s on the
+        # compare API below and the sentinel nags for an update that can never
+        # clear it, since the carried work is the whole point.
+        ancestor = subprocess.run(
+            ["git", "merge-base", "--is-ancestor", target_rev, "HEAD"],
+            capture_output=True, timeout=5, cwd=str(repo_dir),
+        )
+        if ancestor.returncode == 0:
+            return 0
+        # Genuinely behind: recover the exact count from the GitHub compare API
+        # when possible; otherwise report the honest "count unknown" sentinel.
         counted = _github_compare_behind(head_rev, target_rev)
         return counted if counted is not None else UPDATE_AVAILABLE_NO_COUNT
 

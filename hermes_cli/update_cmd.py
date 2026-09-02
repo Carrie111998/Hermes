@@ -4710,10 +4710,37 @@ def _cmd_update_check(branch: str = "main", *, branch_explicit: bool = False):
             from hermes_cli.banner import _github_compare_behind
             from hermes_cli.config import recommended_update_command
 
+            # Differing tips are not proof of being behind: a carried local
+            # commit puts HEAD ahead of the fetched tip. Ask git before the
+            # compare API, which cannot see a commit that exists only here and
+            # would otherwise report a permanent, unclearable "update
+            # available" (mirrors the banner's shallow path).
+            #
+            # A non-zero exit means "not an ancestor". An exception means git
+            # could not answer at all, which is not the same fact — so a failed
+            # run leaves the question open instead of resolving it against the
+            # user, whose carried work an unnecessary update could discard.
+            ancestry_known = True
+            try:
+                ancestor = subprocess.run(
+                    git_cmd + ["merge-base", "--is-ancestor", target_sha, "HEAD"],
+                    cwd=_m().PROJECT_ROOT, capture_output=True, timeout=5,
+                )
+            except (OSError, subprocess.SubprocessError):
+                ancestry_known = False
+            else:
+                if ancestor.returncode == 0:
+                    print("✓ Already up to date.")
+                    return
+
             counted = _github_compare_behind(head_sha, target_sha)
             if counted == 0:
                 # Local commits on top of the remote tip — not behind.
                 print("✓ Already up to date.")
+                return
+            if counted is None and not ancestry_known:
+                # Neither git nor the compare API could answer.
+                print(f"⚕ Update status unknown (could not compare with {compare_branch}).")
                 return
             if counted is not None:
                 commits_word = "commit" if counted == 1 else "commits"
