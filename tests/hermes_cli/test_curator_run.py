@@ -50,3 +50,21 @@ def test_dry_run_default_reports_synchronous_wording(monkeypatch, capsys):
     out = capsys.readouterr().out
     assert "When the report lands" not in out
     assert "Read the report with `hermes curator status`" in out
+
+
+def test_run_reports_existing_curator_pass(monkeypatch, capsys):
+    import agent.curator as curator_state
+    import hermes_cli.curator as curator_cli
+
+    monkeypatch.setattr(curator_state, "is_enabled", lambda: True)
+    monkeypatch.setattr(
+        curator_state,
+        "run_curator_review",
+        lambda **_kwargs: {"started": False, "reason": "already_running"},
+    )
+
+    assert curator_cli._cmd_run(_args()) == 1
+
+    out = capsys.readouterr().out
+    assert "another review pass is already running" in out
+    assert "llm pass running in background" not in out

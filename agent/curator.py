@@ -21,6 +21,7 @@ Strict invariants:
 
 from __future__ import annotations
 
+import errno
 import json
 import logging
 import os
@@ -35,6 +36,16 @@ from tools import skill_usage
 from utils import atomic_json_write
 
 logger = logging.getLogger(__name__)
+
+try:  # pragma: no cover - platform-dependent import
+    import fcntl
+except ImportError:  # pragma: no cover - Windows
+    fcntl = None  # type: ignore[assignment]
+
+try:  # pragma: no cover - platform-dependent import
+    import msvcrt
+except ImportError:  # pragma: no cover - POSIX
+    msvcrt = None  # type: ignore[assignment]
 
 
 def _strip_aux_credential(value: Any) -> Optional[str]:
@@ -76,6 +87,83 @@ DEFAULT_ARCHIVE_AFTER_DAYS = 90
 # whenever the curator is enabled; only the opinionated, aux-model-cost
 # consolidation pass is opt-in.
 DEFAULT_CONSOLIDATE = False
+
+
+class _CuratorRunLock:
+    """Owned cross-process lock for one complete curator pass."""
+
+    def __init__(self, handle: Any) -> None:
+        self._handle = handle
+
+    def release(self) -> None:
+        """Release once; safe to call again during exception unwinding."""
+        handle = self._handle
+        if handle is None:
+            return
+        self._handle = None
+        try:
+            if fcntl is not None:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            elif msvcrt is not None:
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+        except OSError as e:
+            logger.debug("Failed to release curator run lock: %s", e)
+        finally:
+            try:
+                handle.close()
+            except OSError:
+                pass
+
+
+def _curator_run_lock_path() -> Path:
+    """Profile-scoped lock path outside the rollback-managed skills tree."""
+    return get_hermes_home() / ".curator-run.lock"
+
+
+def _is_run_lock_contention(error: OSError) -> bool:
+    if error.errno is None:
+        return False
+    if fcntl is not None:
+        return error.errno in (errno.EACCES, errno.EAGAIN, errno.EWOULDBLOCK)
+    if msvcrt is not None:
+        return error.errno in (errno.EACCES, errno.EAGAIN, errno.EDEADLK)
+    return False
+
+
+def _try_acquire_curator_run_lock() -> Optional[_CuratorRunLock]:
+    """Acquire the curator run lock without waiting.
+
+    ``None`` means another process owns the pass. Other open/lock failures are
+    raised so callers do not misreport a broken lock as ordinary contention.
+    """
+    if fcntl is None and msvcrt is None:
+        raise RuntimeError("no supported file-lock backend for curator")
+
+    path = _curator_run_lock_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    handle = open(path, "a+b")
+    try:
+        # msvcrt locks a byte range at the current file position. Ensure byte
+        # zero exists and seek to it before every lock/unlock operation.
+        if msvcrt is not None:
+            handle.seek(0, os.SEEK_END)
+            if handle.tell() == 0:
+                handle.write(b" ")
+                handle.flush()
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError as e:
+        try:
+            handle.close()
+        except OSError:
+            pass
+        if _is_run_lock_contention(e):
+            return None
+        raise
+    return _CuratorRunLock(handle)
 
 
 # ---------------------------------------------------------------------------
@@ -1553,7 +1641,37 @@ def run_curator_review(
     can read what the curator WOULD have done. A dry-run also honors
     *consolidate*: when consolidation is off, the preview only reports the
     deterministic prune candidates.
+
+    Only one process may own a pass for a profile at a time. The lock spans
+    the complete background review, not just its scheduling preamble.
     """
+    run_lock = _try_acquire_curator_run_lock()
+    if run_lock is None:
+        logger.debug("Curator pass skipped - another process holds the run lock")
+        return {"started": False, "reason": "already_running"}
+
+    try:
+        return _run_curator_review_locked(
+            on_summary=on_summary,
+            synchronous=synchronous,
+            dry_run=dry_run,
+            consolidate=consolidate,
+            run_lock=run_lock,
+        )
+    except BaseException:
+        run_lock.release()
+        raise
+
+
+def _run_curator_review_locked(
+    *,
+    on_summary: Optional[Callable[[str], None]],
+    synchronous: bool,
+    dry_run: bool,
+    consolidate: Optional[bool],
+    run_lock: _CuratorRunLock,
+) -> Dict[str, Any]:
+    """Execute a pass while transferring lock ownership to its worker."""
     if consolidate is None:
         consolidate = get_consolidate()
     start = datetime.now(timezone.utc)
@@ -1771,13 +1889,24 @@ def run_curator_review(
             except Exception:
                 pass
 
+    def _llm_pass_and_release() -> None:
+        try:
+            _llm_pass()
+        finally:
+            run_lock.release()
+
     if synchronous:
-        _llm_pass()
+        _llm_pass_and_release()
     else:
-        t = threading.Thread(target=_llm_pass, daemon=True, name="curator-review")
+        t = threading.Thread(
+            target=_llm_pass_and_release,
+            daemon=True,
+            name="curator-review",
+        )
         t.start()
 
     return {
+        "started": True,
         "started_at": start.isoformat(),
         "auto_transitions": counts,
         "summary_so_far": auto_summary,
@@ -2051,7 +2180,8 @@ def maybe_run_curator(
             min_idle_s = get_min_idle_hours() * 3600.0
             if idle_for_seconds < min_idle_s:
                 return None
-        return run_curator_review(on_summary=on_summary)
+        result = run_curator_review(on_summary=on_summary)
+        return result if result.get("started") is not False else None
     except Exception as e:
         logger.debug("maybe_run_curator failed: %s", e, exc_info=True)
         return None

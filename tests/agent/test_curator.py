@@ -395,11 +395,57 @@ def test_run_review_records_state(curator_env):
     u.mark_agent_created("a")
 
     result = c.run_curator_review(synchronous=True)
+    assert result["started"] is True
     assert "started_at" in result
     state = c.load_state()
     assert state["last_run_at"] is not None
     assert state["run_count"] >= 1
     assert state["last_run_summary"] is not None
+
+
+def test_run_review_skips_when_run_lock_is_held(curator_env):
+    c = curator_env["curator"]
+    lock = c._try_acquire_curator_run_lock()
+    assert lock is not None
+    try:
+        result = c.run_curator_review(
+            synchronous=True,
+            dry_run=True,
+            consolidate=True,
+        )
+    finally:
+        lock.release()
+
+    assert result == {"started": False, "reason": "already_running"}
+
+
+def test_run_lock_released_when_setup_raises(curator_env, monkeypatch):
+    c = curator_env["curator"]
+
+    def _fail(**_kwargs):
+        raise RuntimeError("setup failed")
+
+    monkeypatch.setattr(c, "_run_curator_review_locked", _fail)
+    with pytest.raises(RuntimeError, match="setup failed"):
+        c.run_curator_review(synchronous=True)
+
+    lock = c._try_acquire_curator_run_lock()
+    assert lock is not None
+    lock.release()
+
+
+def test_maybe_run_preserves_none_contract_when_lock_is_held(
+    curator_env,
+    monkeypatch,
+):
+    c = curator_env["curator"]
+    monkeypatch.setattr(c, "should_run_now", lambda: True)
+    lock = c._try_acquire_curator_run_lock()
+    assert lock is not None
+    try:
+        assert c.maybe_run_curator(idle_for_seconds=float("inf")) is None
+    finally:
+        lock.release()
 
 
 
