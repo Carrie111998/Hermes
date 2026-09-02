@@ -443,6 +443,7 @@ def scan_skill_commands() -> Dict[str, Dict[str, Any]]:
     try:
         from tools.skills_tool import _skills_dir, _parse_frontmatter, skill_matches_platform, skill_matches_environment, _get_disabled_skill_names
         from agent.skill_utils import (
+            EXCLUDED_SKILL_DIRS,
             get_external_skills_dirs,
             get_project_skills_dirs,
             iter_project_skill_files,
@@ -471,7 +472,7 @@ def scan_skill_commands() -> Dict[str, Dict[str, Any]]:
                 else iter_skill_index_files(scan_dir, "SKILL.md")
             )
             for skill_md in _iter:
-                if any(part in {'.git', '.github', '.hub', '.archive'} for part in skill_md.parts):
+                if any(part in EXCLUDED_SKILL_DIRS for part in skill_md.parts):
                     continue
                 try:
                     content = skill_md.read_text(encoding='utf-8')
