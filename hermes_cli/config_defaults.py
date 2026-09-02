@@ -4061,7 +4061,9 @@ DEFAULT_CONFIG = {
     },
 
     # Config schema version - bump this when adding new required fields
-    "_config_version": 39,
+    # v40 evacuates inbound webhook credentials from YAML/JSON into
+    # profile-scoped secret references before any other config rewrite.
+    "_config_version": 40,
 }
 
 # Optional environment variables that enhance functionality
@@ -5224,7 +5226,7 @@ OPTIONAL_ENV_VARS = {
         "category": "messaging",
     },
     "WEBHOOK_SECRET": {
-        "description": "Global HMAC secret for webhook signature validation (overridable per route in config.yaml).",
+        "description": "Global HMAC secret for webhook signature validation (routes override it with a secret_ref).",
         "prompt": "Webhook secret",
         "url": None,
         "password": True,

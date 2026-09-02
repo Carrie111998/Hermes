@@ -1764,7 +1764,7 @@ def load_gateway_config() -> GatewayConfig:
                     bridged["typing_indicator"] = platform_cfg["typing_indicator"]
                 if "typing_status_text" in platform_cfg:
                     bridged["typing_status_text"] = platform_cfg["typing_status_text"]
-                # Bridge top-level port/host/secret into extra for platforms
+                # Bridge top-level listener/credential references into extra for platforms
                 # whose adapters read these from config.extra (webhook,
                 # msgraph_webhook, api_server).  Without this, YAML like:
                 #   platforms:
@@ -1775,7 +1775,7 @@ def load_gateway_config() -> GatewayConfig:
                 # PlatformConfig.from_dict only extracts ``extra`` from the
                 # ``extra:`` sub-key, not from the top level.
                 if plat in {Platform.WEBHOOK, Platform.MSGRAPH_WEBHOOK}:
-                    for _bridge_key in ("port", "host", "secret"):
+                    for _bridge_key in ("port", "host", "secret", "secret_ref"):
                         if _bridge_key in platform_cfg and _bridge_key not in platform_cfg.get("extra", {}):
                             bridged[_bridge_key] = platform_cfg[_bridge_key]
                 if plat == Platform.API_SERVER:
@@ -2341,7 +2341,7 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
     # Webhook platform
     webhook_enabled = is_truthy_value(getenv("WEBHOOK_ENABLED", ""))
     webhook_port = getenv("WEBHOOK_PORT")
-    webhook_secret = getenv("WEBHOOK_SECRET", "")
+    webhook_secret_available = bool(getenv("WEBHOOK_SECRET", ""))
     if webhook_enabled:
         if Platform.WEBHOOK not in config.platforms:
             config.platforms[Platform.WEBHOOK] = PlatformConfig()
@@ -2351,8 +2351,12 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
                 config.platforms[Platform.WEBHOOK].extra["port"] = int(webhook_port)
             except ValueError:
                 pass
-        if webhook_secret:
-            config.platforms[Platform.WEBHOOK].extra["secret"] = webhook_secret
+        if webhook_secret_available:
+            # Runtime configuration carries only the resolver key. The adapter
+            # obtains the value inside the active profile secret scope.
+            config.platforms[Platform.WEBHOOK].extra["secret_ref"] = (
+                "WEBHOOK_SECRET"
+            )
 
     # Microsoft Graph webhook platform
     msgraph_webhook_enabled = is_truthy_value(getenv("MSGRAPH_WEBHOOK_ENABLED", ""))

@@ -16,8 +16,9 @@ import re
 import secrets
 import tempfile
 import time
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Dict
+from typing import Dict, Iterator
 
 from hermes_constants import display_hermes_home
 from utils import atomic_replace
@@ -49,12 +50,27 @@ def _load_subscriptions() -> Dict[str, dict]:
 
 
 def _save_subscriptions(subs: Dict[str, dict]) -> None:
+    for name, route in subs.items():
+        if not isinstance(route, dict):
+            raise ValueError(f"Webhook route {name!r} must be an object")
+        if any(key in route for key in ("secret", "secret_value")):
+            raise ValueError(
+                f"Refusing to persist plaintext webhook secret for route {name!r}; "
+                "run 'hermes webhook migrate-secrets' first"
+            )
+        from hermes_cli.webhook_secrets import validate_webhook_secret_ref
+
+        try:
+            validate_webhook_secret_ref(route.get("secret_ref"))
+        except ValueError:
+            raise ValueError(
+                f"Webhook route {name!r} must contain a canonical secret_ref"
+            ) from None
     path = _subscriptions_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    # webhook_subscriptions.json contains per-route HMAC secrets — write
-    # via tempfile + chmod 0o600 before the atomic rename so a permissive
-    # umask cannot leave the secrets readable to other local users in the
-    # window between create and rename.
+    # The route store is reference-only, but still contains operational
+    # metadata. Write via tempfile + chmod 0o600 before the atomic rename so
+    # a permissive umask cannot expose it between create and rename.
     fd, tmp_name = tempfile.mkstemp(
         prefix=f".{path.name}.",
         suffix=".tmp",
@@ -78,6 +94,53 @@ def _save_subscriptions(subs: Dict[str, dict]) -> None:
         except OSError:
             pass
         raise
+
+
+@contextmanager
+def _subscription_write_transaction() -> Iterator[None]:
+    """Migrate legacy state, then serialize the complete route-store update."""
+    path = _subscriptions_path()
+    if path.exists():
+        from hermes_cli.migrations.webhook_secret_refs import migrate_webhook_routes
+
+        backups = tuple(path.parent.glob(path.name + ".bak*"))
+        migrate_webhook_routes(path, backup_paths=backups)
+
+    from hermes_cli.webhook_secrets import webhook_secret_write_lock
+
+    with webhook_secret_write_lock():
+        yield
+
+
+def _store_route_secret_unlocked(name: str, value: str) -> str:
+    """Persist one new credential version while the route writer lock is held."""
+    from hermes_cli.webhook_secrets import (
+        store_webhook_secret_unlocked,
+        webhook_route_secret_ref,
+    )
+
+    ref = webhook_route_secret_ref(name, versioned=True)
+    store_webhook_secret_unlocked(ref, value)
+    return ref
+
+
+def _store_route_secret(name: str, value: str) -> str:
+    """Persist one route secret and return its opaque reference."""
+    from hermes_cli.webhook_secrets import webhook_secret_write_lock
+
+    with webhook_secret_write_lock():
+        return _store_route_secret_unlocked(name, value)
+
+
+def _resolve_route_secret(route: dict) -> str:
+    """Resolve a reference; plaintext is accepted only for migration fallback."""
+    ref = route.get("secret_ref")
+    if ref not in (None, ""):
+        from hermes_cli.webhook_secrets import resolve_webhook_secret
+
+        return resolve_webhook_secret(ref)
+    value = route.get("secret")
+    return value if isinstance(value, str) else ""
 
 
 def _get_webhook_config() -> dict:
@@ -118,7 +181,7 @@ def _setup_hint() -> str:
          enabled: true
          extra:
            port: 8644
-           secret: "your-global-hmac-secret"
+           secret_ref: WEBHOOK_SECRET
 
   3. Or set environment variables in {_dhh}/.env:
      WEBHOOK_ENABLED=true
@@ -142,8 +205,12 @@ def webhook_command(args):
     sub = getattr(args, "webhook_action", None)
 
     if not sub:
-        print("Usage: hermes webhook {subscribe|list|remove|test}")
+        print("Usage: hermes webhook {subscribe|list|remove|test|migrate-secrets}")
         print("Run 'hermes webhook --help' for details.")
+        return
+
+    if sub == "migrate-secrets":
+        _cmd_migrate_secrets(args)
         return
 
     if not _require_webhook_enabled():
@@ -165,47 +232,66 @@ def _cmd_subscribe(args):
         print(f"Error: Invalid name '{name}'. Use lowercase alphanumeric with hyphens/underscores.")
         return
 
-    subs = _load_subscriptions()
-    is_update = name in subs
-
-    secret = args.secret or secrets.token_urlsafe(32)
+    supplied_secret = bool(args.secret)
     events = [e.strip() for e in args.events.split(",")] if args.events else []
 
-    route = {
-        "description": args.description or f"Agent-created subscription: {name}",
-        "events": events,
-        "secret": secret,
-        "prompt": args.prompt or "",
-        "skills": [s.strip() for s in args.skills.split(",")] if args.skills else [],
-        "deliver": args.deliver or "log",
-        "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-    }
+    if getattr(args, "deliver_only", False) and (args.deliver or "log") == "log":
+        print(
+            "Error: --deliver-only requires --deliver to be a real target "
+            "(telegram, discord, slack, github_comment, etc.) — not 'log'."
+        )
+        return
 
-    if getattr(args, "deliver_only", False):
-        if route["deliver"] == "log":
-            print(
-                "Error: --deliver-only requires --deliver to be a real target "
-                "(telegram, discord, slack, github_comment, etc.) — not 'log'."
-            )
-            return
-        route["deliver_only"] = True
+    with _subscription_write_transaction():
+        subs = _load_subscriptions()
+        is_update = name in subs
+        existing_route = subs.get(name) if is_update else None
+        existing_ref = (
+            existing_route.get("secret_ref")
+            if isinstance(existing_route, dict)
+            else None
+        )
+        disclose_secret = not is_update or supplied_secret or not existing_ref
+        secret = args.secret or (
+            secrets.token_urlsafe(32) if disclose_secret else ""
+        )
+        secret_ref = (
+            _store_route_secret_unlocked(name, secret)
+            if secret
+            else str(existing_ref)
+        )
 
-    script = getattr(args, "script", "") or ""
-    if script.strip():
-        route["script"] = script.strip()
+        route = {
+            "description": args.description or f"Agent-created subscription: {name}",
+            "events": events,
+            "secret_ref": secret_ref,
+            "prompt": args.prompt or "",
+            "skills": [s.strip() for s in args.skills.split(",")] if args.skills else [],
+            "deliver": args.deliver or "log",
+            "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        }
+        if getattr(args, "deliver_only", False):
+            route["deliver_only"] = True
 
-    if args.deliver_chat_id:
-        route["deliver_extra"] = {"chat_id": args.deliver_chat_id}
+        script = getattr(args, "script", "") or ""
+        if script.strip():
+            route["script"] = script.strip()
 
-    subs[name] = route
-    _save_subscriptions(subs)
+        if args.deliver_chat_id:
+            route["deliver_extra"] = {"chat_id": args.deliver_chat_id}
+
+        subs[name] = route
+        _save_subscriptions(subs)
 
     base_url = _get_webhook_base_url()
     status = "Updated" if is_update else "Created"
 
     print(f"\n  {status} webhook subscription: {name}")
     print(f"  URL:    {base_url}/webhooks/{name}")
-    print(f"  Secret: {secret}")
+    if disclose_secret:
+        print(f"  Secret: {secret}")
+    else:
+        print("  Secret: (unchanged; not displayed)")
     if events:
         print(f"  Events: {', '.join(events)}")
     else:
@@ -252,15 +338,16 @@ def _cmd_list(args):
 
 def _cmd_remove(args):
     name = args.name.strip().lower()
-    subs = _load_subscriptions()
+    with _subscription_write_transaction():
+        subs = _load_subscriptions()
 
-    if name not in subs:
-        print(f"  No subscription named '{name}'.")
-        print("  Note: Static routes from config.yaml cannot be removed here.")
-        return
+        if name not in subs:
+            print(f"  No subscription named '{name}'.")
+            print("  Note: Static routes from config.yaml cannot be removed here.")
+            return
 
-    del subs[name]
-    _save_subscriptions(subs)
+        del subs[name]
+        _save_subscriptions(subs)
     print(f"  Removed webhook subscription: {name}")
 
 
@@ -274,7 +361,10 @@ def _cmd_test(args):
         return
 
     route = subs[name]
-    secret = route.get("secret", "")
+    secret = _resolve_route_secret(route)
+    if not secret:
+        print("  Error: webhook secret reference could not be resolved")
+        return
     base_url = _get_webhook_base_url()
     url = f"{base_url}/webhooks/{name}"
 
@@ -305,3 +395,48 @@ def _cmd_test(args):
     except Exception as e:
         print(f"  Error: {e}")
         print("  Is the gateway running? (hermes gateway run)")
+
+
+def _cmd_migrate_secrets(args):
+    """Migrate every legacy webhook secret with value-free receipts."""
+    from hermes_cli.migrations.webhook_secret_refs import (
+        migrate_webhook_config,
+        migrate_webhook_routes,
+    )
+
+    route_path = _subscriptions_path()
+    route_result = {
+        "migrated_routes": [],
+        "receipts": [],
+        "scrubbed_backups": [],
+    }
+    if route_path.exists():
+        route_backups = tuple(route_path.parent.glob(route_path.name + ".bak*"))
+        route_result = migrate_webhook_routes(
+            route_path,
+            backup_paths=route_backups,
+        )
+
+    config_path = _hermes_home() / "config.yaml"
+    config_result = {
+        "migrated": False,
+        "receipts": [],
+        "scrubbed_backups": [],
+    }
+    if config_path.exists():
+        config_backups = tuple(config_path.parent.glob(config_path.name + ".bak*"))
+        config_result = migrate_webhook_config(
+            config_path,
+            backup_paths=config_backups,
+        )
+
+    result = {"routes": route_result, "config": config_result}
+    if getattr(args, "json", False):
+        print(json.dumps(result, indent=2, sort_keys=True))
+    else:
+        print(
+            "Webhook secret migration complete: "
+            f"{len(route_result.get('migrated_routes', []))} route(s), "
+            f"config={'migrated' if config_result.get('migrated') else 'unchanged'}."
+        )
+    return result

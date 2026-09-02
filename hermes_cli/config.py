@@ -1467,8 +1467,72 @@ def _is_env_config_key(key: str) -> bool:
     return (
         key_upper in api_keys
         or key_upper.endswith(('_API_KEY', '_TOKEN', '_SECRET'))
+        or key_upper.startswith('WEBHOOK_ROUTE_')
         or key_upper.startswith('TERMINAL_SSH')
     )
+
+
+WEBHOOK_SECRET_REMEDIATION = (
+    "Webhook plaintext secrets cannot be stored in config.yaml. "
+    "Use 'hermes webhook subscribe <name>', set a WEBHOOK_ROUTE_* value in "
+    "the profile secret backend, or run 'hermes webhook migrate-secrets'."
+)
+
+
+def _is_plaintext_webhook_config_key(key: str) -> bool:
+    """Whether a dotted CLI key would put webhook secret material in YAML."""
+    parts = [part.strip().lower() for part in key.split(".")]
+    return (
+        bool(parts)
+        and parts[-1] in {"secret", "secret_value"}
+        and "webhook" in parts[:-1]
+    )
+
+
+def _plaintext_webhook_secret_paths(config: Any) -> list[str]:
+    """Return secret-bearing webhook YAML paths without returning any values."""
+    if not isinstance(config, dict):
+        return []
+    platforms = config.get("platforms")
+    if not isinstance(platforms, dict):
+        return []
+    webhook = platforms.get("webhook")
+    if not isinstance(webhook, dict):
+        return []
+
+    found: list[str] = []
+
+    def _check(container: Any, prefix: str) -> None:
+        if not isinstance(container, dict):
+            return
+        for leaf in ("secret", "secret_value"):
+            if leaf in container:
+                found.append(f"{prefix}.{leaf}")
+
+    _check(webhook, "platforms.webhook")
+    extra = webhook.get("extra")
+    _check(extra, "platforms.webhook.extra")
+    for routes, prefix in (
+        (
+            extra.get("routes") if isinstance(extra, dict) else None,
+            "platforms.webhook.extra.routes",
+        ),
+        (webhook.get("routes"), "platforms.webhook.routes"),
+    ):
+        if not isinstance(routes, dict):
+            continue
+        for name, route in routes.items():
+            _check(route, f"{prefix}.{name}")
+    return found
+
+
+def reject_plaintext_webhook_secrets(config: Any) -> None:
+    """Hard-reject any config write that would persist webhook credentials."""
+    paths = _plaintext_webhook_secret_paths(config)
+    if paths:
+        raise RuntimeError(
+            f"{WEBHOOK_SECRET_REMEDIATION} Blocked path(s): {', '.join(paths)}"
+        )
 
 
 def _format_config_get_value(value, *, as_json: bool) -> str:
@@ -2646,6 +2710,63 @@ def _persist_migration(config: Dict[str, Any]) -> None:
     save_config(config)
 
 
+def _migrate_webhook_secret_records(results: Dict[str, Any], quiet: bool) -> None:
+    """Evacuate legacy webhook credentials before other config rewrites."""
+    try:
+        from hermes_cli.migrations.webhook_secret_refs import (
+            migrate_webhook_config,
+            migrate_webhook_routes,
+        )
+
+        webhook_config_path = get_config_path()
+        migrated = 0
+        if webhook_config_path.exists():
+            config_receipt = migrate_webhook_config(
+                webhook_config_path,
+                backup_paths=tuple(
+                    webhook_config_path.parent.glob(
+                        webhook_config_path.name + ".bak*"
+                    )
+                ),
+            )
+            migrated += int(bool(config_receipt.get("migrated")))
+            results["env_added"].extend(
+                receipt["reference"]
+                for receipt in config_receipt.get("receipts", [])
+                if receipt.get("document") == "source"
+            )
+
+        webhook_routes_path = get_hermes_home() / "webhook_subscriptions.json"
+        if webhook_routes_path.exists():
+            route_receipt = migrate_webhook_routes(
+                webhook_routes_path,
+                backup_paths=tuple(
+                    webhook_routes_path.parent.glob(
+                        webhook_routes_path.name + ".bak*"
+                    )
+                ),
+            )
+            migrated += len(route_receipt.get("migrated_routes", []))
+            results["env_added"].extend(
+                receipt["reference"]
+                for receipt in route_receipt.get("receipts", [])
+                if receipt.get("document") == "source"
+            )
+        if migrated and not quiet:
+            print(
+                f"  ✓ Migrated {migrated} webhook secret "
+                "record(s) to profile references"
+            )
+    except Exception as migration_error:
+        # Migration exceptions are value-safe by contract. Fail closed before
+        # any later config-version write can preserve/copy plaintext again.
+        warning = f"Webhook secret migration was deferred: {migration_error}"
+        results["warnings"].append(warning)
+        if not quiet:
+            print(f"  ⚠ {warning}")
+        raise RuntimeError(warning) from None
+
+
 def migrate_config(interactive: bool = True, quiet: bool = False) -> Dict[str, Any]:
     """
     Migrate config to latest version, prompting for new required fields.
@@ -2707,6 +2828,7 @@ def migrate_config(interactive: bool = True, quiet: bool = False) -> Dict[str, A
         if not quiet:
             print(f"  ⚠ {msg}")
     else:
+        _migrate_webhook_secret_records(results, quiet)
         # ── Versioned migration ladder (table-driven) ──
         # The per-version steps live in hermes_cli.config_migrations as a
         # (target_version, fn) registry; the driver applies every step whose
@@ -3833,6 +3955,7 @@ def atomic_config_write(config_path: Path, data: Any, **kwargs: Any) -> None:
     """
     from utils import atomic_yaml_write
 
+    reject_plaintext_webhook_secrets(data)
     require_readable_config_before_write(config_path)
     atomic_yaml_write(config_path, data, **kwargs)
 
@@ -4373,6 +4496,8 @@ def save_config(
                 DEFAULT_CONFIG,
                 preserve_keys=effective_preserve_keys,
             )
+
+        reject_plaintext_webhook_secrets(normalized)
 
         # Build optional commented-out sections for features that are off by
         # default or only relevant when explicitly configured.
@@ -5920,6 +6045,8 @@ def set_config_value(key: str, value: str, force: bool = False):
             file=sys.stderr,
         )
         sys.exit(1)
+    if _is_plaintext_webhook_config_key(key):
+        raise RuntimeError(WEBHOOK_SECRET_REMEDIATION)
     # Check if it's an API key (goes to .env)
     if _is_env_config_key(key):
         # Unified lifecycle: also rotates any config.yaml mirror of the old
@@ -6099,8 +6226,7 @@ def set_config_value(key: str, value: str, force: bool = False):
         print("  (note: 'api_base' is an alias — saved as model.base_url)")
     # Write only user config back (not the full merged defaults)
     ensure_hermes_home()
-    from utils import atomic_yaml_write
-    atomic_yaml_write(config_path, user_config, sort_keys=False)
+    atomic_config_write(config_path, user_config, sort_keys=False)
     
     # Keep .env in sync for keys that terminal_tool reads directly from env vars.
     # config.yaml is authoritative, but terminal_tool only reads TERMINAL_ENV etc.
@@ -6167,6 +6293,15 @@ def get_config_value(key: str, *, as_json: bool = False):
         print(f"Config key not set: {key}", file=sys.stderr)
         sys.exit(1)
 
+    if (
+        _is_plaintext_webhook_config_key(key)
+        or key.upper() == "WEBHOOK_SECRET"
+        or key.upper().startswith("WEBHOOK_ROUTE_")
+    ) and isinstance(value, str) and value:
+        from agent.redact import mask_secret
+
+        value = mask_secret(value)
+
     print(_format_config_get_value(value, as_json=as_json))
 
 
@@ -6222,8 +6357,7 @@ def unset_config_value(key: str):
         sys.exit(1)
 
     ensure_hermes_home()
-    from utils import atomic_yaml_write
-    atomic_yaml_write(config_path, user_config, sort_keys=False)
+    atomic_config_write(config_path, user_config, sort_keys=False)
     print(f"✓ Unset {key} from {config_path}")
 
 

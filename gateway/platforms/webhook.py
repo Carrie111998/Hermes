@@ -8,7 +8,8 @@ source or to another configured platform.
 Configuration lives in config.yaml under platforms.webhook.extra.routes.
 Each route defines:
   - events: which event types to accept (header-based filtering)
-  - secret: HMAC secret for signature validation (REQUIRED)
+  - secret_ref: profile secret reference for signature validation (REQUIRED)
+  - secret: legacy HMAC secret accepted during incremental migration only
   - prompt: template string formatted with the webhook payload
   - skills: optional list of skills to load for the agent
   - deliver: where to send the response (github_comment, telegram, etc.)
@@ -42,6 +43,7 @@ import subprocess
 import sys
 import time
 from collections import deque
+from contextlib import nullcontext
 from typing import Any, Deque, Dict, List, Optional
 
 try:
@@ -192,6 +194,9 @@ class WebhookAdapter(BasePlatformAdapter):
         self._host: Optional[str] = _cfg_host or None
         self._port: int = int(config.extra.get("port", DEFAULT_PORT))
         self._global_secret: str = config.extra.get("secret", "")
+        self._global_secret_ref: str = str(
+            config.extra.get("secret_ref", "") or ""
+        )
         self._static_routes: Dict[str, dict] = config.extra.get("routes", {})
         self._dynamic_routes: Dict[str, dict] = {}
         self._dynamic_routes_mtime: float = 0.0
@@ -241,6 +246,71 @@ class WebhookAdapter(BasePlatformAdapter):
             script_timeout_seconds=self._script_timeout_seconds
         )
 
+    @staticmethod
+    def _resolve_secret_ref(secret_ref: object) -> str:
+        """Resolve through the active profile's fail-closed secret authority."""
+        from hermes_cli.webhook_secrets import resolve_webhook_secret
+
+        return resolve_webhook_secret(secret_ref)
+
+    def _route_secret(self, route: object) -> str:
+        """Resolve references first; explicit unresolved refs never fall back."""
+        if isinstance(route, dict):
+            if "secret_ref" in route:
+                return self._resolve_secret_ref(route.get("secret_ref"))
+            if "secret" in route:
+                legacy = route.get("secret")
+                return legacy if isinstance(legacy, str) else ""
+        if self._global_secret_ref:
+            return self._resolve_secret_ref(self._global_secret_ref)
+        return self._global_secret
+
+    def _route_secret_for_profile(
+        self, route: object, profile: Optional[str]
+    ) -> str:
+        """Resolve referenced credentials inside their owning profile shard."""
+        uses_reference = (
+            isinstance(route, dict) and "secret_ref" in route
+        ) or (
+            not (isinstance(route, dict) and "secret" in route)
+            and bool(self._global_secret_ref)
+        )
+        if not uses_reference:
+            return self._route_secret(route)
+        with self._profile_runtime_context(profile):
+            return self._route_secret(route)
+
+    def _profile_runtime_context(self, profile: Optional[str]):
+        """Resolve authentication inside the URL-selected profile shard."""
+        runner = self.gateway_runner
+        config = getattr(runner, "config", None)
+        if getattr(config, "multiplex_profiles", False) is not True:
+            return nullcontext()
+        resolver = getattr(runner, "_resolve_profile_home_for_source", None)
+        if not callable(resolver):
+            raise RuntimeError(
+                "multiplexed webhook secret resolver is unavailable"
+            )
+        from gateway.session import SessionSource
+        from gateway.run import _profile_runtime_scope
+
+        requested = (profile or "").strip() or None
+        if requested == "default":
+            requested = None
+        source = SessionSource(
+            platform=Platform.WEBHOOK,
+            chat_id="webhook:secret-resolution",
+            profile=requested,
+        )
+        return _profile_runtime_scope(resolver(source))
+
+    @staticmethod
+    def _route_profile(route: object) -> Optional[str]:
+        if not isinstance(route, dict):
+            return None
+        profile = route.get("profile")
+        return profile if isinstance(profile, str) else None
+
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
@@ -251,12 +321,18 @@ class WebhookAdapter(BasePlatformAdapter):
 
         # Validate routes at startup — secret is required per route
         for name, route in self._routes.items():
-            secret = route.get("secret", self._global_secret)
+            try:
+                secret = self._route_secret_for_profile(
+                    route, self._route_profile(route)
+                )
+            except Exception:
+                secret = ""
             if not secret:
                 raise ValueError(
                     f"[webhook] Route '{name}' has no HMAC secret. "
-                    f"Set 'secret' on the route or globally. "
-                    f"For testing without auth, set secret to '{_INSECURE_NO_AUTH}'."
+                    f"Set 'secret_ref' on the route or globally. "
+                    f"For local testing without auth, store '{_INSECURE_NO_AUTH}' "
+                    f"under that reference."
                 )
 
             # Safety rail: refuse to start if INSECURE_NO_AUTH is combined with a
@@ -529,12 +605,18 @@ class WebhookAdapter(BasePlatformAdapter):
             for k, v in data.items():
                 if k in self._static_routes:
                     continue
-                effective_secret = v.get("secret", self._global_secret)
+                try:
+                    effective_secret = self._route_secret_for_profile(
+                        v, self._route_profile(v)
+                    )
+                except Exception:
+                    effective_secret = ""
                 if not effective_secret:
                     logger.warning(
-                        "[webhook] Dynamic route '%s' skipped: 'secret' is "
-                        "missing or empty. Set a valid HMAC secret, or use "
-                        "'%s' to explicitly disable auth (testing only).",
+                        "[webhook] Dynamic route '%s' skipped: 'secret_ref' "
+                        "is missing or unresolved. Store a valid HMAC secret "
+                        "under the reference, or use '%s' to explicitly "
+                        "disable auth (loopback testing only).",
                         k,
                         _INSECURE_NO_AUTH,
                     )
@@ -706,7 +788,10 @@ class WebhookAdapter(BasePlatformAdapter):
         # INSECURE_NO_AUTH mode). Missing/empty secrets must fail closed here,
         # not only during connect(), so direct handler reuse cannot turn a
         # network webhook route into an unauthenticated agent-dispatch surface.
-        secret = route_config.get("secret", self._global_secret)
+        try:
+            secret = self._route_secret_for_profile(route_config, profile)
+        except Exception:
+            secret = ""
         if not secret:
             logger.error(
                 "[webhook] Route %s has no HMAC secret; refusing request",

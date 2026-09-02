@@ -14098,8 +14098,10 @@ def _webhook_route_summary(name: str, route: Dict[str, Any], base_url: str) -> D
         "skills": list(route.get("skills") or []),
         "created_at": route.get("created_at"),
         "url": f"{base_url}/webhooks/{name}",
-        # Secret is masked on read; full value only returned on create.
-        "secret_set": bool(route.get("secret")),
+        # Never return credential material on reads. The opaque reference is
+        # safe to expose and makes migrations/debugging auditable.
+        "secret_set": bool(route.get("secret_ref") or route.get("secret")),
+        "secret_ref": route.get("secret_ref"),
         # Default-enabled; only an explicit enabled:false turns a route off.
         "enabled": route.get("enabled", True) is not False,
     }
@@ -14169,25 +14171,27 @@ async def create_webhook(body: WebhookCreate):
         )
 
     secret = body.secret or _secrets.token_urlsafe(32)
-    route: Dict[str, Any] = {
-        "description": body.description or f"Dashboard-created subscription: {name}",
-        "events": [e.strip() for e in body.events if e.strip()],
-        "secret": secret,
-        "prompt": body.prompt or "",
-        "skills": [s.strip() for s in body.skills if s.strip()],
-        "deliver": body.deliver or "log",
-        "created_at": _time.strftime("%Y-%m-%dT%H:%M:%SZ", _time.gmtime()),
-    }
-    if body.script and body.script.strip():
-        route["script"] = body.script.strip()
-    if body.deliver_only:
-        route["deliver_only"] = True
-    if body.deliver_chat_id:
-        route["deliver_extra"] = {"chat_id": body.deliver_chat_id}
+    with wh._subscription_write_transaction():
+        secret_ref = wh._store_route_secret_unlocked(name, secret)
+        route: Dict[str, Any] = {
+            "description": body.description or f"Dashboard-created subscription: {name}",
+            "events": [e.strip() for e in body.events if e.strip()],
+            "secret_ref": secret_ref,
+            "prompt": body.prompt or "",
+            "skills": [s.strip() for s in body.skills if s.strip()],
+            "deliver": body.deliver or "log",
+            "created_at": _time.strftime("%Y-%m-%dT%H:%M:%SZ", _time.gmtime()),
+        }
+        if body.script and body.script.strip():
+            route["script"] = body.script.strip()
+        if body.deliver_only:
+            route["deliver_only"] = True
+        if body.deliver_chat_id:
+            route["deliver_extra"] = {"chat_id": body.deliver_chat_id}
 
-    subs = wh._load_subscriptions()
-    subs[name] = route
-    wh._save_subscriptions(subs)
+        subs = wh._load_subscriptions()
+        subs[name] = route
+        wh._save_subscriptions(subs)
 
     base_url = wh._get_webhook_base_url()
     summary = _webhook_route_summary(name, route, base_url)
@@ -14201,11 +14205,12 @@ async def delete_webhook(name: str):
     import hermes_cli.webhook as wh
 
     key = (name or "").strip().lower()
-    subs = wh._load_subscriptions()
-    if key not in subs:
-        raise HTTPException(status_code=404, detail=f"No subscription named '{key}'")
-    del subs[key]
-    wh._save_subscriptions(subs)
+    with wh._subscription_write_transaction():
+        subs = wh._load_subscriptions()
+        if key not in subs:
+            raise HTTPException(status_code=404, detail=f"No subscription named '{key}'")
+        del subs[key]
+        wh._save_subscriptions(subs)
     return {"ok": True}
 
 
@@ -14221,11 +14226,12 @@ async def set_webhook_enabled(name: str, body: WebhookEnabledToggle):
     import hermes_cli.webhook as wh
 
     key = (name or "").strip().lower()
-    subs = wh._load_subscriptions()
-    if key not in subs:
-        raise HTTPException(status_code=404, detail=f"No subscription named '{key}'")
-    subs[key]["enabled"] = bool(body.enabled)
-    wh._save_subscriptions(subs)
+    with wh._subscription_write_transaction():
+        subs = wh._load_subscriptions()
+        if key not in subs:
+            raise HTTPException(status_code=404, detail=f"No subscription named '{key}'")
+        subs[key]["enabled"] = bool(body.enabled)
+        wh._save_subscriptions(subs)
     return {"ok": True, "name": key, "enabled": bool(body.enabled)}
 
 

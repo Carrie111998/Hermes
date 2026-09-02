@@ -82,17 +82,24 @@ Post a concise review. If the PR is a trivial docs/typo change, say so briefly."
 
 **Option B — Static route (config.yaml):**
 
+Store the secret values in the active profile before adding the route:
+
+```bash
+hermes config set WEBHOOK_SECRET your-global-secret
+hermes config set WEBHOOK_ROUTE_GITHUB_PR_REVIEW github-webhook-secret
+```
+
 ```yaml
 platforms:
   webhook:
     enabled: true
     extra:
       port: 8644
-      secret: "your-global-secret"
+      secret_ref: WEBHOOK_SECRET
       routes:
         github-pr-review:
           events: ["pull_request"]
-          secret: "github-webhook-secret"
+          secret_ref: WEBHOOK_ROUTE_GITHUB_PR_REVIEW
           prompt: |
             Review PR #{pull_request.number}: {pull_request.title}
             Repository: {repository.full_name}
@@ -379,6 +386,10 @@ Analyze CI failures and post diagnostics on the PR.
 
 **Trigger:** GitHub webhook
 
+```bash
+hermes config set WEBHOOK_ROUTE_CI_FAILURE ci-secret
+```
+
 ```yaml
 # config.yaml route
 platforms:
@@ -388,7 +399,7 @@ platforms:
       routes:
         ci-failure:
           events: ["check_run"]
-          secret: "ci-secret"
+          secret_ref: WEBHOOK_ROUTE_CI_FAILURE
           prompt: |
             CI check failed:
             Repository: {repository.full_name}
