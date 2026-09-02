@@ -2,6 +2,7 @@
 
 import json
 import os
+import shlex
 import signal
 import subprocess
 import sys
@@ -1282,6 +1283,218 @@ class TestTerminateHostPidWindows:
         assert "12345" in captured["args"]
         assert "/T" in captured["args"], "Tree flag required to reach descendants"
         assert "/F" in captured["args"], "Force flag required for headless Chromium"
+
+    @pytest.mark.windows_only
+    def test_spawned_job_kills_reparented_descendants(self, registry, tmp_path):
+        """Cancelling a local session must kill a grandchild after reparenting."""
+        grand = tmp_path / "grand.py"
+        mid = tmp_path / "mid.py"
+        top = tmp_path / "top.py"
+        grand_pid_file = tmp_path / "grand.pid"
+        mid_done = tmp_path / "mid.done"
+        grand.write_text(
+            "import sys,time,os\n"
+            "from pathlib import Path\n"
+            "Path(sys.argv[1]).write_text(str(os.getpid()), encoding='ascii')\n"
+            "time.sleep(120)\n",
+            encoding="utf-8",
+        )
+        mid.write_text(
+            "import subprocess,sys,time\n"
+            "from pathlib import Path\n"
+            "CREATE_NO_WINDOW=0x08000000\n"
+            "subprocess.Popen([sys.executable, sys.argv[1], *sys.argv[2:]], "
+            "creationflags=CREATE_NO_WINDOW, close_fds=True)\n"
+            "time.sleep(0.4)\n"
+            "Path(sys.argv[3]).write_text('done', encoding='ascii')\n",
+            encoding="utf-8",
+        )
+        top.write_text(
+            "import subprocess,sys,time\n"
+            "CREATE_NO_WINDOW=0x08000000\n"
+            "subprocess.Popen([sys.executable, sys.argv[1], *sys.argv[2:]], "
+            "creationflags=CREATE_NO_WINDOW, close_fds=True)\n"
+            "time.sleep(120)\n",
+            encoding="utf-8",
+        )
+
+        command = " ".join(
+            shlex.quote(value)
+            for value in (
+                sys.executable,
+                top.as_posix(),
+                mid.as_posix(),
+                grand.as_posix(),
+                grand_pid_file.as_posix(),
+                mid_done.as_posix(),
+            )
+        )
+        session = registry.spawn_local(command, cwd=str(tmp_path))
+        grand_pid = None
+        try:
+            assert _wait_until(
+                lambda: grand_pid_file.exists() and mid_done.exists(),
+                timeout=10.0,
+            )
+            grand_pid = int(grand_pid_file.read_text(encoding="ascii"))
+            result = registry.kill_process(session.id, source="windows_job_regression")
+            assert result["status"] == "killed"
+
+            import psutil
+
+            assert _wait_until(
+                lambda: not psutil.pid_exists(grand_pid),
+                timeout=5.0,
+            ), "reparented grandchild survived session cancellation"
+        finally:
+            if not session.exited:
+                registry.kill_process(session.id, source="windows_job_cleanup")
+            if grand_pid is not None:
+                subprocess.run(
+                    ["taskkill", "/PID", str(grand_pid), "/F"],
+                    capture_output=True,
+                    timeout=10,
+                )
+
+    @pytest.mark.windows_only
+    def test_job_survives_registry_restart_and_recovers_watcher(self, tmp_path):
+        """A durable job survives owner exit and is killable from a new registry."""
+        from pathlib import Path
+
+        import psutil
+
+        repo_root = Path(__file__).resolve().parents[2]
+        hermes_home = tmp_path / "hermes-home"
+        tree_script = tmp_path / "tree.py"
+        owner_script = tmp_path / "owner.py"
+        recovery_script = tmp_path / "recovery.py"
+        tree_script.write_text(
+            "import json, os, subprocess, sys, time\n"
+            "from pathlib import Path\n"
+            "state = Path(sys.argv[2])\n"
+            "mode = sys.argv[1]\n"
+            "def save(name, value):\n"
+            "    (state / name).write_text(json.dumps(value), encoding='utf-8')\n"
+            "def loop():\n"
+            "    while True:\n"
+            "        time.sleep(1)\n"
+            "if mode == 'grand':\n"
+            "    save('grand.json', {'pid': os.getpid()})\n"
+            "    loop()\n"
+            "elif mode == 'middle':\n"
+            "    child = subprocess.Popen([sys.executable, __file__, 'grand', str(state)], "
+            "creationflags=0x08000000, close_fds=True)\n"
+            "    save('middle.json', {'pid': os.getpid(), 'grand_pid': child.pid})\n"
+            "    (state / 'middle.done').write_text('done', encoding='ascii')\n"
+            "    time.sleep(0.5)\n"
+            "elif mode == 'top':\n"
+            "    child = subprocess.Popen([sys.executable, __file__, 'middle', str(state)], "
+            "creationflags=0x08000000, close_fds=True)\n"
+            "    save('top.json', {'pid': os.getpid(), 'middle_pid': child.pid})\n"
+            "    loop()\n",
+            encoding="utf-8",
+        )
+        owner_script.write_text(
+            "import os, shlex, sys, time\n"
+            "from pathlib import Path\n"
+            "from tools.process_registry import ProcessRegistry\n"
+            "state = Path(sys.argv[1])\n"
+            "tree = Path(sys.argv[2])\n"
+            "command = ' '.join(shlex.quote(value) for value in (\n"
+            "    Path(sys.executable).as_posix(), tree.as_posix(), 'top', state.as_posix()))\n"
+            "registry = ProcessRegistry()\n"
+            "session = registry.spawn_local(command, cwd=os.getcwd())\n"
+            "session.notify_on_complete = True\n"
+            "session.watcher_interval = 1\n"
+            "session.watcher_platform = 'windows-job-test'\n"
+            "session.session_key = 'windows-job-recovery'\n"
+            "registry._write_checkpoint()\n"
+            "deadline = time.monotonic() + 30\n"
+            "while not (state / 'middle.done').exists() and time.monotonic() < deadline:\n"
+            "    time.sleep(0.05)\n"
+            "if not (state / 'middle.done').exists():\n"
+            "    raise SystemExit('worker tree did not start')\n"
+            "(state / 'ready').write_text('ready', encoding='ascii')\n"
+            "while not (state / 'release').exists():\n"
+            "    time.sleep(0.05)\n"
+            "os._exit(0)\n",
+            encoding="utf-8",
+        )
+        recovery_script.write_text(
+            "import json, sys\n"
+            "from pathlib import Path\n"
+            "from tools.process_registry import ProcessRegistry\n"
+            "state = Path(sys.argv[1])\n"
+            "registry = ProcessRegistry()\n"
+            "recovered = registry.recover_from_checkpoint()\n"
+            "sessions = [row for row in registry.list_sessions() if row['status'] == 'running']\n"
+            "result = {'recovered': recovered, 'sessions': [row['session_id'] for row in sessions],\n"
+            "          'watchers': registry.pending_watchers}\n"
+            "if sessions:\n"
+            "    result['kill'] = registry.kill_process(sessions[0]['session_id'], source='restart-test')\n"
+            "(state / 'recovery.json').write_text(json.dumps(result), encoding='utf-8')\n",
+            encoding="utf-8",
+        )
+
+        env = os.environ.copy()
+        env["HERMES_HOME"] = str(hermes_home)
+        env["PYTHONPATH"] = str(repo_root) + os.pathsep + env.get("PYTHONPATH", "")
+        owner = subprocess.Popen(
+            [sys.executable, str(owner_script), str(tmp_path), str(tree_script)],
+            cwd=str(repo_root),
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            creationflags=0x08000000,
+        )
+        top_pid = grand_pid = None
+        try:
+            assert _wait_until(lambda: (tmp_path / "ready").exists(), timeout=30), (
+                owner.stdout.read() if owner.poll() is not None else "owner did not become ready"
+            )
+            checkpoint = json.loads((hermes_home / "processes.json").read_text())
+            assert checkpoint[0]["job_name"].startswith("Local\\HermesAgentProcess_")
+            assert "job_handle" not in checkpoint[0]
+            top_pid = json.loads((tmp_path / "top.json").read_text())["pid"]
+            assert _wait_until(lambda: (tmp_path / "grand.json").exists(), timeout=10)
+            grand_pid = json.loads((tmp_path / "grand.json").read_text())["pid"]
+
+            (tmp_path / "release").write_text("release", encoding="ascii")
+            owner.wait(timeout=15)
+            assert _wait_until(lambda: psutil.pid_exists(top_pid), timeout=5)
+            assert _wait_until(lambda: psutil.pid_exists(grand_pid), timeout=5)
+
+            recovered = subprocess.run(
+                [sys.executable, str(recovery_script), str(tmp_path)],
+                cwd=str(repo_root),
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            assert recovered.returncode == 0, recovered.stdout + recovered.stderr
+            result = json.loads((tmp_path / "recovery.json").read_text())
+            assert result["recovered"] == 1
+            assert result["kill"]["status"] == "killed"
+            assert result["watchers"][0]["notify_on_complete"] is True
+            assert _wait_until(lambda: not psutil.pid_exists(top_pid), timeout=10)
+            assert _wait_until(lambda: not psutil.pid_exists(grand_pid), timeout=10)
+            assert json.loads((hermes_home / "processes.json").read_text()) == []
+        finally:
+            if owner.poll() is None:
+                (tmp_path / "release").write_text("cleanup", encoding="ascii")
+                try:
+                    owner.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    owner.kill()
+            for pid in (top_pid, grand_pid):
+                if pid and psutil.pid_exists(pid):
+                    subprocess.run(
+                        ["taskkill", "/PID", str(pid), "/T", "/F"],
+                        capture_output=True,
+                        timeout=10,
+                    )
 
 class TestTerminateHostPidPosix:
     """POSIX branch walks the tree via psutil and SIGTERMs children first."""

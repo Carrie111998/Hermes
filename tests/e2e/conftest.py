@@ -284,13 +284,30 @@ def make_adapter(platform: Platform, runner=None):
 async def send_and_capture(adapter, text: str, platform: Platform, **event_kwargs) -> AsyncMock:
     """Send a message through the full e2e flow and return the send mock.
 
-    Polls for the send rather than waiting a fixed delay: handler DB work now
-    hops to worker threads (AsyncSessionDB), so completion latency varies.
+    Await the task created by the adapter when one exists instead of relying
+    only on a short wall-clock poll. Handler DB work now hops to worker threads
+    (AsyncSessionDB), so a cold CI runner can exceed the old two-second window.
+    The bounded poll remains for inline handlers and adapters that do not expose
+    their task registry.
     """
     event = make_event(platform, text, **event_kwargs)
     adapter.send.reset_mock()
+    before_tasks = list(getattr(adapter, "_session_tasks", {}).values())
     await adapter.handle_message(event)
-    for _ in range(40):  # up to ~2s; returns as soon as the send lands
+    after_tasks = list(getattr(adapter, "_session_tasks", {}).values())
+    new_tasks = [
+        task
+        for task in after_tasks
+        if not any(task is previous for previous in before_tasks)
+    ]
+    for task in new_tasks:
+        try:
+            await asyncio.wait_for(asyncio.shield(task), timeout=10.0)
+        except asyncio.TimeoutError:
+            # Keep the final polling fallback below; the task remains alive
+            # because shield() prevents wait_for from cancelling it.
+            pass
+    for _ in range(200):  # up to ~10s; returns as soon as the send lands
         if adapter.send.called:
             break
         await asyncio.sleep(0.05)
