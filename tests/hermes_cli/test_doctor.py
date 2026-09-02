@@ -348,6 +348,34 @@ class TestDoctorMemoryProviderSection:
         assert "Honcho API key" not in out
         assert "Mem0" not in out
 
+    def test_missing_optional_package_hint_names_install_command(
+        self, monkeypatch, tmp_path
+    ):
+        """An optional package that fails to import must point at the install
+        command — a bare "(optional, not installed)" left users guessing
+        (#89121). discord.py is the reported case. The command must name the
+        PyPI distribution, not the import name: ``pip install telegram``
+        would fetch an unrelated abandoned project."""
+        import builtins
+
+        real_import = builtins.__import__
+
+        def _fake_import(name, *args, **kwargs):
+            if name in ("discord", "telegram"):
+                raise ImportError(f"No module named {name!r}")
+            return real_import(name, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "__import__", _fake_import)
+        out = self._run_doctor_and_capture(monkeypatch, tmp_path, provider="")
+        assert "discord.py (optional, not installed)" in out
+        assert (
+            f"install with: {doctor._python_install_cmd()} discord.py" in out
+        )
+        assert (
+            f"install with: {doctor._python_install_cmd()} python-telegram-bot"
+            in out
+        )
+
 
     def test_mem0_provider_not_installed_shows_fail(self, monkeypatch, tmp_path):
         # Make mem0 import fail

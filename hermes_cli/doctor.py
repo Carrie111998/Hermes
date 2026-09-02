@@ -1447,33 +1447,44 @@ def run_doctor(args):
     check_certificates(should_fix=should_fix, issues=manual_issues)
 
     _section("Required Packages")
+    # (import name, display name, pip spec) — the spec is the PyPI
+    # distribution, which is not always the import name (e.g. importing
+    # ``telegram`` needs ``python-telegram-bot``; a bare ``pip install
+    # telegram`` would fetch an unrelated abandoned project).
     required_packages = [
-        ("openai", "OpenAI SDK"),
-        ("rich", "Rich (terminal UI)"),
-        ("dotenv", "python-dotenv"),
-        ("yaml", "PyYAML"),
-        ("httpx", "HTTPX"),
+        ("openai", "OpenAI SDK", "openai"),
+        ("rich", "Rich (terminal UI)", "rich"),
+        ("dotenv", "python-dotenv", "python-dotenv"),
+        ("yaml", "PyYAML", "PyYAML"),
+        ("httpx", "HTTPX", "httpx"),
     ]
-    
+
     optional_packages = [
-        ("croniter", "Croniter (cron expressions)"),
-        ("telegram", "python-telegram-bot"),
-        ("discord", "discord.py"),
+        ("croniter", "Croniter (cron expressions)", "croniter"),
+        ("telegram", "python-telegram-bot", "python-telegram-bot"),
+        ("discord", "discord.py", "discord.py"),
     ]
-    
-    for module, name in required_packages:
+
+    for module, name, spec in required_packages:
         try:
             __import__(module)
             check_ok(name)
         except ImportError:
-            _fail_and_issue(name, "(missing)", f"Install {name}: {_python_install_cmd()} {module}", issues)
-    
-    for module, name in optional_packages:
+            _fail_and_issue(name, "(missing)", f"Install {name}: {_python_install_cmd()} {spec}", issues)
+
+    for module, name, spec in optional_packages:
         try:
             __import__(module)
             check_ok(name, "(optional)")
         except ImportError:
-            check_warn(name, "(optional, not installed)")
+            # Point at the install command so the warning is actionable —
+            # "not installed" alone leaves the user guessing (#89121). The
+            # spec must be the PyPI distribution, never the import name.
+            check_warn(
+                name,
+                f"(optional, not installed) — install with: "
+                f"{_python_install_cmd()} {spec}",
+            )
     
     _section("Configuration Files")
     # Managed scope (administrator-pinned config/env), when present.
