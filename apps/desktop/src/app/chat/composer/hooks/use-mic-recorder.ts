@@ -33,6 +33,13 @@ interface MicRecorderHandle {
   cancel: () => void
 }
 
+const MIN_RECORDING_DURATION_MS = 250
+const MIN_RECORDING_BYTES = 256
+
+export function isUsableMicRecording(audio: Blob, durationMs: number): boolean {
+  return durationMs >= MIN_RECORDING_DURATION_MS && audio.size >= MIN_RECORDING_BYTES
+}
+
 function micError(error: unknown, copy: MicRecorderErrorCopy): Error {
   const name = error instanceof DOMException ? error.name : ''
 
@@ -224,6 +231,7 @@ export function useMicRecorder(copy: MicRecorderErrorCopy): {
       const recordingType = recorder.mimeType || mimeType || 'audio/webm'
       const durationMs = Date.now() - startedAtRef.current
       const heardSpeech = heardSpeechRef.current
+      const audio = new Blob(chunks, { type: recordingType })
 
       chunksRef.current = []
       cleanup()
@@ -231,14 +239,18 @@ export function useMicRecorder(copy: MicRecorderErrorCopy): {
       const resolver = stopResolverRef.current
       stopResolverRef.current = null
 
-      if (!chunks.length) {
+      // Chromium may emit a non-empty, header-only WebM when recording is
+      // stopped immediately (for example by an accidental end-turn keypress).
+      // Passing that blob to faster-whisper surfaces an FFmpeg "End of file"
+      // error. Treat it as no recording and let the voice loop re-arm.
+      if (!isUsableMicRecording(audio, durationMs)) {
         resolver?.(null)
 
         return
       }
 
       resolver?.({
-        audio: new Blob(chunks, { type: recordingType }),
+        audio,
         durationMs,
         heardSpeech
       })

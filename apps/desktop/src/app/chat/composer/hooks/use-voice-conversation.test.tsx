@@ -157,6 +157,28 @@ describe('useVoiceConversation full-duplex barge-in', () => {
     await waitFor(() => expect(monitorCalls.length).toBeGreaterThan(0))
   })
 
+  it('does not consume Space while listening', async () => {
+    const { hook } = renderConversation()
+
+    await act(async () => {
+      await hook.result.current.start()
+    })
+    await waitFor(() => expect(hook.result.current.status).toBe('listening'))
+    micHandle.stop.mockClear()
+
+    const event = new KeyboardEvent('keydown', {
+      bubbles: true,
+      cancelable: true,
+      code: 'Space',
+      key: ' '
+    })
+
+    globalThis.document.body.dispatchEvent(event)
+
+    expect(event.defaultPrevented).toBe(false)
+    expect(micHandle.stop).not.toHaveBeenCalled()
+  })
+
   it('interrupts the in-flight turn when speech trips mid-generation', async () => {
     const { hook, onInterrupt } = renderConversation()
 
