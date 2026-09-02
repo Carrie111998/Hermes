@@ -381,6 +381,15 @@ def _(rid, params: dict) -> dict:
                 all_pairs.append([k, d[:120] + ("…" if len(d) > 120 else "")])
                 name = str(info.get("name") or k.lstrip("/"))
                 skills[k] = {"usage": usage(name), "origin": origin_of(name)}
+                # Skill commands must enter `canon` so the TUI exact-match
+                # resolver can find them; otherwise a built-in whose name is a
+                # prefix of a skill name (e.g. built-in `/logs` shadowing a
+                # skill named `log`) wins resolution and the skill is
+                # unreachable via its bare slash name (#96972). Dedup-guard so
+                # an exact name collision with a built-in keeps the built-in
+                # canonical (same policy as plugin / TUI-extra commands).
+                if k.lower() not in canon:
+                    canon[k.lower()] = k
                 skill_count += 1
         except Exception as e:
             warning = f"skill discovery unavailable: {e}"
