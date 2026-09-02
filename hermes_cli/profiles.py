@@ -104,6 +104,11 @@ _CLONE_ALL_STRIP: list[str] = [
 #   bin           — installed binaries (tirith etc., ~10 MB) shared per-host
 #   node_modules  — npm packages (hundreds of MB)
 #
+#   lost+found    — filesystem-created recovery dir, root-owned 0700 on every
+#                   ext filesystem; copying it aborts the whole clone with
+#                   PermissionError (#91850) and it is never useful in a
+#                   profile.
+#
 # See ``_DEFAULT_EXPORT_EXCLUDE_ROOT`` below for the broader export-side
 # exclusion list (export also drops logs / caches because the archive is a
 # portable snapshot; clone-all keeps those because the cloned profile is
@@ -114,6 +119,7 @@ _CLONE_ALL_DEFAULT_EXCLUDE_ROOT: frozenset[str] = frozenset({
     "profiles",
     "bin",
     "node_modules",
+    "lost+found",
 })
 
 # Per-profile history artifacts excluded from --clone-all regardless of the
@@ -130,6 +136,10 @@ _CLONE_ALL_DEFAULT_EXCLUDE_ROOT: frozenset[str] = frozenset({
 #   backups             — `hermes backup` archives
 #   state-snapshots     — quick-backup snapshot trees
 #   checkpoints         — session checkpoint data
+#   portal-recovery     — platform-managed recovery snapshots, written by a
+#                         root-owned recovery process (root:root 0640 files
+#                         abort the clone with PermissionError, #91850); a
+#                         profile never restores from the host's snapshots
 _CLONE_ALL_HISTORY_EXCLUDE_ROOT: frozenset[str] = frozenset({
     "state.db",
     "state.db-wal",
@@ -138,6 +148,7 @@ _CLONE_ALL_HISTORY_EXCLUDE_ROOT: frozenset[str] = frozenset({
     "backups",
     "state-snapshots",
     "checkpoints",
+    "portal-recovery",
 })
 
 # Marker file written by `hermes profile create --no-skills`.  When present in
