@@ -22,10 +22,7 @@ LONG_HANDLERS = frozenset({
     "groups.rename",
     "groups.log",
     "groups.disband",
-    "groups.replicate",
     "groups.replica_state",
-    "groups.promote",
-    "groups.demote",
     "groups.stop",
     "groups.retry",
     "groups.approve",
@@ -258,8 +255,6 @@ def _(rid, params: dict) -> dict:
                 "replayable_disband",
                 "typed_events",
                 "actor_identity",
-                "log_replication",
-                "authority_takeover",
             ],
             "methods": [
                 "groups.capabilities",
@@ -270,10 +265,7 @@ def _(rid, params: dict) -> dict:
                 "groups.rename",
                 "groups.log",
                 "groups.disband",
-                "groups.replicate",
                 "groups.replica_state",
-                "groups.promote",
-                "groups.demote",
                 "groups.stop",
                 "groups.retry",
                 "groups.approve",
@@ -313,9 +305,7 @@ def _(rid, params: dict) -> dict:
             grant_id=str(params.get("grant_id") or f"grant-{os.urandom(16).hex()}"),
             room_id=str(params.get("room_id") or ""),
             home_install_id=str(params.get("home_install_id") or ""),
-            authority_gateway_id=str(
-                params.get("authority_gateway_id") or ""
-            ),
+            authority_gateway_id=str(params.get("authority_gateway_id") or ""),
             authority_epoch=int(params.get("authority_epoch") or 0),
             member_id=str(params.get("member_id") or ""),
             target_install_id=installation_id,
@@ -356,7 +346,10 @@ def _(rid, params: dict) -> dict:
     """Revoke one target-issued grant using its exact profile scope."""
     try:
         from gateway import hosted_rooms
-        from gateway.hosted_room_peer import decode_room_grant, gateway_room_grant_secret
+        from gateway.hosted_room_peer import (
+            decode_room_grant,
+            gateway_room_grant_secret,
+        )
 
         profile = _requested_profile(params)
         claims = decode_room_grant(
@@ -366,16 +359,13 @@ def _(rid, params: dict) -> dict:
         )
         if (
             claims["target_profile"] != profile
-            or claims["target_install_id"]
-            != hosted_rooms.local_authority_gateway_id()
+            or claims["target_install_id"] != hosted_rooms.local_authority_gateway_id()
         ):
             raise ValueError("room grant target does not match this profile")
         hosted_rooms.revoke_room_grant_scope(
             hosted_rooms.default_db_path(),
             claims=claims,
-            expires_at=float(
-                claims.get("status_expires_at", claims["expires_at"])
-            ),
+            expires_at=float(claims.get("status_expires_at", claims["expires_at"])),
         )
         return _ok(rid, {"revoked": True})
     except Exception as exc:
@@ -646,9 +636,7 @@ def _(rid, params: dict) -> dict:
             return disband_room(
                 service.db_path,
                 room_id=params.get("room_id"),
-                expected_gateway_id=str(
-                    local_gateway_id
-                ),
+                expected_gateway_id=str(local_gateway_id),
                 expected_epoch=int(
                     state["authority_epoch"] if state is not None else 1
                 ),
@@ -772,28 +760,13 @@ def _(rid, params: dict) -> dict:
 
 @method("groups.replicate")
 def _(rid, params: dict) -> dict:
-    """Persist one authority-stamped replay page into the local replica store.
-
-    ``page`` is the verbatim ``groups.log`` result read from the room's
-    authority gateway; ingest is idempotent and refuses sequence gaps and
-    authority-epoch regressions.
-    """
-    from gateway.hosted_room_replicas import ReplicaError, ingest_page
-    from gateway.hosted_rooms import default_db_path
-
-    try:
-        result = ingest_page(
-            default_db_path(),
-            room_id=params.get("room_id"),
-            room_name=params.get("room_name"),
-            members=params.get("members"),
-            page=params.get("page"),
-        )
-        return _ok(rid, result)
-    except ReplicaError as exc:
-        return _err(rid, 4116, str(exc))
-    except Exception as exc:
-        return _err(rid, 5116, str(exc))
+    """Fail closed until replica ingest is bound to verified RoomLink claims."""
+    return _err(
+        rid,
+        4116,
+        "Group Chat replication requires a verified RoomLink grant.",
+        {"reason": "replica_provenance_required"},
+    )
 
 
 @method("groups.replica_state")
@@ -805,61 +778,33 @@ def _(rid, params: dict) -> dict:
     try:
         return _ok(rid, replica_state(default_db_path(), room_id=params.get("room_id")))
     except ReplicaError as exc:
-        return _err(rid, 4117, str(exc))
+        reason = getattr(exc, "reason", None)
+        return _err(rid, 4117, str(exc), {"reason": reason} if reason else None)
     except Exception as exc:
         return _err(rid, 5117, str(exc))
 
 
 @method("groups.promote")
 def _(rid, params: dict) -> dict:
-    """Continue a replicated room on THIS gateway at ``epoch + 1``.
-
-    Requires ``confirm: true`` — the caller asserts the previous authority can
-    no longer commit (explicit user action; a lease/quorum driver later).
-    """
-    from gateway.hosted_room_replicas import ReplicaError, promote_replica
-    from gateway.hosted_rooms import HostedRoomError, default_db_path
-
-    if params.get("confirm") is not True:
-        return _err(
-            rid,
-            4118,
-            "promotion requires confirm=true acknowledging the previous "
-            "authority can no longer commit",
-        )
-    try:
-        result = promote_replica(
-            default_db_path(),
-            room_id=params.get("room_id"),
-            reason=params.get("reason", "authority-unreachable"),
-        )
-        return _ok(rid, result)
-    except ReplicaError as exc:
-        return _err(rid, 4118, str(exc))
-    except HostedRoomError as exc:
-        return _err(rid, 4118, str(exc))
-    except Exception as exc:
-        return _err(rid, 5118, str(exc))
+    """Fail closed for clients that cached the retired takeover method."""
+    return _err(
+        rid,
+        4118,
+        "Group Chat takeover is disabled until Hermes can select one globally "
+        "exclusive authority.",
+        {"reason": "authority_takeover_disabled"},
+    )
 
 
 @method("groups.demote")
 def _(rid, params: dict) -> dict:
-    """Fence this gateway's stale room authority against a proven newer epoch."""
-    from gateway.hosted_room_replicas import ReplicaError, demote_room
-    from gateway.hosted_rooms import default_db_path
-
-    try:
-        result = demote_room(
-            default_db_path(),
-            room_id=params.get("room_id"),
-            observed_gateway_id=params.get("observed_gateway_id"),
-            observed_epoch=params.get("observed_epoch"),
-        )
-        return _ok(rid, result)
-    except ReplicaError as exc:
-        return _err(rid, 4119, str(exc))
-    except Exception as exc:
-        return _err(rid, 5119, str(exc))
+    """Fail closed for clients that cached the retired demotion method."""
+    return _err(
+        rid,
+        4119,
+        "Group Chat authority changes require a verified takeover decision.",
+        {"reason": "authority_takeover_disabled"},
+    )
 
 
 def register(server) -> None:
