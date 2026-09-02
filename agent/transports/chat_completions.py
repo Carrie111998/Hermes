@@ -1068,8 +1068,17 @@ class ChatCompletionsTransport(ProviderTransport):
             model_extra = getattr(msg, "model_extra", None) or {}
             if isinstance(model_extra, dict) and "reasoning_content" in model_extra:
                 reasoning_content = model_extra["reasoning_content"]
+        # Truthiness (``not``) is deliberate: an empty-string standard field
+        # counts as absent, so a relay that sends ``reasoning_content=""``
+        # beside a real ``thinking`` block still falls back — the relay is
+        # effectively renaming its reasoning field. Pinned by
+        # test_normalize_response_empty_reasoning_content_falls_back_to_thinking.
         if not reasoning and not reasoning_content:
             thinking = getattr(msg, "thinking", None)
+            if thinking is None and hasattr(msg, "model_extra"):
+                model_extra = getattr(msg, "model_extra", None) or {}
+                if isinstance(model_extra, dict):
+                    thinking = model_extra.get("thinking")
             if thinking:
                 reasoning = thinking
 
