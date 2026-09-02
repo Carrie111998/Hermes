@@ -9733,6 +9733,26 @@ def _gateway_platform_config(platform_id: str):
     return config, platform, platform_config
 
 
+def _enrich_live_health(health: dict | None) -> dict | None:
+    """Annotate a live_health record with ``age_seconds`` for staleness detection.
+
+    Computes the elapsed seconds since ``checked_at`` so API consumers don't
+    have to re-implement freshness math.  Returns *health* unchanged when it
+    is ``None`` or lacks a parseable ``checked_at`` timestamp.
+    """
+    if not isinstance(health, dict):
+        return health
+    checked_at = health.get("checked_at")
+    if not isinstance(checked_at, str):
+        return health
+    try:
+        ts = datetime.fromisoformat(checked_at)
+        age = (datetime.now(timezone.utc) - ts).total_seconds()
+        return {**health, "age_seconds": round(age, 1)}
+    except (ValueError, TypeError):
+        return health
+
+
 def _messaging_platform_payload(
     entry: dict[str, Any],
     env_on_disk: dict[str, str],
@@ -9892,6 +9912,11 @@ def _messaging_platform_payload(
         "error_message": error_message,
         "updated_at": (
             runtime_platform.get("updated_at")
+            if isinstance(runtime_platform, dict)
+            else None
+        ),
+        "live_health": _enrich_live_health(
+            runtime_platform.get("live_health")
             if isinstance(runtime_platform, dict)
             else None
         ),
