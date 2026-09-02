@@ -601,6 +601,80 @@ async def test_safe_sync_reads_permission_attrs_from_existing_command():
     fake_http.upsert_global_command.assert_not_awaited()
 
 
+@pytest.mark.asyncio
+async def test_safe_sync_accepts_discord_expanded_default_install_types():
+    """Discord expands an omitted integration_types policy server-side.
+
+    The local Command tree leaves the application default unspecified (None),
+    while fetched commands may contain [0, 1].  That is semantically unchanged
+    and must not trigger delete+recreate churn for every command on startup.
+    """
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="test-token"))
+
+    desired = {
+        "name": "new",
+        "description": "Start a new conversation",
+        "type": 1,
+        "options": [],
+        "nsfw": False,
+        "dm_permission": True,
+        "default_member_permissions": None,
+        "contexts": None,
+        "integration_types": None,
+    }
+
+    class _DesiredCommand:
+        def to_dict(self, tree):
+            return dict(desired)
+
+    class _ExistingCommand:
+        id = 42
+        name = "new"
+        description = desired["description"]
+        type = SimpleNamespace(value=1)
+        nsfw = False
+        guild_only = False
+        default_member_permissions = None
+
+        def to_dict(self):
+            return {
+                "id": self.id,
+                "application_id": 999,
+                **desired,
+                "integration_types": [0, 1],
+            }
+
+    fake_tree = SimpleNamespace(
+        get_commands=lambda: [_DesiredCommand()],
+        fetch_commands=AsyncMock(return_value=[_ExistingCommand()]),
+    )
+    fake_http = SimpleNamespace(
+        upsert_global_command=AsyncMock(),
+        edit_global_command=AsyncMock(),
+        delete_global_command=AsyncMock(),
+    )
+    adapter._client = SimpleNamespace(
+        tree=fake_tree,
+        http=fake_http,
+        application_id=999,
+        user=SimpleNamespace(id=999),
+    )
+
+    summary = await adapter._safe_sync_slash_commands()
+
+    assert summary == {
+        "total": 1,
+        "unchanged": 1,
+        "updated": 0,
+        "recreated": 0,
+        "created": 0,
+        "deleted": 0,
+    }
+    fake_http.edit_global_command.assert_not_awaited()
+    fake_http.delete_global_command.assert_not_awaited()
+    fake_http.upsert_global_command.assert_not_awaited()
+
+
 # ============================================================================
 # #31049: unconfigured platform skips reconnection (non-retryable fatal error)
 # ============================================================================

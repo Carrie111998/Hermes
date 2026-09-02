@@ -142,6 +142,34 @@ async def test_registers_native_thread_slash_command(adapter):
 
 
 @pytest.mark.asyncio
+async def test_native_new_dispatches_canonical_new_command(adapter):
+    adapter._run_simple_slash = AsyncMock()
+    adapter._register_slash_commands()
+
+    command = adapter._client.tree.commands["new"]
+    interaction = SimpleNamespace()
+    await command(interaction)
+
+    adapter._run_simple_slash.assert_awaited_once_with(
+        interaction, "/new", "New conversation started~"
+    )
+
+
+@pytest.mark.asyncio
+async def test_registers_native_rename_slash_command(adapter):
+    adapter._run_simple_slash = AsyncMock()
+    adapter._register_slash_commands()
+
+    command = adapter._client.tree.commands["rename"]
+    interaction = SimpleNamespace()
+    await command(interaction, name="Clean Thread Name")
+
+    adapter._run_simple_slash.assert_awaited_once_with(
+        interaction, "/rename Clean Thread Name"
+    )
+
+
+@pytest.mark.asyncio
 async def test_run_simple_slash_executes_when_defer_interaction_expired(adapter):
     class UnknownInteraction(Exception):
         status = 404
@@ -440,6 +468,36 @@ async def test_rename_thread_edits_only_when_current_name_matches(adapter):
         "999",
         "Semantic Session Title",
         only_if_current_name="raw user prompt",
+    )
+
+    assert result is True
+    thread.edit.assert_awaited_once_with(
+        name="Semantic Session Title",
+        reason="Hermes semantic session title",
+    )
+
+
+@pytest.mark.asyncio
+async def test_rename_thread_accepts_shared_gateway_contract_kwargs(adapter):
+    """Native Discord must accept the same rename kwargs as relay adapters.
+
+    The gateway calls every adapter through one polymorphic contract.  Native
+    Discord ignores relay-only routing hints, but rejecting them prevents the
+    semantic rename from running at all.
+    """
+    thread = SimpleNamespace(
+        id=999,
+        name="raw user prompt",
+        edit=AsyncMock(),
+    )
+    adapter._client.get_channel = lambda _id: thread
+
+    result = await adapter.rename_thread(
+        "999",
+        "Semantic Session Title",
+        only_if_current_name="raw user prompt",
+        prefer_connector_created=False,
+        parent_chat_id=None,
     )
 
     assert result is True
