@@ -36,6 +36,10 @@ from utils import is_truthy_value
 from tools.environments.local import hermes_subprocess_env
 from agent.replay_cleanup import sanitize_replay_history
 from agent.compaction_display import project_compaction_message_for_display
+from agent.context_compressor import (
+    awaiting_post_compression_usage,
+    context_gauge,
+)
 from agent.skill_commands import describe_skill_invocation
 from agent.conversation_loop import INTERRUPT_WAITING_FOR_MODEL_PREFIX
 from tui_gateway import git_probe
@@ -7532,9 +7536,32 @@ def _get_usage(agent) -> dict:
             last_prompt = 0
         ctx_max = getattr(comp, "context_length", 0) or 0
         if ctx_max and last_prompt:
-            usage["context_used"] = last_prompt
             usage["context_max"] = ctx_max
-            usage["context_percent"] = max(0, min(100, round(last_prompt / ctx_max * 100)))
+            usage["context_used"], usage["context_percent"] = context_gauge(
+                last_prompt, ctx_max
+            )
+        elif ctx_max and awaiting_post_compression_usage(comp):
+            # Bridge the one transitional turn between a compaction and the
+            # next provider-reported usage.
+            #
+            # Omitting the gauge here is not neutral: appChrome.tsx falls back
+            # to `usage.total` (cumulative session tokens, which compaction does
+            # NOT reduce) whenever context_max is missing, and drops the fill
+            # bar. So the turn right after a successful compaction showed a
+            # LARGER, unrelated number instead of the smaller context — the
+            # opposite of what just happened.
+            #
+            # This does not reintroduce #50421: the two fields consulted by
+            # awaiting_post_compression_usage() are written only by the built-in
+            # compressor's post-compaction path, so an external context engine
+            # that doesn't report last_prompt_tokens still emits no gauge.
+            usage["context_max"] = ctx_max
+            usage["context_used"], usage["context_percent"] = context_gauge(
+                comp.last_compression_rough_tokens, ctx_max
+            )
+            # Lets a client mark the bridged reading as an estimate. Rendering is
+            # a deliberate follow-up (see the CLI snapshot for the same note).
+            usage["context_estimated"] = True
         usage["compressions"] = getattr(comp, "compression_count", 0) or 0
     # Cache-hit ratio + rolling latency/throughput for the TUI status bar.
     # Mirrors the classic CLI bar (cli.py _get_status_bar_snapshot / PR #98250):

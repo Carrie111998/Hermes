@@ -51,6 +51,68 @@ from tools.todo_tool import TODO_INJECTION_HEADER
 logger = logging.getLogger(__name__)
 
 
+def awaiting_post_compression_usage(compressor: Any) -> bool:
+    """True while a compaction's rough estimate is the best context signal.
+
+    After a successful compaction ``conversation_compression.py`` parks
+    ``last_prompt_tokens`` at the -1 sentinel and records
+    ``last_compression_rough_tokens``; ``update_from_response()`` then clears
+    ``awaiting_real_usage_after_compression`` as soon as the provider reports
+    real usage for the now-shorter conversation. In between, the rough estimate
+    is the only occupancy figure available, and status surfaces should show it
+    rather than a hard zero (or nothing at all).
+
+    BOTH fields must be checked. ``last_compression_rough_tokens`` is never
+    zeroed, so on its own it stays truthy for the rest of the session and would
+    resurrect a stale, many-turns-old value on any later turn that happened to
+    report ``prompt_tokens=0`` — common behind OpenAI-compatible proxies whose
+    streams omit usage.
+
+    Duck-typed on purpose (plain ``getattr`` with defaults) so status-bar call
+    sites can pass any compressor-shaped object, including the lightweight
+    stand-ins used in tests and by external context engines.
+
+    The bridge this gates is bounded to ONE turn, including on providers whose
+    streams omit usage entirely. Two independent guarantees:
+
+      * ``update_from_response()`` clears
+        ``awaiting_real_usage_after_compression`` unconditionally at the end of
+        the method — outside the ``last_prompt_tokens > 0`` branch — precisely
+        "so a usage-less response can't leave it armed for a later, unrelated
+        reading";
+      * ``agent/conversation_loop.py`` calls ``update_from_response({})`` when a
+        response carries no usage AND this flag is set, so "preflight deferral
+        does not remain latched indefinitely".
+
+    So the estimate cannot pin the gauge across many turns: the next response
+    clears the flag whether or not the provider reported anything.
+    """
+    return bool(
+        getattr(compressor, "awaiting_real_usage_after_compression", False)
+        and (getattr(compressor, "last_compression_rough_tokens", 0) or 0) > 0
+    )
+
+
+def context_gauge(used: int, context_length: int) -> tuple[int, int]:
+    """Return ``(used, percent)`` for a context gauge, clamped consistently.
+
+    Shared by the CLI status bar and the TUI gateway usage payload so the two
+    surfaces cannot drift: same clamping, same rounding, one place to change.
+
+    ``used`` is clamped to ``context_length`` before the percentage is derived.
+    A post-compaction ROUGH estimate can legitimately exceed the window (the
+    estimator intentionally over-counts schema-heavy requests), and reporting
+    ``180k / 150k`` alongside a 100%-clamped bar left the two halves of the
+    read-out contradicting each other.
+    """
+    used = max(0, int(used or 0))
+    context_length = max(0, int(context_length or 0))
+    if not context_length:
+        return used, 0
+    used = min(used, context_length)
+    return used, max(0, min(100, round(used / context_length * 100)))
+
+
 def _safe_int(value: Any) -> int | None:
     """Best-effort integer coercion for telemetry fields."""
     try:
