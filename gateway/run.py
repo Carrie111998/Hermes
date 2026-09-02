@@ -35,6 +35,7 @@ import os
 import queue
 import re
 import shlex
+import shutil
 import site
 import sys
 import signal
@@ -2210,6 +2211,108 @@ def _multiplex_profile_homes(config: object) -> list[tuple[str, "Path"]]:
             profile_allowlist=getattr(config, "multiplex_profile_allowlist", None),
         )
     )
+
+
+def _cache_mounts_for_home(home: Path) -> list[dict[str, str]]:
+    """Resolve cache mounts against one explicit Hermes home."""
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+    from tools.credential_files import get_cache_directory_mounts
+
+    token = set_hermes_home_override(home)
+    try:
+        return get_cache_directory_mounts()
+    finally:
+        reset_hermes_home_override(token)
+
+
+def _relocate_inbound_media_for_active_profile(event: "MessageEvent") -> None:
+    """Move adapter-cached media into the active multiplex profile cache.
+
+    Platform adapters can download attachments before profile routing installs
+    its runtime scope. Match only files from the process cache, copy them into
+    the corresponding active-profile mount, and preserve whether ``media_urls``
+    originally used a host or sandbox path.
+    """
+    from hermes_constants import get_process_hermes_home
+
+    urls = list(getattr(event, "media_urls", None) or [])
+    if not urls:
+        return
+
+    source_home = get_process_hermes_home()
+    target_home = get_hermes_home()
+    if source_home == target_home or not target_home.is_dir():
+        return
+
+    source_mounts = _cache_mounts_for_home(source_home)
+    target_mounts = {
+        mount["container_path"]: mount for mount in _cache_mounts_for_home(target_home)
+    }
+    rewritten = list(urls)
+
+    for index, raw_path in enumerate(urls):
+        path = Path(raw_path)
+        for source_mount in source_mounts:
+            target_mount = target_mounts.get(source_mount["container_path"])
+            if target_mount is None:
+                continue
+
+            source_root = Path(source_mount["host_path"])
+            container_root = Path(source_mount["container_path"])
+            host_form = True
+            try:
+                relative = path.relative_to(source_root)
+            except ValueError:
+                host_form = False
+                try:
+                    relative = path.relative_to(container_root)
+                except ValueError:
+                    continue
+            if ".." in relative.parts:
+                continue
+
+            source_path = source_root / relative
+            target_path = Path(target_mount["host_path"]) / relative
+            try:
+                if target_path.is_file():
+                    if host_form:
+                        rewritten[index] = str(target_path)
+                    break
+                if not source_path.is_file():
+                    break
+            except OSError:
+                break
+
+            temporary = target_path.with_name(
+                f".{target_path.name}.{os.getpid()}.{threading.get_ident()}.{index}.tmp"
+            )
+            try:
+                target_path.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(source_path, temporary)
+                os.replace(temporary, target_path)
+            except OSError:
+                try:
+                    temporary.unlink(missing_ok=True)
+                except OSError:
+                    pass
+                logger.warning(
+                    "Failed to relocate inbound attachment into profile cache",
+                    exc_info=True,
+                )
+                break
+
+            try:
+                source_path.unlink()
+            except OSError:
+                logger.debug(
+                    "Copied inbound attachment but could not remove process-cache copy",
+                    exc_info=True,
+                )
+            if host_form:
+                rewritten[index] = str(target_path)
+            break
+
+    event.media_urls = rewritten
 
 
 @_contextmanager
@@ -18655,6 +18758,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         already run and images are represented in-text.
         """
         history = history or []
+        if getattr(self.config, "multiplex_profiles", False):
+            try:
+                _relocate_inbound_media_for_active_profile(event)
+            except Exception:
+                # Attachment relocation is a compatibility repair. If an
+                # unusual filesystem/backend rejects it, retain the original
+                # paths and let the established media pipeline handle them.
+                logger.warning(
+                    "Failed to scope inbound attachments to routed profile",
+                    exc_info=True,
+                )
         _pending_stt_prepared = hasattr(event, "_gateway_pending_stt_text")
         message_text = (
             getattr(event, "_gateway_pending_stt_text", None)
