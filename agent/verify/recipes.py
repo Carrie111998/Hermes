@@ -25,10 +25,13 @@ Layer ownership vs :mod:`agent.coding_context`:
 from __future__ import annotations
 
 import json
+import logging
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -439,16 +442,71 @@ _COMPOSE_FILES = (
 )
 
 
+def _compose_host_port(root: Path, compose_file: str) -> int | None:
+    """First host port published by the compose file, or ``None`` if unknowable.
+
+    ``hermes verify`` probes readiness on ``127.0.0.1``, so only a real
+    ``HOST:CONTAINER`` publishing pins a probeable port; a container-only
+    short entry (``"3000"``) leaves the host port to Docker's discretion and
+    must not be guessed.
+    """
+    try:
+        import yaml  # core dependency; guarded so a broken install degrades, not crashes
+
+        doc = yaml.safe_load((root / compose_file).read_text(encoding="utf-8"))
+    except Exception:
+        # An unparseable compose file must stay indistinguishable from an
+        # unpinned one in behavior, but leave a trace for debugging a wrong
+        # probe target.
+        logger.debug(
+            "verify: could not parse %s for a published host port",
+            compose_file, exc_info=True,
+        )
+        return None
+    services = doc.get("services") if isinstance(doc, dict) else None
+    if not isinstance(services, dict):
+        return None
+    for svc in services.values():
+        ports = svc.get("ports") if isinstance(svc, dict) else None
+        if not isinstance(ports, list):
+            continue
+        for entry in ports:
+            if isinstance(entry, dict):
+                # Long syntax: {"target": ..., "published": HOST} (published
+                # may be a str; a range pins several — take the first).
+                published = entry.get("published")
+                if isinstance(published, str):
+                    published = published.split("-")[0]
+                    published = int(published) if published.isdigit() else None
+                if (
+                    isinstance(published, int)
+                    and not isinstance(published, bool)
+                    and 0 < published < 65536
+                ):
+                    return published
+                continue
+            if not (isinstance(entry, str) and ":" in entry):
+                continue  # container-only entry: host port not pinned
+            host = entry.split(":")[-2]  # "[IP:]HOST:CONTAINER[/proto]"
+            host = host.split("-")[0]  # "3000-3005" range pins several — take the first
+            if host.isdigit() and 0 < int(host) < 65536:
+                return int(host)
+    return None
+
+
 def _detect_compose_recipe(root: Path) -> Recipe | None:
     compose_file = next((f for f in _COMPOSE_FILES if (root / f).exists()), None)
     if compose_file is None:
         return None
+    host_port = _compose_host_port(root, compose_file)
     return Recipe(
         name="docker-compose project",
         kind="compose",
         build=["docker compose build"],
         start="docker compose up",
-        evidence=[f"Detected {compose_file}"],
+        port=host_port,
+        evidence=[f"Detected {compose_file}"]
+        + ([f"Probing first published host port: {host_port}"] if host_port else []),
     )
 
 

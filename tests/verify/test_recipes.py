@@ -205,6 +205,69 @@ class TestOtherEcosystems:
         assert recipe.kind == "compose"
         assert recipe.start == "docker compose up"
 
+    def test_compose_port_from_short_syntax(self, tmp_path):
+        # "HOST:CONTAINER" and "[IP:]HOST:CONTAINER[/proto]" both pin a
+        # probeable host port (#99391: probe 3002, not the 8000 fallback).
+        (tmp_path / "docker-compose.yml").write_text(
+            "services:\n"
+            "  app:\n"
+            '    ports: ["127.0.0.1:3002:3002"]\n',
+            encoding="utf-8",
+        )
+        recipe = detect_recipe(tmp_path)
+        assert recipe.kind == "compose"
+        assert recipe.port == 3002
+
+    def test_compose_port_from_short_range_syntax(self, tmp_path):
+        # "FIRST-LAST:CONTAINER" pins a range — probe its first port, the
+        # same tie-break the long syntax applies to a str "published".
+        (tmp_path / "docker-compose.yml").write_text(
+            "services:\n"
+            "  app:\n"
+            '    ports: ["3000-3005:3000"]\n',
+            encoding="utf-8",
+        )
+        assert detect_recipe(tmp_path).port == 3000
+
+    def test_compose_port_from_long_syntax(self, tmp_path):
+        (tmp_path / "compose.yaml").write_text(
+            "services:\n"
+            "  app:\n"
+            "    ports:\n"
+            "      - target: 80\n"
+            '        published: "3002"\n',
+            encoding="utf-8",
+        )
+        assert detect_recipe(tmp_path).port == 3002
+
+    def test_compose_port_first_mapped_service_wins(self, tmp_path):
+        (tmp_path / "docker-compose.yml").write_text(
+            "services:\n"
+            "  db:\n"
+            "    image: postgres\n"
+            "  app:\n"
+            '    ports: ["8080:80"]\n',
+            encoding="utf-8",
+        )
+        recipe = detect_recipe(tmp_path)
+        assert recipe.port == 8080
+        assert recipe.evidence[-1] == "Probing first published host port: 8080"
+
+    def test_compose_port_not_guessed_when_unpinned_or_broken(self, tmp_path):
+        # Container-only entries leave the host port to Docker — keep the
+        # 8000 fallback rather than guessing; malformed YAML must not break
+        # detection either.
+        (tmp_path / "docker-compose.yml").write_text(
+            "services:\n"
+            "  app:\n"
+            '    ports: ["3002"]\n',
+            encoding="utf-8",
+        )
+        assert detect_recipe(tmp_path).port is None
+        (tmp_path / "docker-compose.yml").write_text("services: [broken", encoding="utf-8")
+        recipe = detect_recipe(tmp_path)
+        assert recipe is not None and recipe.port is None
+
     def test_empty_dir_returns_none(self, tmp_path):
         assert detect_recipe(tmp_path) is None
 
