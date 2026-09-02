@@ -587,6 +587,14 @@ def test_restart_indexes_terminal_task_after_policy_compaction(tmp_path: Path):
         status="settled",
         execution_generation=0,
     )
+    with sqlite3.connect(db) as conn:
+        conn.execute("DELETE FROM hosted_room_policy_publications")
+    assert service.policy_checkpoint.publication_exists(
+        room_id="room-1",
+        task_id=task["identity"].task_id,
+        status="settled",
+        execution_generation=0,
+    )
 
 
 def test_policy_checkpoint_bounds_replay_after_completed_room_history(

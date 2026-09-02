@@ -629,6 +629,27 @@ class HostedRoomPolicyCheckpoint:
                        )""",
                     (room_id, task_id),
                 ).fetchone()
+            if row is None:
+                if status == "deferred":
+                    row = conn.execute(
+                        """SELECT 1 FROM hosted_room_events
+                           WHERE room_id=? AND kind=?
+                             AND json_extract(payload_json, '$.task_id')=?
+                             AND COALESCE(CAST(json_extract(
+                                 payload_json, '$.execution_generation'
+                             ) AS INTEGER), 0)=?
+                           LIMIT 1""",
+                        (room_id, kind, task_id, generation),
+                    ).fetchone()
+                else:
+                    row = conn.execute(
+                        """SELECT 1 FROM hosted_room_events
+                           WHERE room_id=? AND kind IN (
+                               'turn.settled', 'turn.failed', 'turn.cancelled'
+                           ) AND json_extract(payload_json, '$.task_id')=?
+                           LIMIT 1""",
+                        (room_id, task_id),
+                    ).fetchone()
         return row is not None
 
     def events_for_task(
