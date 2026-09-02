@@ -9139,7 +9139,10 @@ def _resolve_runtime_with_fallback(
             if not fb_provider or not fb_model:
                 continue
             try:
-                from hermes_cli.fallback_config import resolve_entry_api_key
+                from hermes_cli.fallback_config import (
+                    effective_runtime_provider,
+                    resolve_entry_api_key,
+                )
 
                 fb_kwargs: dict = {
                     "requested": fb_provider,
@@ -9151,6 +9154,10 @@ def _resolve_runtime_with_fallback(
                 if fb_api_key:
                     fb_kwargs["explicit_api_key"] = fb_api_key
                 runtime = resolve_runtime_provider(**fb_kwargs)
+                # Named custom entries resolve to the bare "custom" billing
+                # class; keep the configured identity so the session/UI shows
+                # the provider name, matching the manual-switch path (#98739).
+                runtime["provider"] = effective_runtime_provider(entry, runtime)
                 import logging
 
                 logging.getLogger(__name__).warning(
