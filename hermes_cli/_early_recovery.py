@@ -616,14 +616,59 @@ def _complete_pending_core_install(root: Path, core_marker: Path) -> bool:
         except OSError:
             attempts = 0
 
-        if attempts >= _EARLY_CORE_INSTALL_MAX_ATTEMPTS:
+        # #97819: dangling editable finder (MAPPING points at deleted
+        # site-packages copy) must be healed even when the full-install
+        # attempt budget is exhausted.  Try a cheap ``pip install -e . --no-deps``
+        # regeneration first without consuming an attempt; if that fails
+        # allow one more full reinstall despite the ceiling.
+        _finder_dangling = False
+        _finder_reasons: list[str] = []
+        try:
+            _finder_dangling, _finder_reasons = ir.editable_finder_is_dangling(root)
+        except Exception:
+            pass
+        if _finder_dangling:
             print(
-                "⚠ Pending interrupted-update install has already failed "
-                f"{attempts} times in the early pass — leaving it for the "
-                "post-import recovery path.",
+                f"⚠ Editable finder MAPPING is dangling: {', '.join(_finder_reasons[:3])} — regenerating editable install...",
                 file=sys.stderr,
             )
-            return False
+            try:
+                ir._clean_stale_site_packages_physical_copies(root)
+            except Exception:
+                pass
+            try:
+                if ir._regenerate_editable_finder(root):
+                    _still, _reasons2 = ir.editable_finder_is_dangling(root)
+                    if not _still:
+                        print("  ✓ Editable finder regenerated in early pass.", file=sys.stderr)
+                        try:
+                            core_marker.unlink()
+                        except OSError:
+                            pass
+                        return True
+                    print(
+                        f"  ⚠ Finder still dangling after lightweight regen: {', '.join(_reasons2[:2])} — will retry full install...",
+                        file=sys.stderr,
+                    )
+                else:
+                    print("  ⚠ Lightweight finder regeneration failed — will retry full install...", file=sys.stderr)
+            except Exception:
+                pass
+            if attempts >= _EARLY_CORE_INSTALL_MAX_ATTEMPTS:
+                print(
+                    "  → Dangling finder detected — retrying full install despite attempt ceiling...",
+                    file=sys.stderr,
+                )
+            # fall through to full install even at ceiling
+        else:
+            if attempts >= _EARLY_CORE_INSTALL_MAX_ATTEMPTS:
+                print(
+                    "⚠ Pending interrupted-update install has already failed "
+                    f"{attempts} times in the early pass — leaving it for the "
+                    "post-import recovery path.",
+                    file=sys.stderr,
+                )
+                return False
 
         if not _claim_recovery_lock(root):
             return False
@@ -636,6 +681,26 @@ def _complete_pending_core_install(root: Path, core_marker: Path) -> bool:
                 file=sys.stderr,
             )
             ir.run_core_install(root)
+            # #97819: post-install finder health sweep — a stale physical
+            # copy could have poisoned the just-finished reinstall.
+            try:
+                _is_dangling, _reasons = ir.editable_finder_is_dangling(root)
+                if _is_dangling:
+                    print(
+                        f"  ⚠ Editable finder still dangling after full reinstall: {', '.join(_reasons[:2])} — regenerating...",
+                        file=sys.stderr,
+                    )
+                    ir._clean_stale_site_packages_physical_copies(root)
+                    if ir._regenerate_editable_finder(root):
+                        _is_dangling2, _reasons2 = ir.editable_finder_is_dangling(root)
+                        if _is_dangling2:
+                            raise RuntimeError(f"editable finder still dangling: {_reasons2}")
+                    else:
+                        raise RuntimeError(f"finder regeneration failed after dangling: {_reasons}")
+            except RuntimeError:
+                raise
+            except Exception:
+                pass
         except Exception as exc:
             new_attempts = ir.bump_marker_attempts(core_marker)
             print(

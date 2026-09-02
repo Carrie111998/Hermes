@@ -9465,6 +9465,40 @@ def _recover_core_update_marker_locked() -> None:
         # established by _recover_from_interrupted_install, so
         # run_core_install's own redirect nests harmlessly.
         _ir.run_core_install(PROJECT_ROOT)
+        # #97819: verify editable finder health after the full reinstall.
+        # A stale physical copy in site-packages can poison the freshly
+        # generated MAPPING; regenerating the editable metadata fixes the
+        # launcher's ModuleNotFoundError.  Do not clear the marker if the
+        # finder is still dangling — the next launch must retry.
+        try:
+            _is_dangling, _reasons = _ir.editable_finder_is_dangling(PROJECT_ROOT)
+            if _is_dangling:
+                print(
+                    f"  ⚠ Editable finder still dangling after reinstall: {', '.join(_reasons[:2])} — regenerating...",
+                )
+                _ir._clean_stale_site_packages_physical_copies(PROJECT_ROOT)
+                if not _ir._regenerate_editable_finder(PROJECT_ROOT):
+                    raise RuntimeError(f"finder regeneration failed: {_reasons}")
+                _is_dangling2, _reasons2 = _ir.editable_finder_is_dangling(PROJECT_ROOT)
+                if _is_dangling2:
+                    raise RuntimeError(f"editable finder still dangling after regeneration: {_reasons2}")
+                print("  ✓ Editable finder healed after regeneration")
+        except RuntimeError:
+            raise
+        except Exception:
+            pass
+
+        # Final guard: do not clear the breadcrumb if the finder is still
+        # dangling — the install looks successful but the launcher would
+        # still crash with ModuleNotFoundError on next launch.
+        try:
+            _is_dangling, _ = _ir.editable_finder_is_dangling(PROJECT_ROOT)
+            if _is_dangling:
+                raise RuntimeError(f"editable finder still dangling: {_reasons}")
+        except RuntimeError:
+            raise
+        except Exception:
+            pass
 
         _clear_update_incomplete_marker()
         print("✓ Dependency installation recovered — your install is healthy again.")

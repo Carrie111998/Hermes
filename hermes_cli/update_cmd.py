@@ -4571,15 +4571,84 @@ def _cmd_update_check(branch: str = "main", *, branch_explicit: bool = False):
         record_refusal_receipt,
     )
 
-    refusal = evaluate_update_admission(_m().PROJECT_ROOT)
+    # #97819: anchor repo detection at the install directory (the same
+    # path ``hermes --version`` prints as ``Install directory``), not at
+    # cwd or at a poisoned site-packages path.  When the editable finder
+    # MAPPING dangles the ``hermes_cli`` package resolves from
+    # ``venv/Lib/site-packages/hermes_cli`` and ``_m().PROJECT_ROOT``
+    # (derived from ``hermes_cli.__file__``) would point at site-packages
+    # instead of the checkout, making ``update --check`` mis-report
+    # ``Not a git repository``.  Fall back to the canonical checkout under
+    # the hermes home or to ``_startup_fast.project_root_str()`` which is
+    # the path baked into ``hermes --version``.
+    def _resolve_repo_dir() -> Path:
+        # Use the import-time PROJECT_ROOT first — it is the install dir
+        # when the finder is healthy.
+        try:
+            cand = Path(_m().PROJECT_ROOT)
+            if (cand / ".git").is_dir() or (cand / ".git").is_file():
+                return cand
+        except Exception:
+            pass
+        # Fallback 1: the directory ``hermes --version`` prints
+        try:
+            from hermes_cli import _startup_fast as _sf
+            cand = Path(_sf.project_root_str())
+            if cand.is_dir() and ((cand / ".git").is_dir() or (cand / ".git").is_file()):
+                print(f"  (using install directory {cand})", file=sys.stderr)
+                return cand
+        except Exception:
+            pass
+        # Fallback 2: canonical checkout next to the hermes home
+        try:
+            from hermes_constants import get_default_hermes_root
+            cand = Path(get_default_hermes_root()) / "hermes-agent"
+            if cand.is_dir() and ((cand / ".git").is_dir() or (cand / ".git").is_file()):
+                print(f"  (using fallback checkout {cand})", file=sys.stderr)
+                return cand
+        except Exception:
+            pass
+        try:
+            from hermes_cli.config import get_hermes_home
+            home = Path(get_hermes_home())
+            for cand in (home / "hermes-agent", home.parent / "hermes-agent"):
+                try:
+                    if cand.is_dir() and ((cand / ".git").is_dir() or (cand / ".git").is_file()):
+                        print(f"  (using fallback checkout {cand})", file=sys.stderr)
+                        return cand
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        # Last resort: original PROJECT_ROOT (will trigger the git error below)
+        try:
+            return Path(_m().PROJECT_ROOT)
+        except Exception:
+            return Path.cwd()
+
+    _repo_dir = _resolve_repo_dir()
+
+    refusal = evaluate_update_admission(_repo_dir)
     if refusal is not None:
         print(refusal.message)
         record_refusal_receipt(refusal)
         sys.exit(2)
 
-    git_dir = _m().PROJECT_ROOT / ".git"
+    git_dir = _repo_dir / ".git"
     if not git_dir.exists():
-        print("✗ Not a git repository — cannot check for updates.")
+        # Include the install directory in the error so the user can see
+        # where the check looked — the old message alone was misleading
+        # when the finder was dangling.
+        print(f"✗ Not a git repository — cannot check for updates (looked in {_repo_dir}).")
+        # Suggest the finder-heal when we can detect it
+        try:
+            from hermes_cli import _install_repair as _ir
+            _dangling, _reasons = _ir.editable_finder_is_dangling(_repo_dir)
+            if _dangling:
+                print(f"  ⚠ Editable finder appears dangling: {', '.join(_reasons[:2])}", file=sys.stderr)
+                print("  Try: python -m pip install -e . --no-deps --no-build-isolation", file=sys.stderr)
+        except Exception:
+            pass
         sys.exit(1)
 
     git_cmd = ["git"]
@@ -4592,13 +4661,13 @@ def _cmd_update_check(branch: str = "main", *, branch_explicit: bool = False):
     # compares stale refs). Self-heal abandoned locks before fetching.
     from hermes_cli.gitlock import clear_stale_git_locks, clear_stale_tmp_packs
 
-    cleared = clear_stale_git_locks(_m().PROJECT_ROOT)
+    cleared = clear_stale_git_locks(_repo_dir)
     for lock_path in cleared:
         print(f"  (removed stale git lock: {lock_path})")
     # Aborted fetches on flaky lines also strand tmp_pack_* debris in
     # .git/objects/pack — unchecked it reached 6 GB and corrupted the pack
     # dir outright (#93732). Same age+process safety contract as the locks.
-    swept = clear_stale_tmp_packs(_m().PROJECT_ROOT)
+    swept = clear_stale_tmp_packs(_repo_dir)
     if swept:
         print(f"  (removed {len(swept)} aborted-fetch pack temp file(s))")
 
@@ -4616,7 +4685,7 @@ def _cmd_update_check(branch: str = "main", *, branch_explicit: bool = False):
     is_shallow = (
         subprocess.run(
             git_cmd + ["rev-parse", "--is-shallow-repository"],
-            cwd=_m().PROJECT_ROOT,
+            cwd=_repo_dir,
             capture_output=True,
             text=True, encoding="utf-8", errors="replace",
         ).stdout.strip()
@@ -4632,7 +4701,7 @@ def _cmd_update_check(branch: str = "main", *, branch_explicit: bool = False):
         has_upstream_remote = (
             subprocess.run(
                 git_cmd + ["remote", "get-url", "upstream"],
-                cwd=_m().PROJECT_ROOT,
+                cwd=_repo_dir,
                 capture_output=True,
                 text=True, encoding="utf-8", errors="replace",
             ).returncode
@@ -4643,7 +4712,7 @@ def _cmd_update_check(branch: str = "main", *, branch_explicit: bool = False):
             print("→ Fetching from upstream...")
             fetch_result = subprocess.run(
                 git_cmd + ["fetch"] + depth_args + ["upstream", branch],
-                cwd=_m().PROJECT_ROOT,
+                cwd=_repo_dir,
                 capture_output=True,
                 text=True, encoding="utf-8", errors="replace",
             )
@@ -4655,7 +4724,7 @@ def _cmd_update_check(branch: str = "main", *, branch_explicit: bool = False):
             print("→ Fetching from origin...")
             fetch_result = subprocess.run(
                 git_cmd + ["fetch"] + depth_args + ["origin", branch],
-                cwd=_m().PROJECT_ROOT,
+                cwd=_repo_dir,
                 capture_output=True,
                 text=True, encoding="utf-8", errors="replace",
             )
@@ -4666,7 +4735,7 @@ def _cmd_update_check(branch: str = "main", *, branch_explicit: bool = False):
         print("→ Fetching from origin...")
         fetch_result = subprocess.run(
             git_cmd + ["fetch"] + depth_args + ["origin", branch],
-            cwd=_m().PROJECT_ROOT,
+            cwd=_repo_dir,
             capture_output=True,
             text=True, encoding="utf-8", errors="replace",
         )
@@ -4683,7 +4752,7 @@ def _cmd_update_check(branch: str = "main", *, branch_explicit: bool = False):
     # traceback. Friendlier to detect-and-report.
     verify_result = subprocess.run(
         git_cmd + ["rev-parse", "--verify", "--quiet", compare_branch],
-        cwd=_m().PROJECT_ROOT,
+        cwd=_repo_dir,
         capture_output=True,
         text=True, encoding="utf-8", errors="replace",
     )
@@ -4698,11 +4767,11 @@ def _cmd_update_check(branch: str = "main", *, branch_explicit: bool = False):
         # even when the local one is truncated.
         head_sha = subprocess.run(
             git_cmd + ["rev-parse", "HEAD"],
-            cwd=_m().PROJECT_ROOT, capture_output=True, text=True, encoding="utf-8", errors="replace",
+            cwd=_repo_dir, capture_output=True, text=True, encoding="utf-8", errors="replace",
         ).stdout.strip()
         target_sha = subprocess.run(
             git_cmd + ["rev-parse", compare_branch],
-            cwd=_m().PROJECT_ROOT, capture_output=True, text=True, encoding="utf-8", errors="replace",
+            cwd=_repo_dir, capture_output=True, text=True, encoding="utf-8", errors="replace",
         ).stdout.strip()
         if head_sha and target_sha and head_sha == target_sha:
             print("✓ Already up to date.")
@@ -4725,7 +4794,7 @@ def _cmd_update_check(branch: str = "main", *, branch_explicit: bool = False):
 
     rev_result = subprocess.run(
         git_cmd + ["rev-list", f"HEAD..{compare_branch}", "--count"],
-        cwd=_m().PROJECT_ROOT,
+        cwd=_repo_dir,
         capture_output=True,
         text=True, encoding="utf-8", errors="replace",
         check=True,

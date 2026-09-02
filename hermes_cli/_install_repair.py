@@ -28,12 +28,295 @@ import shutil
 import subprocess
 import sys
 import time
+import pathlib
 from pathlib import Path
 
 # Single source of truth for the recovery-lock lifecycle and uv lookup —
 # _early_recovery already owns both, and importing it is free (stdlib-only).
 from hermes_cli import _early_recovery as _er
 
+# ---------------------------------------------------------------------------
+# Editable finder health & stale physical-copy cleanup  (#97819)
+# ---------------------------------------------------------------------------
+_HERMES_EDITABLE_FALLBACK_TOP_LEVELS: frozenset[str] = frozenset(
+    {
+        "hermes_cli",
+        "gateway",
+        "tools",
+        "agent",
+        "cron",
+        "acp_adapter",
+        "plugins",
+        "providers",
+        "tui_gateway",
+        "hermes_constants",
+        "hermes_state",
+        "hermes_state_common",
+        "hermes_state_portability",
+        "hermes_state_schema",
+        "hermes_state_search",
+        "hermes_bootstrap",
+        "hermes_logging",
+        "hermes_time",
+        "run_agent",
+        "cli",
+        "model_tools",
+        "toolsets",
+        "toolset_distributions",
+        "batch_runner",
+        "trajectory_compressor",
+        "utils",
+        "mcp_serve",
+        "registration_lifecycle",
+    }
+)
+
+def _get_site_packages_dir(root: pathlib.Path) -> pathlib.Path | None:
+    try:
+        from hermes_constants import project_venv_dir
+        venv_dir = project_venv_dir(pathlib.Path(root))
+        if venv_dir is not None and pathlib.Path(venv_dir).is_dir():
+            win = pathlib.Path(venv_dir) / "Lib" / "site-packages"
+            if win.is_dir():
+                return win
+            lib = pathlib.Path(venv_dir) / "lib"
+            if lib.is_dir():
+                for py in lib.glob("python*"):
+                    cand = py / "site-packages"
+                    if cand.is_dir():
+                        return cand
+                cand = lib / "site-packages"
+                if cand.is_dir():
+                    return cand
+            return None
+    except Exception:
+        pass
+    for name in ("venv", ".venv"):
+        venv_dir = pathlib.Path(root) / name
+        if not venv_dir.is_dir():
+            continue
+        win = venv_dir / "Lib" / "site-packages"
+        if win.is_dir():
+            return win
+        lib = venv_dir / "lib"
+        if lib.is_dir():
+            for py in lib.glob("python*"):
+                cand = py / "site-packages"
+                if cand.is_dir():
+                    return cand
+    return None
+
+def _hermes_top_levels_from_pyproject(root: pathlib.Path) -> set[str]:
+    fallback = set(_HERMES_EDITABLE_FALLBACK_TOP_LEVELS)
+    pyproject = pathlib.Path(root) / "pyproject.toml"
+    if not pyproject.is_file():
+        return fallback
+    try:
+        import tomllib
+        with open(pyproject, "rb") as fh:
+            data = tomllib.load(fh)
+    except Exception:
+        return fallback
+    tops: set[str] = set()
+    try:
+        tool = data.get("tool", {}) if isinstance(data, dict) else {}
+        setuptools = tool.get("setuptools", {}) if isinstance(tool, dict) else {}
+        py_mods = setuptools.get("py-modules", []) or []
+        for mod in py_mods:
+            if isinstance(mod, str) and mod.strip():
+                tops.add(mod.strip().split(".")[0])
+        pkgs = setuptools.get("packages", {}) if isinstance(setuptools, dict) else {}
+        find = pkgs.get("find", {}) if isinstance(pkgs, dict) else {}
+        include = find.get("include", []) if isinstance(find, dict) else []
+        for inc in include:
+            if isinstance(inc, str) and inc.strip():
+                base = inc.strip().split(".")[0].split("*")[0].strip()
+                if base:
+                    tops.add(base)
+    except Exception:
+        return fallback
+    return tops or fallback
+
+def _clean_stale_site_packages_physical_copies(root: pathlib.Path) -> list[str]:
+    site_packages = _get_site_packages_dir(pathlib.Path(root))
+    if not site_packages or not pathlib.Path(site_packages).is_dir():
+        return []
+    tops = _hermes_top_levels_from_pyproject(pathlib.Path(root))
+    removed: list[str] = []
+    root_resolved = None
+    try:
+        root_resolved = pathlib.Path(root).resolve()
+    except Exception:
+        root_resolved = pathlib.Path(root)
+    for name in sorted(tops):
+        for suffix in ("", ".py"):
+            target = pathlib.Path(site_packages) / f"{name}{suffix}"
+            if not target.exists():
+                continue
+            if target.name.startswith("__editable__"):
+                continue
+            try:
+                if target.is_symlink():
+                    try:
+                        if target.resolve().is_relative_to(root_resolved):
+                            continue
+                    except AttributeError:
+                        try:
+                            if str(target.resolve()).lower().startswith(str(root_resolved).lower()):
+                                continue
+                        except Exception:
+                            pass
+                    except Exception:
+                        pass
+                if target.is_dir() and not target.is_symlink():
+                    import shutil
+                    shutil.rmtree(target)
+                    removed.append(str(target))
+                elif target.is_file():
+                    target.unlink()
+                    removed.append(str(target))
+                    try:
+                        pycache = pathlib.Path(site_packages) / "__pycache__"
+                        if pycache.is_dir():
+                            for pyc in pycache.glob(f"{name}.*.pyc"):
+                                try:
+                                    pyc.unlink()
+                                except OSError:
+                                    pass
+                    except Exception:
+                        pass
+            except OSError:
+                pass
+    if removed:
+        import sys
+        print(f"  \u2713 Cleaned {len(removed)} stale site-packages copy(ies): " + ", ".join(pathlib.Path(p).name for p in removed[:5]) + ("..." if len(removed) > 5 else ""), file=sys.stderr)
+    return removed
+
+def _find_editable_finder_files(site_packages: pathlib.Path) -> list[pathlib.Path]:
+    try:
+        return list(pathlib.Path(site_packages).glob("__editable__*finder.py"))
+    except Exception:
+        return []
+
+def _parse_finder_mapping(finder_path: pathlib.Path) -> dict[str, str]:
+    try:
+        text = pathlib.Path(finder_path).read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return {}
+    try:
+        import ast
+        tree = ast.parse(text)
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Assign):
+                for target in node.targets:
+                    if isinstance(target, ast.Name) and target.id == "MAPPING":
+                        if isinstance(node.value, ast.Dict):
+                            mapping: dict[str, str] = {}
+                            for k, v in zip(node.value.keys, node.value.values):
+                                if isinstance(k, ast.Constant) and isinstance(v, ast.Constant):
+                                    if isinstance(k.value, str) and isinstance(v.value, str):
+                                        mapping[k.value] = v.value
+                            return mapping
+    except Exception:
+        pass
+    import re
+    mapping: dict[str, str] = {}
+    try:
+        m = re.search(r"MAPPING\s*=\s*\{([^}]*)\}", text, re.DOTALL)
+        if m:
+            inner = m.group(1)
+            for km in re.finditer(r"['\"]([^'\"]+)['\"]\s*:\s*['\"]([^'\"]+)['\"]", inner):
+                mapping[km.group(1)] = km.group(2)
+    except Exception:
+        pass
+    return mapping
+
+def _is_path_inside(child: pathlib.Path, parent: pathlib.Path) -> bool:
+    try:
+        child_r = pathlib.Path(child).resolve()
+        parent_r = pathlib.Path(parent).resolve()
+        try:
+            return child_r.is_relative_to(parent_r)
+        except AttributeError:
+            import sys
+            c = str(child_r)
+            p = str(parent_r)
+            if sys.platform == "win32":
+                c = c.lower().replace("/", "\\").rstrip("\\")
+                p = p.lower().replace("/", "\\").rstrip("\\")
+                return c == p or c.startswith(p + "\\")
+            else:
+                return c == p or c.startswith(p.rstrip("/") + "/")
+    except Exception:
+        return False
+
+def editable_finder_is_dangling(root: pathlib.Path, *, site_packages: pathlib.Path | None = None) -> tuple[bool, list[str]]:
+    try:
+        sp = pathlib.Path(site_packages) if site_packages is not None else _get_site_packages_dir(pathlib.Path(root))
+    except Exception:
+        sp = None
+    if sp is None or not pathlib.Path(sp).is_dir():
+        return (False, [])
+    finders = _find_editable_finder_files(pathlib.Path(sp))
+    if not finders:
+        return (False, [])
+    combined: dict[str, str] = {}
+    for f in finders:
+        combined.update(_parse_finder_mapping(f))
+    if not combined:
+        return (False, [])
+    reasons: list[str] = []
+    for pkg, target_str in combined.items():
+        target = pathlib.Path(target_str)
+        if not target.exists():
+            reasons.append(f"{pkg}: {target_str} missing")
+            continue
+        if _is_path_inside(target, pathlib.Path(sp)):
+            reasons.append(f"{pkg}: maps to site-packages {target_str}")
+            continue
+        try:
+            if not _is_path_inside(target, pathlib.Path(root)):
+                reasons.append(f"{pkg}: maps outside repo {target_str}")
+        except Exception:
+            pass
+    return (len(reasons) > 0, reasons)
+
+def _regenerate_editable_finder(root: pathlib.Path) -> bool:
+    try:
+        prefix, env = _resolve_install_target(pathlib.Path(root))
+    except Exception:
+        return False
+    cmd = prefix + ["install", "-e", ".", "--no-deps", "--no-build-isolation"]
+    try:
+        with _stdout_to_stderr():
+            _run_install_cmd(cmd, env=env, root=pathlib.Path(root))
+        return True
+    except Exception as exc:
+        import sys
+        print(f"  \u2717 Editable finder regeneration failed: {exc}", file=sys.stderr)
+        return False
+
+def ensure_editable_finder_health(root: pathlib.Path, *, reinstall: bool = True) -> tuple[bool, list[str]]:
+    is_dangling, reasons = editable_finder_is_dangling(pathlib.Path(root))
+    if not is_dangling:
+        return (True, [])
+    if not reinstall:
+        return (False, reasons)
+    import sys
+    print(f"\u26a0 Editable finder MAPPING is dangling: " + ", ".join(reasons[:3]) + ("..." if len(reasons) > 3 else "") + " \u2014 regenerating editable install...", file=sys.stderr)
+    try:
+        _clean_stale_site_packages_physical_copies(pathlib.Path(root))
+    except Exception:
+        pass
+    ok = _regenerate_editable_finder(pathlib.Path(root))
+    if not ok:
+        return (False, reasons)
+    is_dangling2, reasons2 = editable_finder_is_dangling(pathlib.Path(root))
+    if is_dangling2:
+        print(f"  \u2717 Finder still dangling after regeneration: " + ", ".join(reasons2[:3]), file=sys.stderr)
+        return (False, reasons2)
+    print("  \u2713 Editable finder regenerated and healthy", file=sys.stderr)
+    return (True, [])
 
 def _is_windows() -> bool:
     return sys.platform == "win32"
@@ -631,6 +914,20 @@ def run_core_install(root: Path) -> None:
                 prefix + ["install", "-e", f".[{group}]"], env=env, root=root
             )
             return
+            # #97819: even a successful core install can leave a dangling
+            # editable finder if stale physical copies were present during the
+            # build. Verify and regenerate if needed before declaring success.
+            try:
+                _is_dangling, _reasons = editable_finder_is_dangling(pathlib.Path(root))
+                if _is_dangling:
+                    print(
+                        f"  ⚠ Editable finder still dangling after install: {', '.join(_reasons[:2])} — regenerating...",
+                        file=sys.stderr,
+                    )
+                    _clean_stale_site_packages_physical_copies(pathlib.Path(root))
+                    _regenerate_editable_finder(pathlib.Path(root))
+            except Exception:
+                pass
         except subprocess.CalledProcessError:
             print(
                 "  ⚠ Optional extras failed, reinstalling base dependencies "
@@ -659,6 +956,18 @@ def run_core_install(root: Path) -> None:
                 "  ⚠ Skipped optional extras that still failed: "
                 + ", ".join(failed_extras)
             )
+        # #97819: post-install finder health sweep for the fallback path too
+        try:
+            _is_dangling, _reasons = editable_finder_is_dangling(pathlib.Path(root))
+            if _is_dangling:
+                print(
+                    f"  ⚠ Editable finder still dangling after install: {', '.join(_reasons[:2])} — regenerating...",
+                    file=sys.stderr,
+                )
+                _clean_stale_site_packages_physical_copies(pathlib.Path(root))
+                _regenerate_editable_finder(pathlib.Path(root))
+        except Exception:
+            pass
 
 
 # ---------------------------------------------------------------------------
