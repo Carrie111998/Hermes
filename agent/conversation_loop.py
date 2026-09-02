@@ -4734,7 +4734,12 @@ def run_conversation(
                     if getattr(agent.context_compressor, "_context_probed", False):
                         ctx = agent.context_compressor.context_length
                         if getattr(agent.context_compressor, "_context_probe_persistable", False):
-                            save_context_length(agent.model, agent.base_url, ctx)
+                            save_context_length(
+                                agent.model,
+                                agent.base_url,
+                                ctx,
+                                provider=getattr(agent, "provider", "") or "",
+                            )
                             agent._safe_print(f"{agent.log_prefix}💾 Cached context length: {ctx:,} tokens for {agent.model}")
                         agent.context_compressor._context_probed = False
                         agent.context_compressor._context_probe_persistable = False
@@ -6481,7 +6486,12 @@ def run_conversation(
                         # of those should discard metadata the provider already
                         # confirmed. Keep the probe flags as a best-effort
                         # post-success retry if this write cannot complete.
-                        save_context_length(agent.model, agent.base_url, new_ctx)
+                        save_context_length(
+                            agent.model,
+                            agent.base_url,
+                            new_ctx,
+                            provider=getattr(agent, "provider", "") or "",
+                        )
                         # Context probing flags — only set on built-in
                         # compressor (plugin engines manage their own).  This
                         # value came from the provider, so it is safe to cache.
