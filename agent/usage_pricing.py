@@ -292,6 +292,23 @@ _OFFICIAL_DOCS_PRICING: Dict[tuple[str, str], PricingEntry] = {
     ),
     (
         "anthropic",
+        "claude-opus-5",
+    ): PricingEntry(
+        # Published Anthropic rates (claude-opus-5 announcement + pricing
+        # docs, checked 2026-09-02, #100848). cache_write is the 5m-TTL
+        # rate (1.25x input) to match the single-number snapshot format;
+        # the 1h rate is 2x input (10.00) — see #88374 for making the TTL
+        # explicit per-entry.
+        input_cost_per_million=Decimal("5.00"),
+        output_cost_per_million=Decimal("25.00"),
+        cache_read_cost_per_million=Decimal("0.50"),
+        cache_write_cost_per_million=Decimal("6.25"),
+        source="official_docs_snapshot",
+        source_url="https://platform.claude.com/docs/en/about-claude/pricing",
+        pricing_version="anthropic-pricing-2026-09-opus5",
+    ),
+    (
+        "anthropic",
         "claude-opus-4-6-20250414",
     ): PricingEntry(
         input_cost_per_million=Decimal("5.00"),
