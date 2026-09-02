@@ -71,30 +71,50 @@ CODING_TOOLSET = "coding"
 # in a group is not pair-programming.
 INTERACTIVE_CODING_PLATFORMS = {"cli", "tui", "acp", "desktop", ""}
 
-# Project-root signals that mark a directory as a code workspace even when it
-# isn't (yet) a git repo. Cheap filename checks — no parsing.
-_PROJECT_MARKERS = (
+# Project manifests that mark a directory as a code workspace even when it
+# isn't (yet) a git repo. Cheap filename checks — no parsing. A manifest is
+# dispositive on its own.
+_MANIFEST_MARKERS = (
     "pyproject.toml", "setup.py", "setup.cfg", "requirements.txt",
     "package.json", "tsconfig.json", "deno.json",
     "Cargo.toml", "go.mod", "pom.xml", "build.gradle", "build.gradle.kts",
     "Gemfile", "composer.json", "mix.exs", "pubspec.yaml",
     "CMakeLists.txt", "Makefile", "Dockerfile",
-    "AGENTS.md", "CLAUDE.md", ".cursorrules",
 )
 
-# Agent-instruction files surfaced separately from manifests in the snapshot.
-_CONTEXT_FILES = ("AGENTS.md", "CLAUDE.md", ".cursorrules")
+# Agent-instruction files. Unlike manifests these are NOT sufficient project
+# evidence on their own — they appear in prose/notes/research vaults too, so
+# they require bounded source-code corroboration (see _marker_root).
+_INSTRUCTION_MARKERS = ("AGENTS.md", "CLAUDE.md", ".cursorrules")
 
-# Source-file extensions that make a git repo a *code* workspace even with no
+# Complete project-root marker union, surfaced in project-fact snapshots.
+_PROJECT_MARKERS = _MANIFEST_MARKERS + _INSTRUCTION_MARKERS
+
+# Agent-instruction files surfaced separately from manifests in the snapshot.
+_CONTEXT_FILES = _INSTRUCTION_MARKERS
+
+# Source-file extensions that corroborate a code workspace even with no
 # manifest. Without this, `git init` on a notes/writing/research folder (a huge
 # non-coding use case) would flip the whole session into the coding posture just
-# for having a `.git`. A manifest still wins on its own (see `_PROJECT_MARKERS`).
+# for having a `.git`. A manifest still wins on its own; an instruction marker
+# requires this corroboration. Includes application, static-web, infrastructure,
+# schema, and smart-contract source types.
 _CODE_EXTENSIONS = frozenset({
     ".py", ".pyi", ".ipynb", ".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs",
     ".go", ".rs", ".java", ".kt", ".kts", ".scala", ".rb", ".php", ".c", ".h",
     ".cc", ".cpp", ".hpp", ".cs", ".swift", ".m", ".mm", ".dart", ".ex", ".exs",
     ".lua", ".sh", ".bash", ".zsh", ".sql", ".vue", ".svelte", ".r", ".jl",
     ".hs", ".clj", ".erl", ".pl",
+    # application / static-web
+    ".html", ".htm", ".css", ".scss", ".sass", ".less",
+    # infrastructure / IaC
+    ".tf", ".tfvars", ".hcl",
+    # schema / IPC
+    ".proto",
+    # smart contracts
+    ".sol",
+    # systems / functional / other
+    ".zig", ".fs", ".fsx", ".vb", ".groovy",
 })
 
 # Dirs never worth scanning for the code check (deps/build/vcs/venv noise).
@@ -103,22 +123,29 @@ _CODE_SCAN_SKIP_DIRS = frozenset({
     "target", ".next", ".turbo", "vendor",
 })
 
+# Conventional code roots may contain another package directory before source
+# files appear (for example ``src/pkg/main.py``). Descend those roots one extra
+# level without treating arbitrary nested vault/project folders as code signals.
+_CODE_SCAN_DEEP_DIRS = frozenset({"src", "app", "lib", "tests", "test"})
+
 # Bounded sweep: a code workspace reveals itself in the first handful of entries.
 _CODE_SCAN_MAX_ENTRIES = 500
 
 
 def _has_code_files(root: Path) -> bool:
-    """Cheap, bounded check for source files in a repo's top two levels.
+    """Cheap, bounded check for source files in a repo's top few levels.
 
     Lets a git repo of loose scripts (no manifest) still read as a code
-    workspace while a bare notes/writing repo does not. Scans the root and its
-    immediate subdirectories only, capped at ``_CODE_SCAN_MAX_ENTRIES`` stats —
-    a handful of readdirs at session start, not a full walk.
+    workspace while a bare notes/writing repo does not. Scans the root, its
+    immediate subdirectories, plus one package level beneath conventional
+    ``src``/``app``/``lib``/``tests``/``test`` roots, capped at
+    ``_CODE_SCAN_MAX_ENTRIES`` stats — a handful of readdirs at session start,
+    not a full walk.
     """
     seen = 0
-    stack = [(root, True)]
+    stack = [(root, 0)]
     while stack:
-        directory, is_root = stack.pop()
+        directory, depth = stack.pop()
         try:
             with os.scandir(directory) as entries:
                 for entry in entries:
@@ -130,8 +157,9 @@ def _has_code_files(root: Path) -> bool:
                         if entry.is_file():
                             if os.path.splitext(name)[1].lower() in _CODE_EXTENSIONS:
                                 return True
-                        elif is_root and entry.is_dir() and name not in _CODE_SCAN_SKIP_DIRS and not name.startswith("."):
-                            stack.append((Path(entry.path), False))
+                        elif entry.is_dir() and name not in _CODE_SCAN_SKIP_DIRS and not name.startswith("."):
+                            if depth == 0 or (depth == 1 and directory.name in _CODE_SCAN_DEEP_DIRS):
+                                stack.append((Path(entry.path), depth + 1))
                     except OSError:
                         continue
         except OSError:
@@ -409,6 +437,11 @@ def _marker_root(cwd: Path) -> Optional[Path]:
     even when the user is in a subdirectory. ``$HOME`` itself is skipped — a
     Makefile or AGENTS.md sitting in the home directory is global user config,
     not a project-root signal.
+
+    A project manifest is dispositive on its own. An instruction marker
+    (``AGENTS.md`` / ``CLAUDE.md`` / ``.cursorrules``) is NOT — prose and notes
+    vaults carry them too, so they only count when the directory actually holds
+    corroborating source code.
     """
     current = cwd.resolve()
     home = _home()
@@ -425,9 +458,37 @@ def _marker_root(cwd: Path) -> Optional[Path]:
             break
         if parent == home or (temp_root is not None and parent == temp_root):
             continue
-        for marker in _PROJECT_MARKERS:
-            if (parent / marker).exists():
+        if any((parent / marker).exists() for marker in _MANIFEST_MARKERS):
+            return parent
+        if any((parent / marker).exists() for marker in _INSTRUCTION_MARKERS):
+            if _has_code_files(parent):
                 return parent
+    return None
+
+
+def _code_workspace_root(cwd: Path) -> Optional[Path]:
+    """Nearest ancestor that is a genuine code workspace, or ``None``.
+
+    The single source of truth for \"is this a code workspace?\", shared by
+    posture detection and project-fact / verify-on-stop consumers so they never
+    drift. Returns the nearest ancestor that is:
+
+    * a manifest root (dispositive), or
+    * an instruction-marker root corroborated by source code, or
+    * a bare git repo that actually holds source code.
+
+    A prose/notes Git vault (instruction markers only, no source) returns
+    ``None``, so it is never independently reclassified as code. The ``$HOME``
+    dotfiles repo is excluded.
+    """
+    marker = _marker_root(cwd)
+    if marker is not None:
+        return marker
+    git_root = _git_root(cwd)
+    if git_root is not None and git_root == _home():
+        return None  # dotfiles repo at $HOME — not a code workspace
+    if git_root is not None and _has_code_files(git_root):
+        return git_root
     return None
 
 
@@ -454,16 +515,7 @@ def _detect_profile_name(mode: str, platform: str, cwd_str: str) -> str:
     if platform and platform.strip().lower() not in INTERACTIVE_CODING_PLATFORMS:
         return GENERAL_PROFILE.name
     cwd = Path(cwd_str)
-    # A recognized project root (manifest / AGENTS.md / .cursorrules) is a code
-    # workspace on its own — cheap stat checks, no scan.
-    if _marker_root(cwd) is not None:
-        return CODING_PROFILE.name
-    git_root = _git_root(cwd)
-    if git_root is not None and git_root == _home():
-        git_root = None  # dotfiles repo at $HOME — not a code workspace
-    # A bare git repo only counts when it actually holds code, so `git init` on a
-    # notes/writing/research folder stays in the general posture.
-    if git_root is not None and _has_code_files(git_root):
+    if _code_workspace_root(cwd) is not None:
         return CODING_PROFILE.name
     return GENERAL_PROFILE.name
 
@@ -800,7 +852,7 @@ def detect_project_facts(root: Path) -> ProjectFacts:
     of truth for both the prompt snapshot (:func:`_project_facts`) and the
     gateway's ``project.facts`` — so the UI never re-sniffs verify commands.
     """
-    manifests = [m for m in _PROJECT_MARKERS if m not in _CONTEXT_FILES and (root / m).is_file()]
+    manifests = [m for m in _MANIFEST_MARKERS if (root / m).is_file()]
     package_managers = list(
         dict.fromkeys(pm for lock, pm in (*_PY_LOCKFILES, *_JS_LOCKFILES) if (root / lock).is_file())
     )
@@ -862,9 +914,11 @@ def project_facts_for(cwd: Optional[str | Path] = None) -> Optional[dict[str, An
     Same detection the system-prompt snapshot uses (git root, else marker root),
     exposed for non-prompt consumers (the desktop verify UI) so they never
     re-derive "are we coding?" or duplicate the verify-command sniffing.
+    Aligned with :func:`_code_workspace_root`: an instruction-only prose Git
+    vault returns ``None`` rather than being reclassified as code.
     """
     resolved = _resolve_cwd(cwd)
-    root = _git_root(resolved) or _marker_root(resolved)
+    root = _code_workspace_root(resolved)
     if root is None:
         return None
 

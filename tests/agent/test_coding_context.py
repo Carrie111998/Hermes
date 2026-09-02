@@ -172,6 +172,54 @@ class TestProjectFacts:
             assert cmd in verify_line
 
 
+# ── instruction-only prose Git vault (never reclassified as code) ──────────
+
+def _prose_git_vault(path: Path) -> Path:
+    """Create a git repo containing only an instruction marker + prose notes."""
+    env = {
+        "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
+        "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t",
+        "HOME": str(path),
+    }
+    path.mkdir(parents=True, exist_ok=True)
+    (path / "AGENTS.md").write_text("# workspace instructions\n")
+    (path / "notes.md").write_text("# prose only\n")
+    for args in (
+        ["init", "-q", "-b", "main"],
+        ["add", "-A"],
+        ["commit", "-q", "-m", "init commit"],
+    ):
+        subprocess.run([shutil.which("git"), "-C", str(path), *args], check=True, env=env)
+    return path
+
+
+class TestProseGitVaultStaysGeneral:
+    def test_instruction_only_git_vault_is_not_coding(self, tmp_path):
+        vault = _prose_git_vault(tmp_path / "vault")
+        cfg = {"agent": {"coding_context": "auto"}}
+        assert cc.is_coding_context(platform="cli", cwd=vault, config=cfg) is False
+
+    def test_project_facts_none_for_instruction_only_git_vault(self, tmp_path):
+        vault = _prose_git_vault(tmp_path / "vault")
+        assert cc.project_facts_for(vault) is None
+
+    def test_project_facts_present_for_instruction_marker_plus_source(self, tmp_path):
+        vault = _prose_git_vault(tmp_path / "vault")
+        (vault / "main.py").write_text("print('hi')\n")
+        assert cc.project_facts_for(vault) is not None
+
+    def test_verification_snapshot_no_project_for_prose_vault(self, tmp_path):
+        """verify-on-stop receives no project for an instruction-only Git
+        workspace editing a non-document path — it stays general, so no verify
+        recipe is implied."""
+        from agent.verification_stop import _verification_snapshot
+        vault = _prose_git_vault(tmp_path / "vault")
+        snapshot = _verification_snapshot(
+            session_id="sess", changed_paths=[str(vault / "notes.md")]
+        )
+        assert snapshot is None
+
+
 
 # ── $HOME dotfiles guard ────────────────────────────────────────────────────
 
@@ -337,11 +385,61 @@ class TestProfiles:
 # ── detection signals ───────────────────────────────────────────────────────
 
 class TestDetection:
-    @pytest.mark.parametrize("marker", ["pyproject.toml", "package.json", "go.mod", "AGENTS.md"])
+    @pytest.mark.parametrize("marker", ["pyproject.toml", "package.json", "go.mod"])
     def test_project_manifest_triggers_without_git(self, tmp_path, marker):
         (tmp_path / marker).write_text("x")
         cfg = {"agent": {"coding_context": "auto"}}
         assert cc.is_coding_context(platform="cli", cwd=tmp_path, config=cfg) is True
+
+    @pytest.mark.parametrize("marker", cc._INSTRUCTION_MARKERS)
+    def test_instruction_marker_alone_stays_general(self, tmp_path, marker):
+        """An instruction marker in a prose-only workspace is NOT coding."""
+        (tmp_path / marker).write_text("# workspace instructions\n")
+        (tmp_path / "notes.md").write_text("# prose only\n")
+        cfg = {"agent": {"coding_context": "auto"}}
+        assert cc.is_coding_context(platform="cli", cwd=tmp_path, config=cfg) is False
+
+    @pytest.mark.parametrize("marker", cc._INSTRUCTION_MARKERS)
+    def test_instruction_marker_with_source_file_triggers(self, tmp_path, marker):
+        (tmp_path / marker).write_text("# workspace instructions\n")
+        (tmp_path / "main.py").write_text("print('hello')\n")
+        cfg = {"agent": {"coding_context": "auto"}}
+        assert cc.is_coding_context(platform="cli", cwd=tmp_path, config=cfg) is True
+
+    @pytest.mark.parametrize(
+        "filename", ["index.html", "style.css", "style.scss", "style.less", "main.tf", "variables.tfvars", "config.hcl", "message.proto", "contract.sol", "main.zig", "main.fsx", "Main.vb", "build.groovy"]
+    )
+    def test_instruction_marker_with_static_web_and_iac_source_triggers(self, tmp_path, filename):
+        (tmp_path / "AGENTS.md").write_text("# workspace instructions\n")
+        (tmp_path / filename).write_text("x")
+        cfg = {"agent": {"coding_context": "auto"}}
+        assert cc.is_coding_context(platform="cli", cwd=tmp_path, config=cfg) is True
+
+    def test_instruction_marker_with_src_layout_triggers(self, tmp_path):
+        (tmp_path / "AGENTS.md").write_text("# workspace instructions\n")
+        package = tmp_path / "src" / "pkg"
+        package.mkdir(parents=True)
+        (package / "main.py").write_text("print('hello')\n")
+        cfg = {"agent": {"coding_context": "auto"}}
+        assert cc.is_coding_context(platform="cli", cwd=tmp_path, config=cfg) is True
+
+    def test_instruction_marker_ignores_code_in_arbitrary_nested_project(self, tmp_path):
+        (tmp_path / "AGENTS.md").write_text("# vault instructions\n")
+        nested = tmp_path / "projects" / "utility"
+        nested.mkdir(parents=True)
+        (nested / "main.py").write_text("print('nested project')\n")
+        cfg = {"agent": {"coding_context": "auto"}}
+        assert cc.is_coding_context(platform="cli", cwd=tmp_path, config=cfg) is False
+
+    def test_instruction_marker_with_manifest_triggers(self, tmp_path):
+        (tmp_path / "AGENTS.md").write_text("# workspace instructions\n")
+        (tmp_path / "package.json").write_text("{}\n")
+        cfg = {"agent": {"coding_context": "auto"}}
+        assert cc.is_coding_context(platform="cli", cwd=tmp_path, config=cfg) is True
+
+    def test_project_marker_union_remains_complete(self):
+        assert cc._PROJECT_MARKERS == cc._MANIFEST_MARKERS + cc._INSTRUCTION_MARKERS
+        assert cc._CONTEXT_FILES == cc._INSTRUCTION_MARKERS
 
     def test_marker_in_parent_counts_from_subdir(self, tmp_path):
         (tmp_path / "pyproject.toml").write_text("x")
