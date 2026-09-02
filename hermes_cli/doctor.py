@@ -5,6 +5,7 @@ Diagnoses issues with Hermes Agent setup.
 """
 
 import os
+import re
 import sys
 import subprocess
 import shutil
@@ -1254,6 +1255,89 @@ def check_macos_full_disk_access() -> None:
         "grant survives every update."
     )
 
+# FTS5 object-name shapes (virtual table + shadow tables) for the messages
+# search indexes: messages_fts{,_trigram,_cjk} plus their _data/_idx/
+# _content/_docsize/_config/_segdir/_segments shadows. Full-match anchored on
+# the Hermes-owned roots: a suffix-only pattern would also swallow a
+# user-created lookalike such as archive_fts_data into the FTS set and keep
+# routing its damage to the FTS rebuild paths.
+_FTS_OBJECT_RE = re.compile(
+    r"messages_fts(_trigram|_cjk)?(_data|_idx|_content|_docsize|_config|_segdir|_segments)?"
+)
+_TREE_RE = re.compile(r"\bTree (\d+)\b")
+_MISSING_INDEX_RE = re.compile(r"missing from index (\S+)")
+_FREELIST_RE = re.compile(r"^Freelist\b")
+
+
+def _integrity_damage_is_non_fts(integrity_rows: list, master_rows: list) -> bool:
+    """Classify integrity_check damage as structural (non-FTS) or FTS-only.
+
+    ``integrity_rows`` are the raw PRAGMA integrity_check result rows;
+    ``master_rows`` are ``(rootpage, type, name)`` triples from sqlite_master.
+    Damage is structural when any damaged object — a tree id mapped through
+    rootpage, an index named in a "row N missing from index X" line, or the
+    database's own freelist — falls outside the FTS shadow set. Unparseable
+    lines are deliberately NOT counted (fail-closed toward the existing FTS
+    wording, which is never wrong to show, just incomplete).
+    """
+    name_by_rootpage = {int(rp): name for rp, _t, name in master_rows if rp}
+
+    def _is_fts(name: str) -> bool:
+        return bool(_FTS_OBJECT_RE.fullmatch(name))
+
+    for row in integrity_rows:
+        text = str(row[0]) if isinstance(row, (tuple, list)) else str(row)
+        if _FREELIST_RE.match(text):
+            # Freelist damage belongs to the database file itself, not to any
+            # FTS object: the free-page chain survives no FTS rebuild, so it
+            # is structural by definition (field-reported alongside a damaged
+            # canonical tree in the #88587 follow-up incident).
+            return True
+        m = _TREE_RE.search(text)
+        if m:
+            name = name_by_rootpage.get(int(m.group(1)), "")
+            if name and not _is_fts(name):
+                return True
+        m = _MISSING_INDEX_RE.search(text)
+        if m and not _is_fts(m.group(1)):
+            return True
+    return False
+
+
+def _state_db_has_non_fts_damage(state_db_path) -> bool:
+    """True when the failing write-health probe reflects STRUCTURAL damage.
+
+    Re-runs integrity_check read-only and maps damaged tree ids through
+    sqlite_master so doctor can distinguish canonical-table corruption
+    (recover via `hermes sessions recover`) from FTS-index corruption
+    (repairable in place). Best-effort: any error classifies as False so
+    the caller keeps the pre-existing FTS reporting path (#88587).
+    """
+    import sqlite3
+
+    try:
+        conn = sqlite3.connect(
+            f"file:{state_db_path}?mode=ro", uri=True, isolation_level=None
+        )
+    except sqlite3.Error:
+        return False
+    try:
+        integrity_rows = conn.execute("PRAGMA integrity_check").fetchall()
+        master_rows = [
+            tuple(r) for r in conn.execute(
+                "SELECT rootpage, type, name FROM sqlite_master WHERE rootpage > 0"
+            ).fetchall()
+        ]
+    except sqlite3.Error:
+        return False
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+    return _integrity_damage_is_non_fts(integrity_rows, master_rows)
+
+
 
 def run_doctor(args):
     """Run diagnostic checks."""
@@ -2097,7 +2181,27 @@ def run_doctor(args):
             from hermes_state import _db_opens_cleanly, repair_state_db_schema
 
             _write_reason = _db_opens_cleanly(state_db_path)
-            if _write_reason is not None:
+            if _write_reason is not None and _state_db_has_non_fts_damage(state_db_path):
+                # Structural corruption (canonical tables/indexes damaged —
+                # #88587): an FTS rebuild CANNOT repair this, and the
+                # .malformed-backup the FTS repair path leaves beside the DB
+                # is a snapshot of the same corrupt file. Name the class
+                # honestly and route to the tool that actually recovers:
+                # `hermes sessions recover --allow-partial` rebuilds canonical
+                # rows into a fresh database.
+                check_warn(
+                    f"{_DHH}/state.db has STRUCTURAL corruption "
+                    "(canonical tables/indexes damaged — not an FTS-index issue)",
+                    f"({_write_reason})",
+                )
+                issues.append(
+                    "state.db structural corruption — an FTS rebuild cannot "
+                    "repair it. Run 'hermes sessions recover --allow-partial' "
+                    "to rebuild canonical rows into a fresh database. Do NOT "
+                    "restore a .malformed-backup copy beside state.db: it is "
+                    "a snapshot of the same corrupt file."
+                )
+            elif _write_reason is not None:
                 check_warn(
                     f"{_DHH}/state.db fails a write-health probe (FTS index may be corrupt)",
                     f"({_write_reason})",
