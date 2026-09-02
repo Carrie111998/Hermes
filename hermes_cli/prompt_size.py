@@ -32,6 +32,11 @@ _NAMES_ONLY_LINE_RE = re.compile(r"^  .+ \[names only\]: (?P<names>.+)$")
 # Cap the human-readable "Skills by size" table; ``--json`` always has them all.
 _SKILLS_TABLE_LIMIT = 20
 
+# Bucket label for the tool_search bridge tools. They are synthesised at
+# assembly time (``tools.tool_search.assemble_tool_defs``) rather than
+# registered in a toolset, so they have no registry attribution of their own.
+_DEFERRED_BRIDGE_LABEL = "(deferred tool-search bridge)"
+
 
 def _bytes(s: str) -> int:
     return len(s.encode("utf-8"))
@@ -47,6 +52,88 @@ def _tool_name(tool: Any) -> str:
     return str(tool.get("name", ""))
 
 
+def _resolve_gui_surface_toolsets(platform: str) -> set:
+    """GUI/client-surface toolsets the tui_gateway folds in at agent creation.
+
+    ``desktop``/``tui`` sessions are not built from a ``hermes-<platform>``
+    composite — they run through ``tui_gateway.server._load_enabled_toolsets``,
+    which resolves the CLI toolsets and then adds the client-surface toolsets
+    that are deliberately off ``_HERMES_CORE_TOOLS``. Delegating to the real
+    resolver keeps this diagnostic in lockstep with runtime instead of
+    re-deriving the set here.
+    """
+    try:
+        from tui_gateway.server import _gui_surface_toolsets
+
+        return set(_gui_surface_toolsets(platform))
+    except Exception:
+        # Conservative mirror of the resolver's contract if the gateway module
+        # is unavailable (e.g. a trimmed install).
+        surfaces = {"project"}
+        if platform == "desktop":
+            surfaces.add("desktop_ui")
+        return surfaces
+
+
+def _resolve_subagent_toolsets(cfg: dict) -> Tuple[List[str], List[str]]:
+    """Enabled + extra-disabled toolsets for a default delegated subagent.
+
+    ``tools/delegate_tool.py`` never resolves a ``hermes-subagent`` composite.
+    A child *inherits the parent's* enabled toolsets (``child_toolsets =
+    _strip_blocked_tools(parent_enabled)``) and is additionally handed
+    ``_blocked_toolsets_for_role(role) + ["kanban"]`` as ``disabled_toolsets``
+    so the blocked tools are subtracted after composite expansion. Model a
+    leaf child of a CLI-configured parent — the common case — so
+    ``--platform subagent`` reports a prompt a real subagent would receive.
+
+    Returns ``(enabled, disabled_extra)``.
+    """
+    from hermes_cli.tools_config import _get_platform_tools
+
+    parent = sorted(_get_platform_tools(cfg, "cli", include_default_mcp_servers=True))
+    try:
+        from tools.delegate_tool import (
+            _blocked_toolsets_for_role,
+            _strip_blocked_tools,
+        )
+
+        enabled = _strip_blocked_tools(parent)
+        disabled_extra = list(
+            dict.fromkeys(_blocked_toolsets_for_role("leaf") + ["kanban"])
+        )
+    except Exception:
+        enabled = [ts for ts in parent if ts not in {"delegation", "kanban"}]
+        disabled_extra = ["kanban"]
+    return sorted(enabled), disabled_extra
+
+
+def _resolve_inspection_toolsets(
+    cfg: dict, platform: str
+) -> Tuple[List[str], List[str]]:
+    """Resolve enabled + extra-disabled toolsets the way *platform*'s host does.
+
+    ``_get_platform_tools`` only knows platforms that own a ``hermes-<name>``
+    composite toolset (see ``hermes_cli/platforms.py``). ``desktop``, ``tui``
+    and ``subagent`` are real ``agent.platform`` values with no such composite,
+    so a bare lookup resolved to an empty set and the diagnostic reported a
+    toolless, skill-less prompt that no session ever ships. Route those three
+    through the resolver their actual host uses.
+
+    Returns ``(enabled, disabled_extra)``; ``disabled_extra`` is empty for
+    every platform except ``subagent``, whose host imposes a role blocklist.
+    """
+    from hermes_cli.tools_config import _get_platform_tools
+
+    if platform == "subagent":
+        return _resolve_subagent_toolsets(cfg)
+    if platform in ("desktop", "tui"):
+        # tui_gateway resolves the CLI toolsets, then folds in the surfaces
+        # that only exist because of the client on the other end.
+        base = _get_platform_tools(cfg, "cli", include_default_mcp_servers=True)
+        return sorted(set(base) | _resolve_gui_surface_toolsets(platform)), []
+    return sorted(_get_platform_tools(cfg, platform)), []
+
+
 def _build_inspection_agent(platform: str) -> Any:
     """Construct an offline AIAgent for prompt inspection.
 
@@ -56,18 +143,19 @@ def _build_inspection_agent(platform: str) -> Any:
     """
     from run_agent import AIAgent
     from hermes_cli.config import load_config
-    from hermes_cli.tools_config import _get_platform_tools
 
     cfg = load_config()
     model_cfg = cfg.get("model", {}) if isinstance(cfg.get("model"), dict) else {}
     model = model_cfg.get("default") or model_cfg.get("model") or ""
 
-    # Resolve platform-specific toolsets the same way the gateway does.
-    enabled_toolsets = sorted(_get_platform_tools(cfg, platform))
+    # Resolve platform-specific toolsets the same way the platform's host does.
+    enabled_toolsets, disabled_extra = _resolve_inspection_toolsets(cfg, platform)
     agent_cfg = cfg.get("agent") or {}
     from agent.skill_utils import parse_config_string_list
 
-    disabled_toolsets = parse_config_string_list(agent_cfg.get("disabled_toolsets")) or None
+    disabled_toolsets = parse_config_string_list(agent_cfg.get("disabled_toolsets")) or []
+    # The host's own role blocklist stacks on top of the user's config.
+    disabled_toolsets = list(dict.fromkeys(list(disabled_toolsets) + disabled_extra))
 
     return AIAgent(
         model=model,
@@ -77,7 +165,7 @@ def _build_inspection_agent(platform: str) -> Any:
         save_trajectories=False,
         platform=platform,
         enabled_toolsets=enabled_toolsets,
-        disabled_toolsets=disabled_toolsets,
+        disabled_toolsets=disabled_toolsets or None,
     )
 
 
@@ -88,6 +176,13 @@ def _skill_md_paths_by_name() -> Dict[str, Path]:
     skill directory name, so either resolves. Local skills win over external
     dirs (``get_all_skills_dirs`` yields local first), matching the index's own
     precedence. Used to attribute the real on-disk read cost per skill.
+
+    Resolution is two-pass: every frontmatter ``name`` is registered first, and
+    directory names are only added as aliases for keys no frontmatter claimed.
+    A single-pass ``setdefault`` let an earlier skill's *directory* alias shadow
+    a later skill's declared ``name`` (renamed skills are exactly this shape),
+    so the breakdown attributed one file's bytes to two different skills while
+    the real skill's SKILL.md went unreported.
     """
     from agent.skill_utils import (
         get_all_skills_dirs,
@@ -95,22 +190,29 @@ def _skill_md_paths_by_name() -> Dict[str, Path]:
         parse_frontmatter,
     )
 
-    mapping: Dict[str, Path] = {}
+    by_frontmatter: Dict[str, Path] = {}
+    by_dirname: Dict[str, Path] = {}
     for skills_dir in get_all_skills_dirs():
         if not skills_dir.exists():
             continue
         for skill_file in iter_skill_index_files(skills_dir, "SKILL.md"):
-            frontmatter_name = skill_file.parent.name
+            dir_name = skill_file.parent.name
+            frontmatter_name = dir_name
             try:
                 frontmatter, _ = parse_frontmatter(
                     skill_file.read_text(encoding="utf-8")
                 )
-                frontmatter_name = str(frontmatter.get("name") or frontmatter_name)
+                frontmatter_name = str(frontmatter.get("name") or dir_name)
             except Exception:
                 pass
             # setdefault keeps the first (local) occurrence on name collisions.
-            mapping.setdefault(frontmatter_name, skill_file)
-            mapping.setdefault(skill_file.parent.name, skill_file)
+            by_frontmatter.setdefault(frontmatter_name, skill_file)
+            by_dirname.setdefault(dir_name, skill_file)
+
+    # Declared names always win; dir names only fill keys nobody declared.
+    mapping: Dict[str, Path] = dict(by_frontmatter)
+    for dir_name, skill_file in by_dirname.items():
+        mapping.setdefault(dir_name, skill_file)
     return mapping
 
 
@@ -214,14 +316,30 @@ def _compute_toolsets_breakdown(tools: List[Any]) -> List[Dict[str, Any]]:
     sum of the individual tool serializations (which is the array total from
     ``tools['json_bytes']`` minus JSON framing of ``2 * count`` bytes). Sorted
     largest-first by ``json_bytes``, tie-broken by toolset name.
+
+    ``tool_search``/``tool_describe``/``tool_call`` are synthesised by
+    ``tools.tool_search.assemble_tool_defs`` and are in no toolset, so the
+    registry map has no entry for them. Bucketing them under ``(unknown)``
+    hid the single largest lever on the shipped payload — the deferred-tool
+    bridge — behind a label that reads like a bug. They get their own
+    ``(deferred tool-search bridge)`` bucket instead, which also carries the
+    embedded catalog listing's bytes where the reader can see them.
     """
     from tools.registry import registry
+
+    try:
+        from tools.tool_search import BRIDGE_TOOL_NAMES
+    except Exception:
+        BRIDGE_TOOL_NAMES = frozenset()
 
     tool_to_toolset = registry.get_tool_to_toolset_map()
     groups: Dict[str, Dict[str, Any]] = {}
     for tool in tools:
         name = _tool_name(tool)
-        toolset = tool_to_toolset.get(name) or "(unknown)"
+        if name in BRIDGE_TOOL_NAMES:
+            toolset = _DEFERRED_BRIDGE_LABEL
+        else:
+            toolset = tool_to_toolset.get(name) or "(unknown)"
         group = groups.setdefault(
             toolset, {"toolset": toolset, "tool_count": 0, "json_bytes": 0}
         )
@@ -328,12 +446,13 @@ def render_breakdown(data: Dict[str, Any]) -> str:
     # Per-toolset schema cost — which toolset's tools cost the most to ship.
     toolsets = data.get("toolsets_breakdown") or []
     if toolsets:
+        width = max(22, *(len(ts["toolset"]) for ts in toolsets))
         lines.append("")
         lines.append("  Toolsets by size (tool-schema JSON, largest first):")
-        lines.append(f"    {'toolset':<22} {'tools':>5}  {'schema':>10}")
+        lines.append(f"    {'toolset':<{width}} {'tools':>5}  {'schema':>10}")
         for ts in toolsets:
             lines.append(
-                f"    {ts['toolset']:<22} {ts['tool_count']:>5}  "
+                f"    {ts['toolset']:<{width}} {ts['tool_count']:>5}  "
                 f"{ts['json_bytes']:>8,} B  ({_fmt_kb(ts['json_bytes'])})"
             )
 

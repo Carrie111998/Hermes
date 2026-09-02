@@ -598,6 +598,7 @@ const sidebars: SidebarsConfig = {
                     'user-guide/skills/optional/software-development/software-development-ast-grep',
                     'user-guide/skills/optional/software-development/software-development-code-wiki',
                     'user-guide/skills/optional/software-development/software-development-grill-me',
+                    'user-guide/skills/optional/software-development/software-development-hermes-diagnostic-fidelity',
                     'user-guide/skills/optional/software-development/software-development-rest-graphql-debug',
                     'user-guide/skills/optional/software-development/software-development-subagent-driven-development',
                   ],
@@ -839,8 +840,8 @@ const sidebars: SidebarsConfig = {
           items: [
             'reference/tools-reference',
             'reference/toolsets-reference',
-            'reference/skills-catalog',
-            'reference/optional-skills-catalog',
+            { type: 'ref', id: 'reference/skills-catalog' },
+            { type: 'ref', id: 'reference/optional-skills-catalog' },
           ],
         },
         'reference/cli-symbols',
