@@ -2977,6 +2977,7 @@ _RETRYABLE_ERROR_PATTERNS = (
 # reply), an ``EphemeralReply`` to opt the reply into auto-deletion, or
 # ``None`` when the response was already delivered (e.g. via streaming).
 MessageHandler = Callable[[MessageEvent], Awaitable[Optional[Union[str, "EphemeralReply"]]]]
+ExclusiveInboundHandler = Callable[[MessageEvent], Awaitable[Union[bool, str]]]
 
 
 def resolve_channel_prompt(
@@ -3205,6 +3206,12 @@ class BasePlatformAdapter(ABC):
         self.config = config
         self.platform = platform
         self._message_handler: Optional[MessageHandler] = None
+        # Optional runner-owned admission boundary for a core-configured,
+        # exact-chat exclusive claim. Platform adapters invoke this once per
+        # normalized native message, before any batching or session merging.
+        # ``True`` means the message was consumed (accepted or rejected) and
+        # must never enter the normal Hermes agent loop.
+        self._exclusive_inbound_handler: Optional[ExclusiveInboundHandler] = None
         # Optional gateway-supplied fan-out for platform-native emoji
         # reaction events (see ``set_reaction_handler``).
         self._reaction_handler: Optional[
@@ -3878,6 +3885,24 @@ class BasePlatformAdapter(ABC):
         an optional response string.
         """
         self._message_handler = handler
+
+    def set_exclusive_inbound_handler(
+        self,
+        handler: Optional[ExclusiveInboundHandler],
+    ) -> None:
+        """Install the runner-owned per-message exclusive admission boundary."""
+        self._exclusive_inbound_handler = handler
+
+    async def dispatch_exclusive_inbound(self, event: MessageEvent) -> bool:
+        """Return whether *event* was consumed by an exclusive claim.
+
+        Adapters must call this after normalizing one native message and before
+        any platform debounce/batching or :meth:`handle_message` call.
+        """
+        handler = getattr(self, "_exclusive_inbound_handler", None)
+        if handler is None:
+            return False
+        return await handler(event)
 
     def set_platform_event_handler(
         self,

@@ -1388,10 +1388,31 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                         for msg_data in messages:
                             event = await self._build_message_event(msg_data)
                             if event:
+                                # Preserve one native message per exclusive
+                                # admission. This must precede WhatsApp text
+                                # debounce and BasePlatformAdapter's active-
+                                # session merging so quote/message identity is
+                                # never coalesced into another delivery.
+                                # Poll updates are native Hermes interaction
+                                # traffic, not ordinary inbox messages. Keep
+                                # them on the stock WhatsApp path even when the
+                                # containing chat has an exclusive text/media
+                                # claim.
+                                native_type = str(
+                                    (event.metadata or {}).get("whatsapp_native_type") or ""
+                                ).lower()
+                                is_stock_interaction = native_type.startswith(("poll", "reaction"))
+                                claimed = (
+                                    False
+                                    if is_stock_interaction
+                                    else await self.dispatch_exclusive_inbound(event)
+                                )
                                 # Fire-and-forget: a slow bridge /read must not
                                 # delay message dispatch (matches BlueBubbles
                                 # asyncio.create_task pattern for mark_read).
                                 asyncio.create_task(self._send_read_receipt(msg_data))
+                                if claimed:
+                                    continue
                                 if event.message_type == MessageType.TEXT:
                                     self._enqueue_text_event(event)
                                 else:
@@ -1655,7 +1676,9 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                         except Exception as e:
                             print(f"[{self.name}] Failed to read document text: {e}", flush=True)
 
-            metadata: Dict[str, Any] = {}
+            metadata: Dict[str, Any] = {
+                "whatsapp_original_body": str(data.get("body") or ""),
+            }
             native_type = str(data.get("nativeType") or "").strip()
             native_metadata = data.get("nativeMetadata")
             if native_type:

@@ -3409,6 +3409,38 @@ class PluginContext:
         logger.debug("Plugin %s registered hook: %s", self.manifest.name, hook_name)
         return handle
 
+    def register_exclusive_inbound_handler(
+        self,
+        name: str,
+        callback: Callable,
+    ) -> PluginRegistration:
+        """Register a named async admission for an exclusive inbound claim.
+
+        Core configuration owns which exact chat is claimed. A plugin owns
+        only durable admission of the normalized message. Multiple callbacks
+        remain visible so the runner can detect a collision and fail closed.
+        """
+        key = str(name or "").strip()
+        if not key:
+            raise ValueError("exclusive inbound handler name must not be empty")
+        if not callable(callback):
+            raise TypeError("exclusive inbound handler callback must be callable")
+        callbacks = self._manager._exclusive_inbound_handlers.setdefault(key, [])
+        callbacks.append(callback)
+        handle = self._track(
+            "exclusive_inbound_handler",
+            key,
+            lambda: self._manager._remove_callback(
+                self._manager._exclusive_inbound_handlers, key, callback
+            ),
+        )
+        logger.debug(
+            "Plugin %s registered exclusive inbound handler: %s",
+            self.manifest.name,
+            key,
+        )
+        return handle
+
     def register_system_prompt_section(
         self,
         id: str,
@@ -3747,6 +3779,10 @@ class PluginManager:
         self._discovery_lock = threading.RLock()
         self._plugins: Dict[str, LoadedPlugin] = {}
         self._hooks: Dict[str, List[Callable]] = {}
+        # Named async admissions for core-configured exclusive inbound claims.
+        # Lists are intentional: the runner detects duplicate registrations
+        # and fails the claimed chat closed instead of choosing by load order.
+        self._exclusive_inbound_handlers: Dict[str, List[Callable]] = {}
         self._middleware: Dict[str, List[Callable]] = {}
         self._plugin_tool_names: Set[str] = set()
         self._plugin_platform_names: Set[str] = set()
@@ -4168,6 +4204,7 @@ class PluginManager:
             self._ownership_ledger.clear()
             self._plugins.clear()
             self._hooks.clear()
+            self._exclusive_inbound_handlers.clear()
             self._middleware.clear()
             self._plugin_tool_names.clear()
             self._plugin_platform_names.clear()
@@ -5913,6 +5950,10 @@ class PluginManager:
     def iter_hook_callbacks(self, hook_name: str) -> tuple[Callable, ...]:
         """Return a stable snapshot of callbacks registered for a hook."""
         return tuple(self._hooks.get(hook_name, ()))
+
+    def iter_exclusive_inbound_handlers(self, name: str) -> tuple[Callable, ...]:
+        """Return a stable snapshot of callbacks registered for *name*."""
+        return tuple(self._exclusive_inbound_handlers.get(name, ()))
 
     def render_system_prompt_sections(
         self, session_info: Mapping[str, Any]

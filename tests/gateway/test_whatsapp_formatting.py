@@ -215,6 +215,7 @@ class TestBridgeEventMetadata:
         assert event.raw_message["quotedParticipant"] == "99999999999@s.whatsapp.net"
         assert event.raw_message["quotedRemoteJid"] == "15551234567@s.whatsapp.net"
         assert event.raw_message["hasQuotedMessage"] is True
+        assert event.metadata["whatsapp_original_body"] == "approved"
 
 
 # ---------------------------------------------------------------------------
@@ -228,4 +229,3 @@ class TestWhatsAppTier:
         from gateway.display_config import resolve_display_setting
         # TIER_MEDIUM has streaming: None (follow global), not False
         assert resolve_display_setting({}, "whatsapp", "streaming") is None
-

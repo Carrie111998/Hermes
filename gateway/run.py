@@ -14225,6 +14225,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             adapter.set_message_handler(self._primary_message_handler())
             adapter.set_fatal_error_handler(self._handle_adapter_fatal_error)
             adapter.set_session_store(self.session_store)
+            self._configure_exclusive_inbound(adapter)
             adapter.set_busy_session_handler(self._handle_active_session_busy_message)
             _set_reaction = getattr(adapter, "set_reaction_handler", None)
             if callable(_set_reaction):
@@ -16092,6 +16093,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     adapter.set_message_handler(self._primary_message_handler())
                     adapter.set_fatal_error_handler(self._handle_adapter_fatal_error)
                     adapter.set_session_store(self.session_store)
+                    self._configure_exclusive_inbound(adapter)
                     adapter.set_busy_session_handler(self._handle_active_session_busy_message)
                     _set_reaction = getattr(adapter, "set_reaction_handler", None)
                     if callable(_set_reaction):
@@ -17364,6 +17366,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         _set_owner = getattr(adapter, "set_owner_profile", None)
         if callable(_set_owner):
             _set_owner(profile_name)
+        self._configure_exclusive_inbound(adapter, profile_name=profile_name)
         adapter.set_busy_session_handler(
             self._make_profile_busy_session_handler(profile_name)
         )
@@ -17806,6 +17809,187 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 return await self._handle_gateway_platform_event(event, source)
 
         return _handler
+
+    @staticmethod
+    def _exclusive_inbound_claim(adapter: BasePlatformAdapter) -> Optional[dict]:
+        """Validate and return one adapter-scoped exclusive inbound claim."""
+        extra = getattr(getattr(adapter, "config", None), "extra", None) or {}
+        raw = extra.get("exclusive_inbound")
+        if raw is None:
+            return None
+        if not isinstance(raw, dict):
+            raise ValueError("platform extra.exclusive_inbound must be a mapping")
+        chat_id = raw.get("chat_id")
+        handler = raw.get("handler")
+        if not isinstance(chat_id, str) or not chat_id.strip():
+            raise ValueError("exclusive_inbound.chat_id must be a non-empty string")
+        if not isinstance(handler, str) or not handler.strip():
+            raise ValueError("exclusive_inbound.handler must be a non-empty string")
+        allowed_senders = raw.get("allowed_senders")
+        if allowed_senders is not None and (
+            not isinstance(allowed_senders, list)
+            or not allowed_senders
+            or any(not isinstance(item, str) or not item.strip() for item in allowed_senders)
+        ):
+            raise ValueError(
+                "exclusive_inbound.allowed_senders must be a non-empty list of strings"
+            )
+        failure_message = raw.get("failure_message")
+        if failure_message is not None and (
+            not isinstance(failure_message, str) or not failure_message.strip()
+        ):
+            raise ValueError(
+                "exclusive_inbound.failure_message must be a non-empty string"
+            )
+        return {
+            "chat_id": chat_id.strip(),
+            "handler": handler.strip(),
+            "allowed_senders": (
+                {item.strip().lower() for item in allowed_senders}
+                if isinstance(allowed_senders, list)
+                else None
+            ),
+            "failure_message": (
+                failure_message.strip()
+                if isinstance(failure_message, str)
+                else "This message could not be accepted by the configured "
+                "inbound handler. Please try again or check Hermes."
+            ),
+        }
+
+    async def _send_exclusive_inbound_failure(
+        self,
+        adapter: BasePlatformAdapter,
+        event: MessageEvent,
+        message: str,
+    ) -> None:
+        """Best-effort visible failure for a consumed exclusive message."""
+        try:
+            result = await adapter.send(
+                event.source.chat_id,
+                message,
+                reply_to=event.message_id,
+            )
+            if not getattr(result, "success", False):
+                logger.error(
+                    "Exclusive inbound failure notice could not be sent on %s/%s: %s",
+                    adapter.platform.value,
+                    event.source.chat_id,
+                    getattr(result, "error", "unknown error"),
+                )
+        except Exception:
+            logger.exception(
+                "Exclusive inbound failure notice raised on %s/%s",
+                adapter.platform.value,
+                event.source.chat_id,
+            )
+
+    def _configure_exclusive_inbound(
+        self,
+        adapter: BasePlatformAdapter,
+        *,
+        profile_name: Optional[str] = None,
+    ) -> None:
+        """Install one exact-chat, runner-owned exclusive admission boundary."""
+        claim = self._exclusive_inbound_claim(adapter)
+        setter = getattr(adapter, "set_exclusive_inbound_handler", None)
+        if not callable(setter):
+            if claim is not None:
+                raise TypeError(
+                    "adapter with exclusive_inbound config does not support "
+                    "per-message admission"
+                )
+            return
+        if claim is None:
+            setter(None)
+            return
+
+        transport_home = Path(get_hermes_home())
+        if profile_name:
+            try:
+                from hermes_cli.profiles import get_profile_dir
+
+                transport_home = Path(get_profile_dir(profile_name))
+            except Exception:
+                logger.warning(
+                    "Could not resolve profile home for exclusive inbound claim: %s",
+                    profile_name,
+                    exc_info=True,
+                )
+
+        async def _handler(event: MessageEvent) -> bool:
+            source = event.source
+            if str(getattr(source, "chat_id", "")) != claim["chat_id"]:
+                return False
+
+            # A matched claim is always consumed. Missing plugins, collisions,
+            # callback failures, and authorization failures can never fall
+            # through into the normal Hermes agent loop.
+            source._authorization_profile_home = transport_home
+            if profile_name and not getattr(source, "profile", None):
+                source.profile = profile_name
+
+            with _profile_runtime_scope(transport_home):
+                claim_sender_allowed = (
+                    claim["allowed_senders"] is None
+                    or str(getattr(source, "user_id", "")).strip().lower()
+                    in claim["allowed_senders"]
+                )
+                if not claim_sender_allowed or not self._is_user_authorized_for_source(source):
+                    logger.warning(
+                        "Unauthorized sender dropped from exclusive inbound claim "
+                        "on %s/%s",
+                        adapter.platform.value,
+                        source.chat_id,
+                    )
+                    return True
+
+                from hermes_cli.plugins import get_plugin_manager
+
+                callbacks = get_plugin_manager().iter_exclusive_inbound_handlers(
+                    claim["handler"]
+                )
+                if len(callbacks) != 1:
+                    logger.error(
+                        "Exclusive inbound handler %s has %d registrations for %s/%s",
+                        claim["handler"],
+                        len(callbacks),
+                        adapter.platform.value,
+                        source.chat_id,
+                    )
+                    await self._send_exclusive_inbound_failure(
+                        adapter, event, claim["failure_message"]
+                    )
+                    return True
+
+                try:
+                    accepted = callbacks[0](event)
+                    if not inspect.isawaitable(accepted):
+                        raise TypeError(
+                            "exclusive inbound handler must return an awaitable"
+                        )
+                    accepted = await accepted
+                    if isinstance(accepted, str) and accepted.strip():
+                        await self._send_exclusive_inbound_failure(
+                            adapter, event, accepted.strip()[:500]
+                        )
+                    elif accepted is not True:
+                        raise RuntimeError(
+                            "exclusive inbound handler did not durably accept message"
+                        )
+                except Exception:
+                    logger.exception(
+                        "Exclusive inbound handler %s failed for %s/%s",
+                        claim["handler"],
+                        adapter.platform.value,
+                        source.chat_id,
+                    )
+                    await self._send_exclusive_inbound_failure(
+                        adapter, event, claim["failure_message"]
+                    )
+                return True
+
+        setter(_handler)
 
     def _is_user_authorized_for_source(
         self,
