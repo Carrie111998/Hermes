@@ -1618,6 +1618,8 @@ def _cleanup_failed_worktree_add(repo_root: str, wt_path: Path, branch_name: str
             subprocess.run(
                 ["git", *args],
                 capture_output=True, text=True, timeout=15, cwd=repo_root, check=False,
+                encoding="utf-8",
+                errors="replace",
             )
         except Exception:
             pass
@@ -1668,12 +1670,16 @@ def _maintain_pack_health(repo_root: str) -> None:
         subprocess.run(
             cmd,
             capture_output=True, text=True, timeout=1800, cwd=repo_root, check=False,
+            encoding="utf-8",
+            errors="replace",
         )
         # Repacking can strand now-duplicated admin files; a prune here keeps
         # the worktree bookkeeping tight on the same maintenance pass.
         subprocess.run(
             ["git", "worktree", "prune"],
             capture_output=True, text=True, timeout=60, cwd=repo_root, check=False,
+            encoding="utf-8",
+            errors="replace",
         )
     except Exception as e:
         logger.debug("pack maintenance skipped: %s", e)

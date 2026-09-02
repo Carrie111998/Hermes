@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
 """
-Grep-based checker for Windows cross-platform footguns.
+Grep + AST checker for Windows cross-platform footguns.
 
 Flags common patterns that break silently on Windows. Run before PRs —
 cheap, fast, catches regressions in a codebase that runs on three OSes.
+The subprocess text=True rule additionally runs an stdlib-AST pass so
+multi-line calls (``text=True`` on its own continuation line) are caught
+instead of escaping the line-based scan.
 
 Usage:
     # Scan staged changes (default when run from a git checkout)
@@ -29,6 +32,7 @@ Suppress an intentional use (e.g. tests or platform-gated code) with:
 from __future__ import annotations
 
 import argparse
+import ast
 import os
 import re
 import subprocess
@@ -591,6 +595,115 @@ def _looks_like_string_literal(line: str, match: "re.Match") -> bool:
     return in_s or in_d
 
 
+def _subprocess_bindings(tree: ast.AST) -> tuple[set[str], set[str]]:
+    """Return ``(module_aliases, direct_names)`` bound to subprocess.
+
+    ``module_aliases`` covers ``import subprocess`` / ``import subprocess
+    as sp``; ``direct_names`` covers ``from subprocess import run, Popen,``
+    etc. Used by the AST pass to recognize call targets precisely instead
+    of guessing from substrings on one line.
+    """
+    module_aliases = {"subprocess"}
+    direct_names: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name == "subprocess":
+                    module_aliases.add(alias.asname or "subprocess")
+        elif isinstance(node, ast.ImportFrom) and node.module == "subprocess":
+            for alias in node.names:
+                direct_names.add(alias.asname or alias.name)
+    return module_aliases, direct_names
+
+
+_SUBPROCESS_FUNCS = {"run", "Popen", "call", "check_output", "check_call"}
+
+
+def _call_target(call: ast.Call) -> tuple[str | None, str | None]:
+    """Return ``(root_or_name, attr)`` for a call target, best-effort."""
+    func = call.func
+    if isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name):
+        return func.value.id, func.attr
+    if isinstance(func, ast.Name):
+        return func.id, func.id
+    return None, None
+
+
+def _call_is_suppressed(lines: list[str], node: ast.AST) -> bool:
+    """True when any line of the call carries the suppression marker or an
+    obvious platform guard — same escape hatches the line-based rules use."""
+    start = getattr(node, "lineno", 0)
+    end = getattr(node, "end_lineno", start) or start
+    for lineno in range(start, end + 1):
+        line = lines[lineno - 1] if 0 < lineno <= len(lines) else ""
+        if SUPPRESS_MARKER.search(line):
+            return True
+        if any(hint in line for hint in GUARD_HINTS):
+            return True
+    return False
+
+
+def _kwarg_is_true(call: ast.Call, name: str) -> bool:
+    return any(
+        kw.arg == name
+        and isinstance(kw.value, ast.Constant)
+        and kw.value.value is True
+        for kw in call.keywords
+    )
+
+
+def _kwarg_present(call: ast.Call, name: str) -> bool:
+    return any(kw.arg == name for kw in call.keywords)
+
+
+def scan_file_ast(
+    path: Path, text: str, footguns: list["Footgun"]
+) -> list[tuple[int, str, "Footgun"]]:
+    """AST pass for encoding footguns on MULTI-LINE subprocess calls.
+
+    The line-based ``text=True`` rule requires a subprocess-shaped token on
+    the same line as the match, so a call spelled across several lines —
+    ``subprocess.run(`` / ``cmd,`` / ``text=True,`` — is a documented false
+    negative of the line scan. This pass parses the module (stdlib ``ast``,
+    still no third-party deps) and inspects the real call node: keyword
+    arguments are authoritative regardless of how the call is wrapped.
+
+    Scope: the subprocess ``text=True`` rule only. The read_text/write_text
+    rule keeps its line-based form plus the gateway AST guard test; extending
+    this pass there is a deliberate follow-up, not an oversight.
+    """
+    by_name = {fg.name: fg for fg in footguns}
+    fg_sub = by_name.get("subprocess text=True without explicit encoding=")
+    if fg_sub is None or path.suffix not in {".py", ".pyw", ".pyi"}:
+        return []
+    try:
+        tree = ast.parse(text)
+    except (SyntaxError, ValueError):
+        # Unparsable file — the line-based scan already did what it can.
+        return []
+
+    module_aliases, direct_names = _subprocess_bindings(tree)
+    lines = text.splitlines()
+    matches: list[tuple[int, str, Footgun]] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        if _call_is_suppressed(lines, node):
+            continue
+        root, attr = _call_target(node)
+        is_subprocess = root is not None and (
+            (root in module_aliases and attr in _SUBPROCESS_FUNCS)
+            or (attr is not None and root in direct_names)
+        )
+        if is_subprocess and _kwarg_is_true(node, "text") and not _kwarg_present(
+            node, "encoding"
+        ):
+            lineno = getattr(node, "lineno", 1)
+            line = lines[lineno - 1].rstrip() if 0 < lineno <= len(lines) else ""
+            matches.append((lineno, line, fg_sub))
+    return matches
+
+
 def scan_file(path: Path, footguns: list[Footgun]) -> list[tuple[int, str, Footgun]]:
     """Return a list of (line_number, line, footgun) for unsuppressed matches."""
     try:
@@ -665,6 +778,15 @@ def scan_file(path: Path, footguns: list[Footgun]) -> list[tuple[int, str, Footg
                     # Post-filter assumed a named group that isn't there — skip.
                     continue
             matches.append((i, line.rstrip(), fg))
+
+    # AST pass: catch the multi-line subprocess calls the line-based rules
+    # structurally miss. Dedupe on (line, rule) so a call already flagged by
+    # a line rule is never reported twice.
+    seen = {(lineno, fg.name) for lineno, _, fg in matches}
+    for lineno, line, fg in scan_file_ast(path, text, footguns):
+        if (lineno, fg.name) not in seen:
+            matches.append((lineno, line, fg))
+            seen.add((lineno, fg.name))
     return matches
 
 
@@ -759,6 +881,11 @@ def main(argv: list[str]) -> int:
             REPO_ROOT / "plugins",
             REPO_ROOT / "scripts",
             REPO_ROOT / "acp_adapter",
+            REPO_ROOT / "tui_gateway",
+            # Root-level entry-point god files: the primary CLI and agent
+            # loop. Previously invisible to --all entirely.
+            REPO_ROOT / "cli.py",
+            REPO_ROOT / "run_agent.py",
         ]
         roots = [r for r in roots if r.exists()]
     elif args.diff:

@@ -62,10 +62,14 @@ def _git_proc_running() -> bool:
             out = subprocess.run(
                 ["tasklist", "/FI", "IMAGENAME eq git.exe", "/FO", "CSV"],
                 capture_output=True, text=True, timeout=10,
+                encoding="utf-8",
+                errors="replace",
             ).stdout.lower()
             return "git.exe" in out
         out = subprocess.run(
             ["pgrep", "-x", "git"], capture_output=True, text=True, timeout=10,
+            encoding="utf-8",
+            errors="replace",
         )
         return out.returncode == 0
     except Exception:
@@ -185,6 +189,8 @@ def is_ancestor_of_head(repo_root: Path, rev: str) -> bool:
             ["git", "merge-base", "--is-ancestor", rev, "HEAD"],
             cwd=str(repo_root),
             capture_output=True, text=True, timeout=10,
+            encoding="utf-8",
+            errors="replace",
         )
         return result.returncode == 0
     except Exception:

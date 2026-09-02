@@ -550,6 +550,8 @@ def _list_available_patches(
             env=env,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             check=False,
             timeout=15,
         )
@@ -625,6 +627,8 @@ def _attempt_install_generation(
         env=env,
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        errors="replace",
         check=False,
     )
     if install.returncode != 0:
@@ -650,6 +654,8 @@ def _attempt_install_generation(
         env=env,
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        errors="replace",
         check=False,
     )
     if found.returncode != 0 or not found.stdout.strip():
@@ -861,6 +867,8 @@ def _smoke_candidate_venv(venv_dir: Path) -> tuple[bool, str, SQLiteRuntimeInfo 
             env=env,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=90,
             check=False,
         )
@@ -911,6 +919,8 @@ def _stage_candidate_venv(
         env=env,
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        errors="replace",
         check=False,
     )
     if created.returncode != 0:

@@ -383,6 +383,8 @@ def _linux_session_locked() -> Optional[bool]:
         proc = subprocess.run(
             ["loginctl", "list-sessions", "--no-legend"],
             capture_output=True, text=True, timeout=2.0,
+            encoding="utf-8",
+            errors="replace",
         )
         if proc.returncode != 0:
             return None
@@ -395,6 +397,8 @@ def _linux_session_locked() -> Optional[bool]:
             probe = subprocess.run(
                 ["loginctl", "show-session", parts[0], "-p", "LockedHint"],
                 capture_output=True, text=True, timeout=2.0,
+                encoding="utf-8",
+                errors="replace",
             )
             if "LockedHint=no" in probe.stdout:
                 return False
@@ -813,6 +817,8 @@ class _EmbeddedCuaDaemon:
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             env=env,
         )
         self._owns_runtime = True
@@ -840,6 +846,8 @@ class _EmbeddedCuaDaemon:
                     stdin=subprocess.DEVNULL,
                     capture_output=True,
                     text=True,
+                    encoding="utf-8",
+                    errors="replace",
                     timeout=2.0,
                     env=env,
                 )

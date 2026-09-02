@@ -212,6 +212,8 @@ def _process_start_marker(pid: int) -> str:
         ["ps", "-p", str(pid), "-o", "lstart="],
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        errors="replace",
         check=False,
     )
     marker = result.stdout.strip()

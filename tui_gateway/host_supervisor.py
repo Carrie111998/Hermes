@@ -93,15 +93,12 @@ def _default_registry_path() -> Path:
 def _pid_alive(pid: int) -> bool:
     if pid <= 0:
         return False
-    try:
-        os.kill(pid, 0)
-        return True
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    except Exception:
-        return False
+    # gateway.status._pid_exists is the canonical cross-platform probe:
+    # a bare os.kill(pid, 0) delivers CTRL_C_EVENT on Windows instead of
+    # probing (bpo-14484), silently killing the compute host.
+    from gateway.status import _pid_exists
+
+    return _pid_exists(pid)
 
 
 def _pid_command(pid: int) -> str:
@@ -618,12 +615,17 @@ class HostSupervisor:
             if not _pid_alive(pid):
                 return
             time.sleep(0.05)
+        # gateway.status.terminate_pid(force=True) is the centralized
+        # force-kill primitive: taskkill /T /F on Windows (bare
+        # signal.SIGKILL doesn't exist there), SIGKILL on POSIX.
+        from gateway.status import terminate_pid
+
         try:
-            os.kill(pid, signal.SIGKILL)
+            terminate_pid(pid, force=True)
         except ProcessLookupError:
             return
         except Exception:
-            logger.debug("failed to SIGKILL compute host pid=%s", pid, exc_info=True)
+            logger.debug("failed to force-kill compute host pid=%s", pid, exc_info=True)
 
     def _terminate_process(self, proc: subprocess.Popen[str]) -> None:
         if proc.poll() is not None:
