@@ -10,7 +10,9 @@ state_lost/state_reset reporting, fail-open, and owner isolation.
 """
 import json
 import os
+import subprocess
 import sys
+import tempfile
 import unittest
 from unittest.mock import patch
 
@@ -18,6 +20,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 
 from tools.code_kernel_remote import (
     _REMOTE_KERNELS,
+    REMOTE_KERNEL_RUNNER_SOURCE,
     RemoteKernel,
     execute_in_remote_kernel,
     shutdown_all_remote_kernels,
@@ -117,6 +120,7 @@ class TestSpawnAndReuse(RemoteKernelBase):
         self.assertEqual(
             sum(1 for c in env.commands if "nohup" in c), 1,
         )
+        self.assertEqual(first["exit_code"], 0)
 
     def test_spawn_failure_fails_open(self):
         env = ScriptedEnv([
@@ -208,7 +212,7 @@ class TestDispatchIntegration(unittest.TestCase):
 
         fake = {
             "status": "success", "stdout": "kernel says hi\n", "stderr": "",
-            "traceback": "", "tool_calls_made": 0,
+            "traceback": "", "tool_calls_made": 0, "exit_code": 0,
             "kernel": {"reused": True, "remote": True, "execution_count": 3},
         }
         env = ScriptedEnv([
@@ -222,8 +226,39 @@ class TestDispatchIntegration(unittest.TestCase):
                    return_value=fake):
             result = json.loads(_execute_remote("print()", "t", ["read_file"]))
         self.assertEqual(result["status"], "success")
+        self.assertEqual(result["exit_code"], 0)
         self.assertIn("kernel says hi", result["output"])
         self.assertEqual(result["kernel"]["execution_count"], 3)
+
+    def test_execute_remote_preserves_runner_clipping_metadata(self):
+        from tools.code_execution_tool import _execute_remote
+
+        fake = {
+            "status": "success", "stdout": "x" * 50_000, "stderr": "",
+            "traceback": "", "tool_calls_made": 0, "exit_code": 0,
+            "stdout_clipped": True, "stdout_bytes_total": 80_000,
+            "stdout_spill_path": "/tmp/kernel/cell_000001_stdout.txt",
+            "kernel": {"reused": False, "remote": True, "execution_count": 1},
+        }
+        env = ScriptedEnv([
+            ("command -v python3", lambda c: {"output": "OK\n", "returncode": 0}),
+        ])
+        with patch("tools.code_execution_tool._load_config",
+                   return_value={"timeout": 30, "max_tool_calls": 5}), \
+             patch("tools.code_execution_tool._get_or_create_env",
+                   return_value=(env, "ssh")), \
+             patch("tools.code_kernel_remote.execute_in_remote_kernel",
+                   return_value=fake):
+            result = json.loads(_execute_remote("print()", "t", ["read_file"]))
+        self.assertEqual(result["exit_code"], 0)
+        self.assertTrue(result["stdout_truncated"])
+        self.assertEqual(result["stdout_bytes_total"], 80_000)
+        self.assertGreater(result["stdout_bytes_omitted"], 0)
+        self.assertEqual(
+            result["stdout_spill_path"],
+            "/tmp/kernel/cell_000001_stdout.txt",
+        )
+        self.assertIn("read_file", result["warning"])
 
     def test_execute_remote_falls_open_to_per_call(self):
         from tools.code_execution_tool import _execute_remote
@@ -247,6 +282,36 @@ class TestDispatchIntegration(unittest.TestCase):
         self.assertEqual(result["status"], "success")
         self.assertIn("per-call ran", result["output"])
 
+
+class TestRemoteRunnerSpill(unittest.TestCase):
+    def test_clipped_stdout_is_spilled_before_runner_exit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cells = os.path.join(tmp, "cells")
+            os.makedirs(cells)
+            runner = os.path.join(tmp, "kernel_runner.py")
+            source = REMOTE_KERNEL_RUNNER_SOURCE.format(
+                capture_limit=100, spill_cap=1_000, idle_exit=2,
+            )
+            with open(runner, "w", encoding="utf-8") as f:
+                f.write(source)
+            request_path = os.path.join(cells, "cell_req_000001.json")
+            with open(request_path, "w", encoding="utf-8") as f:
+                json.dump({
+                    "id": "000001",
+                    "code": "print('x' * 250)\nraise SystemExit(0)",
+                }, f)
+            env = dict(os.environ, HERMES_KERNEL_DIR=tmp)
+            subprocess.run(
+                [sys.executable, runner], env=env, check=True, timeout=10,
+            )
+            response_path = os.path.join(cells, "cell_res_000001.json")
+            with open(response_path, encoding="utf-8") as f:
+                result = json.load(f)
+            self.assertTrue(result["stdout_clipped"])
+            self.assertGreater(result["stdout_bytes_total"], 100)
+            self.assertTrue(os.path.isfile(result["stdout_spill_path"]))
+            with open(result["stdout_spill_path"], encoding="utf-8") as f:
+                self.assertIn("x" * 250, f.read())
 
 if __name__ == "__main__":
     unittest.main()
