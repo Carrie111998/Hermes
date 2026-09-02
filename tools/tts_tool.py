@@ -58,7 +58,7 @@ from typing import Callable, Dict, Any, Iterator, List, Optional, Tuple
 from urllib.parse import urljoin, urlparse
 
 from hermes_cli._subprocess_compat import windows_hide_flags
-from hermes_constants import display_hermes_home
+from hermes_constants import display_hermes_home, hermes_home_key
 
 logger = logging.getLogger(__name__)
 def get_env_value(name, default=None):
@@ -2941,7 +2941,17 @@ def _lazy_sdk_feature_for_provider(provider: str) -> Optional[str]:
 
 
 _tts_lease_lock = threading.Lock()
+# (profile home key, lease name) pairs — profile-scoped so two profiles
+# toggling speech output with the same lease name (e.g. "tui:voice-tts")
+# under gateway.multiplex_profiles don't collapse into one holder. Without
+# this, one profile releasing its lease would look like the last holder
+# released and unload the local TTS models another profile is still
+# speaking through mid-conversation, even though its own lease is still held.
 _tts_leases: set = set()
+
+
+def _scoped_lease(lease: str) -> Tuple[str, str]:
+    return (hermes_home_key(), lease)
 
 
 def warm_tts_provider(
@@ -3030,7 +3040,7 @@ def acquire_tts_lease(lease: str, tts_config: Optional[Dict[str, Any]] = None) -
     re-warms — cheap on a cache hit, and heals a cache cleared elsewhere).
     """
     with _tts_lease_lock:
-        _tts_leases.add(lease)
+        _tts_leases.add(_scoped_lease(lease))
         holders = len(_tts_leases)
     result = warm_tts_provider(tts_config)
     result["leases"] = holders
@@ -3042,10 +3052,13 @@ def release_tts_lease(lease: str) -> Dict[str, Any]:
 
     Releasing a lease that was never acquired is a no-op (still reports the
     live holder count) so surfaces can call it unconditionally on their
-    "off" path.
+    "off" path. Must be called under the SAME profile scope (contextvar
+    override) the matching ``acquire_tts_lease`` call used — otherwise the
+    scoped key resolves to the wrong profile and the real lease is never
+    found (never released, never counted).
     """
     with _tts_lease_lock:
-        _tts_leases.discard(lease)
+        _tts_leases.discard(_scoped_lease(lease))
         holders = len(_tts_leases)
         result: Dict[str, Any] = {"leases": holders, "released": 0}
         if holders == 0:
@@ -3054,9 +3067,9 @@ def release_tts_lease(lease: str) -> Dict[str, Any]:
 
 
 def tts_lease_holders() -> List[str]:
-    """Snapshot of live lease names (diagnostics / tests)."""
+    """Snapshot of live lease names across all profiles (diagnostics / tests)."""
     with _tts_lease_lock:
-        return sorted(_tts_leases)
+        return sorted({lease for _scope, lease in _tts_leases})
 
 
 def _reset_tts_leases_for_tests() -> None:
