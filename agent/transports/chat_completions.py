@@ -730,7 +730,7 @@ class ChatCompletionsTransport(ProviderTransport):
         base_url = params.get("base_url")
 
         provider_prefs = params.get("provider_preferences")
-        if provider_prefs and is_openrouter:
+        if provider_prefs and is_openrouter and not model.startswith("@preset/"):
             extra_body["provider"] = provider_prefs
 
         # Pareto Code router plugin — model-gated. Same shape as the

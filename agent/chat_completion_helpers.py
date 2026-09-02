@@ -3363,9 +3363,14 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
 
             if profile_extra_body:
                 summary_extra_body.update(profile_extra_body)
-            if provider_preferences and "provider" not in profile_extra_body and (
-                (agent.provider or "").strip().lower() == "openrouter"
-                or agent._is_openrouter_url()
+            if (
+                provider_preferences
+                and not agent.model.startswith("@preset/")
+                and "provider" not in profile_extra_body
+                and (
+                    (agent.provider or "").strip().lower() == "openrouter"
+                    or agent._is_openrouter_url()
+                )
             ):
                 summary_extra_body["provider"] = provider_preferences
 

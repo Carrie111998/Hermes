@@ -93,6 +93,27 @@ class TestOpenRouterProfile:
         body = p.build_extra_body(provider_preferences={"allow": ["anthropic"]})
         assert body["provider"] == {"allow": ["anthropic"]}
 
+    def test_preset_logs_ignored_provider_preferences(self, caplog):
+        p = get_provider_profile("openrouter")
+
+        with caplog.at_level("WARNING"):
+            p.build_extra_body(
+                model="@preset/diagnostic-contract",
+                provider_preferences={"data_collection": "deny"},
+            )
+            p.build_extra_body(
+                model="@preset/another-preset",
+                provider_preferences={"sort": "price"},
+            )
+
+        messages = [
+            record.getMessage()
+            for record in caplog.records
+            if "Ignoring provider_routing for OpenRouter preset"
+            in record.getMessage()
+        ]
+        assert len(messages) == 1
+
     def test_sticky_session_id_normalizes_cron_timestamp(self):
         """Cron re-fires of the same job keep the same sticky routing key."""
         p = get_provider_profile("openrouter")

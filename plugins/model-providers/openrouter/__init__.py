@@ -11,6 +11,7 @@ from providers.base import ProviderProfile
 logger = logging.getLogger(__name__)
 
 _CACHE: list[str] | None = None
+_PRESET_PROVIDER_ROUTING_WARNED = False
 
 # Anthropic model families that still accept an explicit "disable thinking"
 # request (the manual ``thinking: {type: "disabled"}`` form OpenRouter emits
@@ -115,6 +116,8 @@ class OpenRouterProfile(ProviderProfile):
     def build_extra_body(
         self, *, session_id: str | None = None, **context: Any
     ) -> dict[str, Any]:
+        global _PRESET_PROVIDER_ROUTING_WARNED
+
         body: dict[str, Any] = {}
         # Top-level session_id → OpenRouter's sticky routing key. Per their
         # prompt-caching docs it is used directly as the routing key instead of
@@ -139,15 +142,25 @@ class OpenRouterProfile(ProviderProfile):
         )
         if sticky_key:
             body["session_id"] = sticky_key
+        model = context.get("model") or ""
         prefs = context.get("provider_preferences")
         if prefs:
-            body["provider"] = prefs
+            if model.startswith("@preset/"):
+                if not _PRESET_PROVIDER_ROUTING_WARNED:
+                    _PRESET_PROVIDER_ROUTING_WARNED = True
+                    logger.warning(
+                        "Ignoring provider_routing for OpenRouter preset %r because "
+                        "request-level provider preferences replace the preset's "
+                        "server-side provider policy",
+                        model,
+                    )
+            else:
+                body["provider"] = prefs
 
         # Pareto Code router — model-gated. The plugins block is only
         # meaningful for openrouter/pareto-code; sending it on any other
         # model has no documented effect and would be confusing in logs.
         # See: https://openrouter.ai/docs/guides/routing/routers/pareto-router
-        model = (context.get("model") or "")
         if model == "openrouter/pareto-code":
             score = context.get("openrouter_min_coding_score")
             if score is not None and score != "":
