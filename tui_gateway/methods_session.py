@@ -229,7 +229,9 @@ def _(rid, params: dict) -> dict:
                 "skills": {},
                 "cwd": _sessions[sid]["cwd"],
                 "branch": _git_branch_for_cwd(_sessions[sid]["cwd"]),
-                "project": _project_info_for_cwd(_sessions[sid]["cwd"]),
+                "project": _project_info_for_cwd(
+                    _sessions[sid]["cwd"], profile_home
+                ),
                 "lazy": True,
                 "desktop_contract": DESKTOP_BACKEND_CONTRACT,
                 "profile_name": _response_profile_name(profile),
@@ -1229,7 +1231,7 @@ def _(rid, params: dict) -> dict:
     info = _session_info(agent, session) if agent is not None else {
         "cwd": cwd,
         "branch": _git_branch_for_cwd(cwd),
-        "project": _project_info_for_cwd(cwd),
+        "project": _project_info_for_cwd(cwd, session.get("profile_home")),
         "lazy": True,
     }
     _emit("session.info", params.get("session_id", ""), info)
@@ -1303,7 +1305,9 @@ def _(rid, params: dict) -> dict:
         info = _session_info(agent, live) if agent is not None else {
             "cwd": resolved,
             "branch": branch,
-            "project": _project_info_for_cwd(resolved),
+            "project": _project_info_for_cwd(
+                resolved, live.get("profile_home")
+            ),
             "lazy": True,
         }
         _emit("session.info", live_sid, info)
@@ -2896,7 +2900,9 @@ def _(rid, params: dict) -> dict:
     usage = _session_usage_snapshot(session)
     provider = getattr(agent, "provider", None) or mirror.get("provider") or "unknown"
     model = getattr(agent, "model", None) or mirror.get("model") or "(unknown)"
-    project = _project_info_for_cwd(_display_session_cwd(session))
+    project = _project_info_for_cwd(
+        _display_session_cwd(session), session.get("profile_home")
+    )
     lines = [
         "Hermes TUI Status",
         "",

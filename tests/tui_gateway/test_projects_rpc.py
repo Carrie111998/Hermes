@@ -266,6 +266,142 @@ def test_session_info_carries_project_for_owned_cwd(tmp_path):
     assert info["project"]["name"] == "Proj"
 
 
+def test_session_info_uses_owning_profiles_project_registry(monkeypatch, tmp_path):
+    """A multiplexed sfb session must not borrow default's same-named project."""
+    from hermes_cli import projects_db as pdb
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    default_home = tmp_path / "default-home"
+    sfb_home = tmp_path / "sfb-home"
+    default_db = default_home / "projects.db"
+    sfb_db = sfb_home / "projects.db"
+
+    with pdb.connect_closing(default_db) as conn:
+        default_id = pdb.create_project(
+            conn,
+            name="Default SFB",
+            folders=[str(repo)],
+            primary_path=str(repo),
+        )
+    with pdb.connect_closing(sfb_db) as conn:
+        sfb_id = pdb.create_project(
+            conn,
+            name="Profile SFB",
+            folders=[str(repo)],
+            primary_path=str(repo),
+        )
+
+    monkeypatch.setattr(pdb, "projects_db_path", lambda: default_db)
+
+    info = server._session_info(
+        None,
+        {
+            "cwd": str(repo),
+            "profile_home": str(sfb_home),
+            "session_key": "sfb-session",
+        },
+    )
+
+    assert info["project"]["id"] == sfb_id
+    assert info["project"]["id"] != default_id
+    assert info["project"]["name"] == "Profile SFB"
+
+
+def _conflicting_profile_projects(monkeypatch, tmp_path):
+    """Create launch/coder projects that claim the same working directory."""
+    launch_home = _profile_dir(tmp_path, "launch")
+    coder_home = _profile_dir(tmp_path, "coder")
+    shared = tmp_path / "shared-worktree"
+    shared.mkdir()
+    _bind_profiles(monkeypatch, tmp_path, {"default": launch_home, "coder": coder_home})
+    _create_project(launch_home, "Launch Project", shared, use=True)
+    _create_project(coder_home, "Coder Project", shared, use=True)
+    return launch_home, coder_home, shared
+
+
+def _register_lazy_profile_session(session_id, session_key, profile_home, cwd):
+    server._sessions[session_id] = {
+        "agent": None,
+        "cwd": str(cwd),
+        "history": [],
+        "profile_home": str(profile_home),
+        "running": False,
+        "session_key": session_key,
+    }
+
+
+def test_session_create_reports_project_from_requested_profile(monkeypatch, tmp_path):
+    """Immediate lazy metadata must not borrow the launch profile's project."""
+    launch_home, _coder_home, shared = _conflicting_profile_projects(monkeypatch, tmp_path)
+    monkeypatch.setattr(server, "_enable_gateway_prompts", lambda: None)
+    monkeypatch.setattr(server, "_schedule_agent_build", lambda *_a, **_k: None)
+    monkeypatch.setattr(server, "_schedule_session_cap_enforcement", lambda: None)
+
+    with _serving_launch_profile(launch_home):
+        created = _call(
+            "session.create",
+            {"cwd": str(shared), "profile": "coder", "source": "desktop"},
+        )
+
+    try:
+        assert created["info"]["project"]["name"] == "Coder Project"
+    finally:
+        server._sessions.pop(created["session_id"], None)
+
+
+def test_session_cwd_set_reports_project_from_session_profile(monkeypatch, tmp_path):
+    """A lazy profile session's cwd update must use its own project registry."""
+    launch_home, coder_home, shared = _conflicting_profile_projects(monkeypatch, tmp_path)
+    session_id, session_key = "cwd-profile-runtime", "cwd-profile-stored"
+    _create_session(coder_home, session_key, shared)
+    _register_lazy_profile_session(session_id, session_key, coder_home, shared)
+
+    try:
+        with _serving_launch_profile(launch_home):
+            info = _call("session.cwd.set", {"session_id": session_id, "cwd": str(shared)})
+        assert info["project"]["name"] == "Coder Project"
+    finally:
+        server._sessions.pop(session_id, None)
+
+
+def test_session_workspace_move_emits_project_from_session_profile(monkeypatch, tmp_path):
+    """A live profile session's move event must describe its owning project."""
+    launch_home, coder_home, shared = _conflicting_profile_projects(monkeypatch, tmp_path)
+    session_id, session_key = "move-profile-runtime", "move-profile-stored"
+    _create_session(coder_home, session_key, shared)
+    _register_lazy_profile_session(session_id, session_key, coder_home, shared)
+    emitted = []
+    monkeypatch.setattr(server, "_emit", lambda *args: emitted.append(args))
+
+    try:
+        with _serving_launch_profile(launch_home):
+            _call(
+                "session.workspace.move",
+                {"cwd": str(shared), "profile": "coder", "session_key": session_key},
+            )
+        info = next(args[2] for args in emitted if args[:2] == ("session.info", session_id))
+        assert info["project"]["name"] == "Coder Project"
+    finally:
+        server._sessions.pop(session_id, None)
+
+
+def test_session_status_reports_project_from_session_profile(monkeypatch, tmp_path):
+    """Status output must not name a same-path project from the launch profile."""
+    launch_home, coder_home, shared = _conflicting_profile_projects(monkeypatch, tmp_path)
+    session_id, session_key = "status-profile-runtime", "status-profile-stored"
+    _create_session(coder_home, session_key, shared)
+    _register_lazy_profile_session(session_id, session_key, coder_home, shared)
+
+    try:
+        with _serving_launch_profile(launch_home):
+            status = _call("session.status", {"session_id": session_id})
+        assert "Project: Coder Project" in status["output"]
+        assert "Project: Launch Project" not in status["output"]
+    finally:
+        server._sessions.pop(session_id, None)
+
+
 def test_update_and_archive(tmp_path):
     pid = _call("projects.create", {"name": "Orig", "folders": [str(tmp_path)]})["project"]["id"]
 

@@ -7673,7 +7673,10 @@ def _session_usage_snapshot(session: dict | None) -> dict:
     return dict(mirror_usage) if isinstance(mirror_usage, dict) else {}
 
 
-def _project_info_for_cwd(cwd: str) -> dict | None:
+def _project_info_for_cwd(
+    cwd: str,
+    profile_home: str | os.PathLike[str] | None = None,
+) -> dict | None:
     """Return the first-class Project owning ``cwd`` for UI status surfaces.
 
     Backed by the per-profile projects.db (the same store the desktop's project
@@ -7687,7 +7690,12 @@ def _project_info_for_cwd(cwd: str) -> dict | None:
     try:
         from hermes_cli import projects_db as pdb
 
-        with pdb.connect_closing() as conn:
+        # A multiplexed desktop backend serves sessions from several profile
+        # homes in one process. get_hermes_home() still names the launch
+        # profile outside a profile-scoped RPC, so ambient lookup can assign a
+        # secondary-profile session to a same-named default-profile project.
+        db_path = Path(profile_home) / "projects.db" if profile_home else None
+        with pdb.connect_closing(db_path=db_path) as conn:
             project = pdb.project_for_path(conn, cwd)
         if project is None:
             return None
@@ -7776,7 +7784,7 @@ def _session_info(agent, session: dict | None = None) -> dict:
         "skills": dict(mirror.get("skills") or {}) if isinstance(mirror.get("skills"), dict) else {},
         "cwd": cwd,
         "branch": _git_branch_for_cwd(cwd),
-        "project": _project_info_for_cwd(cwd),
+        "project": _project_info_for_cwd(cwd, (session or {}).get("profile_home")),
         "terminal_backend": _effective_terminal_backend(),
         "personality": str(personality or ""),
         "running": bool((session or {}).get("running")),
@@ -8618,7 +8626,7 @@ def _apply_project_workspace(task_id: str, path: str, _name: str = "") -> None:
             else {
                 "cwd": resolved,
                 "branch": _git_branch_for_cwd(resolved),
-                "project": _project_info_for_cwd(resolved),
+                "project": _project_info_for_cwd(resolved, session.get("profile_home")),
                 "lazy": True,
             }
         )
@@ -10908,7 +10916,7 @@ def _lazy_resume_info(
     info = {
         "cwd": cwd,
         "branch": _git_branch_for_cwd(cwd),
-        "project": _project_info_for_cwd(cwd),
+        "project": _project_info_for_cwd(cwd, _profile_home(profile)),
         "model": model or _resolve_model(),
         "tools": {},
         "skills": {},
@@ -11310,7 +11318,7 @@ def _fallback_session_info(session: dict) -> dict:
     return {
         "cwd": cwd,
         "branch": _git_branch_for_cwd(cwd),
-        "project": _project_info_for_cwd(cwd),
+        "project": _project_info_for_cwd(cwd, session.get("profile_home")),
         "lazy": True,
         "model": _resolve_model(),
         "skills": {},
