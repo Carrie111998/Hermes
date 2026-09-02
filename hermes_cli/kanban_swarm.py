@@ -132,6 +132,8 @@ def create_swarm(
     workers: Iterable[SwarmWorkerSpec],
     verifier_assignee: str,
     synthesizer_assignee: str,
+    verifier_skills: Optional[list[str]] = None,
+    synthesizer_skills: Optional[list[str]] = None,
     root_title: Optional[str] = None,
     verifier_title: str = "Verify swarm outputs",
     synthesizer_title: str = "Synthesize swarm outputs",
@@ -154,6 +156,8 @@ def create_swarm(
             workers=workers,
             verifier_assignee=verifier_assignee,
             synthesizer_assignee=synthesizer_assignee,
+            verifier_skills=verifier_skills,
+            synthesizer_skills=synthesizer_skills,
             root_title=root_title,
             verifier_title=verifier_title,
             synthesizer_title=synthesizer_title,
@@ -203,6 +207,8 @@ def _create_swarm_uncommitted(
     workers: Iterable[SwarmWorkerSpec],
     verifier_assignee: str,
     synthesizer_assignee: str,
+    verifier_skills: Optional[list[str]] = None,
+    synthesizer_skills: Optional[list[str]] = None,
     root_title: Optional[str] = None,
     verifier_title: str = "Verify swarm outputs",
     synthesizer_title: str = "Synthesize swarm outputs",
@@ -301,7 +307,7 @@ def _create_swarm_uncommitted(
         priority=priority,
         workspace_kind=workspace_kind,
         workspace_path=workspace_path,
-        skills=["requesting-code-review"],
+        skills=verifier_skills,
     )
 
     synthesizer_body = (
@@ -320,7 +326,7 @@ def _create_swarm_uncommitted(
         priority=priority,
         workspace_kind=workspace_kind,
         workspace_path=workspace_path,
-        skills=["humanizer"],
+        skills=synthesizer_skills,
     )
 
     created = SwarmCreated(root, worker_ids, verifier, synthesizer)
