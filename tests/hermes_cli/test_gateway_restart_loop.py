@@ -232,6 +232,42 @@ class TestGatewayLifecyclePattern:
         text = 'echo "unbalanced\nhermes gateway restart'
         assert _contains_gateway_lifecycle_command(text), f"Should match: {text!r}"
 
+    def test_single_line_data_file_long_span_not_matched(self):
+        # #98869: a compact single-line JSON data file whose path appears in
+        # a cron command is scanned as a referenced script. The old
+        # unbounded `[^\n]*` gap joined three unrelated words across ~650 KB
+        # of email metadata — "kill the deal review" in one record, a
+        # "gateway" in another, "Hermes" in a third — into a 652 KB
+        # "lifecycle command". A real command never separates verb and
+        # target by more than 200 chars, so the gap is capped; the words
+        # here are separated by tens of thousands of filler chars.
+        filler = " ".join(
+            f"summary of email {i} about quarterly planning" for i in range(1200)
+        )
+        one_line = (
+            '{"subject": "kill the deal review", "notes": "'
+            + filler
+            + ' gateway pool status ok '
+            + filler
+            + ' sent by Hermes bot"}'
+        )
+        assert len(one_line) > 100_000  # far beyond any real command span
+        assert not _contains_gateway_lifecycle_command(one_line)
+
+    @pytest.mark.parametrize("text", [
+        # The cap must not weaken real commands: verb and target within the
+        # 200-char budget stay blocked, whatever sits between them.
+        "pkill -f hermes-gateway",
+        "pkill -f " + "x" * 190 + " hermes gateway watcher.sh",
+        # A flag-heavy invocation: verb-to-unit distance sits well inside
+        # the cap, so Branches C/D keep blocking it.
+        "systemctl restart --no-block --no-wall "
+        "--job-mode=irreversibly-isolate hermes-gateway.service",
+        "launchctl bootout gui/$(id -u)/ai.hermes.gateway.plist",
+    ])
+    def test_span_cap_still_blocks_in_cap_commands(self, text):
+        assert _contains_gateway_lifecycle_command(text), f"Should match: {text!r}"
+
     @pytest.mark.parametrize("text", [
         # #68289: execute_code payloads carry the argv as a Python list —
         # brackets/commas separate the words the OS will exec.
