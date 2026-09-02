@@ -6667,12 +6667,22 @@ class TelegramAdapter(BasePlatformAdapter):
 
             if choices:
                 # Telegram caps callback_data at 64 bytes; keep "cl:<id>:<idx>"
-                # short.
+                # short. Button label shows the option text itself (falling
+                # back to the index number if the text is empty), trimmed to
+                # ~20 chars because Telegram truncates long button labels.
                 rows = []
                 for idx in range(len(choices)):
+                    _label = str(choices[idx]).strip()
+                    # Drop a stray "(Recommended)" marker from the label.
+                    if _label.lower().endswith("(recommended)"):
+                        _label = _label[: -len("(Recommended)")].rstrip()
+                    if not _label:
+                        _label = str(idx + 1)
+                    elif len(_label) > 20:
+                        _label = _label[:19].rstrip() + "…"
                     rows.append([
                         InlineKeyboardButton(
-                            str(idx + 1),
+                            _label,
                             callback_data=f"cl:{clarify_id}:{idx}",
                         )
                     ])
@@ -8919,9 +8929,17 @@ class TelegramAdapter(BasePlatformAdapter):
                     # Already escaped
                     if s > 0 and _seg[s - 1] == '\\':
                         return ch
-                    # ( that opens a MarkdownV2 link [text](url)
+                    # ( that opens a MarkdownV2 link [text](url) — only when
+                    # the link is actually closed on the same line. A link
+                    # truncated by chunk splitting has no closing ')' and its
+                    # bare '(' makes Telegram reject the whole chunk
+                    # ("character '(' is reserved"), forcing the plain-text
+                    # fallback and losing all bold formatting.
                     if ch == '(' and s > 0 and _seg[s - 1] == ']':
-                        return ch
+                        _rest = _seg[s + 1:]
+                        _close = _rest.find(')')
+                        if _close != -1 and '\n' not in _rest[:_close]:
+                            return ch
                     # ) that closes a link URL
                     if ch == ')':
                         before = _seg[:s]

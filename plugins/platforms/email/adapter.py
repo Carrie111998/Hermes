@@ -379,6 +379,122 @@ def _strip_html(html: str) -> str:
     return text.strip()
 
 
+def _md_inline(s: str) -> str:
+    """Format inline Markdown (code, bold, italic, links) as HTML."""
+    import html as _html
+
+    s = _html.escape(s)
+    s = re.sub(r"`([^`]+)`", r"<code>\1</code>", s)
+    s = re.sub(r"\*\*([^*]+)\*\*", r"<strong>\1</strong>", s)
+    s = re.sub(r"(?<!\*)\*([^*]+)\*(?!\*)", r"<em>\1</em>", s)
+    s = re.sub(r"\[([^\]]+)\]\(([^)]+)\)", r'<a href="\2">\1</a>', s)
+    return s
+
+
+def _md_to_html(text: str) -> str:
+    """Convert a Markdown-ish agent body to simple HTML for email clients."""
+    lines = text.split("\n")
+    out = []
+    in_code = False
+    in_list = False
+    code_buf = []
+
+    def close_list():
+        nonlocal in_list
+        if in_list:
+            out.append("</ul>")
+            in_list = False
+
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("```"):
+            if in_code:
+                out.append("<pre><code>" + _html_escape("\n".join(code_buf)) + "</code></pre>")
+                code_buf = []
+                in_code = False
+            else:
+                close_list()
+                in_code = True
+            continue
+        if in_code:
+            code_buf.append(line)
+            continue
+        m = re.match(r"^(#{1,6})\s+(.*)$", stripped)
+        if m:
+            close_list()
+            lvl = len(m.group(1))
+            out.append(f"<h{lvl}>{_md_inline(m.group(2))}</h{lvl}>")
+            continue
+        if re.match(r"^[-*]\s+", stripped):
+            if not in_list:
+                out.append("<ul>")
+                in_list = True
+            out.append("<li>" + _md_inline(re.sub(r"^[-*]\s+", "", stripped)) + "</li>")
+            continue
+        close_list()
+        if re.match(r"^(\*\*\*|---|___)$", stripped):
+            out.append("<hr>")
+            continue
+        if not stripped:
+            continue
+        out.append("<p>" + _md_inline(stripped) + "</p>")
+
+    if in_code:
+        out.append("<pre><code>" + _html_escape("\n".join(code_buf)) + "</code></pre>")
+    close_list()
+    return "\n".join(out)
+
+
+def _html_escape(s: str) -> str:
+    """Minimal HTML escape for code block content."""
+    import html as _html
+
+    return _html.escape(s)
+
+
+def _md_to_plain(text: str) -> str:
+    """Strip Markdown markers so plain-text clients see clean text."""
+    s = text
+    s = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", s)
+    s = re.sub(r"\*\*([^*]+)\*\*", r"\1", s)
+    s = re.sub(r"(?<!\*)\*([^*]+)\*(?!\*)", r"\1", s)
+    s = re.sub(r"`([^`]+)`", r"\1", s)
+    s = re.sub(r"^#{1,6}\s+", "", s, flags=re.MULTILINE)
+    s = re.sub(r"^\s*[-*]\s+", "• ", s, flags=re.MULTILINE)
+    s = re.sub(r"^\s*\d+[.)]\s+", "", s, flags=re.MULTILINE)
+    # Drop code fences and their language hint line
+    lines = s.split("\n")
+    out = []
+    in_fence = False
+    for line in lines:
+        if line.strip().startswith("```"):
+            in_fence = not in_fence
+            continue
+        if in_fence and not line.strip():
+            continue
+        out.append(line)
+    return "\n".join(out)
+
+
+def _attach_body(msg, body: str) -> None:
+    """Attach body as multipart/alternative: clean plain text + formatted HTML."""
+    plain = _md_to_plain(body) if body else ""
+    html_body = _md_to_html(body) if body else ""
+    if html_body:
+        html_doc = (
+            "<html><body style='font-family:-apple-system,Segoe UI,Roboto,Arial,sans-serif;"
+            "font-size:14px;line-height:1.5;color:#1a1a1a'>"
+            + html_body
+            + "</body></html>"
+        )
+        alt = MIMEMultipart("alternative")
+        alt.attach(MIMEText(plain, "plain", "utf-8"))
+        alt.attach(MIMEText(html_doc, "html", "utf-8"))
+        msg.attach(alt)
+    else:
+        msg.attach(MIMEText(plain, "plain", "utf-8"))
+
+
 def _extract_email_address(raw: str) -> str:
     """Extract bare email address from 'Name <addr>' format."""
     match = re.search(r"<([^>]+)>", raw)
@@ -1258,7 +1374,7 @@ class EmailAdapter(BasePlatformAdapter):
         msg_id = f"<hermes-{uuid.uuid4().hex[:12]}@{self._message_id_domain()}>"
         msg["Message-ID"] = msg_id
 
-        msg.attach(MIMEText(body, "plain", "utf-8"))
+        _attach_body(msg, body)
 
         smtp = self._connect_smtp()
         try:
@@ -1372,7 +1488,7 @@ class EmailAdapter(BasePlatformAdapter):
         msg["Message-ID"] = msg_id
 
         if body:
-            msg.attach(MIMEText(body, "plain", "utf-8"))
+            _attach_body(msg, body)
 
         for file_path in file_paths:
             p = Path(file_path)
@@ -1452,7 +1568,7 @@ class EmailAdapter(BasePlatformAdapter):
         msg["Message-ID"] = msg_id
 
         if body:
-            msg.attach(MIMEText(body, "plain", "utf-8"))
+            _attach_body(msg, body)
 
         # Attach file
         p = Path(file_path)
@@ -1535,7 +1651,8 @@ async def _standalone_send(
         return {"error": "Email not configured (EMAIL_ADDRESS, EMAIL_PASSWORD, EMAIL_SMTP_HOST required)"}
 
     try:
-        msg = MIMEText(message, "plain", "utf-8")
+        msg = MIMEMultipart("alternative")
+        _attach_body(msg, message)
         msg["From"] = address
         msg["To"] = chat_id
         msg["Subject"] = "Hermes Agent"
