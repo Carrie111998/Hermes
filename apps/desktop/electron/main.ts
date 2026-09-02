@@ -16157,7 +16157,7 @@ async function dispatchRegistryApiRequest(
   })
 
   return (request?.method || 'GET').toUpperCase() === 'GET'
-    ? tagRegistrySessionResponse(requestPath, response, registryConnectionId)
+    ? tagRegistrySessionResponse(requestPath, response, registryConnectionId, routeProfile)
     : response
 }
 
