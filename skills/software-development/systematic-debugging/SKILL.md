@@ -97,6 +97,8 @@ You MUST complete each phase before proceeding to the next.
 9. **Differential loop** comparing old vs new version, two configs, two providers, or two datasets.
 10. **Human-in-the-loop script** only as a last resort: script the human steps and capture their result so the loop stays structured.
 
+**Escalation discipline:** Start at the cheapest layer capable of reproducing the exact symptom: unit/component, integration/E2E, API/protocol, or browser/UI. Escalate only when the lower layer cannot reproduce or exercise it, and stop at the first conclusive reproduction. Record the exact commands and outcomes. Treat the successful layer as localization evidence, not automatic ownership by that component.
+
 **Tighten the loop once it exists:**
 
 - Make it faster: cache setup, narrow scope, skip unrelated initialization.
