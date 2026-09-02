@@ -343,6 +343,7 @@ export function SettingsView({ onClose, onConfigSaved, onMainModelChanged }: Set
         'flex h-(--titlebar-control-height) items-center gap-1.5 rounded-full border border-(--ui-stroke-secondary) bg-(--ui-chat-surface-background) px-2.5 text-(--ui-text-tertiary) shadow-sm transition-all duration-200 ease-out hover:text-foreground motion-reduce:transition-none',
         paletteOpen && 'pointer-events-none scale-110 opacity-0'
       )}
+      data-glass-opaque=""
       onClick={() => {
         triggerHaptic('open')
         openCommandPalettePage('settings')
