@@ -5,7 +5,7 @@ Run with Blender's Python, not the application's Python:
 """
 
 import json
-from math import cos, pi, sin
+from math import atan2, cos, pi, sin
 from pathlib import Path
 
 import bpy
@@ -54,11 +54,13 @@ def move_to(obj, target):
     target.objects.link(obj)
 
 
-def cube(name, location, scale, mat, target, bevel=0.15):
+def cube(name, location, scale, mat, target, bevel=0.15, rotation=None):
     bpy.ops.mesh.primitive_cube_add(location=location)
     obj = bpy.context.object
     obj.name = name
     obj.scale = scale
+    if rotation:
+        obj.rotation_euler = rotation
     bpy.ops.object.transform_apply(location=False, rotation=False, scale=True)
     if bevel:
         modifier = obj.modifiers.new("soft_shell_edges", "BEVEL")
@@ -85,6 +87,38 @@ def sphere(name, location, radius, mat, target, segments=16, rings=8):
     obj = bpy.context.object
     obj.name = name
     obj["lod"] = "high"
+    obj.data.materials.append(mat)
+    move_to(obj, target)
+    return obj
+
+
+def cone(name, location, radius1, radius2, depth, mat, target, vertices=16, rotation=None):
+    bpy.ops.mesh.primitive_cone_add(
+        vertices=vertices,
+        radius1=radius1,
+        radius2=radius2,
+        depth=depth,
+        location=location,
+        rotation=rotation or (0, 0, 0),
+    )
+    obj = bpy.context.object
+    obj.name = name
+    obj["lod"] = "high"
+    obj.data.materials.append(mat)
+    move_to(obj, target)
+    return obj
+
+
+def text_label(name, text, location, mat, target, size=0.34):
+    bpy.ops.object.text_add(location=location, rotation=(1.2, 0, 0))
+    obj = bpy.context.object
+    obj.name = name
+    obj.data.body = text
+    obj.data.align_x = "CENTER"
+    obj.data.align_y = "CENTER"
+    obj.data.size = size
+    obj.data.extrude = 0.012
+    obj["lod"] = "hero"
     obj.data.materials.append(mat)
     move_to(obj, target)
     return obj
@@ -136,8 +170,8 @@ def ribbon(name, points, width, mat, target):
 
 
 def terrain(target, mat):
-    size = 42
-    steps = 48
+    size = 46
+    steps = 72
     verts = []
     faces = []
     for y in range(steps + 1):
@@ -157,6 +191,7 @@ def terrain(target, mat):
     obj = bpy.data.objects.new("terrain-colony-basin", mesh)
     target.objects.link(obj)
     obj["lod"] = "high"
+    obj["collision_role"] = "terrain"
     solid = obj.modifiers.new("terrain_thickness", "SOLIDIFY")
     solid.thickness = 0.5
     bevel = obj.modifiers.new("terrain_edge_softening", "BEVEL")
@@ -167,47 +202,134 @@ def terrain(target, mat):
 
 def ground_height(x, y):
     radius = (x * x + y * y) ** 0.5
-    return -0.35 - 0.007 * radius * radius + 0.16 * sin(x * 0.45) * cos(y * 0.33)
+    return -0.35 - 0.0055 * radius * radius + 0.14 * sin(x * 0.45) * cos(y * 0.33)
+
+
+def place_grounded_cube(name, x, y, zoff, scale, mat, target, bevel=0.12, rotation=None):
+    return cube(name, (x, y, ground_height(x, y) + zoff), scale, mat, target, bevel, rotation)
+
+
+def scatter_terrain_detail(props, mats):
+    for index in range(58):
+        angle = (index * 2.399963229728653) % (pi * 2)
+        radius = 5.0 + (index % 11) * 1.65
+        x = cos(angle) * radius + sin(index * 0.7) * 1.4
+        y = sin(angle) * radius + cos(index * 0.5) * 1.1
+        if -3 < x < 4 and -4 < y < 3:
+            continue
+        z = ground_height(x, y)
+        if index % 5 == 0:
+            cylinder(f"terrain_crater_{index}", (x, y, z + 0.012), 0.35 + (index % 4) * 0.12, 0.025, mats["crater"], props, 24)
+        else:
+            rock = sphere(f"terrain_rock_{index}", (x, y, z + 0.08), 0.08 + (index % 3) * 0.05, mats["rock"], props, 8, 4)
+            rock.scale.x *= 1.3
+            rock.scale.y *= 0.8
+
+
+ROLE_LABELS = {
+    "archive": "ARCHIVE",
+    "creative": "ARTS STUDIO",
+    "engineering": "ENGINEERING",
+    "governance": "COUNCIL HALL",
+    "knowledge": "LIBRARY",
+    "medical": "TRIAGE",
+    "research": "RESEARCH LAB",
+    "review": "REVIEW OFFICE",
+}
+
+
+def add_role_props(asset_id, role, x, y, base, accent, buildings, mats):
+    back_y = y + 1.45
+    if role in {"knowledge", "archive"}:
+        for shelf in range(3):
+            sx = x - 1.45 + shelf * 1.45
+            cube(f"{asset_id}_bookshelf_{shelf}", (sx, back_y, base + 0.85), (0.42, 0.14, 0.78), mats["wood"], buildings, 0.04)
+            for row in range(3):
+                cube(f"{asset_id}_book_row_{shelf}_{row}", (sx, back_y - 0.13, base + 0.38 + row * 0.32), (0.34, 0.035, 0.045), mats[accent], buildings, 0.015)
+        sphere(f"{asset_id}_orb", (x + 1.4, y - 0.3, base + 1.0), 0.28, mats[accent], buildings, 24, 12)
+    elif role == "research":
+        cylinder(f"{asset_id}_telescope_tripod", (x + 1.25, y - 0.25, base + 0.52), 0.08, 0.95, mats["panel"], buildings, 12)
+        cone(f"{asset_id}_telescope_tube", (x + 1.55, y - 0.55, base + 1.05), 0.18, 0.12, 1.05, mats["shell"], buildings, 18, rotation=(1.15, 0.25, -0.75))
+        for console in range(3):
+            cube(f"{asset_id}_console_{console}", (x - 1.2 + console * 1.0, y + 0.65, base + 0.45), (0.42, 0.24, 0.25), mats["console"], buildings, 0.06)
+    elif role == "creative":
+        cube(f"{asset_id}_easel", (x + 0.95, y - 0.35, base + 0.75), (0.06, 0.08, 0.62), mats["wood"], buildings, 0.02, rotation=(0, 0, 0.2))
+        cube(f"{asset_id}_canvas", (x + 0.95, y - 0.43, base + 0.95), (0.38, 0.04, 0.3), mats["cream"], buildings, 0.025)
+        for pot in range(5):
+            cube(f"{asset_id}_paint_pot_{pot}", (x - 1.4 + pot * 0.28, y - 0.65, base + 0.22), (0.09, 0.09, 0.08), mats[accent], buildings, 0.025)
+    elif role == "engineering":
+        for bench in range(2):
+            cube(f"{asset_id}_workbench_{bench}", (x - 0.9 + bench * 1.8, y + 0.3, base + 0.42), (0.65, 0.28, 0.18), mats["wood"], buildings, 0.04)
+            cube(f"{asset_id}_tool_glow_{bench}", (x - 0.9 + bench * 1.8, y + 0.06, base + 0.68), (0.36, 0.035, 0.05), mats[accent], buildings, 0.02)
+        cylinder(f"{asset_id}_parts_tower", (x + 1.45, y + 0.5, base + 0.72), 0.18, 0.9, mats["panel"], buildings, 12)
+    elif role == "governance":
+        cylinder(f"{asset_id}_holo_table", (x, y - 0.1, base + 0.4), 0.62, 0.18, mats["glass"], buildings, 32)
+        sphere(f"{asset_id}_hologram", (x, y - 0.1, base + 0.92), 0.48, mats["glass"], buildings, 24, 12)
+        for flag in (-1, 1):
+            cube(f"{asset_id}_banner_{flag}", (x + flag * 1.95, y + 0.85, base + 1.1), (0.18, 0.035, 0.78), mats[accent], buildings, 0.025)
+    elif role == "medical":
+        cube(f"{asset_id}_medbed", (x - 0.55, y - 0.2, base + 0.45), (0.82, 0.38, 0.16), mats["cream"], buildings, 0.07)
+        cube(f"{asset_id}_med_sign_cross_h", (x + 0.95, y - 0.55, base + 0.88), (0.32, 0.035, 0.07), mats[accent], buildings, 0.015)
+        cube(f"{asset_id}_med_sign_cross_v", (x + 0.95, y - 0.55, base + 0.88), (0.07, 0.035, 0.32), mats[accent], buildings, 0.015)
+        cylinder(f"{asset_id}_scanner_column", (x + 1.45, y + 0.35, base + 0.78), 0.22, 1.05, mats["glass"], buildings, 20)
+    else:
+        for monitor in range(4):
+            cube(f"{asset_id}_review_monitor_{monitor}", (x - 1.25 + monitor * 0.8, y + 0.65, base + 0.82), (0.28, 0.035, 0.22), mats["glass"], buildings, 0.03)
+        cube(f"{asset_id}_review_desk", (x, y - 0.25, base + 0.42), (0.9, 0.34, 0.18), mats["wood"], buildings, 0.05)
 
 
 def building(asset_id, role, location, accent, buildings, mats):
     x, y = location
     base = ground_height(x, y)
-    shell = cube(f"{asset_id}_shell", (x, y, base + 1.28), (3.05, 2.45, 1.28), mats["shell"], buildings, 0.32)
-    inner = cube(f"{asset_id}_inner", (x, y - 0.22, base + 1.08), (2.48, 1.76, 1.08), mats["interior"], buildings, 0.22)
-    roof = cube(f"{asset_id}_roof", (x, y, base + 2.72), (2.72, 2.08, 0.2), mats["shell"], buildings, 0.18)
-    sign = cube(f"{asset_id}_sign", (x, y - 2.34, base + 1.65), (1.35, 0.06, 0.35), mats[accent], buildings, 0.06)
+    floor = cube(f"{asset_id}_floor", (x, y, base + 0.12), (2.95, 2.35, 0.12), mats["floor"], buildings, 0.18)
+    back_wall = cube(f"{asset_id}_back_wall", (x, y + 1.92, base + 1.32), (3.02, 0.18, 1.26), mats["shell"], buildings, 0.22)
+    left_wall = cube(f"{asset_id}_left_wall", (x - 2.9, y, base + 1.18), (0.18, 1.94, 1.12), mats["shell"], buildings, 0.22)
+    right_wall = cube(f"{asset_id}_right_wall", (x + 2.9, y, base + 1.18), (0.18, 1.94, 1.12), mats["shell"], buildings, 0.22)
+    roof_back = cube(f"{asset_id}_roof_back_beam", (x, y + 1.84, base + 2.6), (3.02, 0.22, 0.18), mats["shell"], buildings, 0.18)
+    roof_left = cube(f"{asset_id}_roof_left_beam", (x - 2.9, y - 0.2, base + 2.52), (0.18, 1.74, 0.16), mats["shell"], buildings, 0.18)
+    roof_right = cube(f"{asset_id}_roof_right_beam", (x + 2.9, y - 0.2, base + 2.52), (0.18, 1.74, 0.16), mats["shell"], buildings, 0.18)
+    roof_caps = []
+    for cap_index, dx in enumerate((-2.1, -0.7, 0.7, 2.1)):
+        roof_caps.append(cube(f"{asset_id}_roof_segment_cap_{cap_index}", (x + dx, y + 0.95, base + 2.68), (0.42, 0.74, 0.1), mats["shell"], buildings, 0.12))
+    sign = cube(f"{asset_id}_sign", (x, y - 2.17, base + 1.75), (1.55, 0.06, 0.38), mats[accent], buildings, 0.06)
+    text_label(f"{asset_id}_sign_text", ROLE_LABELS.get(role, role.upper()), (x, y - 2.245, base + 1.76), mats["sign_text"], buildings, 0.28 if role != "engineering" else 0.22)
     sign["asset_id"] = asset_id
     sign["role"] = role
-    shell["asset_id"] = asset_id
-    shell["role"] = role
-    shell["lod"] = "hero"
-    inner["skinned_wireframe_shell"] = True
-    roof["skinned_wireframe_shell"] = True
-    for dx in (-1.75, 0, 1.75):
-        cube(f"{asset_id}_window_{dx}", (x + dx, y - 2.31, base + 0.85), (0.42, 0.05, 0.28), mats["glass"], buildings, 0.04)
-    for index, dx in enumerate((-2.35, -1.2, 1.2, 2.35)):
-        cube(f"{asset_id}_skin_panel_{index}", (x + dx, y - 2.38, base + 1.35), (0.08, 0.05, 0.92), mats["panel"], buildings, 0.035)
-    for index, dz in enumerate((0.38, 2.18)):
-        cube(f"{asset_id}_horizontal_skin_{index}", (x, y - 2.39, base + dz), (2.78, 0.04, 0.06), mats["panel"], buildings, 0.025)
+    floor["asset_id"] = asset_id
+    floor["role"] = role
+    floor["lod"] = "hero"
+    for shell in (back_wall, left_wall, right_wall, roof_back, roof_left, roof_right, *roof_caps):
+        shell["asset_id"] = asset_id
+        shell["role"] = role
+        shell["skinned_wireframe_shell"] = True
+    for tile_x in (-1.95, -0.95, 0, 0.95, 1.95):
+        cube(f"{asset_id}_floor_tile_seam_x_{tile_x}", (x + tile_x, y, base + 0.255), (0.018, 2.0, 0.012), mats["panel"], buildings, 0.006)
+    for tile_y in (-1.3, -0.6, 0.1, 0.8):
+        cube(f"{asset_id}_floor_tile_seam_y_{tile_y}", (x, y + tile_y, base + 0.258), (2.55, 0.018, 0.012), mats["panel"], buildings, 0.006)
+    for dx in (-1.72, 0, 1.72):
+        cube(f"{asset_id}_back_window_{dx}", (x + dx, y + 1.73, base + 1.18), (0.42, 0.05, 0.28), mats["glass"], buildings, 0.04)
+    for index, dx in enumerate((-2.95, -1.9, -0.75, 0.75, 1.9, 2.95)):
+        cube(f"{asset_id}_skin_panel_{index}", (x + dx, y - 2.05, base + 1.35), (0.08, 0.06, 0.92), mats["panel"], buildings, 0.035)
+    for index, dz in enumerate((0.34, 0.72, 2.16, 2.46)):
+        cube(f"{asset_id}_horizontal_skin_{index}", (x, y - 2.1, base + dz), (2.86, 0.04, 0.055), mats["panel"], buildings, 0.025)
     for dx in (-2.55, 2.55):
-        cylinder(f"{asset_id}_vent_{dx}", (x + dx, y, base + 2.7), 0.24, 0.35, mats[accent], buildings)
+        cylinder(f"{asset_id}_vent_{dx}", (x + dx, y + 0.4, base + 2.88), 0.2, 0.5, mats[accent], buildings, 18)
     curve(
         f"{asset_id}_arched_entry_frame",
         [
-            (x - 2.72, y - 2.28, base + 0.22),
-            (x - 2.72, y - 2.28, base + 2.05),
-            (x - 2.25, y - 2.28, base + 2.48),
-            (x, y - 2.28, base + 2.62),
-            (x + 2.25, y - 2.28, base + 2.48),
-            (x + 2.72, y - 2.28, base + 2.05),
-            (x + 2.72, y - 2.28, base + 0.22),
+            (x - 2.78, y - 2.14, base + 0.22),
+            (x - 2.78, y - 2.14, base + 2.02),
+            (x - 2.25, y - 2.14, base + 2.44),
+            (x, y - 2.14, base + 2.72),
+            (x + 2.25, y - 2.14, base + 2.44),
+            (x + 2.78, y - 2.14, base + 2.02),
+            (x + 2.78, y - 2.14, base + 0.22),
         ],
         0.12,
         mats["shell"],
         buildings,
     )
-    for radius, zoff in ((2.95, 0.38), (3.08, 2.38)):
+    for radius, zoff in ((2.96, 0.38), (3.04, 1.24), (3.08, 2.38)):
         curve(
             f"{asset_id}_wire_skin_rib_{zoff}",
             [
@@ -221,7 +343,10 @@ def building(asset_id, role, location, accent, buildings, mats):
             mats[accent],
             buildings,
         )
-    shell["architecture"] = "arched_entry_frame"
+    for step in range(5):
+        cube(f"{asset_id}_front_step_{step}", (x, y - 2.42 - step * 0.24, base + 0.08 + step * 0.01), (1.55 - step * 0.1, 0.09, 0.045), mats["floor"], buildings, 0.035)
+    add_role_props(asset_id, role, x, y, base, accent, buildings, mats)
+    floor["architecture"] = "open_front_skinned_wireframe_shell"
     return {
         "asset_id": asset_id,
         "base_z": base,
@@ -240,7 +365,8 @@ def character(name, location, leader, characters, mats, role=None, personality=N
     child = kind == "child"
     radius = 0.25 if child else (0.34 if not leader else 0.48)
     height = 0.65 if child else (0.9 if not leader else 1.2)
-    body = cylinder(f"{name}_body", (x, y, z + height / 2), radius, height, mats[accent or "character"], characters)
+    suit = mats[accent or "character"] if leader else mats["character"]
+    body = cylinder(f"{name}_body", (x, y, z + height / 2), radius, height, suit, characters, 24 if leader else 16)
     bpy.ops.mesh.primitive_ico_sphere_add(
         subdivisions=2,
         radius=0.32 if child else (0.43 if not leader else 0.58),
@@ -249,8 +375,24 @@ def character(name, location, leader, characters, mats, role=None, personality=N
     head = bpy.context.object
     head.name = f"{name}_head"
     head["lod"] = "high"
-    head.data.materials.append(mats["helmet"])
+    head.data.materials.append(mats["fur"] if leader else mats["helmet"])
     move_to(head, characters)
+    if leader:
+        for side in (-1, 1):
+            cone(
+                f"{name}_ear_{side}",
+                (x + side * 0.28, y, z + height + 0.97),
+                0.16,
+                0.02,
+                0.42,
+                mats["fur"],
+                characters,
+                12,
+                rotation=(0.2, side * 0.4, 0),
+            )
+        cone(f"{name}_snout", (x, y - 0.48, z + height + 0.42), 0.17, 0.08, 0.36, mats["fur_light"], characters, 16, rotation=(1.45, 0, 0))
+        cube(f"{name}_cloak", (x, y + 0.22, z + height * 0.52), (0.5, 0.08, 0.62), mats[accent or "violet"], characters, 0.08)
+        cube(f"{name}_collar", (x, y - 0.15, z + height + 0.02), (0.46, 0.07, 0.08), mats["gold"], characters, 0.035)
     visor = cube(
         f"{name}_visor",
         (x, y - (0.3 if child else 0.39), z + height + (0.35 if child else 0.45)),
@@ -264,6 +406,35 @@ def character(name, location, leader, characters, mats, role=None, personality=N
     body["kind"] = kind or ("leader" if leader else "worker")
     body["asset_family"] = "hermes-profile-variant"
     add_animation_library(body, name, leader)
+
+
+def add_transport_and_infrastructure(props, mats):
+    route = [(-4.5, 2.7), (-0.5, 2.4), (4.2, 3.0), (8.7, 5.0)]
+    for offset, mat_name in ((-0.34, "panel"), (0.34, "panel")):
+        curve(
+            f"tram_track_{offset}",
+            [(x, y + offset, ground_height(x, y) + 0.12) for x, y in route],
+            0.025,
+            mats[mat_name],
+            props,
+        )
+    x, y = 3.1, 2.75
+    z = ground_height(x, y)
+    cube("transit_shuttle_body", (x, y, z + 0.42), (1.55, 0.42, 0.36), mats["transport"], props, 0.12)
+    cube("transit_shuttle_window", (x - 0.55, y - 0.43, z + 0.52), (0.35, 0.04, 0.16), mats["glass"], props, 0.025)
+    cube("transit_shuttle_door", (x + 0.55, y - 0.43, z + 0.42), (0.22, 0.04, 0.25), mats["amber"], props, 0.025)
+    for sign_x, sign_y, label in [(-1.2, 3.7, "READY"), (2.1, -5.6, "TRIAGE"), (-4.2, 0.7, "BUS STOP")]:
+        z = ground_height(sign_x, sign_y)
+        cylinder(f"wayfinding_post_{label}", (sign_x, sign_y, z + 0.55), 0.035, 1.1, mats["panel"], props, 8)
+        cube(f"wayfinding_sign_{label}", (sign_x, sign_y - 0.08, z + 1.15), (0.48, 0.035, 0.18), mats["green"], props, 0.025)
+        text_label(f"wayfinding_text_{label}", label, (sign_x, sign_y - 0.125, z + 1.16), mats["sign_text"], props, 0.18)
+
+
+def add_habitat_domes(props, mats):
+    for index, (x, y, radius) in enumerate([(16, 7.5, 1.0), (-16, 6.8, 0.9), (18, -4.5, 0.8)]):
+        z = ground_height(x, y)
+        sphere(f"habitat_dome_{index}", (x, y, z + radius * 0.52), radius, mats["glass"], props, 32, 12)
+        cylinder(f"habitat_dome_base_{index}", (x, y, z + 0.08), radius * 0.86, 0.16, mats["panel"], props, 32)
 
 
 def add_animation_library(body, name, leader):
@@ -391,28 +562,52 @@ def main():
     lighting = collection("Lighting")
 
     mats = {
-        "terrain": material("Lunar regolith", (0.08, 0.09, 0.11), roughness=0.93),
-        "shell": material("Colony shell", (0.28, 0.32, 0.36), metallic=0.55, roughness=0.32),
-        "interior": material("Interior shadow", (0.025, 0.04, 0.06), metallic=0.25, roughness=0.5),
-        "glass": material("Cyan emissive glass", (0.02, 0.18, 0.25), metallic=0.2, roughness=0.16, emission=(0.0, 0.8, 1.0)),
+        "terrain": material("Lunar regolith", (0.18, 0.19, 0.21), roughness=0.94),
+        "crater": material("Crater shadow", (0.08, 0.085, 0.095), roughness=0.96),
+        "rock": material("Regolith rock", (0.24, 0.25, 0.27), roughness=0.9),
+        "shell": material("Colony shell", (0.46, 0.49, 0.54), metallic=0.52, roughness=0.28),
+        "floor": material("Road and room floor plate", (0.18, 0.2, 0.23), metallic=0.4, roughness=0.38),
+        "interior": material("Interior shadow", (0.045, 0.055, 0.075), metallic=0.25, roughness=0.5),
+        "glass": material("Cyan emissive glass", (0.02, 0.24, 0.32), metallic=0.2, roughness=0.12, emission=(0.0, 0.85, 1.0)),
         "violet": material("Violet identity", (0.35, 0.05, 0.62), metallic=0.2, roughness=0.3, emission=(0.4, 0.02, 0.8)),
         "cyan": material("Cyan identity", (0.02, 0.38, 0.55), metallic=0.25, roughness=0.3, emission=(0.0, 0.45, 0.8)),
         "amber": material("Amber identity", (0.65, 0.23, 0.03), metallic=0.25, roughness=0.3, emission=(0.9, 0.18, 0.02)),
-        "green": material("Garden identity", (0.1, 0.35, 0.12), metallic=0.1, roughness=0.55),
-        "road": material("Road composite", (0.12, 0.14, 0.17), metallic=0.45, roughness=0.42),
-        "panel": material("Inset hull panel", (0.44, 0.48, 0.52), metallic=0.52, roughness=0.28),
+        "green": material("Garden identity", (0.12, 0.42, 0.14), metallic=0.1, roughness=0.48, emission=(0.12, 0.55, 0.1)),
+        "road": material("Road composite", (0.2, 0.22, 0.26), metallic=0.44, roughness=0.34),
+        "panel": material("Inset hull panel", (0.62, 0.65, 0.68), metallic=0.5, roughness=0.24),
+        "wood": material("Warm interior wood", (0.38, 0.18, 0.08), metallic=0.05, roughness=0.62),
+        "console": material("Console dark alloy", (0.06, 0.09, 0.12), metallic=0.5, roughness=0.28, emission=(0.02, 0.18, 0.22)),
+        "cream": material("Canvas and med fabric", (0.78, 0.7, 0.56), metallic=0.0, roughness=0.72),
+        "fur": material("Leader warm fur", (0.72, 0.36, 0.13), roughness=0.48),
+        "fur_light": material("Leader muzzle fur", (0.92, 0.72, 0.45), roughness=0.54),
+        "gold": material("Leader trim gold", (0.82, 0.52, 0.14), metallic=0.62, roughness=0.26),
+        "transport": material("Transit shuttle red alloy", (0.54, 0.08, 0.05), metallic=0.46, roughness=0.28),
+        "sign_text": material("Sign text glow", (0.85, 0.96, 1.0), roughness=0.2, emission=(0.85, 0.96, 1.0)),
         "character": material("Worker suit", (0.18, 0.22, 0.26), metallic=0.35, roughness=0.36),
         "helmet": material("Helmet shell", (0.78, 0.82, 0.86), metallic=0.65, roughness=0.2),
         "star": material("Skybox star", (0.7, 0.9, 1.0), roughness=0.1, emission=(0.45, 0.75, 1.0)),
     }
 
     terrain(terrain_col, mats["terrain"])
+    scatter_terrain_detail(props, mats)
     roads_points = [
         (x, y, ground_height(x, y) + ROAD_CLEARANCE)
-        for x, y in [(-17, -9), (-10, -5), (-4, -3), (0, 0), (6, 2), (12, 7), (18, 11)]
+        for x, y in [(-18, -10), (-12, -6), (-6, -3.4), (0, -0.5), (5.8, 2.0), (12, 6.8), (18, 10.8)]
     ]
     ribbon("road-network-primary", roads_points, 1.4, mats["road"], roads)
     curve("road-network-glow", [(x, y, z + 0.05) for x, y, z in roads_points], 0.055, mats["glass"], roads)
+    for a, b in zip(roads_points, roads_points[1:]):
+        ax, ay, az = a
+        bx, by, bz = b
+        steps = max(2, int(((bx - ax) ** 2 + (by - ay) ** 2) ** 0.5 / 1.3))
+        yaw = atan2(by - ay, bx - ax)
+        for step in range(steps):
+            t = (step + 0.5) / steps
+            x = ax + (bx - ax) * t
+            y = ay + (by - ay) * t
+            z = ground_height(x, y) + ROAD_CLEARANCE + 0.035
+            tile = cube(f"road_tile_{ax}_{ay}_{step}", (x, y, z), (0.46, 0.58, 0.025), mats["floor"], roads, 0.025, rotation=(0, 0, yaw))
+            tile["terrain_conforming"] = True
     for index, (x, y, z) in enumerate(roads_points[1:-1]):
         cube(f"road_intersection_{index}", (x, y, z + 0.02), (0.75, 0.75, 0.045), mats["road"], roads, 0.16)
 
@@ -439,10 +634,13 @@ def main():
         y = -1 + sin(angle) * radius * 0.7
         z = ground_height(x, y)
         cylinder(f"break-garden_plant_{index}", (x, y, z + 0.18), 0.07, 0.35, mats["green"], props, 8)
-    character("leader-prototype", (-2, -1, 0.5), True, characters, mats)
-    for index, location in enumerate(((-1, -2, 0.4), (1, -2, 0.4), (2, 0, 0.4), (-2, 0, 0.4))):
-        character(f"worker-prototype-{index}", location, False, characters, mats)
-    cube("dispatcher-cube", (0, 4, 0.5), (0.55, 0.55, 0.55), mats["glass"], characters, 0.18)
+    add_habitat_domes(props, mats)
+    add_transport_and_infrastructure(props, mats)
+    for index, (x, y, accent) in enumerate(((-10, 6.2, "violet"), (8.7, 6.8, "cyan"), (12, -5.4, "violet"), (-9, -10.4, "cyan"))):
+        character(f"leader-scene-{index}", (x, y, ground_height(x, y)), True, characters, mats, accent=accent)
+    for index, (x, y) in enumerate(((-4, -2), (-1, -1.9), (2, -1.6), (4, 0.6), (-7, -4.4), (8.8, -1.7), (10.8, -7.5), (-12, -0.6), (15, 5.2))):
+        character(f"worker-scene-{index}", (x, y, ground_height(x, y)), False, characters, mats)
+    cube("dispatcher-cube", (0, 4, ground_height(0, 4) + 0.62), (0.55, 0.55, 0.55), mats["glass"], characters, 0.18)
 
     asset_library = collection("Character Asset Library")
     asset_library["source"] = "sanitized Hermes role and personality classes"
@@ -508,28 +706,43 @@ def main():
     bpy.ops.object.light_add(type="AREA", location=(0, 0, 28))
     key = bpy.context.object
     key.name = "Lunar key light"
-    key.data.energy = 2400
+    key.data.energy = 4200
     key.data.shape = "DISK"
     key.data.size = 20
     move_to(key, lighting)
     bpy.ops.object.light_add(type="AREA", location=(-18, -12, 8))
     fill = bpy.context.object
     fill.name = "Colony cyan fill"
-    fill.data.energy = 900
+    fill.data.energy = 1600
     fill.data.color = (0.05, 0.4, 1.0)
     fill.data.size = 10
     move_to(fill, lighting)
+    bpy.ops.object.light_add(type="POINT", location=(9, 9, 4))
+    hero_glow = bpy.context.object
+    hero_glow.name = "Research lab practical glow"
+    hero_glow.data.energy = 850
+    hero_glow.data.color = (0.05, 0.75, 1.0)
+    move_to(hero_glow, lighting)
+    bpy.ops.object.light_add(type="POINT", location=(-10, 8, 4))
+    library_glow = bpy.context.object
+    library_glow.name = "Library violet practical glow"
+    library_glow.data.energy = 700
+    library_glow.data.color = (0.5, 0.15, 1.0)
+    move_to(library_glow, lighting)
     for index in range(42):
         angle = index / 42 * pi * 2
         radius = 28 + (index % 5) * 1.7
-        sphere(f"skybox_star_{index}", (cos(angle) * radius, sin(angle) * radius, 13 + (index % 7) * 2.1), 0.045, mats["star"], lighting, 8, 4)
+        sphere(f"skybox_star_{index}", (cos(angle) * radius, sin(angle) * radius, 15 + (index % 7) * 2.1), 0.045, mats["star"], lighting, 8, 4)
+    sphere("skybox_earth", (-18, 17, 18), 1.25, mats["glass"], lighting, 32, 16)
 
-    bpy.ops.object.camera_add(location=(32, -38, 34))
+    bpy.ops.object.camera_add(location=(27, -31, 25))
     camera = bpy.context.object
     camera.name = "Lunar City hero camera"
-    camera.data.lens = 52
+    camera.data.type = "ORTHO"
+    camera.data.ortho_scale = 31
+    camera.data.lens = 62
     camera.rotation_euler = (0.82, 0, 0.68)
-    target = Vector((0, 0, 0))
+    target = Vector((0, -0.5, -0.4))
     direction = target - camera.location
     camera.rotation_euler = direction.to_track_quat("-Z", "Y").to_euler()
     bpy.context.scene.camera = camera
@@ -539,12 +752,26 @@ def main():
     bpy.context.scene.world = world
     world.use_nodes = True
     world.node_tree.nodes["Background"].inputs["Color"].default_value = (0.004, 0.008, 0.02, 1.0)
-    world.node_tree.nodes["Background"].inputs["Strength"].default_value = 0.18
+    world.node_tree.nodes["Background"].inputs["Strength"].default_value = 0.28
     scene = bpy.context.scene
     scene.render.engine = "BLENDER_EEVEE"
+    if hasattr(scene, "eevee"):
+        for attr, value in (
+            ("use_gtao", True),
+            ("use_raytracing", True),
+            ("gtao_distance", 4),
+            ("gtao_factor", 1.2),
+            ("use_shadows", True),
+        ):
+            if hasattr(scene.eevee, attr):
+                setattr(scene.eevee, attr, value)
     scene.render.resolution_x = 1280
     scene.render.resolution_y = 900
     scene.render.resolution_percentage = 100
+    scene.view_settings.view_transform = "Filmic"
+    scene.view_settings.look = "Medium High Contrast"
+    scene.view_settings.exposure = 0.35
+    scene.view_settings.gamma = 1.0
     scene.render.filepath = str(OUTPUT / "lunar-city-baseline.png")
     scene.render.image_settings.file_format = "PNG"
     scene["asset_manifest"] = "asset-manifest.json"
