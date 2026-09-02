@@ -136,9 +136,27 @@ class MattermostAdapter(BasePlatformAdapter):
 
         # Reply mode: "thread" to nest replies, "off" for flat messages.
         self._reply_mode: str = (
-            config.extra.get("reply_mode", "")
-            or os.getenv("MATTERMOST_REPLY_MODE", "off")
+            os.getenv("MATTERMOST_REPLY_MODE", "")
+            or config.extra.get("reply_mode", "")
+            or "off"
         ).lower()
+        # Keep the historical reply_mode behavior unless an operator opts
+        # into a DM-specific policy.  "off" leaves top-level DMs flat while
+        # preserving replies inside an existing DM thread.
+        self._dm_reply_mode: str = str(
+            config.extra.get("dm_reply_mode", "inherit") or "inherit"
+        ).strip().lower()
+        if self._dm_reply_mode not in {"inherit", "off", "thread"}:
+            logger.warning(
+                "Mattermost: invalid dm_reply_mode=%r; using 'inherit'",
+                self._dm_reply_mode,
+            )
+            self._dm_reply_mode = "inherit"
+
+        # WebSocket events include the Mattermost channel type.  Cache it so
+        # the response path can distinguish DMs from team channels without a
+        # REST lookup on every chunk/file/progress send.
+        self._channel_type_cache: Dict[str, str] = {}
 
         self._last_post_status: Optional[int] = None
         self._last_post_error: str = ""
@@ -204,18 +222,49 @@ class MattermostAdapter(BasePlatformAdapter):
 
     async def _thread_root_for_send(
         self,
+        chat_id: str,
         reply_to: Optional[str],
         metadata: Optional[Dict[str, Any]],
     ) -> Optional[str]:
-        """Resolve the Mattermost root_id from reply_to or metadata."""
+        """Resolve the Mattermost root_id under channel/DM reply policy."""
         if self._reply_mode != "thread":
             return None
         candidate = reply_to
+        candidate_is_existing_thread = False
         if not candidate and isinstance(metadata, dict):
             candidate = metadata.get("thread_id") or metadata.get("root_id")
+            candidate_is_existing_thread = bool(candidate)
         if not candidate:
             return None
-        return await self._resolve_root_id(str(candidate))
+
+        resolved_root, post_is_existing_thread = await self._resolve_root_id_details(
+            str(candidate)
+        )
+        candidate_is_existing_thread = (
+            candidate_is_existing_thread or post_is_existing_thread
+        )
+
+        if (
+            getattr(self, "_dm_reply_mode", "inherit") == "off"
+            and not candidate_is_existing_thread
+            and await self._is_direct_channel(chat_id)
+        ):
+            return None
+        return resolved_root
+
+    async def _is_direct_channel(self, chat_id: str) -> bool:
+        """Return whether ``chat_id`` is a Mattermost direct-message channel."""
+        channel_type_cache = getattr(self, "_channel_type_cache", None)
+        if channel_type_cache is None:
+            channel_type_cache = {}
+            self._channel_type_cache = channel_type_cache
+        channel_type = channel_type_cache.get(str(chat_id))
+        if channel_type is None:
+            data = await self._api_get(f"channels/{chat_id}")
+            channel_type = str(data.get("type", "")) if data else ""
+            if channel_type:
+                channel_type_cache[str(chat_id)] = channel_type
+        return channel_type == "D"
 
     def _last_post_failure_is_broken_thread_root(self) -> bool:
         """Return True only for clear invalid/missing Mattermost thread roots."""
@@ -375,13 +424,18 @@ class MattermostAdapter(BasePlatformAdapter):
         root_id instead.  Using a reply's own ID as root_id causes
         "Invalid RootId parameter" errors.
         """
+        root_id, _ = await self._resolve_root_id_details(post_id)
+        return root_id
+
+    async def _resolve_root_id_details(self, post_id: str) -> tuple[str, bool]:
+        """Return the root id and whether ``post_id`` already belongs to a thread."""
         if not post_id:
-            return post_id
-        # Check if this post has a root_id (meaning it's a reply)
+            return post_id, False
         data = await self._api_get(f"posts/{post_id}")
-        if data and data.get("root_id"):
-            return data["root_id"]
-        return post_id
+        existing_root = data.get("root_id") if data else None
+        if existing_root:
+            return str(existing_root), True
+        return post_id, False
 
     async def send(
         self,
@@ -404,7 +458,7 @@ class MattermostAdapter(BasePlatformAdapter):
                 "message": chunk,
             })
             # Thread support: reply_to or metadata["thread_id"] is the root post ID.
-            resolved_root = await self._thread_root_for_send(reply_to, metadata)
+            resolved_root = await self._thread_root_for_send(chat_id, reply_to, metadata)
             if resolved_root:
                 payload["root_id"] = resolved_root
 
@@ -586,7 +640,7 @@ class MattermostAdapter(BasePlatformAdapter):
             "message": caption or "",
             "file_ids": [file_id],
         })
-        resolved_root = await self._thread_root_for_send(reply_to, metadata)
+        resolved_root = await self._thread_root_for_send(chat_id, reply_to, metadata)
         if resolved_root:
             payload["root_id"] = resolved_root
 
@@ -627,7 +681,7 @@ class MattermostAdapter(BasePlatformAdapter):
             "message": caption or "",
             "file_ids": [file_id],
         })
-        resolved_root = await self._thread_root_for_send(reply_to, metadata)
+        resolved_root = await self._thread_root_for_send(chat_id, reply_to, metadata)
         if resolved_root:
             payload["root_id"] = resolved_root
 
@@ -715,7 +769,7 @@ class MattermostAdapter(BasePlatformAdapter):
                     "message": "\n".join(caption_parts),
                     "file_ids": file_ids,
                 })
-                resolved_root = await self._thread_root_for_send(None, metadata)
+                resolved_root = await self._thread_root_for_send(chat_id, None, metadata)
                 if resolved_root:
                     payload["root_id"] = resolved_root
                 logger.info(
@@ -854,6 +908,8 @@ class MattermostAdapter(BasePlatformAdapter):
         # Build message event.
         channel_id = post.get("channel_id", "")
         channel_type_raw = data.get("channel_type", "O")
+        if channel_id:
+            self._channel_type_cache[str(channel_id)] = str(channel_type_raw)
         chat_type = _CHANNEL_TYPE_MAP.get(channel_type_raw, "channel")
 
         # For DMs, user_id is sufficient.  For channels, check for @mention.
@@ -1239,7 +1295,7 @@ def _apply_yaml_config(yaml_cfg: dict, mattermost_cfg: dict) -> dict | None:
     Mirrors the legacy ``mattermost_cfg`` block that used to live in
     ``gateway/config.py::load_gateway_config()`` before this migration.
 
-    The MattermostAdapter reads its runtime configuration via
+    The MattermostAdapter reads its access/gating compatibility settings via
     ``os.getenv()`` for ``MATTERMOST_REQUIRE_MENTION``,
     ``MATTERMOST_FREE_RESPONSE_CHANNELS``, and
     ``MATTERMOST_ALLOWED_CHANNELS``.  Rather than rewrite those call sites
@@ -1249,8 +1305,10 @@ def _apply_yaml_config(yaml_cfg: dict, mattermost_cfg: dict) -> dict | None:
 
     Env vars take precedence over YAML — every assignment is guarded
     by ``not os.getenv(...)`` so an explicit env var survives a config.yaml
-    update.  Returns ``None`` because no extras are seeded into
-    ``PlatformConfig.extra`` directly (everything flows through env).
+    update. Reply behavior is behavioral config, so it is returned as
+    profile-scoped ``PlatformConfig.extra`` instead of adding another public
+    environment variable. The legacy ``MATTERMOST_REPLY_MODE`` remains
+    supported and takes precedence inside the adapter.
     """
     if "require_mention" in mattermost_cfg and not os.getenv("MATTERMOST_REQUIRE_MENTION"):
         os.environ["MATTERMOST_REQUIRE_MENTION"] = str(mattermost_cfg["require_mention"]).lower()
@@ -1265,7 +1323,12 @@ def _apply_yaml_config(yaml_cfg: dict, mattermost_cfg: dict) -> dict | None:
         if isinstance(ac, list):
             ac = ",".join(str(v) for v in ac)
         os.environ["MATTERMOST_ALLOWED_CHANNELS"] = str(ac)
-    return None  # all settings flow through env; nothing to merge into extras
+    extras = {}
+    if mattermost_cfg.get("reply_mode") is not None:
+        extras["reply_mode"] = str(mattermost_cfg["reply_mode"]).strip().lower()
+    if mattermost_cfg.get("dm_reply_mode") is not None:
+        extras["dm_reply_mode"] = str(mattermost_cfg["dm_reply_mode"]).strip().lower()
+    return extras or None
 
 
 # ---------------------------------------------------------------------------
