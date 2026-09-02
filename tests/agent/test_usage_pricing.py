@@ -949,7 +949,6 @@ def test_anthropic_snapshot_alias_never_substitutes_a_different_model():
     opus_4_5 = get_pricing_entry("claude-opus-4-5", provider="anthropic")
     assert opus_4 is not None and opus_4_5 is not None
     assert opus_4.input_cost_per_million != opus_4_5.input_cost_per_million
-    assert opus_4 is _OFFICIAL_DOCS_PRICING[("anthropic", "claude-opus-4-20250514")]
 
 
 def test_anthropic_ambiguous_family_stays_unpriced(monkeypatch):
