@@ -106,6 +106,9 @@ _WS_AUTH_TIMEOUT = 20.0
 _WS_MAX_MESSAGE_BYTES = 2_000_000
 _WS_MEMBERSHIP_KIND = 44100
 _WS_MEMBERSHIP_SUB_ID = "hermes-buzz-membership"
+# Sentinel for "subscription id absent from the mapping" (a channel id can
+# never be None — the membership sub maps to None, so None is a real value).
+_UNSET = object()
 
 # Where to look for a credentials JSON (keys: nsec / private_key_hex) when
 # BUZZ_PRIVATE_KEY is not set.  Module-level so tests can point it at a tmpdir.
@@ -838,6 +841,44 @@ class BuzzAdapter(BasePlatformAdapter):
             await self._send_channel_subscription(websocket, subscription_id, channel_id)
             logger.info("Buzz: subscribed to new conversation %s", channel_id)
 
+    def _handle_ws_closed_frame(self, message: list, subscriptions: Dict[str, Optional[str]]) -> None:
+        """Handle a relay CLOSED frame.
+
+        A CLOSED naming a per-channel subscription is a per-subscription
+        rejection (e.g. `restricted: not a channel member`): drop ONLY that
+        subscription and keep the connection plus every other subscription
+        alive. Tearing the whole socket down for one rejected channel
+        subscription caused a reconnect loop that killed all inbound Buzz
+        delivery (the 2026-08-29/30 incident, 51k reconnects in ~22h — the
+        frozen watch-set re-offered the phantom channel on every reconnect).
+
+        CLOSED naming the membership subscription (`hermes-buzz-membership`)
+        still triggers the total reconnect via ConnectionError: it is
+        essential for DM discovery, and a reconnect with fresh `since`
+        filters is the right recovery there.
+        """
+        if len(message) < 2:
+            logger.warning("Buzz: relay CLOSED without subscription id: %s", message)
+            return
+        subscription_id = str(message[1])
+        if subscription_id == _WS_MEMBERSHIP_SUB_ID:
+            detail = message[2] if len(message) > 2 else "membership subscription closed"
+            raise ConnectionError(f"Buzz membership subscription closed: {detail}")
+        channel_id = subscriptions.pop(subscription_id, _UNSET)
+        if channel_id is _UNSET:
+            logger.warning(
+                "Buzz: relay closed unknown subscription %s (%s); ignoring",
+                subscription_id,
+                message[2] if len(message) > 2 else "no reason",
+            )
+            return
+        logger.warning(
+            "Buzz: relay closed subscription %s (channel %s): %s; dropping it, keeping connection alive",
+            subscription_id,
+            channel_id,
+            message[2] if len(message) > 2 else "no reason",
+        )
+
     async def _websocket_loop(self) -> None:
         """Persistent authenticated subscription with bounded reconnect
         backoff. Events route through _handle_event() — identical semantics
@@ -886,8 +927,7 @@ class BuzzAdapter(BasePlatformAdapter):
                                     await self._handle_event(channel_id, state, event)
                                     self._trim_seen(state)
                             elif message[0] == "CLOSED":
-                                detail = message[-1] if len(message) > 2 else "subscription closed"
-                                raise ConnectionError(str(detail))
+                                self._handle_ws_closed_frame(message, subscriptions)
                             elif message[0] == "NOTICE":
                                 logger.warning("Buzz: relay notice: %s", message[-1])
                 except asyncio.CancelledError:
