@@ -30,6 +30,7 @@ import {
   setWorkspaceScope
 } from '@/components/pane-shell/workspace-scope'
 import { FloatingPet } from '@/components/pet/floating-pet'
+import { PetCompanions } from '@/components/pet/pet-companions'
 import { RemoteDisplayBanner } from '@/components/remote-display-banner'
 import { SendDiagnosticsHost } from '@/components/send-diagnostics-dialog'
 import { TipHost } from '@/components/tips'
@@ -1271,6 +1272,7 @@ export function ContribWiring({ children }: { children: ReactNode }) {
       {/* Petdex floating mascot — renders nothing unless installed + enabled.
           Never in the HUD: that window is the chat bar and nothing else. */}
       {!isHudWindow() && !isBrowserWindow() && <FloatingPet />}
+      {!isHudWindow() && !isBrowserWindow() && <PetCompanions />}
 
       {/* In-app tips. Renders nothing until the app is quiet and has something
           to point at, and nothing at all once they're off or all retired. The

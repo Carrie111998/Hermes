@@ -139,6 +139,16 @@ export function derivePetState(activity: PetActivity): PetState {
 export const $petInfo = atom<PetInfo>({ enabled: false })
 export const $petActivity = atom<PetActivity>({})
 
+/**
+ * Additional pets the desktop renders alongside the primary floating mascot.
+ * Populated from the ``pet.info.list`` RPC (the ``display.pet.pets`` roster)
+ * minus the primary slug, which ``FloatingPet`` already owns via ``$petInfo``.
+ * Empty when the roster is a single pet, so single-pet setups render exactly
+ * one mascot as before.
+ */
+export const $petCompanions = atom<PetInfo[]>([])
+export const setPetCompanions = (list: PetInfo[]) => $petCompanions.set(list)
+
 /** Pet installed + enabled with a loaded spritesheet (ready to show/react). */
 export const $petActive = computed($petInfo, info => info.enabled && Boolean(info.spritesheetBase64))
 

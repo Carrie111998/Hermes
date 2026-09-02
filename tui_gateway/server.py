@@ -11650,6 +11650,47 @@ def _pet_active_selection():
     return enabled, pet, scale
 
 
+def _pet_roster_selections() -> list:
+    """Resolve the configured pet roster as a list of ``(pet, scale)``.
+
+    The roster lives under ``display.pet.pets`` (an ordered list of slugs).
+    When that key is absent/empty the roster collapses to the single configured
+    ``display.pet.slug`` so a single-pet setup keeps its exact behaviour. Only
+    slugs that resolve to an installed, on-disk pet are returned, so a stale
+    list never emits an empty frame. Scale is shared across the roster.
+    """
+    from agent.pet import constants, store
+
+    try:
+        from hermes_cli.config import load_config
+
+        cfg = load_config()
+        display = cfg.get("display", {}) if isinstance(cfg.get("display"), dict) else {}
+        pet_cfg = display.get("pet", {}) if isinstance(display.get("pet"), dict) else {}
+    except Exception:
+        pet_cfg = {}
+
+    if not is_truthy_value(pet_cfg.get("enabled"), default=False):
+        return []
+
+    scale = float(pet_cfg.get("scale", constants.DEFAULT_SCALE) or constants.DEFAULT_SCALE)
+
+    pet_slugs = pet_cfg.get("pets")
+    if isinstance(pet_slugs, list) and pet_slugs:
+        slug_list = [str(s).strip() for s in pet_slugs if str(s).strip()]
+    else:
+        slug_list = [str(pet_cfg.get("slug", "") or "").strip()]
+
+    out: list = []
+    for slug in slug_list:
+        if not slug:
+            continue
+        pet = store.load_pet(slug)
+        if pet is not None and pet.exists:
+            out.append((pet, scale))
+    return out
+
+
 def _pet_state_rows(spritesheet) -> list[str]:
     """Row taxonomy for the concrete active pet sheet.
 

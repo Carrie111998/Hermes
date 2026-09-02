@@ -1938,6 +1938,43 @@ def _(rid, params: dict) -> dict:
         return _ok(rid, {"enabled": False})
 
 
+@method("pet.info.list")
+@_profile_scoped
+def _(rid, params: dict) -> dict:
+    """Return every configured pet's sprite payload for multi-pet rendering.
+
+    The desktop renders ``display.pet.pets`` as a roster; this RPC returns the
+    full array in that order (each entry a ``pet.info``-shaped payload with its
+    own slug + spritesheet). Used by the companion surface so the primary pet
+    keeps the single ``pet.info`` contract while the extras arrive together.
+    Send-once: the caller passes ``knownRevisions={slug: revision}`` and an
+    unchanged sheet comes back as metadata only (``spritesheetUnchanged``).
+    Fail-open: ``{enabled: False, pets: []}`` on any error.
+    """
+    try:
+        roster = _pet_roster_selections()
+        if not roster:
+            return _ok(rid, {"enabled": False, "pets": []})
+
+        known = params.get("knownRevisions") or {}
+        if not isinstance(known, dict):
+            known = {}
+
+        pets: list[dict] = []
+        for pet, scale in roster:
+            payload = {"enabled": True, **_pet_sprite_payload(pet, scale=scale)}
+            revision = str(payload.get("spritesheetRevision", "") or "")
+            if revision and str(known.get(pet.slug, "") or "") == revision:
+                payload.pop("spritesheetBase64", None)
+                payload["spritesheetUnchanged"] = True
+            pets.append(payload)
+
+        return _ok(rid, {"enabled": True, "pets": pets})
+    except Exception as exc:  # noqa: BLE001 - cosmetic, never break the surface
+        logger.debug("pet.info.list failed: %s", exc)
+        return _ok(rid, {"enabled": False, "pets": []})
+
+
 @method("pet.cells")
 @_profile_scoped
 def _(rid, params: dict) -> dict:
