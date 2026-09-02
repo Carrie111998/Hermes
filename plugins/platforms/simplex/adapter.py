@@ -345,11 +345,15 @@ class SimplexAdapter(
 
         # Text message batching — concatenate rapid-fire messages into one
         # event before dispatching, mirroring Telegram's batching.
+        text_batch_delay = _scoped_platform_setting(
+            "HERMES_SIMPLEX_TEXT_BATCH_DELAY", extra, "text_batch_delay"
+        )
         self._text_batch_delay = float(
-            os.getenv("HERMES_SIMPLEX_TEXT_BATCH_DELAY", "0.8")
+            "0.8" if text_batch_delay in (None, "") else text_batch_delay
         )
         self._pending_text_batches: Dict[str, MessageEvent] = {}
         self._pending_text_batch_tasks: Dict[str, asyncio.Task] = {}
+        self._text_batch_dispatching: set[str] = set()
 
         logger.info(
             "SimpleX adapter initialized: url=%s auto_accept=%s groups=%s",
@@ -377,8 +381,20 @@ class SimplexAdapter(
             logger.error("SimpleX: SIMPLEX_WS_URL is required")
             return False
 
-        if self._running and self._ws is not None and self._ws_ready.is_set():
-            return True
+        if self._running and self._ws_task and not self._ws_task.done():
+            if self._ws is not None and self._ws_ready.is_set():
+                return True
+            try:
+                await asyncio.wait_for(
+                    self._ws_ready.wait(), timeout=max(self._connect_timeout, 0.1)
+                )
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "SimpleX: existing listener is still reconnecting to %s",
+                    self.ws_url,
+                )
+                return False
+            return self._ws is not None
 
         try:
             if not self._acquire_platform_lock(
@@ -402,7 +418,16 @@ class SimplexAdapter(
             await self.disconnect()
             return False
         except asyncio.CancelledError:
-            await self.disconnect()
+            # A second cancellation must not interrupt teardown after the
+            # daemon-ownership lock has been acquired. Keep the cleanup in its
+            # own task and drain it before propagating the original cancel.
+            cleanup_task = asyncio.create_task(self.disconnect())
+            while not cleanup_task.done():
+                try:
+                    await asyncio.shield(cleanup_task)
+                except asyncio.CancelledError:
+                    continue
+            cleanup_task.result()
             raise
         except Exception:
             logger.exception("SimpleX: listener startup failed")
@@ -1309,7 +1334,7 @@ class SimplexAdapter(
         in-flight event has been restored ahead of it.
         """
         if prior_task is not None:
-            if not prior_task.done():
+            if not prior_task.done() and key not in self._text_batch_dispatching:
                 prior_task.cancel()
             await asyncio.gather(prior_task, return_exceptions=True)
         await self._flush_text_batch(key)
@@ -1344,10 +1369,11 @@ class SimplexAdapter(
     async def _flush_text_batch(self, key: str) -> None:
         """Wait for the quiet period then dispatch the aggregated text."""
         current_task = asyncio.current_task()
+        recovered_after_cancel = False
         try:
             await asyncio.sleep(self._text_batch_delay)
             event = self._pending_text_batches.pop(key, None)
-            if not event:
+            if event is None:
                 return
             logger.info(
                 "[SimpleX] Flushing text batch %s (%d chars)",
@@ -1355,16 +1381,23 @@ class SimplexAdapter(
                 len(event.text or ""),
             )
             try:
+                self._text_batch_dispatching.add(key)
                 await self.handle_message(event)
             except asyncio.CancelledError:
                 newer = self._pending_text_batches.get(key)
                 self._pending_text_batches[key] = prepend_cancelled_batch(
                     event, newer
                 )
+                recovered_after_cancel = True
                 raise
         finally:
+            self._text_batch_dispatching.discard(key)
             if self._pending_text_batch_tasks.get(key) is current_task:
                 self._pending_text_batch_tasks.pop(key, None)
+                if recovered_after_cancel and self._running:
+                    self._pending_text_batch_tasks[key] = asyncio.create_task(
+                        self._flush_text_batch(key)
+                    )
 
     # ------------------------------------------------------------------
     # Command interface

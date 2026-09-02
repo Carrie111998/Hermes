@@ -14,7 +14,10 @@ def profile_scoped() -> bool:
 
         return bool(is_multiplex_active() and current_secret_scope() is not None)
     except Exception:
-        return False
+        # This helper is an isolation boundary. If the multiplex state cannot
+        # be established, treating the call as unscoped would fall through to
+        # the process environment and could expose another profile's values.
+        return True
 
 
 def scoped_platform_setting(

@@ -54,18 +54,19 @@ def _text_event(adapter: SimplexAdapter, message_id: str, text: str):
 
 
 @pytest.mark.asyncio
-async def test_cancelled_flush_rebuffers_complete_batch_before_newer_text():
-    """Cancellation after pop must not lose text or edit-correlation metadata."""
+async def test_new_text_does_not_cancel_an_inflight_dispatch():
+    """A downstream side effect must not be duplicated by batch cancellation."""
     adapter = _adapter()
     adapter._text_batch_delay = 0
     first_dispatch_started = asyncio.Event()
+    allow_first_dispatch_to_finish = asyncio.Event()
     dispatched = []
 
     async def blocked_then_capture(event):
+        dispatched.append(event)
         if event.text == "first":
             first_dispatch_started.set()
-            await asyncio.Event().wait()
-        dispatched.append(event)
+            await allow_first_dispatch_to_finish.wait()
 
     adapter.handle_message = blocked_then_capture
     adapter._enqueue_text_event(_text_event(adapter, "1", "first"))
@@ -73,12 +74,47 @@ async def test_cancelled_flush_rebuffers_complete_batch_before_newer_text():
 
     # This resets the timer while the prior flush is already dispatching.
     adapter._enqueue_text_event(_text_event(adapter, "2", "second"))
+    allow_first_dispatch_to_finish.set()
     await asyncio.gather(*list(adapter._pending_text_batch_tasks.values()))
 
-    assert [event.text for event in dispatched] == ["first\nsecond"]
+    assert [event.text for event in dispatched] == ["first", "second"]
     assert dispatched[0].metadata["simplex_batch_items"] == [
         {"message_id": "1", "text": "first"},
+    ]
+    assert dispatched[1].metadata["simplex_batch_items"] == [
         {"message_id": "2", "text": "second"},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_cancelled_inflight_dispatch_retries_when_adapter_is_running():
+    adapter = _adapter()
+    adapter._running = True
+    adapter._text_batch_delay = 0
+    first_dispatch_started = asyncio.Event()
+    dispatched = []
+    attempts = 0
+
+    async def cancelled_then_capture(event):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            first_dispatch_started.set()
+            await asyncio.Event().wait()
+        dispatched.append(event)
+
+    adapter.handle_message = cancelled_then_capture
+    adapter._enqueue_text_event(_text_event(adapter, "1", "first"))
+    await asyncio.wait_for(first_dispatch_started.wait(), timeout=1)
+    adapter._pending_text_batch_tasks[
+        adapter._text_batch_key(_text_event(adapter, "1", "first"))
+    ].cancel()
+    await asyncio.sleep(0)
+    await asyncio.gather(*list(adapter._pending_text_batch_tasks.values()))
+
+    assert [event.text for event in dispatched] == ["first"]
+    assert dispatched[0].metadata["simplex_batch_items"] == [
+        {"message_id": "1", "text": "first"},
     ]
 
 
@@ -105,6 +141,7 @@ def test_secondary_profile_does_not_inherit_default_simplex_env(
     monkeypatch.setenv("SIMPLEX_WS_URL", "ws://default-daemon:5225")
     monkeypatch.setenv("SIMPLEX_AUTO_ACCEPT", "false")
     monkeypatch.setenv("SIMPLEX_GROUP_ALLOWED", "*")
+    monkeypatch.setenv("HERMES_SIMPLEX_TEXT_BATCH_DELAY", "30")
 
     configured = _adapter(
         extra={
@@ -118,11 +155,29 @@ def test_secondary_profile_does_not_inherit_default_simplex_env(
     assert configured.ws_url == "ws://secondary-daemon:5225"
     assert configured.auto_accept is True
     assert configured.group_allow_from == {"secondary-only"}
+    assert configured._text_batch_delay == 0.8
     assert unconfigured.auto_accept is True
     assert unconfigured.group_allow_from == set()
     assert _simplex.validate_config(unconfigured.config) is False
     assert _simplex.is_connected(unconfigured.config) is False
     assert _simplex._env_enablement() is None
+
+
+def test_profile_scope_detection_failure_does_not_fall_through_to_env(
+    monkeypatch,
+):
+    import sys
+
+    from plugins.platforms.simplex import config as simplex_config
+
+    monkeypatch.setenv("SIMPLEX_WS_URL", "ws://default-daemon:5225")
+    monkeypatch.setitem(sys.modules, "agent.secret_scope", None)
+
+    assert simplex_config.profile_scoped() is True
+    assert (
+        simplex_config.scoped_platform_setting("SIMPLEX_WS_URL", {}, "ws_url")
+        is None
+    )
 
 
 @pytest.mark.asyncio
@@ -209,6 +264,57 @@ async def test_connect_fails_before_listener_when_lock_is_held(monkeypatch):
     assert await adapter.connect() is False
     listener.assert_not_awaited()
     adapter._release_platform_lock.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_connect_during_reconnect_does_not_start_second_listener(monkeypatch):
+    adapter = _adapter()
+    adapter._connect_timeout = 0.01
+    adapter._running = True
+    adapter._ws = None
+    adapter._ws_ready.clear()
+    adapter._ws_task = asyncio.create_task(asyncio.Event().wait())
+    adapter._acquire_platform_lock = MagicMock(return_value=True)
+
+    try:
+        assert await adapter.connect() is False
+        adapter._acquire_platform_lock.assert_not_called()
+        assert not adapter._ws_task.done()
+    finally:
+        adapter._ws_task.cancel()
+        await asyncio.gather(adapter._ws_task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_connect_double_cancel_still_releases_listener_lock(monkeypatch):
+    adapter = _adapter()
+    adapter._acquire_platform_lock = MagicMock(return_value=True)
+    adapter._release_platform_lock = MagicMock()
+    listener_started = asyncio.Event()
+    listener_cancelled = asyncio.Event()
+    allow_listener_exit = asyncio.Event()
+
+    async def slow_listener_cleanup():
+        listener_started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            listener_cancelled.set()
+            await allow_listener_exit.wait()
+            raise
+
+    monkeypatch.setattr(adapter, "_ws_listener", slow_listener_cleanup)
+    connect_task = asyncio.create_task(adapter.connect())
+    await asyncio.wait_for(listener_started.wait(), timeout=1)
+
+    connect_task.cancel()
+    await asyncio.wait_for(listener_cancelled.wait(), timeout=1)
+    connect_task.cancel()
+    allow_listener_exit.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await connect_task
+    adapter._release_platform_lock.assert_called_once()
 
 
 def _group_item(group_id: int, member_id: int, text: str) -> dict:
