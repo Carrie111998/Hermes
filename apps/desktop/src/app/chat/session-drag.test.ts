@@ -1,7 +1,7 @@
 import type { PointerEvent as ReactPointerEvent } from 'react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
-import { findGroupOfPane, group, split } from '@/components/pane-shell/tree/model'
+import { findGroup, findGroupOfPane, group, split } from '@/components/pane-shell/tree/model'
 import { $layoutTree } from '@/components/pane-shell/tree/store'
 import { openSessionTile } from '@/store/session-states'
 
@@ -233,6 +233,81 @@ describe('session drop targeting across stacked tabs', () => {
     })
     expect(openSessionTile).not.toHaveBeenCalled()
   })
+
+  // The reviewed PR path is not strip-only: `subZonePosition` resolves an edge
+  // band to a split pos, and `moveTreePane` must carry the workspace through
+  // `movePane` for EVERY TileDock value, not just `center`. Parameterized over
+  // all four edges — each asserts the pane landed in a NEW split group on that
+  // edge of the destination zone AND the emptied lower zone dissolved (the
+  // reviewer's dangling-empty-group question, answered per edge).
+  it.each(['bottom', 'left', 'right', 'top'] as const)(
+    'moves the primary workspace on an edge-split drop (%s) and dissolves the source zone',
+    pos => {
+      document.body.innerHTML = `
+        <div data-tree-group="top">
+          <div data-tree-tab="session-tile:top"></div>
+        </div>
+        <div data-tree-group="bottom">
+          <button id="workspace-tab" data-tree-tab="workspace"></button>
+        </div>
+      `
+
+      const top = document.querySelector<HTMLElement>('[data-tree-group="top"]')!
+      const bottom = document.querySelector<HTMLElement>('[data-tree-group="bottom"]')!
+      const workspaceTab = document.getElementById('workspace-tab')!
+
+      stubRect(top, { left: 0, top: 0, right: 1000, bottom: 390 })
+      stubRect(bottom, { left: 0, top: 410, right: 1000, bottom: 800 })
+      stubRect(workspaceTab, { left: 0, top: 410, right: 300, bottom: 442 })
+
+      $layoutTree.set(
+        split('column', [
+          group(['session-tile:top'], { active: 'session-tile:top', id: 'top' }),
+          group(['workspace'], { active: 'workspace', id: 'bottom' })
+        ])
+      )
+
+      startSessionDrag(
+        { id: 'main-session', profile: 'default', title: 'Main chat' },
+        {
+          button: 0,
+          clientX: 100,
+          clientY: 425,
+          currentTarget: workspaceTab,
+          pointerId: 1
+        } as unknown as ReactPointerEvent<HTMLElement>,
+        { sourcePaneId: 'workspace' }
+      )
+
+      // Off the strip, past the center ellipse (r = 0.62): the dominant-axis
+      // radial pick resolves each named edge, e.g. bottom-right → 'bottom'.
+      window.dispatchEvent(
+        new MouseEvent('pointermove', {
+          bubbles: true,
+          clientX: pos === 'left' ? 30 : 970,
+          clientY: pos === 'top' ? 30 : 360
+        })
+      )
+      window.dispatchEvent(
+        new MouseEvent('pointerup', {
+          bubbles: true,
+          clientX: pos === 'left' ? 30 : 970,
+          clientY: pos === 'top' ? 30 : 360
+        })
+      )
+
+      // The workspace moved to a fresh group docked on `pos` of the upper zone
+      // — not duplicated through openSessionTile.
+      expect(openSessionTile).not.toHaveBeenCalled()
+      const tree = $layoutTree.get()!
+      expect(findGroupOfPane(tree, 'workspace')).toMatchObject({ panes: ['workspace'] })
+
+      // The upper zone still stands; the emptied lower one is GONE (normalize
+      // prunes it) — the reviewer's dangling-empty-group question.
+      expect(findGroup(tree, 'top')).not.toBeNull()
+      expect(findGroup(tree, 'bottom')).toBeNull()
+    }
+  )
 
   it('excludes the primary workspace pane from its own same-strip insertion slots', () => {
     document.body.innerHTML = `
