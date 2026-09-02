@@ -47,7 +47,9 @@ def test_sibling_container_config_sites_carry_docker_network():
         assert sites >= 1, f"expected at least one container_config site in {module.__name__}"
 
 
-def _reuse_guard_harness(monkeypatch, *, existing_mode: str, network: bool):
+def _reuse_guard_harness(
+    monkeypatch, *, existing_mode: str, network: bool, extra_args=None
+):
     """Drive DockerEnvironment through the cross-process reuse path with a
     fake existing container whose NetworkMode is *existing_mode*.
 
@@ -84,6 +86,7 @@ def _reuse_guard_harness(monkeypatch, *, existing_mode: str, network: bool):
         timeout=60,
         task_id="reuse-guard-test",
         network=network,
+        extra_args=extra_args,
         persist_across_processes=True,
     )
     return commands
@@ -114,3 +117,90 @@ def test_reuse_skips_inspect_when_network_enabled(monkeypatch):
     assert not any(cmd[1] == "inspect" for cmd in commands)
     assert not any(cmd[1] == "rm" for cmd in commands)
     assert not any(cmd[1] == "run" for cmd in commands)
+
+
+def test_extra_args_network_none_emits_flag_once(monkeypatch):
+    """docker_network=false plus an explicit --network=none in
+    docker_extra_args must emit the flag once, not twice.
+
+    Docker rejects a repeated --network outright ("network \"none\" is
+    specified multiple times", exit 125), so emitting both made every
+    container start fail. Issue #100248.
+    """
+    commands = _reuse_guard_harness(
+        monkeypatch,
+        existing_mode="bridge",
+        network=False,
+        extra_args=["--network=none", "--user", "1009:1009"],
+    )
+
+    run_cmd = next(cmd for cmd in commands if len(cmd) > 2 and cmd[1:3] == ["run", "-d"])
+    assert run_cmd.count("--network=none") == 1, (
+        f"--network=none emitted {run_cmd.count('--network=none')} times: {run_cmd}"
+    )
+    # The operator's other extra args are untouched.
+    assert "--user" in run_cmd and "1009:1009" in run_cmd
+
+
+def test_extra_args_space_separated_network_none_emits_flag_once(monkeypatch):
+    commands = _reuse_guard_harness(
+        monkeypatch,
+        existing_mode="bridge",
+        network=False,
+        extra_args=["--network", "none"],
+    )
+
+    run_cmd = next(cmd for cmd in commands if len(cmd) > 2 and cmd[1:3] == ["run", "-d"])
+    assert "--network=none" not in run_cmd, (
+        f"implicit --network=none added despite explicit --network none: {run_cmd}"
+    )
+    assert run_cmd.count("--network") == 1
+
+
+def test_lockdown_still_applies_without_extra_network_arg(monkeypatch):
+    """Unchanged common case: no network flag in extra args means the
+    implicit --network=none is still emitted."""
+    commands = _reuse_guard_harness(
+        monkeypatch,
+        existing_mode="bridge",
+        network=False,
+        extra_args=["--user", "1009:1009"],
+    )
+
+    run_cmd = next(cmd for cmd in commands if len(cmd) > 2 and cmd[1:3] == ["run", "-d"])
+    assert run_cmd.count("--network=none") == 1
+
+
+def test_contradictory_network_request_fails_closed(monkeypatch):
+    """docker_network=false with --network=host in extra args is contradictory.
+
+    Honouring the extra arg would defeat the configured lockdown, and the
+    reuse guard (which requires NetworkMode == "none") would then remove and
+    recreate that container on every startup. Fail loudly instead.
+    """
+    import pytest
+
+    with pytest.raises(RuntimeError, match="docker_network"):
+        _reuse_guard_harness(
+            monkeypatch,
+            existing_mode="bridge",
+            network=False,
+            extra_args=["--network=host"],
+        )
+
+
+def test_extra_args_network_mode_parsing():
+    from tools.environments.docker import _extra_args_network_mode
+
+    assert _extra_args_network_mode(["--network=none"]) == "none"
+    assert _extra_args_network_mode(["--network", "none"]) == "none"
+    assert _extra_args_network_mode(["--net=host"]) == "host"
+    assert _extra_args_network_mode(["--net", "host"]) == "host"
+    assert _extra_args_network_mode(["--network=my-net"]) == "my-net"
+    assert _extra_args_network_mode(["--user", "1009:1009"]) is None
+    assert _extra_args_network_mode([]) is None
+    assert _extra_args_network_mode(None) is None
+    # Non-string entries are skipped rather than raising.
+    assert _extra_args_network_mode([1009, None]) is None
+    # A trailing bare flag with no value must not IndexError.
+    assert _extra_args_network_mode(["--network"]) == ""
