@@ -105,6 +105,7 @@ apps/desktop/src/**/*.d.ts
 /*.png.bak
 *.tar.gz
 *.tgz
+!ui-tui/vendor/*.tgz
 apps/shared/src/**/*.js
 apps/shared/src/**/*.js.map
 apps/shared/src/**/*.d.ts

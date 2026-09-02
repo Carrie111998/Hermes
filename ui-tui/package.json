@@ -25,7 +25,7 @@
     "ink-text-input": "6.0.0",
     "nanostores": "1.4.2",
     "react": "19.2.7",
-    "thinking-orbs": "github:kvnloo/thinking-orbs#625053683f33e7067a4e3eda3125378bc59c9480",
+    "thinking-orbs": "file:./vendor/thinking-orbs-0.3.1-6250536.tgz",
     "undici": "6.28.0",
     "unicode-animations": "1.0.3"
   },
