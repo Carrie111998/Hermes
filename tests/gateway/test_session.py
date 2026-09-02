@@ -1602,6 +1602,69 @@ class TestGatewaySessionDbRecovery:
         assert len(pending) <= store._MAX_PENDING_PER_SESSION
 
 
+class TestRebuildFtsOnceTransientSkip:
+    """_rebuild_fts_once: the once-per-lifetime guard must only burn on an
+    actually-executed attempt. A foreign-holder skip is transient (e.g.
+    `hermes sessions optimize-storage` raced startup) — if it consumed the
+    flag, a long-running gateway whose startup hit one reader would never
+    rebuild a stale index."""
+
+    def _store(self, db):
+        import threading
+
+        store = object.__new__(SessionStore)
+        store._db = db
+        store._lock = threading.RLock()
+        store._entries = {}
+        store._loaded = True
+        store._save = lambda: None
+        store._transcript_retry_lock = threading.Lock()
+        store._dirty_transcripts = {}
+        store._transcript_append_failures = {}
+        store._fts_rebuild_attempted = False
+        return store
+
+    def test_transient_foreign_holder_skip_allows_later_retry(self):
+        rebuild_calls = []
+
+        class FakeDb:
+            def _foreign_state_db_holders(self):
+                return self.holders
+
+            def rebuild_fts(self):
+                rebuild_calls.append(1)
+                return 1
+
+        db = FakeDb()
+        db.holders = ["pid-123 (other process)"]
+        store = self._store(db)
+
+        assert store._rebuild_fts_once() is False
+        assert store._fts_rebuild_attempted is False, (
+            "transient skip must not consume the attempt"
+        )
+        assert rebuild_calls == []
+
+        db.holders = []
+        assert store._rebuild_fts_once() is True
+        assert rebuild_calls == [1]
+        assert store._fts_rebuild_attempted is True
+
+    def test_second_call_after_success_is_noop(self):
+        class FakeDb:
+            def __init__(self):
+                self.holders = []
+
+            def rebuild_fts(self):
+                return 1
+
+        db = FakeDb()
+        store = self._store(db)
+
+        assert store._rebuild_fts_once() is True
+        assert store._rebuild_fts_once() is False
+
+
 class TestGatewayRoutingTable:
     """state.db gateway_routing table is the primary routing index (#9006 follow-up)."""
 
