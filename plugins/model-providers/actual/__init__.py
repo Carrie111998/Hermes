@@ -43,16 +43,33 @@ class ActualProfile(ProviderProfile):
     setting ACTUAL_BASE_URL to the local API URL.
     """
 
+    def supported_reasoning_efforts(self, model: str | None) -> tuple[str, ...] | None:
+        from agent.reasoning_effort import ACTUAL_RELAY_EFFORTS
+
+        return ACTUAL_RELAY_EFFORTS
+
     def build_api_kwargs_extras(
         self, *, reasoning_config: dict | None = None, **context: Any
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         if not isinstance(reasoning_config, dict):
             return {}, {}
 
+        from agent.reasoning_effort import clamp_effort, requested_effort
+
         enabled = reasoning_config.get("enabled") is not False
         if str(reasoning_config.get("effort") or "").strip().lower() == "none":
             enabled = False
-        return {"thinking": {"type": "enabled" if enabled else "disabled"}}, {}
+        extra_body = {"thinking": {"type": "enabled" if enabled else "disabled"}}
+
+        top_level: dict[str, Any] = {}
+        effort = requested_effort(reasoning_config)
+        if effort is not None:
+            supported = self.supported_reasoning_efforts(context.get("model"))
+            clamped = clamp_effort(effort, supported)
+            if clamped in (supported or ()):
+                top_level["reasoning_effort"] = clamped
+
+        return extra_body, top_level
 
     def fetch_models(
         self,

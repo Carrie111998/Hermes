@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from unittest.mock import patch
 
 from agent.auxiliary_client import _normalize_aux_provider
@@ -27,6 +28,7 @@ from providers import get_provider_profile
 def _clear_actual_env(monkeypatch):
     monkeypatch.delenv("ACTUAL_API_KEY", raising=False)
     monkeypatch.delenv("ACTUAL_BASE_URL", raising=False)
+    monkeypatch.delenv("ACTUAL_API_MODE", raising=False)
 
 
 def test_actual_aliases_and_profile_metadata():
@@ -113,8 +115,9 @@ def test_actual_runtime_uses_hosted_default(monkeypatch):
     assert resolved["base_url"] == DEFAULT_ACTUAL_BASE_URL
 
 
-def test_actual_runtime_repairs_stale_responses_mode(monkeypatch):
+def test_actual_runtime_repairs_stale_responses_mode(monkeypatch, caplog):
     _clear_actual_env(monkeypatch)
+    caplog.set_level(logging.INFO, logger="hermes_cli.auth")
     monkeypatch.setenv("ACTUAL_API_KEY", "actual-test-key")
     monkeypatch.setattr(
         rp,
@@ -135,6 +138,30 @@ def test_actual_runtime_repairs_stale_responses_mode(monkeypatch):
 
     assert resolved["api_mode"] == "chat_completions"
     assert explicit["api_mode"] == "chat_completions"
+    assert "persisted api_mode=codex_responses" in caplog.text
+
+
+def test_actual_runtime_responses_escape_hatch(monkeypatch):
+    _clear_actual_env(monkeypatch)
+    monkeypatch.setenv("ACTUAL_API_KEY", "actual-test-key")
+    monkeypatch.setenv("ACTUAL_API_MODE", "codex_responses")
+    monkeypatch.setattr(
+        rp,
+        "_get_model_config",
+        lambda: {"provider": "actual", "default": "actual/test-model"},
+    )
+
+    resolved = rp.resolve_runtime_provider(requested="actual")
+
+    assert resolved["api_mode"] == "codex_responses"
+
+
+def test_actual_hostname_detection_preserves_custom_responses_route():
+    base_url = "https://api.actual.inc/v1"
+
+    assert rp._detect_api_mode_for_url(base_url) == "codex_responses"
+    assert rp._fallback_api_mode("custom", base_url) == "codex_responses"
+    assert rp._resolve_plain_custom_api_mode({}, base_url) == "codex_responses"
 
 
 def test_actual_runtime_uses_local_env_without_key(monkeypatch):
@@ -350,14 +377,29 @@ def test_actual_profile_translates_explicit_reasoning_controls():
     profile = get_provider_profile("actual")
 
     assert profile.build_api_kwargs_extras(reasoning_config=None) == ({}, {})
-    for config, expected in (
-        ({"enabled": True, "effort": "high"}, "enabled"),
-        ({"enabled": False, "effort": "high"}, "disabled"),
-        ({"enabled": True, "effort": "none"}, "disabled"),
+    assert profile.supported_reasoning_efforts("zai-org/GLM-5.3") == (
+        "none",
+        "low",
+        "medium",
+        "high",
+        "max",
+    )
+    for config, expected_toggle, expected_effort in (
+        ({"enabled": True, "effort": "high"}, "enabled", "high"),
+        ({"enabled": True, "effort": "xhigh"}, "enabled", "high"),
+        ({"enabled": True, "effort": "ultra"}, "enabled", "max"),
+        ({"enabled": False, "effort": "high"}, "disabled", None),
+        ({"enabled": True, "effort": "none"}, "disabled", "none"),
     ):
-        extra_body, top_level = profile.build_api_kwargs_extras(reasoning_config=config)
-        assert extra_body == {"thinking": {"type": expected}}
-        assert top_level == {}
+        extra_body, top_level = profile.build_api_kwargs_extras(
+            reasoning_config=config,
+            model="zai-org/GLM-5.3",
+        )
+        assert extra_body == {"thinking": {"type": expected_toggle}}
+        if expected_effort is None:
+            assert "reasoning_effort" not in top_level
+        else:
+            assert top_level["reasoning_effort"] == expected_effort
 
 
 def test_actual_agent_side_routing_keeps_chat_completions_for_any_model():
@@ -390,6 +432,30 @@ def test_actual_agent_init_repairs_stale_responses_mode():
         )
 
     assert agent.api_mode == "chat_completions"
+
+
+def test_actual_agent_init_honors_responses_escape_hatch(monkeypatch):
+    from run_agent import AIAgent
+
+    _clear_actual_env(monkeypatch)
+    monkeypatch.setenv("ACTUAL_API_MODE", "codex_responses")
+    with (
+        patch("run_agent.get_tool_definitions", return_value=[]),
+        patch("run_agent.check_toolset_requirements", return_value={}),
+        patch("run_agent.OpenAI"),
+    ):
+        agent = AIAgent(
+            api_key="actual-test-key",
+            base_url=DEFAULT_ACTUAL_BASE_URL,
+            provider="actual",
+            api_mode="chat_completions",
+            model="zai-org/GLM-5.3",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+        )
+
+    assert agent.api_mode == "codex_responses"
 
 
 def test_actual_chat_completions_wire_replays_reasoning_through_tool_turn(
@@ -563,6 +629,8 @@ def test_actual_chat_completions_wire_replays_reasoning_through_tool_turn(
         "/v1/chat/completions",
     ]
     assert requests[0][1]["thinking"] == {"type": "enabled"}
+    assert requests[0][1]["reasoning_effort"] == "high"
+    assert requests[1][1]["reasoning_effort"] == "high"
     replayed = requests[1][1]["messages"][-2]
     assert replayed["reasoning"] == "I should call the probe tool."
     assert replayed["reasoning_content"] == "I should call the probe tool."

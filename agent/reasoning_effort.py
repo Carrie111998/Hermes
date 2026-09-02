@@ -87,6 +87,9 @@ CODEX_RESPONSES_EFFORTS: tuple[str, ...] = CODEX_GPT56_EFFORTS
 XAI_GROK46_EFFORTS: tuple[str, ...] = ("low", "medium", "high", "xhigh")
 XAI_LEGACY_EFFORTS: tuple[str, ...] = ("low", "medium", "high")
 
+#: Actual Computer relays (SGLang/vLLM): none/low/medium/high/max.
+ACTUAL_RELAY_EFFORTS: tuple[str, ...] = ("none", "low", "medium", "high", "max")
+
 #: Moonshot/Kimi K3: low/high/max (server default high).
 KIMI_K3_EFFORTS: tuple[str, ...] = ("low", "high", "max")
 #: Moonshot/Kimi K2-era models: low/medium/high.
