@@ -77,13 +77,30 @@ def evaluate_command(command: str, env_type: str = "local") -> dict:
             "normalized_variants": variants,
         }
 
-    # 1. Isolated container backends skip every guard (runtime parity:
-    #    this fires BEFORE the hardline floor in check_all_command_guards).
+    # 1. Isolated container backends skip ORDINARY guards, but the runtime
+    #    evaluates the operator's explicit deny/ask policy BEFORE the
+    #    optimization (parity with check_all_command_guards / #91029).
     if approval._should_skip_container_guards(env_type):
+        _deny = approval._match_user_deny_rule(command)
+        if _deny is not None:
+            return result(
+                "user-deny", rule=_deny,
+                detail="matches a user-defined approvals.deny rule in "
+                       "config.yaml (blocked even in an isolated container, "
+                       "under --yolo, or with mode=off)",
+            )
+        _ask = approval._match_user_ask_rule(command)
+        if _ask is not None:
+            return result(
+                "ask-approval", rule=f"approvals.ask: {_ask}",
+                detail="matches a user-defined approvals.ask rule in "
+                       "config.yaml (prompted even in an isolated container)",
+            )
         return result(
             "allow",
             detail=(f"env_type '{env_type}' is an isolated container backend; "
-                    "the runtime skips all command guards for it"),
+                    "the runtime skips ordinary command guards after "
+                    "approvals.deny / approvals.ask evaluation"),
         )
 
     # 2. Hardline blocklist — never bypassable, even under yolo.
@@ -110,6 +127,17 @@ def evaluate_command(command: str, env_type: str = "local") -> dict:
             "user-deny", rule=deny_pattern,
             detail="matches a user-defined approvals.deny rule in "
                    "config.yaml (blocked even under --yolo / mode=off)",
+        )
+
+    # 4.5 User-defined approvals.ask rules — also fire before yolo/off,
+    # but unlike deny they PROMPT instead of blocking.
+    ask_pattern = approval._match_user_ask_rule(command)
+    if ask_pattern is not None:
+        return result(
+            "ask-approval", rule=f"approvals.ask: {ask_pattern}",
+            detail="matches a user-defined approvals.ask rule in config.yaml; "
+                   "the runtime raises an approval prompt even under "
+                   "--yolo / approvals.mode=off",
         )
 
     # 5. Yolo / approvals.mode=off bypass.

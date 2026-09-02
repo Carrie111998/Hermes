@@ -113,12 +113,14 @@ class TestDenyOrdering:
         assert result["approved"] is False
         assert result.get("user_deny") is True
 
-    def test_container_backend_skips_deny(self, deny_config, clean_env):
-        """Isolated container backends bypass the whole guard stack (existing
-        contract) — deny rules protect the host, containers can't touch it."""
+    def test_container_backend_cannot_skip_deny(self, deny_config, clean_env):
+        """Explicit operator deny policy precedes the isolation fast-path —
+        an isolated container may skip ordinary guards, never approvals.deny
+        (PR #92437 blocker 2; composes with #91029's ordering)."""
         deny_config(["git push --force*"])
         result = mod.check_dangerous_command("git push --force origin main", "docker")
-        assert result["approved"] is True
+        assert result["approved"] is False
+        assert result.get("user_deny") is True
 
     def test_benign_command_unaffected(self, deny_config, clean_env):
         deny_config(["git push --force*"])
