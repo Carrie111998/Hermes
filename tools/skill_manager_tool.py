@@ -1930,6 +1930,36 @@ def _maybe_debounced_sync_push(skill_name: str) -> None:
         _sync_push_timer.start()
 
 
+def _crossed_skill_payload_error(action, content, file_content):
+    """Name the rejected sibling key so the model can self-correct.
+
+    The operations-item schema advertises both ``content`` (create/patch)
+    and ``file_content`` (write_file). Models pick the wrong one and then
+    loop on a missing-key error that never names the key they sent
+    (#101418). Do not alias the fields — schema-alias-coverage forbids it.
+    """
+    has_content = bool(content)
+    has_file_content = file_content is not None
+    if action in {"create", "edit"} and not has_content and has_file_content:
+        return (
+            f"'file_content' is only valid for action='write_file'; "
+            f"for '{action}' pass 'content' with the full SKILL.md text "
+            f"(frontmatter + body)."
+        )
+    if action == "write_file" and file_content is None and has_content:
+        return (
+            "'content' is only valid for action='create' or 'patch'; "
+            "for 'write_file' pass 'file_content'."
+        )
+    if action == "patch" and not has_content and has_file_content:
+        return (
+            "'file_content' is only valid for action='write_file'; "
+            "for 'patch' pass 'content' (full rewrite) or "
+            "old_string/new_string (targeted replacement)."
+        )
+    return None
+
+
 def skill_manage(
     action: str,
     name: str,
@@ -2000,6 +2030,9 @@ def skill_manage(
         pass
 
     if action == "create":
+        crossed = _crossed_skill_payload_error(action, content, file_content)
+        if crossed:
+            return tool_error(crossed, success=False)
         if not content:
             return tool_error("content is required for 'create'. Provide the full SKILL.md text (frontmatter + body).", success=False)
         result = _create_skill(name, content, category)
@@ -2007,6 +2040,9 @@ def skill_manage(
     elif action == "edit":
         # Legacy alias for a full rewrite (kept for old transcripts/callers;
         # no longer advertised in the schema — use patch with `content`).
+        crossed = _crossed_skill_payload_error(action, content, file_content)
+        if crossed:
+            return tool_error(crossed, success=False)
         if not content:
             return tool_error("content is required for a full rewrite. Provide the full updated SKILL.md text.", success=False)
         result = _edit_skill(name, content)
@@ -2023,6 +2059,9 @@ def skill_manage(
         if content:
             result = _edit_skill(name, content)
         else:
+            crossed = _crossed_skill_payload_error(action, content, file_content)
+            if crossed:
+                return tool_error(crossed, success=False)
             # Targeted-replacement validation lives in _patch_skill so the
             # public tool and the helper return the same actionable guidance.
             # A bare "required" error here would shadow it and leave the
@@ -2036,6 +2075,9 @@ def skill_manage(
         if not file_path:
             return tool_error("file_path is required for 'write_file'. Example: 'references/api-guide.md'", success=False)
         if file_content is None:
+            crossed = _crossed_skill_payload_error(action, content, file_content)
+            if crossed:
+                return tool_error(crossed, success=False)
             return tool_error("file_content is required for 'write_file'.", success=False)
         result = _write_file(name, file_path, file_content)
 
@@ -2175,7 +2217,8 @@ SKILL_MANAGE_SCHEMA = {
                             "description": (
                                 "Full SKILL.md text (YAML frontmatter + "
                                 "markdown body) for create, or a full "
-                                "rewrite on patch."
+                                "rewrite on patch. Not for write_file "
+                                "(that key is file_content)."
                             )
                         },
                         "category": {
@@ -2209,7 +2252,10 @@ SKILL_MANAGE_SCHEMA = {
                         },
                         "file_content": {
                             "type": "string",
-                            "description": "Content for write_file."
+                            "description": (
+                                "write_file only. create/patch use content, "
+                                "not this key."
+                            )
                         }
                     },
                     "required": ["name", "action"]
