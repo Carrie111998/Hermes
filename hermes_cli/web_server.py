@@ -19269,6 +19269,266 @@ async def serve_plugin_asset(plugin_name: str, file_path: str):
     )
 
 
+def _plugin_api_mount_allowed(plugin: dict, enabled_set: set, disabled_set: set) -> bool:
+    """Gate: may this plugin's Python ``api`` file be imported at all?
+
+    Shared by the startup mount and the runtime reload endpoint so both
+    enforce exactly the same policy.  User plugins must be in
+    ``plugins.enabled`` and not in ``plugins.disabled`` before we import
+    their Python code.  Bundled plugins are trusted (they ship with the
+    release) but still respect an explicit disable.  Project plugins are
+    never imported (GHSA-5qr3-c538-wm9j).
+    """
+    plugin_name = plugin.get("name", "")
+    if plugin.get("source") == "user":
+        if plugin_name in disabled_set:
+            _log.debug(
+                "Plugin %s: skipping API mount (explicitly disabled)",
+                plugin_name,
+            )
+            return False
+        if plugin_name not in enabled_set:
+            _log.debug(
+                "Plugin %s: skipping API mount (not in plugins.enabled)",
+                plugin_name,
+            )
+            return False
+    elif plugin.get("source") == "bundled":
+        if plugin_name in disabled_set:
+            _log.debug(
+                "Plugin %s: skipping API mount (explicitly disabled)",
+                plugin_name,
+            )
+            return False
+    if plugin.get("source") == "project":
+        _log.warning(
+            "Plugin %s: ignoring backend api=%s (project plugins may "
+            "not auto-import Python code; move the plugin to "
+            "~/.hermes/plugins/ if you trust it)",
+            plugin["name"], plugin.get("_api_file"),
+        )
+        return False
+    return True
+
+
+def _import_plugin_api_router(plugin: dict):
+    """Import one plugin's ``api`` file fresh from disk, return its router.
+
+    Any previously imported ``hermes_dashboard_plugin_<name>`` module is
+    evicted from ``sys.modules`` first, so a runtime reload actually
+    re-executes the file instead of reusing the boot-time copy (the
+    dashboard's ``sys.modules`` is otherwise frozen — see
+    ``_dashboard_code_skew_guard``).  Returns ``None`` (with a logged
+    warning) when the file is missing, unsafe, or exposes no ``router``;
+    raises when ``exec_module`` itself fails so the caller can decide
+    between a logged skip (startup) and a structured error (reload).
+    """
+    api_file_name = plugin.get("_api_file")
+    if not api_file_name:
+        return None
+    dashboard_dir = Path(plugin["_dir"])
+    api_path = dashboard_dir / api_file_name
+    try:
+        resolved_api = api_path.resolve()
+        resolved_base = dashboard_dir.resolve()
+        resolved_api.relative_to(resolved_base)
+    except (OSError, RuntimeError, ValueError):
+        # Discovery already filters this, but re-check here in case
+        # ``_dir`` was tampered with after caching or a future caller
+        # bypasses the validator.  Defence in depth keeps the import
+        # primitive contained even if the upstream check regresses.
+        _log.warning(
+            "Plugin %s: refusing to import api file outside its "
+            "dashboard directory (%s)", plugin["name"], api_path,
+        )
+        return None
+    if not api_path.exists():
+        _log.warning("Plugin %s declares api=%s but file not found", plugin["name"], api_file_name)
+        return None
+    plugin_name = plugin["name"]
+    module_name = f"hermes_dashboard_plugin_{plugin_name}"
+    # Evict the boot-time copy so this import re-executes the file.
+    sys.modules.pop(module_name, None)
+    spec = importlib.util.spec_from_file_location(module_name, api_path)
+    if spec is None or spec.loader is None:
+        return None
+    mod = importlib.util.module_from_spec(spec)
+    # Register in sys.modules BEFORE exec_module so pydantic/FastAPI
+    # can resolve forward references (e.g. models defined in a file
+    # that uses `from __future__ import annotations`). Without this,
+    # TypeAdapter lazy-build fails at first request with
+    # "is not fully defined" because the module namespace isn't
+    # reachable by name for string-annotation resolution.
+    sys.modules[module_name] = mod
+    try:
+        spec.loader.exec_module(mod)
+    except Exception:
+        sys.modules.pop(module_name, None)
+        raise
+    router = getattr(mod, "router", None)
+    if router is None:
+        _log.warning("Plugin %s api file has no 'router' attribute", plugin_name)
+    return router
+
+
+def _mount_plugin_router(router, plugin_name: str) -> int:
+    """Mount a plugin router under ``/api/plugins/<name>/``, before the SPA
+    catch-all.  Returns the number of routes mounted.
+
+    Starlette matches routes in registration order.  At startup this runs
+    before ``mount_spa(app)``, so appended routes naturally precede the
+    catch-all; on a runtime reload the catch-all ``/{full_path:path}`` is
+    already registered and answers unmatched ``api/*`` paths with a JSON
+    404, so freshly added routes must be spliced in ahead of it or they
+    are unreachable.
+    """
+    existing = list(app.router.routes)
+    app.include_router(router, prefix=f"/api/plugins/{plugin_name}")
+    new_routes = [r for r in app.router.routes if r not in existing]
+    catch_all_idx = next(
+        (
+            i for i, r in enumerate(app.router.routes)
+            if getattr(r, "path", None) == "/{full_path:path}"
+        ),
+        len(app.router.routes),
+    )
+    for route in new_routes:
+        app.router.routes.remove(route)
+    for offset, route in enumerate(new_routes):
+        app.router.routes.insert(catch_all_idx + offset, route)
+    return len(new_routes)
+
+
+# Serialize runtime plugin-route swaps: only the route-table mutation
+# section is guarded — the (slow) plugin re-import happens outside it.
+_plugin_route_swap_lock = threading.Lock()
+
+
+def _reload_plugin_api_routes(plugin_name: str) -> Dict[str, Any]:
+    """Re-import and re-mount one plugin's backend API routes at runtime.
+
+    Picks up edits to a plugin's ``api`` file without a dashboard restart:
+    evict the stale module from ``sys.modules``, re-execute the file from
+    disk, drop the plugin's previously mounted routes, and insert the new
+    ones before the SPA catch-all.  The new module is imported BEFORE the
+    old routes are dropped, so a plugin that fails re-import keeps serving
+    its previous routes (the old route objects still reference the old
+    module's functions even after the ``sys.modules`` eviction).  The
+    remove+mount swap runs under a module-level lock: requests racing
+    the swap can briefly see a 404 for paths that are brand-new in the
+    reloaded file, while previously served paths keep answering
+    throughout.
+
+    Never raises — the request path must stay safe even when the plugin
+    file on disk is broken mid-edit; failures come back as a structured
+    error dict instead.
+    """
+    try:
+        try:
+            from hermes_cli.plugins_cmd import _get_enabled_set, _get_disabled_set
+            enabled_set = _get_enabled_set()
+            disabled_set = _get_disabled_set()
+        except Exception:
+            enabled_set = set()
+            disabled_set = set()
+
+        # Force a rescan so a plugin installed or re-enabled since startup
+        # (or a manifest that newly declares ``api``) is picked up.
+        plugin = next(
+            (
+                p for p in _get_dashboard_plugins(force_rescan=True)
+                if p.get("name") == plugin_name
+            ),
+            None,
+        )
+        if plugin is None:
+            return {"ok": False, "plugin": plugin_name, "error": "plugin not found"}
+        if not plugin.get("_api_file"):
+            return {
+                "ok": False,
+                "plugin": plugin_name,
+                "error": "plugin declares no api file",
+            }
+        if not _plugin_api_mount_allowed(plugin, enabled_set, disabled_set):
+            return {
+                "ok": False,
+                "plugin": plugin_name,
+                "error": "plugin is disabled or its source may not mount backend routes",
+            }
+        try:
+            router = _import_plugin_api_router(plugin)
+        except Exception as exc:
+            _log.warning("Plugin %s: runtime API reload failed: %s", plugin_name, exc)
+            return {
+                "ok": False,
+                "plugin": plugin_name,
+                "error": f"import failed: {exc}",
+            }
+        if router is None:
+            return {
+                "ok": False,
+                "plugin": plugin_name,
+                "error": "api file missing or exposes no 'router' attribute",
+            }
+
+        prefix = f"/api/plugins/{plugin_name}"
+        # Serialize the route-table swap: two concurrent reloads of the
+        # same (or different) plugins must not interleave stale-removal
+        # and mounting, or one reload can delete routes the other just
+        # installed and leave the table incoherent.  The import above
+        # stays outside the lock (it is the slow part and touching only
+        # its own module object); only the mutation of the shared route
+        # list is serialized.
+        with _plugin_route_swap_lock:
+            stale_routes = [
+                r for r in app.router.routes
+                if getattr(r, "path", "") == prefix
+                or getattr(r, "path", "").startswith(prefix + "/")
+            ]
+            # Snapshot the route list so a failure while removing stale
+            # routes or mounting the new ones can be rolled back, leaving
+            # the serving process with the exact route table it had
+            # before the reload attempt (import-before-remove already
+            # protects import failures; this covers the swap itself).
+            saved_routes = list(app.router.routes)
+            try:
+                for route in stale_routes:
+                    app.router.routes.remove(route)
+                mounted = _mount_plugin_router(router, plugin_name)
+            except Exception:
+                app.router.routes[:] = saved_routes
+                raise
+        _log.info(
+            "Reloaded plugin API routes: /api/plugins/%s/ (%d routes, %d stale removed)",
+            plugin_name, mounted, len(stale_routes),
+        )
+        return {
+            "ok": True,
+            "plugin": plugin_name,
+            "routes": mounted,
+            "stale_removed": len(stale_routes),
+        }
+    except Exception as exc:
+        _log.warning("Plugin %s: runtime API reload failed: %s", plugin_name, exc)
+        return {"ok": False, "plugin": plugin_name, "error": str(exc)}
+
+
+@app.post("/api/plugins/{plugin_name}/reload")
+async def reload_plugin_api_routes(plugin_name: str):
+    """Re-import and re-mount a plugin's backend API routes without a restart.
+
+    Lets a plugin author iterate on ``dashboard/plugin_api.py`` against a
+    running dashboard.  Auth is enforced by the same middleware stack that
+    guards the plugin's own routes (``auth_middleware`` requires the
+    session token on every ``/api/`` path, and ``_plugin_api_runtime_gate``
+    rejects disabled/unknown plugins before this handler runs), so the
+    endpoint inherits the existing policy instead of re-implementing it.
+    The reload itself never raises — a broken plugin file yields a
+    structured error, not a 500.
+    """
+    return _reload_plugin_api_routes(plugin_name)
+
+
 def _mount_plugin_api_routes():
     """Import and mount backend API routes from plugins that declare them.
 
@@ -19300,84 +19560,15 @@ def _mount_plugin_api_routes():
         disabled_set = set()
 
     for plugin in _get_dashboard_plugins():
-        api_file_name = plugin.get("_api_file")
-        if not api_file_name:
+        if not plugin.get("_api_file"):
             continue
-        plugin_name = plugin.get("name", "")
-        # Gate: user plugins must be in plugins.enabled and not in
-        # plugins.disabled before we import their Python code.
-        # Bundled plugins are trusted (they ship with the release) but
-        # still respect an explicit disable.
-        if plugin.get("source") == "user":
-            if plugin_name in disabled_set:
-                _log.debug(
-                    "Plugin %s: skipping API mount (explicitly disabled)",
-                    plugin_name,
-                )
-                continue
-            if plugin_name not in enabled_set:
-                _log.debug(
-                    "Plugin %s: skipping API mount (not in plugins.enabled)",
-                    plugin_name,
-                )
-                continue
-        elif plugin.get("source") == "bundled":
-            if plugin_name in disabled_set:
-                _log.debug(
-                    "Plugin %s: skipping API mount (explicitly disabled)",
-                    plugin_name,
-                )
-                continue
-        if plugin.get("source") == "project":
-            _log.warning(
-                "Plugin %s: ignoring backend api=%s (project plugins may "
-                "not auto-import Python code; move the plugin to "
-                "~/.hermes/plugins/ if you trust it)",
-                plugin["name"], api_file_name,
-            )
-            continue
-        dashboard_dir = Path(plugin["_dir"])
-        api_path = dashboard_dir / api_file_name
-        try:
-            resolved_api = api_path.resolve()
-            resolved_base = dashboard_dir.resolve()
-            resolved_api.relative_to(resolved_base)
-        except (OSError, RuntimeError, ValueError):
-            # Discovery already filters this, but re-check here in case
-            # ``_dir`` was tampered with after caching or a future caller
-            # bypasses the validator.  Defence in depth keeps the import
-            # primitive contained even if the upstream check regresses.
-            _log.warning(
-                "Plugin %s: refusing to import api file outside its "
-                "dashboard directory (%s)", plugin["name"], api_path,
-            )
-            continue
-        if not api_path.exists():
-            _log.warning("Plugin %s declares api=%s but file not found", plugin["name"], api_file_name)
+        if not _plugin_api_mount_allowed(plugin, enabled_set, disabled_set):
             continue
         try:
-            module_name = f"hermes_dashboard_plugin_{plugin['name']}"
-            spec = importlib.util.spec_from_file_location(module_name, api_path)
-            if spec is None or spec.loader is None:
-                continue
-            mod = importlib.util.module_from_spec(spec)
-            # Register in sys.modules BEFORE exec_module so pydantic/FastAPI
-            # can resolve forward references (e.g. models defined in a file
-            # that uses `from __future__ import annotations`). Without this,
-            # TypeAdapter lazy-build fails at first request with
-            # "is not fully defined" because the module namespace isn't
-            # reachable by name for string-annotation resolution.
-            sys.modules[module_name] = mod
-            try:
-                spec.loader.exec_module(mod)
-            except Exception:
-                sys.modules.pop(module_name, None)
-                raise
-            router = getattr(mod, "router", None)
+            router = _import_plugin_api_router(plugin)
             if router is None:
-                _log.warning("Plugin %s api file has no 'router' attribute", plugin["name"])
                 continue
-            app.include_router(router, prefix=f"/api/plugins/{plugin['name']}")
+            _mount_plugin_router(router, plugin["name"])
             _log.info("Mounted plugin API routes: /api/plugins/%s/", plugin["name"])
         except Exception as exc:
             _log.warning("Failed to load plugin %s API routes: %s", plugin["name"], exc)
