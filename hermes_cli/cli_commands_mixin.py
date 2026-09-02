@@ -3030,6 +3030,48 @@ class CLICommandsMixin:
             f"any memory/skill updates will be reported when done."
         )
 
+    def _handle_self_improvement_command(self, cmd: str) -> None:
+        """Dispatch /self-improvement on|off|status — toggle background review in session.
+
+        Affects the live ``AIAgent.skip_background_review`` attribute for the
+        current session only.  Never persists to config or SessionDB.  /refine
+        (user-triggered) is always independent and unaffected by this toggle.
+        """
+        from cli import _DIM, _RST, _cprint
+
+        parts = (cmd or "").strip().split(None, 1)
+        arg = parts[1].strip().lower() if len(parts) > 1 else ""
+
+        agent = getattr(self, "agent", None)
+        if agent is None:
+            _cprint(
+                f"  {_DIM}No active agent yet — self-improvement is enabled "
+                f"by default and will apply once the agent starts.{_RST}"
+            )
+            return
+
+        current = getattr(agent, "skip_background_review", False)
+
+        if arg == "on":
+            agent.skip_background_review = False
+            _cprint("  ✅ Self-improvement ON — background review + curator are active.")
+        elif arg == "off":
+            agent.skip_background_review = True
+            _cprint(
+                f"  ⏸ Self-improvement OFF — background review paused for this session. "
+                f"Manual /refine still works."
+            )
+        elif arg == "status":
+            state = "OFF (paused)" if current else "ON (active)"
+            _cprint(f"  Self-improvement: {state}")
+        else:
+            state = "OFF" if current else "ON"
+            _cprint(
+                f"  Self-improvement is currently {state}.\n"
+                f"  Usage: /self-improvement on|off|status\n"
+                f"  {_DIM}Manual /refine is always available regardless of this setting.{_RST}"
+            )
+
     def _handle_review_command(self, cmd: str) -> None:
         """Dispatch /review — spawn an independent reviewer subagent.
 
