@@ -496,6 +496,8 @@ def _task_summary_dict(kb, conn, task) -> dict[str, Any]:
         "id": task.id,
         "title": task.title,
         "assignee": task.assignee,
+        "assignment_state": task.assignment_state,
+        "pending_assignee": task.pending_assignee,
         "status": task.status,
         "priority": task.priority,
         "tenant": task.tenant,
@@ -545,6 +547,8 @@ def _handle_show(args: dict, **kw) -> str:
                 return {
                     "id": t.id, "title": t.title, "body": t.body,
                     "assignee": t.assignee, "status": t.status,
+                    "assignment_state": t.assignment_state,
+                    "pending_assignee": t.pending_assignee,
                     "tenant": t.tenant, "priority": t.priority,
                     "workspace_kind": t.workspace_kind,
                     "workspace_path": t.workspace_path,

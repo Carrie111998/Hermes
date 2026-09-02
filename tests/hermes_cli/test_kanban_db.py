@@ -171,6 +171,80 @@ def test_connect_migrates_legacy_db_before_optional_column_indexes(tmp_path):
 # ---------------------------------------------------------------------------
 
 
+def test_task_assignment_state_tracks_dispatchability(kanban_home):
+    from hermes_cli.kanban import _fmt_task_line, _task_to_dict
+
+    with kb.connect() as conn:
+        parent = kb.create_task(conn, title="parent", assignee="builder")
+        child = kb.create_task(
+            conn, title="child", assignee="verifier", parents=[parent]
+        )
+        task = kb.get_task(conn, child)
+
+    assert task is not None
+    assert task.assignment_state == "reserved"
+    assert task.pending_assignee == "verifier"
+    assert "(reserved → verifier)" in _fmt_task_line(task)
+    assert _task_to_dict(task)["assignment_state"] == "reserved"
+    assert _task_to_dict(task)["pending_assignee"] == "verifier"
+    assert "todo" in _fmt_task_line(task)
+
+    with kb.connect() as conn:
+        assert kb.complete_task(conn, parent)
+        active = kb.get_task(conn, child)
+    assert active is not None
+    assert active.status == "ready"
+    assert active.assignment_state == "active"
+    assert active.pending_assignee is None
+
+
+def test_parent_free_manual_todo_owner_is_reserved(kanban_home):
+    """Reserved means not dispatchable, not specifically dependency-blocked."""
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="manual hold", assignee="builder")
+        conn.execute("UPDATE tasks SET status='todo' WHERE id=?", (tid,))
+        conn.commit()
+        task = kb.get_task(conn, tid)
+
+    assert task is not None
+    assert task.assignment_state == "reserved"
+    assert task.pending_assignee == "builder"
+
+
+def test_specified_parent_free_todo_owner_is_reserved(kanban_home, monkeypatch):
+    """The state stays honest even in the brief triage→todo transition."""
+    original = kb.recompute_ready
+    monkeypatch.setattr(kb, "recompute_ready", lambda conn, failure_limit=None: 0)
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="draft", assignee="builder", triage=True)
+        assert kb.specify_triage_task(conn, tid, body="ready to route")
+        task = kb.get_task(conn, tid)
+    monkeypatch.setattr(kb, "recompute_ready", original)
+
+    assert task is not None
+    assert task.status == "todo"
+    assert task.assignment_state == "reserved"
+    assert task.pending_assignee == "builder"
+
+
+def test_cli_create_labels_todo_owner_reserved(kanban_home, capsys):
+    import argparse
+    from hermes_cli import kanban as kb_cli
+
+    with kb.connect() as conn:
+        parent = kb.create_task(conn, title="parent", assignee="builder")
+
+    args = argparse.Namespace(
+        title="child", body=None, assignee="verifier", created_by="user",
+        workspace="scratch", tenant=None, priority=0, parent=[parent],
+        triage=False, idempotency_key=None, max_runtime=None, skills=None,
+        max_retries=None, model_override=None, provider_override=None,
+        goal_mode=False, goal_max_turns=None, initial_status="running",
+        project_id=None, branch=None, json=False,
+    )
+    assert kb_cli._cmd_create(args) == 0
+    assert "todo, reserved=verifier" in capsys.readouterr().out
+
 
 # ---------------------------------------------------------------------------
 # Links + dependency resolution

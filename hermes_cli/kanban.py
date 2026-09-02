@@ -52,6 +52,8 @@ def _fmt_ts(ts: Optional[int]) -> str:
 def _fmt_task_line(t: kb.Task) -> str:
     icon = _STATUS_ICONS.get(t.status, "?")
     assignee = t.assignee or "(unassigned)"
+    if t.pending_assignee:
+        assignee = f"(reserved → {t.pending_assignee})"
     tenant = f" [{t.tenant}]" if t.tenant else ""
     return f"{icon} {t.id}  {t.status:8s}  {assignee:20s}{tenant}  {t.title}"
 
@@ -62,6 +64,8 @@ def _task_to_dict(t: kb.Task) -> dict[str, Any]:
         "title": t.title,
         "body": t.body,
         "assignee": t.assignee,
+        "assignment_state": t.assignment_state,
+        "pending_assignee": t.pending_assignee,
         "status": t.status,
         "priority": t.priority,
         "tenant": t.tenant,
@@ -1688,10 +1692,18 @@ def _cmd_create(args: argparse.Namespace) -> int:
             initial_status=getattr(args, "initial_status", "running"),
         )
         task = kb.get_task(conn, task_id)
+    if task is None:
+        print(f"created task disappeared before readback: {task_id}", file=sys.stderr)
+        return 1
     if getattr(args, "json", False):
         print(json.dumps(_task_to_dict(task), indent=2, ensure_ascii=False))
     else:
-        print(f"Created {task_id}  ({task.status}, assignee={task.assignee or '-'})")
+        owner = (
+            f"reserved={task.pending_assignee}"
+            if task.pending_assignee
+            else f"assignee={task.assignee or '-'}"
+        )
+        print(f"Created {task_id}  ({task.status}, {owner})")
 
         # Warn when the task would sit in `ready` because no dispatcher is
         # present. Only warn on ready+assigned tasks — triage/todo are

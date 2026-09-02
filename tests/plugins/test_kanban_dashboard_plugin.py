@@ -190,6 +190,47 @@ def test_dashboard_markdown_html_is_sanitized_before_render():
     assert "dangerouslySetInnerHTML: { __html: renderMarkdown(props.source || \"\") }" not in js
 
 
+def test_todo_assignee_is_exposed_as_waiting_not_active(client):
+    parent = client.post(
+        "/api/plugins/kanban/tasks", json={"title": "parent", "assignee": "builder"},
+    ).json()["task"]
+    child = client.post(
+        "/api/plugins/kanban/tasks",
+        json={
+            "title": "child",
+            "assignee": "verifier",
+            "parents": [parent["id"]],
+        },
+    ).json()["task"]
+
+    assert child["status"] == "todo"
+    assert child["assignee"] == "verifier"
+    assert child["assignment_state"] == "reserved"
+    assert child["pending_assignee"] == "verifier"
+
+    # The same stored profile becomes active as soon as dependencies clear.
+    done = client.patch(
+        f"/api/plugins/kanban/tasks/{parent['id']}", json={"status": "done"},
+    )
+    assert done.status_code == 200
+    promoted = client.get(
+        f"/api/plugins/kanban/tasks/{child['id']}"
+    ).json()["task"]
+    assert promoted["status"] == "ready"
+    assert promoted["assignee"] == "verifier"
+    assert promoted["assignment_state"] == "active"
+    assert promoted["pending_assignee"] is None
+
+
+def test_todo_card_bundle_renders_waiting_owner():
+    repo_root = Path(__file__).resolve().parents[2]
+    js = (
+        repo_root / "plugins" / "kanban" / "dashboard" / "dist" / "index.js"
+    ).read_text(encoding="utf-8")
+    assert 't.assignment_state === "reserved"' in js
+    assert '"reserved → @", t.pending_assignee' in js
+
+
 # ---------------------------------------------------------------------------
 # GET /tasks/:id returns body + comments + events + links
 # ---------------------------------------------------------------------------
