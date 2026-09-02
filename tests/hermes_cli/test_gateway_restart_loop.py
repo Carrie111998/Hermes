@@ -2087,3 +2087,33 @@ class TestLifecycleGuardNeverRaises:
         if os.name != "nt":
             with pytest.raises(GatewayLifecycleBlocked):
                 check_gateway_lifecycle("clean prompt", "/dev/null")
+
+    def test_clock_rollback_does_not_chain_ancient_boots(self):
+        """A large backward clock step (NTP correction, restored RTC) must
+        not pull arbitrarily old boots into the chain: the future-entry
+        adjacency exemption is bounded by max_gap_seconds like every other
+        link. Unbounded, three-week-old restart-interrupted boots would
+        trip the breaker and wedge auto-resume (fail-closed) after one NTP
+        step — violating the module's fail-open contract."""
+        import gateway.restart_loop_guard as rlg
+
+        # Two boots from an episode weeks ago, then a big backward jump.
+        rlg.record_restart_interrupted_boot(60, now=1000.0)
+        rlg.record_restart_interrupted_boot(60, now=1010.0)
+        # now=500.0 — the clock stepped back ~500s; 1000/1010 are >gap away.
+        assert rlg.check_and_record(3, 60, now=500.0) is False
+        assert rlg.is_restart_loop_tripped(3, 60, now=501.0) is False
+
+    def test_clock_rollback_small_step_still_adjacent(self):
+        """A *small* backward step keeps the intended adjacency behavior:
+        a recent boot slightly in the 'future' stays in the chain."""
+        import gateway.restart_loop_guard as rlg
+
+        rlg.record_restart_interrupted_boot(60, now=1100.0)
+        rlg.record_restart_interrupted_boot(60, now=1150.0)
+        # Clock steps back 100s: boot at 1150 is now 50s "in the future",
+        # well within gap — chain intact, next boot trips normally.
+        assert rlg.record_restart_interrupted_boot(60, now=1050.0) == [
+            1100.0, 1150.0, 1050.0,
+        ]
+        assert rlg.is_restart_loop_tripped(3, 60, now=1060.0) is True
