@@ -74,6 +74,106 @@ suppress_platform_ver_console()
 import os
 import sys
 
+# ``tools catalog`` is an observation-only audit command. Establish the
+# contract before recovery, dotenv, config, logging, and tool modules import.
+# Match only a real top-level catalog invocation: arbitrary prompt/query text
+# containing the consecutive words ``tools catalog`` must not suppress normal
+# startup maintenance.
+def _is_catalog_readonly_argv(argv: list[str]) -> bool:
+    value_flags = {
+        "--usage-file",
+        "-m",
+        "--model",
+        "--provider",
+        "--reasoning",
+        "-t",
+        "--toolsets",
+        "--in",
+        "--skills",
+        "-s",
+        "--profile",
+        "-p",
+    }
+    disqualifying_flags = {
+        "-z",
+        "--oneshot",
+        "--resume",
+        "-r",
+        "--continue",
+        "-c",
+        "--worktree",
+        "-w",
+        "--version",
+        "-V",
+        "--tui",
+        "--cli",
+        "--dev",
+    }
+    boolean_flags = {
+        "--no-restore-cwd",
+        "--accept-hooks",
+        "--yolo",
+        "--pass-session-id",
+        "--ignore-user-config",
+        "--ignore-rules",
+        "--safe-mode",
+    }
+    long_value_flags = {flag for flag in value_flags if flag.startswith("--")}
+    # argparse accepts attached values for its short options (for example
+    # ``-mMODEL``). ``-p`` is pre-parsed separately by
+    # ``_apply_profile_override`` and intentionally accepts only ``-p value``.
+    short_value_flags = {
+        flag
+        for flag in value_flags
+        if flag.startswith("-") and not flag.startswith("--") and flag != "-p"
+    }
+    long_disqualifying_flags = {
+        flag for flag in disqualifying_flags if flag.startswith("--")
+    }
+    short_disqualifying_value_flags = {"-c", "-r"}
+
+    index = 0
+    while index < len(argv):
+        arg = argv[index]
+        if arg == "tools":
+            return argv[index : index + 2] == ["tools", "catalog"]
+        if arg == "--":
+            return False
+        if arg in disqualifying_flags or any(
+            arg.startswith(flag + "=") for flag in long_disqualifying_flags
+        ):
+            return False
+        if arg in value_flags:
+            if index + 1 >= len(argv):
+                return False
+            index += 2
+            continue
+        if any(arg.startswith(flag + "=") for flag in long_value_flags):
+            index += 1
+            continue
+        if any(arg.startswith(flag) and len(arg) > len(flag) for flag in short_value_flags):
+            index += 1
+            continue
+        if any(
+            arg.startswith(flag) and len(arg) > len(flag)
+            for flag in short_disqualifying_value_flags
+        ):
+            return False
+        if arg in boolean_flags:
+            index += 1
+            continue
+        return False
+    return False
+
+
+_CATALOG_READONLY = _is_catalog_readonly_argv(sys.argv[1:])
+if _CATALOG_READONLY:
+    os.environ["HERMES_CATALOG_READONLY"] = "1"
+else:
+    # This is an internal startup sentinel, not a user-facing mode switch.
+    # Ambient values must not suppress normal CLI initialization.
+    os.environ.pop("HERMES_CATALOG_READONLY", None)
+
 # ── Startup fast-path bootstrap ─────────────────────────────────────────
 # Two lines of inline path math so ``python hermes_cli/main.py`` (script
 # mode — sys.path[0] is hermes_cli/, not the repo root) can import the
@@ -97,10 +197,11 @@ from hermes_cli import _startup_fast  # noqa: E402
 # the full recovery path below.
 from hermes_cli import _early_recovery as _early_recovery_mod
 
-try:
-    _early_recovery_mod.recover_if_needed()
-except Exception:
-    pass
+if not _CATALOG_READONLY:
+    try:
+        _early_recovery_mod.recover_if_needed()
+    except Exception:
+        pass
 
 # Startup-liveness watchdog (OOF-298): for gateway runs, arm BEFORE the heavy
 # module-level import graph below — an import-time deadlock (native-extension
@@ -770,13 +871,19 @@ _apply_profile_override()
 # profiles resolve. The launcher dir itself is per-machine (the helper
 # anchors on the DEFAULT root, not HERMES_HOME), so profile sessions heal
 # the same shared dir.
-if sys.platform == "win32":
+def _repair_windows_launchers_if_needed() -> None:
+    """Repair shared Windows launchers unless this is an observation-only audit."""
+    if sys.platform != "win32" or _CATALOG_READONLY:
+        return
     try:
         from hermes_cli import _install_repair as _install_repair_mod
 
         _install_repair_mod.ensure_windows_bin_launchers(_bootstrap_root)
     except Exception:
         pass
+
+
+_repair_windows_launchers_if_needed()
 
 # Load .env from ~/.hermes/.env first, then project root as dev fallback.
 # User-managed env files should override stale shell exports on restart.
@@ -790,10 +897,11 @@ from hermes_cli.env_loader import load_hermes_dotenv
 # flags have already been stripped above, so the first remaining argument is
 # the authoritative argparse subcommand.  Dotenv/managed config still loads;
 # only external secret fetches are unnecessary for installation maintenance.
-load_hermes_dotenv(
-    project_env=PROJECT_ROOT / ".env",
-    load_external_secrets=sys.argv[1:2] != ["update"],
-)
+if not _CATALOG_READONLY:
+    load_hermes_dotenv(
+        project_env=PROJECT_ROOT / ".env",
+        load_external_secrets=sys.argv[1:2] != ["update"],
+    )
 
 # Bridge security.redact_secrets from config.yaml → HERMES_REDACT_SECRETS env
 # var BEFORE hermes_logging imports agent.redact (which snapshots the flag at
@@ -843,19 +951,20 @@ except Exception:
 # (chat, setup, gateway, config, etc.) write to agent.log + errors.log.
 # Dashboard entrypoints bootstrap with GUI mode so gui.log is always present
 # during GUI testing, including pre-dispatch startup failures.
-try:
-    from hermes_logging import setup_logging as _setup_logging
+if not _CATALOG_READONLY:
+    try:
+        from hermes_logging import setup_logging as _setup_logging
 
-    _setup_logging(
-        mode=(
-            "gui"
-            if next((arg for arg in sys.argv[1:] if not arg.startswith("-")), "")
-            in {"dashboard", "serve", "gui", "desktop"}
-            else "cli"
+        _setup_logging(
+            mode=(
+                "gui"
+                if next((arg for arg in sys.argv[1:] if not arg.startswith("-")), "")
+                in {"dashboard", "serve", "gui", "desktop"}
+                else "cli"
+            )
         )
-    )
-except Exception:
-    pass  # best-effort — don't crash the CLI if logging setup fails
+    except Exception:
+        pass  # best-effort — don't crash the CLI if logging setup fails
 
 # Apply IPv4 preference early, before any HTTP clients are created.
 # We already determined whether to force IPv4 from the raw yaml read above —
@@ -13288,6 +13397,10 @@ def cmd_tools(args):
         from hermes_cli.tools_config import tools_disable_enable_command
 
         tools_disable_enable_command(args)
+    elif action == "catalog":
+        from hermes_cli.tools_config import tools_catalog_command
+
+        tools_catalog_command(args)
     elif action == "post-setup":
         from hermes_cli.tools_config import run_post_setup_command
 
@@ -13512,19 +13625,20 @@ def main():
     except Exception:
         pass
 
-    # Sweep stale ``hermes.exe.old.*`` quarantine files left by previous
-    # ``hermes update`` runs on Windows. Silent no-op on non-Windows or when
-    # there's nothing to clean. See ``_quarantine_running_hermes_exe``.
-    try:
-        _cleanup_quarantined_exes()
-    except Exception:
-        pass
+    if not _CATALOG_READONLY:
+        # Sweep stale ``hermes.exe.old.*`` quarantine files left by previous
+        # ``hermes update`` runs on Windows. Silent no-op on non-Windows or when
+        # there's nothing to clean. See ``_quarantine_running_hermes_exe``.
+        try:
+            _cleanup_quarantined_exes()
+        except Exception:
+            pass
 
-    # If the checkout changed since the last launch (hermes update, manual
-    # git pull, old-updater update that predates newer clears), sweep stale
-    # __pycache__ once so no process — this one's lazy imports included —
-    # resolves fresh source against old bytecode. Never raises.
-    _sweep_stale_bytecode_if_checkout_changed()
+        # If the checkout changed since the last launch (hermes update, manual
+        # git pull, old-updater update that predates newer clears), sweep stale
+        # __pycache__ once so no process — this one's lazy imports included —
+        # resolves fresh source against old bytecode. Never raises.
+        _sweep_stale_bytecode_if_checkout_changed()
 
     # Self-heal a venv left half-built by an interrupted ``hermes update``
     # (Ctrl-C, terminal close, WSL OOM mid-install). Skip when the user is
@@ -13537,7 +13651,7 @@ def main():
     # under-matching (missing ``hermes -p work update``) would race a recovery
     # install against the real one. Loose wins.
     try:
-        if "update" not in sys.argv[1:]:
+        if not _CATALOG_READONLY and "update" not in sys.argv[1:]:
             _recover_from_interrupted_install()
     except Exception:
         pass

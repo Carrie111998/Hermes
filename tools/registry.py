@@ -16,9 +16,11 @@ Import chain (circular-import safe):
 
 import ast
 import functools
+import hashlib
 import importlib
 import json
 import logging
+import re
 import sys
 import threading
 import time
@@ -28,6 +30,142 @@ from typing import Callable, Dict, List, Optional, Set
 from hermes_constants import hermes_home_key
 
 logger = logging.getLogger(__name__)
+
+
+_CATALOG_SECRET_IDENTIFIER_RE = re.compile(
+    r"(?i)(?:^|[_.:-])(?:"
+    r"sk-[A-Za-z0-9]|"
+    r"gh[pousr]_[A-Za-z0-9]|"
+    r"github_pat_[A-Za-z0-9]|"
+    r"xox[baprs]-[A-Za-z0-9]|"
+    r"(?:AKIA|ASIA)[0-9A-Z]"
+    r")"
+)
+
+
+def catalog_identifier(value: object) -> str:
+    """Return a bounded path/secret-safe identifier for machine output."""
+    text = str(value or "")
+    safe_shape = re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_.:-]{0,127}", text)
+    secret_shape = _CATALOG_SECRET_IDENTIFIER_RE.search(text)
+    if safe_shape and not secret_shape:
+        return text
+    digest = hashlib.sha256(text.encode("utf-8", errors="replace")).hexdigest()[:16]
+    return f"redacted-{digest}"
+
+
+def catalog_prefixed_identifier(prefix: str, component: object) -> str:
+    """Compose a catalog ID only after validating its untrusted component."""
+    text = str(component or "")
+    composed = f"{prefix}{text}"
+    if catalog_identifier(text) != text:
+        digest = hashlib.sha256(
+            composed.encode("utf-8", errors="replace")
+        ).hexdigest()[:16]
+        return f"redacted-{digest}"
+    return catalog_identifier(composed)
+
+
+_CATALOG_SCHEMA_ANNOTATIONS = {
+    "$comment",
+    "default",
+    "deprecated",
+    "description",
+    "example",
+    "examples",
+    "readOnly",
+    "title",
+    "writeOnly",
+}
+_CATALOG_SCHEMA_UNORDERED_ARRAYS = {
+    "allOf",
+    "anyOf",
+    "dependencies",
+    "dependentRequired",
+    "enum",
+    "oneOf",
+    "required",
+    "type",
+}
+_CATALOG_SCHEMA_NAMED_MAPS = {
+    "$defs",
+    "definitions",
+    "dependencies",
+    "dependentRequired",
+    "dependentSchemas",
+    "patternProperties",
+    "properties",
+}
+_CATALOG_SCHEMA_INSTANCE_DATA = {"const", "enum"}
+
+
+def _catalog_schema_contract(
+    value: object,
+    *,
+    parent_key: str = "",
+    _named_map_keyword: Optional[str] = None,
+    _instance_data: bool = False,
+) -> object:
+    """Return the stable structural subset used for a catalog schema digest.
+
+    Annotation/default fields can contain profile paths, operator values, or
+    generated prose. They are not part of the observation-safe contract. JSON
+    Schema set-like arrays are sorted so registration order cannot perturb the
+    digest; order-sensitive arrays such as ``prefixItems`` remain untouched.
+    Named-map entry names are kept separate from schema keyword context so a
+    parameter named ``properties`` cannot change canonicalization semantics.
+    Object-valued ``const`` and ``enum`` members are instance data, so keys
+    that happen to match annotation names remain digest-significant there.
+    """
+    if isinstance(value, dict):
+        if _instance_data:
+            return {
+                str(key): _catalog_schema_contract(item, _instance_data=True)
+                for key, item in value.items()
+            }
+        in_named_map = _named_map_keyword is not None
+        contract = {}
+        for key, item in value.items():
+            key_text = str(key)
+            if not in_named_map and key_text in _CATALOG_SCHEMA_ANNOTATIONS:
+                continue
+            if in_named_map:
+                child_parent_key = (
+                    _named_map_keyword
+                    if _named_map_keyword in {"dependencies", "dependentRequired"}
+                    else ""
+                )
+                child_named_map = None
+            else:
+                child_parent_key = key_text
+                child_named_map = (
+                    key_text if key_text in _CATALOG_SCHEMA_NAMED_MAPS else None
+                )
+            contract[key_text] = _catalog_schema_contract(
+                item,
+                parent_key=child_parent_key,
+                _named_map_keyword=child_named_map,
+                _instance_data=(
+                    not in_named_map and key_text in _CATALOG_SCHEMA_INSTANCE_DATA
+                ),
+            )
+        return contract
+    if isinstance(value, list):
+        items = [
+            _catalog_schema_contract(item, _instance_data=_instance_data)
+            for item in value
+        ]
+        if parent_key in _CATALOG_SCHEMA_UNORDERED_ARRAYS:
+            items.sort(
+                key=lambda item: json.dumps(
+                    item,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    ensure_ascii=False,
+                )
+            )
+        return items
+    return value
 
 # Cap on a tool error body; only trims runaway interpolated exceptions (static msgs are ~115 chars).
 _MAX_TOOL_ERROR_CHARS = 2048
@@ -108,7 +246,11 @@ def _module_registers_tools(module_path: Path) -> bool:
     return any(_is_registry_register_call(stmt) for stmt in tree.body)
 
 
-def discover_builtin_tools(tools_dir: Optional[Path] = None) -> List[str]:
+def discover_builtin_tools(
+    tools_dir: Optional[Path] = None,
+    *,
+    read_only: bool = False,
+) -> List[str]:
     """Import built-in self-registering tool modules and return their module names.
 
     The per-file AST scan (:func:`_module_registers_tools`) costs ~145 ms over
@@ -116,7 +258,8 @@ def discover_builtin_tools(tools_dir: Optional[Path] = None) -> List[str]:
     ``(mtime_ns, size)``. A file whose mtime_ns+size match the cached entry is
     trusted without re-reading; any mismatch (or a corrupt/missing cache file)
     falls back to a fresh scan for that file. The cache write is best-effort
-    and atomic, so concurrent processes can race harmlessly.
+    and atomic, so concurrent processes can race harmlessly. ``read_only=True``
+    suppresses cache writes and exception details for audit/catalog callers.
     """
     tools_path = Path(tools_dir) if tools_dir is not None else Path(__file__).resolve().parent
 
@@ -149,7 +292,7 @@ def discover_builtin_tools(tools_dir: Optional[Path] = None) -> List[str]:
             module_names.append(f"tools.{path.stem}")
 
     # Drop entries for files that no longer exist; rewrite only when changed.
-    if cache_dirty or set(fresh_cache) != set(cache):
+    if not read_only and (cache_dirty or set(fresh_cache) != set(cache)):
         _save_discovery_cache(fresh_cache)
 
     imported: List[str] = []
@@ -158,7 +301,10 @@ def discover_builtin_tools(tools_dir: Optional[Path] = None) -> List[str]:
             importlib.import_module(mod_name)
             imported.append(mod_name)
         except Exception as e:
-            logger.warning("Could not import tool module %s: %s", mod_name, e)
+            if read_only:
+                logger.warning("Could not import tool module %s", mod_name)
+            else:
+                logger.warning("Could not import tool module %s: %s", mod_name, e)
     return imported
 
 
@@ -207,12 +353,14 @@ class ToolEntry:
     __slots__ = (
         "name", "toolset", "schema", "handler", "check_fn",
         "requires_env", "is_async", "description", "emoji",
-        "max_result_size_chars", "dynamic_schema_overrides",
+        "max_result_size_chars", "dynamic_schema_overrides", "registration_owner",
+        "registration_module",
     )
 
     def __init__(self, name, toolset, schema, handler, check_fn,
                  requires_env, is_async, description, emoji,
-                 max_result_size_chars=None, dynamic_schema_overrides=None):
+                 max_result_size_chars=None, dynamic_schema_overrides=None,
+                 registration_owner=None, registration_module=None):
         self.name = name
         self.toolset = toolset
         self.schema = schema
@@ -231,6 +379,13 @@ class ToolEntry:
         # on every get_definitions() call; results are merged shallow on top
         # of the base schema before the {"type": "function", ...} wrap.
         self.dynamic_schema_overrides = dynamic_schema_overrides
+        # Canonical owner assigned by the host registration boundary. Plugins
+        # may wrap or reuse built-in callables without joining the built-in
+        # trust domain.
+        self.registration_owner = registration_owner
+        # Capture the registration boundary once. Catalog provenance must not
+        # be recomputed later from mutable/spoofable handler metadata.
+        self.registration_module = registration_module
 
 
 class _PluginOverridePolicy:
@@ -587,6 +742,105 @@ class ToolRegistry:
         """Return the active profile's merged tool entries."""
         return self._snapshot_entries()
 
+    def _catalog_origin(self, entry: ToolEntry) -> dict:
+        """Return a stable, path-free origin descriptor for a catalog entry.
+
+        The capability catalog is intended for diagnostics, CI diffs, and
+        orchestration policy.  It must identify trust domains without leaking
+        absolute source paths or relying on a handler's repr (which may contain
+        an address). MCP origin requires both the canonical toolset shape and the
+        trusted native registration boundary; plugin identity comes from the
+        host ownership ledger rather than callable metadata.
+        """
+        if entry.registration_owner:
+            return {
+                "kind": "plugin",
+                "id": catalog_identifier(entry.registration_owner),
+            }
+        if (
+            entry.registration_module == "tools.mcp_tool"
+            and entry.toolset.startswith("mcp-")
+        ):
+            return {
+                "kind": "mcp",
+                "id": catalog_identifier(entry.toolset.removeprefix("mcp-")),
+            }
+
+        module_name = str(entry.registration_module or "")
+        if module_name == "tools" or module_name.startswith("tools."):
+            return {"kind": "builtin", "id": catalog_identifier(module_name)}
+        return {"kind": "runtime", "id": "runtime"}
+
+    def get_capability_catalog(self, *, probe: bool = False) -> dict:
+        """Return a deterministic, redacted inventory of registered tools.
+
+        ``probe=False`` is deliberately side-effect free: availability checks
+        may touch Docker, browsers, SDKs, credentials, or the network, so the
+        default path reports dynamic checks as unknown without consulting the
+        process-global probe cache.
+        ``probe=True`` executes each unique check function at most once through
+        the registry's bounded/cache-aware probe wrapper. Probe exceptions are
+        contained by that wrapper and represented as unavailable without
+        exposing exception text, which may include host paths or
+        credential-adjacent details.
+
+        The catalog contains environment variable *names* but never values,
+        handler paths, tool arguments/results, or profile filesystem paths.
+        Dynamic schema overrides are intentionally not invoked; the digest is
+        over the declared registration schema and therefore remains a safe,
+        deterministic drift signal.
+        """
+        entries = sorted(self._snapshot_entries(), key=lambda item: item.name)
+        probe_results: Dict[Callable, str] = {}
+
+        tools = []
+        for entry in entries:
+            availability = "available"
+            if entry.check_fn is not None:
+                cached = probe_results.get(entry.check_fn)
+                if cached is None:
+                    if probe:
+                        available = bool(_check_fn_cached(entry.check_fn))
+                        cached = "available" if available else "unavailable"
+                    else:
+                        cached = "unknown"
+                    probe_results[entry.check_fn] = cached
+                availability = cached
+
+            declared_env = [str(name) for name in entry.requires_env]
+            safe_env = sorted(
+                name
+                for name in declared_env
+                if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name)
+                and catalog_identifier(name) == name
+            )
+
+            canonical_schema = json.dumps(
+                _catalog_schema_contract(entry.schema),
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+            ).encode("utf-8")
+            tools.append({
+                "name": catalog_identifier(entry.name),
+                "toolset": catalog_identifier(entry.toolset),
+                "origin": self._catalog_origin(entry),
+                "requires_env": safe_env,
+                "requires_env_redacted": len(safe_env) != len(declared_env),
+                "is_async": bool(entry.is_async),
+                "max_result_size_chars": entry.max_result_size_chars,
+                "schema_sha256": hashlib.sha256(canonical_schema).hexdigest(),
+                "availability": availability,
+                "check_declared": entry.check_fn is not None,
+            })
+
+        return {
+            "schema_version": 1,
+            "probe_performed": bool(probe),
+            "toolsets": sorted({catalog_identifier(entry.toolset) for entry in entries}),
+            "tools": tools,
+        }
+
     def get_tool_names_for_toolset(self, toolset: str) -> List[str]:
         """Return sorted tool names registered under a given toolset."""
         return sorted(
@@ -694,6 +948,24 @@ class ToolRegistry:
             return None
         return self._plugin_namespace_of_module(mod)
 
+    def _registered_plugin_owner_of(self, handler: Callable) -> Optional[str]:
+        """Resolve a handler only through the host's recorded plugin ledger.
+
+        Unlike ``_plugin_owner_of``, this does not treat an arbitrary
+        ``hermes_plugins.*`` string embedded in callable metadata as authority.
+        It is used when capturing catalog provenance at registration time.
+        """
+        module_name = self._callable_module(handler)
+        if not module_name:
+            return None
+        with self._lock:
+            matches = [
+                namespace
+                for namespace in self._plugin_module_scopes
+                if module_name == namespace or module_name.startswith(f"{namespace}.")
+            ]
+        return max(matches, key=len) if matches else None
+
     @staticmethod
     def _callable_module(handler: Callable) -> str:
         """Resolve defining module through wrappers, partials, and objects."""
@@ -800,6 +1072,7 @@ class ToolRegistry:
         dynamic_schema_overrides: Callable = None,
         override: bool = False,
         scope: Optional[str] = None,
+        _registration_owner: Optional[str] = None,
     ):
         """Register a tool.  Called at module-import time by each tool file.
 
@@ -809,9 +1082,18 @@ class ToolRegistry:
         registrations that would shadow an existing tool from a different
         toolset are rejected to prevent accidental overwrites.
         """
-        handler_owner = self._plugin_owner_of(handler)
-        caller_owner = self._plugin_namespace_of_module(self._caller_module())
-        owner = caller_owner or handler_owner
+        registration_module = self._caller_module()
+        caller_owner = self._plugin_namespace_of_module(registration_module)
+        handler_owner = self._registered_plugin_owner_of(handler)
+        # The explicit owner is a host-only handoff from PluginRegistrationFacade.
+        # A plugin calling registry.register() directly must not be able to forge
+        # another trust domain through this private compatibility parameter.
+        declared_owner = (
+            _registration_owner
+            if registration_module == "hermes_cli.plugins"
+            else None
+        )
+        owner = caller_owner or declared_owner or handler_owner
         if scope is None and owner is not None:
             scope = self._plugin_scope_of(owner)
         with self._lock:
@@ -895,6 +1177,8 @@ class ToolRegistry:
                 emoji=emoji,
                 max_result_size_chars=max_result_size_chars,
                 dynamic_schema_overrides=dynamic_schema_overrides,
+                registration_owner=owner,
+                registration_module=registration_module,
             )
             # Availability is now derived per-tool (_toolset_has_exposable_tools),
             # so this map no longer gates a toolset. It is still consumed by

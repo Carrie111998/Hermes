@@ -16,7 +16,7 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
-from typing import Dict, List, Optional, Set
+from typing import Dict, List, Literal, Optional, overload, Set
 
 
 from hermes_cli.config import (
@@ -2525,7 +2525,9 @@ def _parse_enabled_flag(value, default: bool = True) -> bool:
     return default
 
 
-def enabled_mcp_server_names(config: dict) -> Set[str]:
+def enabled_mcp_server_names(
+    config: dict, *, include_portable_plugin_servers: bool = True
+) -> Set[str]:
     """Names of MCP servers globally enabled in config.yaml or by a plugin.
 
     Shared by the gateway/CLI platform resolver (``_get_platform_tools``) and
@@ -2548,6 +2550,8 @@ def enabled_mcp_server_names(config: dict) -> Set[str]:
         if isinstance(server_cfg, dict)
         and _parse_enabled_flag(server_cfg.get("enabled", True), default=True)
     }
+    if not include_portable_plugin_servers:
+        return names
     try:
         from hermes_cli.plugins import (
             get_plugin_manager,
@@ -2643,12 +2647,42 @@ def _enable_recently_shipped_toolsets(
         enabled_toolsets.add(ts_key)
 
 
+@overload
 def _get_platform_tools(
     config: dict,
     platform: str,
     *,
     include_default_mcp_servers: bool = True,
-) -> Set[str]:
+    include_plugin_toolsets: bool = True,
+    include_portable_plugin_mcp_servers: bool = True,
+    probe_credentials: bool = True,
+    return_selection_details: Literal[False] = False,
+) -> Set[str]: ...
+
+
+@overload
+def _get_platform_tools(
+    config: dict,
+    platform: str,
+    *,
+    include_default_mcp_servers: bool = True,
+    include_plugin_toolsets: bool = True,
+    include_portable_plugin_mcp_servers: bool = True,
+    probe_credentials: bool = True,
+    return_selection_details: Literal[True],
+) -> tuple[Set[str], Set[str]]: ...
+
+
+def _get_platform_tools(
+    config: dict,
+    platform: str,
+    *,
+    include_default_mcp_servers: bool = True,
+    include_plugin_toolsets: bool = True,
+    include_portable_plugin_mcp_servers: bool = True,
+    probe_credentials: bool = True,
+    return_selection_details: bool = False,
+) -> Set[str] | tuple[Set[str], Set[str]]:
     """Resolve which individual toolset names are enabled for a platform."""
     from toolsets import resolve_toolset, TOOLSETS
 
@@ -2674,7 +2708,10 @@ def _get_platform_tools(
     toolset_names = [str(ts) for ts in toolset_names]
 
     configurable_keys = {ts_key for ts_key, _, _ in CONFIGURABLE_TOOLSETS}
-    plugin_ts_keys = _get_plugin_toolset_keys()
+    # Audit/catalog callers can intentionally avoid plugin discovery because
+    # discovering Python plugins executes their import code. Normal runtime and
+    # configuration callers preserve the historical default.
+    plugin_ts_keys = _get_plugin_toolset_keys() if include_plugin_toolsets else set()
     platform_default_keys = {p["default_toolset"] for p in PLATFORMS.values()}
     # Plugin-provided toolsets are first-class on a platform-toolsets list —
     # explicit config like ``[hermes-cli, a2a]`` must survive filtering just
@@ -2724,7 +2761,11 @@ def _get_platform_tools(
             default_off = set(_DEFAULT_OFF_TOOLSETS)
             if platform in default_off and platform not in _TOOLSET_PLATFORM_RESTRICTIONS:
                 default_off.remove(platform)
-            if "homeassistant" in default_off and _homeassistant_credentials_present():
+            if (
+                probe_credentials
+                and "homeassistant" in default_off
+                and _homeassistant_credentials_present()
+            ):
                 default_off.remove("homeassistant")
             _exempt_explicit_platform_native(
                 default_off, platform, explicitly_configured=explicitly_configured
@@ -2766,6 +2807,7 @@ def _get_platform_tools(
         # do, the saved list is authoritative.
         x_search_auto_enabled = (
             _toolset_allowed_for_platform("x_search", platform)
+            and probe_credentials
             and _xai_credentials_present()
         )
         if x_search_auto_enabled:
@@ -2786,7 +2828,11 @@ def _get_platform_tools(
         # (e.g. cron) that run through _get_platform_tools without an
         # explicit saved toolset list. Without this, Norbert's HA cron jobs
         # regressed after #14798 made cron honor per-platform tool config.
-        if "homeassistant" in default_off and _homeassistant_credentials_present():
+        if (
+            probe_credentials
+            and "homeassistant" in default_off
+            and _homeassistant_credentials_present()
+        ):
             default_off.remove("homeassistant")
         # Symmetric carve-out for x_search auto-enable (see the inject
         # block above). Without this, the default_off subtraction would
@@ -2891,7 +2937,10 @@ def _get_platform_tools(
     # If the platform explicitly lists one or more MCP server names, treat that
     # as an allowlist. Otherwise include every globally enabled MCP server.
     # Special sentinel: "no_mcp" in the toolset list disables all MCP servers.
-    enabled_mcp_servers = enabled_mcp_server_names(config)
+    enabled_mcp_servers = enabled_mcp_server_names(
+        config,
+        include_portable_plugin_servers=include_portable_plugin_mcp_servers,
+    )
     # Allow "no_mcp" sentinel to opt out of all MCP servers for this platform
     if "no_mcp" in toolset_names:
         explicit_mcp_servers = set()
@@ -2899,13 +2948,15 @@ def _get_platform_tools(
     else:
         explicit_mcp_servers = explicit_passthrough & enabled_mcp_servers
         enabled_toolsets.update(explicit_passthrough - enabled_mcp_servers)
+    native_enabled_toolsets = set(enabled_toolsets)
     if include_default_mcp_servers:
         if explicit_mcp_servers or "no_mcp" in toolset_names:
-            enabled_toolsets.update(explicit_mcp_servers)
+            selected_mcp_servers = explicit_mcp_servers
         else:
-            enabled_toolsets.update(enabled_mcp_servers)
+            selected_mcp_servers = enabled_mcp_servers
     else:
-        enabled_toolsets.update(explicit_mcp_servers)
+        selected_mcp_servers = explicit_mcp_servers
+    enabled_toolsets.update(selected_mcp_servers)
 
     # Honor agent.disabled_toolsets from config.yaml — allows users to
     # globally suppress specific toolsets (e.g. "memory") across all
@@ -2922,6 +2973,8 @@ def _get_platform_tools(
             name.strip() for name in parse_config_string_list(disabled_toolsets) if name.strip()
         }
         enabled_toolsets -= disabled_set
+        native_enabled_toolsets -= disabled_set
+        selected_mcp_servers -= disabled_set
 
     # #38798: if this platform was explicitly configured but every toolset name
     # is invalid (e.g. a migration or hand-edit left `hermes` instead of
@@ -2948,6 +3001,8 @@ def _get_platform_tools(
                 ", ".join(_named),
             )
 
+    if return_selection_details:
+        return native_enabled_toolsets, selected_mcp_servers
     return enabled_toolsets
 
 
@@ -6273,6 +6328,99 @@ def _known_tool_platforms() -> set[str]:
         # third-party plugin is malformed or its dependencies are unavailable.
         pass
     return known
+
+
+def tools_catalog_command(args) -> None:
+    """Print a redacted, deterministic inventory of registered tools.
+
+    Built-in tool registration is loaded by default. Third-party/profile plugin
+    modules are not imported unless the operator explicitly supplies
+    ``--include-plugins``: Python imports execute plugin code, which is a
+    materially different action from reading registry metadata. Availability
+    checks likewise require an explicit ``--probe``.
+    """
+    include_plugins = bool(getattr(args, "include_plugins", False))
+    platform = str(getattr(args, "platform", "cli") or "cli")
+    if include_plugins:
+        valid_platforms = _known_tool_platforms()
+    else:
+        valid_platforms = set(PLATFORMS)
+        try:
+            from gateway.platform_registry import platform_registry
+
+            valid_platforms.update(platform_registry.registered_names())
+        except Exception:
+            pass
+    if platform not in valid_platforms:
+        _print_error(
+            f"Unknown platform '{platform}'. Valid: {', '.join(sorted(valid_platforms))}"
+        )
+        raise SystemExit(2)
+
+    from tools.registry import (
+        catalog_identifier,
+        catalog_prefixed_identifier,
+        discover_builtin_tools,
+        registry,
+    )
+
+    if include_plugins:
+        import model_tools  # noqa: F401 -- normal trusted-plugin discovery path
+    else:
+        discover_builtin_tools(read_only=True)
+
+    config = load_config()
+    enabled_toolsets, enabled_mcp_servers = _get_platform_tools(
+        config,
+        platform,
+        include_default_mcp_servers=True,
+        include_plugin_toolsets=include_plugins,
+        include_portable_plugin_mcp_servers=include_plugins,
+        probe_credentials=False,
+        return_selection_details=True,
+    )
+    payload = registry.get_capability_catalog(probe=bool(getattr(args, "probe", False)))
+    payload["platform"] = platform
+    plugin_preloaded = any(
+        tool.get("origin", {}).get("kind") == "plugin" for tool in payload["tools"]
+    )
+    payload["plugin_loading"] = (
+        "included"
+        if include_plugins
+        else "preloaded"
+        if plugin_preloaded
+        else "skipped"
+    )
+    catalog_toolsets = set(payload["toolsets"])
+    safe_mcp_toolsets = {
+        catalog_prefixed_identifier("mcp-", server) for server in enabled_mcp_servers
+    }
+    safe_enabled_toolsets = {
+        catalog_identifier(toolset) for toolset in enabled_toolsets
+    } | safe_mcp_toolsets
+    # Config is user-controlled and may contain stale names or secret-like
+    # strings. Only serialize identifiers that correspond to capabilities
+    # actually observed in this catalog process.
+    safe_enabled_toolsets &= catalog_toolsets
+    payload["enabled_toolsets"] = sorted(safe_enabled_toolsets)
+    for tool in payload["tools"]:
+        # Selection is only one stage of exposure. Availability checks,
+        # per-session filtering, progressive disclosure, and policy can still
+        # keep a selected tool out of the model-facing definitions.
+        toolset = tool["toolset"]
+        selected = toolset in safe_enabled_toolsets
+        tool["selected_for_platform"] = selected
+
+    compact = bool(getattr(args, "compact", False))
+    print(
+        _json.dumps(
+            payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            indent=None if compact else 2,
+            separators=(",", ":") if compact else None,
+        )
+    )
 
 
 def tools_disable_enable_command(args):

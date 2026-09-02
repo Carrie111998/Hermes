@@ -1045,6 +1045,9 @@ def ensure_hermes_home():
     recreated on the next load, as before). Profile switches change
     ``get_hermes_home()`` and therefore re-run for the new path.
     """
+    if os.getenv("HERMES_CATALOG_READONLY") == "1":
+        return
+
     home = get_hermes_home()
     key = str(home)
 

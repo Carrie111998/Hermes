@@ -1836,6 +1836,7 @@ class PluginContext:
             emoji=emoji,
             override=override,
             scope=scope,
+            _registration_owner=self._manager._policy_module_name(self.manifest),
         )
         registered = registry.snapshot_registration(name, scope=scope)
         if (

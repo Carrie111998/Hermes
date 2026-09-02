@@ -473,11 +473,13 @@ class ProcessRegistry:
         self.completion_queue: _queue_mod.Queue = _queue_mod.Queue()
         # Rehydrate durable delegation completions only at registry startup.
         # Consumers still inject them as fresh turns through this existing rail.
-        try:
-            from tools.async_delegation import restore_undelivered_completions
-            restore_undelivered_completions(self.completion_queue)
-        except Exception as exc:
-            logger.warning("Could not restore async delegation completions: %s", exc)
+        if os.getenv("HERMES_CATALOG_READONLY") != "1":
+            try:
+                from tools.async_delegation import restore_undelivered_completions
+
+                restore_undelivered_completions(self.completion_queue)
+            except Exception as exc:
+                logger.warning("Could not restore async delegation completions: %s", exc)
 
         # Track sessions whose completion was already consumed by the agent
         # via wait/log.  Drain loops AND gateway/tui watchers skip notifications

@@ -73,6 +73,40 @@ def build_tools_parser(subparsers, *, cmd_tools: Callable) -> None:
         help="Platform to apply to (default: cli)",
     )
 
+    # hermes tools catalog [--platform cli] [--probe] [--include-plugins]
+    tools_catalog_p = tools_sub.add_parser(
+        "catalog",
+        help="Print a deterministic, machine-readable tool capability catalog",
+        description=(
+            "Emit a redacted JSON inventory of registered tools for auditing, "
+            "CI diffs, and least-tool orchestration. Availability probes are "
+            "not executed unless --probe is supplied."
+        ),
+    )
+    tools_catalog_p.add_argument(
+        "--platform",
+        default="cli",
+        help="Platform whose enabled toolsets should be marked (default: cli)",
+    )
+    tools_catalog_p.add_argument(
+        "--probe",
+        action="store_true",
+        help="Explicitly run registered availability checks",
+    )
+    tools_catalog_p.add_argument(
+        "--include-plugins",
+        action="store_true",
+        help=(
+            "Load enabled plugin modules so their tools appear (executes trusted "
+            "plugin import code; omitted by default)"
+        ),
+    )
+    tools_catalog_p.add_argument(
+        "--compact",
+        action="store_true",
+        help="Emit compact JSON instead of indented JSON",
+    )
+
     # hermes tools post-setup <key>
     tools_postsetup_p = tools_sub.add_parser(
         "post-setup",
