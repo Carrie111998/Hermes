@@ -459,6 +459,13 @@ def test_active_pr_guard_skipped_for_review_lane_but_defers_ready_lane(
         assert ready_id not in spawned_ids
         assert guarded.get(ready_id) == "active_pr"
 
+        # An explicit operator resume after the PR comment is deliberate. The
+        # stale PR URL remains in history for evidence, but must not keep the
+        # ready task parked behind active_pr forever.
+        with kb.write_txn(conn):
+            kb._append_event(conn, ready_id, "unblocked", {"source": "operator"})
+        assert kb.check_respawn_guard(conn, ready_id) is None
+
         # Rate-limit cooldown still defers the review lane.
         _now = int(__import__("time").time())
         with kb.write_txn(conn):

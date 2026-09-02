@@ -9447,8 +9447,10 @@ def check_respawn_guard(
 
     ``"active_pr"``
         A GitHub PR URL appears in a recent task comment (within
-        ``_RESPAWN_GUARD_PR_WINDOW`` seconds).  A prior worker already
-        opened a PR; re-spawning risks a duplicate PR on the same task.
+        ``_RESPAWN_GUARD_PR_WINDOW`` seconds). A prior worker already
+        opened a PR; re-spawning risks a duplicate PR. Bypassed when an
+        explicit re-queue event arrives after the PR comment, because that is
+        a deliberate resume and the historical link must remain as evidence.
 
     Stale / dead claim locks are NOT a guard reason — they are handled
     by ``release_stale_claims`` and ``detect_crashed_workers`` which
@@ -9537,12 +9539,50 @@ def check_respawn_guard(
             return "recent_success"
 
     # 4. GitHub PR URL in a recent comment — prior worker already opened a PR.
+    #    Preserve the comment as durable evidence, but honor an explicit
+    #    operator re-queue that happened after it. Without this exception an
+    #    unblock/promote/reclaim can leave a legitimate resume silently parked
+    #    behind ``active_pr`` until the whole guard window expires.
     pr_cutoff = now - _RESPAWN_GUARD_PR_WINDOW
+    latest_pr_at: Optional[int] = None
     for c in conn.execute(
-        "SELECT body FROM task_comments WHERE task_id = ? AND created_at >= ?",
+        "SELECT body, created_at FROM task_comments "
+        "WHERE task_id = ? AND created_at >= ?",
         (task_id, pr_cutoff),
     ).fetchall():
         if c["body"] and _RESPAWN_GUARD_PR_URL_RE.search(c["body"]):
+            created_at = int(c["created_at"] or 0)
+            latest_pr_at = max(latest_pr_at or 0, created_at)
+    if latest_pr_at is not None:
+        # Timestamps are integer seconds, so ordering on time alone is
+        # ambiguous for a rapid comment -> unblock sequence. ``add_comment``
+        # appends a ``commented`` event in the same transaction; its monotonic
+        # event id is the safe same-second boundary. If old imported history
+        # lacks that marker, stay conservative and require a later second.
+        comment_event = conn.execute(
+            "SELECT MAX(id) AS id FROM task_events "
+            "WHERE task_id = ? AND kind = 'commented' AND created_at = ?",
+            (task_id, latest_pr_at),
+        ).fetchone()
+        comment_event_id = int(comment_event["id"] or 0) if comment_event else 0
+        if comment_event_id:
+            requeued_after_pr = conn.execute(
+                "SELECT 1 FROM task_events "
+                "WHERE task_id = ? "
+                "AND kind IN ('status', 'promoted', 'unblocked', 'reclaimed') "
+                "AND (created_at > ? OR (created_at = ? AND id > ?)) "
+                "LIMIT 1",
+                (task_id, latest_pr_at, latest_pr_at, comment_event_id),
+            ).fetchone()
+        else:
+            requeued_after_pr = conn.execute(
+                "SELECT 1 FROM task_events "
+                "WHERE task_id = ? AND created_at > ? "
+                "AND kind IN ('status', 'promoted', 'unblocked', 'reclaimed') "
+                "LIMIT 1",
+                (task_id, latest_pr_at),
+            ).fetchone()
+        if not requeued_after_pr:
             return "active_pr"
 
     return None
