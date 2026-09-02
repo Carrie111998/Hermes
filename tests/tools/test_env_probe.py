@@ -43,17 +43,18 @@ class TestSilentWhenHealthy:
 
     @pytest.mark.skipif(
         sys.platform == "win32",
-        reason="Windows terminal PATH is not augmented with the managed dirs "
-        "(local._append_missing_sane_path_entries is a no-op), so a managed-only "
-        "uv is not visible to the probe there — the assertion is POSIX-only.",
+        reason="Windows which('uv') resolves the .exe suffix, so a bare `uv` "
+        "file (no .exe, as this fixture creates) is not found; the Windows "
+        "append is covered by TestLocalEnvironmentPathInjectionGated.",
     )
     def test_managed_only_uv_is_detected(self, monkeypatch, tmp_path):
         """A managed-only install keeps uv in $HERMES_HOME/uv, which is on the
         terminal subshell PATH (local.py appends it to the Hermes sandbox shell)
         but NOT on the agent-process PATH. The probe must ask the terminal PATH,
         so PEP 668 with a managed uv stays silent instead of claiming uv is
-        missing. POSIX only: Windows leaves the terminal PATH and the probe on
-        the process PATH, so both stay consistent there."""
+        missing. POSIX only: on Windows `which('uv')` needs the .exe suffix,
+        which this fixture does not create; the Windows-side append is asserted
+        by TestLocalEnvironmentPathInjectionGated."""
         home = tmp_path / "home"
         uv_dir = home / "uv"
         uv_dir.mkdir(parents=True)
