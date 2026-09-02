@@ -40,7 +40,13 @@ from gateway.session import (
     build_session_key,
     is_shared_multi_user_session,
 )
-from hermes_cli.config import atomic_config_write, cfg_get, clear_model_endpoint_credentials
+from hermes_cli.config import (
+    atomic_config_write,
+    cfg_get,
+    clear_model_endpoint_credentials,
+    coerce_provider_id,
+    stringify_provider_map,
+)
 from utils import (
     atomic_json_write,
     base_url_host_matches,
@@ -1812,24 +1818,32 @@ class GatewaySlashCommandsMixin:
         user_provs = None
         custom_provs = None
         excluded_provs = []
+        excluded_models = {}
         config_path = (_command_profile_home or _hermes_home) / "config.yaml"
         try:
             cfg = _load_gateway_config(config_path=config_path)
             if cfg:
                 model_cfg = cfg.get("model", {})
                 if isinstance(model_cfg, dict):
-                    current_model = model_cfg.get("default", "")
-                    current_provider = model_cfg.get("provider", current_provider)
-                    current_base_url = model_cfg.get("base_url", "")
-                user_provs = cfg.get("providers")
+                    current_model = str(model_cfg.get("default", "") or "")
+                    current_provider = coerce_provider_id(
+                        model_cfg.get("provider", current_provider)
+                    )
+                    current_base_url = str(model_cfg.get("base_url", "") or "")
+                user_provs = stringify_provider_map(cfg.get("providers"))
                 try:
                     from hermes_cli.config import get_compatible_custom_providers
                     custom_provs = get_compatible_custom_providers(cfg)
                 except Exception:
                     custom_provs = cfg.get("custom_providers")
-                _excl = cfg.get("model_catalog", {}).get("excluded_providers")
-                if isinstance(_excl, list):
-                    excluded_provs = _excl
+                catalog_cfg = cfg.get("model_catalog", {})
+                if isinstance(catalog_cfg, dict):
+                    _excl = catalog_cfg.get("excluded_providers")
+                    if isinstance(_excl, list):
+                        excluded_provs = _excl
+                    _excluded_models = catalog_cfg.get("excluded_models")
+                    if isinstance(_excluded_models, dict):
+                        excluded_models = _excluded_models
         except Exception:
             pass
 
@@ -1874,6 +1888,7 @@ class GatewaySlashCommandsMixin:
                         max_models=50,
                         include_moa=True,
                         excluded_providers=excluded_provs,
+                        excluded_models=excluded_models,
                     )
                 except Exception:
                     providers = []
@@ -2179,7 +2194,7 @@ class GatewaySlashCommandsMixin:
                 # Offload blocking provider-listing off the event loop so the
                 # gateway doesn't freeze on a stale-cache HTTP fetch. See #41289.
                 providers = await asyncio.to_thread(
-                    list_authenticated_providers,
+                    list_picker_providers,
                     current_provider=current_provider,
                     current_base_url=current_base_url,
                     current_model=current_model,
@@ -2187,6 +2202,7 @@ class GatewaySlashCommandsMixin:
                     custom_providers=custom_provs,
                     max_models=5,
                     excluded_providers=excluded_provs,
+                    excluded_models=excluded_models,
                 )
                 for p in providers:
                     tag = t("gateway.model.current_tag") if p["is_current"] else ""

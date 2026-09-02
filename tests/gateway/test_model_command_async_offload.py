@@ -1,20 +1,20 @@
 """Regression tests for #41289: the Discord/Telegram ``/model`` slash command
 must not run the blocking provider-listing on the gateway's async event loop.
 
-``list_picker_providers`` / ``list_authenticated_providers`` are synchronous and
-can fall through to a blocking ``urllib`` HTTP fetch when the on-disk provider
-cache is stale. Running that directly on the event loop froze the gateway for
-120-150s ("application did not respond" + delayed agent starts).
+``list_picker_providers`` is synchronous and can fall through to a blocking
+``urllib`` HTTP fetch when the on-disk provider cache is stale. Running it
+directly on the event loop froze the gateway for 120-150s
+("application did not respond" + delayed agent starts).
 
 Fix (ported from #41304, which patched the old ``gateway/run.py`` location):
 ``_handle_model_command`` offloads BOTH provider-listing calls via
 ``asyncio.to_thread`` so the loop stays responsive:
 
-  * line ~1161 — picker path     -> ``list_picker_providers``
-  * line ~1382 — text-fallback   -> ``list_authenticated_providers``
+  * picker path       -> ``list_picker_providers``
+  * text-fallback     -> ``list_picker_providers``
 
 These tests assert the *offload contract* at the real handler seam: each listing
-function must be dispatched through ``asyncio.to_thread`` and must NOT be invoked
+call must be dispatched through ``asyncio.to_thread`` and must NOT be invoked
 directly. Reverting either ``to_thread`` wrap (calling the sync fn inline again)
 makes the corresponding test fail — i.e. the tests are mutation-survivable.
 """
@@ -81,8 +81,56 @@ def _isolated_config(tmp_path, monkeypatch):
 
 
 # --------------------------------------------------------------------------- #
-# Text-fallback path  ->  list_authenticated_providers
+# Text-fallback path  ->  list_picker_providers
 # --------------------------------------------------------------------------- #
+
+
+@pytest.mark.asyncio
+async def test_text_fallback_forwards_provider_scoped_exclusions(
+    _isolated_config,
+    monkeypatch,
+):
+    captured = {}
+    spy = _ToThreadSpy()
+    monkeypatch.setattr(slash_commands.asyncio, "to_thread", spy)
+
+    def _fake_list_picker_providers(**kwargs):
+        captured.update(kwargs)
+        return [{
+            "slug": "openrouter",
+            "name": "OpenRouter",
+            "is_current": True,
+            "models": ["deepseek/deepseek-v4"],
+            "total_models": 1,
+        }]
+
+    monkeypatch.setattr(
+        "hermes_cli.model_switch.list_picker_providers",
+        _fake_list_picker_providers,
+    )
+    monkeypatch.setattr(
+        "gateway.run._load_gateway_config",
+        lambda **_kwargs: {
+            "model": {
+                "provider": "openrouter",
+                "default": "deepseek/deepseek-v4",
+            },
+            "model_catalog": {
+                "excluded_models": {
+                    "openrouter": ["anthropic/*", "openai/*"],
+                },
+            },
+        },
+    )
+
+    runner = _make_runner()
+    result = await runner._handle_model_command(_make_event())
+
+    assert "**OpenRouter**" in result
+    assert _fake_list_picker_providers in spy.funcs_offloaded()
+    assert captured["excluded_models"] == {
+        "openrouter": ["anthropic/*", "openai/*"],
+    }
 
 
 # --------------------------------------------------------------------------- #
@@ -140,3 +188,60 @@ async def test_picker_path_offloads_list_picker_providers(_isolated_config, monk
     )
 
 
+@pytest.mark.asyncio
+async def test_picker_path_forwards_provider_scoped_exclusions(
+    _isolated_config,
+    monkeypatch,
+):
+    captured = {}
+
+    def _fake_list_picker_providers(**kwargs):
+        captured.update(kwargs)
+        return [{
+            "slug": "openrouter",
+            "name": "OpenRouter",
+            "is_current": True,
+            "models": ["deepseek/deepseek-v4"],
+            "total_models": 1,
+        }]
+
+    monkeypatch.setattr(
+        "hermes_cli.model_switch.list_picker_providers",
+        _fake_list_picker_providers,
+    )
+    monkeypatch.setattr(
+        "gateway.run._load_gateway_config",
+        lambda **_kwargs: {
+            "model": {
+                "provider": "openrouter",
+                "default": "deepseek/deepseek-v4",
+            },
+            "model_catalog": {
+                "excluded_models": {
+                    "openrouter": ["anthropic/*", "openai/*"],
+                },
+            },
+        },
+    )
+
+    runner = _make_runner()
+    runner.adapters = {Platform.TELEGRAM: _FakePickerAdapter()}
+    monkeypatch.setattr(
+        runner,
+        "_thread_metadata_for_source",
+        lambda *a, **k: None,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        runner,
+        "_reply_anchor_for_event",
+        lambda *a, **k: None,
+        raising=False,
+    )
+
+    result = await runner._handle_model_command(_make_event())
+
+    assert result is None
+    assert captured["excluded_models"] == {
+        "openrouter": ["anthropic/*", "openai/*"],
+    }
