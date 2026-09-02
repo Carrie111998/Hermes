@@ -175,3 +175,42 @@ Static gates on the four-file Task 3 tree:
 Result: ruff `All checks passed!`; `py_compile` silent; `git diff --check` silent; no non-ASCII added lines. Python identifiers, diagnostic kinds, and JSON keys remain ASCII.
 
 Operator direction for this coder run: do not restart long multi-round Forge loops. Cycle 1 confirmed code finding `3271f746bbb7945c` (stacked mismatch + pid-missing) is addressed by the early-return single-diagnostic rule; remaining clean rounds belong to the later independent Reviewer card, not this commit.
+
+## Task 4/5: fail-closed reconcile module + CLI entry (2026-09-02)
+
+Scope: new `hermes_cli/kanban_reconcile.py` (ReconcileFinding / ProcessSnapshot / argv_matches_task / inspect_task_runtime / reconcile_board), `reconcile_running_task_if_unchanged` NULL-safe CAS helper in `hermes_cli/kanban_db.py`, `reconcile_orphaned_running` re-routed through that CAS, `hermes kanban reconcile [--task|--all-boards] [--fix] [--json]` CLI entry in `hermes_cli/kanban.py`. New tests: `tests/hermes_cli/test_kanban_reconcile_cli.py` (14 cases incl. real CLI subprocess smoke), CAS-primitive contract test added to `tests/gateway/test_kanban_reconcile_orphans.py`.
+
+### Recovery incident (facts, recorded for audit)
+
+Mid-run the worktree `.worktrees/kanban-runtime-reconciliation` and local branch pointer were lost twice. Second loss orphaned the uncommitted Task 4/5 tree. Recovery: replayed the 9 file-mutating tool calls (write_file/patch) and 5 terminal file-writer commands extracted from coder profile `state.db` session `20260902_192125_bf2dac` (messages 65333-65407) onto base `85e7282148`. Verified recovered tree matches the pre-loss snapshot exactly: `git diff --stat` = kanban.py +109, kanban_db.py +142/-55, gateway tests +21; byte sizes kanban_reconcile.py=16030, test file=14057; 24/24 targeted tests pass. Safety ref `backup/t4-recovery-85e728214` left in place until this commit lands.
+
+### Targeted tests (recovered tree, post em-dash ASCII fix)
+
+Command:
+
+    HERMES_PYTHON=/home/houminxi/code/hermes/hermes-agent/venv/bin/python scripts/run_tests.sh tests/hermes_cli/test_kanban_reconcile_cli.py tests/gateway/test_kanban_reconcile_orphans.py -q
+
+Result: exit 0, `2 files, 24 tests passed, 0 failed`.
+
+### Regression across Tasks 1-5 surfaces
+
+Command:
+
+    HERMES_PYTHON=... scripts/run_tests.sh tests/hermes_cli/test_kanban_worker_registration.py tests/hermes_cli/test_kanban_diagnostics.py tests/hermes_cli/test_kanban_review_surfaces.py tests/hermes_cli/test_kanban_cli.py tests/hermes_cli/test_kanban_reconcile_cli.py tests/gateway/test_kanban_reconcile_orphans.py -q
+
+Result: exit 0, `6 files, 72 tests passed, 0 failed`.
+
+### Defect injection (architect first-hand re-run, injection at the fix site)
+
+Mutation: add `live_process_unregistered` to `FIX_ALLOWED_CLASSIFICATIONS` and flip its `fix_allowed` to True in `inspect_task_runtime` (exactly the fail-closed violation the design forbids: auto-fix stealing a card whose live worker process is not the registered one).
+
+Injected result: exit 1, `20 passed, 4 failed`. Failures: `test_live_unregistered_process_refuses_fix`, `test_cli_fix_on_live_unregistered_is_nonzero_and_unchanged`, `test_live_unregistered_fix_allowed_injection_is_refused`, `test_real_cli_subprocess_smoke` (real subprocess `hermes kanban reconcile --fix` returned rc=0 and requeued the card under the mutation). Restored result: exit 0, `2 files, 24 tests passed, 0 failed`.
+
+### Static gates
+
+    python3 -m py_compile hermes_cli/kanban_reconcile.py hermes_cli/kanban_db.py hermes_cli/kanban.py tests/hermes_cli/test_kanban_reconcile_cli.py tests/gateway/test_kanban_reconcile_orphans.py
+    ruff check <same five files>
+    git diff --check
+    git diff --unified=0 | grep -cP '^\+(?!\+\+\+).*[^\x00-\x7F]'
+
+Result: py_compile silent; ruff `All checks passed!`; diff check silent; non-ASCII added-line count 0 (3 em-dashes in new kanban_db.py comment/string lines replaced with ASCII `-`).
