@@ -13,14 +13,21 @@ import type { GroupChat, RosterRow } from './types'
 // window, and disbanding one — plus the ordering rules that keep the in-pane
 // fallback from painting a duplicate beside the main tab.
 
-const { beginHostedRoomMutation, disbandHostedGroupChat, host, markHostedRoomLocallyDeleted, renameHostedGroupChat } =
-  vi.hoisted(() => ({
-    beginHostedRoomMutation: vi.fn(() => 1),
-    disbandHostedGroupChat: vi.fn(async () => true),
-    host: {} as Record<string, unknown>,
-    markHostedRoomLocallyDeleted: vi.fn(),
-    renameHostedGroupChat: vi.fn(async () => true)
-  }))
+const {
+  beginHostedRoomMutation,
+  disbandHostedGroupChat,
+  host,
+  markHostedRoomLocallyDeleted,
+  queueHostedGroupChat,
+  renameHostedGroupChat
+} = vi.hoisted(() => ({
+  beginHostedRoomMutation: vi.fn(() => 1),
+  disbandHostedGroupChat: vi.fn(async () => true),
+  host: {} as Record<string, unknown>,
+  markHostedRoomLocallyDeleted: vi.fn(),
+  queueHostedGroupChat: vi.fn(async () => undefined),
+  renameHostedGroupChat: vi.fn(async () => true)
+}))
 
 vi.mock('@hermes/plugin-sdk', async () => {
   const { pluginSdkMock } = await import('./group-test-utils')
@@ -32,8 +39,10 @@ vi.mock('./hosted-room-runtime', () => ({
   beginHostedRoomMutation,
   disbandHostedGroupChat,
   markHostedRoomLocallyDeleted,
+  queueHostedGroupChat,
   readHostedGroupChatAttachment: vi.fn(),
   renameHostedGroupChat,
+  retryFailedHostedRoomCommand: vi.fn(),
   retryHostedGroupChat: vi.fn(),
   retryHostedRoomReplay: vi.fn()
 }))
@@ -104,6 +113,7 @@ describe('renaming a hosted Group Chat', () => {
         watermarks: {}
       }
     })
+    room.chat.$groupHostedNeedsYou.set({ Core: true })
 
     await expect(room.view.renameGroupChat('Core', 'Launch', [])).resolves.toBe('Launch')
 
@@ -113,6 +123,7 @@ describe('renaming a hosted Group Chat', () => {
       hosted: 'install:studio',
       continuityIssue: 'Rename saved. It will sync when Studio is online.'
     })
+    expect(room.chat.$groupHostedNeedsYou.get()).toEqual({ Launch: true })
   })
 })
 
@@ -284,6 +295,7 @@ describe('disband', () => {
     })
     room.chat.$groupChatWorkspace.set('Gone')
     room.chat.$groupNeedsYou.set({ Gone: true, Keep: true })
+    room.chat.$groupHostedNeedsYou.set({ Gone: true, Keep: true })
 
     await room.view.disbandGroupChat('Gone', [{ name: 'builder' }])
 
@@ -294,6 +306,8 @@ describe('disband', () => {
     expect(room.chat.$groupChatWorkspace.get()).toBeNull()
     expect(room.chat.$groupNeedsYou.get().Gone).toBeUndefined()
     expect(room.chat.$groupNeedsYou.get().Keep).toBe(true)
+    expect(room.chat.$groupHostedNeedsYou.get().Gone).toBeUndefined()
+    expect(room.chat.$groupHostedNeedsYou.get().Keep).toBe(true)
     // Disband removes only this membership; other groups survive.
     expect(room.data.$botMeta.get().builder.groups).toEqual(['Keep'])
     expect(room.data.$botMeta.get().builder.group).toBe('Keep')

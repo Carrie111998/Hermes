@@ -56,6 +56,7 @@ function matchingLocalMember(
   const handle = String(serverMember.handle || '')
   const target = record(serverMember.target)
   const targetAuthority = String(target?.installation_id || target?.peer_id || '')
+
   const candidates = members.filter(
     member =>
       String(member.targetProfile || member.name || '') === profile &&
@@ -83,6 +84,7 @@ async function reconnectPeer(group: string, memberId: string, lifecycle: number)
       throw new Error('Group Chat connections changed. Try Reconnect again.')
     }
   }
+
   const room = $groupChats.get()[group]
   const roomId = String(room?.roomId || '')
   const homeAuthority = groupChatHostedGateway(room)
@@ -105,25 +107,33 @@ async function reconnectPeer(group: string, memberId: string, lifecycle: number)
       room_id: roomId
     })
   )
+
   assertCurrent()
   const serverRoom = record(state?.room)
   const driver = record(state?.driver_status)
   const authorityId = String(serverRoom?.authority_gateway_id || '')
   const authorityEpoch = Number(serverRoom?.authority_epoch || 0)
+
   const serverMember = (Array.isArray(serverRoom?.members) ? serverRoom.members : [])
     .map(record)
     .find(member => String(member?.member_id || '') === memberId)
+
   const target = record(serverMember?.target)
   const targetAuthority = String(target?.installation_id || target?.peer_id || '')
+
   const localMember = serverMember
     ? matchingLocalMember(room.members || [], serverMember, $hostedRoomCapabilities.get())
     : null
+
   const peerConnectionId = String(localMember?.route?.connectionId || localMember?.connectionId || '')
   const profile = String(serverMember?.profile || serverMember?.member_id || 'default')
+
   const currentPeerRoute = (Array.isArray(driver?.peer_routes) ? driver.peer_routes : [])
     .map(record)
     .find(route => String(route?.member_id || '') === memberId)
+
   const expectedGrantSha256 = String(currentPeerRoute?.grant_sha256 || '')
+
   const peerRoute = allRoutes.find(
     route =>
       String(route.connectionId || '') === peerConnectionId &&
@@ -148,6 +158,7 @@ async function reconnectPeer(group: string, memberId: string, lifecycle: number)
   const peerCapability = classifyHostedRoomCapability(await requestHostedConnection(peerRoute, 'groups.capabilities'), {
     connectionId: peerConnectionId
   })
+
   assertCurrent()
 
   $hostedRoomCapabilities.set({
@@ -173,6 +184,7 @@ async function reconnectPeer(group: string, memberId: string, lifecycle: number)
       profile
     })
   )
+
   const catalog = record(invitation?.catalog)
   const grant = String(invitation?.grant || '')
   const targetProfile = String(invitation?.target_profile || profile)
@@ -252,6 +264,7 @@ async function reconnectPeer(group: string, memberId: string, lifecycle: number)
       await armHostedRoomCleanup(setupId)
       await dispatchHostedRoomCleanup()
     }
+
     throw new Error('That Bot gateway could not prepare a secure connection.')
   }
 

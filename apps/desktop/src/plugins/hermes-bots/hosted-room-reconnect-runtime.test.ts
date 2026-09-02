@@ -168,15 +168,19 @@ describe('hosted Group Chat runtime', () => {
   it('does not restart cleanup after stop wins a pending storage load', async () => {
     let releaseLoad: (value: unknown) => void = () => undefined
     let loadStarted: () => void = () => undefined
+
     const started = new Promise<void>(resolve => {
       loadStarted = resolve
     })
+
     const pending = new Promise<unknown>(resolve => {
       releaseLoad = resolve
     })
+
     const loaded = await loadRuntime(method => {
       throw new Error(`unexpected method after stop: ${method}`)
     })
+
     const get = vi.fn(async (key: string) => {
       if (key === 'hosted-room-outbox-v1') {
         loadStarted()
@@ -186,6 +190,7 @@ describe('hosted Group Chat runtime', () => {
 
       return null
     })
+
     const storage = {
       get,
       set: vi.fn()
@@ -205,13 +210,17 @@ describe('hosted Group Chat runtime', () => {
   it('does not let a pre-stop refresh rejection mark a restarted runtime offline', async () => {
     let releaseState: () => void = () => undefined
     let stateStarted: () => void = () => undefined
+
     const stateRequested = new Promise<void>(resolve => {
       stateStarted = resolve
     })
+
     const staleState = new Promise<Record<string, unknown>>((_resolve, reject) => {
       releaseState = () => reject(new Error('old connection closed'))
     })
+
     let stateCalls = 0
+
     const loaded = await loadRuntime(method => {
       if (method === 'groups.capabilities') {
         return { authority_gateway_id: 'install:home', driver: true, persistent_process: true }
@@ -236,6 +245,7 @@ describe('hosted Group Chat runtime', () => {
 
       if (method === 'groups.state') {
         stateCalls += 1
+
         if (stateCalls === 1) {
           stateStarted()
 
@@ -261,6 +271,7 @@ describe('hosted Group Chat runtime', () => {
 
       throw new Error(`unexpected method: ${method}`)
     })
+
     const storage = scriptedStorage(loaded.storage).storage
 
     loaded.chat.$groupChats.set({ Release: room() })
@@ -294,6 +305,7 @@ describe('hosted Group Chat runtime', () => {
         }
       }
     ]
+
     const loaded = await loadRuntime(
       (method, _params, route) => {
         const connectionId = String(route?.connectionId || '')
@@ -384,9 +396,118 @@ describe('hosted Group Chat runtime', () => {
     loaded.runtime.stopHostedRoomRuntime()
   })
 
+  it('offers a retry when the peer gateway needed for reauthorization is unavailable', async () => {
+    const serverMembers = [
+      {
+        member_id: 'research',
+        profile: 'research'
+      },
+      {
+        display_name: 'Remote Builder',
+        handle: 'builder',
+        member_id: 'builder',
+        profile: 'builder',
+        target: {
+          installation_id: 'install:peer',
+          kind: 'peer',
+          peer_id: 'install:peer'
+        }
+      }
+    ]
+
+    const loaded = await loadRuntime(method => {
+      if (method === 'groups.capabilities') {
+        return {
+          authority_gateway_id: 'install:home',
+          driver: true,
+          features: ['peer_route_grant_fingerprint'],
+          persistent_process: true
+        }
+      }
+
+      if (method === 'groups.list') {
+        return {
+          rooms: [
+            {
+              authority_epoch: 1,
+              authority_gateway_id: 'install:home',
+              disbanded_at: null,
+              latest_seq: 0,
+              members: serverMembers,
+              name: 'Release',
+              revision: 1,
+              room_id: 'room-1'
+            }
+          ]
+        }
+      }
+
+      if (method === 'groups.state') {
+        return {
+          driver_status: {
+            blocked: true,
+            pending_actions: [{ kind: 'retry', task_id: 'uncertain-task' }],
+            peer_routes: [{ member_id: 'builder', status: 'needs_reauthorization' }],
+            working: false
+          },
+          room: {
+            authority_epoch: 1,
+            authority_gateway_id: 'install:home',
+            disbanded_at: null,
+            members: serverMembers,
+            name: 'Release',
+            room_id: 'room-1'
+          }
+        }
+      }
+
+      if (method === 'groups.log') {
+        return { events: [], has_more: false, latest_seq: 0 }
+      }
+
+      throw new Error(`unexpected method: ${method}`)
+    })
+
+    loaded.chat.$groupChats.set({
+      Release: room({
+        members: [
+          MEMBERS[0],
+          {
+            connectionId: 'gateway-b',
+            handle: 'builder',
+            name: 'builder',
+            route: {
+              connectionId: 'gateway-b',
+              mode: 'remote',
+              profile: 'builder',
+              targetProfile: 'builder'
+            },
+            sourceScoped: true,
+            targetProfile: 'builder'
+          }
+        ]
+      })
+    })
+    await loaded.runtime.startHostedRoomRuntime(scriptedStorage(loaded.storage).storage)
+
+    expect(loaded.chat.$groupChats.get().Release).toMatchObject({
+      continuityIssue: 'Could not reconnect this Bot. Check its gateway and try again.',
+      hostedStatus: {
+        canRetry: true,
+        canStop: false,
+        label: 'Remote Builder needs your attention.',
+        state: 'needs-attention'
+      },
+      running: false
+    })
+    expect(loaded.chat.$groupChats.get().Release.hostedStatus?.taskId).toBeUndefined()
+    loaded.runtime.stopHostedRoomRuntime()
+  })
+
   it('uses the stored member route to explain an older peer gateway without polling forever', async () => {
     let peerUpgraded = false
     let stateCalls = 0
+
     const serverMembers = [
       { member_id: 'research', profile: 'research' },
       {
@@ -401,6 +522,7 @@ describe('hosted Group Chat runtime', () => {
         }
       }
     ]
+
     const loaded = await loadRuntime(
       (method, _params, route) => {
         const connectionId = String(route?.connectionId || '')
@@ -518,9 +640,11 @@ describe('hosted Group Chat runtime', () => {
   it('does not let an in-flight poll restore a cache entry after invalidation', async () => {
     let releaseState: () => void = () => undefined
     let stateStarted: () => void = () => undefined
+
     const stateRequested = new Promise<void>(resolve => {
       stateStarted = resolve
     })
+
     const heldState = new Promise<Record<string, unknown>>(resolve => {
       releaseState = () =>
         resolve({
@@ -535,7 +659,9 @@ describe('hosted Group Chat runtime', () => {
           }
         })
     })
+
     let stateCalls = 0
+
     const loaded = await loadRuntime(method => {
       if (method === 'groups.capabilities') {
         return { authority_gateway_id: 'install:home', driver: true, persistent_process: true }
@@ -560,6 +686,7 @@ describe('hosted Group Chat runtime', () => {
 
       if (method === 'groups.state') {
         stateCalls += 1
+
         if (stateCalls === 1) {
           stateStarted()
 

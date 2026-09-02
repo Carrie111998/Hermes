@@ -419,6 +419,7 @@ describe('hosted Group Chat peer reauthorization', () => {
     mocks.requestHosted.mockImplementation(async (_route, method) => {
       if (method === 'groups.state') {
         stateCalls += 1
+
         return {
           driver_status: {
             peer_routes: [
@@ -617,6 +618,7 @@ describe('hosted Group Chat peer reauthorization', () => {
     mocks.requestHosted.mockImplementation(async (_route, method) => {
       if (method === 'groups.state') {
         stateCalls += 1
+
         return {
           driver_status:
             stateCalls > 1
