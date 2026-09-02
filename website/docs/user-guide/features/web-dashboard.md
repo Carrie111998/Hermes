@@ -822,6 +822,9 @@ dashboard:
       issuer: https://auth.example.com/application/o/hermes/   # required
       client_id: hermes-dashboard                              # required
       scopes: "openid profile email"                           # optional (this is the default)
+      extra_authorize_params:                                  # optional IdP-specific /authorize params
+        access_type: offline                                   # e.g. Google needs these to issue a
+        prompt: consent                                        # refresh token (see note below)
 ```
 
 **Environment variables** — operator overrides (env wins over `config.yaml` when set non-empty; an empty value is treated as unset):
@@ -831,6 +834,7 @@ dashboard:
 | `HERMES_DASHBOARD_OIDC_ISSUER` | `dashboard.oauth.self_hosted.issuer` | OIDC issuer URL — required |
 | `HERMES_DASHBOARD_OIDC_CLIENT_ID` | `dashboard.oauth.self_hosted.client_id` | Public client id — required |
 | `HERMES_DASHBOARD_OIDC_SCOPES` | `dashboard.oauth.self_hosted.scopes` | Defaults to `openid profile email` |
+| `HERMES_DASHBOARD_OIDC_EXTRA_AUTHORIZE_PARAMS` | `dashboard.oauth.self_hosted.extra_authorize_params` | Urlencoded form of the mapping above, e.g. `access_type=offline&prompt=consent` |
 
 In your IDP, register a **public** application/client with the authorization-code + PKCE (S256) grant and add the dashboard's callback as an allowed redirect URI. The callback is `<dashboard public URL>/auth/callback` (see [Public URL override](#public-url-override) for how the dashboard derives its public URL behind a proxy).
 
@@ -846,6 +850,8 @@ The provider verifies the OpenID Connect **ID token** (RS256/ES256) against the 
 | `org_id` | `org_id` / `organization`, else joined `groups` |
 
 The ID token is what establishes identity — the access token is treated as opaque (the OIDC spec does not require it to be a JWT). Endpoint URLs are required to be HTTPS (loopback `http://` is allowed for local-dev IDPs), and the discovery document's advertised `issuer` must match your configured one (a trailing-slash difference is tolerated). Refresh tokens, when the IDP issues them, are used for silent re-auth via the standard `refresh_token` grant; logout calls the IDP's RFC 7009 `revocation_endpoint` when advertised.
+
+> **Some IDPs need extra authorize parameters to issue a refresh token.** Google, most notably, only returns a `refresh_token` when the authorize request carries `access_type=offline` (and `prompt=consent` on repeat logins); without them the session silently degrades to a full re-login at every ID-token expiry (~1h). IdPs are not all equal here and OIDC itself doesn't standardize these switches, so they're exposed via `extra_authorize_params` / `HERMES_DASHBOARD_OIDC_EXTRA_AUTHORIZE_PARAMS` (see [Configuration](#configuration)) — the standard OIDC parameters (`state`, PKCE, `response_type`, …) can't be overridden through it.
 
 > **Confidential clients** (those with a `client_secret`) are not supported yet — configure a public + PKCE client, which is the typical choice for a browser-facing dashboard.
 

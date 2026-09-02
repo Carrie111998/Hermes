@@ -132,20 +132,25 @@ def _make_provider(
     *,
     scopes: str | None = None,
     client_secret: str | None = None,
+    extra_authorize_params: Dict[str, str] | None = None,
     auth_methods: Any = "__unset__",
 ):
     """Construct a provider with discovery + JWKS stubbed (no network).
 
-    ``client_secret`` flips the provider into confidential mode. ``auth_methods``
-    overrides ``token_endpoint_auth_methods_supported`` in the seeded discovery
-    doc (pass a list, or ``None`` to omit the key entirely); left unset, the
-    discovery doc carries no auth-methods key (the absent-key default).
+    ``client_secret`` flips the provider into confidential mode.
+    ``extra_authorize_params`` seeds IdP-specific /authorize parameters.
+    ``auth_methods`` overrides ``token_endpoint_auth_methods_supported`` in
+    the seeded discovery doc (pass a list, or ``None`` to omit the key
+    entirely); left unset, the discovery doc carries no auth-methods key
+    (the absent-key default).
     """
     kwargs: Dict[str, Any] = {"issuer": _ISSUER, "client_id": _CLIENT_ID}
     if scopes is not None:
         kwargs["scopes"] = scopes
     if client_secret is not None:
         kwargs["client_secret"] = client_secret
+    if extra_authorize_params is not None:
+        kwargs["extra_authorize_params"] = extra_authorize_params
     p = oidc_plugin.SelfHostedOIDCProvider(**kwargs)
     # Pre-seed discovery so nothing hits the network.
     disco = dict(_DISCOVERY_DOC)
@@ -321,6 +326,52 @@ class TestStartLogin:
         pkce = result.cookie_payload["hermes_session_pkce"]
         parts = dict(seg.split("=", 1) for seg in pkce.split(";") if "=" in seg)
         assert parts["state"] == params["state"]
+
+    def test_extra_authorize_params_reach_authorize_url(self, rsa_keypair):
+        # The Google-as-IdP regression (#100147): without access_type=offline
+        # (and prompt=consent on repeat logins) the token exchange carries no
+        # refresh_token and every ID-token expiry forces a full re-login.
+        provider = _make_provider(
+            rsa_keypair,
+            extra_authorize_params={
+                "access_type": "offline",
+                "prompt": "consent",
+            },
+        )
+        result = provider.start_login(
+            redirect_uri="https://hermes.example/auth/callback"
+        )
+        parsed = urllib.parse.urlparse(result.redirect_url)
+        params = dict(urllib.parse.parse_qsl(parsed.query))
+        assert params["access_type"] == "offline"
+        assert params["prompt"] == "consent"
+        # The standard OIDC set is untouched by the extras.
+        assert params["response_type"] == "code"
+        assert params["client_id"] == _CLIENT_ID
+        assert params["code_challenge_method"] == "S256"
+        assert "state" in params
+
+    def test_extra_params_cannot_override_standard_params(self, rsa_keypair):
+        provider = _make_provider(
+            rsa_keypair,
+            extra_authorize_params={
+                "state": "attacker-state",
+                "code_challenge": "attacker-challenge",
+                "client_id": "attacker-client",
+                "response_type": "token",
+            },
+        )
+        result = provider.start_login(
+            redirect_uri="https://hermes.example/auth/callback"
+        )
+        parsed = urllib.parse.urlparse(result.redirect_url)
+        params = dict(urllib.parse.parse_qsl(parsed.query))
+        # Our own flow values win: PKCE/state integrity and the client id are
+        # not rewriteable through the operator extension point.
+        assert params["response_type"] == "code"
+        assert params["client_id"] == _CLIENT_ID
+        assert params["state"] != "attacker-state"
+        assert params["code_challenge"] != "attacker-challenge"
 
 
 # ---------------------------------------------------------------------------
@@ -616,6 +667,7 @@ class TestPluginRegister:
             "HERMES_DASHBOARD_OIDC_CLIENT_ID",
             "HERMES_DASHBOARD_OIDC_SCOPES",
             "HERMES_DASHBOARD_OIDC_CLIENT_SECRET",
+            "HERMES_DASHBOARD_OIDC_EXTRA_AUTHORIZE_PARAMS",
         ):
             monkeypatch.delenv(var, raising=False)
 
@@ -726,4 +778,132 @@ class TestPluginRegister:
         oidc_plugin.register(ctx)
         registered = ctx.register_dashboard_auth_provider.call_args.args[0]
         assert registered._client_secret == "cfg-secret"
+
+    # -- extra_authorize_params wiring ---------------------------------------
+
+    def test_extra_authorize_params_from_config(self, patch_config, monkeypatch):
+        patch_config(
+            {
+                "self_hosted": {
+                    "issuer": _ISSUER,
+                    "client_id": _CLIENT_ID,
+                    "extra_authorize_params": {
+                        "access_type": "offline",
+                        "prompt": "consent",
+                    },
+                }
+            }
+        )
+        ctx = MagicMock()
+        oidc_plugin.register(ctx)
+        registered = ctx.register_dashboard_auth_provider.call_args.args[0]
+        assert registered._extra_authorize_params == {
+            "access_type": "offline",
+            "prompt": "consent",
+        }
+
+    def test_extra_authorize_params_from_env_query_string(
+        self, patch_config, monkeypatch
+    ):
+        patch_config(None)
+        monkeypatch.setenv("HERMES_DASHBOARD_OIDC_ISSUER", _ISSUER)
+        monkeypatch.setenv("HERMES_DASHBOARD_OIDC_CLIENT_ID", _CLIENT_ID)
+        monkeypatch.setenv(
+            "HERMES_DASHBOARD_OIDC_EXTRA_AUTHORIZE_PARAMS",
+            "access_type=offline&prompt=consent",
+        )
+        ctx = MagicMock()
+        oidc_plugin.register(ctx)
+        registered = ctx.register_dashboard_auth_provider.call_args.args[0]
+        assert registered._extra_authorize_params == {
+            "access_type": "offline",
+            "prompt": "consent",
+        }
+        # End to end: the registered provider's authorize URL carries the
+        # IdP-specific keys alongside the standard OIDC set. (Discovery is
+        # pre-seeded so start_login stays offline, as in _make_provider.)
+        registered._discovery = dict(_DISCOVERY_DOC)
+        registered._discovery_fetched_at = time.time()
+        result = registered.start_login(
+            redirect_uri="https://hermes.example/auth/callback"
+        )
+        params = dict(
+            urllib.parse.parse_qsl(urllib.parse.urlparse(result.redirect_url).query)
+        )
+        assert params["access_type"] == "offline"
+        assert params["prompt"] == "consent"
+        assert params["client_id"] == _CLIENT_ID
+
+    def test_extra_authorize_params_env_overrides_config(
+        self, patch_config, monkeypatch
+    ):
+        patch_config(
+            {
+                "self_hosted": {
+                    "issuer": _ISSUER,
+                    "client_id": _CLIENT_ID,
+                    "extra_authorize_params": {"audience": "cfg-aud"},
+                }
+            }
+        )
+        monkeypatch.setenv(
+            "HERMES_DASHBOARD_OIDC_EXTRA_AUTHORIZE_PARAMS",
+            "access_type=offline",
+        )
+        ctx = MagicMock()
+        oidc_plugin.register(ctx)
+        registered = ctx.register_dashboard_auth_provider.call_args.args[0]
+        assert registered._extra_authorize_params == {"access_type": "offline"}
+
+    def test_extra_authorize_params_whitespace_stripped(
+        self, patch_config, monkeypatch
+    ):
+        # Whitespace around keys/values must not reach the authorize URL:
+        # ``access_type = offline`` would otherwise urlencode as
+        # ``access_type+=+offline`` and be rejected by the IdP. Both surfaces
+        # (env query string and config mapping) strip the same way.
+        patch_config(
+            {
+                "self_hosted": {
+                    "issuer": _ISSUER,
+                    "client_id": _CLIENT_ID,
+                    "extra_authorize_params": {" audience ": " cfg-aud "},
+                }
+            }
+        )
+        ctx = MagicMock()
+        oidc_plugin.register(ctx)
+        registered = ctx.register_dashboard_auth_provider.call_args.args[0]
+        assert registered._extra_authorize_params == {"audience": "cfg-aud"}
+
+        monkeypatch.setenv(
+            "HERMES_DASHBOARD_OIDC_EXTRA_AUTHORIZE_PARAMS",
+            "access_type = offline & prompt = consent",
+        )
+        ctx = MagicMock()
+        oidc_plugin.register(ctx)
+        registered = ctx.register_dashboard_auth_provider.call_args.args[0]
+        assert registered._extra_authorize_params == {
+            "access_type": "offline",
+            "prompt": "consent",
+        }
+
+    def test_extra_authorize_params_non_dict_config_ignored(
+        self, patch_config, monkeypatch
+    ):
+        # A typo'd config value must not take the auth gate down: registration
+        # proceeds with the standard parameter set.
+        patch_config(
+            {
+                "self_hosted": {
+                    "issuer": _ISSUER,
+                    "client_id": _CLIENT_ID,
+                    "extra_authorize_params": "access_type=offline",
+                }
+            }
+        )
+        ctx = MagicMock()
+        oidc_plugin.register(ctx)
+        registered = ctx.register_dashboard_auth_provider.call_args.args[0]
+        assert registered._extra_authorize_params == {}
 

@@ -58,6 +58,14 @@ same precedence convention as the ``nous`` plugin)::
           scopes: "openid profile email"                           # optional
           # client_secret: set ONLY for a confidential client. It is a
           # credential — prefer the env var / ~/.hermes/.env over config.yaml.
+          # extra_authorize_params: IdP-specific /authorize parameters the
+          # standard OIDC set can't express. Google, for instance, only mints
+          # a refresh_token when asked with access_type=offline (and
+          # prompt=consent on repeat logins) — without them the session
+          # degrades to a full re-login at every ID-token expiry:
+          # extra_authorize_params:
+          #   access_type: offline
+          #   prompt: consent
 
     # Environment overrides (Docker/Fly secret injection)
     HERMES_DASHBOARD_OIDC_ISSUER
@@ -66,6 +74,9 @@ same precedence convention as the ``nous`` plugin)::
     HERMES_DASHBOARD_OIDC_CLIENT_SECRET # optional; set for a confidential client
                                         # (the .env file is the canonical home —
                                         # it's a secret, not a behavioural setting)
+    HERMES_DASHBOARD_OIDC_EXTRA_AUTHORIZE_PARAMS  # optional; urlencoded form of the
+                                        # mapping above, e.g.
+                                        # "access_type=offline&prompt=consent"
 
 Skip reasons: when the plugin loads but can't register (missing issuer /
 client_id), it writes a human-readable reason to the module-level
@@ -185,6 +196,7 @@ class SelfHostedOIDCProvider(DashboardAuthProvider):
         client_id: str,
         scopes: str = _DEFAULT_SCOPES,
         client_secret: str = "",
+        extra_authorize_params: Optional[Dict[str, str]] = None,
     ) -> None:
         if not issuer:
             raise ValueError("issuer is required")
@@ -203,6 +215,17 @@ class SelfHostedOIDCProvider(DashboardAuthProvider):
         # provisioned-but-blank secret can't flip us into a broken confidential
         # mode that sends an empty client_secret. Non-empty ⇒ confidential.
         self._client_secret = (client_secret or "").strip()
+        # IdP-specific /authorize parameters (e.g. Google's
+        # access_type=offline). Values are coerced to str so a YAML `offline:`
+        # style typo can't smuggle a non-string into urlencode later; both
+        # sides are stripped so incidental whitespace can't turn a key/value
+        # into something the IdP won't recognize. Keys overlapping the
+        # standard OIDC set are ignored at use time — see start_login.
+        self._extra_authorize_params: Dict[str, str] = {
+            str(k).strip(): str(v).strip()
+            for k, v in (extra_authorize_params or {}).items()
+            if str(k).strip()
+        }
 
         # Discovery + JWKS are lazily resolved on first use so plugin
         # registration never makes a network call (the IDP may be down at
@@ -224,7 +247,13 @@ class SelfHostedOIDCProvider(DashboardAuthProvider):
         )
         state = _b64url_no_pad(secrets.token_bytes(32))
 
+        # Standard OIDC parameters win over extra_authorize_params: the
+        # operator extension point exists for IdP-specific keys the standard
+        # set can't express (Google's access_type, prompt=consent, …), not to
+        # rewrite response_type/state/PKCE — overriding those would only break
+        # (or weaken) our own flow, never an IdP requirement.
         params = {
+            **self._extra_authorize_params,
             "response_type": "code",
             "client_id": self._client_id,
             "redirect_uri": redirect_uri,
@@ -790,6 +819,46 @@ def _resolve_setting(env_var: str, cfg_value: Any) -> str:
     return str(cfg_value or "").strip()
 
 
+_EXTRA_AUTHORIZE_PARAMS_ENV = "HERMES_DASHBOARD_OIDC_EXTRA_AUTHORIZE_PARAMS"
+
+
+def _resolve_extra_authorize_params(cfg_value: Any) -> Dict[str, str]:
+    """Resolve ``extra_authorize_params`` from env / config.yaml.
+
+    Same env-wins precedence as every other setting, but the value is a
+    mapping, so the two surfaces take different shapes:
+
+    * config.yaml: ``dashboard.oauth.self_hosted.extra_authorize_params`` —
+      a plain mapping (``{access_type: offline}``).
+    * env var (``HERMES_DASHBOARD_OIDC_EXTRA_AUTHORIZE_PARAMS``): the same
+      mapping in urlencoded query form —
+      ``access_type=offline&prompt=consent`` — matching the encoding the
+      authorize request itself uses, so operators can copy a working query
+      string straight from their IdP docs.
+
+    A non-dict config value resolves to ``{}`` (standard behaviour) rather
+    than failing registration — a typo in an optional enhancement must not
+    take the auth gate down.
+
+    Both surfaces strip whitespace around keys and values: an env form like
+    ``access_type = offline`` would otherwise urlencode the spaces, and the
+    IdP would reject a key it doesn't recognize.
+    """
+    env = os.environ.get(_EXTRA_AUTHORIZE_PARAMS_ENV, "").strip()
+    if env:
+        return {
+            k.strip(): v.strip()
+            for k, v in urllib.parse.parse_qsl(env, keep_blank_values=True)
+        }
+    if isinstance(cfg_value, dict):
+        return {
+            str(k).strip(): str(v).strip()
+            for k, v in cfg_value.items()
+            if str(k).strip()
+        }
+    return {}
+
+
 def register(ctx) -> None:
     """Plugin entry — called by the plugin loader at startup.
 
@@ -824,6 +893,12 @@ def register(ctx) -> None:
     client_secret = _resolve_setting(
         "HERMES_DASHBOARD_OIDC_CLIENT_SECRET", oidc_cfg.get("client_secret")
     )
+    # Optional IdP-specific /authorize parameters (e.g. Google's
+    # access_type=offline — without them Google issues no refresh_token and
+    # the session degrades to a full re-login every ID-token expiry; #100147).
+    extra_authorize_params = _resolve_extra_authorize_params(
+        oidc_cfg.get("extra_authorize_params")
+    )
 
     if not issuer or not client_id:
         LAST_SKIP_REASON = (
@@ -844,6 +919,7 @@ def register(ctx) -> None:
             client_id=client_id,
             scopes=scopes,
             client_secret=client_secret,
+            extra_authorize_params=extra_authorize_params,
         )
     except (ValueError, ProviderError) as exc:
         LAST_SKIP_REASON = (

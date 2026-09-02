@@ -2060,6 +2060,8 @@ updates:
 #   dashboard.oauth.self_hosted.client_id      <-  HERMES_DASHBOARD_OIDC_CLIENT_ID
 #   dashboard.oauth.self_hosted.scopes         <-  HERMES_DASHBOARD_OIDC_SCOPES
 #   dashboard.oauth.self_hosted.client_secret  <-  HERMES_DASHBOARD_OIDC_CLIENT_SECRET
+#   dashboard.oauth.self_hosted.extra_authorize_params  <-
+#       HERMES_DASHBOARD_OIDC_EXTRA_AUTHORIZE_PARAMS (urlencoded form)
 #
 # dashboard:
 #   oauth:
@@ -2068,6 +2070,17 @@ updates:
 #       issuer: "https://auth.example.com/application/o/hermes/"  # required
 #       client_id: "hermes-dashboard"                             # required
 #       scopes: "openid profile email"                            # optional
+#
+#       # OPTIONAL — IdP-specific /authorize parameters the standard OIDC set
+#       # can't express. Google, for instance, only issues a refresh_token
+#       # when asked with access_type=offline (and prompt=consent on repeat
+#       # logins); without them the dashboard forces a full re-login at every
+#       # ID-token expiry (~1h). Standard OIDC parameters (state, PKCE,
+#       # response_type, …) cannot be overridden through this mapping.
+#       #
+#       #   extra_authorize_params:
+#       #     access_type: "offline"
+#       #     prompt: "consent"
 #
 #       # OPTIONAL — set ONLY if your IDP registered the client as
 #       # *confidential* (Authentik / Keycloak often default to this). When
