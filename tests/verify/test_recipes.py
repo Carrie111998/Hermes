@@ -125,6 +125,18 @@ class TestPythonDetection:
         assert recipe.start.startswith("uvicorn main:app")
         assert recipe.port == 8000
 
+    def test_fastapi_dependency_without_root_entrypoint_falls_back_to_python(self, tmp_path):
+        """Regression: FastAPI/Uvicorn listed in deps but no main.py or app.py at root
+        must not be reported as a runnable FastAPI app. A dependency is not an
+        entrypoint — the detector must not invent one."""
+        (tmp_path / "requirements.txt").write_text(
+            "fastapi>=0.115\nuvicorn>=0.30\n", encoding="utf-8"
+        )
+        recipe = detect_recipe(tmp_path)
+        assert recipe.kind == "python"
+        assert not recipe.start
+        assert recipe.port is None
+
     def test_flask(self, tmp_path):
         (tmp_path / "requirements.txt").write_text("flask\n", encoding="utf-8")
         (tmp_path / "app.py").touch()
