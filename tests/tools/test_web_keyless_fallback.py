@@ -458,11 +458,12 @@ class TestKeylessFailover:
         assert out["success"] is True
         assert out["data"]["served_by"] == "parallel"
 
-    def test_search_no_failover_on_non_throttle_error(self, monkeypatch):
+    def test_search_no_failover_on_auth_error(self, monkeypatch):
+        """Hard auth failures are vendor-independent: the ring stays put."""
         self._pin(monkeypatch, "exa")
         monkeypatch.setitem(
             keyless_mcp._KEYLESS_SEARCHERS, "exa",
-            lambda q, l: {"success": False, "error": "Unrecognized MCP response shape"},
+            lambda q, l: {"success": False, "error": "Keyless Exa search failed: HTTP 401: unauthorized"},
         )
         called = []
         monkeypatch.setitem(
@@ -472,6 +473,23 @@ class TestKeylessFailover:
         out = keyless_mcp.search_with_failover("exa", "q")
         assert out["success"] is False
         assert not called  # peer never tried
+
+    def test_search_fails_over_on_masked_throttle_shape_error(self, monkeypatch):
+        """Anonymous endpoints sometimes wrap 429s in unparseable bodies:
+        the resulting shape error carries no rate-limit markers but is a
+        vendor failure that must advance the ring (observed live on Exa's
+        keyless MCP endpoint, 2026-08-31)."""
+        self._pin(monkeypatch, "exa")
+        monkeypatch.setitem(
+            keyless_mcp._KEYLESS_SEARCHERS, "exa",
+            lambda q, l: {"success": False, "error": "Unrecognized MCP response shape"},
+        )
+        monkeypatch.setitem(
+            keyless_mcp._KEYLESS_SEARCHERS, "parallel", lambda q, l: self._ok("parallel"),
+        )
+        out = keyless_mcp.search_with_failover("exa", "q")
+        assert out["success"] is True
+        assert out["data"]["served_by"] == "parallel"
 
     def test_search_all_throttled_reports_ring(self, monkeypatch):
         self._pin(monkeypatch, "exa")
@@ -537,18 +555,24 @@ class TestKeylessFailover:
         out = keyless_mcp.extract_with_failover("exa", ["https://a", "https://b"])
         assert out == good
 
-    def test_extract_partial_failure_stays_on_primary(self, monkeypatch):
+    def test_extract_partial_batch_retries_only_retryable_urls(self, monkeypatch):
+        """Per-URL failover: a partial batch re-fetches ONLY the URLs whose
+        errors are vendor-retryable; successes pass through untouched and
+        input order is preserved."""
         self._pin(monkeypatch, "exa")
         partial = [
             {"url": "https://a", "title": "A", "content": "x"},
             {"url": "https://b", "title": "", "content": "", "error": "rate limit"},
         ]
-        called = []
+        seen = []
         monkeypatch.setitem(keyless_mcp._KEYLESS_EXTRACTORS, "exa", lambda urls: partial)
         monkeypatch.setitem(
             keyless_mcp._KEYLESS_EXTRACTORS, "parallel",
-            lambda urls: called.append(1) or [],
+            lambda urls: seen.append(list(urls))
+            or [{"url": "https://b", "title": "B", "content": "y"}],
         )
         out = keyless_mcp.extract_with_failover("exa", ["https://a", "https://b"])
-        assert out == partial
-        assert not called
+        assert seen == [["https://b"]]  # only the retryable URL re-fetched
+        assert out[0] == partial[0]  # success untouched
+        assert out[1]["content"] == "y"
+        assert out[1]["served_by"] == "parallel"

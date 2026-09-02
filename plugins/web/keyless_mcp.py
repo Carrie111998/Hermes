@@ -63,6 +63,30 @@ def _is_rate_limitish(message: str) -> bool:
     return any(marker in lowered for marker in _RATE_LIMIT_MARKERS)
 
 
+_SHAPE_FAILURE_MARKERS = (
+    "unrecognized mcp response shape",
+    "malformed mcp response",
+    "invalid mcp response",
+)
+
+
+def _is_vendor_retryable(message: str) -> bool:
+    """Heuristic: should the ring try the next vendor for this error?
+
+    True for rate-limit-shaped errors and for unparseable MCP response
+    shapes: anonymous endpoints occasionally answer HTTP 200 with an HTML
+    or non-JSON-RPC error page while throttling, which fails response
+    parsing and carries none of the classic rate-limit markers (observed
+    live 2026-08-31: Exa returning masked 429s as "Unrecognized MCP
+    response shape"). Anything else — auth failures, bad input — fails
+    fast: it would fail identically on every vendor.
+    """
+    lowered = (message or "").lower()
+    return _is_rate_limitish(message) or any(
+        marker in lowered for marker in _SHAPE_FAILURE_MARKERS
+    )
+
+
 def keyless_enabled() -> bool:
     """Return True when the keyless fallback tier is enabled.
 
@@ -695,8 +719,10 @@ def search_with_failover(name: str, query: str, limit: int = 5) -> Dict[str, Any
     """Keyless search across the vendor ring with next-in-line failover.
 
     Starts at *name* when the user pinned it, otherwise at the round-robin
-    cursor. Rate-limit-shaped errors advance to the next ring vendor;
-    non-throttle errors stop the walk (a malformed query fails everywhere).
+    cursor. Vendor-retryable errors (rate-limit-shaped, or unparseable
+    response shapes from throttled anonymous endpoints) advance to the
+    next ring vendor; other errors stop the walk (a bad query or auth
+    failure fails everywhere).
     The result notes the serving vendor via ``data.served_by`` whenever it
     differs from *name*.
     """
@@ -714,7 +740,7 @@ def search_with_failover(name: str, query: str, limit: int = 5) -> Dict[str, Any
                 result.setdefault("data", {})["served_by"] = vendor
             return result
         last = result
-        if not _is_rate_limitish(result.get("error", "")):
+        if not _is_vendor_retryable(result.get("error", "")):
             return result
         nxt = order[i + 1] if i + 1 < len(order) else None
         if nxt:
@@ -729,11 +755,14 @@ def search_with_failover(name: str, query: str, limit: int = 5) -> Dict[str, Any
 
 
 def extract_with_failover(name: str, urls: List[str]) -> List[Dict[str, Any]]:
-    """Keyless extract across the vendor ring, failing over per-batch.
+    """Keyless extract across the vendor ring, failing over per-URL.
 
-    Advances to the next ring vendor only when EVERY url in a batch comes
-    back with a rate-limit-shaped error — partial failures are page
-    problems, not throttling, and return as-is.
+    Each URL is retried on the next ring vendor while its error looks
+    vendor-retryable (throttling, or a masked-throttle response-shape
+    failure); successes and hard failures (auth, bad input, page-level
+    problems) are final, so a mixed batch only re-fetches the URLs that
+    actually need another vendor. Results keep input order and length;
+    entries served by a fallback vendor are tagged ``served_by``.
     """
     order = _ring_order(name)
     if not order:
@@ -742,19 +771,35 @@ def extract_with_failover(name: str, urls: List[str]) -> List[Dict[str, Any]]:
              "error": "All keyless web providers are pinned to paid tiers."}
             for u in urls
         ]
-    last: List[Dict[str, Any]] = []
+    final: List[Optional[Dict[str, Any]]] = [None] * len(urls)
+    pending: List[tuple] = list(enumerate(urls))
+    last_result: Dict[int, Dict[str, Any]] = {}
     for i, vendor in enumerate(order):
-        results = _KEYLESS_EXTRACTORS[vendor](list(urls))
-        errors = [r.get("error", "") for r in results]
-        all_throttled = bool(results) and all(
-            e and _is_rate_limitish(e) for e in errors
-        )
-        if not all_throttled:
-            return results
-        last = results
-        nxt = order[i + 1] if i + 1 < len(order) else None
-        if nxt:
+        if not pending:
+            break
+        batch = [u for _idx, u in pending]
+        results = _KEYLESS_EXTRACTORS[vendor](batch)
+        still_pending: List[tuple] = []
+        for (idx, u), r in zip(pending, results):
+            last_result[idx] = r
+            err = r.get("error", "")
+            if err and _is_vendor_retryable(err):
+                still_pending.append((idx, u))
+                continue
+            if vendor != name and not err:
+                r.setdefault("served_by", vendor)
+            final[idx] = r
+        if still_pending and i + 1 < len(order):
             logger.info(
-                "keyless %s extract throttled; failing over to %s", vendor, nxt
+                "keyless %s extract: %d URL(s) vendor-retryable; "
+                "failing over to %s",
+                vendor, len(still_pending), order[i + 1],
             )
-    return last
+        pending = still_pending
+    for idx, u in pending:  # ring exhausted with URLs still retryable
+        fallback = last_result.get(idx)
+        final[idx] = fallback if fallback is not None else {
+            "url": u, "title": "", "content": "",
+            "error": "extract failed on all keyless vendors",
+        }
+    return [r for r in final if r is not None]
