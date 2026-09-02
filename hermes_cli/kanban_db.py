@@ -9449,6 +9449,11 @@ def check_respawn_guard(
         A GitHub PR URL appears in a recent task comment (within
         ``_RESPAWN_GUARD_PR_WINDOW`` seconds).  A prior worker already
         opened a PR; re-spawning risks a duplicate PR on the same task.
+        Bypassed when a re-queue event (``changes_requested`` from the
+        reviewer, ``review_reopened``, or an operator status change /
+        promote / unblock / reclaim) arrives AFTER the PR comment —
+        that turns the comment into the PR to resume, not duplicate
+        work.
 
     Stale / dead claim locks are NOT a guard reason — they are handled
     by ``release_stale_claims`` and ``detect_crashed_workers`` which
@@ -9537,14 +9542,31 @@ def check_respawn_guard(
             return "recent_success"
 
     # 4. GitHub PR URL in a recent comment — prior worker already opened a PR.
+    #    Exception: a re-queue AFTER the freshest PR comment (a reviewer's
+    #    changes_requested / review-reopen, or an operator status change /
+    #    promote / unblock / reclaim) is a deliberate "resume this PR"
+    #    signal — the coder must update the existing PR, not start over, and
+    #    the guard must not strand reviewer-requested rework behind it.
+    #    Without this bypass, every changes-requested card with a live PR
+    #    sits in ready for the full 24h PR window emitting
+    #    respawn_guarded(active_pr) every tick (#t_7fe3363e class).
     pr_cutoff = now - _RESPAWN_GUARD_PR_WINDOW
     for c in conn.execute(
-        "SELECT body FROM task_comments WHERE task_id = ? AND created_at >= ?",
+        "SELECT body, created_at FROM task_comments "
+        "WHERE task_id = ? AND created_at >= ?",
         (task_id, pr_cutoff),
     ).fetchall():
         if c["body"] and _RESPAWN_GUARD_PR_URL_RE.search(c["body"]):
-            return "active_pr"
-
+            requeued_after = conn.execute(
+                "SELECT 1 FROM task_events "
+                "WHERE task_id = ? AND created_at >= ? "
+                "AND kind IN ('changes_requested', 'review_reopened', "
+                "'status', 'promoted', 'unblocked', 'reclaimed') "
+                "LIMIT 1",
+                (task_id, int(c["created_at"] or 0)),
+            ).fetchone()
+            if not requeued_after:
+                return "active_pr"
     return None
 
 
