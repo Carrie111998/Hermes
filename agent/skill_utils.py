@@ -510,6 +510,31 @@ def parse_config_string_list(value) -> List[str]:
 
 
 def _normalize_string_set(values) -> Set[str]:
+    """Parse a disabled-skill config value into a set of skill names.
+
+    Handles the forms produced by different config paths:
+
+    * A YAML list (e.g. ``feishu: [airtable, architecture]``) — iterated
+      directly.
+    * A JSON-array string from ``hermes config set`` / JSON-mode editor
+      saves (``'["a","b"]'``) — parsed via ``parse_config_string_list``
+      (#86661).
+    * A **multi-line YAML block scalar** (e.g. ``"- airtable\\n- architecture"``)
+      — split on newlines, ``- `` prefix stripped from each line.
+    * A single skill name written as a scalar — treated as one element.
+    """
+    if isinstance(values, str) and "\n" in values:
+        # Multi-line block scalar from `hermes config set` → split by line
+        items: list[str] = []
+        for line in values.split("\n"):
+            stripped = line.strip()
+            if stripped.startswith("- "):
+                items.append(stripped[2:])
+            elif stripped.startswith("-"):
+                items.append(stripped[1:])
+            elif stripped:
+                items.append(stripped)
+        values = items
     return {name.strip() for name in parse_config_string_list(values) if name.strip()}
 
 
