@@ -78,6 +78,72 @@ class TestBuildJobPromptContextFrom:
         assert "Today's top story: AI is everywhere." in prompt
         assert f"Output from job '{job_a['id']}'" in prompt
 
+    def test_saved_artifact_injects_response_without_upstream_prompt(self, cron_env):
+        from cron.jobs import create_job, OUTPUT_DIR
+        from cron.scheduler import _build_job_prompt
+
+        upstream = create_job(prompt="Find news", schedule="every 1h")
+        output_dir = OUTPUT_DIR / upstream["id"]
+        output_dir.mkdir(parents=True, exist_ok=True)
+        (output_dir / "2026-08-26_16-25-16.md").write_text(
+            """# Cron Job: upstream
+
+## Prompt
+
+UPSTREAM PROMPT MUST NOT RECURSE
+
+## Response
+
+Useful upstream answer.
+""",
+            encoding="utf-8",
+        )
+
+        downstream = create_job(
+            prompt="Summarize the news",
+            schedule="every 2h",
+            context_from=upstream["id"],
+        )
+
+        prompt = _build_job_prompt(downstream)
+        assert "Useful upstream answer." in prompt
+        assert "UPSTREAM PROMPT MUST NOT RECURSE" not in prompt
+        assert "## Prompt" not in prompt
+
+    def test_failed_artifact_injects_error_without_upstream_prompt(self, cron_env):
+        from cron.jobs import create_job, OUTPUT_DIR
+        from cron.scheduler import _build_job_prompt
+
+        upstream = create_job(prompt="Validate", schedule="every 1h")
+        output_dir = OUTPUT_DIR / upstream["id"]
+        output_dir.mkdir(parents=True, exist_ok=True)
+        (output_dir / "2026-08-26_16-26-00.md").write_text(
+            """# Cron Job: validation (FAILED)
+
+## Prompt
+
+UPSTREAM PROMPT MUST NOT RECURSE
+
+## Error
+
+```
+RuntimeError: provider timeout
+```
+""",
+            encoding="utf-8",
+        )
+
+        downstream = create_job(
+            prompt="Queue actions",
+            schedule="every 2h",
+            context_from=upstream["id"],
+        )
+
+        prompt = _build_job_prompt(downstream)
+        assert "RuntimeError: provider timeout" in prompt
+        assert "UPSTREAM PROMPT MUST NOT RECURSE" not in prompt
+        assert "## Prompt" not in prompt
+
     def test_uses_most_recent_output(self, cron_env):
         from cron.jobs import create_job, OUTPUT_DIR
         from cron.scheduler import _build_job_prompt
@@ -438,5 +504,4 @@ class TestContinuityFlag:
         prompt = _build_job_prompt(job)
         assert "Reported: story A" in prompt
         assert "previous run" in prompt.lower()
-
 

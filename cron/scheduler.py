@@ -64,6 +64,35 @@ from agent.delegation_context import (
 logger = logging.getLogger(__name__)
 
 
+def _extract_cron_context_payload(text: str) -> str:
+    """Extract the useful payload from a persisted cron Markdown artifact.
+
+    Cron output files include the job's original prompt for auditability.  When
+    one job consumes another through ``context_from``, reinjecting that prompt
+    recursively duplicates instructions at every hop.  Prefer the final
+    Response/Error section while preserving legacy plain-text output files.
+    """
+    artifact = (text or "").strip()
+    if not artifact:
+        return ""
+
+    markers = list(re.finditer(r"(?m)^## (Response|Error)\s*$", artifact))
+    if not markers:
+        return artifact
+
+    marker = markers[-1]
+    marker_end = artifact.find("\n", marker.start())
+    if marker_end == -1:
+        return ""
+
+    payload = artifact[marker_end + 1 :].strip()
+    if not payload or payload == "(No response generated)":
+        return ""
+    if marker.group(1) == "Error":
+        return f"## Error\n\n{payload}"
+    return payload
+
+
 def _close_late_session_db_result(future: "concurrent.futures.Future") -> None:
     """Done-callback: close a SessionDB whose constructor finished after run_job's timeout.
 
@@ -4858,7 +4887,9 @@ def _build_job_prompt(
                 )
                 if not output_files:
                     continue  # silent skip — no output yet
-                latest_output = output_files[0].read_text(encoding="utf-8").strip()
+                latest_output = _extract_cron_context_payload(
+                    output_files[0].read_text(encoding="utf-8")
+                )
                 # Truncate to 8K characters to avoid prompt bloat
                 _MAX_CONTEXT_CHARS = 8000
                 if len(latest_output) > _MAX_CONTEXT_CHARS:
