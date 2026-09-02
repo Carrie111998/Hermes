@@ -301,3 +301,84 @@ def test_format_reference_value_round_trips_through_the_parser(value):
 
     assert match is not None
     assert match.group("value").strip("`\"'") == value
+
+
+@pytest.mark.asyncio
+async def test_extra_allowed_root_lets_outside_file_expand(tmp_path: Path):
+    """A staged attachment outside the cwd expands when its dir is passed as
+    an extra allowed root — the file.attach staging dir is never inside the
+    session workspace, so without the extra root every staged @file: ref died
+    with "path is outside the allowed workspace"."""
+    from agent.context_references import preprocess_context_references_async
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    staging = tmp_path / "attachments"
+    staging.mkdir()
+    (staging / "notes.txt").write_text("staged content\n", encoding="utf-8")
+
+    result = await preprocess_context_references_async(
+        f"look at @file:{staging / 'notes.txt'}",
+        cwd=workspace,
+        allowed_root=workspace,
+        extra_allowed_roots=(staging,),
+        context_length=100_000,
+    )
+
+    assert result.expanded
+    assert "staged content" in result.message
+    assert not any("outside the allowed workspace" in w for w in result.warnings)
+
+
+@pytest.mark.asyncio
+async def test_extra_allowed_root_not_granted_without_explicit_param(tmp_path: Path):
+    """The same outside-workspace ref must still be refused when the caller
+    does not widen the roots — the extra root is opt-in, not ambient."""
+    from agent.context_references import preprocess_context_references_async
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    staging = tmp_path / "attachments"
+    staging.mkdir()
+    (staging / "notes.txt").write_text("staged content\n", encoding="utf-8")
+
+    result = await preprocess_context_references_async(
+        f"look at @file:{staging / 'notes.txt'}",
+        cwd=workspace,
+        allowed_root=workspace,
+        context_length=100_000,
+    )
+
+    assert "staged content" not in result.message
+    assert any("outside the allowed workspace" in w for w in result.warnings)
+
+
+@pytest.mark.asyncio
+async def test_extra_allowed_root_keeps_credential_deny_list(tmp_path: Path, monkeypatch):
+    """Widening the root widens WHERE files can live, not WHAT they can be:
+    a secret-bearing file staged inside the extra root must still be refused
+    by the credential deny-list."""
+    from agent.context_references import preprocess_context_references_async
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    staging = tmp_path / "attachments"
+    staging.mkdir()
+    (staging / ".env").write_text("API_KEY=SECRET\n", encoding="utf-8")
+
+    result = await preprocess_context_references_async(
+        f"look at @file:{staging / '.env'}",
+        cwd=workspace,
+        allowed_root=workspace,
+        extra_allowed_roots=(staging,),
+        context_length=100_000,
+    )
+
+    assert "SECRET" not in result.message
+    assert any(
+        "sensitive credential" in warning or "cannot be attached" in warning
+        for warning in result.warnings
+    )

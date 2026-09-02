@@ -13370,6 +13370,9 @@ def _run_prompt_submit(
                     prompt,
                     cwd=cwd,
                     allowed_root=cwd,
+                    extra_allowed_roots=(
+                        str(_desktop_attachment_root(session)),
+                    ),
                     context_length=ctx_len,
                 )
                 if ctx.blocked:
@@ -14401,6 +14404,13 @@ def _attachment_ref_path(session: dict, target: Path) -> str:
         return str(target.resolve())
 
 
+def _desktop_attachment_root(session: dict) -> Path:
+    """The session's file-attachment staging dir, without creating it."""
+    profile_home = session.get("profile_home")
+    base = Path(profile_home) if profile_home else _hermes_home
+    return base / "attachments"
+
+
 def _desktop_attachment_dir(session: dict) -> Path:
     """Resolve the file-attachment staging dir against the session's effective home.
 
@@ -14412,9 +14422,7 @@ def _desktop_attachment_dir(session: dict) -> Path:
     container can never see it (#76577). ``attachments/`` is registered in
     ``tools.credential_files._CACHE_DIRS`` and auto-mounted into containers.
     """
-    profile_home = session.get("profile_home")
-    base = Path(profile_home) if profile_home else _hermes_home
-    root = base / "attachments"
+    root = _desktop_attachment_root(session)
     root.mkdir(parents=True, exist_ok=True)
     return root
 

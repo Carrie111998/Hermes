@@ -10942,13 +10942,16 @@ def test_prompt_submit_expands_context_refs(monkeypatch):
 
     fake_ctx = types.ModuleType("agent.context_references")
     fake_ctx.preprocess_context_references = (
-        lambda message, **kwargs: types.SimpleNamespace(
-            blocked=False,
-            message="expanded prompt",
-            warnings=[],
-            references=[],
-            injected_tokens=0,
-        )
+        lambda message, **kwargs: (
+            captured.update(kwargs),
+            types.SimpleNamespace(
+                blocked=False,
+                message="expanded prompt",
+                warnings=[],
+                references=[],
+                injected_tokens=0,
+            ),
+        )[1]
     )
     fake_meta = types.ModuleType("agent.model_metadata")
     fake_meta.get_model_context_length = lambda *args, **kwargs: 100000
@@ -10970,6 +10973,67 @@ def test_prompt_submit_expands_context_refs(monkeypatch):
     )
 
     assert captured["prompt"] == "expanded prompt"
+
+def test_prompt_submit_passes_attachment_staging_dir_as_extra_allowed_root(monkeypatch, tmp_path):
+    """file.attach stages uploads into the profile home's attachments/ dir,
+    which is never inside the session cwd — prompt expansion must widen its
+    allowed roots with that dir or every staged @file: ref is refused."""
+    captured = {}
+
+    class _Agent:
+        model = "test/model"
+        base_url = ""
+        api_key = ""
+
+        def run_conversation(self, prompt, conversation_history=None, stream_callback=None, **_kwargs):
+            captured["prompt"] = prompt
+            return {
+                "final_response": "ok",
+                "messages": [{"role": "assistant", "content": "ok"}],
+            }
+
+    class _ImmediateThread:
+        def __init__(self, target=None, daemon=None):
+            self._target = target
+
+        def start(self):
+            self._target()
+
+    fake_ctx = types.ModuleType("agent.context_references")
+    fake_ctx.preprocess_context_references = (
+        lambda message, **kwargs: (
+            captured.update(kwargs),
+            types.SimpleNamespace(
+                blocked=False,
+                message="expanded prompt",
+                warnings=[],
+                references=[],
+                injected_tokens=0,
+            ),
+        )[1]
+    )
+    fake_meta = types.ModuleType("agent.model_metadata")
+    fake_meta.get_model_context_length = lambda *args, **kwargs: 100000
+
+    profile_home = tmp_path / "profile-home"
+    server._sessions["sid"] = _session(agent=_Agent(), profile_home=str(profile_home))
+    monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
+    monkeypatch.setattr(server, "_emit", lambda *args, **kwargs: None)
+    monkeypatch.setattr(server, "make_stream_renderer", lambda cols: None)
+    monkeypatch.setattr(server, "render_message", lambda raw, cols: None)
+    monkeypatch.setitem(sys.modules, "agent.context_references", fake_ctx)
+    monkeypatch.setitem(sys.modules, "agent.model_metadata", fake_meta)
+
+    server.handle_request(
+        {
+            "id": "1",
+            "method": "prompt.submit",
+            "params": {"session_id": "sid", "text": "@file:probe.txt"},
+        }
+    )
+
+    extra = captured.get("extra_allowed_roots") or ()
+    assert str(profile_home / "attachments") in [str(Path(p)) for p in extra]
 
 
 def test_image_attach_appends_local_image(monkeypatch):
