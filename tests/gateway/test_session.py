@@ -145,8 +145,10 @@ class TestBuildSessionContextPrompt:
             ctx = build_session_context(source, config)
             return build_session_context_prompt(ctx)
 
-        # Force the Discord IDs block on (it only emits when discord tools load).
-        with patch.object(_gs, "_discord_tools_loaded", return_value=True):
+        # Force the Discord IDs block on and expose only the core action that
+        # can consume the volatile id.
+        with patch.object(_gs, "_discord_tools_loaded", return_value=True), \
+             patch.object(_gs, "_discord_message_id_actions", return_value=("create_thread",)):
             p1 = _prompt_for("1001")
             p2 = _prompt_for("2002")
             p3 = _prompt_for("3003")
@@ -155,6 +157,53 @@ class TestBuildSessionContextPrompt:
         assert "1001" not in p1 and "2002" not in p2 and "3003" not in p3
         # Static pointer tells the agent where the volatile id actually lives.
         assert "provided per-turn in the incoming user message" in p1
+        assert "create_thread" in p1
+        assert "reply/react/pin" not in p1
+
+    def test_discord_message_id_actions_match_loaded_toolsets_and_allowlist(self):
+        from unittest.mock import patch
+        from gateway.session import _discord_message_id_actions
+
+        config = {
+            "platform_toolsets": {"discord": ["discord", "discord_admin"]},
+            "discord": {"server_actions": ["fetch_messages", "pin_message", "delete_message"]},
+        }
+        with patch("agent.secret_scope.get_secret", return_value="token"), \
+             patch("hermes_cli.config.load_config", return_value=config):
+            assert _discord_message_id_actions() == ("pin_message", "delete_message")
+
+    def test_discord_core_only_promises_create_thread_for_message_id(self):
+        from unittest.mock import patch
+        from gateway.session import _discord_message_id_actions
+
+        config = {"platform_toolsets": {"discord": ["discord"]}}
+        with patch("agent.secret_scope.get_secret", return_value="token"), \
+             patch("hermes_cli.config.load_config", return_value=config):
+            assert _discord_message_id_actions() == ("create_thread",)
+
+    def test_discord_message_id_note_names_only_available_actions(self):
+        from unittest.mock import patch
+        from gateway.session import _format_discord_message_id_note
+
+        with patch(
+            "gateway.session._discord_message_id_actions",
+            return_value=("create_thread", "pin_message"),
+        ):
+            note = _format_discord_message_id_note("123")
+
+        assert note == (
+            "[Triggering message id: `123` — available as `message_id` for "
+            "these loaded Discord actions: create_thread, pin_message.]"
+        )
+        assert "reply" not in note
+        assert "react" not in note
+
+    def test_discord_message_id_note_omitted_without_compatible_actions(self):
+        from unittest.mock import patch
+        from gateway.session import _format_discord_message_id_note
+
+        with patch("gateway.session._discord_message_id_actions", return_value=()):
+            assert _format_discord_message_id_note("123") is None
 
     def test_slack_prompt_no_tools_shows_disclaimer(self):
         """Without slack toolset loaded, prompt must show the stale-API disclaimer."""

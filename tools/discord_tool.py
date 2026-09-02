@@ -25,6 +25,7 @@ returns a 403 at call time and :func:`_enrich_403` maps it to
 actionable guidance the model can relay to the user.
 """
 
+import inspect
 import json
 import logging
 import threading
@@ -652,6 +653,10 @@ _ADMIN_ACTION_NAMES = frozenset(_ACTIONS.keys()) - _CORE_ACTION_NAMES
 
 _CORE_ACTIONS = {k: v for k, v in _ACTIONS.items() if k in _CORE_ACTION_NAMES}
 _ADMIN_ACTIONS = {k: v for k, v in _ACTIONS.items() if k in _ADMIN_ACTION_NAMES}
+_MESSAGE_ID_ACTION_NAMES = frozenset(
+    name for name, action in _ACTIONS.items()
+    if "message_id" in inspect.signature(action).parameters
+)
 
 # Single-source-of-truth manifest: action → (signature, one-line description).
 # Consumed by :func:`_build_schema` so the schema's top-level description
@@ -759,6 +764,26 @@ def _available_actions(
             continue
         actions.append(name)
     return actions
+
+
+def get_available_message_id_actions(enabled_toolsets: set[str]) -> Tuple[str, ...]:
+    """Return loaded, allowlisted actions that accept ``message_id``.
+
+    The result follows the schema manifest order and intentionally avoids an
+    API capability probe: none of these actions is privileged-intent gated.
+    """
+    allowlist = _load_allowed_actions_config()
+    allowed = set(_available_actions({"has_members_intent": True}, allowlist))
+    return tuple(
+        name
+        for name, _signature, _description in _ACTION_MANIFEST
+        if name in _MESSAGE_ID_ACTION_NAMES
+        and name in allowed
+        and (
+            (name in _CORE_ACTION_NAMES and "discord" in enabled_toolsets)
+            or (name in _ADMIN_ACTION_NAMES and "discord_admin" in enabled_toolsets)
+        )
+    )
 
 
 # ---------------------------------------------------------------------------
