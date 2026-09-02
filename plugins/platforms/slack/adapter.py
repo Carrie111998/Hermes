@@ -7083,8 +7083,7 @@ class SlackAdapter(BasePlatformAdapter):
             # subtype=bot_message with user=None; flag them so the
             # gateway SLACK_ALLOW_BOTS bypass can authorize them
             # (they carry no user_id to match against the allowlist).
-            # Keep main's trusted api_human_users classification authoritative.
-            is_bot=self._event_declares_bot_sender(event),
+            is_bot=sender_is_bot,
         )
         # Transport-local privacy and replay signals. They are intentionally not
         # serialized: an older relay cannot assert a private one-to-one surface.

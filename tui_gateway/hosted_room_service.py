@@ -985,7 +985,7 @@ class HostedRoomService:
                 str(command["request_id"]),
             )
             if coordinates not in durable:
-                approvals.complete_approval_command(
+                approvals.expire_unstarted_approval_command(
                     self.db_path,
                     command_id=command["command_id"],
                     result="Approval was already resolved.",
@@ -1024,6 +1024,12 @@ class HostedRoomService:
                     self.db_path,
                     command_id=command["command_id"],
                     result=result,
+                )
+            except approvals.MessagingApprovalTerminalError as exc:
+                approvals.expire_unstarted_approval_command(
+                    self.db_path,
+                    command_id=command["command_id"],
+                    result=str(exc),
                 )
             except Exception as exc:
                 logger.warning(
@@ -1228,7 +1234,7 @@ class HostedRoomService:
 
         try:
             room = self._owned_room(room_id)
-        except hosted_rooms.RoomNotFoundError:
+        except (hosted_rooms.RoomNotFoundError, driver.RoomUnavailableError):
             approvals.clear_pending_approval(
                 self.db_path,
                 room_id=room_id,
@@ -1295,32 +1301,41 @@ class HostedRoomService:
             )
         if choice not in {"once", "deny"}:
             raise RuntimeError("room approval choice must be once or deny")
-        approve = getattr(client, "approve_receipt", None)
-        if route is not None and callable(approve):
-            result = approve(
-                task_id=task_id,
-                execution_generation=execution_generation,
-                request_id=requested_approval_id,
-                choice=choice,
-                grant=route.grant,
-            )
-        else:
-            session_id = str(action.get("session_id") or "")
-            profile = str(action.get("profile") or "")
-            if not session_id:
-                raise RuntimeError("local room approval identity is unavailable")
-            if profile:
-                resumed = self.rpc.resume(
-                    profile=profile,
-                    session_id=session_id,
-                    source=ROOM_SESSION_SOURCE,
+
+        def apply():
+            approve = getattr(client, "approve_receipt", None)
+            if route is not None and callable(approve):
+                return approve(
+                    task_id=task_id,
+                    execution_generation=execution_generation,
+                    request_id=requested_approval_id,
+                    choice=choice,
+                    grant=route.grant,
                 )
-                session_id = str((resumed or {}).get("session_id") or session_id)
-            result = self.rpc.approve(
-                session_id=session_id,
-                request_id=requested_approval_id,
-                choice=choice,
-            )
+            else:
+                session_id = str(action.get("session_id") or "")
+                profile = str(action.get("profile") or "")
+                if not session_id:
+                    raise RuntimeError("local room approval identity is unavailable")
+                if profile:
+                    resumed = self.rpc.resume(
+                        profile=profile,
+                        session_id=session_id,
+                        source=ROOM_SESSION_SOURCE,
+                    )
+                    session_id = str((resumed or {}).get("session_id") or session_id)
+                return self.rpc.approve(
+                    session_id=session_id,
+                    request_id=requested_approval_id,
+                    choice=choice,
+                )
+
+        result = approvals.apply_pending_decision(
+            self.db_path,
+            pending={**action, "room_id": room_id, "member_id": member_id},
+            choice=choice,
+            apply=apply,
+        )
         if not isinstance(result, Mapping) or int(result.get("resolved") or 0) != 1:
             raise RuntimeError("room approval target did not resolve the exact request")
         for attempt in range(2):

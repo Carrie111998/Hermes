@@ -7,7 +7,7 @@ import json
 import re
 import sqlite3
 import time
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any
 
@@ -144,6 +144,7 @@ def _initialize(conn: sqlite3.Connection) -> None:
                request_id TEXT NOT NULL,
                choice TEXT NOT NULL CHECK (choice IN ('once', 'deny')),
                state TEXT NOT NULL CHECK (state IN ('pending', 'completed')),
+               application_started_at REAL,
                result_text TEXT,
                created_at REAL NOT NULL,
                updated_at REAL NOT NULL,
@@ -154,6 +155,36 @@ def _initialize(conn: sqlite3.Connection) -> None:
                )
            )"""
     )
+    columns = {
+        str(row[1])
+        for row in conn.execute(
+            "PRAGMA table_info(hosted_room_messaging_approval_commands)"
+        )
+    }
+    if "application_started_at" not in columns:
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            columns = {
+                str(row[1])
+                for row in conn.execute(
+                    "PRAGMA table_info(hosted_room_messaging_approval_commands)"
+                )
+            }
+            if "application_started_at" not in columns:
+                conn.execute(
+                    "ALTER TABLE hosted_room_messaging_approval_commands "
+                    "ADD COLUMN application_started_at REAL"
+                )
+                # Old pending receipts may represent an applied decision whose
+                # reply was lost; absence of tracking is not proof of no action.
+                conn.execute(
+                    "UPDATE hosted_room_messaging_approval_commands "
+                    "SET application_started_at=updated_at WHERE state='pending'"
+                )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
 
 
 def _prune_locked(conn: sqlite3.Connection, *, now: float) -> None:
@@ -631,6 +662,117 @@ def list_all_pending_approval_commands(
     return [dict(row) for row in rows]
 
 
+def expire_unstarted_approval_command(
+    db_path: Path | str, *, command_id: str, result: str
+) -> bool:
+    """Expire only a decision that has never crossed the application boundary."""
+    conn = _connect(db_path)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        command = conn.execute(
+            "SELECT * FROM hosted_room_messaging_approval_commands "
+            "WHERE command_id=? AND state='pending' AND application_started_at IS NULL",
+            (_identifier(command_id, label="command_id"),),
+        ).fetchone()
+        if command is None:
+            conn.commit()
+            return False
+        conn.execute(
+            "UPDATE hosted_room_messaging_approval_commands "
+            "SET state='completed', result_text=?, updated_at=? WHERE command_id=?",
+            (_text(result), time.time(), command_id),
+        )
+        conn.execute(
+            "DELETE FROM hosted_room_pending_approvals WHERE room_id=? "
+            "AND member_id=? AND request_id=? AND authority_gateway_id=? "
+            "AND authority_epoch=? AND task_id=? AND execution_generation=?",
+            tuple(
+                command[key]
+                for key in (
+                    "room_id",
+                    "member_id",
+                    "request_id",
+                    "authority_gateway_id",
+                    "authority_epoch",
+                    "task_id",
+                    "execution_generation",
+                )
+            ),
+        )
+        conn.commit()
+        return True
+    finally:
+        conn.close()
+
+
+def apply_pending_decision(
+    db_path: Path | str,
+    *,
+    pending: Mapping[str, Any],
+    choice: str,
+    apply: Callable[[], Mapping[str, Any]],
+) -> Mapping[str, Any]:
+    """Journal an exact decision before RPC without holding SQLite over I/O."""
+    coordinates = "\0".join(str(pending[field]) for field in _APPROVAL_SCOPE_FIELDS)
+    plan = begin_approval_command(
+        db_path,
+        command_id="approval:" + hashlib.sha256(coordinates.encode()).hexdigest(),
+        pending=pending,
+        choice=choice,
+    )
+    conn = _connect(db_path)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        command = conn.execute(
+            "SELECT state, result_text FROM hosted_room_messaging_approval_commands "
+            "WHERE command_id=?",
+            (plan["command_id"],),
+        ).fetchone()
+        if command is None:
+            raise MessagingApprovalTerminalError(
+                "Approval receipt is no longer available."
+            )
+        if command["state"] == "completed":
+            conn.commit()
+            if command["result_text"] in {"Approved once.", "Denied."}:
+                return {"resolved": 1}
+            raise MessagingApprovalTerminalError(str(command["result_text"]))
+        _require_observer_lease(conn, pending, now=time.time())
+        if (
+            conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' "
+                "AND name='hosted_room_disband_fences'"
+            ).fetchone()
+            is not None
+            and conn.execute(
+                "SELECT 1 FROM hosted_room_disband_fences WHERE room_id=?",
+                (pending["room_id"],),
+            ).fetchone()
+            is not None
+        ):
+            raise MessagingApprovalTerminalError(
+                "Approval expired because the Group Chat is no longer available."
+            )
+        conn.execute(
+            "UPDATE hosted_room_messaging_approval_commands "
+            "SET application_started_at=COALESCE(application_started_at, ?), updated_at=? "
+            "WHERE command_id=?",
+            (time.time(), time.time(), plan["command_id"]),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    result = apply()
+    if not isinstance(result, Mapping) or int(result.get("resolved") or 0) != 1:
+        raise RuntimeError("room approval target did not resolve the exact request")
+    complete_approval_command(
+        db_path,
+        command_id=plan["command_id"],
+        result="Approved once." if plan["choice"] == "once" else "Denied.",
+    )
+    return result
+
+
 def terminalize_unowned_approval_commands(
     db_path: Path | str,
     *,
@@ -645,7 +787,7 @@ def terminalize_unowned_approval_commands(
         reason = ""
         try:
             room = hosted_rooms.room_state(db_path, room_id=command["room_id"])
-        except (hosted_rooms.RoomNotFoundError, hosted_rooms.RoomQuarantinedError):
+        except (hosted_rooms.RoomNotFoundError, hosted_rooms.AuthorityConflictError):
             reason = "Approval expired because the Group Chat is no longer available."
         else:
             if (
@@ -657,20 +799,29 @@ def terminalize_unowned_approval_commands(
                 reason = "Approval expired because Group Chat authority changed."
         if not reason:
             continue
-        clear_pending_approval(
-            db_path,
-            room_id=command["room_id"],
-            member_id=command["member_id"],
-            request_id=command["request_id"],
-            authority_gateway_id=command["authority_gateway_id"],
-            authority_epoch=command["authority_epoch"],
-        )
-        complete_approval_command(
+        expired = expire_unstarted_approval_command(
             db_path,
             command_id=command["command_id"],
             result=reason,
         )
-        completed += 1
+        completed += int(expired)
+    return completed
+
+
+def terminalize_room_approval_commands(
+    db_path: Path | str,
+    *,
+    room_id: str,
+    result: str,
+) -> int:
+    completed = 0
+    for command in list_pending_approval_commands(db_path, room_id=room_id):
+        expired = expire_unstarted_approval_command(
+            db_path,
+            command_id=command["command_id"],
+            result=result,
+        )
+        completed += int(expired)
     return completed
 
 
@@ -756,17 +907,22 @@ def submit_approval(
             )
         except MessagingApprovalTerminalError as exc:
             result = _text(exc) or "Approval is no longer available."
-            complete_approval_command(
+            expired = expire_unstarted_approval_command(
                 db_path,
                 command_id=plan["command_id"],
                 result=result,
             )
+            if not expired:
+                receipt = approval_command(db_path, command_id=plan["command_id"])
+                if receipt is None or receipt["state"] != "completed":
+                    return {**plan, "queued": True}
+                result = str(receipt["result_text"])
             return {
                 **plan,
                 "state": "completed",
                 "result": result,
                 "queued": False,
-                "applied": False,
+                "applied": result in {"Approved once.", "Denied."},
             }
         except Exception:
             return {**plan, "queued": True}

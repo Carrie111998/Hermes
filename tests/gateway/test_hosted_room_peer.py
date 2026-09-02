@@ -19,6 +19,7 @@ from gateway.hosted_room_peer import (
     PROTOCOL_VERSION,
     RoomLinkProbe,
     catalog_mapping,
+    decode_room_grant,
     derive_room_grant_secret,
     gateway_room_grant_secret,
     issue_room_grant,
