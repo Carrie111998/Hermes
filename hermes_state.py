@@ -3554,24 +3554,41 @@ def _db_opens_cleanly(db_path: Path) -> Optional[str]:
                 # while reads of the FTS5 table itself parse fine.
                 return f"fts5 read probe failed on {fts_table}: {exc}"
 
-        # FTS write probe: drive a row through the messages_fts* triggers in a
+        # FTS write probe: drive rows through the messages_fts* triggers in a
         # transaction that is always rolled back, so a corrupt FTS index that
         # rejects writes is caught even though reads look healthy. The probe is
         # best-effort — if the messages/sessions tables don't exist yet (brand
         # new file mid-init) the OperationalError is treated as "not yet a
         # populated DB", not corruption.
         probe_session_id = f"_hermes_fts_health_probe_{time.time_ns()}"
+        # Several distinct contents, not one fixed string: FTS5 shadow-table
+        # damage can be segment-state dependent (#100227) — a probe whose
+        # trigram tokens land in a healthy segment succeeds while real user
+        # messages whose terms hit the corrupt (segid, term) key range fail
+        # with IntegrityError. The variants widen which segments get
+        # exercised: high-frequency English trigrams are the most likely to
+        # be populated, and the per-run unique token samples a fresh key
+        # range each run. Content probing stays heuristic — it narrows this
+        # corruption class without eliminating it; an inspection-based
+        # shadow-table consistency check is the deterministic complement.
+        probe_variants = (
+            "_fts_health_probe",
+            "the quick brown fox jumps over the lazy dog and then the team "
+            "said it was one of those things for the project",
+            f"hermes fts health probe unique token {time.time_ns()}",
+        )
         try:
             conn.execute("BEGIN IMMEDIATE")
             conn.execute(
                 "INSERT INTO sessions (id, source, started_at) VALUES (?, ?, ?)",
                 (probe_session_id, "_health_probe", time.time()),
             )
-            conn.execute(
-                "INSERT INTO messages (session_id, role, content, timestamp) "
-                "VALUES (?, ?, ?, ?)",
-                (probe_session_id, "user", "_fts_health_probe", time.time()),
-            )
+            for probe_content in probe_variants:
+                conn.execute(
+                    "INSERT INTO messages (session_id, role, content, timestamp) "
+                    "VALUES (?, ?, ?, ?)",
+                    (probe_session_id, "user", probe_content, time.time()),
+                )
             conn.execute("ROLLBACK")
         except sqlite3.OperationalError as exc:
             # Missing tables / FTS disabled — not the corruption class we probe.
@@ -3589,6 +3606,18 @@ def _db_opens_cleanly(db_path: Path) -> Optional[str]:
                 # a tokenizer-less one self-heals by dropping the triggers.
                 return None
             return str(exc)
+        except sqlite3.IntegrityError as exc:
+            # Segment-dependent FTS corruption surfaces as a shadow-table
+            # constraint violation (PRIMARY KEY (segid, term) collision in
+            # messages_fts_trigram_idx, #100227) — IntegrityError, not
+            # OperationalError. Roll back so the probe stays
+            # non-destructive, and label the reason so the operator is sent
+            # to the FTS index, not the base tables.
+            try:
+                conn.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass
+            return f"fts write probe failed: {exc}"
         return None
     except sqlite3.DatabaseError as exc:
         return str(exc)
