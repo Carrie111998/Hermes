@@ -3565,6 +3565,25 @@ def create_task(
                         "provider_override": provider_override,
                     },
                 )
+                # ``recompute_ready`` treats an explicit ``blocked`` event as
+                # the durable marker that an operator block is sticky.  A task
+                # created directly in ``blocked`` previously had only the
+                # status in its row / ``created`` payload, so the next
+                # dispatcher tick promoted parentless gates to ``ready`` and
+                # could spawn them.  Record the same lifecycle marker used by
+                # ``block_task`` so initial blocked gates remain fail-closed.
+                if task_status == "blocked":
+                    _append_event(
+                        conn,
+                        task_id,
+                        "blocked",
+                        {
+                            "reason": "initial_status=blocked",
+                            "kind": None,
+                            "recurrences": 0,
+                            "source_status": "created",
+                        },
+                    )
                 _inherit_notify_subs(conn, task_id, parents, created_at=now)
             return task_id
         except sqlite3.IntegrityError:
