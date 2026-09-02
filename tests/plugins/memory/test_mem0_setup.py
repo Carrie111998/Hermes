@@ -12,6 +12,7 @@ from plugins.memory.mem0._setup import (
     build_oss_config,
     _write_env,
     _prompt_api_key,
+    _validate_entity_id,
     post_setup,
     _check_qdrant_path,
     _check_ollama,
@@ -244,6 +245,49 @@ class TestDryRun:
     def test_dry_run_flag_parsed(self):
         flags = parse_flags(["--mode", "oss", "--oss-llm-key", "sk-oai", "--dry-run"])
         assert flags["dry_run"] is True
+
+
+class TestEntityIdValidation:
+    """#97922: mem0ai rejects entity ids containing whitespace on the first
+    memory operation; OSS setup must apply the same contract before saving."""
+
+    def test_validate_entity_id_contract(self):
+        assert _validate_entity_id("hermes-user", "user_id") is None
+        assert _validate_entity_id("  spaced-user  ", "user_id") is None
+        assert "cannot be empty" in _validate_entity_id("", "user_id")
+        assert "cannot be empty" in _validate_entity_id("   ", "user_id")
+        assert "cannot contain whitespace" in _validate_entity_id("user alpha", "user_id")
+        assert "cannot contain whitespace" in _validate_entity_id("agent\talpha", "agent_id")
+
+    def test_oss_flag_mode_rejects_whitespace_user_id(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("sys.argv", [
+            "hermes", "--mode", "oss", "--oss-llm", "openai",
+            "--oss-llm-key", "sk-test", "--user-id", "user alpha",
+        ])
+        monkeypatch.setattr("plugins.memory.mem0._setup.get_hermes_home", lambda: tmp_path)
+        _inject_fake_hermes_cli(monkeypatch)
+        monkeypatch.setattr("plugins.memory.mem0._setup._install_provider_deps", lambda *a: None)
+        monkeypatch.setattr("plugins.memory.mem0._setup._run_connectivity_checks", lambda c: None)
+        config = {"memory": {}}
+        with pytest.raises(SystemExit) as ei:
+            post_setup(str(tmp_path), config)
+        assert ei.value.code == 1
+        assert not (tmp_path / "mem0.json").exists()
+
+    def test_oss_flag_mode_saves_trimmed_user_id(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("sys.argv", [
+            "hermes", "--mode", "oss", "--oss-llm", "openai",
+            "--oss-llm-key", "sk-test", "--user-id", "  hermes-user  ",
+        ])
+        monkeypatch.setattr("plugins.memory.mem0._setup.get_hermes_home", lambda: tmp_path)
+        _inject_fake_hermes_cli(monkeypatch)
+        monkeypatch.setattr("plugins.memory.mem0._setup._install_provider_deps", lambda *a: None)
+        monkeypatch.setattr("plugins.memory.mem0._setup._run_connectivity_checks", lambda c: None)
+        config = {"memory": {}}
+        post_setup(str(tmp_path), config)
+        assert config["memory"]["provider"] == "mem0"
+        mem0_json = json.loads((tmp_path / "mem0.json").read_text())
+        assert mem0_json["user_id"] == "hermes-user"  # outer whitespace trimmed
 
 
 class TestConnectivityChecks:

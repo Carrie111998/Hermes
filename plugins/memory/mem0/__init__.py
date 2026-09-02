@@ -355,6 +355,22 @@ class Mem0MemoryProvider(MemoryProvider):
             configured = None
         self._user_id = configured or kwargs.get("user_id") or _DEFAULT_USER_ID
         self._agent_id = self._config.get("agent_id", "hermes")
+        # mem0ai's OSS Memory.add() rejects entity ids containing whitespace
+        # on the first memory operation, leaving a configured-but-unusable
+        # provider (#97922). Values persisted before that contract was
+        # enforced at setup time are rejected here, at initialization, with
+        # the same rule — the memory stack degrades instead of failing at
+        # first use. Only the OSS backend runs mem0ai's local validator, so
+        # other modes keep their own (server-side) contracts.
+        if self._mode == "oss":
+            from ._setup import _validate_entity_id
+
+            for name, value in (("user_id", configured), ("agent_id", self._agent_id)):
+                if value is None:
+                    continue
+                err = _validate_entity_id(str(value), name)
+                if err:
+                    raise ValueError(f"mem0.json: {err}")
         # Persisted rerank preference (setup wizard / mem0.json). Used as the
         # DEFAULT for mem0_search when the model doesn't pass ``rerank``
         # explicitly; per-call args still win. Platform-only feature — other

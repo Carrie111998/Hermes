@@ -51,6 +51,22 @@ def _prompt(label: str, default: str | None = None, secret: bool = False) -> str
     return val or (default or "")
 
 
+def _validate_entity_id(value: str, name: str) -> str | None:
+    """Apply mem0ai's entity-ID contract before a value is saved (#97922).
+
+    Mirrors ``_validate_and_trim_entity_id`` in the pinned mem0ai
+    (trim outer whitespace, reject blank, reject internal whitespace) so an
+    identifier the SDK would reject on the first memory operation fails at
+    setup time instead. Returns an error message, or None when valid.
+    """
+    trimmed = value.strip()
+    if not trimmed:
+        return f"Invalid {name}: cannot be empty or whitespace-only."
+    if any(c.isspace() for c in trimmed):
+        return f"Invalid {name}: cannot contain whitespace (got {value!r})."
+    return None
+
+
 def has_oss_flags() -> bool:
     """Check if OSS-related flags are present in sys.argv."""
     flags = parse_flags(sys.argv[1:])
@@ -457,7 +473,11 @@ def _setup_oss(hermes_home: str, config: dict, flags: dict[str, str]) -> None:
             print(f"  Error: {e}", file=sys.stderr)
         sys.exit(1)
 
-    user_id = flags.get("user_id") or os.getenv("USER", "hermes-user")
+    user_id = (flags.get("user_id") or os.getenv("USER", "hermes-user")).strip()
+    err = _validate_entity_id(user_id, "user_id")
+    if err:
+        print(f"  Error: {err}", file=sys.stderr)
+        sys.exit(1)
 
     llm_id = oss_config["llm"]["provider"]
     embedder_id = oss_config["embedder"]["provider"]
@@ -806,6 +826,12 @@ def _setup_oss_interactive(hermes_home: str, config: dict) -> None:
 
     agent_id = input("  Agent ID [hermes]: ").strip()
     agent_id = agent_id or "hermes"
+
+    for name, value in (("user_id", user_id), ("agent_id", agent_id)):
+        err = _validate_entity_id(value, name)
+        if err:
+            print(f"  Error: {err}", file=sys.stderr)
+            return
 
     flags = {
         "oss_llm": llm_id,
