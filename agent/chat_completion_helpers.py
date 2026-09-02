@@ -2376,6 +2376,7 @@ def build_assistant_message(agent, assistant_message, finish_reason: str) -> dic
             getattr(agent, "provider", None),
             getattr(agent, "model", None),
             getattr(agent, "base_url", None),
+            getattr(agent, "api_mode", None),
         )
 
     # Anthropic interleaved-thinking replay: when a turn interleaves signed
@@ -2811,13 +2812,14 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
             _replay_field = _replay_field.strip().lower()
         agent._reasoning_replay_field = (
             _replay_field
-            if _replay_field in {"reasoning", "reasoning_content"}
+            if _replay_field
+            in {"auto", "reasoning", "reasoning_content", "none"}
             else None
         )
         _compressor = getattr(agent, "context_compressor", None)
         if _compressor is not None:
             _compressor.replay_historical_reasoning = bool(
-                agent._reasoning_replay_field
+                agent._reasoning_replay_field_for_api()
             )
         if hasattr(agent, "_transport_cache"):
             agent._transport_cache.clear()

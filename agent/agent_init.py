@@ -526,7 +526,12 @@ def _custom_provider_reasoning_replay_field_for_agent(
         replay_field = entry.get("reasoning_replay_field")
         if isinstance(replay_field, str):
             replay_field = replay_field.strip().lower()
-        if replay_field not in {"reasoning", "reasoning_content"}:
+        if replay_field not in {
+            "auto",
+            "reasoning",
+            "reasoning_content",
+            "none",
+        }:
             continue
         if _custom_provider_model_matches(model, entry):
             if entry.get("model") or entry.get("models"):
@@ -2903,7 +2908,9 @@ def init_agent(
             proactive_prune_min_reclaim_tokens=compression_proactive_prune_min_reclaim,
             min_tail_user_messages=compression_min_tail_users,
             tail_mode=compression_tail_mode,
-            replay_historical_reasoning=bool(agent._reasoning_replay_field),
+            replay_historical_reasoning=bool(
+                agent._reasoning_replay_field_for_api()
+            ),
         )
     _bind_session_state = getattr(agent.context_compressor, "bind_session_state", None)
     if callable(_bind_session_state):

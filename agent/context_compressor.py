@@ -6704,6 +6704,11 @@ This compaction should PRIORITISE preserving all information related to the focu
                 getattr(self, "provider", "") or "",
                 getattr(self, "model", "") or "",
                 getattr(self, "base_url", "") or "",
+                reasoning_replay_field=(
+                    "reasoning"
+                    if getattr(self, "replay_historical_reasoning", False)
+                    else None
+                ),
             )
         except Exception:
             return False
