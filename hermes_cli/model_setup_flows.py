@@ -1466,6 +1466,24 @@ def _model_flow_azure_foundry(config, current_model=""):
         print("No model name provided. Cancelled.")
         return
 
+    # GPT-5.x / o-series / codex deployments on Azure Foundry only accept
+    # the Responses API — /chat/completions 400s with "The requested
+    # operation is unsupported." The transport auto-detect above only
+    # distinguishes OpenAI-style vs Anthropic-style (chat_completions vs
+    # anthropic_messages), so an OpenAI-style gpt-5.x/o-series/codex
+    # deployment picked here would otherwise be saved as plain
+    # chat_completions and fail at call time. Upgrade using the same
+    # per-model inference the main runtime resolver applies
+    # (azure_foundry_model_api_mode), unless the user is on the
+    # Anthropic-style wire (never upgrade that).
+    if api_mode == "chat_completions":
+        from hermes_cli.models import azure_foundry_model_api_mode
+
+        _inferred_mode = azure_foundry_model_api_mode(effective_model)
+        if _inferred_mode:
+            api_mode = _inferred_mode
+            print(f"✓ {effective_model} requires the Responses API on Azure Foundry — using {api_mode}")
+
     # ── Step 6: context-length lookup ────────────────────────────────
     ctx_len = azure_detect.lookup_context_length(
         effective_model,
