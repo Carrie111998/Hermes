@@ -1,4 +1,11 @@
-import { createContext, useContext, useState, useCallback, useEffect, type ReactNode } from "react";
+import {
+  createContext,
+  useContext,
+  useState,
+  useCallback,
+  useEffect,
+  type ReactNode,
+} from "react";
 import type { Locale, Translations } from "./types";
 import { en } from "./en";
 import { zh } from "./zh";
@@ -17,6 +24,7 @@ import { pt } from "./pt";
 import { ru } from "./ru";
 import { hu } from "./hu";
 import { ar } from "./ar";
+import { sv } from "./sv";
 
 const TRANSLATIONS: Record<Locale, Translations> = {
   en,
@@ -36,6 +44,7 @@ const TRANSLATIONS: Record<Locale, Translations> = {
   ru,
   hu,
   ar,
+  sv,
 };
 
 // Locales whose script flows right-to-left. Consumed by the provider to set the
@@ -69,6 +78,7 @@ export const LOCALE_META: Record<Locale, { name: string }> = {
   ru: { name: "Русский" },
   hu: { name: "Magyar" },
   ar: { name: "العربية" },
+  sv: { name: "Svenska" },
 };
 
 const SUPPORTED_LOCALES = Object.keys(TRANSLATIONS) as Locale[];
@@ -124,11 +134,7 @@ export function I18nProvider({ children }: { children: ReactNode }) {
     t: TRANSLATIONS[locale],
   };
 
-  return (
-    <I18nContext.Provider value={value}>
-      {children}
-    </I18nContext.Provider>
-  );
+  return <I18nContext.Provider value={value}>{children}</I18nContext.Provider>;
 }
 
 export function useI18n() {
