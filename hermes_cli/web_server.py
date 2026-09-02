@@ -5776,6 +5776,12 @@ async def speak_stream_ws(ws: "WebSocket") -> None:
         await ws.close(code=4403)
         return
     await ws.accept()
+    from hermes_cli.ssh_isolated_liveness import (
+        note_ssh_isolated_client_close,
+        note_ssh_isolated_client_open,
+    )
+
+    note_ssh_isolated_client_open()
 
     # Profile via query param, like /api/pty and /api/console: the provider
     # chain + API keys must resolve from the requesting profile's config, not
@@ -5804,6 +5810,7 @@ async def speak_stream_ws(ws: "WebSocket") -> None:
         with contextlib.suppress(Exception):
             await ws.send_json({"type": "fallback"})
             await ws.close()
+        note_ssh_isolated_client_close()
         return
 
     await ws.send_json(
@@ -5901,6 +5908,7 @@ async def speak_stream_ws(ws: "WebSocket") -> None:
         pump.cancel()
         with contextlib.suppress(Exception):
             await ws.close()
+        note_ssh_isolated_client_close()
 
 
 @app.get("/api/actions/{name}/status")
@@ -17326,6 +17334,12 @@ async def console_ws(ws: WebSocket) -> None:
         return
 
     await ws.accept()
+    from hermes_cli.ssh_isolated_liveness import (
+        note_ssh_isolated_client_close,
+        note_ssh_isolated_client_open,
+    )
+
+    note_ssh_isolated_client_open()
 
     profile = _console_profile_from_ws(ws)
     send_lock = asyncio.Lock()
@@ -17347,6 +17361,7 @@ async def console_ws(ws: WebSocket) -> None:
             },
         )
         await ws.close(code=4400, reason=_ws_close_reason(str(exc.detail)))
+        note_ssh_isolated_client_close()
         return
     except Exception as exc:
         _log.exception("console failed to initialize")
@@ -17360,6 +17375,7 @@ async def console_ws(ws: WebSocket) -> None:
             },
         )
         await ws.close(code=1011)
+        note_ssh_isolated_client_close()
         return
 
     _log.info(
@@ -17642,6 +17658,7 @@ async def console_ws(ws: WebSocket) -> None:
                 await active_task
             except (asyncio.CancelledError, Exception):
                 pass
+        note_ssh_isolated_client_close()
 
 
 @app.websocket("/api/pty")
@@ -17682,6 +17699,12 @@ async def pty_ws(ws: WebSocket) -> None:
         return
 
     await ws.accept()
+    from hermes_cli.ssh_isolated_liveness import (
+        note_ssh_isolated_client_close,
+        note_ssh_isolated_client_open,
+    )
+
+    note_ssh_isolated_client_open()
     _log.info("pty accepted peer=%s mode=%s cred=%s", peer, mode, cred)
 
     # On native Windows, the POSIX PTY bridge can't be imported.  Tell the
@@ -17694,6 +17717,7 @@ async def pty_ws(ws: WebSocket) -> None:
             "tab — the rest of the dashboard works here.\x1b[0m\r\n"
         )
         await ws.close(code=1011)
+        note_ssh_isolated_client_close()
         return
 
     # --- spawn PTY ------------------------------------------------------
@@ -17738,11 +17762,13 @@ async def pty_ws(ws: WebSocket) -> None:
         # Unknown/invalid profile from _resolve_profile_dir.
         await ws.send_text(f"\r\n\x1b[31mChat unavailable: {exc.detail}\x1b[0m\r\n")
         await ws.close(code=1011)
+        note_ssh_isolated_client_close()
         return
     except SystemExit as exc:
         # _make_tui_argv calls sys.exit(1) when node/npm is missing.
         await ws.send_text(f"\r\n\x1b[31mChat unavailable: {exc}\x1b[0m\r\n")
         await ws.close(code=1011)
+        note_ssh_isolated_client_close()
         return
 
 
@@ -17764,12 +17790,17 @@ async def pty_ws(ws: WebSocket) -> None:
         except PtyUnavailableError as exc:
             await ws.send_text(f"\r\n\x1b[31mChat unavailable: {exc}\x1b[0m\r\n")
             await ws.close(code=1011)
+            note_ssh_isolated_client_close()
             return
         except (FileNotFoundError, OSError) as exc:
             await ws.send_text(f"\r\n\x1b[31mChat failed to start: {exc}\x1b[0m\r\n")
             await ws.close(code=1011)
+            note_ssh_isolated_client_close()
             return
-        await _legacy_pump(ws, bridge)
+        try:
+            await _legacy_pump(ws, bridge)
+        finally:
+            note_ssh_isolated_client_close()
         return
 
     # Keep-alive path: the PTY outlives this socket; reattach by token.
@@ -17780,10 +17811,12 @@ async def pty_ws(ws: WebSocket) -> None:
     except PtyUnavailableError as exc:
         await ws.send_text(f"\r\n\x1b[31mChat unavailable: {exc}\x1b[0m\r\n")
         await ws.close(code=1011)
+        note_ssh_isolated_client_close()
         return
     except (FileNotFoundError, OSError, RegistryFull) as exc:
         await ws.send_text(f"\r\n\x1b[31mChat unavailable: {exc}\x1b[0m\r\n")
         await ws.close(code=1011)
+        note_ssh_isolated_client_close()
         return
 
     # A fresh xterm cannot reliably reconstruct the TUI from an arbitrary
@@ -17827,6 +17860,7 @@ async def pty_ws(ws: WebSocket) -> None:
         # Detach only — the PTY keeps running for a reattach; the registry
         # reaper closes it after the TTL (or immediately on process exit).
         PTY_REGISTRY.detach(attach_token, ws)
+        note_ssh_isolated_client_close()
 
 
 # ---------------------------------------------------------------------------
@@ -17855,16 +17889,18 @@ async def gateway_ws(ws: WebSocket) -> None:
         return
 
     from tui_gateway.ws import handle_ws
+    from hermes_cli.ssh_isolated_liveness import track_ssh_isolated_ws
 
     # The authenticated identity (ticket / internal credential) was stamped
     # onto the WS object by _ws_auth_reason; carry it into the gateway
     # transport where it becomes the identity authority for privileged RPCs
     # (browser.controller.register). None on the legacy token path.
-    await handle_ws(
-        ws,
-        auth_identity=getattr(ws, "_hermes_auth_identity", None),
-        subprotocol=getattr(ws, "_hermes_ws_subprotocol", None),
-    )
+    with track_ssh_isolated_ws():
+        await handle_ws(
+            ws,
+            auth_identity=getattr(ws, "_hermes_auth_identity", None),
+            subprotocol=getattr(ws, "_hermes_ws_subprotocol", None),
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -17900,11 +17936,14 @@ async def pub_ws(ws: WebSocket) -> None:
 
     await ws.accept()
 
-    try:
-        while True:
-            await _broadcast_event(ws.app, channel, await ws.receive_text())
-    except WebSocketDisconnect:
-        pass
+    from hermes_cli.ssh_isolated_liveness import track_ssh_isolated_ws
+
+    with track_ssh_isolated_ws():
+        try:
+            while True:
+                await _broadcast_event(ws.app, channel, await ws.receive_text())
+        except WebSocketDisconnect:
+            pass
 
 
 @app.websocket("/api/events")
@@ -17928,27 +17967,30 @@ async def events_ws(ws: WebSocket) -> None:
 
     await ws.accept()
 
-    event_channels, event_lock = _get_event_state(ws.app)
-    async with event_lock:
-        event_channels.setdefault(channel, set()).add(ws)
+    from hermes_cli.ssh_isolated_liveness import track_ssh_isolated_ws
 
-    try:
-        while True:
-            # Subscribers don't speak — the receive() just blocks until
-            # disconnect so the connection stays open as long as the
-            # browser holds it.
-            await ws.receive_text()
-    except WebSocketDisconnect:
-        pass
-    finally:
+    with track_ssh_isolated_ws():
+        event_channels, event_lock = _get_event_state(ws.app)
         async with event_lock:
-            subs = event_channels.get(channel)
+            event_channels.setdefault(channel, set()).add(ws)
 
-            if subs is not None:
-                subs.discard(ws)
+        try:
+            while True:
+                # Subscribers don't speak — the receive() just blocks until
+                # disconnect so the connection stays open as long as the
+                # browser holds it.
+                await ws.receive_text()
+        except WebSocketDisconnect:
+            pass
+        finally:
+            async with event_lock:
+                subs = event_channels.get(channel)
 
-                if not subs:
-                    event_channels.pop(channel, None)
+                if subs is not None:
+                    subs.discard(ws)
+
+                    if not subs:
+                        event_channels.pop(channel, None)
 
 
 def _normalise_prefix(raw: Optional[str]) -> str:
@@ -19807,6 +19849,21 @@ def start_server(
     _apply_ssh_session_token(ssh_session_token or "")
     _apply_ssh_owner_nonce(ssh_owner_nonce)
 
+    if (ssh_session_token or "").strip():
+        from hermes_cli.ssh_isolated_liveness import (
+            SSH_ISOLATED_HOME_LOCKED_SENTINEL,
+            acquire_ssh_isolated_home_lock,
+        )
+        from hermes_constants import get_hermes_home
+
+        _ssh_home_lock_fd = acquire_ssh_isolated_home_lock(get_hermes_home())
+        if _ssh_home_lock_fd is None:
+            print(SSH_ISOLATED_HOME_LOCKED_SENTINEL, flush=True)
+            raise SystemExit(
+                "Another SSH-isolated Hermes backend already holds this "
+                "HERMES_HOME database; refusing a second writer."
+            )
+
     # Raise RLIMIT_NOFILE for dashboard-mode starts that don't route through
     # the `serve` path in main.py (which applies the same floor). Canonical
     # policy lives in resource_limits; #81547's motivating leak (iterdir fds)
@@ -20030,6 +20087,15 @@ def start_server(
         except (TypeError, ValueError):
             return default
 
+    from hermes_cli.ssh_isolated_liveness import ssh_isolated_ws_ping_window
+
+    _ws_ping_interval, _ws_ping_timeout = ssh_isolated_ws_ping_window(
+        is_loopback=_is_loopback,
+        ssh_session_token=ssh_session_token,
+        default_interval=_ws_ping_setting("ws_ping_interval"),
+        default_timeout=_ws_ping_setting("ws_ping_timeout"),
+    )
+
     config = uvicorn.Config(
         app, host=host, port=port, log_level="warning",
         # proxy_headers defaults to False so _ws_client_is_allowed sees
@@ -20046,12 +20112,12 @@ def start_server(
         # metadata without accepting spoofed X-Forwarded-* headers from every
         # caller.
         forwarded_allow_ips=_dashboard_forwarded_allow_ips(_dash_cfg),
-        # Half-open detection for public binds only (see above). Loopback
-        # disables the protocol ping (None) so an event-loop stall can never
-        # trigger a false disconnect; a genuinely dead local client is still
-        # reaped via the WebSocketDisconnect → disconnect/reap path.
-        ws_ping_interval=None if _is_loopback else _ws_ping_setting("ws_ping_interval"),
-        ws_ping_timeout=None if _is_loopback else _ws_ping_setting("ws_ping_timeout"),
+        # Half-open detection: plain loopback has no network hop, so ping
+        # stays off (#53773). SSH-isolated loopback *is* a tunneled hop
+        # (#101626 — sleeping laptop, ``lastrcv`` while state.db is held),
+        # so ping stays on for that spawn only.
+        ws_ping_interval=_ws_ping_interval,
+        ws_ping_timeout=_ws_ping_timeout,
         ws_max_size=_DESKTOP_ATTACHMENT_WS_MAX_BYTES,
     )
     server = uvicorn.Server(config)
@@ -20125,6 +20191,26 @@ def start_server(
             # tui_gateway/slash_worker.py::_start_parent_death_watchdog. No-op
             # for standalone `hermes serve` (no HERMES_PARENT_PID env).
             _start_parent_death_watchdog()
+            # SSH-isolated remotes have no local parent PID. Idle-exit after
+            # grace when the tunneled client is gone (#101626). No-op without
+            # --ssh-session-token-file.
+            from hermes_cli.ssh_isolated_liveness import (
+                start_ssh_isolated_idle_watchdog,
+            )
+
+            def _ssh_isolated_turn_in_flight() -> bool:
+                try:
+                    from tui_gateway.server import _any_session_running
+
+                    return bool(_any_session_running())
+                except Exception:
+                    return False
+
+            start_ssh_isolated_idle_watchdog(
+                has_ssh_token=bool((ssh_session_token or "").strip()),
+                request_shutdown=lambda: setattr(server, "should_exit", True),
+                turn_probe=_ssh_isolated_turn_in_flight,
+            )
 
             actual_port = _read_bound_port(server, fallback=port)
             app.state.bound_port = actual_port
