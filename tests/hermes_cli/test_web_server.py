@@ -3800,6 +3800,23 @@ class TestNormaliseThemeDefinition:
         assert "seriesColors" not in result
         assert "swatchColors" not in result
 
+    def test_passthrough_trims_and_clamps(self):
+        """Whitespace-padded values are trimmed; 4+ swatch entries clamp to 3."""
+        from hermes_cli.web_server import _normalise_theme_definition
+
+        result = _normalise_theme_definition({
+            "name": "padded",
+            "label": "Padded",
+            "palette": {"background": {"hex": "#101010", "alpha": 1.0}},
+            "terminalBackground": "  #1e1e2e  ",
+            "terminalForeground": "#cdd6f4",
+            "seriesColors": {"inputTokenAccent": " #ff0000 "},
+            "swatchColors": ["#1e1e2e", "#cdd6f4", "#a6e3a1", "#f38ba8", "#94e2d5"],
+        })
+        assert result["terminalBackground"] == "#1e1e2e"
+        assert result["seriesColors"]["inputTokenAccent"] == "#ff0000"
+        assert result["swatchColors"] == ["#1e1e2e", "#cdd6f4", "#a6e3a1"]
+
 
 
 

@@ -18292,11 +18292,11 @@ def _normalise_theme_definition(data: Dict[str, Any]) -> Optional[Dict[str, Any]
     for key in ("terminalBackground", "terminalForeground"):
         val = data.get(key)
         if isinstance(val, str) and val.strip():
-            result[key] = val
+            result[key] = val.strip()
     series_src = data.get("seriesColors")
     if isinstance(series_src, dict):
         series_out = {
-            k: v
+            k: v.strip()
             for k, v in series_src.items()
             if k in ("inputTokenAccent", "outputTokenAccent")
             and isinstance(v, str)
@@ -18305,10 +18305,13 @@ def _normalise_theme_definition(data: Dict[str, Any]) -> Optional[Dict[str, Any]
         if series_out:
             result["seriesColors"] = series_out
     swatch_src = data.get("swatchColors")
-    if isinstance(swatch_src, list) and len(swatch_src) == 3 and all(
-        isinstance(c, str) and c.strip() for c in swatch_src
-    ):
-        result["swatchColors"] = list(swatch_src)
+    if isinstance(swatch_src, list):
+        # Frontend contract is exactly three entries (web/src/themes/types.ts
+        # swatchColors: [string, string, string]); clamp longer lists instead
+        # of dropping the whole theme's swatch.
+        swatch_clamped = [c for c in swatch_src if isinstance(c, str) and c.strip()][:3]
+        if len(swatch_clamped) == 3:
+            result["swatchColors"] = swatch_clamped
     return result
 
 
