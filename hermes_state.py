@@ -4575,6 +4575,86 @@ def quarantine_cross_process_lock(path: Path, timeout: float = 5.0):
             handle.close()
 
 
+def _state_db_single_writer_enabled() -> bool:
+    """Opt-in switch for the singleton-writer flock (2026-09-01 wide-corruption
+    handoff, `hermes-fixer` docs/handoff-next-agent.md and Obsidian ADR 0030
+    "Layer 1"). Off by default: the incident that motivated it (33 profile
+    `state.db` files, some via multiplexed `serve` processes) never confirmed
+    concurrent app-level writers as root cause — the confirmed mechanism was a
+    macOS Time Machine local snapshot racing the live WAL file, which the
+    `tmutil addexclusion` on state.db*/profiles/*/state.db* addresses
+    directly. This flock is defense-in-depth against a *related but distinct*
+    latent risk (two writer processes on the same path), opt-in via env so it
+    can't itself introduce a new startup-hang failure mode for users who
+    never hit that risk.
+    """
+    return os.environ.get("STATE_DB_SINGLE_WRITER", "").strip().lower() in (
+        "1", "true", "yes",
+    )
+
+
+def acquire_state_db_singleton_writer_lock(path: Path):
+    """Best-effort exclusive flock so only one writer process holds *path* open.
+
+    No-op (returns None) unless ``STATE_DB_SINGLE_WRITER`` is truthy in the
+    environment. Kernel-level ``flock`` — same primitive as
+    :func:`quarantine_cross_process_lock` and ``_cross_process_repair_lock`` —
+    so a killed holder (``kill -9`` included) releases automatically instead
+    of wedging every future opener the way a pidfile would. Non-blocking: a
+    second writer fails fast with a clear ``sqlite3.OperationalError`` rather
+    than hanging, since a silent multi-minute stall is exactly the failure
+    shape (gateway housekeeping going dark for 35 minutes) that made the
+    2026-09-01 wide corruption hard to diagnose after the fact.
+
+    Caller owns the returned handle's lifetime — release via
+    :func:`release_state_db_singleton_writer_lock` in ``close()``.
+    """
+    if not _state_db_single_writer_enabled():
+        return None
+    lock_path = path.with_name(path.name + ".singleton.lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    handle = lock_path.open("a+b")
+    try:
+        if _IS_WINDOWS:
+            import msvcrt
+
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except (BlockingIOError, OSError) as exc:
+        handle.close()
+        raise sqlite3.OperationalError(
+            f"state.db singleton-writer lock held by another process "
+            f"({lock_path}) — STATE_DB_SINGLE_WRITER=true forbids a second "
+            f"concurrent writer on {path}. Set STATE_DB_SINGLE_WRITER=false "
+            "to disable this guard."
+        ) from exc
+    return handle
+
+
+def release_state_db_singleton_writer_lock(handle) -> None:
+    """Release a handle from :func:`acquire_state_db_singleton_writer_lock`."""
+    if handle is None:
+        return
+    try:
+        if _IS_WINDOWS:
+            import msvcrt
+
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    except (OSError, AttributeError):
+        pass
+    finally:
+        handle.close()
+
+
 def quarantine_zeroed_state_db(
     path: Path, *, already_locked: bool = False
 ) -> Optional[Path]:
@@ -5084,6 +5164,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         # live-DB test-isolation guard block near _default_db_path().
         _ensure_test_isolation(self.db_path)
         self.read_only = read_only
+        # Set unconditionally (not just on the write path below) so close()
+        # and the failure-path finally block can always reference it, even
+        # if construction fails before the write-path acquire runs.
+        self._singleton_writer_lock = None
 
         self._lock = threading.Lock()
         # Read-path split (WAL only): recall/browse queries borrow a
@@ -5262,6 +5346,15 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
             self.db_path.parent.mkdir(parents=True, exist_ok=True)
 
+            # Opt-in singleton-writer guard (STATE_DB_SINGLE_WRITER) — see
+            # acquire_state_db_singleton_writer_lock. Acquired before any
+            # write-mode preflight/connect so a second writer fails fast
+            # instead of racing this one. Released in close(). (read_only
+            # never reaches this line — it returns above.)
+            self._singleton_writer_lock = acquire_state_db_singleton_writer_lock(
+                self.db_path
+            )
+
             # Read-only file/sidecar preflight (port of kilocode#12508):
             # repair-or-refuse BEFORE the first connection so users get an
             # actionable message instead of an opaque "attempt to write a
@@ -5436,6 +5529,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             if not initialization_complete:
                 conn, self._conn = self._conn, None
                 self._close_connection_quietly(conn)
+                lock, self._singleton_writer_lock = self._singleton_writer_lock, None
+                release_state_db_singleton_writer_lock(lock)
 
     # ── Read-path split ──
 
@@ -6635,6 +6730,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                         )
                 conn, self._conn = self._conn, None
                 self._close_connection_quietly(conn)
+        lock, self._singleton_writer_lock = getattr(
+            self, "_singleton_writer_lock", None
+        ), None
+        release_state_db_singleton_writer_lock(lock)
 
     def __del__(self) -> None:
         """Safety net: close the connection if the caller forgot.
