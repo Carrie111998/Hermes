@@ -565,9 +565,17 @@ export function useMainApp(gw: GatewayClient) {
       let readyText = ''
       let stdoutBuffer = ''
       let ready = false
+      let protocolSessionId: string | null = null
+      let lastProtocolSequence = 0
       child.stdout?.setEncoding('utf8')
       const rejectOversizedFrame = () => {
         errorText = 'Realtime voice child emitted an oversized protocol frame.'
+        stdoutBuffer = ''
+        sys(`Native realtime voice error: ${errorText}`)
+        child.kill('SIGINT')
+      }
+      const rejectProtocolFrame = (message: string) => {
+        errorText = message
         stdoutBuffer = ''
         sys(`Native realtime voice error: ${errorText}`)
         child.kill('SIGINT')
@@ -602,6 +610,19 @@ export function useMainApp(gw: GatewayClient) {
           if (!event || realtimeVoiceRef.current !== child) {
             continue
           }
+          if (
+            (protocolSessionId !== null && event.surface_session_id !== protocolSessionId) ||
+            event.sequence <= lastProtocolSequence
+          ) {
+            rejectProtocolFrame('Realtime voice child emitted an out-of-order protocol frame.')
+            return
+          }
+          protocolSessionId = event.surface_session_id
+          lastProtocolSequence = event.sequence
+
+          if (event.type === 'metric') {
+            continue
+          }
 
           if (event.type === 'transcript') {
             setRealtimeVoiceTranscript(event)
@@ -612,7 +633,10 @@ export function useMainApp(gw: GatewayClient) {
 
             continue
           }
-
+          if (event.type === 'warning') {
+            sys(`Native realtime voice warning: ${event.message}`)
+            continue
+          }
 
           if (event.type === 'error') {
             errorText = `${errorText}\n${event.message}`.slice(-4000)
@@ -646,11 +670,7 @@ export function useMainApp(gw: GatewayClient) {
           void submitDelegatedPrompt(event.request, sessionId, { appendMessage, gw }).catch(error => {
             const activeDelegation = realtimeVoiceDelegationRef.current
 
-            if (
-              !activeDelegation ||
-              activeDelegation.child !== child ||
-              activeDelegation.id !== event.id
-            ) {
+            if (!activeDelegation || activeDelegation.child !== child || activeDelegation.id !== event.id) {
               return
             }
 
@@ -658,9 +678,7 @@ export function useMainApp(gw: GatewayClient) {
               child,
               encodeRealtimeVoiceDelegationResult(
                 event.id,
-                `Hermes text-agent delegation failed: ${
-                  error instanceof Error ? error.message : String(error)
-                }`
+                `Hermes text-agent delegation failed: ${error instanceof Error ? error.message : String(error)}`
               )
             )
             realtimeVoiceDelegationRef.current = null
@@ -1187,11 +1205,7 @@ export function useMainApp(gw: GatewayClient) {
       const progress = String(ev.payload?.text ?? '').trim()
 
       if (progress) {
-        writeRealtimeVoiceControl(
-          pending.child,
-          encodeRealtimeVoiceDelegationProgress(pending.id, progress),
-          false
-        )
+        writeRealtimeVoiceControl(pending.child, encodeRealtimeVoiceDelegationProgress(pending.id, progress), false)
       }
       return
     }

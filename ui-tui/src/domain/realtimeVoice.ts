@@ -89,18 +89,25 @@ export type RealtimeVoicePhase = 'composing' | 'listening' | 'solving'
 export const MAX_REALTIME_VOICE_FRAME_CHARS = 65_536
 export const MAX_REALTIME_VOICE_TEXT_CHARS = 10_000
 
-
 export interface RealtimeVoiceTranscript {
   final: boolean
   role: 'assistant' | 'user'
   text: string
 }
 
-export type RealtimeVoiceEvent =
-  | { type: 'delegate'; id: string; request: string }
-  | { type: 'error'; message: string }
-  | ({ type: 'transcript' } & RealtimeVoiceTranscript)
-
+export interface RealtimeVoiceEnvelope {
+  protocol_version: 1
+  sequence: number
+  surface_session_id: string
+}
+export type RealtimeVoiceEvent = RealtimeVoiceEnvelope &
+  (
+    | { type: 'delegate'; id: string; request: string }
+    | { type: 'error'; message: string }
+    | { type: 'warning'; message: string }
+    | { type: 'metric'; name: string; value_ms: number }
+    | ({ type: 'transcript' } & RealtimeVoiceTranscript)
+  )
 const EVENT_PREFIX = 'talk: event '
 
 const STATE_PREFIX = 'talk: state '
@@ -135,6 +142,20 @@ export const parseRealtimeVoiceEvent = (line: string): RealtimeVoiceEvent | null
     }
 
     const event = value as Record<string, unknown>
+    if (
+      event.protocol_version !== 1 ||
+      typeof event.surface_session_id !== 'string' ||
+      !event.surface_session_id ||
+      !Number.isSafeInteger(event.sequence) ||
+      Number(event.sequence) < 1
+    ) {
+      return null
+    }
+    const envelope: RealtimeVoiceEnvelope = {
+      protocol_version: 1,
+      surface_session_id: event.surface_session_id,
+      sequence: Number(event.sequence)
+    }
 
     if (
       event.type === 'delegate' &&
@@ -143,11 +164,26 @@ export const parseRealtimeVoiceEvent = (line: string): RealtimeVoiceEvent | null
       typeof event.request === 'string' &&
       event.request.trim()
     ) {
-      return { type: 'delegate', id: event.id, request: event.request.trim() }
+      return { ...envelope, type: 'delegate', id: event.id, request: event.request.trim() }
     }
 
     if (event.type === 'error' && typeof event.message === 'string' && event.message.trim()) {
-      return { type: 'error', message: event.message.trim() }
+      return { ...envelope, type: 'error', message: event.message.trim() }
+    }
+
+    if (
+      event.type === 'metric' &&
+      typeof event.name === 'string' &&
+      event.name.length > 0 &&
+      typeof event.value_ms === 'number' &&
+      Number.isFinite(event.value_ms) &&
+      event.value_ms >= 0
+    ) {
+      return { ...envelope, type: 'metric', name: event.name, value_ms: event.value_ms }
+    }
+
+    if (event.type === 'warning' && typeof event.message === 'string' && event.message.trim()) {
+      return { ...envelope, type: 'warning', message: event.message.trim() }
     }
 
     if (
@@ -157,6 +193,7 @@ export const parseRealtimeVoiceEvent = (line: string): RealtimeVoiceEvent | null
       typeof event.final === 'boolean'
     ) {
       return {
+        ...envelope,
         type: 'transcript',
         role: event.role,
         text: event.text,

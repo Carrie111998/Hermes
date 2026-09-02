@@ -19,6 +19,15 @@ afterEach(() => {
   vi.useRealTimers()
 })
 
+const envelope = {
+  protocol_version: 1 as const,
+  sequence: 1,
+  surface_session_id: 'surface-1'
+}
+
+const framed = (payload: Record<string, unknown>): string =>
+  `talk: event ${JSON.stringify({ ...envelope, ...payload })}`
+
 describe('realtime voice lifecycle', () => {
   it.each(['listening', 'solving', 'composing'] as const)('parses the %s phase', phase => {
     expect(parseRealtimeVoicePhase(`talk: state ${phase}`)).toBe(phase)
@@ -31,28 +40,46 @@ describe('realtime voice lifecycle', () => {
 
   it('parses framed live transcripts without mistaking model text for control data', () => {
     expect(
-      parseRealtimeVoiceEvent(
-        'talk: event {"type":"transcript","role":"user","text":"check the weather","final":true}'
-      )
+      parseRealtimeVoiceEvent(framed({ type: 'transcript', role: 'user', text: 'check the weather', final: true }))
     ).toEqual({
+      ...envelope,
       type: 'transcript',
       role: 'user',
       text: 'check the weather',
       final: true
     })
-    expect(
-      parseRealtimeVoiceEvent('talk: event {"type":"error","message":"connection closed"}')
-    ).toEqual({
+    expect(parseRealtimeVoiceEvent(framed({ type: 'error', message: 'connection closed' }))).toEqual({
+      ...envelope,
       type: 'error',
       message: 'connection closed'
     })
     expect(parseRealtimeVoiceEvent('{"type":"transcript","role":"user"}')).toBeNull()
+    expect(parseRealtimeVoiceEvent('talk: event {"type":"error","message":"missing envelope"}')).toBeNull()
+    expect(parseRealtimeVoiceEvent(framed({ type: 'error', message: 'bad sequence', sequence: 0 }))).toBeNull()
+  })
+
+  it('parses nonterminal provider warnings', () => {
+    expect(parseRealtimeVoiceEvent(framed({ type: 'warning', message: 'input queue overrun' }))).toEqual({
+      ...envelope,
+      type: 'warning',
+      message: 'input queue overrun'
+    })
+  })
+
+  it('parses monotonic latency observations', () => {
+    expect(
+      parseRealtimeVoiceEvent(framed({ type: 'metric', name: 'endpoint_to_first_audio_ms', value_ms: 234.5 }))
+    ).toEqual({
+      ...envelope,
+      type: 'metric',
+      name: 'endpoint_to_first_audio_ms',
+      value_ms: 234.5
+    })
   })
 
   it('round-trips a delegated text-agent result over child stdin', () => {
-    expect(
-      parseRealtimeVoiceEvent('talk: event {"type":"delegate","id":"call-1","request":"inspect the bug"}')
-    ).toEqual({
+    expect(parseRealtimeVoiceEvent(framed({ type: 'delegate', id: 'call-1', request: 'inspect the bug' }))).toEqual({
+      ...envelope,
       type: 'delegate',
       id: 'call-1',
       request: 'inspect the bug'
@@ -76,15 +103,14 @@ describe('realtime voice lifecycle', () => {
 
     expect(parseRealtimeVoiceEvent(oversizedEvent)).toBeNull()
     expect(parseRealtimeVoicePhase(oversizedState)).toBeNull()
-    expect(
-      JSON.parse(encodeRealtimeVoiceDelegationResult('call-1', oversizedText)).output
-    ).toHaveLength(MAX_REALTIME_VOICE_TEXT_CHARS)
-    expect(
-      JSON.parse(encodeRealtimeVoiceDelegationProgress('call-1', oversizedText)).text
-    ).toHaveLength(MAX_REALTIME_VOICE_TEXT_CHARS)
+    expect(JSON.parse(encodeRealtimeVoiceDelegationResult('call-1', oversizedText)).output).toHaveLength(
+      MAX_REALTIME_VOICE_TEXT_CHARS
+    )
+    expect(JSON.parse(encodeRealtimeVoiceDelegationProgress('call-1', oversizedText)).text).toHaveLength(
+      MAX_REALTIME_VOICE_TEXT_CHARS
+    )
   })
 })
-
 
 describe('realtime voice child supervision', () => {
   const childProcess = (exitOnInterrupt: boolean) => {
@@ -122,11 +148,7 @@ describe('realtime voice child supervision', () => {
     input.emit('drain')
     writeRealtimeVoiceControl(child, 'progress-3', false)
 
-    expect(input.write.mock.calls.map(([payload]) => payload)).toEqual([
-      'progress-1',
-      'result',
-      'progress-3'
-    ])
+    expect(input.write.mock.calls.map(([payload]) => payload)).toEqual(['progress-1', 'result', 'progress-3'])
   })
 
   it('stops the registered child once with SIGINT', async () => {
