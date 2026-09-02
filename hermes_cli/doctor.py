@@ -2311,6 +2311,80 @@ def run_doctor(args):
                         manual_issues.append(f"Add {_cmd_link_display} to your PATH")
                 else:
                     issues.append(f"Missing {_cmd_link_display}/hermes symlink — run 'hermes doctor --fix'")
+    else:
+        _section("Command Installation")
+        # On Windows, canonical launchers live in the managed binary dir (HERMES_HOME\bin)
+        from hermes_constants import get_default_hermes_root, project_venv_dir, venv_bin_dir
+        from hermes_cli import _install_repair as _ir_mod
+        from hermes_cli._install_repair import _WINDOWS_BIN_LAUNCHERS
+
+        try:
+            _default_root = Path(get_default_hermes_root())
+        except Exception:
+            _default_root = Path.home() / ".hermes"
+
+        _managed_bin = _default_root / "bin"
+        _launcher_names = _WINDOWS_BIN_LAUNCHERS
+
+        _venv_dir = project_venv_dir(PROJECT_ROOT)
+        _venv_scripts = venv_bin_dir(_venv_dir, windows=True) if _venv_dir else None
+        _venv_hermes_exe = (_venv_scripts / "hermes.exe") if _venv_scripts else None
+
+        if _venv_hermes_exe is None or not _venv_hermes_exe.is_file():
+            check_warn(
+                "Venv entry point not found",
+                f"(hermes.exe not found in venv Scripts directory — reinstall with pip install -e '.[all]')"
+            )
+            manual_issues.append(
+                f"Reinstall entry point: cd {PROJECT_ROOT} && venv\\Scripts\\activate && pip install -e '.[all]'"
+            )
+        else:
+            try:
+                _rel = _venv_hermes_exe.relative_to(PROJECT_ROOT)
+            except ValueError:
+                _rel = _venv_hermes_exe
+            check_ok(f"Venv entry point exists ({_rel})")
+
+            _missing_launchers = [
+                name for name in _launcher_names
+                if not ((_managed_bin / f"{name}.exe").is_file() or (_managed_bin / f"{name}.cmd").is_file())
+            ]
+
+            if not _missing_launchers:
+                check_ok(f"Managed launchers exist in {_managed_bin}")
+            else:
+                _missing_str = ", ".join(_missing_launchers)
+                check_fail(
+                    f"Managed launcher(s) missing: {_missing_str}",
+                    f"(expected in {_managed_bin})"
+                )
+                if should_fix:
+                    try:
+                        _restored = _ir_mod.ensure_windows_bin_launchers(PROJECT_ROOT, windows=True)
+                        if _restored:
+                            check_ok(f"Restored managed launcher(s): {', '.join(_restored)}")
+                            fixed_count += 1
+                        else:
+                            check_warn(f"Could not automatically restore launchers into {_managed_bin}")
+                    except Exception as _e:
+                        check_warn(f"Failed to restore launchers: {_e}")
+                else:
+                    issues.append(f"Missing managed launcher(s) in {_managed_bin} — run 'hermes doctor --fix'")
+
+            # Check if managed bin dir is in user/process PATH
+            _norm_bin = _ir_mod._normalize_windows_path(_managed_bin)
+            _user_entries = _ir_mod._windows_user_path_entries()
+            _norm_entries = {_ir_mod._normalize_windows_path(e) for e in _user_entries}
+
+            if _norm_bin in _norm_entries:
+                check_ok(f"{_managed_bin} is on PATH")
+            else:
+                _escaped_bin = str(_managed_bin).replace("'", "''")
+                check_warn(
+                    f"{_managed_bin} is not on your PATH",
+                    f"(run in PowerShell: [Environment]::SetEnvironmentVariable('Path', [Environment]::GetEnvironmentVariable('Path', 'User') + ';' + '{_escaped_bin}', 'User'))"
+                )
+                manual_issues.append(f"Add {_managed_bin} to your User PATH")
 
     _section("External Tools")
     # Git

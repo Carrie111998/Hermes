@@ -149,3 +149,49 @@ class TestDoctorCommandInstallation:
         assert "Command Installation" in out
         assert "$PREFIX/bin" in out
 
+    @pytest.mark.windows_only
+    def test_windows_managed_launchers_doctor_check_and_fix(self, monkeypatch, tmp_path):
+        """On Windows, doctor checks %LOCALAPPDATA%\\hermes\\bin and repairs missing launchers."""
+        home = tmp_path / "hermes"
+        project = home / "hermes-agent"
+        scripts = project / "venv" / "Scripts"
+        scripts.mkdir(parents=True)
+        (scripts / "hermes.exe").write_bytes(b"MZ launcher hermes")
+        (scripts / "hermes-acp.exe").write_bytes(b"MZ launcher acp")
+        (project / "venv" / "pyvenv.cfg").write_text("home = X\n", encoding="utf-8")
+
+        monkeypatch.setattr(doctor_mod, "HERMES_HOME", home)
+        monkeypatch.setattr(doctor_mod, "PROJECT_ROOT", project)
+        monkeypatch.setattr(doctor_mod, "_DHH", str(home))
+
+        import hermes_constants
+        monkeypatch.setattr(hermes_constants, "get_default_hermes_root", lambda: str(home))
+
+        fake_model_tools = types.SimpleNamespace(
+            check_tool_availability=lambda *a, **kw: ([], []),
+            TOOLSET_REQUIREMENTS={},
+        )
+        monkeypatch.setitem(sys.modules, "model_tools", fake_model_tools)
+
+        from hermes_cli import _install_repair as ir_mod
+        # Simulate managed bin on user PATH
+        managed_bin = home / "bin"
+        monkeypatch.setattr(ir_mod, "_windows_user_path_entries", lambda: [str(managed_bin)])
+
+        # 1. First run without fix — detects missing launchers
+        out_no_fix = _run_doctor(fix=False)
+        assert "Command Installation" in out_no_fix
+        assert "Venv entry point exists" in out_no_fix
+        assert "Managed launcher(s) missing" in out_no_fix
+
+        # 2. Run with fix — repairs launchers into home/bin
+        out_fix = _run_doctor(fix=True)
+        assert "Restored managed launcher(s)" in out_fix
+        assert (managed_bin / "hermes.exe").is_file()
+        assert (managed_bin / "hermes-acp.exe").is_file()
+
+        # 3. Subsequent run without fix — all ok
+        out_after_fix = _run_doctor(fix=False)
+        assert "Managed launchers exist" in out_after_fix
+        assert "is on PATH" in out_after_fix
+
