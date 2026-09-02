@@ -9570,27 +9570,45 @@ class TelegramAdapter(BasePlatformAdapter):
         )
 
     def _apply_telegram_group_observe_attribution(self, event: MessageEvent) -> MessageEvent:
-        """Align triggered group turns with observed-history attribution."""
-        if not self._telegram_observe_unmentioned_group_messages():
-            return event
+        """Align triggered group turns with observed-history attribution.
+
+        Always injects the bot identity hint into ``channel_prompt`` for
+        group messages, even when ``observe_unmentioned_group_messages`` is
+        off — the agent needs to know its own @-mention handle to recognize
+        that messages addressed to ``@<bot>`` are requests for it. Without
+        this hint the agent treats ``@<bot> test`` as an unknown third-party
+        mention and stays silent.
+        """
         raw_message = getattr(event, "raw_message", None)
         if not raw_message or not self._is_group_chat(raw_message):
             return event
+
+        # Always-on identity hint for group messages. The bot needs to know
+        # its own handle to interpret "@<bot> test" as addressed-to-it
+        # rather than as a third-party mention to ignore.
+        identity_prompt = self._telegram_bot_identity_channel_prompt()
+        channel_prompt = (
+            f"{event.channel_prompt}\n\n{identity_prompt}"
+            if event.channel_prompt
+            else identity_prompt
+        )
+
+        if not self._telegram_observe_unmentioned_group_messages():
+            return dataclasses.replace(event, channel_prompt=channel_prompt)
+
+        # Observed-history attribution path (unchanged).
         chat_id_str = str(getattr(getattr(raw_message, "chat", None), "id", ""))
         allowed = self._telegram_observe_allowed_chats()
         if not allowed or chat_id_str not in allowed:
-            return event
+            return dataclasses.replace(event, channel_prompt=channel_prompt)
         shared_source = self._telegram_group_observe_shared_source(event.source)
         observe_prompt = self._telegram_group_observe_channel_prompt()
-        channel_prompt = f"{event.channel_prompt}\n\n{observe_prompt}" if event.channel_prompt else observe_prompt
+        channel_prompt = (
+            f"{channel_prompt}\n\n{observe_prompt}"
+            if channel_prompt
+            else observe_prompt
+        )
         if event.message_type == MessageType.COMMAND:
-            # Commands must retain the original source (with user_id) so
-            # slash-access control (_check_slash_access) can identify the
-            # sender.  Replacing the source with an anonymised shared source
-            # (user_id=None) causes admin-only commands like /new to be
-            # denied even when the sender is an admin, because
-            # SlashAccessPolicy.is_admin(None) is always False.
-            # Still inject channel_prompt for group context.
             return dataclasses.replace(
                 event,
                 channel_prompt=channel_prompt,
@@ -9600,6 +9618,20 @@ class TelegramAdapter(BasePlatformAdapter):
             text=self._telegram_group_observe_attributed_text(event),
             source=shared_source,
             channel_prompt=channel_prompt,
+        )
+
+    def _telegram_bot_identity_channel_prompt(self) -> str:
+        """Return a short channel-prompt block announcing the bot's identity
+        so the agent knows its own @-mention handle in Telegram group chats.
+        """
+        username = self._current_bot_username() or "unknown"
+        bot_id = getattr(getattr(self, "_bot", None), "id", None) or "unknown"
+        return (
+            "Telegram group context:\n"
+            f"- Your identity: user_id={bot_id}, @-mention name in this group=@{username}\n"
+            "- When the current message contains your @-mention, treat it as "
+            "addressed to you even if the leading handle was stripped from the "
+            "message text. Reply accordingly."
         )
 
     def _media_message_type(self, msg: Message) -> MessageType:
