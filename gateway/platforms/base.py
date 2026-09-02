@@ -2523,6 +2523,10 @@ class MessageEvent:
     reply_to_author_id: Optional[str] = None
     reply_to_author_name: Optional[str] = None
     reply_to_is_own_message: bool = False  # True when the user replied to this bot/assistant's message
+    # True when the quoted context came from a cross-chat external reference
+    # (Telegram ``external_reply``): there is no in-chat message id, but the
+    # quote must still be injected as a disambiguation pointer.
+    reply_from_external: bool = False
 
     # Structured interactive-prompt reply (relay Phase 3). Present when this
     # event is the user answering a native interactive prompt rendered by the

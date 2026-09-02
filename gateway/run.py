@@ -20667,13 +20667,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     f"{message_text}"
                 )
 
-        if getattr(event, "reply_to_text", None) and event.reply_to_message_id:
+        if getattr(event, "reply_to_text", None) and (
+            event.reply_to_message_id or getattr(event, "reply_from_external", False)
+        ):
             # Always inject the reply-to pointer — even when the quoted text
             # already appears in history. The prefix isn't deduplication, it's
             # disambiguation: it tells the agent *which* prior message the user
             # is referencing. History can contain the same or similar text
             # multiple times, and without an explicit pointer the agent has to
             # guess (or answer for both subjects). Token overhead is minimal.
+            # Cross-chat external quotes (Telegram ``external_reply``) carry no
+            # in-chat message id, so they are gated on the explicit
+            # ``reply_from_external`` marker instead of an id.
             reply_snippet = event.reply_to_text[:500]
             if getattr(event, "reply_to_is_own_message", False):
                 message_text = (

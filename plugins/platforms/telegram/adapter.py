@@ -10959,6 +10959,38 @@ class TelegramAdapter(BasePlatformAdapter):
         # / caption when no native quote is present.
         reply_to_id = None
         reply_to_text = None
+        # External replies (cross-chat quotes, ExternalReplyInfo): when the
+        # user quotes a message from a *different* chat or channel, Telegram
+        # sends ``external_reply`` and leaves ``reply_to_message`` empty.
+        # Without handling, the reference is dropped entirely and the agent
+        # receives a bare question with no idea what it refers to. Extract
+        # the quoted text/caption (preferring the user's manual selection)
+        # so the standard reply-context pipeline can inject it. There is no
+        # in-chat message id for an external reference, so ``reply_to_id``
+        # stays None; downstream injection must not require an id for this
+        # shape (see the matching change in gateway/run.py).
+        external_reply = getattr(message, "external_reply", None)
+        if external_reply is not None:
+            external_quote = getattr(message, "quote", None)
+            external_quote_text = (
+                getattr(external_quote, "text", None)
+                if external_quote is not None
+                else None
+            )
+            if not external_quote_text:
+                external_quote_text = (
+                    getattr(external_reply, "text", None)
+                    or getattr(external_reply, "caption", None)
+                )
+            if external_quote_text:
+                origin = getattr(external_reply, "origin", None)
+                origin_chat = getattr(origin, "chat", None) if origin is not None else None
+                origin_title = getattr(origin_chat, "title", None) if origin_chat is not None else None
+                if origin_title:
+                    reply_to_text = f"{origin_title}: {external_quote_text}"
+                else:
+                    reply_to_text = external_quote_text
+
         if message.reply_to_message:
             reply_to_id = str(message.reply_to_message.message_id)
             quote = getattr(message, "quote", None)
@@ -11003,6 +11035,9 @@ class TelegramAdapter(BasePlatformAdapter):
             platform_update_id=update_id,
             reply_to_message_id=reply_to_id,
             reply_to_text=reply_to_text,
+            reply_from_external=bool(
+                getattr(message, "external_reply", None) is not None and reply_to_text
+            ),
             auto_skill=topic_skill,
             channel_prompt=_channel_prompt,
             timestamp=message.date,
