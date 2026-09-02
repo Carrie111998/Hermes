@@ -1697,21 +1697,31 @@ class HermesACPAgent(acp.Agent):
         state = self.session_manager.get_session(session_id)
         if state and state.cancel_event:
             with state.runtime_lock:
+                was_running = state.is_running
                 if state.is_running and state.current_prompt_text:
                     state.interrupted_prompt_text = state.current_prompt_text
-                # Publish cancellation and hard-stop the agent before another
-                # prompt can acquire this lock and mistake the turn for
-                # redirectable work.
+                # Publish cancellation before another prompt can acquire this lock
+                # and mistake the turn for redirectable work.
                 state.cancel_event.set()
-                try:
-                    if getattr(state, "agent", None):
-                        request_hard_interrupt(state.agent)
-                except Exception:
-                    logger.debug(
-                        "Failed to interrupt ACP session %s",
-                        session_id,
-                        exc_info=True,
-                    )
+                # Only hard-interrupt the agent when a turn is genuinely in
+                # flight. A `session/cancel` that lands on an IDLE session — e.g.
+                # Xcode's "stop and send" firing a cancel notification right
+                # before it submits the next message — would otherwise leave
+                # _interrupt_requested set on the REUSED agent, and the very
+                # next prompt aborts at the session-turn-lease acquire with
+                # "Stopped waiting for another Hermes process on this session"
+                # even though nothing else is running on it. The next prompt
+                # clears cancel_event itself at turn start.
+                if was_running:
+                    try:
+                        if getattr(state, "agent", None):
+                            request_hard_interrupt(state.agent)
+                    except Exception:
+                        logger.debug(
+                            "Failed to interrupt ACP session %s",
+                            session_id,
+                            exc_info=True,
+                        )
             logger.info("Cancelled session %s", session_id)
 
     async def fork_session(
