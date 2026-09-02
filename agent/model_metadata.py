@@ -2328,7 +2328,7 @@ def _stale_pre_catalog_cache_entry(model: str, cached: int) -> bool:
     matches = [
         (key, value)
         for key, value in DEFAULT_CONTEXT_LENGTHS.items()
-        if key in model_lower
+        if _catalog_key_matches(key, model_lower)
     ]
     if not matches:
         return False
@@ -2561,6 +2561,18 @@ def _normalize_model_version(model: str) -> str:
     Normalize both to dashes for comparison.
     """
     return model.replace(".", "-")
+
+
+def _catalog_key_matches(catalog_key: str, model_lower: str) -> bool:
+    """Check if a *catalog_key* is a substring of *model_lower*, normalizing
+    version separators first.
+
+    Catalog keys may use dots (e.g. ``"glm-5.3"``) while provider slugs use
+    hyphens (e.g. ``"z-ai-glm-5-3"``).  Without normalization the substring
+    check ``"glm-5.3" in "z-ai-glm-5-3"`` is ``False`` and the model silently
+    falls back to a shorter catch-all entry (e.g. ``"glm"`` → 202 752).
+    """
+    return _normalize_model_version(catalog_key) in _normalize_model_version(model_lower)
 
 
 def _query_anthropic_context_length(model: str, base_url: str, api_key: str) -> Optional[int]:
@@ -3385,7 +3397,7 @@ def get_model_context_length(
                 key=lambda x: len(x[0]),
                 reverse=True,
             ):
-                if default_model in model_lower:
+                if _catalog_key_matches(default_model, model_lower):
                     logger.info(
                         "Using hardcoded context length %s for model %r "
                         "(custom endpoint, catalog match on %r)",
@@ -3565,7 +3577,7 @@ def get_model_context_length(
     for default_model, length in sorted(
         DEFAULT_CONTEXT_LENGTHS.items(), key=lambda x: len(x[0]), reverse=True
     ):
-        if default_model in model_lower:
+        if _catalog_key_matches(default_model, model_lower):
             return length
 
     # 9. Default fallback — warn (deduped per model+endpoint) so
