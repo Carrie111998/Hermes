@@ -1,15 +1,19 @@
 """Bot Mode roster probe — canonical Bot Chat system prompt section.
 
-When the desktop's Bot Mode manages this install (any profile carries a
-``ui_meta['hermes-bots']`` block in its profile.yaml), a bot's canonical
-"Bot Chat" session — and ONLY that session — gets a short "Messaging other
-agents" section so the bot can receive teammate DMs, reply with attribution,
-and hand off @mentions.  Regular sessions never carry the section; the
-desktop's composer middleware owns the @mention send path there.
+When the desktop's Bot Mode manages this install, routed Bot Mode sessions
+receive a short "Messaging other agents" section so the bot can receive
+teammate DMs, reply with attribution, and hand off @mentions. Routed means:
 
-The caller (agent/system_prompt.py) enforces the session-title gate against
-``BOT_CHAT_TITLE``; this module answers "is this install Bot-Mode-managed,
-and what should the section say for this profile".
+- the canonical "Bot Chat" on a Bot-Mode-managed install, or
+- a messaging-gateway chat (Discord, Telegram, Slack, ...) whose OWN profile
+  carries ``ui_meta['hermes-bots']``.
+
+Regular self-owned sessions (CLI, TUI, cron, subagents, ...) and gateway
+chats of unmanaged profiles never carry the section; the desktop's composer
+middleware owns the @mention send path there.
+
+The shared :func:`bot_mode_session_state` gate is used by the prompt,
+schema-injection, and dispatch paths so defense in depth cannot drift.
 
 This replaces the plugin-side SOUL.md backfill: the protocol is injected by
 the core at prompt-build time instead of appended to user-authored SOUL
@@ -42,6 +46,8 @@ BOT_CHAT_TITLE = "Bot Chat"
 
 _lock = threading.Lock()
 _cached: dict[str, str] = {}
+_session_state_lock = threading.Lock()
+_session_state_cache: dict[tuple[str, str], dict] = {}
 
 
 def _hermes_root(home: Path) -> Path:
@@ -108,6 +114,175 @@ def is_bot_mode_managed(home: str | os.PathLike | None = None) -> bool:
         return any(_is_bot_managed(d) for _n, d in _roster(root))
     except Exception:
         return False
+
+
+def is_profile_bot_managed(home: str | os.PathLike | None = None) -> bool:
+    """True when the CURRENT profile itself is Bot-Mode-managed.
+
+    Used by the messaging-gateway arm of the routing gate: a gateway chat
+    may only route teammates when the profile behind it opted into Bot
+    Mode (``ui_meta['hermes-bots']``). Never raises.
+    """
+    try:
+        resolved = Path(
+            str(home) if home else (os.getenv("HERMES_HOME") or os.path.expanduser("~/.hermes"))
+        )
+        return _is_bot_managed(resolved)
+    except Exception:
+        return False
+
+
+# ── messaging-gateway session gate ───────────────────────────────────────────
+#
+# Session sources that belong to a local surface (this process or one it
+# spawned): never messaging-gateway chats. Mirrors the TUI backend's
+# ``_NON_GATEWAY_SOURCES`` (tui_gateway/server.py). Any OTHER source that
+# resolves to a gateway ``Platform`` — built-in enum member or registered
+# plugin platform via ``Platform._missing_`` — is a messaging-gateway chat
+# (Discord, Telegram, Slack, IRC, ...), so new platforms are covered
+# structurally instead of by a hardcoded allowlist.
+
+_SELF_OWNED_SESSION_SOURCES = frozenset({
+    "", "cli", "tui", "desktop", "cron", "kanban", "subagent", "test",
+    "local", "acp", "webhook", "api_server", "msgraph_webhook", "webui",
+})
+
+
+def is_messaging_gateway_session(agent: object) -> bool:
+    """True when ``agent`` serves a messaging-gateway chat.
+
+    Reads the agent's ``platform`` source (set by every spawner: "cli",
+    "discord", "telegram", ..., "cron", "subagent"). Structural, not an
+    allowlist: unknown-but-registered platform plugins qualify, arbitrary
+    junk strings and self-owned surfaces fail closed to False. Stable for
+    a session's lifetime, so gates keyed on it are prompt-cache safe.
+    Never raises.
+    """
+    try:
+        source = str(getattr(agent, "platform", "") or "").strip().lower()
+        if source in _SELF_OWNED_SESSION_SOURCES:
+            return False
+        from gateway.config import Platform
+
+        Platform(source)  # raises ValueError for non-platform strings
+        return True
+    except Exception:
+        return False
+
+
+def _agent_home(agent: object) -> str:
+    """The routed profile home: ContextVar first, shared DB only as fallback.
+
+    Multiplex gateways bind the current profile with
+    ``set_hermes_home_override`` while every agent may still point at the
+    launch/default ``state.db``. Threads that lose that context fall back to
+    the DB parent, matching :func:`agent.system_prompt._agent_home`.
+    """
+    try:
+        from hermes_constants import get_hermes_home_override
+
+        override = get_hermes_home_override()
+        if override:
+            return override
+    except Exception:
+        pass
+    try:
+        sdb = getattr(agent, "_session_db", None)
+        db_path = getattr(sdb, "db_path", None)
+        if db_path:
+            return str(Path(db_path).parent)
+    except Exception:
+        pass
+    return os.getenv("HERMES_HOME") or os.path.expanduser("~/.hermes")
+
+
+def _session_title(agent: object) -> str:
+    title = str(getattr(agent, "_session_title_hint", "") or "").strip()
+    if title:
+        return title
+    try:
+        sdb = getattr(agent, "_session_db", None)
+        sid = getattr(agent, "session_id", None)
+        if sdb and sid:
+            return str(sdb.get_session_title(sid) or "").strip()
+    except Exception:
+        pass
+    return ""
+
+
+def bot_mode_session_state(
+    agent: object, home: str | os.PathLike | None = None
+) -> dict:
+    """The single Bot Mode routing answer, shared by every gate.
+
+    Returns ``{"managed": bool, "session_kind": str | None}`` where
+    ``session_kind`` is:
+
+    - ``"bot_chat"``  — the canonical "Bot Chat" of a Bot-Mode-managed
+      current profile (the existing bot-profile contract),
+    - ``"gateway"``   — a messaging-gateway chat (Discord, Telegram, ...)
+      whose OWN profile is Bot-Mode-managed: the bot can route teammates
+      from its chats, not only from its Bot Chat,
+    - ``None``        — gated: unmanaged installs/profiles, self-owned
+      ordinary sessions (CLI, TUI, cron, subagents, ...), arbitrary sources.
+
+    The answer is frozen by profile home + persisted session identity for the
+    process lifetime. That survives agent-object recreation while keeping the
+    system prompt and tool schema byte-stable across a conversation. Explicit
+    ``home`` probes are uncached. Never raises; fails closed to ``None``.
+    """
+    cache_key = None
+    try:
+        if home is None:
+            cached = getattr(agent, "_bot_mode_session_state", None)
+            if isinstance(cached, dict) and "session_kind" in cached:
+                return cached
+
+        protocol_enabled = bool(getattr(agent, "_bot_mode_protocol", True))
+        resolved = str(Path(home if home else _agent_home(agent)).expanduser().resolve())
+        title = _session_title(agent)
+        session_id = str(getattr(agent, "session_id", "") or "")
+
+        if home is None and session_id:
+            # Session identity alone owns the frozen answer. Title, platform,
+            # config, and metadata changes cannot perturb a live conversation.
+            cache_key = (resolved, session_id)
+            with _session_state_lock:
+                cached = _session_state_cache.get(cache_key)
+            if cached is not None:
+                try:
+                    setattr(agent, "_bot_mode_session_state", cached)
+                except Exception:
+                    pass
+                return cached
+
+        if not protocol_enabled:
+            state = {"managed": False, "session_kind": None}
+        else:
+            managed = is_bot_mode_managed(resolved)
+            profile_managed = is_profile_bot_managed(resolved)
+            if not managed:
+                state = {"managed": False, "session_kind": None}
+            elif profile_managed and title == BOT_CHAT_TITLE:
+                state = {"managed": True, "session_kind": "bot_chat"}
+            # Gateway chats route only for a MANAGED CURRENT profile — an
+            # unrelated profile's group chat on a managed install stays gated.
+            elif profile_managed and is_messaging_gateway_session(agent):
+                state = {"managed": True, "session_kind": "gateway"}
+            else:
+                state = {"managed": True, "session_kind": None}
+    except Exception:
+        state = {"managed": False, "session_kind": None}
+
+    if home is None:
+        if cache_key is not None:
+            with _session_state_lock:
+                state = _session_state_cache.setdefault(cache_key, state)
+        try:
+            setattr(agent, "_bot_mode_session_state", state)
+        except Exception:
+            pass
+    return state
 
 
 def _soul_has_protocol(profile_dir: Path) -> bool:
@@ -260,13 +435,14 @@ def _build_section(home: Path) -> str:
         f"{_PROTOCOL_HEADING}\n"
         "This install runs Bot Mode: each Hermes profile is an agent teammate with "
         'one canonical "Bot Chat" conversation, and you have the `message_agent` '
-        "tool to DM any of them. It is FIRE-AND-FORGET: it delivers your message "
-        "with your attribution prefixed automatically and returns an acknowledgement "
-        "immediately — it never returns the reply. Send it, finish your turn, and "
-        "the reply arrives later as a background-process completion notification "
-        "that wakes you; relay it to the user then, attributed to that agent. "
-        "COMPOSE every message yourself — say what YOU need from that agent; never "
-        "forward the user's words verbatim, and never reveal private 1:1 chat "
+        "tool to DM any of them — from this messaging chat (Discord, Telegram, "
+        "Slack, ...) or from your Bot Chat. It is FIRE-AND-FORGET: it delivers your "
+        "message with your attribution prefixed automatically and returns an "
+        "acknowledgement immediately — it never returns the reply. Send it, finish "
+        "your turn, and the reply arrives later as a background-process completion "
+        "notification that wakes you; relay it to the user then, attributed to that "
+        "agent. COMPOSE every message yourself — say what YOU need from that agent; "
+        "never forward the user's words verbatim, and never reveal private 1:1 chat "
         "content. When the user says \"ask <name>\" or \"tell <name> ...\", that is "
         "a handoff: pick the right teammate from the roster below, message them "
         "with message_agent, and report back naming which agent replied. Message "
@@ -382,8 +558,9 @@ def capability_fingerprint(home: str | os.PathLike | None = None) -> str:
         surface["roster"] = []
     # Protocol-text version salt: bumping this refreshes every eternal Bot
     # Chat prompt ONCE so existing bots adopt a new protocol section (e.g.
-    # the v2 message_agent tool replacing the shellout instructions).
-    surface["protocol_version"] = 2
+    # the v3 wording adding messaging-gateway chats as a message_agent
+    # surface).
+    surface["protocol_version"] = 3
     try:
         # Peer gateways are part of the messaging surface: registering one
         # must refresh eternal Bot Chat prompts so the cross-machine DM
@@ -467,3 +644,5 @@ def stored_bot_chat_prompt_needs_upgrade(stored_prompt: str, home: str | os.Path
 def _reset_cache_for_tests() -> None:
     with _lock:
         _cached.clear()
+    with _session_state_lock:
+        _session_state_cache.clear()
