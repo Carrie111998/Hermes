@@ -8,8 +8,10 @@ own; methods access the host's attributes (``self._conn``, ``self.db_path``,
 module-level constants live in hermes_state_common.
 """
 
-import logging
+from contextlib import contextmanager
+from contextvars import ContextVar
 import json
+import logging
 import os
 import re
 import sqlite3
@@ -17,6 +19,7 @@ import time
 from typing import Any, Callable, Collection, Dict, List, Optional, Tuple
 
 from agent.skill_commands import describe_skill_invocation
+from gateway.recall_scope import recall_scope_sql
 from hermes_state_common import (
     FTS_CJK_STALE_KEY,
     FTS_SQL,
@@ -33,6 +36,15 @@ from hermes_state_common import (
 # Moved methods logged under the "hermes_state" logger before the split;
 # keep that logger identity so log filtering/capture behavior is unchanged.
 logger = logging.getLogger("hermes_state")
+
+# Current-scope recall is an interactive, fail-closed security boundary. A
+# pathological common-term query must not monopolize SQLite indefinitely; a
+# bounded error is safer than falling back to global results. Global/explicit
+# ``scope=all`` keeps current main's uncapped behavior.
+_CURRENT_SCOPE_SEARCH_DEADLINE_SECONDS = 2.0
+_CURRENT_SCOPE_SEARCH_DEADLINE: ContextVar[Optional[float]] = ContextVar(
+    "current_scope_session_search_deadline", default=None
+)
 
 # Characters FTS5's query grammar rejects outside a quoted phrase. Anything
 # missing from this set reaches MATCH raw and raises, which the execute site
@@ -79,6 +91,96 @@ class SessionSearchMixin:
         return tuple(
             field for field in cls._SEARCH_MESSAGE_RESULT_FIELDS if field in requested
         )
+
+    @staticmethod
+    def _recall_scope_sql(
+        alias: str,
+        recall_scope: object,
+    ) -> Tuple[str, List[Any]]:
+        """Build the canonical fail-closed predicate for one gateway scope."""
+        if not recall_scope:
+            return "", []
+        return recall_scope_sql(alias, recall_scope)
+
+    @staticmethod
+    def _fts_search_from_sql(
+        table: str,
+        recall_scope: object,
+    ) -> tuple[str, List[str]]:
+        """Return a global or scope-first FTS join plan.
+
+        With a current-chat scope, ``CROSS JOIN`` fixes the loop order at
+        sessions -> that scope's messages -> FTS rowid lookup.  This prevents a
+        common term from walking the entire profile-wide posting list before
+        applying the origin_json predicate.  Global searches retain current
+        main's FTS-first ranking plan.
+        """
+        if table not in {
+            "messages_fts",
+            "messages_fts_cjk",
+            "messages_fts_trigram",
+        }:
+            raise ValueError("invalid FTS table")
+        if recall_scope:
+            return (
+                "FROM sessions AS s "
+                "CROSS JOIN messages AS m INDEXED BY idx_messages_session_id "
+                f"CROSS JOIN {table}",
+                ["m.session_id = s.id", f"{table}.rowid = m.id"],
+            )
+        return (
+            f"FROM {table} "
+            f"JOIN messages AS m ON m.id = {table}.rowid "
+            "JOIN sessions AS s ON s.id = m.session_id",
+            [],
+        )
+
+    @staticmethod
+    def _like_search_from_sql(recall_scope: object) -> tuple[str, List[str]]:
+        """Return a global or scope-first canonical-message join plan."""
+        if recall_scope:
+            return (
+                "FROM sessions AS s "
+                "CROSS JOIN messages AS m INDEXED BY idx_messages_session_id",
+                ["m.session_id = s.id"],
+            )
+        return "FROM messages AS m JOIN sessions AS s ON s.id = m.session_id", []
+
+    @contextmanager
+    def _search_read_ctx(self):
+        """Yield a read connection with the current-scope deadline installed."""
+        with self._read_ctx() as conn:
+            deadline = _CURRENT_SCOPE_SEARCH_DEADLINE.get()
+            if deadline is None:
+                yield conn
+                return
+
+            conn.set_progress_handler(
+                lambda: time.monotonic() >= deadline,
+                1_000,
+            )
+            try:
+                yield conn
+            finally:
+                # Pooled connections outlive this query; never leak its
+                # interrupt callback into an unrelated/global read.
+                conn.set_progress_handler(None, 0)
+
+    def session_matches_recall_scope(
+        self,
+        session_id: str,
+        recall_scope: object,
+    ) -> bool:
+        """Return whether a durable session belongs to ``recall_scope``."""
+        if not recall_scope:
+            return True
+        clause, params = self._recall_scope_sql("s", recall_scope)
+        with self._read_ctx() as conn:
+            row = conn.execute(
+                f"SELECT 1 FROM sessions s WHERE s.id = ? AND {clause} LIMIT 1",
+                [session_id, *params],
+            ).fetchone()
+        return row is not None
 
     def _try_incremental_merge_fts(self) -> None:
         """Run one bounded FTS5 merge pass without failing the completed write."""
@@ -1348,6 +1450,7 @@ class SessionSearchMixin:
         role_filter: List[str] = None,
         limit: int = 20,
         offset: int = 0,
+        recall_scope: object = None,
     ) -> Optional[List[Dict[str, Any]]]:
         """Run a search against a substring-capable FTS index.
 
@@ -1374,7 +1477,8 @@ class SessionSearchMixin:
             else:
                 parts.append('"' + tok.replace('"', '""') + '"')
         trigram_query = " ".join(parts)
-        tri_where = [f"{table} MATCH ?"]
+        from_sql, join_where = self._fts_search_from_sql(table, recall_scope)
+        tri_where = [*join_where, f"{table} MATCH ?"]
         tri_params: list = [trigram_query]
         if not include_inactive:
             tri_where.append("(m.active = 1 OR m.compacted = 1)")
@@ -1387,6 +1491,10 @@ class SessionSearchMixin:
         if role_filter:
             tri_where.append(f"m.role IN ({','.join('?' for _ in role_filter)})")
             tri_params.extend(role_filter)
+        scope_sql, scope_params = self._recall_scope_sql("s", recall_scope)
+        if scope_sql:
+            tri_where.append(scope_sql)
+            tri_params.extend(scope_params)
         tri_sql = f"""
             SELECT
                 m.id,
@@ -1398,15 +1506,13 @@ class SessionSearchMixin:
                 s.source,
                 s.model,
                 s.started_at AS session_started
-            FROM {table}
-            JOIN messages m ON m.id = {table}.rowid
-            JOIN sessions s ON s.id = m.session_id
+            {from_sql}
             WHERE {' AND '.join(tri_where)}
             {order_by_sql}
             LIMIT ? OFFSET ?
         """
         tri_params.extend([limit, offset])
-        with self._read_ctx() as conn:
+        with self._search_read_ctx() as conn:
             try:
                 tri_cursor = conn.execute(tri_sql, tri_params)
             except sqlite3.OperationalError:
@@ -1425,6 +1531,7 @@ class SessionSearchMixin:
         sort: str = None,
         include_inactive: bool = False,
         fields: Optional[Collection[str]] = None,
+        recall_scope: object = None,
     ) -> List[Dict[str, Any]]:
         """Instrumented wrapper around :meth:`_search_messages_impl`.
 
@@ -1435,21 +1542,42 @@ class SessionSearchMixin:
         Threshold: HERMES_SEARCH_SLOW_MS (default 1000; 0 logs every call).
         """
         started = time.time()
+        deadline = None
+        deadline_token = None
+        if recall_scope:
+            deadline = (
+                time.monotonic() + _CURRENT_SCOPE_SEARCH_DEADLINE_SECONDS
+            )
+            deadline_token = _CURRENT_SCOPE_SEARCH_DEADLINE.set(deadline)
         rows = None
         try:
-            rows = self._search_messages_impl(
-                query,
-                source_filter=source_filter,
-                exclude_sources=exclude_sources,
-                role_filter=role_filter,
-                limit=limit,
-                offset=offset,
-                sort=sort,
-                include_inactive=include_inactive,
-                fields=fields,
-            )
+            try:
+                rows = self._search_messages_impl(
+                    query,
+                    source_filter=source_filter,
+                    exclude_sources=exclude_sources,
+                    role_filter=role_filter,
+                    limit=limit,
+                    offset=offset,
+                    sort=sort,
+                    include_inactive=include_inactive,
+                    fields=fields,
+                    recall_scope=recall_scope,
+                )
+            except sqlite3.OperationalError as exc:
+                if deadline is not None and time.monotonic() >= deadline:
+                    raise TimeoutError(
+                        "current-scoped session search exceeded its bounded query deadline"
+                    ) from exc
+                raise
+            if deadline is not None and time.monotonic() >= deadline:
+                raise TimeoutError(
+                    "current-scoped session search exceeded its bounded query deadline"
+                )
             return rows
         finally:
+            if deadline_token is not None:
+                _CURRENT_SCOPE_SEARCH_DEADLINE.reset(deadline_token)
             try:
                 threshold = float(os.getenv("HERMES_SEARCH_SLOW_MS", "1000"))
             except (TypeError, ValueError):
@@ -1556,13 +1684,15 @@ class SessionSearchMixin:
         offset: int,
         sort: Optional[str],
         include_inactive: bool,
+        recall_scope: object,
     ) -> List[Dict[str, Any]]:
         """Search canonical messages while derived FTS state is stale."""
         predicate, params, snippet_term = self._compile_like_boolean_query(query)
         if not predicate or snippet_term is None:
             return []
 
-        where = [f"({predicate})"]
+        from_sql, join_where = self._like_search_from_sql(recall_scope)
+        where = [*join_where, f"({predicate})"]
         if not include_inactive:
             where.append("(m.active = 1 OR m.compacted = 1)")
         if source_filter is not None:
@@ -1576,6 +1706,10 @@ class SessionSearchMixin:
         if role_filter:
             where.append(f"m.role IN ({','.join('?' for _ in role_filter)})")
             params.extend(role_filter)
+        scope_sql, scope_params = self._recall_scope_sql("s", recall_scope)
+        if scope_sql:
+            where.append(scope_sql)
+            params.extend(scope_params)
 
         order = (
             "ASC"
@@ -1587,13 +1721,12 @@ class SessionSearchMixin:
                    substr(m.content, max(1, instr(m.content, ?) - 40), 120) AS snippet,
                    m.timestamp, m.tool_name,
                    s.source, s.model, s.started_at AS session_started
-            FROM messages m
-            JOIN sessions s ON s.id = m.session_id
+            {from_sql}
             WHERE {' AND '.join(where)}
             ORDER BY m.timestamp {order}, m.id {order}
             LIMIT ? OFFSET ?
         """
-        with self._read_ctx() as conn:
+        with self._search_read_ctx() as conn:
             rows = conn.execute(
                 sql, [snippet_term, *params, limit, offset]
             ).fetchall()
@@ -1634,7 +1767,7 @@ class SessionSearchMixin:
         )
         for match in context_matches:
             try:
-                with self._read_ctx() as conn:
+                with self._search_read_ctx() as conn:
                     ctx_cursor = conn.execute(
                         """WITH target AS (
                                SELECT session_id, timestamp, id
@@ -1719,6 +1852,7 @@ class SessionSearchMixin:
         sort: str = None,
         include_inactive: bool = False,
         fields: Optional[Collection[str]] = None,
+        recall_scope: object = None,
     ) -> List[Dict[str, Any]]:
         """
         Full-text search across session messages using FTS5.
@@ -1771,6 +1905,7 @@ class SessionSearchMixin:
                 offset=offset,
                 sort=sort,
                 include_inactive=include_inactive,
+                recall_scope=recall_scope,
             )
             return self._finalize_search_matches(
                 matches, result_fields=result_fields
@@ -1797,8 +1932,13 @@ class SessionSearchMixin:
         else:
             order_by_sql = "ORDER BY rank"
 
-        # Build WHERE clauses dynamically
-        where_clauses = ["messages_fts MATCH ?"]
+        # Build WHERE clauses dynamically. Current-chat queries deliberately
+        # start from the matching sessions/messages; global queries keep the
+        # historical FTS-first plan.
+        fts_from_sql, fts_join_where = self._fts_search_from_sql(
+            "messages_fts", recall_scope
+        )
+        where_clauses = [*fts_join_where, "messages_fts MATCH ?"]
         params: list = [query]
         if not include_inactive:
             # Live rows (active=1) AND compaction-archived rows (compacted=1)
@@ -1821,6 +1961,11 @@ class SessionSearchMixin:
             where_clauses.append(f"m.role IN ({role_placeholders})")
             params.extend(role_filter)
 
+        scope_sql, scope_params = self._recall_scope_sql("s", recall_scope)
+        if scope_sql:
+            where_clauses.append(scope_sql)
+            params.extend(scope_params)
+
         where_sql = " AND ".join(where_clauses)
         params.extend([limit, offset])
 
@@ -1835,9 +1980,7 @@ class SessionSearchMixin:
                 s.source,
                 s.model,
                 s.started_at AS session_started
-            FROM messages_fts
-            JOIN messages m ON m.id = messages_fts.rowid
-            JOIN sessions s ON s.id = m.session_id
+            {fts_from_sql}
             WHERE {where_sql}
             {order_by_sql}
             LIMIT ? OFFSET ?
@@ -1900,7 +2043,10 @@ class SessionSearchMixin:
                     else:
                         parts.append('"' + tok.replace('"', '""') + '"')
                 cjk_query = " ".join(parts)
-                cjk_where = ["messages_fts_cjk MATCH ?"]
+                cjk_from_sql, cjk_join_where = self._fts_search_from_sql(
+                    "messages_fts_cjk", recall_scope
+                )
+                cjk_where = [*cjk_join_where, "messages_fts_cjk MATCH ?"]
                 cjk_params: list = [cjk_query]
                 if not include_inactive:
                     cjk_where.append("(m.active = 1 OR m.compacted = 1)")
@@ -1913,6 +2059,10 @@ class SessionSearchMixin:
                 if role_filter:
                     cjk_where.append(f"m.role IN ({','.join('?' for _ in role_filter)})")
                     cjk_params.extend(role_filter)
+                scope_sql, scope_params = self._recall_scope_sql("s", recall_scope)
+                if scope_sql:
+                    cjk_where.append(scope_sql)
+                    cjk_params.extend(scope_params)
                 cjk_sql = f"""
                     SELECT
                         m.id,
@@ -1924,16 +2074,14 @@ class SessionSearchMixin:
                         s.source,
                         s.model,
                         s.started_at AS session_started
-                    FROM messages_fts_cjk
-                    JOIN messages m ON m.id = messages_fts_cjk.rowid
-                    JOIN sessions s ON s.id = m.session_id
+                    {cjk_from_sql}
                     WHERE {' AND '.join(cjk_where)}
                     {order_by_sql}
                     LIMIT ? OFFSET ?
                 """
                 cjk_params.extend([limit, offset])
                 try:
-                    with self._read_ctx() as conn:
+                    with self._search_read_ctx() as conn:
                         cjk_cursor = conn.execute(cjk_sql, cjk_params)
                         matches = [dict(row) for row in cjk_cursor.fetchall()]
                         _trigram_succeeded = True
@@ -1975,7 +2123,10 @@ class SessionSearchMixin:
                     else:
                         parts.append('"' + tok.replace('"', '""') + '"')
                 trigram_query = " ".join(parts)
-                tri_where = ["messages_fts_trigram MATCH ?"]
+                tri_from_sql, tri_join_where = self._fts_search_from_sql(
+                    "messages_fts_trigram", recall_scope
+                )
+                tri_where = [*tri_join_where, "messages_fts_trigram MATCH ?"]
                 tri_params: list = [trigram_query]
                 if not include_inactive:
                     tri_where.append("(m.active = 1 OR m.compacted = 1)")
@@ -1988,6 +2139,10 @@ class SessionSearchMixin:
                 if role_filter:
                     tri_where.append(f"m.role IN ({','.join('?' for _ in role_filter)})")
                     tri_params.extend(role_filter)
+                scope_sql, scope_params = self._recall_scope_sql("s", recall_scope)
+                if scope_sql:
+                    tri_where.append(scope_sql)
+                    tri_params.extend(scope_params)
                 tri_sql = f"""
                     SELECT
                         m.id,
@@ -1999,16 +2154,14 @@ class SessionSearchMixin:
                         s.source,
                         s.model,
                         s.started_at AS session_started
-                    FROM messages_fts_trigram
-                    JOIN messages m ON m.id = messages_fts_trigram.rowid
-                    JOIN sessions s ON s.id = m.session_id
+                    {tri_from_sql}
                     WHERE {' AND '.join(tri_where)}
                     {order_by_sql}
                     LIMIT ? OFFSET ?
                 """
                 tri_params.extend([limit, offset])
                 try:
-                    with self._read_ctx() as conn:
+                    with self._search_read_ctx() as conn:
                         tri_cursor = conn.execute(tri_sql, tri_params)
                         matches = [dict(row) for row in tri_cursor.fetchall()]
                         _trigram_succeeded = True
@@ -2045,7 +2198,13 @@ class SessionSearchMixin:
                         "(m.content LIKE ? ESCAPE '\\' OR m.tool_name LIKE ? ESCAPE '\\' OR m.tool_calls LIKE ? ESCAPE '\\')"
                     )
                     like_params += [f"%{esc}%", f"%{esc}%", f"%{esc}%"]
-                like_where = [f"({' OR '.join(token_clauses)})"]
+                like_from_sql, like_join_where = self._like_search_from_sql(
+                    recall_scope
+                )
+                like_where = [
+                    *like_join_where,
+                    f"({' OR '.join(token_clauses)})",
+                ]
                 if not include_inactive:
                     # Same visibility rule as the FTS5 paths: live rows and
                     # compaction-archived rows are discoverable; rewind/undo
@@ -2060,6 +2219,10 @@ class SessionSearchMixin:
                 if role_filter:
                     like_where.append(f"m.role IN ({','.join('?' for _ in role_filter)})")
                     like_params.extend(role_filter)
+                scope_sql, scope_params = self._recall_scope_sql("s", recall_scope)
+                if scope_sql:
+                    like_where.append(scope_sql)
+                    like_params.extend(scope_params)
                 like_sql = f"""
                     SELECT m.id, m.session_id, m.role,
                            substr(m.content,
@@ -2067,8 +2230,7 @@ class SessionSearchMixin:
                                   120) AS snippet,
                            m.timestamp, m.tool_name,
                            s.source, s.model, s.started_at AS session_started
-                    FROM messages m
-                    JOIN sessions s ON s.id = m.session_id
+                    {like_from_sql}
                     WHERE {' AND '.join(like_where)}
                     ORDER BY m.timestamp DESC
                     LIMIT ? OFFSET ?
@@ -2076,12 +2238,12 @@ class SessionSearchMixin:
                 like_params.extend([limit, offset])
                 # instr() for snippet uses first search token
                 like_params = [non_op_tokens[0]] + like_params
-                with self._read_ctx() as conn:
+                with self._search_read_ctx() as conn:
                     like_cursor = conn.execute(like_sql, like_params)
                     matches = [dict(row) for row in like_cursor.fetchall()]
         else:
             try:
-                with self._read_ctx() as conn:
+                with self._search_read_ctx() as conn:
                     cursor = conn.execute(sql, params)
                     matches = [dict(row) for row in cursor.fetchall()]
             except sqlite3.OperationalError:
@@ -2106,6 +2268,7 @@ class SessionSearchMixin:
                     offset=offset,
                     sort=sort,
                     include_inactive=include_inactive,
+                    recall_scope=recall_scope,
                 )
 
         # Deferred-rebuild supplement (schema v23): while the background
@@ -2125,6 +2288,7 @@ class SessionSearchMixin:
                     source_filter=source_filter,
                     exclude_sources=exclude_sources,
                     role_filter=role_filter,
+                    recall_scope=recall_scope,
                 )
                 seen_ids = {m["id"] for m in matches}
                 matches.extend(m for m in gap_matches if m["id"] not in seen_ids)
@@ -2165,6 +2329,7 @@ class SessionSearchMixin:
                     role_filter=role_filter,
                     limit=limit,
                     offset=offset,
+                    recall_scope=recall_scope,
                 )
                 if cjk_fb:
                     matches = cjk_fb
@@ -2182,6 +2347,7 @@ class SessionSearchMixin:
                     role_filter=role_filter,
                     limit=limit,
                     offset=offset,
+                    recall_scope=recall_scope,
                 )
                 if tri_matches:
                     matches = tri_matches
@@ -2197,6 +2363,7 @@ class SessionSearchMixin:
         source_filter: Optional[List[str]] = None,
         exclude_sources: Optional[List[str]] = None,
         role_filter: Optional[List[str]] = None,
+        recall_scope: object = None,
     ) -> List[Dict[str, Any]]:
         """LIKE-scan the rows the deferred rebuild hasn't indexed yet.
 
@@ -2222,7 +2389,8 @@ class SessionSearchMixin:
         if not terms:
             return []
 
-        where = ["m.id > ? AND m.id <= ?"]
+        from_sql, join_where = self._like_search_from_sql(recall_scope)
+        where = [*join_where, "m.id > ? AND m.id <= ?"]
         params: list = [progress, high_water]
         for term in terms:
             esc = _escape_like(term)
@@ -2242,6 +2410,10 @@ class SessionSearchMixin:
         if role_filter:
             where.append(f"m.role IN ({','.join('?' for _ in role_filter)})")
             params.extend(role_filter)
+        scope_sql, scope_params = self._recall_scope_sql("s", recall_scope)
+        if scope_sql:
+            where.append(scope_sql)
+            params.extend(scope_params)
 
         sql = f"""
             SELECT m.id, m.session_id, m.role,
@@ -2250,14 +2422,13 @@ class SessionSearchMixin:
                           120) AS snippet,
                    m.timestamp, m.tool_name,
                    s.source, s.model, s.started_at AS session_started
-            FROM messages m
-            JOIN sessions s ON s.id = m.session_id
+            {from_sql}
             WHERE {' AND '.join(where)}
             ORDER BY m.timestamp DESC
             LIMIT ?
         """
         params = [terms[0]] + params + [limit]
-        with self._read_ctx() as conn:
+        with self._search_read_ctx() as conn:
             rows = conn.execute(sql, params).fetchall()
         return [dict(r) for r in rows]
 
