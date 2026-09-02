@@ -392,17 +392,50 @@ def _has_healthy_oauth_fallback_for_apikey_provider(provider_label: str) -> bool
     return False
 
 
+# JSON collection is enabled only for one ``run_doctor`` invocation.  The
+# command is a single-process CLI entrypoint, and each invocation resets the
+# collector before emitting any output.
+_json_mode: bool = False
+_json_results: list[dict[str, str]] = []
+_json_current_section: str = ""
+
+
+def _record_check(status: str, text: str, detail: str = "") -> None:
+    """Record one check for JSON output; do nothing in human mode."""
+    if not _json_mode:
+        return
+    cleaned_detail = detail or ""
+    if cleaned_detail.startswith("(") and cleaned_detail.endswith(")"):
+        cleaned_detail = cleaned_detail[1:-1]
+    _json_results.append(
+        {
+            "section": _json_current_section,
+            "status": status,
+            "message": text,
+            "detail": cleaned_detail,
+        }
+    )
+
+
 def check_ok(text: str, detail: str = ""):
-    print(f"  {color('✓', Colors.GREEN)} {text}" + (f" {color(detail, Colors.DIM)}" if detail else ""))
+    if not _json_mode:
+        print(f"  {color('✓', Colors.GREEN)} {text}" + (f" {color(detail, Colors.DIM)}" if detail else ""))
+    _record_check("ok", text, detail)
 
 def check_warn(text: str, detail: str = ""):
-    print(f"  {color('⚠', Colors.YELLOW)} {text}" + (f" {color(detail, Colors.DIM)}" if detail else ""))
+    if not _json_mode:
+        print(f"  {color('⚠', Colors.YELLOW)} {text}" + (f" {color(detail, Colors.DIM)}" if detail else ""))
+    _record_check("warn", text, detail)
 
 def check_fail(text: str, detail: str = ""):
-    print(f"  {color('✗', Colors.RED)} {text}" + (f" {color(detail, Colors.DIM)}" if detail else ""))
+    if not _json_mode:
+        print(f"  {color('✗', Colors.RED)} {text}" + (f" {color(detail, Colors.DIM)}" if detail else ""))
+    _record_check("fail", text, detail)
 
 def check_info(text: str):
-    print(f"    {color('→', Colors.CYAN)} {text}")
+    if not _json_mode:
+        print(f"    {color('→', Colors.CYAN)} {text}")
+    _record_check("info", text)
 
 
 def _doctor_memory_config(hermes_home: Path | None = None) -> dict:
@@ -531,14 +564,19 @@ def _render_state_db_stats(stats: dict, holders=None) -> list:
 
 def _section(title: str) -> None:
     """Print a doctor section banner: blank line + bold cyan ◆ title."""
-    print()
-    print(color(f"◆ {title}", Colors.CYAN, Colors.BOLD))
+    global _json_current_section
+    _json_current_section = title
+    if not _json_mode:
+        print()
+        print(color(f"◆ {title}", Colors.CYAN, Colors.BOLD))
 
 
 def _fail_and_issue(text: str, detail: str, fix: str, issues: list[str]) -> None:
     """Emit a check_fail and append the corresponding fix instruction."""
     check_fail(text, detail)
     issues.append(fix)
+    if _json_mode:
+        _json_results[-1]["fix"] = fix
 
 
 # Deprecated / legacy config keys still read for back-compat. Doctor surfaces
@@ -1255,10 +1293,113 @@ def check_macos_full_disk_access() -> None:
     )
 
 
+def _sanitize_url_for_display(url: str) -> str:
+    """Remove credentials, query parameters, and fragments from a URL."""
+    if not url:
+        return url
+    try:
+        from urllib.parse import urlparse, urlunparse
+
+        parsed = urlparse(url)
+        netloc = parsed.netloc.rsplit("@", 1)[-1]
+        return urlunparse(parsed._replace(netloc=netloc, query="", fragment=""))
+    except Exception:
+        return "<url-redacted>"
+
+
+def _show_verbose_route_details() -> None:
+    """Show resolved primary routing configuration for ``doctor --verbose``."""
+    _section("Route Configuration")
+    try:
+        from hermes_cli.config import load_config
+
+        cfg = load_config()
+        model_cfg = cfg.get("model") if isinstance(cfg, dict) else {}
+        model_cfg = model_cfg if isinstance(model_cfg, dict) else {}
+        provider = str(model_cfg.get("provider") or "auto")
+        model = str(model_cfg.get("default") or model_cfg.get("model") or "")
+        base_url = str(model_cfg.get("base_url") or "")
+        api_mode = str(model_cfg.get("api_mode") or "")
+
+        check_info(f"provider: {provider}")
+        if model:
+            check_info(f"model: {model}")
+        if base_url:
+            check_info(f"base_url: {_sanitize_url_for_display(base_url)}")
+        if api_mode:
+            check_info(f"api_mode: {api_mode}")
+
+        provider_routing = cfg.get("provider_routing") if isinstance(cfg, dict) else None
+        if isinstance(provider_routing, dict):
+            routing_parts = [
+                f"{key}={provider_routing[key]}"
+                for key in ("sort", "order", "only", "ignore")
+                if provider_routing.get(key)
+            ]
+            if routing_parts:
+                check_info(f"provider_routing: {', '.join(routing_parts)}")
+    except Exception as exc:
+        check_warn("Could not read route configuration", f"({exc})")
+
+
+def _show_verbose_fallback_chain() -> None:
+    """Show the effective, deduplicated fallback provider chain."""
+    _section("Fallback Chain")
+    try:
+        from hermes_cli.config import load_config
+        from hermes_cli.fallback_config import get_fallback_chain
+
+        chain = get_fallback_chain(load_config())
+        if not chain:
+            check_info("No fallback providers configured")
+            return
+        for index, fallback in enumerate(chain):
+            provider = fallback.get("provider", "?")
+            model = fallback.get("model", "default")
+            label = f"[{index}] {provider} ({model})"
+            if fallback.get("base_url"):
+                label += f" at {_sanitize_url_for_display(str(fallback['base_url']))}"
+            check_info(label)
+    except Exception as exc:
+        check_warn("Could not read fallback chain", f"({exc})")
+
+
+def _show_verbose_auxiliary_config() -> None:
+    """Show every configured auxiliary-task override without hardcoding tasks."""
+    _section("Auxiliary Tasks")
+    try:
+        from hermes_cli.config import load_config
+
+        cfg = load_config()
+        auxiliary = cfg.get("auxiliary") if isinstance(cfg, dict) else {}
+        if not isinstance(auxiliary, dict) or not auxiliary:
+            check_info("No auxiliary task configuration found")
+            return
+        for task in sorted(auxiliary):
+            task_cfg = auxiliary[task]
+            if not isinstance(task_cfg, dict):
+                continue
+            parts = [f"provider={task_cfg.get('provider') or 'auto'}"]
+            if task_cfg.get("model"):
+                parts.append(f"model={task_cfg['model']}")
+            if task_cfg.get("timeout"):
+                parts.append(f"timeout={task_cfg['timeout']}s")
+            check_info(f"{task}: {', '.join(parts)}")
+    except Exception as exc:
+        check_warn("Could not read auxiliary configuration", f"({exc})")
+
+
 def run_doctor(args):
     """Run diagnostic checks."""
+    global _json_mode, _json_results, _json_current_section
     should_fix = getattr(args, 'fix', False)
     ack_target = getattr(args, 'ack', None)
+    use_json = getattr(args, 'json', False)
+    use_verbose = getattr(args, 'verbose', False)
+
+    _json_mode = use_json
+    _json_results = []
+    _json_current_section = ""
 
     # Doctor runs from the interactive CLI, so CLI-gated tool availability
     # checks (like cronjob management) should see the same context as `hermes`.
@@ -1299,10 +1440,11 @@ def run_doctor(args):
     manual_issues = []  # issues that can't be auto-fixed
     fixed_count = 0
 
-    print()
-    print(color("┌─────────────────────────────────────────────────────────┐", Colors.CYAN))
-    print(color("│                 🩺 Hermes Doctor                        │", Colors.CYAN))
-    print(color("└─────────────────────────────────────────────────────────┘", Colors.CYAN))
+    if not _json_mode:
+        print()
+        print(color("┌─────────────────────────────────────────────────────────┐", Colors.CYAN))
+        print(color("│                 🩺 Hermes Doctor                        │", Colors.CYAN))
+        print(color("└─────────────────────────────────────────────────────────┘", Colors.CYAN))
 
     _section("Security Advisories")
     try:
@@ -1320,13 +1462,19 @@ def run_doctor(args):
                     f"{hit.advisory.title}",
                     f"({hit.package}=={hit.installed_version})",
                 )
-                # Print the full remediation block, indented under the
-                # check_fail header so it reads as a single section.
-                for line in full_remediation_text(hit):
-                    if line:
-                        print(f"    {color(line, Colors.YELLOW)}")
-                    else:
-                        print()
+                remediation_lines = full_remediation_text(hit)
+                if _json_mode:
+                    remediation = "\n".join(line for line in remediation_lines if line)
+                    if remediation:
+                        _json_results[-1]["remediation"] = remediation
+                else:
+                    # Print the full remediation block, indented under the
+                    # check_fail header so it reads as a single section.
+                    for line in remediation_lines:
+                        if line:
+                            print(f"    {color(line, Colors.YELLOW)}")
+                        else:
+                            print()
                 # Funnel into the action list so the summary block surfaces it
                 # for users who scroll past the section.
                 manual_issues.append(
@@ -3152,8 +3300,9 @@ def run_doctor(args):
 
     # Print a single status line so users see something happening, then
     # fan out. ``\r`` clears it once the first real result line lands.
-    print(f"  {color(f'Running {len(_probes)} connectivity checks in parallel…', Colors.DIM)}",
-          end="", flush=True)
+    if not _json_mode:
+        print(f"  {color(f'Running {len(_probes)} connectivity checks in parallel…', Colors.DIM)}",
+              end="", flush=True)
 
     # Disable boto3's EC2 instance-metadata-service probe for the duration
     # of the parallel block. boto's default credential chain tries
@@ -3181,13 +3330,18 @@ def run_doctor(args):
             os.environ["AWS_EC2_METADATA_DISABLED"] = _imds_prev
 
     # Clear the "Running …" line and print all results in submission order.
-    print("\r" + " " * 70 + "\r", end="")
+    if not _json_mode:
+        print("\r" + " " * 70 + "\r", end="")
     for _r in _results:
         for _glyph, _label, _detail in _r.lines:
-            if _detail:
-                print(f"  {_glyph} {_label} {_detail}")
-            else:
-                print(f"  {_glyph} {_label}")
+            if not _json_mode:
+                if _detail:
+                    print(f"  {_glyph} {_label} {_detail}")
+                else:
+                    print(f"  {_glyph} {_label}")
+            glyph_text = str(_glyph)
+            status = "fail" if "✗" in glyph_text else "warn" if "⚠" in glyph_text else "ok"
+            _record_check(status, _label, str(_detail))
         _issues_to_add = list(_r.issues)
         if _issues_to_add and _has_healthy_oauth_fallback_for_apikey_provider(_r.label):
             _issues_to_add = []
@@ -3420,31 +3574,53 @@ def run_doctor(args):
     except Exception:
         pass
 
-    print()
+    if use_verbose:
+        _show_verbose_route_details()
+        _show_verbose_fallback_chain()
+        _show_verbose_auxiliary_config()
+
     remaining_issues = issues + manual_issues
-    if should_fix and fixed_count > 0:
-        print(color("─" * 60, Colors.GREEN))
-        print(color(f"  Fixed {fixed_count} issue(s).", Colors.GREEN, Colors.BOLD), end="")
-        if remaining_issues:
-            print(color(f" {len(remaining_issues)} issue(s) require manual intervention.", Colors.YELLOW, Colors.BOLD))
-        else:
-            print()
+    if not _json_mode:
         print()
-        if remaining_issues:
+        if should_fix and fixed_count > 0:
+            print(color("─" * 60, Colors.GREEN))
+            print(color(f"  Fixed {fixed_count} issue(s).", Colors.GREEN, Colors.BOLD), end="")
+            if remaining_issues:
+                print(color(f" {len(remaining_issues)} issue(s) require manual intervention.", Colors.YELLOW, Colors.BOLD))
+            else:
+                print()
+            print()
+            if remaining_issues:
+                for i, issue in enumerate(remaining_issues, 1):
+                    print(f"  {i}. {issue}")
+                print()
+        elif remaining_issues:
+            print(color("─" * 60, Colors.YELLOW))
+            print(color(f"  Found {len(remaining_issues)} issue(s) to address:", Colors.YELLOW, Colors.BOLD))
+            print()
             for i, issue in enumerate(remaining_issues, 1):
                 print(f"  {i}. {issue}")
             print()
-    elif remaining_issues:
-        print(color("─" * 60, Colors.YELLOW))
-        print(color(f"  Found {len(remaining_issues)} issue(s) to address:", Colors.YELLOW, Colors.BOLD))
+            if not should_fix:
+                print(color("  Tip: run 'hermes doctor --fix' to auto-fix what's possible.", Colors.DIM))
+        else:
+            print(color("─" * 60, Colors.GREEN))
+            print(color("  All checks passed! 🎉", Colors.GREEN, Colors.BOLD))
         print()
-        for i, issue in enumerate(remaining_issues, 1):
-            print(f"  {i}. {issue}")
-        print()
-        if not should_fix:
-            print(color("  Tip: run 'hermes doctor --fix' to auto-fix what's possible.", Colors.DIM))
-    else:
-        print(color("─" * 60, Colors.GREEN))
-        print(color("  All checks passed! 🎉", Colors.GREEN, Colors.BOLD))
-    
-    print()
+
+    if _json_mode:
+        import json as _json
+
+        output = {
+            "hermes_home": str(HERMES_HOME),
+            "python_version": f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}",
+            "checks": _json_results,
+            "issues": issues,
+            "manual_issues": manual_issues,
+            "fixable_count": sum(
+                1 for issue in issues if "hermes doctor --fix" in issue or "doctor --fix" in issue
+            ),
+            "total_issues": len(remaining_issues),
+            "fixed_count": fixed_count,
+        }
+        print(_json.dumps(output, indent=2, ensure_ascii=False))

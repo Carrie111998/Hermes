@@ -6,7 +6,7 @@ import sys
 import types
 import io
 import contextlib
-from argparse import Namespace
+from argparse import ArgumentParser, Namespace
 from types import SimpleNamespace
 
 import pytest
@@ -15,6 +15,158 @@ import hermes_cli.doctor as doctor
 import hermes_cli.gateway as gateway_cli
 from hermes_cli import doctor as doctor_mod
 from hermes_cli.doctor import _has_provider_env_config
+from hermes_cli.subcommands.doctor import build_doctor_parser
+
+
+class TestDoctorParser:
+    """The CLI parser must expose and validate doctor output modes."""
+
+    @staticmethod
+    def _parser() -> ArgumentParser:
+        parser = ArgumentParser()
+        subparsers = parser.add_subparsers(dest="command", required=True)
+        build_doctor_parser(subparsers, cmd_doctor=lambda _args: None)
+        return parser
+
+    def test_json_flag_reaches_doctor_handler(self):
+        args = self._parser().parse_args(["doctor", "--json"])
+
+        assert args.command == "doctor"
+        assert args.json is True
+        assert args.verbose is False
+        assert args.ack is None
+
+    def test_existing_fix_and_ack_modes_remain_available(self):
+        fix_args = self._parser().parse_args(["doctor", "--fix", "--json"])
+        ack_args = self._parser().parse_args(["doctor", "--ack", "ADV-1"])
+        live_args = self._parser().parse_args(["doctor", "--json", "--live"])
+
+        assert fix_args.fix is True
+        assert fix_args.json is True
+        assert ack_args.ack == "ADV-1"
+        assert live_args.json is True
+        assert live_args.live is True
+
+    @pytest.mark.parametrize(
+        "argv",
+        (["doctor", "--json", "--verbose"], ["doctor", "--json", "--ack", "ADV-1"]),
+    )
+    def test_json_rejects_incompatible_doctor_modes(self, argv):
+        with pytest.raises(SystemExit):
+            self._parser().parse_args(argv)
+
+
+class TestDoctorOutputModes:
+    """Observable contracts for the JSON-only and verbose doctor modes."""
+
+    def _run_doctor(self, monkeypatch, tmp_path, *, json_mode=False,
+                    verbose=False, config_yaml="memory: {}\n", setup=None):
+        home = tmp_path / ".hermes"
+        home.mkdir()
+        (home / "config.yaml").write_text(config_yaml, encoding="utf-8")
+        project = tmp_path / "project"
+        project.mkdir()
+
+        monkeypatch.setattr(doctor_mod, "HERMES_HOME", home)
+        monkeypatch.setattr(doctor_mod, "PROJECT_ROOT", project)
+        monkeypatch.setattr(doctor_mod, "_DHH", str(home))
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        monkeypatch.setattr(doctor_mod, "_APIKEY_PROVIDERS_CACHE", [])
+        monkeypatch.setitem(
+            sys.modules,
+            "model_tools",
+            types.SimpleNamespace(
+                check_tool_availability=lambda *args, **kwargs: ([], []),
+                TOOLSET_REQUIREMENTS={},
+            ),
+        )
+        if setup is not None:
+            setup()
+
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            doctor_mod.run_doctor(
+                Namespace(
+                    fix=False,
+                    ack=None,
+                    json=json_mode,
+                    verbose=verbose,
+                )
+            )
+        return out.getvalue()
+
+    def test_json_stdout_is_one_clean_json_document(self, monkeypatch, tmp_path):
+        import json
+
+        output = self._run_doctor(monkeypatch, tmp_path, json_mode=True)
+        payload = json.loads(output)
+
+        assert {"checks", "issues", "manual_issues"} <= payload.keys()
+        assert "\x1b" not in output
+        for glyph in ("✓", "✗", "⚠", "🩺", "◆", "┌", "🎉"):
+            assert glyph not in output
+
+    def test_verbose_reports_effective_route_configuration(self, monkeypatch, tmp_path):
+        output = self._run_doctor(
+            monkeypatch,
+            tmp_path,
+            verbose=True,
+            config_yaml="""\
+model:
+  provider: openrouter
+  default: anthropic/claude-sonnet
+provider_routing:
+  only: [openrouter]
+fallback_providers:
+  - provider: nous
+    model: google/gemini-3-flash
+fallback_model:
+  provider: custom
+  model: local-llama
+auxiliary:
+  compression:
+    provider: custom
+    model: compact-model
+    timeout: 60
+""",
+        )
+
+        assert "Route Configuration" in output
+        assert "provider: openrouter" in output
+        assert "provider_routing: only=['openrouter']" in output
+        assert "Fallback Chain" in output
+        assert "nous (google/gemini-3-flash)" in output
+        assert "custom (local-llama)" in output
+        assert "Auxiliary Tasks" in output
+        assert "compression: provider=custom, model=compact-model, timeout=60s" in output
+
+    def test_json_remains_valid_when_an_advisory_has_remediation(self, monkeypatch, tmp_path):
+        import json
+        from hermes_cli import security_advisories
+
+        hit = types.SimpleNamespace(
+            advisory=types.SimpleNamespace(id="TEST-ADVISORY", title="Test advisory"),
+            package="test-package",
+            installed_version="1.0",
+        )
+
+        def set_advisory() -> None:
+            monkeypatch.setattr(security_advisories, "detect_compromised", lambda: [hit])
+            monkeypatch.setattr(security_advisories, "filter_unacked", lambda hits: hits)
+            monkeypatch.setattr(security_advisories, "get_acked_ids", lambda: set())
+            monkeypatch.setattr(
+                security_advisories,
+                "full_remediation_text",
+                lambda _hit: ["Remove the package now.", "Rotate credentials."],
+            )
+
+        output = self._run_doctor(
+            monkeypatch, tmp_path, json_mode=True, setup=set_advisory
+        )
+        payload = json.loads(output)
+
+        failed = [check for check in payload["checks"] if check["status"] == "fail"]
+        assert failed[0]["remediation"] == "Remove the package now.\nRotate credentials."
 
 
 class TestDoctorPlatformHints:
