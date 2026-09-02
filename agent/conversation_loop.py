@@ -310,6 +310,17 @@ def _should_skip_model_call_for_reference_handoff(
     return True
 
 
+def _reanchor_active_user_after_compaction(
+    agent: Any,
+    messages: List[Dict[str, Any]],
+    user_message: Any,
+) -> int:
+    """Point live composition and persistence at the post-compaction ask."""
+    current_turn_user_idx = reanchor_current_turn_user_idx(messages, user_message)
+    agent._persist_user_message_idx = current_turn_user_idx
+    return current_turn_user_idx
+
+
 # Fallback final_response for a turn ended by the sole-handoff skip (#80622).
 # Deliberately NOT a replay of the last assistant text: finalize_turn's
 # non-assistant-tail chokepoint (#43849) appends final_response as a fresh
@@ -3094,6 +3105,9 @@ def run_conversation(
                         final_response = _HANDOFF_SKIP_FINAL_RESPONSE
                     _turn_exit_reason = "compaction_handoff_not_actionable"
                     break
+                current_turn_user_idx = _reanchor_active_user_after_compaction(
+                    agent, messages, user_message
+                )
                 continue
         elif (
             agent.compression_enabled
@@ -7113,10 +7127,9 @@ def run_conversation(
             # Ordered AFTER the handoff guard: the guard may have re-appended
             # this turn's real user ask (restore path), and the anchor must
             # land on that restored row, not on -1 / a pre-restore index.
-            current_turn_user_idx = reanchor_current_turn_user_idx(
-                messages, user_message
+            current_turn_user_idx = _reanchor_active_user_after_compaction(
+                agent, messages, user_message
             )
-            agent._persist_user_message_idx = current_turn_user_idx
             continue
 
         if _retry.restart_with_rebuilt_messages:
@@ -8049,6 +8062,9 @@ def run_conversation(
                                 final_response = _HANDOFF_SKIP_FINAL_RESPONSE
                             _turn_exit_reason = "compaction_handoff_not_actionable"
                             break
+                        current_turn_user_idx = _reanchor_active_user_after_compaction(
+                            agent, messages, user_message
+                        )
                 elif agent.compression_enabled:
                     # Over threshold but compression is blocked (summary-LLM
                     # cooldown or anti-thrashing). Surface a deduped warning so

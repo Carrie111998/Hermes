@@ -10,6 +10,8 @@ the already-completed work.
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 
 from agent.context_compressor import (
@@ -31,6 +33,7 @@ from agent.context_compressor import (
     user_originated_turn_view,
 )
 from agent.conversation_loop import (
+    _reanchor_active_user_after_compaction,
     _should_skip_model_call_for_reference_handoff,
 )
 from agent.agent_runtime_helpers import repair_message_sequence
@@ -271,6 +274,25 @@ class TestSkipGuardRestoresRealUser:
             for message in messages
             if user_originated_turn_view(message) is not None
         ] == [{"role": "user", "content": "current ask"}]
+
+
+class TestPostCompactionActiveUserAnchor:
+    def test_restored_prompt_becomes_composition_and_persistence_anchor(self):
+        messages = [_standalone_handoff()]
+        agent = SimpleNamespace(_persist_user_message_idx=17)
+
+        assert _should_skip_model_call_for_reference_handoff(
+            messages, "prepare the scheduled briefing"
+        ) is False
+        current_turn_user_idx = _reanchor_active_user_after_compaction(
+            agent, messages, "prepare the scheduled briefing"
+        )
+
+        assert current_turn_user_idx == len(messages) - 1
+        assert messages[current_turn_user_idx]["content"] == (
+            "prepare the scheduled briefing"
+        )
+        assert agent._persist_user_message_idx == current_turn_user_idx
 
 
 class TestUserOriginatedTurnPredicate:
