@@ -395,6 +395,43 @@ def test_comment_ignores_caller_supplied_author(worker_env):
         conn.close()
 
 
+def test_create_schema_exposes_scheduled_initial_status():
+    from tools.kanban_tools import KANBAN_CREATE_SCHEMA
+
+    initial_status = KANBAN_CREATE_SCHEMA["parameters"]["properties"]["initial_status"]
+    assert "scheduled" in initial_status["enum"]
+    assert "outside the dispatcher" in initial_status["description"]
+
+
+def test_list_schema_exposes_scheduled_status_filter():
+    from tools.kanban_tools import KANBAN_LIST_SCHEMA
+
+    status = KANBAN_LIST_SCHEMA["parameters"]["properties"]["status"]
+    assert "scheduled" in status["enum"]
+
+
+def test_create_scheduled_stays_outside_dispatch_queue(worker_env):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    payload = json.loads(
+        kt._handle_create(
+            {
+                "title": "route before dispatch",
+                "assignee": "peer",
+                "initial_status": "scheduled",
+            }
+        )
+    )
+
+    assert payload["ok"] is True
+    assert payload["status"] == "scheduled"
+    with kb.connect_closing() as conn:
+        assert kb.recompute_ready(conn) == 0
+        assert kb.claim_task(conn, payload["task_id"]) is None
+        assert kb.get_task(conn, payload["task_id"]).status == "scheduled"
+
+
 def test_create_happy_path(worker_env):
     from tools import kanban_tools as kt
     out = kt._handle_create({

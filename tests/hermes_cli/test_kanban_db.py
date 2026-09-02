@@ -188,6 +188,125 @@ def test_connect_migrates_legacy_db_before_optional_column_indexes(tmp_path):
 
 
 
+def test_create_task_can_start_scheduled_until_explicit_release(kanban_home):
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="route before dispatch",
+            assignee="ops",
+            initial_status="scheduled",
+        )
+
+        task = kb.get_task(conn, task_id)
+        promoted = kb.recompute_ready(conn)
+        after_recompute = kb.get_task(conn, task_id)
+        claimed_while_scheduled = kb.claim_task(conn, task_id)
+        released = kb.unblock_task(conn, task_id)
+        after_release = kb.get_task(conn, task_id)
+
+        assert task is not None
+        assert after_recompute is not None
+        assert after_release is not None
+        assert task.status == "scheduled"
+        assert claimed_while_scheduled is None
+        assert promoted == 0
+        assert after_recompute.status == "scheduled"
+        assert released is True
+        assert after_release.status == "ready"
+
+
+def test_create_scheduled_unblock_waits_for_unfinished_parent(kanban_home):
+    with kb.connect() as conn:
+        parent_id = kb.create_task(conn, title="parent", assignee="ops")
+        child_id = kb.create_task(
+            conn,
+            title="held child",
+            assignee="ops",
+            parents=[parent_id],
+            initial_status="scheduled",
+        )
+
+        assert kb.unblock_task(conn, child_id) is True
+        assert kb.get_task(conn, child_id).status == "todo"
+
+        assert kb.complete_task(conn, parent_id, summary="parent complete") is True
+        assert kb.get_task(conn, child_id).status == "ready"
+
+
+def test_create_scheduled_unblock_is_ready_when_parent_done(kanban_home):
+    with kb.connect() as conn:
+        parent_id = kb.create_task(conn, title="parent", assignee="ops")
+        assert kb.complete_task(conn, parent_id, summary="parent complete") is True
+        child_id = kb.create_task(
+            conn,
+            title="held child",
+            assignee="ops",
+            parents=[parent_id],
+            initial_status="scheduled",
+        )
+
+        assert kb.unblock_task(conn, child_id) is True
+        assert kb.get_task(conn, child_id).status == "ready"
+
+
+def test_create_scheduled_child_is_atomic_inside_outer_transaction(tmp_path):
+    db_path = tmp_path / "kanban.db"
+    writer = kb.connect(db_path)
+    reader = kb.connect(db_path)
+    try:
+        with kb.write_txn(writer):
+            parent_id = kb.create_task(writer, title="parent", assignee="ops")
+            child_id = kb.create_task(
+                writer,
+                title="held child",
+                assignee="ops",
+                parents=[parent_id],
+                initial_status="scheduled",
+            )
+
+            assert kb.get_task(writer, child_id).status == "scheduled"
+            assert reader.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 0
+
+        child = kb.get_task(reader, child_id)
+        assert child is not None
+        assert child.status == "scheduled"
+        assert kb.parent_ids(reader, child_id) == [parent_id]
+    finally:
+        reader.close()
+        writer.close()
+
+
+def test_dispatch_once_does_not_spawn_scheduled_task(
+    kanban_home, all_assignees_spawnable,
+):
+    spawns = []
+
+    def fake_spawn(task, workspace, board=None):
+        spawns.append(task.id)
+        return 42
+
+    with kb.connect() as conn:
+        scheduled_id = kb.create_task(
+            conn,
+            title="route before dispatch",
+            assignee="ops",
+            initial_status="scheduled",
+        )
+        ready_id = kb.create_task(
+            conn,
+            title="dispatcher control",
+            assignee="ops",
+        )
+
+        result = kb.dispatch_once(conn, spawn_fn=fake_spawn, max_spawn=2)
+        scheduled = kb.get_task(conn, scheduled_id)
+
+    assert spawns == [ready_id]
+    assert [item[0] for item in result.spawned] == [ready_id]
+    assert scheduled is not None
+    assert scheduled.status == "scheduled"
+
+
 def test_schedule_task_parks_time_delay_without_dispatching(kanban_home):
     with kb.connect() as conn:
         t = kb.create_task(conn, title="delayed recheck", assignee="ops")
