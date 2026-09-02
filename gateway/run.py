@@ -129,8 +129,9 @@ _GATEWAY_RETRY_FINAL_DIAGNOSTIC_RE = re.compile(
     r"|model\s+returned\s+no\s+content\s+after\s+all\s+retries"
     r"(?:\s+and\s+fallback\s+attempts)?\."
     r"(?:\s+no\s+fallback\s+providers\s+configured\.)?"
-    r"|no\s+reply:\s+the\s+model\s+returned\s+empty\s+content\.\s+"
-    r"try\s+again,\s+switch\s+model/provider,\s+or\s+inspect\s+the\s+tool\s+output\s+above\."
+    r"|no\s+reply:\s+the\s+model\s+returned\s+empty\s+content"
+    r"(?:\s+after\s+retries\s+and\s+any\s+fallback\s+providers)?\.\s+"
+    r"try\s+(?:`continue`|again),\s+switch\s+model/provider,\s+or\s+inspect\s+the\s+tool\s+output\s+above\."
     r")\s*$",
     re.IGNORECASE,
 )

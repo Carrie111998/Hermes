@@ -11,6 +11,7 @@ from gateway.run import (
     _prepare_gateway_status_message,
     _sanitize_gateway_final_response,
 )
+from run_agent import AIAgent
 
 # Every human-facing chat surface that must receive noise-filtered,
 # secret-redacted, provider-error-sanitized output (not just Telegram).
@@ -265,10 +266,7 @@ def test_chat_gateways_keep_normal_answers(platform):
         "⚠️ Model returning empty responses — switching to fallback provider...",
         "❌ Model returned no content after all retries. No fallback providers configured.",
         "❌ Model returned no content after all retries and fallback attempts.",
-        (
-            "No reply: the model returned empty content. Try again, switch "
-            "model/provider, or inspect the tool output above."
-        ),
+        AIAgent._format_turn_completion_explanation("empty_response_exhausted"),
     ],
 )
 def test_chat_gateways_replace_retry_chatter_used_as_final_response(platform, message):
