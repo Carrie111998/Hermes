@@ -15,16 +15,22 @@ Gesture
 Newest-first ordering: index 0 is always the most recently stashed draft, so
 the common "undo my last Ctrl+S" case is a single keystroke.
 
-Nothing is written to disk. Drafts frequently contain credentials, prompts
-under NDA, or pasted secrets, and a session-scoped stash keeps that material
-in memory only. Callers that later want cross-restart persistence must route
-through ``get_hermes_home()`` rather than hardcoding ``~/.hermes``.
+Disk persistence (optional)
+----------------------------
+The stash can be saved to and loaded from disk via ``save_stash()`` /
+``load_stash()``.  The serialized format uses wall-clock timestamps so
+entries are meaningful across restarts.  Files are written atomically
+(tmp + rename) and locked to owner-only permissions (``0o600``) because
+drafts frequently contain credentials, prompts under NDA, or pasted secrets.
 """
 
 from __future__ import annotations
 
+import json
+import logging
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, List, Optional, Sequence, Tuple
 
 # Single-line preview length for the browse panel.
@@ -171,6 +177,70 @@ class PromptStash:
         self.panel_open = False
         self.panel_cursor = 0
 
+    # ---------------------------------------------------------- serialization
+
+    def to_dict(self) -> dict:
+        """Serialize stash items to a JSON-safe dict with wall-clock timestamps.
+
+        Returns ``{"items": [{text, images, stashed_at_wall, preview}, ...]}``.
+        Each entry's ``stashed_at_wall`` is derived from the in-memory monotonic
+        clock so the value is meaningful across restarts.
+        """
+        mono_now = self._clock()
+        wall_now = time.time()
+        items = []
+        for entry in self._items:
+            wall_time = wall_now - (mono_now - entry.stashed_at)
+            items.append({
+                "text": entry.text,
+                "images": list(entry.images),
+                "stashed_at_wall": wall_time,
+                "preview": entry.preview,
+            })
+        return {"items": items}
+
+    @classmethod
+    def from_dict(
+        cls,
+        data: dict,
+        *,
+        max_items: int = MAX_STASH_ITEMS,
+        clock=None,
+    ) -> PromptStash:
+        """Deserialize stash items from a dict produced by :meth:`to_dict`.
+
+        Wall-clock timestamps are converted back to monotonic offsets so the
+        age display stays accurate for the current session.  Entries with
+        missing or invalid fields are silently skipped.
+        """
+        stash = cls(max_items=max_items, clock=clock)
+        raw_items = data.get("items", []) if isinstance(data, dict) else []
+        entries: list[StashEntry] = []
+        for item in raw_items:
+            if not isinstance(item, dict):
+                continue
+            text = item.get("text")
+            images = item.get("images")
+            wall_time = item.get("stashed_at_wall")
+            preview = item.get("preview")
+            if text is None or images is None or wall_time is None:
+                continue
+            if not isinstance(wall_time, (int, float)):
+                continue
+            # Convert wall clock → session monotonic offset.
+            _clock = stash._clock
+            monotonic_at = _clock() - time.time() + wall_time
+            entries.append(StashEntry(
+                text=text,
+                images=list(images),
+                stashed_at=monotonic_at,
+                preview=preview or "",
+            ))
+        # Restore newest-first ordering (matching in-memory convention).
+        entries.sort(key=lambda e: e.stashed_at, reverse=True)
+        stash._items = entries[: stash._max_items]
+        return stash
+
     # ------------------------------------------------------------ panel state
 
     def _clamp_cursor(self, value: int) -> int:
@@ -258,3 +328,59 @@ def resolve_ctrl_s(
         return ACTION_RESTORED, stash.pop(0)
     stash.open_panel()
     return ACTION_OPEN_PANEL, None
+
+
+# ------------------------------------------------------------------ persistence
+
+_log = logging.getLogger(__name__)
+
+
+def save_stash(stash: PromptStash, path: Path | None = None) -> None:
+    """Persist *stash* to a JSON file.
+
+    The file is written atomically (to a ``.tmp`` sibling, then renamed) and
+    locked to owner-only permissions (``0o600``).  Nothing is written when the
+    stash is empty.
+
+    *path* defaults to ``get_hermes_home() / "stash.json"``.
+    """
+    if not stash:
+        return  # no-op — don't create a file for an empty stash.
+    if path is None:
+        from hermes_constants import get_hermes_home
+
+        path = Path(get_hermes_home()) / "stash.json"
+
+    try:
+        import os as _os
+
+        data = stash.to_dict()
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+        tmp.chmod(0o600)
+        _os.replace(tmp, path)  # os.replace, not Path.rename — atomic on Windows
+    except Exception:
+        _log.exception("Failed to save prompt stash to %s", path)
+
+
+def load_stash(path: Path | None = None) -> PromptStash:
+    """Load a previously saved stash from disk.
+
+    Returns an empty :class:`PromptStash` on any error (missing file, corrupt
+    JSON, invalid data).
+
+    *path* defaults to ``get_hermes_home() / "stash.json"``.
+    """
+    if path is None:
+        from hermes_constants import get_hermes_home
+
+        path = Path(get_hermes_home()) / "stash.json"
+
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return PromptStash.from_dict(data)
+    except FileNotFoundError:
+        return PromptStash()
+    except Exception:
+        _log.warning("Corrupt or unreadable stash file %s — starting fresh", path)
+        return PromptStash()

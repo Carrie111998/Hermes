@@ -5787,10 +5787,11 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         self._attached_images: list[Path] = []
         self._image_counter = 0
         # Ctrl+S prompt stash — park a half-written draft, send something
-        # else, bring the draft back.  Session-scoped and in-memory only:
-        # drafts routinely contain secrets, so nothing is written to disk.
+        # else, bring the draft back.  Persisted to disk (0o600 permissions)
+        # so drafts survive crashes and are restored on `hermes -c` / `/resume`.
         from hermes_cli.prompt_stash import PromptStash as _PromptStash
-        self._prompt_stash = _PromptStash()
+        from hermes_cli.prompt_stash import load_stash as _load_stash
+        self._prompt_stash = _load_stash()
         self.preloaded_skills: list[str] = []
         self._startup_skills_line_shown = False
         # Background --skills preload (started by cmd_chat; joined by
@@ -7867,6 +7868,19 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             return frags
         except Exception:
             return [("class:status-bar", f" {self._build_status_bar_text()} ")]
+
+    def _save_stash_to_disk(self) -> None:
+        """Persist the prompt stash to disk after a mutation.
+
+        Called after every Ctrl+S action that changes stash contents (push,
+        pop, delete).  Errors are swallowed — a failed save must never break
+        the interactive TUI.
+        """
+        try:
+            from hermes_cli.prompt_stash import save_stash as _save_stash
+            _save_stash(self._prompt_stash)
+        except Exception:
+            pass
 
     @staticmethod
     def _fmt_stash_age(stashed_at: float) -> str:
@@ -18953,8 +18967,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 # the undo stack are cleared along with the text.
                 buf.reset()
                 cli_ref._attached_images.clear()
+                cli_ref._save_stash_to_disk()
             elif action == ACTION_RESTORED:
                 _restore_stash_payload(event, payload)
+                cli_ref._save_stash_to_disk()
             elif action == ACTION_OPEN_PANEL:
                 pass  # resolve_ctrl_s already flipped panel_open
 
@@ -18975,6 +18991,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             """Enter in the browse panel restores the highlighted draft."""
             payload = cli_ref._prompt_stash.restore_at_cursor()
             _restore_stash_payload(event, payload)
+            cli_ref._save_stash_to_disk()
             event.app.invalidate()
 
         @kb.add('d', filter=_stash_panel_filter, eager=True)
@@ -18982,6 +18999,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         def handle_stash_panel_delete(event):
             """D in the browse panel discards the highlighted draft."""
             cli_ref._prompt_stash.delete_at_cursor()
+            cli_ref._save_stash_to_disk()
             event.app.invalidate()
 
         @kb.add('escape', filter=_stash_panel_filter, eager=True)

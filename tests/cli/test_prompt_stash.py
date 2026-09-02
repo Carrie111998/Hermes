@@ -422,6 +422,172 @@ class TestResolveCtrlS:
             assert len(stash) == 0
 
 
+# ---------------------------------------------------------------- serialization
+
+
+class TestSerialization:
+    """to_dict / from_dict for disk persistence."""
+
+    def test_to_dict_empty_stash(self):
+        s = PromptStash()
+        data = s.to_dict()
+        assert data == {"items": []}
+
+    def test_to_dict_with_entries(self, stash):
+        stash.stash("hello world")
+        stash.stash("nested\ntext")
+        data = stash.to_dict()
+        assert len(data["items"]) == 2
+        # Newest-first order
+        assert data["items"][0]["text"] == "nested\ntext"
+        assert data["items"][1]["text"] == "hello world"
+        for item in data["items"]:
+            assert "text" in item
+            assert "images" in item
+            assert "stashed_at_wall" in item
+            assert "preview" in item
+            # stashed_at_wall should be a reasonable wall-clock time
+            assert isinstance(item["stashed_at_wall"], (int, float))
+            assert item["stashed_at_wall"] > 1_600_000_000  # well past year 2020
+
+    def test_to_dict_includes_images(self, stash):
+        stash.stash("with images", ["/tmp/a.png", "/tmp/b.png"])
+        data = stash.to_dict()
+        assert data["items"][0]["images"] == ["/tmp/a.png", "/tmp/b.png"]
+
+    def test_from_dict_round_trip(self):
+        """Manually build a dict and verify from_dict reconstructs entries."""
+        data = {
+            "items": [
+                {
+                    "text": "first draft",
+                    "images": [],
+                    "stashed_at_wall": 1_700_000_000.0,
+                    "preview": "first draft",
+                },
+                {
+                    "text": "second\ndraft",
+                    "images": ["/tmp/pic.png"],
+                    "stashed_at_wall": 1_700_000_100.0,
+                    "preview": "second ⏎ draft",
+                },
+            ]
+        }
+        restored = PromptStash.from_dict(data)
+        assert len(restored) == 2
+        assert restored._items[0].text == "second\ndraft"
+        assert restored._items[1].text == "first draft"
+        assert restored._items[0].images == ["/tmp/pic.png"]
+        # stashed_at should be adjusted to monotonic — just verify it's a number
+        assert isinstance(restored._items[0].stashed_at, float)
+        assert restored._items[1].preview == "first draft"
+
+    def test_from_dict_missing_fields_skipped(self):
+        """Entries with missing/invalid fields are skipped."""
+        data = {
+            "items": [
+                {"text": "good", "images": [], "stashed_at_wall": 1_700_000_000.0, "preview": "good"},
+                {"text": "bad", "images": [], "stashed_at_wall": None, "preview": "bad"},
+                {},
+                {"text": "no timestamp", "images": []},
+            ]
+        }
+        restored = PromptStash.from_dict(data)
+        assert len(restored) == 1
+        assert restored._items[0].text == "good"
+
+    def test_from_dict_empty_items(self):
+        restored = PromptStash.from_dict({"items": []})
+        assert len(restored) == 0
+
+
+# ---------------------------------------------------------------- persistence
+
+
+class TestDiskPersistence:
+    """save_stash / load_stash — atomic writes, permissions, graceful errors."""
+
+    def test_save_creates_file_with_600_permissions(self, tmp_path):
+        from hermes_cli.prompt_stash import save_stash
+
+        stash = PromptStash()
+        stash.stash("draft one")
+        stash.stash("draft two")
+
+        path = tmp_path / "stash.json"
+        save_stash(stash, path)
+        assert path.exists()
+        stat = path.stat()
+        # Unix permissions: 0o600 = owner read+write only
+        assert stat.st_mode & 0o777 == 0o600
+
+    def test_save_load_round_trip(self, tmp_path):
+        from hermes_cli.prompt_stash import save_stash, load_stash
+
+        stash = PromptStash()
+        stash.stash("hello")
+        stash.stash("line one\nline two", ["/tmp/img.png"])
+
+        path = tmp_path / "stash.json"
+        save_stash(stash, path)
+
+        loaded = load_stash(path)
+        assert len(loaded) == 2
+        entries = loaded.items
+        assert entries[0].text == "line one\nline two"
+        assert entries[0].images == ["/tmp/img.png"]
+        assert entries[1].text == "hello"
+        # Round-trip preserves previews
+        assert entries[0].preview == "line one ⏎ line two"
+
+    def test_load_after_crash(self, tmp_path):
+        """Partial/corrupt JSON still returns an empty stash."""
+        path = tmp_path / "stash.json"
+        path.write_text('{"items": [{"text": "incomplete"')
+        from hermes_cli.prompt_stash import load_stash
+
+        loaded = load_stash(path)
+        assert len(loaded) == 0
+
+    def test_from_dict_missing_file_returns_empty(self, tmp_path):
+        from hermes_cli.prompt_stash import load_stash
+
+        loaded = load_stash(tmp_path / "nonexistent.json")
+        assert len(loaded) == 0
+        assert isinstance(loaded, PromptStash)
+
+    def test_from_dict_corrupt_json_returns_empty(self, tmp_path):
+        """Non-JSON file returns empty stash."""
+        path = tmp_path / "stash.json"
+        path.write_text("this is not json")
+        from hermes_cli.prompt_stash import load_stash
+
+        loaded = load_stash(path)
+        assert len(loaded) == 0
+
+    def test_save_stash_noop_on_empty(self, tmp_path):
+        """Don't create a file when the stash is empty."""
+        from hermes_cli.prompt_stash import save_stash
+
+        stash = PromptStash()
+        path = tmp_path / "stash.json"
+        save_stash(stash, path)
+        assert not path.exists()
+
+    def test_save_stash_empty_with_images(self, tmp_path):
+        """An images-only draft is not empty — should write."""
+        from hermes_cli.prompt_stash import save_stash, load_stash
+
+        stash = PromptStash()
+        stash.stash("", ["/tmp/img.png"])
+        path = tmp_path / "stash.json"
+        save_stash(stash, path)
+        assert path.exists()
+        loaded = load_stash(path)
+        assert len(loaded) == 1
+        assert loaded.peek().preview == "(images only)"
+
+
 # --------------------------------------------------------------------- ages
 
 
