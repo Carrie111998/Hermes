@@ -2591,6 +2591,12 @@ class CredentialPool:
             # Increment usage counter so subsequent selections distribute load
             updated = replace(entry, request_count=entry.request_count + 1)
             self._replace_entry(entry, updated)
+            # Persist the incremented counter: pools are re-loaded from disk
+            # per process/session (gateway resolves a fresh pool per message),
+            # so an in-memory-only counter resets to a 0/0 tie every load and
+            # min() then always returns the priority-0 entry — defeating the
+            # strategy entirely across restarts. Mirrors round_robin's persist.
+            self._persist()
             self._current_id = entry.id
             return updated, pending_refresh
 
