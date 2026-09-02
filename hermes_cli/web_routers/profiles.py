@@ -74,7 +74,10 @@ _cron_profile_home = late("_cron_profile_home")
 _disable_unselected_skills = late("_disable_unselected_skills")
 _fallback_profile_dicts = late("_fallback_profile_dicts")
 _hub_action_name = late("_hub_action_name")
+_is_isolated_server = late("_is_isolated_server")
+_isolated_scope_dir = late("_isolated_scope_dir")
 _open_session_db_at_path = late("_open_session_db_at_path")
+_profile_name_for_scope = late("_profile_name_for_scope")
 _profile_setup_command = late("_profile_setup_command")
 _profile_to_dict = late("_profile_to_dict")
 _resolve_profile_dir = late("_resolve_profile_dir")
@@ -261,7 +264,18 @@ def get_profiles_sessions(
     from hermes_cli import profiles as profiles_mod
 
     targets: List[Tuple[str, Path]] = []
-    if profile and profile != "all":
+    iso = _isolated_target() if _is_isolated_server() else None
+    if iso is not None:
+        # An isolated server reads only its pinned profile's sessions. An
+        # explicit sibling selector fails before any I/O.
+        pinned = iso[0]
+        if profile and profile != "all" and profile != pinned:
+            raise HTTPException(
+                status_code=403,
+                detail=f"This dashboard is isolated to '{pinned}'; refusing profile '{profile}'.",
+            )
+        targets.append(iso)
+    elif profile and profile != "all":
         name, home = _cron_profile_home(profile)
         targets.append((name, home))
     else:
@@ -407,13 +421,28 @@ def get_profiles_sessions_sidebar(
     """
     from hermes_cli import profiles as profiles_mod
 
-    try:
-        # Session aggregation only needs name/path; the lightweight enumerator
-        # avoids YAML/meta/gateway/skill probes for all profiles per refresh.
-        targets: List[Tuple[str, Path]] = profiles_mod.profiles_to_serve(multiplex=True)
-    except Exception:
-        _log.exception("GET /api/profiles/sessions/sidebar: list_profiles failed")
-        targets = []
+    # Isolation authority is resolved BEFORE any fallback try/except: an
+    # explicit sibling selector on an isolated server must 403 — never be
+    # swallowed by the enumeration fallback and silently served from the
+    # default profile (#91330 review, "explicit sibling selectors must fail
+    # before I/O").
+    iso = _isolated_target() if _is_isolated_server() else None
+    if iso is not None:
+        recents_scope = (recents_profile or "all").strip() or "all"
+        if recents_scope != "all" and recents_scope != iso[0]:
+            raise HTTPException(
+                status_code=403,
+                detail=f"This dashboard is isolated to '{iso[0]}'; refusing profile '{recents_scope}'.",
+            )
+        targets: List[Tuple[str, Path]] = [iso]
+    else:
+        try:
+            # Session aggregation only needs name/path; the lightweight enumerator
+            # avoids YAML/meta/gateway/skill probes for all profiles per refresh.
+            targets: List[Tuple[str, Path]] = profiles_mod.profiles_to_serve(multiplex=True)
+        except Exception:
+            _log.exception("GET /api/profiles/sessions/sidebar: list_profiles failed")
+            targets = []
     if not targets:
         targets.append(("default", profiles_mod.get_profile_dir("default")))
 
@@ -648,10 +677,15 @@ def get_profiles_projects_tree(preview_limit: int = 3, session_limit: int = 2000
     from hermes_constants import reset_hermes_home_override, set_hermes_home_override
     from tui_gateway import server as gateway_server
 
+    # Isolation authority resolved BEFORE the fallback try/except so a 403
+    # (sibling or ambiguous scope) propagates instead of being swallowed into
+    # a default-profile fallback (#91330 review).
+    iso = _isolated_target() if _is_isolated_server() else None
     try:
-        targets: List[Tuple[str, Path]] = [
-            (info.name, info.path) for info in profiles_mod.list_profiles()
-        ]
+        if iso is not None:
+            targets: List[Tuple[str, Path]] = [iso]
+        else:
+            targets = [(info.name, info.path) for info in profiles_mod.list_profiles()]
     except Exception:
         _log.exception("GET /api/profiles/projects/tree: list_profiles failed")
         targets = []
@@ -742,8 +776,15 @@ def post_profiles_sessions_pull_requests(body: SessionPrScanBody):
     if not wanted:
         return {"pull_requests": {}, "scanned": []}
 
+    # Isolation authority resolved BEFORE the fallback try/except so a 403
+    # (sibling or ambiguous scope) propagates instead of falling back to a
+    # default-profile scan (#91330 review).
+    iso = _isolated_target() if _is_isolated_server() else None
     try:
-        targets = [(info.name, info.path) for info in profiles_mod.list_profiles()]
+        if iso is not None:
+            targets: List[Tuple[str, Path]] = [iso]
+        else:
+            targets = [(info.name, info.path) for info in profiles_mod.list_profiles()]
     except Exception:
         _log.exception("POST /api/profiles/sessions/pull-requests: list_profiles failed")
         targets = []
@@ -782,8 +823,15 @@ def post_profiles_sessions_pull_requests(body: SessionPrScanBody):
 @router.get("/api/profiles")
 async def list_profiles_endpoint():
     from hermes_cli import profiles as profiles_mod
+    # Isolation authority resolved BEFORE the fallback try/except: an isolated
+    # server with no unambiguous scoped principal must 403, not fall through to
+    # a directory scan that could surface siblings (#91330 review).
+    iso = _isolated_target() if _is_isolated_server() else None
     try:
         profiles = await run_in_threadpool(profiles_mod.list_profiles)
+        if iso is not None:
+            pinned = iso[0]
+            profiles = [p for p in profiles if getattr(p, "name", None) == pinned]
         return {"profiles": [_profile_to_dict(p) for p in profiles]}
     except Exception:
         _log.exception("GET /api/profiles failed; falling back to profile directory scan")
@@ -792,6 +840,12 @@ async def list_profiles_endpoint():
 
 @router.post("/api/profiles")
 async def create_profile_endpoint(body: ProfileCreate):
+    # Every clone source (explicit clone_from, clone_all, and the implicit
+    # "default") is an authority-bearing profile selector: cloning READS the
+    # source profile's config/.env/SOUL/skills. On an isolated server the
+    # source may be a sibling profile, so creation is refused outright before
+    # any source file is touched (#91330 review).
+    _assert_machine_control_plane_allowed("profile create")
     from hermes_cli import profiles as profiles_mod
     explicit_source = (body.clone_from or "").strip()
     if explicit_source:
@@ -931,6 +985,9 @@ async def set_active_profile_endpoint(body: ProfileActiveUpdate):
     Note: this does not retarget the already-running dashboard process —
     it changes which profile subsequent CLI commands and gateways use.
     """
+    # Switching the machine-wide active profile is a control-plane operation
+    # over the whole profile set — refused on an isolated server (#91330 review).
+    _assert_machine_control_plane_allowed("active-profile switch")
     from hermes_cli import profiles as profiles_mod
     try:
         profiles_mod.set_active_profile(body.name)
@@ -946,11 +1003,13 @@ async def set_active_profile_endpoint(body: ProfileActiveUpdate):
 
 @router.get("/api/profiles/{name}/setup-command")
 async def get_profile_setup_command(name: str):
+    _assert_profile_in_scope(name)
     return {"command": _profile_setup_command(name)}
 
 
 @router.post("/api/profiles/{name}/open-terminal")
 async def open_profile_terminal_endpoint(name: str):
+    _assert_profile_in_scope(name)
     try:
         command = _profile_setup_command(name)
 
@@ -1005,6 +1064,7 @@ async def open_profile_terminal_endpoint(name: str):
 
 @router.patch("/api/profiles/{name}")
 async def rename_profile_endpoint(name: str, body: ProfileRename):
+    _assert_profile_in_scope(name)
     from hermes_cli import profiles as profiles_mod
     try:
         path = profiles_mod.rename_profile(name, body.new_name)
@@ -1041,6 +1101,7 @@ async def delete_profile_endpoint(name: str):
     """Delete a profile. The dashboard collects the user's confirmation in
     its own dialog before this request, so we always pass ``yes=True`` to
     skip the CLI's interactive prompt."""
+    _assert_profile_in_scope(name)
     from hermes_cli import profiles as profiles_mod
     try:
         path = profiles_mod.delete_profile(name, yes=True)
@@ -1054,8 +1115,111 @@ async def delete_profile_endpoint(name: str):
     return {"ok": True, "path": str(path)}
 
 
+def _isolated_target() -> Optional[Tuple[str, Path]]:
+    """The (name, home) of the profile this isolated server is pinned to.
+
+    Returns ``None`` on the machine dashboard (no restriction). When the server
+    is isolated, returns the single pinned profile or raises 403 — the
+    canonical launch identity stored on ``app.state`` is the only authority,
+    and an unrecognized/ambiguous principal (a HERMES_HOME that is neither the
+    default root nor a named ``~/.hermes/profiles/<name>``) fails closed: no
+    named profile is provably in scope, so none may be addressed (#91330
+    review, fail-open identity aliasing).
+    """
+    if not _is_isolated_server():
+        return None
+    scope = _isolated_scope_dir()
+    name = _profile_name_for_scope(scope)
+    if name is None:
+        raise HTTPException(
+            status_code=403,
+            detail="This dashboard is isolated but has no unambiguous scoped profile.",
+        )
+    return (name, Path(scope))
+
+
+def _assert_profile_in_scope(name: str) -> None:
+    """Reject cross-profile access from a scoped (isolated) server.
+
+    A dashboard/serve process launched with ``--isolated`` is scoped to a
+    single profile (its own HERMES_HOME). Such a server must not read,
+    mutate, export, or destroy another profile's data: that is the
+    prompt/identity-injection and data-exfiltration boundary behind #91330
+    (an attacker who can reach an isolated dashboard could otherwise rewrite
+    a different profile's persona — or export its config/secrets — to inject
+    a malicious prompt or steal data).
+
+    Isolation is tracked explicitly on ``app.state.isolated`` (threaded from
+    the ``--isolated`` launch flag through :func:`start_server`), not inferred
+    from the profile name — an isolated server may be scoped to the default
+    profile too, and must still be restricted. The default (unified) machine
+    dashboard (isolated=False) is *intentionally* a machine-wide management
+    surface, so this guard is a no-op there. Every ``/api/profiles/{name}/*``
+    read/mutate/export/delete endpoint routes through this guard.
+
+    Authorization compares *canonical resolved paths* — ``get_profile_dir``
+    of the requested name against the stored launch authority — never the
+    profile-name string. ``get_active_profile_name()`` returns the sentinels
+    ``"custom"`` / ``"default"`` for an unrecognized home or a derivation
+    failure, and those are valid real profile names, so a string equality
+    check aliases an isolated server onto a sibling profile (#91330 review,
+    fail-open identity). Path comparison makes the aliasing request resolve
+    to the real sibling directory, which never equals the scoped home.
+    """
+    if not _is_isolated_server():
+        # Unified machine dashboard: cross-profile management is by design.
+        return
+    from hermes_cli import profiles as profiles_mod
+
+    scope = _isolated_scope_dir()
+    requested = profiles_mod.get_profile_dir(name).resolve()
+    if scope is not None and scope == requested:
+        # Asking for the very profile this server is scoped to is always fine.
+        return
+    shown = _profile_name_for_scope(scope) if scope is not None else "(unknown)"
+    raise HTTPException(
+        status_code=403,
+        detail=(
+            f"This dashboard is isolated to '{shown}'. "
+            f"Refusing to access another profile ('{name}')."
+        ),
+    )
+
+
+def _assert_machine_control_plane_allowed(action: str) -> None:
+    """Refuse machine-global profile operations from a scoped (isolated) server.
+
+    Profile creation, archive import, and active-profile switching are
+    control-plane operations over the WHOLE machine's profile set, not over a
+    single ``{name}`` target: ``POST /api/profiles`` accepts caller-controlled
+    ``clone_from``/``clone_all`` (and an implicit ``default`` source), so a
+    client of an isolated server could copy a sibling profile's
+    config/.env/SOUL/skills into a new profile it legitimately controls —
+    reading the protected profile through the clone source even though every
+    destination-side route is guarded (#91330 review, "authority-bearing
+    selectors"). Import archives and active-profile switches carry the same
+    cross-profile authority shape.
+
+    An isolated server is scoped to exactly one profile, so these operations
+    are denied outright (fail-closed) instead of partially permitted. The
+    unified machine dashboard keeps them by design.
+    """
+    if not _is_isolated_server():
+        return
+    scope = _isolated_scope_dir()
+    shown = _profile_name_for_scope(scope) if scope is not None else "(unknown)"
+    raise HTTPException(
+        status_code=403,
+        detail=(
+            f"This dashboard is isolated to '{shown}'. "
+            f"Refusing machine-global profile operation ({action})."
+        ),
+    )
+
+
 @router.get("/api/profiles/{name}/soul")
 async def get_profile_soul(name: str):
+    _assert_profile_in_scope(name)
     soul_path = _resolve_profile_dir(name) / "SOUL.md"
     if soul_path.exists():
         try:
@@ -1067,6 +1231,7 @@ async def get_profile_soul(name: str):
 
 @router.put("/api/profiles/{name}/soul")
 async def update_profile_soul(name: str, body: ProfileSoulUpdate):
+    _assert_profile_in_scope(name)
     soul_path = _resolve_profile_dir(name) / "SOUL.md"
     try:
         from utils import atomic_write_text
@@ -1102,6 +1267,7 @@ async def update_profile_description_endpoint(name: str, body: ProfileDescriptio
     user-authored description (``description_auto: false``) so the
     auto-describer won't overwrite it on a sweep.
     """
+    _assert_profile_in_scope(name)
     from hermes_cli import profiles as profiles_mod
     profile_dir = _resolve_profile_dir(name)
     text = (body.description or "").strip()
@@ -1124,6 +1290,7 @@ async def update_profile_model_endpoint(name: str, body: ProfileModelUpdate):
     active profile. Mirrors ``POST /api/model/set`` (main scope) but scoped
     to the named profile via the HERMES_HOME override.
     """
+    _assert_profile_in_scope(name)
     profile_dir = _resolve_profile_dir(name)
     provider = (body.provider or "").strip()
     model = (body.model or "").strip()
@@ -1147,6 +1314,7 @@ async def describe_profile_auto_endpoint(name: str, body: ProfileDescribeAuto):
     ``ok: false`` with a reason rather than an HTTP error so the UI can
     surface it inline and let the operator fix config and retry.
     """
+    _assert_profile_in_scope(name)
     _resolve_profile_dir(name)
     try:
         from hermes_cli import profile_describer
@@ -1174,6 +1342,7 @@ async def describe_profile_auto_endpoint(name: str, body: ProfileDescribeAuto):
 
 @router.post("/api/profiles/{name}/export")
 async def export_profile_endpoint(name: str, body: ProfileExport):
+    _assert_profile_in_scope(name)
     from hermes_cli import profiles as profiles_mod
 
     output = (body.output or "").strip()
@@ -1203,6 +1372,9 @@ async def export_profile_endpoint(name: str, body: ProfileExport):
 
 @router.post("/api/profiles/import")
 async def import_profile_endpoint(body: ProfileImport):
+    # An imported archive becomes a full profile directory under this server's
+    # control plane — machine-global mutation, refused when isolated.
+    _assert_machine_control_plane_allowed("profile import")
     from hermes_cli import profiles as profiles_mod
 
     archive = (body.archive or "").strip()
@@ -1255,6 +1427,7 @@ async def import_profile_endpoint(body: ProfileImport):
 async def get_profile_desktop_overlay(name: str):
     """The desktop appearance/interface overlay bundled with an imported
     profile (``desktop.json`` at the profile root), or ``exists: false``."""
+    _assert_profile_in_scope(name)
     overlay_path = _resolve_profile_dir(name) / "desktop.json"
     if not overlay_path.is_file():
         return {"exists": False, "desktop": None}

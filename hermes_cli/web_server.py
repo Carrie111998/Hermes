@@ -300,8 +300,22 @@ def _start_desktop_cron_ticker(stop_event: "threading.Event", interval: int = 60
         try:
             from hermes_cli.profiles import profiles_to_serve
 
-            profile_homes = list(profiles_to_serve(multiplex=True))
-            if len(profile_homes) > 1:
+            if getattr(app.state, "isolated", False):
+                # An isolated backend ticks ONLY its pinned profile's cron
+                # store — never siblings. The multiplex tick is a property
+                # of the machine dashboard / multiplex gateway (#91330
+                # review, consolidation owner). The home is wired
+                # explicitly even for a single profile so the scheduler
+                # targets the canonical pinned store, not an inferred
+                # "active" profile.
+                scope_dir = _isolated_scope_dir()
+                pinned = _profile_name_for_scope(scope_dir)
+                if pinned is None:
+                    _log.warning(
+                        "Isolated backend has no unambiguous scoped profile; cron ticker disabled"
+                    )
+                    return
+                profile_homes = [(pinned, Path(scope_dir))]
                 start_kwargs["profile_homes"] = profile_homes
                 # Stand down, per tick, for any profile whose OWN gateway is
                 # running: that gateway ticks it with live adapters, and the
@@ -318,10 +332,21 @@ def _start_desktop_cron_ticker(stop_event: "threading.Event", interval: int = 60
 
                 enable_profile_log_routing(profile_homes)
                 _log.info(
-                    "Desktop cron scheduler will tick %d profile(s): %s",
-                    len(profile_homes),
+                    "Desktop cron scheduler will tick 1 profile(s): %s",
                     [name for name, _home in profile_homes],
                 )
+            else:
+                profile_homes = list(profiles_to_serve(multiplex=True))
+                if len(profile_homes) > 1:
+                    start_kwargs["profile_homes"] = profile_homes
+                    from hermes_logging import enable_profile_log_routing
+
+                    enable_profile_log_routing(profile_homes)
+                    _log.info(
+                        "Desktop cron scheduler will tick %d profile(s): %s",
+                        len(profile_homes),
+                        [name for name, _home in profile_homes],
+                    )
         except Exception:
             # Fail open to the single-store ticker — the active profile's
             # jobs must keep firing even if profile enumeration breaks.
@@ -3632,6 +3657,113 @@ def _collect_profile_gateway_topology() -> Dict[str, Any]:
     }
 
 
+def _collect_single_profile_gateway_topology(
+    name: str, home: Path
+) -> Dict[str, Any]:
+    """Build the ``/api/status`` topology for exactly one pinned profile home.
+
+    An isolated server uses this instead of the machine-wide
+    ``_collect_profile_gateway_topology``: the latter enumerates *every* profile
+    home via ``profiles_to_serve`` and reads each one's ``gateway_state.json``,
+    which on a gated/network bind is pre-auth sibling enumeration
+    (#91381 re-review). The isolation invariant is that an isolated principal
+    must never exercise sibling read authority in the first place — not collect
+    machine-wide and then redact. This scoped collector touches only the
+    pinned ``home``, so the isolation boundary is enforced by *which* data is
+    read, not by post-hoc filtering.
+    """
+    from hermes_cli.profiles import _check_gateway_running
+    from gateway.status import read_runtime_status
+
+    gateways: List[Dict[str, Any]] = []
+    profile_platforms: Dict[str, dict] = {}
+    served: List[str] = []
+    try:
+        running = _check_gateway_running(home)
+    except Exception:
+        running = False
+
+    if running:
+        try:
+            runtime = read_runtime_status(home / "gateway_state.json")
+        except Exception:
+            runtime = None
+        served = [str(p) for p in ((runtime or {}).get("served_profiles") or [])]
+        plats = (runtime or {}).get("platforms")
+        if isinstance(plats, dict) and plats:
+            owned = _owned_profile_platforms(
+                _profile_gateway_writer_identity(home, runtime), plats
+            )
+            if owned:
+                profile_platforms[name] = owned
+        entry: Dict[str, Any] = {
+            "profile": name,
+            "ports": _profile_platform_ports(home, runtime),
+        }
+        if served:
+            entry["served_profiles"] = served
+        gateways.append(entry)
+
+    # Multiplex detection reads only the pinned gateway's OWN runtime status
+    # (served_profiles from its home) — not sibling enumeration — so an
+    # isolated default-profile multiplex gateway still reports "multiplex"
+    # rather than "single" (#91381 re-review, codex P2).
+    if name == "default" and len(served) > 1:
+        mode = "multiplex"
+    elif len(gateways) > 1:
+        mode = "multiple"
+    elif len(gateways) == 1:
+        mode = "single"
+    else:
+        mode = "none"
+
+    return {
+        "profiles": [name],
+        "gateway_mode": mode,
+        "gateways": gateways,
+        "profile_platforms": profile_platforms,
+    }
+
+
+# /api/status is polled ~1/s by the desktop app while it waits for the backend
+# (and again by the dashboard badge). The machine-wide collector is cached for
+# exactly that reason (#_TOPOLOGY_CACHE_TTL below — concurrent polls piling up
+# on profile-home walks starve the event loop). The isolated scoped collector
+# reads only one profile home, so it is cheap, but it is still real file/psutil
+# I/O on a high-frequency route; cache it the same way, keyed by the pinned
+# home so an isolated server never re-scans its own home on every poll
+# (#91381 re-review P2).
+_SCOPED_TOPOLOGY_CACHE: Dict[str, Any] = {"ts": 0.0, "home": None, "data": None}
+_SCOPED_TOPOLOGY_CACHE_TTL = 10.0
+
+
+def _collect_single_profile_gateway_topology_cached(
+    name: str, home: Path
+) -> Dict[str, Any]:
+    """Cached wrapper around :func:`_collect_single_profile_gateway_topology`.
+
+    Keyed by the pinned home so the (single, process-stable) isolated scope
+    reuses one 10s entry instead of re-walking the profile home on every
+    desktop status poll. Shares the topology cache lock so a concurrent
+    isolated and machine-wide collection cannot interleave.
+    """
+    key = str(home)
+    now = time.monotonic()
+    entry = _SCOPED_TOPOLOGY_CACHE
+    if entry["home"] == key and entry["data"] is not None and now - entry["ts"] < _SCOPED_TOPOLOGY_CACHE_TTL:
+        return entry["data"]
+    with _TOPOLOGY_CACHE_LOCK:
+        entry = _SCOPED_TOPOLOGY_CACHE
+        now = time.monotonic()
+        if entry["home"] == key and entry["data"] is not None and now - entry["ts"] < _SCOPED_TOPOLOGY_CACHE_TTL:
+            return entry["data"]
+        data = _collect_single_profile_gateway_topology(name, home)
+        _SCOPED_TOPOLOGY_CACHE["home"] = key
+        _SCOPED_TOPOLOGY_CACHE["data"] = data
+        _SCOPED_TOPOLOGY_CACHE["ts"] = now
+        return data
+
+
 # /api/status is polled ~1/s by the desktop app while it waits for the backend
 # (and again by the dashboard badge). Each uncached call above walks 7+ profile
 # homes (yaml.safe_load with the pure-Python loader + psutil process-table
@@ -3823,6 +3955,26 @@ def _merge_profile_gateway_platforms(
 @app.get("/api/status")
 async def get_status(profile: Optional[str] = None):
     status_scope = None
+    # An isolated backend answers only for its pinned profile — explicit
+    # sibling selectors 403 before any config/env/gateway read (#91330
+    # review, consolidation owner). Omitted/"current" also pins to the
+    # scoped profile: the machine-level topology aggregation below must not
+    # enumerate sibling gateway state from an isolated backend.
+    if _is_isolated_server():
+        scope = _isolated_scope_dir()
+        pinned = _profile_name_for_scope(scope)
+        if pinned is None:
+            raise HTTPException(
+                status_code=403,
+                detail="This dashboard is isolated but has no unambiguous scoped profile.",
+            )
+        # Whitespace-only selectors must count as "omitted" too: the clamp
+        # below strips and would otherwise leave requested_profile == "" and
+        # fall into the machine-level aggregation branch (#91381 review).
+        requested_stripped = (profile or "").strip()
+        if not requested_stripped or requested_stripped.lower() in ("all", "current"):
+            profile = pinned
+    profile = _clamp_profile_query_for_isolated(profile, allow_all=True)
     requested_profile = (profile or "").strip()
     # Plain /api/status stays the machine-level public liveness probe. The
     # dashboard adds ?profile= when its management switcher targets another
@@ -3976,7 +4128,20 @@ async def get_status(profile: Optional[str] = None):
         # ``<profile>:<platform>`` grammar so fleet health sees them (OOF-3).
         # A ``?profile=`` request targets one profile's view and is left
         # unmerged.
-        topology = await run_in_threadpool(_collect_profile_gateway_topology_cached)
+        if _is_isolated_server():
+            # Isolation invariant (#91381 re-review): an isolated principal
+            # must never exercise sibling read authority — not run the
+            # machine-wide collector and then redact. Use the scoped
+            # collector that reads ONLY the pinned profile's home, so the
+            # plain no-query /api/status (pre-auth via PUBLIC_API_PATHS,
+            # #76932-class) cannot enumerate sibling profile names, gateway
+            # mode, or host ports in the first place.
+            topology = await run_in_threadpool(
+                _collect_single_profile_gateway_topology_cached, pinned, scope
+            )
+        else:
+            topology = await run_in_threadpool(_collect_profile_gateway_topology_cached)
+            topology = _scope_topology_for_isolated(topology)
         if not requested_profile:
             gateway_platforms = _merge_profile_gateway_platforms(
                 gateway_platforms, topology.get("profile_platforms") or {}
@@ -10773,6 +10938,10 @@ async def cancel_telegram_onboarding(pairing_id: str):
 
 @app.get("/api/messaging/platforms")
 async def get_messaging_platforms(profile: Optional[str] = None):
+    # An isolated backend answers only for its pinned profile — explicit
+    # sibling selectors 403 before any channel-credential/env read (#91330
+    # review, consolidation owner).
+    profile = _clamp_profile_query_for_isolated(profile, allow_all=True)
     # Profile-scoped so the dashboard's global profile switcher shows the
     # TARGET profile's channel credentials/state, not the root install's.
     # load_env() honors the HERMES_HOME contextvar override; the gateway
@@ -13014,6 +13183,22 @@ def _cron_profile_dicts() -> List[Dict[str, Any]]:
     for every profile; polling cron jobs through that path creates avoidable
     GIL pressure on large profile pools.
     """
+    if _is_isolated_server():
+        # Shared aggregation seam: an isolated server's cron surface is its
+        # pinned profile only. The profile-control-plane policy owner lives
+        # here so ``profile=all`` cron reads cannot enumerate siblings
+        # (#91330 review, consolidation owner).
+        scope = _isolated_scope_dir()
+        pinned = _profile_name_for_scope(scope)
+        if pinned is not None:
+            return [
+                {
+                    "name": pinned,
+                    "path": str(scope),
+                    "is_default": pinned == "default",
+                }
+            ]
+        return []
     from hermes_cli import profiles as profiles_mod
     try:
         return [
@@ -13061,7 +13246,23 @@ def _cron_profile_home(profile: Optional[str]) -> Tuple[str, Path]:
         raise HTTPException(status_code=400, detail=str(e))
     if not profiles_mod.profile_exists(canon):
         raise HTTPException(status_code=404, detail=f"Profile '{canon}' does not exist.")
-    return canon, profiles_mod.get_profile_dir(canon)
+    home = profiles_mod.get_profile_dir(canon)
+    if _is_isolated_server() and home.resolve() != _isolated_scope_dir():
+        # Shared resolution seam for session-DB opens and cron routing: an
+        # isolated server may address only its pinned profile. Every
+        # session endpoint (single-session reads/deletes/patch/export) and
+        # cron route resolves the target through here, so the policy owner
+        # denies a sibling selector BEFORE any session DB or cron directory
+        # is opened (#91330 review, consolidation owner).
+        shown = _profile_name_for_scope(_isolated_scope_dir())
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                f"This dashboard is isolated to '{shown}'. "
+                f"Refusing to access another profile ('{canon}')."
+            ),
+        )
+    return canon, home
 
 
 def _annotate_cron_job(job: Dict[str, Any], profile: str, home: Path) -> Dict[str, Any]:
@@ -15158,7 +15359,68 @@ def _fallback_profile_dicts(profiles_mod) -> List[Dict[str, Any]]:
                 "has_alias": False,
             })
 
+    # An isolated server must not even surface sibling profiles in the list.
+    if _is_isolated_server():
+        scope = _isolated_scope_dir()
+        pinned = _profile_name_for_scope(scope)
+        if pinned is None:
+            return []
+        profiles = [p for p in profiles if p.get("name") == pinned]
+
     return profiles
+
+
+# ---------------------------------------------------------------------------
+# Isolated-profile scope policy — owned by hermes_cli/isolated_scope.py.
+#
+# Re-exported under the legacy underscore names so web_server's own handlers,
+# the web_routers' web_deps.late() proxies, and any
+# ``monkeypatch.setattr(web_server, "<name>", ...)`` keep resolving at call
+# time (the late-binding contract). The substantive policy lives in the
+# focused module; this file keeps only the thin seam (#91381 review).
+# ---------------------------------------------------------------------------
+
+
+def _is_isolated_server() -> bool:
+    """True when this server was launched with ``--isolated`` (see
+    ``hermes_cli.isolated_scope.is_isolated_server``)."""
+    from hermes_cli.isolated_scope import is_isolated_server
+
+    return is_isolated_server()
+
+
+def _isolated_scope_dir() -> Optional[Path]:
+    """Canonical resolved HERMES_HOME this isolated server is scoped to (see
+    ``hermes_cli.isolated_scope.isolated_scope_dir``)."""
+    from hermes_cli.isolated_scope import isolated_scope_dir
+
+    return isolated_scope_dir()
+
+
+def _profile_name_for_scope(scope_dir: Optional[Path]) -> Optional[str]:
+    """Map a resolved HERMES_HOME to its profile name or ``None`` (see
+    ``hermes_cli.isolated_scope.profile_name_for_scope``)."""
+    from hermes_cli.isolated_scope import profile_name_for_scope
+
+    return profile_name_for_scope(scope_dir)
+
+
+def _scope_topology_for_isolated(topology: Dict[str, Any]) -> Dict[str, Any]:
+    """Narrow a machine-wide ``/api/status`` topology to an isolated server
+    (see ``hermes_cli.isolated_scope.scope_topology_for_isolated``)."""
+    from hermes_cli.isolated_scope import scope_topology_for_isolated
+
+    return scope_topology_for_isolated(topology)
+
+
+def _clamp_profile_query_for_isolated(
+    profile: Optional[str], *, allow_all: bool = False
+) -> Optional[str]:
+    """Clamp or reject a ``profile`` query param against the isolated scope
+    (see ``hermes_cli.isolated_scope.clamp_profile_query_for_isolated``)."""
+    from hermes_cli.isolated_scope import clamp_profile_query_for_isolated
+
+    return clamp_profile_query_for_isolated(profile, allow_all=allow_all)
 
 
 def _resolve_profile_dir(name: str) -> Path:
@@ -15170,7 +15432,25 @@ def _resolve_profile_dir(name: str) -> Path:
         raise HTTPException(status_code=400, detail=str(e))
     if not profiles_mod.profile_exists(name):
         raise HTTPException(status_code=404, detail=f"Profile '{name}' does not exist.")
-    return profiles_mod.get_profile_dir(name)
+    profile_dir = profiles_mod.get_profile_dir(name)
+    if _is_isolated_server() and profile_dir.resolve() != _isolated_scope_dir():
+        # Shared resolution seam: EVERY route that turns a profile selector
+        # into an on-disk directory funnels through here (_profile_scope,
+        # _config_profile_scope, _profile_cli_args, setup-command, ...). An
+        # isolated server may resolve only its pinned profile by path — the
+        # "custom"/"default" sentinel strings of get_active_profile_name()
+        # are valid real profile ids, so a name comparison would alias a
+        # sibling onto the boundary; the canonical resolved path cannot
+        # (#91330 review, fail-open identity aliasing / consolidation owner).
+        shown = _profile_name_for_scope(_isolated_scope_dir())
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                f"This dashboard is isolated to '{shown}'. "
+                f"Refusing to resolve another profile ('{name}')."
+            ),
+        )
+    return profile_dir
 
 
 def _profile_setup_command(name: str) -> str:
@@ -19704,6 +19984,7 @@ def start_server(
     allow_public: bool = False,
     initial_profile: str = "",
     headless: bool = False,
+    isolated: bool = False,
     ssh_session_token: Optional[str] = None,
     ssh_owner_nonce: Optional[str] = None,
     start_mcp_discovery_after_bind: bool = False,
@@ -19719,6 +20000,13 @@ def start_server(
     build and no SPA mount (mount_spa() honours ``HERMES_SERVE_HEADLESS``), so
     the banner announces the bind rather than a browser URL.
 
+    ``isolated`` marks a server launched with ``--isolated``: it is scoped
+    to a single profile (its own HERMES_HOME) and must not read, mutate,
+    export, or delete another profile's data (enforced by the per-profile
+    guard ``_assert_profile_in_scope`` on the profiles router). The unified
+    machine dashboard (isolated=False) remains a machine-wide management
+    surface.
+
     ``ssh_session_token`` and ``ssh_owner_nonce`` are process-local Desktop SSH
     bootstrap state. Neither is persisted or exported to child processes.
 
@@ -19728,6 +20016,17 @@ def start_server(
     """
     _apply_ssh_session_token(ssh_session_token or "")
     _apply_ssh_owner_nonce(ssh_owner_nonce)
+    app.state.isolated = bool(isolated)
+    # Capture the canonical launch authority once, as an immutable path. The
+    # isolated scope must be an identity this process was actually launched
+    # with — never re-derived at request time from a string that can alias a
+    # sibling profile ("custom"/"default" sentinels) (#91330 review).
+    if isolated:
+        from hermes_constants import get_hermes_home
+
+        app.state.isolated_scope_dir = get_hermes_home().resolve()
+    else:
+        app.state.isolated_scope_dir = None
 
     # Raise RLIMIT_NOFILE for dashboard-mode starts that don't route through
     # the `serve` path in main.py (which applies the same floor). Canonical
