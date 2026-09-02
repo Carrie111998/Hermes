@@ -3576,21 +3576,23 @@ def cleanup_task_resources(agent, task_id: str) -> None:
     # above: a dead driver socket must not break the rest of the cleanup
     # chain. The lazy import keeps the narrow core footprint for sessions
     # that never touch computer use.
-    if getattr(agent, "_interrupt_requested", False):
-        try:
-            from tools.computer_use import release_computer_use_session
+    if not getattr(agent, "_interrupt_requested", False):
+        return
+    session_id = str(getattr(agent, "session_id", "") or "")
+    if not session_id:
+        return
+    try:
+        from tools.computer_use import release_computer_use_session
 
-            release_computer_use_session(
-                str(getattr(agent, "session_id", "") or "")
+        release_computer_use_session(session_id)
+    except Exception as e:
+        if agent.verbose_logging:
+            logger.warning(
+                "Failed to release computer-use session for session %s "
+                "after interrupt: %s",
+                getattr(agent, "session_id", None),
+                e,
             )
-        except Exception as e:
-            if agent.verbose_logging:
-                logger.warning(
-                    "Failed to release computer-use session for session %s "
-                    "after interrupt: %s",
-                    getattr(agent, "session_id", None),
-                    e,
-                )
 
 
 def _build_partial_stream_stub(

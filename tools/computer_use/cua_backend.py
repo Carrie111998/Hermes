@@ -982,7 +982,10 @@ def _mcp_args_with_overlay_flag(
     driver_cmd: str = _CUA_DRIVER_DEFAULT_CMD,
 ) -> List[str]:
     """Return *args* with ``--no-overlay`` appended when configured and supported."""
-    if "--no-overlay" in args:
+    if any(
+        arg == "--no-overlay" or arg.startswith("--no-overlay=")
+        for arg in args
+    ):
         # The user asked for it explicitly — never duplicate the flag.
         return list(args)
     if _cua_no_overlay() and _cua_driver_supports_no_overlay(driver_cmd):
@@ -1045,7 +1048,7 @@ def normalize_user_cua_driver_args(
     )
 
 
-@functools.lru_cache(maxsize=1)
+@functools.lru_cache(maxsize=8)
 def _cua_driver_supports_no_overlay(driver_cmd: str) -> bool:
     """True if the installed cua-driver recognises ``--no-overlay``.
 

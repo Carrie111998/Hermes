@@ -31,7 +31,7 @@ class _StubBudget:
 class _StubAgent:
     """Minimal agent surface that ``cleanup_task_resources`` reads from."""
 
-    def __init__(self, session_id="sess-42"):
+    def __init__(self, session_id: str | None = "sess-42"):
         self.session_id = session_id
         self.verbose_logging = False
         self.cleaned_vm = []
@@ -107,6 +107,15 @@ class TestInterruptedTurnReleasesComputerUse:
             "tools.computer_use.release_computer_use_session"
         ) as mock_release:
             _cleanup(monkeypatch, agent, interrupted=False)
+        mock_release.assert_not_called()
+
+    def test_interrupted_turn_without_session_id_skips_release(self, monkeypatch):
+        """An incomplete agent stub must not target the empty cache key."""
+        agent = _StubAgent(session_id=None)
+        with patch(
+            "tools.computer_use.release_computer_use_session"
+        ) as mock_release:
+            _cleanup(monkeypatch, agent, interrupted=True)
         mock_release.assert_not_called()
 
     def test_release_failure_never_raises(self, monkeypatch):

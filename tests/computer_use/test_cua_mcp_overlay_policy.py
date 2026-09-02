@@ -13,6 +13,7 @@ opt-in preservation, byte-identical passthrough for unrelated commands, and
 the older-driver support-probe invariant — not snapshots of config.
 """
 
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -76,8 +77,11 @@ class TestNormalizeUserCuaDriverArgs:
             )
         assert result == ["mcp", "--no-overlay"]
 
-    def test_deduplicates_explicit_flag(self):
-        """A user who already wrote ``--no-overlay`` keeps exactly one —
+    @pytest.mark.parametrize(
+        "flag", ["--no-overlay", "--no-overlay=true", "--no-overlay=false"]
+    )
+    def test_deduplicates_explicit_flag(self, flag):
+        """A user who already supplied ``--no-overlay`` keeps one token —
         duplicate flags are noise at best and a driver-side error at worst."""
         with patch.object(cua_backend, "_cua_no_overlay", return_value=True), \
              patch.object(
@@ -85,9 +89,9 @@ class TestNormalizeUserCuaDriverArgs:
                  return_value=True,
              ):
             result = cua_backend.normalize_user_cua_driver_args(
-                "cua-driver", ["mcp", "--no-overlay"],
+                "cua-driver", ["mcp", flag],
             )
-        assert result == ["mcp", "--no-overlay"]
+        assert result == ["mcp", flag]
 
     def test_explicit_optin_false_preserves_overlay(self):
         """``computer_use.no_overlay: false`` is the documented opt-in to
@@ -153,6 +157,22 @@ class TestNormalizeUserCuaDriverArgs:
                 "/opt/relocated/cua-driver", ["mcp"],
             )
         mock_probe.assert_called_with("/opt/relocated/cua-driver")
+
+
+class TestCuaDriverSupportProbeCache:
+    def test_retains_results_for_multiple_driver_paths(self):
+        """Side-by-side cua-driver installs are each probed only once."""
+        completed = SimpleNamespace(
+            stdout="--no-overlay",
+            stderr="",
+        )
+        with patch.object(
+            cua_backend.subprocess, "run", return_value=completed,
+        ) as mock_run:
+            assert cua_backend._cua_driver_supports_no_overlay("/opt/a/cua-driver")
+            assert cua_backend._cua_driver_supports_no_overlay("/opt/b/cua-driver")
+            assert cua_backend._cua_driver_supports_no_overlay("/opt/a/cua-driver")
+        assert mock_run.call_count == 2
 
 
 class TestMcpStdioHookAppliesPolicy:
