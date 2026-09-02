@@ -92,13 +92,20 @@ _STALE_PURGE_PREFIXES = (
 #: Modules that must survive the purge: they are (or are referenced by) the
 #: code currently EXECUTING the update, so evicting them buys nothing — the
 #: running frames keep their module objects alive regardless — and reloading
-#: them mid-flight is the one genuinely unsafe move.
+#: them mid-flight is the one genuinely unsafe move. Same for a module that
+#: carries this run's process state: ``update_receipt`` holds the in-flight
+#: receipt as a module-level singleton, begun before the checkout changed.
+#: Evict it and every later ``from hermes_cli.update_receipt import
+#: finalize_update_receipt`` (success path, command-boundary safety net)
+#: binds a fresh module with no open receipt, so a successful update
+#: finishes without writing one.
 _STALE_PURGE_PROTECTED = frozenset(
     {
         "hermes_cli",
         "hermes_cli.main",
         "hermes_cli.update_cmd",
         "hermes_cli.hermes_logging",
+        "hermes_cli.update_receipt",
     }
 )
 

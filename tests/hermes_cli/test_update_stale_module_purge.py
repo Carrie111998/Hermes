@@ -16,6 +16,8 @@ module graph from the updated checkout.
 
 from __future__ import annotations
 
+import importlib
+import json
 import sys
 import types
 
@@ -40,6 +42,18 @@ def _restore_sys_modules():
     for name in list(sys.modules):
         if name not in snapshot:
             del sys.modules[name]
+    # A post-purge import also rebinds the submodule attribute on its parent
+    # package (``hermes_cli.config`` -> fresh module object). Put those back
+    # too: pytest's monkeypatch resolves dotted targets through package
+    # attributes, so a stale binding would make a later test patch a module
+    # object that no ``from hermes_cli.config import ...`` ever sees.
+    for name, mod in snapshot.items():
+        parent, _, child = name.rpartition(".")
+        if not parent or parent not in snapshot:
+            continue
+        bound = getattr(snapshot[parent], child, None)
+        if isinstance(bound, types.ModuleType) and bound is not mod:
+            setattr(snapshot[parent], child, mod)
 
 
 def _fake_module(name: str) -> types.ModuleType:
@@ -134,3 +148,40 @@ def test_stale_symbol_scenario_end_to_end():
         sys.modules.pop(name, None)
         if real is not None:
             sys.modules[name] = real
+
+
+def test_purge_keeps_in_flight_update_receipt(tmp_path, monkeypatch):
+    """The receipt begun before the checkout changed must be the one the
+    success path finalizes after the purge.
+
+    ``hermes_cli.update_receipt`` keeps the open receipt as a module-level
+    singleton. If the purge evicted it, the lazy
+    ``from hermes_cli.update_receipt import finalize_update_receipt`` that
+    follows the gateway-restart phase would bind a fresh module with no open
+    receipt and return None — so every successful update would finish
+    without a receipt on disk (the Desktop's managed SSH update then reports
+    the run as failed for want of a durable receipt).
+    """
+    import hermes_cli.update_receipt as ur
+
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    # Env, not attribute patching: the purge re-imports hermes_cli.config,
+    # and a fresh module would not carry a monkeypatched attribute.
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    ur._current = None
+    ur.begin_update_receipt()
+    assert ur._current is not None
+    try:
+        cli_main._purge_stale_hermes_modules()
+
+        reimported = importlib.import_module("hermes_cli.update_receipt")
+        assert reimported is ur, "update_receipt was evicted by the purge"
+        assert reimported._current is not None
+
+        path = reimported.finalize_update_receipt("success")
+        assert path is not None and path.exists()
+        assert path.is_relative_to(home)
+        assert json.loads(path.read_text(encoding="utf-8"))["outcome"] == "success"
+    finally:
+        ur._current = None
