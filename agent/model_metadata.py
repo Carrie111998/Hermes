@@ -1059,6 +1059,43 @@ def _localhost_to_ipv4(url: str) -> str:
     )
 
 
+def _is_lmstudio_models_payload(response: Any) -> bool:
+    """Return True only when an ``/api/v1/models`` 200 is genuinely LM Studio.
+
+    A 200 on this path is not by itself evidence of LM Studio: any
+    OpenAI-compatible local server is free to serve it, and several do (a
+    loopback proxy that exposes ``/api/v1/models`` so a harness can validate
+    model names, for one). Those return the standard OpenAI listing envelope,
+    ``{"object": "list", "data": [{"id": ..., "object": "model"}]}``.
+
+    LM Studio's native listing is structurally different: it keys entries under
+    ``models``. Both consumers of a positive detection read that exact key, so
+    accepting a ``data``-keyed response would classify a payload they cannot
+    consume and discard its metadata. Discriminating on the consumer-readable
+    envelope — rather than on a bare 200 — keeps generic OpenAI servers out of
+    the LM Studio branch.
+
+    Fails closed: any parse error or unrecognised shape returns False, so the
+    caller simply continues its detection waterfall and ends up on the
+    OpenAI-compatible path, which is the correct handling for such a server.
+    """
+    try:
+        data = response.json()
+    except Exception:
+        return False
+    if not isinstance(data, dict):
+        return False
+    # An explicit OpenAI list envelope is a decisive NEGATIVE signal: LM Studio's
+    # native payload does not stamp object="list". This rejects every standard
+    # OpenAI-compatible server up front, whatever its entries happen to carry.
+    if data.get("object") == "list":
+        return False
+    # Both LM Studio consumers read payload["models"]. Requiring that list is
+    # therefore a detector/consumer contract, not a vendor-field snapshot. It
+    # also preserves idle LM Studio detection via {"models": []}.
+    return isinstance(data.get("models"), list)
+
+
 def detect_local_server_type(base_url: str, api_key: str = "") -> Optional[str]:
     """Detect which local server is running at base_url by probing known endpoints.
 
@@ -1125,10 +1162,18 @@ def detect_local_server_type(base_url: str, api_key: str = "") -> Optional[str]:
     result: Optional[str] = None
     try:
         with httpx.Client(timeout=2.0, headers=headers) as client:
-            # LM Studio exposes /api/v1/models — check first (most specific)
+            # LM Studio exposes /api/v1/models — check first (most specific).
+            #
+            # A 200 is NOT sufficient evidence: other OpenAI-compatible local
+            # servers answer this path too, and returning the standard OpenAI
+            # listing shape. Classifying those as LM Studio routes the caller
+            # into the LM Studio metadata parser, which reads payload["models"]
+            # — absent from an OpenAI listing — and yields NO metadata at all,
+            # so an advertised context window is discarded and the caller falls
+            # back to a probe-tier default. Require the native payload shape.
             try:
                 r = client.get(f"{lmstudio_url}/api/v1/models")
-                if r.status_code == 200:
+                if r.status_code == 200 and _is_lmstudio_models_payload(r):
                     result = "lm-studio"
             except Exception as exc:
                 _probe_failed(exc)
@@ -1318,8 +1363,9 @@ def _extract_pricing(payload: Dict[str, Any]) -> Dict[str, Any]:
         pricing: Dict[str, Any] = {}
         for target, aliases in alias_map.items():
             for alias in aliases:
-                if alias in normalized and normalized[alias] not in {None, ""}:
-                    pricing[target] = normalized[alias]
+                value = normalized.get(alias)
+                if isinstance(value, (int, float, str)) and value not in {None, ""}:
+                    pricing[target] = value
                     break
         if pricing:
             return pricing
