@@ -1934,7 +1934,11 @@ def restore_quick_snapshot(
                 # (gateway, dashboard, another CLI session) see the
                 # restored data instead of continuing to serve stale
                 # cached pages from a replaced inode (issue #65942).
-                _safe_restore_db(src, dst)
+                # Fail closed: a False from _safe_restore_db means a live
+                # holder blocked the unlink+move fallback. Do not count
+                # that as restored or the CLI prints success anyway.
+                if not _safe_restore_db(src, dst):
+                    return False
             else:
                 shutil.copy2(src, dst)
             restored += 1
