@@ -111,6 +111,8 @@ from hermes_logging import set_session_context
 from tools.skill_provenance import set_current_write_origin
 from utils import base_url_host_matches, env_var_enabled
 
+from agent.log_context import model_provider_fields
+
 logger = logging.getLogger(__name__)
 
 
@@ -627,12 +629,12 @@ def _ollama_context_limit_error(agent: Any, request_tokens: int) -> Optional[str
 
     logger.warning(
         "Ollama runtime context too small for Hermes tool use: "
-        "model=%s provider=%s base_url=%s runtime_context=%d "
+        "provider=%s base_url=%s model=%s runtime_context=%d "
         "minimum_context=%d estimated_request_tokens=%d tool_count=%d "
         "session=%s",
-        model,
         provider,
         base_url,
+        model,
         runtime_ctx,
         MINIMUM_CONTEXT_LENGTH,
         request_tokens,
@@ -1128,10 +1130,9 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
         stored_state = "stale_runtime"
         logger.info(
             "Stored system prompt for session %s has stale runtime identity; "
-            "rebuilding for model=%s provider=%s.",
+            "rebuilding. %s",
             agent.session_id,
-            getattr(agent, "model", "") or "",
-            getattr(agent, "provider", "") or "",
+            model_provider_fields(agent),
         )
 
     if conversation_history and stored_state in ("null", "empty"):
@@ -3738,10 +3739,10 @@ def run_conversation(
                                     _resp_incomplete = getattr(response, "incomplete_details", None)
                                     logger.warning(
                                         "Codex response.output is empty after stream backfill "
-                                        "(status=%s, incomplete_details=%s, model=%s). %s",
+                                        "(status=%s, incomplete_details=%s). %s %s",
                                         _resp_status, _resp_incomplete,
-                                        getattr(response, "model", None),
-                                        f"api_mode={agent.api_mode} provider={agent.provider}",
+                                        f"response_model={getattr(response, 'model', None)}",
+                                        f"api_mode={agent.api_mode} {model_provider_fields(agent)}",
                                     )
                                     response_invalid = True
                                     error_details.append("response.output is empty")
@@ -4076,8 +4077,8 @@ def run_conversation(
                     )
                     logger.warning(
                         "%sModel declined to respond (finish_reason=content_filter). "
-                        "model=%s provider=%s refusal=%s",
-                        agent.log_prefix, agent.model, agent.provider,
+                        "%s refusal=%s",
+                        agent.log_prefix, model_provider_fields(agent),
                         _refusal_log or "(no text)",
                     )
                     agent._emit_status(
@@ -4764,10 +4765,9 @@ def run_conversation(
                     if canonical_usage.cache_read_tokens and prompt_tokens:
                         _cache_pct = f" cache={canonical_usage.cache_read_tokens}/{prompt_tokens} ({100*canonical_usage.cache_read_tokens/prompt_tokens:.0f}%)"
                     logger.info(
-                        "API call #%d: model=%s provider=%s in=%d out=%d total=%d latency=%.1fs%s",
-                        agent.session_api_calls, agent.model, agent.provider or "unknown",
-                        prompt_tokens, completion_tokens, total_tokens,
-                        api_duration, _cache_pct,
+                        "API call #%d in=%d out=%d total=%d latency=%.1fs%s %s",
+                        agent.session_api_calls, prompt_tokens, completion_tokens, total_tokens,
+                        api_duration, _cache_pct, model_provider_fields(agent),
                     )
 
                     # On the MoA path, agent.model/provider are the virtual
@@ -7081,9 +7081,10 @@ def run_conversation(
                         )
 
                     logger.error(
-                        "%sAPI call failed after %s retries. %s | provider=%s model=%s msgs=%s tokens=~%s",
+                        "%sAPI call failed after %s retries. %s | msgs=%d tokens=~%s %s",
                         agent.log_prefix, max_retries, _final_summary,
-                        _provider, _model, len(api_messages), f"{approx_tokens:,}",
+                        len(api_messages), f"{approx_tokens:,}",
+                        model_provider_fields(agent),
                     )
                     if api_kwargs is not None:
                         agent._dump_api_request_debug(
@@ -8523,9 +8524,10 @@ def run_conversation(
                         )
                         logger.warning(
                             "Empty response (no content or reasoning) — "
-                            "retry %d/%d in %.1fs (model=%s)",
+                            "retry %d/%d in %.1fs. %s",
                             agent._empty_content_retries,
-                            _empty_retry_budget, wait_time, agent.model,
+                            _empty_retry_budget, wait_time,
+                            model_provider_fields(agent),
                         )
                         _budget_note = (
                             " — high-cost request, reduced retry budget"
@@ -8589,9 +8591,9 @@ def run_conversation(
                     if _truly_empty and agent._fallback_chain:
                         logger.warning(
                             "Empty response after %d retries — "
-                            "attempting fallback (model=%s, provider=%s)",
-                            agent._empty_content_retries, agent.model,
-                            agent.provider,
+                            "attempting fallback. %s",
+                            agent._empty_content_retries,
+                            model_provider_fields(agent),
                         )
                         agent._buffer_status(
                             "⚠️ Model returning empty responses — "
@@ -8665,10 +8667,9 @@ def run_conversation(
                     else:
                         logger.warning(
                             "Empty response (no content or reasoning) "
-                            "after %d retries. No fallback available. "
-                            "model=%s provider=%s",
-                            agent._empty_content_retries, agent.model,
-                            agent.provider,
+                            "after %d retries. No fallback available. %s",
+                            agent._empty_content_retries,
+                            model_provider_fields(agent),
                         )
                         agent._emit_status(
                             "❌ Model returned no content after all retries"
@@ -8804,8 +8805,9 @@ def run_conversation(
                     logger.warning(
                         "finish_reason=tool_calls with empty tool_calls array "
                         "(narration only) — re-prompting to emit the call "
-                        "(retry %d/3, model=%s provider=%s)",
-                        agent._dropped_toolcall_retries, agent.model, agent.provider,
+                        "(retry %d/3). %s",
+                        agent._dropped_toolcall_retries,
+                        model_provider_fields(agent),
                     )
                     agent._emit_status(
                         "↻ Model signaled a tool call but sent none — "
