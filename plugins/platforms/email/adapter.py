@@ -575,7 +575,8 @@ class EmailAdapter(BasePlatformAdapter):
         # Read-only / no-auto-reply mode — configured via config.yaml:
         #   platforms:
         #     email:
-        #       read_only: true
+        #       extra:
+        #         read_only: true
         # When enabled the adapter still polls IMAP and dispatches incoming mail
         # normally, but every outgoing send is suppressed (no SMTP) so a mailbox
         # can be used purely as a read feed without ever replying to the sender
