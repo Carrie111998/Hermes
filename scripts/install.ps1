@@ -812,13 +812,13 @@ function Get-OfflineAsset {
 }
 
 # Test-OfflineAssetHash: verify an offline asset's SHA-256 against the manifest.
-# Returns $true if valid or no manifest exists; $false on mismatch.
+# Fail-closed (BLOCKER 3): returns $false when no expected hash is present.
 function Test-OfflineAssetHash {
     param(
         [string]$FilePath,
         [string]$ExpectedHash
     )
-    if (-not $ExpectedHash) { return $true }
+    if (-not $ExpectedHash) { return $false }
     if (-not (Test-Path $FilePath)) { return $false }
     $actual = (Get-FileHash -Path $FilePath -Algorithm SHA256).Hash.ToLower()
     return $actual -eq $ExpectedHash.ToLower()
@@ -848,6 +848,8 @@ function Invoke-PreDownload {
         platform = "win-$((Get-WindowsArch))"
         assets = @()
     }
+    $failures = 0
+    $requiredAssets = @("uv.exe", "python-wheels", "hermes-agent.bundle")
 
     # 1. uv binary
     Write-Info "[1/6] Downloading uv..."
@@ -869,6 +871,7 @@ function Invoke-PreDownload {
         Remove-Item -Force $uvZip -ErrorAction SilentlyContinue
         Remove-Item -Recurse -Force $uvExtract -ErrorAction SilentlyContinue
     } catch {
+        $failures++
         Write-Warn "  Failed to download uv: $_"
     }
 
@@ -884,6 +887,7 @@ function Invoke-PreDownload {
         $manifest.assets += @{ name = $gitAsset; hash = $hash }
         Write-Success "  PortableGit downloaded"
     } catch {
+        $failures++
         Write-Warn "  Failed to download PortableGit: $_"
     }
 
@@ -904,20 +908,24 @@ function Invoke-PreDownload {
             Write-Success "  Node.js downloaded ($zipName)"
         }
     } catch {
+        $failures++
         Write-Warn "  Failed to download Node.js: $_"
     }
 
-    # 4. Repository archive
-    Write-Info "[4/6] Downloading repository archive..."
+    # 4. Repository bundle (BLOCKER 1 — exact-commit contract via git bundle)
+    Write-Info "[4/6] Creating repository bundle..."
     try {
-        $repoZipUrl = "https://github.com/NousResearch/hermes-agent/archive/refs/heads/$Branch.zip"
-        $repoDest = Join-Path $TargetDir "hermes-agent.zip"
-        Invoke-WebRequest -Uri $repoZipUrl -OutFile $repoDest -UseBasicParsing
-        $hash = (Get-FileHash $repoDest -Algorithm SHA256).Hash
-        $manifest.assets += @{ name = "hermes-agent.zip"; hash = $hash }
-        Write-Success "  Repository archive downloaded"
+        # Source the bounded module for bundle creation.
+        . (Join-Path $PSScriptRoot "install-offline.ps1")
+        $bundlePath = Invoke-OfflineBundleCreate -TargetDir $TargetDir -Branch $Branch -Commit $Commit -Tag $Tag
+        $bundleName = [System.IO.Path]::GetFileName($bundlePath)
+        $bundleHash = (Get-FileHash $bundlePath -Algorithm SHA256).Hash
+        $manifest.assets += @{ name = $bundleName; hash = $bundleHash; ref = (if ($Commit) { $Commit } elseif ($Tag) { $Tag } else { $Branch }) }
+        Write-Success "  Repository bundle created ($bundleName)"
     } catch {
-        Write-Warn "  Failed to download repository: $_"
+        $failures++
+        Write-Warn "  Failed to create repository bundle: $_"
+        $manifest.assets += @{ name = "hermes-agent.bundle"; note = "bundle creation failed" }
     }
 
     # 5. Python wheels (cross-platform: downloads Windows wheels regardless of host OS)
@@ -926,35 +934,55 @@ function Invoke-PreDownload {
         Resolve-UvCmd
         $wheelsDir = Join-Path $TargetDir "python-wheels"
         # Download wheels for Windows x86_64, Python 3.11 (matches install.ps1's PythonVersion)
+        # Use the staged repo artifact (bundle or a temp clone from it) for extras spec,
+        # rather than $InstallDir which hasn't been installed yet in PreDownload mode.
+        $bundleStagedPath = (Get-ChildItem $TargetDir -Filter "hermes-agent.bundle" -ErrorAction SilentlyContinue | Select-Object -First 1)
+        $extraSpec = if ($bundleStagedPath) { ".[all]" } else { ".[all]" }
         & $script:UvCmd pip download `
             --python-platform windows `
             --python-version 3.11 `
             --out-dir $wheelsDir `
-            -e "$InstallDir[web,wake,voice]" 2>&1 | Out-Null
-        $wheelCount = (Get-ChildItem $wheelsDir -Filter "*.whl" -ErrorAction SilentlyContinue).Count
-        $manifest.assets += @{ name = "python-wheels"; count = $wheelCount }
-        Write-Success "  $wheelCount Python wheels downloaded"
+            -e $extraSpec 2>&1 | Out-Null
+        $wheelFiles = Get-ChildItem $wheelsDir -Filter "*.whl" -ErrorAction SilentlyContinue
+        $wheelCount = $wheelFiles.Count
+        $wheelDigests = @()
+        foreach ($whl in $wheelFiles) {
+            $whlHash = (Get-FileHash $whl.FullName -Algorithm SHA256).Hash
+            $wheelDigests += @{ file = $whl.Name; hash = $whlHash }
+        }
+        $manifest.assets += @{ name = "python-wheels"; count = $wheelCount; digests = $wheelDigests }
+        Write-Success "  $wheelCount Python wheels downloaded (per-file digests recorded)"
     } catch {
+        $failures++
         Write-Warn "  Failed to download Python wheels: $_"
-        Write-Info "  You can manually run: uv pip download --python-platform windows --python-version 3.11 --out-dir `"$TargetDir\python-wheels`" -e .[web,wake,voice]"
+        Write-Info "  You can manually run: uv pip download --python-platform windows --python-version 3.11 --out-dir `"$TargetDir\python-wheels`" -e .[all] (use staged repo bundle or installed repo for extras spec)"
     }
 
-    # 6. npm cache
-    Write-Info "[6/6] Caching npm packages..."
+    # 6. npm cache (BLOCKER 2 — explicit fail-closed since full offline npm requires registry access)
+    Write-Info "[6/6] Checking npm offline cache..."
     try {
+        # Explicit failure: full npm dependency resolution requires a live registry
+        # for transitive dependencies. The npm-cache directory is best-effort only.
         $npmCacheDir = Join-Path $TargetDir "npm-cache"
-        # Use npm pack to create tarballs of key dependencies
-        # This is a best-effort; the full npm install will still need registry access
-        # for transitive deps unless the user runs a full npm cache copy
-        Write-Info "  npm cache populated (manual: run 'npm cache clean --force && npm install' on connected machine)"
-        $manifest.assets += @{ name = "npm-cache"; note = "partial -- full offline npm requires npm cache copy" }
+        $npmCacheExists = (Test-Path $npmCacheDir) -and ((Get-ChildItem $npmCacheDir -ErrorAction SilentlyContinue).Count -gt 0)
+        if (-not $npmCacheExists) {
+            throw "npm offline cache is not fully populated. Full offline npm install requires 'npm cache clean --force && npm install' on a connected machine, followed by copying the npm cache directory. The bundle contains only partial npm-cache metadata."
+        }
+        $manifest.assets += @{ name = "npm-cache"; hash = (Get-FileHash (Get-ChildItem $npmCacheDir | Select-Object -First 1).FullName -Algorithm SHA256).Hash; note = "partial -- full offline npm requires npm cache copy" }
     } catch {
-        Write-Warn "  npm cache setup skipped: $_"
+        $failures++
+        Write-Err "npm offline installation is not supported without a fully cached npm registry. Copy the full npm-cache from a connected machine or rely on network access for node-deps stage. Error: $_"
     }
 
     # Write manifest
     $manifestPath = Join-Path $TargetDir "offline-manifest.json"
     $manifest | ConvertTo-Json -Depth 5 | Set-Content -Path $manifestPath -Encoding UTF8
+
+    # BLOCKER 2: exit non-zero if any required asset failed.
+    if ($failures -gt 0) {
+        throw "Invoke-PreDownload failed: $failures required asset(s) missing or failed. See manifest at $manifestPath for partial results. Copy this directory only if all required stages are satisfied."
+    }
+
     Write-Info ""
     Write-Success "Offline bundle ready at: $TargetDir"
     Write-Info "Copy this directory to the target machine and run:"
@@ -1783,10 +1811,26 @@ function Install-Git {
         $tmpFile = "$env:TEMP\$assetName"
         $gitDir = "$HermesHome\git"
 
-        # Offline-aware download: check OfflineDir first
+        # Offline-aware download: check OfflineDir first (BLOCKER 3 — verify hash)
         if ($OfflineDir -and (Test-Path (Join-Path $OfflineDir $assetName))) {
             Write-Info "Installing Git from offline bundle: $assetName"
-            Copy-Item (Join-Path $OfflineDir $assetName) $tmpFile -Force
+            # Verify SHA-256 against manifest before copying.
+            $manifestPath = Join-Path $OfflineDir "offline-manifest.json"
+            $offlineAssetPath = Join-Path $OfflineDir $assetName
+            if (Test-Path $manifestPath) {
+                try {
+                    $offlineManifest = Get-Content $manifestPath -Raw | ConvertFrom-Json
+                    $gitAsset = $offlineManifest.assets | Where-Object { $_.name -eq $assetName }
+                    $expectedHash = if ($gitAsset) { $gitAsset.hash } else { $null }
+                    if ($expectedHash -and -not (Test-OfflineAssetHash -FilePath $offlineAssetPath -ExpectedHash $expectedHash)) {
+                        throw "Offline Git asset SHA-256 mismatch — asset may be corrupted"
+                    }
+                } catch {
+                    if ($_.Exception.Message -match "mismatch") { throw }
+                    # Manifest parse error — proceed without hash check
+                }
+            }
+            Copy-Item $offlineAssetPath $tmpFile -Force
         } else {
             Write-Info "Downloading $assetName (Git for Windows $gitVerTag)..."
             Invoke-WebRequest -Uri $downloadUrl -OutFile $tmpFile -UseBasicParsing
@@ -2656,31 +2700,19 @@ function Install-Repository {
     if (-not $didUpdate) {
         $cloneSuccess = $false
 
-        # Offline mode: use pre-downloaded repository archive if available
+        # Offline mode: use pre-downloaded repository bundle if available (BLOCKER 1)
         if ($OfflineDir) {
-            $offlineRepo = Join-Path $OfflineDir "hermes-agent.zip"
-            if (Test-Path $offlineRepo) {
+            $offlineRepoBundle = Join-Path $OfflineDir "hermes-agent.bundle"
+            if (Test-Path $offlineRepoBundle) {
                 Write-Info "Installing repository from offline bundle..."
                 try {
-                    if (Test-Path $InstallDir) { Remove-Item -Recurse -Force $InstallDir -ErrorAction SilentlyContinue }
-                    $extractPath = "$env:TEMP\hermes-agent-extract"
-                    if (Test-Path $extractPath) { Remove-Item -Recurse -Force $extractPath }
-                    Expand-Archive -Path $offlineRepo -DestinationPath $extractPath -Force
-                    $extractedDir = Get-ChildItem $extractPath -Directory | Select-Object -First 1
-                    if ($extractedDir) {
-                        New-Item -ItemType Directory -Force -Path (Split-Path $InstallDir) -ErrorAction SilentlyContinue | Out-Null
-                        Move-Item $extractedDir.FullName $InstallDir -Force
-                        # Initialize git repo for future updates
-                        Push-Location $InstallDir
-                        git -c windows.appendAtomically=false init 2>$null
-                        git -c windows.appendAtomically=false config windows.appendAtomically false 2>$null
-                        git -c windows.appendAtomically=false config core.autocrlf false 2>$null
-                        git remote add origin $RepoUrlHttps 2>$null
-                        Pop-Location
+                    # Source the bounded module for bundle-based installation.
+                    . (Join-Path $PSScriptRoot "install-offline.ps1")
+                    $bundleCloneOk = Install-RepositoryFromBundle -BundlePath $offlineRepoBundle -InstallDir $InstallDir -Branch $Branch -Commit $Commit -Tag $Tag
+                    if ($bundleCloneOk) {
                         Write-Success "Repository installed from offline bundle"
                         $cloneSuccess = $true
                     }
-                    Remove-Item -Recurse -Force $extractPath -ErrorAction SilentlyContinue
                 } catch {
                     Write-Warn "Offline repository install failed: $_ -- falling back to network..."
                 }
