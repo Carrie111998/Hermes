@@ -1440,7 +1440,7 @@ def _managed_runtime_path_entries() -> list[str]:
 
 
 def _append_missing_sane_path_entries(existing_path: str) -> str:
-    """Return a normalised POSIX PATH with missing sane entries appended.
+    """Return a normalised PATH with missing sane entries appended.
 
     On POSIX the caller-supplied PATH is rewritten (not merely appended to):
     empty entries and duplicate entries are dropped, preserving
@@ -1463,11 +1463,28 @@ def _append_missing_sane_path_entries(existing_path: str) -> str:
 
     For a well-formed PATH (no empties, no duplicates) the leading segment is
     byte-identical to the input and ordering is preserved; only the missing
-    sane entries are appended. On Windows this is a no-op passthrough (the
-    separator is ``;`` and the native PATH must not be touched).
+    sane entries are appended.
+
+    On Windows the native PATH must not be reordered — so this is NOT a
+    pass-through: it only appends the private managed-uv dir
+    (``$HERMES_HOME\\uv``) at the tail, where the user's own uv (if any) on
+    their PATH still wins (first-occurrence-wins). ``bin`` and the node dirs
+    are handled by ``_prepend_hermes_bin_dir`` / ``iter_hermes_node_dirs``
+    elsewhere; this closes the gap where ``$HERMES_HOME\\uv`` (post-uv-
+    isolation) would otherwise be unreachable in the agent's terminal shell.
     """
     if _IS_WINDOWS:
-        return existing_path
+        try:
+            from hermes_constants import get_hermes_home
+
+            uv_dir = str(get_hermes_home() / "uv")
+        except Exception:
+            return existing_path
+        sep = os.pathsep
+        entries = [e for e in existing_path.split(sep) if e] if existing_path else []
+        if uv_dir and uv_dir not in entries:
+            entries.append(uv_dir)
+        return sep.join(entries)
 
     sane_entries = [entry for entry in _SANE_PATH.split(":") if entry]
     sane_entries.extend(

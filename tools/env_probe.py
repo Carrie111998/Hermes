@@ -248,8 +248,9 @@ def _build_probe_line() -> str:
     # ($HERMES_HOME/uv for the managed uv, $HERMES_HOME/bin for other managed
     # CLIs), so the probe must ask THAT PATH — the agent process's own PATH
     # never carries the managed dirs, and a managed-only install would look
-    # uv-less here even though the model can run uv. Windows leaves both the
-    # terminal PATH and this probe on the process PATH, so they stay in sync.
+    # uv-less here even though the model can run uv. On Windows the helper
+    # appends $HERMES_HOME\uv at the tail too, keeping the probe and the
+    # actual subshell in sync there as well.
     has_uv = shutil.which("uv", path=_terminal_probe_path()) is not None
 
     # If python3 exists, has pip, has uv (or no PEP 668), and there's no
