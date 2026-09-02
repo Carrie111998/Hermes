@@ -216,3 +216,58 @@ async def test_start_gateway_does_not_start_cron_after_aborted_startup(tmp_path,
     assert exc.value.code == GATEWAY_SERVICE_RESTART_EXIT_CODE
     assert cron_started is False
     assert export_shutdown_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_start_gateway_claims_identity_before_runner_opens_state_db(
+    tmp_path, monkeypatch
+):
+    """A slow SessionDB migration must already be visible as the live gateway.
+
+    Dashboard orphan reaping runs concurrently with gateway startup.  The
+    runner constructor opens state.db, so delaying the PID/runtime-lock claim
+    until after construction lets the dashboard misclassify a migrating
+    gateway as an orphan and terminate it.
+    """
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    events = []
+
+    class StopAfterConstructor(RuntimeError):
+        pass
+
+    class MigrationProbeRunner:
+        def __init__(self, config):
+            events.append("runner")
+            raise StopAfterConstructor
+
+    monkeypatch.setattr("gateway.status.get_running_pid", lambda: None)
+    monkeypatch.setattr(
+        "gateway.status.acquire_gateway_runtime_lock",
+        lambda: events.append("runtime-lock") or True,
+    )
+    monkeypatch.setattr(
+        "gateway.status.write_pid_file", lambda: events.append("pid-file")
+    )
+    monkeypatch.setattr(
+        "gateway.status.remove_pid_file", lambda: events.append("remove-pid")
+    )
+    monkeypatch.setattr(
+        "gateway.status.release_gateway_runtime_lock",
+        lambda: events.append("release-lock"),
+    )
+    monkeypatch.setattr("tools.skills_sync.sync_skills", lambda quiet=True: None)
+    monkeypatch.setattr("hermes_logging.setup_logging", lambda hermes_home, mode: None)
+    monkeypatch.setattr("gateway.run.GatewayRunner", MigrationProbeRunner)
+
+    with pytest.raises(StopAfterConstructor):
+        await gateway_run.start_gateway(
+            config=GatewayConfig(), replace=False, verbosity=None
+        )
+
+    assert events == [
+        "runtime-lock",
+        "pid-file",
+        "runner",
+        "remove-pid",
+        "release-lock",
+    ]

@@ -32982,7 +32982,46 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
         if _stderr_level < logging.getLogger().level:
             logging.getLogger().setLevel(_stderr_level)
 
-    runner = GatewayRunner(config)
+    # Claim the runtime identity BEFORE constructing GatewayRunner.  Its
+    # constructor opens SessionStore/SessionDB and may spend minutes in a
+    # large schema migration.  Until the PID file exists, the dashboard's
+    # orphan sweep cannot distinguish that live startup from an abandoned
+    # gateway and may terminate it, leaving the successor blocked in the same
+    # migration path (#100968).
+    import atexit
+    from gateway.status import write_pid_file, remove_pid_file, get_running_pid
+    _current_pid = get_running_pid()
+    if _current_pid is not None and _current_pid != os.getpid():
+        logger.error(
+            "Another gateway instance (PID %d) started during our startup. "
+            "Exiting to avoid double-running.", _current_pid
+        )
+        return False
+    if not acquire_gateway_runtime_lock():
+        logger.error(
+            "Gateway runtime lock is already held by another instance. Exiting."
+        )
+        return False
+    try:
+        write_pid_file()
+    except FileExistsError:
+        release_gateway_runtime_lock()
+        logger.error(
+            "PID file race lost to another gateway instance. Exiting."
+        )
+        return False
+    atexit.register(remove_pid_file)
+    atexit.register(release_gateway_runtime_lock)
+
+    try:
+        runner = GatewayRunner(config)
+    except BaseException:
+        # Construction can fail after opening config/state resources but
+        # before runner.stop() exists to own cleanup.  Do not leave the early
+        # identity claim behind for a healthy retry.
+        remove_pid_file()
+        release_gateway_runtime_lock()
+        raise
     # ``--replace`` is explicit startup authority, not a durable reconnect
     # policy. GatewayRunner scopes this bit to cold adapter connects and clears
     # it before the background reconnect watcher starts.
@@ -33143,37 +33182,6 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
         name="planned-stop-watcher",
     )
     _planned_stop_watcher_thread.start()
-
-    # Claim the PID file BEFORE bringing up any platform adapters.
-    # This closes the --replace race window: two concurrent `gateway run
-    # --replace` invocations both pass the termination-wait above, but
-    # only the winner of the O_CREAT|O_EXCL race below will ever open
-    # Telegram polling, Discord gateway sockets, etc. The loser exits
-    # cleanly before touching any external service.
-    import atexit
-    from gateway.status import write_pid_file, remove_pid_file, get_running_pid
-    _current_pid = get_running_pid()
-    if _current_pid is not None and _current_pid != os.getpid():
-        logger.error(
-            "Another gateway instance (PID %d) started during our startup. "
-            "Exiting to avoid double-running.", _current_pid
-        )
-        return False
-    if not acquire_gateway_runtime_lock():
-        logger.error(
-            "Gateway runtime lock is already held by another instance. Exiting."
-        )
-        return False
-    try:
-        write_pid_file()
-    except FileExistsError:
-        release_gateway_runtime_lock()
-        logger.error(
-            "PID file race lost to another gateway instance. Exiting."
-        )
-        return False
-    atexit.register(remove_pid_file)
-    atexit.register(release_gateway_runtime_lock)
 
     # Control socket (#92091 step 1) — the gateway-owned identify/status
     # surface. Started immediately after the PID-file claim: winning that
