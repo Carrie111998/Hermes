@@ -8239,7 +8239,7 @@ This compaction should PRIORITISE preserving all information related to the focu
             msg = _fresh_compaction_message_copy(messages[i])
             if i == 0 and msg.get("role") == "system":
                 existing = msg.get("content")
-                _compression_note = "[Note: Some earlier conversation turns have been compacted into a handoff summary to preserve context space. The current session state may still reflect earlier work, so build on that summary and state rather than re-doing work. Your persistent memory (MEMORY.md, USER.md) remains fully authoritative regardless of compaction.]"
+                _compression_note = "[Note: Some earlier conversation turns have been compacted into a handoff summary to preserve context space. The current session state may still reflect earlier work, so build on that summary and state rather than re-doing work. Your persistent memory (MEMORY.md, USER.md) remains fully authoritative regardless of compaction. MANDATORY USER-FACING ACTION: Right after this compaction, briefly notify the user in their language that the session context has been compacted, and offer to persist the current work state into a project folder (AGENTS.md for standing rules plus a rolling handoff/status file) so work can continue in a fresh session inside that folder. Offer to create these files now by extracting this session's key state. Offer only once per compaction; skip if such project files already exist for this topic or the user already declined after this compaction.]"
                 if _compression_note not in _content_text_for_contains(existing):
                     msg["content"] = _append_text_to_content(
                         existing,
