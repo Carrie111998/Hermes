@@ -168,6 +168,25 @@ class TestSendWithRetryFallback:
         assert "plain text" in adapter._send_calls[1][1].lower()
 
 
+    @pytest.mark.asyncio
+    async def test_structured_permanent_rate_limit_skips_plain_text_fallback(self):
+        adapter = _StubAdapter()
+        adapter._send_results = [
+            SendResult(
+                success=False,
+                error="provider quota exhausted",
+                retryable=False,
+                error_kind="rate_limited",
+            ),
+        ]
+
+        result = await adapter._send_with_retry("chat1", "hello", max_retries=2)
+
+        assert not result.success
+        assert result.error == "provider quota exhausted"
+        assert len(adapter._send_calls) == 1
+
+
 # ---------------------------------------------------------------------------
 # _send_with_retry — retry_after honor
 # ---------------------------------------------------------------------------

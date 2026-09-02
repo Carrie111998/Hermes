@@ -5826,6 +5826,12 @@ class BasePlatformAdapter(ABC):
         error_str = result.error or ""
         is_network = result.retryable or self._is_retryable_error(error_str)
 
+        # A structured rate-limit rejection cannot be repaired by changing
+        # message formatting. Return it unchanged; adapter-level ``retryable``
+        # still decides whether the retry loop above is appropriate.
+        if not is_network and result.error_kind == "rate_limited":
+            return result
+
         # Timeout errors are not safe to retry (message may have been
         # delivered) and not formatting errors — return the failure as-is.
         if not is_network and self._is_timeout_error(error_str):

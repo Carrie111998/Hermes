@@ -174,6 +174,14 @@ _PLATFORM_DEFAULTS: dict[str, dict[str, Any]] = {
     "photon":          _TIER_LOW,
     "bluebubbles":     _TIER_LOW,
     "weixin":          _TIER_LOW,
+    # QQ C2C passive replies share a small, time-boxed reply quota per inbound
+    # msg_id (official docs put it at 5 calls within the reply window), and the
+    # wakeup/"recall" channel QQ falls back to once that's exhausted is capped
+    # even tighter (about 1 per interval — error 40034122 once it's spent). The
+    # adapter has no edit_message implementation, so progress/commentary/
+    # heartbeat sends are permanent messages that eat into both budgets and can
+    # starve the final answer of any delivery channel at all.
+    "qqbot":           _TIER_LOW,
     # WeCom is technically non-editable but exposes a native streaming
     # transport (msgtype: "stream" via aibot_respond_msg) that the gateway
     # consumer routes mid-stream content through. Enable streaming by default

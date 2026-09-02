@@ -266,6 +266,15 @@ class QQAdapter(BasePlatformAdapter):
         # Typing debounce: chat_id → last send_typing timestamp
         self._typing_sent_at: Dict[str, float] = {}
 
+        # Content dropped by a permanent C2C quota failure (_is_c2c_quota_error),
+        # keyed by chat_id → (content, dropped_at). Both the passive-reply and
+        # wakeup budgets are scoped to a stale msg_id/time window and cannot be
+        # recovered by retrying — see send()/_send_chunk(). Carried forward and
+        # prepended to the next message this adapter manages to deliver to the
+        # same chat, so a quota-exhaustion incident degrades to "answer arrives
+        # late, attached to the next reply" instead of silent data loss.
+        self._quota_undelivered: Dict[str, Tuple[str, float]] = {}
+
         # Token cache
         self._access_token: Optional[str] = None
         self._token_expires_at: float = 0.0
@@ -2493,17 +2502,87 @@ class QQAdapter(BasePlatformAdapter):
         if not content or not content.strip():
             return SendResult(success=True)
 
+        had_carried_content = chat_id in self._quota_undelivered
+        content = self._prepend_undelivered(chat_id, content)
+
         formatted = self.format_message(content)
         chunks = self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH)
 
         last_result = SendResult(success=False, error="No chunks")
-        for chunk in chunks:
+        for chunk_index, chunk in enumerate(chunks):
             last_result = await self._send_chunk(chat_id, chunk, reply_to)
             if not last_result.success:
+                if last_result.error_kind == "rate_limited":
+                    self._stash_undelivered(
+                        chat_id, "\n\n".join(chunks[chunk_index:])
+                    )
                 return last_result
             # Only reply_to the first chunk
             reply_to = None
+        if had_carried_content:
+            self._quota_undelivered.pop(chat_id, None)
         return last_result
+
+    # Longest a dropped answer is carried forward before we give up on
+    # reattaching it to a later reply — long enough to span QQ's own C2C
+    # passive-reply window (60 min) with headroom, short enough that we never
+    # glue a stale answer onto an unrelated, much later conversation.
+    _UNDELIVERED_CARRY_SECONDS = 6 * 3600
+
+    def _stash_undelivered(self, chat_id: str, content: str) -> None:
+        """Remember content QQ permanently refused to deliver (quota exhausted).
+
+        Overwrites any previous stash for this chat — we carry forward the
+        most recent dropped answer only, so a repeatedly quota-starved chat
+        doesn't accumulate an unbounded backlog.
+        """
+        self._quota_undelivered[chat_id] = (content, time.time())
+        logger.warning(
+            "[%s] Dropped message for %s after quota exhaustion — will "
+            "prepend to the next deliverable send to this chat",
+            self._log_tag, chat_id,
+        )
+
+    def _prepend_undelivered(self, chat_id: str, content: str) -> str:
+        """Splice a previously stashed, undelivered answer onto ``content``.
+
+        Leaves the stash in place until the merged send succeeds. If quota is
+        exhausted again, ``send()`` replaces it with only the chunks that were
+        not delivered, avoiding both silent loss and duplicate delivered chunks.
+        """
+        carried = self._quota_undelivered.get(chat_id)
+        if not carried:
+            return content
+        carried_content, dropped_at = carried
+        if time.time() - dropped_at > self._UNDELIVERED_CARRY_SECONDS:
+            self._quota_undelivered.pop(chat_id, None)
+            logger.warning(
+                "[%s] Discarding stale undelivered message for %s (%.0fs old)",
+                self._log_tag, chat_id, time.time() - dropped_at,
+            )
+            return content
+        return (
+            f"{carried_content}\n\n"
+            f"—\n"
+            f"⚠️ The message above was delayed by QQ's reply rate limit and is "
+            f"being re-delivered now along with this reply.\n\n"
+            f"{content}"
+        )
+
+    @staticmethod
+    def _is_c2c_quota_error(error: str) -> bool:
+        """Return whether QQ rejected a C2C passive/wakeup quota."""
+        lowered = error.lower()
+        return any(
+            marker in lowered
+            for marker in (
+                "40034128",
+                "40034122",
+                "被动回复时间或次数超限",
+                "被动回复时间或者次数超过限制",
+                "召回消息已达区间上限",
+            )
+        )
 
     async def _send_chunk(
             self,
@@ -2530,8 +2609,14 @@ class QQAdapter(BasePlatformAdapter):
             except Exception as exc:
                 last_exc = exc
                 err = str(exc).lower()
+                # QQ C2C passive-reply and wakeup quota errors are permanent.
+                # Retrying cannot replenish either quota and only duplicates the
+                # same non-idempotent delivery attempt.
+                c2c_quota_exhausted = (
+                    chat_type == "c2c" and self._is_c2c_quota_error(err)
+                )
                 # Permanent errors — don't retry
-                if any(
+                if c2c_quota_exhausted or any(
                         k in err
                         for k in ("invalid", "forbidden", "not found", "bad request")
                 ):
@@ -2550,10 +2635,16 @@ class QQAdapter(BasePlatformAdapter):
 
         error_msg = (str(last_exc) or type(last_exc).__name__) if last_exc else "Unknown error"
         logger.error("[%s] Send failed: %s", self._log_tag, error_msg)
-        retryable = not any(
+        quota_exhausted = chat_type == "c2c" and self._is_c2c_quota_error(error_msg)
+        retryable = not quota_exhausted and not any(
             k in error_msg.lower() for k in ("invalid", "forbidden", "not found")
         )
-        return SendResult(success=False, error=error_msg, retryable=retryable)
+        return SendResult(
+            success=False,
+            error=error_msg,
+            retryable=retryable,
+            error_kind="rate_limited" if quota_exhausted else None,
+        )
 
     async def _send_c2c_text(
             self,

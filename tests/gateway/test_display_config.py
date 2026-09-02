@@ -140,6 +140,16 @@ class TestPlatformDefaults:
             assert resolve_display_setting({}, plat, "tool_progress") == "off", plat
 
 
+    def test_qqbot_defaults_protect_finite_passive_reply_quota(self):
+        """QQ C2C cannot edit progress bubbles, so chatty surfaces stay off."""
+        from gateway.display_config import resolve_display_setting
+
+        assert resolve_display_setting({}, "qqbot", "tool_progress") == "off"
+        assert resolve_display_setting({}, "qqbot", "interim_assistant_messages") is False
+        assert resolve_display_setting({}, "qqbot", "long_running_notifications") is False
+        assert resolve_display_setting({}, "qqbot", "busy_ack_detail") is False
+        assert resolve_display_setting({}, "qqbot", "streaming") is False
+
     def test_telegram_mobile_chatter_defaults(self):
         """Telegram keeps real mid-turn signal (interim commentary + heartbeats)
         but skips the verbose busy-ack iteration counter by default."""
