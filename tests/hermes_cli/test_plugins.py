@@ -1060,6 +1060,41 @@ class TestForceReloadSymmetry:
         assert elapsed < 5.0, f"caller blocked for {elapsed:.2f}s after timeout"
         hold.set()
 
+    def test_late_timed_out_hook_cannot_complete_successor(self, monkeypatch):
+        """A late first worker cannot publish state for the next callback."""
+        monkeypatch.setattr(
+            "hermes_cli.plugins._resolve_hook_callback_timeout", lambda: 0.15
+        )
+
+        second_started = threading.Event()
+        release_second = threading.Event()
+        second_completed = threading.Event()
+
+        def first(**_kwargs):
+            assert second_started.wait(timeout=1.0)
+            return "late-first"
+
+        def second(**_kwargs):
+            second_started.set()
+            release_second.wait(timeout=10.0)
+            second_completed.set()
+            return "late-second"
+
+        def third(**_kwargs):
+            return "third"
+
+        mgr = PluginManager()
+        mgr._hooks["post_tool_call"] = [first, second, third]
+
+        try:
+            results = mgr.invoke_hook("post_tool_call")
+            assert not second_completed.is_set()
+            assert results == ["third"]
+        finally:
+            second_started.set()
+            release_second.set()
+            assert second_completed.wait(timeout=1.0)
+
     def test_hook_callback_within_timeout_returns_value(self, monkeypatch):
         monkeypatch.setattr(
             "hermes_cli.plugins._resolve_hook_callback_timeout", lambda: 1.0

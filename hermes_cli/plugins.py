@@ -5655,21 +5655,25 @@ class PluginManager:
                         _cb: Callable[..., Any] = cb,
                         _key: tuple = callback_key,
                         _token: object = token,
+                        _context: contextvars.Context = context,
+                        _outcome: Dict[str, Any] = outcome,
+                        _failure: Dict[str, Exception] = failure,
+                        _done: threading.Event = done,
                     ) -> None:
                         try:
                             # Route through _invoke_hook_callback so the
                             # additive-payload signature filtering (narrow
                             # legacy callbacks) applies on the worker too.
-                            outcome["value"] = context.run(
+                            _outcome["value"] = _context.run(
                                 self._invoke_hook_callback, _cb, kwargs
                             )
                         except Exception as exc:
-                            failure["exc"] = exc
+                            _failure["exc"] = exc
                         finally:
                             with self._hook_timeout_lock:
                                 if self._hook_running_callbacks.get(_key) is _token:
                                     self._hook_running_callbacks.pop(_key, None)
-                            done.set()
+                            _done.set()
 
                     thread = threading.Thread(
                         target=_runner,
