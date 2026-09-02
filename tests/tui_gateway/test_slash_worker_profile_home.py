@@ -8,10 +8,14 @@ def test_slash_worker_accepts_profile_home():
     """_SlashWorker.__init__ accepts profile_home parameter."""
     # hermes_state evaluates get_hermes_home() / "state.db" at import time, so
     # the mock must return a Path (a bare str raises TypeError under per-file
-    # subprocess isolation).
+    # subprocess isolation). Also mock get_default_hermes_root so
+    # hermes_cli.main._apply_profile_override (triggered via
+    # tui_gateway.server -> gateway.code_skew -> hermes_cli.main) does not
+    # read a MagicMock string from active_profile and sys.exit (#99859).
     with patch.dict("sys.modules", {
         "hermes_constants": MagicMock(
             get_hermes_home=MagicMock(return_value=Path("/tmp/hermes_test")),
+            get_default_hermes_root=MagicMock(return_value=Path("/tmp/hermes_test_default")),
         ),
     }):
         with patch("subprocess.Popen") as mock_popen:

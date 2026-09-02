@@ -59,6 +59,20 @@ load_hermes_dotenv(
     hermes_home=_hermes_home, project_env=Path(__file__).parent.parent / ".env"
 )
 
+# Record checkout fingerprint for stale-code detection (mirrors gateway/run.py
+# and hermes_cli/web_server.py). Long-lived isolated backends (hermes serve
+# --isolated) hold sys.modules from boot; after a git pull / hermes update
+# the on-disk checkout diverges and the process can serve an invalid model
+# string that only fails at the provider boundary (#99859). Recording here
+# lets the turn path refuse with a clear restart message instead of
+# falling through to an unvalidated model.
+try:
+    from gateway.code_skew import record_boot_fingerprint
+
+    record_boot_fingerprint()
+except Exception:
+    pass
+
 
 # ── Panic logger ─────────────────────────────────────────────────────
 # Gateway crashes in a TUI session leave no forensics: stdout is the
@@ -6871,6 +6885,39 @@ def _sync_agent_model_with_config(sid: str, session: dict) -> None:
         )
 
 
+def _tui_code_skew_guard() -> str | None:
+    """Return a restart-required message when this isolated backend runs stale code.
+
+    The Desktop app spawns long-lived ``hermes serve --isolated`` backends per
+    window/profile. Their ``sys.modules`` is frozen at boot; after ``hermes
+    update`` replaces the checkout underneath, the process can hand sessions
+    an invalid model string (e.g. ``z-ai/glm-5.2`` fallback or a stale catalog
+    entry like ``claude-opus-4-6``) that only fails at the provider boundary
+    as ``agent_init_failed`` / 404 (#99859). Mirrors the gateway's
+    ``_model_switch_skew_guard`` and the dashboard's
+    ``_dashboard_code_skew_guard`` (#97046, #86207): refuse the turn with an
+    actionable restart message instead of serving an unvalidated model.
+
+    Returns None when no drift is detectable (fresh process or non-git
+    install — never a false positive).
+    """
+    try:
+        from gateway.code_skew import detect_code_skew
+    except Exception:
+        return None
+    skew = detect_code_skew()
+    if not skew:
+        return None
+    boot_rev, disk_rev = skew
+    return (
+        f"This process is running code from {boot_rev} but the checkout on "
+        f"disk is now {disk_rev}. The backend would risk serving an invalid "
+        f"model from stale code — restart the Desktop-owned backend to load "
+        f"the new code (use Restart backend in Hermes Desktop, or quit and "
+        f"reopen the app)"
+    )
+
+
 def _pending_switch_selection_warning(model: str, provider: str) -> str | None:
     """Selection-guard message for a model queued mid-turn, or ``None``.
 
@@ -13331,6 +13378,76 @@ def _run_prompt_submit(
             # the sudo.request overlay. (secret capture is a module global, so
             # re-running is a harmless no-op.)
             _wire_callbacks(sid)
+            # ── Stale isolated-backend guard (#99859) ──────────────────
+            # Long-lived ``hermes serve --isolated`` backends cache sys.modules
+            # at boot. After a checkout update they can serve an invalid model
+            # string that only fails at the provider (z-ai/glm-5.2 fallback or
+            # stale catalog entry -> 404 / agent_init_failed). Refuse the turn
+            # with a clear restart message instead of an unvalidated model.
+            skew_msg = _tui_code_skew_guard()
+            if skew_msg:
+                logger.warning("Refusing turn for %s: code skew %s", sid, skew_msg)
+                with session["history_lock"]:
+                    session["running"] = False
+                    session.pop("_active_turn_marker_key", None)
+                try:
+                    clear_turn_marker(marker_home, marker_key)
+                except Exception:
+                    pass
+                _emit(
+                    "error",
+                    sid,
+                    {
+                        "message": f"Restart required: {skew_msg}",
+                        "code": "restart_required",
+                        "retryable": False,
+                    },
+                )
+                return
+            # Deleted/incomplete profile guard (#99859): an isolated backend
+            # that was started before ``hermes profile delete`` keeps the
+            # profile in memory and will otherwise recreate a zombie directory
+            # or keep referencing a missing config.
+            if _profile_home_str:
+                try:
+                    _p = Path(_profile_home_str)
+                    from hermes_constants import named_profile_home, named_profile_is_deleted
+
+                    # Only enforce for managed named profiles (under
+                    # ~/.hermes/profiles/<name>). Ad-hoc temp Homes used in
+                    # tests (e.g. /tmp/test-profile) are exempt — they are not
+                    # Bots UI creations and typically lack config.yaml by design.
+                    _named_home = named_profile_home(_p)
+                    if _named_home is not None:
+                        if named_profile_is_deleted(_named_home) or not _named_home.is_dir():
+                            raise FileNotFoundError(
+                                f"Named profile home does not exist: {_named_home}. Create the profile explicitly before using it."
+                            )
+                        if not (_named_home / "config.yaml").is_file():
+                            raise FileNotFoundError(
+                                f"Profile {_named_home.name} is incomplete (missing config.yaml) — recreate via hermes profile create"
+                            )
+                except FileNotFoundError as _profile_err:
+                    logger.warning("Refusing turn for %s: %s", sid, _profile_err)
+                    with session["history_lock"]:
+                        session["running"] = False
+                        session.pop("_active_turn_marker_key", None)
+                    try:
+                        clear_turn_marker(marker_home, marker_key)
+                    except Exception:
+                        pass
+                    _emit(
+                        "error",
+                        sid,
+                        {
+                            "message": f"Profile unavailable: {_profile_err}. Recreate the profile or restart the backend.",
+                            "code": "profile_missing",
+                            "retryable": False,
+                        },
+                    )
+                    return
+                except Exception:
+                    pass
             # Skip the config-model sync while a /model --once override is
             # active: the once-model is intentionally not pinned as a session
             # model_override (it must not persist), so without this guard the
@@ -14059,7 +14176,14 @@ def _run_prompt_submit(
             # Drop both local snapshots of the pre-turn history before asking
             # glibc to return pages. session["history"] already points at the
             # new/pruned result; retaining either list defeats this trim.
-            history.clear()
+            # Guard for early returns (e.g. code-skew / profile-missing guards
+            # that return before history is defined, #99859).
+            try:
+                history.clear()  # type: ignore[possibly-undefined]
+            except NameError:
+                pass
+            except Exception:
+                pass
             local_run_kwargs = locals().get("run_kwargs")
             if isinstance(local_run_kwargs, dict):
                 local_run_kwargs.clear()

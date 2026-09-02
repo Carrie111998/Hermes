@@ -718,8 +718,17 @@ def _apply_profile_override() -> None:
             if active_path.exists():
                 name = active_path.read_text(encoding="utf-8").strip()
                 if name and name != "default":
-                    profile_name = name
-                    consume = 0  # don't strip anything from argv
+                    import re as _re_ap
+
+                    # Validate sticky active_profile content before accepting it.
+                    # Mirrors the explicit --profile guard (rejects pytest's
+                    # `-p no:xdist` etc.) so incomplete test mocks that return
+                    # a MagicMock string like
+                    # "<magicmock name='mock.get_default_hermes_root()...'>"
+                    # are treated as corrupted file, not a fatal ValueError.
+                    if _re_ap.match(r"^[a-z0-9][a-z0-9_-]{0,63}$", name):
+                        profile_name = name
+                        consume = 0  # don't strip anything from argv
         except (UnicodeDecodeError, OSError):
             pass  # corrupted file, skip
 
@@ -735,6 +744,12 @@ def _apply_profile_override() -> None:
                 print(f"Error: {exc}", file=sys.stderr)
                 sys.exit(1)
         except ValueError as exc:
+            # Sticky active_profile (consume==0) with invalid/reserved name
+            # (e.g. corrupted file) should not crash the process — treat as
+            # no profile, like the UnicodeDecodeError path. Explicit --profile
+            # (consume>0) must still refuse hard (keep refuse-not-fallback).
+            if consume == 0:
+                return
             print(f"Error: {exc}", file=sys.stderr)
             sys.exit(1)
         except Exception as exc:

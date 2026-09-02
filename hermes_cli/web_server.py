@@ -7411,6 +7411,12 @@ def get_model_info(profile: Optional[str] = None):
     Also returns model capabilities (vision, reasoning, tools) when available.
     """
     try:
+        skew_msg = _dashboard_code_skew_guard()
+        if skew_msg:
+            _log.warning("GET /api/model/info refused: %s", skew_msg)
+            raise HTTPException(
+                status_code=503, detail=f"Restart required: {skew_msg}"
+            )
         with _profile_scope(profile):
             cfg = load_config()
         model_cfg = cfg.get("model", "")
@@ -7722,6 +7728,12 @@ def get_auxiliary_models(profile: Optional[str] = None):
     selected profile's (read/write asymmetry).
     """
     try:
+        skew_msg = _dashboard_code_skew_guard()
+        if skew_msg:
+            _log.warning("GET /api/model/auxiliary refused: %s", skew_msg)
+            raise HTTPException(
+                status_code=503, detail=f"Restart required: {skew_msg}"
+            )
         with _profile_scope(profile):
             cfg = load_config()
         aux_cfg = cfg.get("auxiliary", {})
@@ -7759,6 +7771,12 @@ def get_auxiliary_models(profile: Optional[str] = None):
 def get_moa_models(profile: Optional[str] = None):
     """Return the configured Mixture-of-Agents provider/model slots."""
     try:
+        skew_msg = _dashboard_code_skew_guard()
+        if skew_msg:
+            _log.warning("GET /api/model/moa refused: %s", skew_msg)
+            raise HTTPException(
+                status_code=503, detail=f"Restart required: {skew_msg}"
+            )
         from hermes_cli.moa_config import normalize_moa_config
 
         with _profile_scope(profile):
@@ -7775,6 +7793,12 @@ def get_moa_models(profile: Optional[str] = None):
 def set_moa_models(body: MoaConfigPayload, profile: Optional[str] = None):
     """Persist the Mixture-of-Agents provider/model slots."""
     try:
+        skew_msg = _dashboard_code_skew_guard()
+        if skew_msg:
+            _log.warning("PUT /api/model/moa refused: %s", skew_msg)
+            raise HTTPException(
+                status_code=503, detail=f"Restart required: {skew_msg}"
+            )
         from hermes_cli.moa_config import normalize_moa_config, validate_moa_payload
 
         def _slot_dict(slot: MoaModelSlot) -> dict:
@@ -7864,6 +7888,12 @@ async def set_model_assignment(body: ModelAssignment, profile: Optional[str] = N
         raise HTTPException(status_code=400, detail="scope must be 'main' or 'auxiliary'")
 
     try:
+        skew_msg = _dashboard_code_skew_guard()
+        if skew_msg:
+            _log.warning("POST /api/model/set refused: %s", skew_msg)
+            raise HTTPException(
+                status_code=503, detail=f"Restart required: {skew_msg}"
+            )
         # Expensive-model warning runs BEFORE the profile scope is entered:
         # _profile_scope must never be held across an await (the RLock is
         # reentrant per-thread, so a second coroutine interleaving on the
