@@ -75,7 +75,8 @@ def _is_orphaned(original_ppid, getppid=os.getppid) -> bool:
                 return code.value != _STILL_ACTIVE
             finally:
                 _kernel32.CloseHandle(handle)
-        except Exception:
+        except Exception as exc:  # keep worker alive; log for observability
+            logger.debug("Windows orphan check failed for ppid %s: %s: %s", original_ppid, type(exc).__name__, exc)
             return False
     return getppid() != original_ppid
 

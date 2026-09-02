@@ -43,6 +43,7 @@ Usage (see ``tools/mcp_tool.py::_run_stdio``)::
 from __future__ import annotations
 
 import argparse
+import logging
 import os
 import signal
 import subprocess
@@ -52,6 +53,7 @@ import time
 
 _POLL_INTERVAL_S = 2.0
 _TERM_GRACE_S = 3.0
+logger = logging.getLogger(__name__)
 
 
 def _is_orphaned(original_ppid: int, getppid=os.getppid) -> bool:
@@ -77,7 +79,8 @@ def _is_orphaned(original_ppid: int, getppid=os.getppid) -> bool:
                 return code.value != _STILL_ACTIVE
             finally:
                 _kernel32.CloseHandle(handle)
-        except Exception:
+        except Exception as exc:  # keep watchdog alive; log for observability
+            logger.debug("Windows orphan check failed for ppid %s: %s: %s", original_ppid, type(exc).__name__, exc)
             return False
     return getppid() != original_ppid
 
