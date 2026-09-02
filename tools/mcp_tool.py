@@ -422,6 +422,17 @@ def _ensure_mcp_sdk() -> bool:
                 logger.debug("MCP notification types not available -- dynamic tool discovery disabled")
         except ImportError:
             logger.debug("mcp package not installed -- MCP tool support disabled")
+            # A `from mcp import ClientSession, StdioServerParameters` can bind
+            # ClientSession BEFORE StdioServerParameters fails (SDK versions
+            # that moved it out of the top-level namespace). That partial bind
+            # made the availability guard below return True on later calls
+            # (`ClientSession is not None`) while StdioServerParameters stayed
+            # unbound → NameError at the stdio call site (#96528). Clear the
+            # partial state so the guard never reports available with unbound
+            # symbols.
+            _MCP_AVAILABLE = False
+            ClientSession = None
+            StdioServerParameters = None
 
         if _MCP_AVAILABLE:
             try:

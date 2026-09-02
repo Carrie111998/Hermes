@@ -3012,3 +3012,39 @@ class TestRedirectHeaderStripper:
         asyncio.run(hook(response))
         assert next_request.headers["authorization"] == "Bearer x"
         assert next_request.headers["x-tenant"] == "t"
+
+
+def test_ensure_mcp_sdk_partial_import_clears_state(monkeypatch):
+    """#96528: a partial `from mcp import ClientSession, StdioServerParameters`
+    (an SDK version that moved StdioServerParameters out of the top-level
+    namespace binds ClientSession first, then fails) must NOT leave the
+    availability guard returning True with an unbound symbol — the partial
+    state is cleared so callers see the SDK as unavailable instead of hitting
+    NameError at the stdio call site."""
+    import builtins
+    from tools import mcp_tool as mt
+
+    class _PartialMCP:
+        ClientSession = object()  # binds fine
+        # StdioServerParameters intentionally absent from the top level
+
+    real_import = builtins.__import__
+
+    def fake_import(name, *args, **kwargs):
+        if name == "mcp":
+            return _PartialMCP
+        return real_import(name, *args, **kwargs)
+
+    # Fresh guard state so the partial import path is actually exercised.
+    mt._MCP_AVAILABLE = True
+    mt._MCP_SDK_IMPORT_ATTEMPTED = False
+    mt.ClientSession = None
+    mt.StdioServerParameters = None
+
+    monkeypatch.setattr(builtins, "__import__", fake_import)
+    available = mt._ensure_mcp_sdk()
+
+    assert available is False, "partial import must not report the SDK available"
+    assert mt.ClientSession is None, "partial ClientSession bind must be cleared"
+    assert mt.StdioServerParameters is None
+    assert mt._MCP_AVAILABLE is False
