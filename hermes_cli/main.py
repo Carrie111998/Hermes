@@ -14652,6 +14652,41 @@ def main():
     sessions_rename.add_argument("session_id", help="Session ID to rename")
     sessions_rename.add_argument("title", nargs="+", help="New title for the session")
 
+    sessions_retitle_new = sessions_subparsers.add_parser(
+        "retitle",
+        help="Regenerate a session's title from recent conversation (DB-only)",
+        description=(
+            "Regenerate a session's title using the last N turns of conversation "
+            "as context, instead of just the opening message. Writes to the DB "
+            "only — does NOT rename Telegram topics or Discord threads (matches "
+            "the /retitle slash command default). Sessions with a user-set "
+            "title are skipped unless --force is passed."
+        ),
+    )
+    sessions_retitle_new.add_argument(
+        "session_id", help="Session ID or unique prefix to retitle"
+    )
+    sessions_retitle_new.add_argument(
+        "--turns",
+        type=int,
+        default=None,
+        help=(
+            "Number of user+assistant turns to feed the title model "
+            "(default: auxiliary.title_generation.retitle.turns_window, "
+            "typically 10)"
+        ),
+    )
+    sessions_retitle_new.add_argument(
+        "--force",
+        action="store_true",
+        help="Overwrite even a user-set title (default: skip user-set titles)",
+    )
+    sessions_retitle_new.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Show what would happen without calling the model or writing",
+    )
+
     sessions_pin = sessions_subparsers.add_parser(
         "pin",
         help="Pin session(s) — durable keep flag, exempt from auto-archive",

@@ -19424,6 +19424,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if canonical == "title":
             return await self._handle_title_command(event)
 
+        if canonical == "retitle":
+            return await self._handle_retitle_command(event)
+
         if canonical == "resume":
             return await self._handle_resume_command(event)
 

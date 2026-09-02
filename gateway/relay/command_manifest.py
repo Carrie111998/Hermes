@@ -100,6 +100,17 @@ def build_relay_command_manifest() -> List[Dict[str, Any]]:
             "options": [_opt("text", "New title. Leave empty to show.")],
         },
         {
+            "name": "retitle",
+            "description": "Regenerate the session title from recent conversation",
+            "options": [
+                _opt(
+                    "force",
+                    "Pass 'force' to overwrite even a manual title",
+                    choices=["force"],
+                )
+            ],
+        },
+        {
             "name": "resume",
             "description": "Resume a previously-named session",
             "options": [_opt("name", "Session title or id")],
