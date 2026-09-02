@@ -61,9 +61,14 @@ export const TimelineTimestamp: FC<{
 
   if (precision === 'clock') {
     // A chat bubble answers "when did this arrive", so it shows the settled
-    // moment (completion when the turn produced one, otherwise the send time)
-    // as a single `4:30 PM`. Full precision stays on hover.
-    const landed = completed ?? started
+    // moment as a single `4:30 PM`. Full precision stays on hover.
+    //
+    // Two deliberate fallbacks to the start time: a turn that never completed
+    // (still streaming, errored, or cancelled) has no completion to show, and
+    // an instant turn whose completion equals its start has nothing to add.
+    // While streaming, the row therefore shows the send minute and settles to
+    // the landing minute — invisible for sub-minute turns, a single quiet
+    // change for long ones.
     const landedSeconds = validCompletedAt ?? timestamp
 
     return (
@@ -72,7 +77,7 @@ export const TimelineTimestamp: FC<{
         data-slot="timeline-timestamp"
         title={title}
       >
-        <time dateTime={landed.toISOString()}>{formatClockTimestamp(landedSeconds)}</time>
+        <time dateTime={(completed ?? started).toISOString()}>{formatClockTimestamp(landedSeconds)}</time>
       </span>
     )
   }
@@ -100,9 +105,8 @@ export const TimelineTimestamp: FC<{
 /** Timestamp for the current assistant-ui message lifecycle. */
 export const MessageTimelineTimestamp: FC<{
   className?: string
-  precision?: 'clock' | 'exact'
   suppressIfDuplicatePart?: boolean
-}> = ({ className, precision = 'clock', suppressIfDuplicatePart = false }) => {
+}> = ({ className, suppressIfDuplicatePart = false }) => {
   const timestamp = useAuiState(s => {
     const value = (s.message.metadata?.custom as { timelineTimestamp?: unknown } | undefined)?.timelineTimestamp
 
@@ -136,5 +140,5 @@ export const MessageTimelineTimestamp: FC<{
     return null
   }
 
-  return <TimelineTimestamp className={className} completedAt={completedAt} precision={precision} timestamp={timestamp} />
+  return <TimelineTimestamp className={className} completedAt={completedAt} precision="clock" timestamp={timestamp} />
 }

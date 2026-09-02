@@ -50,6 +50,19 @@ describe('TimelineTimestamp precision', () => {
   const started = new Date(2026, 4, 1, 16, 30, 3, 456).getTime() / 1000
   const finished = new Date(2026, 4, 1, 16, 32, 9, 789).getTime() / 1000
 
+  // Mirrors the component's own hover formatter, so the assertion survives a
+  // locale that renders digits differently (e.g. ar-SA).
+  const preciseFormat = (d: Date) =>
+    new Intl.DateTimeFormat(undefined, {
+      day: 'numeric',
+      fractionalSecondDigits: 3,
+      hour: 'numeric',
+      minute: '2-digit',
+      month: 'short',
+      second: '2-digit',
+      year: 'numeric'
+    }).format(d)
+
   beforeEach(() => {
     $displayTimestamps.set(true)
   })
@@ -59,8 +72,10 @@ describe('TimelineTimestamp precision', () => {
     const text = container.querySelector('[data-slot="timeline-timestamp"]')?.textContent ?? ''
 
     expect(text).toContain('→')
-    expect(text).toContain('456')
-    expect(text).toContain('789')
+    // Sub-minute detail is exactly what an activity row must keep: two
+    // instants in the same minute stay distinguishable here.
+    expect(text).not.toBe(formatClockTimestamp(started))
+    expect(text.split('→')[0]?.trim()).not.toBe(formatClockTimestamp(started))
   })
 
   it('collapses to a single landing clock with no seconds when precision is clock', () => {
@@ -69,11 +84,11 @@ describe('TimelineTimestamp precision', () => {
     const text = node?.textContent ?? ''
 
     expect(text).not.toContain('→')
-    expect(text).not.toContain('456')
-    expect(text).not.toContain('789')
     expect(text).toBe(formatClockTimestamp(finished))
     // Full precision is still reachable on hover.
-    expect(node?.getAttribute('title') ?? '').toContain('456')
+    expect(node?.getAttribute('title') ?? '').toBe(
+      `${preciseFormat(new Date(started * 1000))} → ${preciseFormat(new Date(finished * 1000))}`
+    )
   })
 
   it('falls back to the send time in clock mode when the turn never completed', () => {
