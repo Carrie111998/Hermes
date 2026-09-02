@@ -2667,6 +2667,11 @@ class SessionStore:
             )
             if now.hour < policy.at_hour:
                 today_reset -= timedelta(days=1)
+            if policy.day_of_week is not None:
+                dow = policy.day_of_week.strip().lower()
+                expected = SessionResetPolicy._WEEKDAYS.get(dow)
+                if expected is not None and now.weekday() != expected:
+                    return False
             if entry.updated_at < today_reset:
                 return True
 
@@ -2775,6 +2780,12 @@ class SessionStore:
             )
             if now.hour < policy.at_hour:
                 today_reset -= timedelta(days=1)
+            
+            if policy.day_of_week is not None:
+                dow = policy.day_of_week.strip().lower()
+                expected = SessionResetPolicy._WEEKDAYS.get(dow)
+                if expected is not None and now.weekday() != expected:
+                    return None
             
             if entry.updated_at < today_reset:
                 return "daily"

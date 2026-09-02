@@ -14,7 +14,7 @@ import os
 import json
 from pathlib import Path
 from dataclasses import asdict, dataclass, field, is_dataclass
-from typing import Dict, List, Optional, Any, Callable
+from typing import ClassVar, Dict, List, Optional, Any, Callable
 from enum import Enum
 
 from hermes_cli.config import get_hermes_home
@@ -563,9 +563,18 @@ class SessionResetPolicy:
     # by the reset guard. Raise this if you run legitimate multi-day jobs whose
     # liveness should pin the conversation open.
     bg_process_max_age_hours: int = 24
+    # When set (e.g. "sunday"), the daily reset fires only on that weekday.
+    # None = every day (existing behavior). Accepts lowercase weekday names.
+    day_of_week: Optional[str] = None
+
+    # Day name → Python weekday() int mapping (Monday=0 … Sunday=6)
+    _WEEKDAYS: ClassVar[Dict[str, int]] = {
+        "monday": 0, "tuesday": 1, "wednesday": 2, "thursday": 3,
+        "friday": 4, "saturday": 5, "sunday": 6,
+    }
 
     def to_dict(self) -> Dict[str, Any]:
-        return {
+        d: Dict[str, Any] = {
             "mode": self.mode,
             "at_hour": self.at_hour,
             "idle_minutes": self.idle_minutes,
@@ -573,6 +582,9 @@ class SessionResetPolicy:
             "notify_exclude_platforms": list(self.notify_exclude_platforms),
             "bg_process_max_age_hours": self.bg_process_max_age_hours,
         }
+        if self.day_of_week is not None:
+            d["day_of_week"] = self.day_of_week
+        return d
     
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "SessionResetPolicy":
@@ -584,6 +596,18 @@ class SessionResetPolicy:
         notify = data.get("notify")
         exclude = data.get("notify_exclude_platforms")
         bg_max_age = data.get("bg_process_max_age_hours")
+        day = data.get("day_of_week")
+        # Validate and normalize day_of_week
+        if day is not None:
+            day_lower = str(day).strip().lower()
+            if day_lower in cls._WEEKDAYS:
+                day = day_lower
+            else:
+                logger.warning(
+                    "Invalid day_of_week=%r (must be one of %s). Ignoring.",
+                    day, list(cls._WEEKDAYS.keys()),
+                )
+                day = None
         return cls(
             mode=mode if mode is not None else "none",
             at_hour=at_hour if at_hour is not None else 4,
@@ -591,6 +615,7 @@ class SessionResetPolicy:
             notify=_coerce_bool(notify, True),
             notify_exclude_platforms=tuple(exclude) if exclude is not None else ("api_server", "webhook"),
             bg_process_max_age_hours=bg_max_age if bg_max_age is not None else 24,
+            day_of_week=day,
         )
 
 
@@ -1939,6 +1964,17 @@ def _validate_gateway_config(config: "GatewayConfig") -> None:
             policy.idle_minutes,
         )
         policy.idle_minutes = 1440
+
+    if policy.day_of_week is not None:
+        dow = policy.day_of_week.strip().lower()
+        if dow not in SessionResetPolicy._WEEKDAYS:
+            logger.warning(
+                "Invalid day_of_week=%r (must be a weekday name). Ignoring.",
+                policy.day_of_week,
+            )
+            policy.day_of_week = None
+        else:
+            policy.day_of_week = dow
 
     # Warn about empty bot tokens — platforms that loaded an empty string
     # won't connect and the cause can be confusing without a log line.

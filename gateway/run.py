@@ -21377,7 +21377,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         elif reset_reason == "resume_pending_expired":
                             reason_text = "gateway restart recovery timed out"
                         elif reset_reason == "daily":
-                            reason_text = f"daily schedule at {policy.at_hour}:00"
+                            if policy.day_of_week:
+                                reason_text = f"weekly {policy.day_of_week} schedule at {policy.at_hour}:00"
+                            else:
+                                reason_text = f"daily schedule at {policy.at_hour}:00"
                         else:
                             hours = policy.idle_minutes // 60
                             mins = policy.idle_minutes % 60
