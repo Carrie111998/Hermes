@@ -1132,6 +1132,7 @@ def _terminate_command_tts_process_tree(proc: subprocess.Popen) -> None:
                 stderr=subprocess.DEVNULL,
                 timeout=5,
                 stdin=subprocess.DEVNULL,
+                creationflags=windows_hide_flags(),
             )
         except Exception:
             proc.kill()
