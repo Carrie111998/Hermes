@@ -2304,6 +2304,7 @@ def write_credential_pool(
     entries: List[Dict[str, Any]],
     *,
     removed_ids: Optional[Iterable[str]] = None,
+    preserve_disk_status: bool = True,
 ) -> Path:
     """Persist one provider's credential pool under auth.json.
 
@@ -2322,7 +2323,19 @@ def write_credential_pool(
 
     Pass ``removed_ids`` for entries the caller intentionally removed, so the
     merge does not resurrect them from the on-disk copy.
+
+    Pass ``preserve_disk_status=False`` ONLY for an explicit operator reset
+    (``CredentialPool.reset_statuses``, i.e. ``hermes auth reset``): the
+    cleared in-memory status carries no ``last_status_at``, so the recency
+    merge would always treat it as stale and resurrect the very cooldown the
+    user asked to clear (#84711). Every other writer must keep the default.
     """
+    if not preserve_disk_status:
+        logger.debug(
+            "auth: write_credential_pool(%r) with preserve_disk_status=False — "
+            "disk cooldown/status merge bypassed (explicit operator reset)",
+            provider_id,
+        )
     removed = {rid for rid in (removed_ids or ()) if rid}
     with _auth_store_lock():
         auth_store = _load_auth_store()
@@ -2347,12 +2360,15 @@ def write_credential_pool(
             for entry in sanitized_entries
             if isinstance(entry, dict) and entry.get("id")
         }
-        merged: List[Dict[str, Any]] = [
-            _merge_disk_cooldown_state(
+        def _merged(entry: Dict[str, Any]) -> Dict[str, Any]:
+            if not preserve_disk_status:
+                return entry
+            return _merge_disk_cooldown_state(
                 entry, existing_by_id.get(entry.get("id")), provider_id
             )
-            if isinstance(entry, dict)
-            else entry
+
+        merged: List[Dict[str, Any]] = [
+            _merged(entry) if isinstance(entry, dict) else entry
             for entry in sanitized_entries
         ]
         for disk_entry in existing_list:
