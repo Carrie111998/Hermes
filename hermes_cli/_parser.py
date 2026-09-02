@@ -15,9 +15,10 @@ from functools import lru_cache
 
 
 # `--profile` / `-p` is consumed by ``main._apply_profile_override`` before
-# argparse runs (it sets ``HERMES_HOME`` and strips itself from ``sys.argv``),
-# so it isn't on the parser. Listed here so all "carry over on relaunch"
-# metadata lives in one file.
+# argparse runs (it sets ``HERMES_HOME`` and strips itself from ``sys.argv``).
+# It is also declared on the parser below so the supported selector appears in
+# top-level help. Listed here so all "carry over on relaunch" metadata lives in
+# one file.
 PRE_ARGPARSE_INHERITED_FLAGS: list[tuple[str, bool]] = [
     ("--profile", True),
     ("-p", True),
@@ -39,9 +40,19 @@ _VALUE_FLAGS_FALLBACK: frozenset[str] = frozenset(
         "-s", "--skills",
         "--usage-file",
         "--in",
+        "-p", "--profile",
     }
 )
 _OPTIONAL_VALUE_FLAGS_FALLBACK: frozenset[str] = frozenset({"-c", "--continue"})
+
+
+class _PreparsedProfileAction(argparse.Action):
+    """Expose the bootstrap-only profile selector without accepting it here."""
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        parser.error(
+            f"{option_string or '--profile'} must be processed before argument parsing"
+        )
 
 
 @lru_cache(maxsize=1)
@@ -149,6 +160,14 @@ def build_top_level_parser():
 
     parser.add_argument(
         "--version", "-V", action="store_true", help="Show version and exit"
+    )
+    parser.add_argument(
+        "--profile",
+        "-p",
+        metavar="PROFILE",
+        action=_PreparsedProfileAction,
+        default=argparse.SUPPRESS,
+        help="Run this command against the named profile.",
     )
     parser.add_argument(
         "-z",

@@ -75,7 +75,10 @@ class TestCronStatusHeartbeatGuard:
             cron_mod.cron_status()
 
         stdout = capsys.readouterr().out
-        assert "✓ Gateway is running — cron jobs will fire automatically" in stdout
+        assert (
+            "✓ Gateway is running for profile 'default' — "
+            "cron jobs will fire automatically"
+        ) in stdout
         assert "⚠" not in stdout
 
 
