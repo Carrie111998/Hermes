@@ -447,22 +447,47 @@ _NIX_STORE = Path("/nix/store")
 _IGNORED_MANAGED_VALUES = frozenset({"brew", "homebrew"})
 
 
+def _resolve_managed_marker(home: Path) -> Optional[str]:
+    """Return the managed marker for a specific Hermes home, or None.
+
+    A ``.managed`` marker with content names the system that manages the
+    install. An interactive shell reads the marker because it does not see
+    the HERMES_MANAGED variable of the service.
+    """
+    managed_marker = home / ".managed"
+    if not managed_marker.exists():
+        return None
+    try:
+        return managed_marker.read_text(encoding="utf-8", errors="replace").strip().lower()
+    except OSError:
+        return ""
+
+
 def get_managed_system() -> Optional[str]:
-    """Return the package manager owning this install, if any."""
-    raw = os.getenv("HERMES_MANAGED", "").strip()
+    """Return the package manager owning this install, if any.
+
+    Managed-ness is home-aware: when a profile home override is active
+    (i.e. we're scoped to a specific profile, e.g. via the dashboard's
+    ``_profile_scope``), the decision comes from that profile dir's
+    ``.managed`` marker — NOT the process-global ``HERMES_MANAGED`` env var.
+    A package manager (NixOS/Homebrew) manages the main install's
+    ``config.yaml``, not per-profile configs, so a profile without its own
+    ``.managed`` marker must remain user-writable even when the global
+    install is managed.
+    """
+    from hermes_constants import get_hermes_home_override
+
+    override = get_hermes_home_override()
     marker = None
-    if raw:
-        marker = raw.lower()
+    if override:
+        # Profile-scoped: only the profile's own marker governs managed-ness.
+        marker = _resolve_managed_marker(Path(override))
     else:
-        managed_marker = get_hermes_home() / ".managed"
-        # An interactive shell reads the marker, because it does not see the
-        # HERMES_MANAGED variable of the service. A marker with content
-        # names the system that manages the install.
-        if managed_marker.exists():
-            try:
-                marker = managed_marker.read_text(encoding="utf-8", errors="replace").strip().lower()
-            except OSError:
-                marker = ""
+        raw = os.getenv("HERMES_MANAGED", "").strip()
+        if raw:
+            marker = raw.lower()
+        else:
+            marker = _resolve_managed_marker(get_hermes_home())
 
     if marker is None:
         return None
