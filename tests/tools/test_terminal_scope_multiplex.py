@@ -182,3 +182,64 @@ def test_tui_and_cron_boundaries_bind_and_reset(tmp_path):
     with install_and_reset_profile_terminal_scope(home):  # cron fire helper
         assert terminal_env("TERMINAL_ENV") == "local"
     assert get_terminal_scope() is None
+
+
+def test_scope_serializes_list_dict_config_as_json(tmp_path):
+    """#101465: config.yaml list/dict terminal values must mirror as JSON.
+
+    Consumers (terminal_tool's _parse_env_var) json.loads these mirrors;
+    str() would emit a Python repr ("['X']") and the docker-backend
+    requirement check would fail, disabling terminal tools for profiles
+    served through the multiplexed dashboard."""
+    from tools.terminal_scope import (
+        build_profile_terminal_scope,
+        install_and_reset_profile_terminal_scope,
+    )
+
+    home = _profile(
+        tmp_path,
+        "cee",
+        "terminal:\n"
+        "  backend: docker\n"
+        "  docker_forward_env:\n"
+        "    - EMAIL_HOME_ADDRESS\n"
+        "  docker_volumes:\n"
+        "    - /data:/data:ro\n"
+        "  docker_env:\n"
+        "    Gateway: upstream-proxy\n"
+        "  docker_extra_args:\n"
+        "    - --pids-limit\n"
+        "    - '256'\n"
+        "  timeout: 240\n",
+    )
+    scope = build_profile_terminal_scope(home)
+    assert json.loads(scope["TERMINAL_DOCKER_FORWARD_ENV"]) == ["EMAIL_HOME_ADDRESS"]
+    assert json.loads(scope["TERMINAL_DOCKER_VOLUMES"]) == ["/data:/data:ro"]
+    assert json.loads(scope["TERMINAL_DOCKER_ENV"]) == {"Gateway": "upstream-proxy"}
+    assert json.loads(scope["TERMINAL_DOCKER_EXTRA_ARGS"]) == ["--pids-limit", "256"]
+    # Scalars keep the plain str() mirror.
+    assert scope["TERMINAL_TIMEOUT"] == "240"
+
+    import tools.terminal_tool as tt
+
+    with install_and_reset_profile_terminal_scope(home):
+        cfg = tt._get_env_config()
+    assert cfg["env_type"] == "docker"
+    assert cfg["docker_forward_env"] == ["EMAIL_HOME_ADDRESS"]
+    assert cfg["docker_env"] == {"Gateway": "upstream-proxy"}
+    assert cfg["docker_volumes"] == ["/data:/data:ro"]
+
+
+def test_scope_keeps_dotenv_json_strings_verbatim(tmp_path):
+    """.env TERMINAL_* values are already JSON strings; they must pass
+    through unchanged (no double-encoding, no repr)."""
+    from tools.terminal_scope import build_profile_terminal_scope
+
+    home = _profile(
+        tmp_path,
+        "dee",
+        dotenv='TERMINAL_DOCKER_VOLUMES=["/v:/v:rw"]\nTERMINAL_ENV=docker\n',
+    )
+    scope = build_profile_terminal_scope(home)
+    assert scope["TERMINAL_DOCKER_VOLUMES"] == '["/v:/v:rw"]'
+    assert json.loads(scope["TERMINAL_DOCKER_VOLUMES"]) == ["/v:/v:rw"]
