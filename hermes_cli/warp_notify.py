@@ -99,7 +99,7 @@ def _emit_osc777(title: str, body: str) -> None:
     a failure here must never interrupt the agent loop."""
     seq = f"\033]777;notify;{title};{body}\007"
     try:
-        with open("/dev/tty", "w") as tty:
+        with open("/dev/tty", "w", encoding="utf-8") as tty:
             tty.write(seq)
             tty.flush()
     except OSError:
