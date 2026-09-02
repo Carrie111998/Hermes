@@ -79,23 +79,19 @@ function stepInk(color: ScreenAnnotationColor): string {
 }
 
 function stepAnchor(shape: ScreenAnnotationShape): { x: number; y: number } {
-  if (shape.kind === 'circle') {
-    return { x: shape.x - shape.radius, y: shape.y - shape.radius }
+  switch (shape.kind) {
+    case 'circle':
+      return { x: shape.x - shape.radius, y: shape.y - shape.radius }
+    case 'rect':
+      return { x: shape.x, y: shape.y }
+    case 'arrow':
+    case 'line':
+      return { x: shape.toX, y: shape.toY }
+    case 'polyline':
+      return shape.points[0] ?? { x: 0, y: 0 }
+    case 'label':
+      return { x: shape.x, y: shape.y }
   }
-
-  if (shape.kind === 'rect') {
-    return { x: shape.x, y: shape.y }
-  }
-
-  if (shape.kind === 'arrow' || shape.kind === 'line') {
-    return { x: shape.toX, y: shape.toY }
-  }
-
-  if (shape.kind === 'polyline') {
-    return shape.points[0] ?? { x: 0, y: 0 }
-  }
-
-  return { x: shape.x, y: shape.y }
 }
 
 function StepBadge({ color, step, x, y }: { color: ScreenAnnotationColor; step?: number; x: number; y: number }) {

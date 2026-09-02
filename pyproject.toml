@@ -536,6 +536,7 @@ python-olm = false
 python-telegram-bot = false
 pyyaml = false
 qrcode = false
+rapidocr = false
 requests = false
 rich = false
 ruamel-yaml = false
