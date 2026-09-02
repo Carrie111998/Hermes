@@ -698,6 +698,7 @@ driven by the managed Portal / `hermes` CLI.
 
 The relevance layer (§7.1) is the per-tenant parity for the gateway's own
 behaviour knobs (`require_mention`, `free_response_channels`,
+`threaded_free_response_channels`,
 `{PLATFORM}_ALLOW_BOTS`). So the **same** behaviour governs relay delivery, the
 gateway projects those knobs into a **platform-agnostic** policy and POSTs it to
 `POST /relay/policy` at boot (after its per-gateway secret is resolved).
@@ -708,7 +709,7 @@ Body (`gateway/relay/__init__.py` `relay_relevance_policy()` → `send_relay_pol
 | --- | --- | --- | --- |
 | `platform` | string | the fronted platform (`relay_platform_identity`) | which platform this policy applies to. |
 | `requireAddress` | bool | `require_mention` | a non-owner message must @mention / reply-to the bot to be relevant. |
-| `freeResponseScopes` | string[] | `free_response_channels` | scope (channel) ids where `requireAddress` is waived. Same scope vocabulary as §7.1's scope grants. |
+| `freeResponseScopes` | string[] | `free_response_channels` ∪ `threaded_free_response_channels` (with `{PLATFORM}_*` env compatibility fallback) | scope (channel) ids where `requireAddress` is waived. Same scope vocabulary as §7.1's scope grants. |
 | `allowOtherBots` | bool | `{PLATFORM}_ALLOW_BOTS ∈ {mentions, all}` | admit bot-authored messages (default off). |
 
 Auth is the per-gateway upgrade token (§6.1), so the connector attaches the

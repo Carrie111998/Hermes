@@ -2459,6 +2459,7 @@ DEFAULT_CONFIG = {
     "discord": {
         "require_mention": True,       # Require @mention to respond in server channels
         "free_response_channels": "",  # Comma-separated channel IDs where bot responds without mention
+        "threaded_free_response_channels": [],  # Mention-free channels that still auto-thread each parent message
         "allowed_channels": "",        # If set, bot ONLY responds in these channel IDs (whitelist)
         "auto_thread": True,           # Auto-create threads on @mention in channels (like Slack)
         "thread_require_mention": False,  # If True, require @mention in threads too (multi-bot threads)
@@ -2467,7 +2468,7 @@ DEFAULT_CONFIG = {
         "history_backfill_limit": 50,     # Max number of recent messages to scan when assembling the backfill block
         "missed_message_backfill": {
             "enabled": False,             # Replay missed Discord messages after reconnect/startup
-            "channels": "",               # Comma-separated channel IDs; empty uses free_response_channels
+            "channels": "",               # Comma-separated channel IDs; empty uses allowed/free/threaded-response channels
             "window_seconds": 21600,      # Only inspect messages from the last 6 hours
             "limit": 100,                 # Global cap on messages scanned per reconnect
             "max_dispatches": 10,         # Cap on recovered messages dispatched per reconnect

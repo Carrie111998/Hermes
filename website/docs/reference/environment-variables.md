@@ -348,6 +348,7 @@ These are set automatically by the Docker terminal backend when `proxy.enabled: 
 | `DISCORD_REACTIONS` | Enable emoji reactions on messages during processing (default: `true`) |
 | `DISCORD_IGNORED_CHANNELS` | Comma-separated channel IDs where the bot never responds |
 | `DISCORD_NO_THREAD_CHANNELS` | Comma-separated channel IDs where bot responds without auto-threading |
+| `DISCORD_THREADED_FREE_RESPONSE_CHANNELS` | Compatibility/manual override for `discord.threaded_free_response_channels`: comma-separated channel IDs that stay mention-free and still auto-thread each new parent-channel message. Prefer the `config.yaml` key. |
 | `DISCORD_REPLY_TO_MODE` | Reply-reference behavior: `off`, `first` (default), or `all` |
 | `DISCORD_ALLOW_MENTION_EVERYONE` | Allow the bot to ping `@everyone`/`@here` (default: `false`). See [Mention Control](../user-guide/messaging/discord.md#mention-control). |
 | `DISCORD_ALLOW_MENTION_ROLES` | Allow the bot to ping `@role` mentions (default: `false`). |
