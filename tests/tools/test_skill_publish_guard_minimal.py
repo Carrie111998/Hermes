@@ -276,7 +276,21 @@ def _worker_publish_with_failure(
 # ---------------------------------------------------------------------------
 
 def _wait_until_released(lock_path: Path, timeout: float) -> bool:
-    """Poll whether the lock file is unheld (try non-blocking flock).
+    """Poll whether the lock file is unheld (try non-blocking probe lock).
+
+    Backend-aware so the helper runs meaningfully on native Windows
+    rather than crashing on the absent ``fcntl`` module:
+
+      * On POSIX the original ``fcntl.flock`` semantics are preserved
+        byte-for-byte (whole-file advisory lock, EWOULDBLOCK / EAGAIN
+        is contention, descriptor close releases).
+      * On native Windows the helper probes the same one-byte range
+        that ``tools.skill_publish_guard`` acquires, with the same
+        byte-0 materialisation and seek-to-0 positioning the
+        production guard requires, and the same EACCES / EDEADLK
+        contention taxonomy it classifies. The probe lock is
+        released with LK_UNLCK before the descriptor is closed, and
+        any successfully acquired probe is always released.
 
     Returns True if the lock is released (or never held) within
     ``timeout`` seconds. This is the only place we ever sleep, and
@@ -285,6 +299,23 @@ def _wait_until_released(lock_path: Path, timeout: float) -> bool:
     """
     if not lock_path.exists():
         return True
+
+    # Mirror the production guard's primitive selection: prefer
+    # ``fcntl`` whenever it is importable so POSIX behaviour is
+    # byte-for-byte unchanged; only fall through to ``msvcrt`` when
+    # ``fcntl`` is genuinely absent (native Windows) and ``msvcrt``
+    # is present. Neither import is unconditional because the same
+    # helper runs on both platforms.
+    try:
+        import fcntl as _fcntl
+    except ImportError:
+        _fcntl = None
+    try:
+        import msvcrt as _msvcrt
+    except ImportError:
+        _msvcrt = None
+    _use_msvcrt = _fcntl is None and _msvcrt is not None
+
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         try:
@@ -292,18 +323,83 @@ def _wait_until_released(lock_path: Path, timeout: float) -> bool:
         except OSError:
             time.sleep(_LOCK_RELEASED_POLL_INTERVAL_S)
             continue
+        # Always close the descriptor, and always release any probe
+        # lock we successfully acquired on this iteration.
+        probe_held = False
         try:
-            import fcntl as _fcntl
-            try:
-                _fcntl.flock(fd, _fcntl.LOCK_EX | _fcntl.LOCK_NB)
-                _fcntl.flock(fd, _fcntl.LOCK_UN)
+            if _use_msvcrt:
+                # msvcrt.locking is a byte-range lock relative to the
+                # CURRENT file position. Two consequences the POSIX
+                # path does not have:
+                #   - a zero-length lock file has no byte to lock, so
+                #     we materialise byte 0 (same as the production
+                #     guard and as ``hermes_cli/managed_uv.py``).
+                #   - the descriptor must be seeked to 0 before
+                #     locking, or two publishers could lock disjoint
+                #     ranges and both believe they won.
+                try:
+                    if os.fstat(fd).st_size == 0:
+                        os.write(fd, b"\0")
+                except OSError:
+                    # Read-only or otherwise non-writable: the byte
+                    # may already be present from a prior holder.
+                    pass
+                os.lseek(fd, 0, os.SEEK_SET)
+                try:
+                    _msvcrt.locking(fd, _msvcrt.LK_NBLCK, 1)
+                except OSError as exc:
+                    # Mirror the production contention taxonomy so
+                    # this helper's notion of "contention" matches
+                    # ``_classify_flock_failure`` on native Windows.
+                    if exc.errno in (errno.EACCES, errno.EDEADLK):
+                        time.sleep(_LOCK_RELEASED_POLL_INTERVAL_S)
+                        continue
+                    raise
+                # Acquired the one-byte probe range; release it
+                # immediately so the next legitimate acquirer is not
+                # blocked behind the helper. The release covers the
+                # same byte at the same offset as the acquire.
+                probe_held = True
+                os.lseek(fd, 0, os.SEEK_SET)
+                try:
+                    _msvcrt.locking(fd, _msvcrt.LK_UNLCK, 1)
+                except OSError:
+                    # Best-effort release: an LK_UNLCK failure here
+                    # is a soft signal that another process was
+                    # already probing the same range, which is
+                    # itself the contention we were checking for.
+                    # The descriptor close below still tears down
+                    # the kernel handle, and the production guard
+                    # runs the same LK_UNLCK on the same byte when
+                    # it actually holds the lock, so a transient
+                    # here cannot mask a real leak in the guard.
+                    pass
                 return True
-            except OSError as exc:
-                if exc.errno in (errno.EWOULDBLOCK, errno.EAGAIN):
-                    time.sleep(_LOCK_RELEASED_POLL_INTERVAL_S)
-                    continue
-                raise
+            else:
+                # POSIX: fcntl.flock is whole-file. The original
+                # semantic contract is preserved verbatim:
+                # non-blocking probe + immediate release, EWOULDBLOCK
+                # / EAGAIN is contention, descriptor close releases.
+                try:
+                    _fcntl.flock(fd, _fcntl.LOCK_EX | _fcntl.LOCK_NB)
+                    _fcntl.flock(fd, _fcntl.LOCK_UN)
+                    return True
+                except OSError as exc:
+                    if exc.errno in (errno.EWOULDBLOCK, errno.EAGAIN):
+                        time.sleep(_LOCK_RELEASED_POLL_INTERVAL_S)
+                        continue
+                    raise
         finally:
+            if probe_held and _use_msvcrt:
+                # Defensive: if the explicit LK_UNLCK above raised
+                # before the success return, still attempt to drop
+                # the probe before closing the descriptor so we never
+                # leak a held range out of the helper.
+                try:
+                    os.lseek(fd, 0, os.SEEK_SET)
+                    _msvcrt.locking(fd, _msvcrt.LK_UNLCK, 1)
+                except OSError:
+                    pass
             os.close(fd)
     return False
 
@@ -1398,6 +1494,10 @@ def test_mf2_c_normal_non_redirect_create_still_succeeds(hermes_home):
 #
 # Contract: callers MUST be able to distinguish CONTENTION (retryable)
 # from HARD_ACQUISITION_FAILURE (NOT retryable in the short term).
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="MF3-A EWOULDBLOCK-as-CONTENTION classification: this witness forces the POSIX fcntl.flock LOCK_EX|LOCK_NB EWOULDBLOCK contract; the equivalent Windows contention-coverage lives in test_mf1_e (EACCES/EDEADLK).",
+)
 
 def test_mf3_a_contention_classification(monkeypatch):
     """MF3-A: forcing fcntl.flock to raise EWOULDBLOCK must classify the
@@ -1474,6 +1574,10 @@ def test_mf3_a_contention_classification(monkeypatch):
         f"MF3-A: caller payload must surface CONTENTION classification, "
         f"got: {payload}"
     )
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="MF3-B EIO-as-HARD classification: this witness forces fcntl.flock to raise EIO, which is the POSIX-only contract; the equivalent Windows hard-failure coverage lives in test_mf1_f.",
+)
 
 
 def test_mf3_b_hard_acquisition_failure_not_misleadingly_retryable(
@@ -1632,6 +1736,10 @@ def _patch_unlock_failure(monkeypatch, errno_value: int = errno.EIO):
         return original_flock(fd, op)
 
     monkeypatch.setattr(guard_mod.fcntl, "flock", unlocking_flock)
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="MF4-A body-success / unlock-failure observability: this witness forces the POSIX fcntl.flock LOCK_UN contract; the equivalent Windows unlock-diagnostic coverage lives in test_mf1_g.",
+)
 
 
 def test_mf4_a_body_success_unlock_failure_is_observable_not_masking(
@@ -1731,6 +1839,10 @@ def test_mf4_a_body_success_unlock_failure_is_observable_not_masking(
         f"caplog records: "
         f"{[(r.levelname, r.getMessage()) for r in caplog.records]}"
     )
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="MF4-B body+unlock double-failure diagnostic: this witness forces fcntl.flock LOCK_UN to raise, which is the POSIX-only contract; the equivalent Windows unlock-diagnostic coverage lives in test_mf1_g.",
+)
 
 
 def test_mf4_b_body_failure_unlock_failure_does_not_mask_primary(
@@ -2168,6 +2280,10 @@ def test_mf1_c_windows_release_uses_lk_unlck_before_close(hermes_home):
 
 
 # --- MF1-D: POSIX regression witness ----------------------------------------
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="MF1-D POSIX fcntl regression: this witness directly monkeypatches fcntl.flock which is absent on native Windows; the Windows lane is covered by the native msvcrt witnesses NW1, NW2, and NW3.",
+)
 
 def test_mf1_d_posix_still_uses_fcntl_and_never_requires_msvcrt(hermes_home):
     """MF1-D: the Windows work must not disturb the accepted POSIX path.
