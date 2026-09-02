@@ -2589,6 +2589,97 @@ def _interpret_signal_exit(exit_code: int) -> str | None:
     return None
 
 
+def _has_masking_shell_control(command: str) -> bool:
+    """Return True when shell structure can hide which command produced the status.
+
+    Single-quoted text and escaped characters are inert. Double-quoted text is
+    inert except for command substitutions, and backticks/process substitutions
+    are executable even when the surrounding command looks simple.
+    """
+    quote: str | None = None
+    i = 0
+    n = len(command)
+
+    while i < n:
+        ch = command[i]
+
+        # Backslashes are literal inside single quotes; only the closing quote
+        # changes parser state.
+        if quote == "single":
+            if ch == "'":
+                quote = None
+            i += 1
+            continue
+
+        # ANSI-C $'...' quotes interpret backslash escapes, including an
+        # escaped quote, but shell operators inside remain inert.
+        if quote == "ansi_single":
+            if ch == "\\":
+                i += 2 if i + 1 < n else 1
+                continue
+            if ch == "'":
+                quote = None
+            i += 1
+            continue
+
+        if ch == "\\":
+            i += 2 if i + 1 < n else 1
+            continue
+
+        if quote == "double":
+            if ch == '"':
+                quote = None
+                i += 1
+                continue
+            if ch == "`" or command.startswith("$(", i):
+                return True
+            i += 1
+            continue
+
+        if command.startswith("$'", i):
+            quote = "ansi_single"
+            i += 2
+            continue
+        if ch == "'":
+            quote = "single"
+            i += 1
+            continue
+        if ch == '"':
+            quote = "double"
+            i += 1
+            continue
+
+        # Command, process, and legacy backtick substitutions can fail without
+        # determining the outer command's final exit status.
+        if ch == "`" or command.startswith(("$(", "<(", ">("), i):
+            return True
+
+        # Ignore a shell comment. A newline followed by another statement is
+        # still a masking sequence; a trailing comment is inert.
+        if ch == "#" and (
+            i == 0 or command[i - 1].isspace() or command[i - 1] in ";|&()"
+        ):
+            newline = command.find("\n", i)
+            if newline == -1:
+                return False
+            return bool(command[newline + 1 :].strip())
+
+        if ch == "\n" or ch == ";":
+            return True
+        if command.startswith("&&", i) or command.startswith("||", i):
+            return True
+        # Redirection setup can fail before the apparent command runs (for
+        # example, an unwritable output path), while returning the same code
+        # that the command uses for a benign result. Treat all unquoted shell
+        # redirections as ambiguous rather than guessing which layer failed.
+        if ch in "<>|&":
+            return True
+
+        i += 1
+
+    return False
+
+
 def _interpret_exit_code(command: str, exit_code: int) -> str | None:
     """Return a human-readable note when a non-zero exit code is non-erroneous.
 
@@ -2614,11 +2705,19 @@ def _interpret_exit_code(command: str, exit_code: int) -> str | None:
     if signal_note is not None:
         return signal_note
 
-    # Extract the last command in a pipeline/chain — that determines the
-    # exit code.  Handles  `cmd1 && cmd2`, `cmd1 | cmd2`, `cmd1; cmd2`.
-    # Deliberately simple: split on shell operators and take the last piece.
-    segments = re.split(r'\s*(?:\|\||&&|[|;])\s*', command)
-    last_segment = (segments[-1] if segments else command).strip()
+    # A pipeline, compound sequence, or executable substitution does not prove
+    # that the apparent final segment produced the observed status: pipelines
+    # expose only the last process, `&&` may short-circuit before that segment
+    # runs, and substitutions can fail without setting the outer command's
+    # status. Applying the apparent final segment's benign semantics to the
+    # whole command can turn an upstream "Permission denied" into a reassuring
+    # "No matches found (not an error)". Fail closed so the output-pattern hint
+    # tier can surface the real failure text.
+    if _has_masking_shell_control(command):
+        return None
+
+    unquoted_command = _strip_quotes(command)
+    last_segment = unquoted_command.strip()
 
     # Get base command name (first word), stripping env var assignments
     # like  VAR=val cmd ...

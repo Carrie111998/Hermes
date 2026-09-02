@@ -114,12 +114,92 @@ class TestTerminalIntegration:
         hint = annotate_failure("python x.py", 127, "bash: python: command not found")
         assert hint and "python3" in hint
 
-    def test_exit_note_suppresses_pattern_hint(self):
-        # grep exit 1 is informational; annotate_failure must not be reached
-        # for it in the wiring (exit_note wins). Just verify the semantics
-        # table still covers it.
+    def test_simple_grep_exit_note_suppresses_pattern_hint(self):
+        # A single grep with exit 1 is informational; the semantics table
+        # still owns that unambiguous case.
         from tools import terminal_tool
         assert terminal_tool._interpret_exit_code("grep foo bar.txt", 1) is not None
+
+    def test_pipeline_does_not_suppress_upstream_permission_hint(self):
+        # In a pipeline the final grep status says nothing about an upstream
+        # failure. Do not stamp the whole result "not an error"; this lets the
+        # output-pattern tier surface the real failure text.
+        from tools import terminal_tool
+
+        command = "crontab -l | grep -c parlami-queue-health.py"
+        output = "crontabs/cryptonovado/: fopen: Permission denied\n0"
+        assert terminal_tool._interpret_exit_code(command, 1) is None
+        hint = annotate_failure(command, 1, output)
+        assert hint and "Permission denied" in hint
+
+    def test_real_pipeline_surfaces_upstream_permission_denied(self, tmp_path, monkeypatch):
+        """Exercise the terminal result assembly, not only the pure helpers."""
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+        from tools.terminal_tool import terminal_tool
+
+        command = (
+            "sh -c 'printf \"crontabs/user/: fopen: Permission denied\\n\" >&2; exit 1' "
+            "| grep -c needle"
+        )
+        result = json.loads(terminal_tool(command, task_id="pipeline-permission-denied"))
+
+        assert result["exit_code"] == 1
+        assert "Permission denied" in result["output"]
+        assert "exit_code_meaning" not in result
+        assert "Permission denied" in result["hint"]
+
+    def test_short_circuited_and_chain_surfaces_upstream_permission_denied(
+        self, tmp_path, monkeypatch
+    ):
+        """The final grep never runs when an earlier && segment fails."""
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+        from tools.terminal_tool import terminal_tool
+
+        command = (
+            "sh -c 'printf \"crontabs/user/: fopen: Permission denied\\n\" >&2; exit 1' "
+            "&& grep -c needle /dev/null"
+        )
+        result = json.loads(terminal_tool(command, task_id="and-permission-denied"))
+
+        assert result["exit_code"] == 1
+        assert "Permission denied" in result["output"]
+        assert "exit_code_meaning" not in result
+        assert "Permission denied" in result["hint"]
+
+    def test_quoted_command_substitution_surfaces_permission_denied(
+        self, tmp_path, monkeypatch
+    ):
+        """Double quotes do not make an embedded command substitution inert."""
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+        from tools.terminal_tool import terminal_tool
+
+        command = (
+            'grep "$(sh -c \'printf "source: Permission denied\\n" >&2; exit 1\')" '
+            "/dev/null"
+        )
+        result = json.loads(
+            terminal_tool(command, task_id="substitution-permission-denied")
+        )
+
+        assert result["exit_code"] == 1
+        assert "Permission denied" in result["output"]
+        assert "exit_code_meaning" not in result
+        assert "Permission denied" in result["hint"]
+
+    def test_redirection_failure_is_not_relabelled_as_benign(
+        self, tmp_path, monkeypatch
+    ):
+        """A redirect can fail before grep runs, while still exiting with 1."""
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+        from tools.terminal_tool import terminal_tool
+
+        missing_parent = tmp_path / "missing" / "out.txt"
+        command = f"grep needle /dev/null > {missing_parent}"
+        result = json.loads(terminal_tool(command, task_id="redirect-failure"))
+
+        assert result["exit_code"] == 1
+        assert "No such file or directory" in result["output"]
+        assert "exit_code_meaning" not in result
 
 
 class TestMaskedSuccess:
