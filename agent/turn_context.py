@@ -548,6 +548,74 @@ class TurnContext:
     preflight_compression_blocked: bool = False
 
 
+# Stable core wrappers the gateway wraps around voice-derived content
+# (gateway/run.py _enrich_message_with_transcription). Origin is classified
+# from these shapes per-row at ingest — no cross-message state anywhere.
+_VOICE_MARKERS = (
+    "[voice message could not be transcribed",
+    "[The user sent a voice message but it came through",
+)
+
+
+def _neutralize_untrusted(value: Any) -> str:
+    """Cap untrusted display strings using the session module's sanitizer.
+
+    Falls back to a length-capped str() when the sanitizer is unavailable so
+    a missing import can never block attribution storage.
+    """
+    try:
+        from gateway.session import neutralize_untrusted_inline_text
+
+        return neutralize_untrusted_inline_text(value)
+    except Exception:
+        return str(value or "")[:200]
+
+
+def _classify_origin(content: Any) -> str:
+    """Per-row origin: 'voice' when the body carries a voice wrapper, else 'text'."""
+    text = content if isinstance(content, str) else ""
+    stripped = text.lstrip()
+    is_voice = (
+        (text.startswith('"') and text.rstrip().endswith('"') and len(text) >= 2)
+        or any(stripped.startswith(m) for m in _VOICE_MARKERS)
+    )
+    return "voice" if is_voice else "text"
+
+
+def _derive_source_annotation(
+    agent: Any, content: Any = None
+) -> Optional[Dict[str, Any]]:
+    """Build the default ``display_metadata`` from the agent's source attributes.
+
+    The agent already resolves these at init (agent_init.py:681-684) from the
+    inbound SessionSource, so no per-caller wiring is required. Returns ``None``
+    when there is nothing worth storing, keeping unannotated rows byte-identical
+    to stock. Untrusted display strings (user_name/chat_name) are neutralized so
+    stored metadata is safe to render anywhere.
+    """
+    try:
+        raw = {
+            "platform": getattr(agent, "platform", None),
+            "chat_id": getattr(agent, "_chat_id", None) or "",
+            "chat_type": getattr(agent, "_chat_type", None) or "",
+            "user_id": getattr(agent, "_user_id", None) or "",
+            "user_name": getattr(agent, "_user_name", None) or "",
+            "chat_name": getattr(agent, "_chat_name", None) or "",
+        }
+        ann: Dict[str, Any] = {}
+        for field, value in raw.items():
+            if value in (None, ""):
+                continue
+            if field in ("user_name", "chat_name"):
+                ann[field] = _neutralize_untrusted(value)
+            else:
+                ann[field] = str(value)
+        ann["origin"] = _classify_origin(content)
+        return ann or None
+    except Exception:
+        return None
+
+
 def build_turn_context(
     agent,
     user_message: Any,
@@ -813,8 +881,19 @@ def build_turn_context(
     # build strips both fields from every outgoing copy.
     if persist_user_display_kind:
         user_msg["display_kind"] = persist_user_display_kind
-        if persist_user_display_metadata:
-            user_msg["display_metadata"] = persist_user_display_metadata
+    # Persist structured origin metadata on EVERY user message, not only
+    # those carrying a display_kind. display_metadata rides the stored
+    # transcript row (api message assembly strips it from outgoing copies),
+    # so it never touches message content and defaults change nothing for
+    # anyone who does not set it. When the caller did not supply one, derive
+    # it from the agent's already-resolved source attributes so attribution
+    # survives compaction / cross-session continuity without per-caller wiring.
+    if persist_user_display_metadata is None:
+        _derived = _derive_source_annotation(agent, user_message)
+        if _derived:
+            persist_user_display_metadata = _derived
+    if persist_user_display_metadata:
+        user_msg["display_metadata"] = persist_user_display_metadata
 
     # Stamp the platform-side message id (e.g. the Discord/Telegram message id)
     # as metadata on the user turn so it survives the early crash-resilience
