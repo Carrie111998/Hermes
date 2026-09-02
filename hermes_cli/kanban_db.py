@@ -3940,6 +3940,44 @@ def task_graph_contexts(
     if not ordered_ids:
         return contexts
 
+    running_rows = conn.execute(
+        "SELECT assignee, COUNT(*) AS count FROM tasks "
+        "WHERE status = 'running' GROUP BY assignee"
+    ).fetchall()
+    running_by_assignee = {
+        (row["assignee"] or ""): int(row["count"])
+        for row in running_rows
+    }
+    running_total = (
+        sum(running_by_assignee.values())
+        + count_running_tasks_other_boards(
+            current_db_path=_connection_db_path(conn)
+        )
+    )
+
+    assignee_rows = conn.execute(
+        f"SELECT id, assignee FROM tasks WHERE id IN ({','.join('?' for _ in ordered_ids)})",
+        tuple(ordered_ids),
+    ).fetchall()
+    try:
+        from hermes_cli.profiles import profile_exists
+    except Exception:
+        profile_exists = None  # type: ignore[assignment]
+    valid_profile_by_task = {}
+    for row in assignee_rows:
+        try:
+            valid_profile_by_task[row["id"]] = bool(
+                profile_exists and profile_exists(row["assignee"] or "")
+            )
+        except Exception:
+            valid_profile_by_task[row["id"]] = False
+
+    for context in contexts.values():
+        context["running_total"] = running_total
+        context["running_by_assignee"] = running_by_assignee
+    for task_id, is_valid in valid_profile_by_task.items():
+        contexts[task_id]["assignee_profile_exists"] = is_valid
+
     placeholders = ",".join("?" for _ in ordered_ids)
     for row in conn.execute(
         "SELECT l.child_id AS owner_id, t.id, t.title, t.status "
@@ -9749,7 +9787,22 @@ def count_running_tasks(conn: sqlite3.Connection) -> int:
         return 0
 
 
-def count_running_tasks_other_boards(board: Optional[str] = None) -> int:
+def _connection_db_path(conn: sqlite3.Connection) -> Optional[Path]:
+    """Return the main database path for an open connection when available."""
+    try:
+        for row in conn.execute("PRAGMA database_list").fetchall():
+            if row[1] == "main" and row[2]:
+                return Path(row[2])
+    except Exception:
+        pass
+    return None
+
+
+def count_running_tasks_other_boards(
+    board: Optional[str] = None,
+    *,
+    current_db_path: Optional[Path] = None,
+) -> int:
     """Total ``running`` tasks across every board EXCEPT ``board``.
 
     The concurrency caps bound the HOST (workers are OS processes sharing
@@ -9764,7 +9817,9 @@ def count_running_tasks_other_boards(board: Optional[str] = None) -> int:
     on the healthy ones.
     """
     try:
-        current_path = str(kanban_db_path(board=board).expanduser().resolve())
+        current_path = str(
+            (current_db_path or kanban_db_path(board=board)).expanduser().resolve()
+        )
     except Exception:
         current_path = None
     try:
