@@ -469,8 +469,11 @@ _MEMORY_REVIEW_PROMPT = (
     "preferences, or personal details worth remembering?\n"
     "2. Has the user expressed expectations about how you should behave, their work "
     "style, or ways they want you to operate?\n\n"
-    "If something stands out, save it using the memory tool. "
-    "If nothing is worth saving, just say 'Nothing to save.' and stop."
+    "If something stands out, save it using the memory tool with "
+    "target='user' (USER.md), not target='memory' (MEMORY.md). "
+    "Use target='memory' only for durable facts about the operating "
+    "environment, tools, or project configuration. If nothing is worth "
+    "saving, just say 'Nothing to save.' and stop."
 )
 
 _SKILL_REVIEW_PROMPT = (
