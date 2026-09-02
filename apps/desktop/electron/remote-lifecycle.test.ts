@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { exec as execCallback, spawn } from 'node:child_process'
+import { exec as execCallback, execFile as execFileCallback, spawn } from 'node:child_process'
 import { chmod, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
@@ -11,6 +11,7 @@ import { profileSshOverride } from './connection-config'
 import {
   assertRemoteInstallUpdateClear,
   buildSpawnCommand,
+  buildSpawnPayload,
   classifySshReuseProof,
   cleanupStale,
   connect,
@@ -44,6 +45,7 @@ import {
 const OWNERSHIP_ID = '0123456789abcdef0123456789abcdef'
 const SPAWN_NONCE = '0123456789abcdef'
 const exec = promisify(execCallback)
+const execFile = promisify(execFileCallback)
 
 test('SSH reuse proof rejects a backend whose runtime was replaced', () => {
   assert.equal(
@@ -827,6 +829,67 @@ test('buildSpawnCommand atomically reserves the ownership slot through spawn and
   assert.ok(cmd.indexOf('lock_json') > cmd.indexOf('serve --isolated'))
 })
 
+test('buildSpawnCommand passes the update mutex path as one shell word, never double-quoted', () => {
+  const cmd = buildSpawnCommand('/x/hermes', 'work', {
+    hermesHome: '~/.hermes',
+    logPath: spawnLogPath(OWNERSHIP_ID, SPAWN_NONCE),
+    ownershipId: OWNERSHIP_ID,
+    reservationNonce: SPAWN_NONCE,
+    spawnNonce: SPAWN_NONCE,
+    tokenFilePath: spawnTokenPath(OWNERSHIP_ID, SPAWN_NONCE),
+    lockMetadata: {
+      ownershipId: OWNERSHIP_ID,
+      spawnNonce: SPAWN_NONCE,
+      port: 0,
+      profile: 'work',
+      hermesPath: '/x/hermes',
+      hermesHome: '~/.hermes',
+      logPath: spawnLogPath(OWNERSHIP_ID, SPAWN_NONCE),
+      tokenFingerprint: fingerprintToken('stored-token'),
+      protocolVersion: PROTOCOL_VERSION,
+      startedAt: '2026-07-14T00:00:00.000Z'
+    }
+  })
+
+  // expandRemotePath('~/.hermes/.hermes-update-in-progress.mutex') is already
+  // the complete shell word "$HOME"'/.hermes/.hermes-update-in-progress.mutex'.
+  // The mutex argv must be exactly that word; an extra shq() layer would store
+  // the quote characters literally and the remote python would makedirs/flock
+  // a bogus "$HOME/' tree — a mutex that silently serializes nothing (#96188).
+  assert.ok(cmd.includes(`"$HOME"'/.hermes/.hermes-update-in-progress.mutex'`))
+  assert.doesNotMatch(cmd, /'"\$HOME"'/)
+})
+
+test('buildSpawnCommand publishes the initial lockfile with an integer pid', () => {
+  const cmd = buildSpawnCommand('/x/hermes', 'work', {
+    hermesHome: '~/.hermes',
+    logPath: spawnLogPath(OWNERSHIP_ID, SPAWN_NONCE),
+    ownershipId: OWNERSHIP_ID,
+    reservationNonce: SPAWN_NONCE,
+    spawnNonce: SPAWN_NONCE,
+    tokenFilePath: spawnTokenPath(OWNERSHIP_ID, SPAWN_NONCE),
+    lockMetadata: {
+      ownershipId: OWNERSHIP_ID,
+      spawnNonce: SPAWN_NONCE,
+      port: 0,
+      profile: 'work',
+      hermesPath: '/x/hermes',
+      hermesHome: '~/.hermes',
+      logPath: spawnLogPath(OWNERSHIP_ID, SPAWN_NONCE),
+      tokenFingerprint: fingerprintToken('stored-token'),
+      protocolVersion: PROTOCOL_VERSION,
+      startedAt: '2026-07-14T00:00:00.000Z'
+    }
+  })
+
+  // The __PID__ placeholder is JSON-quoted in the metadata template. The
+  // remote sed swap must replace the QUOTED form so the published record
+  // carries a real number: readLockfile requires an integer pid (a quoted
+  // string yields malformed-pid skew, which fails closed on the next connect)
+  // and the in-payload reuse regex only matches "pid":<digits>.
+  assert.ok(cmd.includes('sed "s/\\"__PID__\\"/${child}/"'))
+})
+
 test.skipIf(process.platform === 'win32')('detached backend does not inherit the update mutex descriptor', async () => {
   const directory = await mkdtemp(path.join(os.tmpdir(), 'hermes-update-mutex-'))
   const hermesPath = path.join(directory, 'hermes')
@@ -1501,9 +1564,33 @@ test('buildSpawnCommand lockfile publication is POSIX sh (no bash substitution)'
 
   // ${var//pat/rep} is bash-only; dash aborts the payload on it AFTER the
   // serve was spawned, so the client sees an unknown failure, deletes the
-  // token file, and orphans the backend.
+  // token file, and orphans the backend. The sed swap must target the QUOTED
+  // placeholder so the published pid is a JSON integer (readLockfile rejects
+  // a quoted-string pid as malformed-pid skew and fails closed).
   assert.doesNotMatch(cmd, /\$\{lock_json\/\//, 'must not use ${var//} substitution under sh')
-  assert.ok(cmd.includes('sed "s/__PID__/${child}/"'), 'pid substitution must use sed')
+  assert.ok(cmd.includes('sed "s/\\"__PID__\\"/${child}/"'), 'pid substitution must use sed on the quoted placeholder')
+})
+
+test.skipIf(process.platform !== 'linux')('buildSpawnPayload parses as POSIX sh under dash', async () => {
+  const payload = buildSpawnPayload('/x/hermes', 'work', {
+    hermesHome: '~/.hermes',
+    logPath: spawnLogPath(OWNERSHIP_ID, SPAWN_NONCE),
+    ownershipId: OWNERSHIP_ID,
+    reservationNonce: SPAWN_NONCE,
+    spawnNonce: SPAWN_NONCE,
+    tokenFilePath: spawnTokenPath(OWNERSHIP_ID, SPAWN_NONCE),
+    lockMetadata: { ownershipId: OWNERSHIP_ID, pid: '__PID__' }
+  })
+
+  const directory = await mkdtemp(path.join(os.tmpdir(), 'hermes-remote-payload-'))
+  const payloadPath = path.join(directory, 'payload.sh')
+
+  try {
+    await writeFile(payloadPath, payload, { mode: 0o700 })
+    await execFile('dash', ['-n', payloadPath])
+  } finally {
+    await rm(directory, { recursive: true, force: true })
+  }
 })
 
 test('spawnRemoteDashboard removes a token file when upload reporting fails', async () => {
