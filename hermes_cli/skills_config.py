@@ -47,20 +47,23 @@ def get_disabled_skills(config: dict, platform: Optional[str] = None) -> Set[str
 
     A globally-disabled skill stays disabled on every platform, so the
     platform list adds to the global list rather than replacing it. This
-    mirrors ``agent.skill_utils.get_disabled_skill_names``.
+    mirrors ``agent.skill_utils.get_disabled_skill_names`` and also
+    applies the ``bundled_whitelist`` filter.
     """
     skills_cfg = config.get("skills") or {}
     if not isinstance(skills_cfg, dict):
         return set()
-    from agent.skill_utils import ESSENTIAL_SKILLS
+    from agent.skill_utils import ESSENTIAL_SKILLS, _bundled_whitelist_blocked
     global_disabled = _normalize_skill_names(skills_cfg.get("disabled"))
+    whitelist_blocked = _bundled_whitelist_blocked(skills_cfg)
+    effective_disabled = global_disabled | whitelist_blocked
     if platform is None:
-        return global_disabled - ESSENTIAL_SKILLS
+        return effective_disabled - ESSENTIAL_SKILLS
     platform_disabled = cfg_get(skills_cfg, "platform_disabled", platform)
     if platform_disabled is None:
-        return global_disabled - ESSENTIAL_SKILLS
+        return effective_disabled - ESSENTIAL_SKILLS
     return (
-        global_disabled | _normalize_skill_names(platform_disabled)
+        effective_disabled | _normalize_skill_names(platform_disabled)
     ) - ESSENTIAL_SKILLS
 
 
@@ -206,6 +209,27 @@ def skills_command(args=None):
         print(color("  No changes.", Colors.DIM))
         return
 
-    save_disabled_skills(config, new_disabled, platform)
-    enabled_count = len(skills) - len(new_disabled)
-    print(color(f"✓ Saved: {enabled_count} enabled, {len(new_disabled)} disabled ({platform_label}).", Colors.GREEN))
+    # Whitelist-blocked skills must NOT be persisted into skills.disabled:
+    # they appear disabled in the UI but the user didn't explicitly toggle
+    # them off. Toggling whitelist off later would otherwise leave stale
+    # disabled entries. Enabling one from this UI cannot take effect while
+    # the whitelist is active — manage allowlisted names via
+    # skills.bundled_enabled in config.yaml.
+    from agent.skill_utils import _bundled_whitelist_blocked
+    whitelist_blocked = _bundled_whitelist_blocked(config.get("skills") or {})
+    persisted_disabled = new_disabled - whitelist_blocked
+
+    if persisted_disabled == disabled - whitelist_blocked:
+        print(color(
+            "  No changes saved (only whitelist-blocked skills toggled; "
+            "allow them via skills.bundled_enabled in config.yaml).",
+            Colors.YELLOW,
+        ))
+        return
+
+    save_disabled_skills(config, persisted_disabled, platform)
+    names = {s["name"] for s in skills}
+    masked = whitelist_blocked & names
+    enabled_count = len(skills) - len(persisted_disabled | masked)
+    masked_note = f" (+{len(masked)} whitelist-blocked)" if masked else ""
+    print(color(f"✓ Saved: {enabled_count} enabled, {len(persisted_disabled)} disabled{masked_note} ({platform_label}).", Colors.GREEN))
