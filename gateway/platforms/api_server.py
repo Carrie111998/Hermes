@@ -7,6 +7,7 @@ Exposes an HTTP server with endpoints:
 - GET  /v1/responses/{response_id} — Retrieve a stored response
 - DELETE /v1/responses/{response_id} — Delete a stored response
 - GET  /v1/models                  — lists hermes-agent and any configured model_routes aliases
+- POST /v1/search/rewrite          — lightweight provider call that rewrites natural language for FTS
 - GET  /v1/capabilities            — machine-readable API capabilities for external UIs
 - GET  /api/sessions               — list client-visible Hermes sessions
 - POST /api/sessions               — create an empty Hermes session
@@ -386,6 +387,27 @@ def _clean_request_string(value: Any) -> Optional[str]:
         return None
     cleaned = value.strip()
     return cleaned or None
+
+
+def _parse_search_rewrite_content(value: Any) -> str:
+    """Extract a bounded FTS query from strict JSON or a cheap-model fallback."""
+    if not isinstance(value, str):
+        return ""
+    candidate = value.strip()
+    if candidate.startswith("```"):
+        candidate = re.sub(r"^```(?:json)?\s*", "", candidate, flags=re.IGNORECASE)
+        candidate = re.sub(r"\s*```$", "", candidate).strip()
+    try:
+        decoded = json.loads(candidate)
+    except (TypeError, ValueError):
+        decoded = None
+    if isinstance(decoded, dict) and isinstance(decoded.get("query"), str):
+        candidate = decoded["query"]
+    else:
+        candidate = re.sub(r"^query\s*:\s*", "", candidate, flags=re.IGNORECASE)
+    candidate = re.sub(r"[\r\n\t]+", " ", candidate)
+    candidate = re.sub(r"\s+", " ", candidate).strip()
+    return candidate[:80]
 
 
 def _request_reasoning_config(model_options: Any) -> Optional[Dict[str, Any]]:
@@ -2219,6 +2241,7 @@ class APIServerAdapter(BasePlatformAdapter):
             ("GET", "/v1/health", self._handle_health),
             ("GET", "/v1/models", self._handle_models),
             ("GET", "/api/model/options", self._handle_model_options),
+            ("POST", "/v1/search/rewrite", self._handle_search_rewrite),
             ("GET", "/v1/capabilities", self._handle_capabilities),
             # Authenticated browser-control surface: POST registration
             # mints a short-lived ticket; the controller then opens the WS with
@@ -3424,6 +3447,166 @@ class APIServerAdapter(BasePlatformAdapter):
                 status=500,
             )
 
+    async def _handle_search_rewrite(self, request: "web.Request") -> "web.Response":
+        """POST /v1/search/rewrite — turn natural language into a tiny FTS query.
+
+        Unlike ``/v1/chat/completions``, this endpoint does not construct an
+        AIAgent, load memories, expose tools, or create a session. It calls the
+        explicitly selected configured provider with a fixed minimal prompt so
+        mobile search can use an inexpensive model without sending the full
+        Hermes system prompt.
+        """
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response(
+                _openai_error("Invalid JSON body.", code="invalid_json"),
+                status=400,
+            )
+        if not isinstance(body, dict):
+            return web.json_response(
+                _openai_error("Request body must be an object.", code="invalid_request"),
+                status=400,
+            )
+
+        query = _clean_request_string(body.get("query"))
+        provider = _clean_request_string(body.get("provider"))
+        model = _clean_request_string(body.get("model"))
+        for field, value in (("query", query), ("provider", provider), ("model", model)):
+            if not value:
+                return web.json_response(
+                    _openai_error(
+                        f"The '{field}' field is required.",
+                        code=f"missing_{field}",
+                    ),
+                    status=400,
+                )
+        if len(query) > 500:
+            return web.json_response(
+                _openai_error(
+                    "The 'query' field must be 500 characters or fewer.",
+                    code="search_rewrite_query_too_long",
+                ),
+                status=400,
+            )
+        if len(provider) > 100 or len(model) > 300:
+            return web.json_response(
+                _openai_error(
+                    "Provider or model identifier is too long.",
+                    code="search_rewrite_model_invalid",
+                ),
+                status=400,
+            )
+
+        client = None
+        try:
+            from agent.auxiliary_client import resolve_provider_client
+
+            client, resolved_model = resolve_provider_client(
+                provider,
+                model=model,
+                async_mode=True,
+            )
+            if client is None or not resolved_model:
+                return web.json_response(
+                    _openai_error(
+                        "The selected provider/model is not configured on this Hermes host.",
+                        code="search_rewrite_provider_unavailable",
+                    ),
+                    status=400,
+                )
+
+            completion_kwargs: Dict[str, Any] = {
+                "model": resolved_model,
+                "messages": [
+                    {
+                        "role": "system",
+                        "content": (
+                            "Rewrite the user's request into a short lexical query for "
+                            "searching their chat message history. Return JSON only: "
+                            '{"query":"..."}. Use 1 to 4 distinctive words or one quoted '
+                            "phrase likely to occur verbatim. Preserve names, project names, "
+                            "places, model names, and technical terms. Do not answer, explain, "
+                            "use markdown, wildcards, or boolean operators. Keep it under 80 "
+                            "characters."
+                        ),
+                    },
+                    {"role": "user", "content": query},
+                ],
+                "temperature": 0,
+                # Reasoning models may spend ~100 hidden tokens before emitting
+                # their tiny JSON answer, so 120 can terminate with content=null.
+                "max_tokens": 400,
+            }
+            if "gpt-oss" in resolved_model.lower():
+                completion_kwargs["extra_body"] = {"reasoning_effort": "low"}
+
+            response = await asyncio.wait_for(
+                client.chat.completions.create(**completion_kwargs),
+                timeout=30,
+            )
+            choices = getattr(response, "choices", None) or []
+            message = getattr(choices[0], "message", None) if choices else None
+            content = getattr(message, "content", "") if message is not None else ""
+            rewritten = _parse_search_rewrite_content(content)
+            if not rewritten:
+                return web.json_response(
+                    _openai_error(
+                        "The selected model returned no usable search query.",
+                        code="search_rewrite_empty",
+                    ),
+                    status=502,
+                )
+
+            usage = getattr(response, "usage", None)
+            input_tokens = int(getattr(usage, "prompt_tokens", 0) or 0)
+            output_tokens = int(getattr(usage, "completion_tokens", 0) or 0)
+            total_tokens = int(getattr(usage, "total_tokens", 0) or 0)
+            if not total_tokens:
+                total_tokens = input_tokens + output_tokens
+            return web.json_response(
+                {
+                    "query": rewritten,
+                    "provider": provider,
+                    "model": resolved_model,
+                    "usage": {
+                        "input_tokens": input_tokens,
+                        "output_tokens": output_tokens,
+                        "total_tokens": total_tokens,
+                    },
+                }
+            )
+        except asyncio.TimeoutError:
+            return web.json_response(
+                _openai_error(
+                    "The search rewrite model timed out.",
+                    code="search_rewrite_timeout",
+                ),
+                status=504,
+            )
+        except Exception as exc:
+            logger.exception("[%s] POST /v1/search/rewrite failed", self.name)
+            return web.json_response(
+                _openai_error(
+                    f"Search rewrite failed: {_redact_api_error_text(exc)}",
+                    code="search_rewrite_failed",
+                ),
+                status=502,
+            )
+        finally:
+            close = getattr(client, "close", None)
+            if close is not None:
+                try:
+                    result = close()
+                    if asyncio.iscoroutine(result):
+                        await result
+                except Exception:
+                    logger.debug("Failed to close search rewrite client", exc_info=True)
+
     async def _handle_capabilities(self, request: "web.Request") -> "web.Response":
         """GET /v1/capabilities — advertise the stable API surface.
 
@@ -3472,6 +3655,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "approval_events": True,
                 "session_resources": True,
                 "model_options": True,
+                "search_rewrite": True,
                 "session_chat": True,
                 "session_chat_streaming": True,
                 "session_fork": True,
