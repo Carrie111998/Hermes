@@ -112,6 +112,7 @@ OPENROUTER_MODELS: list[tuple[str, str]] = [
     ("deepseek/deepseek-v4-flash-0731",        "dated snapshot of v4-flash"),
     # Qwen
     ("qwen/qwen3.8-max",                       ""),
+    ("qwen/qwen3.8-max-0902",                  "dated snapshot of qwen3.8-max"),
     ("qwen/qwen3.8-flash",                     ""),
     # MoonshotAI
     ("moonshotai/kimi-k3",                     "recommended"),
@@ -295,6 +296,7 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
         "deepseek/deepseek-v4-flash-0731",
         # Qwen
         "qwen/qwen3.8-max",
+        "qwen/qwen3.8-max-0902",
         "qwen/qwen3.8-flash",
         # MoonshotAI
         "moonshotai/kimi-k3",
@@ -712,7 +714,7 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
     # (token-plan.ap-southeast-1.maas.aliyuncs.com), key tier `sk-sp-...`.
     # Catalog verified against a live Token Plan subscription (2026-08-03).
     "alibaba-token-plan": [
-        "qwen3.8-max-preview",
+        "qwen3.8-max-0902",
         "qwen3.7-max",
         "qwen3.7-plus",
         "qwen3.6-plus",
@@ -730,7 +732,7 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
     # Alibaba Token Plan (China) — domestic token-plan endpoint
     # (token-plan.cn-beijing.maas.aliyuncs.com); same catalog as intl.
     "alibaba-token-plan-cn": [
-        "qwen3.8-max-preview",
+        "qwen3.8-max-0902",
         "qwen3.7-max",
         "qwen3.7-plus",
         "qwen3.6-plus",
