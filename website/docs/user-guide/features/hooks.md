@@ -381,11 +381,11 @@ def register(ctx):
 
 **General rules for all hooks:**
 
-- Callbacks receive **keyword arguments**. Always accept `**kwargs` for forward compatibility.
-- Callback exceptions are logged and skipped; later callbacks continue.
-- If a Python plugin callback on a **timeout-bounded** hook (hot-path observers such as `post_tool_call` / `pre_llm_call`, plus the policy hook `pre_tool_call`) **blocks** longer than `plugins.hook_callback_timeout` (default 30s, set `0` to disable, max 600), it is abandoned without joining the worker so the agent loop continues. Timed-out or still-running `pre_tool_call` callbacks **fail closed** (block the tool); other bounded hooks fail open (skip). Hooks with a documented caller-thread contract (`subagent_stop`) are never moved onto a timeout worker. Shell hooks keep their own per-entry `timeout`.
+- Callbacks receive **keyword arguments**. Always accept `**kwargs` for forward compatibility — new parameters may be added in future versions without breaking your plugin.
+- If a callback **crashes**, it's logged and skipped. Other hooks and the agent continue normally. A misbehaving plugin can never break the agent.
+- Three hook groups' return values affect behavior: [`pre_tool_call`](#pre_tool_call) can **block** the tool, [`pre_llm_call`](#pre_llm_call) can **inject context** into the LLM call, and the skill lifecycle hooks can **handle** or **block** skill operations ([`pre_skill_create`](#pre_skill_create) can also **redirect** to a custom directory). All other hooks, including `post_skill_*`, are fire-and-forget observers.
 - The catalog below is descriptive: **observers** ignore returns, **transforms** accept the first valid string replacement, and **directive/control** hooks consume documented return shapes. Plugin middleware is a separate registry and surface, not another hook category.
-- Correlation fields such as `turn_id`, `api_request_id`, `task_id`, `session_id`, and `api_call_count` are hook-specific and may be absent. Treat IDs as opaque.
+- Observer callbacks receive `telemetry_schema_version` automatically. When present, `turn_id`, `api_request_id`, `task_id`, `session_id`, and `api_call_count` are separate correlation fields. Treat IDs as opaque; do not parse their string format.
 - Runtime event-name validity comes from `hermes_cli.plugins.VALID_HOOKS`. `hermes hooks list` lists configured shell/outbound hooks, not every available event; `hermes hooks test <event>` reports the valid set only when an invalid event is supplied.
 
 ### Cache-safe system prompt sections
@@ -526,6 +526,258 @@ Return values are ignored. To keep the stream fast, callbacks should enqueue the
 
 ---
 
+### `pre_skill_create`
+
+Fires before `skill_manage(action='create')` writes a new skill to disk.
+The hook runs after the name validation, collision check, and write guards,
+but before the atomic write. Plugins may **block**, **handle**, or
+**redirect** the write to a custom directory.
+
+**Callback signature:**
+
+```python
+def my_callback(name: str, content: str, category: str | None, **kwargs):
+```
+
+| Action | Return value | Effect |
+|--------|-------------|--------|
+| Block   | `{"action": "block", "reason": "…"}` | Abort creation |
+| Handle  | `{"action": "handled"}` | Plugin wrote the skill; Hermes skips its own write |
+| Redirect | `{"action": "redirect", "path": "/abs/path"}` | Write to a custom directory |
+| Fallthrough | `None`, `{}`, or any other dict | Hermes proceeds with default write |
+
+---
+
+### `post_skill_create`
+
+Fires after a skill is successfully created (or handled by a plugin).
+Observer-only — return value ignored.
+
+**Callback signature:**
+
+```python
+def my_callback(name: str, category: str, path: str, success: bool, **kwargs):
+```
+
+`path` is the absolute path to the created skill directory, or `""`
+when creation was handled externally by a plugin.
+
+### Nested guard hooks (`:guard` suffix)
+
+Each skill lifecycle operation has a **nested-hook model** with two hook
+phases:
+
+```
+:guard hook  →  guards (existence, org-mirror, review)  →  pre hook  →  execute
+```
+
+- **`:guard` hook** — fires **before** guard checks.  Used for pre-processing
+  independent of filesystem state (e.g. skill-graph resolving a non-existent
+  skill).  Accepts the same kwargs as the pre hook, except `old_content` (the
+  skill may not exist yet).  Supports `handled` and `block` actions.
+- **`pre` hook** — fires **after** guards pass.  The skill exists and is safe
+  to modify.  Supports `handled` and `block` actions.
+
+If no plugin registers a `:guard` hook, the default behaviour is
+guard-first — matching expectations before nested hooks existed.
+
+The `:guard` variants are listed immediately before their corresponding pre
+hooks below.
+
+
+
+---
+
+### `pre_skill_edit:guard`
+
+Fires **before** existence + write-guard checks for `skill_manage(action='edit')`.
+Use when you need to intercept at the guard level (e.g. to resolve a
+skill from a graph catalog before checking the filesystem).
+
+**Callback signature:**
+
+```python
+def my_callback(name: str, content: str, **kwargs):
+```
+
+- `name` — the skill name the model requested to edit
+- `content` — the raw SKILL.md content to write
+
+**Return value:**
+
+| Return | Effect |
+|--------|--------|
+| `None` / `{}` | Fall through to existence and write-guard checks |
+| `{"action": "handled"}` | Edit was handled; skip Hermes edit |
+| `{"action": "block", "reason": "..."}` | Abort with error |
+
+---
+
+### `pre_skill_edit`
+
+Fires before `skill_manage(action='edit')` replaces a SKILL.md.
+Runs after the existing skill is resolved, write guards, and security scan,
+but before the atomic write.
+
+**Callback signature:**
+
+```python
+def my_callback(name: str, content: str, old_content: str | None, **kwargs):
+```
+
+| Action | Return value | Effect |
+|--------|-------------|--------|
+| Block   | `{"action": "block", "reason": "…"}` | Abort edit |
+| Handle  | `{"action": "handled"}` | Plugin handled the edit; Hermes skips its own write |
+| Fallthrough | `None`, `{}`, or any other dict | Hermes proceeds with default write |
+
+---
+
+### `post_skill_edit`
+
+Fires after a skill is successfully edited (or handled by a plugin).
+Observer-only — return value ignored.
+
+**Callback signature:**
+
+```python
+def my_callback(name: str, path: str, success: bool, **kwargs):
+```
+
+---
+
+### `pre_skill_patch:guard`
+
+Fires **before** existence + write-guard checks for `skill_manage(action='patch')`.
+
+**Callback signature:**
+
+```python
+def my_callback(name: str, old_string: str, new_string: str,
+                file_path: str | None, replace_all: bool, **kwargs):
+```
+
+**Return value:** same as `pre_skill_edit:guard`.
+
+---
+
+### `pre_skill_patch`
+
+Fires before `skill_manage(action='patch')` applies a targeted edit.
+Same ordering as `pre_skill_edit`: after guards, before write.
+
+**Callback signature:**
+
+```python
+def my_callback(name: str, old_string: str, new_string: str,
+                file_path: str | None, replace_all: bool, **kwargs):
+```
+
+| Action | Return value | Effect |
+|--------|-------------|--------|
+| Block   | `{"action": "block", "reason": "…"}` | Abort patch |
+| Handle  | `{"action": "handled"}` | Plugin handled the patch; Hermes skips |
+| Fallthrough | `None`, `{}`, or any other dict | Hermes proceeds |
+
+---
+
+### `pre_skill_write_file:guard`
+
+Fires **before** existence + write-guard checks for `skill_manage(action='write_file')`.
+
+**Callback signature:**
+
+```python
+def my_callback(name: str, file_path: str, file_content: str, **kwargs):
+```
+
+**Return value:** same as `pre_skill_edit:guard`.
+
+---
+
+### `pre_skill_write_file`
+
+Fires before `skill_manage(action='write_file')` writes a supporting file
+into a skill directory. After guards, before write.
+
+**Callback signature:**
+
+```python
+def my_callback(name: str, file_path: str, file_content: str, **kwargs):
+```
+
+| Action | Return value | Effect |
+|--------|-------------|--------|
+| Block   | `{"action": "block", "reason": "…"}` | Abort |
+| Handle  | `{"action": "handled"}` | Plugin wrote the file; Hermes skips |
+| Fallthrough | `None`, `{}`, or any other dict | Hermes proceeds |
+
+---
+
+### `pre_skill_remove_file:guard`
+
+Fires **before** existence + write-guard checks for `skill_manage(action='remove_file')`.
+
+**Callback signature:**
+
+```python
+def my_callback(name: str, file_path: str, **kwargs):
+```
+
+**Return value:** same as `pre_skill_edit:guard`.
+
+---
+
+### `pre_skill_remove_file`
+
+Fires before `skill_manage(action='remove_file')` removes a supporting file.
+
+**Callback signature:**
+
+```python
+def my_callback(name: str, file_path: str, **kwargs):
+```
+
+| Action | Return value | Effect |
+|--------|-------------|--------|
+| Block   | `{"action": "block", "reason": "…"}` | Abort |
+| Handle  | `{"action": "handled"}` | Plugin removed the file; Hermes skips |
+| Fallthrough | `None`, `{}`, or any other dict | Hermes proceeds |
+
+---
+
+### `pre_skill_delete:guard`
+
+Fires **before** existence + pinned + curator-guard checks for `skill_manage(action='delete')`.
+
+**Callback signature:**
+
+```python
+def my_callback(name: str, **kwargs):
+```
+
+**Return value:** same as `pre_skill_edit:guard`.
+
+---
+
+### `pre_skill_delete`
+
+Fires before `skill_manage(action='delete')` removes a skill directory.
+
+**Callback signature:**
+
+```python
+def my_callback(name: str, **kwargs):
+```
+
+| Action | Return value | Effect |
+|--------|-------------|--------|
+| Block   | `{"action": "block", "reason": "…"}` | Abort deletion |
+| Handle  | `{"action": "handled"}` | Plugin deleted the skill; Hermes skips |
+| Fallthrough | `None`, `{}`, or any other dict | Hermes proceeds |
+
+---
+
 ### `pre_tool_call`
 
 Fires **immediately before** every tool execution — built-in tools and plugin tools alike.
@@ -569,8 +821,6 @@ Shell hooks also accept the Claude Code-compatible format:
 ```
 
 Both formats are normalized internally to `{"action": "modify", "args": {...}}`.
-
-If a `pre_tool_call` callback exceeds `plugins.hook_callback_timeout` (or is still running from a previous timed-out fire), Hermes **fails closed**: the tool is blocked with a timeout message rather than proceeding without a policy decision.
 
 **Use cases:** Logging, audit trails, tool call counters, blocking dangerous operations, rate limiting, per-user policy enforcement, argument sanitization, path rewriting, injecting default parameters.
 
@@ -1118,7 +1368,7 @@ def register(ctx):
 
 ### `subagent_stop`
 
-Fires **once per child agent** after `delegate_task` finishes. Whether you delegated a single task or a batch of three, this hook fires once for each child. Dispatch is serialised on the parent thread after child futures drain, and each Python callback body runs on that same caller thread (not on a timeout worker).
+Fires **once per child agent** after `delegate_task` finishes. Whether you delegated a single task or a batch of three, this hook fires once for each child, serialised on the parent thread.
 
 **Callback signature:**
 
@@ -1137,7 +1387,7 @@ def my_callback(parent_session_id: str, child_role: str | None,
 | `tool_call_history` | `list[dict]` | Ordered metadata-only tool calls: `tool_name`, bounded `tool_input`, `input_bytes`, `output_bytes`, and `status`; raw inputs and outputs are excluded |
 | `duration_ms` | `int` | Wall-clock time spent running the child, in milliseconds |
 
-**Fires:** In `tools/delegate_tool.py`, after `ThreadPoolExecutor.as_completed()` drains all child futures. `invoke_hook("subagent_stop", ...)` is marshalled to the parent thread so authors don't see child-pool re-entrancy, and callbacks stay on that caller thread.
+**Fires:** In `tools/delegate_tool.py`, after `ThreadPoolExecutor.as_completed()` drains all child futures. Firing is marshalled to the parent thread so hook authors don't have to reason about concurrent callback execution.
 
 **Return value:** Ignored.
 
