@@ -160,14 +160,53 @@ describe('CollectiveWisdomPanel', () => {
           author_description: '<script>window.pwned=true</script>',
           latest_version: 1,
           install_count: 0,
-          state: 'active'
+          state: 'active',
+          security_check: { status: 'pass' }
         }
       ]
     })
     render(<CollectiveWisdomPanel profile="research" />)
     expect(await screen.findByText('<img src=x onerror=alert(1)>')).toBeTruthy()
-    expect(screen.getByText('server scan passed')).toBeTruthy()
+    expect(screen.getByText('Security: Pass')).toBeTruthy()
     expect(document.querySelector('script')).toBeNull()
+  })
+
+  it('keeps the first and returning qualification notice attached to each candidate', async () => {
+    getWisdomCandidates.mockResolvedValue({
+      candidates: [
+        {
+          local_skill_id: 'local-first',
+          name: 'first-skill',
+          path: '/skills/first-skill',
+          content_hash: 'sha256:first',
+          eligibility: 'eligible',
+          reason: null,
+          qualification: 'meaningful_refinements',
+          qualification_sequence: 1,
+          notice_variant: 'first',
+          organization_name: 'Nous Research',
+          contribution_state: 'new'
+        },
+        {
+          local_skill_id: 'local-returning',
+          name: 'returning-skill',
+          path: '/skills/returning-skill',
+          content_hash: 'sha256:returning',
+          eligibility: 'eligible',
+          reason: null,
+          qualification: 'consecutive_business_days',
+          qualification_sequence: 2,
+          notice_variant: 'returning',
+          organization_name: 'Nous Research',
+          contribution_state: 'new'
+        }
+      ]
+    })
+
+    render(<CollectiveWisdomPanel profile="research" />)
+
+    expect(await screen.findByText(/Your organisation \(Nous Research\) has enabled Collective Wisdom/)).toBeTruthy()
+    expect(screen.getByText(/Hermes detected another skill that could be useful to your team/)).toBeTruthy()
   })
 
   it('keeps preparation local until explicit owner copy and System Specification submission', async () => {
@@ -202,7 +241,7 @@ describe('CollectiveWisdomPanel', () => {
     })
     expect(screen.queryByLabelText(/System Specification \(declarative metadata/)).toBeNull()
     fireEvent.click(screen.getByRole('checkbox', { name: 'Linux' }))
-    fireEvent.click(screen.getByRole('button', { name: 'Submit for owner-only server review' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Submit draft' }))
 
     await waitFor(() => expect(suggestWisdomSkill).toHaveBeenCalledTimes(2))
     expect(suggestWisdomSkill.mock.calls[1]).toEqual([

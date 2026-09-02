@@ -35,6 +35,8 @@ export interface WisdomTranslations {
   serverScanPassed: string
   localOnly: string
   qualifiedLocally: string
+  qualificationFirst: (organizationName?: string | null) => string
+  qualificationReturning: string
   savedLocally: string
   prepare: string
   continueDraft: string

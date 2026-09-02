@@ -1256,6 +1256,9 @@ export const zhHant = defineLocale({
       serverScanPassed: '伺服器掃描已通過',
       localOnly: '可從此裝置共享。',
       qualifiedLocally: 'Hermes 將此本機技能識別為可能的貢獻。',
+      qualificationFirst: organizationName =>
+        `${organizationName ? `您的組織（${organizationName}）` : '您的組織'}已啟用 Collective Wisdom，此功能會自動探索所有團隊成員的實用技能。恭喜！Hermes 偵測到一項可能對您的團隊有用的技能。`,
+      qualificationReturning: 'Hermes 又偵測到一項可能對您的團隊有用的技能。',
       savedLocally: '私人草稿已儲存在此裝置上。',
       prepare: '開始貢獻',
       continueDraft: '繼續編輯草稿',
@@ -1288,7 +1291,7 @@ export const zhHant = defineLocale({
       ownerDescription: '擁有者撰寫的描述',
       systemSpecification: '系統規格',
       cancel: '取消',
-      submit: '提交至僅擁有者可見的伺服器審核',
+      submit: '提交草稿',
       submitting: '正在提交…',
       readEvery: '請閱讀每個檔案。核准將綁定到下方三個精確雜湊值。',
       editReview:
@@ -1308,8 +1311,7 @@ export const zhHant = defineLocale({
       localSuggestion: '可供你審核',
       preparingLocal: '正在準備可編輯的本機審核…',
       whySuggested: 'Hermes 建議此技能的原因',
-      proposalNotice:
-        'Hermes 在此工作後識別到一個可重複使用的技能。資格原因只保留在此裝置上；在你審核並核准精確套件前，不會共享任何內容。',
+      proposalNotice: '資格原因只保留在此裝置上；在你審核並核准精確套件前，不會共享任何內容。',
       openCollective: '開啟集體',
       prepareExact: '審核並編輯',
       skillName: '技能名稱',
@@ -1318,7 +1320,7 @@ export const zhHant = defineLocale({
       hideDetailedRequirements: '收合詳細需求',
       specificationNotice: '請審核擁有者撰寫的文案和宣告式系統規格。此操作不會授權執行任何相依項目。',
       openFullReview: '開啟完整審核',
-      sendPrivateReview: '繼續審批',
+      sendPrivateReview: '提交草稿',
       saveLocal: '儲存',
       savingLocal: '正在儲存…',
       source: '原始碼',

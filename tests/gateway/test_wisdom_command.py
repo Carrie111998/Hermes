@@ -114,6 +114,9 @@ class _Service:
                 "local_skill_id": "local-1",
                 "eligibility": "eligible",
                 "qualification": "high_usage",
+                "qualification_sequence": 1,
+                "notice_variant": "first",
+                "organization_name": "Nous Research",
             }
         ]
 
@@ -238,6 +241,28 @@ def test_parse_supports_quoted_search_and_cli_aliases():
         "submit",
         ["local-skill"],
     )
+
+
+def test_candidates_uses_the_stable_first_notice_projection():
+    service = _Service()
+
+    view = WisdomCommandController().execute("candidates", service, _context())
+
+    assert "Your organisation (Nous Research) has enabled Collective Wisdom" in (
+        view.items[0].detail
+    )
+    assert "Congratulations! Hermes detected a skill" in view.items[0].detail
+    assert "Why suggested: high usage" in view.items[0].detail
+
+
+def test_skill_preview_keeps_install_as_the_trailing_action():
+    view = WisdomCommandController().execute("show skill-1", _Service(), _context())
+
+    assert [action.label for action in view.actions] == [
+        "Versions",
+        "View in Portal ↗",
+        "Install",
+    ]
 
 
 def test_local_action_command_resumes_bound_controller_action():

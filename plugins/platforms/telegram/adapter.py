@@ -7935,14 +7935,14 @@ class TelegramAdapter(BasePlatformAdapter):
                 if state == "ready":
                     actions = [
                         {
-                            "label": "Approve & publish",
-                            "callback_data": f"wi:publish:{event_id}",
-                            "primary": True,
+                            "label": "Decline",
+                            "callback_data": f"wi:decline:{event_id}",
                         },
                         *view_action,
                         {
-                            "label": "Decline",
-                            "callback_data": f"wi:decline:{event_id}",
+                            "label": "Approve & publish",
+                            "callback_data": f"wi:publish:{event_id}",
+                            "primary": True,
                         },
                     ]
                     status = (
@@ -8536,12 +8536,18 @@ class TelegramAdapter(BasePlatformAdapter):
             if professionalism_review is not None
             else ""
         )
+        status_html = (
+            _html.escape(status)
+            .replace("Hermes detected another", "Hermes detected <b>another</b>")
+            .replace("\n", "<br/>")
+        )
         return (
             "<h3>Hermes Collective Wisdom</h3>"
-            "<p><b>Reusable skill ready to review</b><br/>"
+            f"<p>{status_html}<br/><br/>"
+            "<b>Reusable skill ready to review</b><br/>"
             f"<code>{_html.escape(skill_name)}</code><br/>"
             f"<b>Why suggested:</b> {_html.escape(qualification_reason)}<br/>"
-            f"{_html.escape(status)}{review_html}{control_html}</p>"
+            f"{review_html}{control_html}</p>"
         )
 
     @staticmethod
@@ -8573,9 +8579,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 )
         if not buttons:
             return None
-        rows = [buttons[:2]]
-        if len(buttons) > 2:
-            rows.append(buttons[2:])
+        rows = [buttons[index : index + 3] for index in range(0, len(buttons), 3)]
         return InlineKeyboardMarkup(rows)
 
     async def _edit_wisdom_candidate_card(
@@ -8636,13 +8640,14 @@ class TelegramAdapter(BasePlatformAdapter):
         metadata: Optional[Dict[str, Any]] = None,
     ) -> int:
         """Surface newly qualified local skills in their exact Telegram session."""
+        from hermes_wisdom.notice import qualification_notice
         from hermes_wisdom.professionalism import review_text
         from hermes_wisdom.service import WisdomService
         from hermes_wisdom.store import WisdomStore
 
         events = await self._run_wisdom_profile_operation(
-            lambda: WisdomStore().pending_telegram_events(
-                kind="wisdom.candidate", session_id=session_id
+            lambda: WisdomService(store=WisdomStore()).pending_candidate_events(
+                session_id=session_id, surface="telegram"
             )
         )
         sent = 0
@@ -8662,9 +8667,14 @@ class TelegramAdapter(BasePlatformAdapter):
             qualification_reason = self._wisdom_candidate_qualification_reason(
                 str(event.get("qualification") or payload.get("qualification") or "")
             )
+            notice = qualification_notice(event)
             actions: List[Dict[str, Any]] = [
                 {
-                    "label": "Draft in Collective",
+                    "label": "Decline",
+                    "callback_data": f"wi:decline:{event_id}",
+                },
+                {
+                    "label": "Submit draft",
                     "callback_data": f"wi:draft:{event_id}",
                 },
                 {
@@ -8672,18 +8682,11 @@ class TelegramAdapter(BasePlatformAdapter):
                     "callback_data": f"wi:publish:{event_id}",
                     "primary": True,
                 },
-                {
-                    "label": "Decline",
-                    "callback_data": f"wi:decline:{event_id}",
-                },
             ]
             html = self._wisdom_candidate_html(
                 skill_name=skill_name,
                 qualification_reason=qualification_reason,
-                status=(
-                    "Hermes found a reusable skill after this task. Nothing is shared "
-                    "until you choose an action."
-                ),
+                status=f"{notice}\n\nNothing is shared until you choose an action.",
                 actions=actions,
                 professionalism_review=professionalism_review,
             )
@@ -8723,6 +8726,7 @@ class TelegramAdapter(BasePlatformAdapter):
                     "text": (
                         "<b>Hermes Collective Wisdom</b>\n"
                         "<b>Reusable skill ready to review</b>\n"
+                        f"{_html.escape(notice).replace('another', '<b>another</b>')}\n\n"
                         f"<code>{_html.escape(skill_name)}</code>\n"
                         "<b>Why suggested:</b> "
                         f"{_html.escape(qualification_reason)}\n"

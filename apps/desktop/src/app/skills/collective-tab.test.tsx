@@ -319,7 +319,7 @@ describe('CollectiveTab', () => {
     fireEvent.click(await screen.findByRole('button', { name: 'Start contribution' }))
     const description = await screen.findByLabelText('Owner-authored description')
     fireEvent.change(description, { target: { value: 'Approved owner copy' } })
-    fireEvent.click(screen.getByRole('button', { name: 'Submit for owner-only server review' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Submit draft' }))
 
     await waitFor(() => expect(suggestWisdomSkill).toHaveBeenCalledTimes(2))
     const payload = suggestWisdomSkill.mock.calls[1][2]

@@ -39,6 +39,9 @@ export interface WisdomCandidate {
   eligibility: 'eligible' | 'instruction_only_fork_required'
   reason: null | string
   qualification: string
+  qualification_sequence: number | null
+  notice_variant: 'first' | 'returning' | null
+  organization_name: string | null
   contribution_state: 'new' | 'prepared'
   professionalism_check?: null | WisdomReviewCheck
 }
@@ -49,6 +52,9 @@ export interface WisdomCandidateEvent {
   session_id: null | string
   task_id: null | string
   content_hash: string
+  qualification_sequence: number
+  notice_variant: 'first' | 'returning'
+  organization_name: string | null
   payload: {
     skill_name: string
     qualification: string

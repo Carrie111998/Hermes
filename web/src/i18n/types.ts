@@ -41,6 +41,8 @@ export interface WisdomTranslations {
   continueDraft: string
   localOnly: string
   qualifiedLocally: string
+  qualificationFirst: (organizationName?: string | null) => string
+  qualificationReturning: string
   savedLocally: string
   reviewExact: string
   draftState: (state: string) => string

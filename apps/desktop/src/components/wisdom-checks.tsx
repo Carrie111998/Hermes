@@ -14,24 +14,44 @@ function statusLabel(status: string): string {
 }
 
 function StatusIcon({ status }: { status: WisdomReviewStatus }) {
-  if (status === 'pass') return <CheckCircle2 aria-hidden className="size-3" />
-  if (status === 'blocked') return <XCircle aria-hidden className="size-3" />
+  if (status === 'pass') {
+    return <CheckCircle2 aria-hidden className="size-3" />
+  }
+
+  if (status === 'blocked') {
+    return <XCircle aria-hidden className="size-3" />
+  }
+
   if (status === 'pending' || status === 'retry' || status === 'running') {
     return <Loader2 aria-hidden className="size-3 animate-spin" />
   }
-  if (status === 'advisory') return <AlertTriangle aria-hidden className="size-3" />
+
+  if (status === 'advisory') {
+    return <AlertTriangle aria-hidden className="size-3" />
+  }
+
   return <CircleHelp aria-hidden className="size-3" />
 }
 
 function tone(status: WisdomReviewStatus): string {
-  if (status === 'pass') return 'border-emerald-500/50 text-emerald-600'
-  if (status === 'blocked') return 'border-destructive/60 text-destructive'
-  if (status === 'advisory') return 'border-amber-500/60 text-amber-500'
+  if (status === 'pass') {
+    return 'border-emerald-500/50 text-emerald-600'
+  }
+
+  if (status === 'blocked') {
+    return 'border-destructive/60 text-destructive'
+  }
+
+  if (status === 'advisory') {
+    return 'border-amber-500/60 text-amber-500'
+  }
+
   return 'border-(--ui-stroke-tertiary) text-muted-foreground'
 }
 
 export function WisdomCheckBadge({ label, value }: { label: string; value?: null | WisdomReviewCheck }) {
   const status = value?.status ?? 'unavailable'
+
   return (
     <span className={cnStatus(status)}>
       <StatusIcon status={status} />
@@ -51,6 +71,7 @@ function rowLabel(row: WisdomReviewCheckRow): string {
 function CheckTable({ label, note, value }: { label: string; note: string; value?: null | WisdomReviewCheck }) {
   const status = value?.status ?? 'unavailable'
   const rows = value?.checks ?? []
+
   return (
     <section aria-label={label} className="border-t border-(--ui-stroke-tertiary) py-3 first:border-0">
       <div className="flex flex-wrap items-center justify-between gap-2">

@@ -7769,6 +7769,7 @@ class SlackAdapter(BasePlatformAdapter):
     ) -> int:
         """DM newly qualified local skills after their originating Slack turn."""
         from gateway.wisdom_command import WisdomAction
+        from hermes_wisdom.notice import qualification_notice
         from hermes_wisdom.professionalism import review_text
         from hermes_wisdom.service import WisdomService
         from hermes_wisdom.store import WisdomStore
@@ -7785,10 +7786,8 @@ class SlackAdapter(BasePlatformAdapter):
             return 0
         profile = metadata.get("profile") or getattr(self, "_owner_profile", None)
         events = await self._run_wisdom_profile_operation(
-            lambda: WisdomStore().pending_surface_events(
-                kind="wisdom.candidate",
-                session_id=session_id,
-                surface="slack",
+            lambda: WisdomService(store=WisdomStore()).pending_candidate_events(
+                session_id=session_id, surface="slack"
             ),
             profile=profile,
         )
@@ -7816,27 +7815,28 @@ class SlackAdapter(BasePlatformAdapter):
                 ),
                 profile=profile,
             )
+            notice = qualification_notice(event)
             view = self._wisdom_candidate_view(
                 skill_name=skill_name,
                 qualification=qualification,
                 status=(
-                    "Nothing is shared until you choose an action.\n"
+                    f"{notice}\n\nNothing is shared until you choose an action.\n"
                     + review_text(professionalism_review, include_checks=True)
                 ),
                 actions=[
                     WisdomAction(
-                        "Draft in Collective",
+                        "Decline",
+                        callback_data=f"wi:decline:{event_id}",
+                        destructive=True,
+                    ),
+                    WisdomAction(
+                        "Submit draft",
                         callback_data=f"wi:draft:{event_id}",
                     ),
                     WisdomAction(
                         "Approve & publish",
                         callback_data=f"wi:publish:{event_id}",
                         primary=True,
-                    ),
-                    WisdomAction(
-                        "Decline",
-                        callback_data=f"wi:decline:{event_id}",
-                        destructive=True,
                     ),
                 ],
             )
@@ -7936,11 +7936,13 @@ class SlackAdapter(BasePlatformAdapter):
 
         return WisdomView(
             "Hermes Collective Wisdom",
-            "Reusable skill ready to review",
+            status.replace(
+                "Hermes detected another", "Hermes detected *another*"
+            ),
             items=[
                 WisdomItem(
                     skill_name,
-                    f"Why suggested: {cls._wisdom_candidate_reason(qualification)}\n{status}",
+                    f"Why suggested: {cls._wisdom_candidate_reason(qualification)}",
                     actions=list(actions),
                 )
             ],
@@ -8226,13 +8228,13 @@ class SlackAdapter(BasePlatformAdapter):
                 status = "Private draft created. Nothing is shared until you approve it."
                 actions = [
                     WisdomAction(
-                        "Approve & publish",
-                        callback_data=f"wi:publish:{event_id}",
-                        primary=True,
+                        "Decline", callback_data=f"wi:decline:{event_id}"
                     ),
                     *view_action,
                     WisdomAction(
-                        "Decline", callback_data=f"wi:decline:{event_id}"
+                        "Approve & publish",
+                        callback_data=f"wi:publish:{event_id}",
+                        primary=True,
                     ),
                 ]
             elif state == "pending_moderation":

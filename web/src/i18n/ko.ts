@@ -385,6 +385,9 @@ export const ko: Translations = {
       continueDraft: '초안 계속하기',
       localOnly: '이 기기에서 공유 가능',
       qualifiedLocally: 'Hermes가 이 로컬 스킬을 기여 후보로 식별했습니다.',
+      qualificationFirst: organizationName =>
+        `${organizationName ? `조직(${organizationName})에서` : '조직에서'} 모든 팀원의 유용한 스킬을 자동으로 감지하는 Collective Wisdom을 활성화했습니다. 축하합니다! Hermes가 팀에 유용할 수 있는 스킬을 감지했습니다.`,
+      qualificationReturning: 'Hermes가 팀에 유용할 수 있는 또 다른 스킬을 감지했습니다.',
       savedLocally: '이 기기에 비공개 초안이 저장되어 있습니다.',
       reviewExact: '세부정보 보기',
       draftState: state => {
@@ -417,7 +420,7 @@ export const ko: Translations = {
       systemSpecification: '시스템 사양(선언형 메타데이터, 종속 항목은 설치되지 않음)',
       localOverlay: '로컬 오버레이',
       cancel: '취소',
-      submit: '소유자 전용 서버 검토에 제출',
+      submit: '초안 제출',
       submitting: '제출 중…',
       publishing: '게시 중…',
       approve: '정확한 내용 승인 및 게시',

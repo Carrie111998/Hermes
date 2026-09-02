@@ -352,9 +352,14 @@ export function CollectiveWisdomPanel({ profile }: Props) {
   }
 
   const candidateSummary = (candidate: WisdomCandidate): string => {
-    if (candidate.contribution_state === 'prepared') return copy.savedLocally
     if (candidate.eligibility !== 'eligible') return candidate.reason || copy.localOnly
-    return candidate.qualification === 'manual_selection' ? copy.localOnly : copy.qualifiedLocally
+    const qualification =
+      candidate.qualification === 'manual_selection'
+        ? copy.localOnly
+        : candidate.notice_variant === 'first'
+          ? copy.qualificationFirst(candidate.organization_name)
+          : copy.qualificationReturning
+    return candidate.contribution_state === 'prepared' ? `${qualification} ${copy.savedLocally}` : qualification
   }
 
   const openSkill = async (skillId: string) => {
@@ -1096,38 +1101,43 @@ export function CollectiveWisdomPanel({ profile }: Props) {
           <p className="mt-2 break-all font-mono text-[11px] text-text-tertiary">
             {copy.localOverlay}: {prepared.overlay_path}
           </p>
-          <div className="mt-4 flex justify-end gap-2">
-            <Button size="sm" outlined onClick={() => setPrepared(null)}>
-              {copy.cancel}
-            </Button>
-            <Button
-              size="sm"
-              disabled={busy === prepared.local_draft_id || !!approvedSpecificationError}
-              onClick={async () => {
-                setBusy(prepared.local_draft_id)
-                setError(null)
-                try {
-                  if (!approvedSpecification || approvedSpecificationError) {
-                    throw new Error(approvedSpecificationError || 'System Specification is unavailable')
+          <div className="mt-4 grid grid-cols-3 items-center gap-2">
+            <div className="justify-self-start">
+              <Button size="sm" outlined onClick={() => setPrepared(null)}>
+                {copy.cancel}
+              </Button>
+            </div>
+            <div className="justify-self-center">
+              <Button
+                size="sm"
+                disabled={busy === prepared.local_draft_id || !!approvedSpecificationError}
+                onClick={async () => {
+                  setBusy(prepared.local_draft_id)
+                  setError(null)
+                  try {
+                    if (!approvedSpecification || approvedSpecificationError) {
+                      throw new Error(approvedSpecificationError || 'System Specification is unavailable')
+                    }
+                    await api.suggestWisdomSkill(
+                      preparedSkill,
+                      profile,
+                      approvedDescription,
+                      approvedSpecification,
+                      preparedSkillId
+                    )
+                    await refreshContributionData()
+                    setPrepared(null)
+                  } catch (reason) {
+                    setError(userFacingError(reason))
+                  } finally {
+                    setBusy(null)
                   }
-                  await api.suggestWisdomSkill(
-                    preparedSkill,
-                    profile,
-                    approvedDescription,
-                    approvedSpecification,
-                    preparedSkillId
-                  )
-                  await refreshContributionData()
-                  setPrepared(null)
-                } catch (reason) {
-                  setError(userFacingError(reason))
-                } finally {
-                  setBusy(null)
-                }
-              }}
-            >
-              {busy === prepared.local_draft_id ? copy.submitting : copy.submit}
-            </Button>
+                }}
+              >
+                {busy === prepared.local_draft_id ? copy.submitting : copy.submit}
+              </Button>
+            </div>
+            <span aria-hidden="true" />
           </div>
         </div>
       )}
@@ -1199,62 +1209,68 @@ export function CollectiveWisdomPanel({ profile }: Props) {
               onChange={value => setReviewFiles(current => ({ ...current, [file.path]: value }))}
             />
           ))}
-          <div className="mt-4 flex justify-end gap-2">
-            <Button size="sm" outlined onClick={closeReview}>
-              {copy.close}
-            </Button>
-            {reviewCanEdit && reviewDirty && (
-              <>
-                <Button size="sm" outlined disabled={busy === review.draft.id} onClick={resetReviewEdits}>
-                  {copy.resetChanges}
-                </Button>
-                <Button
-                  size="sm"
-                  disabled={busy === review.draft.id || !!reviewManifestError}
-                  onClick={saveReviewRevision}
-                >
-                  {busy === review.draft.id ? copy.savingRevision : copy.saveAndRescan}
-                </Button>
-              </>
-            )}
-            <Button
-              size="sm"
-              outlined
-              disabled={busy === review.draft.id}
-              onClick={async () => {
-                setBusy(review.draft.id)
-                try {
-                  await api.decideWisdomDraft(review.draft.id, 'decline', profile)
-                  await refreshContributionData()
-                  closeReview()
-                } catch (reason) {
-                  setError(userFacingError(reason))
-                } finally {
-                  setBusy(null)
-                }
-              }}
-            >
-              {copy.decline}
-            </Button>
-            <Button
-              size="sm"
-              disabled={busy === review.draft.id || reviewDirty}
-              onClick={async () => {
-                setBusy(review.draft.id)
-                try {
-                  await api.reviewWisdomDraft(review.draft.id, true, profile)
-                  await api.decideWisdomDraft(review.draft.id, 'approve', profile)
-                  await refreshContributionData()
-                  closeReview()
-                } catch (reason) {
-                  setError(userFacingError(reason))
-                } finally {
-                  setBusy(null)
-                }
-              }}
-            >
-              {busy === review.draft.id ? copy.publishing : copy.approve}
-            </Button>
+          <div className="mt-4 grid grid-cols-3 items-center gap-2">
+            <div className="justify-self-start">
+              <Button
+                size="sm"
+                outlined
+                disabled={busy === review.draft.id}
+                onClick={async () => {
+                  setBusy(review.draft.id)
+                  try {
+                    await api.decideWisdomDraft(review.draft.id, 'decline', profile)
+                    await refreshContributionData()
+                    closeReview()
+                  } catch (reason) {
+                    setError(userFacingError(reason))
+                  } finally {
+                    setBusy(null)
+                  }
+                }}
+              >
+                {copy.decline}
+              </Button>
+            </div>
+            <div className="flex flex-wrap justify-center gap-2">
+              <Button size="sm" outlined onClick={closeReview}>
+                {copy.close}
+              </Button>
+              {reviewCanEdit && reviewDirty && (
+                <>
+                  <Button size="sm" outlined disabled={busy === review.draft.id} onClick={resetReviewEdits}>
+                    {copy.resetChanges}
+                  </Button>
+                  <Button
+                    size="sm"
+                    disabled={busy === review.draft.id || !!reviewManifestError}
+                    onClick={saveReviewRevision}
+                  >
+                    {busy === review.draft.id ? copy.savingRevision : copy.saveAndRescan}
+                  </Button>
+                </>
+              )}
+            </div>
+            <div className="justify-self-end">
+              <Button
+                size="sm"
+                disabled={busy === review.draft.id || reviewDirty}
+                onClick={async () => {
+                  setBusy(review.draft.id)
+                  try {
+                    await api.reviewWisdomDraft(review.draft.id, true, profile)
+                    await api.decideWisdomDraft(review.draft.id, 'approve', profile)
+                    await refreshContributionData()
+                    closeReview()
+                  } catch (reason) {
+                    setError(userFacingError(reason))
+                  } finally {
+                    setBusy(null)
+                  }
+                }}
+              >
+                {busy === review.draft.id ? copy.publishing : copy.approve}
+              </Button>
+            </div>
           </div>
         </div>
       )}

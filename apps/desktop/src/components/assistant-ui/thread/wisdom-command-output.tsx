@@ -2,7 +2,6 @@ import { useEffect, useMemo, useState } from 'react'
 
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
-import { WisdomCheckBadge, WisdomReviewTables } from '@/components/wisdom-checks'
 import {
   Dialog,
   DialogContent,
@@ -11,6 +10,7 @@ import {
   DialogHeader,
   DialogTitle
 } from '@/components/ui/dialog'
+import { WisdomCheckBadge, WisdomReviewTables } from '@/components/wisdom-checks'
 import {
   getWisdomSkill,
   getWisdomVersion,
@@ -66,6 +66,7 @@ function formatPublishedAt(value: string): string {
   if (!value) {
     return ''
   }
+
   const date = new Date(value)
 
   return Number.isNaN(date.valueOf())
@@ -79,6 +80,7 @@ function parseVersionSummary(value: Record<string, unknown>): null | VersionSumm
   if (!version) {
     return null
   }
+
   const verifiedFacts = asRecord(value.verified_facts)
   const scan = asRecord(value.scan)
 
@@ -99,6 +101,7 @@ function requirementsFrom(specification: Record<string, unknown>): string[] {
   const hermes = asRecord(source.hermes)
   const runtime = asRecord(source.runtime)
   const minimumVersion = asText(hermes.minimum_version)
+
   const list = (key: string) =>
     Array.isArray(source[key])
       ? source[key].filter((item): item is string => typeof item === 'string' && Boolean(item.trim()))
@@ -225,10 +228,12 @@ function WisdomSkillPreview({ onClose, skillId }: { onClose: () => void; skillId
     const scan = asRecord(version.scan)
     const verifiedFacts = asRecord(version.verified_facts)
     const systemSpec = asRecord(version.system_spec)
+
     const versions = state.detail.versions
       .map(item => parseVersionSummary(asRecord(item)))
       .filter((item): item is VersionSummary => item !== null)
       .sort((a, b) => b.version - a.version)
+
     const latestVersion = versionNumber(version.version) ?? versions[0]?.version ?? null
 
     return {
@@ -256,8 +261,10 @@ function WisdomSkillPreview({ onClose, skillId }: { onClose: () => void; skillId
   useEffect(() => {
     if (!selectedVersion || !preview) {
       setVersionState({ detail: null, error: null, status: 'idle' })
+
       return
     }
+
     let current = true
 
     setVersionState({ detail: null, error: null, status: 'loading' })
@@ -286,6 +293,7 @@ function WisdomSkillPreview({ onClose, skillId }: { onClose: () => void; skillId
     if (versionState.status !== 'ready') {
       return null
     }
+
     const version = asRecord(versionState.detail.version)
     const compatibility = asRecord(versionState.detail.local_compatibility)
     const scan = asRecord(version.scan)
@@ -337,12 +345,14 @@ function WisdomSkillPreview({ onClose, skillId }: { onClose: () => void; skillId
 
   const screen = selectedVersion ? 'version' : showVersions ? 'versions' : 'overview'
   const portalUrl = screen === 'version' ? versionPreview?.portalUrl : preview?.portalUrl
+
   const dialogBadge =
     screen === 'version' && selectedVersion
       ? `v${selectedVersion}`
       : screen === 'versions'
         ? copy.versions
         : copy.preview
+
   const dialogDescription =
     screen === 'version' ? versionPreview?.authorDescription : screen === 'overview' ? preview?.description : ''
 
@@ -376,7 +386,7 @@ function WisdomSkillPreview({ onClose, skillId }: { onClose: () => void; skillId
                 <WisdomCheckBadge label="Security" value={preview.securityCheck} />
                 <WisdomCheckBadge label="Professionalism" value={preview.professionalismCheck} />
               </div>
-              <WisdomReviewTables security={preview.securityCheck} professionalism={preview.professionalismCheck} />
+              <WisdomReviewTables professionalism={preview.professionalismCheck} security={preview.securityCheck} />
               <Requirements label={copy.systemSpecification} specification={preview.systemSpec} />
               {preview.versions.length ? (
                 <section aria-label={copy.versionHistory}>
@@ -435,8 +445,8 @@ function WisdomSkillPreview({ onClose, skillId }: { onClose: () => void; skillId
                 version={versionPreview.version}
               />
               <WisdomReviewTables
-                security={versionPreview.securityCheck}
                 professionalism={versionPreview.professionalismCheck}
+                security={versionPreview.securityCheck}
               />
               {versionPreview.publishedAt ? (
                 <time className="text-xs text-muted-foreground" dateTime={versionPreview.publishedAt}>

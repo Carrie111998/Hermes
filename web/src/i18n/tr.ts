@@ -387,6 +387,9 @@ export const tr: Translations = {
       continueDraft: 'Taslağa devam et',
       localOnly: 'Bu cihazdan paylaşılabilir',
       qualifiedLocally: 'Hermes bu yerel beceriyi olası bir katkı olarak belirledi.',
+      qualificationFirst: organizationName =>
+        `${organizationName ? `Kuruluşunuz (${organizationName})` : 'Kuruluşunuz'} tüm ekip üyelerindeki yararlı becerileri otomatik olarak algılamak için tasarlanan Collective Wisdom özelliğini etkinleştirdi. Tebrikler! Hermes ekibiniz için yararlı olabilecek bir beceri algıladı.`,
+      qualificationReturning: 'Hermes ekibiniz için yararlı olabilecek başka bir beceri algıladı.',
       savedLocally: 'Bu cihazda özel bir taslak kayıtlı.',
       reviewExact: 'Ayrıntıları görüntüle',
       draftState: state => {
@@ -419,7 +422,7 @@ export const tr: Translations = {
       systemSpecification: 'Sistem Belirtimi (bildirimsel meta veri; hiçbir bağımlılık kurulmaz)',
       localOverlay: 'Yerel katman',
       cancel: 'İptal',
-      submit: 'Sahibe özel sunucu incelemesine gönder',
+      submit: 'Taslağı gönder',
       submitting: 'Gönderiliyor…',
       publishing: 'Yayımlanıyor…',
       approve: 'Kesin içeriği onayla ve yayımla',

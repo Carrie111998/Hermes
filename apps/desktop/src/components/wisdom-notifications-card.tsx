@@ -109,6 +109,11 @@ export function WisdomNotificationsCard({
               {notificationText(event, copy)}
             </p>
             <div className="flex shrink-0 items-center gap-3">
+              {event.portal_url ? (
+                <Button onClick={() => openExternalLink(event.portal_url || '')} size="inline" variant="text">
+                  {copy.viewSkill}
+                </Button>
+              ) : null}
               {onPlanAction && (event.category === 'new_skill' || event.category === 'update_available') ? (
                 <Button
                   disabled={planning === event.event_id}
@@ -125,11 +130,6 @@ export function WisdomNotificationsCard({
                   variant="textStrong"
                 >
                   {event.category === 'new_skill' ? copy.install : copy.reviewUpdate}
-                </Button>
-              ) : null}
-              {event.portal_url ? (
-                <Button onClick={() => openExternalLink(event.portal_url || '')} size="inline" variant="text">
-                  {copy.viewSkill}
                 </Button>
               ) : null}
             </div>

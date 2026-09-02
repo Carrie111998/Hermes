@@ -447,6 +447,9 @@ export const en: Translations = {
       continueDraft: 'Continue draft',
       localOnly: 'Available to share from this device',
       qualifiedLocally: 'Hermes identified this local skill as a possible contribution.',
+      qualificationFirst: organizationName =>
+        `${organizationName ? `Your organisation (${organizationName})` : 'Your organisation'} has enabled Collective Wisdom, a feature designed to automatically detect useful skills across all team members. Congratulations! Hermes detected a skill that could be useful to your team.`,
+      qualificationReturning: 'Hermes detected another skill that could be useful to your team.',
       savedLocally: 'A private draft is saved on this device.',
       reviewExact: 'View details',
       draftState: state => {
@@ -479,7 +482,7 @@ export const en: Translations = {
       systemSpecification: 'System Specification (declarative metadata; no dependencies are installed)',
       localOverlay: 'Local overlay',
       cancel: 'Cancel',
-      submit: 'Submit for owner-only server review',
+      submit: 'Submit draft',
       submitting: 'Submitting…',
       publishing: 'Publishing…',
       approve: 'Approve exact content & publish',

@@ -396,6 +396,9 @@ export const ga: Translations = {
       continueDraft: 'Lean leis an dréacht',
       localOnly: 'Ar fáil le roinnt ón ngléas seo',
       qualifiedLocally: 'D’aithin Hermes an scil áitiúil seo mar ranníocaíocht fhéideartha.',
+      qualificationFirst: organizationName =>
+        `${organizationName ? `Chumasaigh d’eagraíocht (${organizationName})` : 'Chumasaigh d’eagraíocht'} Collective Wisdom, gné a aimsíonn scileanna úsáideacha go huathoibríoch i measc bhaill uile na foirne. Comhghairdeas! D’aimsigh Hermes scil a d’fhéadfadh a bheith úsáideach do d’fhoireann.`,
+      qualificationReturning: 'D’aimsigh Hermes scil eile a d’fhéadfadh a bheith úsáideach do d’fhoireann.',
       savedLocally: 'Tá dréacht príobháideach sábháilte ar an ngléas seo.',
       reviewExact: 'Féach ar na sonraí',
       draftState: state => {
@@ -428,7 +431,7 @@ export const ga: Translations = {
       systemSpecification: 'Sonraíocht Córais (meiteashonraí dearbhaitheacha; ní shuiteáiltear spleáchais)',
       localOverlay: 'Forleagan áitiúil',
       cancel: 'Cealaigh',
-      submit: 'Cuir isteach le haghaidh athbhreithniú príobháideach freastalaí',
+      submit: 'Cuir dréacht isteach',
       submitting: 'Á chur isteach…',
       publishing: 'Á fhoilsiú…',
       approve: 'Ceadaigh an t-ábhar beacht agus foilsigh',

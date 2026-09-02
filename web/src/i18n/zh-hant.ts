@@ -384,6 +384,9 @@ export const zhHant: Translations = {
       continueDraft: '繼續編輯草稿',
       localOnly: '可從此裝置共享',
       qualifiedLocally: 'Hermes 將此本機技能識別為可能的貢獻。',
+      qualificationFirst: organizationName =>
+        `${organizationName ? `您的組織（${organizationName}）` : '您的組織'}已啟用 Collective Wisdom，此功能會自動探索所有團隊成員的實用技能。恭喜！Hermes 偵測到一項可能對您的團隊有用的技能。`,
+      qualificationReturning: 'Hermes 又偵測到一項可能對您的團隊有用的技能。',
       savedLocally: '私人草稿已儲存在此裝置上。',
       reviewExact: '檢視詳細資料',
       draftState: state => {
@@ -416,7 +419,7 @@ export const zhHant: Translations = {
       systemSpecification: '系統規格（宣告式中繼資料；不會安裝相依項目）',
       localOverlay: '本機覆疊',
       cancel: '取消',
-      submit: '提交至僅擁有者可見的伺服器審核',
+      submit: '提交草稿',
       submitting: '正在提交…',
       publishing: '正在發佈…',
       approve: '核准精確內容並發佈',

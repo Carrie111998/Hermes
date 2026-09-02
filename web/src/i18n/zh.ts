@@ -380,6 +380,9 @@ export const zh: Translations = {
       continueDraft: '继续编辑草稿',
       localOnly: '可从此设备共享',
       qualifiedLocally: 'Hermes 将此本地技能识别为可能的贡献。',
+      qualificationFirst: organizationName =>
+        `${organizationName ? `您的组织（${organizationName}）` : '您的组织'}已启用 Collective Wisdom，此功能会自动发现所有团队成员的实用技能。恭喜！Hermes 检测到一项可能对您的团队有用的技能。`,
+      qualificationReturning: 'Hermes 又检测到一项可能对您的团队有用的技能。',
       savedLocally: '私有草稿已保存在此设备上。',
       reviewExact: '查看详情',
       draftState: state => {
@@ -412,7 +415,7 @@ export const zh: Translations = {
       systemSpecification: '系统规格（声明式元数据；不会安装依赖项）',
       localOverlay: '本地叠加层',
       cancel: '取消',
-      submit: '提交到仅所有者可见的服务器审核',
+      submit: '提交草稿',
       submitting: '正在提交…',
       publishing: '正在发布…',
       approve: '批准准确内容并发布',

@@ -1187,6 +1187,12 @@ class WisdomConsumption:
             lines.extend(["", f"<b>{escape(heading)}</b>", escape(detail)])
             rich_items.append({"heading": heading, "detail": detail})
             row: list[dict[str, str]] = []
+            portal_url = event.get("portal_url")
+            if isinstance(portal_url, str) and portal_url:
+                row.append({
+                    "label": "View ↗",
+                    "url": portal_url,
+                })
             if event["category"] == "new_skill":
                 row.append({
                     "label": "Install",
@@ -1196,12 +1202,6 @@ class WisdomConsumption:
                 row.append({
                     "label": "Update",
                     "callback_data": f"wi:plan:update:{event['skill_id']}",
-                })
-            portal_url = event.get("portal_url")
-            if isinstance(portal_url, str) and portal_url:
-                row.append({
-                    "label": "View ↗",
-                    "url": portal_url,
                 })
             # Keep one row per notification even when an item has no actions,
             # so rich-message controls cannot drift onto the next skill.
@@ -1301,6 +1301,9 @@ class WisdomConsumption:
             lines.extend(["", heading, detail])
             items.append({"heading": heading, "detail": detail})
             row: list[dict[str, str]] = []
+            portal_url = event.get("portal_url")
+            if isinstance(portal_url, str) and portal_url:
+                row.append({"label": "View in Portal ↗", "url": portal_url})
             if private_home and event["category"] == "new_skill":
                 row.append(
                     {
@@ -1315,9 +1318,6 @@ class WisdomConsumption:
                         "callback_data": f"wi:plan:update:{event['skill_id']}",
                     }
                 )
-            portal_url = event.get("portal_url")
-            if isinstance(portal_url, str) and portal_url:
-                row.append({"label": "View in Portal ↗", "url": portal_url})
             button_rows.append(row)
         try:
             from tools.send_message_tool import send_slack_wisdom_notification_pane

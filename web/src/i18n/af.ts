@@ -387,6 +387,9 @@ export const af: Translations = {
       continueDraft: 'Gaan voort met konsep',
       localOnly: 'Kan vanaf hierdie toestel gedeel word',
       qualifiedLocally: 'Hermes het hierdie plaaslike vaardigheid as ’n moontlike bydrae geïdentifiseer.',
+      qualificationFirst: organizationName =>
+        `${organizationName ? `Jou organisasie (${organizationName})` : 'Jou organisasie'} het Collective Wisdom geaktiveer, ’n funksie wat nuttige vaardighede outomaties oor alle spanlede opspoor. Geluk! Hermes het ’n vaardigheid opgespoor wat vir jou span nuttig kan wees.`,
+      qualificationReturning: 'Hermes het nog ’n vaardigheid opgespoor wat vir jou span nuttig kan wees.',
       savedLocally: '’n Privaat konsep is op hierdie toestel gestoor.',
       reviewExact: 'Bekyk besonderhede',
       draftState: state => {
@@ -419,7 +422,7 @@ export const af: Translations = {
       systemSpecification: 'Stelselspesifikasie (verklarende metadata; geen afhanklikhede word geïnstalleer nie)',
       localOverlay: 'Plaaslike oorlaag',
       cancel: 'Kanselleer',
-      submit: 'Dien in vir privaat bedienerhersiening',
+      submit: 'Dien konsep in',
       submitting: 'Word ingedien…',
       publishing: 'Word gepubliseer…',
       approve: 'Keur presiese inhoud goed en publiseer',

@@ -23,6 +23,7 @@ from hermes_wisdom.package import (
     prepare_package,
     verify_content_files,
 )
+from hermes_wisdom.notice import qualification_notice
 from hermes_wisdom.service import WisdomService
 from hermes_wisdom.store import WisdomStore
 
@@ -543,6 +544,97 @@ def _qualified_candidate_event(service: WisdomService, skill: Path) -> str:
     )
     assert event_id is not None
     return event_id
+
+
+def test_candidate_notice_projection_is_stable_across_surfaces_and_uses_verified_org_name(
+    monkeypatch, tmp_path: Path
+):
+    store = WisdomStore(tmp_path / "state")
+    store.installation_identity()
+    store.verify_installation_identity("org-1")
+    calls = 0
+
+    def account_info(**_kwargs):
+        nonlocal calls
+        calls += 1
+        return SimpleNamespace(org_id="org-1", org_name="Nous Research")
+
+    monkeypatch.setattr(
+        "hermes_cli.nous_account.get_nous_portal_account_info", account_info
+    )
+    service = WisdomService(store=store, client=FakeClient())
+    for index, name in enumerate(("first-skill", "second-skill"), start=1):
+        path = tmp_path / name
+        path.mkdir()
+        (path / "SKILL.md").write_text(name, encoding="utf-8")
+        skill_id = store.register_skill(
+            path, content_hash=f"sha256:{name}", source_kind="local"
+        )
+        assert store.emit_local_event(
+            kind="wisdom.candidate",
+            skill_id=skill_id,
+            content_hash=f"sha256:{name}",
+            payload={"skill_name": name, "local_reasons": {}},
+            session_id="session-1",
+            task_id=f"task-{index}",
+            qualification="high_usage",
+        )
+
+    events = list(reversed(service.local_candidate_events(session_id="session-1")))
+    pending = service.pending_candidate_events(
+        session_id="session-1", surface="telegram"
+    )
+
+    assert calls == 1
+    assert [event["notice_variant"] for event in events] == ["first", "returning"]
+    assert [event["qualification_sequence"] for event in events] == [1, 2]
+    assert {event["organization_name"] for event in events} == {"Nous Research"}
+    assert {
+        event["id"]: event["notice_variant"] for event in pending
+    } == {event["id"]: event["notice_variant"] for event in events}
+    assert qualification_notice(events[0]).startswith(
+        "Your organisation (Nous Research) has enabled Collective Wisdom"
+    )
+    assert qualification_notice(events[1]) == (
+        "Hermes detected another skill that could be useful to your team."
+    )
+
+
+def test_organization_name_mismatch_and_failure_are_negative_cached(
+    monkeypatch, tmp_path: Path
+):
+    store = WisdomStore(tmp_path / "state")
+    store.installation_identity()
+    store.verify_installation_identity("org-1")
+    calls = 0
+
+    def mismatched(**_kwargs):
+        nonlocal calls
+        calls += 1
+        return SimpleNamespace(org_id="org-2", org_name="Wrong Organization")
+
+    monkeypatch.setattr(
+        "hermes_cli.nous_account.get_nous_portal_account_info", mismatched
+    )
+    service = WisdomService(store=store, client=FakeClient())
+
+    assert service.organization_display_name() is None
+    assert service.organization_display_name() is None
+    assert calls == 1
+    cached = store.organization_display_name("org-1")
+    assert cached is not None and cached["display_name"] is None
+    assert cached["resolved"] == 0
+
+    def unavailable(**_kwargs):
+        raise RuntimeError("portal unavailable")
+
+    monkeypatch.setattr(
+        "hermes_cli.nous_account.get_nous_portal_account_info", unavailable
+    )
+    assert service.organization_display_name(force=True) is None
+    assert qualification_notice({"notice_variant": "first"}).startswith(
+        "Your organisation has enabled Collective Wisdom"
+    )
 
 
 def test_telegram_candidate_creates_an_owner_private_draft_and_portal_link(

@@ -388,6 +388,9 @@ export const pt: Translations = {
       continueDraft: 'Continuar rascunho',
       localOnly: 'Disponível para partilhar a partir deste dispositivo',
       qualifiedLocally: 'O Hermes identificou esta competência local como uma possível contribuição.',
+      qualificationFirst: organizationName =>
+        `${organizationName ? `A sua organização (${organizationName})` : 'A sua organização'} ativou o Collective Wisdom, uma funcionalidade concebida para detetar automaticamente competências úteis entre todos os membros da equipa. Parabéns! O Hermes detetou uma competência que poderá ser útil para a sua equipa.`,
+      qualificationReturning: 'O Hermes detetou outra competência que poderá ser útil para a sua equipa.',
       savedLocally: 'Foi guardado um rascunho privado neste dispositivo.',
       reviewExact: 'Ver detalhes',
       draftState: state => {
@@ -420,7 +423,7 @@ export const pt: Translations = {
       systemSpecification: 'Especificação do sistema (metadados declarativos; nenhuma dependência é instalada)',
       localOverlay: 'Sobreposição local',
       cancel: 'Cancelar',
-      submit: 'Submeter para revisão privada do servidor',
+      submit: 'Submeter rascunho',
       submitting: 'A submeter…',
       publishing: 'A publicar…',
       approve: 'Aprovar o conteúdo exato e publicar',

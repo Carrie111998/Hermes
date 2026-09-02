@@ -384,6 +384,9 @@ class TestTelegramApprovalCallback:
         from hermes_wisdom.store import WisdomStore
 
         store = WisdomStore(tmp_path / "wisdom")
+        store.installation_identity()
+        store.verify_installation_identity("org-1")
+        store.record_organization_display_name_check("org-1", "Nous Research")
         skill = tmp_path / "telegram-skill"
         skill.mkdir()
         (skill / "SKILL.md").write_text("# Telegram skill\n", encoding="utf-8")
@@ -426,12 +429,17 @@ class TestTelegramApprovalCallback:
         assert raw_call.args == ("sendRichMessage",)
         html = raw_call.kwargs["api_kwargs"]["rich_message"]["html"]
         assert "telegram-skill" in html
+        assert "Your organisation (Nous Research) has enabled Collective Wisdom" in html
+        assert "Congratulations! Hermes detected a skill" in html
         assert "Why suggested:" in html
         assert "consistently across consecutive business days" in html
         assert "consecutive_business_days" not in html
         assert "Australia/Brisbane" not in html
-        assert "Draft in Collective" in html
+        assert "Submit draft" in html
         assert "Approve &amp; publish" in html
+        assert html.index("Decline") < html.index("Submit draft") < html.index(
+            "Approve &amp; publish"
+        )
         assert f"wi:draft:{event_id}" in html
         assert f"wi:publish:{event_id}" in html
         assert store.pending_telegram_events(
@@ -443,6 +451,42 @@ class TestTelegramApprovalCallback:
                 kind="wisdom.candidate", session_id="telegram-session"
             )
         ] == [event_id]
+
+    def test_wisdom_candidate_returning_copy_and_mobile_keyboard_order(
+        self, monkeypatch
+    ):
+        from hermes_wisdom.notice import qualification_notice
+
+        captured_rows = []
+        monkeypatch.setattr(
+            "plugins.platforms.telegram.adapter.InlineKeyboardButton",
+            lambda text, **kwargs: text,
+        )
+        monkeypatch.setattr(
+            "plugins.platforms.telegram.adapter.InlineKeyboardMarkup",
+            lambda rows: captured_rows.extend(rows) or rows,
+        )
+        notice = qualification_notice({"notice_variant": "returning"})
+        actions = [
+            {"label": "Decline", "callback_data": "wi:decline:event-2"},
+            {"label": "Submit draft", "callback_data": "wi:draft:event-2"},
+            {
+                "label": "Approve & publish",
+                "callback_data": "wi:publish:event-2",
+                "primary": True,
+            },
+        ]
+        html = TelegramAdapter._wisdom_candidate_html(
+            skill_name="another-skill",
+            qualification_reason="It met the local rules.",
+            status=f"{notice}\n\nNothing is shared until you choose an action.",
+            actions=actions,
+        )
+        keyboard = TelegramAdapter._wisdom_candidate_keyboard(actions)
+
+        assert "Hermes detected <b>another</b> skill" in html
+        assert keyboard is not None
+        assert captured_rows == [["Decline", "Submit draft", "Approve & publish"]]
 
     def test_wisdom_candidate_reason_explains_refinement_without_raw_evidence(self):
         reason = TelegramAdapter._wisdom_candidate_qualification_reason("refinement")
@@ -487,6 +531,9 @@ class TestTelegramApprovalCallback:
         assert "Approve &amp; publish" in html
         assert "https://portal.test/review/draft-1" in html
         assert "wi:decline:event-1" in html
+        assert html.index("Decline") < html.index("View") < html.index(
+            "Approve &amp; publish"
+        )
 
     @pytest.mark.asyncio
     async def test_wisdom_candidate_publish_callback_reports_moderation_state(self):

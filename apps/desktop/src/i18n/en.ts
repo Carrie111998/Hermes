@@ -1427,6 +1427,9 @@ export const en: Translations = {
       serverScanPassed: 'server scan passed',
       localOnly: 'Available to share from this device.',
       qualifiedLocally: 'Hermes identified this local skill as a possible contribution.',
+      qualificationFirst: organizationName =>
+        `${organizationName ? `Your organisation (${organizationName})` : 'Your organisation'} has enabled Collective Wisdom, a feature designed to automatically detect useful skills across all team members. Congratulations! Hermes detected a skill that could be useful to your team.`,
+      qualificationReturning: 'Hermes detected another skill that could be useful to your team.',
       savedLocally: 'A private draft is saved on this device.',
       prepare: 'Start contribution',
       continueDraft: 'Continue draft',
@@ -1459,7 +1462,7 @@ export const en: Translations = {
       ownerDescription: 'Owner-authored description',
       systemSpecification: 'System Specification',
       cancel: 'Cancel',
-      submit: 'Submit for owner-only server review',
+      submit: 'Submit draft',
       submitting: 'Submitting…',
       readEvery: 'Read every file. Approval is bound to the exact three hashes below.',
       editReview:
@@ -1480,7 +1483,7 @@ export const en: Translations = {
       preparingLocal: 'Preparing an editable local review…',
       whySuggested: 'Why Hermes suggested this skill',
       proposalNotice:
-        'Hermes recognized a reusable skill after this task. Its qualification reasons stay on this device; nothing is shared until you review and approve the exact package.',
+        'Its qualification reasons stay on this device; nothing is shared until you review and approve the exact package.',
       openCollective: 'Open Collective',
       prepareExact: 'Review & edit',
       skillName: 'Skill name',
@@ -1491,7 +1494,7 @@ export const en: Translations = {
       specificationNotice:
         'Review the owner-authored copy and declarative System Specification. No dependency action is authorized.',
       openFullReview: 'Open full review',
-      sendPrivateReview: 'Continue to approval',
+      sendPrivateReview: 'Submit draft',
       saveLocal: 'Save',
       savingLocal: 'Saving…',
       source: 'Source',

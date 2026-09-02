@@ -14,7 +14,10 @@ from gateway.wisdom_command import (
     WisdomView,
 )
 from plugins.platforms.slack.adapter import SlackAdapter
-from plugins.platforms.slack.wisdom_blocks import render_wisdom_blocks
+from plugins.platforms.slack.wisdom_blocks import (
+    render_wisdom_blocks,
+    wisdom_fallback_text,
+)
 
 
 def _adapter() -> SlackAdapter:
@@ -56,6 +59,36 @@ def test_wisdom_blocks_render_details_and_inline_actions():
     assert buttons[0]["value"] == "wi:cmd:opaque"
     assert buttons[0]["style"] == "primary"
     assert buttons[1]["url"] == "https://portal.test/s/1"
+
+
+def test_candidate_card_uses_returning_copy_and_requested_action_order():
+    adapter = _adapter()
+    view = adapter._wisdom_candidate_view(
+        skill_name="incident-handoff",
+        qualification="high_usage",
+        status=(
+            "Hermes detected another skill that could be useful to your team.\n\n"
+            "Nothing is shared until you choose an action."
+        ),
+        actions=[
+            WisdomAction("Decline", callback_data="wi:decline:event-2", destructive=True),
+            WisdomAction("Submit draft", callback_data="wi:draft:event-2"),
+            WisdomAction(
+                "Approve & publish",
+                callback_data="wi:publish:event-2",
+                primary=True,
+            ),
+        ],
+    )
+
+    blocks = render_wisdom_blocks(view)
+    action_block = next(block for block in blocks if block["type"] == "actions")
+    assert [button["text"]["text"] for button in action_block["elements"]] == [
+        "Decline",
+        "Submit draft",
+        "Approve & publish",
+    ]
+    assert "Hermes detected *another* skill" in wisdom_fallback_text(view)
 
 
 def test_wisdom_blocks_escape_untrusted_skill_text_and_limit_items():

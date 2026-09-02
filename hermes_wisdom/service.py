@@ -12,6 +12,7 @@ import tempfile
 import uuid
 import webbrowser
 from dataclasses import asdict
+from datetime import datetime, timedelta, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any
 from urllib.parse import parse_qs, quote, urlparse
@@ -64,6 +65,8 @@ WISDOM_DISCLOSURE = (
     "Candidate signals stay on this profile. Only owner-approved private draft bytes, "
     "author copy, manifest metadata, and managed-install state reach the Gateway."
 )
+ORGANIZATION_NAME_REFRESH = timedelta(days=1)
+ORGANIZATION_NAME_FAILURE_RETRY = timedelta(minutes=15)
 
 
 def _parse_package_manifest(raw: bytes) -> PackageManifest:
@@ -324,6 +327,89 @@ class WisdomService:
         return process_pending_reviews(
             self.store, max_jobs=max_jobs, review_id=review_id
         )
+
+    def organization_display_name(
+        self, *, organization_id: str | None = None, force: bool = False
+    ) -> str | None:
+        """Return a verified, cached organization name for local presentation."""
+
+        active_org_id = self.store.active_org_id()
+        target_org_id = organization_id or active_org_id
+        if target_org_id is None or target_org_id != active_org_id:
+            return None
+        cached = self.store.organization_display_name(target_org_id)
+        cached_name = (
+            str(cached["display_name"])
+            if cached and cached["display_name"]
+            else None
+        )
+        cached_resolved = bool(cached and cached.get("resolved"))
+        if cached and not force:
+            try:
+                checked_at = datetime.fromisoformat(str(cached["checked_at"]))
+                if checked_at.tzinfo is None:
+                    checked_at = checked_at.replace(tzinfo=timezone.utc)
+                ttl = (
+                    ORGANIZATION_NAME_REFRESH
+                    if cached_resolved
+                    else ORGANIZATION_NAME_FAILURE_RETRY
+                )
+                if datetime.now(timezone.utc) - checked_at < ttl:
+                    return cached_name
+            except (TypeError, ValueError):
+                pass
+        try:
+            from hermes_cli.nous_account import get_nous_portal_account_info
+
+            account = get_nous_portal_account_info(force_fresh=True)
+            verified_name = (
+                account.org_name.strip()
+                if account.org_id == target_org_id
+                and isinstance(account.org_name, str)
+                and account.org_name.strip()
+                else None
+            )
+        except Exception:
+            verified_name = None
+        self.store.record_organization_display_name_check(
+            target_org_id, verified_name
+        )
+        return verified_name or cached_name
+
+    def _project_candidate_event(
+        self, event: dict[str, Any], *, organization_name: str | None
+    ) -> dict[str, Any]:
+        sequence = int(event.get("qualification_sequence") or 1)
+        return {
+            **event,
+            "qualification_sequence": sequence,
+            "notice_variant": "first" if sequence == 1 else "returning",
+            "organization_name": organization_name,
+        }
+
+    def local_candidate_events(
+        self, *, session_id: str | None = None
+    ) -> list[dict[str, Any]]:
+        events = self.store.local_events(
+            kind="wisdom.candidate", session_id=session_id
+        )
+        organization_name = self.organization_display_name()
+        return [
+            self._project_candidate_event(event, organization_name=organization_name)
+            for event in events
+        ]
+
+    def pending_candidate_events(
+        self, *, session_id: str, surface: str
+    ) -> list[dict[str, Any]]:
+        events = self.store.pending_surface_events(
+            kind="wisdom.candidate", session_id=session_id, surface=surface
+        )
+        organization_name = self.organization_display_name()
+        return [
+            self._project_candidate_event(event, organization_name=organization_name)
+            for event in events
+        ]
 
     def candidate_professionalism_review(
         self, *, skill_id: str, content_hash: str
@@ -694,7 +780,7 @@ class WisdomService:
         candidates: list[dict[str, Any]] = []
         qualified = {
             (str(event["skill_id"]), str(event["content_hash"])): event
-            for event in self.store.local_events(kind="wisdom.candidate")
+            for event in self.local_candidate_events()
         }
         eligible_paths = self._eligible_paths()
         self.store.mark_missing_skills({str(path.resolve()) for path in eligible_paths})
@@ -746,6 +832,15 @@ class WisdomService:
                 ),
                 "qualification": (
                     str(event["qualification"]) if event else "manual_selection"
+                ),
+                "qualification_sequence": (
+                    int(event["qualification_sequence"]) if event else None
+                ),
+                "notice_variant": (
+                    str(event["notice_variant"]) if event else None
+                ),
+                "organization_name": (
+                    event.get("organization_name") if event else None
                 ),
                 "contribution_state": "prepared" if contribution else "new",
                 "professionalism_check": candidate_review,

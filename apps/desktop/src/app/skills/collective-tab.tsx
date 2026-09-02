@@ -6,8 +6,8 @@ import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
 import { Textarea } from '@/components/ui/textarea'
-import { WisdomNotificationsCard } from '@/components/wisdom-notifications-card'
 import { WisdomCheckBadge, WisdomReviewTables } from '@/components/wisdom-checks'
+import { WisdomNotificationsCard } from '@/components/wisdom-notifications-card'
 import {
   acknowledgeWisdomNotifications,
   applyWisdomInstall,
@@ -293,15 +293,18 @@ export function CollectiveTab({ profile, query }: { profile: ProfileScope; query
   }, [candidates, discovery, drafts])
 
   const candidateSummary = (candidate: WisdomCandidate): string => {
-    if (candidate.contribution_state === 'prepared') {
-      return copy.savedLocally
-    }
-
     if (candidate.eligibility !== 'eligible') {
       return candidate.reason || copy.localOnly
     }
 
-    return candidate.qualification === 'manual_selection' ? copy.localOnly : copy.qualifiedLocally
+    const qualification =
+      candidate.qualification === 'manual_selection'
+        ? copy.localOnly
+        : candidate.notice_variant === 'first'
+          ? copy.qualificationFirst(candidate.organization_name)
+          : copy.qualificationReturning
+
+    return candidate.contribution_state === 'prepared' ? `${qualification} ${copy.savedLocally}` : qualification
   }
 
   const prepare = async (candidate: WisdomCandidate) => {
@@ -977,12 +980,12 @@ export function CollectiveTab({ profile, query }: { profile: ProfileScope; query
                   {String(detail.data.skill.authorDescription || detail.data.skill.author_description || '')}
                 </p>
                 <WisdomReviewTables
-                  security={
-                    asRecord(asRecord(detail.data.latest_version_detail).version).security_check as
-                      WisdomReviewCheck | undefined
-                  }
                   professionalism={
                     asRecord(asRecord(detail.data.latest_version_detail).version).professionalism_check as
+                      WisdomReviewCheck | undefined
+                  }
+                  security={
+                    asRecord(asRecord(detail.data.latest_version_detail).version).security_check as
                       WisdomReviewCheck | undefined
                   }
                 />

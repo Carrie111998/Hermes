@@ -386,6 +386,9 @@ export const ja: Translations = {
       continueDraft: 'ドラフトを続ける',
       localOnly: 'このデバイスから共有できます',
       qualifiedLocally: 'Hermes がこのローカルスキルを貢献候補として認識しました。',
+      qualificationFirst: organizationName =>
+        `${organizationName ? `あなたの組織（${organizationName}）` : 'あなたの組織'}では、チーム全体から役立つスキルを自動検出する Collective Wisdom が有効になっています。おめでとうございます。Hermes がチームに役立つ可能性のあるスキルを検出しました。`,
+      qualificationReturning: 'Hermes がチームに役立つ可能性のある別のスキルを検出しました。',
       savedLocally: '非公開ドラフトがこのデバイスに保存されています。',
       reviewExact: '詳細を表示',
       draftState: state => {
@@ -418,7 +421,7 @@ export const ja: Translations = {
       systemSpecification: 'システム仕様（宣言的メタデータ。依存関係はインストールされません）',
       localOverlay: 'ローカルオーバーレイ',
       cancel: 'キャンセル',
-      submit: '所有者限定のサーバーレビューに提出',
+      submit: '下書きを提出',
       submitting: '提出中…',
       publishing: '公開中…',
       approve: '正確な内容を承認して公開',

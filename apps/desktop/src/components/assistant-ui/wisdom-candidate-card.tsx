@@ -233,6 +233,10 @@ export function WisdomCandidateCard({ profile, sessionId }: { profile?: ProfileS
   }
 
   const skill = event.payload.skill_name
+
+  const qualificationNotice =
+    event.notice_variant === 'first' ? copy.qualificationFirst(event.organization_name) : copy.qualificationReturning
+
   const preparedManifest = preparedFiles['skill.manifest.json'] || ''
   const preparedManifestError = prepared ? wisdomManifestValidationError(preparedManifest) : null
   const preparedSkillName = manifestName(preparedManifest)
@@ -413,9 +417,13 @@ export function WisdomCandidateCard({ profile, sessionId }: { profile?: ProfileS
         </span>
       </header>
 
+      <div className="border-b border-(--ui-stroke-tertiary) px-4 py-3">
+        <p className="text-xs leading-5">{qualificationNotice}</p>
+        <p className="mt-1 text-xs text-muted-foreground">{copy.proposalNotice}</p>
+      </div>
+
       {!prepared && !review && (
         <div className="p-4">
-          <p className="text-xs text-muted-foreground">{copy.proposalNotice}</p>
           {busy === 'prepare' && <p className="mt-3 text-xs">{copy.preparingLocal}</p>}
           {preparationError && (
             <div className="mt-3 text-xs text-destructive" role="alert">
@@ -552,11 +560,8 @@ export function WisdomCandidateCard({ profile, sessionId }: { profile?: ProfileS
             </div>
           )}
 
-          <footer className="mt-3 flex flex-wrap justify-end gap-2 border-t border-(--ui-stroke-tertiary) pt-3">
-            <span className="mr-auto self-center">{fullReviewLink}</span>
-            <Button disabled={busy !== null} onClick={() => void decline()} size="sm" variant="outline">
-              {copy.decline}
-            </Button>
+          <div className="mt-3 flex flex-wrap items-center justify-between gap-2 border-t border-(--ui-stroke-tertiary) pt-3">
+            {fullReviewLink}
             {!editorOpen ? (
               <Button aria-expanded={false} disabled={busy !== null} onClick={() => setEditorOpen(true)} size="sm">
                 {copy.prepareExact}
@@ -582,15 +587,25 @@ export function WisdomCandidateCard({ profile, sessionId }: { profile?: ProfileS
                 >
                   {busy === 'save-local' ? copy.savingLocal : copy.saveLocal}
                 </Button>
-                <Button
-                  disabled={busy !== null || preparedDirty || Boolean(preparedManifestError)}
-                  onClick={() => void submit()}
-                  size="sm"
-                >
-                  {busy === 'submit' ? copy.submitting : copy.sendPrivateReview}
-                </Button>
               </>
             )}
+          </div>
+          <footer className="mt-3 grid grid-cols-3 items-center gap-2">
+            <div className="justify-self-start">
+              <Button disabled={busy !== null} onClick={() => void decline()} size="sm" variant="outline">
+                {copy.decline}
+              </Button>
+            </div>
+            <div className="justify-self-center">
+              <Button
+                disabled={busy !== null || preparedDirty || Boolean(preparedManifestError)}
+                onClick={() => void submit()}
+                size="sm"
+              >
+                {busy === 'submit' ? copy.submitting : copy.sendPrivateReview}
+              </Button>
+            </div>
+            <span aria-hidden="true" />
           </footer>
         </div>
       )}
@@ -720,43 +735,49 @@ export function WisdomCandidateCard({ profile, sessionId }: { profile?: ProfileS
             </div>
           )}
 
-          <footer className="mt-3 flex flex-wrap justify-end gap-2 border-t border-(--ui-stroke-tertiary) pt-3">
-            <span className="mr-auto self-center">{fullReviewLink}</span>
-            <Button disabled={busy !== null} onClick={() => void decline()} size="sm" variant="outline">
-              {copy.decline}
-            </Button>
-            {!editorOpen ? (
-              <Button aria-expanded={false} disabled={busy !== null} onClick={() => setEditorOpen(true)} size="sm">
-                {copy.prepareExact}
+          <div className="mt-3 border-t border-(--ui-stroke-tertiary) pt-3">{fullReviewLink}</div>
+          <footer className="mt-3 grid grid-cols-3 items-center gap-2">
+            <div className="justify-self-start">
+              <Button disabled={busy !== null} onClick={() => void decline()} size="sm" variant="outline">
+                {copy.decline}
               </Button>
-            ) : (
-              <>
-                <Button
-                  disabled={busy !== null}
-                  onClick={() => {
-                    setEditorOpen(false)
-                    setDetailedEditorOpen(false)
-                  }}
-                  size="sm"
-                  variant="outline"
-                >
-                  {copy.close}
+            </div>
+            <div className="flex flex-wrap justify-center gap-2">
+              {!editorOpen ? (
+                <Button aria-expanded={false} disabled={busy !== null} onClick={() => setEditorOpen(true)} size="sm">
+                  {copy.prepareExact}
                 </Button>
-                {reviewCanEdit && (
+              ) : (
+                <>
                   <Button
-                    disabled={busy !== null || !reviewDirty || Boolean(reviewManifestError)}
-                    onClick={() => void saveServerRevision()}
+                    disabled={busy !== null}
+                    onClick={() => {
+                      setEditorOpen(false)
+                      setDetailedEditorOpen(false)
+                    }}
                     size="sm"
                     variant="outline"
                   >
-                    {busy === 'save-server' ? copy.savingRevision : copy.saveAndRescan}
+                    {copy.close}
                   </Button>
-                )}
-                <Button disabled={busy !== null || reviewDirty} onClick={() => void approve()} size="sm">
-                  {busy === 'approve' ? copy.publishing : copy.approvePublish}
-                </Button>
-              </>
-            )}
+                  {reviewCanEdit && (
+                    <Button
+                      disabled={busy !== null || !reviewDirty || Boolean(reviewManifestError)}
+                      onClick={() => void saveServerRevision()}
+                      size="sm"
+                      variant="outline"
+                    >
+                      {busy === 'save-server' ? copy.savingRevision : copy.saveAndRescan}
+                    </Button>
+                  )}
+                </>
+              )}
+            </div>
+            <div className="justify-self-end">
+              <Button disabled={busy !== null || reviewDirty} onClick={() => void approve()} size="sm">
+                {busy === 'approve' ? copy.publishing : copy.approvePublish}
+              </Button>
+            </div>
           </footer>
         </div>
       )}

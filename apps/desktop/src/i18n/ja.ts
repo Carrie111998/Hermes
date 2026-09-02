@@ -1307,6 +1307,9 @@ export const ja = defineLocale({
       serverScanPassed: 'サーバースキャン合格',
       localOnly: 'このデバイスから共有できます。',
       qualifiedLocally: 'Hermes がこのローカルスキルを貢献候補として認識しました。',
+      qualificationFirst: organizationName =>
+        `${organizationName ? `あなたの組織（${organizationName}）` : 'あなたの組織'}では、チーム全体から役立つスキルを自動検出する Collective Wisdom が有効になっています。おめでとうございます。Hermes がチームに役立つ可能性のあるスキルを検出しました。`,
+      qualificationReturning: 'Hermes がチームに役立つ可能性のある別のスキルを検出しました。',
       savedLocally: '非公開ドラフトがこのデバイスに保存されています。',
       prepare: '貢献を開始',
       continueDraft: 'ドラフトを続ける',
@@ -1340,7 +1343,7 @@ export const ja = defineLocale({
       ownerDescription: '所有者による説明',
       systemSpecification: 'システム仕様',
       cancel: 'キャンセル',
-      submit: '所有者限定のサーバーレビューに提出',
+      submit: '下書きを提出',
       submitting: '提出中…',
       readEvery: 'すべてのファイルを確認してください。承認は下記の正確な3つのハッシュに紐づきます。',
       editReview:
@@ -1361,7 +1364,7 @@ export const ja = defineLocale({
       preparingLocal: '編集可能なローカルレビューを準備中…',
       whySuggested: 'Hermes がこのスキルを提案した理由',
       proposalNotice:
-        'Hermes がこのタスク後に再利用可能なスキルを認識しました。適格性の理由はこのデバイスだけに残り、正確なパッケージを確認して承認するまで何も共有されません。',
+        '適格性の理由はこのデバイスだけに残り、正確なパッケージを確認して承認するまで何も共有されません。',
       openCollective: 'コレクティブを開く',
       prepareExact: '確認して編集',
       skillName: 'スキル名',
@@ -1371,7 +1374,7 @@ export const ja = defineLocale({
       hideDetailedRequirements: '詳細な要件を閉じる',
       specificationNotice: '所有者による説明と宣言的なシステム仕様を確認してください。依存関係の操作は許可されません。',
       openFullReview: '完全なレビューを開く',
-      sendPrivateReview: '承認へ進む',
+      sendPrivateReview: '下書きを提出',
       saveLocal: '保存',
       savingLocal: '保存中…',
       source: 'ソース',

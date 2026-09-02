@@ -1605,6 +1605,9 @@ export const zh: Translations = {
       serverScanPassed: '服务器扫描已通过',
       localOnly: '可从此设备共享。',
       qualifiedLocally: 'Hermes 将此本地技能识别为可能的贡献。',
+      qualificationFirst: organizationName =>
+        `${organizationName ? `您的组织（${organizationName}）` : '您的组织'}已启用 Collective Wisdom，此功能会自动发现所有团队成员的实用技能。恭喜！Hermes 检测到一项可能对您的团队有用的技能。`,
+      qualificationReturning: 'Hermes 又检测到一项可能对您的团队有用的技能。',
       savedLocally: '私有草稿已保存在此设备上。',
       prepare: '开始贡献',
       continueDraft: '继续编辑草稿',
@@ -1637,7 +1640,7 @@ export const zh: Translations = {
       ownerDescription: '所有者撰写的描述',
       systemSpecification: '系统规格',
       cancel: '取消',
-      submit: '提交到仅所有者可见的服务器审核',
+      submit: '提交草稿',
       submitting: '正在提交…',
       readEvery: '请阅读每个文件。批准将绑定到下方三个准确哈希值。',
       editReview:
@@ -1657,8 +1660,7 @@ export const zh: Translations = {
       localSuggestion: '可供你审核',
       preparingLocal: '正在准备可编辑的本地审核…',
       whySuggested: 'Hermes 推荐此技能的原因',
-      proposalNotice:
-        'Hermes 在此任务后识别到一个可复用技能。资格原因只保留在此设备上；在你审核并批准准确包之前，不会共享任何内容。',
+      proposalNotice: '资格原因只保留在此设备上；在你审核并批准准确包之前，不会共享任何内容。',
       openCollective: '打开集体',
       prepareExact: '审核并编辑',
       skillName: '技能名称',
@@ -1667,7 +1669,7 @@ export const zh: Translations = {
       hideDetailedRequirements: '收起详细要求',
       specificationNotice: '请审核所有者撰写的文案和声明式系统规格。此操作不会授权执行任何依赖项。',
       openFullReview: '打开完整审核',
-      sendPrivateReview: '继续审批',
+      sendPrivateReview: '提交草稿',
       saveLocal: '保存',
       savingLocal: '正在保存…',
       source: '源文件',

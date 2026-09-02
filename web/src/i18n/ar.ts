@@ -330,6 +330,9 @@ export const ar = defineLocale({
       continueDraft: 'متابعة المسودة',
       localOnly: 'متاحة للمشاركة من هذا الجهاز',
       qualifiedLocally: 'حدّد Hermes هذه المهارة المحلية كمساهمة محتملة.',
+      qualificationFirst: organizationName =>
+        `${organizationName ? `فعّلت مؤسستك (${organizationName})` : 'فعّلت مؤسستك'} Collective Wisdom، وهي ميزة مصممة لاكتشاف المهارات المفيدة تلقائيًا لدى جميع أعضاء الفريق. تهانينا! اكتشف Hermes مهارة قد تكون مفيدة لفريقك.`,
+      qualificationReturning: 'اكتشف Hermes مهارة أخرى قد تكون مفيدة لفريقك.',
       savedLocally: 'تم حفظ مسودة خاصة على هذا الجهاز.',
       reviewExact: 'عرض التفاصيل',
       draftState: (state: string) => {
@@ -362,7 +365,7 @@ export const ar = defineLocale({
       systemSpecification: 'مواصفات النظام (بيانات تعريفية تصريحية؛ لا يتم تثبيت أي تبعيات)',
       localOverlay: 'التراكب المحلي',
       cancel: 'إلغاء',
-      submit: 'إرسال لمراجعة خادم خاصة بالمالك',
+      submit: 'إرسال المسودة',
       submitting: 'جارٍ الإرسال…',
       publishing: 'جارٍ النشر…',
       approve: 'الموافقة على المحتوى الدقيق ونشره',

@@ -387,6 +387,9 @@ export const uk: Translations = {
       continueDraft: 'Продовжити чернетку',
       localOnly: 'Можна поширити з цього пристрою',
       qualifiedLocally: 'Hermes визначив цю локальну навичку як можливий внесок.',
+      qualificationFirst: organizationName =>
+        `${organizationName ? `Ваша організація (${organizationName})` : 'Ваша організація'} увімкнула Collective Wisdom — функцію, яка автоматично знаходить корисні навички в усіх учасників команди. Вітаємо! Hermes виявив навичку, яка може бути корисною вашій команді.`,
+      qualificationReturning: 'Hermes виявив ще одну навичку, яка може бути корисною вашій команді.',
       savedLocally: 'Приватну чернетку збережено на цьому пристрої.',
       reviewExact: 'Переглянути деталі',
       draftState: state => {
@@ -419,7 +422,7 @@ export const uk: Translations = {
       systemSpecification: 'Специфікація системи (декларативні метадані; залежності не встановлюються)',
       localOverlay: 'Локальний шар',
       cancel: 'Скасувати',
-      submit: 'Надіслати на приватну серверну перевірку',
+      submit: 'Надіслати чернетку',
       submitting: 'Надсилання…',
       publishing: 'Публікація…',
       approve: 'Схвалити точний вміст і опублікувати',

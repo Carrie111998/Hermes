@@ -15568,13 +15568,9 @@ async def get_wisdom_candidates(profile: Optional[str] = None):
 async def get_wisdom_events(
     profile: Optional[str] = None, session_id: Optional[str] = None
 ):
-    def read(_service):
-        from hermes_wisdom.store import WisdomStore
-
+    def read(service):
         return {
-            "events": WisdomStore().local_events(
-                kind="wisdom.candidate", session_id=session_id
-            )
+            "events": service.local_candidate_events(session_id=session_id)
         }
 
     return await _run_wisdom(profile, read)

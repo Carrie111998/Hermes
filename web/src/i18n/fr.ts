@@ -388,6 +388,9 @@ export const fr: Translations = {
       continueDraft: 'Continuer le brouillon',
       localOnly: 'Peut être partagé depuis cet appareil',
       qualifiedLocally: 'Hermes a identifié cette compétence locale comme une contribution possible.',
+      qualificationFirst: organizationName =>
+        `${organizationName ? `Votre organisation (${organizationName})` : 'Votre organisation'} a activé Collective Wisdom, une fonctionnalité conçue pour détecter automatiquement les compétences utiles de tous les membres de l’équipe. Félicitations ! Hermes a détecté une compétence qui pourrait être utile à votre équipe.`,
+      qualificationReturning: 'Hermes a détecté une autre compétence qui pourrait être utile à votre équipe.',
       savedLocally: 'Un brouillon privé est enregistré sur cet appareil.',
       reviewExact: 'Voir les détails',
       draftState: state => {
@@ -420,7 +423,7 @@ export const fr: Translations = {
       systemSpecification: 'Spécification système (métadonnées déclaratives ; aucune dépendance n’est installée)',
       localOverlay: 'Superposition locale',
       cancel: 'Annuler',
-      submit: 'Soumettre à l’examen serveur privé',
+      submit: 'Soumettre le brouillon',
       submitting: 'Envoi…',
       publishing: 'Publication…',
       approve: 'Approuver le contenu exact et publier',

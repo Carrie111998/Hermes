@@ -386,6 +386,9 @@ export const ru: Translations = {
       continueDraft: 'Продолжить черновик',
       localOnly: 'Можно поделиться с этого устройства',
       qualifiedLocally: 'Hermes определил этот локальный навык как возможный вклад.',
+      qualificationFirst: organizationName =>
+        `${organizationName ? `Ваша организация (${organizationName})` : 'Ваша организация'} включила Collective Wisdom — функцию, которая автоматически находит полезные навыки у всех участников команды. Поздравляем! Hermes обнаружил навык, который может быть полезен вашей команде.`,
+      qualificationReturning: 'Hermes обнаружил ещё один навык, который может быть полезен вашей команде.',
       savedLocally: 'Приватный черновик сохранён на этом устройстве.',
       reviewExact: 'Показать детали',
       draftState: state => {
@@ -418,7 +421,7 @@ export const ru: Translations = {
       systemSpecification: 'Системная спецификация (декларативные метаданные; зависимости не устанавливаются)',
       localOverlay: 'Локальный слой',
       cancel: 'Отмена',
-      submit: 'Отправить на приватную серверную проверку',
+      submit: 'Отправить черновик',
       submitting: 'Отправка…',
       publishing: 'Публикация…',
       approve: 'Одобрить точное содержимое и опубликовать',

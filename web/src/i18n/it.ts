@@ -387,6 +387,9 @@ export const it: Translations = {
       continueDraft: 'Continua bozza',
       localOnly: 'Disponibile per la condivisione da questo dispositivo',
       qualifiedLocally: 'Hermes ha identificato questa competenza locale come possibile contributo.',
+      qualificationFirst: organizationName =>
+        `${organizationName ? `La tua organizzazione (${organizationName})` : 'La tua organizzazione'} ha attivato Collective Wisdom, una funzione progettata per rilevare automaticamente competenze utili tra tutti i membri del team. Congratulazioni! Hermes ha rilevato una competenza che potrebbe essere utile al tuo team.`,
+      qualificationReturning: 'Hermes ha rilevato un’altra competenza che potrebbe essere utile al tuo team.',
       savedLocally: 'Una bozza privata è salvata su questo dispositivo.',
       reviewExact: 'Visualizza dettagli',
       draftState: state => {
@@ -419,7 +422,7 @@ export const it: Translations = {
       systemSpecification: 'Specifica di sistema (metadati dichiarativi; non viene installata alcuna dipendenza)',
       localOverlay: 'Sovrapposizione locale',
       cancel: 'Annulla',
-      submit: 'Invia alla revisione privata del server',
+      submit: 'Invia bozza',
       submitting: 'Invio…',
       publishing: 'Pubblicazione…',
       approve: 'Approva il contenuto esatto e pubblica',

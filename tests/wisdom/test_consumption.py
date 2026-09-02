@@ -592,12 +592,12 @@ def test_telegram_update_available_offers_verified_update_action(
     assert calls[0]["button_rows"] == [
         [
             {
-                "label": "Update",
-                "callback_data": "wi:plan:update:skill-1",
-            },
-            {
                 "label": "View ↗",
                 "url": "https://portal.nousresearch.com/orgs/org-1/wisdom/skills/skill-1?version=2",
+            },
+            {
+                "label": "Update",
+                "callback_data": "wi:plan:update:skill-1",
             },
         ]
     ]
@@ -694,12 +694,12 @@ def test_notifications_resolve_org_skill_names_filter_noise_and_deep_link(
     assert calls[0]["button_rows"] == [
         [
             {
-                "label": "Install",
-                "callback_data": "wi:plan:install:remote-skill",
-            },
-            {
                 "label": "View ↗",
                 "url": "http://127.0.0.1:3111/orgs/org-1/wisdom/skills/remote-skill?version=3",
+            },
+            {
+                "label": "Install",
+                "callback_data": "wi:plan:install:remote-skill",
             },
         ]
     ]
@@ -862,7 +862,7 @@ def test_slack_dm_home_offers_verified_update_action(
     )
 
     assert manager.dispatch_slack() == {"attempted": True, "delivered": 1}
-    assert calls[0]["button_rows"][0][0] == {
+    assert calls[0]["button_rows"][0][-1] == {
         "label": "Update",
         "callback_data": "wi:plan:update:skill-1",
     }

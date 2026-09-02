@@ -22,6 +22,7 @@ from hermes_wisdom.client import (
     WisdomValidationError,
 )
 from hermes_wisdom.package import PackagePolicyError
+from hermes_wisdom.notice import qualification_notice
 from hermes_wisdom.review_presentation import (
     aggregate_review_text,
     full_review_text,
@@ -998,13 +999,6 @@ class WisdomCommandController:
             ]),
             actions=[
                 WisdomAction(
-                    "Install",
-                    "install_modes",
-                    {"reference": skill_id},
-                    primary=True,
-                    local_command=_wisdom_command("install", skill_id),
-                ),
-                WisdomAction(
                     "Versions",
                     "versions",
                     {"skill": skill_id},
@@ -1012,6 +1006,13 @@ class WisdomCommandController:
                 ),
                 WisdomAction(
                     "View in Portal ↗", url=self._portal_skill_url(service, skill_id)
+                ),
+                WisdomAction(
+                    "Install",
+                    "install_modes",
+                    {"reference": skill_id},
+                    primary=True,
+                    local_command=_wisdom_command("install", skill_id),
                 ),
             ],
         )
@@ -1097,8 +1098,16 @@ class WisdomCommandController:
             items=[
                 WisdomItem(
                     str(item["name"]),
-                    str(item.get("qualification") or "manual selection").replace(
-                        "_", " "
+                    (
+                        f"{qualification_notice(item)}\n"
+                        "Why suggested: "
+                        + str(item.get("qualification") or "manual selection").replace(
+                            "_", " "
+                        )
+                        if item.get("notice_variant")
+                        else str(
+                            item.get("qualification") or "manual selection"
+                        ).replace("_", " ")
                     ),
                     actions=[
                         WisdomAction(

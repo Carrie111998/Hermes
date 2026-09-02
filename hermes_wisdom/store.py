@@ -15,7 +15,7 @@ from typing import Any, Iterator
 from hermes_constants import get_hermes_home
 
 
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 
 
 def utc_now() -> str:
@@ -175,11 +175,12 @@ class WisdomStore:
                   skill_id TEXT NOT NULL,
                   content_hash TEXT NOT NULL,
                   qualification TEXT NOT NULL,
+                  organization_id TEXT,
+                  qualification_sequence INTEGER,
                   payload_json TEXT NOT NULL,
                   state TEXT NOT NULL,
                   telegram_delivered_at TEXT,
                   created_at TEXT NOT NULL,
-                  UNIQUE(kind, skill_id, content_hash, qualification),
                   FOREIGN KEY(skill_id) REFERENCES local_skill(id) ON DELETE CASCADE
                 );
                 CREATE TABLE IF NOT EXISTS local_event_delivery (
@@ -188,6 +189,12 @@ class WisdomStore:
                   delivered_at TEXT NOT NULL,
                   PRIMARY KEY(event_id, surface),
                   FOREIGN KEY(event_id) REFERENCES local_event(id) ON DELETE CASCADE
+                );
+                CREATE TABLE IF NOT EXISTS wisdom_organization (
+                  organization_id TEXT PRIMARY KEY,
+                  display_name TEXT,
+                  resolved INTEGER NOT NULL DEFAULT 0,
+                  checked_at TEXT NOT NULL
                 );
                 CREATE TABLE IF NOT EXISTS feed_state (
                   singleton INTEGER PRIMARY KEY CHECK(singleton=1),
@@ -348,6 +355,94 @@ class WisdomStore:
                 db.execute(
                     "ALTER TABLE local_event ADD COLUMN telegram_delivered_at TEXT"
                 )
+            if "organization_id" not in event_columns:
+                db.execute("ALTER TABLE local_event ADD COLUMN organization_id TEXT")
+            if "qualification_sequence" not in event_columns:
+                db.execute(
+                    "ALTER TABLE local_event ADD COLUMN qualification_sequence INTEGER"
+                )
+            organization_columns = {
+                str(row[1])
+                for row in db.execute(
+                    "PRAGMA table_info(wisdom_organization)"
+                ).fetchall()
+            }
+            if "resolved" not in organization_columns:
+                db.execute(
+                    "ALTER TABLE wisdom_organization "
+                    "ADD COLUMN resolved INTEGER NOT NULL DEFAULT 0"
+                )
+            active_org = db.execute(
+                "SELECT verified_org_id FROM installation_identity WHERE singleton=1"
+            ).fetchone()
+            active_org_id = str(active_org[0]) if active_org and active_org[0] else None
+            if active_org_id:
+                sequence_row = db.execute(
+                    "SELECT COALESCE(MAX(qualification_sequence),0) FROM local_event "
+                    "WHERE kind='wisdom.candidate' AND organization_id=?",
+                    (active_org_id,),
+                ).fetchone()
+                sequence = int(sequence_row[0]) if sequence_row else 0
+                legacy_events = db.execute(
+                    "SELECT id FROM local_event WHERE kind='wisdom.candidate' "
+                    "AND qualification_sequence IS NULL ORDER BY created_at,id"
+                ).fetchall()
+                for event in legacy_events:
+                    sequence += 1
+                    db.execute(
+                        "UPDATE local_event SET organization_id=?,qualification_sequence=? "
+                        "WHERE id=?",
+                        (active_org_id, sequence, event["id"]),
+                    )
+            event_sql = str(
+                db.execute(
+                    "SELECT sql FROM sqlite_master WHERE type='table' "
+                    "AND name='local_event'"
+                ).fetchone()[0]
+            ).replace("\n", " ")
+            if "UNIQUE(kind, skill_id, content_hash, qualification)" in event_sql:
+                db.executescript(
+                    """
+                    CREATE TEMP TABLE local_event_delivery_v9 AS
+                      SELECT * FROM local_event_delivery;
+                    CREATE TABLE local_event_v9 (
+                      id TEXT PRIMARY KEY,
+                      kind TEXT NOT NULL,
+                      session_id TEXT,
+                      task_id TEXT,
+                      skill_id TEXT NOT NULL,
+                      content_hash TEXT NOT NULL,
+                      qualification TEXT NOT NULL,
+                      organization_id TEXT,
+                      qualification_sequence INTEGER,
+                      payload_json TEXT NOT NULL,
+                      state TEXT NOT NULL,
+                      telegram_delivered_at TEXT,
+                      created_at TEXT NOT NULL,
+                      FOREIGN KEY(skill_id) REFERENCES local_skill(id) ON DELETE CASCADE
+                    );
+                    INSERT INTO local_event_v9
+                      SELECT id,kind,session_id,task_id,skill_id,content_hash,
+                        qualification,organization_id,qualification_sequence,
+                        payload_json,state,telegram_delivered_at,created_at
+                      FROM local_event;
+                    DROP TABLE local_event;
+                    ALTER TABLE local_event_v9 RENAME TO local_event;
+                    INSERT OR IGNORE INTO local_event_delivery
+                      SELECT * FROM local_event_delivery_v9;
+                    DROP TABLE local_event_delivery_v9;
+                    """
+                )
+            db.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS local_event_org_identity "
+                "ON local_event(kind,COALESCE(organization_id,''),skill_id,"
+                "content_hash,qualification)"
+            )
+            db.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS local_event_org_qualification_sequence "
+                "ON local_event(organization_id,qualification_sequence) "
+                "WHERE kind='wisdom.candidate' AND qualification_sequence IS NOT NULL"
+            )
             # Seed the transport-neutral delivery ledger from pre-v7 Telegram
             # timestamps. Keeping the legacy columns during the migration
             # window preserves older readers while Slack gains independent
@@ -620,10 +715,29 @@ class WisdomStore:
         qualification: str,
     ) -> str | None:
         event_id = str(uuid.uuid4())
+        now = utc_now()
         with self.transaction() as db:
+            organization_id: str | None = None
+            if kind == "wisdom.candidate":
+                organization = db.execute(
+                    "SELECT verified_org_id FROM installation_identity WHERE singleton=1"
+                ).fetchone()
+                organization_id = (
+                    str(organization[0])
+                    if organization is not None and organization[0]
+                    else None
+                )
+            existing = db.execute(
+                "SELECT 1 FROM local_event WHERE kind=? AND skill_id=? "
+                "AND content_hash=? AND qualification=? "
+                "AND COALESCE(organization_id,'')=COALESCE(?,'')",
+                (kind, skill_id, content_hash, qualification, organization_id),
+            ).fetchone()
+            if existing is not None:
+                return None
             cursor = db.execute(
                 "INSERT OR IGNORE INTO candidate VALUES(?,?,?,'suggested',?,NULL)",
-                (skill_id, content_hash, qualification, utc_now()),
+                (skill_id, content_hash, qualification, now),
             )
             if cursor.rowcount == 0:
                 row = db.execute(
@@ -632,11 +746,26 @@ class WisdomStore:
                 ).fetchone()
                 if row and row["state"] == "dismissed":
                     return None
+            qualification_sequence: int | None = None
+            if kind == "wisdom.candidate":
+                if organization_id is None:
+                    sequence_row = db.execute(
+                        "SELECT COALESCE(MAX(qualification_sequence),0) FROM local_event "
+                        "WHERE kind='wisdom.candidate' AND organization_id IS NULL"
+                    ).fetchone()
+                else:
+                    sequence_row = db.execute(
+                        "SELECT COALESCE(MAX(qualification_sequence),0) FROM local_event "
+                        "WHERE kind='wisdom.candidate' AND organization_id=?",
+                        (organization_id,),
+                    ).fetchone()
+                qualification_sequence = int(sequence_row[0]) + 1
             cursor = db.execute(
                 "INSERT OR IGNORE INTO local_event("
                 "id,kind,session_id,task_id,skill_id,content_hash,qualification,"
-                "payload_json,state,telegram_delivered_at,created_at"
-                ") VALUES(?,?,?,?,?,?,?,?,'unread',NULL,?)",
+                "organization_id,qualification_sequence,payload_json,state,"
+                "telegram_delivered_at,created_at"
+                ") VALUES(?,?,?,?,?,?,?,?,?,?,'unread',NULL,?)",
                 (
                     event_id,
                     kind,
@@ -645,8 +774,10 @@ class WisdomStore:
                     skill_id,
                     content_hash,
                     qualification,
+                    organization_id,
+                    qualification_sequence,
                     json.dumps(payload, sort_keys=True),
-                    utc_now(),
+                    now,
                 ),
             )
             return event_id if cursor.rowcount else None
@@ -666,6 +797,13 @@ class WisdomStore:
         if kind:
             query += " AND e.kind=?"
             params.append(kind)
+        if kind == "wisdom.candidate":
+            active_org_id = self.active_org_id()
+            if active_org_id is None:
+                query += " AND e.organization_id IS NULL"
+            else:
+                query += " AND e.organization_id=?"
+                params.append(active_org_id)
         if session_id:
             query += " AND e.session_id=?"
             params.append(session_id)
@@ -892,15 +1030,35 @@ class WisdomStore:
     ) -> list[dict[str, Any]]:
         """Return unread session events not yet delivered to one surface."""
         with self.transaction() as db:
+            organization = db.execute(
+                "SELECT verified_org_id FROM installation_identity WHERE singleton=1"
+            ).fetchone()
+            active_org_id = (
+                str(organization[0])
+                if organization is not None and organization[0]
+                else None
+            )
+            organization_clause = (
+                "AND e.organization_id=? "
+                if active_org_id is not None and kind == "wisdom.candidate"
+                else "AND e.organization_id IS NULL "
+                if kind == "wisdom.candidate"
+                else ""
+            )
+            params: list[str] = [kind, session_id]
+            if active_org_id is not None and kind == "wisdom.candidate":
+                params.append(active_org_id)
+            params.append(surface)
             rows = [
                 dict(row)
                 for row in db.execute(
                     "SELECT e.* FROM local_event e WHERE e.kind=? AND e.session_id=? "
-                    "AND e.state='unread' AND NOT EXISTS ("
+                    + organization_clause
+                    + "AND e.state='unread' AND NOT EXISTS ("
                     "SELECT 1 FROM local_event_delivery d "
                     "WHERE d.event_id=e.id AND d.surface=?"
                     ") ORDER BY e.created_at",
-                    (kind, session_id, surface),
+                    params,
                 ).fetchall()
             ]
         for row in rows:
@@ -1044,6 +1202,29 @@ class WisdomStore:
                 "SELECT verified_org_id FROM installation_identity WHERE singleton=1"
             ).fetchone()
             return str(row[0]) if row and row[0] else None
+
+    def organization_display_name(self, organization_id: str) -> dict[str, Any] | None:
+        with self.transaction() as db:
+            row = db.execute(
+                "SELECT display_name,resolved,checked_at FROM wisdom_organization "
+                "WHERE organization_id=?",
+                (organization_id,),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def record_organization_display_name_check(
+        self, organization_id: str, display_name: str | None
+    ) -> None:
+        normalized = display_name.strip()[:160] if display_name else None
+        with self.transaction() as db:
+            db.execute(
+                "INSERT INTO wisdom_organization(organization_id,display_name,resolved,checked_at) "
+                "VALUES(?,?,?,?) ON CONFLICT(organization_id) DO UPDATE SET "
+                "display_name=COALESCE(excluded.display_name,wisdom_organization.display_name),"
+                "resolved=excluded.resolved,"
+                "checked_at=excluded.checked_at",
+                (organization_id, normalized or None, int(bool(normalized)), utc_now()),
+            )
 
     def record_draft(self, values: dict[str, str]) -> None:
         now = utc_now()

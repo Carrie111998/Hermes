@@ -388,6 +388,9 @@ export const de: Translations = {
       continueDraft: 'Entwurf fortsetzen',
       localOnly: 'Kann von diesem Gerät geteilt werden',
       qualifiedLocally: 'Hermes hat diesen lokalen Skill als möglichen Beitrag erkannt.',
+      qualificationFirst: organizationName =>
+        `${organizationName ? `Deine Organisation (${organizationName})` : 'Deine Organisation'} hat Collective Wisdom aktiviert. Diese Funktion erkennt automatisch nützliche Skills aller Teammitglieder. Glückwunsch! Hermes hat einen Skill erkannt, der für dein Team nützlich sein könnte.`,
+      qualificationReturning: 'Hermes hat einen weiteren Skill erkannt, der für dein Team nützlich sein könnte.',
       savedLocally: 'Ein privater Entwurf ist auf diesem Gerät gespeichert.',
       reviewExact: 'Details anzeigen',
       draftState: state => {
@@ -421,7 +424,7 @@ export const de: Translations = {
       systemSpecification: 'Systemspezifikation (deklarative Metadaten; keine Abhängigkeiten werden installiert)',
       localOverlay: 'Lokale Überlagerung',
       cancel: 'Abbrechen',
-      submit: 'Zur privaten Serverprüfung einreichen',
+      submit: 'Entwurf einreichen',
       submitting: 'Wird eingereicht…',
       publishing: 'Wird veröffentlicht…',
       approve: 'Exakten Inhalt freigeben und veröffentlichen',

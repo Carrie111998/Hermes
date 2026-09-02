@@ -33,6 +33,9 @@ const candidate = {
   session_id: 'session-1',
   task_id: 'task-1',
   content_hash: 'sha256:local',
+  qualification_sequence: 1,
+  notice_variant: 'first',
+  organization_name: 'Nous Research',
   payload: {
     skill_name: 'safe-skill',
     qualification: 'meaningful_refinements',
@@ -147,6 +150,8 @@ describe('WisdomCandidateCard', () => {
     await renderCard()
 
     expect(await screen.findByRole('button', { name: 'Review & edit' })).toBeTruthy()
+    expect(screen.getByText(/Your organisation \(Nous Research\) has enabled Collective Wisdom/)).toBeTruthy()
+    expect(screen.getByText(/Congratulations! Hermes detected a skill/)).toBeTruthy()
     expect(screen.queryByDisplayValue('Owner copy')).toBeNull()
     expect(screen.queryByLabelText('Edit SKILL.md')).toBeNull()
     expect(screen.queryByText('Minimum Hermes version')).toBeNull()
@@ -191,7 +196,7 @@ describe('WisdomCandidateCard', () => {
     const localEditor = await screen.findByLabelText('Edit SKILL.md')
     fireEvent.change(screen.getByDisplayValue('safe-skill'), { target: { value: 'safer-skill' } })
     fireEvent.change(localEditor, { target: { value: '# Locally edited\n' } })
-    expect((screen.getByRole('button', { name: 'Continue to approval' }) as HTMLButtonElement).disabled).toBe(true)
+    expect((screen.getByRole('button', { name: 'Submit draft' }) as HTMLButtonElement).disabled).toBe(true)
     fireEvent.click(screen.getByRole('button', { name: 'Save' }))
     await waitFor(() =>
       expect(saveWisdomPreparedDraft).toHaveBeenCalledWith(
@@ -206,9 +211,9 @@ describe('WisdomCandidateCard', () => {
     )
 
     await waitFor(() =>
-      expect((screen.getByRole('button', { name: 'Continue to approval' }) as HTMLButtonElement).disabled).toBe(false)
+      expect((screen.getByRole('button', { name: 'Submit draft' }) as HTMLButtonElement).disabled).toBe(false)
     )
-    fireEvent.click(screen.getByRole('button', { name: 'Continue to approval' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Submit draft' }))
     expect(await screen.findByText(/sha256:draft-1-content/)).toBeTruthy()
     expect(suggestWisdomSkill.mock.calls[1][3]).toBe('local-skill-1')
 

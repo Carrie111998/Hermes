@@ -387,6 +387,9 @@ export const hu: Translations = {
       continueDraft: 'Piszkozat folytatása',
       localOnly: 'Erről az eszközről megosztható',
       qualifiedLocally: 'A Hermes ezt a helyi készséget lehetséges hozzájárulásként azonosította.',
+      qualificationFirst: organizationName =>
+        `${organizationName ? `A szervezeted (${organizationName})` : 'A szervezeted'} engedélyezte a Collective Wisdom funkciót, amely automatikusan felismeri a csapattagok hasznos készségeit. Gratulálunk! A Hermes olyan készséget talált, amely hasznos lehet a csapatodnak.`,
+      qualificationReturning: 'A Hermes egy újabb készséget talált, amely hasznos lehet a csapatodnak.',
       savedLocally: 'Ezen az eszközön privát piszkozat van mentve.',
       reviewExact: 'Részletek megtekintése',
       draftState: state => {
@@ -419,7 +422,7 @@ export const hu: Translations = {
       systemSpecification: 'Rendszerspecifikáció (deklaratív metaadatok; nem telepít függőségeket)',
       localOverlay: 'Helyi fedvény',
       cancel: 'Mégse',
-      submit: 'Beküldés privát szerveres ellenőrzésre',
+      submit: 'Piszkozat beküldése',
       submitting: 'Beküldés…',
       publishing: 'Közzététel…',
       approve: 'Pontos tartalom jóváhagyása és közzététele',

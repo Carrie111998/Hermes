@@ -154,7 +154,7 @@ def test_identity_rotation_is_atomic_with_org_activation(tmp_path: Path):
     assert store.active_org_id() == "org-2"
 
 
-def test_schema_v8_tracks_profile_local_usage_surface_delivery_and_reviews(
+def test_schema_v9_tracks_profile_local_usage_surface_delivery_reviews_and_notices(
     tmp_path: Path,
 ):
     store = WisdomStore(tmp_path / "wisdom")
@@ -177,6 +177,12 @@ def test_schema_v8_tracks_profile_local_usage_surface_delivery_and_reviews(
                 "PRAGMA table_info(professionalism_review)"
             ).fetchall()
         }
+        organization_columns = {
+            row[1]
+            for row in db.execute(
+                "PRAGMA table_info(wisdom_organization)"
+            ).fetchall()
+        }
         version = db.execute(
             "SELECT value FROM schema_meta WHERE key='schema_version'"
         ).fetchone()[0]
@@ -185,6 +191,8 @@ def test_schema_v8_tracks_profile_local_usage_surface_delivery_and_reviews(
     assert {"day_local", "timezone_name"} <= usage_columns
     assert "day_utc" not in usage_columns
     assert "telegram_delivered_at" in event_columns
+    assert {"organization_id", "qualification_sequence"} <= event_columns
+    assert {"display_name", "resolved", "checked_at"} <= organization_columns
     assert {
         "content_hash",
         "author_description_hash",
@@ -194,7 +202,184 @@ def test_schema_v8_tracks_profile_local_usage_surface_delivery_and_reviews(
         "lease_expires_at",
         "result_json",
     } <= review_columns
-    assert version == "8"
+    assert version == "9"
+
+
+def test_candidate_sequence_is_atomic_idempotent_and_scoped_by_organization(
+    tmp_path: Path,
+):
+    store = WisdomStore(tmp_path / "wisdom")
+    store.installation_identity()
+    store.verify_installation_identity("org-1")
+
+    def emit(name: str, content_hash: str) -> str | None:
+        path = tmp_path / name
+        path.mkdir(exist_ok=True)
+        (path / "SKILL.md").write_text(name, encoding="utf-8")
+        skill_id = store.register_skill(
+            path, content_hash=content_hash, source_kind="local"
+        )
+        return store.emit_local_event(
+            kind="wisdom.candidate",
+            skill_id=skill_id,
+            content_hash=content_hash,
+            payload={"skill_name": name},
+            session_id="session-1",
+            task_id="task-1",
+            qualification="high_usage",
+        )
+
+    first_id = emit("first", "sha256:first")
+    assert first_id is not None
+    assert emit("first", "sha256:first") is None
+    second_id = emit("second", "sha256:second")
+    assert second_id is not None
+
+    org_one = store.local_events(kind="wisdom.candidate")
+    assert [event["qualification_sequence"] for event in reversed(org_one)] == [1, 2]
+    assert {event["organization_id"] for event in org_one} == {"org-1"}
+
+    store.verify_installation_identity("org-2")
+    third_id = emit("third", "sha256:third")
+    assert third_id is not None
+    org_two = store.local_events(kind="wisdom.candidate")
+    assert [event["id"] for event in org_two] == [third_id]
+    assert org_two[0]["qualification_sequence"] == 1
+
+    store.verify_installation_identity("org-1")
+    assert {event["id"] for event in store.local_events(kind="wisdom.candidate")} == {
+        first_id,
+        second_id,
+    }
+
+
+def test_schema_v9_backfills_active_organization_events_chronologically(
+    tmp_path: Path,
+):
+    root = tmp_path / "wisdom"
+    store = WisdomStore(root)
+    store.installation_identity()
+    store.verify_installation_identity("org-1")
+    event_ids: list[str] = []
+    for index, name in enumerate(("older", "newer"), start=1):
+        path = tmp_path / name
+        path.mkdir()
+        (path / "SKILL.md").write_text(name, encoding="utf-8")
+        skill_id = store.register_skill(
+            path, content_hash=f"sha256:{name}", source_kind="local"
+        )
+        event_id = store.emit_local_event(
+            kind="wisdom.candidate",
+            skill_id=skill_id,
+            content_hash=f"sha256:{name}",
+            payload={"skill_name": name},
+            session_id="session-1",
+            task_id=f"task-{index}",
+            qualification="high_usage",
+        )
+        assert event_id is not None
+        event_ids.append(event_id)
+    with store.transaction() as db:
+        db.execute("DROP INDEX local_event_org_qualification_sequence")
+        db.execute(
+            "UPDATE local_event SET organization_id=NULL,qualification_sequence=NULL"
+        )
+        db.execute(
+            "UPDATE local_event SET created_at='2026-01-01T00:00:00+00:00' WHERE id=?",
+            (event_ids[0],),
+        )
+        db.execute(
+            "UPDATE local_event SET created_at='2026-01-02T00:00:00+00:00' WHERE id=?",
+            (event_ids[1],),
+        )
+
+    migrated = WisdomStore(root)
+    events = list(reversed(migrated.local_events(kind="wisdom.candidate")))
+    assert [event["id"] for event in events] == event_ids
+    assert [event["qualification_sequence"] for event in events] == [1, 2]
+    assert {event["organization_id"] for event in events} == {"org-1"}
+
+
+def test_schema_v9_rebuilds_legacy_event_identity_without_losing_delivery(
+    tmp_path: Path,
+):
+    root = tmp_path / "wisdom"
+    root.mkdir()
+    database = root / "wisdom.db"
+    with sqlite3.connect(database) as db:
+        db.executescript(
+            """
+            PRAGMA foreign_keys=ON;
+            CREATE TABLE local_skill (
+              id TEXT PRIMARY KEY,
+              canonical_path TEXT NOT NULL,
+              fs_identity TEXT,
+              current_hash TEXT,
+              source_kind TEXT NOT NULL,
+              deleted_at TEXT,
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL
+            );
+            CREATE TABLE installation_identity (
+              singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+              installation_id TEXT NOT NULL,
+              verified_org_id TEXT,
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL
+            );
+            CREATE TABLE local_event (
+              id TEXT PRIMARY KEY,
+              kind TEXT NOT NULL,
+              session_id TEXT,
+              task_id TEXT,
+              skill_id TEXT NOT NULL,
+              content_hash TEXT NOT NULL,
+              qualification TEXT NOT NULL,
+              payload_json TEXT NOT NULL,
+              state TEXT NOT NULL,
+              telegram_delivered_at TEXT,
+              created_at TEXT NOT NULL,
+              UNIQUE(kind, skill_id, content_hash, qualification),
+              FOREIGN KEY(skill_id) REFERENCES local_skill(id) ON DELETE CASCADE
+            );
+            CREATE TABLE local_event_delivery (
+              event_id TEXT NOT NULL,
+              surface TEXT NOT NULL,
+              delivered_at TEXT NOT NULL,
+              PRIMARY KEY(event_id, surface),
+              FOREIGN KEY(event_id) REFERENCES local_event(id) ON DELETE CASCADE
+            );
+            INSERT INTO local_skill VALUES(
+              'skill-1','/tmp/skill',NULL,'sha256:content','local',NULL,
+              '2026-01-01T00:00:00+00:00','2026-01-01T00:00:00+00:00'
+            );
+            INSERT INTO installation_identity VALUES(
+              1,'hwi_test','org-1','2026-01-01T00:00:00+00:00',
+              '2026-01-01T00:00:00+00:00'
+            );
+            INSERT INTO local_event VALUES(
+              'event-1','wisdom.candidate','session-1','task-1','skill-1',
+              'sha256:content','high_usage','{"skill_name":"skill"}',
+              'unread',NULL,'2026-01-01T00:00:00+00:00'
+            );
+            INSERT INTO local_event_delivery VALUES(
+              'event-1','telegram','2026-01-01T00:01:00+00:00'
+            );
+            """
+        )
+
+    store = WisdomStore(root)
+
+    with store.transaction() as db:
+        event = db.execute(
+            "SELECT organization_id,qualification_sequence FROM local_event "
+            "WHERE id='event-1'"
+        ).fetchone()
+        delivery = db.execute(
+            "SELECT surface FROM local_event_delivery WHERE event_id='event-1'"
+        ).fetchone()
+    assert tuple(event) == ("org-1", 1)
+    assert delivery["surface"] == "telegram"
 
 
 def test_professionalism_review_queue_is_hash_bound_idempotent_and_leased(
