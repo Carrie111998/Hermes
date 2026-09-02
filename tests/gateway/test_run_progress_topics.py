@@ -742,6 +742,80 @@ def test_all_mode_respects_custom_preview_length(monkeypatch, tmp_path):
     assert len(preview_text) <= 120, f"Preview too long ({len(preview_text)}): {preview_text}"
 
 
+def test_all_mode_zero_preview_length_means_unlimited(monkeypatch, tmp_path):
+    """``display.tool_preview_length: 0`` means unlimited, not the 40-char fallback.
+
+    agent/display.py documents 0 as "no limit" (set_tool_preview_max_len) and the
+    verbose-mode branch already honors it, but the all/new preview path used to
+    coerce 0 into a hardcoded 40-char cap, silently truncating gateway tool
+    previews for every deployment running the default config.
+    """
+    adapter, result = _run_long_preview_helper(monkeypatch, tmp_path, preview_length=0)
+    assert result["final_response"] == "done"
+    assert adapter.sent
+    content = adapter.sent[0]["content"]
+    preview_text = _extract_progress_preview(content)
+    assert preview_text is not None, f"No preview found in: {content}"
+    # The full command survives — no arbitrary 40-char cap.
+    assert LongPreviewAgent.LONG_CMD in content, (
+        f"Full command missing from progress content ({len(preview_text)} chars): {preview_text}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_zero_preview_length_terminal_block_shows_full_command(monkeypatch, tmp_path):
+    """On markdown-capable gateways, ``tool_preview_length: 0`` keeps the full
+    multi-line terminal command block in non-verbose modes (parity with the
+    verbose-mode behavior)."""
+    monkeypatch.setenv("HERMES_TOOL_PROGRESS_MODE", "all")
+
+    fake_dotenv = types.ModuleType("dotenv")
+    fake_dotenv.load_dotenv = lambda *args, **kwargs: None
+    monkeypatch.setitem(sys.modules, "dotenv", fake_dotenv)
+
+    fake_run_agent = types.ModuleType("run_agent")
+    fake_run_agent.AIAgent = TerminalCommandAgent
+    monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
+    import tools.terminal_tool  # noqa: F401 - register terminal emoji
+
+    import yaml
+    (tmp_path / "config.yaml").write_text(
+        yaml.dump({"display": {"tool_preview_length": 0}}),
+        encoding="utf-8",
+    )
+
+    adapter = CodeBlockProgressAdapter(platform=Platform.TELEGRAM)
+    runner = _make_runner(adapter)
+    gateway_run = importlib.import_module("gateway.run")
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "***"})
+
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="12345",
+        chat_type="dm",
+        thread_id=None,
+    )
+    result = await runner._run_agent(
+        message="hello",
+        context_prompt="",
+        history=[],
+        source=source,
+        session_id="sess-terminal-zero-preview",
+        session_key="agent:main:telegram:dm:12345",
+    )
+
+    assert result["final_response"] == "done"
+    all_content = " ".join(call["content"] for call in adapter.sent)
+    all_content += " ".join(call["content"] for call in adapter.edits)
+    # Every command line survives — the block was not collapsed to one line.
+    assert "set -euo pipefail" in all_content
+    assert "node --version" in all_content
+    assert "npm install -g hyperframes@latest" in all_content
+    # No truncation marker injected into the block.
+    assert "..." not in all_content
+
+
 def test_discord_truncated_tool_url_links_to_full_destination(monkeypatch, tmp_path):
     """The real gateway path must retain the URL beyond its visible cap."""
     import yaml
@@ -756,8 +830,11 @@ def test_discord_truncated_tool_url_links_to_full_destination(monkeypatch, tmp_p
     fake_run_agent.AIAgent = UrlPreviewAgent
     monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
 
+    # Explicit cap so the visible text truncates while the full URL must
+    # survive behind the link target (0 would mean unlimited now, and the
+    # URL would render in full without exercising the link-metadata path).
     (tmp_path / "config.yaml").write_text(
-        yaml.dump({"display": {"tool_preview_length": 0}}),
+        yaml.dump({"display": {"tool_preview_length": 40}}),
         encoding="utf-8",
     )
 

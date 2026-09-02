@@ -5040,17 +5040,24 @@ class TurnRunner:
                 "" if ctx.last_was_terminal_block[0] else f"{emoji} {tool_name}\n"
             )
             _code_block_full = f"{_block_header}```\n{_cmd_full}\n```"
-            # Single-line, capped preview for non-verbose modes.
+            # Single-line capped preview for non-verbose modes when a length is
+            # explicitly configured.  ``tool_preview_length: 0`` means unlimited
+            # (the same semantics as agent/display.py and the verbose-mode
+            # branch), so the full multi-line command block is shown instead of
+            # an arbitrary 40-char fallback.
             _pl = get_tool_preview_max_len()
-            _cap = _pl if _pl > 0 else 40
-            _lines = _cmd_full.splitlines()
-            _cmd_short = _lines[0] if _lines else _cmd_full
-            _multiline = len(_lines) > 1
-            if len(_cmd_short) > _cap:
-                _cmd_short = _cmd_short[:_cap - 3] + "..."
-            elif _multiline:
-                _cmd_short = _cmd_short + " ..."
-            _code_block_short = f"{_block_header}```\n{_cmd_short}\n```"
+            if _pl > 0:
+                _cap = _pl
+                _lines = _cmd_full.splitlines()
+                _cmd_short = _lines[0] if _lines else _cmd_full
+                _multiline = len(_lines) > 1
+                if len(_cmd_short) > _cap:
+                    _cmd_short = _cmd_short[:_cap - 3] + "..."
+                elif _multiline:
+                    _cmd_short = _cmd_short + " ..."
+                _code_block_short = f"{_block_header}```\n{_cmd_short}\n```"
+            else:
+                _code_block_short = _code_block_full
 
         # Verbose mode: show detailed arguments, respects tool_preview_length
         if ctx.progress_mode == "verbose":
@@ -5093,7 +5100,11 @@ class TurnRunner:
                 verb_drops_preview,
             )
             _pl = get_tool_preview_max_len()
-            _cap = _pl if _pl > 0 else 40
+            # tool_preview_length: 0 means unlimited (same semantics as
+            # agent/display.py) — pass it through so prepare_tool_preview's
+            # internal truncation skips capping instead of falling back to an
+            # arbitrary 40 chars.
+            _cap = _pl
             _prepared_preview = prepare_tool_preview(
                 tool_name,
                 args,
