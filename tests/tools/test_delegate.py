@@ -306,6 +306,8 @@ class TestDelegateTask(unittest.TestCase):
                 )
             self.assertIn("error", result)
             self.assertIn("live session owner changed", result["error"])
+            self.assertEqual(result["delegation_status"], "failed")
+            self.assertEqual(json.dumps(result).count('"delegation_status": "failed"'), 1)
             build.assert_not_called()
         finally:
             with server._sessions_lock:
@@ -354,6 +356,8 @@ class TestDelegateTask(unittest.TestCase):
                 )
             self.assertIn("error", result)
             self.assertIn("replaced or rebound", result["error"])
+            self.assertEqual(result["delegation_status"], "failed")
+            self.assertEqual(json.dumps(result).count('"delegation_status": "failed"'), 1)
             build.assert_not_called()
         finally:
             with server._sessions_lock:
@@ -438,6 +442,8 @@ class TestDelegateTask(unittest.TestCase):
                 )
             self.assertIn("error", result)
             self.assertIn("no child was spawned", result["error"])
+            self.assertEqual(result["delegation_status"], "failed")
+            self.assertEqual(json.dumps(result).count('"delegation_status": "failed"'), 1)
             build.assert_not_called()
         finally:
             with server._sessions_lock:

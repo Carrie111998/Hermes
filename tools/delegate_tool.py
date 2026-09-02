@@ -4175,6 +4175,33 @@ def delegate_task(
 
     _bound_run_binding = current_run_binding()
     _gateway_run_authority = current_gateway_run_authority()
+
+    def _publish_delegation_status(status: str) -> None:
+        """Publish terminal delegation state on the server-owned turn rail."""
+        try:
+            from gateway.session_context import set_delegation_status
+
+            set_delegation_status(status)
+        except Exception:
+            logger.debug("Could not publish delegation status", exc_info=True)
+
+    def _binding_projection() -> Optional[Dict[str, str]]:
+        if _bound_run_binding is None:
+            return None
+        return {
+            "repo": _bound_run_binding.repo_root,
+            "branch": _bound_run_binding.branch or _bound_run_binding.ref,
+            "sha": _bound_run_binding.short_head,
+        }
+
+    def _binding_refusal(message: str) -> str:
+        _publish_delegation_status("failed")
+        extra: Dict[str, Any] = {"delegation_status": "failed"}
+        projection = _binding_projection()
+        if projection is not None:
+            extra["run_binding"] = projection
+        return tool_error(message, **extra)
+
     _gateway_server = None
     try:
         from tui_gateway import server as _gateway_server
@@ -4194,7 +4221,7 @@ def delegate_task(
         # helper so a replaced or rebound row cannot pass on stale context.
         if not _bound_run_binding.ui_session_id and _gateway_run_authority is not None:
             if not _gateway_run_authority.validate():
-                return tool_error(
+                return _binding_refusal(
                     "Delegation refused: the originating live gateway session was "
                     "replaced or rebound after this turn was bound. Start a new "
                     "conversation turn."
@@ -4208,7 +4235,7 @@ def delegate_task(
             }
             _live_transport = _gateway_run_authority.transport
         elif _gateway_server is None:
-            return tool_error(
+            return _binding_refusal(
                 "Delegation refused: the live UI session authority is unavailable."
             )
         else:
@@ -4221,7 +4248,7 @@ def delegate_task(
                 or _authority_record is not _context_session_record
                 or _authority_transport is not _context_transport
             ):
-                return tool_error(
+                return _binding_refusal(
                     "Delegation refused: the live UI session was replaced or "
                     "rebound after this turn was bound. Start a new conversation turn."
                 )
@@ -4238,7 +4265,7 @@ def delegate_task(
                 for record in list(_gateway_server._sessions.values())
             )
         if not _registered:
-            return tool_error(
+            return _binding_refusal(
                 "Delegation refused: the originating live UI session is no "
                 "longer registered. Start a new conversation turn."
             )
@@ -4247,7 +4274,7 @@ def delegate_task(
         # SessionStore/adapter authority is the live owner registry instead;
         # validate it now, while still keeping Git capture lazy.
         if not _gateway_run_authority.validate():
-            return tool_error(
+            return _binding_refusal(
                 "Delegation refused: the originating live gateway session is no "
                 "longer current. Start a new conversation turn."
             )
@@ -4262,7 +4289,7 @@ def delegate_task(
 
     if _bound_run_binding is not None or _live_session_record is not None:
         if _live_session_record is None:
-            return tool_error(
+            return _binding_refusal(
                 "Delegation refused: the originating live session is no longer active."
             )
         _parent_task_id = getattr(parent_agent, "_current_task_id", None)
@@ -4306,7 +4333,7 @@ def delegate_task(
             if _bound_run_binding.profile != _live_profile:
                 _binding_drift.append("profile")
         if _binding_drift:
-            return tool_error(
+            return _binding_refusal(
                 "Delegation refused: the live session owner changed after this "
                 f"turn was bound ({', '.join(dict.fromkeys(_binding_drift))})."
             )
@@ -4345,7 +4372,7 @@ def delegate_task(
                 ),
             )
         except ValueError as exc:
-            return tool_error(
+            return _binding_refusal(
                 "Delegation refused: the selected live session must be attached "
                 "to a Git worktree. "
                 f"{exc}"
@@ -4353,7 +4380,7 @@ def delegate_task(
         if _bound_run_binding is not None:
             _binding_drift = list(_bound_run_binding.differences(_reprobed))
             if _binding_drift:
-                return tool_error(
+                return _binding_refusal(
                     "Delegation refused: the live session/worktree changed after "
                     f"this turn was bound ({', '.join(_binding_drift)}). "
                     f"Bound {_bound_run_binding.display()}; current {_reprobed.display()}. "
@@ -4370,7 +4397,7 @@ def delegate_task(
         except Exception:
             logger.debug("Could not publish gateway run binding", exc_info=True)
         if run_git(_binding_cwd, "status", "--porcelain", "--untracked-files=all"):
-            return tool_error(
+            return _binding_refusal(
                 "Delegation refused: the selected worktree has uncommitted changes. "
                 "Commit or clean it before delegating so the bound HEAD is complete."
             )
@@ -4438,7 +4465,7 @@ def delegate_task(
         from tools import subagent_worktree
 
         if not subagent_worktree.local_backend_active():
-            return tool_error(
+            return _binding_refusal(
                 "Delegation refused: bound runs require a local isolated Git "
                 "worktree, but the active terminal backend cannot create one."
             )
@@ -4457,7 +4484,7 @@ def delegate_task(
                 for _created in _precreated_worktrees:
                     if _created is not None:
                         subagent_worktree.finalize_subagent_worktree(_created)
-                return tool_error(
+                return _binding_refusal(
                     "Delegation refused: the bound Git worktree could not be "
                     "created; no child was spawned and the parent workspace "
                     "was not used as a fallback."
@@ -4513,7 +4540,7 @@ def delegate_task(
             for _created in _precreated_worktrees:
                 if _created is not None:
                     _sw.finalize_subagent_worktree(_created)
-            return tool_error(str(exc))
+            return _binding_refusal(str(exc))
         if i < len(_precreated_worktrees):
             child._bound_worktree_info = _precreated_worktrees[i]
         # Attach the validated schema for the completion-side validation
@@ -4738,9 +4765,20 @@ def delegate_task(
                     entry["live_transcript"] = live_paths[_idx]
         update_manifest_statuses(live_deleg_id, results)
 
+        # The child lifecycle owns this outcome.  The parent agent's generic
+        # ``failed`` flag describes the enclosing model turn and is not a
+        # delegation result, so never use it for the user-facing binding line.
+        _delegation_status = (
+            "completed"
+            if results and all(entry.get("status") == "completed" for entry in results)
+            else "failed"
+        )
+        _publish_delegation_status(_delegation_status)
+
         combined: Dict[str, Any] = {
             "results": results,
             "total_duration_seconds": total_duration,
+            "delegation_status": _delegation_status,
         }
         if _bound_run_binding is not None:
             combined["run_binding"] = {

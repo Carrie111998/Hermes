@@ -120,6 +120,9 @@ _CURRENT_RUN_BINDING: ContextVar[RunBinding | None] = ContextVar(
 _CURRENT_GATEWAY_RUN_AUTHORITY: ContextVar[GatewayRunAuthority | None] = ContextVar(
     "HERMES_CURRENT_GATEWAY_RUN_AUTHORITY", default=None
 )
+_CURRENT_DELEGATION_STATUS: ContextVar[str | None] = ContextVar(
+    "HERMES_CURRENT_DELEGATION_STATUS", default=None
+)
 
 # Process-level flag: has any code in this process bound a session via
 # set_session_vars()? Concurrent multi-session hosts (the messaging gateway, the
@@ -307,6 +310,17 @@ def current_gateway_run_authority() -> GatewayRunAuthority | None:
     return _CURRENT_GATEWAY_RUN_AUTHORITY.get()
 
 
+def set_delegation_status(status: str | None) -> object:
+    """Publish the server-owned terminal status for the current turn."""
+    if status not in (None, "completed", "failed"):
+        raise ValueError("delegation status must be completed, failed, or None")
+    return _CURRENT_DELEGATION_STATUS.set(status)
+
+
+def current_delegation_status() -> str | None:
+    return _CURRENT_DELEGATION_STATUS.get()
+
+
 @contextmanager
 def scoped_current_session_id(session_id: str | None = None) -> Iterator[None]:
     """Bind a task-local session id and restore the prior value on exit.
@@ -439,6 +453,7 @@ def clear_session_vars(tokens: list) -> None:
     _SESSION_ASYNC_DELIVERY.set(_UNSET)
     _CURRENT_RUN_BINDING.set(None)
     _CURRENT_GATEWAY_RUN_AUTHORITY.set(None)
+    _CURRENT_DELEGATION_STATUS.set(None)
     try:
         from agent.runtime_cwd import clear_session_cwd
 
@@ -489,6 +504,7 @@ def reset_session_vars() -> None:
     _SESSION_ASYNC_DELIVERY.set(_UNSET)
     _CURRENT_RUN_BINDING.set(None)
     _CURRENT_GATEWAY_RUN_AUTHORITY.set(None)
+    _CURRENT_DELEGATION_STATUS.set(None)
     try:
         from agent.runtime_cwd import clear_session_cwd
 

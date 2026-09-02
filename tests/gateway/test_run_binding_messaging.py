@@ -6,7 +6,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from gateway.config import Platform
-from gateway.run import GatewayRunner, TurnRunner
+from gateway.run import GatewayRunner, TurnRunner, _format_delegation_binding_line
 from gateway.session import SessionContext, SessionSource
 from gateway.session_context import reset_session_vars
 from tools.delegate_tool import delegate_task
@@ -82,6 +82,7 @@ def test_gateway_turn_binds_lazily_at_delegate_boundary():
             result = delegate_task(goal="Inspect the selected repository", parent_agent=parent)
 
         assert '"status": "completed"' in result
+        assert '"delegation_status": "completed"' in result
         build.assert_called_once()
         assert build.call_args.kwargs["run_binding"] is binding
     finally:
@@ -111,10 +112,11 @@ def test_final_adapter_delivery_keeps_binding_when_progress_is_off():
     adapter.extract_media.side_effect = lambda text: ([], text)
     adapter.send = AsyncMock()
     source = SessionSource(platform=Platform.TELEGRAM, chat_id="chat")
-    response = (
-        "The child completed the requested work.\n\n"
-        "🔀 delegation completed · repo=/workspace branch=main sha=abc123456789"
+    line = _format_delegation_binding_line(
+        {"repo": "/workspace", "branch": "main", "sha": "abc123456789"},
+        "completed",
     )
+    response = f"The child completed the requested work.\n\n{line}"
 
     # This is the existing final adapter path. No progress queue is involved;
     # progress display is off, but the final same-channel reply remains intact.
@@ -129,3 +131,27 @@ def test_final_adapter_delivery_keeps_binding_when_progress_is_off():
 
     adapter.send.assert_awaited_once()
     assert response in adapter.send.await_args.args
+    assert adapter.send.await_args.args[1].count("🔀 delegation") == 1
+
+
+def test_streaming_binding_trailing_delivery_is_exactly_once_when_progress_is_off():
+    runner = object.__new__(GatewayRunner)
+    adapter = MagicMock()
+    adapter.send = AsyncMock()
+    runner._adapter_for_source = lambda source: adapter
+    runner._thread_metadata_for_source = lambda source, anchor=None: {}
+    runner._reply_anchor_for_event = lambda event: None
+    source = SessionSource(platform=Platform.TELEGRAM, chat_id="chat")
+    event = SimpleNamespace()
+    line = _format_delegation_binding_line(
+        {"repo": "/workspace", "branch": "main", "sha": "abc123456789"},
+        "completed",
+    )
+
+    # This is the already_sent=True trailing adapter path.  There is no
+    # progress queue; the terminal binding is still delivered once.
+    asyncio.run(runner._send_delegation_binding_line(source, event, line))
+
+    adapter.send.assert_awaited_once()
+    assert adapter.send.await_args.args[1] == line
+    assert adapter.send.await_args.args[1].count("🔀 delegation") == 1
