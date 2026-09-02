@@ -1744,6 +1744,40 @@ def _build_audio_delivery_files(
 # ===========================================================================
 # Provider: Edge TTS (free)
 # ===========================================================================
+def _edge_tts_connector():
+    """Build a connector that enforces Hermes' configured CA bundle.
+
+    edge-tts supplies its own certifi-based SSL context on each request.  In
+    aiohttp, that request context takes precedence over a normal connector
+    context, so the connector must deliberately override it when Hermes has a
+    custom trust source.  Returning ``None`` preserves edge-tts' default
+    behavior when no valid custom CA is configured.
+    """
+    from agent.ssl_verify import resolve_httpx_verify
+
+    verify = resolve_httpx_verify()
+    if verify is True:
+        return None
+
+    import aiohttp
+
+    class _HermesCAConnector(aiohttp.TCPConnector):
+        def _get_ssl_context(self, req):
+            if not req.is_ssl():
+                return None
+            return verify
+
+        async def close(self, *, abort_ssl: bool = False) -> None:
+            # edge-tts creates an owning ClientSession for every text chunk.
+            # Keep this shared connector alive until the whole synthesis ends.
+            return None
+
+        async def close_from_hermes(self) -> None:
+            await super().close()
+
+    return _HermesCAConnector(ssl=verify)
+
+
 async def _generate_edge_tts(text: str, output_path: str, tts_config: Dict[str, Any]) -> str:
     """
     Generate audio using Edge TTS.
@@ -1766,8 +1800,16 @@ async def _generate_edge_tts(text: str, output_path: str, tts_config: Dict[str, 
         pct = round((speed - 1.0) * 100)
         kwargs["rate"] = f"{pct:+d}%"
 
-    communicate = _edge_tts.Communicate(text, **kwargs)
-    await communicate.save(output_path)
+    connector = _edge_tts_connector()
+    if connector is not None:
+        kwargs["connector"] = connector
+
+    try:
+        communicate = _edge_tts.Communicate(text, **kwargs)
+        await communicate.save(output_path)
+    finally:
+        if connector is not None:
+            await connector.close_from_hermes()
     return output_path
 
 
