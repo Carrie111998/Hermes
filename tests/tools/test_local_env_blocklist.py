@@ -585,6 +585,25 @@ class TestActiveVenvMarkerStripping:
         assert "VIRTUAL_ENV" not in result
         assert "CONDA_PREFIX" not in result
 
+    def test_session_env_cannot_reintroduce_active_venv_markers(self):
+        """Terminal session overrides must not bypass the runtime guard.
+
+        ``_make_run_env`` merges the session environment after the gateway's
+        process environment.  Keep the stripping step after that merge so a
+        coding session cannot point package managers back at the live Hermes
+        environment.
+        """
+        from tools.environments.local import _make_run_env
+
+        session_env = {
+            "VIRTUAL_ENV": "/home/user/.hermes/hermes-agent/venv",
+            "CONDA_PREFIX": "/opt/conda/envs/hermes",
+        }
+        with patch.dict(os.environ, {"PATH": "/usr/bin"}, clear=True):
+            result = _make_run_env(session_env)
+        assert "VIRTUAL_ENV" not in result
+        assert "CONDA_PREFIX" not in result
+
     def test_sanitize_subprocess_env_strips_markers(self):
         from tools.environments.local import _sanitize_subprocess_env
         base = {"VIRTUAL_ENV": "/venv", "CONDA_PREFIX": "/conda", "HOME": "/home/user"}

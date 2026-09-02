@@ -5364,7 +5364,9 @@ class BasePlatformAdapter(ABC):
         partition lives in ``gateway/run.py``.
 
         Paths inside fenced code blocks (``` ... ```) and inline code
-        (`...`) are ignored so that code samples are never mutilated.
+        (`...`) are ignored so that code samples are never mutilated.  The
+        one exception is a reply whose entire non-whitespace content is a
+        single backtick-wrapped path: that is treated as an artifact handoff.
 
         Returns:
             Tuple of (list of expanded file paths, cleaned text with the
@@ -5382,24 +5384,49 @@ class BasePlatformAdapter(ABC):
             re.IGNORECASE,
         )
 
-        # Build spans covered by fenced code blocks and inline code
+        # Build spans covered by fenced code blocks and inline code. A lone
+        # backtick-wrapped path is a special case: models commonly format the
+        # final artifact path as inline code, but when that path is the entire
+        # response it is an attachment handoff rather than a code sample.
+        # Preserve the surrounding-prose exclusion below.
+        stripped = content.strip()
+        lone_inline_path_span: tuple[int, int] | None = None
+        lone_inline_cleanup: str | None = None
+        if (
+            len(stripped) > 2
+            and stripped.startswith('`')
+            and stripped.endswith('`')
+            and path_re.fullmatch(stripped[1:-1])
+        ):
+            leading_ws = len(content) - len(content.lstrip())
+            lone_inline_path_span = (
+                leading_ws + 1,
+                leading_ws + len(stripped) - 1,
+            )
+            lone_inline_cleanup = stripped
+
         code_spans: list = []
         for m in re.finditer(r'```[^\n]*\n.*?```', content, re.DOTALL):
             code_spans.append((m.start(), m.end()))
         for m in re.finditer(r'`[^`\n]+`', content):
+            if lone_inline_path_span == (m.start() + 1, m.end() - 1):
+                continue
             code_spans.append((m.start(), m.end()))
 
         def _in_code(pos: int) -> bool:
             return any(s <= pos < e for s, e in code_spans)
 
-        found: list = []  # (raw_match_text, expanded_path)
+        found: list = []  # (text_to_remove, expanded_path)
         for match in path_re.finditer(content):
             if _in_code(match.start()):
                 continue
             raw = match.group(0)
             expanded = os.path.expanduser(raw)
             if os.path.isfile(expanded):
-                found.append((raw, expanded))
+                cleanup_text = raw
+                if lone_inline_path_span == (match.start(), match.end()):
+                    cleanup_text = lone_inline_cleanup or raw
+                found.append((cleanup_text, expanded))
             else:
                 # The reply mentions a deliverable-looking path that does not
                 # exist on disk, so it is silently dropped from native delivery.

@@ -137,6 +137,25 @@ class TestCodeBlockExclusion:
         assert paths == []
         assert "`/tmp/image.png`" in cleaned
 
+    def test_lone_backtick_wrapped_path_is_delivered(self):
+        """A response containing only an artifact path should upload it.
+
+        Models commonly wrap a final path in inline-code formatting.  That is
+        an attachment handoff, not a code sample, when it is the entire reply.
+        The wrapper must disappear with the delivered path so the user does
+        not receive an orphaned pair of backticks.
+        """
+        paths, cleaned = _extract("  `/tmp/report.html`\n")
+        assert paths == ["/tmp/report.html"]
+        assert cleaned == ""
+
+    def test_nonexistent_lone_backtick_path_remains_visible(self):
+        """Do not erase a promised artifact that is missing on disk."""
+        content = "`/tmp/missing-report.html`"
+        paths, cleaned = _extract(content, existing_files=set())
+        assert paths == []
+        assert cleaned == content
+
 
 # ---------------------------------------------------------------------------
 # Deduplication
