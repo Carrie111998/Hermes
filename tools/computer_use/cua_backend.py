@@ -4079,9 +4079,11 @@ class CuaDriverBackend(ComputerUseBackend):
            supplied. Returns an explicit 'stale' error if the snapshot
            has been superseded."
 
-        Gated on the per-tool capability claim so we don't send the
-        field to drivers that predate the surface (which would reject
-        the schema with `additionalProperties: false`).
+        Compatible drivers expose `element_token` either through the
+        capability list or directly in the live tool schema. The schema is
+        authoritative when capability metadata is absent; older drivers that
+        accept neither remain untouched because they commonly reject unknown
+        fields with `additionalProperties: false`.
         """
         idx = args.get("element_index")
         if not isinstance(idx, int):
@@ -4089,9 +4091,10 @@ class CuaDriverBackend(ComputerUseBackend):
         token = self._snapshot_tokens.get(idx)
         if not token:
             return
-        if not self._session.supports_capability(
+        supports_tokens = self._session.supports_capability(
             "accessibility.element_tokens", tool=tool
-        ):
+        ) or self._session.supports_input_property(tool, "element_token")
+        if not supports_tokens:
             return
         args["element_token"] = token
 

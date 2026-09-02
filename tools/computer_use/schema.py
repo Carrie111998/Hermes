@@ -110,9 +110,8 @@ COMPUTER_USE_SCHEMA: Dict[str, Any] = {
             "element": {
                 "type": "integer",
                 "description": (
-                    "The 1-based SOM index returned by the last "
-                    "`capture(mode='som')` call. Strongly preferred over "
-                    "raw coordinates."
+                    "The 0-based element index from the last capture, passed "
+                    "exactly as returned. Strongly preferred over raw coordinates."
                 ),
             },
             "coordinate": {
@@ -121,9 +120,10 @@ COMPUTER_USE_SCHEMA: Dict[str, Any] = {
                 "minItems": 2,
                 "maxItems": 2,
                 "description": (
-                    "Pixel coordinates [x, y] relative to the captured window "
-                    "screenshot (top-left origin). Only use this if no element "
-                    "index is available."
+                    "Native desktop coordinates [x, y], preferably derived "
+                    "from returned element bounds. They are not necessarily "
+                    "screenshot pixels on scaled displays. Only use this if "
+                    "no element index is available."
                 ),
             },
             "button": {
@@ -151,13 +151,13 @@ COMPUTER_USE_SCHEMA: Dict[str, Any] = {
                 "type": "array",
                 "items": {"type": "integer"},
                 "minItems": 2, "maxItems": 2,
-                "description": "Source [x,y] (drag; use when no element available).",
+                "description": "Source native desktop [x,y] (use when no element is available).",
             },
             "to_coordinate": {
                 "type": "array",
                 "items": {"type": "integer"},
                 "minItems": 2, "maxItems": 2,
-                "description": "Target [x,y] (drag; use when no element available).",
+                "description": "Target native desktop [x,y] (use when no element is available).",
             },
             # ── scroll ─────────────────────────────────────────────
             "direction": {
