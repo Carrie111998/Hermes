@@ -16,14 +16,25 @@
  * attaches artifacts whose bytes match the recorded inventory — arbitrary
  * bytes with an aligned mtime cannot masquerade as the build.
  *
- * IMPORTANT ordering (the #100600 review's second blocker): the version-bump
- * commit in release.py creates a NEW HEAD, so a manifest built before
- * `release.py --publish` can never match. Build the DMG at the FINAL HEAD:
- * commit the bump first, then build, then publish. On the macOS release host:
+ * DIRTY-TREE REFUSAL: a manifest written over uncommitted source would
+ * attest a clean HEAD while packaging different bytes. Run
+ * `git status --porcelain` first and refuse on any output — the release
+ * gate then fails with "no build manifest", which is the honest outcome.
+ * EXCEPTION: the bundle directory itself (target/) is gitignored, so its
+ * contents never count as dirt; status is run with --untracked-files=no to
+ * avoid untracked build outputs blocking a legit clean build.
  *
- *   1. python scripts/release.py --bump minor   (commits the bump; no tag)
+ * IMPORTANT ordering (the #100600 review's second blocker): the version-bump
+ * commit in release.py creates a NEW HEAD, so a manifest built before the
+ * bump commit can never match the release HEAD. Build the DMG at the FINAL
+ * HEAD. On the macOS release host:
+ *
+ *   1. python scripts/release.py --bump minor --prepare-only
+ *        (commits the bump AND the full set of version files; no tag/push)
  *   2. cd apps/bootstrap-installer && npm run tauri:build
+ *        (manifest written at this exact HEAD; refuses on a dirty tree)
  *   3. python scripts/release.py --publish --no-bump --date <same calver>
+ *        (gate validates against the prepare HEAD, then tags/pushes/releases)
  *
  * Best-effort by design: if git or the bundle dir is unavailable the
  * manifest is skipped and the release gate reports "no build manifest" —
@@ -45,11 +56,25 @@ if (!existsSync(bundleDir)) {
 }
 
 let sha = ''
+let dirty = ''
 try {
   sha = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: repoRoot, encoding: 'utf-8' }).trim()
+  dirty = execFileSync('git', ['status', '--porcelain', '--untracked-files=no'],
+    { cwd: repoRoot, encoding: 'utf-8' }).trim()
 } catch {
   console.error('[build-manifest] git unavailable — no manifest written; release gate will refuse (correct: provenance unknown)')
   process.exit(0)
+}
+
+if (dirty) {
+  const lines = dirty.split('\n').slice(0, 5).join('\n  ')
+  console.error(
+    '[build-manifest] REFUSING to write the manifest: the working tree is dirty.\n' +
+    '  A manifest over uncommitted source would attest a clean HEAD while\n' +
+    '  packaging different bytes. Commit or stash first, then rerun\n' +
+    '  `npm run tauri:build`. Dirty entries:\n  ' + lines
+  )
+  process.exit(1)
 }
 
 function sha256Of(file) {

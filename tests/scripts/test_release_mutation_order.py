@@ -213,3 +213,172 @@ class TestMutationOrderThroughMain:
             with pytest.raises(SystemExit) as e:
                 release.main()
         assert e.value.code == 0  # --help exits 0 and lists the flags
+
+
+class TestFlagMatrixValidation:
+    """Contradictory transitions must be rejected up front (#100600 v4)."""
+
+    def _run_with(self, argv):
+        with (
+            patch.object(sys, "argv", ["release.py"] + argv),
+            patch.object(release, "next_available_tag", lambda b: (b, b[1:])),
+            patch.object(release, "get_current_version", lambda: "0.20.0"),
+            patch.object(release, "get_last_tag", lambda: "v2026.8.31"),
+            patch.object(release, "get_commits", lambda since_tag=None: [
+                {"sha": "abc", "author_name": "T", "author_email": "t@x",
+                 "subject": "s", "body": "", "github_author": "t"}]),
+        ):
+            with pytest.raises(SystemExit) as e:
+                release.main()
+            return e.value.code
+
+    def test_prepare_only_no_bump_nothing_rejected(self):
+        """--prepare-only --no-bump prepares nothing -> exit(2)."""
+        assert self._run_with(["--prepare-only", "--no-bump"]) == 2
+
+    def test_publish_with_prepare_only_rejected(self):
+        """Phase flags are mutually exclusive -> exit(2)."""
+        assert self._run_with(["--publish", "--prepare-only", "--bump", "minor"]) == 2
+
+    def test_publish_bump_no_bump_contradiction_rejected(self):
+        """--bump computes a version while --no-bump skips committing it."""
+        assert self._run_with(["--publish", "--bump", "minor", "--no-bump"]) == 2
+
+    def test_valid_phase2_combination_accepted(self):
+        """The documented phase 2 parses cleanly (no exit-2 from the matrix)."""
+        # It will exit later at the manifest gate (no bundle dir) — but the
+        # matrix validator must not reject it. Distinguish exit codes:
+        # matrix rejection is 2; gate refusal is 1; argparse help is 0.
+        with (
+            patch.object(sys, "argv", ["release.py", "--publish", "--no-bump", "--date", "2026.9.2"]),
+            patch.object(release, "git_result", _GitCallLog()),
+            patch.object(release, "next_available_tag", lambda b: (b, b[1:])),
+            patch.object(release, "get_current_version", lambda: "0.20.0"),
+            patch.object(release, "get_last_tag", lambda: "v2026.8.31"),
+            patch.object(release, "get_commits", lambda since_tag=None: [
+                {"sha": "abc", "author_name": "T", "author_email": "t@x",
+                 "subject": "s", "body": "", "github_author": "t"}]),
+            patch.object(release, "generate_changelog", lambda *a, **k: "c"),
+            patch.object(release, "_BUNDLE_DMG_DIR",
+                         Path(__file__).parent / "nonexistent-bundle"),
+        ):
+            with pytest.raises(SystemExit) as e:
+                release.main()
+        assert e.value.code == 1, (
+            "phase 2 must reach the manifest gate (exit 1), not be rejected "
+            "by the flag matrix (exit 2)"
+        )
+
+
+class TestPushFailureAborts:
+    """Push failure must abort BEFORE gh release create (#100600 v4)."""
+
+    def test_push_failure_no_release_create(self, tmp_path, monkeypatch):
+        """A failed push exits(1) and gh release create is never invoked."""
+        import hashlib
+        import json as _json
+        import time as _time
+
+        dmg_dir = tmp_path / "bundle" / "dmg"
+        dmg_dir.mkdir(parents=True)
+        dmg = dmg_dir / "H.dmg"
+        dmg.write_bytes(b"bytes")
+        (dmg_dir / ".build-manifest.json").write_text(_json.dumps({
+            "sha": "deadbeefcafe1234",
+            "built_at_unix": int(_time.time()) - 600,
+            "artifacts": [{"filename": dmg.name, "sha256": hashlib.sha256(b"bytes").hexdigest(),
+                           "size": 5, "arch": "aarch64"}],
+        }), encoding="utf-8")
+        monkeypatch.setattr(release, "_BUNDLE_DMG_DIR", dmg_dir)
+        monkeypatch.chdir(tmp_path)
+
+        # git stub: rev-parse succeeds, tag succeeds, push FAILS
+        gitlog = _GitCallLog(head_sha="deadbeefcafe1234")
+        gh_cmds: list[list[str]] = []
+
+        def _failing_push(*args, cwd=None):
+            call = list(args)
+            gitlog.calls.append(call)
+            m = MagicMock()
+            if args[0] == "rev-parse":
+                m.returncode = 0; m.stdout = gitlog.head_sha; m.stderr = ""
+            elif args[0] == "push":
+                m.returncode = 1; m.stdout = ""; m.stderr = "access denied"
+            else:
+                m.returncode = 0; m.stdout = ""; m.stderr = ""
+            return m
+
+        def _gh_run(cmd, **kw):
+            gh_cmds.append(cmd)
+            m = MagicMock(); m.returncode = 0; m.stdout = "r"; m.stderr = ""
+            return m
+
+        with (
+            patch.object(sys, "argv", ["release.py", "--publish", "--no-bump", "--date", "2026.9.2"]),
+            patch.object(release, "git_result", _failing_push),
+            patch.object(release, "next_available_tag", lambda b: (b, b[1:])),
+            patch.object(release, "get_current_version", lambda: "0.20.0"),
+            patch.object(release, "get_last_tag", lambda: "v2026.8.31"),
+            patch.object(release, "get_commits", lambda since_tag=None: [
+                {"sha": "a", "author_name": "T", "author_email": "t@x",
+                 "subject": "s", "body": "", "github_author": "t"}]),
+            patch.object(release, "generate_changelog", lambda *a, **k: "c"),
+            patch.object(release.subprocess, "run", _gh_run),
+        ):
+            with pytest.raises(SystemExit) as e:
+                release.main()
+
+        assert e.value.code == 1, "push failure must abort with exit(1)"
+        release_calls = [c for c in gh_cmds if c[:3] == ["gh", "release", "create"]]
+        assert not release_calls, (
+            "gh release create must NEVER run after a failed push — without "
+            "--verify-tag it would auto-tag the default branch (#100600 v4)"
+        )
+
+    def test_gh_release_uses_verify_tag(self, tmp_path, monkeypatch):
+        """The happy path: gh release create carries --verify-tag."""
+        import hashlib
+        import json as _json
+        import time as _time
+
+        dmg_dir = tmp_path / "bundle" / "dmg"
+        dmg_dir.mkdir(parents=True)
+        dmg = dmg_dir / "H.dmg"
+        dmg.write_bytes(b"bytes")
+        (dmg_dir / ".build-manifest.json").write_text(_json.dumps({
+            "sha": "deadbeefcafe1234",
+            "built_at_unix": int(_time.time()) - 600,
+            "artifacts": [{"filename": dmg.name, "sha256": hashlib.sha256(b"bytes").hexdigest(),
+                           "size": 5, "arch": "aarch64"}],
+        }), encoding="utf-8")
+        monkeypatch.setattr(release, "_BUNDLE_DMG_DIR", dmg_dir)
+        monkeypatch.chdir(tmp_path)
+
+        gitlog = _GitCallLog(head_sha="deadbeefcafe1234")
+        gh_cmds: list[list[str]] = []
+
+        def _gh_run(cmd, **kw):
+            gh_cmds.append(cmd)
+            m = MagicMock(); m.returncode = 0; m.stdout = "r"; m.stderr = ""
+            return m
+
+        with (
+            patch.object(sys, "argv", ["release.py", "--publish", "--no-bump", "--date", "2026.9.2"]),
+            patch.object(release, "git_result", gitlog),
+            patch.object(release, "next_available_tag", lambda b: (b, b[1:])),
+            patch.object(release, "get_current_version", lambda: "0.20.0"),
+            patch.object(release, "get_last_tag", lambda: "v2026.8.31"),
+            patch.object(release, "get_commits", lambda since_tag=None: [
+                {"sha": "a", "author_name": "T", "author_email": "t@x",
+                 "subject": "s", "body": "", "github_author": "t"}]),
+            patch.object(release, "generate_changelog", lambda *a, **k: "c"),
+            patch.object(release.subprocess, "run", _gh_run),
+        ):
+            release.main()
+
+        release_calls = [c for c in gh_cmds if c[:3] == ["gh", "release", "create"]]
+        assert release_calls, "happy path must create the release"
+        assert "--verify-tag" in release_calls[0], (
+            "gh release create must require the remote tag (--verify-tag) so "
+            "a push race cannot auto-tag the default branch"
+        )

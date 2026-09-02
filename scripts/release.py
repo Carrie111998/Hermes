@@ -33,6 +33,7 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 VERSION_FILE = REPO_ROOT / "hermes_cli" / "__init__.py"
 PYPROJECT_FILE = REPO_ROOT / "pyproject.toml"
+DESKTOP_PKG_FILE = REPO_ROOT / "apps" / "desktop" / "package.json"
 
 # ──────────────────────────────────────────────────────────────────────
 # Git email → GitHub username mapping
@@ -2674,6 +2675,31 @@ def main():
                         help="Write changelog to file instead of stdout")
     args = parser.parse_args()
 
+    # ── Flag-matrix validation (#100600 v4 review blocker) ──────────────
+    # Contradictory transitions were previously accepted silently. Reject
+    # them up front so the documented lifecycle is the ONLY one that runs.
+    parser_errors: list[str] = []
+    if args.prepare_only and args.no_bump and not args.bump:
+        parser_errors.append(
+            "--prepare-only --no-bump prepares nothing: no bump to commit "
+            "and no-bump skips it. Use --bump minor --prepare-only."
+        )
+    if args.publish and args.prepare_only:
+        parser_errors.append(
+            "--publish and --prepare-only are mutually exclusive phases: "
+            "prepare commits the bump and stops; publish gates and ships."
+        )
+    if args.publish and args.no_bump and args.bump:
+        parser_errors.append(
+            "--publish --bump X --no-bump is contradictory: --bump computes "
+            "a new version while --no-bump skips committing it. Phase 2 is "
+            "--publish --no-bump (no --bump)."
+        )
+    if parser_errors:
+        for err in parser_errors:
+            print(f"  ✗ {err}")
+        sys.exit(2)
+
     # Determine CalVer date
     if args.date:
         calver_date = args.date
@@ -2743,8 +2769,15 @@ def main():
             update_version_files(new_version, calver_date)
             print(f"  ✓ Updated version files to v{new_version} ({calver_date})")
 
-            # Commit version bump
+            # Commit version bump — stage EVERY file update_version_files
+            # touches (VERSION_FILE, PYPROJECT_FILE, and the desktop
+            # package.json kept in lockstep at release.py:2381-2390).
+            # Staging only two of the three left the checkout dirty by
+            # construction, so the build hook's dirty-tree refusal would
+            # reject every canonical prepare (#100600 v4 review blocker 3).
             add_files = [str(VERSION_FILE), str(PYPROJECT_FILE)]
+            if DESKTOP_PKG_FILE.exists():
+                add_files.append(str(DESKTOP_PKG_FILE))
             add_result = git_result("add", *add_files)
             if add_result.returncode != 0:
                 print(f"  ✗ Failed to stage version files: {add_result.stderr.strip()}")
@@ -2757,6 +2790,17 @@ def main():
                 print(f"  ✗ Failed to commit version bump: {commit_result.stderr.strip()}")
                 return
             print("  ✓ Committed version bump")
+            # Post-prepare cleanliness witness: the build hook refuses on a
+            # dirty tree, so prove the prepare left the tree clean — or fail
+            # loudly HERE rather than at the macOS build host hours later.
+            status_result = git_result("status", "--porcelain", "--untracked-files=no")
+            if status_result.returncode == 0 and status_result.stdout.strip():
+                print("  ✗ Version-bump commit left the tree dirty — the build "
+                      "hook will refuse to write a manifest. Dirty entries:")
+                for line in status_result.stdout.strip().splitlines()[:5]:
+                    print(f"      {line}")
+                sys.exit(1)
+            print("  ✓ Prepare verified: working tree clean after bump commit")
 
         # --prepare-only: two-phase lifecycle, phase 1 complete. The version
         # bump commit IS the mutation contract for this phase — no tag, no
@@ -2850,14 +2894,20 @@ def main():
             return
         print(f"  ✓ Created tag {tag_name}")
 
-        # Push
+        # Push — a failure here MUST abort: `gh release create` without
+        # --verify-tag auto-creates a missing tag from the default branch,
+        # so continuing would publish the verified DMG under a remote tag
+        # pointing at a different commit (#100600 v4 review blocker 4).
         push_result = git_result("push", "origin", "HEAD", "--tags")
         if push_result.returncode == 0:
             print("  ✓ Pushed to origin")
         else:
-            print(f"  ✗ Failed to push to origin: {push_result.stderr.strip()}")
-            print("    Continue manually after fixing access:")
-            print("    git push origin HEAD --tags")
+            print(f"  ✗ REFUSING to continue: push failed: {push_result.stderr.strip()}")
+            print("    A release without the pushed tag would let `gh release")
+            print("    create` auto-tag the default branch instead of this HEAD.")
+            print("    Fix access and rerun phase 2:")
+            print("    python scripts/release.py --publish --no-bump --date <calver>")
+            sys.exit(1)
 
         # Create GitHub release
         changelog_file = REPO_ROOT / ".release_notes.md"
@@ -2865,6 +2915,7 @@ def main():
 
         gh_cmd = [
             "gh", "release", "create", tag_name,
+            "--verify-tag",
             "--title", f"Hermes Agent v{new_version} ({calver_date})",
             "--notes-file", str(changelog_file),
         ]
