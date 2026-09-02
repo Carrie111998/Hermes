@@ -2587,3 +2587,60 @@ class TestTimeoutStopSecCoversCronFloor:
             env={"HERMES_CRON_DRAIN_TIMEOUT": "200"},
         )
         assert "TimeoutStopSec=240" in unit
+
+class TestLaunchdLegacyNameFallback:
+    """Legacy pre-rename ``com.hermes.gateway`` service resolution.
+
+    Older install.sh revisions wrote the launchd service under the label
+    ``com.hermes.gateway``; the CLI only looked for ``ai.hermes.gateway``, so
+    ``hermes gateway status`` reported "not running" on upgraded machines whose
+    service kept the legacy name (every PID source missed it: label lookup,
+    missing PID file, and the process-table scan excluding the gateway as an
+    ancestor of the invoking CLI).  ``get_launchd_plist_path`` /
+    ``get_launchd_label`` now fall back to the legacy name when the canonical
+    plist is absent.
+    """
+
+    @staticmethod
+    def _make_launch_agents(tmp_path) -> Path:
+        la = tmp_path / "Library" / "LaunchAgents"
+        la.mkdir(parents=True)
+        return la
+
+    def test_legacy_plist_only_falls_back_to_legacy_name(self, tmp_path, monkeypatch):
+        la = self._make_launch_agents(tmp_path)
+        legacy = la / "com.hermes.gateway.plist"
+        legacy.write_text("{}")
+        monkeypatch.setattr(gateway_cli, "_profile_suffix", lambda: "")
+        monkeypatch.setattr(gateway_cli, "_launchd_user_home", lambda: tmp_path)
+
+        assert gateway_cli.get_launchd_plist_path() == legacy
+        assert gateway_cli.get_launchd_label() == "com.hermes.gateway"
+
+    def test_canonical_plist_wins_when_present(self, tmp_path, monkeypatch):
+        la = self._make_launch_agents(tmp_path)
+        canonical = la / "ai.hermes.gateway.plist"
+        canonical.write_text("{}")
+        (la / "com.hermes.gateway.plist").write_text("{}")
+        monkeypatch.setattr(gateway_cli, "_profile_suffix", lambda: "")
+        monkeypatch.setattr(gateway_cli, "_launchd_user_home", lambda: tmp_path)
+
+        assert gateway_cli.get_launchd_plist_path() == canonical
+        assert gateway_cli.get_launchd_label() == "ai.hermes.gateway"
+
+    def test_no_plist_returns_canonical_for_install(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(gateway_cli, "_profile_suffix", lambda: "")
+        monkeypatch.setattr(gateway_cli, "_launchd_user_home", lambda: tmp_path)
+
+        assert gateway_cli.get_launchd_plist_path() == (
+            tmp_path / "Library" / "LaunchAgents" / "ai.hermes.gateway.plist"
+        )
+        assert gateway_cli.get_launchd_label() == "ai.hermes.gateway"
+
+    def test_profiled_profile_never_uses_legacy_name(self, tmp_path, monkeypatch):
+        la = self._make_launch_agents(tmp_path)
+        (la / "com.hermes.gateway.plist").write_text("{}")
+        monkeypatch.setattr(gateway_cli, "_profile_suffix", lambda: "coder")
+        monkeypatch.setattr(gateway_cli, "_launchd_user_home", lambda: tmp_path)
+
+        assert gateway_cli.get_launchd_label() == "ai.hermes.gateway-coder"

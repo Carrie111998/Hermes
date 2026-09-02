@@ -3729,10 +3729,20 @@ def get_launchd_plist_path() -> Path:
 
     Default ``~/.hermes`` → ``ai.hermes.gateway.plist`` (backward compatible).
     Profile ``~/.hermes/profiles/coder`` → ``ai.hermes.gateway-coder.plist``.
+    Legacy pre-rename installs wrote ``com.hermes.gateway.plist`` — fall back
+    to it when the canonical name is absent so status/start/stop keep working
+    on upgraded machines.
     """
     suffix = _profile_suffix()
     name = f"ai.hermes.gateway-{suffix}" if suffix else "ai.hermes.gateway"
-    return _launchd_user_home() / "Library" / "LaunchAgents" / f"{name}.plist"
+    path = _launchd_user_home() / "Library" / "LaunchAgents" / f"{name}.plist"
+    if not suffix and not path.exists():
+        legacy = (
+            _launchd_user_home() / "Library" / "LaunchAgents" / "com.hermes.gateway.plist"
+        )
+        if legacy.exists():
+            return legacy
+    return path
 
 
 def launchd_gateway_labels_for_install() -> list[str]:
@@ -5004,8 +5014,19 @@ def systemd_status(deep: bool = False, system: bool = False, full: bool = False)
 
 
 def get_launchd_label() -> str:
-    """Return the launchd service label, scoped per profile."""
+    """Return the launchd service label, scoped per profile.
+
+    Mirrors ``get_launchd_plist_path``'s legacy-name fallback so the label
+    always matches the resolved plist on machines that still run the
+    pre-rename ``com.hermes.gateway`` service.
+    """
     suffix = _profile_suffix()
+    if not suffix:
+        launch_agents = _launchd_user_home() / "Library" / "LaunchAgents"
+        legacy_plist = launch_agents / "com.hermes.gateway.plist"
+        canonical_plist = launch_agents / "ai.hermes.gateway.plist"
+        if legacy_plist.exists() and not canonical_plist.exists():
+            return "com.hermes.gateway"
     return f"ai.hermes.gateway-{suffix}" if suffix else "ai.hermes.gateway"
 
 
