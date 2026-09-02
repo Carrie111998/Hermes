@@ -261,6 +261,8 @@ def _(rid, params: dict) -> dict:
             return None, None
 
     try:
+        import json as _json
+
         from hermes_cli.profiles import list_profiles
 
         include_sessions = is_truthy_value(params.get("include_sessions", True))
@@ -312,7 +314,16 @@ def _(rid, params: dict) -> dict:
                         raw_meta = _yaml.safe_load(f) or {}
                     ui_meta = raw_meta.get("ui_meta")
                     if isinstance(ui_meta, dict) and ui_meta:
-                        row["ui_meta"] = ui_meta
+                        # YAML promotes unquoted timestamps to datetime/date,
+                        # but this handler's contract is JSON. Normalize those
+                        # (and any other YAML-only scalar) at the boundary.
+                        def _json_default(value):
+                            isoformat = getattr(value, "isoformat", None)
+                            return isoformat() if callable(isoformat) else str(value)
+
+                        row["ui_meta"] = _json.loads(
+                            _json.dumps(ui_meta, default=_json_default)
+                        )
                     revisions = raw_meta.get("_ui_meta_revisions")
                     if isinstance(revisions, dict) and revisions:
                         row["ui_meta_revisions"] = {
