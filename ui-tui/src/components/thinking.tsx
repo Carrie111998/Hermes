@@ -24,6 +24,7 @@ import {
   pick,
   splitToolDuration,
   thinkingPreview,
+  toolCardCollapsedByDefault,
   toolTrailLabel
 } from '../lib/text.js'
 import type { Theme } from '../theme.js'
@@ -675,11 +676,73 @@ export const Thinking = memo(function Thinking({
 // ── ToolTrail ────────────────────────────────────────────────────────
 
 interface Group {
+  collapsedDefault?: boolean
   color: string
   content: ReactNode
   details: DetailRow[]
+  duration?: string
   key: string
   label: string
+  preview?: string
+  toolName?: string
+}
+
+function ToolCard({
+  defaultOpen,
+  group,
+  rails,
+  t
+}: {
+  defaultOpen: boolean
+  group: Group
+  rails: TreeRails
+  t: Theme
+}) {
+  const [open, setOpen] = useState(defaultOpen)
+  const preview = group.preview ? compactPreview(group.preview, 72) : ''
+  const duration = group.duration
+  const title = splitToolDuration(group.label).label
+
+  return (
+    <Box flexDirection="column">
+      <TreeRow branch="last" rails={rails} t={t}>
+        <Box
+          onClick={(e: any) => {
+            e?.stopPropagation?.()
+            setOpen(v => !v)
+          }}
+        >
+          <Text color={t.color.muted} wrap="truncate-end">
+            <Text color={t.color.accent}>{open ? '▾ ' : '▸ '}</Text>
+            <Text color={t.color.tool}>● </Text>
+            {title}
+            {duration ? (
+              <Text color={t.color.statusFg} dim>
+                {duration.startsWith(' ') ? duration : ` ${duration}`}
+              </Text>
+            ) : null}
+            {!open && preview ? (
+              <Text color={t.color.muted} dim>
+                {'  '}
+                {preview}
+              </Text>
+            ) : null}
+          </Text>
+        </Box>
+      </TreeRow>
+      {open
+        ? group.details.map((detail, detailIndex) => (
+            <Detail
+              {...detail}
+              branch={detailIndex === group.details.length - 1 ? 'last' : 'mid'}
+              key={detail.key}
+              rails={[...rails, true]}
+              t={t}
+            />
+          ))
+        : null}
+    </Box>
+  )
 }
 
 export const ToolTrail = memo(function ToolTrail({
@@ -836,11 +899,15 @@ export const ToolTrail = memo(function ToolTrail({
 
     if (parsed) {
       groups.push({
+        collapsedDefault: toolCardCollapsedByDefault(parsed.call.split('(')[0] ?? parsed.call),
         color: parsed.mark === '✗' ? t.color.error : t.color.text,
         content: parsed.call,
         details: [],
+        duration: splitToolDuration(parsed.call).duration,
         key: `tr-${i}`,
-        label: parsed.call
+        label: parsed.call,
+        preview: parsed.detail,
+        toolName: parsed.call.split('(')[0]?.trim()
       })
 
       if (parsed.detail) {
@@ -893,9 +960,13 @@ export const ToolTrail = memo(function ToolTrail({
     const label = formatToolCall(tool.name, tool.context || '')
 
     groups.push({
+      collapsedDefault: toolCardCollapsedByDefault(tool.name),
       color: t.color.text,
       key: tool.id,
       label,
+      preview: tool.context || '',
+      duration: tool.startedAt ? ` (${fmtElapsed(now - tool.startedAt)})` : '',
+      toolName: tool.name,
       details: tool.verboseArgs
         ? [
             {
@@ -1119,34 +1190,30 @@ export const ToolTrail = memo(function ToolTrail({
             // registered — so users can open the live monitor immediately.
             const isDelegateGroup = group.label.startsWith('Delegate Task')
 
+            const cardOpenByDefault =
+              visible.tools === 'expanded' && !group.collapsedDefault
+
             return (
               <Box flexDirection="column" key={group.key}>
-                <TreeTextRow
-                  branch={branch}
-                  color={group.color}
-                  content={
-                    <>
-                      <Text color={t.color.tool}>● </Text>
-                      {toolLabel(group)}
-                      {isDelegateGroup ? (
+                {isDelegateGroup ? (
+                  <TreeTextRow
+                    branch={branch}
+                    color={group.color}
+                    content={
+                      <>
+                        <Text color={t.color.tool}>● </Text>
+                        {toolLabel(group)}
                         <Text color={t.color.statusFg} dim>
                           {'  (/agents to monitor)'}
                         </Text>
-                      ) : null}
-                    </>
-                  }
-                  rails={rails}
-                  t={t}
-                />
-                {group.details.map((detail, detailIndex) => (
-                  <Detail
-                    {...detail}
-                    branch={detailIndex === group.details.length - 1 && !hasInlineSubagents ? 'last' : 'mid'}
-                    key={detail.key}
-                    rails={childRails}
+                      </>
+                    }
+                    rails={rails}
                     t={t}
                   />
-                ))}
+                ) : (
+                  <ToolCard defaultOpen={cardOpenByDefault} group={group} rails={rails} t={t} />
+                )}
                 {hasInlineSubagents ? renderSubagentList(childRails) : null}
               </Box>
             )

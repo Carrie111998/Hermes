@@ -16,6 +16,7 @@ import { PLACEHOLDER } from '../content/placeholders.js'
 import { prevRenderedMsg } from '../domain/blockLayout.js'
 import {
   COMPOSER_PROMPT_GAP_WIDTH,
+  composerFrameChromeCols,
   composerPromptWidth,
   inputVisualHeight,
   stableComposerColumns
@@ -290,7 +291,8 @@ const ComposerPane = memo(function ComposerPane({
 
   const promptWidth = composerPromptWidth(promptText)
   const promptBlank = ' '.repeat(promptWidth)
-  const inputColumns = stableComposerColumns(composer.cols, promptWidth, TERMUX_TUI_MODE)
+  const frameChrome = composerFrameChromeCols(ui.compact)
+  const inputColumns = stableComposerColumns(composer.cols, promptWidth, TERMUX_TUI_MODE, frameChrome)
   const inputHeight = inputVisualHeight(composer.input, inputColumns)
   const inputMouseRef = useRef<null | TextInputMouseApi>(null)
 
@@ -383,7 +385,13 @@ const ComposerPane = memo(function ComposerPane({
         {composer.input === '?' && !composer.inputBuf.length && <HelpHint t={ui.theme} />}
 
         {!isBlocked && (
-          <>
+          <Box
+            borderColor={ui.theme.color.border}
+            borderStyle={ui.compact ? 'single' : 'round'}
+            flexDirection="column"
+            paddingX={ui.compact ? 0 : 1}
+            width={Math.max(4, composer.cols - 2)}
+          >
             {composer.inputBuf.map((line, i) => (
               <Box key={i}>
                 <Box width={promptWidth}>
@@ -403,7 +411,7 @@ const ComposerPane = memo(function ComposerPane({
               onMouseDrag={dragFromPromptRow}
               onMouseUp={endInputDrag}
               position="relative"
-              width={Math.max(1, composer.cols - 2)}
+              width={Math.max(1, composer.cols - 2 - frameChrome)}
             >
               <Box width={promptWidth}>
                 {sh ? (
@@ -441,7 +449,7 @@ const ComposerPane = memo(function ComposerPane({
                 <GoodVibesHeart t={ui.theme} tick={status.goodVibesTick} />
               </Box>
             </Box>
-          </>
+          </Box>
         )}
       </Box>
 
