@@ -90,6 +90,19 @@ class TestToolResultContentProactiveDowngrade:
         assert isinstance(content, str)
         assert "screenshot captured" in content
 
+    def test_opencode_go_downgrades_to_text_summary(self):
+        """OpenCode Go accepts images in user messages, but not tool messages."""
+        agent = _make_agent("opencode-go", "mimo-v2.5")
+        result = _multimodal_result(text="screenshot captured")
+
+        with patch.object(agent, "_model_supports_vision", return_value=True):
+            content = agent._tool_result_content_for_active_model(
+                "browser_screenshot", result
+            )
+
+        assert isinstance(content, str)
+        assert "screenshot captured" in content
+
     def test_xiaomi_non_multimodal_passes_through(self):
         """Non-multimodal results should pass through unchanged."""
         agent = _make_agent("xiaomi", "mimo-v2.5")
@@ -149,5 +162,4 @@ class TestProviderProfileField:
         profile = get_provider_profile("xiaomi")
         assert profile is not None
         assert profile.supports_vision_tool_messages is False
-
 
