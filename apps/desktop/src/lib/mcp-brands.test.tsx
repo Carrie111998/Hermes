@@ -71,7 +71,6 @@ const CATALOG_FALLBACKS = [
   'microsoft-learn',
   'monday',
   'motherduck',
-  'neon',
   'plaid',
   'semgrep',
   'twelve-data',
