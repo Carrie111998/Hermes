@@ -32566,6 +32566,68 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _mark_turn = getattr(adapter, "_mark_streaming_tts_completed_turn", None)
                     if callable(_mark_turn):
                         _mark_turn(session_key, run_generation)
+
+            # Schedule deletion of tracked temporary progress bubbles BEFORE
+            # pending-message inspection. The in-band pending path recurses
+            # into the queued follow-up before the old post-try registration
+            # block is reached; registering here ensures the pending branch's
+            # pop sees the cleanup and awaiting it delays turn-2 until turn-1
+            # deletion completes. The callback itself is async and directly
+            # awaits each delete_message so completion is observable.
+            if (
+                _cleanup_progress
+                and _cleanup_adapter is not None
+                and _cleanup_msg_ids
+                and session_key
+                and isinstance(response, dict)
+                and not response.get("failed")
+                and hasattr(_cleanup_adapter, "register_post_delivery_callback")
+            ):
+                _ids_snapshot = list(_cleanup_msg_ids)
+                _chat_id_snapshot = source.chat_id
+                _adapter_snapshot = _cleanup_adapter
+
+                async def _cleanup_temp_bubbles() -> None:
+                    _ok = 0
+                    _fail = 0
+                    for _mid in _ids_snapshot:
+                        try:
+                            _res = await _adapter_snapshot.delete_message(
+                                _chat_id_snapshot, _mid
+                            )
+                            if _res:
+                                _ok += 1
+                            else:
+                                _fail += 1
+                                logger.debug(
+                                    "Temp bubble cleanup: delete_message returned False for %s",
+                                    _mid,
+                                )
+                        except Exception as _e:
+                            _fail += 1
+                            logger.debug(
+                                "Temp bubble cleanup failed for %s: %s", _mid, _e, exc_info=True
+                            )
+                    if _ok or _fail:
+                        if _fail:
+                            logger.info(
+                                "Temp bubble cleanup completed: %d deleted, %d failed for session %s",
+                                _ok, _fail, session_key or "?",
+                            )
+                        else:
+                            logger.info(
+                                "Temp bubble cleanup completed: %d deleted for session %s",
+                                _ok, session_key or "?",
+                            )
+
+                try:
+                    _cleanup_adapter.register_post_delivery_callback(
+                        session_key,
+                        _cleanup_temp_bubbles,
+                        generation=run_generation,
+                    )
+                except Exception as _rpe:
+                    logger.debug("Post-delivery cleanup registration failed: %s", _rpe)
             
             # Get pending message from adapter.
             # Use session_key (not source.chat_id) to match adapter's storage keys.
@@ -33121,52 +33183,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _transformed,
                     len(_final),
                 )
-
-        # Schedule deletion of tracked temporary progress bubbles after the
-        # final response lands. Failed runs skip this so bubbles remain as
-        # breadcrumbs for the user to see what work happened. Only fires on
-        # adapters that support ``delete_message`` (see init above); failures
-        # are swallowed — deletion is best-effort.
-        if (
-            _cleanup_progress
-            and _cleanup_adapter is not None
-            and _cleanup_msg_ids
-            and session_key
-            and isinstance(response, dict)
-            and not response.get("failed")
-            and hasattr(_cleanup_adapter, "register_post_delivery_callback")
-        ):
-            _ids_snapshot = list(_cleanup_msg_ids)
-            _chat_id_snapshot = source.chat_id
-            _adapter_snapshot = _cleanup_adapter
-            _loop_snapshot = asyncio.get_running_loop()
-
-            def _cleanup_temp_bubbles() -> None:
-                async def _delete_all() -> None:
-                    for _mid in _ids_snapshot:
-                        try:
-                            await _adapter_snapshot.delete_message(
-                                _chat_id_snapshot, _mid
-                            )
-                        except Exception:
-                            pass
-                try:
-                    safe_schedule_threadsafe(
-                        _delete_all(), _loop_snapshot,
-                        logger=logger,
-                        log_message="Temp bubble cleanup scheduling error",
-                    )
-                except Exception:
-                    pass
-
-            try:
-                _cleanup_adapter.register_post_delivery_callback(
-                    session_key,
-                    _cleanup_temp_bubbles,
-                    generation=run_generation,
-                )
-            except Exception as _rpe:
-                logger.debug("Post-delivery cleanup registration failed: %s", _rpe)
 
         return response
 
