@@ -9818,6 +9818,290 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             self._delete_unreferenced_system_prompts(conn)
         self._execute_write(_do)
 
+    @staticmethod
+    def _session_model_route(row: Any) -> Dict[str, Any]:
+        """Normalize the three persisted session route shapes for diagnostics."""
+        data = dict(row) if isinstance(row, sqlite3.Row) else dict(row or {})
+        raw_config = data.get("model_config")
+        config: Dict[str, Any] = {}
+        malformed = False
+        if isinstance(raw_config, str) and raw_config.strip():
+            try:
+                parsed = json.loads(raw_config)
+                if isinstance(parsed, dict):
+                    config = parsed
+                else:
+                    malformed = True
+            except (json.JSONDecodeError, TypeError):
+                malformed = True
+        elif isinstance(raw_config, dict):
+            config = dict(raw_config)
+
+        runtime = config.get("gateway_runtime")
+        if not isinstance(runtime, dict):
+            runtime = {}
+        column_model = str(data.get("model") or "").strip()
+        billing_provider = str(data.get("billing_provider") or "").strip()
+        config_model = str(runtime.get("model") or config.get("model") or "").strip()
+        config_provider = str(
+            runtime.get("provider") or config.get("provider") or ""
+        ).strip()
+        issues: List[str] = []
+        if malformed:
+            issues.append("model_config is malformed")
+        if config_model and column_model and config_model != column_model:
+            issues.append("model_config.model != sessions.model")
+        if (
+            config_provider
+            and billing_provider
+            and billing_provider.lower() not in _BARE_BILLING_PROVIDERS
+            and config_provider.lower() != billing_provider.lower()
+        ):
+            issues.append("model_config.provider != sessions.billing_provider")
+        top_model = str(config.get("model") or "").strip()
+        runtime_model = str(runtime.get("model") or "").strip()
+        if top_model and runtime_model and top_model != runtime_model:
+            issues.append("gateway_runtime.model != model_config.model")
+        top_provider = str(config.get("provider") or "").strip()
+        runtime_provider = str(runtime.get("provider") or "").strip()
+        if (
+            top_provider
+            and runtime_provider
+            and top_provider.lower() != runtime_provider.lower()
+        ):
+            issues.append("gateway_runtime.provider != model_config.provider")
+        for key in ("base_url", "api_mode"):
+            top_value = str(config.get(key) or "").strip()
+            runtime_value = str(runtime.get(key) or "").strip()
+            if top_value and runtime_value and top_value != runtime_value:
+                issues.append(f"gateway_runtime.{key} != model_config.{key}")
+
+        return {
+            **data,
+            "stored_model": column_model or config_model,
+            "stored_provider": config_provider or billing_provider,
+            "route_issues": issues,
+            "_parsed_model_config": config,
+        }
+
+    def audit_session_model_routes(
+        self,
+        *,
+        model_glob: Optional[str] = None,
+        provider: Optional[str] = None,
+        source: Optional[str] = None,
+        exclude_sources: Optional[List[str]] = None,
+        inconsistent_only: bool = False,
+        limit: Optional[int] = None,
+    ) -> List[Dict[str, Any]]:
+        """Return profile-local session model routes with optional audit filters."""
+        import fnmatch
+
+        self.flush_token_counts()
+        with self._read_ctx() as conn:
+            rows = conn.execute(
+                "SELECT s.*, "
+                "COALESCE(s.last_activity_at, s.ended_at, s.started_at) AS last_active "
+                "FROM sessions s "
+                "ORDER BY last_active DESC, s.started_at DESC, s.id DESC"
+            ).fetchall()
+
+        model_pattern = (model_glob or "").strip().lower()
+        provider_needle = (provider or "").strip().lower()
+        source_needle = (source or "").strip().lower()
+        excluded = {str(value).strip().lower() for value in (exclude_sources or [])}
+        result: List[Dict[str, Any]] = []
+        if limit is not None and int(limit) <= 0:
+            return result
+        for raw_row in rows:
+            row = self._session_model_route(raw_row)
+            if model_pattern and not fnmatch.fnmatchcase(
+                str(row["stored_model"]).lower(), model_pattern
+            ):
+                continue
+            if provider_needle and str(row["stored_provider"]).lower() != provider_needle:
+                continue
+            row_source = str(row.get("source") or "").lower()
+            if source_needle and row_source != source_needle:
+                continue
+            if excluded and row_source in excluded:
+                continue
+            if inconsistent_only and not row["route_issues"]:
+                continue
+            row.pop("_parsed_model_config", None)
+            result.append(row)
+            if limit is not None and len(result) >= int(limit):
+                break
+        return result
+
+    def reset_session_model_routes(
+        self,
+        *,
+        target_model: str,
+        target_provider: str,
+        target_base_url: Optional[str] = None,
+        target_api_mode: Optional[str] = None,
+        dry_run: bool = False,
+    ) -> Dict[str, Any]:
+        """Atomically align every non-target session route after a safe backup."""
+        target_model = str(target_model or "").strip()
+        target_provider = str(target_provider or "").strip()
+        if not target_model or not target_provider:
+            raise ValueError("target model and provider are required")
+        base_url = str(target_base_url or "").strip() or None
+        api_mode = str(target_api_mode or "").strip() or None
+        self.flush_token_counts()
+
+        def _target_config(raw: Dict[str, Any]) -> Dict[str, Any]:
+            config = dict(raw)
+            runtime = config.get("gateway_runtime")
+            runtime = dict(runtime) if isinstance(runtime, dict) else {}
+            config["model"] = target_model
+            config["provider"] = target_provider
+            runtime["model"] = target_model
+            runtime["provider"] = target_provider
+            for key, value in (("base_url", base_url), ("api_mode", api_mode)):
+                if value is None:
+                    config.pop(key, None)
+                    runtime.pop(key, None)
+                else:
+                    config[key] = value
+                    runtime[key] = value
+            config["gateway_runtime"] = runtime
+            config.pop("browser_model_lock", None)
+            return config
+
+        def _needs_reset(row: Dict[str, Any]) -> bool:
+            route = self._session_model_route(row)
+            config = route["_parsed_model_config"]
+            runtime = config.get("gateway_runtime")
+            runtime = runtime if isinstance(runtime, dict) else {}
+            return any(
+                (
+                    str(row.get("model") or "").strip() != target_model,
+                    str(row.get("billing_provider") or "").strip().lower()
+                    != target_provider.lower(),
+                    str(config.get("model") or "").strip() != target_model,
+                    str(config.get("provider") or "").strip().lower()
+                    != target_provider.lower(),
+                    str(runtime.get("model") or "").strip() != target_model,
+                    str(runtime.get("provider") or "").strip().lower()
+                    != target_provider.lower(),
+                    (str(config.get("base_url") or "").strip() or None) != base_url,
+                    (str(runtime.get("base_url") or "").strip() or None) != base_url,
+                    (str(config.get("api_mode") or "").strip() or None) != api_mode,
+                    (str(runtime.get("api_mode") or "").strip() or None) != api_mode,
+                    "browser_model_lock" in config,
+                )
+            )
+
+        def _candidates(conn) -> List[Dict[str, Any]]:
+            return [
+                dict(row)
+                for row in conn.execute(
+                    "SELECT * FROM sessions ORDER BY started_at DESC, id DESC"
+                ).fetchall()
+                if _needs_reset(dict(row))
+            ]
+
+        with self._read_ctx() as conn:
+            candidates = _candidates(conn)
+        candidate_ids = [str(row["id"]) for row in candidates]
+        route_fields = (
+            "model",
+            "billing_provider",
+            "billing_base_url",
+            "billing_mode",
+            "model_config",
+        )
+        if dry_run or not candidates:
+            return {
+                "dry_run": bool(dry_run),
+                "rows_affected": len(candidates),
+                "row_ids": candidate_ids,
+                "backup_path": None,
+                "remaining_non_target": len(candidates),
+            }
+
+        import datetime
+
+        stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        backup = self.db_path.with_name(
+            f"{self.db_path.name}.pre-model-reset-backup-{stamp}"
+        )
+        suffix = 1
+        while backup.exists():
+            backup = self.db_path.with_name(
+                f"{self.db_path.name}.pre-model-reset-backup-{stamp}_{suffix}"
+            )
+            suffix += 1
+        with self._lock:
+            self._conn.execute("VACUUM INTO ?", (str(backup),))
+        backed_up_routes: Dict[str, Any] = {}
+        candidate_id_set = set(candidate_ids)
+        with sqlite3.connect(str(backup)) as backup_conn:
+            backup_conn.row_factory = sqlite3.Row
+            for backup_row in backup_conn.execute("SELECT * FROM sessions"):
+                backup_data = dict(backup_row)
+                backup_id = str(backup_data["id"])
+                if backup_id in candidate_id_set:
+                    backed_up_routes[backup_id] = tuple(
+                        backup_data.get(field) for field in route_fields
+                    )
+
+        def _do(conn):
+            changed: List[str] = []
+            # Bind the write set to the rows audited before the backup. A row
+            # created between VACUUM INTO and BEGIN IMMEDIATE is intentionally
+            # left alone (and makes read-back verification non-zero) because it
+            # does not exist in the safety snapshot.
+            for candidate_id in candidate_ids:
+                current = conn.execute(
+                    "SELECT * FROM sessions WHERE id = ?", (candidate_id,)
+                ).fetchone()
+                if current is None:
+                    continue
+                row = dict(current)
+                if candidate_id not in backed_up_routes or tuple(
+                    row.get(field) for field in route_fields
+                ) != backed_up_routes[candidate_id]:
+                    continue
+                if not _needs_reset(row):
+                    continue
+                config = self._session_model_route(row)["_parsed_model_config"]
+                serialized = json.dumps(
+                    _target_config(config), separators=(",", ":"), sort_keys=True
+                )
+                conn.execute(
+                    "UPDATE sessions SET model = ?, billing_provider = ?, "
+                    "billing_base_url = ?, billing_mode = ?, model_config = ?, "
+                    "system_prompt = NULL, system_prompt_hash = NULL "
+                    "WHERE id = ?",
+                    (
+                        target_model,
+                        target_provider,
+                        base_url,
+                        api_mode,
+                        serialized,
+                        row["id"],
+                    ),
+                )
+                changed.append(str(row["id"]))
+            if changed:
+                self._delete_unreferenced_system_prompts(conn)
+            return changed
+
+        changed_ids = self._execute_write(_do)
+        with self._read_ctx() as conn:
+            remaining = len(_candidates(conn))
+        return {
+            "dry_run": False,
+            "rows_affected": len(changed_ids),
+            "row_ids": changed_ids,
+            "backup_path": str(backup),
+            "remaining_non_target": remaining,
+        }
+
     def _merge_model_config_json(
         self,
         conn,

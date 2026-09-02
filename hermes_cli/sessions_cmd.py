@@ -20,6 +20,7 @@ time — no import cycle).
 """
 
 import os
+import sqlite3
 import sys
 from pathlib import Path
 
@@ -119,6 +120,106 @@ def _prune_never_active_keyed(db, args):
         f"Deleted {deleted} never-active session(s) and {routing_deleted} "
         "stale routing entr(ies)."
     )
+
+
+def _resolve_session_model_target(args):
+    """Resolve reset-model's explicit target over the active profile defaults."""
+    from hermes_cli.runtime_provider import _get_model_config
+
+    config = _get_model_config()
+    configured_model = str(config.get("default") or "").strip()
+    configured_provider = str(config.get("provider") or "").strip()
+    model = str(getattr(args, "to", None) or configured_model).strip()
+    provider = str(
+        getattr(args, "provider", None) or configured_provider
+    ).strip()
+    if not model:
+        raise ValueError(
+            "no target model was supplied and model.default is not configured"
+        )
+    if not provider:
+        raise ValueError(
+            "no target provider was supplied and model.provider is not configured"
+        )
+
+    # Endpoint/mode belong to the configured default route. An explicit provider
+    # change must not carry that old route's endpoint into the new provider.
+    same_provider = not getattr(args, "provider", None) or (
+        provider.lower() == configured_provider.lower()
+    )
+    return {
+        "model": model,
+        "provider": provider,
+        "base_url": str(config.get("base_url") or "").strip() if same_provider else "",
+        "api_mode": str(config.get("api_mode") or "").strip() if same_provider else "",
+    }
+
+
+def _print_session_model_audit(rows):
+    home = get_hermes_home()
+    profile = (
+        home.name
+        if home.parent.name == "profiles"
+        else os.environ.get("HERMES_PROFILE", "default")
+    )
+    print(f"Profile: {profile}")
+    if not rows:
+        print("No sessions match the model/provider audit filters.")
+        return
+    print(
+        f"{'Model':<30} {'Provider':<18} {'Status':<9} "
+        f"{'Last Active':<13} {'Src':<10} {'ID'}"
+    )
+    print("─" * 120)
+    for row in rows:
+        status = "DESYNC" if row.get("route_issues") else "ok"
+        print(
+            f"{str(row.get('stored_model') or '-')[:28]:<30} "
+            f"{str(row.get('stored_provider') or '-')[:16]:<18} "
+            f"{status:<9} {_relative_time(row.get('last_active')):<13} "
+            f"{str(row.get('source') or '-')[:8]:<10} {row['id']}"
+        )
+        if row.get("route_issues"):
+            print(f"  route issues: {'; '.join(row['route_issues'])}")
+
+
+def _reset_session_models(db, args):
+    if not getattr(args, "all", False):
+        print(
+            "Error: reset-model requires --all to acknowledge that every "
+            "non-target session in this profile is in scope."
+        )
+        return 2
+    try:
+        target = _resolve_session_model_target(args)
+        report = db.reset_session_model_routes(
+            target_model=target["model"],
+            target_provider=target["provider"],
+            target_base_url=target.get("base_url"),
+            target_api_mode=target.get("api_mode"),
+            dry_run=bool(getattr(args, "dry_run", False)),
+        )
+    except (OSError, ValueError, sqlite3.Error) as exc:
+        print(f"Error: session model reset failed: {exc}")
+        return 1
+
+    print(
+        f"Target route: {target['provider']} / {target['model']} "
+        f"({report['rows_affected']} session(s))"
+    )
+    for session_id in report["row_ids"]:
+        print(f"  {session_id}")
+    if report["dry_run"]:
+        print("Dry run — no rows changed and no backup was created.")
+        return 0
+    if report["backup_path"]:
+        print(f"  backup: {report['backup_path']}")
+    print(f"✓ Updated {report['rows_affected']} session(s).")
+    print(
+        "Read-back verification — remaining non-target sessions: "
+        f"{report['remaining_non_target']}"
+    )
+    return 0 if report["remaining_non_target"] == 0 else 1
 
 
 def cmd_sessions(args, sessions_parser=None):
@@ -329,6 +430,20 @@ def cmd_sessions(args, sessions_parser=None):
     if action == "list":
         from hermes_state import workspace_key as _ws_key
 
+        model_filter = getattr(args, "model", None)
+        provider_filter = getattr(args, "provider", None)
+        if model_filter or provider_filter:
+            rows = db.audit_session_model_routes(
+                model_glob=model_filter,
+                provider=provider_filter,
+                source=_source,
+                exclude_sources=_exclude,
+                limit=args.limit,
+            )
+            _print_session_model_audit(rows)
+            db.close()
+            return
+
         sessions = db.list_sessions_rich(
             source=args.source, exclude_sources=_exclude, limit=args.limit
         )
@@ -399,6 +514,12 @@ def cmd_sessions(args, sessions_parser=None):
             else:
                 sid = s["id"]
                 print(f"{preview:<50} {last_active:<13} {s['source']:<6} {sid}")
+
+    elif action == "reset-model":
+        try:
+            return _reset_session_models(db, args)
+        finally:
+            db.close()
 
     elif action == "export":
         from hermes_cli.session_filters import (

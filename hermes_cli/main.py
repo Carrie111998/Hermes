@@ -14440,7 +14440,7 @@ def main():
     # =========================================================================
     sessions_parser = subparsers.add_parser(
         "sessions",
-        help="Manage session history (list, rename, export, prune, delete)",
+        help="Manage session history and stored model routes",
         description="View and manage the SQLite session store",
     )
     sessions_subparsers = sessions_parser.add_subparsers(dest="sessions_action")
@@ -14457,6 +14457,45 @@ def main():
         metavar="NEEDLE",
         help="Only sessions in one workspace: a git repo root or project dir "
         "(matched by path substring or basename).",
+    )
+    sessions_list.add_argument(
+        "--model",
+        metavar="GLOB",
+        help="Audit sessions whose stored model matches a glob (for example 'gpt-*')",
+    )
+    sessions_list.add_argument(
+        "--provider",
+        metavar="NAME",
+        help="Audit sessions whose stored provider matches NAME",
+    )
+
+    sessions_reset_model = sessions_subparsers.add_parser(
+        "reset-model",
+        help="Safely bulk-reset session model/provider overrides",
+        description=(
+            "Reset every non-target session route in the active profile. The "
+            "profile's model.default/model.provider are used unless overridden. "
+            "A full SQLite backup is mandatory before writes, and the result is "
+            "read back for verification."
+        ),
+    )
+    sessions_reset_model.add_argument(
+        "--to", metavar="MODEL", help="Target model (default: profile model.default)"
+    )
+    sessions_reset_model.add_argument(
+        "--provider",
+        metavar="NAME",
+        help="Target provider (default: profile model.provider)",
+    )
+    sessions_reset_model.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Print exact session IDs without writing or creating a backup",
+    )
+    sessions_reset_model.add_argument(
+        "--all",
+        action="store_true",
+        help="Acknowledge that all non-target sessions in this profile are in scope",
     )
 
     def _add_session_filter_args(p, default_older_help):

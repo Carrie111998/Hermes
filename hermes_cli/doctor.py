@@ -121,6 +121,24 @@ def _hermes_database_paths(hermes_home: Path) -> list[tuple[str, Path]]:
     return entries
 
 
+def _session_model_route_diagnostics(db_path: Path) -> dict:
+    """Read-only summary of internally inconsistent session model routes."""
+    from hermes_state import SessionDB
+
+    db = SessionDB(db_path, read_only=True)
+    try:
+        rows = db.audit_session_model_routes(inconsistent_only=True)
+    finally:
+        db.close()
+    return {
+        "count": len(rows),
+        "session_ids": [str(row["id"]) for row in rows[:10]],
+        "issues": sorted(
+            {issue for row in rows for issue in row.get("route_issues", [])}
+        ),
+    }
+
+
 _SQLITE_HEADER_MAGIC = b"SQLite format 3\x00"
 
 
@@ -2088,6 +2106,24 @@ def run_doctor(args):
             count = cursor.fetchone()[0]
             conn.close()
             check_ok(f"{_DHH}/state.db exists ({count} sessions)")
+
+            route_report = _session_model_route_diagnostics(state_db_path)
+            if route_report["count"]:
+                shown_ids = ", ".join(route_report["session_ids"])
+                suffix = (
+                    f", +{route_report['count'] - len(route_report['session_ids'])} more"
+                    if route_report["count"] > len(route_report["session_ids"])
+                    else ""
+                )
+                check_warn(
+                    f"{route_report['count']} session model route(s) are inconsistent",
+                    f"({shown_ids}{suffix}; audit with `hermes sessions list --model '*'`)",
+                )
+                issues.append(
+                    "Session model/provider metadata is inconsistent — audit with "
+                    "`hermes sessions list --model '*'` and repair with "
+                    "`hermes sessions reset-model --dry-run --all`"
+                )
 
             # FTS write-health probe (#50502): `SELECT COUNT(*)` above succeeds
             # even when the FTS index is corrupt and every message write fails
