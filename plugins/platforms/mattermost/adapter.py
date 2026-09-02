@@ -209,10 +209,8 @@ class MattermostAdapter(BasePlatformAdapter):
         reply_to: Optional[str],
         metadata: Optional[Dict[str, Any]],
     ) -> Optional[str]:
-        """Resolve the Mattermost root_id from reply_to or metadata."""
-        if self._reply_mode != "thread":
-            return None
-        candidate = reply_to
+        """Resolve a Mattermost root_id for a new or existing thread."""
+        candidate = reply_to if self._reply_mode == "thread" else None
         if not candidate and isinstance(metadata, dict):
             candidate = metadata.get("thread_id") or metadata.get("root_id")
         if not candidate:

@@ -201,6 +201,24 @@ class TestMattermostSend:
 
 
     @pytest.mark.asyncio
+    async def test_send_in_existing_thread_when_reply_mode_is_off(self):
+        self.adapter._reply_mode = "off"
+        self.adapter._api_get = AsyncMock(
+            return_value={"id": "reply_post", "root_id": "root_post"}
+        )
+        self.adapter._api_post = AsyncMock(return_value={"id": "post456"})
+
+        result = await self.adapter.send(
+            "channel_1",
+            "Reply!",
+            reply_to="reply_post",
+            metadata={"thread_id": "root_post"},
+        )
+
+        assert result.success is True
+        assert self.adapter._api_post.call_args.args[1]["root_id"] == "root_post"
+
+    @pytest.mark.asyncio
     async def test_progress_send_with_invalid_thread_root_never_falls_back_flat(self):
         """Tool/status/progress bubbles must stay quiet when the thread is broken."""
         self.adapter._reply_mode = "thread"
