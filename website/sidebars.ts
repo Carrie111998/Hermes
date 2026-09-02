@@ -807,6 +807,7 @@ const sidebars: SidebarsConfig = {
             'developer-guide/cron-internals',
             'developer-guide/egress-internals',
             'developer-guide/trajectory-format',
+            'developer-guide/agent-learning-loop',
           ],
         },
       ],
