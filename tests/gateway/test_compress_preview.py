@@ -85,3 +85,30 @@ async def test_aggressive_dry_run_shows_preview_plus_note():
     runner.session_store.rewrite_transcript.assert_not_called()
 
 
+def _make_tool_history() -> list[dict]:
+    return [
+        {"role": "user", "content": "read the config"},
+        {"role": "assistant", "content": "",
+         "tool_calls": [{"id": "c1", "function": {"name": "terminal", "arguments": "{}"}}]},
+        {"role": "tool", "tool_call_id": "c1", "content": "X" * 2000},
+        {"role": "assistant", "content": "done."},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_preview_counts_tool_results_and_tool_call_turns():
+    """#98360: the preview must count the rows the real run compresses
+    (user/assistant/tool, tool results included) — not a user+assistant,
+    content-only subset that dropped tool results and empty-content tool_call
+    turns, undercounting both tokens and the "N of M" message count."""
+    runner = _make_runner(_make_tool_history())
+    result = await runner._handle_compress_command(
+        _make_event("/compress --preview")
+    )
+    # All four compressible rows counted, not just the two user+assistant
+    # rows with non-empty content the old filter kept.
+    assert "4 of 4" in result
+    assert "2 of 2" not in result
+    runner.session_store.rewrite_transcript.assert_not_called()
+
+

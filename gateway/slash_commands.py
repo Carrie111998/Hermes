@@ -4580,10 +4580,17 @@ class GatewaySlashCommandsMixin:
         if _preview:
             # Report what WOULD be compressed — no agent, no writes.
             from agent.model_metadata import estimate_request_tokens_rough
+            # Count the same rows the real run compresses: user/assistant/tool
+            # with their full payloads (tool results and tool_call turns
+            # included), matching the non-preview branch below and the CLI.
+            # The previous user+assistant, content-only filter dropped tool
+            # results and empty-content tool_call turns, so both the token
+            # estimate and the "N of M" message count undercounted (#98360).
+            # (The system prompt + tool schemas remain out of scope here — the
+            # preview path deliberately builds no agent to obtain them.)
             _pv_msgs = [
-                {"role": m.get("role"), "content": m.get("content")}
-                for m in history
-                if m.get("role") in {"user", "assistant"} and m.get("content")
+                m for m in history
+                if m.get("role") in {"user", "assistant", "tool"}
             ]
             approx_tokens = estimate_request_tokens_rough(_pv_msgs)
             report = summarize_compress_preview(
