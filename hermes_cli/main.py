@@ -553,6 +553,7 @@ def _apply_profile_override() -> None:
     profile_name = None
     consume = 0
     profile_index = None
+    subcommand = None
 
     def _inside_mcp_add_args(index: int) -> bool:
         """True once argv reaches `hermes mcp add ... --args <command argv>`.
@@ -605,6 +606,35 @@ def _apply_profile_override() -> None:
     from hermes_cli._parser import top_level_value_flag_sets
 
     value_flags, optional_value_flags = top_level_value_flag_sets()
+
+    def _find_subcommand() -> tuple[str | None, int | None]:
+        """Find the first positional command, skipping option values.
+
+        Looking for the literal ``doctor`` in the preceding tokens is not
+        sufficient: ``--model doctor chat`` contains the word without
+        selecting the doctor command.
+        """
+        i = 0
+        while i < len(argv):
+            arg = argv[i]
+            if arg == "--" or (arg == "--args" and _inside_mcp_add_args(i)):
+                return None, None
+            if arg in {"--profile", "-p"} or arg in value_flags:
+                i += 2 if i + 1 < len(argv) else 1
+            elif arg in optional_value_flags:
+                if i + 1 < len(argv) and not argv[i + 1].startswith("-"):
+                    i += 2
+                else:
+                    i += 1
+            elif arg.startswith("--profile=") or "=" in arg:
+                i += 1
+            elif arg.startswith("-"):
+                i += 1
+            else:
+                return arg, i
+        return None, None
+
+    subcommand, subcommand_index = _find_subcommand()
     i = 0
     while i < len(argv):
         arg = argv[i]
@@ -612,12 +642,28 @@ def _apply_profile_override() -> None:
             break
         if arg == "--args" and _inside_mcp_add_args(i):
             break
+        if subcommand is None and not arg.startswith("-"):
+            subcommand = arg
+        # `hermes doctor --profile NAME` is a read-only inspection target,
+        # not the global profile override. The doctor subparser owns that
+        # spelling; retain the historical global override everywhere else.
+        doctor_before = (
+            subcommand == "doctor"
+            and subcommand_index is not None
+            and i > subcommand_index
+        )
         if arg in {"--profile", "-p"} and i + 1 < len(argv):
+            if doctor_before:
+                i += 2
+                continue
             profile_name = argv[i + 1]
             consume = 2
             profile_index = i
             break
         if arg.startswith("--profile="):
+            if doctor_before:
+                i += 1
+                continue
             profile_name = arg.split("=", 1)[1]
             consume = 1
             profile_index = i
@@ -5931,6 +5977,29 @@ def cmd_hooks(args):
 
 def cmd_doctor(args):
     """Check configuration and dependencies."""
+    if getattr(args, "json", False) and not (
+        getattr(args, "profile", None) is not None
+        or getattr(args, "all_profiles", False)
+    ):
+        raise SystemExit("--json requires --profile NAME or --all-profiles")
+    if (
+        getattr(args, "profile", None) is not None
+        or getattr(args, "all_profiles", False)
+        or getattr(args, "json", False)
+    ):
+        from hermes_cli.profile_doctor import render_profile_doctor_report
+
+        try:
+            output = render_profile_doctor_report(
+                profile=getattr(args, "profile", None),
+                all_profiles=getattr(args, "all_profiles", False),
+                as_json=getattr(args, "json", False),
+            )
+        except ValueError as exc:
+            raise SystemExit(str(exc)) from exc
+        print(output)
+        return
+
     from hermes_cli.doctor import run_doctor
 
     run_doctor(args)

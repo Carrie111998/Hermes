@@ -16,6 +16,8 @@ import sys
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 
 def _run_apply_profile_override(
     tmp_path, monkeypatch, *, hermes_home: str | None, active_profile: str | None,
@@ -122,6 +124,72 @@ class TestApplyProfileOverrideHermesHomeGuard:
 
         assert os.environ.get("HERMES_HOME") == str(profile_dir)
         assert sys.argv == ["hermes", "gateway", "install", "--system"]
+
+    def test_doctor_value_before_real_subcommand_does_not_hide_global_profile(
+        self, tmp_path, monkeypatch
+    ):
+        """A value such as ``--model doctor`` is not the doctor command."""
+        hermes_root = tmp_path / ".hermes"
+        (hermes_root / "profiles" / "coder").mkdir(parents=True)
+
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        monkeypatch.delenv("HERMES_HOME", raising=False)
+        monkeypatch.setattr(
+            sys, "argv", ["hermes", "--model", "doctor", "chat", "--profile", "coder"]
+        )
+
+        from hermes_cli.main import _apply_profile_override
+        _apply_profile_override()
+
+        assert os.environ.get("HERMES_HOME") == str(hermes_root / "profiles" / "coder")
+        assert sys.argv == ["hermes", "--model", "doctor", "chat"]
+
+    @pytest.mark.parametrize(
+        "argv",
+        [
+            ["hermes", "doctor", "--profile", "coder"],
+            ["hermes", "--profile", "base", "doctor", "--profile", "coder"],
+            ["hermes", "--profile=base", "doctor", "--profile", "coder"],
+        ],
+    )
+    def test_supported_doctor_profile_layouts_preserve_scope(
+        self, tmp_path, monkeypatch, argv
+    ):
+        """Doctor's target profile is distinct from the global profile flag."""
+        hermes_root = tmp_path / ".hermes"
+        (hermes_root / "profiles" / "base").mkdir(parents=True)
+        (hermes_root / "profiles" / "coder").mkdir(parents=True)
+
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        monkeypatch.delenv("HERMES_HOME", raising=False)
+        monkeypatch.setattr(sys, "argv", argv)
+
+        from hermes_cli.main import _apply_profile_override
+        _apply_profile_override()
+
+        has_global_base = "base" in argv or "--profile=base" in argv
+        expected = hermes_root / "profiles" / "base" if has_global_base else None
+        assert os.environ.get("HERMES_HOME") == (str(expected) if expected else None)
+        if expected:
+            assert sys.argv == ["hermes", "doctor", "--profile", "coder"]
+        else:
+            assert sys.argv == argv
+
+    def test_mcp_args_profile_belongs_to_child_command(self, tmp_path, monkeypatch):
+        """A ``--profile`` after MCP ``--args`` is not Hermes' profile flag."""
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        monkeypatch.delenv("HERMES_HOME", raising=False)
+        argv = [
+            "hermes", "mcp", "add", "server", "--args", "docker",
+            "run", "--profile", "child",
+        ]
+        monkeypatch.setattr(sys, "argv", argv)
+
+        from hermes_cli.main import _apply_profile_override
+        _apply_profile_override()
+
+        assert os.environ.get("HERMES_HOME") is None
+        assert sys.argv == argv
 
 
 
