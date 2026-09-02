@@ -62,6 +62,25 @@ def test_race_loser_converges_on_existing_row(race_home):
         assert count == 1, f"expected exactly 1 row for key, found {count}"
 
 
+def test_empty_string_key_means_no_key(race_home):
+    """Regression: '' key must behave identically to None.
+
+    The guard historically treats '' as falsy (no idempotency), but the
+    INSERT stored '' as a value — under the UNIQUE index a second ''-key
+    create then crashed with IntegrityError ('' collided with the stored
+    ''). Normalizing '' to NULL at entry makes guard and storage agree:
+    each ''-key create is an ordinary independent task.
+    """
+    a = kb.create_task(kb.connect(), title="empty one", idempotency_key="")
+    b = kb.create_task(kb.connect(), title="empty two", idempotency_key="")
+    assert a != b, "'' key must not be idempotent — it means no key"
+    with kb.connect() as conn:
+        rows = conn.execute(
+            "SELECT COUNT(*) FROM tasks WHERE idempotency_key = ''"
+        ).fetchone()[0]
+    assert rows == 0, f"'' must be normalized to NULL, found {rows} stored '' keys"
+
+
 def test_concurrent_same_key_creates_produce_exactly_one_row(race_home):
     """Real concurrency: 8 threads, separate connections, one key.
 

@@ -3268,6 +3268,12 @@ def create_task(
     model_override = (model_override or "").strip() or None
     provider_override = (provider_override or "").strip() or None
     reasoning_effort = normalize_reasoning_effort(reasoning_effort)
+    # '' (or whitespace) means "no key": normalize to None so the guard
+    # (truthiness check) and the INSERT (which would store '' as a value
+    # and collide under the UNIQUE index) agree. NULL never participates
+    # in the UNIQUE constraint; '' would — a second ''-key create would
+    # crash with IntegrityError instead of being an ordinary task.
+    idempotency_key = (idempotency_key or "").strip() or None
     if provider_override and not model_override:
         raise ValueError("provider_override requires a model_override")
     assignee = _canonical_assignee(assignee)
