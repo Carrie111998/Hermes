@@ -40,11 +40,23 @@ Configuration (config.yaml):
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from functools import lru_cache
+from typing import Any, Dict, List, Optional, Tuple
 
 import logging
 
 logger = logging.getLogger(__name__)
+
+
+# ── Perf: route-match cache for isolated runtimes (#99986) ───────────────
+# Hot path: every inbound message (Telegram/Discord/etc.) calls
+# match_profile_route, which previously linear-scanned all routes. With
+# isolated runtimes behind gateway.profile_routes, this scan happens
+# under the TenantSupervisor's per-profile worker handoff and must stay
+# cheap at high message rates. Cache is keyed by the routes' identity
+# (frozen ProfileRoute is hashable) plus the source discriminators.
+# Invalidation is implicit: a new routes list (new tuple object) misses.
+
 
 
 class ProfileRouteRejected(RuntimeError):
@@ -106,6 +118,22 @@ class ProfileRoute:
         return True
 
 
+@lru_cache(maxsize=512)
+def _cached_match(
+    routes_key: Tuple[ProfileRoute, ...],
+    platform: str,
+    guild_id: Optional[str],
+    chat_id: Optional[str],
+    thread_id: Optional[str],
+    parent_chat_id: Optional[str],
+) -> Optional[ProfileRoute]:
+    """Cached linear scan (most-specific-first). Routes are frozen & hashable."""
+    for route in routes_key:
+        if route.matches(platform, guild_id=guild_id, chat_id=chat_id, thread_id=thread_id, parent_chat_id=parent_chat_id):
+            return route
+    return None
+
+
 def parse_profile_routes(raw: Optional[List[Dict[str, Any]]]) -> List[ProfileRoute]:
     """Parse profile_routes from config.yaml into ProfileRoute objects.
 
@@ -164,7 +192,27 @@ def match_profile_route(
     parent_chat_id: Optional[str] = None,
 ) -> Optional[ProfileRoute]:
     """Return the best-matching route, or None for no match."""
-    for route in routes:
-        if route.matches(platform, guild_id=guild_id, chat_id=chat_id, thread_id=thread_id, parent_chat_id=parent_chat_id):
-            return route
-    return None
+    if not routes:
+        return None
+    # Fast path: cached scan. Tuple conversion is cheap for the typical
+    # small route table (2-10 entries) and the LRU avoids re-scanning
+    # the same (platform, guild, chat, thread) on every message in a
+    # busy chat (perf, #99986). Falls back to direct scan on any
+    # hashing/type error so a malformed route never breaks delivery.
+    try:
+        # Routes are already sorted most-specific-first by parse_profile_routes
+        key = tuple(routes)  # ProfileRoute is frozen+hashable
+        return _cached_match(key, platform, guild_id, chat_id, thread_id, parent_chat_id)
+    except Exception:
+        for route in routes:
+            if route.matches(platform, guild_id=guild_id, chat_id=chat_id, thread_id=thread_id, parent_chat_id=parent_chat_id):
+                return route
+        return None
+
+
+def clear_profile_route_cache() -> None:
+    """Clear the route-match LRU (for tests and config reload)."""
+    try:
+        _cached_match.cache_clear()
+    except Exception:
+        pass

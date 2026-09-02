@@ -1034,6 +1034,16 @@ class GatewayConfig:
     # dict with: name, platform, profile, and optional guild_id/chat_id/thread_id.
     profile_routes: list = field(default_factory=list)
 
+    # Isolated agent runtimes behind gateway profile routing (#99986).
+    # Controls how routed profiles are executed: in_process (legacy shared
+    # process, no OS isolation), worker (per-profile isolated runtime
+    # via ContextVar HERMES_HOME/secret/terminal isolation + TenantSupervisor
+    # — the perf-friendly MVP), or future container/microvm backends.
+    # ``mode: off`` disables the supervisor and keeps pure in-process routing.
+    # Additional keys: unmatched (deny|default_profile), allowed_profiles,
+    # max_workers_per_profile, max_queue_depth, request_timeout_seconds.
+    tenant_isolation: dict = field(default_factory=dict)
+
     def __post_init__(self) -> None:
         self.multiplex_profile_allowlist = _normalize_multiplex_profile_allowlist(
             self.multiplex_profile_allowlist
@@ -1153,6 +1163,7 @@ class GatewayConfig:
             "max_concurrent_sessions": self.max_concurrent_sessions,
             "multiplex_profiles": self.multiplex_profiles,
             "multiplex_profile_allowlist": self.multiplex_profile_allowlist,
+            "tenant_isolation": self.tenant_isolation,
             "room_link_url": self.room_link_url,
             "systemd_watchdog_seconds": self.systemd_watchdog_seconds,
             "loop_watchdog": self.loop_watchdog,
@@ -1317,6 +1328,12 @@ class GatewayConfig:
         # Parse profile routes (validated by gateway.profile_routing)
         from gateway.profile_routing import parse_profile_routes
         profile_routes = parse_profile_routes(data.get("profile_routes") or [])
+        tenant_isolation = data.get("tenant_isolation")
+        if not isinstance(tenant_isolation, dict):
+            nested_gw = data.get("gateway") if isinstance(data.get("gateway"), dict) else {}
+            tenant_isolation = nested_gw.get("tenant_isolation") if isinstance(nested_gw.get("tenant_isolation"), dict) else {}
+        if not isinstance(tenant_isolation, dict):
+            tenant_isolation = {}
 
         return cls(
             platforms=platforms,
@@ -1348,6 +1365,7 @@ class GatewayConfig:
             streaming=StreamingConfig.from_dict(data.get("streaming", {})),
             session_store_max_age_days=session_store_max_age_days,
             profile_routes=profile_routes,
+            tenant_isolation=tenant_isolation,
         )
 
     def get_unauthorized_dm_behavior(self, platform: Optional[Platform] = None) -> str:
