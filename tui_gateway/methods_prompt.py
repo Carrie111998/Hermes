@@ -1894,17 +1894,27 @@ def _(rid, params: dict) -> dict:
     try:
         from tools.approval import resolve_gateway_approval
 
-        return _ok(
-            rid,
-            {
-                "resolved": resolve_gateway_approval(
-                    session["session_key"],
-                    params.get("choice", "deny"),
-                    resolve_all=params.get("all", False),
-                    request_id=params.get("request_id"),
-                )
-            },
+        choice = params.get("choice", "deny")
+        request_id = params.get("request_id")
+        resolved = resolve_gateway_approval(
+            session["session_key"],
+            choice,
+            resolve_all=params.get("all", False),
+            request_id=request_id,
         )
+        if not resolved and request_id:
+            from tools.bot_mode_approval import resolve_bot_mode_approval
+
+            # Match resolve_gateway_approval's integer count contract so RPC
+            # clients see the same payload shape on both resolution paths.
+            resolved = int(
+                resolve_bot_mode_approval(
+                    session["session_key"],
+                    choice,
+                    request_id=request_id,
+                )
+            )
+        return _ok(rid, {"resolved": resolved})  # type: ignore[name-defined]
     except Exception as e:
         return _err(rid, 5004, str(e))
 

@@ -22297,6 +22297,26 @@ def main(
                         # (they check agent.tool_progress_mode, initialized
                         # from display.tool_progress at construction).
                         cli.agent.tool_progress_mode = "off"
+                        # Bot Mode query-file deliveries run outside the target
+                        # profile gateway process, so route approvals through a
+                        # durable mailbox that the open Bot Chat gateway polls.
+                        try:
+                            from tools.bot_mode_approval import (
+                                install_bot_mode_approval_callback,
+                            )
+
+                            install_bot_mode_approval_callback(
+                                cli,
+                                timeout=int(
+                                    CLI_CONFIG.get("approvals", {}).get(
+                                        "timeout", 300
+                                    )
+                                ),
+                            )
+                        except Exception:
+                            # Fail closed: without the bridge, protected tools
+                            # retain their normal timeout/deny behavior.
+                            pass
                         try:
                             result = cli.agent.run_conversation(
                                 user_message=effective_query,

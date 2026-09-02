@@ -3075,15 +3075,37 @@ def _pending_clarify_request_payload(sid: str) -> dict | None:
 
 
 def _pending_approval_request_payload(session_key: str) -> dict | None:
-    """Read the oldest unresolved approval in a session, if there is one."""
+    """Read the oldest unresolved in-process or Bot Mode approval."""
     try:
         from tools.approval import get_pending_gateway_approval
 
         approval = get_pending_gateway_approval(session_key)
+        if not approval:
+            from tools.bot_mode_approval import get_pending_bot_mode_approval
+
+            approval = get_pending_bot_mode_approval(session_key)
     except Exception:
         logger.debug("failed to read pending approval for %s", session_key, exc_info=True)
         return None
     return _approval_request_payload(approval) if approval else None
+
+
+def _poll_bot_mode_approval(sid: str, session: dict, seen: set[str]) -> None:
+    """Surface a new approval owned by an external Bot Mode query process."""
+    try:
+        from tools.bot_mode_approval import get_pending_bot_mode_approval
+
+        approval = get_pending_bot_mode_approval(str(session.get("session_key") or ""))
+    except Exception:
+        logger.debug("failed to poll Bot Mode approvals for %s", sid, exc_info=True)
+        return
+    if not approval:
+        return
+    request_id = str(approval.get("request_id") or "")
+    if not request_id or request_id in seen:
+        return
+    seen.add(request_id)
+    _emit_approval_request(sid, approval)
 
 
 def _emit_approval_request(sid: str, data: dict | None) -> None:
@@ -12605,9 +12627,13 @@ def _notification_poller_loop(
     from tools.process_registry import process_registry, format_process_notification
 
     _emitted = set()  # dedup re-queued events so same completion isn't emitted 50 times while session is busy
+    # Per-session and bounded by approvals surfaced during this poller's
+    # lifetime; the set is discarded when the session finalizes.
+    _bot_mode_approvals_seen: set[str] = set()
     _last_kanban_poll = 0.0
     _last_loop_poll = 0.0
     while not stop_event.is_set() and not session.get("_finalized"):
+        _poll_bot_mode_approval(sid, session, _bot_mode_approvals_seen)
         _now = time.monotonic()
         # ── /loop wakeup driver ──────────────────────────────────────
         # Fire a due /loop tick for THIS session while it's idle. Same

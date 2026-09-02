@@ -403,6 +403,30 @@ def test_delivery_runner_unlinks_when_child_launch_raises(tmp_path, monkeypatch)
     assert not dm_file.exists()
 
 
+def test_query_file_delivery_marks_bot_mode_approval_bridge(tmp_path):
+    dm_file = tmp_path / "message.txt"
+    dm_file.write_text("secret", encoding="utf-8")
+    observed = tmp_path / "observed.txt"
+    child = tmp_path / "child.py"
+    child.write_text(
+        "import os, pathlib, sys\n"
+        "pathlib.Path(sys.argv[1]).write_text(\n"
+        "    os.environ.get('HERMES_BOT_MODE_QUERY_FILE', ''), encoding='utf-8'\n"
+        ")\n",
+        encoding="utf-8",
+    )
+
+    returncode = bot_mode_dm._run_delivery(
+        [sys.executable, str(child), str(observed)],
+        str(dm_file),
+        stdin_file=False,
+    )
+
+    assert returncode == 0
+    assert observed.read_text(encoding="utf-8") == "1"
+    assert not dm_file.exists()
+
+
 def test_delivery_runner_preserves_child_failure_and_unlinks(tmp_path):
     dm_file = tmp_path / "message.txt"
     dm_file.write_text("secret", encoding="utf-8")
