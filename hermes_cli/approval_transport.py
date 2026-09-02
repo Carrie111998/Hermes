@@ -30,6 +30,19 @@ ApprovalPresentFn = Callable[
 ]
 
 
+def make_approval_scope(profile_name: str, session_key: str) -> str:
+    """Return a stable, non-secret scope identifier owned by the host.
+
+    The raw conversation/session key is deliberately never exposed to a
+    transport.  Including the profile prevents a request from one profile
+    being mistaken for the same conversation in another profile.
+    """
+    material = f"hermes-approval-scope-v1\0{profile_name}\0{session_key}".encode(
+        "utf-8"
+    )
+    return hashlib.sha256(material).hexdigest()
+
+
 @dataclass(frozen=True)
 class ApprovalDecision:
     """A transport response bound to one exact host-created request."""
@@ -51,6 +64,11 @@ class ApprovalRequest:
     pattern_key: str
     pattern_keys: tuple[str, ...]
     surface: str
+    profile_name: str
+    # Compatibility field retained for lifecycle/plugin consumers. It is the
+    # opaque scope key, never the raw host session key.
+    session_key: str
+    conversation_scope_key: str
     timeout_seconds: float
     allowed_choices: tuple[ApprovalChoice, ...]
 
@@ -67,8 +85,20 @@ class ApprovalRequest:
         allow_session: bool,
         allow_permanent: bool,
         timeout_seconds: float = 300,
+        profile_name: str = "default",
     ) -> "ApprovalRequest":
+        """Create a request with an opaque conversation scope.
+
+        The raw session key is host-internal input used only to derive the
+        scope. If request construction fails, the selected transport path
+        must deny rather than fall back to the built-in prompt or raw data.
+        """
         request_id = uuid.uuid4().hex
+        from hermes_cli.profiles import normalize_profile_name, validate_profile_name
+
+        profile_name = normalize_profile_name(profile_name)
+        validate_profile_name(profile_name)
+        conversation_scope_key = make_approval_scope(profile_name, session_key)
         choices: list[ApprovalChoice] = ["once"]
         if allow_session:
             choices.append("session")
@@ -82,8 +112,10 @@ class ApprovalRequest:
             "description": description,
             "pattern_key": pattern_key,
             "pattern_keys": list(pattern_keys),
-            "session_key": session_key,
+            "session_key": conversation_scope_key,
             "surface": surface,
+            "profile_name": profile_name,
+            "conversation_scope_key": conversation_scope_key,
             "timeout_seconds": timeout_seconds,
             "allowed_choices": choices,
         }
@@ -99,6 +131,9 @@ class ApprovalRequest:
             pattern_key=pattern_key,
             pattern_keys=pattern_keys,
             surface=surface,
+            profile_name=profile_name,
+            session_key=conversation_scope_key,
+            conversation_scope_key=conversation_scope_key,
             timeout_seconds=timeout_seconds,
             allowed_choices=tuple(choices),
         )

@@ -4352,6 +4352,10 @@ def _present_with_selected_transport(
         from agent.redact import redact_sensitive_text
         from hermes_cli.approval_transport import ApprovalRequest, invoke_approval_transport
 
+        from hermes_cli.profiles import get_active_profile_name
+
+        profile_name = get_active_profile_name()
+
         timeout_seconds = _get_approval_timeout()
         request = ApprovalRequest.create(
             command=redact_sensitive_text(command, force=True),
@@ -4363,6 +4367,7 @@ def _present_with_selected_transport(
             allow_session=allow_session,
             allow_permanent=allow_permanent,
             timeout_seconds=timeout_seconds,
+            profile_name=profile_name,
         )
     except Exception:
         # Never fall back to raw text if redaction or request construction
@@ -4383,7 +4388,8 @@ def _present_with_selected_transport(
         description=request.description,
         pattern_key=pattern_key,
         pattern_keys=list(pattern_keys),
-        session_key=session_key,
+        session_key=request.session_key,
+        conversation_scope_key=request.conversation_scope_key,
         surface=hook_surface,
         request_id=request.request_id,
         request_digest=request.digest,
@@ -4414,7 +4420,8 @@ def _present_with_selected_transport(
         description=request.description,
         pattern_key=pattern_key,
         pattern_keys=list(pattern_keys),
-        session_key=session_key,
+        session_key=request.session_key,
+        conversation_scope_key=request.conversation_scope_key,
         surface=hook_surface,
         choice=hook_choice,
         request_id=request.request_id,

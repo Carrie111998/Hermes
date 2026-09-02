@@ -209,6 +209,12 @@ In short: **bundled "always-works" infrastructure loads automatically; third-par
 
 ### Approval transports
 
+The host-facing constructor is `ApprovalRequest.create(...)`. It derives the
+opaque `conversation_scope_key` from the canonical profile name and conversation
+session key; callers cannot supply or override that scope. `profile_name` must be
+a canonical value returned by Hermes profile resolution (`default`, `custom`, or a
+valid profile id).
+
 An approval transport changes **where a human sees and answers** an existing
 Hermes tool-approval request. It does not decide whether a command needs
 approval and it is not an authorization-policy API.
