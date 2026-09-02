@@ -1275,6 +1275,44 @@ def normalize_converse_stream_events(event_stream) -> SimpleNamespace:
     return stream_converse_with_callbacks(event_stream)
 
 
+def _assemble_streamed_reasoning(
+    ordered_blocks: List[Dict[str, Any]],
+) -> Optional[str]:
+    """Join streamed reasoning, treating blocks — not deltas — as the unit.
+
+    ``"\n\n"`` is the separator between reasoning *blocks*. That is what
+    :func:`normalize_converse_response` applies, correctly, because there every
+    element it walks genuinely is a content block.
+
+    On the streaming path the things arriving are *deltas*, and a delta is a
+    fragment — routinely a fragment of a single word. Measured against
+    ``us.anthropic.claude-sonnet-4-5-20250929-v1:0`` on Converse with thinking
+    enabled, one reply arrived as 45 deltas beginning::
+
+        "Let"  " me check if 91 is prime"  " by seeing"  ...  " div"
+        "iding by small primes:"
+
+    so joining them with the block separator welded 44 copies of ``"\n\n"``
+    into the text — 88 characters the model never emitted, including one inside
+    the word "dividing" (#98468).
+
+    The per-block text in ``stream_blocks`` is accumulated by plain
+    concatenation as the deltas arrive, so blocks are the right unit to join
+    here and no second accumulator is needed. The live display was never
+    affected: ``on_reasoning_delta`` is handed each raw chunk directly. Only
+    the stored copy was corrupted — the one that feeds history, compression,
+    ``/resume`` replay and token accounting.
+    """
+    texts: List[str] = []
+    for block in ordered_blocks:
+        reasoning = block.get("reasoningContent")
+        if isinstance(reasoning, dict):
+            text = reasoning.get("text")
+            if text:
+                texts.append(text)
+    return "\n\n".join(texts) if texts else None
+
+
 def stream_converse_with_callbacks(
     event_stream,
     on_text_delta=None,
@@ -1313,7 +1351,6 @@ def stream_converse_with_callbacks(
         ``normalize_converse_response()``.
     """
     text_parts: List[str] = []
-    reasoning_parts: List[str] = []
     reasoning_details: List[Dict[str, Any]] = []
     tool_calls: List[SimpleNamespace] = []
     stream_blocks: Dict[int, Dict[str, Any]] = {}
@@ -1381,7 +1418,6 @@ def stream_converse_with_callbacks(
                 if isinstance(reasoning, dict):
                     thinking_text = reasoning.get("text", "")
                     if thinking_text:
-                        reasoning_parts.append(str(thinking_text))
                         if on_reasoning_delta:
                             on_reasoning_delta(thinking_text)
                         block = stream_blocks.setdefault(current_block_index if current_block_index is not None else len(stream_blocks), {"reasoningContent": {}})
@@ -1439,13 +1475,15 @@ def stream_converse_with_callbacks(
     if current_text_buffer:
         text_parts.append("".join(current_text_buffer))
 
+    ordered_stream_blocks = [stream_blocks[i] for i in sorted(stream_blocks)]
+
     msg = SimpleNamespace(
         role="assistant",
         content="\n".join(text_parts) if text_parts else None,
         tool_calls=tool_calls if tool_calls else None,
-        reasoning_content="\n\n".join(reasoning_parts) if reasoning_parts else None,
+        reasoning_content=_assemble_streamed_reasoning(ordered_stream_blocks),
         reasoning_details=reasoning_details or None,
-        bedrock_content_blocks=[stream_blocks[i] for i in sorted(stream_blocks)] or None,
+        bedrock_content_blocks=ordered_stream_blocks or None,
     )
 
     input_tokens = usage_data.get("inputTokens", 0)
