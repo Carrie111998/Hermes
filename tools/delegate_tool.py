@@ -2023,18 +2023,20 @@ def _build_child_agent(
     # agent does.  _fallback_chain is a list accepted by AIAgent's
     # fallback_model parameter (which handles both list and dict forms).
     #
-    # EXCEPT when the user pinned delegation.provider: an explicit pin means
-    # "children run on THIS provider".  Inheriting the parent chain would let
-    # a mid-run auth/429 failure silently reroute the quiet-mode child onto
-    # the parent's fallback models with no surfaced signal (#80450) — the
-    # same class of silent-drag the override_provider filter-clearing below
-    # already prevents for OpenRouter routing preferences.  Predictability >
-    # liveness for explicit pins: the pinned child fails loudly instead.
-    parent_fallback = (
-        None
-        if override_provider
-        else (getattr(parent_agent, "_fallback_chain", None) or None)
-    )
+    # Delegation fallback takes precedence over parent inheritance:
+    # when delegation.fallback_providers (or fallback_chain/fallback_model)
+    # is configured it fully replaces the parent chain (mirrors the
+    # auxiliary fallback pattern).  Otherwise:
+    #   - pinned provider (override_provider set) => None (backward compat;
+    #     explicit pin means "run on THIS provider" #80450)
+    #   - unpinned => inherit parent chain (existing behaviour)
+    delegation_fallback = _get_delegation_fallback_chain(delegation_cfg)
+    if delegation_fallback:
+        parent_fallback = delegation_fallback
+    elif override_provider:
+        parent_fallback = None
+    else:
+        parent_fallback = getattr(parent_agent, "_fallback_chain", None) or None
 
     # Inherit the parent's OpenRouter provider-preference filters by default
     # (so subagents routed to the same provider honour the same routing
@@ -5037,6 +5039,25 @@ def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
         "command": runtime.get("command"),
         "args": list(runtime.get("args") or []),
     }
+
+
+def _get_delegation_fallback_chain(delegation_cfg: dict | None) -> list | None:
+    """Resolve delegation fallback chain with backward compat.
+
+    Delegates to hermes_cli.fallback_config.get_fallback_chain which
+    merges delegation.fallback_providers / fallback_chain / fallback_model
+    (in that priority order) with dedup, mirroring the top-level fallback
+    logic. Empty chain normalizes to None so callers can distinguish
+    "no delegation fallback configured" from "explicit chain".
+    """
+    if not isinstance(delegation_cfg, dict):
+        return None
+    try:
+        from hermes_cli.fallback_config import get_fallback_chain
+    except Exception:
+        return None
+    chain = get_fallback_chain(delegation_cfg)
+    return chain or None
 
 
 def _load_config() -> dict:

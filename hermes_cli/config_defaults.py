@@ -2214,6 +2214,19 @@ DEFAULT_CONFIG = {
         # Set to true to restore delivery of child process notifications
         # (with subagent attribution lines).
         "surface_child_process_notifications": False,
+        # Fallback providers for delegation subagents — tried when the pinned
+        # delegation provider fails with rate-limit/overload/auth errors.
+        # Empty (default) preserves the legacy behavior: a pinned
+        # delegation.provider disables the parent's fallback_providers chain
+        # (no silent reroute). When set, this list is passed as the child's
+        # fallback_model / _fallback_chain, exactly like the top-level
+        # fallback_providers chain but scoped to delegation. Each entry needs
+        # provider + model; base_url / api_mode / key_env are optional.
+        # Aliases fallback_chain / fallback_model are also honored via
+        # hermes_cli.fallback_config.get_fallback_chain() for back-compat.
+        "fallback_providers": [],
+        "fallback_chain": [],
+        "fallback_model": None,
     },
 
     # Ephemeral prefill messages file — JSON list of {role, content} dicts
