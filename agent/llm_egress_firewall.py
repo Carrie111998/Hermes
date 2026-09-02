@@ -276,6 +276,16 @@ _PRIVATE_ABSOLUTE_PATH = re.compile(
     r")",
     re.IGNORECASE,
 )
+# Remote egress needs a stricter assignment scan than ordinary log redaction.
+# ``redact_sensitive_text`` intentionally leaves bare ``token=...`` in prose
+# alone to avoid false positives, but a provider-bound request must fail closed
+# when it contains an explicit credential-shaped assignment.
+_EGRESS_SECRET_ASSIGNMENT = re.compile(
+    r"(?i)(?<![A-Za-z0-9_])"
+    r"(?:access[_-]?token|refresh[_-]?token|id[_-]?token|token|secret|"
+    r"password|passwd|api[_-]?key|apikey|client[_-]?secret|private[_-]?key)"
+    r"\s*[:=]\s*(?!<redacted>)[^\s,}\"']+"
+)
 # These are fixed provider-protocol grammar atoms, not a caller-configurable
 # egress allowlist. Several happen to round-trip as unpadded Base64 even though
 # they are required JSON schema words. They still go through the final secret
@@ -706,7 +716,7 @@ def _contains_secret(value: Any, *, seen: set[int] | None = None) -> bool:
             value,
             force=True,
             redact_url_credentials=True,
-        ) != value
+        ) != value or _EGRESS_SECRET_ASSIGNMENT.search(value) is not None
     if isinstance(value, (bytes, bytearray, memoryview)):
         # Binary request material is not safely inspectable as text.
         return True
