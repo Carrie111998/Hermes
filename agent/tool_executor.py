@@ -2151,6 +2151,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                     window=next_args.get("window", 5),
                     sort=next_args.get("sort"),
                     detail=next_args.get("detail", "adaptive"),
+                    profile=next_args.get("profile"),
                     db=session_db,
                     current_session_id=agent.session_id,
                 )
@@ -2177,6 +2178,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                     target=target,
                     content=next_args.get("content"),
                     old_text=next_args.get("old_text"),
+                    new_text=next_args.get("new_text"),
                     operations=operations,
                     store=agent._memory_store,
                 )
@@ -2287,6 +2289,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                     amount=next_args.get("amount"),
                     to=next_args.get("to"),
                     limit=next_args.get("max"),
+                    full=next_args.get("full"),
                     callback=getattr(agent, "drive_preview_callback", None),
                 )
             function_result, function_args, middleware_trace, _execution_blocked, _execution_dispatched = _managed_values(_run_agent_tool_execution_middleware(
