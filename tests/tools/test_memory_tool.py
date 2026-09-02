@@ -244,6 +244,75 @@ class TestMemoryConsolidationGracefulDegrade:
         assert "continue with your reply" not in r["error"]
 
 
+class TestMemorySuccessfulWriteBudget:
+    """#81120: a loop made entirely of SUCCESSFUL memory mutations bypasses the
+    #42405 failure cap (every success resets it). Successful writes must have
+    their own per-turn budget; beyond it further writes are refused with a
+    terminal result, the store keeps its last known-good state, and unrelated
+    entries survive."""
+
+    def test_alternating_successful_writes_stop_after_cap(self, store):
+        store.add("memory", "unrelated durable fact")
+        # Seed done; a new turn starts with a fresh write budget.
+        store.reset_consolidation_failures()
+
+        cap = store._MAX_SUCCESSFUL_WRITES_PER_TURN
+        # The observed oscillation: add(x) -> remove(x) -> add(x) -> ... Every
+        # call succeeds, so the #42405 failure counter never accumulates.
+        # Each round consumes 2 writes, so cap // 2 rounds stay within budget.
+        for i in range(cap // 2):
+            r = store.add("memory", f"temp note {i}")
+            assert r["success"] is True
+            r = store.remove("memory", f"temp note {i}")
+            assert r["success"] is True
+        assert store._successful_writes == cap
+
+        # Budget exhausted: the next mutation is refused, terminally, and the
+        # store keeps its last known-good state.
+        r = store.add("memory", "another fact")
+        assert r["success"] is False
+        assert r["done"] is True
+        assert "continue with your reply" in r["error"]
+        assert "another fact" not in store.memory_entries
+        assert "unrelated durable fact" in store.memory_entries
+
+    def test_batch_writes_count_toward_budget(self, store):
+        cap = store._MAX_SUCCESSFUL_WRITES_PER_TURN
+        batch = [{"action": "add", "content": "fact A"}]
+        for _ in range(cap):
+            r = store.apply_batch("memory", batch)
+            assert r["success"] is True
+        # The atomic batch path is the primary consolidation route; it must
+        # consume the same budget as single ops (sibling call path).
+        r = store.apply_batch("memory", batch)
+        assert r["success"] is False
+        assert r["done"] is True
+        assert "continue with your reply" in r["error"]
+
+    def test_duplicate_add_counts_toward_budget(self, store):
+        cap = store._MAX_SUCCESSFUL_WRITES_PER_TURN
+        for _ in range(cap):
+            r = store.add("memory", "same fact")
+            assert r["success"] is True  # idempotent no-op after the first
+        # Idempotent successes still consume budget: re-issuing an
+        # already-saved write is the repeat behaviour the budget suppresses.
+        r = store.add("memory", "same fact")
+        assert r["success"] is False
+        assert r["done"] is True
+
+    def test_budget_resets_at_turn_boundary(self, store):
+        cap = store._MAX_SUCCESSFUL_WRITES_PER_TURN
+        for i in range(cap):
+            assert store.add("memory", f"fact {i}")["success"] is True
+        assert store.add("memory", "overflow fact")["success"] is False
+
+        # New user turn -> fresh, legitimate maintenance episode.
+        store.reset_consolidation_failures()
+        r = store.add("memory", "new turn fact")
+        assert r["success"] is True
+        assert "new turn fact" in store.memory_entries
+
+
 class TestMemoryStorePersistence:
     def test_save_and_load_roundtrip(self, tmp_path, monkeypatch):
         monkeypatch.setattr("tools.memory_tool.get_memory_dir", lambda: tmp_path)
