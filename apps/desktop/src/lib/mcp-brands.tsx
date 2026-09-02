@@ -40,6 +40,7 @@ import {
   SiPaypal,
   SiPostgresql,
   SiPostman,
+  SiPrisma,
   SiRailway,
   SiRobinhood,
   SiSentry,
@@ -53,6 +54,7 @@ import {
   SiVercel,
   SiWebflow,
   SiWolfram,
+  SiWordpress,
   SiZapier
 } from '@icons-pack/react-simple-icons'
 import type { ComponentType, SVGProps } from 'react'
@@ -99,6 +101,7 @@ export const MCP_BRAND_ICONS: Record<string, McpBrand> = {
   postgres: { Icon: SiPostgresql, color: '#4169E1' },
   postgresql: { Icon: SiPostgresql, color: '#4169E1' },
   postman: { Icon: SiPostman, color: '#FF6C37' },
+  'prisma-postgres': { Icon: SiPrisma, color: '#2D3748', monochrome: true },
   railway: { Icon: SiRailway, color: '#0B0D0E', monochrome: true },
   robinhood: { Icon: SiRobinhood, color: '#CCFF00' },
   sentry: { Icon: SiSentry, color: '#362D59' },
@@ -111,6 +114,7 @@ export const MCP_BRAND_ICONS: Record<string, McpBrand> = {
   'unreal-engine': { Icon: SiUnrealengine, color: '#0E1128', monochrome: true },
   vercel: { Icon: SiVercel, color: '#000000', monochrome: true },
   webflow: { Icon: SiWebflow, color: '#146EF5' },
+  'wordpress-com': { Icon: SiWordpress, color: '#21759B' },
   wolfram: { Icon: SiWolfram, color: '#DD1100' },
   zapier: { Icon: SiZapier, color: '#FF4A00' }
 }
