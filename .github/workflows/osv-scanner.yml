@@ -57,7 +57,7 @@ jobs:
 
   emit-status:
     name: Emit review status
-    runs-on: ubuntu-latest
+    runs-on: self-hosted
     needs: scan
     if: always()
     outputs:
