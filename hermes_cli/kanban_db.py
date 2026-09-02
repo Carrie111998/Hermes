@@ -5935,7 +5935,6 @@ def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:
             _cleanup_worktree_workspace(task_id, path, row["branch_name"])
             _try_cleanup_parent_workspaces(conn, task_id)
             return
-        import shutil
         wp = Path(path)
         if wp.is_dir():
             # Containment guard (#28818): a board's ``default_workdir`` can
@@ -5944,8 +5943,23 @@ def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:
             # completion would unconditionally ``shutil.rmtree`` that path
             # and silently delete the user's source data.
             if _is_managed_scratch_path(wp):
-                shutil.rmtree(wp, ignore_errors=True)
-                _log.debug("Removed scratch workspace: %s", wp)
+                from hermes_cli.kanban_retention import remove_exact_tree_for_lifecycle
+                _managed, board = _managed_scratch_path_info(wp)
+                root = workspaces_root(board=board)
+                removed, reason = remove_exact_tree_for_lifecycle(wp, root)
+                if removed:
+                    _log.debug("Removed scratch workspace: %s", wp)
+                else:
+                    _log.warning(
+                        "Deferred scratch cleanup for task %s: %s", task_id, reason
+                    )
+                    with write_txn(conn):
+                        _append_event(
+                            conn,
+                            task_id,
+                            "workspace_cleanup_deferred",
+                            {"reason": reason, "workspace_kind": "scratch"},
+                        )
             else:
                 _log.warning(
                     "Refusing to remove out-of-scratch workspace for task %s: %s "
@@ -5973,27 +5987,24 @@ def _cleanup_worktree_workspace(
     (``cli._prune_stale_worktrees``): removal requires a clean working tree
     AND every commit reachable from a remote-tracking ref. Any doubt — dirty
     files, unpushed commits, unresolvable repo, failing git — preserves the
-    worktree. The task's auto-generated ``wt/<task-id>`` branch is deleted
-    with it; custom branches are kept. Best-effort like the scratch path.
+    worktree. The named branch/ref is retained as the compact recovery handle.
+    Best-effort like the scratch path.
     """
     try:
-        from cli import _worktree_has_unpushed_commits, _worktree_is_dirty
-    except Exception:
-        return  # CLI safety predicates unavailable — preserve
-    try:
+        from hermes_cli.kanban_retention import _git_check, _worktree_owner
         wp = Path(path).expanduser()
         if not wp.is_dir():
             return
-        common = _git_common_dir(wp)
-        if common is None or common.name != ".git":
-            return  # not a linked worktree of a normal repo — never guess
-        repo_root = common.parent
-        if wp.resolve(strict=False) == repo_root.resolve(strict=False):
-            return  # never remove the main checkout
-        if _worktree_is_dirty(str(wp)) or _worktree_has_unpushed_commits(str(wp)):
+        repo_root, owner_reason = _worktree_owner(wp)
+        if repo_root is None:
             _log.info(
-                "Preserving worktree for task %s: dirty or unpushed work at %s",
-                task_id, wp,
+                "Preserving worktree for task %s: %s", task_id, owner_reason
+            )
+            return
+        git_ok, git_reason, _proof = _git_check(wp)
+        if not git_ok:
+            _log.info(
+                "Preserving worktree for task %s: %s", task_id, git_reason
             )
             return
         # No --force: the dirty/unpushed checks above run before removal, so
@@ -6014,15 +6025,8 @@ def _cleanup_worktree_workspace(
             )
             return
         _log.debug("Removed worktree workspace: %s", wp)
-        branch = (branch_name or "").strip() or f"wt/{task_id}"
-        if branch.startswith("wt/"):
-            subprocess.run(
-                ["git", "-C", str(repo_root), "branch", "-D", branch],
-                capture_output=True,
-                text=True, encoding='utf-8', errors='replace',
-                timeout=30,
-                check=False,
-            )
+        # Keep the named branch/ref as the compact recovery handle. Workspace
+        # retention may remove the registered checkout, never its preserved ref.
     except Exception:
         pass  # best-effort — never block completion
 
@@ -6067,11 +6071,19 @@ def _try_cleanup_parent_workspaces(conn: sqlite3.Connection, task_id: str) -> No
                     parent_id, row["workspace_path"], row["branch_name"]
                 )
                 continue
-            import shutil
             wp = Path(row["workspace_path"])
             if wp.is_dir() and _is_managed_scratch_path(wp):
-                shutil.rmtree(wp, ignore_errors=True)
-                _log.debug("Deferred cleanup: removed parent %s scratch workspace: %s", parent_id, wp)
+                from hermes_cli.kanban_retention import remove_exact_tree_for_lifecycle
+                _managed, board = _managed_scratch_path_info(wp)
+                removed, reason = remove_exact_tree_for_lifecycle(
+                    wp, workspaces_root(board=board)
+                )
+                if removed:
+                    _log.debug("Deferred cleanup: removed parent %s scratch workspace: %s", parent_id, wp)
+                else:
+                    _log.warning(
+                        "Deferred parent cleanup for task %s: %s", parent_id, reason
+                    )
     except Exception:
         pass  # best-effort
 

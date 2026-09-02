@@ -1033,6 +1033,22 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_gc.add_argument("--log-retention-days", type=int, default=30,
                       help="Delete worker log files older than N days (default: 30)")
 
+    # --- retention --- (truthful, fail-closed workspace lifecycle backstop)
+    p_retention = sub.add_parser(
+        "retention",
+        help="Inventory and safely remove expired terminal workspaces",
+    )
+    p_retention.add_argument("--apply", action="store_true")
+    p_retention.add_argument("--completed-ttl-hours", type=int, default=6)
+    p_retention.add_argument("--recovery-ttl-hours", type=int, default=72)
+    p_retention.add_argument("--active-heartbeat-minutes", type=int, default=15)
+    p_retention.add_argument("--workspace-cap-gib", type=int, default=50)
+    p_retention.add_argument("--workspace-release-gib", type=int, default=40)
+    p_retention.add_argument("--free-floor-gib", type=int, default=25)
+    p_retention.add_argument("--free-release-gib", type=int, default=30)
+    p_retention.add_argument("--max-removals", type=int, default=64)
+    p_retention.add_argument("--max-reclaimed-gib", type=int, default=32)
+
     # --- repair ---
     p_repair = sub.add_parser(
         "repair",
@@ -1189,6 +1205,7 @@ def kanban_command(args: argparse.Namespace) -> int:
             "specify":  _cmd_specify,
             "decompose":  _cmd_decompose,
             "gc":       _cmd_gc,
+            "retention": _cmd_retention,
         }
         handler = handlers.get(action)
         if not handler:
@@ -3336,9 +3353,35 @@ def _cmd_decompose(args: argparse.Namespace) -> int:
     return 0 if (ok_count > 0 or not ids) else 1
 
 
+def _cmd_retention(args: argparse.Namespace) -> int:
+    """Run the out-of-process fail-closed workspace retention engine."""
+    from hermes_cli.kanban_retention import main as retention_main
+
+    argv: list[str] = []
+    if getattr(args, "apply", False):
+        argv.append("--apply")
+    for name, flag in (
+        ("completed_ttl_hours", "--completed-ttl-hours"),
+        ("recovery_ttl_hours", "--recovery-ttl-hours"),
+        ("active_heartbeat_minutes", "--active-heartbeat-minutes"),
+        ("workspace_cap_gib", "--workspace-cap-gib"),
+        ("workspace_release_gib", "--workspace-release-gib"),
+        ("free_floor_gib", "--free-floor-gib"),
+        ("free_release_gib", "--free-release-gib"),
+        ("max_removals", "--max-removals"),
+        ("max_reclaimed_gib", "--max-reclaimed-gib"),
+    ):
+        argv.extend((flag, str(getattr(args, name))))
+    return retention_main(argv)
+
+
 def _cmd_gc(args: argparse.Namespace) -> int:
-    """Remove scratch workspaces of archived tasks, prune old events, and
-    delete old worker logs."""
+    """Remove archived residue plus old events/logs.
+
+    Workspace lifecycle convergence is intentionally separate: use
+    ``hermes kanban retention [--apply]`` so eligible backlog cannot be hidden
+    behind event/log GC success.
+    """
     import shutil
     scratch_root = kb.workspaces_root()
     removed_ws = 0
