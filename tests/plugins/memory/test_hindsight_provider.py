@@ -927,11 +927,12 @@ class TestSyncTurn:
         assert item["context"] == "conversation between Hermes Agent and the User"
         assert item["tags"] == ["conv", "session1", "session:session-1"]
         content = json.loads(item["content"])
-        assert len(content) == 1
-        assert content[0][0]["role"] == "user"
-        assert content[0][0]["content"] == "User (fakeusername): hello"
-        assert content[0][1]["role"] == "assistant"
-        assert content[0][1]["content"] == "Assistant (fakeassistantname): hi there"
+        assert len(content) == 2
+        assert all(isinstance(message, dict) for message in content)
+        assert content[0]["role"] == "user"
+        assert content[0]["content"] == "User (fakeusername): hello"
+        assert content[1]["role"] == "assistant"
+        assert content[1]["content"] == "Assistant (fakeassistantname): hi there"
         assert item["metadata"]["source"] == "hermes"
         assert item["metadata"]["session_id"] == "session-1"
         assert item["metadata"]["platform"] == "discord"
@@ -944,8 +945,8 @@ class TestSyncTurn:
         assert item["metadata"]["agent_identity"] == "fakeassistantname"
         assert item["metadata"]["turn_index"] == "1"
         assert item["metadata"]["message_count"] == "2"
-        assert content[0][0]["timestamp"] == event_time.isoformat(timespec="seconds")
-        assert content[0][1]["timestamp"] == event_time.isoformat(timespec="seconds")
+        assert content[0]["timestamp"] == event_time.isoformat(timespec="seconds")
+        assert content[1]["timestamp"] == event_time.isoformat(timespec="seconds")
         assert re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z", item["metadata"]["retained_at"])
         assert item["timestamp"] == event_time.isoformat(timespec="seconds")
 
@@ -1128,8 +1129,13 @@ class TestSessionSwitchBufferFlush:
         kw = p._client.aretain_batch.call_args.kwargs
         assert kw["document_id"] == old_doc
         item = kw["items"][0]
-        # Both buffered turns must be present in the flushed payload.
+        # Both buffered turns must be present as one flat conversation.
         content = json.loads(item["content"])
+        assert len(content) == 4
+        assert all(isinstance(message, dict) for message in content)
+        assert [message["role"] for message in content] == [
+            "user", "assistant", "user", "assistant",
+        ]
         flat = json.dumps(content)
         assert "turn1-user" in flat
         assert "turn2-user" in flat
@@ -1271,6 +1277,27 @@ class TestUpdateModeAppendCapability:
         assert kw["document_id"] == "test-session"
         item = kw["items"][0]
         assert item["update_mode"] == "append"
+
+    def test_append_sends_only_new_messages_as_flat_conversation(self, provider, monkeypatch):
+        """Each append is a flat JSON message array Hindsight can merge and chunk."""
+        self._clear_capability_cache()
+        monkeypatch.setattr(
+            "plugins.memory.hindsight._fetch_hindsight_api_version",
+            lambda *a, **kw: "0.5.6",
+        )
+
+        provider.sync_turn("first user", "first assistant")
+        provider._retain_queue.join()
+        provider.sync_turn("second user", "second assistant")
+        provider._retain_queue.join()
+
+        assert provider._client.aretain_batch.call_count == 2
+        second_item = provider._client.aretain_batch.call_args_list[1].kwargs["items"][0]
+        content = json.loads(second_item["content"])
+        assert [message["role"] for message in content] == ["user", "assistant"]
+        assert content[0]["content"].endswith("second user")
+        assert content[1]["content"].endswith("second assistant")
+        assert second_item["update_mode"] == "append"
 
 
     def test_session_switch_flush_picks_capability_against_old_session(

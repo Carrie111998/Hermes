@@ -501,6 +501,18 @@ def _normalize_retain_tags(value: Any) -> List[str]:
     return normalized
 
 
+def _serialize_conversation_turns(turns: list[list[dict[str, str]]]) -> str:
+    """Serialize buffered user/assistant pairs as one flat conversation.
+
+    Hindsight recognizes a JSON array of message objects as structured
+    conversation input. Keeping each pair as a nested array instead produces
+    ``[[user, assistant], ...]``; that misses Hindsight's conversation parser
+    and prevents append mode from merging successive JSON arrays.
+    """
+    messages = [message for turn in turns for message in turn]
+    return json.dumps(messages, ensure_ascii=False)
+
+
 _OBSERVATION_SCOPE_KEYWORDS = {"per_tag", "combined", "all_combinations"}
 
 
@@ -858,7 +870,8 @@ class HindsightMemoryProvider(MemoryProvider):
         self._prefetch_retain_drain_timeout = 10.0
         self._retain_context = "conversation between Hermes Agent and the User"
         self._turn_counter = 0
-        self._session_turns: list[str] = []  # accumulates ALL turns for the session
+        self._session_turns: list[list[dict[str, str]]] = []
+        # Accumulates all user/assistant pairs for the session.
         # How many turns the last append-mode retain already shipped. Used to
         # send only the new delta on subsequent retains when the API supports
         # update_mode='append' (legacy/overwrite path still sends everything).
@@ -2115,7 +2128,7 @@ class HindsightMemoryProvider(MemoryProvider):
         if session_id:
             self._session_id = str(session_id).strip()
 
-        turn = json.dumps(self._build_turn_messages(user_content, assistant_content), ensure_ascii=False)
+        turn = self._build_turn_messages(user_content, assistant_content)
         self._session_turns.append(turn)
         self._turn_counter += 1
         self._turn_index = self._turn_counter
@@ -2139,10 +2152,9 @@ class HindsightMemoryProvider(MemoryProvider):
         else:
             turns_to_retain = list(self._session_turns)
 
+        content = _serialize_conversation_turns(turns_to_retain)
         logger.debug("sync_turn: retaining %d/%d turns, payload %d chars",
-                     len(turns_to_retain), len(self._session_turns),
-                     sum(len(t) for t in turns_to_retain))
-        content = "[" + ",".join(turns_to_retain) + "]"
+                     len(turns_to_retain), len(self._session_turns), len(content))
 
         lineage_tags: list[str] = []
         if self._session_id:
@@ -2355,7 +2367,7 @@ class HindsightMemoryProvider(MemoryProvider):
                 old_lineage_tags.append(f"session:{old_session_id}")
             if old_parent_session_id:
                 old_lineage_tags.append(f"parent:{old_parent_session_id}")
-            old_content = "[" + ",".join(old_turns) + "]"
+            old_content = _serialize_conversation_turns(old_turns)
             # Resolve doc_id + update_mode against the OLD session BEFORE
             # we rotate _session_id, so the flush lands in the old
             # session's document either way (legacy: per-process unique;
