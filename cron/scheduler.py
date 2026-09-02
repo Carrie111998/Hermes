@@ -465,6 +465,61 @@ def _summarize_cron_failure_for_delivery(job: dict, error: str | None) -> str:
     return message
 
 
+def _should_suppress_shutdown_queued_delivery(job: dict, error: str | None) -> bool:
+    """Return True when a recurring cron failure during shutdown/restart should not ping the user.
+
+    Fix for #99120 (P2, comp/gateway+comp/cron): during a gateway restart,
+    ticks that were queued behind the admission limit but never started were
+    reconciled with a generic interactive failure string
+    ("Gateway is restarting; this queued task was not started. Please resend...")
+    and delivered as a cron failure. That misleads the operator — the next
+    scheduled tick will run normally — and the message wrongly suggests manual
+    intervention.
+
+    Distinguish cron vs interactive and recurring vs one-shot:
+
+    * Recurring (schedule.kind in cron/interval): silently skip user-facing
+      delivery / log only; the schedule itself guarantees a retry. Emits a log
+      instead of a delivery so the operator can still trace it if needed.
+    * One-shot (kind == once): must NOT be silently lost — it has no future
+      tick to recover, so keep the delivery (or durable deferral) so the
+      operator can recreate it.
+    * Interactive: keep the resend prompt — a human must retry.
+
+    Only suppresses when *error* looks like a shutdown-queued "not started"
+    failure. Normal cron failures (script errors, provider failures, etc.)
+    continue to deliver.
+    """
+    if not error:
+        return False
+    # Only dict jobs are considered; non-dict is treated as non-suppressible.
+    if not isinstance(job, dict):
+        return False
+    schedule = job.get("schedule") or {}
+    kind = schedule.get("kind") if isinstance(schedule, dict) else None
+    # One-shot has no future tick — never silently drop it.
+    if kind == "once":
+        return False
+    # Only explicit recurring kinds are silently deferred. Unknown/missing kind
+    # is treated as non-suppressible to avoid losing one-shot-like jobs.
+    if kind not in ("cron", "interval"):
+        return False
+    lower = str(error).lower()
+    shutdown_markers = (
+        "was not started",
+        "dispatch claim rejected",
+        "fire claim lost",
+        "interpreter is shutting down",
+        "interrupted by shutdown",
+        "gateway is restarting",
+        "queued task was not started",
+        "please resend",
+        "shutting down",
+        "restarting",
+    )
+    return any(m in lower for m in shutdown_markers)
+
+
 def _upsert_incident_for_failure(
     job: dict, error: str, *, output_file: Optional[Any] = None
 ) -> tuple[bool, Optional[str]]:
@@ -7714,6 +7769,24 @@ def _run_one_job_body(
                     job["id"],
                 )
 
+            # Fix #99120: suppress misleading failure delivery for queued recurring
+            # cron ticks during gateway restart. Recurring ticks are durably
+            # deferred to the next schedule; one-shot jobs are NOT suppressed.
+            if should_deliver and _should_suppress_shutdown_queued_delivery(job, error or ""):
+                logger.info(
+                    "Suppressing failure delivery for recurring cron job '%s' queued during shutdown/restart (bug #99120); next tick will retry",
+                    job["id"],
+                )
+                should_deliver = False
+            # Also check deliver_content for shutdown markers when error is empty
+            # but the rendered content contains the misleading string.
+            if should_deliver and _should_suppress_shutdown_queued_delivery(job, deliver_content):
+                logger.info(
+                    "Suppressing failure delivery for recurring cron job '%s' (shutdown marker in content) — bug #99120",
+                    job["id"],
+                )
+                should_deliver = False
+
             if should_deliver:
                 unresolved_origin = (
                     _normalize_deliver_value(_delivery_lane_value(job, for_failure=not success))
@@ -7891,6 +7964,12 @@ def _run_one_job_body(
             )
             if incident_acked:
                 delivery_outcome = "suppressed_acked"
+            elif _should_suppress_shutdown_queued_delivery(job, _err_text):
+                logger.info(
+                    "Suppressing failure delivery for recurring cron job '%s' queued during shutdown/restart (exception path, bug #99120); next tick will retry",
+                    job["id"],
+                )
+                delivery_outcome = "suppressed"
             else:
                 try:
                     delivery_attempted = True
