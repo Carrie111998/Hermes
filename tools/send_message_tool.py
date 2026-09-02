@@ -237,6 +237,15 @@ SEND_MESSAGE_SCHEMA = {
                 "type": "string",
                 "description": "The message text to send. To send an image or file, include MEDIA:<local_path> (e.g. 'MEDIA:/tmp/report.pdf') in the message — the platform will deliver it as a native media attachment."
             },
+            "cc": {
+                "type": ["string", "array"],
+                "items": {"type": "string"},
+                "description": "Email only: CC recipient address or addresses. Ignored for other platforms."
+            },
+            "subject": {
+                "type": "string",
+                "description": "Email only: explicit subject. Ignored for other platforms."
+            },
             "emoji": {
                 "type": "string",
                 "description": "For action='react': the emoji to react with (e.g. '❤️'). On iMessage, ❤️👍👎😂‼️❓ render as native tapbacks; other emoji use custom-emoji reactions."
@@ -370,6 +379,8 @@ def _handle_send(args):
     """Send a message to a platform target."""
     target = args.get("target", "")
     message = args.get("message", "")
+    email_cc = args.get("cc")
+    email_subject = args.get("subject")
     if not target or not message:
         return tool_error("Both 'target' and 'message' are required when action='send'")
 
@@ -498,6 +509,9 @@ def _handle_send(args):
         # the complete typed request.
         if entry is not None and entry.send_message_handler is not None:
             send_kwargs["args"] = args
+        if platform_name == "email":
+            send_kwargs["email_cc"] = email_cc
+            send_kwargs["email_subject"] = email_subject
         result = _run_async(
             _send_to_platform(
                 platform,
@@ -952,6 +966,8 @@ async def _send_via_adapter(
     thread_id=None,
     media_files=None,
     force_document=False,
+    email_cc=None,
+    email_subject=None,
 ):
     """Send a message via a live gateway adapter, with a standalone fallback
     for out-of-process callers (e.g. cron running separately from the gateway).
@@ -984,6 +1000,11 @@ async def _send_via_adapter(
                     metadata["thread_id"] = thread_id
                 if platform_name == "ntfy" and chat_id:
                     metadata["publish_topic"] = chat_id
+                if platform_name == "email":
+                    if email_cc:
+                        metadata["cc"] = email_cc
+                    if email_subject:
+                        metadata["subject"] = email_subject
                 if not metadata:
                     metadata = None
                 # The adapter's send() uses asyncio.Queue + worker tasks bound
@@ -1073,13 +1094,16 @@ async def _send_via_adapter(
 
     if entry is not None and entry.standalone_sender_fn is not None:
         try:
+            standalone_kwargs = {
+                "thread_id": thread_id,
+                "media_files": media_files,
+                "force_document": force_document,
+            }
+            if platform_name == "email":
+                standalone_kwargs["cc"] = email_cc
+                standalone_kwargs["subject"] = email_subject
             result = await entry.standalone_sender_fn(
-                pconfig,
-                chat_id,
-                chunk,
-                thread_id=thread_id,
-                media_files=media_files,
-                force_document=force_document,
+                pconfig, chat_id, chunk, **standalone_kwargs
             )
         except asyncio.CancelledError:
             raise
@@ -1109,7 +1133,18 @@ async def _send_via_adapter(
     }
 
 
-async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None, media_files=None, force_document=False, args=None):
+async def _send_to_platform(
+    platform,
+    pconfig,
+    chat_id,
+    message,
+    thread_id=None,
+    media_files=None,
+    force_document=False,
+    args=None,
+    email_cc=None,
+    email_subject=None,
+):
     """Route a message to the appropriate platform sender.
 
     Long messages are automatically chunked to fit within platform limits
@@ -1489,7 +1524,15 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
         elif platform == Platform.SIGNAL:
             result = await _send_signal(pconfig.extra, chat_id, chunk)
         elif platform == Platform.EMAIL:
-            result = await _registry_standalone_send("email", pconfig, chat_id, chunk, thread_id)
+            result = await _send_via_adapter(
+                platform,
+                pconfig,
+                chat_id,
+                chunk,
+                thread_id=thread_id,
+                email_cc=email_cc,
+                email_subject=email_subject,
+            )
         elif platform == Platform.SMS:
             result = await _registry_standalone_send("sms", pconfig, chat_id, chunk, thread_id)
         elif platform == Platform.DINGTALK:
