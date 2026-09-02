@@ -192,13 +192,12 @@ async def test_coordinator_rejects_foreign_stale_and_regressing_heard_boundaries
 
 
 @pytest.mark.asyncio
-async def test_coordinator_rejects_foreign_event_with_the_same_emission_identity():
+async def test_coordinator_rejects_foreign_event_with_the_same_content():
     emitted = RealtimeEvent.audio(b"emitted", item_id="item-1")
     foreign = RealtimeEvent(
         type=RealtimeEventType.AUDIO,
-        audio_bytes=b"foreign",
+        audio_bytes=b"emitted",
         item_id="item-1",
-        emission_id=emitted.emission_id,
     )
     coordinator = RealtimeVoiceCoordinator(
         FakeProvider("fake", FakeSession([emitted])),

@@ -12,7 +12,6 @@ from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
-from uuid import UUID, uuid4
 
 
 class RealtimeEventType(str, Enum):
@@ -45,7 +44,6 @@ class RealtimeEvent:
     item_id: str | None = None
     role: str | None = None
     arguments: dict[str, Any] = field(default_factory=dict)
-    emission_id: UUID = field(default_factory=uuid4, compare=False, repr=False)
 
     @classmethod
     def audio(cls, pcm: bytes, *, item_id: str | None = None) -> "RealtimeEvent":
