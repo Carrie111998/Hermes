@@ -8513,6 +8513,13 @@ def _normalize_optional_string(value: object) -> Optional[str]:
     YAML ``null`` and empty / whitespace-only / null-ish values all mean
     "unset": return None. Otherwise return the stripped string.
 
+    Note on the null-ish literals: this helper treats the case-insensitive
+    strings ``"null"`` / ``"None"`` as unset. A real provider/model name will
+    never collide with either of those tokens in a meaningful way, so the
+    over-match is intentional and documented here. If a future provider ever
+    legitimately uses one of those tokens, this helper must not be applied to
+    that field.
+
     A previous version used ``str(value or "").strip() or None``, which
     stringified the YAML ``null`` literal into the string "None" and sent
     that to the provider as a model ID / base URL / API key (#100835).

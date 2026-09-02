@@ -370,10 +370,12 @@ class TestMoaAggregatorSharedResolution:
                     f"{field}={null_value!r} resolved to {value!r} "
                     f"(expected None — null must not be forwarded)"
                 )
-        # Provider, when null-ish, becomes "auto" (resolved upstream); the rest
-        # must be None.
+        # Provider, when null-ish, is normalized away and falls through to the
+        # auto-resolution path — the only legal outcome in this configuration
+        # is the literal "auto" sentinel (neither a user deny nor a hardline
+        # fires for a null provider).
         if field == "provider":
-            assert resolved_provider == "auto" or resolved_provider is None
+            assert resolved_provider == "auto"
 
     def test_main_agent_fallback_uses_aggregator_for_moa_main(self, tmp_path, monkeypatch):
         """_try_main_agent_model_fallback with a moa main resolves the
