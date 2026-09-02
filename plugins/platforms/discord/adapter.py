@@ -7490,6 +7490,21 @@ class DiscordAdapter(BasePlatformAdapter):
         thread_name = (name or "handoff").strip()[:80] or "handoff"
         reason = "Hermes session handoff"
 
+        def _track_created_thread(thread: Any) -> str:
+            thread_id = str(thread.id)
+            try:
+                self._threads.mark(thread_id)
+            except Exception:
+                logger.warning(
+                    "[%s] Handoff thread %s was created, but participation "
+                    "tracking failed; mention-free continuation may not survive "
+                    "a gateway restart",
+                    self.name,
+                    thread_id,
+                    exc_info=True,
+                )
+            return thread_id
+
         # First try: create a thread directly on the channel.
         try:
             create = getattr(parent, "create_thread", None)
@@ -7499,7 +7514,7 @@ class DiscordAdapter(BasePlatformAdapter):
                     auto_archive_duration=1440,
                     reason=reason,
                 )
-                return str(thread.id)
+                return _track_created_thread(thread)
         except Exception as direct_error:
             logger.debug(
                 "[%s] Handoff thread: direct create failed (%s); trying seed-message fallback",
@@ -7517,7 +7532,7 @@ class DiscordAdapter(BasePlatformAdapter):
                 auto_archive_duration=1440,
                 reason=reason,
             )
-            return str(thread.id)
+            return _track_created_thread(thread)
         except Exception as fallback_error:
             logger.warning(
                 "[%s] Handoff thread: both create paths failed for parent %s: %s",
