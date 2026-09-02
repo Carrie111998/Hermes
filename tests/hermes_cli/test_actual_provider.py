@@ -4,7 +4,11 @@ from __future__ import annotations
 
 import json
 import logging
+from pathlib import Path
+import sys
 from unittest.mock import patch
+
+import pytest
 
 from agent.auxiliary_client import _normalize_aux_provider
 from hermes_cli import runtime_provider as rp
@@ -400,6 +404,157 @@ def test_actual_profile_translates_explicit_reasoning_controls():
             assert "reasoning_effort" not in top_level
         else:
             assert top_level["reasoning_effort"] == expected_effort
+
+
+def test_actual_hosted_client_uses_scoped_macos_certifi(monkeypatch):
+    import certifi
+
+    profile = get_provider_profile("actual")
+    monkeypatch.setattr(sys, "platform", "darwin")
+
+    assert profile.build_client_kwargs_extras(base_url=DEFAULT_ACTUAL_BASE_URL) == {
+        "ssl_ca_cert": certifi.where()
+    }
+    assert (
+        profile.build_client_kwargs_extras(base_url=DEFAULT_ACTUAL_LOCAL_BASE_URL) == {}
+    )
+
+
+def test_actual_client_tls_default_does_not_override_explicit_config(monkeypatch):
+    from agent.agent_runtime_helpers import create_openai_client
+
+    captured: list[dict] = []
+
+    def fake_resolve_httpx_verify(**kwargs):
+        captured.append(kwargs)
+        return "resolved-verify"
+
+    class FakeAgent:
+        provider = "actual"
+
+        @staticmethod
+        def _build_keepalive_http_client(base_url, *, verify):
+            assert base_url == DEFAULT_ACTUAL_BASE_URL
+            assert verify == "resolved-verify"
+            return "http-client"
+
+        @staticmethod
+        def _client_log_context():
+            return "test"
+
+    monkeypatch.setattr(sys, "platform", "darwin")
+    monkeypatch.setattr(
+        "agent.ssl_verify.resolve_httpx_verify", fake_resolve_httpx_verify
+    )
+    monkeypatch.setattr("agent.auxiliary_client._validate_proxy_env_urls", lambda: None)
+    monkeypatch.setattr("agent.auxiliary_client._validate_base_url", lambda _url: None)
+    monkeypatch.setattr("run_agent.OpenAI", lambda **kwargs: kwargs)
+
+    defaults = create_openai_client(
+        FakeAgent(),
+        {"api_key": "test", "base_url": DEFAULT_ACTUAL_BASE_URL},
+        reason="test",
+        shared=False,
+    )
+    explicit = create_openai_client(
+        FakeAgent(),
+        {
+            "api_key": "test",
+            "base_url": DEFAULT_ACTUAL_BASE_URL,
+            "ssl_ca_cert": "/explicit/corporate-ca.pem",
+        },
+        reason="test",
+        shared=False,
+    )
+
+    assert Path(captured[0]["ca_bundle"]).name == "cacert.pem"
+    assert captured[0]["base_url"] == DEFAULT_ACTUAL_BASE_URL
+    assert captured[1]["ca_bundle"] == "/explicit/corporate-ca.pem"
+    assert defaults["http_client"] == "http-client"
+    assert explicit["http_client"] == "http-client"
+
+
+def test_actual_oneshot_reasoning_override_reaches_agent(monkeypatch):
+    from hermes_cli import oneshot
+
+    captured = {}
+
+    class FakeAgent:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+            self._session_messages = []
+
+        def run_conversation(self, _prompt):
+            return {"final_response": "ok"}
+
+        def shutdown_memory_provider(self, *_args):
+            return None
+
+        def close(self):
+            return None
+
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda: {})
+    monkeypatch.setattr(
+        "hermes_cli.runtime_provider.resolve_runtime_provider",
+        lambda **_kwargs: {
+            "api_key": "actual-test-key",
+            "base_url": DEFAULT_ACTUAL_BASE_URL,
+            "provider": "actual",
+            "requested_provider": "actual",
+            "api_mode": "chat_completions",
+        },
+    )
+    monkeypatch.setattr(
+        "hermes_cli.mcp_startup.ensure_mcp_discovery_before_agent_build",
+        lambda **_kwargs: None,
+    )
+    monkeypatch.setattr(oneshot, "_create_session_db_for_oneshot", lambda: None)
+    monkeypatch.setattr(oneshot, "get_fallback_chain", lambda _cfg: [])
+    monkeypatch.setattr("run_agent.AIAgent", FakeAgent)
+
+    response, _result = oneshot._run_agent(
+        "hello",
+        model="zai-org/GLM-5.3",
+        provider="actual",
+        reasoning="ultra",
+        toolsets=["terminal"],
+        use_config_toolsets=False,
+    )
+
+    assert response == "ok"
+    assert captured["reasoning_config"] == {"enabled": True, "effort": "ultra"}
+
+
+def test_oneshot_dispatch_forwards_reasoning_override(monkeypatch):
+    from hermes_cli import main as main_mod
+    from hermes_cli import oneshot
+
+    captured = {}
+
+    def fake_run_oneshot(prompt, **kwargs):
+        captured["prompt"] = prompt
+        captured.update(kwargs)
+        return 0
+
+    class OneshotExit(Exception):
+        pass
+
+    def fake_exit(_rc):
+        raise OneshotExit
+
+    monkeypatch.setattr(oneshot, "run_oneshot", fake_run_oneshot)
+    monkeypatch.setattr(main_mod, "_cleanup_oneshot_runtime", lambda: None)
+    monkeypatch.setattr(main_mod, "_exit_after_oneshot", fake_exit)
+
+    with pytest.raises(OneshotExit):
+        main_mod._run_and_exit_oneshot(
+            "hello",
+            model="zai-org/GLM-5.3",
+            provider="actual",
+            reasoning="high",
+        )
+
+    assert captured["reasoning"] == "high"
 
 
 def test_actual_agent_side_routing_keeps_chat_completions_for_any_model():

@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import sys
 from typing import Any
 from urllib.parse import urlparse
 import urllib.request
@@ -42,6 +43,21 @@ class ActualProfile(ProviderProfile):
     the Actual client only when it runs in offline mode, so users opt into it by
     setting ACTUAL_BASE_URL to the local API URL.
     """
+
+    def build_client_kwargs_extras(self, **context: Any) -> dict[str, Any]:
+        base_url = str(context.get("base_url") or self.base_url or "")
+        try:
+            hostname = (urlparse(base_url).hostname or "").lower().rstrip(".")
+        except Exception:
+            return {}
+        if sys.platform != "darwin" or hostname != "api.actual.inc":
+            return {}
+
+        try:
+            import certifi
+        except ImportError:
+            return {}
+        return {"ssl_ca_cert": certifi.where()}
 
     def supported_reasoning_efforts(self, model: str | None) -> tuple[str, ...] | None:
         from agent.reasoning_effort import ACTUAL_RELAY_EFFORTS
