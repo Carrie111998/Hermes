@@ -289,6 +289,7 @@ def contains_gateway_lifecycle_command(text: str) -> bool:
 
 _SHELL_EXECUTABLES = frozenset({"sh", "bash", "dash", "ksh", "zsh"})
 _SHELL_OPTIONS_WITH_VALUES = frozenset({"-O", "+O", "-o", "+o"})
+_SHELL_SCRIPT_SUFFIXES = (".sh", ".bash", ".zsh")
 _MAX_REFERENCED_SCRIPT_BYTES = 1024 * 1024
 _MAX_REFERENCED_SCRIPT_DEPTH = 8
 _CONTROL_CHARS = frozenset(";&|()")
@@ -765,10 +766,52 @@ def _iter_option_values(
             yield token[len(prefix):]
 
 
+def _looks_like_shell_script(path: Path) -> bool:
+    """Return True when *path* is plausibly a POSIX shell script.
+
+    A shell suffix or a ``#!`` shebang line qualifies. Used only to gate the
+    bare-path token references the walk derives from *file contents* (prose,
+    Markdown links, Python sources tokenized as command text): following one
+    of those into another file's text treats documentation as shell and is
+    the documentation false-positive class (#98801). Executable-form
+    references (``bash x``, ``source x``, ``./x`` typed by the agent) never
+    consult this — a shell happily runs a suffixless, shebang-less file.
+    """
+    if path.suffix in _SHELL_SCRIPT_SUFFIXES:
+        return True
+    flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except (OSError, ValueError):
+        return False
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode):
+            return False
+        return os.read(descriptor, 2) == b"#!"
+    except OSError:
+        return False
+    finally:
+        os.close(descriptor)
+
+
 def _references_at(
-    segment: list[str], index: int, cwd: Optional[str]
+    segment: list[str],
+    index: int,
+    cwd: Optional[str],
+    content_derived: bool = False,
 ) -> Iterator[Path]:
-    """Yield the scripts the token at *index* executes, if any."""
+    """Yield the scripts the token at *index* executes, if any.
+
+    ``content_derived`` marks that *segment* was tokenized out of a file's
+    text rather than out of a command the agent typed. In that mode the
+    bare-path branch below — the only branch that *guesses* execution from a
+    token's shape — requires the target to look like a shell script, so
+    Markdown link targets and prose path fragments inside documentation
+    cannot keep the recursion walking (#98801). The ``.``/``source`` and
+    shell-argument branches state an executable explicitly and stay
+    unconditional.
+    """
     if index >= len(segment):
         return
     executable = segment[index]
@@ -813,16 +856,20 @@ def _references_at(
     # regular-file check below, hard-blocking innocent .py scripts
     # (#77131). Skip pure-separator tokens.
     if executable.strip("/"):
-        if "/" in executable or executable.endswith((".sh", ".bash", ".zsh")):
+        if "/" in executable or executable.endswith(_SHELL_SCRIPT_SUFFIXES):
             resolved = _resolve_terminal_script_path(executable, cwd)
-            if resolved is not None:
-                yield resolved
+            if resolved is None:
+                return
+            if content_derived and not _looks_like_shell_script(resolved):
+                return
+            yield resolved
 
 
 def _iter_referenced_shell_scripts(
     command: str,
     *,
     cwd: Optional[str] = None,
+    content_derived: bool = False,
 ) -> Iterator[Path]:
     """Yield scripts executed directly or through a POSIX shell.
 
@@ -836,10 +883,10 @@ def _iter_referenced_shell_scripts(
         index = _command_token_index(segment)
         if index is None:
             continue
-        yield from _references_at(segment, index, cwd)
+        yield from _references_at(segment, index, cwd, content_derived)
         peeled = _peel_transparent_prefixes(segment, index)
         if peeled != index:
-            yield from _references_at(segment, peeled, cwd)
+            yield from _references_at(segment, peeled, cwd, content_derived)
 
 
 def _iter_shell_command_payloads(command: str) -> Iterator[str]:
@@ -1032,12 +1079,22 @@ def _contains_unsafe_gateway_action(
     depth: int,
     visited: set[Path],
     read_remote_script: Optional[_ReadRemoteScriptFn] = None,
+    content_derived: bool = False,
 ) -> bool:
+    """Return True when *command* (or scripts it references) is unsafe.
+
+    ``content_derived`` records that *command* is a referenced file's text,
+    not a command the agent typed: prose and Markdown links in it are data,
+    and the bare-path reference branch then requires shell-looking targets
+    (#98801) instead of following documentation around the filesystem.
+    """
     if _direct_lifecycle_scan(command):
         return True
     if depth >= _MAX_REFERENCED_SCRIPT_DEPTH:
         return True
 
+    # A ``sh -c`` payload is a command string that WILL run — its references
+    # keep full-strength tracking even when lifted out of a scanned file.
     for payload in _iter_shell_command_payloads(command):
         if _contains_unsafe_gateway_action(
             payload,
@@ -1048,7 +1105,9 @@ def _contains_unsafe_gateway_action(
         ):
             return True
 
-    for script_path in _iter_referenced_shell_scripts(command, cwd=cwd):
+    for script_path in _iter_referenced_shell_scripts(
+        command, cwd=cwd, content_derived=content_derived
+    ):
         # Do not touch a FileProvider path even to discover whether the file
         # is hydrated. The lexical check covers direct cloud paths; the
         # resolved check below covers local launchers that are symlinks into
@@ -1093,6 +1152,7 @@ def _contains_unsafe_gateway_action(
             depth=depth + 1,
             visited=visited,
             read_remote_script=read_remote_script,
+            content_derived=True,
         ):
             return True
     return False
