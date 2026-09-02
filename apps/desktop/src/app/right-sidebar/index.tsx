@@ -13,7 +13,7 @@ import { cn } from '@/lib/utils'
 import { $panesFlipped } from '@/store/layout'
 import { notifyError } from '@/store/notifications'
 import { openPreview } from '@/store/preview'
-import { $currentCwd, $selectedStoredSessionId, $workspaceCwdOwner } from '@/store/session'
+import { $focusedWorkspaceCwd } from '@/store/session-states'
 
 import { SidebarPanelLabel } from '../shell/sidebar-label'
 
@@ -29,14 +29,8 @@ export function RightSidebarPane({ onActivateFile, onActivateFolder }: RightSide
   const { t } = useI18n()
   const r = t.rightSidebar
   const panesFlipped = useStore($panesFlipped)
-  const currentCwd = useStore($currentCwd).trim()
-  const selectedStoredSessionId = useStore($selectedStoredSessionId)
-  const workspaceCwdOwner = useStore($workspaceCwdOwner)
-
-  // A transition intentionally retains the old CWD until the new session
-  // confirms its workspace. Do not issue a filesystem read against that path:
-  // under a gateway switch it may belong to a different remote machine.
-  const hasWorkspace = Boolean(currentCwd) && (workspaceCwdOwner ?? null) === (selectedStoredSessionId ?? null)
+  const targetCwd = useStore($focusedWorkspaceCwd)
+  const hasWorkspace = Boolean(targetCwd)
 
   const {
     collapseAll,
@@ -49,7 +43,7 @@ export function RightSidebarPane({ onActivateFile, onActivateFolder }: RightSide
     rootError,
     rootLoading,
     setNodeOpen
-  } = useProjectTree(hasWorkspace ? currentCwd : '')
+  } = useProjectTree(hasWorkspace ? targetCwd : '')
 
   const cwdName =
     effectiveCwd

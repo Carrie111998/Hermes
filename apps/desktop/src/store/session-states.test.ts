@@ -17,6 +17,7 @@ import type { SessionTile } from '@/store/session-states'
 import type * as SessionStatesModule from '@/store/session-states'
 import {
   $focusedStoredSessionId,
+  $focusedWorkspaceCwd,
   $sessionStates,
   $sessionTiles,
   blankDraftTile,
@@ -1035,7 +1036,7 @@ describe('$focusedStoredSessionId in Bot Mode (#96062)', () => {
     expect($focusedStoredSessionId.get()).toBeNull()
   })
 
-  it('sessions mode keeps collapsing to the primary selection (derivation gated to Bot Mode)', () => {
+  it('sessions mode retains the active main-zone tile when the tracker sits on side chrome', () => {
     $selectedStoredSessionId.set('primary-1')
     $layoutTree.set(
       split('row', [
@@ -1045,10 +1046,29 @@ describe('$focusedStoredSessionId in Bot Mode (#96062)', () => {
     )
     noteActiveTreeGroup('grp-sessions')
 
-    // The main-zone tile must NOT answer here: in sessions mode the sidebar
-    // highlight follows the primary selection exactly as it always has.
     expect($workspaceMode.get()).toBe('sessions')
-    expect($focusedStoredSessionId.get()).toBe('primary-1')
+    expect($focusedStoredSessionId.get()).toBe('stacked')
+  })
+
+  it('computes $focusedWorkspaceCwd from the focused tile session state or sessions list', () => {
+    $selectedStoredSessionId.set('primary-1')
+    setSessions([{ cwd: '/repo-stacked', id: 'stacked' } as any])
+    $sessionTiles.set([
+      { storedSessionId: 'stacked', runtimeId: 'rt-stacked', workspaceMode: 'sessions' } as any
+    ])
+    $sessionStates.set({
+      'rt-stacked': { cwd: '/repo-stacked' } as any
+    })
+    $layoutTree.set(
+      split('row', [
+        group(['files'], { active: 'files', id: 'grp-files' }),
+        group(['workspace', tilePane('stacked')], { active: tilePane('stacked'), id: 'grp-main' })
+      ])
+    )
+    noteActiveTreeGroup('grp-files')
+
+    expect($focusedStoredSessionId.get()).toBe('stacked')
+    expect($focusedWorkspaceCwd.get()).toBe('/repo-stacked')
   })
 })
 
