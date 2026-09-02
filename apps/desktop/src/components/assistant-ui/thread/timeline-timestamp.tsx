@@ -5,7 +5,7 @@ import type { FC } from 'react'
 import { cn } from '@/lib/utils'
 import { $displayTimestamps } from '@/store/display-timestamps'
 
-import { formatTimelineRange } from './timestamp'
+import { formatClockTimestamp, formatTimelineRange } from './timestamp'
 
 const preciseDateTime = new Intl.DateTimeFormat(undefined, {
   day: 'numeric',
@@ -33,8 +33,14 @@ const unixDate = (value: unknown): Date | null => {
 export const TimelineTimestamp: FC<{
   className?: string
   completedAt?: number
+  /**
+   * `exact` keeps the millisecond range used by tool/activity boundaries.
+   * `clock` collapses the row to a single minute-precision wall clock — the
+   * moment a chat bubble was sent or landed (#41531 follow-up).
+   */
+  precision?: 'clock' | 'exact'
   timestamp?: number
-}> = ({ className, completedAt, timestamp }) => {
+}> = ({ className, completedAt, precision = 'exact', timestamp }) => {
   // One config key everywhere (#41531): `display.timestamps` in config.yaml
   // gates transcript timestamps here exactly as it gates the classic CLI's
   // [HH:MM] labels. Display-only, so toggling never touches model context.
@@ -48,12 +54,31 @@ export const TimelineTimestamp: FC<{
   const completed = validUnixSeconds(completedAt) && completedAt > timestamp ? unixDate(completedAt) : null
 
   const validCompletedAt = completed && validUnixSeconds(completedAt) ? completedAt : undefined
-  const startLabel = formatTimelineRange(timestamp, undefined)
-  const completedLabel = validCompletedAt === undefined ? '' : formatTimelineRange(validCompletedAt, undefined)
 
   const title = completed
     ? `${preciseDateTime.format(started)} → ${preciseDateTime.format(completed)}`
     : preciseDateTime.format(started)
+
+  if (precision === 'clock') {
+    // A chat bubble answers "when did this arrive", so it shows the settled
+    // moment (completion when the turn produced one, otherwise the send time)
+    // as a single `4:30 PM`. Full precision stays on hover.
+    const landed = completed ?? started
+    const landedSeconds = validCompletedAt ?? timestamp
+
+    return (
+      <span
+        className={cn('text-[0.625rem] leading-4 tabular-nums text-muted-foreground/55', className)}
+        data-slot="timeline-timestamp"
+        title={title}
+      >
+        <time dateTime={landed.toISOString()}>{formatClockTimestamp(landedSeconds)}</time>
+      </span>
+    )
+  }
+
+  const startLabel = formatTimelineRange(timestamp, undefined)
+  const completedLabel = validCompletedAt === undefined ? '' : formatTimelineRange(validCompletedAt, undefined)
 
   return (
     <span
@@ -75,8 +100,9 @@ export const TimelineTimestamp: FC<{
 /** Timestamp for the current assistant-ui message lifecycle. */
 export const MessageTimelineTimestamp: FC<{
   className?: string
+  precision?: 'clock' | 'exact'
   suppressIfDuplicatePart?: boolean
-}> = ({ className, suppressIfDuplicatePart = false }) => {
+}> = ({ className, precision = 'clock', suppressIfDuplicatePart = false }) => {
   const timestamp = useAuiState(s => {
     const value = (s.message.metadata?.custom as { timelineTimestamp?: unknown } | undefined)?.timelineTimestamp
 
@@ -110,5 +136,5 @@ export const MessageTimelineTimestamp: FC<{
     return null
   }
 
-  return <TimelineTimestamp className={className} completedAt={completedAt} timestamp={timestamp} />
+  return <TimelineTimestamp className={className} completedAt={completedAt} precision={precision} timestamp={timestamp} />
 }

@@ -12,7 +12,7 @@ import { $displayTimestamps } from '@/store/display-timestamps'
 
 import { stubThreadEnvironment } from '../test-utils'
 
-import { formatTimelineRange, formatTimelineTimestamp } from './timestamp'
+import { formatClockTimestamp, formatTimelineRange } from './timestamp'
 
 import { Thread } from '.'
 
@@ -108,7 +108,7 @@ describe('AssistantMessage branch button visibility (bug #2 fix)', () => {
 })
 
 describe('message timeline timestamps', () => {
-  it('always renders precise user and assistant lifecycle times', async () => {
+  it('shows chat bubbles as a minute-precision clock and activity parts as precise ranges', async () => {
     const { container } = render(<Harness />)
 
     await screen.findByText('done')
@@ -119,10 +119,39 @@ describe('message timeline timestamps', () => {
 
     const startedAt = createdAt.getTime() / 1000
 
-    expect(stamps).toContain(formatTimelineTimestamp(startedAt))
-    expect(stamps).toContain(formatTimelineRange(startedAt, completedAt))
+    // Bubble rows: "when was it sent" / "when did it land", no seconds.
+    expect(stamps).toContain(formatClockTimestamp(startedAt))
+    expect(stamps).toContain(formatClockTimestamp(completedAt))
+    expect(stamps).not.toContain(formatTimelineRange(startedAt, completedAt))
+
+    // Activity parts keep full precision — they measure duration.
     expect(stamps).toContain(formatTimelineRange(startedAt + 0.05, startedAt + 0.1))
     expect(stamps).toContain(formatTimelineRange(startedAt + 0.125, startedAt + 0.5))
+  })
+
+  it('renders the assistant landing clock from the completion time, not the send time', async () => {
+    const startedAt = createdAt.getTime() / 1000
+    // Deliberately crosses a minute boundary so "sent" and "landed" differ.
+    const landedAt = startedAt + 130
+
+    const assistant = {
+      ...assistantMessage(),
+      metadata: {
+        ...assistantMessage().metadata,
+        custom: { timelineCompletedAt: landedAt, timelineTimestamp: startedAt }
+      }
+    } as unknown as ThreadMessage
+
+    const { container } = render(<Harness assistant={assistant} />)
+
+    await screen.findByText('done')
+
+    const stamps = Array.from(container.querySelectorAll('[data-slot="timeline-timestamp"]')).map(node =>
+      node.textContent?.trim()
+    )
+
+    expect(formatClockTimestamp(landedAt)).not.toBe(formatClockTimestamp(startedAt))
+    expect(stamps).toContain(formatClockTimestamp(landedAt))
   })
 
   it('suppresses an aggregate assistant stamp that exactly duplicates its sole part', async () => {
@@ -142,5 +171,8 @@ describe('message timeline timestamps', () => {
     )
 
     expect(stamps.filter(stamp => stamp === formatTimelineRange(startedAt, completedAt))).toHaveLength(1)
+    // Only the user bubble keeps a clock row; the suppressed assistant
+    // aggregate must not reappear as a second one.
+    expect(stamps.filter(stamp => stamp === formatClockTimestamp(startedAt))).toHaveLength(1)
   })
 })

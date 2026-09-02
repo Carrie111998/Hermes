@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 
-import { formatMessageTimestamp, formatTimelineRange, formatTimelineTimestamp } from './timestamp'
+import { formatClockTimestamp, formatMessageTimestamp, formatTimelineRange, formatTimelineTimestamp } from './timestamp'
 
 const labels = {
   today: (time: string) => `Today at ${time}`,
@@ -59,5 +59,25 @@ describe('precise timeline timestamps', () => {
     expect(formatTimelineTimestamp(undefined)).toBe('')
     expect(formatTimelineTimestamp(Number.NaN)).toBe('')
     expect(formatTimelineRange(undefined, 10)).toBe('')
+  })
+})
+
+describe('formatClockTimestamp', () => {
+  it('renders a minute-precision wall clock without seconds or milliseconds', () => {
+    const local = new Date(2026, 4, 1, 16, 30, 3, 456)
+    const formatted = formatClockTimestamp(local.getTime() / 1000)
+
+    expect(formatted).toContain('30')
+    expect(formatted).not.toContain('03')
+    expect(formatted).not.toContain('456')
+    // Same instant, but the precise formatter still carries the detail.
+    expect(formatTimelineTimestamp(local.getTime() / 1000)).toContain('456')
+  })
+
+  it('returns an empty string for invalid values', () => {
+    expect(formatClockTimestamp(undefined)).toBe('')
+    expect(formatClockTimestamp(Number.NaN)).toBe('')
+    expect(formatClockTimestamp(0)).toBe('')
+    expect(formatClockTimestamp(-5)).toBe('')
   })
 })

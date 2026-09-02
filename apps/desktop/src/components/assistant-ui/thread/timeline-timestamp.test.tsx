@@ -4,6 +4,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { $displayTimestamps, setDisplayTimestampsFromConfig } from '@/store/display-timestamps'
 
 import { TimelineTimestamp } from './timeline-timestamp'
+import { formatClockTimestamp } from './timestamp'
 
 afterEach(cleanup)
 
@@ -42,5 +43,42 @@ describe('TimelineTimestamp display.timestamps gate', () => {
     const { container } = render(<TimelineTimestamp timestamp={timestamp} />)
 
     expect(container.querySelector('[data-slot="timeline-timestamp"]')).toBeTruthy()
+  })
+})
+
+describe('TimelineTimestamp precision', () => {
+  const started = new Date(2026, 4, 1, 16, 30, 3, 456).getTime() / 1000
+  const finished = new Date(2026, 4, 1, 16, 32, 9, 789).getTime() / 1000
+
+  beforeEach(() => {
+    $displayTimestamps.set(true)
+  })
+
+  it('defaults to the precise range for activity boundaries', () => {
+    const { container } = render(<TimelineTimestamp completedAt={finished} timestamp={started} />)
+    const text = container.querySelector('[data-slot="timeline-timestamp"]')?.textContent ?? ''
+
+    expect(text).toContain('→')
+    expect(text).toContain('456')
+    expect(text).toContain('789')
+  })
+
+  it('collapses to a single landing clock with no seconds when precision is clock', () => {
+    const { container } = render(<TimelineTimestamp completedAt={finished} precision="clock" timestamp={started} />)
+    const node = container.querySelector('[data-slot="timeline-timestamp"]')
+    const text = node?.textContent ?? ''
+
+    expect(text).not.toContain('→')
+    expect(text).not.toContain('456')
+    expect(text).not.toContain('789')
+    expect(text).toBe(formatClockTimestamp(finished))
+    // Full precision is still reachable on hover.
+    expect(node?.getAttribute('title') ?? '').toContain('456')
+  })
+
+  it('falls back to the send time in clock mode when the turn never completed', () => {
+    const { container } = render(<TimelineTimestamp precision="clock" timestamp={started} />)
+
+    expect(container.querySelector('[data-slot="timeline-timestamp"]')?.textContent).toBe(formatClockTimestamp(started))
   })
 })
