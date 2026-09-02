@@ -74,6 +74,41 @@ def test_no_nudge_after_kanban_complete(clear_kanban_env):
     assert build_kanban_stop_nudge(messages=messages) is None
 
 
+def test_pass_artifact_and_text_are_not_terminal(clear_kanban_env):
+    """Evidence files never replace the transactional board transition."""
+    clear_kanban_env.setenv("HERMES_KANBAN_TASK", "t_pass_only")
+    messages = [
+        {"role": "user", "content": "work kanban task"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "write-1",
+                    "type": "function",
+                    "function": {
+                        "name": "write_file",
+                        "arguments": '{"path":"PASS.md","content":"PASS"}',
+                    },
+                }
+            ],
+        },
+        {
+            "role": "tool",
+            "name": "write_file",
+            "tool_call_id": "write-1",
+            "content": "written",
+        },
+        {"role": "assistant", "content": "PASS"},
+    ]
+
+    assert session_called_kanban_terminal(messages) is False
+    nudge = build_kanban_stop_nudge(messages=messages)
+    assert nudge is not None
+    assert "kanban_complete" in nudge
+    assert "kanban_block" in nudge
+
+
 
 
 

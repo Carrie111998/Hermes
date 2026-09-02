@@ -1279,7 +1279,7 @@ def test_reclaim_task_resets_running_to_ready(kanban_home, monkeypatch):
 
 
 
-def _drive_worker_exit(conn, tid, fake_pid, raw_status):
+def _drive_worker_exit(conn, tid, fake_pid, raw_status, *, failure_limit=2):
     """Claim ``tid``, record ``raw_status`` for its dead worker pid, and run
     one reaper pass.
 
@@ -1299,17 +1299,19 @@ def _drive_worker_exit(conn, tid, fake_pid, raw_status):
     original_alive = _kb._pid_alive
     _kb._pid_alive = lambda p: False
     try:
-        return _kb.detect_crashed_workers(conn)
+        return _kb.detect_crashed_workers(conn, failure_limit=failure_limit)
     finally:
         _kb._pid_alive = original_alive
 
 
-def _drive_protocol_violation(conn, tid, fake_pid):
+def _drive_protocol_violation(conn, tid, fake_pid, *, failure_limit=2):
     """One clean-exit protocol violation reaper pass for ``tid``.
 
     os.W_EXITCODE(status=0, signal=0) == 0 on POSIX.
     """
-    return _drive_worker_exit(conn, tid, fake_pid, 0)
+    return _drive_worker_exit(
+        conn, tid, fake_pid, 0, failure_limit=failure_limit
+    )
 
 
 def _drive_nonzero_crash(conn, tid, fake_pid):
@@ -1357,13 +1359,39 @@ def test_protocol_violation_budget_not_consumed_by_other_failures(kanban_home):
             )
 
         # Third consecutive violation: streak hits the bound — blocked.
-        _drive_protocol_violation(conn, tid, 991003)
+        configured_failure_limit = 5
+        _drive_protocol_violation(
+            conn, tid, 991003, failure_limit=configured_failure_limit
+        )
         task = kb.get_task(conn, tid)
+        assert task is not None
         assert task.status == "blocked"
+        assert task.consecutive_failures >= configured_failure_limit
         gave_up = [e for e in kb.list_events(conn, tid) if e.kind == "gave_up"]
         assert len(gave_up) == 1
         assert (gave_up[0].payload or {}).get("protocol_violations") == \
             _kb._PROTOCOL_VIOLATION_FAILURE_LIMIT
+
+        # A forced breaker trip must be stable under the same promotion pass
+        # that follows crash detection in dispatch_once(). Live incident
+        # t_8dd9ecb5 emitted gave_up and then immediately promoted/spawned a
+        # fourth worker because the persisted counter stayed below the limit.
+        before_promotions = len([
+            e for e in kb.list_events(conn, tid) if e.kind == "promoted"
+        ])
+        assert kb.recompute_ready(
+            conn, failure_limit=configured_failure_limit
+        ) == 0
+        assert kb.recompute_ready(
+            conn, failure_limit=configured_failure_limit
+        ) == 0
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        assert task.status == "blocked"
+        after_promotions = len([
+            e for e in kb.list_events(conn, tid) if e.kind == "promoted"
+        ])
+        assert after_promotions == before_promotions
     finally:
         conn.close()
 
