@@ -1245,6 +1245,16 @@ def _dispatch_to_plugin_provider(
        plugin as unavailable — **not** ``None`` — because the user
        explicitly opted into this plugin via ``stt.provider`` and the
        generic fallthrough message would be misleading.
+    5. Discovery-failure gating: every call that reaches this function
+       already has an explicitly configured, non-built-in provider name
+       (invariants 1-2 filtered out everything else). So when plugin
+       discovery itself raises (a broken or uninstalled addon that fails
+       to import), that means the plugin the user asked for failed to
+       load. This returns a named error envelope carrying the original
+       exception — **not** ``None`` — so a broken plugin is
+       distinguishable from an unconfigured one and the caller surfaces
+       the real load failure instead of a misleading "not registered"
+       error.
 
     Provider exceptions are caught and converted into the standard
     error envelope (matches the legacy built-in error shapes — the
@@ -1277,9 +1287,19 @@ def _dispatch_to_plugin_provider(
             # recovery pattern.
             _ensure_plugins_discovered(force=True)
             plugin_provider = get_provider(key)
-    except Exception as exc:  # noqa: BLE001 — discovery failure is non-fatal
-        logger.debug("STT plugin dispatch skipped (discovery failed): %s", exc)
-        return None
+    except Exception as exc:  # noqa: BLE001 — surfaced below, not swallowed
+        # An explicitly configured plugin provider that fails to even
+        # load must not be indistinguishable from "no plugin configured"
+        # — return a named envelope instead of a bare None.
+        logger.warning(
+            "STT plugin '%s' failed to load: %s", key, exc, exc_info=True,
+        )
+        return {
+            "success": False,
+            "transcript": "",
+            "error": f"STT plugin '{key}' failed to load: {exc}",
+            "provider": key,
+        }
     if plugin_provider is None:
         return None
 

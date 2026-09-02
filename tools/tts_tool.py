@@ -483,6 +483,31 @@ def _resolve_max_text_length(
                 return named_override
             return DEFAULT_COMMAND_TTS_MAX_TEXT_LENGTH
 
+        # Plugin-registered TTS provider: its capability travels WITH the
+        # plugin via the existing ABC surface list_models()[].max_text_length
+        # — no provider name is hardcoded here. Discovery is triggered from
+        # inside this resolver (rather than left to the dispatcher's own
+        # discovery) because this function runs earlier in the request; an
+        # installed-but-not-yet-discovered-in-this-process plugin would
+        # otherwise registry-miss and silently fall back to the generic cap.
+        from agent.tts_registry import get_provider
+        from hermes_cli.plugins import _ensure_plugins_discovered
+
+        _ensure_plugins_discovered()
+        plugin_provider = get_provider(key)
+        if plugin_provider is not None:
+            declared_limits = [
+                model.get("max_text_length")
+                for model in (plugin_provider.list_models() or [])
+                if isinstance(model, dict)
+            ]
+            declared_limits = [
+                limit for limit in declared_limits
+                if isinstance(limit, int) and not isinstance(limit, bool) and limit > 0
+            ]
+            if declared_limits:
+                return max(declared_limits)
+
     return FALLBACK_MAX_TEXT_LENGTH
 
 
@@ -921,6 +946,14 @@ def _dispatch_to_plugin_provider(
     3. Plugin dispatch fires only when ``provider`` matches a registered
        :class:`TTSProvider` whose ``name`` equals the configured value.
        Unknown names return None (caller falls through to Edge default).
+    4. Discovery-failure gating: every call that reaches this function
+       already has an explicitly configured, non-built-in provider name
+       (invariants 1-2 filtered out everything else). So when plugin
+       discovery itself raises (a broken or uninstalled addon that fails
+       to import), that means the plugin the user asked for failed to
+       load. This re-raises instead of returning None, so the caller
+       can't silently fall through to the Edge TTS default while
+       reporting the configured provider as a success.
 
     Plugin exceptions are caught and re-raised — the outer
     ``text_to_speech_tool`` try/except converts them to the standard
@@ -950,9 +983,12 @@ def _dispatch_to_plugin_provider(
             # recovery pattern.
             _ensure_plugins_discovered(force=True)
             plugin_provider = get_provider(key)
-    except Exception as exc:  # noqa: BLE001 — discovery failure is non-fatal
-        logger.debug("tts plugin dispatch skipped (discovery failed): %s", exc)
-        return None
+    except Exception as exc:  # noqa: BLE001 — re-raised below, not swallowed
+        # An explicitly configured plugin provider that fails to even
+        # load must not be indistinguishable from "no plugin configured"
+        # — raise so the caller's outer try/except surfaces a named error
+        # instead of silently falling through to Edge TTS.
+        raise RuntimeError(f"TTS plugin '{key}' failed to load: {exc}") from exc
     if plugin_provider is None:
         return None
 
@@ -3651,6 +3687,22 @@ def _text_to_speech_single(
                 }, ensure_ascii=False)
             logger.info("Generating speech with Piper (local)...")
             _generate_piper_tts(text, file_str, tts_config)
+
+        elif provider not in BUILTIN_TTS_PROVIDERS:
+            # Reaching here means the configured provider is neither a
+            # built-in, a tts.providers.<name> command declaration, nor a
+            # registered plugin (_dispatch_to_plugin_provider returned None
+            # above) — i.e. the user explicitly opted into a provider that
+            # isn't actually available. That must be a terminal, named
+            # error, not a silent reroll through the Edge TTS default below.
+            return json.dumps({
+                "success": False,
+                "error": f"TTS provider '{provider}' is not available: not a "
+                         "built-in, not declared under tts.providers, and no "
+                         "plugin is registered for it. Check tts.provider in "
+                         "config.yaml and that any addon providing it is "
+                         "installed and enabled.",
+            }, ensure_ascii=False)
 
         else:
             # Default: Edge TTS (free), with NeuTTS as local fallback
