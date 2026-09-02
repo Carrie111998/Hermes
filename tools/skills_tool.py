@@ -79,6 +79,7 @@ from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Dict, Any, List, Optional, Set, Tuple
 
 from tools.registry import registry, tool_error
+from tools.skill_provenance import is_background_review
 from hermes_cli.config import cfg_get
 from utils import env_var_enabled
 from agent.skill_utils import (
@@ -2082,6 +2083,17 @@ def _record_skill_view(task_id, name, file_path, payload: dict) -> None:
                 break
 
 
+def _skill_view_dedup_task_id(task_id):
+    """Return the repeat-view namespace for the active provenance context."""
+    if not task_id:
+        return task_id
+    if is_background_review():
+        # Keep the review fork from inheriting the parent session's dedup
+        # state, while leaving the real task/session id untouched elsewhere.
+        return f"__bg_review__:{task_id}"
+    return task_id
+
+
 def _check_skill_view_dedup(task_id, name, file_path) -> str | None:
     """Return a dedup stub when this exact skill file was already served
     to this task and is unchanged on disk; None otherwise."""
@@ -2142,6 +2154,7 @@ def _skill_view_with_bump(args, **kw):
     telemetry failure never breaks the tool call."""
     name = args.get("name", "")
     task_id = kw.get("task_id")
+    dedup_task_id = _skill_view_dedup_task_id(task_id)
     # ── Repeat-view dedup ────────────────────────────────────────────
     # Mirrors read_file's unchanged-stub: when this session already
     # loaded the SAME skill file and it hasn't changed on disk, return a
@@ -2152,7 +2165,7 @@ def _skill_view_with_bump(args, **kw):
     # "skills must be loaded fully" rule is preserved — and the cache is
     # cleared on context compression (same hook as read_file's dedup)
     # so a post-compression re-view returns full content again.
-    stub = _check_skill_view_dedup(task_id, name, args.get("file_path"))
+    stub = _check_skill_view_dedup(dedup_task_id, name, args.get("file_path"))
     if stub is not None:
         return stub
     result = skill_view(
@@ -2161,7 +2174,9 @@ def _skill_view_with_bump(args, **kw):
     try:
         parsed = json.loads(result)
         if isinstance(parsed, dict) and parsed.get("success"):
-            _record_skill_view(task_id, name, args.get("file_path"), parsed)
+            _record_skill_view(
+                dedup_task_id, name, args.get("file_path"), parsed
+            )
             # Use the resolved skill name from the payload when present —
             # qualified forms ("plugin:skill") return with the canonical name.
             resolved = parsed.get("name") or name
