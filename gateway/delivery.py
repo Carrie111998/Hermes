@@ -66,6 +66,7 @@ class DeliveryTransport:
     adapter: Any
     config: Optional[PlatformConfig]
     transport_platform: Platform
+    forwarded: bool = False
 
     @property
     def is_relay(self) -> bool:
@@ -79,7 +80,7 @@ class DeliveryTransport:
         metadata: Optional[Dict[str, Any]],
     ) -> Any:
         """Send through this transport while preserving the logical platform."""
-        if self.is_relay:
+        if self.forwarded:
             return await self.adapter.send_for_platform(
                 logical_platform,
                 chat_id,
@@ -127,6 +128,24 @@ def resolve_delivery_transport(
             adapter=relay,
             config=relay_config,
             transport_platform=Platform.RELAY,
+            forwarded=True,
+        )
+    # Proxy-mode API servers may durably queue proactive output for the thin
+    # gateway that owns the real platform adapter. Use the same explicit
+    # fronts_platform contract as Relay; never infer forwarding from absence of
+    # a native credential.
+    for transport_platform, adapter in live_adapters.items():
+        fronts_platform = getattr(adapter, "fronts_platform", None)
+        if not callable(fronts_platform) or not fronts_platform(platform):
+            continue
+        transport_config = config.platforms.get(transport_platform)
+        if transport_config is not None and not transport_config.enabled:
+            continue
+        return DeliveryTransport(
+            adapter=adapter,
+            config=transport_config,
+            transport_platform=transport_platform,
+            forwarded=True,
         )
     return None
 
