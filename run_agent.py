@@ -297,6 +297,11 @@ _EPHEMERAL_SCAFFOLDING_FLAGS = (
     # drive the bounded retry. Persisting them would replay the internal
     # retry instruction as user-authored context on resume.
     "_dropped_toolcall_nudge",
+    # fabricated tool-use re-prompt pair (a completed turn's text leaked a
+    # tool-call JSON shape or claimed a completed tool action with no real
+    # tool_calls behind it): same reasoning as the dropped-toolcall pair
+    # above, just for a different provider-contract mismatch.
+    "_fabricated_tool_use_nudge",
 )
 
 

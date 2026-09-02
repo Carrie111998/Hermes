@@ -5834,6 +5834,7 @@ This compaction should PRIORITISE preserving all information related to the focu
             _CODEX_INCOMPLETE_NUDGE,
             _DROPPED_TOOLCALL_NUDGE_CONTENT,
             _EMPTY_TOOL_RESPONSE_NUDGE,
+            _FABRICATED_TOOL_USE_NUDGE_CONTENT,
             _LENGTH_CONTINUATION_DROPPED_TOOLS_PREFIX,
             _LENGTH_CONTINUATION_NETWORK_STUB,
             _LENGTH_CONTINUATION_OUTPUT_LIMIT,
@@ -5847,6 +5848,7 @@ This compaction should PRIORITISE preserving all information related to the focu
             _CODEX_ACK_CONTINUATION_NUDGE,
             _DROPPED_TOOLCALL_NUDGE_CONTENT,
             _EMPTY_TOOL_RESPONSE_NUDGE,
+            _FABRICATED_TOOL_USE_NUDGE_CONTENT,
             _LENGTH_CONTINUATION_NETWORK_STUB,
             _LENGTH_CONTINUATION_OUTPUT_LIMIT,
         } or text.startswith(

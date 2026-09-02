@@ -20,7 +20,42 @@ monkeypatch ``run_agent.time.sleep`` locally (see
 
 from __future__ import annotations
 
+from unittest.mock import MagicMock, patch
+
 import pytest
+
+
+@pytest.fixture()
+def loop_agent():
+    """AIAgent with a mocked OpenAI client, ready to stage a
+    ``.chat.completions.create`` response sequence.
+
+    Shared here because this exact fixture body was independently
+    duplicated across several files in this directory (test_run_agent.py's
+    original, test_dropped_tool_call_recovery.py, and others) before being
+    consolidated — new tests should depend on this one rather than adding
+    another copy.
+    """
+    from run_agent import AIAgent
+    with (
+        patch("run_agent.get_tool_definitions", return_value=[]),
+        patch("run_agent.check_toolset_requirements", return_value={}),
+        patch("run_agent.OpenAI"),
+    ):
+        agent = AIAgent(
+            api_key="test-key-1234567890",
+            base_url="https://openrouter.ai/api/v1",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+        )
+        agent.client = MagicMock()
+        agent._cached_system_prompt = "You are helpful."
+        agent._use_prompt_caching = False
+        agent.tool_delay = 0
+        agent.compression_enabled = False
+        agent.save_trajectories = False
+        return agent
 
 
 @pytest.fixture(autouse=True)

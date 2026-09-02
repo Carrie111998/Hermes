@@ -703,6 +703,16 @@ def build_turn_context(
     agent._incomplete_scratchpad_retries = 0
     agent._codex_incomplete_retries = 0
     agent._thinking_prefill_retries = 0
+    # These three are also reset at run_conversation()'s own "genuine turn
+    # end" fallthrough, but that point is skipped by any early return in the
+    # turn loop (e.g. a user interrupt during the empty-response retry
+    # backoff) -- resetting here too, at the one point every turn
+    # unconditionally passes through, is what actually guarantees a stale
+    # value from an aborted turn can never suppress detection on the next,
+    # unrelated turn.
+    agent._dropped_toolcall_retries = 0
+    agent._fabricated_tool_use_retries = 0
+    agent._landed_real_tool_call_this_turn = False
     agent._post_tool_empty_retried = False
     agent._last_content_with_tools = None
     agent._last_content_tools_all_housekeeping = False

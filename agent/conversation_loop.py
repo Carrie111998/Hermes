@@ -1353,6 +1353,64 @@ _DROPPED_TOOLCALL_NUDGE_CONTENT = (
     "the actual tool call now to continue the task."
 )
 
+# Re-prompt sent when a completed turn's text either leaks a raw tool-call
+# JSON fragment or affirmatively claims a completed tool action with a
+# result, while the turn's real tool_calls came back empty -- the
+# fabricated-tool-use recovery below. Named for the same reason as the
+# nudges above.
+_FABRICATED_TOOL_USE_NUDGE_CONTENT = (
+    "Your previous reply described or implied a tool result, but no tool "
+    "was actually called this turn. Do not describe a result you did not "
+    "get — issue the actual tool call now, or answer without claiming to "
+    "have used a tool."
+)
+
+# Structural signal: a `"name": "..."` key and an `"arguments":` key both
+# appearing in the text, in either order — the literal shape of a
+# tool-call payload (OpenAI/Responses-API function-call JSON), independent
+# of whatever prose wording surrounds it. Two separate regexes (not one
+# spanning both) so neither key's position relative to the other, nor how
+# much text sits between them, matters. Accepted false-positive class:
+# legitimate prose that quotes a tool-call-shaped JSON example (e.g.
+# explaining an API schema) will also match — the retry cost of a
+# wrong-but-bounded re-prompt is judged cheaper than the complexity of
+# disambiguating intent here.
+_FABRICATED_TOOL_USE_HAS_NAME_KEY = re.compile(r'"name"\s*:\s*"[^"]*"')
+_FABRICATED_TOOL_USE_HAS_ARGUMENTS_KEY = re.compile(r'"arguments"\s*:')
+
+# Self-claim signal: text affirmatively claiming a COMPLETED tool action
+# with a result ("here's the result from my search", "the search
+# returned..."), as opposed to a proposal ("let me check") or an honest
+# disclaimer ("I can't look that up right now") — the latter two are not
+# this bug and must never match. Seeded from one real captured incident;
+# unlike the JSON check above, this is a wording-based list and will need
+# new entries from future real incidents, same as its prior-art equivalent
+# has already needed twice (see the RFC for the history).
+_FABRICATED_TOOL_USE_PATTERNS = (
+    re.compile(r"here('s| is) the result[s]? (from|of) (my|the) search", re.IGNORECASE),
+    re.compile(r"\bthe search returned\b", re.IGNORECASE),
+    re.compile(r"\bmy search (returned|found|showed)\b", re.IGNORECASE),
+)
+
+
+def _looks_like_fabricated_tool_use(text: Optional[str]) -> bool:
+    """True when ``text`` either leaks a tool-call-shaped JSON fragment or
+    affirmatively claims a completed tool action with a result.
+
+    Caller must separately confirm no real tool_calls exist for this turn —
+    this function only inspects text, matching the same division of
+    responsibility as the dropped-tool-call check below.
+    """
+    if not text:
+        return False
+    if (
+        _FABRICATED_TOOL_USE_HAS_NAME_KEY.search(text)
+        and _FABRICATED_TOOL_USE_HAS_ARGUMENTS_KEY.search(text)
+    ):
+        return True
+    return any(pattern.search(text) for pattern in _FABRICATED_TOOL_USE_PATTERNS)
+
+
 # Re-prompt sent when the model returns an empty response after executing tool
 # calls (#9400). Named for the same reason as the nudges above — its
 # _empty_recovery_synthetic metadata flag doesn't survive SessionDB projection.
@@ -7979,6 +8037,11 @@ def run_conversation(
                 # was recovered — refresh that budget too so it guards each
                 # stall independently rather than capping the whole run.
                 agent._dropped_toolcall_retries = 0
+                # A real tool call this turn means any later completed-turn
+                # text in the SAME turn (e.g. a summary of this result) must
+                # never be mistaken for a fabricated-tool-use claim — see
+                # the fabricated-tool-use check below.
+                agent._landed_real_tool_call_this_turn = True
 
                 previous_msg = messages[-1] if messages else None
                 current_interim_visible = agent._interim_assistant_visible_text(assistant_msg)
@@ -8832,10 +8895,62 @@ def run_conversation(
                     final_response = None
                     continue
 
-                # Reached finalization without the dropped-tool-call mismatch —
-                # a genuine turn end. Clear the consecutive-stall budget so the
-                # next turn starts fresh.
+                # ── Fabricated tool-use recovery (any provider, any tool) ──
+                # A completed turn (any finish_reason other than "tool_calls",
+                # including "stop") whose text either leaks a raw tool-call
+                # JSON fragment or affirmatively claims a completed tool
+                # action with a result, while tool_calls came back empty.
+                # Unlike the dropped-toolcall guard above, this does NOT gate
+                # on finish_reason=="tool_calls" being PRESENT — that guard's
+                # own comment notes "finish_reason='stop' text finishes never
+                # enter this guard," which is exactly the gap this closes.
+                # Excludes finish_reason=="tool_calls" deliberately: that's
+                # the dropped-toolcall check's own territory above, and
+                # letting both checks apply to the same overlap case would
+                # silently double the effective retry budget to 6 instead of
+                # the stated 3. Guarded by _landed_real_tool_call_this_turn so
+                # a genuine post-tool-call summary (whose text may legitimately
+                # say things like "the search returned...") is never mistaken
+                # for a fabrication. See
+                # docs/rfcs/2026-08-fabricated-tool-use-detection.md.
+                elif (
+                    finish_reason != "tool_calls"
+                    and not assistant_message.tool_calls
+                    and not getattr(agent, "_landed_real_tool_call_this_turn", False)
+                    and _looks_like_fabricated_tool_use(final_response)
+                    and getattr(agent, "_fabricated_tool_use_retries", 0) < 3
+                ):
+                    agent._fabricated_tool_use_retries = getattr(agent, "_fabricated_tool_use_retries", 0) + 1
+                    logger.warning(
+                        "completed turn's text claims tool use with no real "
+                        "tool_calls (fabricated-tool-use pattern) — "
+                        "re-prompting (retry %d/3, model=%s provider=%s)",
+                        agent._fabricated_tool_use_retries, agent.model, agent.provider,
+                    )
+                    agent._emit_status(
+                        "↻ Reply looked like a fabricated tool result with no "
+                        f"real tool call — re-prompting ({agent._fabricated_tool_use_retries}/3)"
+                    )
+                    final_msg["_fabricated_tool_use_nudge"] = True
+                    append_message(messages, final_msg)
+                    append_message(messages, {
+                        "role": "user",
+                        "content": _FABRICATED_TOOL_USE_NUDGE_CONTENT,
+                        "_fabricated_tool_use_nudge": True,
+                    })
+                    agent._session_messages = messages
+                    final_response = None
+                    continue
+
+                # Reached finalization without either mismatch — a genuine
+                # turn end. Clear both consecutive-stall budgets, and the
+                # landed-real-tool-call flag, so the NEXT turn starts fresh.
+                # Without resetting the flag here, a single real tool call
+                # anywhere in the session would permanently disable the
+                # fabricated-tool-use check for every later turn.
                 agent._dropped_toolcall_retries = 0
+                agent._fabricated_tool_use_retries = 0
+                agent._landed_real_tool_call_this_turn = False
 
                 # Pop thinking-only prefill and empty-response retry
                 # scaffolding before appending either a final response or a
@@ -8850,6 +8965,7 @@ def run_conversation(
                         or messages[-1].get("_empty_recovery_synthetic")
                         or messages[-1].get("_empty_terminal_sentinel")
                         or messages[-1].get("_dropped_toolcall_nudge")
+                        or messages[-1].get("_fabricated_tool_use_nudge")
                     )
                 ):
                     messages.pop()

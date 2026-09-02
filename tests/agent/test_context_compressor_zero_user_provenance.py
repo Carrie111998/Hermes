@@ -220,6 +220,21 @@ def test_max_iterations_nudge_is_synthetic_not_actionable():
     assert ContextCompressor._transcript_has_real_user_turn([human, nudge]) is True
 
 
+def test_fabricated_tool_use_nudge_is_synthetic_not_actionable():
+    """The fabricated-tool-use recovery nudge (agent/conversation_loop.py) is
+    runtime scaffolding, not a human turn — same recognition requirement as
+    every other sibling nudge in this function, and for the same reason:
+    SessionDB preserves role/content but not underscore-prefixed metadata,
+    so content-based recognition is authoritative after projection."""
+    from agent.conversation_loop import _FABRICATED_TOOL_USE_NUDGE_CONTENT
+
+    nudge = {"role": "user", "content": _FABRICATED_TOOL_USE_NUDGE_CONTENT}
+    assert ContextCompressor._is_synthetic_compression_user_turn(nudge) is True
+
+    human = {"role": "user", "content": "What's the price of gold?"}
+    assert ContextCompressor._is_synthetic_compression_user_turn(human) is False
+
+
 def test_real_task_wins_over_trailing_max_iterations_nudge(compressor):
     """The tail anchor must resolve to the human task, not the nudge that the
     runtime appended after it when iterations were exhausted."""

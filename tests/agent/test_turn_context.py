@@ -326,6 +326,27 @@ def test_turn_start_replaces_stale_parent_history_with_compression_child():
     assert all(message.get("content") != "stale parent" for message in ctx.messages)
 
 
+def test_resets_dropped_toolcall_and_fabricated_tool_use_state():
+    """A stale value on any of these three must never survive into a new
+    turn -- run_conversation()'s own "genuine turn end" reset (near the
+    bottom of its main loop) is skipped by ~35 early-return paths (e.g. a
+    user interrupt during the empty-response retry backoff), so
+    build_turn_context() -- called unconditionally at the START of every
+    run_conversation() invocation -- is the only reset point that reliably
+    covers every path. Before this fix, a real tool call landing in one
+    turn, followed by that same turn exiting early via one of those
+    early-return paths, silently disabled the fabricated-tool-use detector
+    for the next, unrelated turn on the same agent."""
+    agent = _FakeAgent()
+    agent._dropped_toolcall_retries = 2
+    agent._fabricated_tool_use_retries = 1
+    agent._landed_real_tool_call_this_turn = True
+    _build(agent)
+    assert agent._dropped_toolcall_retries == 0
+    assert agent._fabricated_tool_use_retries == 0
+    assert agent._landed_real_tool_call_this_turn is False
+
+
 def test_applies_agent_side_effects():
     agent = _FakeAgent()
     _build(agent)
