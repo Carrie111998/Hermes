@@ -139,6 +139,8 @@ export interface SkillCommandDispatchResponse {
   /** The invocation the UI renders (`/work fix the leak`). `message` is the
    *  expanded skill body — model-facing scaffolding no surface may show. */
   display?: string
+  /** Clean user-authored skill argument for the auxiliary recall planner. */
+  plannerUserMessage?: string | null
 }
 
 export interface SendCommandDispatchResponse {
@@ -147,6 +149,7 @@ export interface SendCommandDispatchResponse {
   notice?: string
   /** Set for a skill-bundle send: see SkillCommandDispatchResponse.display. */
   display?: string
+  plannerUserMessage?: string | null
 }
 
 export interface PrefillCommandDispatchResponse {

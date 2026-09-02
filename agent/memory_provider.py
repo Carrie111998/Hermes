@@ -175,6 +175,24 @@ class MemoryProvider(ABC):
         """
         return ""
 
+    def rewrites_recall_queries(self) -> bool:
+        """Return whether this provider already performs its own query rewrite.
+
+        The host recall planner uses this fail-closed capability to avoid
+        stacking two model planners on one automatic recall path.
+        """
+        return False
+
+    def supports_current_query_recall_planning(self) -> bool:
+        """Return whether ``prefetch(query)`` recalls that exact turn's query.
+
+        Opting in also promises that host-suppressed ``queue_prefetch`` calls
+        are not required for the provider's active-mode recall result. The
+        default is false so released third-party providers keep their current
+        synchronous/background behavior.
+        """
+        return False
+
     def prefetch(self, query: str, *, session_id: str = "") -> str:
         """Recall relevant context for the upcoming turn.
 

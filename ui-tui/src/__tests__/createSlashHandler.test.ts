@@ -911,7 +911,8 @@ describe('createSlashHandler', () => {
                 type: 'skill',
                 message: skillMessage,
                 name: 'hermes-agent-dev',
-                display: '/hermes-agent-dev'
+                display: '/hermes-agent-dev fix it',
+                planner_user_message: 'fix it'
               })
             }
 
@@ -923,9 +924,9 @@ describe('createSlashHandler', () => {
     })
 
     const h = createSlashHandler(ctx)
-    expect(h('/hermes-agent-dev')).toBe(true)
+    expect(h('/hermes-agent-dev fix it')).toBe(true)
     await vi.waitFor(() => {
-      expect(ctx.transcript.send).toHaveBeenCalledWith(skillMessage, true, '/hermes-agent-dev')
+      expect(ctx.transcript.send).toHaveBeenCalledWith(skillMessage, true, '/hermes-agent-dev fix it', 'fix it')
     })
 
     // The expanded skill body is model-facing: no transcript line may carry it.

@@ -793,6 +793,14 @@ export function useMainApp(gw: GatewayClient) {
     sys
   })
 
+  const sendSlash = useCallback(
+    (text: string, showUserMessage = true, displayText?: string, plannerUserMessage?: string | null) =>
+      send(text, showUserMessage, displayText, undefined, {
+        plannerUserMessage
+      }),
+    [send]
+  )
+
   submitLiteralRef.current = submitLiteral
 
   // Drain one queued message whenever the session settles (busy → false):
@@ -973,7 +981,14 @@ export function useMainApp(gw: GatewayClient) {
           setSessionStartedAt
         },
         slashFlightRef,
-        transcript: { page, panel, send, setHistoryItems, sys, trimLastExchange: session.trimLastExchange },
+        transcript: {
+          page,
+          panel,
+          send: sendSlash,
+          setHistoryItems,
+          sys,
+          trimLastExchange: session.trimLastExchange
+        },
         voice: { setVoiceEnabled, setVoiceRecordKey, setVoiceTts }
       }),
     [
@@ -988,7 +1003,7 @@ export function useMainApp(gw: GatewayClient) {
       page,
       panel,
       selection,
-      send,
+      sendSlash,
       session,
       setHistoryItems,
       sys

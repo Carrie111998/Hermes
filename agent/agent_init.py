@@ -1949,9 +1949,17 @@ def init_agent(
             _mem_provider_name = mem_config.get("provider", "") if mem_config else ""
 
             if _mem_provider_name and _mem_provider_name.strip():
-                from agent.memory_manager import MemoryManager as _MemoryManager
+                from agent.memory_manager import (
+                    MemoryManager as _MemoryManager,
+                    normalize_recall_planner_config as _normalize_recall_planner_config,
+                )
                 from plugins.memory import load_memory_provider as _load_mem
-                agent._memory_manager = _MemoryManager()
+                _planner_config = _normalize_recall_planner_config(
+                    mem_config.get("recall_planner") if mem_config else None
+                )
+                agent._memory_manager = _MemoryManager(
+                    recall_planner_config=_planner_config
+                )
                 _mp = _load_mem(_mem_provider_name)
                 if _mp and _mp.is_available():
                     agent._memory_manager.add_provider(_mp)

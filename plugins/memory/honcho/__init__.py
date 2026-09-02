@@ -328,6 +328,10 @@ class HonchoMemoryProvider(MemoryProvider):
     def name(self) -> str:
         return "honcho"
 
+    def rewrites_recall_queries(self) -> bool:
+        """Report the initialized provider-local latest-message rewrite mode."""
+        return bool(self._query_rewrite_enabled)
+
     def is_available(self) -> bool:
         """Check if Honcho is configured. No network calls."""
         try:

@@ -219,6 +219,7 @@ export function useComposerQueue({
           onSubmit(entry.text, {
             attachments: entry.attachments,
             ...(entry.displayText ? { displayText: entry.displayText } : {}),
+            ...(entry.plannerUserMessage !== undefined ? { plannerUserMessage: entry.plannerUserMessage } : {}),
             fromQueue: true,
             sessionId: drainRuntimeSessionId,
             storedSessionId: drainQueueSessionKey

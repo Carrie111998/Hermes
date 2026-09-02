@@ -314,6 +314,9 @@ export function parseCommandDispatch(raw: unknown): CommandDispatchResponse | nu
   const row = raw as Record<string, unknown>
   const str = (value: unknown) => (typeof value === 'string' ? value : undefined)
 
+  const optionalNullableStr = (value: unknown) =>
+    value === null ? null : typeof value === 'string' ? value : undefined
+
   switch (row.type) {
     case 'exec':
 
@@ -325,12 +328,24 @@ export function parseCommandDispatch(raw: unknown): CommandDispatchResponse | nu
 
     case 'skill':
       return typeof row.name === 'string'
-        ? { type: 'skill', name: row.name, message: str(row.message), display: str(row.display) }
+        ? {
+            type: 'skill',
+            name: row.name,
+            message: str(row.message),
+            display: str(row.display),
+            plannerUserMessage: optionalNullableStr(row.planner_user_message)
+          }
         : null
 
     case 'send':
       return typeof row.message === 'string'
-        ? { type: 'send', message: row.message, notice: str(row.notice), display: str(row.display) }
+        ? {
+            type: 'send',
+            message: row.message,
+            notice: str(row.notice),
+            display: str(row.display),
+            plannerUserMessage: optionalNullableStr(row.planner_user_message)
+          }
         : null
 
     case 'prefill':

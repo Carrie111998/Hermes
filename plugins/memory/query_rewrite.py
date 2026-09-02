@@ -15,7 +15,16 @@ import re
 from dataclasses import dataclass
 from typing import Any, Literal, Mapping, Sequence, cast
 
+from agent.context_compressor import (
+    LEGACY_SUMMARY_PREFIX,
+    RECALL_PLANNER_EXCLUDE_METADATA_KEY,
+    RECALL_PLANNER_SUMMARY_SAFE_METADATA_KEY,
+    SUMMARY_PREFIX,
+    ContextCompressor,
+    _SUMMARY_END_MARKER,
+)
 from agent.redact import redact_sensitive_text
+from agent.skill_commands import is_skill_scaffold_message
 
 logger = logging.getLogger(__name__)
 
@@ -29,6 +38,10 @@ _PREVIOUS_USER_CHARS = 600
 _PREVIOUS_ASSISTANT_CHARS = 1_000
 _COMPACTED_SUMMARY_CHARS = 600
 _OMISSION_MARKER = "\n[... middle omitted ...]\n"
+_CONTEXT_REFERENCE_MARKERS = (
+    "\n\n--- Context Warnings ---\n",
+    "\n\n--- Attached Context ---\n",
+)
 _OUTPUT_PREFIX_RE = re.compile(
     r"^(?:retrieval\s+query|memory\s+query|query|question)\s*:\s*",
     re.IGNORECASE,
@@ -208,10 +221,28 @@ def _parse_recall_plan(text: str) -> RecallPlan | None:
     return RecallPlan(action="recall", query=normalized)
 
 
+def _clean_transcript_text(text: str) -> str:
+    """Return visible transcript text, rejecting skill-expanded content."""
+
+    # A rendered skill message is not a provenance boundary: its private body
+    # can contain every delimiter used by the renderer.  Never reconstruct a
+    # user instruction from it.  A clean instruction must be carried to the
+    # caller separately; legacy/history scaffolds fail closed here.
+    if is_skill_scaffold_message(text):
+        return ""
+    boundaries = [
+        index
+        for marker in _CONTEXT_REFERENCE_MARKERS
+        if (index := text.find(marker)) >= 0
+    ]
+    visible = text[: min(boundaries)] if boundaries else text
+    return visible.strip()
+
+
 def _message_text(message: Mapping[str, Any]) -> str:
     content = message.get("content")
     if isinstance(content, str):
-        return content.strip()
+        return _clean_transcript_text(content)
     if not isinstance(content, list):
         return ""
 
@@ -227,7 +258,43 @@ def _message_text(message: Mapping[str, Any]) -> str:
         text = part.get("text")
         if isinstance(text, str):
             chunks.append(text)
-    return "\n".join(chunk for chunk in chunks if chunk).strip()
+    return _clean_transcript_text("\n".join(chunk for chunk in chunks if chunk))
+
+
+def _planner_excluded_history_message(message: Mapping[str, Any]) -> bool:
+    if message.get("_recall_planner_exclude") is True:
+        return True
+    metadata = message.get("display_metadata")
+    return (
+        isinstance(metadata, Mapping)
+        and metadata.get(RECALL_PLANNER_EXCLUDE_METADATA_KEY) is True
+    )
+
+
+def _planner_safe_compacted_summary(message: Mapping[str, Any]) -> bool:
+    if message.get("_recall_planner_summary_safe") is True:
+        return True
+    metadata = message.get("display_metadata")
+    return (
+        isinstance(metadata, Mapping)
+        and metadata.get(RECALL_PLANNER_SUMMARY_SAFE_METADATA_KEY) is True
+    )
+
+
+def _is_compacted_summary_message(message: Mapping[str, Any]) -> bool:
+    if message.get("_compressed_summary") or message.get(
+        "_recall_planner_is_summary"
+    ):
+        return True
+    metadata = message.get("display_metadata")
+    if (
+        isinstance(metadata, Mapping)
+        and RECALL_PLANNER_SUMMARY_SAFE_METADATA_KEY in metadata
+    ):
+        # SessionDB's conversation projection omits the private top-level
+        # marker but preserves display metadata, including an explicit False.
+        return True
+    return ContextCompressor._is_context_summary_content(message.get("content"))
 
 
 def _latest_completed_exchange(
@@ -237,10 +304,20 @@ def _latest_completed_exchange(
     assistant_text = ""
     for index in range(len(history) - 1, -1, -1):
         message = history[index]
+        if _is_compacted_summary_message(message):
+            # Never form an exchange across a compaction boundary. A completed
+            # post-compaction exchange will be encountered before this row.
+            return "", "", False
         if message.get("role") != "assistant":
             continue
-        if message.get("_compressed_summary") or message.get("tool_calls"):
+        if message.get("tool_calls"):
             continue
+        if _planner_excluded_history_message(message):
+            return "", "", False
+        if is_skill_scaffold_message(message.get("api_content")) or is_skill_scaffold_message(
+            message.get("content")
+        ):
+            return "", "", False
         text = _message_text(message)
         if text:
             assistant_index = index
@@ -251,27 +328,65 @@ def _latest_completed_exchange(
 
     for index in range(assistant_index - 1, -1, -1):
         message = history[index]
-        if message.get("role") != "user" or message.get("_compressed_summary"):
+        if _is_compacted_summary_message(message):
+            return "", "", False
+        if message.get("role") != "user":
             continue
+        # The first preceding user-owned row owns the assistant response.  A
+        # compression carrier or explicitly excluded transformed turn cannot be
+        # skipped in favour of an older unrelated user message.
+        if _planner_excluded_history_message(message):
+            return "", "", False
+        api_content = message.get("api_content")
+        if is_skill_scaffold_message(api_content) or is_skill_scaffold_message(
+            message.get("content")
+        ):
+            # A persisted display-clean content field can still belong to a
+            # skill-expanded API turn.  The sidecar proves that the paired
+            # assistant saw private skill material, so exclude the whole
+            # exchange without parsing either text field.
+            return "", "", False
         user_text = _message_text(message)
         if not user_text:
-            continue
-        api_content = message.get("api_content")
+            # The nearest user row owns this assistant response.  If that row
+            # lacks clean provenance (for example, a slash-skill scaffold), do
+            # not pair the response with an older unrelated user turn or expose
+            # an answer that may quote the private scaffold.
+            return "", "", False
         previous_recall = bool(
             isinstance(api_content, str)
             and _EXACT_MEMORY_CONTEXT_RE.search(api_content)
         )
         return user_text, assistant_text, previous_recall
-    return "", assistant_text, False
+    return "", "", False
 
 
 def _latest_compacted_summary(history: Sequence[Mapping[str, Any]]) -> str:
     for message in reversed(history):
-        if not message.get("_compressed_summary"):
+        if not _is_compacted_summary_message(message):
             continue
+        if not _planner_safe_compacted_summary(message):
+            # The newest summary may cover excluded skill-derived turns. Never
+            # skip backward to an older clean summary across that boundary.
+            return ""
         if message.get("role") not in ("user", "assistant"):
             continue
-        text = _message_text(message)
+        content = message.get("content")
+        if not isinstance(content, str):
+            continue
+        if is_skill_scaffold_message(content):
+            return ""
+        # Compaction can merge a real preserved tail row before the generated
+        # summary.  Only the canonical summary body may leave this process; the
+        # preserved carrier can include transformed skill/API material.
+        text = ContextCompressor._strip_summary_prefix(content).strip()
+        for prefix in (SUMMARY_PREFIX, LEGACY_SUMMARY_PREFIX):
+            if text.startswith(prefix):
+                text = text[len(prefix) :].lstrip()
+                break
+        if text.endswith(_SUMMARY_END_MARKER):
+            text = text[: -len(_SUMMARY_END_MARKER)].rstrip()
+        text = _clean_transcript_text(text)
         if text:
             return text
     return ""
@@ -317,12 +432,15 @@ def build_recall_planner_capsule(
     """Return a bounded redacted JSON capsule, or ``""`` on redaction failure."""
 
     try:
+        clean_current = _clean_transcript_text(current_user_message)
+        if not clean_current:
+            return ""
         previous_user, previous_assistant, previous_recall = (
             _latest_completed_exchange(history)
         )
         capsule: dict[str, Any] = {
             "current_user_message": _bounded_text(
-                _redact_for_planner(current_user_message), _CURRENT_MESSAGE_CHARS
+                _redact_for_planner(clean_current), _CURRENT_MESSAGE_CHARS
             ),
             "previous_user_message": _bounded_text(
                 _redact_for_planner(previous_user), _PREVIOUS_USER_CHARS

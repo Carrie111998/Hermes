@@ -50,7 +50,7 @@ export function submitPrompt(
   deps: SubmitPromptDeps,
   showUserMessage = true,
   displayOverride?: string,
-  opts: { skipDetectDrop?: boolean } = {}
+  opts: { plannerUserMessage?: string | null; skipDetectDrop?: boolean } = {}
 ): void {
   const sid = getUiState().sid
 
@@ -80,7 +80,11 @@ export function submitPrompt(
     turnController.interrupted = false
 
     deps.gw
-      .request<PromptSubmitResponse>('prompt.submit', { session_id: liveSid, text: submitText })
+      .request<PromptSubmitResponse>('prompt.submit', {
+        session_id: liveSid,
+        text: submitText,
+        ...(opts.plannerUserMessage !== undefined ? { planner_user_message: opts.plannerUserMessage } : {})
+      })
       .then(r => {
         // The gateway consumed a typed voice stop phrase server-side (voice
         // chat ended, no turn started) — release the busy latch; the

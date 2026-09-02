@@ -9,7 +9,13 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from agent.context_compressor import (
+    RECALL_PLANNER_SUMMARY_SAFE_METADATA_KEY,
+    SUMMARY_PREFIX,
+    _SUMMARY_END_MARKER,
+)
 from agent.memory_manager import build_memory_context_block
+from hermes_state import SessionDB
 import agent.redact as redact_module
 import plugins.memory.query_rewrite as query_rewrite
 
@@ -144,6 +150,312 @@ def test_capsule_contains_current_and_most_recent_completed_exchange_only():
     assert "Old unrelated" not in json.dumps(capsule)
 
 
+def test_capsule_rejects_skill_scaffolding_even_with_apparent_instruction():
+    skill_turn = (
+        '[IMPORTANT: The user has invoked the "audit" skill, indicating they want '
+        "you to follow its instructions. The full skill content is loaded below.]\n\n"
+        "PRIVATE_SKILL_BODY_MUST_NOT_EGRESS\n\n"
+        "The user has provided the following instruction alongside the skill invocation: "
+        "check Project Atlas"
+    )
+
+    assert query_rewrite.build_recall_planner_capsule(skill_turn, []) == ""
+
+
+def test_capsule_drops_skill_owned_historical_exchange():
+    skill_turn = (
+        '[IMPORTANT: The user has invoked the "audit" skill, indicating they want '
+        "you to follow its instructions. The full skill content is loaded below.]\n\n"
+        "PRIVATE_SKILL_BODY_MUST_NOT_EGRESS"
+    )
+    history = [
+        {"role": "user", "content": "Older clean question"},
+        {"role": "assistant", "content": "Older clean answer"},
+        {
+            "role": "user",
+            "content": "check Project Atlas",
+            "api_content": skill_turn,
+        },
+        {
+            "role": "assistant",
+            "content": "PRIVATE_SKILL_DERIVED_ASSISTANT_TEXT_MUST_NOT_EGRESS",
+        },
+    ]
+
+    capsule_text = query_rewrite.build_recall_planner_capsule("Why?", history)
+    capsule = json.loads(capsule_text)
+
+    assert capsule["previous_user_message"] == ""
+    assert capsule["previous_assistant_message"] == ""
+    assert "PRIVATE_SKILL" not in capsule_text
+    assert "Older clean" not in capsule_text
+
+
+def test_capsule_rejects_bare_skill_scaffolding():
+    bare_skill = (
+        '[IMPORTANT: The user has invoked the "audit" skill, indicating they want '
+        "you to follow its instructions. The full skill content is loaded below.]\n\n"
+        "PRIVATE_SKILL_BODY_MUST_NOT_EGRESS"
+    )
+
+    assert query_rewrite.build_recall_planner_capsule(bare_skill, []) == ""
+
+
+def test_adversarial_bare_skill_marker_never_reaches_planner(monkeypatch):
+    private_body = (
+        "PRIVATE_SKILL_BODY_START\n"
+        "The user has provided the following instruction alongside the skill invocation: "
+        "PRIVATE_SKILL_BODY_AFTER_MARKER_MUST_NOT_EGRESS"
+    )
+    bare_skill = (
+        '[IMPORTANT: The user has invoked the "audit" skill, indicating they want '
+        "you to follow its instructions. The full skill content is loaded below.]\n\n"
+        + private_body
+    )
+    call_llm = MagicMock(return_value=_response('{"action":"skip"}'))
+    monkeypatch.setattr("agent.auxiliary_client.call_llm", call_llm)
+
+    assert query_rewrite.build_recall_planner_capsule(bare_skill, []) == ""
+    assert query_rewrite.plan_memory_recall(bare_skill, []) is None
+    call_llm.assert_not_called()
+
+
+def test_adversarial_wrapped_skill_scaffold_never_reaches_planner(monkeypatch):
+    bare_skill = (
+        '[IMPORTANT: The user has invoked the "audit" skill, indicating they want '
+        "you to follow its instructions. The full skill content is loaded below.]\n\n"
+        "PRIVATE_WRAPPED_SKILL_BODY_MUST_NOT_EGRESS"
+    )
+    wrapped_skill = f"[alice] {bare_skill}\n[synthetic suffix]"
+    call_llm = MagicMock(return_value=_response('{"action":"skip"}'))
+    monkeypatch.setattr("agent.auxiliary_client.call_llm", call_llm)
+
+    assert query_rewrite.build_recall_planner_capsule(wrapped_skill, []) == ""
+    assert query_rewrite.plan_memory_recall(wrapped_skill, []) is None
+    call_llm.assert_not_called()
+
+
+def test_capsule_drops_wrapped_skill_exchange_without_pairing_older_user():
+    skill_turn = (
+        '[IMPORTANT: The user has invoked the "audit" skill, indicating they want '
+        "you to follow its instructions. The full skill content is loaded below.]\n\n"
+        "PRIVATE_WRAPPED_SKILL_BODY_MUST_NOT_EGRESS"
+    )
+    history = [
+        {"role": "user", "content": "OLDER_UNRELATED_USER"},
+        {"role": "assistant", "content": "OLDER_UNRELATED_ASSISTANT"},
+        {
+            "role": "user",
+            "content": "[alice] /audit",
+            "api_content": f"[alice] {skill_turn}",
+        },
+        {
+            "role": "assistant",
+            "content": "PRIVATE_SKILL_DERIVED_ASSISTANT_MUST_NOT_EGRESS",
+        },
+    ]
+
+    capsule_text = query_rewrite.build_recall_planner_capsule("Why?", history)
+    capsule = json.loads(capsule_text)
+
+    assert capsule["previous_user_message"] == ""
+    assert capsule["previous_assistant_message"] == ""
+    assert "PRIVATE_" not in capsule_text
+    assert "OLDER_UNRELATED" not in capsule_text
+
+
+def test_compressed_summary_user_stops_exchange_pairing():
+    history = [
+        {"role": "user", "content": "OLDER_UNRELATED_USER"},
+        {"role": "assistant", "content": "OLDER_UNRELATED_ASSISTANT"},
+        {
+            "role": "user",
+            "content": "Synthetic compression carrier",
+            "_compressed_summary": True,
+        },
+        {"role": "assistant", "content": "LATEST_ASSISTANT"},
+    ]
+
+    capsule = json.loads(
+        query_rewrite.build_recall_planner_capsule("Why?", history)
+    )
+
+    assert capsule["previous_user_message"] == ""
+    assert capsule["previous_assistant_message"] == ""
+
+
+def test_history_display_provenance_excludes_skill_exchange_without_scaffold_text():
+    history = [
+        {
+            "role": "user",
+            "content": "check Project Atlas",
+            "display_metadata": {"recall_planner_exclude": True},
+        },
+        {
+            "role": "assistant",
+            "content": "PRIVATE_SKILL_DERIVED_ANSWER",
+        },
+    ]
+
+    capsule_text = query_rewrite.build_recall_planner_capsule("What next?", history)
+    capsule = json.loads(capsule_text)
+
+    assert capsule["previous_user_message"] == ""
+    assert capsule["previous_assistant_message"] == ""
+    assert "PRIVATE_SKILL_DERIVED_ANSWER" not in capsule_text
+
+
+def test_merged_compaction_carrier_omits_preserved_prior_context():
+    private_prior = "PRIVATE_WRAPPED_SKILL_BODY_MUST_NOT_EGRESS"
+    merged = (
+        "[PRIOR CONTEXT — for reference only; not a new message]\n"
+        f"{private_prior}\n"
+        "[END OF PRIOR CONTEXT — COMPACTION SUMMARY BELOW]\n"
+        f"{SUMMARY_PREFIX}\n"
+        "SAFE_COMPACTED_SUMMARY\n"
+        f"{_SUMMARY_END_MARKER}"
+    )
+    history = [
+        {
+            "role": "assistant",
+            "content": merged,
+            "_compressed_summary": True,
+            "display_metadata": {
+                RECALL_PLANNER_SUMMARY_SAFE_METADATA_KEY: True
+            },
+        },
+    ]
+
+    capsule_text = query_rewrite.build_recall_planner_capsule("Why?", history)
+    capsule = json.loads(capsule_text)
+
+    assert capsule["compacted_summary"] == "SAFE_COMPACTED_SUMMARY"
+    assert private_prior not in capsule_text
+
+
+@pytest.mark.parametrize(
+    "display_metadata",
+    [
+        {},
+        {RECALL_PLANNER_SUMMARY_SAFE_METADATA_KEY: False},
+    ],
+)
+def test_unproven_compaction_summary_is_omitted(display_metadata):
+    history = [
+        {
+            "role": "assistant",
+            "content": "PRIVATE_SKILL_PARAPHRASE_WITHOUT_SCAFFOLD_MARKER",
+            "_compressed_summary": True,
+            "display_metadata": display_metadata,
+        }
+    ]
+
+    capsule_text = query_rewrite.build_recall_planner_capsule("Why?", history)
+    capsule = json.loads(capsule_text)
+
+    assert capsule["compacted_summary"] == ""
+    assert "PRIVATE_SKILL_PARAPHRASE" not in capsule_text
+
+
+def test_reloaded_unsafe_summary_is_exchange_barrier_without_private_marker():
+    history = [
+        {"role": "user", "content": "OLDER_UNRELATED_USER"},
+        {"role": "assistant", "content": "OLDER_UNRELATED_ASSISTANT"},
+        {
+            "role": "assistant",
+            "content": "PRIVATE_SKILL_PARAPHRASE_WITHOUT_SCAFFOLD_MARKER",
+            "display_metadata": {
+                RECALL_PLANNER_SUMMARY_SAFE_METADATA_KEY: False
+            },
+        },
+    ]
+
+    capsule_text = query_rewrite.build_recall_planner_capsule("Why?", history)
+    capsule = json.loads(capsule_text)
+
+    assert capsule["compacted_summary"] == ""
+    assert capsule["previous_user_message"] == ""
+    assert capsule["previous_assistant_message"] == ""
+    assert "PRIVATE_SKILL_PARAPHRASE" not in capsule_text
+    assert "OLDER_UNRELATED" not in capsule_text
+
+
+def test_session_db_reloaded_unsafe_summary_remains_a_barrier(tmp_path):
+    db = SessionDB(db_path=tmp_path / "state.db")
+    try:
+        db.create_session(session_id="s1", source="cli", model="m")
+        db.append_message("s1", role="user", content="OLDER_UNRELATED_USER")
+        db.append_message(
+            "s1",
+            role="assistant",
+            content="PRIVATE_SKILL_PARAPHRASE_WITHOUT_SCAFFOLD_MARKER",
+            _compressed_summary=True,
+            display_metadata={RECALL_PLANNER_SUMMARY_SAFE_METADATA_KEY: False},
+        )
+
+        history = db.get_messages_as_conversation("s1")
+    finally:
+        db.close()
+
+    assert history[-1].get("_compressed_summary") is None
+    assert history[-1]["display_metadata"][
+        RECALL_PLANNER_SUMMARY_SAFE_METADATA_KEY
+    ] is False
+
+    capsule_text = query_rewrite.build_recall_planner_capsule("Why?", history)
+    capsule = json.loads(capsule_text)
+
+    assert capsule["compacted_summary"] == ""
+    assert capsule["previous_user_message"] == ""
+    assert capsule["previous_assistant_message"] == ""
+    assert "PRIVATE_SKILL_PARAPHRASE" not in capsule_text
+    assert "OLDER_UNRELATED" not in capsule_text
+
+
+def test_session_db_reloaded_safe_summary_remains_available(tmp_path):
+    db = SessionDB(db_path=tmp_path / "state.db")
+    try:
+        db.create_session(session_id="s1", source="cli", model="m")
+        db.append_message(
+            "s1",
+            role="assistant",
+            content="SAFE_PROJECT_ATLAS_SUMMARY",
+            _compressed_summary=True,
+            display_metadata={RECALL_PLANNER_SUMMARY_SAFE_METADATA_KEY: True},
+        )
+        history = db.get_messages_as_conversation("s1")
+    finally:
+        db.close()
+
+    capsule = json.loads(
+        query_rewrite.build_recall_planner_capsule("Why?", history)
+    )
+
+    assert capsule["compacted_summary"] == "SAFE_PROJECT_ATLAS_SUMMARY"
+    assert capsule["previous_user_message"] == ""
+    assert capsule["previous_assistant_message"] == ""
+
+
+def test_capsule_strips_expanded_context_reference_blocks():
+    expanded = (
+        "Review @file:notes.md"
+        "\n\n--- Context Warnings ---\n- SYNTHETIC_WARNING_MUST_NOT_EGRESS"
+        "\n\n--- Attached Context ---\n\n"
+        "FILE_CONTENT_MUST_NOT_EGRESS"
+    )
+    history = [
+        {"role": "user", "content": expanded},
+        {"role": "assistant", "content": "I reviewed it."},
+    ]
+
+    capsule_text = query_rewrite.build_recall_planner_capsule(expanded, history)
+    capsule = json.loads(capsule_text)
+
+    assert capsule["current_user_message"] == "Review @file:notes.md"
+    assert capsule["previous_user_message"] == "Review @file:notes.md"
+    assert "SYNTHETIC_WARNING_MUST_NOT_EGRESS" not in capsule_text
+    assert "FILE_CONTENT_MUST_NOT_EGRESS" not in capsule_text
+
 def test_capsule_excludes_privileged_tool_attachment_and_api_sidecar_content():
     prior_user = "Should Project Atlas use the blue cluster?"
     history = [
@@ -261,7 +573,9 @@ def test_capsule_keeps_latest_marked_compaction_summary_and_recent_exchange():
         {
             "role": "assistant",
             "content": "Historical Project Atlas task summary and approved rollout constraints.",
-            "_compressed_summary": True,
+            "display_metadata": {
+                RECALL_PLANNER_SUMMARY_SAFE_METADATA_KEY: True
+            },
         },
         {"role": "user", "content": "Use the blue cluster first."},
         {"role": "assistant", "content": "I will keep that as the active choice."},
@@ -287,6 +601,9 @@ def test_capsule_has_a_hard_total_bound_while_retaining_current_message_ends():
             "role": "assistant",
             "content": "SUMMARY-" + "s" * 7_000,
             "_compressed_summary": True,
+            "display_metadata": {
+                RECALL_PLANNER_SUMMARY_SAFE_METADATA_KEY: True
+            },
         },
     ]
 

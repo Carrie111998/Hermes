@@ -3143,7 +3143,7 @@ from gateway.session_state import (
 from gateway.authz_mixin import GatewayAuthorizationMixin
 from gateway.kanban_watchers import GatewayKanbanWatchersMixin
 from gateway.slash_commands import GatewaySlashCommandsMixin
-from gateway.turn_context import TurnContext
+from gateway.turn_context import PLANNER_USER_MESSAGE_UNSET, TurnContext
 from gateway.platforms.base import (
     BasePlatformAdapter,
     EphemeralReply,
@@ -7087,6 +7087,8 @@ class TurnRunner:
                 _conversation_kwargs["persist_user_message"] = _persist_user_message_override
             elif observed_group_context:
                 _conversation_kwargs["persist_user_message"] = ctx.message
+            if ctx.planner_user_message is not PLANNER_USER_MESSAGE_UNSET:
+                _conversation_kwargs["planner_user_message"] = ctx.planner_user_message
             if ctx.persist_user_display_kind:
                 # Internal self-injected turn (#82888): type the persisted user
                 # row at turn start so UIs render it as a timeline notice, not
@@ -18614,6 +18616,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         7. Return response
         """
         source = event.source
+        planner_user_message: Any = PLANNER_USER_MESSAGE_UNSET
 
         # 🔴 Cross-session leak guard. This handler runs inside a per-message
         # asyncio task created via create_task(), which snapshots the spawning
@@ -19993,6 +19996,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     if bundle_result:
                         msg, _loaded, missing = bundle_result
                         event.text = msg
+                        planner_user_message = user_instruction or None
                         _bundle_handled = True
                         if missing:
                             logger.info(
@@ -20071,6 +20075,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         if stacked_result:
                             msg, _loaded, _missing = stacked_result
                             event.text = msg
+                            planner_user_message = stacked_instruction or None
                             # Fall through to normal message processing
                         else:
                             return f"Failed to load stacked skills for /{command}."
@@ -20080,6 +20085,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         )
                         if msg:
                             event.text = msg
+                            planner_user_message = user_instruction or None
                             # Fall through to normal message processing with skill content
                 else:
                     # Not an active skill — check if it's a known-but-disabled or
@@ -23005,6 +23011,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 channel_prompt=event.channel_prompt,
                 moa_config=getattr(event, "_moa_config", None),
                 persist_user_message=persist_user_message,
+                planner_user_message=planner_user_message,
                 persist_user_timestamp=persist_user_timestamp,
                 persist_user_display_kind=persist_user_display_kind,
                 message_type=event.message_type,
@@ -30903,6 +30910,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         channel_prompt: Optional[str] = None,
         moa_config: Optional[dict] = None,
         persist_user_message: Optional[Any] = None,
+        planner_user_message: Any = PLANNER_USER_MESSAGE_UNSET,
         persist_user_timestamp: Optional[float] = None,
         persist_user_display_kind: Optional[str] = None,
         message_type: Optional[str] = None,
@@ -30924,6 +30932,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 inbound_message_id=inbound_message_id,
                 channel_prompt=channel_prompt, moa_config=moa_config,
                 persist_user_message=persist_user_message,
+                planner_user_message=planner_user_message,
                 persist_user_timestamp=persist_user_timestamp,
                 persist_user_display_kind=persist_user_display_kind,
                 message_type=message_type,
@@ -30938,6 +30947,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 inbound_message_id=inbound_message_id,
                 channel_prompt=channel_prompt, moa_config=moa_config,
                 persist_user_message=persist_user_message,
+                planner_user_message=planner_user_message,
                 persist_user_timestamp=persist_user_timestamp,
                 persist_user_display_kind=persist_user_display_kind,
                 message_type=message_type,
@@ -31082,6 +31092,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         channel_prompt: Optional[str] = None,
         moa_config: Optional[dict] = None,
         persist_user_message: Optional[Any] = None,
+        planner_user_message: Any = PLANNER_USER_MESSAGE_UNSET,
         persist_user_timestamp: Optional[float] = None,
         persist_user_display_kind: Optional[str] = None,
         message_type: Optional[str] = None,
@@ -31393,6 +31404,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             inbound_message_id=inbound_message_id,
             moa_config=moa_config,
             persist_user_message=persist_user_message,
+            planner_user_message=planner_user_message,
             persist_user_timestamp=persist_user_timestamp,
             persist_user_display_kind=persist_user_display_kind,
         )

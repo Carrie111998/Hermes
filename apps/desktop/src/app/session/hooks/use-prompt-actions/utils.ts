@@ -703,6 +703,8 @@ export interface SubmitTextOptions {
    *  body — model-facing scaffolding the UI must never render — so the slash
    *  dispatcher passes the invocation (`/work fix the leak`) here. */
   displayText?: string
+  /** Clean user-authored intent paired with model-facing skill expansion. */
+  plannerUserMessage?: string | null
   /** `hidden` types the persisted user row (display_kind) so no bubble
    *  renders anywhere — the off-screen path for widget intents. The agent
    *  still receives the text as a normal user turn. */

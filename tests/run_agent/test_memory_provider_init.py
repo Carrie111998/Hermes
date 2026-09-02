@@ -24,6 +24,12 @@ class RecordingMemoryProvider:
     def shutdown(self):
         pass
 
+    def supports_current_query_recall_planning(self):
+        return True
+
+    def rewrites_recall_queries(self):
+        return False
+
 
 def test_shutdown_memory_provider_is_idempotent():
     from unittest.mock import MagicMock
@@ -126,6 +132,47 @@ def test_aiagent_forwards_user_id_alt_to_memory_provider():
     assert provider.init_kwargs["platform"] == "feishu"
     assert "warning_callback" not in provider.init_kwargs
     assert "status_callback" not in provider.init_kwargs
+
+
+def test_aiagent_loads_one_immutable_startup_recall_planner_config():
+    provider = RecordingMemoryProvider()
+    planner_block = {
+        "mode": "shadow",
+        "provider": "recording",
+        "timeout_seconds": 2.5,
+    }
+    cfg = {
+        "memory": {"provider": "recording", "recall_planner": planner_block},
+        "agent": {},
+    }
+
+    with (
+        patch("hermes_cli.config.load_config", return_value=cfg),
+        patch("hermes_cli.config.load_config_readonly", return_value=cfg),
+        patch("plugins.memory.load_memory_provider", return_value=provider),
+        patch("agent.model_metadata.get_model_context_length", return_value=204_800),
+        patch("run_agent.get_tool_definitions", return_value=[]),
+        patch("run_agent.check_toolset_requirements", return_value={}),
+        patch("run_agent.OpenAI"),
+    ):
+        from run_agent import AIAgent
+
+        agent = AIAgent(
+            api_key="test-key-1234567890",
+            base_url="https://openrouter.ai/api/v1",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=False,
+            session_id="planner-session",
+        )
+
+    planner_block.update(mode="off", provider="changed", timeout_seconds=9)
+
+    assert agent._memory_manager is not None
+    assert agent._memory_manager.recall_planner_config.mode == "shadow"
+    assert agent._memory_manager.recall_planner_config.provider == "recording"
+    assert agent._memory_manager.recall_planner_config.timeout_seconds == 2.5
+    assert agent._memory_manager.recall_planning_enabled is True
 
 
 class CoreShadowProvider:

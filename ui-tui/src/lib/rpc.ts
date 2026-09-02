@@ -24,8 +24,17 @@ export const asCommandDispatch = (value: unknown): CommandDispatchResponse | nul
 
   const str = (value: unknown) => (typeof value === 'string' ? value : undefined)
 
+  const optionalNullableStr = (value: unknown) =>
+    value === null ? null : typeof value === 'string' ? value : undefined
+
   if (t === 'skill' && typeof o.name === 'string') {
-    return { type: 'skill', name: o.name, message: str(o.message), display: str(o.display) }
+    return {
+      type: 'skill',
+      name: o.name,
+      message: str(o.message),
+      display: str(o.display),
+      plannerUserMessage: optionalNullableStr(o.planner_user_message)
+    }
   }
 
   if (t === 'send' && typeof o.message === 'string') {
@@ -33,7 +42,8 @@ export const asCommandDispatch = (value: unknown): CommandDispatchResponse | nul
       type: 'send',
       message: o.message,
       notice: str(o.notice),
-      display: str(o.display)
+      display: str(o.display),
+      plannerUserMessage: optionalNullableStr(o.planner_user_message)
     }
   }
 

@@ -1699,7 +1699,15 @@ describe('usePromptActions slash.exec dispatch payloads', () => {
       }
 
       return (
-        method === 'slash.exec' ? { type: 'skill', name: 'work', message: skillBody, display: '/work fix it' } : {}
+        method === 'slash.exec'
+          ? {
+              type: 'skill',
+              name: 'work',
+              message: skillBody,
+              display: '/work fix it',
+              planner_user_message: 'fix it'
+            }
+          : {}
       ) as never
     })
 
@@ -1715,8 +1723,9 @@ describe('usePromptActions slash.exec dispatch payloads', () => {
 
     await handle!.submitText('/work fix it')
 
-    // The agent still gets the full skill.
-    expect(submitted).toEqual([expect.objectContaining({ text: skillBody })])
+    // The agent still gets the full skill, while the clean instruction travels
+    // in a separate provenance field for the recall planner.
+    expect(submitted).toEqual([expect.objectContaining({ text: skillBody, planner_user_message: 'fix it' })])
 
     const rendered = states.flatMap(state => {
       const messages = Array.isArray(state.messages)

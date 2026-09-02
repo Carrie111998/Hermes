@@ -77,6 +77,19 @@ SKILL_SCAFFOLD_SQL_LIKE = _SKILL_INVOCATION_PREFIX + "%"
 SKILL_EXCERPT_JOINT = "\x1e"
 
 
+def is_skill_scaffold_message(content: Any) -> bool:
+    """Return whether *content* contains model-facing skill expansion text.
+
+    This predicate is only a fail-closed contamination check.  It must never be
+    used to establish user-message provenance or to recover an instruction from
+    rendered scaffold text; clean user input has to travel separately.  Search
+    the whole value because supported gateway transformations may prefix sender
+    attribution or append other model-facing notes around the expansion.
+    """
+
+    return isinstance(content, str) and _SKILL_INVOCATION_PREFIX in content
+
+
 def append_user_instruction(parts: list, instruction: str) -> str:
     """Append the instruction line to ``parts``; return the stable prefix.
 
