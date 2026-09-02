@@ -48,6 +48,7 @@ from agent.credential_pool import (
     resolve_runtime_pool_key,
 )
 from agent.error_classifier import FailoverReason
+from run_agent import _is_ephemeral_scaffolding
 from agent.turn_context import drop_stale_api_content
 from utils import base_url_host_matches, base_url_hostname, env_var_enabled, atomic_json_write
 
@@ -173,7 +174,13 @@ def convert_to_trajectory_format(agent, messages: List[Dict[str, Any]], user_que
     
     while i < len(messages):
         msg = messages[i]
-        
+
+        # Skip ephemeral scaffolding (synthetic nudges, prefill sentinels, etc.)
+        # so they don't leak into saved trajectories as training data.
+        if _is_ephemeral_scaffolding(msg):
+            i += 1
+            continue
+
         if msg["role"] == "assistant":
             # Check if this message has tool calls
             if "tool_calls" in msg and msg["tool_calls"]:
