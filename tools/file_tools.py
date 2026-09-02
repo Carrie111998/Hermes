@@ -737,6 +737,14 @@ _PROTECTED_INSTRUCTION_BASENAMES = frozenset({
     "agents.md", "claude.md", "soul.md", ".cursorrules",
 })
 
+# Basenames that steer agent behavior when sitting directly inside a
+# project-local ``.hermes/`` dir. The parent-dir rule is scoped to these so
+# transient scratch files under ``.hermes/`` are not per-write approval
+# prompts (#95660).
+_HERMES_DIR_PROTECTED_BASENAMES = frozenset({
+    "config.yaml", "config.yml",
+})
+
 _real_hermes_home_cached: str | None = None
 _real_hermes_home_loaded = False
 
@@ -833,9 +841,18 @@ def _protected_instruction_reason(filepath: str, task_id: str = "default",
         # Scope: the file's IMMEDIATE parent must be ``.hermes`` — matching
         # any ancestor named .hermes would gate every write inside a
         # checkout that happens to live under ~/.hermes (e.g. the
-        # hermes-agent repo itself at ~/.hermes/hermes-agent).
+        # hermes-agent repo itself at ~/.hermes/hermes-agent) — and the
+        # basename must be a config spelling. The config-shaped guard is
+        # deliberate: matching EVERY file directly under .hermes/ turned
+        # scratch scripts (tmp_check.py etc.) into per-write approval
+        # prompts that even approvals.mode=off cannot silence, since this
+        # gate is yolo-proof by design (#95660).
         parts = candidate.replace("\\", "/").rstrip("/").split("/")
-        if len(parts) >= 2 and parts[-2] == ".hermes":
+        if (
+            len(parts) >= 2
+            and parts[-2] == ".hermes"
+            and parts[-1].lower() in _HERMES_DIR_PROTECTED_BASENAMES
+        ):
             return candidate
     return None
 

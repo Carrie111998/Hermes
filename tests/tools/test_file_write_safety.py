@@ -547,6 +547,32 @@ class TestProtectedInstructionFiles:
         res = self._write(proj / "config.yaml")
         assert res.get("error") and "BLOCKED" in res["error"]
 
+    def test_project_local_hermes_dir_config_yml_also_gated(self, tmp_path, approvals):
+        proj = tmp_path / "proj" / ".hermes"
+        proj.mkdir(parents=True)
+        approvals["answer"] = "deny"
+        res = self._write(proj / "config.yml")
+        assert res.get("error") and "BLOCKED" in res["error"]
+
+    def test_hermes_dir_scratch_file_not_gated(self, tmp_path, approvals):
+        """Transient scripts directly under .hermes/ steer nothing — the
+        parent-dir rule is scoped to config spellings (#95660). The gate is
+        yolo-proof, so an over-broad match meant an unavoidable per-write
+        approval prompt even under approvals.mode=off."""
+        proj = tmp_path / "proj" / ".hermes"
+        proj.mkdir(parents=True)
+        res = self._write(proj / "tmp_update_html.py", "print('hi')\n")
+        assert not res.get("error"), res
+        assert approvals["calls"] == []
+
+    def test_hermes_dir_nested_subdir_file_not_gated(self, tmp_path, approvals):
+        """Files deeper than directly-under-.hermes keep flowing freely."""
+        nested = tmp_path / "proj" / ".hermes" / "scratch" / "gen.py"
+        nested.parent.mkdir(parents=True)
+        res = self._write(nested, "print('hi')\n")
+        assert not res.get("error"), res
+        assert approvals["calls"] == []
+
     def test_checkout_nested_under_hermes_dir_not_gated(self, tmp_path, approvals):
         """A repo living UNDER a .hermes dir (e.g. ~/.hermes/hermes-agent)
         must not have every write gated — only files directly inside a
