@@ -867,6 +867,9 @@ class TelegramAdapter(BasePlatformAdapter):
         self._choice_picker_state: Dict[str, dict] = {}
         # Approval button state: message_id → session_key
         self._approval_state: Dict[int, str] = {}
+        self._approval_callbacks_enabled = self._coerce_bool_extra(
+            "approval_callbacks_enabled", True
+        )
         # Slash-confirm button state: confirm_id → session_key (for /reload-mcp
         # and any other slash-confirm prompts; see GatewayRunner._request_slash_confirm).
         self._slash_confirm_state: Dict[str, str] = {}
@@ -7501,6 +7504,10 @@ class TelegramAdapter(BasePlatformAdapter):
                     approval_id = int(parts[2])
                 except (ValueError, IndexError):
                     await query.answer(text="Invalid approval data.")
+                    return
+
+                if not self._approval_callbacks_enabled:
+                    await query.answer(text="⛔ Telegram approvals are disabled.")
                     return
 
                 # Only authorized users may click approval buttons.

@@ -1618,6 +1618,27 @@ def load_gateway_config() -> GatewayConfig:
             _merge_platform_map(gateway_platforms)
             _merge_platform_map(yaml_cfg.get("platforms"))
 
+            # Approval policy is global/profile-scoped, while platform
+            # adapters receive only PlatformConfig. Bridge the Telegram gate
+            # into that adapter's extra data so multiplexed profiles keep
+            # their own policy instead of consulting process-global state.
+            _security_cfg = yaml_cfg.get("security")
+            _approval_cfg = (
+                _security_cfg.get("approval")
+                if isinstance(_security_cfg, dict)
+                else None
+            )
+            if (
+                isinstance(_approval_cfg, dict)
+                and "telegram_callbacks_enabled" in _approval_cfg
+            ):
+                _telegram_data, _telegram_extra = _ensure_platform_extra_dict(
+                    platforms_data, Platform.TELEGRAM.value
+                )
+                _telegram_extra["approval_callbacks_enabled"] = _approval_cfg[
+                    "telegram_callbacks_enabled"
+                ]
+
             # Also merge platform configs placed directly under ``gateway.*``
             # (e.g. ``gateway.api_server``) so subsections are discovered the
             # same way ``gateway.streaming`` is handled elsewhere.  Iterate

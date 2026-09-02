@@ -2728,6 +2728,10 @@ DEFAULT_CONFIG = {
         "approval": {
             "transport": "builtin",
             "transport_fallback": "deny",
+            # Keep Telegram's inline command-approval callbacks available for
+            # existing installs. Operators can close only this decision path
+            # while retaining Telegram notifications and status messages.
+            "telegram_callbacks_enabled": True,
         },
         # Writes to agent-instruction files (AGENTS.md/CLAUDE.md/SOUL.md/
         # .cursorrules, project-local .hermes config) always require human
