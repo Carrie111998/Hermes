@@ -980,13 +980,18 @@ class TeamsAdapter(BasePlatformAdapter):
             return 0, {"error": "stored-ref send: service host is not allowlisted"}
         import httpx
 
-        async with httpx.AsyncClient(timeout=15.0) as client:
-            resp = await client.post(url, headers=dict(headers), json=body)
-            try:
-                payload = resp.json()
-            except Exception:
-                payload = {}
-            return resp.status_code, payload
+        try:
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                resp = await client.post(url, headers=dict(headers), json=body)
+                try:
+                    payload = resp.json()
+                except Exception:
+                    payload = {}
+                return resp.status_code, payload
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            return 0, {"error": "stored-ref send: network error"}
 
     async def _get_botframework_token(self) -> str:
         """Acquire a Bot Framework bearer token via client credentials.

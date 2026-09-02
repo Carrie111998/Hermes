@@ -157,3 +157,59 @@ def test_send_from_stored_ref_http_400_is_not_success():
     assert result.get("success") is not True
     assert "error" in result
     assert "400" in result["error"]
+
+
+def test_send_from_stored_ref_missing_activity_id_is_not_success():
+    async def poster(url, headers, body):
+        return 201, {}
+
+    async def run():
+        return await send_from_stored_ref(
+            _throwaway(),
+            "STORED-REF-OWN-SEND",
+            poster=poster,
+            expected_bot_app_id=BOT,
+            token="not-a-secret-for-test",
+        )
+
+    result = asyncio.run(run())
+    assert result.get("success") is not True
+    assert "activity id" in result["error"]
+
+
+def test_send_from_stored_ref_poster_exception_is_not_success():
+    async def poster(url, headers, body):
+        raise TimeoutError("connector timeout")
+
+    async def run():
+        return await send_from_stored_ref(
+            _throwaway(),
+            "STORED-REF-OWN-SEND",
+            poster=poster,
+            expected_bot_app_id=BOT,
+            token="not-a-secret-for-test",
+        )
+
+    result = asyncio.run(run())
+    assert result.get("success") is not True
+    assert "error" in result
+    assert "TimeoutError" in result["error"] or "timeout" in result["error"].lower()
+
+
+def test_send_from_stored_ref_status_zero_is_not_missing_activity_id():
+    async def poster(url, headers, body):
+        return 0, {"error": "stored-ref send: service host is not allowlisted"}
+
+    async def run():
+        return await send_from_stored_ref(
+            _throwaway(),
+            "STORED-REF-OWN-SEND",
+            poster=poster,
+            expected_bot_app_id=BOT,
+            token="not-a-secret-for-test",
+        )
+
+    result = asyncio.run(run())
+    assert result.get("success") is not True
+    assert "activity id" not in result["error"]
+    assert "failed (0)" in result["error"]

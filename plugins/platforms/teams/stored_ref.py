@@ -12,6 +12,7 @@ Framework allowlist.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 from pathlib import Path
@@ -157,8 +158,13 @@ async def send_from_stored_ref(
         "Authorization": f"Bearer {token}",
         "Content-Type": "application/json",
     }
-    status, payload = await poster(url, headers, body)
-    if status >= 400:
+    try:
+        status, payload = await poster(url, headers, body)
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        return {"error": f"stored-ref send failed: {type(exc).__name__}"}
+    if status not in (200, 201, 202):
         return {"error": f"stored-ref send: activity post failed ({status})"}
     if not isinstance(payload, dict) or not payload.get("id"):
         return {"error": "stored-ref send: connector accepted without activity id"}
