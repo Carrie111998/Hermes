@@ -471,6 +471,51 @@ def _custom_provider_extra_body_for_agent(
     return fallback
 
 
+def _custom_provider_parallel_tool_calls_for_agent(
+    *,
+    provider: str,
+    model: str,
+    base_url: str,
+    custom_providers: List[Dict[str, Any]],
+) -> Optional[bool]:
+    provider_norm = (provider or "").strip().lower()
+    if provider_norm == "custom":
+        provider_key_filter = ""
+    elif provider_norm.startswith("custom:"):
+        provider_key_filter = provider_norm.split(":", 1)[1].strip()
+    else:
+        return None
+
+    target_url = _normalized_custom_base_url(base_url)
+    if not target_url:
+        return None
+
+    fallback: Optional[bool] = None
+    for entry in custom_providers or []:
+        if not isinstance(entry, dict):
+            continue
+        if provider_key_filter:
+            entry_keys = {
+                str(entry.get("provider_key", "") or "").strip().lower(),
+                str(entry.get("name", "") or "").strip().lower(),
+            }
+            if provider_key_filter not in entry_keys:
+                continue
+        if _normalized_custom_base_url(entry.get("base_url")) != target_url:
+            continue
+        configured = entry.get("parallel_tool_calls")
+        if not isinstance(configured, bool):
+            continue
+        provider_model = str(entry.get("model", "") or "").strip()
+        if provider_model:
+            if _custom_provider_model_matches(model, entry):
+                return configured
+        elif fallback is None:
+            fallback = configured
+
+    return fallback
+
+
 def _merge_custom_provider_extra_body(agent, custom_providers: List[Dict[str, Any]]) -> None:
     extra_body = _custom_provider_extra_body_for_agent(
         provider=agent.provider,
@@ -478,15 +523,24 @@ def _merge_custom_provider_extra_body(agent, custom_providers: List[Dict[str, An
         base_url=agent.base_url,
         custom_providers=custom_providers,
     )
-    if not extra_body:
+    parallel_tool_calls = _custom_provider_parallel_tool_calls_for_agent(
+        provider=agent.provider,
+        model=agent.model,
+        base_url=agent.base_url,
+        custom_providers=custom_providers,
+    )
+    if not extra_body and parallel_tool_calls is None:
         return
 
     overrides = dict(getattr(agent, "request_overrides", {}) or {})
-    merged_extra_body = dict(extra_body)
-    existing_extra_body = overrides.get("extra_body")
-    if isinstance(existing_extra_body, dict):
-        merged_extra_body.update(existing_extra_body)
-    overrides["extra_body"] = merged_extra_body
+    if extra_body:
+        merged_extra_body = dict(extra_body)
+        existing_extra_body = overrides.get("extra_body")
+        if isinstance(existing_extra_body, dict):
+            merged_extra_body.update(existing_extra_body)
+        overrides["extra_body"] = merged_extra_body
+    if parallel_tool_calls is not None and "parallel_tool_calls" not in overrides:
+        overrides["parallel_tool_calls"] = parallel_tool_calls
     agent.request_overrides = overrides
 
 
