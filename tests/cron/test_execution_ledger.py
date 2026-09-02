@@ -14,6 +14,7 @@ def _point_ledger(monkeypatch, tmp_path):
     import cron.executions as executions
 
     monkeypatch.setattr(executions, "EXECUTIONS_FILE", tmp_path / "cron" / "executions.db")
+    monkeypatch.setattr(executions, "_last_retention_error_by_ledger", {})
     return executions
 
 
@@ -81,6 +82,306 @@ def test_retention_bounds_terminal_history_but_preserves_inflight(monkeypatch, t
     records = executions.list_executions(limit=100)
     assert len([row for row in records if row["status"] == "completed"]) == 3
     assert executions.latest_execution("live")["status"] == "running"
+
+
+def _write_retention_config(raw_value):
+    """Write a real config.yaml into the isolated HERMES_HOME."""
+    from hermes_constants import get_hermes_home
+
+    home = get_hermes_home()
+    home.mkdir(parents=True, exist_ok=True)
+    (home / "config.yaml").write_text(
+        f"cron:\n  max_terminal_executions: {raw_value}\n", encoding="utf-8"
+    )
+
+
+def test_resolve_max_terminal_executions_accepts_valid_values():
+    from cron.executions import (
+        DEFAULT_MAX_TERMINAL_EXECUTIONS,
+        resolve_max_terminal_executions,
+    )
+
+    cases = [
+        (None, DEFAULT_MAX_TERMINAL_EXECUTIONS),  # unset → shipped default
+        (1, 1),
+        (5000, 5000),
+        ((1 << 63) - 1, (1 << 63) - 1),
+        (str((1 << 63) - 1), (1 << 63) - 1),
+        ("25", 25),
+        ("  10  ", 10),
+        (250.0, 250),
+    ]
+    for raw, expected in cases:
+        assert resolve_max_terminal_executions(raw) == expected, raw
+
+
+def test_resolve_max_terminal_executions_rejects_invalid_values():
+    import pytest
+
+    from cron.executions import resolve_max_terminal_executions
+
+    invalid = [
+        True, False,           # booleans are not caps
+        0, -1, -1000,          # zero/negative would wipe or corrupt history
+        0.0, -3.0, 1.5,        # fractional / non-positive floats
+        float("inf"), float("nan"),
+        "", "   ",             # empty strings
+        "0", "-1", "+5",       # non-positive / signed strings
+        "1.5", "abc", "1000x", "1_000",
+        1 << 63, str(1 << 63),
+        [1000], {"cap": 1000},
+    ]
+    for raw in invalid:
+        with pytest.raises(ValueError):
+            resolve_max_terminal_executions(raw)
+
+    with pytest.raises(ValueError):
+        resolve_max_terminal_executions(None, default=1 << 63)
+
+
+def test_default_config_ships_module_default_cap():
+    """The shipped config default and the module default must agree, and the
+    shipped value must pass its own validation."""
+    from cron.executions import (
+        DEFAULT_MAX_TERMINAL_EXECUTIONS,
+        resolve_max_terminal_executions,
+    )
+    from hermes_cli.config_defaults import DEFAULT_CONFIG
+
+    cron_config = DEFAULT_CONFIG["cron"]
+    assert isinstance(cron_config, dict)
+    configured = cron_config["max_terminal_executions"]
+    assert configured == DEFAULT_MAX_TERMINAL_EXECUTIONS
+    assert resolve_max_terminal_executions(configured) == DEFAULT_MAX_TERMINAL_EXECUTIONS
+
+
+def test_default_cap_applies_without_user_config(monkeypatch, tmp_path):
+    executions = _point_ledger(monkeypatch, tmp_path)
+
+    assert (
+        executions.current_max_terminal_executions()
+        == executions.DEFAULT_MAX_TERMINAL_EXECUTIONS
+    )
+
+
+def test_config_cap_applies_end_to_end(monkeypatch, tmp_path):
+    """Real config.yaml in an isolated HERMES_HOME drives the prune cap."""
+    executions = _point_ledger(monkeypatch, tmp_path)
+    _write_retention_config(2)
+
+    assert executions.current_max_terminal_executions() == 2
+
+    inflight = executions.create_execution("live", source="builtin")
+    executions.mark_execution_running(inflight["id"])
+    for index in range(6):
+        row = executions.create_execution(f"done-{index}", source="builtin")
+        executions.finish_execution(row["id"], success=True)
+
+    records = executions.list_executions(limit=100)
+    assert len([row for row in records if row["status"] == "completed"]) == 2
+    assert executions.latest_execution("live")["status"] == "running"
+
+
+def test_configured_cap_and_ledger_follow_context_local_profile(
+    monkeypatch, tmp_path
+):
+    """Each in-process profile keeps its own cap and execution history."""
+    from hermes_constants import (
+        reset_hermes_home_override,
+        set_hermes_home_override,
+    )
+
+    executions = _point_ledger(monkeypatch, tmp_path)
+    monkeypatch.setattr(executions, "EXECUTIONS_FILE", None)
+    profiles = [(tmp_path / "profile-two", 2), (tmp_path / "profile-four", 4)]
+
+    for profile_home, cap in profiles:
+        token = set_hermes_home_override(profile_home)
+        try:
+            _write_retention_config(cap)
+            for index in range(6):
+                row = executions.create_execution(
+                    f"{profile_home.name}-{index}", source="builtin"
+                )
+                executions.finish_execution(row["id"], success=True)
+        finally:
+            reset_hermes_home_override(token)
+
+    for profile_home, cap in profiles:
+        token = set_hermes_home_override(profile_home)
+        try:
+            records = executions.list_executions(limit=100)
+            assert len(records) == cap
+            assert all(row["job_id"].startswith(profile_home.name) for row in records)
+        finally:
+            reset_hermes_home_override(token)
+
+
+def test_monkeypatched_module_constant_wins_over_config(monkeypatch, tmp_path):
+    """The existing test injection point must beat a configured value."""
+    executions = _point_ledger(monkeypatch, tmp_path)
+    _write_retention_config(500)
+    monkeypatch.setattr(executions, "MAX_TERMINAL_EXECUTIONS", 3)
+
+    assert executions.current_max_terminal_executions() == 3
+
+    for index in range(8):
+        row = executions.create_execution(f"done-{index}", source="builtin")
+        executions.finish_execution(row["id"], success=True)
+    records = executions.list_executions(limit=100)
+    assert len([row for row in records if row["status"] == "completed"]) == 3
+
+
+def test_explicit_default_sized_module_override_wins_over_config(monkeypatch, tmp_path):
+    """An explicit override equal to the shipped default is still an override."""
+    executions = _point_ledger(monkeypatch, tmp_path)
+    _write_retention_config(7)
+    monkeypatch.setattr(
+        executions,
+        "MAX_TERMINAL_EXECUTIONS",
+        executions.DEFAULT_MAX_TERMINAL_EXECUTIONS,
+    )
+
+    assert (
+        executions.current_max_terminal_executions()
+        == executions.DEFAULT_MAX_TERMINAL_EXECUTIONS
+    )
+
+
+def test_env_var_does_not_override_configured_cap(monkeypatch, tmp_path):
+    """No HERMES_* env override exists for this setting — config.yaml wins."""
+    executions = _point_ledger(monkeypatch, tmp_path)
+    _write_retention_config(7)
+    monkeypatch.setenv("HERMES_CRON_MAX_EXECUTIONS", "99999")
+    monkeypatch.setenv("HERMES_CRON_MAX_TERMINAL_EXECUTIONS", "99999")
+
+    assert executions.current_max_terminal_executions() == 7
+
+
+def test_env_var_does_not_override_default_cap(monkeypatch, tmp_path):
+    executions = _point_ledger(monkeypatch, tmp_path)
+    monkeypatch.setenv("HERMES_CRON_MAX_EXECUTIONS", "5")
+    monkeypatch.setenv("HERMES_CRON_MAX_TERMINAL_EXECUTIONS", "5")
+
+    assert (
+        executions.current_max_terminal_executions()
+        == executions.DEFAULT_MAX_TERMINAL_EXECUTIONS
+    )
+
+
+def test_invalid_configured_cap_fails_closed_without_deleting(
+    monkeypatch, tmp_path, caplog
+):
+    """An invalid cap must skip pruning entirely — never coerce and delete."""
+    import logging
+
+    import pytest
+
+    executions = _point_ledger(monkeypatch, tmp_path)
+    _write_retention_config(0)
+
+    with pytest.raises(ValueError):
+        executions.current_max_terminal_executions()
+
+    inflight = executions.create_execution("live", source="builtin")
+    executions.mark_execution_running(inflight["id"])
+    with caplog.at_level(logging.ERROR, logger="cron.executions"):
+        for index in range(5):
+            row = executions.create_execution(f"done-{index}", source="builtin")
+            executions.finish_execution(row["id"], success=True)
+
+    records = executions.list_executions(limit=100)
+    assert len([row for row in records if row["status"] == "completed"]) == 5
+    assert executions.latest_execution("live")["status"] == "running"
+    errors = [
+        record
+        for record in caplog.records
+        if record.levelno == logging.ERROR
+        and "max_terminal_executions" in record.message
+    ]
+    assert len(errors) == 1
+
+
+def test_oversized_configured_cap_fails_closed_without_rolling_back_terminal_state(
+    monkeypatch, tmp_path, caplog
+):
+    """A non-bindable SQLite offset must not roll back a completed execution."""
+    import logging
+
+    import pytest
+
+    executions = _point_ledger(monkeypatch, tmp_path)
+    _write_retention_config(1 << 63)
+
+    with pytest.raises(ValueError):
+        executions.current_max_terminal_executions()
+
+    claimed = executions.create_execution("oversized-cap", source="builtin")
+    with caplog.at_level(logging.ERROR, logger="cron.executions"):
+        completed = executions.finish_execution(claimed["id"], success=True)
+
+    assert completed is not None
+    assert completed["status"] == "completed"
+    assert executions.latest_execution("oversized-cap")["status"] == "completed"
+    assert sum(
+        record.levelno == logging.ERROR
+        and "max_terminal_executions" in record.message
+        for record in caplog.records
+    ) == 1
+
+
+def test_retention_error_is_reported_again_after_a_valid_resolution(
+    monkeypatch, tmp_path, caplog
+):
+    """A repaired setting ends the suppressed-error streak for its ledger."""
+    import logging
+
+    executions = _point_ledger(monkeypatch, tmp_path)
+    resolved = iter([ValueError("invalid cap"), 3, ValueError("invalid cap")])
+
+    def _resolve_next():
+        result = next(resolved)
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+    monkeypatch.setattr(executions, "current_max_terminal_executions", _resolve_next)
+
+    with caplog.at_level(logging.ERROR, logger="cron.executions"):
+        for index in range(3):
+            row = executions.create_execution(f"streak-{index}", source="builtin")
+            executions.finish_execution(row["id"], success=True)
+
+    assert sum(record.levelno == logging.ERROR for record in caplog.records) == 2
+
+
+def test_non_numeric_configured_cap_fails_closed_without_deleting(monkeypatch, tmp_path):
+    executions = _point_ledger(monkeypatch, tmp_path)
+    _write_retention_config("not-a-number")
+
+    for index in range(4):
+        row = executions.create_execution(f"done-{index}", source="builtin")
+        executions.finish_execution(row["id"], success=True)
+
+    records = executions.list_executions(limit=100)
+    assert len([row for row in records if row["status"] == "completed"]) == 4
+
+
+def test_recover_prune_honors_configured_cap(monkeypatch, tmp_path):
+    """The restart-recovery prune path resolves the same configured cap."""
+    executions = _point_ledger(monkeypatch, tmp_path)
+    _write_retention_config(2)
+
+    for index in range(5):
+        executions.create_execution(f"dead-{index}", source="builtin")
+    monkeypatch.setattr(executions, "_PROCESS_ID", "another-process")
+    monkeypatch.setattr(executions, "_owner_is_live", lambda pid, started_at: False)
+
+    assert executions.recover_interrupted_executions() == 5
+
+    records = executions.list_executions(limit=100)
+    assert len(records) == 2
+    assert all(row["status"] == "unknown" for row in records)
 
 
 def test_corrupt_store_fails_closed_without_overwrite(monkeypatch, tmp_path):

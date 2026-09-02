@@ -334,6 +334,22 @@ Inspect recent attempts with `hermes cron runs [job-id] --limit 20` (alias:
 `history`). Terminal history is bounded; active attempts are never pruned. The
 ledger is included in quick backups.
 
+By default the ledger keeps the 1000 most recent terminal rows (`completed`,
+`failed`, `unknown`) and prunes older ones on write. High-volume deployments
+running many short-interval jobs can raise the cap so the ledger covers a
+longer audit window:
+
+```yaml
+cron:
+  max_terminal_executions: 20000   # default 1000; whole number from 1 to 2^63-1
+```
+
+In-flight (`claimed`/`running`) attempts are never pruned regardless of the
+cap. An invalid value (zero, negative, non-numeric, or above SQLite's signed
+64-bit integer limit) does not prune with a wrong limit — Hermes skips pruning
+entirely and logs one error per distinct invalid setting until the value is
+fixed.
+
 ### Repeated-failure review nudge
 
 Each job tracks a `failure_streak` — consecutive failed runs (delivery

@@ -7,24 +7,36 @@ proved gone. Terminal states are immutable.
 
 from __future__ import annotations
 
+import logging
 import os
 import sqlite3
 import threading
 import uuid
 from contextlib import contextmanager
+from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional
 
 from hermes_constants import get_hermes_home
 from hermes_time import now as _hermes_now
 
+logger = logging.getLogger(__name__)
+
 # Optional test override. Production resolves the path at transaction time so
 # dashboard operations that temporarily enter another profile cannot leak that
 # profile's execution records into the import-time home.
 EXECUTIONS_FILE: Optional[Path] = None
-MAX_TERMINAL_EXECUTIONS = 1000
+# Shipped default for the terminal-history retention cap, plus the optional
+# module override tests inject through. ``None`` means production should resolve
+# the live cap from ``cron.max_terminal_executions`` in config.yaml;
+# ``monkeypatch.setattr`` of MAX_TERMINAL_EXECUTIONS to any valid value wins over
+# config (#93616), including an explicit override equal to the shipped default.
+DEFAULT_MAX_TERMINAL_EXECUTIONS = 1000
+MAX_TERMINAL_EXECUTIONS: Optional[int] = None
+_SQLITE_MAX_INTEGER = (1 << 63) - 1
 _TERMINAL_STATES = ("completed", "failed", "unknown")
 _lock = threading.RLock()
 _PROCESS_ID = uuid.uuid4().hex
+_last_retention_error_by_ledger: Dict[str, str] = {}
 
 
 def _connect() -> sqlite3.Connection:
@@ -126,9 +138,119 @@ def _owner_is_live(pid: int, started_at: Optional[int]) -> bool:
     return current is not None and current == started_at
 
 
-def _prune_unlocked(conn: sqlite3.Connection) -> None:
-    limit = max(0, int(MAX_TERMINAL_EXECUTIONS))
-    conn.execute(
+def _retention_error(value: Any) -> ValueError:
+    return ValueError(
+        "cron.max_terminal_executions must be a whole number between 1 and "
+        f"{_SQLITE_MAX_INTEGER}, got {value!r}"
+    )
+
+
+def resolve_max_terminal_executions(
+    value: Any, *, default: int = DEFAULT_MAX_TERMINAL_EXECUTIONS
+) -> int:
+    """Validate one configured terminal-history retention cap.
+
+    Accepts integers in SQLite's signed 64-bit range, whole-number floats, and
+    digit-only strings. ``None`` means "unset" and validates *default* through
+    the same path. Everything else — booleans, zero, negatives, oversized or
+    fractional values, empty or non-numeric strings — raises ``ValueError``.
+    Pruning callers must treat that as fail-closed (skip the DELETE); silently
+    coercing e.g. ``-1`` to ``0`` would wipe the entire terminal ledger, while
+    binding a value above SQLite's range would roll back the terminal update.
+    """
+    candidate = default if value is None else value
+    if isinstance(candidate, bool):
+        raise _retention_error(candidate)
+    if isinstance(candidate, int):
+        if not 1 <= candidate <= _SQLITE_MAX_INTEGER:
+            raise _retention_error(candidate)
+        return candidate
+    if isinstance(candidate, float):
+        if not candidate.is_integer():
+            raise _retention_error(candidate)
+        parsed = int(candidate)
+        if not 1 <= parsed <= _SQLITE_MAX_INTEGER:
+            raise _retention_error(candidate)
+        return parsed
+    if isinstance(candidate, str):
+        stripped = candidate.strip()
+        # isdigit() rejects signs, decimals, underscores, and empty strings;
+        # int() can still fail on exotic unicode digits isdigit() accepts.
+        if not stripped.isdigit():
+            raise _retention_error(candidate)
+        try:
+            parsed = int(stripped)
+        except ValueError:
+            raise _retention_error(candidate) from None
+        if not 1 <= parsed <= _SQLITE_MAX_INTEGER:
+            raise _retention_error(candidate)
+        return parsed
+    raise _retention_error(candidate)
+
+
+def current_max_terminal_executions() -> int:
+    """Resolve the live terminal-history cap for this process.
+
+    Precedence:
+
+    1. ``MAX_TERMINAL_EXECUTIONS``, when a test (or caller) set the optional
+       override — preserves the existing
+       ``monkeypatch.setattr(executions, "MAX_TERMINAL_EXECUTIONS", N)``
+       injection point.
+    2. ``cron.max_terminal_executions`` from the active profile's
+       config.yaml, via the read-only config fast path.
+    3. :data:`DEFAULT_MAX_TERMINAL_EXECUTIONS`.
+
+    There is deliberately no environment-variable override — behavioral
+    settings live in config.yaml. Raises ``ValueError`` when the resolved
+    value is invalid or the config loader raises, so pruning callers can fail
+    closed instead of deleting with a wrong cap.
+    """
+    if MAX_TERMINAL_EXECUTIONS is not None:
+        return resolve_max_terminal_executions(MAX_TERMINAL_EXECUTIONS)
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        config = load_config_readonly()
+    except Exception as exc:
+        raise ValueError(
+            f"could not read cron.max_terminal_executions from config.yaml: {exc}"
+        ) from exc
+    cron_config = config.get("cron") if isinstance(config, dict) else None
+    if cron_config is None:
+        return resolve_max_terminal_executions(None)
+    if not isinstance(cron_config, dict):
+        raise ValueError(
+            "cron section in config.yaml must be a mapping, got "
+            f"{type(cron_config).__name__}"
+        )
+    return resolve_max_terminal_executions(cron_config.get("max_terminal_executions"))
+
+
+def _prune_unlocked(conn: sqlite3.Connection) -> int:
+    """Prune the oldest terminal rows beyond the retention cap.
+
+    In-flight (``claimed``/``running``) rows are never touched. On an
+    invalid cap or resolution error this fails closed: it logs and deletes
+    nothing rather than pruning with a wrong limit. Returns the number of rows
+    deleted.
+    """
+    database_row = conn.execute("PRAGMA database_list").fetchone()
+    ledger_key = str(database_row[2]) if database_row is not None else "<unknown>"
+    try:
+        limit = current_max_terminal_executions()
+    except ValueError as exc:
+        detail = str(exc)
+        if _last_retention_error_by_ledger.get(ledger_key) != detail:
+            logger.error(
+                "Skipping cron execution-history prune — %s. Fix "
+                "cron.max_terminal_executions in config.yaml to resume pruning.",
+                exc,
+            )
+            _last_retention_error_by_ledger[ledger_key] = detail
+        return 0
+    _last_retention_error_by_ledger.pop(ledger_key, None)
+    cur = conn.execute(
         """DELETE FROM executions WHERE id IN (
              SELECT id FROM executions
              WHERE status IN ('completed','failed','unknown')
@@ -136,6 +258,7 @@ def _prune_unlocked(conn: sqlite3.Connection) -> None:
            )""",
         (limit,),
     )
+    return cur.rowcount
 
 
 def create_execution(job_id: str, *, source: str) -> Dict[str, Any]:
