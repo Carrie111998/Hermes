@@ -51,7 +51,7 @@ BOT_CHAT_TITLE = "Bot Chat"
 _lock = threading.Lock()
 _cached: dict[str, str] = {}
 _session_state_lock = threading.Lock()
-_session_state_cache: dict[tuple[str, str], dict] = {}
+_session_state_cache: dict[tuple[str, str, str], dict] = {}
 
 
 def _hermes_root(home: Path) -> Path:
@@ -273,17 +273,33 @@ def bot_mode_session_state(
     - ``None``        — gated: unmanaged installs, paths outside the profile
       roster, self-owned sessions, machine/API adapters, arbitrary sources.
 
-    The answer is frozen by profile home + persisted session identity for the
-    process lifetime. That survives agent-object recreation while keeping the
-    system prompt and tool schema byte-stable across a conversation. Explicit
-    ``home`` probes are uncached. Never raises; fails closed to ``None``.
+    The answer is frozen by profile home + persisted session identity +
+    normalized source for the process lifetime. The source component keeps the
+    API/A2A deny boundary intact when one persisted session is resumed by
+    agents on different platform adapters, and keeps a denied source from
+    poisoning a trusted classification; same-source recreation still hits the
+    cache, so the system prompt and tool schema stay byte-stable across a
+    conversation. Explicit ``home`` probes are uncached. Never raises; fails
+    closed to ``None``.
     """
     cache_key = None
+    cached = None
+    source = ""
     try:
         if home is None:
-            cached = getattr(agent, "_bot_mode_session_state", None)
-            if isinstance(cached, dict) and "session_kind" in cached:
-                return cached
+            agent_cached = getattr(agent, "_bot_mode_session_state", None)
+            if (
+                isinstance(agent_cached, tuple)
+                and len(agent_cached) == 2
+                and isinstance(agent_cached[1], dict)
+                and "session_kind" in agent_cached[1]
+            ):
+                # Agent-local reuse is only valid for the same normalized
+                # source; a different platform adapter on the same persisted
+                # session must reclassify (API/A2A stay denied, and a denied
+                # source must not poison a trusted one).
+                if agent_cached[0] == _session_source(agent):
+                    return agent_cached[1]
 
         protocol_enabled = bool(getattr(agent, "_bot_mode_protocol", True))
         resolved = str(
@@ -293,16 +309,19 @@ def bot_mode_session_state(
         )
         title = _session_title(agent)
         session_id = str(getattr(agent, "session_id", "") or "")
+        source = _session_source(agent)
 
         if home is None and session_id:
-            # Session identity alone owns the frozen answer. Title, platform,
-            # config, and metadata changes cannot perturb a live conversation.
-            cache_key = (resolved, session_id)
+            # Session identity + normalized source own the frozen answer.
+            # Title, platform-independent config, and metadata changes cannot
+            # perturb a live conversation, but a different source on the same
+            # persisted session reclassifies instead of reusing trust.
+            cache_key = (resolved, session_id, source)
             with _session_state_lock:
                 cached = _session_state_cache.get(cache_key)
             if cached is not None:
                 try:
-                    setattr(agent, "_bot_mode_session_state", cached)
+                    setattr(agent, "_bot_mode_session_state", (source, cached))
                 except Exception:
                     pass
                 return cached
@@ -332,7 +351,12 @@ def bot_mode_session_state(
             with _session_state_lock:
                 state = _session_state_cache.setdefault(cache_key, state)
         try:
-            setattr(agent, "_bot_mode_session_state", state)
+            # Bind the agent-local copy to its normalized source so a later
+            # call from a different platform adapter on the same persisted
+            # session reclassifies instead of reusing trust across the
+            # API/A2A deny boundary. Same-source recreation still hits the
+            # fast path, keeping the prompt and tool schema byte-stable.
+            setattr(agent, "_bot_mode_session_state", (source, state))
         except Exception:
             pass
     return state
