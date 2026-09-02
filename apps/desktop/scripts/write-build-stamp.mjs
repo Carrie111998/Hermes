@@ -55,9 +55,11 @@ export function fromCI(env = process.env) {
   const sha = env.GITHUB_SHA
   if (!sha) return null
   const branch = env.GITHUB_REF_NAME || env.GITHUB_HEAD_REF || null
+  const refType = env.GITHUB_REF_TYPE || null
   return {
     commit: sha,
     branch: branch,
+    refType: refType,
     dirty: false, // CI builds from a checkout-of-ref by definition
     source: "ci"
   }
@@ -153,6 +155,7 @@ function main() {
     schemaVersion: STAMP_SCHEMA_VERSION,
     commit: stamp.commit,
     branch: stamp.branch,
+    refType: stamp.refType,
     builtAt: new Date().toISOString(),
     dirty: stamp.dirty,
     source: stamp.source

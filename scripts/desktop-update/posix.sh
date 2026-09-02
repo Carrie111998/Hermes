@@ -741,6 +741,7 @@ cd "$INSTALL_ROOT" || {
   FINAL_CODE=3 FINAL_MSG="Update aborted: cannot enter the install root ($INSTALL_ROOT). Nothing was changed."
   log "$FINAL_MSG"; exit 3
 }
+
 export PYTHONUNBUFFERED=1
 # --keep-stash: never re-apply local source edits after the update (they stay
 # parked in git stash). Probe --help first: older installed backends don't
