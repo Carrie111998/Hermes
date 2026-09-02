@@ -921,6 +921,25 @@ def _managed_node_tree_outdated(home: Path | None = None) -> bool:
     return False
 
 
+def _safe_is_file(candidate: Path) -> bool:
+    """``Path.is_file()`` that treats an unreadable candidate as "not a match".
+
+    ``Path.is_file()`` calls ``os.stat()``, which raises ``PermissionError``
+    (``WinError 5``) on Windows when the current user is denied ACL access to
+    the candidate — e.g. ``%LOCALAPPDATA%\\hermes\\node`` populated by an
+    elevated install. An unguarded probe there aborts ``hermes update``
+    before the managed-Node self-heal can run and before the PATH fallback
+    is tried. Skip an unreadable candidate instead of raising, consistent
+    with how :func:`node_tool_runnable` already treats ``OSError``.
+    ``FileNotFoundError`` maps to ``False`` for free (it is an ``OSError``
+    subclass and also what ``is_file`` returns natively for a missing path).
+    """
+    try:
+        return candidate.is_file()
+    except OSError:
+        return False
+
+
 def find_hermes_node_executable(command: str) -> str | None:
     """Return a Hermes-managed Node/npm executable path, healing broken trees.
 
@@ -937,7 +956,7 @@ def find_hermes_node_executable(command: str) -> str | None:
         for directory in iter_hermes_node_dirs():
             for name in names:
                 candidate = directory / name
-                if candidate.is_file() and (
+                if _safe_is_file(candidate) and (
                     sys.platform == "win32" or os.access(candidate, os.X_OK)
                 ):
                     resolved = str(candidate)
@@ -973,14 +992,18 @@ def find_node_executable_on_path(command: str) -> str | None:
         sep and sep in command_str for sep in (os.sep, os.altsep, "/", "\\")
     )
     if has_path_separator:
-        return command_str if Path(command_str).is_file() else None
+        return command_str if _safe_is_file(Path(command_str)) else None
 
     for name in _candidate_node_command_names(command_str):
         for directory in os.environ.get("PATH", "").split(os.pathsep):
             if not directory:
                 continue
             candidate = Path(directory) / name
-            if candidate.is_file():
+            # The installer puts %LOCALAPPDATA%\hermes\node on PATH, so this
+            # walk hits the same tree as find_hermes_node_executable(). An
+            # unguarded is_file() there would let an ACL-denied managed tree
+            # take out the PATH fallback too, leaving no resolution path.
+            if _safe_is_file(candidate):
                 return str(candidate)
     return None
 
