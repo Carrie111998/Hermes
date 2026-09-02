@@ -462,8 +462,9 @@ Payload fields below are the exact event-specific fields supplied by each call s
 | `on_skill_lifecycle` | Observer | After an authoritative skill-usage state change; return ignored. | `action`, `skill_name`, `provenance`, `task_id`, `session_id`, `use_count`, `reused`, `reuse_after_patch` | Exposes the local skill name and provenance. |
 | `subagent_start` | Observer | Child constructed and about to run; return ignored. | `parent_session_id`, `parent_turn_id`, `parent_subagent_id`, `child_session_id`, `child_subagent_id`, `child_role`, `child_goal` | Child goal may contain user/project content. |
 | `subagent_stop` | Observer | Child exit; return ignored. | `parent_session_id`, `parent_turn_id`, `child_session_id`, `child_role`, `child_summary`, `child_status`, `tool_call_history`, `duration_ms` | Summary and redacted tool-history metadata may reveal project structure. |
-| `pre_gateway_dispatch` | Directive/control | Incoming non-internal message before auth/pairing/dispatch; first valid `skip`, `rewrite`, or `allow` controls flow. | `event`, `gateway`, `session_store` | Extremely privileged in-process objects expose inbound user/routing data and host handles. |
-| `gateway_platform_event` | Observer | After the gateway's profile-scoped authorization succeeds, when a supported platform-native event is normalized at the gateway boundary (Telegram: reactions, message edits; Discord: message edits/deletes, thread created/renamed); return ignored. | `platform`, `event_type`, `payload` (event-type-specific dict — see the per-event contracts below) | Normalized plain-dict envelope only; raw SDK objects, adapter handles, and bot clients are never exposed. |
+|| `pre_gateway_dispatch` | Directive/control | Incoming non-internal message before auth/pairing/dispatch; first valid `skip`, `rewrite`, or `allow` controls flow. | `event`, `gateway`, `session_store` | Extremely privileged in-process objects expose inbound user/routing data and host handles. |
+|| `pre_gateway_send` | Directive/control | Outbound message chunk before adapter.send(); first valid `block`, `redirect`, or `allow` controls flow. | `content`, `platform`, `chat_id`, `source`, `chat_type`, `gateway`, `session_store` | Same privilege level as `pre_gateway_dispatch`. |
+|| `gateway_platform_event` | Observer | After the gateway's profile-scoped authorization succeeds, when a supported platform-native event is normalized at the gateway boundary (Telegram: reactions, message edits; Discord: message edits/deletes, thread created/renamed); return ignored. | `platform`, `event_type`, `payload` (event-type-specific dict — see the per-event contracts below) | Normalized plain-dict envelope only; raw SDK objects, adapter handles, and bot clients are never exposed. |
 | `pre_command` | Observer | Recognized slash command about to be dispatched, before the handler runs, on CLI and gateway cold-path dispatch; return ignored in v1 (directive-shaped dicts are logged at debug). Gateway running-agent intercept commands (`/stop`, `/approve` during an active run) are deliberately excluded — control-plane escape hatches must stay outside plugin reach. | `surface` (`"cli"` \| `"gateway"`), `command` (canonical name), `alias_used`, `args_raw`, `session_key`, `platform` | `args_raw` may contain user content or secrets typed after the command. |
 | `pre_approval_request` | Observer | Before prompted or smart approval; return ignored. | `command`, `description`, `pattern_key`, `pattern_keys`, `session_key`, `surface`, `turn_id`, `tool_call_id` | Command may contain secrets; smart observer preparation force-redacts, but surfaces do not all have identical redaction. |
 | `post_approval_response` | Observer | After a decision, timeout, or gateway notification failure; return ignored. | `command`, `description`, `pattern_key`, `pattern_keys`, `session_key`, `surface`, `turn_id`, `tool_call_id`, `choice`; smart path may add `decided_by` | Same command sensitivity plus decision metadata. |
@@ -1223,6 +1224,62 @@ def buffer_or_rewrite(event, **kwargs):
 
 def register(ctx):
     ctx.register_hook("pre_gateway_dispatch", buffer_or_rewrite)
+```
+
+### `pre_gateway_send`
+
+Fires **once per outbound message chunk** in the gateway, inside `GatewayStreamConsumer._send_new_chunk()`, **before** the content reaches the platform adapter. This is the outbound counterpart to `pre_gateway_dispatch` — while `pre_gateway_dispatch` intercepts incoming messages, `pre_gateway_send` intercepts outgoing ones. Use it to implement content gates, routing policies, or compliance checks that prevent certain messages from reaching group chats.
+
+**Callback signature:**
+
+```python
+def my_callback(content, platform, chat_id, source, chat_type, gateway, session_store, **kwargs):
+```
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `content` | `str` | The cleaned response text about to be sent. |
+| `platform` | `Platform` | Target platform enum (from the adapter). |
+| `chat_id` | `str` | Target chat ID. |
+| `source` | `SessionSource` | Original session source that triggered the response. |
+| `chat_type` | `str` | Chat type: `"dm"`, `"group"`, `"supergroup"`, or `"channel"`. |
+| `gateway` | `GatewayRunner` | The active gateway runner (for adapter access via `gateway.adapters`). |
+| `session_store` | `SessionStore` | The session store. |
+
+**Fires:** In `gateway/stream_consumer.py`, inside `GatewayStreamConsumer._send_new_chunk()`, after text cleaning but before `adapter.send()`. Only fires when the consumer was constructed with `hook_context` (the gateway always provides this for agent-generated responses).
+
+**Return value:** `None` or a dict. The first recognized action dict wins; remaining plugin results are ignored. Exceptions in plugin callbacks are caught and logged; the gateway always falls through to normal delivery on error.
+
+| Return | Effect |
+|--------|--------|
+| `{"action": "allow"}` / `None` | Normal delivery to the original target. |
+| `{"action": "redirect", "target": "platform:chat_id"}` | Send to a different platform/chat instead. If the redirect target is invalid or the adapter is unavailable, falls through to normal delivery. |
+| `{"action": "block", "reason": "..."}` | Silently drop the message — no delivery to any platform. |
+
+**Use cases:** Preventing admin/internal messages from leaking to public group chats; routing sensitive responses to DM channels; content compliance gates; per-chat-type delivery policies.
+
+**Example — block admin content from group chats:**
+
+```python
+def admin_gate(content, chat_type, **kwargs):
+    if chat_type in ("group", "supergroup") and "[ADMIN]" in content:
+        return {"action": "block", "reason": "admin-content-in-group"}
+    return None
+
+def register(ctx):
+    ctx.register_hook("pre_gateway_send", admin_gate)
+```
+
+**Example — redirect group responses to an admin DM:**
+
+```python
+def redirect_to_admin(content, chat_type, gateway, **kwargs):
+    if chat_type in ("group", "supergroup") and _is_sensitive(content):
+        return {"action": "redirect", "target": "telegram:ADMIN_CHAT_ID"}
+    return None
+
+def register(ctx):
+    ctx.register_hook("pre_gateway_send", redirect_to_admin)
 ```
 
 ---

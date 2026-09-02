@@ -243,6 +243,8 @@ class GatewayStreamConsumer:
         on_before_finalize: Optional[Callable[[], Any]] = None,
         initial_reply_to_id: Optional[str] = None,
         run_still_current: Optional[Callable[[], bool]] = None,
+        *,
+        hook_context: Optional[dict] = None,
     ):
         self.adapter = adapter
         self.chat_id = chat_id
@@ -359,6 +361,12 @@ class GatewayStreamConsumer:
         # /stop), the run() loop will abandon the stream early instead of
         # continuing to edit and deliver stale deltas.
         self._run_still_current = run_still_current or (lambda: True)
+
+        # Optional hook context for pre_gateway_send plugin interception.
+        self._hook_gateway = (hook_context or {}).get("gateway") if hook_context else None
+        self._hook_source = (hook_context or {}).get("source") if hook_context else None
+        self._hook_chat_type = (hook_context or {}).get("chat_type") if hook_context else None
+        self._hook_session_store = (hook_context or {}).get("session_store") if hook_context else None
 
         # Think-block filter state (mirrors CLI's _stream_delta tag suppression)
         self._in_think_block = False
@@ -2066,6 +2074,135 @@ class GatewayStreamConsumer:
         """
         return _BasePlatformAdapter.strip_media_directives_for_display(text)
 
+    # Sentinel returned by _apply_outbound_gate when the message was
+    # intercepted (blocked or redirected). Callers MUST NOT deliver when
+    # they receive this value. Using a sentinel instead of None avoids
+    # ambiguity with reply_to_id=None (which _send_or_edit passes).
+    _GATE_BLOCKED: str = "__gate_blocked__"
+
+    async def _apply_outbound_gate(
+        self,
+        text: str,
+        *,
+        final: bool = False,
+        reply_to_id: Optional[str] = None,
+    ) -> Optional[str]:
+        """Apply the pre_gateway_send plugin hook gate.
+
+        Returns None to allow normal delivery, or ``_GATE_BLOCKED`` to
+        indicate the message was intercepted (blocked or redirected). When
+        ``_GATE_BLOCKED`` is returned, the caller MUST NOT proceed with
+        its own delivery.
+
+        Composition: all registered hooks fire; the first non-allow action
+        wins. ``allow`` / ``None`` results are skipped — they never terminate
+        evaluation. This ensures a safety plugin registered after a permissive
+        plugin still takes effect.
+        """
+        if self._hook_gateway is None:
+            return None
+
+        try:
+            from hermes_cli.lifecycle import invoke_hook as _invoke_hook
+            _hook_results = _invoke_hook(
+                "pre_gateway_send",
+                content=text,
+                platform=getattr(self.adapter, '_platform', getattr(self.adapter, 'platform', None)),
+                chat_id=self.chat_id,
+                source=self._hook_source,
+                chat_type=self._hook_chat_type,
+                gateway=self._hook_gateway,
+                session_store=self._hook_session_store,
+            )
+        except Exception as _hook_exc:
+            logger.warning("pre_gateway_send invocation failed: %s", _hook_exc)
+            return None  # fail-open on hook infrastructure error
+
+        for _result in _hook_results:
+            if not isinstance(_result, dict):
+                continue
+            _action = _result.get("action")
+            if _action == "allow" or _action is None:
+                continue  # permissive — keep evaluating
+            if _action == "block":
+                logger.info(
+                    "pre_gateway_send block: reason=%s chat=%s",
+                    _result.get("reason"), self.chat_id,
+                )
+                return self._GATE_BLOCKED
+            if _action == "redirect":
+                _new_target = _result.get("target")
+                if isinstance(_new_target, str) and _new_target:
+                    _parts = _new_target.split(":", 1)
+                    if len(_parts) == 2:
+                        _redirect_platform, _redirect_chat = _parts
+                        if self._hook_gateway is not None:
+                            try:
+                                from gateway.config import Platform as _Platform
+                                _rp = _Platform(_redirect_platform.strip().lower())
+                                _redirect_adapter = self._hook_gateway.adapters.get(_rp)
+                                if _redirect_adapter:
+                                    result = await _redirect_adapter.send(
+                                        chat_id=str(_redirect_chat),
+                                        content=text,
+                                        reply_to=None,
+                                        metadata=self._metadata_for_send(final=final, expect_edits=False),
+                                    )
+                                    if result.success:
+                                        logger.info("pre_gateway_send redirected to %s", _new_target)
+                                        return self._GATE_BLOCKED
+                            except Exception as _redir_err:
+                                logger.warning("pre_gateway_send redirect failed: %s", _redir_err)
+                # Fail-closed: do NOT leak to original group chat if redirect fails
+                logger.warning(
+                    "pre_gateway_send redirect failed for target %s; dropping message to prevent leakage",
+                    _new_target,
+                )
+                return self._GATE_BLOCKED
+            # Unknown action — treat as allow, keep evaluating
+
+        # No actionable result found — all results were permissive (allow/None)
+        # or empty. Default to allow (normal delivery).
+        return None
+
+    async def _gate_and_send(
+        self,
+        text: str,
+        reply_to_id: Optional[str],
+        *,
+        final: bool = False,
+    ) -> Optional[str]:
+        """Apply outbound gate, then send if allowed.
+
+        Convenience wrapper used by egress points that call
+        ``adapter.send()`` directly. Returns the message_id on success,
+        or ``reply_to_id`` if the gate blocked/redirected.
+        """
+        gate_result = await self._apply_outbound_gate(
+            text, final=final, reply_to_id=reply_to_id,
+        )
+        if gate_result is not None:
+            return reply_to_id  # blocked or redirected
+        result = await self.adapter.send(
+            chat_id=self.chat_id,
+            content=text,
+            reply_to=reply_to_id,
+            metadata=self._metadata_for_send(
+                final=final,
+                expect_edits=not final,
+            ),
+        )
+        if result.success and result.message_id:
+            self._message_id = str(result.message_id)
+            self._track_preview_ids_from_result(result)
+            self._already_sent = True
+            self._last_sent_text = text
+            self._notify_new_message()
+            return str(result.message_id)
+        else:
+            self._edit_supported = False
+            return reply_to_id
+
     async def _send_new_chunk(
         self,
         text: str,
@@ -2080,31 +2217,8 @@ class GatewayStreamConsumer:
         text = self._clean_for_display(text)
         if not text.strip():
             return reply_to_id
-        try:
-            result = await self.adapter.send(
-                chat_id=self.chat_id,
-                content=text,
-                reply_to=reply_to_id,
-                metadata=self._metadata_for_send(
-                    final=final,
-                    expect_edits=not final,
-                ),
-            )
-            if result.success and result.message_id:
-                self._message_id = str(result.message_id)
-                self._track_preview_ids_from_result(result)
-                self._already_sent = True
-                self._last_sent_text = text
-                # Fresh content bubble — close off any stale tool bubble
-                # above so the next tool starts a new bubble below.
-                self._notify_new_message()
-                return str(result.message_id)
-            else:
-                self._edit_supported = False
-                return reply_to_id
-        except Exception as e:
-            logger.error("Stream send chunk error: %s", e)
-            return reply_to_id
+
+        return await self._gate_and_send(text, reply_to_id, final=final)
 
     def _visible_prefix(self) -> str:
         """Return the visible text already shown in the streamed message."""
@@ -2629,6 +2743,10 @@ class GatewayStreamConsumer:
             # set in tandem with _draft_id in run().  Disable to be safe.
             self._use_draft_streaming = False
             return False
+        # Outbound gate: fire pre_gateway_send hook before draft frame.
+        gate_result = await self._apply_outbound_gate(text)
+        if gate_result is not None:
+            return False  # blocked or redirected
         # Carry the per-turn identity on EVERY frame (review B2): the
         # turn-final send goes out via _metadata_for_send, which stamps
         # reply_to_message_id — the relay adapter keys draft/seal state on
@@ -2936,6 +3054,10 @@ class GatewayStreamConsumer:
         # and take the normal edit path instead.
         if self._turn_split_delivery:
             return False
+        # Outbound gate: fire pre_gateway_send hook before fresh-final send.
+        gate_result = await self._apply_outbound_gate(text, final=True)
+        if gate_result is not None:
+            return False  # blocked or redirected
         stale_ids = set(self._preview_message_ids)
         if self._message_id and self._message_id != "__no_edit__":
             stale_ids.add(self._message_id)
@@ -3134,6 +3256,15 @@ class GatewayStreamConsumer:
                 and self.cfg.cursor in text
                 and len(_visible_stripped) < _MIN_NEW_MSG_CHARS):
             return True  # too short for a standalone message — accumulate more
+
+        # Outbound gate: fire pre_gateway_send hook before any delivery.
+        # This intercepts ALL transport paths (native streaming, drafts,
+        # edits, fresh-final, fallback sends) from a single point.
+        gate_result = await self._apply_outbound_gate(
+            text, final=finalize, reply_to_id=None,
+        )
+        if gate_result is not None:
+            return False  # blocked or redirected — no delivery occurred
 
         # Native streaming transport (e.g. WeCom): every frame — first send,
         # mid-stream updates, and the final answer — flows through
