@@ -21553,6 +21553,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _hyg_provider = None
             _hyg_base_url = None
             _hyg_api_key = None
+            _hyg_runtime = None
             _hyg_configured_model = None
             _hyg_configured_provider = None
             _hyg_configured_base_url = None
@@ -21706,6 +21707,43 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
                 _msg_count = len(history)
 
+                # Stale-thinking basis (#84371 follow-up): the compaction
+                # trigger estimator and tail-budget walks share
+                # ``stale_thinking_reaches_wire`` as the single wire-truth
+                # predicate — but the gateway hygiene path's rough estimates
+                # predate it and still charge persisted ``reasoning`` /
+                # ``reasoning_content`` on every assistant turn. On routes
+                # that strip stale thinking at send time (any non-echo
+                # chat-completions endpoint), a reasoning-heavy session with
+                # no recorded real usage (streaming usage loss) inflates the
+                # hygiene estimate several-fold and can fire phantom
+                # 85%-threshold compressions. Resolve the route's wire truth
+                # once per hygiene pass; every rough estimate below uses the
+                # same basis so comparisons stay like-for-like. Route facts
+                # unresolved (config load failed, empty model/provider) ->
+                # conservative full charge (legacy behavior); resolving on
+                # empty strings would silently pick the lean basis, which
+                # is the under-count direction and must never be the
+                # failure mode.
+                try:
+                    if not _hyg_model or (not _hyg_provider and not _hyg_base_url):
+                        # Config resolution failed — no trustworthy route
+                        # facts, keep the legacy full charge.
+                        _hyg_charge_stale = True
+                    else:
+                        from agent.message_sanitization import (
+                            stale_thinking_reaches_wire as _hyg_stale_on_wire,
+                        )
+
+                        _hyg_charge_stale = _hyg_stale_on_wire(
+                            (_hyg_runtime.get("api_mode") if isinstance(_hyg_runtime, dict) else "") or "chat_completions",
+                            _hyg_provider or "",
+                            _hyg_model,
+                            _hyg_base_url or "",
+                        )
+                except Exception:
+                    _hyg_charge_stale = True
+
                 # Prefer actual API-reported tokens from the last turn
                 # (stored in session entry) over the rough char-based estimate.
                 _stored_tokens = session_entry.last_prompt_tokens
@@ -21713,7 +21751,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _approx_tokens = _stored_tokens
                     _token_source = "actual"
                 else:
-                    _approx_tokens = estimate_messages_tokens_rough(history)
+                    _approx_tokens = estimate_messages_tokens_rough(
+                        history, charge_stale_thinking=_hyg_charge_stale
+                    )
                     _token_source = "estimated"
                     # Note: rough estimates overestimate by 30-50% for code/JSON-heavy
                     # sessions, but that just means hygiene fires a bit early — which
@@ -22580,9 +22620,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                     # Anti-growth guard: refuse a compression
                                     # that did not shrink the transcript
                                     # (observed: 427K -> 598K). Compare
-                                    # like-for-like rough estimates.
-                                    _hyg_in_toks = estimate_messages_tokens_rough(history)
-                                    _hyg_out_toks = estimate_messages_tokens_rough(_compressed)
+                                    # like-for-like rough estimates — same
+                                    # stale-thinking basis as the trigger
+                                    # above, so neither side of the
+                                    # comparison silently charges fields the
+                                    # wire strips on this route (#84371).
+                                    _hyg_in_toks = estimate_messages_tokens_rough(
+                                        history, charge_stale_thinking=_hyg_charge_stale
+                                    )
+                                    _hyg_out_toks = estimate_messages_tokens_rough(
+                                        _compressed,
+                                        charge_stale_thinking=_hyg_charge_stale,
+                                    )
                                     if _hyg_rotated and _hyg_out_toks > _hyg_in_toks:
                                         logger.warning(
                                             "Gateway hygiene compression for session %s "
@@ -22660,7 +22709,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                         history = _compressed
                                         _new_count = len(_compressed)
                                         _new_tokens = estimate_messages_tokens_rough(
-                                            _compressed
+                                            _compressed,
+                                            charge_stale_thinking=_hyg_charge_stale,
                                         )
                                     elif _hyg_in_place:
                                         # archive_and_compact() already persisted the
@@ -22670,7 +22720,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                         history = _compressed
                                         _new_count = len(_compressed)
                                         _new_tokens = estimate_messages_tokens_rough(
-                                            _compressed
+                                            _compressed,
+                                            charge_stale_thinking=_hyg_charge_stale,
                                         )
                                     else:
                                         # No rewrite happened — transcript preserved
