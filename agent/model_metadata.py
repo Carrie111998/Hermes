@@ -3466,6 +3466,15 @@ def get_model_context_length(
         ctx = _resolve_endpoint_context_length(model, base_url, api_key=api_key)
         if ctx is not None:
             return ctx
+    if effective_provider in {"commandcode", "commandcode-anthropic"} and base_url:
+        # commandcode (api.commandcode.ai) exposes authoritative
+        # context_length via /models (e.g. muse-spark 1M) but is a
+        # known provider so step 2's custom-endpoint probe is skipped
+        # and models.dev has no muse-spark entry — without this the
+        # model fell through to the 256K fallback.
+        ctx = _resolve_endpoint_context_length(model, base_url, api_key=api_key)
+        if ctx is not None:
+            return ctx
     # 5e. Ollama native /api/show probe — runs for providers whose base_url
     # is NOT a known non-Ollama provider.  Ollama-compatible servers expose
     # this endpoint regardless of hostname (local Ollama, Ollama Cloud,
