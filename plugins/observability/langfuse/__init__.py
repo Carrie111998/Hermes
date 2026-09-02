@@ -290,7 +290,27 @@ def _get_langfuse() -> Optional[Langfuse]:
 
         public_key = _env("HERMES_LANGFUSE_PUBLIC_KEY") or _env("LANGFUSE_PUBLIC_KEY")
         secret_key = _env("HERMES_LANGFUSE_SECRET_KEY") or _env("LANGFUSE_SECRET_KEY")
+        # Missing credentials used to short-circuit with zero log output
+        # (#98631): a half-configured setup (e.g. a placeholder public key
+        # with the secret left unset) registered the hooks, marked init
+        # failed, and silently dropped every trace. Warn once here, same
+        # one-shot contract as the placeholder branch below.
         if not (public_key and secret_key):
+            missing = [
+                name
+                for name, value in (
+                    ("HERMES_LANGFUSE_PUBLIC_KEY", public_key),
+                    ("HERMES_LANGFUSE_SECRET_KEY", secret_key),
+                )
+                if not value
+            ]
+            logger.warning(
+                "Langfuse plugin: missing credentials (%s), traces will NOT be "
+                "emitted. Set both HERMES_LANGFUSE_PUBLIC_KEY (pk-lf-...) and "
+                "HERMES_LANGFUSE_SECRET_KEY (sk-lf-...) — e.g. via `hermes tools` — "
+                "or disable the plugin to silence this warning.",
+                ", ".join(missing),
+            )
             _LANGFUSE_CLIENT = _INIT_FAILED
             return None
 

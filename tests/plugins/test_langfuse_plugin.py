@@ -578,6 +578,42 @@ class TestPlaceholderKeyDetection:
             "expected 1 (cached via _INIT_FAILED)"
         )
 
+    def test_missing_secret_key_warns_and_skips(self, monkeypatch, caplog):
+        """A half-configured setup (placeholder public key, secret unset)
+        must warn once instead of failing silently (#98631) — the empty
+        branch runs before the placeholder guard, so without a warning
+        here the operator gets zero signal that tracing is dead."""
+        self._clear_env(monkeypatch)
+        monkeypatch.setenv("HERMES_LANGFUSE_PUBLIC_KEY", "your-public-key-here")
+        plugin = self._fresh_plugin(monkeypatch)
+        with caplog.at_level(logging.WARNING, logger=self.LOGGER_NAME):
+            for _ in range(3):
+                assert plugin._get_langfuse() is None
+        warnings = [r for r in caplog.records if r.levelname == "WARNING"
+                    and r.name == self.LOGGER_NAME]
+        assert len(warnings) == 1, (
+            f"Expected exactly one missing-credentials warning; got "
+            f"{len(warnings)}:\n" + "\n".join(r.getMessage() for r in warnings)
+        )
+        text = warnings[0].getMessage()
+        assert "missing credentials" in text
+        assert "HERMES_LANGFUSE_SECRET_KEY" in text
+        assert "traces will NOT be emitted" in text
+        # Never constructed the SDK client — short-circuited before that.
+        assert _FakeLangfuse.instances == []
+
+    def test_both_keys_missing_warning_names_both(self, monkeypatch, caplog):
+        self._clear_env(monkeypatch)
+        plugin = self._fresh_plugin(monkeypatch)
+        with caplog.at_level(logging.WARNING, logger=self.LOGGER_NAME):
+            assert plugin._get_langfuse() is None
+        warnings = [r for r in caplog.records if r.levelname == "WARNING"
+                    and r.name == self.LOGGER_NAME]
+        assert len(warnings) == 1
+        text = warnings[0].getMessage()
+        assert "HERMES_LANGFUSE_PUBLIC_KEY" in text
+        assert "HERMES_LANGFUSE_SECRET_KEY" in text
+
 
 class TestRequestMessageCoercion:
     def test_prefers_request_messages_then_messages_then_history_then_user_message(self):
