@@ -1,8 +1,8 @@
 """Durable operations for gateway-hosted Bot Mode rooms.
 
 The public API in this module owns room identity and its append-only event log.
-Validation lives in hosted_room_contract and root-DB mechanics live in
-hosted_room_storage.
+Validation lives in ``hosted_room_contract`` and root-DB mechanics live in
+``hosted_room_storage``.
 """
 
 from __future__ import annotations
@@ -19,16 +19,17 @@ from gateway.hosted_room_contract import (
     AuthoritySupersededError,
     CONTROL_EVENT_BYTE_RESERVE,
     CONTROL_EVENT_COUNT_RESERVE,
+    DISBANDED_REPLICA_RETENTION_SECONDS,
     DISBANDED_ROOM_RETENTION_SECONDS,
     EventConflictError,
     HostedRoomError,
-    MAX_ACTIVE_ROOMS,
     MAX_ACTOR_ID_CHARS,
     MAX_ACTOR_LABEL_CHARS,
+    MAX_ACTIVE_ROOMS,
     MAX_DISBANDED_ROOM_TOMBSTONES,
     MAX_EVENT_ID_CHARS,
-    MAX_EVENT_JSON_BYTES,
     MAX_EVENT_KIND_CHARS,
+    MAX_EVENT_JSON_BYTES,
     MAX_EVENTS_PER_ROOM,
     MAX_GATEWAY_EVENT_BYTES,
     MAX_LOG_LIMIT,
@@ -44,6 +45,7 @@ from gateway.hosted_room_contract import (
     RoomHistoryExpiredError,
     RoomNotFoundError,
     RoomProbeUnavailableError,
+    RoomQuarantinedError,
     _ACTOR_FIELDS,
     _EVENT_KIND_RE,
     _EVENT_KINDS_BY_ACTOR,
@@ -77,12 +79,16 @@ from gateway.hosted_room_storage import (
     _initialize_schema,
     _migrate_remote_run_schema,
     _primary_key_columns,
+    _prune_disbanded_replicas_locked,
     _prune_disbanded_rooms_locked,
+    _raise_if_quarantined,
     _raise_room_not_found,
     _read_connection,
     _remote_run_identity,
+    _replica_reserves_room_id_locked,
     _room_from_row,
     _room_grant_scope_key,
+    _room_id_reservation_kind_locked,
     _schema_is_current,
     _table_exists,
     _transaction,
@@ -127,6 +133,11 @@ def create_room(
     now = time.time() if now is None else float(now)
 
     with _transaction(db_path, immediate=True) as conn:
+        _raise_if_quarantined(conn, room_id)
+        if _replica_reserves_room_id_locked(conn, room_id):
+            raise RoomConflictError("room_id belongs to a passive replica")
+        if _room_id_reservation_kind_locked(conn, room_id) == "replica":
+            raise RoomConflictError("room_id belongs to a retired passive replica")
         if conn.execute(
             "SELECT 1 FROM hosted_room_retired_ids WHERE room_id=?",
             (room_id,),
@@ -295,12 +306,16 @@ def list_rooms(
     conn = _read_connection(db_path)
     try:
         rows = conn.execute(
-            """SELECT room_id, name, members_json, authority_gateway_id,
-                      authority_epoch, next_seq, revision, created_at, updated_at,
-                      disbanded_at
-               FROM hosted_rooms
-               WHERE disbanded_at IS NULL OR ?
-               ORDER BY updated_at DESC, room_id ASC
+            """SELECT rooms.room_id, rooms.name, rooms.members_json,
+                      rooms.authority_gateway_id, rooms.authority_epoch,
+                      rooms.next_seq, rooms.revision, rooms.created_at,
+                      rooms.updated_at, rooms.disbanded_at,
+                      quarantine.reason AS quarantine_reason
+               FROM hosted_rooms AS rooms
+               LEFT JOIN hosted_room_quarantine AS quarantine
+                 ON quarantine.room_id=rooms.room_id
+               WHERE rooms.disbanded_at IS NULL OR ?
+               ORDER BY rooms.updated_at DESC, rooms.room_id ASC
                LIMIT ? OFFSET ?""",
             (int(include_disbanded), limit, offset),
         ).fetchall()
@@ -471,6 +486,7 @@ def append_event(
     now = time.time() if now is None else float(now)
 
     with _transaction(db_path, immediate=True) as conn:
+        _raise_if_quarantined(conn, room_id)
         existing = conn.execute(
             """SELECT room_id, seq, event_id, kind, actor_json, authority_epoch,
                       payload_json, created_at
@@ -662,6 +678,7 @@ def room_state(
         max_chars=MAX_ROOM_ID_CHARS,
     )
     with _transaction(db_path) as conn:
+        _raise_if_quarantined(conn, room_id)
         row = conn.execute(
             """SELECT room_id, name, members_json, authority_gateway_id,
                       authority_epoch, next_seq, revision, created_at, updated_at,
@@ -778,6 +795,7 @@ def claim_authority(
     )
 
     with _transaction(db_path, immediate=True) as conn:
+        _raise_if_quarantined(conn, room_id)
         row = conn.execute(
             """SELECT authority_gateway_id, authority_epoch, next_seq, event_bytes
                  FROM hosted_rooms
@@ -912,6 +930,7 @@ def disband_room(
     now = time.time() if now is None else float(now)
 
     with _transaction(db_path, immediate=True) as conn:
+        _raise_if_quarantined(conn, room_id)
         room = conn.execute(
             """SELECT authority_gateway_id, authority_epoch, next_seq,
                       event_bytes, disbanded_at
