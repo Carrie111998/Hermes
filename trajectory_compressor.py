@@ -84,6 +84,31 @@ def _default_output_path(input_path: Path, suffix: str = "_compressed") -> Path:
     return input_path.parent / f"{name}{suffix}.jsonl"
 
 
+def _response_finish_reason(response: Any) -> str:
+    """Return ``choices[0].finish_reason`` from a dict- or object-shaped response.
+
+    Local copy of ``agent.context_compressor._response_finish_reason`` —
+    trajectory_compressor is a standalone CLI tool and deliberately avoids
+    importing the (heavy) context compressor module. Returns the lowercased
+    finish reason, or ``""`` when absent/unreadable.
+    """
+    try:
+        if isinstance(response, dict):
+            choices = response.get("choices") or [{}]
+            first = choices[0] if choices else {}
+            reason = (
+                first.get("finish_reason")
+                if isinstance(first, dict)
+                else getattr(first, "finish_reason", None)
+            )
+        else:
+            choices = getattr(response, "choices", None) or []
+            reason = getattr(choices[0], "finish_reason", None) if choices else None
+        return str(reason).strip().lower() if reason else ""
+    except Exception:
+        return ""
+
+
 def _effective_temperature_for_model(
     model: str,
     requested_temperature: float,
@@ -686,6 +711,16 @@ Write only the summary, starting with "[CONTEXT SUMMARY]:" prefix."""
                         _create_kwargs["temperature"] = summary_temperature
                     response = self.client.chat.completions.create(**_create_kwargs)
                 
+                _fr = _response_finish_reason(response)
+                if _fr == "length":
+                    # Length stop = partial summary; storing it as the turn
+                    # replacement silently truncates the trajectory's memory.
+                    # Raise so the retry/backoff loop treats it as a failure
+                    # (pi#7048 class).
+                    raise RuntimeError(
+                        "trajectory summarization hit the output token cap "
+                        "(finish_reason=length); summary is incomplete"
+                    )
                 summary = self._coerce_summary_content(response.choices[0].message.content)
                 return self._ensure_summary_prefix(summary)
                 
@@ -755,6 +790,13 @@ Write only the summary, starting with "[CONTEXT SUMMARY]:" prefix."""
                         _create_kwargs["temperature"] = summary_temperature
                     response = await self._get_async_client().chat.completions.create(**_create_kwargs)
                 
+                if _response_finish_reason(response) == "length":
+                    # Length stop = partial summary; see sync sibling above
+                    # (pi#7048 class).
+                    raise RuntimeError(
+                        "trajectory summarization hit the output token cap "
+                        "(finish_reason=length); summary is incomplete"
+                    )
                 summary = self._coerce_summary_content(response.choices[0].message.content)
                 return self._ensure_summary_prefix(summary)
                 
