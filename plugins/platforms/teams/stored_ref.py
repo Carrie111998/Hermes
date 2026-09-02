@@ -40,8 +40,11 @@ def classify_stored_ref(
     if missing:
         raise StoredRefError(f"stored ref missing fields: {', '.join(missing)}")
     kind = str(ref.get("kind") or "").strip()
-    if kind != "personal":
-        raise StoredRefError(f"stored ref kind must be personal, got {kind!r}")
+    if kind in ("group", "groupChat"):
+        if not str(ref.get("addressed_by") or "").strip():
+            raise StoredRefError("group ref requires inbound addresser")
+    elif kind != "personal":
+        raise StoredRefError(f"stored ref kind must be personal or groupChat, got {kind!r}")
     conv_id = str(ref["conversation_id"])
     if not _CONV_ID_RE.match(conv_id):
         raise StoredRefError("stored ref conversation_id is not a Bot Framework id")
@@ -94,8 +97,14 @@ def persist_inbound_ref(
     user_id: Optional[str] = None,
     person: Optional[str] = None,
     filename_stem: Optional[str] = None,
+    inbound_activity_id: Optional[str] = None,
 ) -> Path:
-    kind = "personal" if conversation_type == "personal" else conversation_type
+    if conversation_type == "personal":
+        kind = "personal"
+    elif conversation_type in ("group", "groupChat"):
+        kind = "groupChat"
+    else:
+        raise StoredRefError(f"cannot persist kind {conversation_type!r}")
     ref: Dict[str, Any] = {
         "kind": kind,
         "conversation_id": conversation_id,
@@ -109,6 +118,13 @@ def persist_inbound_ref(
         ref["aad_object_id"] = aad_object_id
     if user_id:
         ref["user_id"] = user_id
+    if kind == "groupChat":
+        addresser = user_id or aad_object_id
+        if not addresser:
+            raise StoredRefError("group ref requires inbound addresser")
+        ref["addressed_by"] = str(addresser)
+        if inbound_activity_id:
+            ref["last_inbound_activity_id"] = str(inbound_activity_id)
     classify_stored_ref(ref, expected_bot_app_id=bot_app_id)
     directory.mkdir(parents=True, exist_ok=True)
     for existing in directory.glob("*.json"):
@@ -137,6 +153,7 @@ async def send_from_stored_ref(
     poster: Poster,
     expected_bot_app_id: Optional[str] = None,
     token: str,
+    reply_to: Optional[str] = None,
 ) -> Dict[str, Any]:
     if not text or not str(text).strip():
         return {"error": "stored-ref send: empty text"}
@@ -154,6 +171,12 @@ async def send_from_stored_ref(
         "textFormat": "markdown",
         "from": {"id": f"28:{bot}"},
     }
+    kind = str(ref.get("kind") or "").strip()
+    thread_id = str(reply_to or ref.get("last_inbound_activity_id") or "").strip()
+    if kind in ("group", "groupChat"):
+        if not thread_id:
+            return {"error": "stored-ref send: group send is never a first post"}
+        body["replyToId"] = thread_id
     headers = {
         "Authorization": f"Bearer {token}",
         "Content-Type": "application/json",

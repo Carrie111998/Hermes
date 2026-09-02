@@ -948,7 +948,7 @@ class TeamsAdapter(BasePlatformAdapter):
         if not self._client_id:
             return
         conv_type = getattr(conv, "conversation_type", None) or ""
-        if conv_type != "personal":
+        if conv_type not in ("personal", "groupChat", "group"):
             return
         conv_id = getattr(conv, "id", None)
         service_url = getattr(activity, "service_url", None) or ""
@@ -960,13 +960,14 @@ class TeamsAdapter(BasePlatformAdapter):
             persist_inbound_ref(
                 self._stored_ref_dir(),
                 conversation_id=str(conv_id),
-                conversation_type="personal",
+                conversation_type=str(conv_type),
                 service_url=str(service_url),
                 tenant_id=str(getattr(conv, "tenant_id", None) or self._tenant_id or ""),
                 bot_app_id=self._client_id,
                 aad_object_id=getattr(from_account, "aad_object_id", None),
                 user_id=getattr(from_account, "id", None),
                 person=getattr(from_account, "name", None),
+                inbound_activity_id=getattr(activity, "id", None),
             )
             self._load_stored_refs()
         except StoredRefError as exc:
@@ -1445,6 +1446,7 @@ class TeamsAdapter(BasePlatformAdapter):
                     poster=self._post_stored_activity,
                     expected_bot_app_id=self._client_id,
                     token=token,
+                    reply_to=reply_to,
                 )
                 if not result.get("success"):
                     return SendResult(

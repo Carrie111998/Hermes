@@ -42,9 +42,16 @@ def test_classify_accepts_personal_matching_bot():
     classify_stored_ref(_throwaway(), expected_bot_app_id=BOT)
 
 
-def test_classify_rejects_group():
-    with pytest.raises(StoredRefError, match="personal"):
+def test_classify_rejects_group_without_inbound_addresser():
+    with pytest.raises(StoredRefError, match="addresser"):
         classify_stored_ref(_throwaway(kind="groupChat"), expected_bot_app_id=BOT)
+
+
+def test_classify_accepts_group_after_inbound_addresser():
+    classify_stored_ref(
+        _throwaway(kind="groupChat", addressed_by="29:customer-roster"),
+        expected_bot_app_id=BOT,
+    )
 
 
 def test_classify_rejects_wrong_bot():
@@ -213,3 +220,55 @@ def test_send_from_stored_ref_status_zero_is_not_missing_activity_id():
     assert result.get("success") is not True
     assert "activity id" not in result["error"]
     assert "failed (0)" in result["error"]
+
+
+def _group_ref(**overrides):
+    ref = _throwaway(
+        kind="groupChat",
+        conversation_id="19:group-throwaway",
+        addressed_by="29:customer-roster",
+        last_inbound_activity_id="activity-inbound-1",
+    )
+    ref.update(overrides)
+    return ref
+
+
+def test_group_send_without_reply_is_not_a_first_post():
+    async def poster(url, headers, body):
+        raise AssertionError("must not POST a group first post")
+
+    async def run():
+        return await send_from_stored_ref(
+            _group_ref(last_inbound_activity_id=""),
+            "STORED-REF-OWN-SEND",
+            poster=poster,
+            expected_bot_app_id=BOT,
+            token="not-a-secret-for-test",
+        )
+
+    result = asyncio.run(run())
+    assert result.get("success") is not True
+    assert "first post" in result["error"]
+
+
+def test_group_send_replies_in_addressed_thread():
+    posted = {}
+
+    async def poster(url, headers, body):
+        posted["body"] = body
+        return 201, {"id": "activity-group-reply"}
+
+    async def run():
+        return await send_from_stored_ref(
+            _group_ref(),
+            "STORED-REF-OWN-SEND",
+            poster=poster,
+            expected_bot_app_id=BOT,
+            token="not-a-secret-for-test",
+            reply_to="activity-inbound-1",
+        )
+
+    result = asyncio.run(run())
+    assert result["success"] is True
+    assert result["message_id"] == "activity-group-reply"
+    assert posted["body"]["replyToId"] == "activity-inbound-1"
