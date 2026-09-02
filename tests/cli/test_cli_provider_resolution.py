@@ -481,6 +481,28 @@ def test_model_flow_custom_saves_verified_v1_base_url(monkeypatch, capsys):
     assert saved_env["MODEL"] == "llm"
 
 
+def test_model_flow_custom_prefills_endpoint_from_model_config(monkeypatch):
+    prompts = []
+    config = {
+        "model": {
+            "provider": "custom",
+            "base_url": "http://truenas.local:11434/v1",
+            "api_key": "configured-key",
+        }
+    }
+    monkeypatch.setattr("hermes_cli.config.get_env_value", lambda _key: "")
+
+    def _cancel_after_url(prompt=""):
+        prompts.append(prompt)
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr("builtins.input", _cancel_after_url)
+
+    hermes_main._model_flow_custom(config)
+
+    assert "http://truenas.local:11434/v1" in prompts[0]
+
+
 def test_model_flow_custom_persists_selected_api_mode(monkeypatch):
     saved_cfg = {"model": {"default": "", "provider": "custom", "base_url": ""}}
     captured_provider = {}

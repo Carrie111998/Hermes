@@ -11931,6 +11931,19 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                         model_list = live
                 except Exception:
                     pass
+            if (
+                not model_list
+                and provider_data.get("slug") == "custom"
+                and provider_data.get("is_user_defined") is True
+            ):
+                custom_providers = state.get("custom_provs")
+                self._close_model_picker()
+                threading.Thread(
+                    target=self._configure_custom_endpoint_from_picker,
+                    args=(provider_data, custom_providers),
+                    daemon=True,
+                ).start()
+                return
             state["stage"] = "model"
             state["provider_data"] = provider_data
             state["model_list"] = model_list
@@ -11991,6 +12004,79 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     )
                 return
             self._close_model_picker()
+
+    def _configure_custom_endpoint_from_picker(
+        self,
+        provider_data: dict,
+        custom_providers=None,
+    ) -> None:
+        """Configure an empty custom row without fighting TUI stdin ownership."""
+        import asyncio
+
+        from hermes_cli.config import get_compatible_custom_providers, load_config
+        from hermes_cli.main import _model_flow_custom
+
+        def _setup() -> None:
+            setup_config = load_config()
+            model_cfg = setup_config.get("model")
+            if not isinstance(model_cfg, dict):
+                model_cfg = {}
+                setup_config["model"] = model_cfg
+            if not model_cfg.get("base_url") and provider_data.get("api_url"):
+                model_cfg["base_url"] = provider_data["api_url"]
+            _model_flow_custom(setup_config)
+
+        app = getattr(self, "_app", None)
+        app_loop = getattr(app, "loop", None) if app is not None else None
+        try:
+            if app_loop is not None:
+                from prompt_toolkit.application import run_in_terminal
+
+                async def _run_setup() -> None:
+                    await run_in_terminal(_setup, in_executor=True)
+
+                asyncio.run_coroutine_threadsafe(_run_setup(), app_loop).result()
+            else:
+                _setup()
+
+            config = load_config()
+            model_cfg = config.get("model")
+            if not isinstance(model_cfg, dict):
+                _cprint("  No custom endpoint configured.")
+                self._invalidate(min_interval=0.0)
+                return
+            model = str(model_cfg.get("default") or "").strip()
+            base_url = str(model_cfg.get("base_url") or "").strip()
+            if model_cfg.get("provider") != "custom" or not model or not base_url:
+                _cprint("  No custom endpoint configured.")
+                self._invalidate(min_interval=0.0)
+                return
+
+            from hermes_cli.model_switch import switch_model
+
+            fresh_custom_providers = get_compatible_custom_providers(config)
+            result = switch_model(
+                raw_input=model,
+                current_provider=self.provider or "",
+                current_model=self.model or "",
+                current_base_url=base_url,
+                current_api_key=str(model_cfg.get("api_key") or ""),
+                is_global=True,
+                explicit_provider="custom",
+                user_providers=config.get("providers"),
+                custom_providers=fresh_custom_providers or custom_providers,
+            )
+            self._confirm_and_apply_model_switch_result(
+                result,
+                True,
+                custom_providers=fresh_custom_providers or custom_providers,
+            )
+        except KeyboardInterrupt:
+            _cprint("  Custom endpoint setup cancelled.")
+            self._invalidate(min_interval=0.0)
+        except Exception as exc:
+            _cprint(f"  ✗ Custom endpoint setup failed: {exc}")
+            self._invalidate(min_interval=0.0)
 
     def _handle_model_switch(self, cmd_original: str):
         """Handle /model command — switch model.

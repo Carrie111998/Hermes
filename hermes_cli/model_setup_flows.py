@@ -941,8 +941,17 @@ def _model_flow_custom(config):
     )
     from hermes_cli.secret_prompt import masked_secret_prompt
 
-    current_url = get_env_value("OPENAI_BASE_URL") or ""
-    current_key = get_env_value("OPENAI_API_KEY") or ""
+    current_model_cfg = config.get("model")
+    if not isinstance(current_model_cfg, dict):
+        current_model_cfg = {}
+    current_url = (
+        get_env_value("OPENAI_BASE_URL")
+        or str(current_model_cfg.get("base_url") or "").strip()
+    )
+    current_key = (
+        get_env_value("OPENAI_API_KEY")
+        or str(current_model_cfg.get("api_key") or "").strip()
+    )
 
     print("Custom OpenAI-compatible endpoint configuration:")
     if current_url:
@@ -1030,7 +1039,6 @@ def _model_flow_custom(config):
 
     # Prompt for API compatibility mode explicitly so codex-compatible custom
     # providers don't silently fall back to chat_completions.
-    current_model_cfg = config.get("model")
     current_api_mode = ""
     if isinstance(current_model_cfg, dict):
         current_api_mode = str(current_model_cfg.get("api_mode") or "").strip()
