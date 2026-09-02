@@ -362,6 +362,12 @@ class A2ARequestHandler(BaseHTTPRequestHandler):
 class A2AAdapter(BasePlatformAdapter):
     """Inbound A2A server adapter."""
 
+    # The agent-to-agent caller receives the reply as a complete message and
+    # persists/audits exactly what it gets — there is no human-visible
+    # streaming preview, so the consumer must not strip the streamed prefix
+    # from the final text (#95753).
+    HAS_VISIBLE_STREAM: bool = False
+
     def __init__(self, config, **kwargs):
         platform = Platform("a2a")
         super().__init__(config=config, platform=platform)
