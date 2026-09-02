@@ -9569,12 +9569,18 @@ def has_spawnable_ready(conn: sqlite3.Connection) -> bool:
     ).fetchall()
     if not rows:
         return False
+    # ``kanban.non_dispatchable_assignees`` lanes are never spawned, so
+    # they are "correctly idle" — otherwise a human-owner lane parked in
+    # ready would fire a permanent false "dispatcher stuck" warning.
+    _exempt = non_dispatchable_assignees()
     try:
         from hermes_cli.profiles import profile_exists  # local import: avoids cycle
     except Exception:
         # Can't introspect — assume spawnable, preserve legacy behavior.
         return True
     for row in rows:
+        if row["assignee"].lower() in _exempt:
+            continue
         if profile_exists(row["assignee"]):
             return True
     return False
@@ -9595,11 +9601,14 @@ def has_spawnable_review(conn: sqlite3.Connection) -> bool:
     ).fetchall()
     if not rows:
         return False
+    _exempt = non_dispatchable_assignees()
     try:
         from hermes_cli.profiles import profile_exists  # local import: avoids cycle
     except Exception:
         return True
     for row in rows:
+        if row["assignee"].lower() in _exempt:
+            continue
         if profile_exists(row["assignee"]):
             return True
     return False
@@ -9619,6 +9628,50 @@ def review_dispatch_enabled() -> bool:
         )
     except Exception:
         return True
+
+
+def non_dispatchable_assignees() -> set:
+    """Assignees the dispatcher must never spawn workers for.
+
+    ``kanban.non_dispatchable_assignees: [<profile>, ...]`` opts a real,
+    addressable Hermes profile out of autonomous dispatch entirely — the
+    per-assignee counterpart of ``kanban.review_dispatch``. The canonical
+    use case is a human-owner lane: a real profile (created for identity
+    and shared memory) with no model configured. ``profile_exists`` is
+    ``True`` for such a lane, so without this list the dispatcher spawns a
+    worker that exits immediately, and the block-recurrence breaker files
+    a card that was waiting on a person as ``blocked``.
+
+    Entries are normalized with the same rules as profile directories, so
+    a title-cased dashboard label still matches its lowercase lane.
+    """
+    try:
+        from hermes_cli.config import load_config
+        raw = (load_config() or {}).get("kanban", {}).get(
+            "non_dispatchable_assignees", []
+        )
+    except Exception:
+        return set()
+    if isinstance(raw, str):
+        raw = [raw]
+    if not isinstance(raw, (list, tuple)):
+        return set()
+    try:
+        from hermes_cli.profiles import normalize_profile_name
+    except Exception:
+        normalize_profile_name = None  # type: ignore[assignment]
+    out = set()
+    for entry in raw:
+        if not isinstance(entry, str) or not entry.strip():
+            continue
+        if normalize_profile_name is not None:
+            try:
+                out.add(normalize_profile_name(entry))
+                continue
+            except Exception:
+                pass
+        out.add(entry.strip().lower())
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -10111,6 +10164,10 @@ def _dispatch_once_locked(
     # We also resolve profile_exists once here for the same reason.
     _default_assignee = (default_assignee or "").strip() or None
     _default_assignee_resolved = False
+    # Per-assignee dispatch exemption: resolve the operator's
+    # non-dispatchable list once per tick so a human-owner lane is never
+    # spawned, no matter how many of its cards sit in the queue.
+    _non_dispatchable = non_dispatchable_assignees()
     if _default_assignee:
         try:
             from hermes_cli.profiles import profile_exists as _pe
@@ -10190,6 +10247,14 @@ def _dispatch_once_locked(
             # this distinction to suppress spurious "stuck" warnings on
             # multi-lane setups where the ready queue is steadily full
             # of human-pulled work.
+            result.skipped_nonspawnable.append(row["id"])
+            continue
+        # Opted out of autonomous dispatch via
+        # ``kanban.non_dispatchable_assignees`` — a real profile (so the
+        # check above passed) that must never be spawned, such as a
+        # human-owner lane. Same bucket as terminal lanes: expected
+        # steady-state, not an operator-actionable failure.
+        if row_assignee.lower() in _non_dispatchable:
             result.skipped_nonspawnable.append(row["id"])
             continue
         # Per-profile concurrency cap (#21582): even if there's global
@@ -10338,6 +10403,13 @@ def _dispatch_once_locked(
         except Exception:
             profile_exists = None  # type: ignore[assignment]
         if profile_exists is not None and not profile_exists(row["assignee"]):
+            result.skipped_nonspawnable.append(row["id"])
+            continue
+        # ``kanban.non_dispatchable_assignees`` applies to the review lane
+        # too: a human-owner lane opted out of autonomous dispatch must
+        # not get a reviewer spawned behind the back of the ready loop's
+        # exemption.
+        if row["assignee"].lower() in _non_dispatchable:
             result.skipped_nonspawnable.append(row["id"])
             continue
         if _per_profile_cap is not None:
