@@ -226,9 +226,24 @@ up on the next tick (60s by default).
 kanban:
   dispatch_in_gateway: true        # default
   dispatch_interval_seconds: 60    # default
+  service_tier: ""                 # empty = inherit each assignee profile
   review_dispatch: true            # default: spawn the assigned profile with
                                    # the bundled sdlc-review skill. Set false
                                    # for human-only review boards.
+```
+
+Set `kanban.service_tier` to `normal` or `fast` when unattended workers should
+use a different request tier from ordinary conversations. The override applies
+only to dispatcher-spawned workers; an empty or omitted value preserves the
+existing behavior and inherits the assignee profile's `agent.service_tier`.
+Values other than `fast` or `normal` are ignored with the same inheritance.
+For example, this keeps chats fast while Kanban workers use the normal tier:
+
+```yaml
+agent:
+  service_tier: fast
+kanban:
+  service_tier: normal
 ```
 
 Override the config flag at runtime via `HERMES_KANBAN_DISPATCH_IN_GATEWAY=0`
@@ -613,6 +628,7 @@ Config knobs (all under `kanban:` in `~/.hermes/config.yaml`):
 | `auto_decompose_per_tick` | `3` | Cap on decompositions per dispatcher tick. Excess defers to the next tick. |
 | `orchestrator_profile` | `""` | Profile assigned to the root/orchestration task after decomposition. Empty = fall back to active default profile. |
 | `default_assignee` | `""` | Where a child task lands when the LLM picks an unknown profile. Empty = fall back to active default. |
+| `service_tier` | `""` | Request tier for dispatcher-spawned workers: `fast` or `normal`. Empty or invalid = inherit each assignee profile's `agent.service_tier`. |
 | `auto_subscribe_on_create` | `true` | When `kanban_create` runs inside a persistent gateway/TUI session, terminal events resume that originating agent with a synthetic status turn. Set to `false` for passive completion or to require explicit `kanban_notify-subscribe` calls. Independent of `auto_decompose`. |
 | `done_sub_retention_days` | `30` | Notify subscriptions survive `done` (reopen-safe) and are removed on `archived`. The notifier GC purges subscriptions whose task has been `done` or `blocked` with no new events for this many days, bounding sub-table growth on boards that never archive. `0` disables the sweep. |
 

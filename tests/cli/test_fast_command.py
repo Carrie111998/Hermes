@@ -1,5 +1,6 @@
 """Tests for the /fast CLI command and service-tier config handling."""
 
+import copy
 import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -29,6 +30,46 @@ class TestParseServiceTierConfig(unittest.TestCase):
         self.assertEqual(self._parse("fast"), "priority")
         self.assertEqual(self._parse("priority"), "priority")
 
+    def test_invocation_override_wins_over_persisted_default(self):
+        cli_mod = _import_cli()
+        config = copy.deepcopy(cli_mod.CLI_CONFIG)
+        config["agent"]["service_tier"] = "fast"
+
+        with patch.object(cli_mod, "CLI_CONFIG", config):
+            cli = cli_mod.HermesCLI(service_tier="normal", compact=True)
+
+        self.assertIsNone(cli.service_tier)
+
+        config["agent"]["service_tier"] = "normal"
+        with patch.object(cli_mod, "CLI_CONFIG", config):
+            cli = cli_mod.HermesCLI(service_tier="fast", compact=True)
+
+        self.assertEqual(cli.service_tier, "priority")
+
+    def test_absent_or_invalid_invocation_override_preserves_profile_default(self):
+        cli_mod = _import_cli()
+        config = copy.deepcopy(cli_mod.CLI_CONFIG)
+        config["agent"]["service_tier"] = "fast"
+
+        with patch.object(cli_mod, "CLI_CONFIG", config):
+            inherited = cli_mod.HermesCLI(compact=True)
+            invalid = cli_mod.HermesCLI(service_tier="priority", compact=True)
+
+        self.assertEqual(inherited.service_tier, "priority")
+        self.assertEqual(invalid.service_tier, "priority")
+        self.assertEqual(config["agent"]["service_tier"], "fast")
+
+    def test_invocation_tier_does_not_change_reasoning_effort(self):
+        cli_mod = _import_cli()
+        config = copy.deepcopy(cli_mod.CLI_CONFIG)
+
+        with patch.object(cli_mod, "CLI_CONFIG", config):
+            baseline = cli_mod.HermesCLI(reasoning="low", compact=True)
+            overridden = cli_mod.HermesCLI(
+                reasoning="low", service_tier="normal", compact=True
+            )
+
+        self.assertEqual(overridden.reasoning_config, baseline.reasoning_config)
 
 
 class TestHandleFastCommand(unittest.TestCase):
