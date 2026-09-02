@@ -5572,6 +5572,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         # shared chokepoint in hermes_constants (Closes #21256).
         from hermes_constants import resolve_reasoning_config
         self.reasoning_config = resolve_reasoning_config(CLI_CONFIG, self.model)
+        # Set when an explicit --reasoning was applied. Model switches re-run
+        # the chokepoint for the new model (#96012) and must not clobber a
+        # level the user pinned on the command line.
+        self._reasoning_cli_flag_applied = False
         # An explicit --reasoning wins over config for this run only (never
         # persisted). Kanban's dispatcher uses it to pin a task's thinking
         # depth without touching the worker profile's config.yaml. An
@@ -5586,6 +5590,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 )
             else:
                 self.reasoning_config = _cli_reasoning
+                self._reasoning_cli_flag_applied = True
         self.service_tier = _parse_service_tier_config(
             CLI_CONFIG["agent"].get("service_tier", "")
         )
@@ -10465,9 +10470,6 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         # was for the previous session only, not for every session spawned
         # afterwards.
         self._explicit_model_override = False
-        self.reasoning_config = _parse_reasoning_config(
-            CLI_CONFIG["agent"].get("reasoning_effort", "")
-        )
         # /new is a full conversation boundary: session-scoped runtime
         # overrides (/model --session, /fast, one-turn restores) do not carry
         # forward.  Re-derive model/provider and service tier from config.yaml
@@ -10530,6 +10532,25 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 # Best-effort: an unreachable config default must never block
                 # /new. The session keeps the current working model.
                 logger.debug("/new model reset to config default failed", exc_info=True)
+        # Re-resolve reasoning through the shared chokepoint for the model
+        # the fresh session lands on — i.e. after the config-default model
+        # reset above. Resolving from the global key only loses per-model
+        # reasoning_overrides (#96012); an explicit --reasoning stays
+        # authoritative for the whole run, matching the /model switch path.
+        if not getattr(self, "_reasoning_cli_flag_applied", False):
+            try:
+                from hermes_constants import resolve_reasoning_config
+                # A missing/blank model means "unknown current model" — the
+                # chokepoint then resolves for the config-default model
+                # instead of AttributeError-ing into the stale-keeping path.
+                self.reasoning_config = resolve_reasoning_config(
+                    CLI_CONFIG, getattr(self, "model", None)
+                )
+            except Exception:
+                logger.debug(
+                    "reasoning re-resolution at /new failed; keeping prior level",
+                    exc_info=True,
+                )
         _sync_process_session_id(self.session_id)
 
         if self.agent:
@@ -11804,10 +11825,29 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             "api_key": self.api_key,
             "base_url": self.base_url,
             "api_mode": self.api_mode,
+            "reasoning_config": getattr(self, "reasoning_config", None),
         }
         self.model = result.new_model
         self.provider = result.target_provider
         self.requested_provider = result.target_provider
+        # Re-resolve the per-model reasoning override for the NEW model.
+        # self.reasoning_config was resolved against the model that was live
+        # at startup; leaving it stale means the next agent
+        # re-initialization injects the old model's effort over the per-model
+        # override the in-place switch just applied — providers that accept a
+        # narrower level set then 400 (#96012). An explicit --reasoning stays
+        # authoritative for the whole run.
+        if not getattr(self, "_reasoning_cli_flag_applied", False):
+            try:
+                from hermes_constants import resolve_reasoning_config
+                self.reasoning_config = resolve_reasoning_config(
+                    CLI_CONFIG, result.new_model
+                )
+            except Exception:
+                logger.debug(
+                    "reasoning re-resolution for %s failed; keeping prior level",
+                    result.new_model, exc_info=True,
+                )
         # Always overwrite explicit overrides so stale credentials from the
         # previous provider (e.g. Ollama api_key/base_url) don't leak into
         # the new provider's credential resolution on the next turn.
