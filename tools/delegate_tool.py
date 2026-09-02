@@ -1528,6 +1528,18 @@ def _build_child_progress_callback(
         if session_ref and session_ref.get("delegation_id"):
             kw["delegation_id"] = str(session_ref["delegation_id"])
         kw["tool_count"] = _tool_count[0]
+        try:
+            from gateway.session_context import current_run_binding
+
+            binding = current_run_binding()
+            if binding is not None:
+                kw["run_binding"] = {
+                    "repo": binding.repo_root,
+                    "branch": binding.branch or binding.ref,
+                    "sha": binding.short_head,
+                }
+        except Exception:
+            pass
         return kw
 
     def _relay(
@@ -2622,6 +2634,7 @@ def _run_single_child(
     owner_session_id: Optional[str] = None,
     owner_transport: Any = None,
     owner_session_record: Any = None,
+    run_binding: Any = None,
     **_kwargs,
 ) -> Dict[str, Any]:
     """
@@ -2938,9 +2951,16 @@ def _run_single_child(
                         _parent_cwd = _gsc(parent_task_id)
                     except Exception:
                         pass
+                    if run_binding is None:
+                        from gateway.session_context import current_run_binding
+
+                        run_binding = current_run_binding()
                     _worktree_info = subagent_worktree.create_subagent_worktree(
                         _parent_cwd or _resolve_workspace_hint(parent_agent),
                         subagent_id=_subagent_id,
+                        base_commit=(
+                            run_binding.head if run_binding is not None else None
+                        ),
                     )
                 else:
                     logger.debug(
@@ -4116,6 +4136,45 @@ def delegate_task(
             return tool_error(f"Task {i} output_schema invalid: {schema_err}")
         task_schemas.append(coerced_schema)
 
+    # A gateway/TUI turn carries a server-derived immutable RunBinding.  Before
+    # constructing even one child, reprobe the exact session-owned checkout
+    # and identity.  This closes the stale-session/worktree window without
+    # making CLI and legacy callers (which have no binding) fail unexpectedly.
+    from gateway.session_context import current_run_binding, get_session_env
+
+    _bound_run_binding = current_run_binding()
+    if _bound_run_binding is not None:
+        _binding_cwd = _bound_run_binding.cwd
+        _parent_task_id = getattr(parent_agent, "_current_task_id", None)
+        try:
+            from tools.terminal_tool import get_session_cwd
+
+            _binding_cwd = get_session_cwd(_parent_task_id) or _binding_cwd
+        except Exception:
+            pass
+        try:
+            from tui_gateway.git_probe import capture_run_binding
+
+            _reprobed = capture_run_binding(
+                _binding_cwd,
+                session_key=get_session_env("HERMES_SESSION_KEY", ""),
+                ui_session_id=get_session_env("HERMES_UI_SESSION_ID", ""),
+                profile=get_session_env("HERMES_SESSION_PROFILE", ""),
+            )
+        except ValueError as exc:
+            return tool_error(
+                "Delegation refused: the bound Git worktree is no longer available. "
+                f"{exc}"
+            )
+        _binding_drift = _bound_run_binding.differences(_reprobed)
+        if _binding_drift:
+            return tool_error(
+                "Delegation refused: the live session/worktree changed after this "
+                f"turn was bound ({', '.join(_binding_drift)}). "
+                f"Bound {_bound_run_binding.display()}; current {_reprobed.display()}. "
+                "Start a new conversation turn after selecting the intended worktree."
+            )
+
     overall_start = time.monotonic()
     results = []
 
@@ -4263,6 +4322,7 @@ def delegate_task(
                 owner_session_id=_origin_ui_session_id or None,
                 owner_transport=_origin_owner_transport,
                 owner_session_record=_origin_owner_session_record,
+                run_binding=_bound_run_binding,
             )
             results.append(result)
         else:
@@ -4288,6 +4348,7 @@ def delegate_task(
                         owner_session_id=_origin_ui_session_id or None,
                         owner_transport=_origin_owner_transport,
                         owner_session_record=_origin_owner_session_record,
+                        run_binding=_bound_run_binding,
                     )
                     futures[future] = i
 
@@ -4439,6 +4500,12 @@ def delegate_task(
             "results": results,
             "total_duration_seconds": total_duration,
         }
+        if _bound_run_binding is not None:
+            combined["run_binding"] = {
+                "repo": _bound_run_binding.repo_root,
+                "branch": _bound_run_binding.branch or _bound_run_binding.ref,
+                "sha": _bound_run_binding.short_head,
+            }
         if live_paths:
             combined["live_transcripts"] = list(live_paths)
         return combined
@@ -4650,6 +4717,12 @@ def delegate_task(
                 "goals": _goals,
                 "note": note,
             }
+            if _bound_run_binding is not None:
+                payload["run_binding"] = {
+                    "repo": _bound_run_binding.repo_root,
+                    "branch": _bound_run_binding.branch or _bound_run_binding.ref,
+                    "sha": _bound_run_binding.short_head,
+                }
             _sids = [
                 getattr(_c, "_subagent_id", None) for _c in _child_agents
             ]

@@ -4793,6 +4793,7 @@ def _set_session_context(
         # it instead of falling back to the gateway launch dir.
         resolved = cwd if cwd is not None else _cwd_for_session_key(session_key)
         source = _resolve_session_platform()
+        profile = _current_profile_name()
         browser_control_principal = ""
         browser_control_transport_family = ""
         # Derive the live conversation id so terminal/execute_code subprocesses
@@ -4809,6 +4810,9 @@ def _set_session_context(
             for sess in list(_sessions.values()):
                 if sess.get("session_key") == session_key:
                     source = _session_source(sess)
+                    profile_home = sess.get("profile_home")
+                    if profile_home:
+                        profile = Path(str(profile_home)).name
                     session_id = (
                         getattr(sess.get("agent"), "session_id", None) or session_key
                     )
@@ -4830,6 +4834,7 @@ def _set_session_context(
             browser_control_transport_family=browser_control_transport_family,
             cwd=resolved,
             ui_session_id=ui_session_id,
+            profile=profile,
             cron_session="",
         )
     except Exception:
@@ -13253,6 +13258,7 @@ def _run_prompt_submit(
         agent = session["agent"]
         approval_token = None
         session_tokens = []
+        run_binding_token = None
         home_token = None  # per-turn HERMES_HOME override for a resumed remote profile
         secret_token = None
         goal_followup = None  # set by the post-turn goal hook below
@@ -13358,6 +13364,41 @@ def _run_prompt_submit(
                 history_version = int(session.get("history_version", 0))
             cwd = _session_cwd(session)
             _register_session_cwd(session)
+            # Capture checkout identity from the live session at turn start.
+            # The model and RPC payload are intentionally not inputs to this
+            # binding; delegate_task will re-probe it immediately before the
+            # first child is constructed.
+            try:
+                from gateway.session_context import set_run_binding
+
+                _profile = str(
+                    Path(str(session.get("profile_home"))).name
+                    if session.get("profile_home")
+                    else _current_profile_name()
+                )
+                _binding = git_probe.capture_run_binding(
+                    cwd,
+                    session_key=str(session.get("session_key") or ""),
+                    ui_session_id=sid,
+                    profile=_profile,
+                )
+                run_binding_token = set_run_binding(_binding)
+            except ValueError as binding_error:
+                # A conversation without a stable Git worktree cannot safely
+                # attribute a delegated run. Surface the refusal on the same
+                # conversation and spawn no child.
+                _emit(
+                    "message.complete",
+                    sid,
+                    {
+                        "text": str(binding_error),
+                        "status": "error",
+                        "error": str(binding_error),
+                        "failure_reason": "run_binding_refused",
+                        "recoverable": True,
+                    },
+                )
+                return
             cols = session.get("cols", 80)
             streamer = make_stream_renderer(cols)
             prompt = text
@@ -14105,6 +14146,13 @@ def _run_prompt_submit(
                 from tools.terminal_scope import reset_terminal_scope
 
                 reset_terminal_scope(_terminal_scope_token)
+            if run_binding_token is not None:
+                try:
+                    from gateway.session_context import reset_run_binding
+
+                    reset_run_binding(run_binding_token)
+                except Exception:
+                    pass
             _clear_session_context(session_tokens)
             _current_runtime_session_record.reset(runtime_session_token)
             reset_transport(transport_token)
