@@ -38,6 +38,7 @@ import {
   botHandle,
   botMentionTag,
   cachedUnionRoster,
+  hydrateRosterSnapshot,
   isActiveRosterBot,
   migrateBotMeta,
   resolveRosterMentions
@@ -95,6 +96,10 @@ export default {
     'Bot Mode — a one-chat-per-agent roster with avatars, routines, group chats, and bot-to-bot messaging. Ships with the app; disable here if unwanted.',
   register(ctx: PluginContext) {
     setPluginCtx(ctx)
+    // Paint a bounded presentation-only snapshot while the live rich roster
+    // starts. Hydration performs no gateway RPC and marks the cache stale so
+    // the backend remains authoritative immediately.
+    void hydrateRosterSnapshot(ctx.storage)
     const disposeLocales = ctx.i18n.register(BOTS_LOCALES)
     setGroupChatSyncDisposed(false)
     startFaceClock()
