@@ -4664,17 +4664,24 @@ def _annotation_read_only_hint(mcp_tool: Any) -> bool:
     """Return True only when the tool's annotations carry readOnlyHint=True.
 
     Accepts both SDK annotation objects (attribute access) and plain dicts
-    (schema-cache JSON). Anything else — missing annotations, missing key,
-    non-bool truthy values — is False: unknown metadata means the tool must
-    be treated as write-capable.
+    (schema-cache JSON). MCP SDK 2.x maps the camelCase wire field to the
+    ``read_only_hint`` Python attribute, while older test doubles and SDKs may
+    expose ``readOnlyHint`` directly. Anything else — missing annotations,
+    missing key, non-bool truthy values — is False: unknown metadata means the
+    tool must be treated as write-capable.
     """
     annotations = getattr(mcp_tool, "annotations", None)
     if annotations is None:
         return False
     if isinstance(annotations, dict):
-        hint = annotations.get("readOnlyHint")
+        hint = annotations.get(
+            "readOnlyHint", annotations.get("read_only_hint")
+        )
     else:
-        hint = getattr(annotations, "readOnlyHint", None)
+        missing = object()
+        hint = getattr(annotations, "readOnlyHint", missing)
+        if hint is missing:
+            hint = getattr(annotations, "read_only_hint", None)
     return hint is True
 
 
