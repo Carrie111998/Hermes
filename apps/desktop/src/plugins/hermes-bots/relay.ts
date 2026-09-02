@@ -66,6 +66,13 @@ const RELAY_DELIVER_TIMEOUT_MS = RELAY_DELIVER_BACKEND_CEILING_MS + RELAY_DELIVE
 // to ONE drain. The interval poll above stays as the backstop for older
 // backends (and connections whose events don't reach the tap).
 const RELAY_PUSH_DEBOUNCE_MS = 250
+// A registry route can disappear for a few seconds while its SSH tunnel or
+// gateway is restarting. The envelope is already durably claimed by the relay
+// at that point, so classifying one stale route snapshot as a permanent
+// delivery failure loses an otherwise healthy message. Re-read the registry
+// for one bounded gateway-start window before posting a terminal reply.
+const RELAY_ROUTE_RECONNECT_GRACE_MS = 30_000
+const RELAY_ROUTE_RECONNECT_POLL_MS = 500
 
 /** Everything the two loops mutate. */
 interface RelayLifecycle {
@@ -198,6 +205,27 @@ async function relayConnections(): Promise<RelayConnection[]> {
   } catch {
     return []
   }
+}
+
+/** Re-acquire one route after a transient registry/tunnel restart.
+ *
+ * The caller has already claimed the envelope, so this waits in place and
+ * never re-enqueues or duplicates it. A genuinely removed connection still
+ * receives the existing terminal error after the bounded grace window. */
+async function waitForRelayConnection(connectionId: string): Promise<RelayConnection | undefined> {
+  const deadline = Date.now() + RELAY_ROUTE_RECONNECT_GRACE_MS
+
+  while (!relay.disposed && Date.now() < deadline) {
+    await new Promise<void>(resolve => setTimeout(resolve, RELAY_ROUTE_RECONNECT_POLL_MS))
+
+    const match = (await relayConnections()).find(connection => connection.id === connectionId)
+
+    if (match) {
+      return match
+    }
+  }
+
+  return undefined
 }
 
 /** The agents living on one connection, as relay roster rows.
@@ -363,7 +391,8 @@ async function drainRelayOutboxes() {
         }
 
         const envelopeId = String(envelope?.id || '')
-        const target = byId.get(String(envelope?.target_connection || ''))
+        const targetConnectionId = String(envelope?.target_connection || '')
+        let target = byId.get(targetConnectionId)
 
         const postReply = async (payload: { error?: string; reason?: string; reply?: string }) => {
           try {
@@ -381,11 +410,22 @@ async function drainRelayOutboxes() {
         }
 
         if (!target) {
+          target = await waitForRelayConnection(targetConnectionId)
+        }
+
+        if (!target) {
           await postReply({
             error: `connection '${envelope?.target_connection}' is not connected to this Desktop right now`
           })
 
           continue
+        }
+
+        // The route returned after this drain's original retention snapshot.
+        // Pin it now so delivery and the next loop reuse the recovered socket.
+        if (!byId.has(target.id)) {
+          byId.set(target.id, target)
+          syncRelayRetention([...connections, target])
         }
 
         // Needs-attention hook (#93091 item 3): a delivered background DM is
