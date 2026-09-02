@@ -1145,93 +1145,121 @@ class Task:
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
         keys = set(row.keys())
+
+        def _str_val(v: Any) -> Optional[str]:
+            return _text_value(v)
+
+        def _int_val(v: Any, default: Optional[int] = None) -> Optional[int]:
+            if v is None:
+                return default
+            if isinstance(v, bytes):
+                try:
+                    return int(v.decode("utf-8", errors="replace").strip())
+                except Exception:
+                    return default
+            try:
+                return int(v)
+            except Exception:
+                return default
+
+        def _bool_val(v: Any, default: bool = False) -> bool:
+            if v is None:
+                return default
+            if isinstance(v, bytes):
+                s = v.decode("utf-8", errors="replace").strip().lower()
+                return s in ("1", "true", "yes", "t")
+            return bool(v)
+
         # Parse skills JSON blob if present
         skills_value: Optional[list] = None
         if "skills" in keys and row["skills"]:
             try:
-                parsed = json.loads(row["skills"])
+                raw_skills = row["skills"]
+                if isinstance(raw_skills, bytes):
+                    raw_skills = raw_skills.decode("utf-8", errors="replace")
+                parsed = json.loads(raw_skills)
                 if isinstance(parsed, list):
                     skills_value = [str(s) for s in parsed if s]
             except Exception:
                 skills_value = None
         return cls(
-            id=row["id"],
-            title=row["title"],
-            body=row["body"],
-            assignee=row["assignee"],
-            status=row["status"],
-            priority=row["priority"],
-            created_by=row["created_by"],
-            created_at=row["created_at"],
-            started_at=row["started_at"],
-            completed_at=row["completed_at"],
-            workspace_kind=row["workspace_kind"],
-            workspace_path=row["workspace_path"],
-            branch_name=row["branch_name"] if "branch_name" in keys else None,
-            project_id=row["project_id"] if "project_id" in keys else None,
-            claim_lock=row["claim_lock"],
-            claim_expires=row["claim_expires"],
-            tenant=row["tenant"] if "tenant" in keys else None,
-            result=row["result"] if "result" in keys else None,
-            idempotency_key=row["idempotency_key"] if "idempotency_key" in keys else None,
+            id=_str_val(row["id"]) or "",
+            title=_str_val(row["title"]) or "",
+            body=_str_val(row["body"]),
+            assignee=_str_val(row["assignee"]),
+            status=_str_val(row["status"]) or "",
+            priority=_int_val(row["priority"], 0) or 0,
+            created_by=_str_val(row["created_by"]),
+            created_at=_int_val(row["created_at"], 0) or 0,
+            started_at=_int_val(row["started_at"]),
+            completed_at=_int_val(row["completed_at"]),
+            workspace_kind=(_str_val(row["workspace_kind"]) or "scratch") if "workspace_kind" in keys else "scratch",
+            workspace_path=_str_val(row["workspace_path"]) if "workspace_path" in keys else None,
+            branch_name=_str_val(row["branch_name"]) if "branch_name" in keys else None,
+            project_id=_str_val(row["project_id"]) if "project_id" in keys else None,
+            claim_lock=_str_val(row["claim_lock"]),
+            claim_expires=_int_val(row["claim_expires"]),
+            tenant=_str_val(row["tenant"]) if "tenant" in keys else None,
+            result=_str_val(row["result"]) if "result" in keys else None,
+            idempotency_key=_str_val(row["idempotency_key"]) if "idempotency_key" in keys else None,
             consecutive_failures=(
-                row["consecutive_failures"] if "consecutive_failures" in keys
+                _int_val(row["consecutive_failures"], 0) or 0 if "consecutive_failures" in keys
                 # Pre-migration fallback: ``_migrate_add_optional_columns`` always
                 # adds ``consecutive_failures`` now, so this branch is only reachable
                 # on a DB that was never opened since pre-#20410 code ran. Keep for
                 # belt-and-suspenders safety; in practice it is dead code post-migration.
-                else (row["spawn_failures"] if "spawn_failures" in keys else 0)
+                else (_int_val(row["spawn_failures"], 0) or 0 if "spawn_failures" in keys else 0)
             ),
-            worker_pid=row["worker_pid"] if "worker_pid" in keys else None,
+            worker_pid=_int_val(row["worker_pid"]) if "worker_pid" in keys else None,
             last_failure_error=(
-                row["last_failure_error"] if "last_failure_error" in keys
+                _str_val(row["last_failure_error"]) if "last_failure_error" in keys
                 # Same belt-and-suspenders fallback as consecutive_failures above.
-                else (row["last_spawn_error"] if "last_spawn_error" in keys else None)
+                else (_str_val(row["last_spawn_error"]) if "last_spawn_error" in keys else None)
             ),
             max_runtime_seconds=(
-                row["max_runtime_seconds"] if "max_runtime_seconds" in keys else None
+                _int_val(row["max_runtime_seconds"]) if "max_runtime_seconds" in keys else None
             ),
             last_heartbeat_at=(
-                row["last_heartbeat_at"] if "last_heartbeat_at" in keys else None
+                _int_val(row["last_heartbeat_at"]) if "last_heartbeat_at" in keys else None
             ),
             current_run_id=(
-                row["current_run_id"] if "current_run_id" in keys else None
+                _int_val(row["current_run_id"]) if "current_run_id" in keys else None
             ),
             workflow_template_id=(
-                row["workflow_template_id"] if "workflow_template_id" in keys else None
+                _str_val(row["workflow_template_id"]) if "workflow_template_id" in keys else None
             ),
             current_step_key=(
-                row["current_step_key"] if "current_step_key" in keys else None
+                _str_val(row["current_step_key"]) if "current_step_key" in keys else None
             ),
             skills=skills_value,
-            model_override=row["model_override"] if "model_override" in keys and row["model_override"] else None,
+            model_override=_str_val(row["model_override"]) if "model_override" in keys and row["model_override"] else None,
             provider_override=(
-                row["provider_override"]
+                _str_val(row["provider_override"])
                 if "provider_override" in keys and row["provider_override"]
                 else None
             ),
             reasoning_effort=(
-                row["reasoning_effort"]
+                _str_val(row["reasoning_effort"])
                 if "reasoning_effort" in keys and row["reasoning_effort"]
                 else None
             ),
             max_retries=(
-                row["max_retries"] if "max_retries" in keys else None
+                _int_val(row["max_retries"]) if "max_retries" in keys else None
             ),
             goal_mode=(
-                bool(row["goal_mode"]) if "goal_mode" in keys and row["goal_mode"] else False
+                _bool_val(row["goal_mode"]) if "goal_mode" in keys and row["goal_mode"] else False
             ),
             goal_max_turns=(
-                row["goal_max_turns"] if "goal_max_turns" in keys and row["goal_max_turns"] else None
+                _int_val(row["goal_max_turns"]) if "goal_max_turns" in keys and row["goal_max_turns"] else None
             ),
             session_id=(
-                row["session_id"] if "session_id" in keys else None
+                _str_val(row["session_id"]) if "session_id" in keys else None
             ),
             block_kind=(
-                row["block_kind"] if "block_kind" in keys and row["block_kind"] else None
+                _str_val(row["block_kind"]) if "block_kind" in keys and row["block_kind"] else None
             ),
             block_recurrences=(
-                int(row["block_recurrences"])
+                _int_val(row["block_recurrences"], 0) or 0
                 if "block_recurrences" in keys and row["block_recurrences"] is not None
                 else 0
             ),
@@ -3644,6 +3672,15 @@ def get_task(conn: sqlite3.Connection, task_id: str) -> Optional[Task]:
     return Task.from_row(row) if row else None
 
 
+def _text_value(value: Any) -> Optional[str]:
+    """Return a stable text representation for weakly typed SQLite cells."""
+    if value is None:
+        return None
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    return str(value)
+
+
 # Canonical sort-order mappings for ``hermes kanban list --sort``.
 # Each value is a raw SQL fragment appended after ``ORDER BY``.
 VALID_SORT_ORDERS: dict[str, str] = {
@@ -3674,27 +3711,27 @@ def list_tasks(
     query = "SELECT * FROM tasks WHERE 1=1"
     params: list[Any] = []
     if assignee is not None:
-        query += " AND assignee = ?"
+        query += " AND CAST(assignee AS TEXT) = ?"
         params.append(_canonical_assignee(assignee))
     if status is not None:
         if status not in VALID_STATUSES:
             raise ValueError(f"status must be one of {sorted(VALID_STATUSES)}")
-        query += " AND status = ?"
+        query += " AND CAST(status AS TEXT) = ?"
         params.append(status)
     if tenant is not None:
-        query += " AND tenant = ?"
+        query += " AND CAST(tenant AS TEXT) = ?"
         params.append(tenant)
     if session_id is not None:
-        query += " AND session_id = ?"
+        query += " AND CAST(session_id AS TEXT) = ?"
         params.append(session_id)
     if workflow_template_id is not None:
-        query += " AND workflow_template_id = ?"
+        query += " AND CAST(workflow_template_id AS TEXT) = ?"
         params.append(workflow_template_id)
     if current_step_key is not None:
-        query += " AND current_step_key = ?"
+        query += " AND CAST(current_step_key AS TEXT) = ?"
         params.append(current_step_key)
     if not include_archived and status != "archived":
-        query += " AND status != 'archived'"
+        query += " AND CAST(status AS TEXT) != 'archived'"
     if order_by is not None:
         order_by = order_by.strip().lower()
         if order_by not in VALID_SORT_ORDERS:
@@ -9742,7 +9779,7 @@ def count_running_tasks(conn: sqlite3.Connection) -> int:
     try:
         return int(
             conn.execute(
-                "SELECT COUNT(*) FROM tasks WHERE status = 'running'"
+                "SELECT COUNT(*) FROM tasks WHERE CAST(status AS TEXT) = 'running'"
             ).fetchone()[0]
         )
     except Exception:
@@ -11270,21 +11307,23 @@ def board_stats(conn: sqlite3.Connection) -> dict:
     """
     by_status: dict[str, int] = {}
     for row in conn.execute(
-        "SELECT status, COUNT(*) AS n FROM tasks "
-        "WHERE status != 'archived' GROUP BY status"
+        "SELECT CAST(status AS TEXT) AS status, COUNT(*) AS n FROM tasks "
+        "WHERE CAST(status AS TEXT) != 'archived' GROUP BY CAST(status AS TEXT)"
     ):
-        by_status[row["status"]] = int(row["n"])
+        by_status[_text_value(row["status"]) or ""] = int(row["n"])
 
     by_assignee: dict[str, dict[str, int]] = {}
     for row in conn.execute(
-        "SELECT assignee, status, COUNT(*) AS n FROM tasks "
-        "WHERE status != 'archived' AND assignee IS NOT NULL "
-        "GROUP BY assignee, status"
+        "SELECT CAST(assignee AS TEXT) AS assignee, CAST(status AS TEXT) AS status, COUNT(*) AS n FROM tasks "
+        "WHERE CAST(status AS TEXT) != 'archived' AND assignee IS NOT NULL "
+        "GROUP BY CAST(assignee AS TEXT), CAST(status AS TEXT)"
     ):
-        by_assignee.setdefault(row["assignee"], {})[row["status"]] = int(row["n"])
+        a_key = _text_value(row["assignee"]) or ""
+        s_key = _text_value(row["status"]) or ""
+        by_assignee.setdefault(a_key, {})[s_key] = int(row["n"])
 
     oldest_row = conn.execute(
-        "SELECT MIN(created_at) AS ts FROM tasks WHERE status = 'ready'"
+        "SELECT MIN(created_at) AS ts FROM tasks WHERE CAST(status AS TEXT) = 'ready'"
     ).fetchone()
     now = int(time.time())
     oldest_ready_age = (
@@ -11970,7 +12009,7 @@ def read_worker_log(
 # ---------------------------------------------------------------------------
 
 def list_profiles_on_disk() -> list[str]:
-    """Return the set of assignee/profile names discovered on disk.
+    """Return the set of live (non-tombstoned) assignee/profile names discovered on disk.
 
     Includes:
     - named profiles under ``<default-root>/profiles/<name>/config.yaml``
@@ -11981,7 +12020,7 @@ def list_profiles_on_disk() -> list[str]:
     path).
     """
     try:
-        from hermes_constants import get_default_hermes_root
+        from hermes_constants import get_default_hermes_root, named_profile_is_deleted
         default_root = get_default_hermes_root()
         profiles_dir = default_root / "profiles"
     except Exception:
@@ -11995,6 +12034,8 @@ def list_profiles_on_disk() -> list[str]:
         try:
             for entry in sorted(profiles_dir.iterdir()):
                 if not entry.is_dir():
+                    continue
+                if named_profile_is_deleted(entry):
                     continue
                 if (entry / "config.yaml").is_file():
                     names.add(entry.name)

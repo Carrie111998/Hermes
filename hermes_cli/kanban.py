@@ -57,7 +57,20 @@ def _fmt_task_line(t: kb.Task) -> str:
 
 
 def _task_to_dict(t: kb.Task) -> dict[str, Any]:
-    return {
+    def _coerce_json_safe(val: Any) -> Any:
+        if val is None:
+            return None
+        if isinstance(val, bytes):
+            return val.decode("utf-8", errors="replace")
+        if isinstance(val, (int, float, bool, str)):
+            return val
+        if isinstance(val, (list, tuple, set)):
+            return [_coerce_json_safe(item) for item in val]
+        if isinstance(val, dict):
+            return {str(k): _coerce_json_safe(v) for k, v in val.items()}
+        return str(val)
+
+    raw_dict = {
         "id": t.id,
         "title": t.title,
         "body": t.body,
@@ -82,6 +95,7 @@ def _task_to_dict(t: kb.Task) -> dict[str, Any]:
         "workflow_template_id": t.workflow_template_id,
         "current_step_key": t.current_step_key,
     }
+    return {k: _coerce_json_safe(v) for k, v in raw_dict.items()}
 
 
 def _run_state_kwargs(args: argparse.Namespace) -> Optional[dict[str, str]]:
@@ -1322,7 +1336,7 @@ def _board_task_counts(slug: str) -> dict[str, int]:
             return {}
         with kb.connect_closing(board=slug) as conn:
             rows = conn.execute(
-                "SELECT status, COUNT(*) AS n FROM tasks GROUP BY status"
+                "SELECT CAST(status AS TEXT) AS status, COUNT(*) AS n FROM tasks GROUP BY CAST(status AS TEXT)"
             ).fetchall()
         return {r["status"]: int(r["n"]) for r in rows}
     except Exception:

@@ -1172,6 +1172,89 @@ def test_diagnostics_endpoint_surfaces_blocked_hallucination(client):
     assert "t_ffff00001234" in row["diagnostics"][0]["data"]["phantom_ids"]
 
 
+def test_diagnostics_endpoint_surfaces_role_assignee_mismatch_and_reassign_clears_it(client, kanban_home):
+    """Task with role prefix gets suggested_assignee in diagnostic action;
+    reassigning to suggested assignee updates durable state and clears the diagnostic."""
+    # Ensure coder profile exists on disk so it is recognized as spawnable
+    coder_dir = kanban_home / "profiles" / "coder"
+    coder_dir.mkdir(parents=True, exist_ok=True)
+    (coder_dir / "config.yaml").write_text("model: test\n")
+
+    conn = kb.connect()
+    try:
+        t = kb.create_task(conn, title="Coder: fix bug", assignee="reviewer")
+    finally:
+        conn.close()
+
+    r = client.get("/api/plugins/kanban/diagnostics")
+    assert r.status_code == 200
+    data = r.json()
+    mismatch_rows = [row for row in data["diagnostics"] if row["task_id"] == t]
+    assert len(mismatch_rows) == 1
+    diag = mismatch_rows[0]["diagnostics"][0]
+    assert diag["kind"] == "role_assignee_mismatch"
+    reassign_actions = [a for a in diag["actions"] if a["kind"] == "reassign"]
+    assert len(reassign_actions) == 1
+    suggested = reassign_actions[0]["payload"]["suggested_assignee"]
+    assert suggested == "coder"
+
+    # Verify assignees endpoint contains suggested coder profile
+    assignees_r = client.get("/api/plugins/kanban/assignees")
+    assert assignees_r.status_code == 200
+    names = [a["name"] for a in assignees_r.json().get("assignees", [])]
+    assert "coder" in names
+
+    # Send the reassign action POST payload to the API
+    post_r = client.post(
+        f"/api/plugins/kanban/tasks/{t}/reassign",
+        json={"profile": suggested, "reason": f"recovery action for {diag['kind']}"},
+    )
+    assert post_r.status_code == 200, post_r.text
+    assert post_r.json()["assignee"] == "coder"
+
+    # Re-check diagnostics -- warning should now be cleared
+    r2 = client.get("/api/plugins/kanban/diagnostics")
+    assert r2.status_code == 200
+    mismatch_rows2 = [row for row in r2.json()["diagnostics"] if row["task_id"] == t]
+    assert len(mismatch_rows2) == 0
+
+
+def test_diagnostics_endpoint_with_explicit_config_tombstone_suppresses_suggested_reassign(client, kanban_home):
+    """When runtime config contains explicit `profiles: [ghost]` but ghost is tombstoned on disk,
+    the diagnostics endpoint emits advisory role mismatch without suggested reassign actions."""
+    from hermes_constants import mark_named_profile_deleted
+    import yaml
+
+    # Write config with explicit profiles
+    cfg_data = {"profiles": ["ghost", "reviewer"]}
+    (kanban_home / "config.yaml").write_text(yaml.dump(cfg_data))
+
+    # Create tombstoned ghost profile directory
+    ghost_dir = kanban_home / "profiles" / "ghost"
+    ghost_dir.mkdir(parents=True, exist_ok=True)
+    (ghost_dir / "config.yaml").write_text("model: ghost-test\n")
+    mark_named_profile_deleted(ghost_dir)
+
+    conn = kb.connect()
+    try:
+        t = kb.create_task(conn, title="Ghost: cleanup memory", assignee="reviewer")
+    finally:
+        conn.close()
+
+    r = client.get("/api/plugins/kanban/diagnostics")
+    assert r.status_code == 200
+    data = r.json()
+    mismatch_rows = [row for row in data["diagnostics"] if row["task_id"] == t]
+    assert len(mismatch_rows) == 1
+    diag = mismatch_rows[0]["diagnostics"][0]
+    assert diag["kind"] == "role_assignee_mismatch"
+    suggested_actions = [a for a in diag.get("actions", []) if a.get("suggested")]
+    assert len(suggested_actions) == 0, f"Expected 0 suggested actions for dead ghost, got {suggested_actions}"
+    reassign_actions = [a for a in diag.get("actions", []) if a.get("kind") == "reassign"]
+    assert len(reassign_actions) == 0, f"Expected 0 reassign actions for dead ghost, got {reassign_actions}"
+
+
+
 # ---------------------------------------------------------------------------
 # POST /tasks/:id/specify — triage specifier endpoint
 # ---------------------------------------------------------------------------

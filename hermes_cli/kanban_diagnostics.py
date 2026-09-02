@@ -32,7 +32,9 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Callable, Iterable, Optional
 import json
+import re
 import time
+
 
 
 # Severity rungs, ordered least → most urgent. The UI colors them
@@ -1078,6 +1080,175 @@ def _rule_stranded_in_ready(task, events, runs, now, cfg) -> list[Diagnostic]:
     )]
 
 
+COMMON_ROLE_PREFIXES = frozenset({
+    "coder",
+    "reviewer",
+    "devops",
+    "architect",
+    "planner",
+    "researcher",
+    "scribe",
+    "specifier",
+    "synthesizer",
+    "debugger",
+    "qa",
+    "worker",
+    "orchestrator",
+})
+
+_ROLE_PREFIX_PATTERN = re.compile(
+    r"^\s*(?:\[(?P<bracket_role>[A-Za-z0-9_-]+)\]\s*[:\uFF1A]?|(?P<colon_role>[A-Za-z0-9_-]+)\s*[:\uFF1A])",
+    re.UNICODE,
+)
+
+
+def _discover_installed_profiles() -> set[str]:
+    """Discover live (non-tombstoned) installed profile names from disk."""
+    profiles: set[str] = set()
+    try:
+        from hermes_cli.profiles import list_profile_names, profile_exists
+        for p in list_profile_names():
+            s = str(p).strip().lower()
+            if s and profile_exists(s):
+                profiles.add(s)
+    except Exception:
+        pass
+    try:
+        from hermes_cli.kanban_db import list_profiles_on_disk
+        from hermes_cli.profiles import profile_exists
+        for p in list_profiles_on_disk():
+            s = str(p).strip().lower()
+            if s and profile_exists(s):
+                profiles.add(s)
+    except Exception:
+        pass
+    return profiles
+
+
+def _rule_role_assignee_mismatch(task, events, runs, now, cfg) -> list[Diagnostic]:
+    """Detect when a recognized role prefix in the title disagrees with the task's assignee.
+
+    For example, a title starting with 'Coder:' assigned to 'reviewer'.
+    Emits an advisory warning so operators can reassign the task or update
+    the title, without blocking task creation or execution.
+    """
+    if _task_field(task, "status") in ("done", "archived"):
+        return []
+
+    title = str(_task_field(task, "title") or "").strip()
+    assignee = str(_task_field(task, "assignee") or "").strip()
+    if not title or not assignee:
+        return []
+
+    m = _ROLE_PREFIX_PATTERN.match(title)
+    if not m:
+        return []
+
+    role_prefix = m.group("bracket_role") or m.group("colon_role")
+    if not role_prefix:
+        return []
+
+    role_norm = role_prefix.strip().lower()
+
+    # Recognized roles: common prefix vocabulary + on-disk profile directories + configured profiles
+    recognized_roles: set[str] = set(COMMON_ROLE_PREFIXES)
+    try:
+        from hermes_cli.profiles import list_profile_names
+        for p in list_profile_names():
+            s = str(p).strip().lower()
+            if s:
+                recognized_roles.add(s)
+    except Exception:
+        pass
+    try:
+        from hermes_cli.kanban_db import list_profiles_on_disk
+        for p in list_profiles_on_disk():
+            s = str(p).strip().lower()
+            if s:
+                recognized_roles.add(s)
+    except Exception:
+        pass
+
+    configured_profiles: set[str] = set()
+    if isinstance(cfg, dict) and "profiles" in cfg:
+        profiles_cfg = cfg.get("profiles")
+        if isinstance(profiles_cfg, (list, set, tuple, dict)):
+            for p in profiles_cfg:
+                try:
+                    s = str(p).strip().lower()
+                    if s:
+                        configured_profiles.add(s)
+                        recognized_roles.add(s)
+                except Exception:
+                    continue
+
+    if role_norm not in recognized_roles:
+        return []
+
+    if role_norm == assignee.lower():
+        return []
+
+    # Actionable target: must be a live (non-tombstoned) profile verified via profile_exists
+    installed_profiles = _discover_installed_profiles()
+    try:
+        from hermes_cli.profiles import profile_exists
+        for p in configured_profiles:
+            if profile_exists(p):
+                installed_profiles.add(p)
+        is_spawnable = (role_norm in installed_profiles) and profile_exists(role_norm)
+    except Exception:
+        is_spawnable = role_norm in installed_profiles
+    task_id = str(_task_field(task, "id") or "")
+    actions: list[DiagnosticAction] = []
+    if is_spawnable:
+        actions.append(
+            DiagnosticAction(
+                kind="reassign",
+                label=f"Reassign to @{role_norm}",
+                payload={"suggested_assignee": role_norm, "current_assignee": assignee},
+                suggested=True,
+            )
+        )
+        if task_id:
+            actions.append(
+                DiagnosticAction(
+                    kind="cli_hint",
+                    label=f"Reassign via CLI: hermes kanban assign {task_id} {role_norm}",
+                    payload={"command": f"hermes kanban assign {task_id} {role_norm}"},
+                )
+            )
+
+    detail = (
+        f"Task title begins with role prefix '{role_prefix}', but is currently "
+        f"assigned to '{assignee}'. If this task belongs to the {role_prefix} role, "
+        f"reassign it to @{role_norm}; otherwise update the title to avoid confusion."
+        if is_spawnable
+        else (
+            f"Task title begins with role prefix '{role_prefix}', but is currently "
+            f"assigned to '{assignee}'. Profile '{role_norm}' is not currently installed; "
+            f"update the title or install the profile to avoid confusion."
+        )
+    )
+
+    return [
+        Diagnostic(
+            kind="role_assignee_mismatch",
+            severity="warning",
+            title=f"Title role prefix '{role_prefix}' mismatches assignee '{assignee}'",
+            detail=detail,
+            actions=actions,
+            first_seen_at=now,
+            last_seen_at=now,
+            count=1,
+            data={
+                "role_prefix": role_prefix,
+                "expected_assignee": role_norm,
+                "actual_assignee": assignee,
+            },
+        )
+    ]
+
+
 # Registry — order matters: rules higher on the list render first when
 # severity ties. Add new rules here.
 _RULES: list[RuleFn] = [
@@ -1090,6 +1261,7 @@ _RULES: list[RuleFn] = [
     _rule_stuck_in_blocked,
     _rule_block_unblock_cycling,
     _rule_stranded_in_ready,
+    _rule_role_assignee_mismatch,
 ]
 
 
@@ -1105,6 +1277,7 @@ DIAGNOSTIC_KINDS = (
     "stuck_in_blocked",
     "block_unblock_cycling",
     "stranded_in_ready",
+    "role_assignee_mismatch",
 )
 
 
@@ -1161,7 +1334,7 @@ def config_from_runtime_config(raw_config: Optional[dict]) -> dict:
     if isinstance(kanban_cfg, dict):
         cfg.update(config_from_kanban_config(kanban_cfg))
         cfg["kanban"] = kanban_cfg
-    for key in ("auxiliary", "model"):
+    for key in ("auxiliary", "model", "profiles"):
         value = raw_config.get(key)
         if value is not None:
             cfg[key] = value
