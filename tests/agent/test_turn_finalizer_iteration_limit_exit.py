@@ -128,6 +128,24 @@ def _finalize(
 
 
 
+def test_blank_response_at_iteration_limit_requests_summary(monkeypatch):
+    """A prior empty completion must not suppress the limit fallback."""
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
+    agent = _LimitAgent(budget_remaining=182)
+
+    result = _finalize(
+        agent,
+        final_response="",
+        exit_reason="unknown",
+    )
+
+    assert agent._handle_max_iterations_called is True
+    assert result["final_response"] == "summary from extra call"
+    assert result["turn_exit_reason"] == "max_iterations_reached(60/60)"
+    assert result["turn_exit_kind"] == "max_iterations"
+    assert result["completed"] is False
+
+
 @pytest.mark.parametrize(
     ("exit_reason", "interrupted", "failed"),
     [

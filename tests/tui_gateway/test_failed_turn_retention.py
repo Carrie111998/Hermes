@@ -171,6 +171,75 @@ def test_returned_error_result_retains_snapshot_and_emits_terminal_frame(
     assert session["running"] is False
 
 
+def test_iteration_limit_result_is_not_reported_as_complete(emits, turn_env):
+    summary = "I reached the iteration limit while still working."
+    agent = types.SimpleNamespace(
+        session_id="session-key",
+        run_conversation=lambda *a, **k: {
+            "final_response": summary,
+            "completed": False,
+            "failed": False,
+            # The machine-readable kind remains authoritative even if the
+            # diagnostic reason's presentation changes.
+            "turn_exit_reason": "iteration_budget_exhausted(240/240)",
+            "turn_exit_kind": "max_iterations",
+        },
+        clear_interrupt=lambda: None,
+    )
+    session = _session(agent=agent, running=True)
+    server._start_inflight_turn(session, "do the thing")
+
+    server._run_prompt_submit("rid", "sid", session, "do the thing")
+
+    payload = _events(emits, "message.complete")[0]
+    assert payload["text"] == summary
+    assert payload["status"] == "error"
+    assert payload["error"] == summary
+    assert payload["recoverable"] is True
+    assert payload["incomplete_reason"] == "max_iterations"
+
+    snapshot = server._inflight_snapshot(session)
+    assert snapshot is not None
+    assert snapshot["status"] == "error"
+    assert snapshot["error"] == summary
+    assert snapshot["incomplete_reason"] == "max_iterations"
+
+
+@pytest.mark.parametrize(
+    ("turn_exit_kind", "expected_status"),
+    [
+        (None, "error"),
+        ("text_response", "complete"),
+    ],
+)
+def test_iteration_limit_legacy_reason_only_falls_back_when_kind_is_absent(
+    emits, turn_env, turn_exit_kind, expected_status
+):
+    result = {
+        "final_response": "terminal text",
+        "completed": False,
+        "failed": False,
+        "turn_exit_reason": "max_iterations_reached(240/240)",
+    }
+    if turn_exit_kind is not None:
+        result["turn_exit_kind"] = turn_exit_kind
+    agent = types.SimpleNamespace(
+        session_id="session-key",
+        run_conversation=lambda *a, **k: result,
+        clear_interrupt=lambda: None,
+    )
+    session = _session(agent=agent, running=True)
+    server._start_inflight_turn(session, "do the thing")
+
+    server._run_prompt_submit("rid", "sid", session, "do the thing")
+
+    payload = _events(emits, "message.complete")[0]
+    assert payload["status"] == expected_status
+    assert (payload.get("incomplete_reason") == "max_iterations") is (
+        expected_status == "error"
+    )
+
+
 def test_returned_error_result_carries_error_surface(emits, turn_env):
     """A classified failure_reason rides the terminal frame AND the retained
     snapshot as a structured {layer, code, retryable} descriptor, so the
