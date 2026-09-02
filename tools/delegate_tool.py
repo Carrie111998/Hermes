@@ -1232,6 +1232,7 @@ def _build_child_system_prompt(
     context: Optional[str] = None,
     *,
     workspace_path: Optional[str] = None,
+    context_length: Optional[int] = None,
     role: str = "leaf",
     max_spawn_depth: int = 2,
     child_depth: int = 1,
@@ -1272,7 +1273,9 @@ def _build_child_system_prompt(
             from agent.prompt_builder import build_context_files_prompt
 
             _ctx_files = build_context_files_prompt(
-                cwd=str(workspace_path), skip_soul=True
+                cwd=str(workspace_path),
+                skip_soul=True,
+                context_length=context_length,
             )
         except Exception:
             logger.debug(
@@ -1331,6 +1334,38 @@ def _build_child_system_prompt(
             f"is capped at max_spawn_depth={max_spawn_depth}. {child_note}"
         )
     return "\n".join(parts)
+
+
+def _resolve_child_prompt_context_length(
+    child: Any,
+    *,
+    model: str,
+    provider: Optional[str],
+    base_url: Optional[str],
+    api_key: Optional[str],
+) -> Optional[int]:
+    """Best-effort resolve the context window used for child project files."""
+    compressor = getattr(child, "context_compressor", None)
+    compressor_length = getattr(compressor, "context_length", None)
+    if type(compressor_length) is int and compressor_length > 0:
+        return compressor_length
+
+    try:
+        from agent.model_metadata import get_model_context_length
+
+        metadata_length = get_model_context_length(
+            model,
+            base_url=base_url or "",
+            api_key=api_key or "",
+            provider=provider or "",
+        )
+        if type(metadata_length) is int and metadata_length > 0:
+            return metadata_length
+    except Exception:
+        logger.debug(
+            "subagent: child prompt context-length resolution failed", exc_info=True
+        )
+    return None
 
 
 def _resolve_workspace_hint(parent_agent) -> Optional[str]:
@@ -1857,10 +1892,11 @@ def _build_child_agent(
         child_toolsets.append("delegation")
 
     workspace_hint = _resolve_workspace_hint(parent_agent)
+    # Bootstrap construction with only role/task semantics. Workspace context
+    # is loaded once, after AIAgent has resolved the child's actual window.
     child_prompt = _build_child_system_prompt(
         goal,
         context,
-        workspace_path=workspace_hint,
         role=effective_role,
         max_spawn_depth=max_spawn,
         child_depth=child_depth,
@@ -2162,6 +2198,26 @@ def _build_child_agent(
                 except Exception:
                     pass
             raise
+    child_prompt_context_length = _resolve_child_prompt_context_length(
+        child,
+        model=effective_model,
+        provider=effective_provider,
+        base_url=effective_base_url,
+        api_key=effective_api_key,
+    )
+    setattr(
+        child,
+        "ephemeral_system_prompt",
+        _build_child_system_prompt(
+            goal,
+            context,
+            workspace_path=workspace_hint,
+            context_length=child_prompt_context_length,
+            role=effective_role,
+            max_spawn_depth=max_spawn,
+            child_depth=child_depth,
+        ),
+    )
     child._print_fn = getattr(parent_agent, "_print_fn", None)
     # Ownership transfer for the dedicated handle: the child's close() must
     # release it (nothing else holds a reference), and no parent teardown can
