@@ -1059,6 +1059,55 @@ class TestConnectionConfigResolution(unittest.TestCase):
                 self.assertFalse(check_email_requirements())
 
 
+class TestAuthservIdDefault(unittest.TestCase):
+    """_authserv_id defaults to the From-domain of the agent's own address when
+    neither the config key nor EMAIL_AUTHSERV_ID is set (#98599).
+
+    The comment above the assignment documents this fallback; an empty value
+    silently disables Authentication-Results pinning, making the adapter trust
+    the topmost header even when it was injected by an attacker.
+    """
+
+    def _make_adapter(self, address="hermes@example.com", extra=None, authserv_env=None):
+        from gateway.config import PlatformConfig
+
+        with patch.dict(os.environ, {
+            "EMAIL_ADDRESS": address,
+            "EMAIL_PASSWORD": "secret",
+            "EMAIL_IMAP_HOST": "imap.example.com",
+            "EMAIL_SMTP_HOST": "smtp.example.com",
+        }, clear=False):
+            if authserv_env is None:
+                # Ensure the fallback path is exercised: no EMAIL_AUTHSERV_ID.
+                os.environ.pop("EMAIL_AUTHSERV_ID", None)
+            else:
+                os.environ["EMAIL_AUTHSERV_ID"] = authserv_env
+            from plugins.platforms.email.adapter import EmailAdapter
+
+            return EmailAdapter(PlatformConfig(enabled=True, extra=extra or {}))
+
+    def test_defaults_to_from_domain(self):
+        """No config key and no env var: pin to the agent's own From-domain."""
+        adapter = self._make_adapter()
+        self.assertEqual(adapter._authserv_id, "example.com")
+
+    def test_config_key_wins_over_default(self):
+        """An explicit authserv_id in config.yaml overrides the From-domain."""
+        adapter = self._make_adapter(extra={"authserv_id": "mx.operator.net"})
+        self.assertEqual(adapter._authserv_id, "mx.operator.net")
+
+    def test_env_wins_over_default(self):
+        """EMAIL_AUTHSERV_ID overrides the From-domain fallback."""
+        adapter = self._make_adapter(authserv_env="mx.operator.net")
+        self.assertEqual(adapter._authserv_id, "mx.operator.net")
+
+    def test_empty_address_keeps_empty_authserv_id(self):
+        """No derivable domain (no '@' in the address) must not fabricate a
+        pinning value — behavior stays identical to the pre-fix default."""
+        adapter = self._make_adapter(address="not-an-email")
+        self.assertEqual(adapter._authserv_id, "")
+
+
 class TestSenderAuthentication(unittest.TestCase):
     """Verify _verify_sender_authentication parses Authentication-Results
     correctly and resists From: spoofing (GHSA-rxqh-5572-8m77)."""
