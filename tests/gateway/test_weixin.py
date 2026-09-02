@@ -72,6 +72,30 @@ class TestWeixinFormatting:
         assert " ".join(formatted.split()) == " ".join(content.split())
 
 
+    @pytest.mark.parametrize("marker", ["- ", "10. "])
+    def test_format_message_leaves_long_list_items_for_native_client_wrapping(
+        self, marker
+    ):
+        adapter = _make_adapter()
+        content = marker + " ".join(
+            f"knowledge-base-detail-{index}" for index in range(18)
+        )
+
+        assert adapter.format_message(content) == content
+
+    def test_format_message_leaves_long_cjk_prose_for_native_client_wrapping(self):
+        adapter = _make_adapter()
+        content = (
+            "Meta 设计并开源了 MetaRoCE，一个专为 AI 工作负载在通用以太网上打造的 "
+            "RDMA 传输协议，已通过 Open Compute Project（OCP）发布规范、参考软件实现和"
+            "合规测试套件。现有 RDMA Verbs API 和软件栈无需修改即可运行，并可用于规划"
+            "大规模 GPU 集群。"
+        )
+
+        assert len(content) > weixin.WEIXIN_COPY_LINE_WIDTH
+        assert adapter.format_message(content) == content
+
+
 class TestWeixinChunking:
 
 
