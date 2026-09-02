@@ -119,6 +119,45 @@ class TestNonTTYFlow:
             )
         assert registered == []
 
+    def test_no_tty_fail_closed_hook_blocks_without_running_unapproved_command(
+        self, tmp_path,
+    ):
+        from hermes_cli import plugins
+
+        marker = tmp_path / "hook-ran"
+        script = tmp_path / "hook.sh"
+        script.write_text(
+            "#!/usr/bin/env bash\n"
+            f"touch {marker}\n"
+            "printf '{}\\n'\n"
+        )
+        script.chmod(0o755)
+        plugins._plugin_manager = plugins.PluginManager()
+
+        cfg = {
+            "hooks": {
+                "pre_tool_call": [{
+                    "matcher": "terminal",
+                    "command": str(script),
+                    "fail_closed": True,
+                }],
+            },
+        }
+        with patch("sys.stdin") as mock_stdin:
+            mock_stdin.isatty.return_value = False
+            registered = shell_hooks.register_from_config(
+                cfg, accept_hooks=False,
+            )
+
+        assert len(registered) == 1
+        assert plugins.get_pre_tool_call_block_message(
+            tool_name="terminal", args={"command": "echo unsafe"},
+        ) == f"hook {script} failed closed: not allowlisted"
+        assert plugins.get_pre_tool_call_block_message(
+            tool_name="web_search", args={"query": "safe"},
+        ) is None
+        assert not marker.exists()
+
 
     def test_no_tty_with_env_accepts(self, tmp_path, monkeypatch):
         from hermes_cli import plugins
