@@ -1766,16 +1766,20 @@ tool_loop_guardrails:
     exact_failure: 2           # identical failing call repeated N times
     same_tool_failure: 3       # same tool failing N times (different args)
     idempotent_no_progress: 2  # same result, no progress, N times
+    mutating_no_progress: 4    # same for a write — looser, it may be polling
   hard_stop_after:
     exact_failure: 5
     same_tool_failure: 8
     idempotent_no_progress: 5
+    mutating_no_progress: 12
   loop_caps:
     max_web_searches: 50       # max web_search calls per turn (0 = unlimited)
     max_subagents: 50          # max subagents spawned per turn (0 = unlimited)
 ```
 
 `hard_stop_enabled` defaults to `false` because interactive sessions have a human in the loop. In unattended deployments (gateway, cron, kanban workers) set it to `true` so repeated failures are blocked rather than only warned. See also [Docker / unattended deployments](docker.md).
+
+The no-progress detector has two thresholds because a repeated write is a weaker signal than a repeated read: it may legitimately be polling something external, so `mutating_no_progress` sits well above `idempotent_no_progress`. Which one applies to a `terminal` call is decided by the command, not the tool name — a read-only command (`git status`, `gh pr view`, `ls`) is held to the idempotent thresholds, and anything that may write falls back to the mutating ones. Raise `idempotent_no_progress` if your workloads include long `sleep`-then-poll waits whose output stays byte-identical.
 
 ### Per-turn runaway-loop caps
 

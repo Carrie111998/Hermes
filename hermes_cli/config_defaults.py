@@ -821,15 +821,21 @@ DEFAULT_CONFIG = {
     "tool_loop_guardrails": {
         "warnings_enabled": True,
         "hard_stop_enabled": False,
+        # A mutating call repeating byte-identical args AND output is also
+        # making no progress, just with a weaker signal than a read (a write
+        # can legitimately be retried while waiting on something external),
+        # so its thresholds are deliberately looser than the idempotent ones.
         "warn_after": {
             "exact_failure": 2,
             "same_tool_failure": 3,
             "idempotent_no_progress": 2,
+            "mutating_no_progress": 4,
         },
         "hard_stop_after": {
             "exact_failure": 5,
             "same_tool_failure": 8,
             "idempotent_no_progress": 5,
+            "mutating_no_progress": 12,
         },
         # Per-turn runaway-loop caps (inspired by Claude Code v2.1.212,
         # Week 29, July 2026). Hard ceilings on how many times a runaway-prone
