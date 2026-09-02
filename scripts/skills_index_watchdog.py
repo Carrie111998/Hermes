@@ -30,7 +30,14 @@ def recovery_action(statuses: Iterable[object]) -> str:
 
 def _run(command: Sequence[str]) -> subprocess.CompletedProcess[str]:
     """Run a GitHub CLI command with captured output for deterministic handling."""
-    return subprocess.run(command, text=True, capture_output=True, check=False)
+    return subprocess.run(
+        command,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        capture_output=True,
+        check=False,
+    )
 
 
 def trigger_recovery(repo: str, workflow: str) -> str:
