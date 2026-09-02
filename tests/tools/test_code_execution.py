@@ -128,6 +128,12 @@ class TestHermesToolsGeneration(unittest.TestCase):
             self.assertIn(f"def {tool}(", src)
 
 
+    def test_terminal_stub_passes_security_risk_annotation(self):
+        src = generate_hermes_tools_module(["terminal"])
+
+        self.assertIn("security_risk: str = None", src)
+        self.assertIn('"security_risk": security_risk', src)
+
     def test_empty_list_generates_nothing(self):
         src = generate_hermes_tools_module([])
         self.assertNotIn("def terminal(", src)

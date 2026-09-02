@@ -3936,6 +3936,7 @@ TERMINAL_CONFIG_ENV_MAP = {
     "cwd": "TERMINAL_CWD",
     "temp_dir": "TERMINAL_TEMP_DIR",
     "timeout": "TERMINAL_TIMEOUT",
+    "confirmation_policy": "TERMINAL_CONFIRMATION_POLICY",
     "lifetime_seconds": "TERMINAL_LIFETIME_SECONDS",
     "docker_image": "TERMINAL_DOCKER_IMAGE",
     "docker_forward_env": "TERMINAL_DOCKER_FORWARD_ENV",

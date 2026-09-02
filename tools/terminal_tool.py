@@ -382,11 +382,13 @@ def _docker_has_host_access(config: Dict[str, Any]) -> bool:
 
 
 def _check_all_guards(command: str, env_type: str,
+                      security_risk: Optional[str] = None,
                       has_host_access: bool = False) -> dict:
     """Delegate to consolidated guard (tirith + dangerous cmd) with CLI callback."""
     return _check_all_guards_impl(command, env_type,
                                   approval_callback=_get_approval_callback(),
-                                  has_host_access=has_host_access)
+                                  has_host_access=has_host_access,
+                                  security_risk=security_risk)
 
 
 # Allowlist: characters that can legitimately appear in directory paths.
@@ -2855,6 +2857,7 @@ def terminal_tool(
     pty: bool = False,
     notify_on_complete: bool = False,
     watch_patterns: Optional[List[str]] = None,
+    security_risk: Optional[str] = None,
     _host_local: bool = False,
 ) -> str:
     """
@@ -2871,6 +2874,8 @@ def terminal_tool(
         pty: If True, use pseudo-terminal for interactive CLI tools (local backend only)
         notify_on_complete: If True and background=True, you'll be notified exactly once when the process exits. The right choice for almost every long task. MUTUALLY EXCLUSIVE with watch_patterns.
         watch_patterns: List of strings to watch for in background output. HARD rate limit: 1 notification per 15s per process. After 3 strike windows in a row — or after a small lifetime cap of delivered matches, however cleanly spaced — watch_patterns is disabled and the session is auto-promoted to notify_on_complete. Use ONLY for rare, one-shot mid-process signals on long-lived processes (server readiness, migration-done markers). NEVER use in loops/batch jobs — error patterns there will hit the strike limit and get disabled. MUTUALLY EXCLUSIVE with notify_on_complete — set one, not both.
+        security_risk: Optional advisory LLM self-annotation: LOW, MEDIUM,
+            HIGH, or UNKNOWN. This is not a security scan.
 
     Returns:
         str: JSON string with output, exit_code, and error fields
@@ -3278,6 +3283,7 @@ def terminal_tool(
         if not force:
             approval = _check_all_guards(
                 command, env_type,
+                security_risk=security_risk,
                 has_host_access=_docker_has_host_access(config),
             )
             if not approval["approved"]:
@@ -4180,6 +4186,24 @@ TERMINAL_SCHEMA = {
                     {"type": "boolean"},
                     {"type": "array", "items": {"type": "string"}}
                 ]
+            },
+            "security_risk": {
+                "type": "string",
+                "enum": ["LOW", "MEDIUM", "HIGH", "UNKNOWN"],
+                "description": (
+                    "Optional but recommended advisory LLM self-annotation for this "
+                    "command's security risk. This is not a security scan or an "
+                    "authoritative safety decision: LOW/MEDIUM are not proof that a "
+                    "command is safe, and deterministic guards still run separately. "
+                    "LOW = read-only or inspection-only commands. MEDIUM = "
+                    "project-scoped changes such as builds, installs, edits, or "
+                    "tests. HIGH = destructive/system-level changes, credential "
+                    "exposure, privileged operations, or data leaving the environment. "
+                    "UNKNOWN = uncertain risk; prefer UNKNOWN over under-classifying. "
+                    "HIGH/UNKNOWN may trigger the existing approval flow depending on "
+                    "terminal.confirmation_policy; trusted environments can set that "
+                    "policy to never while hardline guards still apply."
+                ),
             }
             # Legacy aliases (unadvertised, still accepted): notify_on_complete
             # (bool) and watch_patterns (list). notify=true|[...] maps onto
@@ -4246,6 +4270,7 @@ def _handle_terminal(args, **kw):
         pty=args.get("pty", False),
         notify_on_complete=notify_on_complete,
         watch_patterns=watch_patterns,
+        security_risk=args.get("security_risk"),
     )
 
 

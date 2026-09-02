@@ -3432,6 +3432,71 @@ def _normalize_approval_mode(mode) -> str:
     return "manual"
 
 
+def _normalize_terminal_confirmation_policy(policy) -> str:
+    """Normalize terminal.confirmation_policy / TERMINAL_CONFIRMATION_POLICY."""
+    if isinstance(policy, str):
+        normalized = policy.strip().lower()
+        if normalized in {"never", "risky", "always"}:
+            return normalized
+    return "risky"
+
+
+def _get_terminal_confirmation_policy() -> str:
+    """Read the terminal risk-annotation confirmation policy from env.
+
+    The config bridge sets TERMINAL_CONFIRMATION_POLICY at startup so the
+    hot path does not need to parse config.yaml for every terminal command.
+    """
+    return _normalize_terminal_confirmation_policy(
+        os.getenv("TERMINAL_CONFIRMATION_POLICY", "risky")
+    )
+
+
+def _normalize_security_risk(security_risk) -> Optional[str]:
+    """Normalize optional LLM-provided terminal security_risk annotations."""
+    if security_risk is None:
+        return None
+    if isinstance(security_risk, str):
+        normalized = security_risk.strip().upper()
+        if normalized in {"LOW", "MEDIUM", "HIGH", "UNKNOWN"}:
+            return normalized
+    return "UNKNOWN"
+
+
+def _terminal_policy_key(prefix: str, command: str) -> str:
+    digest = hashlib.sha256((command or "").encode("utf-8", "replace")).hexdigest()
+    return f"terminal:{prefix}:{digest[:16]}"
+
+
+def _security_risk_warning(command: str, security_risk,
+                           confirmation_policy: str) -> tuple[str, str] | None:
+    """Return an advisory approval warning for LLM risk annotations."""
+    normalized_risk = _normalize_security_risk(security_risk)
+
+    if confirmation_policy == "always":
+        return (
+            _terminal_policy_key("always", command),
+            "terminal confirmation policy requires approval for this command",
+        )
+
+    if confirmation_policy != "risky":
+        return None
+
+    # Missing annotation stays backwards-compatible: existing pattern/Tirith
+    # checks remain the fallback. Explicit UNKNOWN/invalid annotations are
+    # treated as uncertain and escalated.
+    if normalized_risk in {"HIGH", "UNKNOWN"}:
+        return (
+            _terminal_policy_key(f"risk:{normalized_risk.lower()}", command),
+            (
+                "LLM self-annotation marked this terminal command "
+                f"{normalized_risk} risk (advisory signal, not a security scan)"
+            ),
+        )
+
+    return None
+
+
 def _get_approval_config() -> dict:
     """Read the approvals config block. Returns a dict with 'mode', 'timeout', etc.
 
@@ -4729,7 +4794,8 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
 
 def check_all_command_guards(command: str, env_type: str,
                              approval_callback=None,
-                             has_host_access: bool = False) -> dict:
+                             has_host_access: bool = False,
+                             security_risk=None) -> dict:
     """Run all pre-exec security checks and return a single approval decision.
 
     Gathers findings from tirith and dangerous-command detection, then
@@ -4775,10 +4841,18 @@ def check_all_command_guards(command: str, env_type: str,
                        deny_pattern, command[:200])
         return _user_deny_block_result(deny_pattern)
 
-    # --yolo or approvals.mode=off: bypass all approval prompts.
+    # --yolo / approvals.mode=off / confirmation_policy=never:
+    # bypass all approval prompts. Hardline and sudo-stdin guards above still
+    # apply because those are unconditional safety floors.
     # Gateway /yolo is session-scoped; CLI --yolo remains process-scoped.
     approval_mode = _get_approval_mode()
-    if _YOLO_MODE_FROZEN or is_current_session_yolo_enabled() or approval_mode == "off":
+    confirmation_policy = _get_terminal_confirmation_policy()
+    if (
+        _YOLO_MODE_FROZEN
+        or is_current_session_yolo_enabled()
+        or approval_mode == "off"
+        or confirmation_policy == "never"
+    ):
         return {"approved": True, "message": None}
 
     if _command_matches_permanent_allowlist(command):
@@ -5046,7 +5120,7 @@ def check_all_command_guards(command: str, env_type: str,
     # --- Phase 2: Decide ---
 
     # Collect warnings that need approval
-    warnings = []  # list of (pattern_key, description, is_tirith)
+    warnings = []  # list of (pattern_key, description, allow_permanent)
 
     session_key = get_current_session_key()
 
@@ -5060,11 +5134,19 @@ def check_all_command_guards(command: str, env_type: str,
         tirith_key = f"tirith:{rule_id}"
         tirith_desc = _format_tirith_description(tirith_result)
         if not is_approved(session_key, tirith_key):
-            warnings.append((tirith_key, tirith_desc, True))
+            warnings.append((tirith_key, tirith_desc, False))
 
     if is_dangerous:
         if not is_approved(session_key, pattern_key):
-            warnings.append((pattern_key, description, False))
+            warnings.append((pattern_key, description, True))
+
+    risk_warning = _security_risk_warning(
+        command, security_risk, confirmation_policy
+    )
+    if risk_warning is not None:
+        risk_key, risk_desc = risk_warning
+        if not is_approved(session_key, risk_key):
+            warnings.append((risk_key, risk_desc, False))
 
     # Nothing to warn about
     if not warnings:
@@ -5121,15 +5203,11 @@ def check_all_command_guards(command: str, env_type: str,
     combined_desc = "; ".join(desc for _, desc, _ in warnings)
     primary_key = warnings[0][0]
     all_keys = [key for key, _, _ in warnings]
-    # "Always" is offered when at least one warning is a dangerous-pattern
-    # key that the persistence layer would actually allowlist permanently.
-    # Pure-tirith findings are session-max by design (no broad permanent
-    # allowlisting of content-level security findings), so a prompt with
-    # ONLY tirith warnings keeps Always hidden.  Mixed prompts (pattern +
-    # tirith) previously hid Always too, even though choosing it would
-    # correctly persist the pattern key and downgrade the tirith key to
-    # session — the UI was stricter than the persistence layer.
-    has_permanent_capable = any(not is_t for _, _, is_t in warnings)
+    # "Always" is offered when at least one warning can actually be persisted.
+    # Input-scoped findings (Tirith and LLM risk annotations) remain session-max;
+    # mixed prompts can still persist a dangerous-pattern key while downgrading
+    # input-scoped keys to session approval.
+    has_permanent_capable = any(can_persist for _, _, can_persist in warnings)
 
     # An explicitly selected plugin transport replaces every built-in prompt
     # surface (CLI/TUI/gateway/ACP). Detection, allowed scopes, persistence,
@@ -5178,9 +5256,9 @@ def check_all_command_guards(command: str, env_type: str,
                     "user_consent": False,
                 }
             if not smart_denied_for_owner:
-                for key, _, is_tirith in warnings:
+                for key, _, can_permanently_allow in warnings:
                     if transport_choice == "session" or (
-                        transport_choice == "always" and is_tirith
+                        transport_choice == "always" and not can_permanently_allow
                     ):
                         approve_session(session_key, key)
                     elif transport_choice == "always":
@@ -5224,12 +5302,12 @@ def check_all_command_guards(command: str, env_type: str,
                 "description": redact_sensitive_text(combined_desc),
                 # Smart DENY overrides are one-operation decisions, so the UI
                 # must not offer a permanent scope.  Otherwise offer Always
-                # whenever any dangerous-pattern warning can actually be
-                # persisted (pure-tirith prompts stay session-max).
+                # whenever any warning can actually be persisted; input-scoped
+                # findings remain capped at session approval.
                 "allow_permanent": has_permanent_capable and not smart_denied_for_owner,
                 # Session approval is safe for every non-Smart-DENY prompt —
-                # including pure-tirith ones, where the persistence layer
-                # already caps scope at session. Adapters use this to render
+                # including input-scoped ones, where the persistence layer
+                # caps scope at session. Adapters use this to render
                 # a session tier independently of the permanent tier.
                 "allow_session": not smart_denied_for_owner,
             }
@@ -5294,8 +5372,8 @@ def check_all_command_guards(command: str, env_type: str,
             # older client returns "session" or "always". Manual and ESCALATE
             # choices retain their existing persistence semantics.
             if not smart_denied_for_owner:
-                for key, _, is_tirith in warnings:
-                    if choice == "session" or (choice == "always" and is_tirith):
+                for key, _, can_permanently_allow in warnings:
+                    if choice == "session" or (choice == "always" and not can_permanently_allow):
                         approve_session(session_key, key)
                     elif choice == "always":
                         approve_session(session_key, key)
@@ -5421,9 +5499,9 @@ def check_all_command_guards(command: str, env_type: str,
     # Smart-DENY owner overrides are one-operation scoped. Preserve existing
     # persistence for manual mode and smart ESCALATE.
     if not smart_denied_for_owner:
-        for key, _, is_tirith in warnings:
-            if choice == "session" or (choice == "always" and is_tirith):
-                # tirith: session only (no permanent broad allowlisting)
+        for key, _, can_permanently_allow in warnings:
+            if choice == "session" or (choice == "always" and not can_permanently_allow):
+                # Input-scoped findings stay session-only.
                 approve_session(session_key, key)
             elif choice == "always":
                 # dangerous patterns: permanent allowed
