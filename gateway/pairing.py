@@ -226,10 +226,12 @@ def _sync_allowlist_add(platform: str, user_id: str) -> None:
         from hermes_cli.config import save_env_value
 
         save_env_value(env_var, ",".join(ids))
-    except Exception:
+    except Exception as exc:
         # Best-effort: the pairing store grant still authorizes via the union,
         # so a failure here degrades to "grant recorded but not mirrored".
-        pass
+        # Surface the failure so operators can detect persistent config issues
+        # (disk full, permissions, profile-multiplex conflicts).
+        logger.warning("allowlist add failed for %s env=%s: %s", platform, env_var, exc)
 
 
 def _iter_live_gateway_adapters():
@@ -353,8 +355,8 @@ def _sync_allowlist_remove(platform: str, user_id: str) -> None:
             save_env_value(env_var, ",".join(remaining))
         else:
             remove_env_value(env_var)
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.warning("allowlist remove failed for %s env=%s: %s", platform, env_var, exc)
     _sync_live_adapter_allowlist_remove(platform, user_id)
 
 
