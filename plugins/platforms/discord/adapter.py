@@ -142,6 +142,11 @@ import sys
 from pathlib import Path as _Path
 sys.path.insert(0, str(_Path(__file__).resolve().parents[3]))
 
+try:
+    from . import choice_picker as _choice_picker
+except ImportError:
+    from plugins.platforms.discord import choice_picker as _choice_picker
+
 
 def _is_discord_transport_error(exc: BaseException) -> bool:
     """Return True for connection-shaped send failures (dead/dropping WS).
@@ -7956,43 +7961,19 @@ class DiscordAdapter(BasePlatformAdapter):
         `/reasoning`, `/fast`, and any future finite-choice command. Each
         choice dict: ``{"value": str, "label": str, "is_current": bool}``.
         """
-        if not self._client or not DISCORD_AVAILABLE:
-            return SendResult(success=False, error="Not connected")
-
-        try:
-            target_id = chat_id
-            if metadata and metadata.get("thread_id"):
-                target_id = metadata["thread_id"]
-
-            channel = self._client.get_channel(int(target_id))
-            if not channel:
-                channel = await self._client.fetch_channel(int(target_id))
-
-            navigation = any(choice.get("full_width") for choice in choices)
-            first_line = title.splitlines()[0] if title else "Choose an option"
-            embed = discord.Embed(
-                title=first_line if navigation else f"⚙ {first_line}",
-                description="\n".join(title.splitlines()[1:]) or None,
-                color=discord.Color.blue(),
-            )
-
-            view = ChoicePickerView(
-                choices=choices,
-                on_choice_selected=on_choice_selected,
-                allowed_user_ids=self._allowed_user_ids,
-                allowed_role_ids=self._allowed_role_ids,
-                requester_user_id=str((metadata or {}).get("requester_user_id") or "")
-                or None,
-                navigation=navigation,
-            )
-
-            msg = await channel.send(embed=embed, view=view)
-            view._message = msg  # store for on_timeout expiration editing
-            return SendResult(success=True, message_id=str(msg.id))
-
-        except Exception as e:
-            logger.warning("[%s] send_choice_picker failed: %s", self.name, e)
-            return SendResult(success=False, error=str(e))
+        return await _choice_picker.send_choice_picker(
+            self,
+            chat_id,
+            title,
+            choices,
+            session_key,
+            on_choice_selected,
+            metadata,
+            discord_sdk=discord,
+            discord_available=DISCORD_AVAILABLE,
+            view_class=globals().get("ChoicePickerView"),
+            logger=logger,
+        )
 
     def _get_parent_channel_id(self, channel: Any) -> Optional[str]:
         """Return the parent channel ID for a Discord thread-like channel, if present."""
@@ -9638,116 +9619,14 @@ def _define_discord_view_classes() -> None:
                     pass
 
 
-    class ChoicePickerView(discord.ui.View):
-        """Flat select-menu view for finite-choice commands (/reasoning, /fast).
-
-        One dropdown, one selection, done — the generic single-level companion
-        to ``ModelPickerView``. Auth gating mirrors ``ExecApprovalView``.
-        Times out after 2 minutes.
-        """
-
-        def __init__(
-            self,
-            choices: list,
-            on_choice_selected,
-            allowed_user_ids: set,
-            allowed_role_ids: Optional[set] = None,
-            requester_user_id: Optional[str] = None,
-            navigation: bool = False,
-        ):
-            super().__init__(timeout=120)
-            self.choices = list(choices)[:_DISCORD_SELECT_MAX_OPTIONS]
-            self.on_choice_selected = on_choice_selected
-            self.allowed_user_ids = allowed_user_ids
-            self.allowed_role_ids = allowed_role_ids or set()
-            self.requester_user_id = requester_user_id
-            self.navigation = navigation
-            self.resolved = False
-            self._message = None
-
-            options = []
-            for choice in self.choices:
-                label = str(choice.get("label") or choice.get("value") or "")
-                options.append(
-                    discord.SelectOption(
-                        label=_truncate_discord_component_text(
-                            label, _DISCORD_SELECT_FIELD_LIMIT
-                        ),
-                        value=str(choice.get("value") or ""),
-                        description="current" if choice.get("is_current") else None,
-                    )
-                )
-            select = discord.ui.Select(
-                placeholder="Choose an option...",
-                options=options,
-            )
-            select.callback = self._on_select
-            self.add_item(select)
-
-        def _check_auth(self, interaction: discord.Interaction) -> bool:
-            if self.requester_user_id and self.requester_user_id != str(
-                getattr(getattr(interaction, "user", None), "id", "")
-            ):
-                return False
-            return _component_check_auth(
-                interaction, self.allowed_user_ids, self.allowed_role_ids,
-            )
-
-        async def _on_select(self, interaction: discord.Interaction):
-            if not self._check_auth(interaction):
-                await interaction.response.send_message(
-                    (
-                        "⛔ You are not authorized to use this menu."
-                        if self.navigation
-                        else "⛔ You are not authorized to change this setting."
-                    ),
-                    ephemeral=True,
-                )
-                return
-            if self.resolved:
-                await interaction.response.defer()
-                return
-            self.resolved = True
-
-            value = interaction.data.get("values", [""])[0]
-            try:
-                result_text = await self.on_choice_selected(
-                    str(interaction.channel_id), value
-                )
-            except Exception as exc:
-                logger.error("Choice picker selection failed: %s", exc)
-                result_text = f"Error applying selection: {exc}"
-
-            embed = discord.Embed(
-                description=result_text,
-                color=(
-                    discord.Color.blue()
-                    if self.navigation
-                    else discord.Color.green()
-                ),
-            )
-            self.clear_items()
-            self.stop()
-            await interaction.response.edit_message(embed=embed, view=self)
-
-        async def on_timeout(self):
-            if self.resolved:
-                return
-            msg = self._message
-            if msg is not None:
-                try:
-                    embed = discord.Embed(
-                        description=(
-                            "⏱ Menu expired — run the command again."
-                            if self.navigation
-                            else "⏱ Selection expired — no change made."
-                        ),
-                        color=discord.Color.greyple(),
-                    )
-                    self.clear_items()
-                    await msg.edit(embed=embed, view=self)
-                except Exception:
-                    pass
+    ChoicePickerView = _choice_picker.define_choice_picker_view(
+        discord_sdk=discord,
+        component_check_auth=_component_check_auth,
+        truncate_component_text=_truncate_discord_component_text,
+        logger=logger,
+        max_options=_DISCORD_SELECT_MAX_OPTIONS,
+        field_limit=_DISCORD_SELECT_FIELD_LIMIT,
+    )
 
     class ClarifyChoiceView(discord.ui.View):
         """Interactive button view for the clarify tool's multiple-choice prompts.
