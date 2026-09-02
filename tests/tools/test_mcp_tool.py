@@ -576,6 +576,35 @@ class TestToolHandler:
         finally:
             _servers.pop("test_srv", None)
 
+    def test_argless_tool_call_exception_logs_nonblank_reason(self, caplog):
+        from tools.mcp_tool import _make_tool_handler, _servers
+
+        mock_session = MagicMock()
+        mock_session.call_tool = AsyncMock(side_effect=asyncio.TimeoutError())
+        server = _make_mock_server("test_srv", session=mock_session)
+        _servers["test_srv"] = server
+
+        try:
+            handler = _make_tool_handler("test_srv", "greet", 120)
+            with self._patch_mcp_loop(), caplog.at_level(
+                logging.ERROR, logger="tools.mcp_tool"
+            ):
+                result = json.loads(handler({"name": "world"}))
+
+            error_lines = [
+                record.getMessage()
+                for record in caplog.records
+                if "call failed" in record.getMessage()
+            ]
+            assert error_lines == [
+                "MCP tool test_srv/greet call failed: TimeoutError: TimeoutError()"
+            ]
+            assert result["error"] == (
+                "MCP call failed: TimeoutError: TimeoutError()"
+            )
+        finally:
+            _servers.pop("test_srv", None)
+
 
     def test_recycled_stdio_server_reconnects_lazily_on_tool_call(self):
         from tools.mcp_tool import _make_tool_handler, _servers
