@@ -1046,7 +1046,12 @@ class PhotonAdapter(BasePlatformAdapter):
         still running the handoff, so the handoff always reaches the
         reconnect queue.
         """
-        asyncio.create_task(self._notify_fatal_error_logged())
+        # Track: an unreferenced task can be GC-reaped before it runs and
+        # the fatal-error notification silently lost.
+        notify_task = asyncio.create_task(self._notify_fatal_error_logged())
+        self._background_tasks.add(notify_task)
+        if hasattr(notify_task, "add_done_callback"):
+            notify_task.add_done_callback(self._background_tasks.discard)
 
     async def _notify_fatal_error_logged(self) -> None:
         try:

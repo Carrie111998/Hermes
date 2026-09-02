@@ -1690,7 +1690,13 @@ class _IncomingHandler(
             # eventually causing a disconnect.  _on_message is wrapped so
             # exceptions inside the task surface in logs instead of
             # disappearing into the event loop.
-            asyncio.create_task(self._safe_on_message(chatbot_msg))
+            # Track the task: unreferenced tasks can be GC-reaped before
+            # they run (the loop keeps only weak refs), silently dropping
+            # the inbound message.
+            _msg_task = asyncio.create_task(self._safe_on_message(chatbot_msg))
+            self._adapter._background_tasks.add(_msg_task)
+            if hasattr(_msg_task, "add_done_callback"):
+                _msg_task.add_done_callback(self._adapter._background_tasks.discard)
         except Exception:
             logger.exception(
                 "[%s] Error preparing incoming message", self._adapter.name

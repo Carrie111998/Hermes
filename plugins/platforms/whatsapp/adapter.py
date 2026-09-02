@@ -1391,7 +1391,11 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                                 # Fire-and-forget: a slow bridge /read must not
                                 # delay message dispatch (matches BlueBubbles
                                 # asyncio.create_task pattern for mark_read).
-                                asyncio.create_task(self._send_read_receipt(msg_data))
+                                # Tracked so GC cannot reap it mid-flight.
+                                receipt_task = asyncio.create_task(self._send_read_receipt(msg_data))
+                                self._background_tasks.add(receipt_task)
+                                if hasattr(receipt_task, "add_done_callback"):
+                                    receipt_task.add_done_callback(self._background_tasks.discard)
                                 if event.message_type == MessageType.TEXT:
                                     self._enqueue_text_event(event)
                                 else:

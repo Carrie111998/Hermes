@@ -1327,7 +1327,12 @@ class DiscordAdapter(BasePlatformAdapter):
                     exc_info=True,
                 )
 
-        asyncio.create_task(_notify())
+        # Track the task so GC cannot reap the fatal-error notification
+        # (the loop keeps only weak references to tasks).
+        notify_task = asyncio.create_task(_notify())
+        self._background_tasks.add(notify_task)
+        if hasattr(notify_task, "add_done_callback"):
+            notify_task.add_done_callback(self._background_tasks.discard)
 
     async def connect(self, *, is_reconnect: bool = False) -> bool:
         """Connect to Discord and start receiving events."""
@@ -5396,9 +5401,13 @@ class DiscordAdapter(BasePlatformAdapter):
 
         # Fire-and-forget: don't block the interaction handler on Telegram I/O.
         try:
-            asyncio.create_task(self._notify_unauthorized_slash(
+            # Retain a strong ref so GC cannot reap the security notice.
+            unauthorized_task = asyncio.create_task(self._notify_unauthorized_slash(
                 user_name, user_id, chan_id, guild_id, command_text, reason,
             ))
+            self._background_tasks.add(unauthorized_task)
+            if hasattr(unauthorized_task, "add_done_callback"):
+                unauthorized_task.add_done_callback(self._background_tasks.discard)
         except Exception as e:
             logger.debug("[Discord] Could not schedule admin notify task: %s", e)
 
