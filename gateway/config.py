@@ -203,6 +203,37 @@ def _coerce_optional_positive_int(value: Any, key: str) -> Optional[int]:
 _SYSTEMD_WATCHDOG_MAX_SECONDS = 2_147_483_647
 
 
+def _coerce_non_negative_int(value: Any, key: str, default: int) -> int:
+    """Coerce a config value to a non-negative int, falling back to *default*.
+
+    Zero is meaningful (it disables the setting), so it is preserved rather
+    than treated as unset. Malformed values are ignored with a warning so a
+    typo never prevents the gateway from starting.
+    """
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        logger.warning("Ignoring invalid %s=%r (expected a non-negative integer)", key, value)
+        return default
+    try:
+        if isinstance(value, float):
+            if not value.is_integer():
+                raise ValueError(value)
+            parsed = int(value)
+        elif isinstance(value, str):
+            parsed = int(value.strip(), 10)
+        else:
+            parsed = int(value)
+    except (TypeError, ValueError):
+        logger.warning("Ignoring invalid %s=%r (expected a non-negative integer)", key, value)
+        return default
+    if parsed < 0:
+        logger.warning("Ignoring invalid %s=%r (expected a non-negative integer)", key, value)
+        return default
+    return parsed
+
+
+
 def coerce_systemd_watchdog_seconds(
     value: Any, key: str = "gateway.systemd_watchdog_seconds"
 ) -> int:
@@ -1016,6 +1047,20 @@ class GatewayConfig:
     # is fixed at the root by the off-loop write + two-witness probe, so
     # raising this fleet-wide would only delay genuine-wedge recovery.
     loop_watchdog_max_strikes: int = DEFAULT_LOOP_WATCHDOG_MAX_STRIKES
+    # Minimum seconds between two home-channel "gateway shutting down"
+    # broadcasts to the SAME destination, enforced DURABLY across gateway
+    # processes (gateway/shutdown_notice.py).
+    #
+    # The in-process dedup set only suppresses duplicates within one shutdown,
+    # so a host that repeatedly cycles the gateway re-announces every time: a
+    # WSL host under Windows Modern Standby produced 240 home-channel notices,
+    # 19 inside one 10-minute window, against 1 active-session notice. This
+    # window collapses such a burst to one message while leaving a genuine
+    # restart hours later fully visible.
+    #
+    # Applies ONLY to the home-channel broadcast; per-active-session interrupt
+    # pings are never suppressed. 0 disables the guard (always broadcast).
+    shutdown_notification_cooldown_seconds: int = 300
 
     # Unauthorized DM policy
     unauthorized_dm_behavior: str = "pair"  # "pair" or "ignore"
@@ -1160,6 +1205,7 @@ class GatewayConfig:
             "loop_watchdog_probe_interval_s": self.loop_watchdog_probe_interval_s,
             "loop_watchdog_probe_timeout_s": self.loop_watchdog_probe_timeout_s,
             "loop_watchdog_max_strikes": self.loop_watchdog_max_strikes,
+            "shutdown_notification_cooldown_seconds": self.shutdown_notification_cooldown_seconds,
             "unauthorized_dm_behavior": self.unauthorized_dm_behavior,
             "streaming": self.streaming.to_dict(),
             "session_store_max_age_days": self.session_store_max_age_days,
@@ -1278,6 +1324,19 @@ class GatewayConfig:
             loop_watchdog_probe_timeout_s = DEFAULT_LOOP_WATCHDOG_TIMEOUT_S
         if loop_watchdog_max_strikes < 1 or loop_watchdog_max_strikes > 1000:
             loop_watchdog_max_strikes = DEFAULT_LOOP_WATCHDOG_MAX_STRIKES
+        if "shutdown_notification_cooldown_seconds" in data:
+            shutdown_cooldown_raw = data.get("shutdown_notification_cooldown_seconds")
+            shutdown_cooldown_key = "shutdown_notification_cooldown_seconds"
+        else:
+            shutdown_cooldown_raw = nested_gateway.get(
+                "shutdown_notification_cooldown_seconds"
+            )
+            shutdown_cooldown_key = "gateway.shutdown_notification_cooldown_seconds"
+        shutdown_notification_cooldown_seconds = _coerce_non_negative_int(
+            shutdown_cooldown_raw,
+            shutdown_cooldown_key,
+            300,
+        )
         if multiplex_profiles is None and isinstance(nested_gateway, dict):
             # Also honor gateway.multiplex_profiles written by
             # ``hermes config set gateway.multiplex_profiles true``.
@@ -1344,6 +1403,7 @@ class GatewayConfig:
             loop_watchdog_probe_interval_s=loop_watchdog_probe_interval_s,
             loop_watchdog_probe_timeout_s=loop_watchdog_probe_timeout_s,
             loop_watchdog_max_strikes=loop_watchdog_max_strikes,
+            shutdown_notification_cooldown_seconds=shutdown_notification_cooldown_seconds,
             max_concurrent_sessions=max_concurrent_sessions,
             unauthorized_dm_behavior=unauthorized_dm_behavior,
             streaming=StreamingConfig.from_dict(data.get("streaming", {})),
@@ -1521,6 +1581,20 @@ def load_gateway_config() -> GatewayConfig:
                     gw_data["systemd_watchdog_seconds"] = gateway_section[
                         "systemd_watchdog_seconds"
                     ]
+
+            # Shutdown-notice cooldown: top-level wins; nested gateway.* is the
+            # fallback shape written by ``hermes config set``.
+            if "shutdown_notification_cooldown_seconds" in yaml_cfg:
+                gw_data["shutdown_notification_cooldown_seconds"] = yaml_cfg[
+                    "shutdown_notification_cooldown_seconds"
+                ]
+            elif (
+                isinstance(gateway_section, dict)
+                and "shutdown_notification_cooldown_seconds" in gateway_section
+            ):
+                gw_data["shutdown_notification_cooldown_seconds"] = gateway_section[
+                    "shutdown_notification_cooldown_seconds"
+                ]
 
             if "max_concurrent_sessions" in yaml_cfg:
                 gw_data["max_concurrent_sessions"] = yaml_cfg["max_concurrent_sessions"]
