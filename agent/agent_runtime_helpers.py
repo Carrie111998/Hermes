@@ -2828,6 +2828,10 @@ def create_openai_client(agent, client_kwargs: dict, *, reason: str, shared: boo
             client_kwargs["default_headers"] = existing
     except Exception:
         _ra().logger.debug("Copilot default-header guard skipped", exc_info=True)
+    if str(getattr(agent, "model", "") or "").strip().lower().startswith("claude-"):
+        headers = dict(client_kwargs.get("default_headers") or {})
+        headers["User-Agent"] = "claude-cli/2.1.233 (external, sdk-cli)"
+        client_kwargs["default_headers"] = headers
     # OpenCode Free: the tier is served ANONYMOUSLY — any bearer the relay
     # doesn't recognize (including placeholders) is a 401. Route every
     # opencode-free client through the shared keyless header policy: an

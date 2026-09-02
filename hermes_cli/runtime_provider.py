@@ -1952,7 +1952,42 @@ def _resolve_explicit_runtime(
     return None
 
 
+def _apply_claude_cli_identity(
+    runtime: Dict[str, Any],
+    target_model: Optional[str],
+) -> Dict[str, Any]:
+    """Preserve Claude CLI identity for OpenAI-compatible Claude runtimes."""
+    try:
+        if not isinstance(runtime, dict):
+            return runtime
+        if not str(target_model or "").strip().lower().startswith("claude-"):
+            return runtime
+        if str(runtime.get("api_mode") or "").strip().lower() == "chat_completions":
+            headers = dict(runtime.get("extra_headers") or {})
+            headers["User-Agent"] = "claude-cli/2.1.233 (external, sdk-cli)"
+            runtime["extra_headers"] = headers
+    except Exception:
+        pass
+    return runtime
+
+
 def resolve_runtime_provider(
+    *,
+    requested: Optional[str] = None,
+    explicit_api_key: Optional[str] = None,
+    explicit_base_url: Optional[str] = None,
+    target_model: Optional[str] = None,
+) -> Dict[str, Any]:
+    runtime = _resolve_runtime_provider_impl(
+        requested=requested,
+        explicit_api_key=explicit_api_key,
+        explicit_base_url=explicit_base_url,
+        target_model=target_model,
+    )
+    return _apply_claude_cli_identity(runtime, target_model)
+
+
+def _resolve_runtime_provider_impl(
     *,
     requested: Optional[str] = None,
     explicit_api_key: Optional[str] = None,
