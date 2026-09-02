@@ -142,6 +142,41 @@ def test_profile_omitting_keys_gets_defaults_not_launch_values(tmp_path):
     assert json.loads(os.environ["TERMINAL_DOCKER_VOLUMES"])  # A unchanged
 
 
+def test_profile_list_and_dict_values_round_trip_as_json(tmp_path):
+    """A docker profile that DOES set docker_volumes / docker_env must project
+    them as JSON, not Python repr. build_profile_terminal_scope stringifies
+    every value with str(); for a list that yields single-quoted Python repr
+    (['a']), but the terminal_tool consumer parses these keys with json.loads
+    (double quotes required), so the turn died with 'Invalid value for
+    TERMINAL_DOCKER_VOLUMES ... (expected valid JSON)'. Regression for the bug
+    a docker-backend profile hit on its first isolated turn.
+    """
+    import tools.terminal_tool as tt
+
+    cfg_yaml = (
+        "terminal:\n"
+        "  backend: docker\n"
+        "  docker_volumes:\n"
+        "    - /host/vault:/vault:rw\n"
+        "    - agent-x-ssh:/home/x/.ssh\n"
+        "  docker_env:\n"
+        "    GIT_AUTHOR_NAME: X Agent\n"
+    )
+    home = _profile(tmp_path, "dock", cfg_yaml)
+    token = install_profile_terminal_scope(home)
+    try:
+        # Must not raise on the json.loads parse of the projected value.
+        cfg = tt._get_env_config()
+        assert cfg["env_type"] == "docker"
+        assert cfg["docker_volumes"] == [
+            "/host/vault:/vault:rw",
+            "agent-x-ssh:/home/x/.ssh",
+        ]
+        assert cfg["docker_env"] == {"GIT_AUTHOR_NAME": "X Agent"}
+    finally:
+        reset_terminal_scope(token)
+
+
 def test_malformed_profile_config_refuses_execution(tmp_path):
     """Unresolvable policy → refusal scope; terminal_tool refuses instead of
     running under the launch process's ambient policy (fail closed)."""
