@@ -353,6 +353,173 @@ class TestSegmentBreakOnToolBoundary:
 
 
     @pytest.mark.asyncio
+    async def test_segment_break_seals_bubble_with_continuation_marker(self):
+        """A clean segment break marks the sealed bubble as continued (#92063).
+
+        The sealed prefix plus the fresh continuation bubble must read as one
+        continued answer, not as the reply being sent twice.
+        """
+        adapter = MagicMock()
+        send_result = SimpleNamespace(success=True, message_id="msg_1")
+        adapter.send = AsyncMock(return_value=send_result)
+        adapter.edit_message = AsyncMock(return_value=SimpleNamespace(success=True))
+        adapter.MAX_MESSAGE_LENGTH = 4096
+
+        config = StreamConsumerConfig(edit_interval=0.01, buffer_threshold=5, cursor=" ▉")
+        consumer = GatewayStreamConsumer(adapter, "chat_123", config)
+
+        consumer.on_delta("Part one of the answer")
+        consumer.on_segment_break()
+        consumer.on_delta("Part two")
+        consumer.finish()
+
+        await consumer.run()
+
+        sealed = [
+            call[1].get("content", "")
+            for call in adapter.edit_message.call_args_list
+            if "(continued below)" in call[1].get("content", "")
+        ]
+        assert sealed, (
+            "expected a sealed-continuation edit; got "
+            f"{[c[1].get('content') for c in adapter.edit_message.call_args_list]!r}"
+        )
+        assert "▉" not in sealed[-1]
+        assert "Part one" in sealed[-1]
+
+
+    @pytest.mark.asyncio
+    async def test_segment_break_strips_frozen_cursor_when_nothing_accumulated(self):
+        """The #92063 race: break arrives between edit ticks with the on-screen
+        bubble still carrying the streaming cursor and nothing accumulated —
+        the seal edit must strip the cursor and mark the bubble continued."""
+        adapter = MagicMock()
+        send_result = SimpleNamespace(success=True, message_id="msg_1")
+        adapter.send = AsyncMock(return_value=send_result)
+        adapter.edit_message = AsyncMock(return_value=SimpleNamespace(success=True))
+        adapter.MAX_MESSAGE_LENGTH = 4096
+
+        config = StreamConsumerConfig(edit_interval=0.01, buffer_threshold=5, cursor=" ▉")
+        consumer = GatewayStreamConsumer(adapter, "chat_123", config)
+
+        # Reproduce the frozen state directly: text already streamed to the
+        # screen (cursor attached), buffer empty, then the external break.
+        consumer._message_id = "msg_1"
+        consumer._last_sent_text = "Frozen mid-sentence prefix ▉"
+        consumer._accumulated = ""
+        consumer.on_segment_break()
+        consumer.finish()
+
+        await consumer.run()
+
+        contents = [
+            call[1].get("content", "")
+            for call in adapter.edit_message.call_args_list
+        ]
+        assert any(
+            "Frozen mid-sentence prefix" in c and "▉" not in c and "(continued below)" in c
+            for c in contents
+        ), f"no cursor-stripped continuation seal in {contents!r}"
+
+
+    @pytest.mark.asyncio
+    async def test_segment_break_seal_truncates_prefix_near_limit(self):
+        """A prefix that already filled the adapter limit must be truncated so
+        the seal edit (prefix + continuation marker) stays within the limit —
+        an over-limit seal is rejected outright on platforms that hard-enforce
+        MAX_MESSAGE_LENGTH, re-freezing the cursor (#92063)."""
+        adapter = MagicMock()
+        send_result = SimpleNamespace(success=True, message_id="msg_1")
+        adapter.send = AsyncMock(return_value=send_result)
+        adapter.edit_message = AsyncMock(return_value=SimpleNamespace(success=True))
+        adapter.MAX_MESSAGE_LENGTH = 64
+
+        config = StreamConsumerConfig(edit_interval=0.01, buffer_threshold=5, cursor=" ▉")
+        consumer = GatewayStreamConsumer(adapter, "chat_123", config)
+
+        consumer._message_id = "msg_1"
+        consumer._last_sent_text = "x" * 100
+        consumer._accumulated = ""
+        consumer.on_segment_break()
+        consumer.finish()
+
+        await consumer.run()
+
+        sealed = [
+            call[1].get("content", "")
+            for call in adapter.edit_message.call_args_list
+            if call[1].get("content", "").endswith("(continued below)")
+        ]
+        assert sealed, (
+            "expected a truncated continuation seal; got "
+            f"{[c[1].get('content') for c in adapter.edit_message.call_args_list]!r}"
+        )
+        assert len(sealed[-1]) <= 64, (
+            f"sealed edit exceeds the adapter limit: {len(sealed[-1])} > 64"
+        )
+
+
+    @pytest.mark.asyncio
+    async def test_segment_break_seal_skipped_for_buffer_only(self):
+        """buffer_only platforms have no editable bubble — the seal path must
+        not attempt a continuation edit."""
+        adapter = MagicMock()
+        send_result = SimpleNamespace(success=True, message_id="msg_1")
+        adapter.send = AsyncMock(return_value=send_result)
+        adapter.edit_message = AsyncMock(return_value=SimpleNamespace(success=True))
+        adapter.MAX_MESSAGE_LENGTH = 4096
+
+        config = StreamConsumerConfig(
+            edit_interval=0.01, buffer_threshold=5, buffer_only=True, cursor=" ▉"
+        )
+        consumer = GatewayStreamConsumer(adapter, "chat_123", config)
+
+        consumer._message_id = "msg_1"
+        consumer._last_sent_text = "Already on screen"
+        consumer._accumulated = ""
+        consumer.on_segment_break()
+        consumer.finish()
+
+        await consumer.run()
+
+        sealed = [
+            call[1].get("content", "")
+            for call in adapter.edit_message.call_args_list
+            if "(continued below)" in call[1].get("content", "")
+        ]
+        assert not sealed, f"buffer_only must not attempt a seal edit: {sealed!r}"
+
+
+    @pytest.mark.asyncio
+    async def test_segment_break_seal_skipped_without_editable_message(self):
+        """The ``__no_edit__`` message id marks uneditable sends — the seal
+        path must not attempt a continuation edit."""
+        adapter = MagicMock()
+        send_result = SimpleNamespace(success=True, message_id="__no_edit__")
+        adapter.send = AsyncMock(return_value=send_result)
+        adapter.edit_message = AsyncMock(return_value=SimpleNamespace(success=True))
+        adapter.MAX_MESSAGE_LENGTH = 4096
+
+        config = StreamConsumerConfig(edit_interval=0.01, buffer_threshold=5, cursor=" ▉")
+        consumer = GatewayStreamConsumer(adapter, "chat_123", config)
+
+        consumer._message_id = "__no_edit__"
+        consumer._last_sent_text = "Sent without an editable message"
+        consumer._accumulated = ""
+        consumer.on_segment_break()
+        consumer.finish()
+
+        await consumer.run()
+
+        sealed = [
+            call[1].get("content", "")
+            for call in adapter.edit_message.call_args_list
+            if "(continued below)" in call[1].get("content", "")
+        ]
+        assert not sealed, f"__no_edit__ must not attempt a seal edit: {sealed!r}"
+
+
+    @pytest.mark.asyncio
     async def test_segment_break_clears_failed_edit_fallback_state(self):
         """A tool boundary after edit failure must flush the undelivered tail
         without duplicating the prefix the user already saw (#8124)."""

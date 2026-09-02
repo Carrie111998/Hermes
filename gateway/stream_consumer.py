@@ -1974,6 +1974,13 @@ class GatewayStreamConsumer:
                             and self._message_id != "__no_edit__"
                         ):
                             await self._flush_segment_tail_on_edit_failure()
+                        else:
+                            # Clean break: whatever the finalize edit above
+                            # did, seal the on-screen bubble stripped and
+                            # marked — otherwise it keeps the streaming
+                            # cursor and the fresh continuation bubble below
+                            # reads like a duplicate send (#92063).
+                            await self._seal_segment_for_continuation()
                         self._reset_segment_state(preserve_no_edit=True)
 
                 # Flush barrier satisfied: the buffered segment (if any) has now
@@ -2751,6 +2758,51 @@ class GatewayStreamConsumer:
                 self._last_sent_text = prefix
         except Exception:
             pass  # best-effort — don't let this block the fallback path
+
+    async def _seal_segment_for_continuation(self) -> None:
+        """Best-effort final edit on the bubble a segment break seals.
+
+        A clean segment break leaves the on-screen bubble at its last
+        streaming edit — cursor (▉) still attached when the break arrives
+        between edit ticks. The fresh continuation bubble below then reads
+        like a duplicate send of the same prefix (#92063). Re-edit the sealed
+        bubble with the cursor stripped and a continuation marker appended,
+        so the pair reads as one continued answer.
+
+        The marker is optimistic best-effort: it is applied at every clean
+        break, so if the turn then aborts right after the boundary the sealed
+        bubble advertises a continuation that is delivered by the fallback
+        path (or never arrives). Trading that rare stale marker for never
+        leaving the cursor frozen is the intended contract.
+        """
+        if self.cfg.buffer_only:
+            return  # uneditable platform — nothing to seal
+        if not self._message_id or self._message_id == "__no_edit__":
+            return
+        prefix = self._visible_prefix()
+        if not prefix or not prefix.strip():
+            return
+        marker = "\n\n(continued below)"
+        # A segment that filled close to the adapter limit has no room for
+        # the marker — an over-limit seal edit is rejected outright (limit is
+        # hard-enforced e.g. on Telegram) and the cursor stays frozen, the
+        # exact #92063 symptom resurfacing only for long segments.
+        budget = max(self._raw_message_limit() - len(marker), 0)
+        if len(prefix) > budget:
+            prefix = prefix[:budget]
+        sealed = f"{prefix.rstrip()}{marker}"
+        try:
+            result = await self._edit_message(
+                message_id=self._message_id,
+                content=sealed,
+            )
+            if getattr(result, "success", False):
+                self._last_sent_text = sealed
+        except Exception as e:
+            # best-effort — a failing seal edit must not stall the break,
+            # but leave a trace: a platform that starts rejecting these
+            # edits is invisible otherwise when debugging stuck cursors.
+            logger.debug("Seal edit failed: %s", e)
 
     async def _send_commentary(self, text: str) -> bool:
         """Send a completed interim assistant commentary message."""
