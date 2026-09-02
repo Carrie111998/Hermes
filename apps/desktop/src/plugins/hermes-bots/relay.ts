@@ -238,6 +238,51 @@ async function waitForRelayConnection(
   return undefined
 }
 
+/** Rebuild the relay mesh after a cold Desktop launch.
+ *
+ * The registry persists every gateway, but profileRoutes only includes routes
+ * whose backend has been opened in this renderer lifetime. Without this boot
+ * step a relaunch silently shrinks the roster to the active connection until
+ * the user visits every gateway by hand. Warm each registered source without
+ * foregrounding it, wait for the credential-free routes, then resync. */
+async function bootstrapRelayConnections() {
+  if (typeof host.connections !== 'function' || typeof host.warmAgent !== 'function') {
+    return
+  }
+
+  try {
+    const registered = await host.connections()
+
+    const ids = new Set(
+      (Array.isArray(registered) ? registered : [])
+        .map(connection => String(connection?.id || ''))
+        .filter(Boolean)
+    )
+
+    for (const id of ids) {
+      host.warmAgent(id, 'default')
+    }
+
+    const deadline = Date.now() + RELAY_ROUTE_RECONNECT_GRACE_MS
+
+    while (!relay.disposed && Date.now() < deadline) {
+      const live = new Set((await relayConnections()).map(connection => connection.id))
+
+      if ([...ids].every(id => live.has(id))) {
+        break
+      }
+
+      await new Promise<void>(resolve => setTimeout(resolve, RELAY_ROUTE_RECONNECT_POLL_MS))
+    }
+
+    if (!relay.disposed) {
+      await syncRelayRosters()
+    }
+  } catch {
+    // Older/in-flight registries fall back to the standing roster/drain loops.
+  }
+}
+
 /** The agents living on one connection, as relay roster rows.
  *  Returns null on FAILURE (transient RPC blip, slow socket) — distinct from
  *  a genuine empty profile list. Conflating the two would push a fresh union
@@ -520,6 +565,7 @@ export function startBotRelay() {
   if (relay.rosterTimer === null) {
     relay.rosterTimer = setInterval(() => void syncRelayRosters(), RELAY_ROSTER_INTERVAL_MS)
     void syncRelayRosters()
+    void bootstrapRelayConnections()
   }
 
   if (relay.drainTimer === null) {

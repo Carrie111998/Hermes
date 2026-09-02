@@ -29,6 +29,7 @@ import type { ProfileRoute } from './types'
 const { clearBotAttentionMock, hostMock, noteBotAttentionMock, UnboundedCache } = vi.hoisted(() => ({
   clearBotAttentionMock: vi.fn(),
   hostMock: {
+    connections: vi.fn(),
     onEvent: vi.fn(),
     profileRoutes: vi.fn(),
     requestProfile: vi.fn(),
@@ -131,6 +132,7 @@ beforeEach(() => {
   vi.useFakeTimers()
   vi.clearAllMocks()
   hostMock.onEvent = vi.fn(() => vi.fn())
+  hostMock.connections = vi.fn(async () => [])
   hostMock.profileRoutes = vi.fn(async () => [route('a'), route('b')])
   hostMock.requestProfile = vi.fn(async () => ({}))
   hostMock.retainProfileSocket = vi.fn(() => vi.fn())
@@ -142,6 +144,24 @@ afterEach(() => {
 })
 
 describe('push-notified drain (#93091)', () => {
+  it('warms every registered gateway after a cold renderer launch', async () => {
+    hostMock.connections = vi.fn(async () => [{ id: 'a' }, { id: 'b' }, { id: 'c' }])
+    hostMock.profileRoutes = vi.fn(async () => [route('a'), route('b'), route('c')])
+    respondWith(() => ({ envelopes: [] }))
+
+    const { startBotRelay, stopBotRelay } = await loadRelay()
+
+    startBotRelay()
+    await vi.advanceTimersByTimeAsync(1000)
+
+    expect(hostMock.warmAgent).toHaveBeenCalledTimes(3)
+    expect(hostMock.warmAgent).toHaveBeenCalledWith('a', 'default')
+    expect(hostMock.warmAgent).toHaveBeenCalledWith('b', 'default')
+    expect(hostMock.warmAgent).toHaveBeenCalledWith('c', 'default')
+
+    stopBotRelay()
+  })
+
   it('collapses a burst of pending signals into ONE drain', async () => {
     const calls = respondWith(() => ({ envelopes: [] }))
     const { startBotRelay, stopBotRelay } = await loadRelay()
