@@ -1934,8 +1934,18 @@ def _generate_openai_tts(
             create_kwargs["speed"] = max(0.25, min(4.0, speed))
         if instructions:
             create_kwargs["instructions"] = instructions
+        # Build extra_body for OpenAI-compatible servers that need extra fields.
+        # `lang_code` is Hermes's own extension, `consent_attestation` is
+        # required by some self-hosted cloned-voice servers (e.g. Qwen3-TTS)
+        # that reject 400 consent_required when it is missing (#99775).
+        extra_body: Dict[str, Any] = {}
         if language:
-            create_kwargs["extra_body"] = {"lang_code": language}
+            extra_body["lang_code"] = language
+        consent_attestation = oai_config.get("consent_attestation")
+        if isinstance(consent_attestation, str) and consent_attestation.strip():
+            extra_body["consent_attestation"] = consent_attestation.strip()
+        if extra_body:
+            create_kwargs["extra_body"] = extra_body
         response = client.audio.speech.create(**create_kwargs)
 
         response.stream_to_file(output_path)
