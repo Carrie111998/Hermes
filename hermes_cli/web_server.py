@@ -19318,12 +19318,16 @@ def _read_bound_port(server: "uvicorn.Server", fallback: int) -> int:
 
 
 def _write_dashboard_ready_file(actual_port: int) -> None:
-    """Optionally publish the dashboard port through an atomic ready file.
+    """Optionally publish Desktop's backend handshake through an atomic file.
 
-    Windows Desktop can launch dashboard backends with ``pythonw.exe`` to avoid
-    console flashes. That path cannot rely on stdout for the port announcement,
-    so Electron passes ``HERMES_DESKTOP_READY_FILE`` and waits for this JSON.
-    Normal CLI/dashboard launches still use the stdout READY line below.
+    ``HERMES_DESKTOP_READY_FILE`` is a private Electron-to-child handshake,
+    not a general dashboard API.  The backend publishes both the bound port and
+    the session token it actually resolved *after* dotenv and managed-secret
+    loading.  That lets a Desktop-spawned headless ``serve`` recover from a
+    deliberate .env token override without parsing config itself or exposing a
+    token in stdout/the logs.  Older Desktop versions ignore the additive
+    ``session_token`` field; older backends simply never create this file and
+    the Electron stdout compatibility path remains in use.
     """
     target = os.environ.get("HERMES_DESKTOP_READY_FILE")
     if not target:
@@ -19333,7 +19337,10 @@ def _write_dashboard_ready_file(actual_port: int) -> None:
     try:
         path = Path(target)
         path.parent.mkdir(parents=True, exist_ok=True)
-        payload = json.dumps({"port": int(actual_port)}, separators=(",", ":"))
+        payload = json.dumps(
+            {"port": int(actual_port), "session_token": _SESSION_TOKEN},
+            separators=(",", ":"),
+        )
         with tempfile.NamedTemporaryFile(
             "w",
             encoding="utf-8",
@@ -19346,6 +19353,10 @@ def _write_dashboard_ready_file(actual_port: int) -> None:
             fh.flush()
             os.fsync(fh.fileno())
             tmp_name = fh.name
+        # NamedTemporaryFile is private by default on POSIX. Pin that contract
+        # explicitly before the atomic replace so the one-time credential never
+        # becomes group/world-readable if a platform's default changes.
+        os.chmod(tmp_name, 0o600)
         os.replace(tmp_name, path)
     except Exception as exc:
         if tmp_name:
