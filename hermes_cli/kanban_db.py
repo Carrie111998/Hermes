@@ -9548,61 +9548,467 @@ def check_respawn_guard(
     return None
 
 
-def has_spawnable_ready(conn: sqlite3.Connection) -> bool:
-    """Return True iff there is at least one ready+assigned+unclaimed task
-    whose assignee maps to a real Hermes profile.
+@dataclass(frozen=True)
+class _ProfileAdmission:
+    """Validated profile resolution used by both dispatch and health probes."""
 
-    Used by the gateway- and CLI-embedded dispatchers' health telemetry to
-    decide whether ``0 spawned`` is a "stuck" condition (real spawnable
-    work waiting) or a "correctly idle" condition (only control-plane
-    lanes like ``orion-cc`` / ``orion-research`` waiting on terminals
-    that pull tasks via ``claim_task`` directly).
+    canonical: Optional[str]
+    spawnable: Optional[bool]
 
-    Falls back to "any ready+assigned" if ``profile_exists`` is not
-    importable (e.g. partial install) — preserves the old behavior so
-    the warning still fires in degraded environments.
+
+@dataclass(frozen=True)
+class _DispatchAdmission:
+    """Result of the non-mutating portion of one dispatch admission check."""
+
+    assignee: Optional[str] = None
+    canonical_assignee: Optional[str] = None
+    reason: Optional[str] = None
+    guard_reason: Optional[str] = None
+    current_running: int = 0
+    auto_assigned_default: bool = False
+
+
+# ``None`` is a meaningful explicit value for the optional caps, so the health
+# API uses a sentinel to distinguish "caller supplied no context" from
+# "caller supplied an uncapped setting".
+_DISPATCH_CONTEXT_UNSET = object()
+
+
+def _profile_admission(assignee: Optional[str]) -> _ProfileAdmission:
+    """Resolve and validate *assignee* without allowing path traversal.
+
+    ``spawnable=None`` means profile introspection was unavailable. That keeps
+    the historical conservative health behavior for a degraded installation;
+    a syntactically invalid name is still a definitive ``False`` whenever the
+    profiles module is available (which is the normal dispatcher path).
     """
-    rows = conn.execute(
-        "SELECT DISTINCT assignee FROM tasks "
-        "WHERE status = 'ready' AND assignee IS NOT NULL "
-        "    AND claim_lock IS NULL"
-    ).fetchall()
-    if not rows:
-        return False
+    if not assignee:
+        return _ProfileAdmission(None, False)
     try:
-        from hermes_cli.profiles import profile_exists  # local import: avoids cycle
+        from hermes_cli.profiles import (
+            normalize_profile_name,
+            profile_exists,
+            validate_profile_name,
+        )
     except Exception:
-        # Can't introspect — assume spawnable, preserve legacy behavior.
-        return True
+        # A partial install cannot prove that an otherwise opaque assignee is
+        # a control-plane lane. Preserve the pre-existing fail-open telemetry
+        # behavior rather than hiding a possible stuck task.
+        return _ProfileAdmission(assignee, None)
+    try:
+        canonical = normalize_profile_name(assignee)
+        validate_profile_name(canonical)
+    except (AttributeError, TypeError, ValueError):
+        # Validation must happen before profile_exists: profile_exists resolves
+        # its path and a value such as ``..`` could otherwise escape profiles/.
+        return _ProfileAdmission(None, False)
+    try:
+        return _ProfileAdmission(canonical, bool(profile_exists(canonical)))
+    except Exception:
+        # A profile-store read failure is not proof that this is an intentional
+        # human lane. Keep the existing conservative fallback for health and
+        # let the normal dispatch path retain its previous behavior.
+        return _ProfileAdmission(canonical, None)
+
+
+def _profile_spawnability(assignee: Optional[str]) -> Optional[bool]:
+    """Return the validated profile spawnability for *assignee*."""
+    return _profile_admission(assignee).spawnable
+
+
+def _dispatch_admission(
+    conn: sqlite3.Connection,
+    row: Mapping[str, Any],
+    *,
+    lane: str,
+    default_assignee: Optional[str] = None,
+    per_profile_cap: Optional[int] = None,
+    per_profile_running: Optional[Mapping[str, int]] = None,
+    check_dependencies: bool = True,
+) -> _DispatchAdmission:
+    """Apply the shared, read-only dispatch admission predicate.
+
+    ``claim_task`` / ``claim_review_task`` remain the final atomic gates. The
+    real dispatcher passes ``check_dependencies=False`` so those functions can
+    demote a raced row exactly as before; dry-run and health callers set it to
+    true so a row with unfinished parents is never reported as spawnable.
+    """
+    row_assignee = row["assignee"]
+    auto_assigned_default = False
+    if not row_assignee:
+        if lane != "ready" or not default_assignee:
+            return _DispatchAdmission(reason="unassigned")
+        default_profile = _profile_admission(default_assignee)
+        if default_profile.spawnable is False:
+            # The dispatcher reports an unusable fallback in the same bucket
+            # as an unassigned row; there is no profile it can safely spawn.
+            return _DispatchAdmission(reason="unassigned")
+        row_assignee = default_assignee
+        auto_assigned_default = True
+
+    profile = _profile_admission(row_assignee)
+    if profile.spawnable is False:
+        return _DispatchAdmission(
+            assignee=row_assignee,
+            canonical_assignee=profile.canonical,
+            reason="nonspawnable",
+        )
+
+    current_running = 0
+    if per_profile_cap is not None and per_profile_cap > 0:
+        current_running = int((per_profile_running or {}).get(row_assignee, 0))
+        if current_running >= per_profile_cap:
+            return _DispatchAdmission(
+                assignee=row_assignee,
+                canonical_assignee=profile.canonical,
+                reason="per_profile_capped",
+                current_running=current_running,
+                auto_assigned_default=auto_assigned_default,
+            )
+
+    # Keep the guard before the dependency claim, matching dispatch_once's
+    # existing order and preserving its active-PR/review-lane semantics.
+    guard_reason = check_respawn_guard(conn, row["id"], lane=lane)
+    if guard_reason is not None:
+        return _DispatchAdmission(
+            assignee=row_assignee,
+            canonical_assignee=profile.canonical,
+            reason="guard",
+            guard_reason=guard_reason,
+            auto_assigned_default=auto_assigned_default,
+        )
+
+    if check_dependencies and not _parents_satisfied(conn, row["id"]):
+        return _DispatchAdmission(
+            assignee=row_assignee,
+            canonical_assignee=profile.canonical,
+            reason="dependency",
+            auto_assigned_default=auto_assigned_default,
+        )
+
+    return _DispatchAdmission(
+        assignee=row_assignee,
+        canonical_assignee=profile.canonical,
+        current_running=current_running,
+        auto_assigned_default=auto_assigned_default,
+    )
+
+
+def _positive_dispatch_cap(value: Any, *, allow_zero: bool = False) -> Optional[int]:
+    """Parse an optional dispatcher cap without applying a default."""
+    if value is None:
+        return None
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    if parsed < 0 or (parsed == 0 and not allow_zero):
+        return None
+    return parsed
+
+
+def _resolve_dispatch_health_context(
+    *,
+    default_assignee: Any = _DISPATCH_CONTEXT_UNSET,
+    max_spawn: Any = _DISPATCH_CONTEXT_UNSET,
+    max_in_progress: Any = _DISPATCH_CONTEXT_UNSET,
+    max_in_progress_per_profile: Any = _DISPATCH_CONTEXT_UNSET,
+    board: Optional[str] = None,
+    memory_pressure: Any = _DISPATCH_CONTEXT_UNSET,
+    review_dispatch: Any = _DISPATCH_CONTEXT_UNSET,
+) -> dict[str, Any]:
+    """Resolve the exact settings needed by the health admission probe.
+
+    Gateway and standalone callers pass their already-resolved values. Direct
+    callers that omit context get the same read-only config/memory defaults as
+    the dispatcher, which keeps the public compatibility helper truthful too.
+    """
+    kanban_cfg: Mapping[str, Any] = {}
+    if any(
+        value is _DISPATCH_CONTEXT_UNSET
+        for value in (
+            default_assignee,
+            max_spawn,
+            max_in_progress,
+            max_in_progress_per_profile,
+            memory_pressure,
+            review_dispatch,
+        )
+    ):
+        try:
+            from hermes_cli.config import load_config
+            loaded = load_config()
+            candidate = loaded.get("kanban", {}) if isinstance(loaded, dict) else {}
+            kanban_cfg = candidate if isinstance(candidate, dict) else {}
+        except Exception:
+            kanban_cfg = {}
+
+    if default_assignee is _DISPATCH_CONTEXT_UNSET:
+        default_assignee = (kanban_cfg.get("default_assignee") or "").strip() or None
+    elif default_assignee is not None:
+        default_assignee = str(default_assignee).strip() or None
+
+    if max_spawn is _DISPATCH_CONTEXT_UNSET:
+        max_spawn = _positive_dispatch_cap(
+            kanban_cfg.get("max_spawn"), allow_zero=True
+        )
+    else:
+        max_spawn = _positive_dispatch_cap(max_spawn, allow_zero=True)
+
+    if max_in_progress is _DISPATCH_CONTEXT_UNSET:
+        configured = _positive_dispatch_cap(kanban_cfg.get("max_in_progress"))
+        max_in_progress = resolve_max_in_progress(configured)
+    elif max_in_progress is not None:
+        max_in_progress = _positive_dispatch_cap(max_in_progress, allow_zero=True)
+
+    if max_in_progress_per_profile is _DISPATCH_CONTEXT_UNSET:
+        max_in_progress_per_profile = _positive_dispatch_cap(
+            kanban_cfg.get("max_in_progress_per_profile")
+        )
+    else:
+        max_in_progress_per_profile = _positive_dispatch_cap(
+            max_in_progress_per_profile
+        )
+
+    if memory_pressure is _DISPATCH_CONTEXT_UNSET:
+        memory_pressure = _memory_pressure_level()
+
+    if review_dispatch is _DISPATCH_CONTEXT_UNSET:
+        review_dispatch = bool(kanban_cfg.get("review_dispatch", True))
+    else:
+        review_dispatch = bool(review_dispatch)
+
+    return {
+        "default_assignee": default_assignee,
+        "max_spawn": max_spawn,
+        "max_in_progress": max_in_progress,
+        "max_in_progress_per_profile": max_in_progress_per_profile,
+        "board": board,
+        "memory_pressure": memory_pressure,
+        "review_dispatch": review_dispatch,
+    }
+
+
+def _health_spawn_budget(
+    conn: sqlite3.Connection, context: Mapping[str, Any]
+) -> Optional[int]:
+    """Return this tick's remaining spawn budget, or None when uncapped."""
+    max_spawn = context["max_spawn"]
+    max_in_progress = context["max_in_progress"]
+    running_count = 0
+    if max_spawn is not None or max_in_progress is not None:
+        running_count = count_running_tasks(conn)
+
+    budget: Optional[int] = None
+    if max_spawn is not None:
+        if running_count >= max_spawn:
+            return 0
+        budget = max_spawn - running_count
+
+    if max_in_progress is not None:
+        try:
+            other_running = count_running_tasks_other_boards(context["board"])
+        except Exception:
+            # A broken peer-board probe aborts the live tick; keep the health
+            # probe conservative rather than hiding potentially spawnable work.
+            other_running = 0
+        total_running = running_count + other_running
+        if total_running >= max_in_progress:
+            return 0
+        remaining = max_in_progress - total_running
+        if budget is None or budget > remaining:
+            budget = remaining
+
+    pressure = context["memory_pressure"]
+    if pressure == "critical":
+        return 0
+    if pressure == "elevated":
+        if budget is None:
+            return 1
+        return min(budget, 1)
+    return budget
+
+
+def _running_counts_by_profile(
+    conn: sqlite3.Connection, per_profile_cap: Optional[int]
+) -> dict[str, int]:
+    if per_profile_cap is None or per_profile_cap <= 0:
+        return {}
+    try:
+        return {
+            row["assignee"]: int(row["n"])
+            for row in conn.execute(
+                "SELECT assignee, COUNT(*) AS n FROM tasks "
+                "WHERE status = 'running' AND assignee IS NOT NULL "
+                "GROUP BY assignee"
+            )
+        }
+    except Exception:
+        # The dispatch loop's query normally succeeds; if it does not, do not
+        # hide potentially spawnable work from a health warning.
+        return {}
+
+
+def _has_admissible_rows(
+    conn: sqlite3.Connection,
+    rows: Iterable[Mapping[str, Any]],
+    *,
+    lane: str,
+    default_assignee: Optional[str],
+    per_profile_cap: Optional[int],
+    per_profile_running: Mapping[str, int],
+) -> bool:
+    """Return whether any row passes the shared non-mutating predicate."""
     for row in rows:
-        if profile_exists(row["assignee"]):
+        try:
+            admission = _dispatch_admission(
+                conn,
+                row,
+                lane=lane,
+                default_assignee=default_assignee,
+                per_profile_cap=per_profile_cap,
+                per_profile_running=per_profile_running,
+                check_dependencies=True,
+            )
+        except Exception:
+            # A guard/read failure must remain conservative: the dispatcher
+            # may still be able to spawn once the transient error clears.
+            return True
+        if admission.reason is None:
             return True
     return False
 
 
-def has_spawnable_review(conn: sqlite3.Connection) -> bool:
-    """Return True iff there is at least one review+assigned+unclaimed task
-    whose assignee maps to a real Hermes profile.
+def _has_spawnable_tasks(
+    conn: sqlite3.Connection,
+    *,
+    status: str,
+    lane: str,
+    default_assignee: Any = _DISPATCH_CONTEXT_UNSET,
+    max_spawn: Any = _DISPATCH_CONTEXT_UNSET,
+    max_in_progress: Any = _DISPATCH_CONTEXT_UNSET,
+    max_in_progress_per_profile: Any = _DISPATCH_CONTEXT_UNSET,
+    board: Optional[str] = None,
+    memory_pressure: Any = _DISPATCH_CONTEXT_UNSET,
+    review_dispatch: Any = _DISPATCH_CONTEXT_UNSET,
+) -> bool:
+    """Return whether the current dispatcher tick could spawn a row.
 
-    Mirror of :func:`has_spawnable_ready` for the review column —
-    used by the health telemetry to decide whether the dispatcher
-    should have spawned a review agent.
+    This mirrors the actual dispatcher admission gates: dependency state,
+    validated/default profile routing, both concurrency caps, memory pressure,
+    per-profile capacity, and the lane-specific respawn guard. A raw ready row
+    is intentionally not enough to trigger a stuck warning.
     """
-    rows = conn.execute(
-        "SELECT DISTINCT assignee FROM tasks "
-        "WHERE status = 'review' AND assignee IS NOT NULL "
-        "    AND claim_lock IS NULL"
-    ).fetchall()
-    if not rows:
+    context = _resolve_dispatch_health_context(
+        default_assignee=default_assignee,
+        max_spawn=max_spawn,
+        max_in_progress=max_in_progress,
+        max_in_progress_per_profile=max_in_progress_per_profile,
+        board=board,
+        memory_pressure=memory_pressure,
+        review_dispatch=review_dispatch,
+    )
+    if status == "review" and not context["review_dispatch"]:
         return False
-    try:
-        from hermes_cli.profiles import profile_exists  # local import: avoids cycle
-    except Exception:
-        return True
-    for row in rows:
-        if profile_exists(row["assignee"]):
-            return True
-    return False
+    budget = _health_spawn_budget(conn, context)
+    if budget == 0:
+        return False
+
+    per_profile_cap = context["max_in_progress_per_profile"]
+    per_profile_running = _running_counts_by_profile(conn, per_profile_cap)
+    rows = conn.execute(
+        "SELECT id, assignee FROM tasks "
+        "WHERE status = ? AND claim_lock IS NULL "
+        "ORDER BY priority DESC, created_at ASC",
+        (status,),
+    ).fetchall()
+
+    if status == "ready":
+        ready_budget = budget
+        if budget is not None and budget > 0 and context["review_dispatch"]:
+            review_rows = conn.execute(
+                "SELECT id, assignee FROM tasks "
+                "WHERE status = 'review' AND claim_lock IS NULL "
+                "ORDER BY priority DESC, created_at ASC"
+            ).fetchall()
+            review_spawnable = _has_admissible_rows(
+                conn,
+                review_rows,
+                lane="review",
+                default_assignee=None,
+                per_profile_cap=per_profile_cap,
+                per_profile_running=per_profile_running,
+            )
+            if review_spawnable:
+                ready_budget = max(budget - 1, 0)
+        if ready_budget == 0:
+            return False
+    else:
+        ready_budget = budget
+
+    # A finite budget is already checked for zero above. The predicate only
+    # needs to find one admissible row; the actual dispatcher consumes the
+    # budget as it iterates and claims rows.
+    return _has_admissible_rows(
+        conn,
+        rows,
+        lane=lane,
+        default_assignee=(context["default_assignee"] if lane == "ready" else None),
+        per_profile_cap=per_profile_cap,
+        per_profile_running=per_profile_running,
+    )
+
+
+def has_spawnable_ready(
+    conn: sqlite3.Connection,
+    *,
+    default_assignee: Any = _DISPATCH_CONTEXT_UNSET,
+    max_spawn: Any = _DISPATCH_CONTEXT_UNSET,
+    max_in_progress: Any = _DISPATCH_CONTEXT_UNSET,
+    max_in_progress_per_profile: Any = _DISPATCH_CONTEXT_UNSET,
+    board: Optional[str] = None,
+    memory_pressure: Any = _DISPATCH_CONTEXT_UNSET,
+    review_dispatch: Any = _DISPATCH_CONTEXT_UNSET,
+) -> bool:
+    """Return True iff a ready task would pass this dispatch tick's gates."""
+    return _has_spawnable_tasks(
+        conn,
+        status="ready",
+        lane="ready",
+        default_assignee=default_assignee,
+        max_spawn=max_spawn,
+        max_in_progress=max_in_progress,
+        max_in_progress_per_profile=max_in_progress_per_profile,
+        board=board,
+        memory_pressure=memory_pressure,
+        review_dispatch=review_dispatch,
+    )
+
+
+def has_spawnable_review(
+    conn: sqlite3.Connection,
+    *,
+    default_assignee: Any = _DISPATCH_CONTEXT_UNSET,
+    max_spawn: Any = _DISPATCH_CONTEXT_UNSET,
+    max_in_progress: Any = _DISPATCH_CONTEXT_UNSET,
+    max_in_progress_per_profile: Any = _DISPATCH_CONTEXT_UNSET,
+    board: Optional[str] = None,
+    memory_pressure: Any = _DISPATCH_CONTEXT_UNSET,
+    review_dispatch: Any = _DISPATCH_CONTEXT_UNSET,
+) -> bool:
+    """Return True iff a review task would pass review dispatch admission."""
+    return _has_spawnable_tasks(
+        conn,
+        status="review",
+        lane="review",
+        default_assignee=default_assignee,
+        max_spawn=max_spawn,
+        max_in_progress=max_in_progress,
+        max_in_progress_per_profile=max_in_progress_per_profile,
+        board=board,
+        memory_pressure=memory_pressure,
+        review_dispatch=review_dispatch,
+    )
 
 
 def review_dispatch_enabled() -> bool:
@@ -10066,25 +10472,20 @@ def _dispatch_once_locked(
     # from the ready loop so the review lane always gets a spawn
     # opportunity. The reservation is per-tick and self-releasing: with no
     # spawnable review work (or no cap at all) the ready loop keeps the
-    # full budget. "Spawnable" mirrors the review loop's own gate
-    # (assigned + real profile) so a review column full of human-pulled
-    # control-plane lanes doesn't permanently tax ready throughput.
+    # full budget. "Spawnable" uses the same validated profile, dependency,
+    # per-profile, and respawn gates as the review loop.
     def _any_spawnable_review() -> bool:
         if not review_rows:
             return False
-        try:
-            from hermes_cli.profiles import profile_exists as _rpe
-        except Exception:
-            # Profiles module unavailable (test stubs, exotic envs) —
-            # assume spawnable, matching the review loop's own fallback.
-            return any(row["assignee"] for row in review_rows)
-        return any(
-            row["assignee"] and _rpe(row["assignee"]) for row in review_rows
+        return _has_admissible_rows(
+            conn,
+            review_rows,
+            lane="review",
+            default_assignee=None,
+            per_profile_cap=_per_profile_cap,
+            per_profile_running=_per_profile_running,
         )
 
-    ready_budget = spawn_budget
-    if spawn_budget is not None and spawn_budget > 0 and _any_spawnable_review():
-        ready_budget = max(spawn_budget - 1, 0)
     spawned = 0
     # Per-profile concurrency cap (#21582): when set, track how many
     # workers each assignee already has in flight, and refuse to spawn
@@ -10108,123 +10509,90 @@ def _dispatch_once_locked(
             _per_profile_running[prow["assignee"]] = int(prow["n"])
     # Normalize default_assignee once: empty/whitespace string → None so the
     # rest of the loop can use ``if default_assignee:`` as a single check.
-    # We also resolve profile_exists once here for the same reason.
+    # Profile validation and existence are performed by _dispatch_admission,
+    # which is also used by the health probe. This prevents a path-shaped
+    # synthetic assignee from being accepted by profile_exists directly.
     _default_assignee = (default_assignee or "").strip() or None
-    _default_assignee_resolved = False
-    if _default_assignee:
-        try:
-            from hermes_cli.profiles import profile_exists as _pe
-            _default_assignee_resolved = bool(_pe(_default_assignee))
-        except Exception:
-            # Profiles module not importable (test stubs, exotic envs).
-            # Trust the operator's config and try the assignment; the
-            # downstream profile_exists check on the assigned row will
-            # bucket it as nonspawnable if the profile genuinely isn't
-            # there, with the existing diagnostic.
-            _default_assignee_resolved = True
+    ready_budget = spawn_budget
+    if spawn_budget is not None and spawn_budget > 0 and _any_spawnable_review():
+        ready_budget = max(spawn_budget - 1, 0)
     for row in ready_rows:
         if ready_budget is not None and spawned >= ready_budget:
             break
-        row_assignee = row["assignee"]
-        if not row_assignee:
-            # Honour kanban.default_assignee: when the dispatcher hits an
-            # unassigned ready task and an operator-configured fallback
-            # exists, persist the assignment and proceed. This removes the
-            # dashboard footgun where a task created without an assignee
-            # parks in 'ready' forever even though the operator's intent
-            # ("default") was perfectly clear (#27145). Mutating the row
-            # (not just the in-memory view) keeps diagnostics and the
-            # board state consistent: the task is now legitimately owned
-            # by ``kanban.default_assignee``, not "unassigned but secretly
-            # routed".
-            if _default_assignee and _default_assignee_resolved:
-                # Dry-run: show what WOULD happen (auto-assign + spawn) without
-                # mutating the DB. Real run: mutate the row + emit the
-                # 'assigned' event so the board state matches what just happened.
-                if not dry_run:
-                    try:
-                        with write_txn(conn):
-                            conn.execute(
-                                "UPDATE tasks SET assignee = ? WHERE id = ? "
-                                "AND (assignee IS NULL OR assignee = '')",
-                                (_default_assignee, row["id"]),
-                            )
-                            _append_event(
-                                conn, row["id"], "assigned",
-                                {
-                                    "assignee": _default_assignee,
-                                    "source": "kanban.default_assignee",
-                                },
-                            )
-                    except Exception:
-                        _log.debug(
-                            "kanban dispatch: failed to apply default_assignee=%r "
-                            "to task %s",
-                            _default_assignee, row["id"], exc_info=True,
+        admission = _dispatch_admission(
+            conn,
+            row,
+            lane="ready",
+            default_assignee=_default_assignee,
+            per_profile_cap=_per_profile_cap,
+            per_profile_running=_per_profile_running,
+            # The atomic claim remains the final dependency gate on a real
+            # tick. Dry-run must still report parent-blocked rows accurately.
+            check_dependencies=dry_run,
+        )
+        row_assignee = admission.assignee or ""
+        if admission.auto_assigned_default:
+            # Dry-run: show what WOULD happen (auto-assign + spawn) without
+            # mutating the DB. Real run: mutate the row + emit the 'assigned'
+            # event so the board state matches what just happened.
+            if not dry_run:
+                try:
+                    with write_txn(conn):
+                        conn.execute(
+                            "UPDATE tasks SET assignee = ? WHERE id = ? "
+                            "AND (assignee IS NULL OR assignee = '')",
+                            (_default_assignee, row["id"]),
                         )
-                        result.skipped_unassigned.append(row["id"])
-                        continue
-                row_assignee = _default_assignee
-                result.auto_assigned_default.append(row["id"])
-            else:
-                result.skipped_unassigned.append(row["id"])
-                continue
-        # Skip ready tasks whose assignee is not a real Hermes profile.
-        # `_default_spawn` invokes ``hermes -p <assignee>`` which fails
-        # with "Profile 'X' does not exist" when the assignee names a
-        # control-plane lane (e.g. an interactive Claude Code terminal
-        # like ``orion-cc`` / ``orion-research``) rather than a Hermes
-        # profile. Those task lanes are pulled by terminals via
-        # ``claim_task`` directly and should NEVER auto-spawn — the
-        # subprocess would crash on startup, get reaped as a zombie,
-        # the task would loop back to ``ready`` on next tick, and we'd
-        # burn CPU forever (#kanban-dispatcher-crash-loop 2026-05-05).
-        try:
-            from hermes_cli.profiles import profile_exists  # local import: avoids cycle
-        except Exception:
-            profile_exists = None  # type: ignore[assignment]
-        if profile_exists is not None and not profile_exists(row_assignee):
-            # Bucket separately from skipped_unassigned: the operator
-            # cannot fix this by assigning a profile (the assignee IS the
-            # intended owner — a terminal lane). Health telemetry uses
-            # this distinction to suppress spurious "stuck" warnings on
-            # multi-lane setups where the ready queue is steadily full
-            # of human-pulled work.
+                        _append_event(
+                            conn,
+                            row["id"],
+                            "assigned",
+                            {
+                                "assignee": _default_assignee,
+                                "source": "kanban.default_assignee",
+                            },
+                        )
+                except Exception:
+                    _log.debug(
+                        "kanban dispatch: failed to apply default_assignee=%r "
+                        "to task %s",
+                        _default_assignee,
+                        row["id"],
+                        exc_info=True,
+                    )
+                    result.skipped_unassigned.append(row["id"])
+                    continue
+            result.auto_assigned_default.append(row["id"])
+        if admission.reason == "unassigned":
+            result.skipped_unassigned.append(row["id"])
+            continue
+        if admission.reason == "nonspawnable":
+            # `_default_spawn` invokes ``hermes -p <assignee>``. Control-plane
+            # lanes and malformed synthetic names are pulled by terminals and
+            # must never reach a subprocess spawn path.
             result.skipped_nonspawnable.append(row["id"])
             continue
-        # Per-profile concurrency cap (#21582): even if there's global
-        # headroom, refuse to spawn for an assignee that's already at
-        # its in-flight cap. Prevents one profile's local model / API
-        # quota / browser pool from being overwhelmed by a fan-out
-        # while the global max_in_progress / max_spawn caps still allow
-        # work on OTHER profiles.
-        if _per_profile_cap is not None:
-            current = _per_profile_running.get(row_assignee, 0)
-            if current >= _per_profile_cap:
-                result.skipped_per_profile_capped.append(
-                    (row["id"], row_assignee, current)
-                )
-                continue
-        # Respawn guard: refuse to re-spawn when useful work is already
-        # in-flight/recent, or when the last failure is a deterministic
-        # blocker (quota / auth). The guard defers the spawn this tick so
-        # the task gets a chance to clear (rate limits often reset in
-        # seconds-to-minutes); the existing consecutive_failures counter
-        # still trips the auto-block circuit breaker after failure_limit
-        # consecutive failures, so a persistent auth error eventually
-        # blocks via the normal path rather than on first occurrence.
-        guard_reason = check_respawn_guard(conn, row["id"])
-        if guard_reason is not None:
-            result.respawn_guarded.append((row["id"], guard_reason))
-            # Emit an event so operators can see why the task was
-            # skipped when reading `hermes kanban tail` — without
-            # this the task appears stuck in ready with no diagnosis.
+        if admission.reason == "per_profile_capped":
+            result.skipped_per_profile_capped.append(
+                (row["id"], row_assignee, admission.current_running)
+            )
+            continue
+        if admission.reason == "guard":
+            guard_reason = admission.guard_reason
+            result.respawn_guarded.append((row["id"], guard_reason or "unknown"))
+            # Emit an event so operators can see why the task was skipped when
+            # reading `hermes kanban tail` — without this the task appears
+            # stuck in ready with no diagnosis.
             if not dry_run:
                 with write_txn(conn):
                     _append_event(
-                        conn, row["id"], "respawn_guarded",
+                        conn,
+                        row["id"],
+                        "respawn_guarded",
                         {"reason": guard_reason},
                     )
+            continue
+        if admission.reason == "dependency":
             continue
         if dry_run:
             result.spawned.append((row["id"], row_assignee, ""))
@@ -10330,39 +10698,46 @@ def _dispatch_once_locked(
     for row in review_rows:
         if spawn_budget is not None and spawned >= spawn_budget:
             break
-        if not row["assignee"]:
+        admission = _dispatch_admission(
+            conn,
+            row,
+            lane="review",
+            per_profile_cap=_per_profile_cap,
+            per_profile_running=_per_profile_running,
+            check_dependencies=dry_run,
+        )
+        row_assignee = admission.assignee or ""
+        if admission.reason == "unassigned":
             result.skipped_unassigned.append(row["id"])
             continue
-        try:
-            from hermes_cli.profiles import profile_exists
-        except Exception:
-            profile_exists = None  # type: ignore[assignment]
-        if profile_exists is not None and not profile_exists(row["assignee"]):
+        if admission.reason == "nonspawnable":
             result.skipped_nonspawnable.append(row["id"])
             continue
-        if _per_profile_cap is not None:
-            current = _per_profile_running.get(row["assignee"], 0)
-            if current >= _per_profile_cap:
-                result.skipped_per_profile_capped.append(
-                    (row["id"], row["assignee"], current)
-                )
-                continue
-        guard_reason = check_respawn_guard(conn, row["id"], lane="review")
-        if guard_reason is not None:
-            result.respawn_guarded.append((row["id"], guard_reason))
+        if admission.reason == "per_profile_capped":
+            result.skipped_per_profile_capped.append(
+                (row["id"], row_assignee, admission.current_running)
+            )
+            continue
+        if admission.reason == "guard":
+            guard_reason = admission.guard_reason
+            result.respawn_guarded.append((row["id"], guard_reason or "unknown"))
             if not dry_run:
                 with write_txn(conn):
                     _append_event(
-                        conn, row["id"], "respawn_guarded",
+                        conn,
+                        row["id"],
+                        "respawn_guarded",
                         {"reason": guard_reason},
                     )
             continue
+        if admission.reason == "dependency":
+            continue
         if dry_run:
-            result.spawned.append((row["id"], row["assignee"], ""))
+            result.spawned.append((row["id"], row_assignee, ""))
             spawned += 1
-            if _per_profile_cap is not None:
-                _per_profile_running[row["assignee"]] = (
-                    _per_profile_running.get(row["assignee"], 0) + 1
+            if _per_profile_cap is not None and row_assignee:
+                _per_profile_running[row_assignee] = (
+                    _per_profile_running.get(row_assignee, 0) + 1
                 )
             continue
         claimed = claim_review_task(conn, row["id"], ttl_seconds=ttl_seconds)
@@ -10986,15 +11361,28 @@ def run_daemon(
             # entire backlog in one tick even with the derived default in
             # place everywhere else. Re-resolved every tick (config load is
             # mtime-cached) so operator edits apply without a restart.
-            max_in_progress = resolve_max_in_progress(
-                configured_max_in_progress()
+            # Resolve the remaining admission settings here as well so the
+            # standalone path and its health probe agree on default routing,
+            # per-profile capacity, and the configured max_spawn override.
+            configured_max = configured_max_in_progress()
+            dispatch_context = _resolve_dispatch_health_context(
+                max_spawn=(
+                    max_spawn
+                    if max_spawn is not None
+                    else _DISPATCH_CONTEXT_UNSET
+                ),
+                max_in_progress=resolve_max_in_progress(configured_max),
             )
             with contextlib.closing(connect()) as conn:
                 res = dispatch_once(
                     conn,
-                    max_spawn=max_spawn,
-                    max_in_progress=max_in_progress,
+                    max_spawn=dispatch_context["max_spawn"],
+                    max_in_progress=dispatch_context["max_in_progress"],
                     failure_limit=failure_limit,
+                    default_assignee=dispatch_context["default_assignee"],
+                    max_in_progress_per_profile=dispatch_context[
+                        "max_in_progress_per_profile"
+                    ],
                 )
             if on_tick is not None:
                 try:

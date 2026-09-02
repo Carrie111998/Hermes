@@ -2896,7 +2896,7 @@ def _cmd_daemon(args: argparse.Namespace) -> int:
     health_state = {"bad_ticks": 0, "last_warn_at": 0}
 
     def _on_tick(res):
-        ready_pending = bool(res.skipped_unassigned) or _ready_queue_nonempty()
+        ready_pending = _ready_queue_nonempty()
         spawned_any = bool(res.spawned)
         if ready_pending and not spawned_any:
             health_state["bad_ticks"] += 1
@@ -2936,18 +2936,29 @@ def _cmd_daemon(args: argparse.Namespace) -> int:
             )
 
     def _ready_queue_nonempty() -> bool:
-        """Cheap probe — is there at least one ready+assigned+unclaimed
-        task whose assignee maps to a real Hermes profile (i.e. one the
-        dispatcher would actually try to spawn for)?
+        """Return whether this tick has ready or review work to spawn.
 
-        Filters out tasks assigned to control-plane lanes
-        (e.g. ``orion-cc``, ``orion-research``) that are pulled by
-        terminals via ``claim_task`` directly — those are correctly idle
-        from the dispatcher's perspective, not stuck.
+        The health probe resolves the same routing, capacity, memory, and
+        review settings as ``run_daemon``/``dispatch_once``. A queue row that
+        is dependency-blocked, capped, guarded, or otherwise non-admissible is
+        correctly idle rather than evidence of a stuck dispatcher.
         """
         try:
             with kb.connect_closing() as conn:
-                return kb.has_spawnable_ready(conn)
+                health_context = kb._resolve_dispatch_health_context(
+                    max_spawn=(
+                        args.max
+                        if getattr(args, "max", None) is not None
+                        else kb._DISPATCH_CONTEXT_UNSET
+                    ),
+                    memory_pressure=kb._memory_pressure_level(),
+                )
+                if kb.has_spawnable_ready(conn, **health_context):
+                    return True
+                return bool(
+                    health_context["review_dispatch"]
+                    and kb.has_spawnable_review(conn, **health_context)
+                )
         except Exception:
             return False
 
