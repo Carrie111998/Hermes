@@ -771,8 +771,51 @@ def test_service_publishes_deferred_turn_continues_and_retries_new_generation(
     requeued = service.retry_room_task(
         "room-1",
         task_id=first["identity"].task_id,
+        retry_id="retry-1",
     )
     assert requeued["status"] == "queued"
+    replayed = service.retry_room_task(
+        "room-1",
+        task_id=first["identity"].task_id,
+        retry_id="retry-1",
+    )
+    assert replayed["status"] == "queued"
+    assert replayed["idempotent"] is True
+    with sqlite3.connect(db) as conn:
+        conn.execute(
+            """UPDATE hosted_room_driver_tasks
+                  SET status='deferred', execution_generation=2
+                WHERE room_id='room-1' AND task_id=?""",
+            (first["identity"].task_id,),
+        )
+        conn.commit()
+    second_retry = service.retry_room_task(
+        "room-1",
+        task_id=first["identity"].task_id,
+        retry_id="retry-2",
+    )
+    assert second_retry["status"] == "queued"
+    with sqlite3.connect(db) as conn:
+        conn.execute(
+            """UPDATE hosted_room_driver_tasks
+                  SET status='deferred', execution_generation=3
+                WHERE room_id='room-1' AND task_id=?""",
+            (first["identity"].task_id,),
+        )
+        conn.commit()
+    delayed_first = service.retry_room_task(
+        "room-1",
+        task_id=first["identity"].task_id,
+        retry_id="retry-1",
+    )
+    assert delayed_first["status"] == "deferred"
+    assert delayed_first["idempotent"] is True
+    third_retry = service.retry_room_task(
+        "room-1",
+        task_id=first["identity"].task_id,
+        retry_id="retry-3",
+    )
+    assert third_retry["status"] == "queued"
     lease = service.runtime._leases["room-1"]
     retried = driver.start_task(
         db,
@@ -781,7 +824,7 @@ def test_service_publishes_deferred_turn_continues_and_retries_new_generation(
         expected_cancel_generation=0,
         clock=clock,
     )
-    assert retried.execution_generation == old_attempt.execution_generation + 1
+    assert retried.execution_generation == third_retry["execution_generation"] + 1
 
 
 def test_stop_fence_prevents_the_next_room_member_from_starting(
@@ -966,6 +1009,147 @@ def test_local_pending_approval_requires_exact_task_generation_and_request(
     ) == {"resolved": 1}
     assert rpc.approvals == [("ops-session", "approval-1", "once")]
     assert service.status("room-1")["pending_actions"] == []
+
+
+def test_headless_room_publishes_peer_member_reply_without_desktop_transport(
+    tmp_path: Path,
+):
+    db = tmp_path / "state.db"
+    peer = _FakePeerClient()
+    route = PeerMemberRoute(
+        home_install_id="install-home",
+        member_id="member-reviewer",
+        target_install_id="install-peer",
+        target_profile="reviewer",
+        capability_digest="a" * 64,
+        execution_policy_digest="b" * 64,
+        cancellation_scope_id="cancel-room-1",
+        trace_id="trace-room-1",
+        grant="signed-room-grant",
+    )
+    service = HostedRoomService(
+        _server(),
+        db_path=db,
+        peer_routes={("room-1", "member-reviewer"): route},
+        peer_clients={"install-peer": peer},
+    )
+    service.rpc = _FakeRPC()
+    service.runtime.rpc = service.rpc
+    service.local_profiles = lambda: ("default",)
+    room = service.create_room(
+        room_id="room-1",
+        name="Review room",
+        members=[
+            {
+                "member_id": "default",
+                "profile": "default",
+                "handle": "local",
+            },
+            {
+                "member_id": "member-reviewer",
+                "profile": "reviewer",
+                "handle": "reviewer",
+                "target": {
+                    "kind": "peer",
+                    "peer_id": "peer-review",
+                    "installation_id": "install-peer",
+                    "profile": "reviewer",
+                    "capability_digest": "a" * 64,
+                },
+            },
+        ],
+    )
+    assert room["members"][1]["target"]["kind"] == "peer"
+
+    service.start()
+    service.send(
+        room_id="room-1",
+        event_id="user-peer-1",
+        payload={"text": "@reviewer inspect this", "thread_id": "thread-1"},
+    )
+    _wait_for(
+        lambda: any(
+            event["kind"] == "message.member" for event in service._events("room-1")
+        )
+    )
+    assert service.stop(timeout=1.0)
+
+    events = service._events("room-1")
+    reply = next(event for event in events if event["kind"] == "message.member")
+    assert reply["payload"]["member_id"] == "member-reviewer"
+    assert reply["payload"]["text"] == "Remote review complete."
+    assert reply["actor"]["connection_id"] == "peer-review"
+    assert peer.dispatches[0]["target_profile"] == "reviewer"
+
+
+def test_unadmitted_peer_failure_does_not_block_next_healthy_member(
+    tmp_path: Path,
+):
+    db = tmp_path / "state.db"
+    route = PeerMemberRoute(
+        home_install_id="install-home",
+        member_id="member-peer",
+        target_install_id="install-peer",
+        target_profile="reviewer",
+        capability_digest="a" * 64,
+        cancellation_scope_id="cancel-room-1",
+        trace_id="trace-room-1",
+        grant="signed-room-grant",
+    )
+    service = HostedRoomService(
+        _server(),
+        db_path=db,
+        peer_routes={("room-1", "member-peer"): route},
+        peer_clients={"install-peer": _UnavailablePeerClient()},
+    )
+    service.rpc = _FakeRPC()
+    service.runtime.rpc = service.rpc
+    service.local_profiles = lambda: ("local",)
+    service.create_room(
+        room_id="room-1",
+        name="Fallback room",
+        members=[
+            {
+                "member_id": "member-peer",
+                "profile": "reviewer",
+                "handle": "reviewer",
+                "target": {
+                    "kind": "peer",
+                    "peer_id": "peer-review",
+                    "installation_id": "install-peer",
+                    "profile": "reviewer",
+                    "capability_digest": "a" * 64,
+                },
+            },
+            {"member_id": "local", "profile": "local", "handle": "local"},
+        ],
+    )
+
+    service.start()
+    service.send(
+        room_id="room-1",
+        event_id="user-fallback-1",
+        payload={"text": "Review this together", "thread_id": "thread-1"},
+    )
+    _wait_for(
+        lambda: any(
+            event["kind"] == "message.member"
+            and event["payload"]["member_id"] == "local"
+            for event in service._events("room-1")
+        )
+    )
+    assert service.stop(timeout=1.0)
+
+    events = service._events("room-1")
+    assert any(
+        event["kind"] == "turn.failed"
+        and event["payload"]["member_id"] == "member-peer"
+        for event in events
+    )
+    assert any(
+        event["kind"] == "message.member" and event["payload"]["member_id"] == "local"
+        for event in events
+    )
 
 
 def test_registered_peer_route_rehydrates_after_service_restart(tmp_path: Path):
@@ -1923,3 +2107,71 @@ def test_stale_local_approval_cannot_resolve_replacement_request(tmp_path: Path)
     assert service.status("room-1")["pending_actions"][0]["request_id"] == (
         "approval-B"
     )
+
+
+def test_peer_recovery_replays_the_same_execution_generation(tmp_path: Path):
+    db = tmp_path / "state.db"
+    catalog = GatewayRoomCatalog.from_mapping(
+        catalog_mapping(installation_id="install-peer", persistent_process=True)
+    )
+    route = PeerMemberRoute(
+        home_install_id=hosted_rooms.local_authority_gateway_id(),
+        member_id="member-peer",
+        target_install_id="install-peer",
+        target_profile="reviewer",
+        capability_digest=catalog.catalog_digest,
+        cancellation_scope_id="cancel-room-1",
+        trace_id="trace-room-1",
+        grant="signed.room.grant",
+    )
+    peer = _RecoveringPeerClient()
+    service = HostedRoomService(_server(), db_path=db)
+    service.register_peer_route(
+        room_id="room-1",
+        member_id="member-peer",
+        route=route,
+        client=peer,
+        target_url="https://peer.example.test",
+        catalog=catalog,
+    )
+    service.create_room(
+        room_id="room-1",
+        name="Peer room",
+        members=[
+            {"member_id": "default", "profile": "default", "handle": "hermes"},
+            {
+                "member_id": "member-peer",
+                "profile": "reviewer",
+                "handle": "reviewer",
+                "target": {
+                    "kind": "peer",
+                    "peer_id": "peer-review",
+                    "installation_id": "install-peer",
+                    "profile": "reviewer",
+                    "capability_digest": catalog.catalog_digest,
+                },
+            },
+        ],
+    )
+    identity = driver.TaskIdentity("room-1", "task-1", "thread-1", "turn-1")
+
+    service._resolve_member_transport(
+        service.bindings()[0],
+        {
+            "identity": identity,
+            "status": "indeterminate",
+            "execution_generation": 1,
+            "payload": {
+                "target_member_id": "member-peer",
+                "target_profile": "reviewer",
+                "source_event_seq": 9,
+                "prompt": "Recover the accepted review.",
+            },
+        },
+    )
+
+    assert len(peer.recoveries) == 1
+    recovered = peer.recoveries[0]["dispatch"]
+    assert recovered["task_id"] == "task-1"
+    assert recovered["execution_generation"] == 1
+    assert recovered["prompt"] == "Recover the accepted review."

@@ -5314,6 +5314,17 @@ def _bot_relay_outbox_sig():
     return _bot_relay_outbox_seen or None
 
 
+def _desktop_room_mailbox_sig():
+    """mtime of commands written by a messaging process for Desktop rooms."""
+
+    home = _watcher_home()
+    root = home.parent.parent if home.parent.name == "profiles" else home
+    try:
+        return (root / "desktop_room_mailbox.pending").stat().st_mtime_ns
+    except OSError:
+        return None
+
+
 # Watched change signals: event → (check interval, signature fn, payload fn).
 # Signatures are stat/dict-lookup cheap, same bar as the skin watcher; the
 # check interval keeps the pricier probes (pet resolves the active sheet off
@@ -5327,6 +5338,11 @@ _CHANGE_WATCHES: dict[str, tuple[float, Any, Any]] = {
     # Cross-connection DM latency: 1s check so a queued envelope reaches the
     # Desktop's push-triggered drain fast; the Desktop's poll stays backstop.
     "bot_relay.outbox.pending": (1.0, _bot_relay_outbox_sig, lambda: {}),
+    "desktop_rooms.commands.pending": (
+        1.0,
+        _desktop_room_mailbox_sig,
+        lambda: {},
+    ),
 }
 
 # state.db moves on every message append during a streaming turn, and the

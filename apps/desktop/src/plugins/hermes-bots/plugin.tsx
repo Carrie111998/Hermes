@@ -42,6 +42,7 @@ import {
   migrateBotMeta,
   resolveRosterMentions
 } from './data'
+import { startDesktopRoomCommandRuntime, stopDesktopRoomCommandRuntime } from './desktop-room-command-runtime'
 import {
   $groupChats,
   $groupChatWorkspace,
@@ -128,6 +129,7 @@ export default {
             hostedAlreadyRenamed: true
           })
       })
+      void startDesktopRoomCommandRuntime(ctx.storage)
     }
 
     startFaceClock()
@@ -144,6 +146,7 @@ export default {
       ctx.onDispose(() => {
         roomServicesDisposed = true
         stopHostedRoomRuntime()
+        stopDesktopRoomCommandRuntime()
       })
     }
 
@@ -278,6 +281,18 @@ export default {
                   holds: room.holds && typeof room.holds === 'object' ? room.holds : {},
                   members: Array.isArray(room.members) ? room.members : [],
                   roomId: typeof room.roomId === 'string' && room.roomId ? room.roomId : null,
+                  desktopCoordinatorId:
+                    typeof room.desktopCoordinatorId === 'string' && room.desktopCoordinatorId
+                      ? room.desktopCoordinatorId
+                      : null,
+                  desktopAuthorityToken:
+                    typeof room.desktopAuthorityToken === 'string' && room.desktopAuthorityToken
+                      ? room.desktopAuthorityToken
+                      : null,
+                  desktopCommandSettled:
+                    room.desktopCommandSettled && typeof room.desktopCommandSettled === 'object'
+                      ? room.desktopCommandSettled
+                      : {},
                   hosted: typeof room.hosted === 'string' && room.hosted ? room.hosted : null,
                   hostedEpoch: Math.max(0, Number(room.hostedEpoch || 0)) || null,
                   hostedConnectionId:

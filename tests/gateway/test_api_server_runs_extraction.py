@@ -180,6 +180,9 @@ def test_roomlink_and_run_route_tuples_are_shard_owned():
         ("GET", "/v1/room-members/capabilities"),
         ("POST", "/v1/room-members/grants/refresh"),
         ("POST", "/v1/room-members/grants/revoke"),
+        ("GET", "/v1/room-controls/{room_id}"),
+        ("POST", "/v1/room-controls/{room_id}"),
+        ("DELETE", "/v1/room-controls/{room_id}"),
         ("POST", "/v1/room-members/attachments"),
         (
             "PUT",

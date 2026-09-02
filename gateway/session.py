@@ -193,6 +193,10 @@ class SessionSource:
     # Transport-local fail-closed signal for an explicit profile route whose
     # target is not served. Excluded from repr/equality and wire serialization.
     profile_route_rejected: bool = field(default=False, repr=False, compare=False)
+    # Transport-local trust facts; never deserialize these from stored/wire data.
+    is_one_to_one: Optional[bool] = field(default=None, repr=False, compare=False)
+    message_is_edit: bool = field(default=False, repr=False, compare=False)
+    message_had_attachments: bool = field(default=False, repr=False, compare=False)
 
     # Discord auto-thread metadata.  Newly auto-created Discord threads start
     # with a fast placeholder title from the raw message, then the gateway can
@@ -268,6 +272,7 @@ class SessionSource:
             "user_name": self.user_name,
             "thread_id": self.thread_id,
             "chat_topic": self.chat_topic,
+            "is_bot": self.is_bot,
         }
         if self.user_id_alt:
             d["user_id_alt"] = self.user_id_alt
@@ -313,6 +318,7 @@ class SessionSource:
             scope_id=data.get("scope_id", data.get("guild_id")),
             parent_chat_id=data.get("parent_chat_id"),
             message_id=data.get("message_id"),
+            is_bot=bool(data.get("is_bot", False)),
             profile=data.get("profile"),
             auto_thread_created=bool(data.get("auto_thread_created", False)),
             auto_thread_initial_name=data.get("auto_thread_initial_name"),

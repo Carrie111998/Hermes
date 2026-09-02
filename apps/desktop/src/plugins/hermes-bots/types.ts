@@ -152,6 +152,8 @@ export interface GroupMessage {
   at: number
   /** Stable gateway event identity after a hosted-room replay. */
   eventId?: string
+  /** True for an idempotent message accepted through a messaging bridge. */
+  external?: boolean
   from: GroupMessageAuthor
   id?: string
   images?: Attachment[]
@@ -170,6 +172,14 @@ export interface GroupHold {
 export interface GroupChat {
   /** User-facing continuity choice. Missing records are classic Desktop rooms. */
   continuityMode?: 'desktop' | 'distributed' | 'gateway'
+  /** Public SHA-256 commitment to the local authority token. */
+  desktopAuthorityHash?: null | string
+  /** Secret held only by the Desktop that coordinates this classic room. */
+  desktopAuthorityToken?: null | string
+  /** Stable installation/window identity that owns classic room commands. */
+  desktopCoordinatorId?: null | string
+  /** Bounded idempotency receipts for messaging commands already settled. */
+  desktopCommandSettled?: Record<string, number>
   /** Bumped to abandon in-flight member turns from a previous round. */
   epoch?: number
   holds?: Record<string, GroupHold>

@@ -257,6 +257,17 @@ def test_new_envelope_after_drain_fires_pending_again(watcher_home):
     ]
 
 
+def test_desktop_room_command_signal_broadcasts_pending(watcher_home):
+    home, events = watcher_home
+    signal = home / "desktop_room_mailbox.pending"
+    server._broadcast_watched_changes(now=0.0)
+
+    signal.write_text("1")
+    server._broadcast_watched_changes(now=10.0)
+
+    assert ("desktop_rooms.commands.pending", {}) in events
+
+
 def test_no_outbox_dir_never_fires_pending(watcher_home):
     home, events = watcher_home
     server._broadcast_watched_changes(now=0.0)

@@ -6062,6 +6062,7 @@ class SlackAdapter(BasePlatformAdapter):
         self, event: dict, payload: Optional[dict] = None
     ) -> None:
         """Handle an incoming Slack message event."""
+        is_message_edit = event.get("subtype") == "message_changed"
         # DEBUG entry log — fires BEFORE any filtering so users debugging
         # bot-to-bot interop, allow_bots config, or SLACK_ALLOWED_USERS
         # drops can confirm whether the event actually arrived from Slack
@@ -7089,10 +7090,12 @@ class SlackAdapter(BasePlatformAdapter):
             # subtype=bot_message with user=None; flag them so the
             # gateway SLACK_ALLOW_BOTS bypass can authorize them
             # (they carry no user_id to match against the allowlist).
-            # Same predicate as the drop gate above, so an api_human_users
-            # post is a plain human here too.
-            is_bot=self._event_declares_bot_sender(event),
+            is_bot=sender_is_bot,
         )
+        # Transport-local privacy and replay signals. They are intentionally not
+        # serialized: an older relay cannot assert a private one-to-one surface.
+        source.is_one_to_one = is_one_to_one_dm
+        source.message_is_edit = is_message_edit
 
         # Per-channel ephemeral prompt
         from gateway.platforms.base import (
@@ -7152,6 +7155,7 @@ class SlackAdapter(BasePlatformAdapter):
                 "slack_team_id": team_id,
                 "slack_channel_id": channel_id,
                 "slack_thread_ts": thread_ts,
+                "message_is_edit": is_message_edit,
             },
         )
 
@@ -8596,6 +8600,8 @@ class SlackAdapter(BasePlatformAdapter):
             thread_id=thread_id,
             scope_id=team_id or None,
         )
+        source.is_one_to_one = is_dm
+        source.message_is_edit = False
 
         event = MessageEvent(
             text=text,

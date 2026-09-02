@@ -12,6 +12,11 @@ const mocks = vi.hoisted(() => ({
   createAutonomousHostedGroupChat: vi.fn(),
   markHostedRoomLocallyDeleted: vi.fn(),
   notify: vi.fn(),
+  prepareDesktopRoomAuthority: vi.fn(async () => ({
+    desktopAuthorityHash: 'a'.repeat(64),
+    desktopAuthorityToken: 'authority:test',
+    desktopCoordinatorId: 'desktop:test'
+  })),
   probeHostedRoomMembers: vi.fn(),
   saveBotMeta: vi.fn(async (_owner: unknown, _patch: unknown) => undefined)
 }))
@@ -43,6 +48,10 @@ vi.mock('./hosted-room-runtime', () => ({
   describeHostedRoomCreationError: () => null,
   markHostedRoomLocallyDeleted: mocks.markHostedRoomLocallyDeleted,
   probeHostedRoomMembers: mocks.probeHostedRoomMembers
+}))
+
+vi.mock('./desktop-room-command-runtime', () => ({
+  prepareDesktopRoomAuthority: mocks.prepareDesktopRoomAuthority
 }))
 
 const roster: RosterRow[] = [
@@ -80,6 +89,7 @@ const eligibleProbe: HostedRoomProbe = {
     },
     persistentProcess: true,
     routeGrantFingerprint: false,
+    reciprocalControl: false,
     reason: null,
     roomLink: null
   },
@@ -181,6 +191,8 @@ describe('automatic Group Chat continuity', () => {
     await waitFor(() => expect(mocks.createAutonomousHostedGroupChat).toHaveBeenCalledTimes(1))
 
     const { $groupChats } = await import('./group-chat')
+
+    await waitFor(() => expect(Object.values($groupChats.get())).toHaveLength(1))
     const created = Object.values($groupChats.get())[0]
 
     expect(created).toMatchObject({
@@ -348,6 +360,8 @@ describe('automatic Group Chat continuity', () => {
     })
 
     const { $groupChats } = await import('./group-chat')
+
+    await waitFor(() => expect(Object.values($groupChats.get())).toHaveLength(1))
     const created = Object.values($groupChats.get())[0]
 
     expect(created.continuityMode).toBe('desktop')

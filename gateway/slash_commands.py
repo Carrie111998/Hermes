@@ -33,6 +33,7 @@ from agent.account_usage import fetch_account_usage, render_account_usage_lines
 from agent.i18n import t
 from agent.turn_context import extract_api_content_sidecar
 from gateway.config import HomeChannel, Platform, PlatformConfig, persist_home_channel
+from gateway.group_chat_slash import GroupChatSlashCommandsMixin
 from gateway.platforms.base import EphemeralReply, MessageEvent, MessageType
 from gateway.session import (
     AsyncSessionStore,
@@ -54,7 +55,6 @@ logger = logging.getLogger("gateway.run")
 # past this the reset proceeds and the cleanup is left to finish (or leak) in
 # its worker thread. (#35994)
 _RESET_CLEANUP_TIMEOUT_S = 30.0
-
 
 def _clean_str(value: Any) -> str:
     """Strip and return a non-empty string value, or empty string."""
@@ -123,7 +123,7 @@ def _home_thread_from_source(source) -> Optional[str]:
     return str(thread_id)
 
 
-class GatewaySlashCommandsMixin:
+class GatewaySlashCommandsMixin(GroupChatSlashCommandsMixin):
     """In-session slash-command handlers for GatewayRunner."""
 
     async_session_store: AsyncSessionStore
@@ -572,6 +572,13 @@ class GatewaySlashCommandsMixin:
         if len(output) > 3800:
             output = output[:3800] + "\n" + t("gateway.kanban.truncated_suffix")
         return output or t("gateway.kanban.no_output")
+
+
+
+
+
+
+
 
     async def _handle_status_command(self, event: MessageEvent) -> str:
         """Handle /status command."""
@@ -3900,9 +3907,12 @@ class GatewaySlashCommandsMixin:
         if not has_picker:
             return False
         try:
-            metadata = self._thread_metadata_for_source(
+            metadata = dict(self._thread_metadata_for_source(
                 event.source, self._reply_anchor_for_event(event)
-            )
+            ) or {})
+            requester_user_id = getattr(event.source, "user_id", None)
+            if requester_user_id is not None:
+                metadata["requester_user_id"] = str(requester_user_id)
             result = await adapter.send_choice_picker(
                 chat_id=event.source.chat_id,
                 title=title,
