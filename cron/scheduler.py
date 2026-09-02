@@ -7031,7 +7031,23 @@ def run_job(
 
     except Exception as e:
         error_msg = f"{type(e).__name__}: {str(e)}"
-        logger.exception("Job '%s' failed: %s", job_name, error_msg)
+        # Drift-guard alert-once contract (#44585/#73506): a drift-skip is a
+        # deliberate fail-closed guard action, not an unexpected crash, and
+        # the SILENT marker means the operator was already alerted on a
+        # prior tick. Logging this at ERROR every subsequent tick — same as
+        # any other job failure — means Sentry (hooked at the ERROR level)
+        # re-ingests a fresh event on EVERY tick forever, even though
+        # delivery is correctly suppressed below. Downgrade to INFO once
+        # already-alerted so the skip stays visible in agent.log without
+        # paging anyone or feeding Sentry; the first (non-silent) drift tick
+        # still logs at the normal failure level so it isn't silently lost.
+        if DRIFT_SKIP_SILENT_MARKER in error_msg:
+            logger.info(
+                "Job '%s' skipped (drift guard, already alerted — see #44585): %s",
+                job_name, error_msg,
+            )
+        else:
+            logger.exception("Job '%s' failed: %s", job_name, error_msg)
         # Best-effort audit write on failure path. _audit_fire_id
         # may be unset if the exception fired before submit() — guard
         # with a None check so the audit write itself never raises.

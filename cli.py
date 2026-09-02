@@ -5063,7 +5063,24 @@ def save_config_value(key_path: str, value: any) -> bool:
     try:
         # Ensure parent directory exists (for ~/.hermes/config.yaml on first use)
         config_path.parent.mkdir(parents=True, exist_ok=True)
-        
+
+        # Snapshot the pre-write value for the audit-trail log below (#44585
+        # follow-up) — must read BEFORE atomic_roundtrip_yaml_update mutates
+        # the file, or "old" and "new" would read identical. Best-effort:
+        # a missing/unparseable file (first-ever write, corrupt config) just
+        # means no old value to report, never a reason to fail the save.
+        _old_value_for_warning = None
+        try:
+            if config_path.exists():
+                with open(config_path, "r", encoding="utf-8") as _f:
+                    from hermes_cli.config import _get_nested, _MISSING
+                    _existing_config = fast_safe_load(_f) or {}
+                _snapshot = _get_nested(_existing_config, key_path)
+                if _snapshot is not _MISSING:
+                    _old_value_for_warning = _snapshot
+        except Exception:
+            pass
+
         # Save back atomically while preserving comments, ordering, quotes, and
         # readable Unicode in user-edited config.yaml.
         from utils import atomic_roundtrip_yaml_update
@@ -5082,7 +5099,9 @@ def save_config_value(key_path: str, value: any) -> bool:
             warn_unpinned_cron_jobs_after_model_config_change,
         )
 
-        warn_unpinned_cron_jobs_after_model_config_change(key_path, value)
+        warn_unpinned_cron_jobs_after_model_config_change(
+            key_path, value, old_value=_old_value_for_warning
+        )
         
         return True
     except Exception as e:

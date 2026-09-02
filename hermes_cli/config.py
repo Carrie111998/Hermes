@@ -5603,8 +5603,26 @@ def warn_unpinned_cron_jobs_after_model_config_change(
     key: str,
     value: Any,
     config: Optional[Dict[str, Any]] = None,
+    old_value: Any = None,
 ) -> None:
-    """Warn when a global model/provider change will trip cron's drift guard."""
+    """Warn when a global model/provider change will trip cron's drift guard.
+
+    ``old_value``: best-effort snapshot of what ``key`` held immediately
+    before this write, when the caller has it. Purely informational — it
+    only shapes the audit-trail message below — so a caller that can't
+    cheaply capture it (or genuinely has no prior value, e.g. first-ever
+    write) may leave it ``None`` without breaking the affected-job check.
+
+    This is the ONLY durable record of a global model/provider change that
+    risks tripping the cron drift guard (#44585). Before this, the warning
+    was print()-only: a change made non-interactively, via a session no one
+    was watching, or whose terminal output was lost left zero trace, which
+    is what turned a routine model bump into a multi-hour incident
+    investigation (NICHE-BOTS-T) with no way to pinpoint who/when changed
+    model.default. logger.warning() lands in agent.log (searchable, always
+    on) in addition to the interactive print(); the print stays for
+    immediate operator feedback.
+    """
     axis = _cron_model_drift_axis_for_config_key(key)
     if axis is None:
         return
@@ -5625,13 +5643,20 @@ def warn_unpinned_cron_jobs_after_model_config_change(
     snapshot_field = f"{axis}_snapshot"
     noun = "job" if affected == 1 else "jobs"
     verb = "has" if affected == 1 else "have"
-    print(
+    old_value_text = _model_assignment_text(old_value) or "(unknown/unset)"
+    message = (
         f"⚠️  {affected} enabled unpinned cron {noun} {verb} stored "
         f"{snapshot_field} values that differ from the new global {axis}. "
         "They will fail closed on their next run instead of silently using the "
         "changed model/provider. Inspect with `hermes cron list`, then pin the "
         "intended values with `hermes cron edit <job_id> --provider <provider> "
         "--model <model>`."
+    )
+    print(message)
+    logger.warning(
+        "Global %s changed from %r to %r, affecting %d unpinned cron %s "
+        "(%s). %s",
+        axis, old_value_text, new_value, affected, noun, snapshot_field, message,
     )
 
 
@@ -6017,6 +6042,13 @@ def set_config_value(key: str, value: str, force: bool = False):
     # _set_nested which preserves list-typed nodes; before #17876 the
     # inline navigation here silently overwrote lists with dicts.
 
+    # Capture the pre-write value for the audit-trail log below (#44585
+    # follow-up): must happen before _set_nested mutates user_config in
+    # place, or "old" and "new" would read identical.
+    _old_value_for_warning = _get_nested(user_config, key)
+    if _old_value_for_warning is _MISSING:
+        _old_value_for_warning = None
+
     # Preserve values for string-typed settings.  In particular, enum members
     # such as approvals.mode="off" must not become YAML booleans.  Unknown keys
     # retain the historical best-effort coercion behavior.
@@ -6191,7 +6223,9 @@ def set_config_value(key: str, value: str, force: bool = False):
     else:
         _display_value = value
     print(f"✓ Set {key} = {_display_value} in {config_path}")
-    warn_unpinned_cron_jobs_after_model_config_change(key, value, user_config)
+    warn_unpinned_cron_jobs_after_model_config_change(
+        key, value, user_config, old_value=_old_value_for_warning
+    )
 
     # Post-write unknown-key notice (#34067): value IS saved, but tell the
     # user the runtime may never read it and suggest the likely-intended path.
