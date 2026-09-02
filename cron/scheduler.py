@@ -7000,10 +7000,6 @@ def run_job(
 **Run Time:** {_hermes_now().strftime('%Y-%m-%d %H:%M:%S')}
 **Schedule:** {job.get('schedule_display', 'N/A')}
 
-## Prompt
-
-{prompt}
-
 ## Response
 
 {logged_response}
@@ -7056,10 +7052,6 @@ def run_job(
 **Job ID:** {job_id}
 **Run Time:** {_hermes_now().strftime('%Y-%m-%d %H:%M:%S')}
 **Schedule:** {job.get('schedule_display', 'N/A')}
-
-## Prompt
-
-{prompt}
 
 ## Error
 
