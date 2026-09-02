@@ -27,6 +27,14 @@ Output contract: print ONLY the token on stdout, either bare or as JSON with
 an ``access_token`` field (``expires_in`` is honoured when present) — the
 shape OAuth 2.0 token endpoints and the helpers above already emit.
 
+Command execution: ``key_cmd`` is an argv-style command line. Hermes parses it
+with the platform's command-line rules and invokes the resulting argument vector
+with shell execution disabled. Shell operators and expansion syntax are rejected
+rather than reinterpreted, and shell interpreters/command-string modes are not
+valid helpers, so shell-only helpers must be migrated to an executable plus
+explicit arguments. On Windows, use native command-line quoting: backslashes
+are literal path separators except when they precede a double quote.
+
 Precedence: an explicit ``--api-key`` still wins (the one-off recovery escape
 hatch); otherwise ``key_cmd`` is preferred over a static ``api_key`` /
 ``key_env`` on the same entry.
@@ -36,7 +44,9 @@ from __future__ import annotations
 
 import json
 import logging
+import shlex
 import subprocess
+import sys
 import threading
 import time
 from typing import Callable, Optional
@@ -63,12 +73,166 @@ class CommandTokenError(RuntimeError):
     """A ``key_cmd`` failed to produce a usable token."""
 
 
+_SHELL_SYNTAX = frozenset(
+    (";", "&", "|", "<", ">", "$", "(", ")", "`", "\r", "\n")
+)
+_SHELL_EXECUTABLES = frozenset(
+    {
+        "bash",
+        "bash.exe",
+        "busybox.exe",
+        "command.com",
+        "csh",
+        "csh.exe",
+        "dash",
+        "dash.exe",
+        "fish",
+        "fish.exe",
+        "ksh",
+        "ksh.exe",
+        "pwsh",
+        "pwsh.exe",
+        "pwsh-preview.exe",
+        "powershell",
+        "powershell.exe",
+        "powershell_ise.exe",
+        "sh",
+        "sh.exe",
+        "tcsh",
+        "tcsh.exe",
+        "zsh",
+        "zsh.exe",
+        "cmd",
+        "cmd.exe",
+    }
+)
+
+
+_PROCESS_DISPATCH_WRAPPERS = frozenset({
+    "doas", "doas.exe", "env", "env.exe", "nice", "nice.exe",
+    "nohup", "nohup.exe", "runuser", "runuser.exe", "script", "script.exe",
+    "setsid", "setsid.exe", "sudo", "sudo.exe", "timeout", "timeout.exe",
+    "wsl", "wsl.exe", "xargs", "xargs.exe",
+})
+
+
+def _command_basename(value: str) -> str:
+    return value.replace("\\", "/").rsplit("/", 1)[-1].casefold()
+
+
+def _reject_shell_launcher(argv: list[str], label: str) -> None:
+    """Keep child shells and dispatch wrappers behind the trusted boundary."""
+    executable = _command_basename(argv[0])
+    if executable in _PROCESS_DISPATCH_WRAPPERS:
+        raise CommandTokenError(
+            f"key_cmd for provider {label!r} cannot launch a process wrapper; "
+            "use the credential executable directly"
+        )
+    if executable in _SHELL_EXECUTABLES:
+        raise CommandTokenError(
+            f"key_cmd for provider {label!r} cannot launch a shell; "
+            "use an executable plus explicit arguments"
+        )
+
+
+def _has_unquoted_shell_syntax_posix(command: str) -> bool:
+    in_single_quote = False
+    in_double_quote = False
+    escaped = False
+    for char in command:
+        if escaped:
+            escaped = False
+            continue
+        if char == "\\" and not in_single_quote:
+            escaped = True
+            continue
+        if char == "'" and not in_double_quote:
+            in_single_quote = not in_single_quote
+            continue
+        if char == '"' and not in_single_quote:
+            in_double_quote = not in_double_quote
+            continue
+        if not in_single_quote and not in_double_quote and char in _SHELL_SYNTAX:
+            return True
+    return False
+
+
+def _has_unquoted_shell_syntax_windows(command: str) -> bool:
+    """Check operators using the quote rules used by Windows argv parsing."""
+    in_double_quote = False
+    backslashes = 0
+    for char in command:
+        if char == "\\":
+            backslashes += 1
+            continue
+        if char == '"':
+            # An odd run of backslashes escapes the quote; an even run leaves
+            # half the backslashes and toggles the native quote state.
+            if backslashes % 2 == 0:
+                in_double_quote = not in_double_quote
+            backslashes = 0
+            continue
+        backslashes = 0
+        if not in_double_quote and char in _SHELL_SYNTAX:
+            return True
+    return False
+
+
+def _parse_windows_command_argv(command: str) -> list[str]:
+    """Parse *command* with Windows' ``CommandLineToArgvW`` contract."""
+    import ctypes
+
+    argc = ctypes.c_int()
+    command_line_to_argv = ctypes.windll.shell32.CommandLineToArgvW
+    command_line_to_argv.argtypes = [
+        ctypes.c_wchar_p,
+        ctypes.POINTER(ctypes.c_int),
+    ]
+    command_line_to_argv.restype = ctypes.POINTER(ctypes.c_wchar_p)
+    argv_pointer = command_line_to_argv(command, ctypes.byref(argc))
+    if not argv_pointer:
+        raise ValueError("CommandLineToArgvW failed")
+    try:
+        return [argv_pointer[index] for index in range(argc.value)]
+    finally:
+        ctypes.windll.kernel32.LocalFree(argv_pointer)
+
+
+def _parse_command_argv(command: str, label: str) -> list[str]:
+    """Parse an argv-style command without granting it shell semantics."""
+    if "\x00" in command:
+        raise CommandTokenError(
+            f"key_cmd for provider {label!r} could not be parsed as argv"
+        )
+    try:
+        if sys.platform == "win32":
+            has_shell_syntax = _has_unquoted_shell_syntax_windows(command)
+            argv = _parse_windows_command_argv(command)
+        else:
+            has_shell_syntax = _has_unquoted_shell_syntax_posix(command)
+            argv = shlex.split(command, posix=True)
+    except (OSError, ValueError) as exc:
+        raise CommandTokenError(
+            f"key_cmd for provider {label!r} could not be parsed as argv"
+        ) from exc
+    if has_shell_syntax:
+        raise CommandTokenError(
+            f"key_cmd for provider {label!r} contains unsupported shell syntax; "
+            "use an argv-style command without shell operators"
+        )
+    if not argv:
+        raise CommandTokenError(f"key_cmd for provider {label!r} is empty")
+    _reject_shell_launcher(argv, label)
+    return argv
+
+
 def _mint(command: str, label: str) -> tuple[str, Optional[float]]:
-    """Run *command*, returning ``(token, ttl_seconds_or_None)``."""
+    """Run *command* as argv, returning ``(token, ttl_seconds_or_None)``."""
+    argv = _parse_command_argv(command, label)
     try:
         completed = subprocess.run(
-            command,
-            shell=True,
+            argv,
+            shell=False,
             capture_output=True,
             text=True,
             timeout=_MINT_TIMEOUT_SECONDS,
@@ -77,6 +241,10 @@ def _mint(command: str, label: str) -> tuple[str, Optional[float]]:
         raise CommandTokenError(
             f"key_cmd for provider {label!r} timed out after "
             f"{_MINT_TIMEOUT_SECONDS}s"
+        ) from exc
+    except ValueError as exc:
+        raise CommandTokenError(
+            f"key_cmd for provider {label!r} could not be executed"
         ) from exc
     except OSError as exc:
         raise CommandTokenError(
