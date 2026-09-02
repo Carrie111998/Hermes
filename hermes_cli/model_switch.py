@@ -2544,15 +2544,33 @@ def switch_model(
     # ``extra_body`` such as chat_template_kwargs) so a ``/model`` switch to a
     # custom provider applies it on the gateway, matching the default-provider
     # path. resolve_runtime_provider surfaces these for named custom providers.
+    #
+    # Matched by provider identity, base_url, AND model — the same rule
+    # agent_init._merge_custom_provider_extra_body and
+    # agent_runtime_helpers._apply_switched_provider_request_overrides apply
+    # via the shared _custom_provider_extra_body_for_agent matcher. Two
+    # custom_providers entries can share a name/provider_key while targeting
+    # different models with different extra_body (e.g. a local vLLM endpoint
+    # toggling chat_template_kwargs per model); _get_named_custom_provider
+    # alone always returns the FIRST name match regardless of which model
+    # this switch actually targets, so it can't be used to pick extra_body.
     request_overrides = None
     try:
-        from hermes_cli.runtime_provider import (
-            _get_named_custom_provider,
-            _custom_provider_request_overrides,
-        )
+        from hermes_cli.runtime_provider import _get_named_custom_provider
+        from hermes_cli.config import load_config, get_compatible_custom_providers
+        from agent.agent_init import _custom_provider_extra_body_for_agent
+
         _cp_for_ro = _get_named_custom_provider(target_provider)
         if _cp_for_ro:
-            request_overrides = _custom_provider_request_overrides(_cp_for_ro) or None
+            _cp_identity = str(_cp_for_ro.get("provider_key") or _cp_for_ro.get("name") or "").strip()
+            _extra_body = _custom_provider_extra_body_for_agent(
+                provider=f"custom:{_cp_identity}",
+                model=new_model,
+                base_url=base_url,
+                custom_providers=get_compatible_custom_providers(load_config()),
+            )
+            if _extra_body:
+                request_overrides = {"extra_body": dict(_extra_body)}
     except Exception:
         request_overrides = None
 

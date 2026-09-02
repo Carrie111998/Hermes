@@ -515,6 +515,65 @@ def test_picker_selection_resolves_named_custom_provider_model_id(monkeypatch):
     assert result.new_model == "deepseek-v4-flash"
 
 
+def test_switch_model_extra_body_matches_target_model_not_first_same_name_entry(monkeypatch):
+    """Two custom_providers entries can share a name/base_url while targeting
+    different models with different extra_body (e.g. a local vLLM endpoint
+    toggling chat_template_kwargs per model). A /model switch to the SECOND
+    entry's model must carry that entry's extra_body, not the first entry's
+    — the prior name-only lookup always returned the first list match
+    regardless of which model this switch actually targets."""
+    same_name_entries = [
+        {
+            "name": "vllm-local",
+            "base_url": "http://localhost:8000/v1",
+            "model": "model-a",
+            "extra_body": {"chat_template_kwargs": {"enable_thinking": True}},
+        },
+        {
+            "name": "vllm-local",
+            "base_url": "http://localhost:8000/v1",
+            "model": "model-b",
+            "extra_body": {"chat_template_kwargs": {"enable_thinking": False}},
+        },
+    ]
+    # _get_named_custom_provider() reads config.yaml via its own late-bound
+    # load_config() delegate independent of switch_model()'s custom_providers
+    # kwarg — both must see the same two entries.
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda: {"custom_providers": same_name_entries},
+    )
+    monkeypatch.setattr(
+        "hermes_cli.runtime_provider.resolve_runtime_provider",
+        lambda **kwargs: {
+            "api_key": "test-key",
+            "base_url": "http://localhost:8000/v1",
+            "api_mode": "chat_completions",
+        },
+    )
+    monkeypatch.setattr(
+        "hermes_cli.models.validate_requested_model",
+        lambda *a, **k: _MOCK_VALIDATION,
+    )
+    monkeypatch.setattr("hermes_cli.model_switch.get_model_info", lambda *a, **k: None)
+    monkeypatch.setattr("hermes_cli.model_switch.get_model_capabilities", lambda *a, **k: None)
+
+    result = switch_model(
+        raw_input="model-b",
+        current_provider="openai-codex",
+        current_model="gpt-5.4",
+        explicit_provider="custom:vllm-local",
+        user_providers={},
+        custom_providers=same_name_entries,
+    )
+
+    assert result.success is True
+    assert result.new_model == "model-b"
+    assert result.request_overrides == {
+        "extra_body": {"chat_template_kwargs": {"enable_thinking": False}}
+    }
+
+
 
 
 
