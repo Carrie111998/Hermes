@@ -1320,6 +1320,7 @@ def stream_converse_with_callbacks(
     current_block_index: Optional[int] = None
     current_tool: Optional[Dict] = None
     current_text_buffer: List[str] = []
+    current_reasoning_buffer: List[str] = []
     has_tool_use = False
     stop_reason = "end_turn"
     usage_data: Dict[str, int] = {}
@@ -1376,12 +1377,16 @@ def stream_converse_with_callbacks(
                 if current_tool is not None:
                     current_tool["input_json"] += delta["toolUse"].get("input", "")
             elif "reasoningContent" in delta:
-                # Claude 4.6+ on Bedrock surfaces thinking via reasoningContent
+                # Claude 4.6+ on Bedrock surfaces thinking via reasoningContent.
+                # A reasoning delta carries a fragment of a word, not a whole
+                # thought — buffer it and join on the block boundary, exactly as
+                # the text path does above. Appending straight to reasoning_parts
+                # would weld the "\n\n" block separator between every token.
                 reasoning = delta["reasoningContent"]
                 if isinstance(reasoning, dict):
                     thinking_text = reasoning.get("text", "")
                     if thinking_text:
-                        reasoning_parts.append(str(thinking_text))
+                        current_reasoning_buffer.append(str(thinking_text))
                         if on_reasoning_delta:
                             on_reasoning_delta(thinking_text)
                         block = stream_blocks.setdefault(current_block_index if current_block_index is not None else len(stream_blocks), {"reasoningContent": {}})
@@ -1403,6 +1408,12 @@ def stream_converse_with_callbacks(
                             block.setdefault("reasoningContent", {})["redactedContentBase64"] = encoded
 
         elif "contentBlockStop" in event:
+            # A reasoning block just ended (or a text/tool block did, in which
+            # case the buffer is empty). Genuinely separate thinking blocks stay
+            # separated by the "\n\n" join below.
+            if current_reasoning_buffer:
+                reasoning_parts.append("".join(current_reasoning_buffer))
+                current_reasoning_buffer = []
             if current_tool is not None:
                 try:
                     input_dict = json.loads(current_tool["input_json"]) if current_tool["input_json"] else {}
@@ -1438,6 +1449,11 @@ def stream_converse_with_callbacks(
     # Flush remaining text
     if current_text_buffer:
         text_parts.append("".join(current_text_buffer))
+
+    # Flush reasoning too — an interrupt or a truncated stream can end without
+    # the closing contentBlockStop, and partial thinking still beats none.
+    if current_reasoning_buffer:
+        reasoning_parts.append("".join(current_reasoning_buffer))
 
     msg = SimpleNamespace(
         role="assistant",
