@@ -5686,3 +5686,54 @@ class TestFts5SanitizerCharacterClass:
         # text; keep % intact there (pre-existing contract).
         sanitized = self._sanitize("完成50%")
         assert "%" in sanitized
+
+
+class TestNullFlagTolerance:
+    """Sessions whose archived/hidden columns are NULL behave as
+    not-archived / not-hidden in every listing and filter path.
+
+    Fresh schemas enforce NOT NULL DEFAULT 0 on these columns, but a
+    corruption-repair rebuild (state.db recovery) recreates tables from
+    captured DDL and can lose the constraints — observed Aug 2026, where
+    post-repair sessions had NULL flags and vanished from the sidebar.
+    Equality predicates (archived = 0) exclude NULL rows, so repaired
+    schemas must treat NULL exactly like 0.
+    """
+
+    def _mk_repaired_schema(self, db):
+        """Simulate the constraint-losing table rebuild of a repair.
+
+        Regex out the NOT NULL DEFAULT clauses on archived/hidden from
+        the live DDL, then swap the table (SQLite cannot drop constraints
+        in place). Keeps PK/UNIQUE so the normal insert paths still work.
+        """
+        import re
+        ddl = db._conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'sessions'"
+        ).fetchone()[0]
+        ddl = re.sub(r"archived\s+INTEGER[^,]*", "archived INTEGER", ddl)
+        ddl = re.sub(r"hidden\s+INTEGER[^,]*", "hidden INTEGER", ddl)
+        db._conn.execute("ALTER TABLE sessions RENAME TO sessions_damaged")
+        db._conn.execute(ddl)
+        db._conn.execute("DROP TABLE sessions_damaged")
+        db._conn.commit()
+
+    def _mk_null_flags(self, db, sid="null-flags"):
+        self._mk_repaired_schema(db)
+        db.create_session(session_id=sid, source="cli")
+        db.end_session(sid, "completed")
+        db._conn.execute(
+            "UPDATE sessions SET archived = NULL, hidden = NULL WHERE id = ?",
+            (sid,),
+        )
+        db._conn.commit()
+
+    def test_null_archived_session_appears_in_default_listing(self, db):
+        self._mk_null_flags(db)
+        ids = [row["id"] for row in db.list_sessions_rich()]
+        assert "null-flags" in ids
+
+    def test_null_archived_session_is_not_treated_as_archived(self, db):
+        self._mk_null_flags(db)
+        assert "null-flags" not in [row["id"] for row in db.list_sessions_rich(archived_only=True)]
+        assert "null-flags" in [row["id"] for row in db.list_sessions_rich(archived_only=False)]

@@ -12034,11 +12034,11 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             where_clauses.append("s.message_count >= ?")
             params.append(min_message_count)
         if archived_only:
-            where_clauses.append("s.archived = 1")
+            where_clauses.append("COALESCE(s.archived, 0) = 1")
         elif not include_archived:
-            where_clauses.append("s.archived = 0")
+            where_clauses.append("COALESCE(s.archived, 0) = 0")
         if not include_hidden:
-            where_clauses.append("s.hidden = 0")
+            where_clauses.append("COALESCE(s.hidden, 0) = 0")
 
         where_sql = f"WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
         # Snapshot the filter params before the query builders below extend
@@ -14887,9 +14887,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             where_clauses.append("s.message_count >= ?")
             params.append(min_message_count)
         if archived_only:
-            where_clauses.append("s.archived = 1")
+            where_clauses.append("COALESCE(s.archived, 0) = 1")
         elif not include_archived:
-            where_clauses.append("s.archived = 0")
+            where_clauses.append("COALESCE(s.archived, 0) = 0")
 
         where_sql = f" WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
 
@@ -14940,9 +14940,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             where_clauses.append(_LISTABLE_CHILD_SQL)
             where_clauses.append(f"{_delegate_from_json('s.model_config')} IS NULL")
         if archived_only:
-            where_clauses.append("s.archived = 1")
+            where_clauses.append("COALESCE(s.archived, 0) = 1")
         elif not include_archived:
-            where_clauses.append("s.archived = 0")
+            where_clauses.append("COALESCE(s.archived, 0) = 0")
 
         where_sql = f" WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
 
@@ -15664,9 +15664,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             clauses.append("COALESCE(s.tool_call_count, 0) <= ?")
             params.append(max_tool_calls)
         if archived is True:
-            clauses.append("s.archived = 1")
+            clauses.append("COALESCE(s.archived, 0) = 1")
         elif archived is False:
-            clauses.append("s.archived = 0")
+            clauses.append("COALESCE(s.archived, 0) = 0")
         # Pinned sessions are a durable "keep" flag (exempt from the stale
         # auto-archive sweep). Bulk prune/delete/archive must honor that too:
         # exclude pinned rows unless the caller explicitly opts in. Without
@@ -15828,7 +15828,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             rows = conn.execute(
                 f"""
                 SELECT s.id FROM sessions s
-                WHERE s.archived = 0
+                WHERE COALESCE(s.archived, 0) = 0
                   AND COALESCE(s.end_reason, '') <> 'compression'
                   {pin_clause}
                   AND {_sql_session_last_active("s")} < ?
