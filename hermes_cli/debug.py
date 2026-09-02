@@ -554,6 +554,21 @@ def _capture_default_log_snapshots(
         "desktop": _capture_log_snapshot(
             "desktop", tail_lines=errors_lines, redact=redact
         ),
+        # The update/hand-off pair is the ONLY place the root cause of a
+        # failed `hermes update` / Desktop rebuild lives: update.log is the
+        # full stdout/stderr mirror of the update, desktop-update-handoff.log
+        # carries the hand-off stages including the rebuild retry. Both the
+        # updater's failure message and the Desktop error box send users to
+        # `hermes debug share` (resp. that file), so a share without them
+        # ships zero root-cause signal (#100874). Absent on fresh installs —
+        # keys are simply omitted from the bundle downstream, same as any
+        # other missing log.
+        "update": _capture_log_snapshot(
+            "update", tail_lines=errors_lines, redact=redact
+        ),
+        "handoff": _capture_log_snapshot(
+            "handoff", tail_lines=errors_lines, redact=redact
+        ),
     }
 
 
@@ -648,6 +663,25 @@ def collect_debug_report(
 
     buf.write(f"--- desktop.log (last {errors_lines} lines) ---\n")
     buf.write(log_snapshots["desktop"].tail_text)
+    buf.write("\n\n")
+
+    # The update/hand-off tails ride the errors-line budget (100-line cap):
+    # they are fallback diagnostics for update failures, not chatty
+    # conversation logs, and a long-running install's update.log is
+    # append-only across runs — the 512 KB snapshot cap already bounds the
+    # full-log upload, this bounds the summary. Callers may pass a
+    # hand-built snapshots dict (gateway /debug, older callers) that
+    # predates these keys — degrade to an honest missing-note instead of
+    # KeyError, same contract as an absent file.
+    update_snap = log_snapshots.get("update")
+    handoff_snap = log_snapshots.get("handoff")
+    if update_snap is not None:
+        buf.write(f"--- update.log (last {errors_lines} lines) ---\n")
+        buf.write(update_snap.tail_text)
+        buf.write("\n\n")
+    if handoff_snap is not None:
+        buf.write(f"--- desktop-update-handoff.log (last {errors_lines} lines) ---\n")
+        buf.write(handoff_snap.tail_text)
     buf.write("\n")
 
     return buf.getvalue()
@@ -696,6 +730,8 @@ def collect_share_bundle(
     gateway_log = log_snapshots["gateway"].full_text
     gui_log = log_snapshots["gui"].full_text
     desktop_log = log_snapshots["desktop"].full_text
+    update_log = (log_snapshots.get("update") or LogSnapshot(path=None, tail_text="", full_text=None)).full_text
+    handoff_log = (log_snapshots.get("handoff") or LogSnapshot(path=None, tail_text="", full_text=None)).full_text
 
     # Prepend dump header to each full log so every file is self-contained.
     if agent_log:
@@ -706,6 +742,10 @@ def collect_share_bundle(
         gui_log = dump_text + "\n\n--- full gui.log ---\n" + gui_log
     if desktop_log:
         desktop_log = dump_text + "\n\n--- full desktop.log ---\n" + desktop_log
+    if update_log:
+        update_log = dump_text + "\n\n--- full update.log ---\n" + update_log
+    if handoff_log:
+        handoff_log = dump_text + "\n\n--- full desktop-update-handoff.log ---\n" + handoff_log
 
     # Visible banner so reviewers know redaction was applied at upload time.
     if redact:
@@ -718,6 +758,10 @@ def collect_share_bundle(
             gui_log = _REDACTION_BANNER + gui_log
         if desktop_log:
             desktop_log = _REDACTION_BANNER + desktop_log
+        if update_log:
+            update_log = _REDACTION_BANNER + update_log
+        if handoff_log:
+            handoff_log = _REDACTION_BANNER + handoff_log
 
     bundle: dict[str, str] = {"report": report}
     if agent_log:
@@ -728,6 +772,10 @@ def collect_share_bundle(
         bundle["gui.log"] = gui_log
     if desktop_log:
         bundle["desktop.log"] = desktop_log
+    if update_log:
+        bundle["update.log"] = update_log
+    if handoff_log:
+        bundle["desktop-update-handoff.log"] = handoff_log
     return bundle
 
 
@@ -810,7 +858,16 @@ def build_debug_share(
     urls["Report"] = upload_to_pastebin(report, expiry_days=expiry)
 
     # 2-5. Full logs (optional — failures are collected, not raised)
-    for label in ("agent.log", "gateway.log", "gui.log", "desktop.log"):
+    for label in (
+        "agent.log",
+        "gateway.log",
+        "gui.log",
+        "desktop.log",
+        # Update-failure diagnostics: the only files holding the root cause
+        # of a failed update/Desktop rebuild (#100874).
+        "update.log",
+        "desktop-update-handoff.log",
+    ):
         content = bundle.get(label)
         if not content:
             continue
@@ -884,6 +941,8 @@ def run_debug_share(args):
             ("FULL gateway.log", "gateway.log"),
             ("FULL gui.log", "gui.log"),
             ("FULL desktop.log", "desktop.log"),
+            ("FULL update.log", "update.log"),
+            ("FULL desktop-update-handoff.log", "desktop-update-handoff.log"),
         ):
             body = bundle.get(label)
             if body:
@@ -938,7 +997,9 @@ _NOUS_PRIVACY_NOTICE = """\
   • System info (OS, Python/Hermes version, provider, which API keys are
     configured — NOT the actual keys)
   • Full agent.log, gateway.log, and desktop.log (up to 512 KB each — likely
-    contains conversation content, tool outputs, and file paths)
+    contains conversation content, tool outputs, and file paths), plus
+    update.log and desktop-update-handoff.log when present (update/hand-off
+    output — the root cause of update failures)
 
   • The bundle is viewable only by Nous staff (and allowlisted Discord mods)
     via a Google-login-gated viewer.
