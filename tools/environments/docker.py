@@ -1937,6 +1937,9 @@ class DockerEnvironment(BaseEnvironment):
                 # this, a container created with egress=on can be silently
                 # reused after the operator runs "hermes egress disable",
                 # preserving baked-in proxy env and CA mounts.
+                # NOTE: {{.Label "key"}} is Docker-only; Podman exits 125
+                # (can't evaluate field Label). Use a Podman-compatible
+                # fallback that inspects each candidate when needed.
                 fmt = '{{.ID}}\t{{.State}}\t{{.Label "' + _EGRESS_LABEL_KEY + '"}}'
             result = subprocess.run(
                 [
@@ -1950,6 +1953,64 @@ class DockerEnvironment(BaseEnvironment):
                 check=False,
                 stdin=subprocess.DEVNULL,
             )
+            # Podman fallback: {{.Label}} template is Docker-only (exit 125).
+            # Retry without the Label field and filter via inspect.
+            if result.returncode != 0 and egress_label == "off" and "Label" in result.stderr:
+                logger.debug(
+                    "docker ps Label probe unsupported by runtime (%s), falling back to inspect filter: %s",
+                    self._docker_exe, result.stderr.strip(),
+                )
+                fmt = "{{.ID}}\t{{.State}}"
+                result = subprocess.run(
+                    [
+                        self._docker_exe, "ps", "-a",
+                        *filters,
+                        "--format", fmt,
+                    ],
+                    capture_output=True,
+                    text=True, encoding='utf-8', errors='replace',
+                    timeout=10,
+                    check=False,
+                    stdin=subprocess.DEVNULL,
+                )
+                if result.returncode != 0:
+                    logger.debug(
+                        "docker ps fallback probe returned %d: %s — will start a fresh container",
+                        result.returncode, result.stderr.strip(),
+                    )
+                    return None
+                # Fallback path: need to filter egress via inspect per candidate
+                lines = [ln for ln in result.stdout.splitlines() if ln.strip()]
+                if not lines:
+                    return None
+                running = None
+                first = None
+                for ln in lines:
+                    parts = ln.split("\t", 1)
+                    if len(parts) != 2:
+                        continue
+                    cid, state = parts[0], parts[1].lower()
+                    # Inspect egress label for Podman fallback
+                    try:
+                        insp = subprocess.run(
+                            [self._docker_exe, "inspect", "--format", '{{ index .Config.Labels "' + _EGRESS_LABEL_KEY + '" }}', cid],
+                            capture_output=True, text=True, encoding='utf-8', errors='replace',
+                            timeout=10, check=False, stdin=subprocess.DEVNULL,
+                        )
+                        egress_val = insp.stdout.strip() if insp.returncode == 0 else ""
+                    except Exception:
+                        egress_val = ""
+                    if egress_val not in ("", "<no value>", "off"):
+                        logger.debug(
+                            "skipping container %s for egress=off reuse: "
+                            "label %s=%r", cid, _EGRESS_LABEL_KEY, egress_val,
+                        )
+                        continue
+                    if first is None:
+                        first = (cid, state)
+                    if state == "running" and running is None:
+                        running = (cid, state)
+                return running or first
         except (subprocess.TimeoutExpired, OSError) as e:
             logger.debug("docker ps probe failed: %s — will start a fresh container", e)
             return None
