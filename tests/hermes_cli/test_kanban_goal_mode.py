@@ -128,6 +128,78 @@ def test_loop_stops_when_worker_already_completed(monkeypatch):
     assert turns == []  # no extra turns
 
 
+def _patch_judge_transport_failing(monkeypatch):
+    """Make judge_goal permanently unable to reach its API.
+
+    Matches the real transport-failure contract: verdict "continue",
+    parse_failed False, transport_failed True.
+    """
+
+    def _fake_judge(goal, response, subgoals=None, background_processes=None, **_kw):
+        return "continue", "[Judge check skipped: HTTP 401]", False, None, True
+
+    monkeypatch.setattr(goals, "judge_goal", _fake_judge)
+
+
+def test_loop_blocks_on_persistent_judge_transport_failure(monkeypatch):
+    # A judge that can never reach its API must NOT burn the whole turn
+    # budget: after DEFAULT_MAX_CONSECUTIVE_TRANSPORT_FAILURES consecutive
+    # failures the loop blocks the card blaming the judge config, not the
+    # worker (troubleshooting regression: 20 turns in 43s, blocked_budget).
+    _patch_judge_transport_failing(monkeypatch)
+    turns = []
+    blocks = []
+
+    res = goals.run_kanban_goal_loop(
+        task_id="t1",
+        goal_text="do the thing",
+        run_turn=lambda p: turns.append(p) or "still going",
+        task_status_fn=lambda: "running",
+        block_fn=lambda r: blocks.append(r),
+        first_response="working on it",
+        max_turns=20,
+    )
+    assert res["outcome"] == "blocked_judge_transport"
+    threshold = goals.DEFAULT_MAX_CONSECUTIVE_TRANSPORT_FAILURES
+    # The loop stops at the threshold, far short of the 20-turn budget.
+    assert res["turns_used"] < 20
+    assert len(turns) == threshold - 1
+    assert len(blocks) == 1
+    assert "judge" in blocks[0].lower()
+    assert "worker was not at fault" in blocks[0]
+
+
+def test_transport_failure_counter_resets_on_recovery(monkeypatch):
+    # Transient flakiness must not accumulate: failures below the threshold
+    # followed by a healthy judge verdict reset the counter and the loop
+    # proceeds normally (here: judged done -> finalize nudge -> completed).
+    threshold = goals.DEFAULT_MAX_CONSECUTIVE_TRANSPORT_FAILURES
+    seq = []
+    for _ in range(threshold - 1):
+        seq.append(("continue", "[Judge check skipped: timeout]", False, None, True))
+    seq.append(("done", "all criteria met", False, None, False))
+
+    def _fake_judge(goal, response, subgoals=None, background_processes=None, **_kw):
+        return seq.pop(0) if seq else ("done", "all criteria met", False, None, False)
+
+    monkeypatch.setattr(goals, "judge_goal", _fake_judge)
+
+    statuses = iter(["running"] * threshold + ["done"] * 10)
+    blocks = []
+
+    res = goals.run_kanban_goal_loop(
+        task_id="t1",
+        goal_text="do the thing",
+        run_turn=lambda p: "ok",
+        task_status_fn=lambda: next(statuses),
+        block_fn=lambda r: blocks.append(r),
+        first_response="working on it",
+        max_turns=50,
+    )
+    assert res["outcome"] == "completed_by_worker"
+    assert blocks == []
+
+
 
 
 
