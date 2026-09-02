@@ -5938,6 +5938,52 @@ class BasePlatformAdapter(ABC):
                     logger.debug("[%s] Could not send delivery-failure notice: %s", self.name, notify_err)
                 return result
 
+        # A private Telegram DM topic can disappear while an agent turn is
+        # running. Telegram may report this as a missing thread, closed topic,
+        # or deleted topic. The normal plain-text fallback below would preserve
+        # both its reply anchor and topic metadata, sending the retry to the
+        # same deleted topic. Route this one recovery attempt to the parent DM.
+        normalized_error = " ".join(error_str.lower().split())
+        missing_dm_topic_markers = (
+            "thread not found",
+            "topic deleted",
+            "topic closed",
+            "topic not found",
+            "direct messages topic",
+        )
+        if (
+            isinstance(metadata, dict)
+            and metadata.get("telegram_dm_topic_reply_fallback")
+            and any(marker in normalized_error for marker in missing_dm_topic_markers)
+        ):
+            stale_thread_id = (
+                metadata.get("thread_id")
+                or metadata.get("message_thread_id")
+                or metadata.get("direct_messages_topic_id")
+            )
+            fallback_metadata = {
+                key: value
+                for key, value in metadata.items()
+                if key not in {
+                    "thread_id",
+                    "message_thread_id",
+                    "direct_messages_topic_id",
+                    "telegram_dm_topic_reply_fallback",
+                    "telegram_reply_to_message_id",
+                }
+            }
+            logger.warning(
+                "[%s] Telegram DM topic vanished (chat=%s thread=%s); "
+                "retrying without reply/topic routing",
+                self.name, chat_id, stale_thread_id,
+            )
+            return await self.send(
+                chat_id=chat_id,
+                content=content,
+                reply_to=None,
+                metadata=fallback_metadata or None,
+            )
+
         # Non-network / post-retry formatting failure: try plain text as fallback
         logger.warning("[%s] Send failed: %s — trying plain-text fallback", self.name, error_str)
         fallback_result = await self.send(
