@@ -43,6 +43,10 @@ DEFAULT_CONFIG = {
         "terminal_continue": True,
     },
     "agent": {
+        # Optional per-model cap on non-delegation tool executions per turn.
+        # An empty map keeps the feature fully disabled by default. Keys use
+        # shell-style model-name patterns; values are non-negative integers.
+        "model_execution_budgets": {},
         # Unlimited by default. The agent turn cap caused more problems than
         # it solved (silent mid-task truncation). null = unlimited; set a
         # positive integer to cap, or use "none"/"unlimited"/"inf"/0/-1 —
