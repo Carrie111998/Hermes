@@ -286,6 +286,39 @@ class TestWorkerSpawnEnv:
         expected_ws = fresh_home / "kanban" / "boards" / "spawntest" / "workspaces"
         assert env["HERMES_KANBAN_WORKSPACES_ROOT"] == str(expected_ws)
 
+    def test_default_spawn_pins_comment_baseline_env(self, fresh_home, monkeypatch):
+        """The dispatcher pins HERMES_KANBAN_COMMENT_BASELINE to the task's
+        newest comment id at spawn — the run-start watermark the live
+        comment-injector seeds to (closes the spawn→first-poll swallow)."""
+        captured = {}
+
+        class FakeProc:
+            pid = 12345
+
+        def fake_popen(cmd, *args, **kwargs):
+            captured["cmd"] = cmd
+            captured["env"] = kwargs.get("env", {})
+            return FakeProc()
+
+        monkeypatch.setattr(subprocess, "Popen", fake_popen)
+        kb.create_board("spawntest")
+        with kb.connect(board="spawntest") as conn:
+            tid = kb.create_task(
+                conn, title="baseline worker", assignee="teknium", board="spawntest"
+            )
+            kb.add_comment(conn, tid, author="desktop", body="steer me 1")
+            max_comment_id = kb.add_comment(conn, tid, author="desktop", body="steer me 2")
+
+        # Reuse the same shape _default_spawn sees: a Task row from the DB.
+        with kb.connect(board="spawntest") as conn:
+            task = kb.get_task(conn, tid)
+        assert task is not None
+
+        kb._default_spawn(task, str(fresh_home / "ws"), board="spawntest")
+
+        env = captured["env"]
+        assert env["HERMES_KANBAN_COMMENT_BASELINE"] == str(max_comment_id)
+
 
 # ---------------------------------------------------------------------------
 # CLI surface

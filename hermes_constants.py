@@ -1633,22 +1633,59 @@ def translate_cwd_for_wsl_backend(cwd: str) -> str:
 _container_detected: bool | None = None
 
 
+def _root_mount_indicates_container(mountinfo_text: str) -> bool:
+    """Return True when the root mount (``/``) looks like a container rootfs.
+
+    A real container runtime presents the process root as an ``overlay`` or
+    ``rootfs`` mount (overlayfs snapshot backing). A bare-metal host mounts a
+    real block device (btrfs/ext4/xfs) as ``/``. The critical detail is that
+    only the mount whose mount point is exactly ``/`` is inspected — the host
+    that runs Docker legitimately has ``/var/lib/containerd/...`` and
+    ``/var/lib/docker/...`` paths scattered through its mount table (daemon
+    data, netns, snapshot dirs), but never as the root mount. Scanning the
+    whole blob for runtime substrings (the old behavior) is what produced the
+    false positive.
+
+    mountinfo line layout (fields split on whitespace):
+      id parent major:minor root mountpoint options [opt...] - fstype source superopts
+    """
+    for line in mountinfo_text.splitlines():
+        fields = line.split()
+        if len(fields) < 7:
+            continue
+        if fields[4] != "/":
+            # Not the root mount — skip daemon data mounts under /var/lib/...
+            continue
+        try:
+            sep = fields.index("-")
+            fstype = fields[sep + 1]
+        except (ValueError, IndexError):
+            continue
+        # Container roots are overlay (Docker/Podman/K8s overlay2) or rootfs.
+        # A bare-metal host root is a real device filesystem (btrfs/ext4/xfs).
+        return fstype in ("overlay", "rootfs")
+    return False
+
+
 def is_container() -> bool:
     """Return True when running inside a container.
 
     Recognizes Docker (``/.dockerenv``), Podman (``/run/.containerenv``),
-    and — via ``/proc/1/cgroup`` — the docker/podman/lxc cgroup-v1 markers.
+    Kubernetes (``KUBERNETES_SERVICE_HOST`` env — injected into every pod),
+    the docker/podman/lxc cgroup-v1 markers in ``/proc/1/cgroup``, and —
+    for cgroup-v2 runtimes that mask ``/proc/1/cgroup`` to ``0::/`` (Docker
+    with cgroup namespace isolation, containerd/CRI-O on k3s) — a root
+    filesystem inspection: a container root is ``overlay``/``rootfs``,
+    whereas a bare-metal host root is a real block device.
 
-    cgroup v2 collapses ``/proc/1/cgroup`` to a single ``0::/`` line with no
-    runtime marker, so containerd/CRI-O runtimes (the common case on
-    Kubernetes/k3s) were previously missed. To cover those, also check:
-      * ``KUBERNETES_SERVICE_HOST`` env var — set in every Kubernetes pod.
-      * ``kubepods`` / ``containerd`` / ``crio`` markers in ``/proc/1/cgroup``.
-      * the same markers in ``/proc/self/mountinfo`` (cgroup-v2 fallback).
+    Deliberately does NOT scan the whole ``/proc/self/mountinfo`` blob for
+    ``containerd``/``docker`` substrings: a bare-metal host that runs Docker
+    legitimately has those daemon data paths in its host mount table, which
+    previously caused a false positive (host detected as container → Hermes
+    forced the profile HOME onto every subprocess → cron scripts resolving
+    state via ``$HOME/.hermes`` failed with exit 127).
 
     Result is cached for the process lifetime.  Import-safe — no heavy deps.
-
-    See: NousResearch/hermes-agent#47111
     """
     global _container_detected
     if _container_detected is not None:
@@ -1672,13 +1709,12 @@ def is_container() -> bool:
                 return True
     except OSError:
         pass
-    # cgroup v2: /proc/1/cgroup is just "0::/" with no marker. The container
-    # runtime still shows up in the mount table (overlay rootfs, runtime mount
-    # paths), so scan mountinfo as a last resort.
+    # cgroup v2: /proc/1/cgroup may be "0::/" with no marker (private cgroup
+    # namespace). The container runtime's rootfs is still visible as the root
+    # mount. Inspect only the root mount, never the whole mount table.
     try:
         with open("/proc/self/mountinfo", "r", encoding="utf-8") as f:
-            mountinfo = f.read()
-            if any(marker in mountinfo for marker in ("kubepods", "containerd", "crio")):
+            if _root_mount_indicates_container(f.read()):
                 _container_detected = True
                 return True
     except OSError:

@@ -474,8 +474,9 @@ def discover_entrypoint_manifests() -> List["PluginManifest"]:
 
     * **Kind classification** — the module source is resolved import-free
       (``_resolve_module_source``) and scanned for provider markers
-      (``_detect_kind_from_source``), so memory providers (``exclusive``)
-      and model providers (``model-provider``) are routed to their own
+      (``_detect_kind_from_source``), so memory providers (``exclusive``),
+      model providers (``model-provider``), and cron scheduler providers
+      (``cron-provider``) are routed to their own
       discovery systems instead of being eagerly imported here.
     * **Capability declarations** — read from the companion
       ``hermes_agent.plugin_capabilities`` entry-point group (declarations
@@ -680,7 +681,14 @@ def _get_enabled_plugins() -> Optional[set]:
 # Data classes
 # ---------------------------------------------------------------------------
 
-_VALID_PLUGIN_KINDS: Set[str] = {"standalone", "backend", "exclusive", "platform", "model-provider"}
+_VALID_PLUGIN_KINDS: Set[str] = {
+    "standalone",
+    "backend",
+    "exclusive",
+    "platform",
+    "model-provider",
+    "cron-provider",
+}
 
 
 def _portable_skill_namespace(key: str) -> str:
@@ -990,12 +998,18 @@ def _detect_kind_from_source(source_text: str) -> Optional[str]:
     or ``MemoryProvider``) belongs to the memory-provider discovery
     system (``exclusive``); a module that registers a model provider
     (``register_provider`` + ``ProviderProfile``) belongs to the
-    providers discovery (``model-provider``). Applied to both directory
-    plugins and pip entry-point plugins so neither is eagerly imported
-    by the general PluginManager.
+    providers discovery (``model-provider``); a module that registers a
+    cron scheduler provider (``register_cron_scheduler`` or
+    ``CronScheduler``) belongs to the cron-provider discovery
+    (``cron-provider``, mirroring
+    ``plugins/cron_providers/__init__.py:_is_cron_provider_dir``).
+    Applied to both directory plugins and pip entry-point plugins so
+    neither is eagerly imported by the general PluginManager.
     """
     if "register_memory_provider" in source_text or "MemoryProvider" in source_text:
         return "exclusive"
+    if "register_cron_scheduler" in source_text or "CronScheduler" in source_text:
+        return "cron-provider"
     if "register_provider" in source_text and "ProviderProfile" in source_text:
         return "model-provider"
     return None
@@ -4430,6 +4444,27 @@ class PluginManager:
                 )
                 continue
 
+            # Cron scheduler provider plugins are loaded by
+            # plugins/cron_providers/__init__.py (its own discovery, keyed
+            # off ``cron.provider`` config). The general loader records the
+            # manifest for introspection but does not load the module —
+            # PluginContext has no register_cron_scheduler, so importing
+            # register(ctx) would only produce a spurious
+            # "'PluginContext' object has no attribute
+            # 'register_cron_scheduler'" warning on every session start
+            # (#62951) and leave a permanently failed registration entry.
+            if manifest.kind == "cron-provider":
+                loaded = LoadedPlugin(manifest=manifest, enabled=False)
+                loaded.error = (
+                    "cron-provider plugin — activate via cron.provider config"
+                )
+                self._plugins[lookup_key] = loaded
+                logger.debug(
+                    "Skipping '%s' (cron-provider, handled by cron_providers/ discovery)",
+                    lookup_key,
+                )
+                continue
+
             # Model provider plugins are loaded by providers/__init__.py
             # (its own lazy discovery keyed off first get_provider_profile()
             # call). We record the manifest here for introspection but do
@@ -4865,9 +4900,10 @@ class PluginManager:
         """Classify a pip entry-point plugin by scanning its module source.
 
         The ``kind`` semantics are the same for pip entry points as for
-        directory plugins: memory providers (``exclusive``) and model
-        providers (``model-provider``) have their own discovery systems,
-        so importing them here registers nothing and only pays the
+        directory plugins: memory providers (``exclusive``), model
+        providers (``model-provider``), and cron scheduler providers
+        (``cron-provider``) have their own discovery systems, so
+        importing them here registers nothing and only pays the
         module's import cost in every Hermes process (e.g. a pip
         memory-provider plugin pulling in onnxruntime via fastembed —
         ~60 MB RSS on startup).

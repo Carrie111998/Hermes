@@ -382,10 +382,13 @@ def inject_new_comments_from_env(agent: Any) -> bool:
     (``HERMES_KANBAN_TASK`` set) and ``agent`` exposes ``steer``. Returns True
     if a steer was injected, else False. Never raises into the agent loop.
 
-    The first poll only *seeds* the watermark to the newest existing comment —
-    those are already in the worker's context — so only comments added after
-    the run started are injected. The worker's own authored comments (matched
-    by ``HERMES_PROFILE``) are skipped to avoid echoing itself.
+    The first poll seeds the watermark to the run-start baseline — normally
+    the newest existing comment (those are already in the worker's context),
+    or the dispatcher-pinned ``HERMES_KANBAN_COMMENT_BASELINE`` when set so a
+    comment that lands between spawn/context-build and the first poll is still
+    injected — so only comments added after the run started are folded in.
+    The worker's own authored comments (matched by ``HERMES_PROFILE``) are
+    skipped to avoid echoing itself.
     """
     tid = os.environ.get("HERMES_KANBAN_TASK")
     if not tid or agent is None or not hasattr(agent, "steer"):
@@ -412,10 +415,29 @@ def inject_new_comments_from_env(agent: Any) -> bool:
         return False
 
     if seen is None:
-        # First poll for this task: seed past the existing thread, inject nothing.
-        _comment_watermark[tid] = max((c.id for c in rows), default=0)
-        return False
-    if not rows:
+        # First poll for this task. When the dispatcher pinned a run-start
+        # baseline (HERMES_KANBAN_COMMENT_BASELINE), comments at or below it
+        # are already in the worker's context (build_worker_context includes
+        # the thread): seed the watermark there and fall through so anything
+        # past it — added between spawn/context-build and this poll — is
+        # injected instead of being silently swallowed. Without the env var
+        # (non-dispatcher spawns, legacy) keep the old seed-to-max: the
+        # existing thread is context, inject nothing on first poll.
+        baseline: Optional[int] = None
+        baseline_raw = os.environ.get("HERMES_KANBAN_COMMENT_BASELINE")
+        if baseline_raw is not None:
+            try:
+                baseline = int(baseline_raw)
+            except (TypeError, ValueError):
+                baseline = None
+        if baseline is None:
+            _comment_watermark[tid] = max((c.id for c in rows), default=0)
+            return False
+        _comment_watermark[tid] = baseline
+        rows = [c for c in rows if c.id > baseline]
+        if not rows:
+            return False
+    elif not rows:
         return False
 
     # Advance the watermark past everything we just read (including our own

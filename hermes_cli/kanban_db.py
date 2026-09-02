@@ -10717,6 +10717,31 @@ def _retag_legacy_worker_sessions(workspaces_root_path: str) -> None:
         _log.debug("kanban worker: legacy session retag skipped (%s)", exc)
 
 
+def _max_comment_id_for_task(
+    task_id: str, *, board: Optional[str] = None
+) -> Optional[int]:
+    """Best-effort max comment id for a task, or ``None`` on any failure.
+
+    Internal bridge for the live comment-injector's run-start baseline
+    (``HERMES_KANBAN_COMMENT_BASELINE``). Must never raise into the spawn
+    path — a busy/missing DB just skips the pin and the worker falls back
+    to the legacy seed-to-max behavior.
+    """
+    try:
+        conn = connect(board=board)
+        try:
+            rows = list_comments(conn, task_id)
+            return max((c.id for c in rows), default=0)
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+    except Exception as exc:
+        _log.debug("kanban worker: comment baseline read failed (%s)", exc)
+        return None
+
+
 def _default_spawn(
     task: Task,
     workspace: str,
@@ -10840,6 +10865,18 @@ def _default_spawn(
     # what the tool reads — set it explicitly here so comments are
     # attributed correctly regardless of how the child loads config.
     env["HERMES_PROFILE"] = profile_arg
+
+    # Run-start comment baseline — INTERNAL dispatcher→worker process bridge,
+    # NOT a user-facing config knob. The live comment-injector
+    # (tools/kanban_tools.py::inject_new_comments_from_env) seeds its
+    # per-task watermark to this value on first poll and then injects
+    # anything past it, closing the narrow spawn→first-poll window where a
+    # comment added right after context-build would otherwise be silently
+    # swallowed. Absent/unparseable (non-dispatcher spawns, legacy) → the
+    # injector keeps its old seed-to-max behavior.
+    _baseline = _max_comment_id_for_task(task.id, board=board)
+    if _baseline is not None:
+        env["HERMES_KANBAN_COMMENT_BASELINE"] = str(_baseline)
 
     # A worker must NEVER boot the interactive TUI: an inherited HERMES_TUI=1
     # or a `display.interface: tui` in the profile's config would send the
