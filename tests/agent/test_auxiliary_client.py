@@ -1457,6 +1457,38 @@ class TestIsModelNotFoundError:
         # billing keyword wins — payment owns it
         assert _is_model_not_found_error(exc) is False
 
+    def test_aggregator_503_model_not_found(self):
+        """new-api / one-api style distributors report an unroutable model as
+        503 model_not_found, not 404. The model is genuinely unserviceable on
+        that route, so it must classify here and become fallback-worthy."""
+        exc = Exception(
+            "Error code: 503 - {'error': {'code': 'model_not_found', "
+            "'message': 'No available channel for model claude-opus-4-8 "
+            "under group default (distributor)', 'type': 'new_api_error'}}"
+        )
+        exc.status_code = 503
+        assert _is_model_not_found_error(exc) is True
+
+    def test_plain_5xx_is_not_model_not_found(self):
+        """Widening the status gate to 5xx must stay body-driven: a generic
+        upstream failure carries no model phrasing and must NOT be claimed,
+        or every transient 500 would be treated as a dead model."""
+        for status, body in (
+            (503, "Service Unavailable: upstream timeout"),
+            (500, "Internal server error"),
+            (502, "Bad gateway"),
+        ):
+            exc = Exception(body)
+            exc.status_code = status
+            assert _is_model_not_found_error(exc) is False, body
+
+    def test_billing_5xx_is_not_model_not_found(self):
+        """Billing language still routes to the payment path even on a 5xx
+        that also mentions model_not_found."""
+        exc = Exception("model_not_found but insufficient funds on this account")
+        exc.status_code = 503
+        assert _is_model_not_found_error(exc) is False
+
 
 
 

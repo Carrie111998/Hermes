@@ -4838,10 +4838,15 @@ def _is_model_not_found_error(exc: Exception) -> bool:
         Model 'gpt-5.4-mini' not found. The requested model does not exist
         in our configuration or OpenRouter catalog.
 
-    Distinct from :func:`_is_payment_error` (which also matches some 404s for
-    free-tier/credit language) — this one keys on "does not exist / not found /
-    not a valid model" phrasing, and explicitly excludes the billing keywords
-    that the payment path already owns so the two predicates don't overlap.
+    Billing/quota 404s belong to :func:`_is_payment_error` — don't claim them here.
+
+    Status gate: 404/400/None are the documented shapes, plus 5xx bodies that
+    carry the same phrasing. Aggregator gateways (new-api / one-api style
+    distributors) report an unroutable model as ``503 model_not_found``
+    ("No available channel for model X under group default") — the model is
+    genuinely unserviceable on that route, so classifying it by body rather
+    than by status keeps it out of the generic-5xx bucket where it would
+    otherwise abort the whole auxiliary task instead of failing over.
     """
     status = getattr(exc, "status_code", None)
     err_lower = str(exc).lower()
@@ -4852,7 +4857,9 @@ def _is_model_not_found_error(exc: Exception) -> bool:
         "not available on the free tier",
     )):
         return False
-    if status not in {404, 400, None}:
+    if status not in {404, 400, None} and not (
+        isinstance(status, int) and 500 <= status < 600
+    ):
         return False
     return any(kw in err_lower for kw in (
         "model does not exist",
@@ -10839,6 +10846,7 @@ def _call_llm_impl(
             or _is_connection_error(first_err)
             or _is_rate_limit_error(first_err)
             or _is_model_incompatible_error(first_err)
+            or _is_model_not_found_error(first_err)
             or _is_invalid_aux_response_error(first_err)
         )
         # Respect explicit provider choice for transient errors (auth, request
@@ -10862,6 +10870,7 @@ def _call_llm_impl(
             or _is_connection_error(first_err)
             or _is_rate_limit_error(first_err)
             or _is_model_incompatible_error(first_err)
+            or _is_model_not_found_error(first_err)
             or _is_invalid_aux_response_error(first_err)
         )
         if should_fallback and (is_auto or is_capacity_error):
@@ -10880,6 +10889,8 @@ def _call_llm_impl(
                 reason = "rate limit"
             elif _is_model_incompatible_error(first_err):
                 reason = "model incompatible with route"
+            elif _is_model_not_found_error(first_err):
+                reason = "model not served by route"
             elif _is_invalid_aux_response_error(first_err):
                 reason = "invalid provider response"
             else:
@@ -11600,6 +11611,7 @@ async def _async_call_llm_impl(
             or _is_connection_error(first_err)
             or _is_rate_limit_error(first_err)
             or _is_model_incompatible_error(first_err)
+            or _is_model_not_found_error(first_err)
             or _is_invalid_aux_response_error(first_err)
         )
         # Capacity errors (payment/quota/connection/rate-limit) bypass the
@@ -11615,6 +11627,7 @@ async def _async_call_llm_impl(
             or _is_connection_error(first_err)
             or _is_rate_limit_error(first_err)
             or _is_model_incompatible_error(first_err)
+            or _is_model_not_found_error(first_err)
             or _is_invalid_aux_response_error(first_err)
         )
         if should_fallback and (is_auto or is_capacity_error):
@@ -11629,6 +11642,8 @@ async def _async_call_llm_impl(
                 reason = "rate limit"
             elif _is_model_incompatible_error(first_err):
                 reason = "model incompatible with route"
+            elif _is_model_not_found_error(first_err):
+                reason = "model not served by route"
             elif _is_invalid_aux_response_error(first_err):
                 reason = "invalid provider response"
             else:
