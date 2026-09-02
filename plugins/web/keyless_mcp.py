@@ -76,7 +76,10 @@ def keyless_enabled() -> bool:
         return _keyless_tier_enabled()
     except Exception as exc:  # noqa: BLE001 — resolver optional in stripped envs
         logger.debug("keyless_enabled(): registry helper unavailable: %s", exc)
-        return True
+        # Anonymous third-party egress needs positive policy evidence.  If the
+        # config authority cannot be reached, do not interpret that failure as
+        # permission to transmit the user's query or URLs.
+        return False
 
 
 def provider_tier(name: str) -> str:
@@ -108,18 +111,26 @@ def use_keyless(name: str, api_key: str) -> bool:
     Single chokepoint shared by the Exa/Parallel search + extract paths so
     tier semantics can't drift between capabilities:
 
-    - tier ``free``  → keyless, even when *api_key* is set
+    - ``web.keyless_fallback: false`` → keyed, regardless of provider tier
+    - tier ``free``  → keyless, even when *api_key* is set, while the global
+      keyless policy is enabled
     - tier ``paid``  → keyed, even when *api_key* is missing (the keyed
       path then raises its usual missing-key error)
     - tier ``auto``  → keyed when *api_key* is set; otherwise keyless when
       ``web.keyless_fallback`` is enabled
     """
+    # The global switch is an authoritative egress gate, not merely an
+    # auto-detection preference.  Check it before the explicit ``free`` tier
+    # so an operator/admin opt-out cannot be bypassed by a stale picker value.
+    if not keyless_enabled():
+        return False
+
     tier = provider_tier(name)
     if tier == "free":
         return True
     if tier == "paid":
         return False
-    return not api_key and keyless_enabled()
+    return not api_key
 
 
 def _parse_mcp_body(body: str) -> str:
