@@ -36,7 +36,7 @@ def mirror_to_session(
     Append a delivery-mirror message to the target session's transcript.
 
     Finds the gateway session that matches the given platform + chat_id,
-    then writes a mirror entry to both the JSONL transcript and SQLite DB.
+    then writes a mirror entry to the SQLite session database.
 
     ``session_id``: when the caller already KNOWS the exact session (e.g. the
     cron in_channel seed, which just created the row via
