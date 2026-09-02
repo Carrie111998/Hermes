@@ -162,18 +162,23 @@ describe('submissionCore.submitDelegatedPrompt', () => {
     patchUiState({ sid: 'sess-1' })
   })
 
-  it('submits provider text literally to the owning session', async () => {
+  it.each([
+    '!rm -rf /',
+    '/quit',
+    'inspect ${HOME}/secrets',
+    'search weather\nthen summarize'
+  ])('submits provider text literally to the owning session: %s', async text => {
     const { gw } = makeDeferredGateway()
     const appendMessage = vi.fn()
 
-    await submitDelegatedPrompt('!rm -rf /', 'sess-1', { appendMessage, gw })
+    await submitDelegatedPrompt(text, 'sess-1', { appendMessage, gw })
 
     expect(gw.request).toHaveBeenCalledTimes(1)
     expect(gw.request).toHaveBeenCalledWith('prompt.submit', {
       session_id: 'sess-1',
-      text: '!rm -rf /'
+      text
     })
-    expect(appendMessage).toHaveBeenCalledWith({ role: 'user', text: '!rm -rf /' })
+    expect(appendMessage).toHaveBeenCalledWith({ role: 'user', text })
     expect(getUiState().busy).toBe(true)
   })
 

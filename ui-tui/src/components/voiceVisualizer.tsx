@@ -13,6 +13,26 @@ export interface VoiceVisualizerProps {
   visualizer: 'orb' | 'waveform'
 }
 
+export interface VoiceModeStatus {
+  realtimeVoiceConnecting: boolean
+  realtimeVoicePhase: RealtimeVoicePhase | null
+  voiceProcessing: boolean
+  voiceRecording: boolean
+}
+
+export function resolveVoiceMode(status: VoiceModeStatus): VoiceVisualizerProps['mode'] | null {
+  if (status.realtimeVoiceConnecting) {
+    return 'waiting'
+  }
+  if (status.realtimeVoicePhase) {
+    return status.realtimeVoicePhase
+  }
+  if (status.voiceRecording) {
+    return 'listening'
+  }
+  return status.voiceProcessing ? 'solving' : null
+}
+
 const FRAME_MS = 80
 const ORB_COLUMNS = 19
 const ORB_ROWS = 7

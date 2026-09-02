@@ -3,6 +3,7 @@ import { describe, expect, it } from 'vitest'
 import {
   renderVoiceVisualization,
   renderVoiceWaveform,
+  resolveVoiceMode,
   voiceVisualizationFooter
 } from '../components/voiceVisualizer.js'
 
@@ -44,5 +45,43 @@ describe('renderVoiceWaveform', () => {
     expect(renderVoiceVisualization('orb', 19, 3, 'solving')).not.toEqual(
       renderVoiceVisualization('orb', 19, 3, 'composing')
     )
+  })
+})
+
+describe('resolveVoiceMode', () => {
+  const idle = {
+    realtimeVoiceConnecting: false,
+    realtimeVoicePhase: null,
+    voiceProcessing: false,
+    voiceRecording: false
+  } as const
+
+  it('projects every lifecycle state used by the orb', () => {
+    expect(resolveVoiceMode({ ...idle, realtimeVoiceConnecting: true })).toBe('waiting')
+    expect(resolveVoiceMode({ ...idle, voiceRecording: true })).toBe('listening')
+    expect(resolveVoiceMode({ ...idle, voiceProcessing: true })).toBe('solving')
+    expect(resolveVoiceMode({ ...idle, realtimeVoicePhase: 'listening' })).toBe('listening')
+    expect(resolveVoiceMode({ ...idle, realtimeVoicePhase: 'solving' })).toBe('solving')
+    expect(resolveVoiceMode({ ...idle, realtimeVoicePhase: 'composing' })).toBe('composing')
+    expect(resolveVoiceMode(idle)).toBeNull()
+  })
+
+  it('keeps connection and explicit realtime phases ahead of legacy flags', () => {
+    expect(
+      resolveVoiceMode({
+        realtimeVoiceConnecting: true,
+        realtimeVoicePhase: 'composing',
+        voiceProcessing: true,
+        voiceRecording: true
+      })
+    ).toBe('waiting')
+    expect(
+      resolveVoiceMode({
+        realtimeVoiceConnecting: false,
+        realtimeVoicePhase: 'composing',
+        voiceProcessing: true,
+        voiceRecording: true
+      })
+    ).toBe('composing')
   })
 })

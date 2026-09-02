@@ -36,7 +36,7 @@ import { PetKitty, PetSprite } from './petSprite.js'
 import { QueuedMessages } from './queuedMessages.js'
 import { LiveTodoPanel, StreamingAssistant } from './streamingAssistant.js'
 import { TextInput, type TextInputMouseApi } from './textInput.js'
-import { VoiceVisualizer } from './voiceVisualizer.js'
+import { resolveVoiceMode, VoiceVisualizer } from './voiceVisualizer.js'
 
 // Box geometry, kept here so the transcript's reservation math matches the
 // rendered overlay exactly.
@@ -280,10 +280,7 @@ const ComposerPane = memo(function ComposerPane({
   const ui = useStore($uiState)
   const isBlocked = useStore($isBlocked)
   const sh = (composer.inputBuf[0] ?? composer.input).startsWith('!')
-  const voiceMode = status.realtimeVoiceConnecting
-    ? 'waiting'
-    : status.realtimeVoicePhase ??
-      (status.voiceRecording ? 'listening' : status.voiceProcessing ? 'solving' : null)
+  const voiceMode = resolveVoiceMode(status)
 
   const promptText = composerPromptText(
     ui.theme.brand.prompt,
