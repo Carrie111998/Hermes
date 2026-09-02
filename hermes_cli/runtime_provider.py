@@ -1250,30 +1250,64 @@ def _resolve_named_custom_runtime(
                 "source": "local-runtime",
                 "requested_provider": requested_provider,
             }
-        # No server to serve this model. Say so and stop — falling through
-        # to the generic custom path sends the request to whatever provider
-        # picks it up (OpenRouter with a placeholder key), and the user's
-        # "local server is off" surfaces as that provider's baffling
-        # "401 Invalid API key". The switch's own state picks the message:
-        # the user who turned the server off gets pointed at the switch,
-        # anyone else at the setup pane.
+        # No managed endpoint found. If the user configured an explicit
+        # base_url for the llamacpp alias (external llama.cpp server,
+        # e.g. model.provider=llamacpp + model.base_url=http://...),
+        # honour it via the generic custom path instead of forcing the
+        # managed runtime (fixes #101120 — users with their own server
+        # saw "No inference provider is configured yet" after the
+        # local-runtime feature landed).
         try:
-            from hermes_cli.config import load_config as _load_cfg
+            _cfg = _get_model_config()
+            _cfg_base_url = (_cfg.get("base_url") or "").strip()
+            _cfg_provider = (_cfg.get("provider") or "").strip().lower()
+            if _cfg_base_url and _cfg_provider in ("llamacpp", "llama.cpp", "llama-cpp"):
+                # Fall through to the generic custom-provider handling
+                # which will use this base_url with "no-key-required".
+                pass
+            else:
+                # No user-configured endpoint — surface managed-runtime
+                # guidance. Falling through to generic custom would leak
+                # to OpenRouter with a confusing 401.
+                try:
+                    from hermes_cli.config import load_config as _load_cfg
 
-            _lr_enabled = bool((_load_cfg().get("local_runtime") or {}).get("enabled"))
-        except Exception:  # noqa: BLE001
-            _lr_enabled = False
-        if _lr_enabled:
+                    _lr_enabled = bool((_load_cfg().get("local_runtime") or {}).get("enabled"))
+                except Exception:  # noqa: BLE001
+                    _lr_enabled = False
+                if _lr_enabled:
+                    raise ValueError(
+                        "The local model server isn't running. It may still be "
+                        "starting — try again in a moment, or check Settings → "
+                        "Providers → Local models."
+                    )
+                raise ValueError(
+                    "The local model server is turned off. Turn it back on in "
+                    "Settings → Providers → Local models, or switch to another "
+                    "model."
+                )
+        except ValueError:
+            raise
+        except Exception:
+            # If config probing itself fails, fall back to managed
+            # guidance (same as no base_url case).
+            try:
+                from hermes_cli.config import load_config as _load_cfg
+
+                _lr_enabled = bool((_load_cfg().get("local_runtime") or {}).get("enabled"))
+            except Exception:  # noqa: BLE001
+                _lr_enabled = False
+            if _lr_enabled:
+                raise ValueError(
+                    "The local model server isn't running. It may still be "
+                    "starting — try again in a moment, or check Settings → "
+                    "Providers → Local models."
+                )
             raise ValueError(
-                "The local model server isn't running. It may still be "
-                "starting — try again in a moment, or check Settings → "
-                "Providers → Local models."
+                "The local model server is turned off. Turn it back on in "
+                "Settings → Providers → Local models, or switch to another "
+                "model."
             )
-        raise ValueError(
-            "The local model server is turned off. Turn it back on in "
-            "Settings → Providers → Local models, or switch to another "
-            "model."
-        )
 
     if requested_norm and requested_norm != "custom":
         try:
