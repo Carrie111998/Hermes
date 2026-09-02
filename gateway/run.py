@@ -9331,6 +9331,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             self._running_agent_count()
             + self._active_cron_job_count()
             + self._active_api_run_count()
+            + self._active_async_delegation_count()
+            + self._active_process_registry_work_count()
         )
 
     def _active_cron_job_count(self) -> int:
@@ -9364,6 +9366,31 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             adapter = getattr(self, "adapters", {}).get(Platform.API_SERVER)
             helper = getattr(adapter, "active_agent_work_count", None)
             return max(0, int(helper())) if callable(helper) else 0
+        except Exception:
+            return 0
+
+    def _active_async_delegation_count(self) -> int:
+        """Count detached delegate_task work outside ``_running_agents``."""
+        try:
+            from tools.async_delegation import active_count
+
+            return max(0, int(active_count()))
+        except Exception:
+            return 0
+
+    def _active_process_registry_work_count(self) -> int:
+        """Count live terminal background work as one drain unit.
+
+        The registry exposes a boolean because one or many processes have the
+        same shutdown contract: wait for all of them to finish, then use the
+        existing global kill on timeout. Pending completion watchers are not
+        counted here; they need the gateway watcher loop to run and therefore
+        cannot make progress after shutdown begins.
+        """
+        try:
+            from tools.process_registry import process_registry
+
+            return int(process_registry.has_any_active())
         except Exception:
             return 0
 
@@ -11542,25 +11569,35 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         last_active_count = self._running_agent_count()
         last_cron_count = self._active_cron_job_count()
         last_api_count = self._active_api_run_count()
+        last_async_delegation_count = self._active_async_delegation_count()
+        last_process_registry_count = self._active_process_registry_work_count()
         last_status_at = 0.0
 
         def _maybe_update_status(force: bool = False) -> None:
-            nonlocal last_active_count, last_cron_count, last_api_count, last_status_at
+            nonlocal last_active_count, last_cron_count, last_api_count
+            nonlocal last_async_delegation_count, last_process_registry_count
+            nonlocal last_status_at
             now = asyncio.get_running_loop().time()
             active_count = self._running_agent_count()
             cron_count = self._active_cron_job_count()
             api_count = self._active_api_run_count()
+            async_delegation_count = self._active_async_delegation_count()
+            process_registry_count = self._active_process_registry_work_count()
             if (
                 force
                 or active_count != last_active_count
                 or cron_count != last_cron_count
                 or api_count != last_api_count
+                or async_delegation_count != last_async_delegation_count
+                or process_registry_count != last_process_registry_count
                 or (now - last_status_at) >= 1.0
             ):
                 self._update_runtime_status("draining")
                 last_active_count = active_count
                 last_cron_count = cron_count
                 last_api_count = api_count
+                last_async_delegation_count = async_delegation_count
+                last_process_registry_count = process_registry_count
                 last_status_at = now
 
         # Cron jobs run on the scheduler's own thread pool, outside
@@ -11568,8 +11605,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # same wait/timeout this method already applies to chat sessions,
         # or a cron job's tool work gets killed with zero warning the
         # instant it's the only active thing running (#60432).
-        # API-server / desk sessions have the same structural gap (#63529).
-        if not self._running_agents and last_cron_count == 0 and last_api_count == 0:
+        # API-server / desk sessions, detached async delegations, and terminal
+        # background processes have the same structural gap (#63529).
+        if (
+            not self._running_agents
+            and last_cron_count == 0
+            and last_api_count == 0
+            and last_async_delegation_count == 0
+            and last_process_registry_count == 0
+        ):
             _maybe_update_status(force=True)
             return snapshot, False
 
@@ -11590,7 +11634,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         def _still_draining() -> bool:
             now = loop.time()
             if (
-                len(self._running_agents) or self._active_api_run_count()
+                len(self._running_agents)
+                or self._active_api_run_count()
+                or self._active_async_delegation_count()
+                or self._active_process_registry_work_count()
             ) and now < deadline:
                 return True
             return bool(self._active_cron_job_count()) and now < cron_deadline
@@ -11606,6 +11653,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             bool(len(self._running_agents))
             or bool(self._active_cron_job_count())
             or bool(self._active_api_run_count())
+            or bool(self._active_async_delegation_count())
+            or bool(self._active_process_registry_work_count())
         )
         _maybe_update_status(force=True)
         return snapshot, timed_out
@@ -16178,6 +16227,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             await self._stop_task
             return
 
+        def _optional_active_count(method_name: str) -> int:
+            """Read additive work counters from minimal shutdown test doubles."""
+            helper = getattr(self, method_name, None)
+            if not callable(helper):
+                return 0
+            try:
+                return max(0, int(helper()))
+            except Exception:
+                return 0
+
         async def _stop_impl() -> None:
             def _kill_tool_subprocesses(phase: str) -> list:
                 """Kill tool subprocesses + tear down terminal envs + browsers.
@@ -16269,6 +16328,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     "active_agents": self._running_agent_count(),
                     "active_cron_jobs": self._active_cron_job_count(),
                     "active_api_runs": self._active_api_run_count(),
+                    "active_async_delegations": _optional_active_count(
+                        "_active_async_delegation_count"
+                    ),
+                    "active_process_registry_work": (
+                        _optional_active_count("_active_process_registry_work_count")
+                    ),
                     "restart_drain_timeout": self._restart_drain_timeout,
                     "watchdog_delay_s": resolve_shutdown_watchdog_delay(
                         self._restart_drain_timeout
@@ -16360,6 +16425,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             _cron_at_start = self._active_cron_job_count()
             _api_at_start = self._active_api_run_count()
+            _async_delegations_at_start = _optional_active_count(
+                "_active_async_delegation_count"
+            )
+            _process_registry_at_start = _optional_active_count(
+                "_active_process_registry_work_count"
+            )
             # In-flight cron work gets its own floor, clamped to the watchdog
             # leash we're already running under so the extra wait can never
             # cost us the post-drain cleanup window (#82161).
@@ -16394,7 +16465,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "Shutdown phase: drain done at +%.2fs (drain took %.2fs, "
                 "timed_out=%s, active_at_start=%d, active_now=%d, "
                 "cron_at_start=%d, cron_now=%d, "
-                "api_at_start=%d, api_now=%d)",
+                "api_at_start=%d, api_now=%d, "
+                "async_delegations_at_start=%d, async_delegations_now=%d, "
+                "process_registry_at_start=%d, process_registry_now=%d)",
                 _phase_elapsed(),
                 _drain_elapsed,
                 timed_out,
@@ -16404,6 +16477,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 self._active_cron_job_count(),
                 _api_at_start,
                 self._active_api_run_count(),
+                _async_delegations_at_start,
+                _optional_active_count("_active_async_delegation_count"),
+                _process_registry_at_start,
+                _optional_active_count("_active_process_registry_work_count"),
             )
 
             if not timed_out:
@@ -16423,12 +16500,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if timed_out:
                 logger.warning(
                     "Gateway drain timed out after %.1fs with %d active agent(s), "
-                    "%d in-flight cron job(s), and %d api_server run(s); "
+                    "%d in-flight cron job(s), %d api_server run(s), "
+                    "%d async delegation(s), and %d process-registry work unit(s); "
                     "interrupting remaining work.",
                     _drain_elapsed,
                     self._running_agent_count(),
                     self._active_cron_job_count(),
                     self._active_api_run_count(),
+                    _optional_active_count("_active_async_delegation_count"),
+                    _optional_active_count("_active_process_registry_work_count"),
                 )
                 # Mark forcibly-interrupted sessions as resume_pending BEFORE
                 # interrupting the agents.  This preserves each session's
