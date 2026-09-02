@@ -46,6 +46,19 @@ def _is_pure_tool_call_tail(msg: dict) -> bool:
     return _assistant_row_missing_visible_text(msg)
 
 
+def _is_empty_placeholder_tail(msg: dict) -> bool:
+    """Assistant closer from ``_build_empty_assistant_placeholder``.
+
+    Role-only finalization would keep ``(empty)`` in durable history when
+    ``final_response`` holds the real handoff text. Restrict to the helper's
+    sentinel shape (no tool_calls, ``(empty)`` body) so a real assistant
+    answer is never overwritten.
+    """
+    if msg.get("tool_calls"):
+        return False
+    return flatten_message_text(msg.get("content")).strip() == "(empty)"
+
+
 def _fill_assistant_tail_content(agent, tail: dict, final_response) -> None:
     """Write delivered text onto an already-persisted blank assistant row."""
     tail["content"] = final_response
@@ -392,13 +405,15 @@ def finalize_turn(
                         _recovered_from_stream
                         and _assistant_row_missing_visible_text(_tail)
                     )
+                    or _is_empty_placeholder_tail(_tail)
                 )
             ):
-                # The tail IS an assistant row, but a *pure tool-call turn* or
+                # The tail IS an assistant row, but a *pure tool-call turn*,
                 # a blank assistant tail whose content was recovered from the
-                # stream buffer (#95514). Fill that row's content instead of
-                # appending, so the durable turn ends with the answer without
-                # creating an assistant→assistant pair.
+                # stream buffer (#95514), or the end_turn ``(empty)`` closer:
+                # no delivered answer of its own. Fill that row's content
+                # instead of appending, so the durable turn ends with the
+                # answer without creating an assistant→assistant pair.
                 _fill_assistant_tail_content(agent, _tail, final_response)
 
         # The model has completed its request, so replace API-local
