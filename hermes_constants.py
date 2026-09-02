@@ -1461,21 +1461,34 @@ def resolve_per_model_reasoning_effort(model: str, overrides: dict | None) -> di
     return None
 
 
-def resolve_reasoning_config(cfg: dict | None, model: str = "") -> dict | None:
+def resolve_reasoning_config(
+    cfg: dict | None,
+    model: str = "",
+    active_skill: tuple[str, str | None] | None = None,
+) -> dict | None:
     """Resolve the effective reasoning config for *model* from a config dict.
 
     Single chokepoint for reasoning-effort resolution, shared by every
     surface (CLI startup, messaging gateway, Desktop/TUI, cron, ``/model``
-    switch, fallback activation). Priority:
+    switch, fallback activation). Full precedence (highest first):
 
-    1. Per-model override from ``agent.reasoning_overrides``
-       (spelling-tolerant — see :func:`resolve_per_model_reasoning_effort`)
-    2. Global ``agent.reasoning_effort`` — the raw value is passed through
+    0. Session-scoped override (gateway ``/reasoning --session``) — resolved by
+       the caller BEFORE this function; it always wins when present. The active
+       skill is still atomically consumed at turn admission regardless, so a
+       session override cannot leave stale skill residue for a later turn.
+    1. User override from ``agent.reasoning_by_skill`` for the active skill
+       (if supplied and the skill name matches a key). ``off``/``false`` here
+       disables the skill layer (fall through); an unrecognized non-off value
+       also falls through rather than activating the skill's suggestion.
+    2. Active skill's own suggestion (``metadata.hermes.reasoning``) — ONLY when
+       the user has opted in via ``agent.reasoning_by_skill_optin: true``. Inert
+       by default so installing/viewing a third-party skill cannot silently
+       raise effort/spend.
+    3. Per-model override from ``agent.reasoning_overrides``
+       (spelling-tolerant — see :func:`resolve_per_model_reasoning_effort`).
+    4. Global ``agent.reasoning_effort`` — the raw value is passed through
        so a YAML boolean ``False`` (``reasoning_effort: false``/``off``/
        ``no``) means "thinking disabled", never silently re-enabled.
-
-    Session-scoped overrides (gateway ``/reasoning --session``) are resolved
-    by the caller BEFORE this function — they always win.
 
     Args:
         cfg: A loaded config dict (any of the three loaders' shapes — only
@@ -1483,6 +1496,9 @@ def resolve_reasoning_config(cfg: dict | None, model: str = "") -> dict | None:
         model: The effective model for this surface/session. When empty,
                it is derived from the config's ``model`` section (string
                form, or a dict's ``default``/``model`` keys).
+        active_skill: Optional ``(skill_name, reasoning_suggestion)`` pair
+               for the currently active skill. ``reasoning_suggestion`` is
+               None when the skill declares none (or was not looked up).
 
     Returns:
         The parsed reasoning config dict, or None when unset/unrecognized
@@ -1504,12 +1520,67 @@ def resolve_reasoning_config(cfg: dict | None, model: str = "") -> dict | None:
         else:
             model = ""
 
+    # 1. User per-skill override (explicitly owns the value).
+    # `off`/`false` for the active skill means "disable THIS skill's
+    # suggestion" — skip the whole skill layer (both the user value and the
+    # skill's own suggestion) and fall through to per-model/global. It does
+    # NOT mean "disable thinking globally" (that is a per-model/global
+    # reasoning_effort concern, not a per-skill one).
+    skip_skill = False
+    _SKILL_OFF = {"off", "false", "no", "none", "0", "disable", "disabled"}
+    if active_skill:
+        skill_name, suggestion = active_skill
+        by_skill = agent_cfg.get("reasoning_by_skill") or {}
+        if isinstance(by_skill, dict) and skill_name:
+            user_val = by_skill.get(skill_name)
+            if user_val is not None:
+                # `off`/`false`/etc. for the active skill = disable THIS
+                # skill's suggestion. The generic parse_reasoning_effort only
+                # treats {"none","false","disabled"} as disabled (global-safe),
+                # but the per-skill map accepts the broader falsey set.
+                if isinstance(user_val, bool) and not user_val:
+                    skip_skill = True
+                elif str(user_val).strip().lower() in _SKILL_OFF:
+                    skip_skill = True
+                else:
+                    parsed = parse_reasoning_effort(user_val)
+                    if parsed is not None and parsed.get("enabled"):
+                        return parsed
+                    # Unrecognized non-off value (e.g. a typo like "turbo"):
+                    # the user said SOMETHING for this skill, so we must NOT
+                    # silently fall through to the skill's own suggestion —
+                    # that would activate the very thing they were trying to
+                    # control. Treat it as "skip the skill layer" and fall
+                    # through to per-model/global, matching how per-model
+                    # overrides behave on an unrecognized value.
+                    skip_skill = True
+
+    # 2. Active skill's own suggestion — OPT-IN ONLY. A skill's
+    #    `metadata.hermes.reasoning` frontmatter is treated as inert
+    #    recommendation data by default: it never fires unless the user has
+    #    explicitly opted in via `agent.reasoning_by_skill_optin: true` (or
+    #    given an explicit `reasoning_by_skill[skill]` value, handled above).
+    #    This upholds the contract: "nothing changes by default" — installing
+    #    or viewing a third-party skill cannot silently raise model effort,
+    #    latency, or spend without user consent.
+    skill_optin = agent_cfg.get("reasoning_by_skill_optin")
+    if (
+        not skip_skill
+        and skill_optin
+        and active_skill
+        and active_skill[1]
+    ):
+        parsed = parse_reasoning_effort(active_skill[1])
+        if parsed is not None:
+            return parsed
+
+    # 3. Per-model override.
     overrides = agent_cfg.get("reasoning_overrides") or {}
     per_model = resolve_per_model_reasoning_effort(model, overrides)
     if per_model is not None:
         return per_model
 
-    # Global fallback — keep the raw value; coercing with ``or ""`` turns a
+    # 4. Global fallback — keep the raw value; coercing with ``or ""`` turns a
     # YAML boolean False into "", silently re-enabling thinking for users
     # who explicitly disabled it.
     effort = agent_cfg.get("reasoning_effort", "")

@@ -5849,6 +5849,7 @@ class TurnRunner:
             source=ctx.source,
             session_key=ctx.session_key,
             model=model,
+            task_id=ctx.session_id,
         )
         self._runner._reasoning_config = reasoning_config
         self._runner._service_tier = self._runner._resolve_session_service_tier(
@@ -10124,7 +10125,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         return getattr(self, "_ephemeral_system_prompt", None) or ""
 
     @staticmethod
-    def _load_reasoning_config(model: str = "") -> dict | None:
+    def _load_reasoning_config(
+        model: str = "",
+        active_skill: Optional[Tuple[str, Optional[str]]] = None,
+    ) -> dict | None:
         """Load reasoning effort from config.yaml, respecting per-model overrides.
 
         Thin wrapper over the shared chokepoint
@@ -10132,13 +10136,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         global ``agent.reasoning_effort``; YAML boolean False = disabled).
         Closes #21256.
 
+        ``active_skill`` is an already-consumed ``(skill_name, reasoning)``
+        pair (or None) for the current turn. It is NOT consumed here — the
+        atomic consume happens exactly once at turn admission in
+        :meth:`_resolve_session_reasoning_config`, regardless of which
+        precedence rung wins (addresses review blocker #3: a session override
+        must not leave an unconsumed skill record to fire stale on a later turn).
+
         Args:
             model: The effective model for the calling session. When empty,
                    the config's ``model.default`` is used.
+            active_skill: Consumed ``(skill_name, reasoning)`` for this turn.
         """
         from hermes_constants import resolve_reasoning_config
         cfg = _load_gateway_runtime_config()
-        return resolve_reasoning_config(cfg, model)
+        return resolve_reasoning_config(cfg, model, active_skill=active_skill)
 
     @staticmethod
     def _parse_reasoning_command_args(raw_args: str) -> tuple[str, bool]:
@@ -10172,16 +10184,42 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         source: Optional[SessionSource] = None,
         session_key: Optional[str] = None,
         model: str = "",
+        task_id: Optional[str] = None,
     ) -> dict | None:
         """Resolve reasoning effort for a session, honoring session overrides.
 
         Priority: session-scoped ``/reasoning --session`` override >
-        per-model override (``agent.reasoning_overrides``) > global
-        ``agent.reasoning_effort``. ``model`` should be the session's
-        *effective* model (session ``/model`` override included) so
-        per-model overrides track what the session actually runs — when
-        empty, the config's ``model.default`` is used.
+        per-skill override/suggestion (``agent.reasoning_by_skill`` + active
+        skill's ``metadata.hermes.reasoning``) > per-model override
+        (``agent.reasoning_overrides``) > global ``agent.reasoning_effort``.
+        ``model`` should be the session's *effective* model (session ``/model``
+        override included) so per-model overrides track what the session
+        actually runs — when empty, the config's ``model.default`` is used.
+        ``task_id`` (== session id) is used to atomically consume (pop) the
+        active-skill suggestion for this turn, exactly once, at admission —
+        before the session-override check — so no precedence rung can leave a
+        stale skill record for a later turn (addresses review blocker #3).
+
+        Behavior note (review blocker #1): this is LAST-VIEW-WINS with a
+        one-turn lag. Skills viewed during turn N are recorded; they are
+        consumed at the START of turn N+1 and apply to that turn. The last
+        skill viewed during a turn is the one that applies to the NEXT turn.
+        This is NOT "per-current-skill" attribution — a turn's own effort is
+        decided by what was last viewed in the PREVIOUS turn. This is the
+        documented, intended behavior.
         """
+        # Atomic consume-once at turn admission: pop the active-skill record
+        # (single locked op) regardless of which precedence rung wins. If a
+        # session override is present below, the consumed skill is ignored for
+        # THIS turn but still cleared so it cannot fire stale later.
+        active_skill = None
+        if task_id:
+            try:
+                from tools.skills_tool import pop_active_skill_reasoning
+                active_skill = pop_active_skill_reasoning(str(task_id))
+            except Exception:
+                active_skill = None
+
         resolved_session_key = session_key
         if not resolved_session_key and source is not None:
             try:
@@ -10193,7 +10231,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _r_state = self._peek_session_state(resolved_session_key)
             if _r_state is not None and _r_state.conversation.reasoning_override is not None:
                 return _r_state.conversation.reasoning_override
-        return self._load_reasoning_config(model)
+        return self._load_reasoning_config(model, active_skill=active_skill)
 
     def _set_session_reasoning_override(
         self,
@@ -24551,7 +24589,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             pr = self._provider_routing
             max_iterations = _current_max_iterations()
             reasoning_config = self._resolve_session_reasoning_config(
-                source=source, model=model
+                source=source, model=model, task_id=task_id
             )
             self._reasoning_config = reasoning_config
             self._service_tier = self._resolve_session_service_tier(source=source)

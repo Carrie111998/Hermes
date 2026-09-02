@@ -506,6 +506,93 @@ class TestResolveReasoningConfig:
         assert resolve_reasoning_config(cfg, "gpt-5") == {"enabled": True, "effort": "medium"}
 
 
+class TestResolveReasoningConfigWithSkill:
+    """Tests for per-skill reasoning resolution (skills suggest, config controls).
+
+    Priority: user reasoning_by_skill[activeSkill] > active skill suggestion
+    > per-model override > global agent.reasoning_effort.
+    """
+
+    def _cfg(self, effort="medium", overrides=None, by_skill=None, optin=False):
+        return {
+            "model": {"default": "gpt-5"},
+            "agent": {
+                "reasoning_effort": effort,
+                "reasoning_overrides": overrides or {},
+                "reasoning_by_skill": by_skill or {},
+                "reasoning_by_skill_optin": optin,
+            },
+        }
+
+    def test_skill_suggestion_beats_global_when_opted_in(self):
+        """With explicit `reasoning_by_skill_optin: true`, an active skill's
+        suggestion (xhigh) wins over global medium. (Review #93378 blocker #2:
+        the suggestion must NOT fire without opt-in.)"""
+        from hermes_constants import resolve_reasoning_config
+        cfg = self._cfg(effort="medium", optin=True)
+        result = resolve_reasoning_config(
+            cfg, "gpt-5", active_skill=("plan", "xhigh")
+        )
+        assert result == {"enabled": True, "effort": "xhigh"}
+
+    def test_skill_suggestion_inert_without_optin(self):
+        """Reviewer blocker #2 regression: with default config
+        (`reasoning_by_skill_optin` false/absent), a skill declaring xhigh must
+        be INERT — the result is the pre-PR global medium. Installing/viewing a
+        third-party skill must never silently raise effort."""
+        from hermes_constants import resolve_reasoning_config
+        cfg = self._cfg(effort="medium")  # optin defaults False
+        result = resolve_reasoning_config(
+            cfg, "gpt-5", active_skill=("plan", "xhigh")
+        )
+        assert result == {"enabled": True, "effort": "medium"}
+
+    def test_user_reasoning_by_skill_beats_skill_suggestion(self):
+        """User config mapping plan->high beats the skill's xhigh suggestion."""
+        from hermes_constants import resolve_reasoning_config
+        cfg = self._cfg(by_skill={"plan": "high"})
+        result = resolve_reasoning_config(
+            cfg, "gpt-5", active_skill=("plan", "xhigh")
+        )
+        assert result == {"enabled": True, "effort": "high"}
+
+    def test_user_off_disables_skill_suggestion(self):
+        """plan: off means the skill's xhigh suggestion is ignored -> global."""
+        from hermes_constants import resolve_reasoning_config
+        cfg = self._cfg(effort="medium", by_skill={"plan": "off"})
+        result = resolve_reasoning_config(
+            cfg, "gpt-5", active_skill=("plan", "xhigh")
+        )
+        assert result == {"enabled": True, "effort": "medium"}
+
+    def test_no_active_skill_unchanged(self):
+        """No active skill -> old behavior (per-model > global)."""
+        from hermes_constants import resolve_reasoning_config
+        cfg = self._cfg(effort="medium", overrides={"gpt-5": "high"})
+        assert resolve_reasoning_config(cfg, "gpt-5") == {"enabled": True, "effort": "high"}
+
+    def test_active_skill_without_suggestion_unchanged(self):
+        """An active skill that suggests nothing -> old behavior."""
+        from hermes_constants import resolve_reasoning_config
+        cfg = self._cfg(effort="medium")
+        result = resolve_reasoning_config(cfg, "gpt-5", active_skill=("fetch", None))
+        assert result == {"enabled": True, "effort": "medium"}
+
+    def test_invalid_user_value_skips_skill_suggestion(self):
+        """A typo'd per-skill value must NOT fall through to the skill's
+        suggestion. If the user set plan to something unrecognized, the
+        resolver must skip the skill layer entirely and go to per-model/global
+        — otherwise the typo silently activates the very suggestion the user
+        was trying to override."""
+        from hermes_constants import resolve_reasoning_config
+        cfg = self._cfg(effort="medium", by_skill={"plan": "turbo"})
+        result = resolve_reasoning_config(
+            cfg, "gpt-5", active_skill=("plan", "xhigh")
+        )
+        # Must NOT be xhigh (the skill's suggestion) — must fall through to global medium.
+        assert result == {"enabled": True, "effort": "medium"}
+
+
 class TestReasoningOverridesDefaultConfig:
     """Tests for the agent.reasoning_overrides default config key (Task 2)."""
 
@@ -514,7 +601,6 @@ class TestReasoningOverridesDefaultConfig:
         from hermes_cli.config import DEFAULT_CONFIG
         assert "reasoning_overrides" in DEFAULT_CONFIG["agent"]
         assert DEFAULT_CONFIG["agent"]["reasoning_overrides"] == {}
-
 
     def test_spelling_tolerant_lookup_works_with_user_config(self):
         """resolve_per_model_reasoning_effort works with user-added overrides."""
@@ -532,6 +618,21 @@ class TestReasoningOverridesDefaultConfig:
         # Lookup with provider prefix — should match
         result2 = resolve_per_model_reasoning_effort("openai/gpt-5", overrides2)
         assert result2 == {"enabled": True, "effort": "low"}
+
+
+class TestReasoningBySkillDefaultConfig:
+    """Tests for the agent.reasoning_by_skill default config key.
+
+    Maps skill/mode name -> reasoning effort (or off/false to disable a
+    skill's suggestion). Empty by default: skill frontmatter suggestions
+    pass through unchanged.
+    """
+
+    def test_default_config_has_reasoning_by_skill_key(self):
+        """DEFAULT_CONFIG['agent'] contains 'reasoning_by_skill' as an empty dict."""
+        from hermes_cli.config import DEFAULT_CONFIG
+        assert "reasoning_by_skill" in DEFAULT_CONFIG["agent"]
+        assert DEFAULT_CONFIG["agent"]["reasoning_by_skill"] == {}
 
 
 class TestSecureParentDir:
