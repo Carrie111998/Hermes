@@ -94,6 +94,9 @@ DEFAULT_API_VERSION = "v20.0"
 DEFAULT_WEBHOOK_HOST = None
 DEFAULT_WEBHOOK_PORT = 8090
 DEFAULT_WEBHOOK_PATH = "/whatsapp/webhook"
+# ffmpeg voice-note conversion ceiling: malformed/truncated media can make
+# ffmpeg hang forever, wedging the adapter's send path (input is external).
+_FFMPEG_OPUS_TIMEOUT_S = 120.0
 GRAPH_API_BASE = "https://graph.facebook.com"
 WEBHOOK_MAX_BODY_BYTES = 3 * 1024 * 1024
 # Meta retries failed webhooks for up to 7 days. We don't need to remember
@@ -1286,7 +1289,22 @@ class WhatsAppCloudAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                 stdout=asyncio.subprocess.DEVNULL,
                 stderr=asyncio.subprocess.PIPE,
             )
-            _, stderr = await proc.communicate()
+            # ffmpeg hangs indefinitely on malformed/truncated media. This
+            # input comes from external senders, so the conversion must be
+            # bounded or the adapter's send path wedges forever.
+            try:
+                _, stderr = await asyncio.wait_for(
+                    proc.communicate(), timeout=_FFMPEG_OPUS_TIMEOUT_S
+                )
+            except asyncio.TimeoutError:
+                proc.kill()
+                logger.error(
+                    "[whatsapp_cloud] ffmpeg opus conversion timed out "
+                    "after %ss: %s",
+                    _FFMPEG_OPUS_TIMEOUT_S,
+                    mp3_path,
+                )
+                return None
             if proc.returncode != 0 or not Path(out_path).exists():
                 logger.error(
                     "[whatsapp_cloud] ffmpeg opus conversion failed "
