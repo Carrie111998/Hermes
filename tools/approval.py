@@ -407,7 +407,16 @@ _HERMES_CONFIG_PATH = (
     r'(?:\$hermes_home|\$\{hermes_home\})/)'
     r'config\.yaml\b'
 )
-_PROJECT_ENV_PATH = r'(?:(?:/|\.{1,2}/)?(?:[^\s/"\'`]+/)*\.env(?:\.[^/\s"\'`]+)*)'
+# ``.env``, its dotted variants (``.env.local``), and ``.envrc``. The ``rc``
+# tail needs its own alternative because the dotted-suffix group requires a
+# leading ``.``: ``.envrc`` used to match only its ``.env`` prefix, and the
+# write-target boundary anchors then rejected that partial match. So direnv's
+# ``.envrc`` was ungated on every write vector even though the read guard
+# blocks it by basename — and it is shell direnv sources on cd, making a write
+# arbitrary code execution.
+_PROJECT_ENV_PATH = (
+    r'(?:(?:/|\.{1,2}/)?(?:[^\s/"\'`]+/)*\.env(?:rc\b|(?:\.[^/\s"\'`]+)*))'
+)
 _PROJECT_CONFIG_PATH = r'(?:(?:/|\.{1,2}/)?(?:[^\s/"\'`]+/)*config\.yaml)'
 _SHELL_RC_FILES = (
     r'(?:~|\$home|\$\{home\})/\.'
@@ -1198,6 +1207,17 @@ DANGEROUS_PATTERNS = [
     # the terminal side is not an open door. See #14639.
     (rf'\bsed\s+-[^\s]*i.*(?:{_HERMES_CONFIG_PATH}|{_HERMES_ENV_PATH})', "in-place edit of Hermes config/env"),
     (rf'\bsed\s+--in-place\b.*(?:{_HERMES_CONFIG_PATH}|{_HERMES_ENV_PATH})', "in-place edit of Hermes config/env (long flag)"),
+    # Project-local env files. The tee/redirection/cp-mv-install rules already
+    # cover project paths, but the in-place rules above use
+    # _USER_SENSITIVE_WRITE_TARGET, which omits them — so
+    # `sed -i 's/KEY=.*/KEY=stolen/' .env` mutated a file the read guard will
+    # not even read. Keyed on _PROJECT_ENV_PATH, not the full project target:
+    # a bare config.yaml is ordinary app config unless it is the Hermes one
+    # (covered above), so widening it would gate `sed -i /srv/app/config.yaml`.
+    # perl/ruby -i need no companion rule; `perl -e` is already gated wholesale
+    # by the script-execution pattern.
+    (rf'\bsed\s+-[^\s]*i.*(?:{_PROJECT_ENV_PATH})[^\s"\']*', "in-place edit of project env file"),
+    (rf'\bsed\s+--in-place\b.*(?:{_PROJECT_ENV_PATH})[^\s"\']*', "in-place edit of project env file (long flag)"),
     # perl -i and ruby -i perform the same in-place mutation as sed -i but are
     # not caught by the -e/-c script-execution pattern above (which targets code
     # evaluation, not file mutation). Pairs the sed -i coverage from #14639.
