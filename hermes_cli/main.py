@@ -6668,6 +6668,19 @@ def _do_build_web_ui(web_dir: Path, *, fatal: bool = False) -> bool:
             _say("Install Node.js, then run:  cd web && npm install && npm run build")
         return not fatal
     build_env = _npm_lifecycle_env(with_hermes_node_path())
+    project_root = (
+        web_dir.parent.parent if web_dir.parent.name == "apps" else web_dir.parent
+    )
+    if _is_termux_startup_environment():
+        from hermes_cli._early_recovery import (
+            fix_termux_node_shebangs,
+            prefer_termux_bionic_path,
+        )
+
+        build_env = prefer_termux_bionic_path(build_env)
+        # npm install may have left #!/usr/bin/env shebangs that Termux cannot
+        # execute when /usr/bin/env is missing — fix before tsc/vite run.
+        fix_termux_node_shebangs(project_root)
     _say("→ Building web UI...")
 
     def _relay(result: "subprocess.CompletedProcess") -> None:
@@ -6722,6 +6735,15 @@ def _do_build_web_ui(web_dir: Path, *, fatal: bool = False) -> bool:
             env=build_env,
         )
 
+    def _run_web_build() -> "subprocess.CompletedProcess":
+        if _is_termux_startup_environment():
+            from hermes_cli._early_recovery import fix_termux_node_shebangs
+
+            # npm install rewrites #!/usr/bin/env shebangs; on Termux without
+            # /usr/bin/env that surfaces as `tsc: not found`. Fix before each run.
+            fix_termux_node_shebangs(project_root)
+        return _run_with_idle_timeout([npm, "run", "build"], cwd=web_dir, env=build_env)
+
     r1 = _install_web_deps(silent=True)
     if r1.returncode != 0:
         _say(
@@ -6737,7 +6759,7 @@ def _do_build_web_ui(web_dir: Path, *, fatal: bool = False) -> bool:
     # users react by rebooting, which leaves the editable install in a
     # half-state. Streaming + idle-kill makes failures observable AND
     # recoverable (the stale-dist fallback below handles the kill path).
-    r2 = _run_with_idle_timeout([npm, "run", "build"], cwd=web_dir, env=build_env)
+    r2 = _run_web_build()
     if r2.returncode != 0:
         # The install above can exit 0 while leaving the tree without a build
         # toolchain — a lockfile-hash skip over a half-installed tree, or an
@@ -6748,13 +6770,13 @@ def _do_build_web_ui(web_dir: Path, *, fatal: bool = False) -> bool:
         if missing_tool:
             _say(f"  ⚠ Build could not resolve {missing_tool} — reinstalling web dependencies...")
             _install_web_deps(silent=False)
-            r2 = _run_with_idle_timeout([npm, "run", "build"], cwd=web_dir, env=build_env)
+            r2 = _run_web_build()
         if r2.returncode != 0:
             # Retry once after a short delay — covers boot-time races on Windows
             # (antivirus scanning Node.js binaries, npm cache not ready, transient
             # I/O when launched via Scheduled Task at logon). See issue #23817.
             _time.sleep(3)
-            r2 = _run_with_idle_timeout([npm, "run", "build"], cwd=web_dir, env=build_env)
+            r2 = _run_web_build()
 
     if r2.returncode != 0:
         # _run_with_idle_timeout merges stderr into stdout; older callers
@@ -9695,6 +9717,17 @@ def _run_install_with_heartbeat(
     t = threading.Thread(target=_heartbeat, daemon=True)
     t.start()
     try:
+        if _is_termux_env(env):
+            # Termux: prefer bionic PATH + arch-aware uv --python-platform so
+            # Android wheel-tag rejects and glibc-first PATH breakages don't
+            # strand updates (bare "linux" is x86_64 on uv 0.12+).
+            from hermes_cli._early_recovery import (
+                prefer_termux_bionic_path,
+                with_uv_termux_python_platform,
+            )
+
+            env = prefer_termux_bionic_path(env)
+            cmd = with_uv_termux_python_platform(cmd, env)
         subprocess.run(
             cmd,
             cwd=PROJECT_ROOT,

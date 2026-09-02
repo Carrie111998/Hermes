@@ -4353,6 +4353,16 @@ def _repair_node_deps_on_current_checkout(
     return bool(print_completion(completion_message))
 
 
+def _fix_termux_node_shebangs(project_root: Path) -> None:
+    """Rewrite ``#!/usr/bin/env`` node bins when Termux has no ``/usr/bin/env``.
+
+    Delegates to :func:`hermes_cli._early_recovery.fix_termux_node_shebangs`.
+    """
+    from hermes_cli._early_recovery import fix_termux_node_shebangs
+
+    fix_termux_node_shebangs(project_root)
+
+
 def _update_node_dependencies() -> list[str]:
     """Refresh Node deps for the ui-tui and web workspaces.
 
@@ -4441,6 +4451,10 @@ def _update_node_dependencies() -> list[str]:
     from hermes_constants import with_hermes_node_path
 
     nixos_env = with_hermes_node_path(_m()._nixos_build_env())
+    if _m()._is_termux_env():
+        from hermes_cli._early_recovery import prefer_termux_bionic_path
+
+        nixos_env = prefer_termux_bionic_path(nixos_env)
 
     # NOTE: capture_output=False here is deliberate (#18840) — optional
     # postinstall scripts print download progress, and capturing it makes a
@@ -4455,6 +4469,8 @@ def _update_node_dependencies() -> list[str]:
         env=nixos_env,
     )
     if result.returncode == 0:
+        if _m()._is_termux_env():
+            _fix_termux_node_shebangs(_m().PROJECT_ROOT)
         _record_npm_lockfile_hash(shared_hermes_root)
         print("  ✓ ui-tui, web workspaces installed (desktop skipped)")
         failures: list[str] = []
@@ -8152,6 +8168,14 @@ def _drain_or_signal_gateway_for_update(
 def _cmd_update_impl(args, gateway_mode: bool):
     """Body of ``cmd_update`` — kept separate so the wrapper can always
     restore stdio even on ``sys.exit``."""
+    if _m()._is_termux_env():
+        # Termux under glibc-runner often puts $PREFIX/glibc/bin first; child
+        # builds then pick broken glibc bash/dirname. Prefer bionic tools for
+        # the whole update process (also applied per-subprocess where we pass env).
+        from hermes_cli._early_recovery import prefer_termux_bionic_path
+
+        os.environ["PATH"] = prefer_termux_bionic_path()["PATH"]
+
     # A managed-runtime refresh can replace site-packages before the normal
     # ``.[all]`` install runs. Snapshot while the old environment can still
     # prove which optional backends the user had activated.
