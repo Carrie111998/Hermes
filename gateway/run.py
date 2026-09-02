@@ -11199,6 +11199,52 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return text
         return (enriched_text or text).strip()
 
+    def _label_shared_session_sender_text(
+        self, text: str, source: SessionSource
+    ) -> str:
+        """Prefix ``text`` with the shared-session sender label, if any.
+
+        Busy-path ``steer()``/``redirect()`` payloads bypass
+        ``_prepare_inbound_message_text``, so mid-turn follow-ups in shared
+        multi-user sessions reached the agent (and the persisted transcript)
+        with no sender attribution while messages sent between turns carried
+        theirs (#97569). This is the same labeling the normal inbound path
+        applies, kept as one shared method so the untrusted-name
+        neutralization and the Slack user-id enrichment cannot drift between
+        the two paths. DMs and per-user-isolated sessions label nothing,
+        leaving single-user behavior byte-identical.
+        """
+        if not text:
+            return text
+        _is_shared_multi_user = is_shared_multi_user_session(
+            source,
+            group_sessions_per_user=getattr(
+                self.config, "group_sessions_per_user", True
+            ),
+            thread_sessions_per_user=getattr(
+                self.config, "thread_sessions_per_user", False
+            ),
+        )
+        if not (_is_shared_multi_user and source.user_name):
+            return text
+        # source.user_name is the platform display name — attacker-
+        # influenceable on any platform that lets participants set their
+        # own name. Neutralize embedded newlines/control chars before
+        # interpolating it into the message, or a hostile name can
+        # masquerade as a fake markdown section (same treatment as in
+        # build_session_context_prompt via _format_untrusted_prompt_value).
+        _safe_user_name = neutralize_untrusted_inline_text(source.user_name)
+        # On Slack, expose the current author's verifiable user ID next to
+        # the display name (#17916): display names are ambiguous and
+        # historical mentions may point at someone else. The user_id comes
+        # from the Slack event envelope (not user-editable text), so it
+        # does not need neutralization.
+        if source.platform == Platform.SLACK and source.user_id:
+            _safe_user_name = (
+                f"{_safe_user_name} | Slack user <@{source.user_id}>"
+            )
+        return f"[{_safe_user_name}] {text}"
+
     async def _handle_active_session_busy_message(self, event: MessageEvent, session_key: str) -> bool:
         # --- Authorization gate (#17775) ---
         # The cold path (_handle_message) checks _is_user_authorized before
@@ -11416,7 +11462,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
             if can_steer:
                 try:
-                    steered = bool(running_agent.steer(steer_text))
+                    steered = bool(
+                        running_agent.steer(
+                            self._label_shared_session_sender_text(
+                                steer_text, event.source
+                            )
+                        )
+                    )
                 except Exception as exc:
                     logger.warning("Gateway steer failed for session %s: %s", session_key, exc)
                     steered = False
@@ -11434,7 +11486,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             and hasattr(running_agent, "redirect")
         ):
             try:
-                redirected = bool(running_agent.redirect((event.text or "").strip()))
+                redirected = bool(
+                    running_agent.redirect(
+                        self._label_shared_session_sender_text(
+                            (event.text or "").strip(), event.source
+                        )
+                    )
+                )
             except Exception as exc:
                 logger.warning("Gateway redirect failed for session %s: %s", session_key, exc)
                 redirected = False
@@ -20400,8 +20458,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if _pending_stt_prepared
             else event.text
         ) or ""
-        _group_sessions_per_user = getattr(self.config, "group_sessions_per_user", True)
-        _thread_sessions_per_user = getattr(self.config, "thread_sessions_per_user", False)
         # Prefer the already resolved session key from the caller so this write
         # key matches the consume key at the run_conversation site. Fall back
         # to deriving it here for tests and legacy standalone callers.
@@ -20410,31 +20466,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # concurrently preparing multimodal turns on the same runner.
         self._consume_pending_native_image_paths(session_key)
 
-        _is_shared_multi_user = is_shared_multi_user_session(
-            source,
-            group_sessions_per_user=_group_sessions_per_user,
-            thread_sessions_per_user=_thread_sessions_per_user,
-        )
-        if _is_shared_multi_user and source.user_name:
-            # source.user_name is the platform display name — attacker-
-            # influenceable on any platform that lets participants set their
-            # own name. Neutralize embedded newlines/control chars before
-            # interpolating it into every message in the shared session, or
-            # a hostile name can masquerade as a fake markdown section
-            # (mirrors the same field's treatment in
-            # build_session_context_prompt via _format_untrusted_prompt_value).
-            _safe_user_name = neutralize_untrusted_inline_text(source.user_name)
-            # On Slack, expose the current author's verifiable user ID next to
-            # the display name (#17916): "mention me again" requests need a
-            # trusted `<@U...>` target for the CURRENT speaker — display names
-            # are ambiguous and historical mentions may point at someone else.
-            # The user_id comes from the Slack event envelope (not
-            # user-editable text), so it does not need neutralization.
-            if source.platform == Platform.SLACK and source.user_id:
-                _safe_user_name = (
-                    f"{_safe_user_name} | Slack user <@{source.user_id}>"
-                )
-            message_text = f"[{_safe_user_name}] {message_text}"
+        # Sender attribution for shared multi-user sessions — shared with the
+        # busy steer/redirect path via _label_shared_session_sender_text so
+        # mid-turn follow-ups carry the same label as between-turn ones
+        # (#97569).
+        message_text = self._label_shared_session_sender_text(message_text, source)
 
         # Prepend channel context from history backfill (if any).  This
         # happens after sender-prefix so the prefix only applies to the
