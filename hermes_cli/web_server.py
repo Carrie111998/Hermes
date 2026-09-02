@@ -8032,7 +8032,10 @@ def _apply_model_assignment_sync(
                 slot_provider = str(slot_cfg.get("provider", "") or "").strip()
                 if (
                     slot_provider
-                    and slot_provider.lower() not in {"auto", ""}
+                    # "main" is a supported alias for the active main provider
+                    # (see auxiliary_client._normalize_aux_provider) and always
+                    # tracks the new main model — never a stale pin.
+                    and slot_provider.lower() not in {"auto", "", "main"}
                     and slot_provider.lower() != new_provider
                 ):
                     stale_aux.append({

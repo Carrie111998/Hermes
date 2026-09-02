@@ -514,7 +514,10 @@ export function ModelSettings({ onMainModelChanged, scopeProfile }: ModelSetting
       .filter(entry => {
         const p = (entry.provider ?? '').toLowerCase()
 
-        return p && p !== 'auto' && p !== mainProvider
+        // 'main' is a backend-supported alias (see _normalize_aux_provider in
+        // agent/auxiliary_client.py) meaning "follow the current main provider"
+        // — it can never be a stale pin, so don't warn on it.
+        return p && p !== 'auto' && p !== 'main' && p !== mainProvider
       })
       .map(entry => ({ task: entry.task, provider: entry.provider, model: entry.model }))
   }, [auxiliary, mainModel])
