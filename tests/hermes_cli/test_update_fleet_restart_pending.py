@@ -78,6 +78,9 @@ def _patch_update_deps(monkeypatch, tmp_path, run_side_effect):
     monkeypatch.setattr(hermes_main, "_resolve_update_branch", lambda args: "main")
     monkeypatch.setattr(hermes_main, "_is_windows", lambda: False)
     monkeypatch.setattr(
+        update_cmd, "_restart_macos_launchd_gateways", lambda *a, **k: None
+    )
+    monkeypatch.setattr(
         hermes_main,
         "_get_origin_url",
         lambda *a, **k: "https://github.com/NousResearch/hermes-agent.git",
@@ -240,6 +243,55 @@ def test_successful_receipt_with_pre_update_plan_shas_does_not_retrigger(
     )
 
     assert update_cmd._pending_fleet_restart_needed() is False
+
+
+def test_successful_command_boundary_receipt_without_fleet_does_not_retrigger(
+    monkeypatch,
+):
+    """A normal command-boundary stop is not an interrupted update."""
+    disk_sha = "n" * 40
+    old_sha = "o" * 40
+    monkeypatch.setattr(update_cmd, "_current_checkout_sha", lambda: disk_sha)
+
+    receipt_dir = get_hermes_home() / "logs" / "update_receipts"
+    receipt_dir.mkdir(parents=True)
+    (receipt_dir / "latest.json").write_text(
+        json.dumps(
+            {
+                "exit_code": 0,
+                "outcome": "success",
+                "stop_reason": "completed at command boundary",
+                "plan": {
+                    "expected_sha": old_sha,
+                    "runtimes": [
+                        {
+                            "kind": "gateway",
+                            "profile": "default",
+                            "pid": 1,
+                            "code_sha": old_sha,
+                        }
+                    ],
+                },
+                "fleet": [],
+                "gateway_restart": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert update_cmd._pending_fleet_restart_needed() is False
+
+
+@pytest.mark.parametrize(
+    "receipt",
+    [
+        {"outcome": "success", "exit_code": 0, "stop_reason": "sys.exit(0)"},
+        {"outcome": "success", "stop_reason": "KeyboardInterrupt: "},
+    ],
+)
+def test_other_success_stop_reasons_remain_unfinished(receipt):
+    """Only the known normal command-boundary reason bypasses recovery."""
+    assert update_cmd._receipt_looks_unfinished(receipt) is True
 
 
 def test_stale_fleet_matrix_on_latest_receipt_is_pending(monkeypatch):

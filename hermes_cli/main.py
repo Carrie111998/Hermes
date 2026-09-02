@@ -11143,9 +11143,12 @@ def cmd_update(args):
         raise
     else:
         try:
-            from hermes_cli.update_receipt import finalize_pending_update_receipt
+            from hermes_cli.update_receipt import (
+                COMMAND_BOUNDARY_STOP_REASON,
+                finalize_pending_update_receipt,
+            )
 
-            finalize_pending_update_receipt(0, "completed at command boundary")
+            finalize_pending_update_receipt(0, COMMAND_BOUNDARY_STOP_REASON)
         except Exception:
             pass
         _update_handoff_exit_code = 0
