@@ -396,9 +396,15 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                           help="Author name recorded on the task (default: user)")
     p_create.add_argument("--skill", action="append", default=[], dest="skills",
                           help="Skill to force-load into the worker "
-                               "(repeatable). The kanban lifecycle is already "
-                               "injected automatically. Example: "
+                               "(repeatable). Bare name, or pin a revision "
+                               "with name@sha256:<hex> / name@version:<ver> "
+                               "(#101341). Example: "
                                "--skill translation --skill github-code-review")
+    p_create.add_argument("--pin-skill-digests", action="store_true",
+                          dest="pin_skill_digests",
+                          help="Resolve each --skill under this profile and "
+                               "store package digests so the assignee must "
+                               "load the same artifact (#101341).")
     p_create.add_argument("--max-retries", type=int, default=None,
                           metavar="N",
                           help="Per-task override for the consecutive-failure "
@@ -1662,6 +1668,27 @@ def _cmd_create(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 2
+    skills_arg = getattr(args, "skills", None) or None
+    if skills_arg:
+        from hermes_cli.kanban_skill_pins import (
+            normalize_skills_list,
+            pin_skills_with_home_digests,
+        )
+
+        try:
+            skills_arg = normalize_skills_list(skills_arg)
+            if getattr(args, "pin_skill_digests", False):
+                home = os.environ.get("HERMES_HOME") or str(Path.home() / ".hermes")
+                skills_arg = pin_skills_with_home_digests(skills_arg, home)
+        except ValueError as exc:
+            print(f"kanban: --skill: {exc}", file=sys.stderr)
+            return 2
+    elif getattr(args, "pin_skill_digests", False):
+        print(
+            "kanban: --pin-skill-digests requires at least one --skill",
+            file=sys.stderr,
+        )
+        return 2
     with kb.connect_closing() as conn:
         task_id = kb.create_task(
             conn,
@@ -1679,7 +1706,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
             triage=bool(getattr(args, "triage", False)),
             idempotency_key=getattr(args, "idempotency_key", None),
             max_runtime_seconds=max_runtime,
-            skills=getattr(args, "skills", None) or None,
+            skills=skills_arg,
             max_retries=max_retries,
             model_override=getattr(args, "model_override", None),
             provider_override=getattr(args, "provider_override", None),
@@ -1858,7 +1885,20 @@ def _cmd_show(args: argparse.Namespace) -> int:
     if task.branch_name:
         print(f"  branch:    {task.branch_name}")
     if task.skills:
-        print(f"  skills:    {', '.join(task.skills)}")
+        from hermes_cli.kanban_skill_pins import skill_ref_name
+
+        labels = []
+        for entry in task.skills:
+            if isinstance(entry, dict):
+                bit = skill_ref_name(entry)
+                if entry.get("expected_digest"):
+                    bit += f"@{entry['expected_digest']}"
+                elif entry.get("expected_version"):
+                    bit += f"@version:{entry['expected_version']}"
+                labels.append(bit)
+            else:
+                labels.append(str(entry))
+        print(f"  skills:    {', '.join(labels)}")
     if task.model_override:
         _prov = f" (provider: {task.provider_override})" if task.provider_override else ""
         print(f"  model:     {task.model_override}{_prov}")

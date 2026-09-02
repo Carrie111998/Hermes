@@ -8944,6 +8944,21 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         """
         if getattr(self, "_preload_skills_finalized", False):
             return
+        # Kanban skill revision pins (#101341): refuse to start the model
+        # loop when HERMES_KANBAN_SKILL_PINS does not match what this
+        # profile resolves. Runs before we fold skill bodies into the
+        # prompt so a stale same-named artifact never reaches the model.
+        try:
+            from hermes_cli.kanban_skill_pins import enforce_env_skill_pins
+
+            enforce_env_skill_pins()
+        except SystemExit:
+            raise
+        except Exception:
+            # Only pin-check failures should abort; import/env glitches in
+            # non-kanban sessions must not break ordinary --skills use.
+            if os.environ.get("HERMES_KANBAN_SKILL_PINS"):
+                raise
         thread = getattr(self, "_preload_skills_thread", None)
         if thread is None:
             self._preload_skills_finalized = True

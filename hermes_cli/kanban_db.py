@@ -1090,8 +1090,11 @@ class Task:
     workflow_template_id: Optional[str] = None
     current_step_key: Optional[str] = None
     # Force-loaded skills for the worker on this task (passed via
-    # --skills). Stored as a JSON array of skill names. None = use only
-    # the defaults; empty list = explicitly no extra skills.
+    # --skills). Stored as a JSON array of skill names and/or structured
+    # pin objects ``{name, expected_digest?, expected_version?,
+    # source_policy?}`` (#101341). None = use only the defaults; empty
+    # list = explicitly no extra skills. Bare strings keep legacy
+    # name-only behavior.
     skills: Optional[list] = None
     model_override: Optional[str] = None
     # Provider that ``model_override`` belongs to. When set, the dispatcher
@@ -1145,13 +1148,27 @@ class Task:
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
         keys = set(row.keys())
-        # Parse skills JSON blob if present
+        # Parse skills JSON blob if present. Preserve structured pin
+        # objects (#101341); coerce only scalar entries to strings.
         skills_value: Optional[list] = None
         if "skills" in keys and row["skills"]:
             try:
                 parsed = json.loads(row["skills"])
                 if isinstance(parsed, list):
-                    skills_value = [str(s) for s in parsed if s]
+                    from hermes_cli.kanban_skill_pins import normalize_skill_entry
+
+                    restored: list = []
+                    for item in parsed:
+                        if not item:
+                            continue
+                        try:
+                            restored.append(normalize_skill_entry(item))
+                        except ValueError:
+                            # Legacy / partially-corrupt row: keep the
+                            # bare name when we can, otherwise skip.
+                            if isinstance(item, str) and item.strip():
+                                restored.append(item.strip())
+                    skills_value = restored or None
             except Exception:
                 skills_value = None
         return cls(
@@ -3182,7 +3199,7 @@ def create_task(
     triage: bool = False,
     idempotency_key: Optional[str] = None,
     max_runtime_seconds: Optional[int] = None,
-    skills: Optional[Iterable[str]] = None,
+    skills: Optional[Iterable] = None,
     max_retries: Optional[int] = None,
     model_override: Optional[str] = None,
     provider_override: Optional[str] = None,
@@ -3212,11 +3229,13 @@ def create_task(
     dispatcher SIGTERMs (then SIGKILLs after a grace window) and
     re-queues the task. ``None`` means no cap (default).
 
-    ``skills`` is an optional list of skill names to force-load into
+    ``skills`` is an optional list of skill names (or structured pin
+    objects — see ``hermes_cli.kanban_skill_pins``) to force-load into
     the worker when dispatched. Stored as JSON; the dispatcher passes
-    each name to ``hermes --skills ...``. Use this to pin a task to a
-    specialist skill (e.g. ``skills=["translation"]`` so the worker loads the
-    translation skill regardless of the profile's default config).
+    each name to ``hermes --skills ...``. Structured entries may set
+    ``expected_digest`` / ``expected_version`` so preflight blocks when
+    the assignee resolves a different artifact (#101341). Bare strings
+    keep legacy name-only behavior.
 
     ``model_override`` / ``provider_override`` pin the worker to a specific
     model (and optionally its provider) without touching the profile's
@@ -3360,38 +3379,35 @@ def create_task(
     parents = tuple(p for p in parents if p)
 
     # Normalise + validate skills: strip whitespace, drop empties, dedupe
-    # (preserving order). Refuse commas inside a single name so we don't
-    # invisibly splatter a comma-joined string into one argv slot — the
+    # (preserving order). Accept bare names and structured pin objects
+    # (#101341). Refuse commas inside a single name so we don't invisibly
+    # splatter a comma-joined string into one argv slot — the
     # `hermes --skills X,Y` comma syntax is handled in the dispatcher,
     # not here.
-    skills_list: Optional[list[str]] = None
+    skills_list: Optional[list] = None
     if skills is not None:
-        cleaned: list[str] = []
-        seen: set[str] = set()
+        from hermes_cli.kanban_skill_pins import (
+            normalize_skills_list,
+            skill_ref_name,
+        )
+
+        try:
+            cleaned = normalize_skills_list(skills) or []
+        except ValueError:
+            raise
         # Collect all toolset-name confusions up front so the user sees the
         # whole list at once. Raising on the first hit is friendly when the
         # input has one mistake, but agents that confuse skills with toolsets
         # usually pass several at once (`skills=["web", "browser", "terminal"]`)
         # and serial-correcting one per failure round-trips wastes tokens.
         toolset_typos: list[str] = []
-        for s in skills:
-            if not s:
-                continue
-            name = str(s).strip()
-            if not name:
-                continue
-            if "," in name:
-                raise ValueError(
-                    f"skill name cannot contain comma: {name!r} "
-                    f"(pass a list of separate names instead of a comma-joined string)"
-                )
+        kept: list = []
+        for entry in cleaned:
+            name = skill_ref_name(entry)
             if name.casefold() in KNOWN_TOOLSET_NAMES:
                 toolset_typos.append(name)
                 continue
-            if name in seen:
-                continue
-            seen.add(name)
-            cleaned.append(name)
+            kept.append(entry)
         if toolset_typos:
             quoted = ", ".join(repr(n) for n in toolset_typos)
             noun = "is a toolset name" if len(toolset_typos) == 1 else "are toolset names"
@@ -3402,7 +3418,7 @@ def create_task(
                 "(e.g. `blogwatcher`, `github-code-review`); toolsets are runtime "
                 "capabilities (e.g. `web`, `browser`, `terminal`)."
             )
-        skills_list = cleaned
+        skills_list = kept
 
     # Idempotency check — return the existing task instead of creating a
     # duplicate. Done BEFORE entering write_txn to keep the fast path fast
@@ -10260,6 +10276,8 @@ def _dispatch_once_locked(
         if claimed.workspace_kind == "worktree":
             set_branch_name(conn, claimed.id, resolved_branch_name or (claimed.branch_name or "").strip() or f"wt/{claimed.id}")
         _maybe_emit_scratch_tip(conn, claimed.id, claimed.workspace_kind)
+        if _block_on_skill_pin_mismatch(conn, claimed, result):
+            continue
         _spawn = spawn_fn if spawn_fn is not None else _default_spawn
         try:
             # Back-compat: older spawn_fn signatures accept only
@@ -10391,10 +10409,20 @@ def _dispatch_once_locked(
         # the review logic (AC verification, merge, etc.). The mandatory
         # kanban lifecycle is already injected into every worker's system
         # prompt via KANBAN_GUIDANCE, so this is the only extra skill the
-        # review agent needs.
-        claimed.skills = list(
-            dict.fromkeys([*(claimed.skills or []), "sdlc-review"])
-        )
+        # review agent needs. Preserve structured pin objects (#101341).
+        from hermes_cli.kanban_skill_pins import skill_ref_name
+
+        _merged_skills: list = []
+        _seen_skill_names: set[str] = set()
+        for _entry in list(claimed.skills or []) + ["sdlc-review"]:
+            _name = skill_ref_name(_entry)
+            if not _name or _name in _seen_skill_names:
+                continue
+            _seen_skill_names.add(_name)
+            _merged_skills.append(_entry)
+        claimed.skills = _merged_skills
+        if _block_on_skill_pin_mismatch(conn, claimed, result):
+            continue
         _spawn = spawn_fn if spawn_fn is not None else _default_spawn
         try:
             import inspect
@@ -10717,6 +10745,114 @@ def _retag_legacy_worker_sessions(workspaces_root_path: str) -> None:
         _log.debug("kanban worker: legacy session retag skipped (%s)", exc)
 
 
+def _assignee_hermes_home(assignee: Optional[str]) -> str:
+    """Resolve the HERMES_HOME the worker for ``assignee`` will see."""
+    if not assignee:
+        from hermes_constants import get_hermes_home
+
+        return str(get_hermes_home())
+    try:
+        from hermes_cli.profiles import resolve_profile_env
+
+        return resolve_profile_env(assignee)
+    except Exception:
+        # Tests and missing profile dirs fall back to the active home;
+        # spawn will fail later with a clearer profile error if needed.
+        from hermes_constants import get_hermes_home
+
+        return str(get_hermes_home())
+
+
+def _block_on_skill_pin_mismatch(
+    conn: sqlite3.Connection,
+    task: "Task",
+    result: "DispatchResult",
+) -> bool:
+    """Preflight structured skill pins before the first model call.
+
+    On mismatch/unresolved pin: emit ``skill_pin_check``, block with
+    ``kind="capability"`` (does not increment ``consecutive_failures``),
+    and return True so the caller skips spawn. Name-only skills are a
+    no-op (#101341).
+    """
+    from hermes_cli.kanban_skill_pins import (
+        check_skill_pins,
+        format_skill_pin_failures,
+        pinned_skill_entries,
+    )
+
+    if not pinned_skill_entries(task.skills):
+        return False
+    assignee_home = _assignee_hermes_home(task.assignee)
+    try:
+        from hermes_constants import get_hermes_home
+
+        shared_home = str(get_hermes_home())
+    except Exception:
+        shared_home = assignee_home
+    failures = check_skill_pins(
+        task.skills,
+        assignee_home=assignee_home,
+        shared_home=shared_home,
+        task_id=task.id,
+    )
+    # Always record what was checked when pins are present so a later
+    # review can answer requested vs actual identity without skill content.
+    checked: list[dict] = []
+    for entry in pinned_skill_entries(task.skills):
+        from hermes_cli.kanban_skill_pins import (
+            resolve_pin_home,
+            resolve_skill_identity,
+            skill_ref_name,
+        )
+
+        name = skill_ref_name(entry)
+        policy = str(entry.get("source_policy") or "assignee")
+        home = resolve_pin_home(
+            source_policy=policy,
+            assignee_home=assignee_home,
+            shared_home=shared_home,
+        )
+        identity = resolve_skill_identity(name, home, task_id=task.id)
+        checked.append(
+            {
+                "name": name,
+                "source_policy": policy,
+                "requested_digest": entry.get("expected_digest"),
+                "requested_version": entry.get("expected_version"),
+                "actual_digest": identity.get("digest") if identity else None,
+                "actual_version": identity.get("version") if identity else None,
+                "actual_source": identity.get("source") if identity else None,
+                "ok": not any(f.get("name") == name for f in failures),
+            }
+        )
+    reason = format_skill_pin_failures(failures) if failures else None
+    with write_txn(conn):
+        _append_event(
+            conn,
+            task.id,
+            "skill_pin_check",
+            {
+                "ok": not failures,
+                "assignee_home": assignee_home,
+                "skills": checked,
+                "failures": failures,
+            },
+            run_id=task.current_run_id,
+        )
+    if not failures:
+        return False
+    block_task(
+        conn,
+        task.id,
+        reason=f"skill pin mismatch: {reason}",
+        kind="capability",
+        expected_run_id=task.current_run_id,
+    )
+    result.auto_blocked.append(task.id)
+    return True
+
+
 def _default_spawn(
     task: Task,
     workspace: str,
@@ -10864,10 +11000,16 @@ def _default_spawn(
     # accepts both forms (action='append' + comma-split), but
     # per-name pairs are easier to read in `ps` output and avoid any
     # quoting ambiguity if a skill name ever contains unusual chars.
-    if task.skills:
-        for sk in task.skills:
-            if sk:
-                cmd.extend(["--skills", sk])
+    # Structured pin objects (#101341) contribute only their bare name
+    # here; digests travel via HERMES_KANBAN_SKILL_PINS for worker
+    # re-check.
+    from hermes_cli.kanban_skill_pins import skill_names_for_cli, skill_pins_env_payload
+
+    for sk in skill_names_for_cli(task.skills):
+        cmd.extend(["--skills", sk])
+    pins_env = skill_pins_env_payload(task.skills)
+    if pins_env:
+        env["HERMES_KANBAN_SKILL_PINS"] = pins_env
     if task.model_override:
         cmd.extend(["-m", task.model_override])
         # Pin the provider too when the override names one, so the worker

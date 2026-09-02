@@ -1423,8 +1423,16 @@ def _handle_create(args: dict, **kw) -> str:
         skills = [skills]
     if skills is not None and not isinstance(skills, (list, tuple)):
         return tool_error(
-            f"skills must be a list of skill names, got {type(skills).__name__}"
+            f"skills must be a list of skill names or pin objects, "
+            f"got {type(skills).__name__}"
         )
+    if skills is not None:
+        try:
+            from hermes_cli.kanban_skill_pins import normalize_skills_list
+
+            skills = normalize_skills_list(skills)
+        except ValueError as exc:
+            return tool_error(str(exc))
     goal_mode, goal_bool_error = _parse_bool_arg(args, "goal_mode")
     if goal_bool_error:
         return tool_error(goal_bool_error)
@@ -2269,15 +2277,32 @@ KANBAN_CREATE_SCHEMA = {
             },
             "skills": {
                 "type": "array",
-                "items": {"type": "string"},
+                "items": {
+                    "anyOf": [
+                        {"type": "string"},
+                        {
+                            "type": "object",
+                            "properties": {
+                                "name": {"type": "string"},
+                                "expected_digest": {"type": "string"},
+                                "expected_version": {"type": "string"},
+                                "source_policy": {
+                                    "type": "string",
+                                    "enum": ["assignee", "shared", "task"],
+                                },
+                            },
+                            "required": ["name"],
+                        },
+                    ]
+                },
                 "description": (
-                    "Skill names to force-load into the dispatched "
-                    "worker. The kanban lifecycle is already injected "
-                    "automatically; use this to pin a task to a specialist "
-                    "context — e.g. ['translation'] for a translation "
-                    "task, ['github-code-review'] for a reviewer task. "
-                    "The names must match skills installed on the "
-                    "assignee's profile."
+                    "Skills to force-load into the dispatched worker. "
+                    "Bare names keep legacy behavior. Structured entries "
+                    "may set expected_digest / expected_version so "
+                    "preflight blocks when the assignee resolves a "
+                    "different artifact (#101341). Example: "
+                    "[{'name': 'github-pr-workflow', "
+                    "'expected_digest': 'sha256:abcd...'}]."
                 ),
             },
             "goal_mode": {
