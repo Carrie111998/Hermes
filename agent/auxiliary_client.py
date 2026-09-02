@@ -4820,7 +4820,11 @@ def _is_unsupported_parameter_error(exc: Exception, param: str) -> bool:
     param_lower = (param or "").lower()
     if not param_lower:
         return False
-    err_lower = str(exc).lower()
+    # Some providers/proxies render contractions with a typographic
+    # apostrophe ("doesn’t support", U+2019). Normalize it once so every
+    # present and future contraction marker below matches both styles
+    # (review feedback on PR #94977).
+    err_lower = str(exc).lower().replace("\u2019", "'")
     if param_lower not in err_lower:
         return False
     return any(marker in err_lower for marker in (
@@ -4828,6 +4832,7 @@ def _is_unsupported_parameter_error(exc: Exception, param: str) -> bool:
         "unsupported_parameter",
         "not supported",
         "does not support",
+        "doesn't support",
         "unknown parameter",
         "unrecognized request argument",
         "unrecognized parameter",

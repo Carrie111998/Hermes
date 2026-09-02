@@ -36,6 +36,11 @@ class TestIsUnsupportedParameterError:
         ("temperature", "HTTP 400: Unsupported parameter: temperature"),
         ("temperature", "Error code: 400 - {'error': {'code': 'unsupported_parameter', 'param': 'temperature'}}"),
         ("temperature", "this model does not support temperature"),
+        ("temperature", "this model doesn't support temperature"),
+        # curly (typographic) apostrophe variant — U+2019 — as rendered by
+        # several providers/proxies (review feedback on PR #94977)
+        ("temperature", "this model doesn’t support temperature"),
+        ("max_tokens", "The model doesn’t support max_tokens"),
         # max_tokens phrasings
         ("max_tokens", "HTTP 400: Unsupported parameter: max_tokens"),
         ("max_tokens", "Unknown parameter: max_tokens — use max_completion_tokens"),
