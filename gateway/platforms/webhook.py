@@ -17,6 +17,13 @@ Each route defines:
     message that gets delivered.  Use for external push notifications
     (Supabase, monitoring alerts, inter-agent pings) where zero LLM cost
     and sub-second delivery matter more than agent reasoning.
+  - cron_job: fire an existing cron job (by ID or name) on each event
+    instead of starting a fresh webhook agent session.  The rendered
+    prompt becomes transient per-run context for that job; the job's own
+    prompt, skills, model, and delivery settings apply.  Turns any cron
+    job into an event-triggered task (inspired by ChatGPT Work's
+    webhook-triggered scheduled tasks, Aug 2026).  Mutually exclusive
+    with deliver_only.
 
 Security:
   - HMAC secret is required per route (validated at startup)
@@ -276,6 +283,14 @@ class WebhookAdapter(BasePlatformAdapter):
             # Validate up-front so misconfiguration surfaces at startup rather
             # than on the first webhook POST.
             if route.get("deliver_only"):
+                if route.get("cron_job"):
+                    raise ValueError(
+                        f"[webhook] Route '{name}' sets both deliver_only and "
+                        f"cron_job. They are mutually exclusive: deliver_only "
+                        f"pushes the rendered template as a message, cron_job "
+                        f"fires an existing cron job (which handles its own "
+                        f"delivery)."
+                    )
                 deliver = route.get("deliver", "log")
                 if not deliver or deliver == "log":
                     raise ValueError(
@@ -885,6 +900,67 @@ class WebhookAdapter(BasePlatformAdapter):
             return web.json_response(
                 {"status": "duplicate", "delivery_id": delivery_id},
                 status=200,
+            )
+
+        # ── Cron-job trigger mode (cron_job) ────────────────────
+        # Inspired by ChatGPT Work's webhook-triggered scheduled tasks
+        # (Aug 25 2026): an app event (Gmail/Slack/GitHub/anything that can
+        # POST) fires an EXISTING cron job instead of polling on a cadence.
+        # The rendered prompt template becomes transient per-run context
+        # (same rail as cronjob(action='run', prompt=...)); the job's own
+        # stored prompt, skills, model, and delivery settings all apply.
+        # Reuses the same HMAC auth, rate limiting, filters, script, and
+        # idempotency that protect agent-mode routes above.
+        if route_config.get("cron_job"):
+            job_ref = str(route_config["cron_job"])
+            event_context = (
+                f"This run was triggered by webhook event '{event_type}' "
+                f"on route '{route_name}' (not the schedule).\n\n{prompt}"
+            )
+            logger.info(
+                "[webhook] cron-trigger event=%s route=%s job=%s delivery=%s",
+                event_type,
+                route_name,
+                job_ref,
+                delivery_id,
+            )
+
+            async def _fire_cron_job() -> None:
+                try:
+                    from tools.cronjob_tools import execute_job_for_event
+
+                    # The job is a full agent run (minutes); keep it off the
+                    # gateway event loop.
+                    result = await asyncio.to_thread(
+                        execute_job_for_event, job_ref, event_context
+                    )
+                    if not result.get("success"):
+                        logger.warning(
+                            "[webhook] cron-trigger job=%s route=%s did not "
+                            "complete cleanly: %s",
+                            job_ref,
+                            route_name,
+                            result.get("error"),
+                        )
+                except Exception:
+                    logger.exception(
+                        "[webhook] cron-trigger failed job=%s route=%s",
+                        job_ref,
+                        route_name,
+                    )
+
+            task = asyncio.create_task(_fire_cron_job())
+            self._background_tasks.add(task)
+            task.add_done_callback(self._background_tasks.discard)
+            return web.json_response(
+                {
+                    "status": "accepted",
+                    "route": route_name,
+                    "cron_job": job_ref,
+                    "event": event_type,
+                    "delivery_id": delivery_id,
+                },
+                status=202,
             )
 
         # ── Direct delivery mode (deliver_only) ─────────────────
