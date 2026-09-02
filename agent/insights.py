@@ -94,6 +94,20 @@ def _bar_chart(values: List[int], max_width: int = 20) -> List[str]:
     return ["█" * max(1, int(v / peak * max_width)) if v > 0 else "" for v in values]
 
 
+def _safe_dt_from_ts(ts: Any) -> Optional[datetime]:
+    """Best-effort datetime from a stored Unix timestamp.
+
+    Malformed historical rows (a ``started_at`` of ~8.4e252 was observed in
+    the wild) must never abort the whole report — ``hermes insights``
+    aggregates analytics, and one corrupt record should degrade that
+    session's contribution, not every window's output (#99959).
+    """
+    try:
+        return datetime.fromtimestamp(ts)
+    except (OverflowError, OSError, ValueError, TypeError):
+        return None
+
+
 class InsightsEngine:
     """
     Analyzes session history and produces usage insights.
@@ -857,7 +871,11 @@ class InsightsEngine:
             ts = s.get("started_at")
             if not ts:
                 continue
-            dt = datetime.fromtimestamp(ts)
+            dt = _safe_dt_from_ts(ts)
+            if dt is None:
+                # Malformed historical timestamp — skip the row instead of
+                # aborting the whole activity report (#99959).
+                continue
             day_counts[dt.weekday()] += 1
             hour_counts[dt.hour] += 1
             daily_counts[dt.strftime("%Y-%m-%d")] += 1
@@ -920,21 +938,23 @@ class InsightsEngine:
                 key=lambda s: (s["ended_at"] - s["started_at"]),
             )
             dur = longest["ended_at"] - longest["started_at"]
+            _longest_dt = _safe_dt_from_ts(longest["started_at"])
             top.append({
                 "label": "Longest session",
                 "session_id": longest["id"][:16],
                 "value": format_duration_compact(dur),
-                "date": datetime.fromtimestamp(longest["started_at"]).strftime("%b %d"),
+                "date": _longest_dt.strftime("%b %d") if _longest_dt else "unknown",
             })
 
         # Most messages
         most_msgs = max(sessions, key=lambda s: s.get("message_count") or 0)
         if (most_msgs.get("message_count") or 0) > 0:
+            _msgs_dt = _safe_dt_from_ts(most_msgs.get("started_at"))
             top.append({
                 "label": "Most messages",
                 "session_id": most_msgs["id"][:16],
                 "value": f"{most_msgs['message_count']} msgs",
-                "date": datetime.fromtimestamp(most_msgs["started_at"]).strftime("%b %d") if most_msgs.get("started_at") else "?",
+                "date": _msgs_dt.strftime("%b %d") if _msgs_dt else "unknown",
             })
 
         # Most tokens
@@ -944,21 +964,23 @@ class InsightsEngine:
         )
         token_total = (most_tokens.get("input_tokens") or 0) + (most_tokens.get("output_tokens") or 0)
         if token_total > 0:
+            _tokens_dt = _safe_dt_from_ts(most_tokens.get("started_at"))
             top.append({
                 "label": "Most tokens",
                 "session_id": most_tokens["id"][:16],
                 "value": f"{token_total:,} tokens",
-                "date": datetime.fromtimestamp(most_tokens["started_at"]).strftime("%b %d") if most_tokens.get("started_at") else "?",
+                "date": _tokens_dt.strftime("%b %d") if _tokens_dt else "unknown",
             })
 
         # Most tool calls
         most_tools = max(sessions, key=lambda s: s.get("tool_call_count") or 0)
         if (most_tools.get("tool_call_count") or 0) > 0:
+            _tools_dt = _safe_dt_from_ts(most_tools.get("started_at"))
             top.append({
                 "label": "Most tool calls",
                 "session_id": most_tools["id"][:16],
                 "value": f"{most_tools['tool_call_count']} calls",
-                "date": datetime.fromtimestamp(most_tools["started_at"]).strftime("%b %d") if most_tools.get("started_at") else "?",
+                "date": _tools_dt.strftime("%b %d") if _tools_dt else "unknown",
             })
 
         return top
@@ -995,8 +1017,10 @@ class InsightsEngine:
 
         # Date range
         if o.get("date_range_start") and o.get("date_range_end"):
-            start_str = datetime.fromtimestamp(o["date_range_start"]).strftime("%b %d, %Y")
-            end_str = datetime.fromtimestamp(o["date_range_end"]).strftime("%b %d, %Y")
+            _range_start = _safe_dt_from_ts(o["date_range_start"])
+            _range_end = _safe_dt_from_ts(o["date_range_end"])
+            start_str = _range_start.strftime("%b %d, %Y") if _range_start else "unknown"
+            end_str = _range_end.strftime("%b %d, %Y") if _range_end else "unknown"
             lines.append(f"  Period: {start_str} — {end_str}")
             lines.append("")
 
@@ -1075,7 +1099,8 @@ class InsightsEngine:
             for skill in top_skills[:10]:
                 last_used = "—"
                 if skill.get("last_used_at"):
-                    last_used = datetime.fromtimestamp(skill["last_used_at"]).strftime("%b %d")
+                    _used_dt = _safe_dt_from_ts(skill["last_used_at"])
+                    last_used = _used_dt.strftime("%b %d") if _used_dt else "unknown"
                 lines.append(
                     f"  {skill['skill'][:28]:<28} {skill['view_count']:>7,} {skill['manage_count']:>7,} {last_used:>11}"
                 )
@@ -1191,7 +1216,9 @@ class InsightsEngine:
             for skill in skills["top_skills"][:5]:
                 suffix = ""
                 if skill.get("last_used_at"):
-                    suffix = f", last used {datetime.fromtimestamp(skill['last_used_at']).strftime('%b %d')}"
+                    _used_dt = _safe_dt_from_ts(skill["last_used_at"])
+                    if _used_dt:
+                        suffix = f", last used {_used_dt.strftime('%b %d')}"
                 lines.append(
                     f"  {skill['skill']} — {skill['view_count']:,} loads, {skill['manage_count']:,} edits{suffix}"
                 )
