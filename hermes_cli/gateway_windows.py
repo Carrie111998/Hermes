@@ -883,7 +883,13 @@ def windowless_gateway_restart_spec(
     working_dir = _stable_gateway_working_dir(PROJECT_ROOT)
     project_root = str(PROJECT_ROOT)
     try:
-        hermes_home = str(Path(get_hermes_home()).resolve())
+        # Preserve the configured HERMES_HOME spelling on junction/symlink
+        # installs (same invariant as _preserve_hermes_home_path). Resolving
+        # here made detached spawns identify their home by the junction
+        # target while the Scheduled Task / Startup .vbs launchers set the
+        # configured AppData path — runtime state identity then depended on
+        # which launch route started the gateway.
+        hermes_home = _preserve_hermes_home_path(Path(get_hermes_home()))
     except Exception:
         hermes_home = ""
 

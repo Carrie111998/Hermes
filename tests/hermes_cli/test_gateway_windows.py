@@ -80,6 +80,47 @@ def test_build_gateway_argv_keeps_venv_console_python_for_uv_venv(monkeypatch, t
 
 
 @pytest.mark.windows_only
+def test_build_gateway_argv_preserves_junction_hermes_home_spelling(monkeypatch, tmp_path):
+    """Detached spawns must carry the CONFIGURED HERMES_HOME spelling.
+
+    %LOCALAPPDATA%\\hermes is sometimes a junction to another drive.
+    _build_gateway_argv() used Path(...).resolve(), so gateways started via
+    _spawn_detached() (install immediate-start, Startup fallback, restarts)
+    identified their home by the junction target while the Scheduled Task /
+    Startup .vbs launchers set the configured AppData spelling — runtime
+    state identity depended on which launch route started the gateway.
+    """
+    import _winapi
+
+    real_home = tmp_path / "real-home"
+    link_home = tmp_path / "link-home"
+    real_home.mkdir()
+    _winapi.CreateJunction(str(real_home), str(link_home))
+
+    project = tmp_path / "project"
+    scripts = project / "venv" / "Scripts"
+    base = tmp_path / "uv" / "python" / "cpython-3.11-windows-x86_64-none"
+    scripts.mkdir(parents=True)
+    base.mkdir(parents=True)
+
+    venv_python = scripts / "python.exe"
+    venv_python.write_text("", encoding="utf-8")
+    (project / "venv" / "pyvenv.cfg").write_text(
+        f"home = {base}\nimplementation = CPython\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(gateway, "PROJECT_ROOT", project)
+    monkeypatch.setattr(gateway, "get_python_path", lambda: str(venv_python))
+    monkeypatch.setattr(gateway, "_profile_arg", lambda hermes_home: "")
+    monkeypatch.setattr("hermes_cli.config.get_hermes_home", lambda: str(link_home))
+
+    argv, cwd, env_overlay = gateway_windows._build_gateway_argv()
+
+    assert env_overlay["HERMES_HOME"] == str(link_home)
+
+
+@pytest.mark.windows_only
 def test_spawn_detached_marks_primary_breakaway_success(monkeypatch, tmp_path, caplog):
     """A successful breakaway spawn reports true without a warning."""
     argv = ["python.exe", "-m", "hermes_cli.main", "gateway", "run"]
