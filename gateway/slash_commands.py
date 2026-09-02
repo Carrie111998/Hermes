@@ -5160,26 +5160,52 @@ class GatewaySlashCommandsMixin:
                 return t("gateway.title.empty_after_clean")
             # Set the title
             try:
-                if await self._session_db.set_session_title(session_id, sanitized):
-                    # Propagate the user-chosen title to the visible Telegram
-                    # forum topic name too. Auto-generated titles already rename
-                    # the topic; without this, /title only updated the DB title
-                    # and the topic kept its auto-assigned name. No-ops off
-                    # Telegram topic lanes and when auto-rename is disabled.
-                    schedule_rename = getattr(
-                        self, "_schedule_telegram_topic_title_rename", None
+                from hermes_state import SessionDB
+                # Telegram topic lanes allow duplicate visible names via lineage aliases.
+                is_telegram_topic = await asyncio.to_thread(
+                    self._is_telegram_topic_lane, source
+                ) if self._session_db else False
+                
+                if is_telegram_topic:
+                    result = await self._session_db.set_session_title_with_lineage_collision_handling(
+                        session_id,
+                        sanitized,
+                        allow_lineage_collision=True,
+                        source=SessionDB.TITLE_SOURCE_USER,
                     )
-                    if callable(schedule_rename):
-                        try:
-                            await asyncio.to_thread(schedule_rename, source, session_id, sanitized)
-                        except Exception:
-                            logger.debug(
-                                "Failed to rename Telegram topic from /title",
-                                exc_info=True,
-                            )
-                    return t("gateway.title.set_to", title=sanitized)
+                    if result is None:
+                        return t("gateway.title.not_found")
+                    actual_title, visible_label = result
                 else:
-                    return t("gateway.title.not_found")
+                    if await self._session_db.set_session_title(session_id, sanitized):
+                        actual_title = sanitized
+                        visible_label = sanitized
+                    else:
+                        return t("gateway.title.not_found")
+
+                # Propagate the user-chosen title to the visible Telegram
+                # forum topic name too. Auto-generated titles already rename
+                # the topic; without this, /title only updated the DB title
+                # and the topic kept its auto-assigned name. No-ops off
+                # Telegram topic lanes and when auto-rename is disabled.
+                schedule_rename = getattr(
+                    self, "_schedule_telegram_topic_title_rename", None
+                )
+                if callable(schedule_rename):
+                    try:
+                        await asyncio.to_thread(schedule_rename, source, session_id, visible_label)
+                    except Exception:
+                        logger.debug(
+                            "Failed to rename Telegram topic from /title",
+                            exc_info=True,
+                        )
+
+                # When the internal alias differs from the visible label, surface both.
+                if actual_title == visible_label:
+                    return t("gateway.title.set_to", title=visible_label)
+                else:
+                    return t("gateway.title.set_to_with_alias",
+                             title=visible_label, alias=actual_title)
             except ValueError as e:
                 return t("gateway.shared.warn_passthrough", error=e)
         else:

@@ -360,6 +360,7 @@ Future messages in this room will use that transcript until `/reset` or another 
     warn_prefix:           "⚠️ {error}"
     empty_after_clean:     "⚠️ Il titolo è vuoto dopo la pulizia. Usa caratteri stampabili."
     set_to:                "✏️ Titolo della sessione impostato: **{title}**"
+    set_to_with_alias:     "✏️ Titolo sessione impostato: **{title}** (alias interno: {alias})"
     not_found:             "Sessione non trovata nel database."
     current_with_title:    "📌 Sessione: `{session_id}`\nTitolo: **{title}**"
     current_no_title:      "📌 Sessione: `{session_id}`\nNessun titolo impostato. Uso: `/title My Session Name`"

@@ -362,6 +362,7 @@ gateway:
     warn_prefix:           "⚠️ {error}"
     empty_after_clean:     "⚠️ العنوان فارغ بعد التنظيف. من فضلك استخدم أحرفًا قابلة للطباعة."
     set_to:                "✏️ ضُبط عنوان الجلسة: **{title}**"
+    set_to_with_alias:     "✏️ تم تعيين عنوان الجلسة: **{title}** (الاسم الداخلي: {alias})"
     not_found:             "لم يُعثر على الجلسة في قاعدة البيانات."
     current_with_title:    "📌 الجلسة: `{session_id}`\nالعنوان: **{title}**"
     current_no_title:      "📌 الجلسة: `{session_id}`\nلم يُضبط عنوان. الاستخدام: `/title My Session Name`"

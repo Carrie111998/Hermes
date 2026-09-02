@@ -373,6 +373,7 @@ gateway:
     warn_prefix:           "⚠️ {error}"
     empty_after_clean:     "⚠️ Title is empty after cleanup. Please use printable characters."
     set_to:                "✏️ Session title set: **{title}**"
+    set_to_with_alias:     "✏️ Session title set: **{title}** (internal alias: {alias})"
     not_found:             "Session not found in database."
     current_with_title:    "📌 Session: `{session_id}`\nTitle: **{title}**"
     current_no_title:      "📌 Session: `{session_id}`\nNo title set. Usage: `/title My Session Name`"

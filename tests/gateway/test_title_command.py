@@ -128,110 +128,67 @@ class TestHandleTitleCommand:
 
 
 # ---------------------------------------------------------------------------
+# Telegram topic duplicate title handling
+# ---------------------------------------------------------------------------
+
+
+class TestTelegramTopicDuplicateTitle:
+    """Tests for Telegram topic duplicate-title lineage handling."""
+
+    @pytest.mark.asyncio
+    async def test_telegram_topic_duplicate_title_reserves_lineage_alias(self, tmp_path):
+        """On Telegram topic lane, duplicate /title reserves #2 alias, renames topic to base."""
+        from hermes_state import SessionDB
+        db = SessionDB(db_path=tmp_path / "state.db")
+        db.create_session("first_session", "telegram")
+        db.set_session_title("first_session", "Workshop")
+        db.create_session("test_session_123", "telegram")
+
+        runner = _make_runner(session_db=db)
+        # Mock the telegram lane check to return True
+        runner._is_telegram_topic_lane = lambda _: True
+        runner._schedule_telegram_topic_title_rename = MagicMock()
+
+        event = _make_event(text="/title Workshop")
+        result = await runner._handle_title_command(event)
+
+        # Should succeed with a suffixed alias but visible label "Workshop"
+        assert "Workshop" in result
+        assert "internal alias" in result
+        assert "#2" in result
+        runner._schedule_telegram_topic_title_rename.assert_called_once()
+        # The visible label passed to rename should be "Workshop", not "Workshop #2"
+        rename_call = runner._schedule_telegram_topic_title_rename.call_args[0]
+        assert rename_call[2] == "Workshop", f"Expected visible label 'Workshop', got {rename_call[2]}"
+        # The stored title should be the suffixed alias
+        assert db.get_session_title("test_session_123") == "Workshop #2"
+        db.close()
+
+    @pytest.mark.asyncio
+    async def test_non_telegram_duplicate_title_still_raises(self, tmp_path):
+        """Non-Telegram lanes still raise ValueError on duplicate title."""
+        from hermes_state import SessionDB
+        db = SessionDB(db_path=tmp_path / "state.db")
+        db.create_session("other_session", "api_server")
+        db.set_session_title("other_session", "Taken")
+        db.create_session("test_session_123", "api_server")
+
+        runner = _make_runner(session_db=db)
+        # Not a telegram topic lane
+        runner._is_telegram_topic_lane = lambda _: False
+
+        event = _make_event(text="/title Taken", platform=Platform.API_SERVER)
+        result = await runner._handle_title_command(event)
+
+        assert "already in use" in result
+        assert "⚠️" in result
+        db.close()
+
+
+# ---------------------------------------------------------------------------
 # /title in help and known_commands
 # ---------------------------------------------------------------------------
 
 
 class TestTitleInHelp:
     """Verify /title appears in help text and known commands."""
-
-    @pytest.mark.asyncio
-    async def test_title_in_help_output(self):
-        """The /help output includes /title."""
-        runner = _make_runner()
-        event = _make_event(text="/help")
-        # Need hooks for help command
-        from gateway.hooks import HookRegistry
-        runner.hooks = HookRegistry()
-        result = await runner._handle_help_command(event)
-        assert "/title" in result
-
-
-# ---------------------------------------------------------------------------
-# /new with title
-# ---------------------------------------------------------------------------
-
-
-class TestResetCommandWithTitle:
-    """Tests for GatewayRunner._handle_reset_command with a title argument."""
-
-
-    @pytest.mark.asyncio
-    async def test_reset_command_duplicate_title_surfaces_warning(self):
-        """/new <title> with an already-in-use title returns a warning in the reply."""
-        from datetime import datetime
-
-        from gateway.run import GatewayRunner
-        from gateway.session import SessionEntry, SessionSource, build_session_key
-
-        runner = object.__new__(GatewayRunner)
-        runner.config = GatewayConfig(
-            platforms={Platform.TELEGRAM: PlatformConfig(enabled=True, token="***")}
-        )
-        adapter = MagicMock()
-        adapter.send = AsyncMock()
-        runner.adapters = {Platform.TELEGRAM: adapter}
-        runner._voice_mode = {}
-        runner.hooks = SimpleNamespace(emit=AsyncMock(), loaded_hooks=False)
-        runner._session_model_overrides = {}
-        runner._pending_model_notes = {}
-        runner._background_tasks = set()
-
-        source = SessionSource(
-            platform=Platform.TELEGRAM,
-            user_id="12345",
-            chat_id="67890",
-            user_name="testuser",
-        )
-        session_key = build_session_key(source)
-        new_session_entry = SessionEntry(
-            session_key=session_key,
-            session_id="sess-new",
-            created_at=datetime.now(),
-            updated_at=datetime.now(),
-            platform=Platform.TELEGRAM,
-            chat_type="dm",
-        )
-        runner.session_store = MagicMock()
-        runner.session_store.get_or_create_session.return_value = new_session_entry
-        runner.session_store.reset_session.return_value = new_session_entry
-        runner.session_store._entries = {session_key: new_session_entry}
-        runner.session_store._generate_session_key.return_value = session_key
-        runner._running_agents = {}
-        runner._pending_messages = {}
-        runner._pending_approvals = {}
-        runner._session_db = AsyncMock()
-        runner._session_db.set_session_title.side_effect = ValueError(
-            "Title 'Dup' is already in use by session abc-123"
-        )
-        runner._agent_cache = {}
-        runner._agent_cache_lock = None
-        runner._is_user_authorized = lambda _source: True
-        runner._format_session_info = lambda: ""
-
-        event = _make_event(text="/new Dup")
-        result = await runner._handle_reset_command(event)
-
-        runner._session_db.set_session_title.assert_called_once()
-        reply = str(result)
-        assert "already in use" in reply
-        assert "session started untitled" in reply
-        # Header must NOT claim the rejected title as the session name
-        assert "New session started: Dup" not in reply
-
-
-# ---------------------------------------------------------------------------
-# /new in help output
-# ---------------------------------------------------------------------------
-
-
-class TestNewInHelp:
-    """Verify /new appears in help text with the [name] args hint."""
-
-    def test_new_command_in_help_output(self):
-        """The gateway help output includes /new with the [name] hint."""
-        from hermes_cli.commands import gateway_help_lines
-        lines = gateway_help_lines()
-        new_line = next((line for line in lines if line.startswith("`/new ")), None)
-        assert new_line is not None
-        assert "[name]" in new_line

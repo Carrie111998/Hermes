@@ -360,6 +360,7 @@ Future messages in this room will use that transcript until `/reset` or another 
     warn_prefix:           "⚠️ {error}"
     empty_after_clean:     "⚠️ После очистки название пусто. Используйте печатные символы."
     set_to:                "✏️ Название сеанса установлено: **{title}**"
+    set_to_with_alias:     "✏️ Название сессии установлено: **{title}** (внутренний alias: {alias})"
     not_found:             "Сеанс не найден в базе данных."
     current_with_title:    "📌 Сеанс: `{session_id}`\nНазвание: **{title}**"
     current_no_title:      "📌 Сеанс: `{session_id}`\nНазвание не задано. Использование: `/title Название моего сеанса`"

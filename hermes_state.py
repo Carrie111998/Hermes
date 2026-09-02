@@ -11227,6 +11227,74 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             return cursor.rowcount
 
         return self._execute_write(_do) > 0
+    def set_session_title_with_lineage_collision_handling(
+        self,
+        session_id: str,
+        title: str,
+        *,
+        allow_lineage_collision: bool = False,
+        source: str,
+    ) -> Optional[tuple[str, str]]:
+        """Set a session's title with optional Telegram topic duplicate handling.
+
+        When ``allow_lineage_collision`` is True, a conflict with an existing title
+        does NOT raise ValueError; instead, the next free ``title #N`` variant is
+        reserved atomically and returned. The visible label (used for Telegram
+        topic rename) remains the user-requested ``title``, while the session
+        carries the suffixed internal alias. This allows two different Telegram
+        topics to share the same visible label while keeping ``sessions.title``
+        unique for ``/resume <title>`` semantics.
+
+        Returns ``(actual_title, requested_visible_label)`` on success, or ``None``
+        if the session does not exist. ``requested_visible_label`` equals ``title``
+        except when ``allow_lineage_collision`` is True and a collision occurs.
+
+        Raises ValueError for:
+        - Title validation failures (too long, invalid characters)
+        - Conflicts when ``allow_lineage_collision`` is False
+        """
+        if not allow_lineage_collision:
+            if self._set_session_title(session_id, title, source=source):
+                return (title, title)
+            return None
+
+        # Telegram lane: allow duplicate visible names by reserving a suffixed alias.
+        sanitized = self.sanitize_title(title)
+        if not sanitized:
+            return None
+
+        base = sanitized
+        escaped = _escape_like(base)
+
+        # Try the base first; if it conflicts, find the next free #N.
+        try:
+            if self._set_session_title(session_id, base, source=source):
+                return (base, base)
+        except ValueError as exc:
+            # Only retry on "already in use" from another session.
+            if "already in use" not in str(exc):
+                raise
+
+        # Collision: find the highest existing #N variant and increment.
+        with self._read_ctx() as conn:
+            rows = conn.execute(
+                "SELECT title FROM sessions WHERE title = ? OR (title LIKE ? ESCAPE '\\' AND id != ?)",
+                (base, f"{escaped} #%", session_id),
+            ).fetchall()
+        existing_titles = {row["title"] for row in rows}
+
+        max_num = 1  # The unnumbered base counts as #1.
+        for t in existing_titles:
+            m = re.match(r'^.* #(\d+)$', t)
+            if m:
+                max_num = max(max_num, int(m.group(1)))
+
+        # The next free alias is #(max_num + 1).
+        alias = f"{base} #{max_num + 1}"
+        if self._set_session_title(session_id, alias, source=source):
+            return (alias, base)
+        return None
+
 
     def backfill_null_session_profiles(self, profile_name: str) -> int:
         """One-shot owner backfill for legacy pre-ownership session rows.
