@@ -4041,6 +4041,28 @@ def _deliver_result(
                 try:
                     pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
                     try:
+                        def _send_in_fresh_loop(
+                            _platform=platform,
+                            _pconfig=pconfig,
+                            _chat_id=chat_id,
+                            _content=cleaned_delivery_content,
+                            _thread_id=thread_id,
+                            _media_files=media_files,
+                        ):
+                            fresh_coro = _send_to_platform(
+                                _platform,
+                                _pconfig,
+                                _chat_id,
+                                _content,
+                                thread_id=_thread_id,
+                                media_files=_media_files,
+                            )
+                            try:
+                                return asyncio.run(fresh_coro)
+                            except BaseException:
+                                fresh_coro.close()
+                                raise
+
                         # The fallback worker is a fresh thread: it does NOT
                         # inherit the multiplexed profile ContextVars (home
                         # override + secret scope). Run inside a copy of the
@@ -4051,8 +4073,7 @@ def _deliver_result(
                         _fallback_context = contextvars.copy_context()
                         future = pool.submit(
                             _fallback_context.run,
-                            asyncio.run,
-                            _send_to_platform(platform, pconfig, chat_id, cleaned_delivery_content, thread_id=thread_id, media_files=media_files),
+                            _send_in_fresh_loop,
                         )
                         result = future.result(timeout=30)
                     finally:
