@@ -1680,6 +1680,8 @@ delegation:
   #                                           # delegation.model to an inexpensive one — children carry the
   #                                           # vast majority of tokens, so this is where spend is cut while
   #                                           # planning quality stays with the frontier parent.
+  # worktree_isolation: false                 # Enable per-child git worktree isolation (default: false).
+  # worktree_repo_root: "~/projects/hermes"   # Explicit git repo root anchor for worktrees when parent session cwd is non-git.
 
 # =============================================================================
 # Honcho Integration (Cross-Session User Modeling)

@@ -26,7 +26,7 @@ def _git(args, cwd, check=True):
 
 def _make_repo(root: Path) -> Path:
     repo = root / "repo"
-    repo.mkdir()
+    repo.mkdir(parents=True, exist_ok=True)
     _git(["init", "-q"], repo)
     _git(["config", "user.email", "test@test"], repo)
     _git(["config", "user.name", "Test"], repo)
@@ -36,12 +36,21 @@ def _make_repo(root: Path) -> Path:
     return repo
 
 
-def _break_git_index(wt: Path) -> None:
+def _break_git_index(wt: Path | str) -> None:
     """Corrupt a worktree's index so the real git probes exit non-zero."""
-    git_dir = Path(_git(["rev-parse", "--git-dir"], wt).stdout.strip())
-    if not git_dir.is_absolute():
-        git_dir = (wt / git_dir).resolve()
-    (git_dir / "index").write_bytes(b"not-a-valid-git-index\n")
+    wt_p = Path(wt)
+    dotgit = wt_p / ".git"
+    if dotgit.is_file():
+        text = dotgit.read_text(encoding="utf-8").strip()
+        if text.startswith("gitdir:"):
+            gitdir_path = text.split(":", 1)[1].strip()
+            gitdir = Path(gitdir_path) if Path(gitdir_path).is_absolute() else (wt_p / gitdir_path).resolve()
+            (gitdir / "index").write_bytes(b"not-a-valid-git-index\n")
+            return
+    raw = _git(["rev-parse", "--git-path", "index"], cwd=str(wt)).stdout.strip()
+    p = Path(raw)
+    index_file = p if p.is_absolute() else (wt_p / p).resolve()
+    index_file.write_bytes(b"not-a-valid-git-index\n")
 
 
 class SubagentWorktreeTests(unittest.TestCase):
@@ -388,6 +397,10 @@ class WorktreePayloadSchemaTests(unittest.TestCase):
 
 
 class DelegationConfigGateTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="hermes-sw-gate-"))
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+
     def test_worktree_isolation_default_off(self):
         from tools import delegate_tool
 
@@ -403,6 +416,162 @@ class DelegationConfigGateTests(unittest.TestCase):
         ):
             self.assertTrue(delegate_tool._get_worktree_isolation())
 
+    def test_worktree_repo_root_config_reading(self):
+        from tools import delegate_tool
+
+        with mock.patch.object(delegate_tool, "_load_config", return_value={}):
+            self.assertIsNone(delegate_tool._get_worktree_repo_root())
+
+        with mock.patch.object(
+            delegate_tool, "_load_config",
+            return_value={"worktree_repo_root": str(self.tmp)},
+        ):
+            self.assertEqual(
+                delegate_tool._get_worktree_repo_root(),
+                os.path.abspath(str(self.tmp)),
+            )
+
+    def test_worktree_repo_root_expands_user_and_vars(self):
+        from tools import delegate_tool
+
+        with mock.patch.dict(os.environ, {"MY_REPO_DIR": str(self.tmp)}):
+            with mock.patch.object(
+                delegate_tool, "_load_config",
+                return_value={"worktree_repo_root": "$MY_REPO_DIR"},
+            ):
+                self.assertEqual(
+                    delegate_tool._get_worktree_repo_root(),
+                    os.path.abspath(str(self.tmp)),
+                )
+
+    def test_resolve_worktree_anchor_prefers_configured_repo_root(self):
+        from tools import delegate_tool
+
+        repo1 = _make_repo(self.tmp / "r1")
+        repo2 = _make_repo(self.tmp / "r2")
+        with mock.patch.object(
+            delegate_tool, "_load_config",
+            return_value={"worktree_repo_root": str(repo2)},
+        ):
+            anchor = delegate_tool._resolve_worktree_anchor(
+                parent_cwd=str(repo1),
+                parent_agent=None,
+            )
+            self.assertEqual(
+                Path(anchor).resolve(),
+                repo2.resolve(),
+            )
+
+    def test_resolve_worktree_anchor_falls_back_to_parent_cwd_when_no_config(self):
+        from tools import delegate_tool
+
+        repo1 = _make_repo(self.tmp / "r1")
+        repo2 = _make_repo(self.tmp / "r2")
+        with mock.patch.object(
+            delegate_tool, "_load_config",
+            return_value={},
+        ), mock.patch.object(
+            delegate_tool, "_resolve_workspace_hint",
+            return_value=str(repo2),
+        ):
+            anchor = delegate_tool._resolve_worktree_anchor(
+                parent_cwd=str(repo1),
+                parent_agent=mock.MagicMock(),
+            )
+            self.assertEqual(
+                Path(anchor).resolve(),
+                repo1.resolve(),
+            )
+
+    def test_resolve_worktree_anchor_falls_back_to_workspace_hint_when_parent_cwd_non_git(self):
+        from tools import delegate_tool
+
+        plain = self.tmp / "plain"
+        plain.mkdir(parents=True, exist_ok=True)
+        repo = _make_repo(self.tmp / "hint_repo")
+
+        with mock.patch.object(
+            delegate_tool, "_load_config",
+            return_value={},
+        ), mock.patch.object(
+            delegate_tool, "_resolve_workspace_hint",
+            return_value=str(repo),
+        ):
+            anchor = delegate_tool._resolve_worktree_anchor(
+                parent_cwd=str(plain),
+                parent_agent=mock.MagicMock(),
+            )
+            self.assertEqual(
+                Path(anchor).resolve(),
+                repo.resolve(),
+            )
+
+    def test_resolve_worktree_anchor_returns_none_when_all_non_git(self):
+        from tools import delegate_tool
+
+        plain = self.tmp / "plain"
+        plain.mkdir(parents=True, exist_ok=True)
+
+        with mock.patch.object(
+            delegate_tool, "_load_config",
+            return_value={"worktree_repo_root": str(plain)},
+        ):
+            anchor = delegate_tool._resolve_worktree_anchor(
+                parent_cwd=str(plain),
+                parent_agent=None,
+            )
+            self.assertIsNone(anchor)
+
+    def test_setup_subagent_worktree_happy_path_creates_worktree(self):
+        from tools import delegate_tool
+
+        repo = _make_repo(self.tmp / "happy_repo")
+        with mock.patch.object(delegate_tool, "_get_worktree_isolation", return_value=True), \
+             mock.patch("tools.subagent_worktree.local_backend_active", return_value=True), \
+             mock.patch.object(delegate_tool, "_resolve_worktree_anchor", return_value=str(repo)):
+            info = delegate_tool._setup_subagent_worktree(
+                parent_agent=None,
+                parent_task_id=None,
+                subagent_id="sub-happy",
+            )
+            self.assertIsNotNone(info)
+            self.assertIn("path", info)
+            self.assertIn("branch", info)
+            self.assertIn("base_commit", info)
+            self.assertIn("repo_root", info)
+            self.assertTrue(os.path.isdir(info["path"]))
+
+    def test_setup_subagent_worktree_warns_when_backend_not_local(self):
+        from tools import delegate_tool
+
+        with mock.patch.object(delegate_tool, "_get_worktree_isolation", return_value=True), \
+             mock.patch("tools.subagent_worktree.local_backend_active", return_value=False), \
+             self.assertLogs("tools.delegate_tool", level="WARNING") as cm:
+            info = delegate_tool._setup_subagent_worktree(
+                parent_agent=None,
+                parent_task_id=None,
+                subagent_id="sub-1",
+            )
+            self.assertIsNone(info)
+            self.assertTrue(any("non-local terminal backend" in m for m in cm.output))
+
+    def test_setup_subagent_worktree_warns_when_anchor_resolution_fails(self):
+        from tools import delegate_tool
+
+        with mock.patch.object(delegate_tool, "_get_worktree_isolation", return_value=True), \
+             mock.patch("tools.subagent_worktree.local_backend_active", return_value=True), \
+             mock.patch.object(delegate_tool, "_resolve_worktree_anchor", return_value=None), \
+             self.assertLogs("tools.delegate_tool", level="WARNING") as cm:
+            info = delegate_tool._setup_subagent_worktree(
+                parent_agent=None,
+                parent_task_id=None,
+                subagent_id="sub-2",
+            )
+            self.assertIsNone(info)
+            self.assertTrue(any("no git repository anchor found" in m.lower() or "isolation skipped" in m.lower() for m in cm.output))
+
 
 if __name__ == "__main__":
     unittest.main()
+
+

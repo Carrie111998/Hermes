@@ -955,6 +955,103 @@ def _get_worktree_isolation() -> bool:
     return bool(cfg.get("worktree_isolation", False))
 
 
+def _get_worktree_repo_root() -> Optional[str]:
+    """Read delegation.worktree_repo_root from config (optional absolute path).
+
+    Allows persistent/owner sessions (whose recorded cwd may be home or non-git)
+    to explicitly pin a git repository root for subagent worktrees (#97209).
+    """
+    cfg = _load_config()
+    val = cfg.get("worktree_repo_root")
+    if not val or not isinstance(val, str) or not val.strip():
+        return None
+    try:
+        expanded = os.path.expanduser(os.path.expandvars(val.strip()))
+        return os.path.abspath(expanded)
+    except Exception:
+        return None
+
+
+def _resolve_worktree_anchor(
+    parent_cwd: Optional[str],
+    parent_agent: Any = None,
+) -> Optional[str]:
+    """Resolve the git repository root anchor for subagent worktree creation.
+
+    Priority order (#97209):
+    1. ``_get_worktree_repo_root()`` (configured root in preference when specified).
+    2. ``parent_cwd`` if it resolves to a git repository.
+    3. ``_resolve_workspace_hint(parent_agent)`` if it resolves to a git repository.
+    """
+    from tools import subagent_worktree
+
+    candidates = [
+        _get_worktree_repo_root(),
+        parent_cwd,
+        _resolve_workspace_hint(parent_agent) if parent_agent is not None else None,
+    ]
+    for candidate in candidates:
+        if not candidate:
+            continue
+        root = subagent_worktree.resolve_repo_root(candidate)
+        if root:
+            return root
+    return None
+
+
+def _setup_subagent_worktree(
+    parent_agent: Any,
+    parent_task_id: Optional[str],
+    subagent_id: Optional[str],
+) -> Optional[Dict[str, Any]]:
+    """Set up an isolated git worktree for a child subagent if enabled.
+
+    Emits visible warnings when isolation is requested (worktree_isolation: true)
+    but skipped due to non-local backend or unresolvable git repo anchor (#97209).
+    """
+    if not _get_worktree_isolation():
+        return None
+    try:
+        from tools import subagent_worktree
+
+        if not subagent_worktree.local_backend_active():
+            logger.warning(
+                "Subagent worktree isolation skipped: non-local terminal backend is active"
+            )
+            return None
+
+        _parent_cwd = None
+        try:
+            from tools.terminal_tool import get_session_cwd as _gsc
+
+            _parent_cwd = _gsc(parent_task_id)
+        except Exception:
+            pass
+
+        anchor = _resolve_worktree_anchor(_parent_cwd, parent_agent)
+        if not anchor:
+            logger.warning(
+                "Subagent worktree isolation skipped: no git repository anchor found "
+                "(checked session cwd %r, workspace hint, and delegation.worktree_repo_root)",
+                _parent_cwd,
+            )
+            return None
+
+        worktree_info = subagent_worktree.create_subagent_worktree(
+            anchor,
+            subagent_id=subagent_id,
+        )
+        if worktree_info is None:
+            logger.warning(
+                "Subagent worktree isolation failed to create worktree in %s",
+                anchor,
+            )
+        return worktree_info
+    except Exception as exc:
+        logger.warning("Subagent worktree isolation setup failed: %s", exc)
+        return None
+
+
 _LEGACY_MAX_ASYNC_WARNED = False
 
 
@@ -2924,43 +3021,22 @@ def _run_single_child(
         # Opt-in worktree isolation (delegation.worktree_isolation, inspired
         # by Muse Code's --subagent-worktree-isolation): give this child its
         # own git worktree branched from the parent repo's HEAD, and start its
-        # terminal there. Git-only and local-backend-only; any failure
-        # degrades silently to the shared-workspace behavior above.
-        if _get_worktree_isolation():
+        # terminal there. Git-only and local-backend-only; warns if isolation
+        # cannot resolve a git anchor or backend is non-local (#97209).
+        _worktree_info = _setup_subagent_worktree(parent_agent, parent_task_id, _subagent_id)
+        if _worktree_info is not None:
             try:
-                from tools import subagent_worktree
+                from tools.terminal_tool import record_session_cwd as _rsc
 
-                if subagent_worktree.local_backend_active():
-                    _parent_cwd = None
-                    try:
-                        from tools.terminal_tool import get_session_cwd as _gsc
-
-                        _parent_cwd = _gsc(parent_task_id)
-                    except Exception:
-                        pass
-                    _worktree_info = subagent_worktree.create_subagent_worktree(
-                        _parent_cwd or _resolve_workspace_hint(parent_agent),
-                        subagent_id=_subagent_id,
-                    )
-                else:
-                    logger.debug(
-                        "worktree isolation skipped: non-local terminal backend"
-                    )
+                _rsc(child_task_id, _worktree_info["path"])
             except Exception as e:
-                logger.debug("worktree isolation setup failed: %s", e)
-            if _worktree_info is not None:
-                try:
-                    from tools.terminal_tool import record_session_cwd as _rsc
+                logger.debug("worktree cwd seed failed: %s", e)
+            # The child's context is already built; carry the isolation
+            # contract on the goal message instead (same turn, no
+            # system-prompt mutation).
+            from tools.subagent_worktree import build_worktree_context_note
 
-                    _rsc(child_task_id, _worktree_info["path"])
-                except Exception as e:
-                    logger.debug("worktree cwd seed failed: %s", e)
-                # The child's context is already built; carry the isolation
-                # contract on the goal message instead (same turn, no
-                # system-prompt mutation).
-                from tools.subagent_worktree import build_worktree_context_note
-
-                goal = goal + build_worktree_context_note(_worktree_info)
+            goal = goal + build_worktree_context_note(_worktree_info)
 
         wall_start = time.time()
         parent_reads_snapshot = (
