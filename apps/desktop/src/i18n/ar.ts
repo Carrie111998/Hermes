@@ -2341,7 +2341,8 @@ export const ar = defineLocale({
     loadingTree: 'جار تحميل الشجرة...',
     loadingFiles: 'جار تحميل الملفات...',
     terminalHide: 'إخفاء الطرفية',
-    addToChat: 'إضافة للمحادثة'
+    addToChat: 'إضافة للمحادثة',
+    showHiddenFiles: 'إظهار الملفات المخفية'
   },
   preview: {
     tab: 'معاينة',

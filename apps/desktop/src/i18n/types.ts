@@ -2716,6 +2716,7 @@ export interface Translations {
     terminalCloseOthers: string
     terminalCloseAll: string
     addToChat: string
+    showHiddenFiles: string
   }
 
   preview: {

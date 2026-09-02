@@ -2680,7 +2680,8 @@ export const zhHant = defineLocale({
     terminalNew: '新增終端機',
     terminalCloseOthers: '關閉其他',
     terminalCloseAll: '全部關閉',
-    addToChat: '新增至聊天'
+    addToChat: '新增至聊天',
+    showHiddenFiles: '顯示隱藏檔案'
   },
 
   preview: {

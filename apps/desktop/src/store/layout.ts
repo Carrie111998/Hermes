@@ -395,6 +395,10 @@ export const $sidebarViewCustomized: ReadableAtom<boolean> = computed(
 
 // When true, the sessions sidebar moves to the right and the file browser +
 // preview rail move to the left — a mirror of the default layout.
+/** Whether hidden files (dotfiles) are shown in the file browser tree.
+ *  Defaults to true for backward compatibility — the tree has always shown them. */
+export const $showHiddenFiles = persistentAtom('hermes.desktop.showHiddenFiles', true, Codecs.bool)
+
 export const $panesFlipped = persistentAtom(PANES_FLIPPED_STORAGE_KEY, false, Codecs.bool)
 export const $isSidebarResizing = atom(false)
 export const $sessionsLimit = atom(SIDEBAR_SESSIONS_PAGE_SIZE)

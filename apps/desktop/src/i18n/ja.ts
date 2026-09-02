@@ -2781,7 +2781,8 @@ export const ja = defineLocale({
     terminalNew: '新しいターミナル',
     terminalCloseOthers: '他を閉じる',
     terminalCloseAll: 'すべて閉じる',
-    addToChat: 'チャットに追加'
+    addToChat: 'チャットに追加',
+    showHiddenFiles: '隠しファイルを表示'
   },
 
   preview: {

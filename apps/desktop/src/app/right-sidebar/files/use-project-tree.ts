@@ -3,6 +3,7 @@ import { atom } from 'nanostores'
 import { useCallback, useEffect, useMemo } from 'react'
 
 import { desktopFsCacheKey } from '@/lib/desktop-fs'
+import { $showHiddenFiles } from '@/store/layout'
 import { $connection } from '@/store/session'
 import { $workspaceChangeTick, consumeWorkspaceChange } from '@/store/workspace-events'
 
@@ -29,6 +30,15 @@ const ERROR_PLACEHOLDER_ID = '__error__'
 
 function makeNode(path: string, name: string, isDirectory: boolean): TreeNode {
   return { id: path, isDirectory, name }
+}
+
+/** Filter out dotfiles (names starting with '.') when the hidden-files toggle is off. */
+function filterHiddenFiles(entries: ProjectTreeEntry[]): ProjectTreeEntry[] {
+  if ($showHiddenFiles.get()) {
+    return entries
+  }
+
+  return entries.filter(entry => !entry.name.startsWith('.'))
 }
 
 function patchNode(nodes: TreeNode[] | undefined | null, id: string, patch: (n: TreeNode) => TreeNode): TreeNode[] {
@@ -72,8 +82,9 @@ function findNode(nodes: TreeNode[], id: string): null | TreeNode {
 // dir only re-reads when it's itself in the change set.
 function mergeChildren(existing: TreeNode[], entries: ProjectTreeEntry[]): TreeNode[] {
   const byId = new Map(existing.filter(node => !node.placeholder).map(node => [node.id, node]))
+  const filtered = filterHiddenFiles(entries)
 
-  return entries.map(entry => byId.get(entry.path) ?? makeNode(entry.path, entry.name, entry.isDirectory))
+  return filtered.map(entry => byId.get(entry.path) ?? makeNode(entry.path, entry.name, entry.isDirectory))
 }
 
 function placeholderChild(parentId: string): TreeNode {
@@ -262,7 +273,7 @@ async function loadRoot(
 
     return {
       ...latest,
-      data: error ? [] : entries.map(e => makeNode(e.path, e.name, e.isDirectory)),
+      data: error ? [] : filterHiddenFiles(entries).map(e => makeNode(e.path, e.name, e.isDirectory)),
       loaded: true,
       resolvedCwd,
       rootError: error || null,
@@ -343,9 +354,10 @@ async function revalidateTree(
     }
 
     const byId = new Map(existing.filter(node => !node.placeholder).map(node => [node.id, node]))
+    const filtered = filterHiddenFiles(entries)
 
     return Promise.all(
-      entries.map(async entry => {
+      filtered.map(async entry => {
         const prev = byId.get(entry.path)
 
         if (prev?.isDirectory && prev.children) {
@@ -457,7 +469,7 @@ export function useProjectTree(cwd: string): UseProjectTreeResult {
             ...n,
             loading: false,
             error: error || undefined,
-            children: error ? [errorChild(n.id, error)] : entries.map(e => makeNode(e.path, e.name, e.isDirectory))
+            children: error ? [errorChild(n.id, error)] : filterHiddenFiles(entries).map(e => makeNode(e.path, e.name, e.isDirectory))
           }))
         }
       })

@@ -5,12 +5,13 @@ import { TreeSkeleton } from '@/components/chat/skeletons'
 import { ErrorBoundary } from '@/components/error-boundary'
 import { Button } from '@/components/ui/button'
 import { Codicon } from '@/components/ui/codicon'
+import { Switch } from '@/components/ui/switch'
 import { Tip } from '@/components/ui/tooltip'
 import { useDelayedTrue } from '@/hooks/use-delayed-true'
 import { useI18n } from '@/i18n'
 import { normalizeOrLocalPreviewTarget } from '@/lib/local-preview'
 import { cn } from '@/lib/utils'
-import { $panesFlipped } from '@/store/layout'
+import { $panesFlipped, $showHiddenFiles } from '@/store/layout'
 import { notifyError } from '@/store/notifications'
 import { openPreview } from '@/store/preview'
 import { $currentCwd, $selectedStoredSessionId, $workspaceCwdOwner } from '@/store/session'
@@ -140,6 +141,7 @@ function FilesystemTab({
 }: FilesystemTabProps) {
   const { t } = useI18n()
   const r = t.rightSidebar
+  const showHiddenFiles = useStore($showHiddenFiles)
 
   // No working directory (a bare/detached chat) → no tree, just a terse hint.
   // Switching workspace is a project/worktree action, never a raw folder picker.
@@ -176,6 +178,16 @@ function FilesystemTab({
           >
             <Codicon name="collapse-all" size="0.8125rem" />
           </Button>
+        </Tip>
+      <Tip label={r.showHiddenFiles}>
+          <div className={HEADER_ACTION_CLASS}>
+            <Switch
+              checked={showHiddenFiles}
+              onCheckedChange={next => $showHiddenFiles.set(next)}
+              aria-label={r.showHiddenFiles}
+              className="my-1"
+            />
+          </div>
         </Tip>
       </RightSidebarSectionHeader>
       <FileTreeBody
