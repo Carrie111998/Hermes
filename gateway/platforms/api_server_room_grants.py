@@ -1,7 +1,9 @@
 """RoomLink room-member grants and capability HTTP handlers."""
 
+import asyncio
 import time
 import uuid
+from pathlib import Path
 from typing import Any
 
 try:
@@ -49,7 +51,23 @@ def _room_grant_error_response(exc: Exception, *, _openai_error) -> "web.Respons
 
 
 def _http_routes(self) -> list[tuple[str, str, Any]]:
-    return [
+    async def revoke_exact(request):
+        from gateway.platforms import api_server
+
+        return await _handle_room_member_grant_revoke_exact(
+            self,
+            request,
+            _openai_error=api_server._openai_error,
+            _api_request_profile=api_server._api_request_profile,
+        )
+
+    from gateway.platforms import (
+        api_server_room_artifacts,
+        api_server_room_attachments,
+        api_server_room_controls,
+    )
+
+    routes = [
         (
             "POST",
             "/v1/room-members/invitations",
@@ -70,7 +88,12 @@ def _http_routes(self) -> list[tuple[str, str, Any]]:
             "/v1/room-members/grants/revoke",
             self._handle_room_member_grant_revoke,
         ),
+        ("POST", "/v1/room-members/grants/revoke-exact", revoke_exact),
     ]
+    routes.extend(api_server_room_controls._http_routes(self))
+    routes.extend(api_server_room_attachments._http_routes(self))
+    routes.extend(api_server_room_artifacts._http_routes(self))
+    return routes
 
 
 def _room_grant_token(request: "web.Request") -> str:
@@ -170,13 +193,16 @@ async def _handle_room_member_invitation(
             )
         with self._profile_scope(profile):
             execution_policy = execution_policy_mapping(target_profile=profile)
+        from gateway.platforms.api_server_room_attachments import (
+            roomlink_attachments_available,
+        )
         catalog = catalog_mapping(
             installation_id=target_install_id,
             protocol_versions=(ROOM_LINK_PROTOCOL_VERSION,),
             link_modes=("direct",),
             persistent_process=True,
             text=True,
-            attachments=False,
+            attachments=roomlink_attachments_available(),
             target_profile=profile,
             execution_policy=execution_policy,
         )
@@ -198,8 +224,13 @@ async def _handle_room_member_invitation(
         claims = decode_room_grant(
             self._room_grant_secret(), token, permission="status"
         )
-        hosted_rooms.reserve_peer_room(
-            hosted_rooms.default_db_path(),
+        from gateway.hosted_room_grant_state import (
+            grant_state_db_paths,
+            reserve_grant_state,
+        )
+
+        reserve_grant_state(
+            grant_state_db_paths(),
             claims=claims,
             expires_at=float(claims.get("status_expires_at", claims["expires_at"])),
         )
@@ -247,13 +278,16 @@ async def _handle_room_member_capabilities(
             raise ValueError("room grant target does not match this profile")
         with self._profile_scope(profile):
             execution_policy = execution_policy_mapping(target_profile=profile)
+        from gateway.platforms.api_server_room_attachments import (
+            roomlink_attachments_available,
+        )
         catalog = catalog_mapping(
             installation_id=installation_id,
             protocol_versions=(ROOM_LINK_PROTOCOL_VERSION,),
             link_modes=("direct",),
             persistent_process=True,
             text=True,
-            attachments=False,
+            attachments=roomlink_attachments_available(),
             target_profile=profile,
             execution_policy=execution_policy,
         )
@@ -345,6 +379,10 @@ async def _handle_room_member_grant_refresh(
             ttl_seconds=dispatch_ttl,
             status_expires_at=hard_expiry,
         )
+        # Close the refresh-versus-retirement race. If revocation landed after
+        # the first authorization check, never return the replacement. If it
+        # lands after this check, its scope timestamp also covers this token.
+        self._room_grant_claims(request, permission="dispatch")
     except Exception as exc:
         return _room_grant_error_response(exc, _openai_error=_openai_error)
     return web.json_response(
@@ -356,6 +394,67 @@ async def _handle_room_member_grant_refresh(
             "execution_policy": execution_policy,
         }
     )
+
+
+async def _handle_room_member_grant_revoke_exact(
+    self,
+    request: "web.Request",
+    *,
+    _openai_error,
+    _api_request_profile,
+) -> "web.Response":
+    """Retire only an unpublished bearer without disrupting its replacement."""
+    body, error = await self._read_json_body(request)
+    if error:
+        return error
+    if body:
+        return web.json_response(
+            _openai_error(
+                "Grant revoke accepts no fields.", code="invalid_room_grant_revoke"
+            ),
+            status=400,
+        )
+    try:
+        from gateway import hosted_rooms
+        from gateway.hosted_room_peer import decode_room_grant
+        from gateway.hosted_room_grant_state import (
+            grant_state_db_paths,
+            revoke_grant_state,
+        )
+
+        token = self._room_grant_token(request)
+        if not token:
+            raise ValueError("room grant is missing")
+        claims = decode_room_grant(
+            self._room_grant_secret(),
+            token,
+            permission="status",
+            allow_expired_for_revocation=True,
+        )
+        if (
+            claims["target_profile"] != (_api_request_profile.get() or "default")
+            or claims["target_install_id"] != hosted_rooms.local_authority_gateway_id()
+        ):
+            raise ValueError("room grant target does not match this profile")
+        revoke_grant_state(
+            grant_state_db_paths(),
+            claims=claims,
+            expires_at=float(claims.get("status_expires_at", claims["expires_at"])),
+            exact=True,
+        )
+    except Exception:
+        return web.json_response(
+            _openai_error(
+                "Room authorization is invalid or expired.",
+                err_type="gateway_auth_error",
+                code="invalid_room_grant",
+            ),
+            status=401,
+        )
+    return web.json_response({
+        "object": "hermes.room_member.grant.revocation",
+        "revoked": True,
+    })
 
 
 async def _handle_room_member_grant_revoke(
@@ -391,6 +490,7 @@ async def _handle_room_member_grant_revoke(
             self._room_grant_secret(),
             token,
             permission="status",
+            allow_expired_for_revocation=True,
         )
         profile = _api_request_profile.get() or "default"
         installation_id = hosted_rooms.local_authority_gateway_id()
@@ -399,13 +499,40 @@ async def _handle_room_member_grant_revoke(
             or claims["target_install_id"] != installation_id
         ):
             raise ValueError("room grant target does not match this profile")
-        hosted_rooms.revoke_room_grant_scope(
-            hosted_rooms.default_db_path(),
+        from gateway.hosted_room_grant_state import (
+            grant_state_db_paths,
+            revoke_grant_state,
+        )
+
+        revoke_grant_state(
+            grant_state_db_paths(),
             claims=claims,
             expires_at=float(
                 claims.get("status_expires_at", claims["expires_at"])
             ),
         )
+        try:
+            from gateway.platforms.api_server_room_attachments import (
+                _default_spool,
+            )
+
+            await asyncio.to_thread(_default_spool().discard_scope, claims)
+        except Exception:
+            # Authorization is already revoked. A failed cleanup cannot make
+            # the grant live again; bounded spool expiry remains the backstop.
+            pass
+        try:
+            from gateway.hosted_room_artifacts import RoomArtifactOutbox
+            from hermes_constants import get_hermes_home
+
+            await asyncio.to_thread(
+                RoomArtifactOutbox(Path(get_hermes_home()) / "state.db").discard_claims,
+                claims,
+            )
+        except Exception:
+            # Revocation still closes access immediately. Keep cleanup
+            # best-effort so a local disk fault cannot resurrect the grant.
+            pass
     except Exception:
         return web.json_response(
             _openai_error(
@@ -414,6 +541,23 @@ async def _handle_room_member_grant_revoke(
                 code="invalid_room_grant",
             ),
             status=401,
+        )
+    try:
+        from gateway.hosted_room_control_client import revoke_stored_peer_control
+
+        await asyncio.to_thread(
+            revoke_stored_peer_control,
+            hosted_rooms.default_db_path(),
+            room_id=str(claims["room_id"]),
+            member_id=str(claims["member_id"]),
+        )
+    except Exception:
+        return web.json_response(
+            _openai_error(
+                "Room control cleanup is pending; retry this revocation.",
+                code="room_control_cleanup_pending",
+            ),
+            status=503,
         )
     return web.json_response(
         {

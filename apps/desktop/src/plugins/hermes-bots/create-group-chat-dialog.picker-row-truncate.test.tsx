@@ -86,4 +86,38 @@ describe('CreateGroupChatDialog picker rows', () => {
       expect(row!.className.split(/\s+/)).toContain('min-w-0')
     }
   })
+
+  it('offers on-demand Bots but hides known-unavailable gateway rows', async () => {
+    const { CreateGroupChatDialog } = await import('./create-dialog')
+
+    render(
+      <CreateGroupChatDialog
+        onClose={() => undefined}
+        onCreated={() => undefined}
+        open
+        roster={[
+          { connectionId: 'local', display_name: 'Local Bot', name: 'local' },
+          {
+            connectionId: 'remote-a',
+            display_name: 'Unavailable Remote',
+            name: 'unavailable',
+            remoteSource: true,
+            sourceReachable: false
+          },
+          {
+            connectionId: 'remote-b',
+            display_name: 'On-demand Remote',
+            name: 'on-demand',
+            remoteSource: true,
+            sourceError: 'connect-on-demand'
+          }
+        ]}
+      />
+    )
+
+    expect(screen.getByText('Local Bot')).not.toBeNull()
+    expect(screen.getByText('On-demand Remote')).not.toBeNull()
+    expect(screen.queryByText('Unavailable Remote')).toBeNull()
+    expect(screen.getAllByRole('checkbox')).toHaveLength(2)
+  })
 })

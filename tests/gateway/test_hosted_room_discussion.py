@@ -24,6 +24,50 @@ MEMBERS = [
     }
     for profile in LOCAL_PROFILES[:3]
 ]
+MEMBER_IDS = tuple(member["member_id"] for member in MEMBERS)
+
+
+def _attachment(
+    kind: str,
+    name: str,
+    mime: str,
+    *,
+    size: int = 128,
+    attachment_id: str = "att_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+) -> dict:
+    return {
+        "attachment_id": attachment_id,
+        "kind": kind,
+        "name": name,
+        "size": size,
+        "mime": mime,
+    }
+
+
+def _attachment_manifest() -> list[dict]:
+    return [
+        _attachment(
+            "image",
+            "diagram.png",
+            "image/png",
+            size=2048,
+            attachment_id="att_11111111111111111111111111111111",
+        ),
+        _attachment(
+            "pdf",
+            "release.pdf",
+            "application/pdf",
+            size=4096,
+            attachment_id="att_22222222222222222222222222222222",
+        ),
+        _attachment(
+            "file",
+            "notes.txt",
+            "text/plain",
+            size=512,
+            attachment_id="att_33333333333333333333333333333333",
+        ),
+    ]
 
 
 @pytest.fixture
@@ -55,6 +99,7 @@ def _append_user(
     event_id: str,
     text: str,
     thread_id: str = "thread-1",
+    attachments: list[dict] | None = None,
 ) -> dict:
     return hosted_rooms.append_event(
         db,
@@ -64,7 +109,11 @@ def _append_user(
         actor={"kind": "user", "id": "local-user"},
         authority_gateway_id=GATEWAY_ID,
         authority_epoch=1,
-        payload={"text": text, "thread_id": thread_id},
+        payload={
+            "text": text,
+            "thread_id": thread_id,
+            **({"attachments": attachments} if attachments is not None else {}),
+        },
         now=time.time(),
     )
 
@@ -229,10 +278,16 @@ def test_deterministic_task_fits_existing_driver_and_reconstructs_after_restart(
     assert first.payload == {
         "target_member_id": "member-research",
         "target_profile": "research",
+        "recipient_member_ids": [
+            "member-research",
+            "member-build",
+            "member-review",
+        ],
         "prompt": first.payload["prompt"],
         "source_event_seq": user["seq"],
     }
     assert set(first.payload) == {
+        "recipient_member_ids",
         "target_member_id",
         "target_profile",
         "prompt",
@@ -267,6 +322,60 @@ def test_deterministic_task_fits_existing_driver_and_reconstructs_after_restart(
     )
 
 
+def test_reconstructs_pre_file_handoff_task_without_recipient_snapshot(room_db):
+    db, room = room_db
+    _append_user(db, event_id="legacy-user", text="Check the release.")
+    planned = _next_task(room, db)
+    legacy_payload = dict(planned.payload)
+    legacy_payload.pop("recipient_member_ids")
+    driver.admit_task(
+        db,
+        planned.identity,
+        payload=legacy_payload,
+        clock=time.time,
+    )
+
+    reconstructed = discussion.reconstruct_task_plan(
+        room,
+        _events(db),
+        driver.get_task(db, planned.identity),
+        local_profiles=LOCAL_PROFILES,
+    )
+
+    assert reconstructed.identity == planned.identity
+    assert reconstructed.payload == legacy_payload
+
+
+def test_reconstruction_keeps_admission_time_recipients(room_db):
+    db, room = room_db
+    _append_user(db, event_id="user-frozen-roster", text="Prepare the file.")
+    planned = _next_task(room, db)
+    driver.admit_task(db, planned.identity, payload=planned.payload, clock=time.time)
+    expanded_room = {
+        **room,
+        "members": [
+            *room["members"],
+            {
+                "member_id": "member-late",
+                "profile": "late",
+                "handle": "late",
+                "display_name": "Late",
+            },
+        ],
+    }
+
+    reconstructed = discussion.reconstruct_task_plan(
+        expanded_room,
+        _events(db),
+        driver.get_task(db, planned.identity),
+        local_profiles=(*LOCAL_PROFILES, "late"),
+    )
+
+    assert reconstructed.payload["recipient_member_ids"] == planned.payload[
+        "recipient_member_ids"
+    ]
+
+
 @pytest.mark.parametrize(
     ("text", "expected_profile"),
     [
@@ -274,7 +383,7 @@ def test_deterministic_task_fits_existing_driver_and_reconstructs_after_restart(
         ("@all inspect this", "research"),
         ("@everyone inspect this", "research"),
         ("inspect this", "research"),
-        ("@unknown inspect this", "research"),
+        ("Email ops@example.com, then inspect this", "research"),
     ],
 )
 def test_mentions_select_handles_or_everyone(
@@ -286,6 +395,546 @@ def test_mentions_select_handles_or_everyone(
     _append_user(db, event_id="user-1", text=text)
 
     assert _next_task(room, db).member.profile == expected_profile
+
+
+def test_punctuated_user_mentions_reach_every_addressed_member(
+    room_db: tuple[Path, dict],
+):
+    db, room = room_db
+    _append_user(
+        db,
+        event_id="user-1",
+        text="@research, @build: and @review. Reply independently.",
+    )
+
+    assert _settle_next(room, db, text="Research ready.").member.profile == (
+        "research"
+    )
+    assert _settle_next(room, db, text="Build ready.").member.profile == "build"
+    assert _settle_next(room, db, text="Review ready.").member.profile == "review"
+
+
+def test_unknown_explicit_mention_does_not_broadcast(
+    room_db: tuple[Path, dict],
+):
+    db, room = room_db
+    _append_user(db, event_id="user-1", text="@unknown inspect this")
+
+    decision = discussion.plan_next_task(
+        room,
+        _events(db),
+        local_profiles=LOCAL_PROFILES,
+    )
+
+    assert decision.status == "settled"
+    assert decision.reason == "unresolved_mention"
+
+
+def test_mentions_use_longest_exact_legacy_handle_before_trailing_punctuation():
+    members = (
+        discussion.DiscussionMember(
+            member_id="member-build",
+            profile="build",
+            handle="build",
+            display_name="Build",
+        ),
+        discussion.DiscussionMember(
+            member_id="member-build-colon",
+            profile="build-colon",
+            handle="build:",
+            display_name="Build Colon",
+        ),
+        discussion.DiscussionMember(
+            member_id="member-all-dot",
+            profile="all-dot",
+            handle="all.",
+            display_name="All Dot",
+        ),
+    )
+
+    assert [member.handle for member in discussion.resolve_mentions(
+        ("@build:. reply",), members, default_all=False
+    )] == ["build:"]
+    assert [member.handle for member in discussion.resolve_mentions(
+        ("@all.. reply",), members, default_all=False
+    )] == ["all."]
+
+
+def test_code_email_escaped_and_unicode_adjacent_tokens_are_not_mentions():
+    members = (
+        discussion.DiscussionMember(
+            member_id="member-build",
+            profile="build",
+            handle="build",
+            display_name="Build",
+        ),
+        discussion.DiscussionMember(
+            member_id="member-review",
+            profile="review",
+            handle="review",
+            display_name="Review",
+        ),
+    )
+
+    text = (
+        "Email ops@example.com and 用户@build. "
+        "Document `@everyone.` and \\@review literally. "
+        "```text\n@build: example only\n```"
+    )
+    assert discussion.resolve_mentions((text,), members, default_all=False) == ()
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "@`ignored`everyone.",
+        "````text\n@everyone.\n```\nstill code",
+        "~~~text\n@everyone.\n",
+        "`unterminated @everyone.",
+    ],
+)
+def test_code_masking_never_synthesizes_or_leaks_mentions(text: str):
+    members = tuple(
+        discussion.DiscussionMember(
+            member_id=f"member-{handle}",
+            profile=handle,
+            handle=handle,
+            display_name=handle.title(),
+        )
+        for handle in ("build", "review")
+    )
+
+    assert discussion.resolve_mentions((text,), members, default_all=False) == ()
+
+
+def test_code_masking_preserves_a_boundary_before_a_real_mention():
+    members = (
+        discussion.DiscussionMember(
+            member_id="member-build",
+            profile="build",
+            handle="build",
+            display_name="Build",
+        ),
+    )
+
+    assert discussion.resolve_mentions(
+        ("word`ignored`@build",), members, default_all=False
+    ) == members
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "```text\n```not-a-close\n@build\n```",
+        "~~~text\n~~~not-a-close\n@build\n~~~",
+    ],
+)
+def test_fence_closers_with_trailing_text_do_not_expose_mentions(text: str):
+    member = discussion.DiscussionMember(
+        member_id="member-build",
+        profile="build",
+        handle="build",
+        display_name="Build",
+    )
+
+    assert discussion.resolve_mentions((text,), (member,), default_all=False) == ()
+
+
+def test_escaped_backtick_does_not_hide_a_later_real_mention():
+    member = discussion.DiscussionMember(
+        member_id="member-build",
+        profile="build",
+        handle="build",
+        display_name="Build",
+    )
+
+    assert discussion.resolve_mentions(
+        ("Use \\` literally, then @build",),
+        (member,),
+        default_all=False,
+    ) == (member,)
+
+
+def test_unknown_token_never_narrows_or_overrides_a_broadcast():
+    members = tuple(
+        discussion.DiscussionMember(
+            member_id=f"member-{handle}",
+            profile=handle,
+            handle=handle,
+            display_name=handle.title(),
+        )
+        for handle in ("build", "review")
+    )
+
+    resolved, unresolved = discussion._mention_resolution(
+        ("@all @build @typo",), members, default_all=True
+    )
+    assert resolved == ()
+    assert unresolved is True
+
+
+def test_combining_mark_email_and_link_destination_are_not_mentions():
+    member = discussion.DiscussionMember(
+        member_id="member-build",
+        profile="build",
+        handle="build",
+        display_name="Build",
+    )
+    text = "cafe\u0301@build [docs](https://example.test/@build)"
+
+    assert discussion.resolve_mentions((text,), (member,), default_all=False) == ()
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        '[docs](url "note ) @build")',
+        "[docs](<mailto:@build(foo>)",
+        "https://example.test/?target=@build",
+        "https://example.test/#@build",
+    ],
+)
+def test_link_titles_angle_destinations_and_bare_urls_do_not_mention(text: str):
+    member = discussion.DiscussionMember(
+        member_id="member-build",
+        profile="build",
+        handle="build",
+        display_name="Build",
+    )
+
+    assert discussion.resolve_mentions((text,), (member,), default_all=False) == ()
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "https://example.test/(@build)",
+        "https://example.test/~@build",
+        "https://example.test/;@build",
+        "mailto:person@example.test?cc=@build",
+    ],
+)
+def test_bare_uri_spans_do_not_mention_bots(text: str):
+    member = discussion.DiscussionMember(
+        member_id="member-build",
+        profile="build",
+        handle="build",
+        display_name="Build",
+    )
+
+    assert discussion.resolve_mentions((text,), (member,), default_all=False) == ()
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "查看https://example.test/;@build",
+        "éhttps://example.test/(~@build)",
+    ],
+)
+def test_unicode_adjacent_bare_uri_is_still_masked(text: str):
+    member = discussion.DiscussionMember(
+        member_id="member-build",
+        profile="build",
+        handle="build",
+        display_name="Build",
+    )
+
+    assert discussion.resolve_mentions((text,), (member,), default_all=False) == ()
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "(https://example.test)@build",
+        "https://example.test,@build",
+        "https://example.test!@build",
+    ],
+)
+def test_visible_mention_after_bare_uri_remains_actionable(text: str):
+    member = discussion.DiscussionMember(
+        member_id="member-build",
+        profile="build",
+        handle="build",
+        display_name="Build",
+    )
+
+    assert discussion.resolve_mentions((text,), (member,), default_all=False) == (member,)
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "http://[::1]/;@build",
+        "http://[2001:db8::1]/(~@build)",
+    ],
+)
+def test_ipv6_bare_uri_is_fully_masked(text: str):
+    member = discussion.DiscussionMember(
+        member_id="member-build",
+        profile="build",
+        handle="build",
+        display_name="Build",
+    )
+
+    assert discussion.resolve_mentions((text,), (member,), default_all=False) == ()
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "<!-- @everyone. -->",
+        '<a title="@everyone">docs</a>',
+        "<script>@everyone.</script>",
+        "<style>.x{@everyone.}</style>",
+    ],
+)
+def test_hidden_html_does_not_mention_bots(text: str):
+    members = tuple(
+        discussion.DiscussionMember(
+            member_id=f"member-{handle}",
+            profile=handle,
+            handle=handle,
+            display_name=handle.title(),
+        )
+        for handle in ("build", "review")
+    )
+
+    assert discussion.resolve_mentions((text,), members, default_all=False) == ()
+
+
+def test_visible_text_inside_html_element_can_mention_a_bot():
+    member = discussion.DiscussionMember(
+        member_id="member-build",
+        profile="build",
+        handle="build",
+        display_name="Build",
+    )
+
+    assert discussion.resolve_mentions(
+        ("<span>@build</span>",), (member,), default_all=False
+    ) == (member,)
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        '<script>const x="</scripture>"; @build</script>',
+        "<template><template>x</template>@build</template>",
+        "<script>ß</script> @build",
+        "<!DOCTYPE @build>",
+        "<?xml @build?>",
+    ],
+)
+def test_standard_html_visibility_handles_raw_blocks_and_declarations(text: str):
+    member = discussion.DiscussionMember(
+        member_id="member-build",
+        profile="build",
+        handle="build",
+        display_name="Build",
+    )
+    expected = (member,) if text == "<script>ß</script> @build" else ()
+
+    assert discussion.resolve_mentions((text,), (member,), default_all=False) == expected
+
+
+def test_hidden_html_cannot_mask_a_later_visible_mention():
+    member = discussion.DiscussionMember(
+        member_id="member-build",
+        profile="build",
+        handle="build",
+        display_name="Build",
+    )
+
+    assert discussion.resolve_mentions(
+        ("<!-- [x](unterminated --> @build",),
+        (member,),
+        default_all=False,
+    ) == (member,)
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Intro<br>@build",
+        "<p>Intro</p><p>@build</p>",
+        "&#64;build",
+        "<span>&#64;build</span>",
+    ],
+)
+def test_rendered_html_boundaries_and_entities_preserve_visible_mentions(text: str):
+    member = discussion.DiscussionMember(
+        member_id="member-build",
+        profile="build",
+        handle="build",
+        display_name="Build",
+    )
+
+    assert discussion.resolve_mentions((text,), (member,), default_all=False) == (member,)
+
+
+def test_mismatched_hidden_end_tag_does_not_expose_template_content():
+    member = discussion.DiscussionMember(
+        member_id="member-build",
+        profile="build",
+        handle="build",
+        display_name="Build",
+    )
+
+    assert discussion.resolve_mentions(
+        ("<template></script>@build</template>",),
+        (member,),
+        default_all=False,
+    ) == ()
+
+
+@pytest.mark.parametrize("tag", ["script", "style", "template"])
+def test_self_closing_hidden_tag_remains_hidden_like_html_rendering(tag: str):
+    member = discussion.DiscussionMember(
+        member_id="member-build",
+        profile="build",
+        handle="build",
+        display_name="Build",
+    )
+
+    assert discussion.resolve_mentions(
+        (f"<{tag}/>@build",),
+        (member,),
+        default_all=False,
+    ) == ()
+
+
+def test_self_closing_script_enters_raw_text_until_matching_close():
+    member = discussion.DiscussionMember(
+        member_id="member-build",
+        profile="build",
+        handle="build",
+        display_name="Build",
+    )
+
+    assert discussion.resolve_mentions(
+        ("<script/><style/></script>@build",),
+        (member,),
+        default_all=False,
+    ) == (member,)
+
+
+def test_inline_html_does_not_invent_a_text_boundary():
+    member = discussion.DiscussionMember(
+        member_id="member-build",
+        profile="build",
+        handle="build",
+        display_name="Build",
+    )
+
+    assert discussion.resolve_mentions(
+        ("word<span></span>@build",),
+        (member,),
+        default_all=False,
+    ) == ()
+
+
+@pytest.mark.parametrize(
+    "tag", ["caption", "details", "dialog", "legend", "menu", "summary"]
+)
+def test_standard_block_elements_keep_visible_mentions_separate(tag: str):
+    members = tuple(
+        discussion.DiscussionMember(
+            member_id=f"member-{handle}",
+            profile=handle,
+            handle=handle,
+            display_name=handle.title(),
+        )
+        for handle in ("build", "review")
+    )
+    text = f"<{tag}>@</{tag}><{tag}>everyone</{tag}>"
+
+    assert discussion.resolve_mentions((text,), members, default_all=False) == ()
+
+
+def test_url_apostrophe_does_not_hide_a_later_visible_mention():
+    member = discussion.DiscussionMember(
+        member_id="member-build",
+        profile="build",
+        handle="build",
+        display_name="Build",
+    )
+
+    assert discussion.resolve_mentions(
+        ("[docs](https://example.test/O'Brien) @build",),
+        (member,),
+        default_all=False,
+    ) == (member,)
+
+
+def test_unclosed_link_destination_masks_the_remaining_text_once():
+    member = discussion.DiscussionMember(
+        member_id="member-build",
+        profile="build",
+        handle="build",
+        display_name="Build",
+    )
+    text = "[broken](unterminated " + "](" * 10_000 + " @build"
+
+    assert discussion.resolve_mentions((text,), (member,), default_all=False) == ()
+
+
+def test_literal_unmatched_link_syntax_keeps_its_visible_mention():
+    member = discussion.DiscussionMember(
+        member_id="member-build",
+        profile="build",
+        handle="build",
+        display_name="Build",
+    )
+
+    assert discussion.resolve_mentions(
+        ("](@build)",), (member,), default_all=False
+    ) == (member,)
+
+
+def test_malformed_link_syntax_is_linear_and_does_not_fan_out():
+    members = tuple(
+        discussion.DiscussionMember(
+            member_id=f"member-{handle}",
+            profile=handle,
+            handle=handle,
+            display_name=handle.title(),
+        )
+        for handle in ("build", "review")
+    )
+    text = "](" * (64 * 1024 // 2)
+
+    assert discussion.resolve_mentions((text,), members, default_all=False) == ()
+
+
+def test_bot_handoff_with_unknown_peer_surfaces_unresolved_mention(room_db):
+    db, room = room_db
+    _append_user(db, event_id="user-1", text="@research lead this")
+    _settle_next(room, db, text="@build @typo please continue")
+
+    decision = discussion.plan_next_task(
+        room,
+        _events(db),
+        local_profiles=LOCAL_PROFILES,
+    )
+
+    assert decision.status == "settled"
+    assert decision.reason == "unresolved_mention"
+
+
+def test_long_unknown_mention_is_bounded():
+    members = tuple(
+        discussion.DiscussionMember(
+            member_id=f"member-{handle}",
+            profile=handle,
+            handle=handle,
+            display_name=handle.title(),
+        )
+        for handle in ("build", "review")
+    )
+    text = "@unknown" + "." * (64 * 1024 - len("@unknown"))
+
+    assert discussion.resolve_mentions((text,), members, default_all=False) == ()
 
 
 def test_member_mention_joins_the_next_round_not_the_current_round(
@@ -664,13 +1313,486 @@ def test_prompt_delta_is_bounded_to_24_message_lines(
     assert "Message 29." in task.payload["prompt"]
 
 
-def test_attachment_payload_is_rejected_by_local_text_only_boundary():
-    with pytest.raises(discussion.DiscussionValidationError, match="unknown fields"):
-        discussion.validate_user_payload({
-            "text": "Review.",
+def test_valid_image_pdf_and_file_manifest_is_normalized():
+    payload = discussion.validate_user_payload(
+        {
+            "text": "Review the attached material.",
             "thread_id": "thread-1",
-            "attachments": [{"name": "notes.txt"}],
-        })
+            "attachments": _attachment_manifest(),
+        },
+        member_ids=MEMBER_IDS,
+    )
+
+    assert [attachment["kind"] for attachment in payload["attachments"]] == [
+        "image",
+        "pdf",
+        "file",
+    ]
+    assert payload["attachments"][0] == {
+        "attachment_id": "att_11111111111111111111111111111111",
+        "kind": "image",
+        "name": "diagram.png",
+        "size": 2048,
+        "mime": "image/png",
+    }
+
+
+def test_prompts_include_safe_metadata_and_tasks_carry_attachment_ids(
+    room_db: tuple[Path, dict],
+):
+    db, room = room_db
+    _append_user(
+        db,
+        event_id="user-attachments",
+        text="Review the upload.",
+        attachments=_attachment_manifest(),
+    )
+
+    research = _next_task(room, db)
+    research_prompt = research.payload["prompt"]
+    assert research.member.member_id == "member-research"
+    assert "User (user): Review the upload." in research_prompt
+    assert "User (user): Review the upload. diagram.png" not in research_prompt
+    assert "att_11111111111111111111111111111111" not in research_prompt
+    assert research.payload["attachments"] == _attachment_manifest()
+    assert "Queued image/PDF attachments are staged separately" in research_prompt
+    assert 'Queued image "diagram.png"' in research_prompt
+    assert 'Queued PDF "release.pdf"' in research_prompt
+    assert 'Staged file "notes.txt"' in research_prompt
+
+    publication = discussion.plan_publication(
+        room,
+        _events(db),
+        research,
+        status="settled",
+        result={"text": "(pass)"},
+        local_profiles=LOCAL_PROFILES,
+    )
+    _append_publication(db, publication)
+    build = _next_task(room, db)
+    build_prompt = build.payload["prompt"]
+    assert build.member.member_id == "member-build"
+    assert "att_11111111111111111111111111111111" not in build_prompt
+    assert build.payload["attachments"] == _attachment_manifest()
+    assert build.identity.task_id != research.identity.task_id
+
+
+def test_large_attachment_backlog_advances_in_bounded_lossless_batches(
+    room_db: tuple[Path, dict],
+):
+    db, room = room_db
+    expected_ids: list[str] = []
+    for message_index in range(25):
+        manifest = [
+            _attachment(
+                "file",
+                f"part-{message_index}-{file_index}.bin",
+                "application/octet-stream",
+                size=1,
+                attachment_id=f"att_{message_index * 8 + file_index:032x}",
+            )
+            for file_index in range(8)
+        ]
+        expected_ids.extend(item["attachment_id"] for item in manifest)
+        _append_user(
+            db,
+            event_id=f"user-batch-{message_index}",
+            text=f"Batch {message_index}",
+            attachments=manifest,
+        )
+
+    observed_ids: list[str] = []
+    tasks: list[discussion.DiscussionTaskPlan] = []
+    while len(observed_ids) < len(expected_ids):
+        task = _next_task(room, db)
+        assert task.member.profile == "research"
+        attachments = task.payload["attachments"]
+        assert len(attachments) <= 16
+        assert sum(item["size"] for item in attachments) <= 50_000_000
+        observed_ids.extend(item["attachment_id"] for item in attachments)
+        tasks.append(task)
+        publication = discussion.plan_publication(
+            room,
+            _events(db),
+            task,
+            status="settled",
+            result={"text": "First batch reviewed." if len(tasks) == 1 else "(pass)"},
+            local_profiles=LOCAL_PROFILES,
+        )
+        assert publication.terminal_kind == "turn.settled"
+        _append_publication(db, publication)
+
+    assert observed_ids == expected_ids
+    assert len(tasks) == 13
+    assert len({task.identity.task_id for task in tasks}) == len(tasks)
+    assert tasks[0].seen_through_seq < tasks[-1].seen_through_seq
+    assert "First batch reviewed." not in tasks[1].payload["prompt"]
+
+    next_member = _next_task(room, db)
+    assert next_member.member.profile == "build"
+    assert len(next_member.payload["attachments"]) == 16
+
+
+def test_attachment_backlog_is_also_chunked_by_task_bytes(
+    room_db: tuple[Path, dict],
+):
+    db, room = room_db
+    for message_index in range(3):
+        manifest = [
+            _attachment(
+                "file",
+                f"chunk-{message_index}-{file_index}.bin",
+                "application/octet-stream",
+                size=10_000_000,
+                attachment_id=f"att_{message_index * 2 + file_index:032x}",
+            )
+            for file_index in range(2)
+        ]
+        _append_user(
+            db,
+            event_id=f"user-bytes-{message_index}",
+            text=f"Byte batch {message_index}",
+            attachments=manifest,
+        )
+
+    first = _next_task(room, db)
+    assert sum(item["size"] for item in first.payload["attachments"]) == 40_000_000
+    publication = discussion.plan_publication(
+        room,
+        _events(db),
+        first,
+        status="settled",
+        result={"text": "(pass)"},
+        local_profiles=LOCAL_PROFILES,
+    )
+    _append_publication(db, publication)
+
+    second = _next_task(room, db)
+    assert second.member.profile == "research"
+    assert sum(item["size"] for item in second.payload["attachments"]) == 20_000_000
+
+
+def test_attachment_manifest_changes_the_deterministic_task_id(
+    room_db: tuple[Path, dict],
+):
+    db, room = room_db
+    _append_user(
+        db,
+        event_id="user-attachments",
+        text="Review the upload.",
+        attachments=_attachment_manifest(),
+    )
+    with_attachments = _next_task(room, db)
+    without_events = [
+        {
+            **event,
+            "payload": {
+                "text": event["payload"]["text"],
+                "thread_id": event["payload"]["thread_id"],
+            },
+        }
+        if event["kind"] == "message.user"
+        else event
+        for event in _events(db)
+    ]
+    without_attachments = discussion.plan_next_task(
+        room,
+        without_events,
+        local_profiles=LOCAL_PROFILES,
+    ).task
+
+    assert without_attachments is not None
+    assert with_attachments.identity.turn_id == without_attachments.identity.turn_id
+    assert with_attachments.identity.task_id != without_attachments.identity.task_id
+    assert with_attachments.payload["prompt"] != without_attachments.payload["prompt"]
+
+
+def test_attachment_task_reconstructs_after_driver_reopen(
+    room_db: tuple[Path, dict],
+):
+    db, room = room_db
+    _append_user(
+        db,
+        event_id="user-attachments",
+        text="Review the upload.",
+        attachments=_attachment_manifest(),
+    )
+    task = _next_task(room, db)
+    driver.admit_task(db, task.identity, payload=task.payload, clock=time.time)
+
+    reconstructed = discussion.reconstruct_task_plan(
+        room,
+        _events(db),
+        driver.get_task(db, task.identity),
+        local_profiles=LOCAL_PROFILES,
+    )
+    assert reconstructed == task
+    assert reconstructed.payload["attachments"] == _attachment_manifest()
+    assert "att_11111111111111111111111111111111" not in reconstructed.payload["prompt"]
+
+
+def test_attachment_task_reconstructs_after_its_terminal_publication(
+    room_db: tuple[Path, dict],
+):
+    db, room = room_db
+    _append_user(
+        db,
+        event_id="user-attachments-terminal",
+        text="Review the upload.",
+        attachments=_attachment_manifest(),
+    )
+    first = _next_task(room, db)
+    publication = discussion.plan_publication(
+        room,
+        _events(db),
+        first,
+        status="settled",
+        result={"text": "First review complete."},
+        local_profiles=LOCAL_PROFILES,
+    )
+    _append_publication(db, publication)
+
+    reconstructed = discussion.reconstruct_task_plan(
+        room,
+        _events(db),
+        {"identity": first.identity, "payload": first.payload},
+        local_profiles=LOCAL_PROFILES,
+    )
+    assert reconstructed == first
+
+    second = _next_task(room, db)
+    assert second.member.member_id != first.member.member_id
+    assert second.payload["attachments"] == _attachment_manifest()
+
+
+def test_member_file_publication_reaches_the_next_bot(room_db: tuple[Path, dict]):
+    db, room = room_db
+    _append_user(db, event_id="user-file-handoff", text="Prepare and share the notes.")
+    first = _next_task(room, db)
+    handoff = [_attachment(
+        "file",
+        "handoff.md",
+        "text/markdown",
+        size=42,
+        attachment_id="att_44444444444444444444444444444444",
+    )]
+    publication = discussion.plan_publication(
+        room,
+        _events(db),
+        first,
+        status="settled",
+        result={"text": "Draft attached for review.", "attachments": handoff},
+        local_profiles=LOCAL_PROFILES,
+    )
+
+    message = next(event for event in publication.events if event.kind == "message.member")
+    assert message.payload["attachments"] == handoff
+    _append_publication(db, publication)
+
+    second = _next_task(room, db)
+    assert second.member.member_id != first.member.member_id
+    assert second.payload["attachments"] == handoff
+    assert 'Staged file "handoff.md"' in second.payload["prompt"]
+    driver.admit_task(db, second.identity, payload=second.payload, clock=time.time)
+    assert discussion.reconstruct_task_plan(
+        room,
+        _events(db),
+        driver.get_task(db, second.identity),
+        local_profiles=LOCAL_PROFILES,
+    ) == second
+
+
+def test_attachment_only_member_result_gets_readable_copy(room_db: tuple[Path, dict]):
+    db, room = room_db
+    _append_user(db, event_id="user-file-only", text="Share the finished file.")
+    task = _next_task(room, db)
+    handoff = [_attachment(
+        "file",
+        "result.md",
+        "text/markdown",
+        size=17,
+        attachment_id="att_55555555555555555555555555555555",
+    )]
+
+    publication = discussion.plan_publication(
+        room,
+        _events(db),
+        task,
+        status="settled",
+        result={"text": "(pass)", "attachments": handoff},
+        local_profiles=LOCAL_PROFILES,
+    )
+
+    message = next(event for event in publication.events if event.kind == "message.member")
+    assert message.payload["text"] == "Shared result.md."
+    assert message.payload["attachments"] == handoff
+    terminal = next(event for event in publication.events if event.kind == "turn.settled")
+    assert terminal.payload["passed"] is False
+
+
+def test_attachment_manifest_requires_frozen_member_ids():
+    with pytest.raises(discussion.DiscussionValidationError, match="frozen room member"):
+        discussion.validate_user_payload(
+            {
+                "text": "Review.",
+                "thread_id": "thread-1",
+                "attachments": [_attachment("file", "notes.txt", "text/plain")],
+            },
+        )
+
+
+@pytest.mark.parametrize("field", ["data", "data_url", "base64", "path"])
+def test_attachment_manifest_rejects_raw_data_and_path_fields(field: str):
+    attachment = _attachment("file", "notes.txt", "text/plain")
+    attachment[field] = "/tmp/raw" if field == "path" else "AAAA"
+
+    with pytest.raises(discussion.DiscussionValidationError, match="unknown fields"):
+        discussion.validate_user_payload(
+            {
+                "text": "Review.",
+                "thread_id": "thread-1",
+                "attachments": [attachment],
+            },
+            member_ids=MEMBER_IDS,
+        )
+
+
+def test_attachment_manifest_requires_every_exact_metadata_field():
+    attachment = _attachment("file", "notes.txt", "text/plain")
+    attachment.pop("mime")
+
+    with pytest.raises(discussion.DiscussionValidationError, match="missing fields"):
+        discussion.validate_user_payload(
+            {
+                "text": "Review.",
+                "thread_id": "thread-1",
+                "attachments": [attachment],
+            },
+            member_ids=MEMBER_IDS,
+        )
+
+
+@pytest.mark.parametrize("attachment_id", ["", "att_short", "file:secret", "../secret"])
+def test_attachment_manifest_rejects_non_opaque_ids(attachment_id: str):
+    with pytest.raises(discussion.DiscussionValidationError, match="attachment_id"):
+        discussion.validate_user_payload(
+            {
+                "text": "Review.",
+                "thread_id": "thread-1",
+                "attachments": [
+                    _attachment(
+                        "file",
+                        "notes.txt",
+                        "text/plain",
+                        attachment_id=attachment_id,
+                    )
+                ],
+            },
+            member_ids=MEMBER_IDS,
+        )
+
+
+@pytest.mark.parametrize(
+    ("attachment", "match"),
+    [
+        (
+            _attachment("file", "x" * 256, "text/plain"),
+            "bounded basename",
+        ),
+        (
+            _attachment("file", "../secret", "text/plain"),
+            "bounded basename",
+        ),
+        (
+            _attachment(
+                "file",
+                "notes.txt",
+                "text/plain",
+                size=discussion.MAX_ATTACHMENT_SIZE_BYTES + 1,
+            ),
+            "size must be between",
+        ),
+        (
+            _attachment("image", "image.bin", "application/octet-stream"),
+            "image kind requires image mime",
+        ),
+        (
+            _attachment("pdf", "release.pdf", "application/octet-stream"),
+            "pdf kind requires application/pdf",
+        ),
+    ],
+)
+def test_attachment_metadata_is_bounded(attachment: dict, match: str):
+    with pytest.raises(discussion.DiscussionValidationError, match=match):
+        discussion.validate_user_payload(
+            {
+                "text": "Review.",
+                "thread_id": "thread-1",
+                "attachments": [attachment],
+            },
+            member_ids=MEMBER_IDS,
+        )
+
+
+def test_attachment_count_is_bounded():
+    attachments = [
+        _attachment(
+            "file",
+            f"notes-{index}.txt",
+            "text/plain",
+            attachment_id=f"att_{index:032x}",
+        )
+        for index in range(discussion.MAX_ATTACHMENTS + 1)
+    ]
+
+    with pytest.raises(discussion.DiscussionValidationError, match="at most 8"):
+        discussion.validate_user_payload(
+            {
+                "text": "Review.",
+                "thread_id": "thread-1",
+                "attachments": attachments,
+            },
+            member_ids=MEMBER_IDS,
+        )
+
+
+def test_attachment_manifest_total_bytes_are_bounded():
+    attachments = [
+        _attachment(
+            "file",
+            f"attachment-{index}.bin",
+            "application/octet-stream",
+            size=4_000_000,
+            attachment_id=f"att_{index:032x}",
+        )
+        for index in range(discussion.MAX_ATTACHMENTS)
+    ]
+
+    with pytest.raises(
+        discussion.DiscussionValidationError, match="message byte limit"
+    ):
+        discussion.validate_user_payload(
+            {
+                "text": "Review.",
+                "thread_id": "thread-1",
+                "attachments": attachments,
+            },
+            member_ids=MEMBER_IDS,
+        )
+
+
+def test_attachment_only_user_payload_is_accepted():
+    payload = discussion.validate_user_payload(
+        {
+            "text": "",
+            "thread_id": "thread-1",
+            "attachments": [_attachment("file", "notes.txt", "text/plain")],
+        },
+        member_ids=MEMBER_IDS,
+    )
+
+    assert payload["text"] == ""
+    assert len(payload["attachments"]) == 1
 
 
 @pytest.mark.parametrize(

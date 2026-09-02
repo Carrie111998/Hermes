@@ -19,8 +19,10 @@ import {
   activeBots,
   botCanonicalSessionId,
   botRowOwnsWorkspace,
+  canCreateGroupChat,
   previewKind,
   rosterActivityMatches,
+  selectableGroupChatBots,
   workerActiveAt
 } from './row-helpers'
 import type { RosterRow } from './types'
@@ -154,6 +156,39 @@ describe('which bots are working right now', () => {
     // heartbeat — but not an hour's worth.
     expect(workerActiveAt(finished, NOW)).toBe(false)
     expect(ACTIVE_WINDOW_S).toBeGreaterThan(0)
+  })
+})
+
+describe('Group Chat creation availability', () => {
+  it('shares one routable roster policy across the menu and picker', () => {
+    const local = row({ connectionId: 'local', name: 'local' })
+    const remote = row({ connectionId: 'remote-a', name: 'remote', remoteSource: true, sourceReachable: true })
+
+    const onDemand = row({
+      connectionId: 'remote-b',
+      name: 'on-demand',
+      remoteSource: true,
+      sourceError: 'connect-on-demand'
+    })
+
+    const unavailable = row({
+      connectionId: 'remote-c',
+      name: 'unavailable',
+      remoteSource: true,
+      sourceReachable: false
+    })
+
+    const removed = row({ connectionId: 'remote-d', name: 'removed', remoteSource: true, sourceMissing: true })
+    const ghost = row({ ghost: true, name: 'ghost' })
+
+    expect(selectableGroupChatBots([local, remote, onDemand, unavailable, removed, ghost])).toEqual([
+      local,
+      remote,
+      onDemand
+    ])
+    expect(canCreateGroupChat([local, remote])).toBe(true)
+    expect(canCreateGroupChat([local, unavailable, removed, ghost])).toBe(false)
+    expect(canCreateGroupChat(undefined)).toBe(false)
   })
 })
 

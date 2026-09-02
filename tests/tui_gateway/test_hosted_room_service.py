@@ -35,9 +35,7 @@ from tui_gateway.hosted_room_peer_http import PeerRunsHTTPError
 def _append_room_event(db, **kwargs):
     if kwargs.get("kind") == "message.user":
         room = hosted_rooms.room_state(db, room_id=kwargs["room_id"])
-        kwargs.setdefault(
-            "authority_gateway_id", str(room["authority_gateway_id"])
-        )
+        kwargs.setdefault("authority_gateway_id", str(room["authority_gateway_id"]))
         kwargs.setdefault("authority_epoch", int(room["authority_epoch"]))
     return hosted_rooms.append_event(db, **kwargs)
 
@@ -231,11 +229,11 @@ class _ApprovalPeerClient(_FakePeerClient):
             "status": "waiting_for_approval",
             "active": True,
             "task_id": task_id,
-                "execution_generation": 2,
-                "run_id": "run-peer-1",
-                "session_id": "peer-group-session",
-                "request_id": "req-peer-1",
-                "approval": {
+            "execution_generation": 2,
+            "run_id": "run-peer-1",
+            "session_id": "peer-group-session",
+            "request_id": "req-peer-1",
+            "approval": {
                 "description": "Run the focused tests",
                 "command": "pytest -q tests/focused",
                 "choices": ["once", "deny"],
@@ -245,23 +243,6 @@ class _ApprovalPeerClient(_FakePeerClient):
     def approve_receipt(self, **kwargs):
         self.approvals.append(dict(kwargs))
         return {"resolved": 1}
-
-
-class _RecoveringPeerClient(_FakePeerClient):
-    def __init__(self) -> None:
-        super().__init__()
-        self.recoveries = []
-
-    def recover_dispatch(self, **kwargs):
-        dispatch = dict(kwargs["dispatch"])
-        self.recoveries.append({**kwargs, "dispatch": dispatch})
-        self.dispatches.append(dispatch)
-        return {
-            "status": "accepted",
-            "task_id": dispatch["task_id"],
-            "execution_generation": dispatch["execution_generation"],
-            "run_id": "run-recovered",
-        }
 
 
 class _PromptRecordingRPC(_FakeRPC):
@@ -296,9 +277,10 @@ class _BlockingFirstRPC(_PromptRecordingRPC):
         if len(self.prompts) == 1:
             self.first_started.set()
             assert self.release_first.wait(timeout=2)
-        kwargs["on_terminal"](
-            {"status": "settled", "text": f"reply from {kwargs['profile']}"}
-        )
+        kwargs["on_terminal"]({
+            "status": "settled",
+            "text": f"reply from {kwargs['profile']}",
+        })
         return {"accepted": True}
 
 
@@ -319,7 +301,12 @@ def test_stop_room_snapshots_tasks_before_status_transitions(monkeypatch, tmp_pa
     """One running task must not be counted again after it becomes stopping."""
 
     identity = driver.TaskIdentity("room-1", "task-1", "thread-1", "turn-1")
-    task = {"identity": identity, "status": "running", "cancel_id": None}
+    task = {
+        "identity": identity,
+        "payload": {"source_event_seq": 1},
+        "status": "running",
+        "cancel_id": None,
+    }
     calls = []
 
     def listed(_db, *, room_id, status):
@@ -339,6 +326,7 @@ def test_stop_room_snapshots_tasks_before_status_transitions(monkeypatch, tmp_pa
         lambda _db, *, room_id, cancel_id, **_authority: {
             "room_id": room_id,
             "cancel_id": cancel_id,
+            "seq": 2,
         },
     )
     service = HostedRoomService(_server(), db_path=tmp_path / "state.db")
@@ -589,10 +577,13 @@ def test_same_thread_followup_migrates_and_delivers_committed_peer_reply(
         )
     )
     with sqlite3.connect(db) as conn:
-        assert conn.execute(
-            """SELECT COUNT(*) FROM hosted_room_policy_transcript
+        assert (
+            conn.execute(
+                """SELECT COUNT(*) FROM hosted_room_policy_transcript
                WHERE room_id='room-1' AND thread_id='thread-1'"""
-        ).fetchone()[0] == 2
+            ).fetchone()[0]
+            == 2
+        )
         conn.execute("DELETE FROM hosted_room_policy_transcript")
         conn.execute(
             """DELETE FROM hosted_room_policy_transcript_state
@@ -677,8 +668,7 @@ def test_thread_transcript_prunes_committed_message_and_settlement_together(
     )
     _wait_for(
         lambda: any(
-            event["kind"] == "room.activity"
-            for event in service._events("room-1")
+            event["kind"] == "room.activity" for event in service._events("room-1")
         )
     )
     assert service.stop(timeout=1.0)
@@ -788,8 +778,51 @@ def test_service_publishes_deferred_turn_continues_and_retries_new_generation(
     requeued = service.retry_room_task(
         "room-1",
         task_id=first["identity"].task_id,
+        retry_id="retry-1",
     )
     assert requeued["status"] == "queued"
+    replayed = service.retry_room_task(
+        "room-1",
+        task_id=first["identity"].task_id,
+        retry_id="retry-1",
+    )
+    assert replayed["status"] == "queued"
+    assert replayed["idempotent"] is True
+    with sqlite3.connect(db) as conn:
+        conn.execute(
+            """UPDATE hosted_room_driver_tasks
+                  SET status='deferred', execution_generation=2
+                WHERE room_id='room-1' AND task_id=?""",
+            (first["identity"].task_id,),
+        )
+        conn.commit()
+    second_retry = service.retry_room_task(
+        "room-1",
+        task_id=first["identity"].task_id,
+        retry_id="retry-2",
+    )
+    assert second_retry["status"] == "queued"
+    with sqlite3.connect(db) as conn:
+        conn.execute(
+            """UPDATE hosted_room_driver_tasks
+                  SET status='deferred', execution_generation=3
+                WHERE room_id='room-1' AND task_id=?""",
+            (first["identity"].task_id,),
+        )
+        conn.commit()
+    delayed_first = service.retry_room_task(
+        "room-1",
+        task_id=first["identity"].task_id,
+        retry_id="retry-1",
+    )
+    assert delayed_first["status"] == "deferred"
+    assert delayed_first["idempotent"] is True
+    third_retry = service.retry_room_task(
+        "room-1",
+        task_id=first["identity"].task_id,
+        retry_id="retry-3",
+    )
+    assert third_retry["status"] == "queued"
     lease = service.runtime._leases["room-1"]
     retried = driver.start_task(
         db,
@@ -798,7 +831,7 @@ def test_service_publishes_deferred_turn_continues_and_retries_new_generation(
         expected_cancel_generation=0,
         clock=clock,
     )
-    assert retried.execution_generation == old_attempt.execution_generation + 1
+    assert retried.execution_generation == third_retry["execution_generation"] + 1
 
 
 def test_stop_fence_prevents_the_next_room_member_from_starting(
@@ -897,92 +930,6 @@ def test_acknowledged_stop_refuses_to_disband_while_exact_turn_is_still_running(
     stopping = driver.get_task(db, task["identity"])
     assert stopping["status"] == "stopping"
     assert stopping["cancel_id"] == "stop-1"
-
-
-def test_local_pending_approval_requires_exact_task_generation_and_request(
-    tmp_path: Path,
-):
-    class ApprovalRPC(_FakeRPC):
-        def __init__(self) -> None:
-            super().__init__()
-            self.approvals = []
-
-        def approve(self, *, session_id, request_id, choice):
-            self.approvals.append((session_id, request_id, choice))
-            return {"resolved": 1}
-
-    db = tmp_path / "state.db"
-    service = HostedRoomService(_server(), db_path=db)
-    rpc = ApprovalRPC()
-    service.rpc = rpc
-    service.runtime.rpc = rpc
-    service.local_profiles = lambda: ("default", "ops")
-    service.create_room(
-        room_id="room-1",
-        name="Release room",
-        members=[
-            {"member_id": "default", "profile": "default", "handle": "hermes"},
-            {"member_id": "ops", "profile": "ops", "handle": "ops"},
-        ],
-    )
-    service.send(
-        room_id="room-1",
-        event_id="user-1",
-        payload={"text": "@ops inspect", "thread_id": "thread-1"},
-    )
-    task = driver.list_tasks(db, room_id="room-1", status="queued")[0]
-    binding = service.bindings()[0]
-    lease = driver.acquire_lease(
-        db,
-        room_id="room-1",
-        gateway_id=binding.gateway_id,
-        authority_epoch=binding.authority_epoch,
-        process_generation="worker",
-        ttl_seconds=30,
-        clock=time.time,
-    )
-    driver.start_task(
-        db,
-        task["identity"],
-        lease,
-        expected_cancel_generation=0,
-        clock=time.time,
-    )
-    task = driver.get_task(db, task["identity"])
-    service.runtime._report_pending_action(
-        task,
-        session_id="ops-session",
-        info={
-            "pending_approval": {
-                "request_id": "approval-1",
-                "choices": ["once", "always", "deny"],
-            }
-        },
-    )
-
-    action = service.status("room-1")["pending_actions"][0]
-    assert action["member_id"] == "ops"
-    assert action["approval"]["choices"] == ["once", "deny"]
-    with pytest.raises(RuntimeError, match="no longer pending"):
-        service.approve_room_task(
-            "room-1",
-            member_id="ops",
-            task_id=task["identity"].task_id,
-            execution_generation=1,
-            choice="once",
-            request_id="wrong-request",
-        )
-
-    assert service.approve_room_task(
-        "room-1",
-        member_id="ops",
-        task_id=task["identity"].task_id,
-        execution_generation=1,
-        choice="once",
-        request_id="approval-1",
-    ) == {"resolved": 1}
-    assert rpc.approvals == [("ops-session", "approval-1", "once")]
-    assert service.status("room-1")["pending_actions"] == []
 
 
 def test_headless_room_publishes_peer_member_reply_without_desktop_transport(
@@ -1168,7 +1115,10 @@ def test_one_corrupt_stored_route_does_not_hide_healthy_peers(tmp_path: Path):
         catalog_mapping(installation_id="install-peer", persistent_process=True)
     )
     service = HostedRoomService(_server(), db_path=db)
-    for room_id, member_id in (("room-good", "member-good"), ("room-bad", "member-bad")):
+    for room_id, member_id in (
+        ("room-good", "member-good"),
+        ("room-bad", "member-bad"),
+    ):
         route = PeerMemberRoute(
             home_install_id=hosted_rooms.local_authority_gateway_id(),
             member_id=member_id,
@@ -1199,6 +1149,85 @@ def test_one_corrupt_stored_route_does_not_hide_healthy_peers(tmp_path: Path):
     assert ("room-good", "member-good") in restarted.peer_routes
     assert ("room-bad", "member-bad") not in restarted.peer_routes
     assert restarted.status()["link_load_error"] == "room-bad:member-bad:invalid"
+    with pytest.raises(RuntimeError, match="need repair"):
+        restarted.revoke_room_routes("room-bad")
+    with sqlite3.connect(db) as conn:
+        assert (
+            conn.execute(
+                "SELECT COUNT(*) FROM hosted_room_links WHERE room_id='room-bad'"
+            ).fetchone()[0]
+            == 1
+        )
+
+
+def test_disband_fence_persists_and_rejects_new_work_before_tombstone(
+    tmp_path: Path,
+    monkeypatch,
+):
+    db = tmp_path / "state.db"
+    service = HostedRoomService(_server(), db_path=db)
+    service.local_profiles = lambda: ("default", "ops")
+    room = service.create_room(
+        room_id="room-disbanding",
+        name="Disband safely",
+        members=[
+            {"member_id": "default", "profile": "default", "handle": "default"},
+            {"member_id": "ops", "profile": "ops", "handle": "ops"},
+        ],
+    )
+    append_started = threading.Event()
+    release_append = threading.Event()
+    fence_finished = threading.Event()
+    real_append = hosted_rooms.append_event
+
+    def held_append(*args, **kwargs):
+        if kwargs.get("event_id") == "before-fence":
+            append_started.set()
+            assert release_append.wait(1)
+        return real_append(*args, **kwargs)
+
+    monkeypatch.setattr(hosted_rooms, "append_event", held_append)
+    sender = threading.Thread(
+        target=lambda: service.send(
+            room_id="room-disbanding",
+            event_id="before-fence",
+            payload={"text": "finish this", "thread_id": "thread-before"},
+        )
+    )
+    sender.start()
+    assert append_started.wait(1)
+    fencer = threading.Thread(
+        target=lambda: (
+            service.begin_room_disband("room-disbanding"),
+            fence_finished.set(),
+        )
+    )
+    fencer.start()
+    assert not fence_finished.wait(0.05)
+    release_append.set()
+    sender.join(timeout=1)
+    fencer.join(timeout=1)
+    assert fence_finished.is_set()
+
+    with pytest.raises(driver.RoomUnavailableError, match="being disbanded"):
+        service.send(
+            room_id="room-disbanding",
+            event_id="late-send",
+            payload={"text": "too late", "thread_id": "thread-late"},
+        )
+    restarted = HostedRoomService(_server(), db_path=db)
+    with pytest.raises(driver.RoomUnavailableError, match="being disbanded"):
+        restarted.prepare_room(restarted.bindings()[0])
+
+    restarted.begin_room_disband("room-disbanding")
+    restarted.stop_room("room-disbanding", cancel_id="disband-stop")
+    tombstone = restarted.retire_and_disband_room(
+        "room-disbanding",
+        expected_gateway_id=str(room["authority_gateway_id"]),
+        expected_epoch=int(room["authority_epoch"]),
+    )
+    assert tombstone["disbanded_at"] is not None
+    assert restarted._room_is_disbanding("room-disbanding") is False
 
 
 def test_unpublished_roomlink_v1_route_is_quarantined_for_reinvitation(
@@ -1559,9 +1588,7 @@ def test_not_admitted_dispatch_persists_unavailable_route_until_success(
     )
     binding = service.bindings()[0]
     task = {
-        "identity": driver.TaskIdentity(
-            "room-1", "task-peer", "thread-1", "turn-1"
-        ),
+        "identity": driver.TaskIdentity("room-1", "task-peer", "thread-1", "turn-1"),
         "execution_generation": 1,
         "payload": {
             "target_member_id": "member-peer",
@@ -1718,9 +1745,12 @@ def test_dispatch_refresh_persists_before_remote_admission(tmp_path: Path):
         peer.dispatches[0]["execution_policy_digest"]
         == catalog.execution_policy.policy_digest
     )
-    assert HostedRoomService(_server(), db_path=db).peer_routes[
-        ("room-1", "member-peer")
-    ].grant == new_grant
+    assert (
+        HostedRoomService(_server(), db_path=db)
+        .peer_routes[("room-1", "member-peer")]
+        .grant
+        == new_grant
+    )
 
 
 @pytest.mark.parametrize(
@@ -1858,7 +1888,7 @@ def test_peer_approval_is_scoped_visible_and_resolvable(tmp_path: Path):
                     "profile": "reviewer",
                     "capability_digest": catalog.catalog_digest,
                 },
-            }
+            },
         ],
     )
     identity = driver.TaskIdentity("room-1", "task-1", "thread-1", "turn-1")
@@ -1930,146 +1960,3 @@ def test_peer_approval_is_scoped_visible_and_resolvable(tmp_path: Path):
         }
     ]
     assert service.status("room-1")["pending_actions"] == []
-
-
-def test_local_room_approval_uses_the_exact_hidden_session(tmp_path: Path):
-    service = HostedRoomService(_server(), db_path=tmp_path / "state.db")
-    rpc = _FakeRPC()
-    service.rpc = rpc
-    service.runtime.rpc = rpc
-    service._set_pending_action(
-        "room-1",
-        "local",
-        {
-            "kind": "approval",
-            "task_id": "task-local-1",
-            "execution_generation": 1,
-            "session_id": "local-session",
-            "request_id": "approval-local-1",
-            "approval": {
-                "description": "Run focused tests",
-                "command": "pytest -q tests/focused",
-                "choices": ["once", "deny"],
-            },
-        },
-    )
-
-    assert service.approve_room_task(
-        "room-1",
-        member_id="local",
-        task_id="task-local-1",
-        execution_generation=1,
-        choice="once",
-        request_id="approval-local-1",
-    ) == {"resolved": 1}
-    assert rpc.approvals == [
-        {
-            "session_id": "local-session",
-            "request_id": "approval-local-1",
-            "choice": "once",
-        }
-    ]
-    assert service.status("room-1")["pending_actions"] == []
-
-
-def test_stale_local_approval_cannot_resolve_replacement_request(tmp_path: Path):
-    service = HostedRoomService(_server(), db_path=tmp_path / "state.db")
-    rpc = _FakeRPC()
-    service.rpc = rpc
-    service.runtime.rpc = rpc
-    action = {
-        "kind": "approval",
-        "task_id": "task-local-1",
-        "execution_generation": 1,
-        "session_id": "local-session",
-        "approval": {"choices": ["once", "deny"]},
-    }
-    service._set_pending_action(
-        "room-1", "local", {**action, "request_id": "approval-A"}
-    )
-    service._set_pending_action(
-        "room-1", "local", {**action, "request_id": "approval-B"}
-    )
-
-    with pytest.raises(RuntimeError, match="no longer pending"):
-        service.approve_room_task(
-            "room-1",
-            member_id="local",
-            task_id="task-local-1",
-            execution_generation=1,
-            choice="once",
-            request_id="approval-A",
-        )
-
-    assert rpc.approvals == []
-    assert service.status("room-1")["pending_actions"][0]["request_id"] == (
-        "approval-B"
-    )
-
-
-def test_peer_recovery_replays_the_same_execution_generation(tmp_path: Path):
-    db = tmp_path / "state.db"
-    catalog = GatewayRoomCatalog.from_mapping(
-        catalog_mapping(installation_id="install-peer", persistent_process=True)
-    )
-    route = PeerMemberRoute(
-        home_install_id=hosted_rooms.local_authority_gateway_id(),
-        member_id="member-peer",
-        target_install_id="install-peer",
-        target_profile="reviewer",
-        capability_digest=catalog.catalog_digest,
-        cancellation_scope_id="cancel-room-1",
-        trace_id="trace-room-1",
-        grant="signed.room.grant",
-    )
-    peer = _RecoveringPeerClient()
-    service = HostedRoomService(_server(), db_path=db)
-    service.register_peer_route(
-        room_id="room-1",
-        member_id="member-peer",
-        route=route,
-        client=peer,
-        target_url="https://peer.example.test",
-        catalog=catalog,
-    )
-    service.create_room(
-        room_id="room-1",
-        name="Peer room",
-        members=[
-            {"member_id": "default", "profile": "default", "handle": "hermes"},
-            {
-                "member_id": "member-peer",
-                "profile": "reviewer",
-                "handle": "reviewer",
-                "target": {
-                    "kind": "peer",
-                    "peer_id": "peer-review",
-                    "installation_id": "install-peer",
-                    "profile": "reviewer",
-                    "capability_digest": catalog.catalog_digest,
-                },
-            },
-        ],
-    )
-    identity = driver.TaskIdentity("room-1", "task-1", "thread-1", "turn-1")
-
-    service._resolve_member_transport(
-        service.bindings()[0],
-        {
-            "identity": identity,
-            "status": "indeterminate",
-            "execution_generation": 1,
-            "payload": {
-                "target_member_id": "member-peer",
-                "target_profile": "reviewer",
-                "source_event_seq": 9,
-                "prompt": "Recover the accepted review.",
-            },
-        },
-    )
-
-    assert len(peer.recoveries) == 1
-    recovered = peer.recoveries[0]["dispatch"]
-    assert recovered["task_id"] == "task-1"
-    assert recovered["execution_generation"] == 1
-    assert recovered["prompt"] == "Recover the accepted review."

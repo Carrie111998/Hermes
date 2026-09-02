@@ -7,6 +7,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from gateway.platforms import api_server
+from gateway.platforms import api_server_room_dispatch
 from gateway.platforms import api_server_room_grants
 from gateway.platforms import api_server_runs
 
@@ -37,8 +38,20 @@ def test_api_server_keeps_run_methods_on_the_adapter_class():
     assert _RUN_METHODS <= api_server.APIServerAdapter.__dict__.keys()
 
 
+def test_room_dispatch_errors_never_expose_local_paths():
+    message, code = api_server_room_dispatch._public_dispatch_error(
+        RuntimeError("failed at /Users/private/.hermes/state.db")
+    )
+
+    assert message == "Room dispatch was rejected."
+    assert code == "invalid_room_dispatch"
+    assert "/Users/private" not in message
+
+
 @pytest.mark.asyncio
-@pytest.mark.parametrize(("adapter_name", "implementation_name"), _HTTP_HANDLER_DELEGATES)
+@pytest.mark.parametrize(
+    ("adapter_name", "implementation_name"), _HTTP_HANDLER_DELEGATES
+)
 async def test_run_http_handlers_delegate_without_changing_method_surface(
     monkeypatch, adapter_name, implementation_name
 ):
@@ -169,6 +182,22 @@ def test_roomlink_and_run_route_tuples_are_shard_owned():
         ("GET", "/v1/room-members/capabilities"),
         ("POST", "/v1/room-members/grants/refresh"),
         ("POST", "/v1/room-members/grants/revoke"),
+        ("POST", "/v1/room-members/grants/revoke-exact"),
+        ("GET", "/v1/room-controls/{room_id}"),
+        ("POST", "/v1/room-controls/{room_id}"),
+        ("DELETE", "/v1/room-controls/{room_id}"),
+        ("POST", "/v1/room-members/attachments"),
+        (
+            "PUT",
+            "/v1/room-members/attachments/{task_id}/{execution_generation}/{attachment_id}",
+        ),
+        (
+            "DELETE",
+            "/v1/room-members/attachments/{task_id}/{execution_generation}",
+        ),
+        ("GET", "/v1/runs/{run_id}/artifacts/{artifact_id}"),
+        ("POST", "/v1/runs/{run_id}/artifacts/ack"),
+        ("POST", "/v1/runs/{run_id}/artifacts/discard"),
     ]
     assert [(method, path) for method, path, _ in run_routes] == [
         ("POST", "/v1/runs"),
@@ -178,5 +207,37 @@ def test_roomlink_and_run_route_tuples_are_shard_owned():
         ("POST", "/v1/runs/{run_id}/steer"),
         ("POST", "/v1/runs/{run_id}/stop"),
     ]
-    assert all(handler.__self__ is adapter for _, _, handler in room_routes)
+    assert all(handler.__self__ is adapter for _, _, handler in room_routes[:4])
+    assert all(callable(handler) for _, _, handler in room_routes[4:])
     assert all(handler.__self__ is adapter for _, _, handler in run_routes)
+
+
+def test_artifact_discard_uses_ack_permission(monkeypatch):
+    permissions = []
+    adapter = SimpleNamespace(
+        _room_grant_token=lambda _request: "grant",
+        _room_grant_claims=lambda _request, permission: (
+            permissions.append(permission)
+            or {
+                "room_id": "room-1",
+                "home_install_id": "home",
+                "authority_gateway_id": "gateway",
+                "authority_epoch": 1,
+                "member_id": "member",
+                "target_install_id": "target",
+                "target_profile": "profile",
+            }
+        ),
+    )
+    monkeypatch.setattr(api_server_runs, "_remember_room_retention", lambda *_: None)
+    request = SimpleNamespace(
+        path="/v1/runs/run-1/artifacts/discard",
+        method="POST",
+    )
+
+    assert api_server_runs._run_idempotency_scope(
+        adapter,
+        request,
+        _api_server=api_server,
+    )
+    assert permissions == ["artifact.ack"]

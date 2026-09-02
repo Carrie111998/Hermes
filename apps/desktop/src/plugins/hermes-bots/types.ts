@@ -128,10 +128,16 @@ export type GroupMember = Pick<
 export type AttachmentKind = 'file' | 'image' | 'pdf'
 
 export interface Attachment {
-  /** Data URL. */
-  data: string
+  /** Local composer/preview data URL. Durable replay omits raw bytes. */
+  data?: string
+  /** Opaque gateway identity after durable staging. */
+  attachmentId?: string
   kind: AttachmentKind
+  mime?: string
   name: string
+  size?: number
+  /** Window-local idempotency key retained when a failed upload restores the draft. */
+  uploadId?: string
 }
 
 export interface GroupMessageAuthor {
@@ -144,9 +150,15 @@ export interface GroupMessageAuthor {
 export interface GroupMessage {
   /** Milliseconds. */
   at: number
+  /** Stable gateway event identity after a hosted-room replay. */
+  eventId?: string
+  /** True for an idempotent message accepted through a messaging bridge. */
+  external?: boolean
   from: GroupMessageAuthor
   id?: string
   images?: Attachment[]
+  /** Monotonic gateway order for hosted-room events. */
+  seq?: number
   text: string
   /** Messages predating threading carry the sentinel thread `'legacy'`. */
   thread?: string
@@ -158,6 +170,16 @@ export interface GroupHold {
 }
 
 export interface GroupChat {
+  /** User-facing continuity choice. Missing records are classic Desktop rooms. */
+  continuityMode?: 'desktop' | 'distributed' | 'gateway'
+  /** Public SHA-256 commitment to the local authority token. */
+  desktopAuthorityHash?: null | string
+  /** Secret held only by the Desktop that coordinates this classic room. */
+  desktopAuthorityToken?: null | string
+  /** Stable installation/window identity that owns classic room commands. */
+  desktopCoordinatorId?: null | string
+  /** Bounded idempotency receipts for messaging commands already settled. */
+  desktopCommandSettled?: Record<string, number>
   /** Bumped to abandon in-flight member turns from a previous round. */
   epoch?: number
   holds?: Record<string, GroupHold>
@@ -167,6 +189,26 @@ export interface GroupChat {
   /** Immutable identity, so a rename doesn't fork the room. */
   roomId?: null | string
   running?: boolean
+  /** Stable authority installation id for a gateway-hosted room. */
+  hosted?: null | string
+  /** The local Desktop connection that currently reaches the authority. */
+  hostedConnectionId?: null | string
+  /** Server-issued fencing epoch for the hosted authority. */
+  hostedEpoch?: null | number
+  /** Last contiguous hosted-room event sequence applied locally. */
+  hostedSeq?: number
+  hostedStatus?: null | {
+    canReconnect?: boolean
+    canRetry?: boolean
+    canStop?: boolean
+    label: string
+    reconnectMemberId?: string
+    retryCommandId?: string
+    state: string
+    taskId?: string
+  }
+  /** Short, actionable continuity problem for the room surface. */
+  continuityIssue?: null | string
   /** The immutable owner descriptor captured beside each plumbing session,
    *  keyed the same way as `sessions`. Partial: legacy records hold a bare
    *  `{ name }`, and the sweep re-validates the route before trusting one. */
@@ -206,6 +248,14 @@ export interface GroupPrompt {
   choices: string[]
   command?: string
   group: string
+  /** Exact hosted-task identity when the prompt is owned by a Group Chat
+   * authority rather than a visible member session. */
+  hostedApproval?: {
+    executionGeneration: number
+    memberId: string
+    roomId: string
+    taskId: string
+  }
   kind: GroupPromptKind
   member: string
   memberKey: string

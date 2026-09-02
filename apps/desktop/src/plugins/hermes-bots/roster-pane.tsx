@@ -56,7 +56,7 @@ import {
   useRoster
 } from './data'
 import { EditProfileDialog } from './edit-profile-dialog'
-import { $groupChats, $groupChatWorkspace, $groupNeedsYou } from './group-chat'
+import { $groupChats, $groupChatWorkspace, $groupHostedNeedsYou, $groupNeedsYou } from './group-chat'
 import { disbandGroupChat, GroupChatWorkspace, openGroupChat } from './group-chat-view'
 import { groupChatMemberBots, groupChatNames, groupLastActivity } from './group-membership'
 import { $groupMainTabsRev, shouldRenderGroupChatInPane } from './group-panes'
@@ -77,7 +77,13 @@ import {
 } from './roster-sections'
 import type { ResolvedRosterGatewaySection } from './roster-sections'
 import { botRosterMeta, botWorkspaceOwnerKey, setBotsWorkspaceOwner } from './routing'
-import { ACTIVE_WINDOW_S, activeBots, BOT_ROSTER_SEARCH_THRESHOLD, rosterActivityMatches } from './row-helpers'
+import {
+  ACTIVE_WINDOW_S,
+  activeBots,
+  BOT_ROSTER_SEARCH_THRESHOLD,
+  canCreateGroupChat,
+  rosterActivityMatches
+} from './row-helpers'
 import { backfillMessagingProtocol } from './soul'
 import type { BotMeta, GatewaySource, GroupMember, RosterActivityFilter, RosterKindFilter, RosterRow } from './types'
 import {
@@ -289,6 +295,7 @@ export function BotsPane() {
   // room beside a live main tab and stick).
   useValue($groupMainTabsRev)
   const groupNeedsYou = useValue($groupNeedsYou)
+  const groupHostedNeedsYou = useValue($groupHostedNeedsYou)
   const groupRooms = useValue($groupChats)
   const rememberedSources = useValue($lastSources)
   const rosterHydrated = useValue($rosterHydrated)
@@ -572,7 +579,7 @@ export function BotsPane() {
       group={row.name}
       key={`group:${row.name}`}
       members={row.members}
-      needsYou={Boolean(groupNeedsYou[row.name])}
+      needsYou={Boolean(groupNeedsYou[row.name] || groupHostedNeedsYou[row.name])}
       onDisband={setDeletingGroup}
       onOpen={openGroupChat}
     />
@@ -760,7 +767,10 @@ export function BotsPane() {
                 <Codicon className="mr-1.5" name="hubot" />
                 {b.bot.newTitle}
               </DropdownMenuItem>
-              <DropdownMenuItem disabled={activeSourceRoster.length < 2} onSelect={() => setGroupCreateOpen(true)}>
+              <DropdownMenuItem
+                disabled={!canCreateGroupChat(roster)}
+                onSelect={() => setGroupCreateOpen(true)}
+              >
                 <Codicon className="mr-1.5" name="organization" />
                 {b.group.newTitle}
               </DropdownMenuItem>
