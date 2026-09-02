@@ -12146,15 +12146,6 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     GROUP BY root_id
                 )
                 SELECT {_sel}{prompt_select},
-                    COALESCE(
-                        (SELECT {_PREVIEW_RAW_SELECT}
-                         FROM messages m
-                         WHERE m.session_id = s.id AND m.role = 'user' AND m.content IS NOT NULL
-                           AND {_PREVIEW_ELIGIBLE_SQL}
-                         ORDER BY m.timestamp, m.id LIMIT 1),
-                        ''
-                    ) AS _preview_raw,
-                    {_sql_session_last_active("s")} AS last_active,
                     COALESCE(cm.effective_last_active, s.started_at) AS _effective_last_active
                 FROM sessions s
                 LEFT JOIN chain_max cm ON cm.root_id = s.id
@@ -12189,6 +12180,43 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         with self._read_ctx() as conn:
             cursor = conn.execute(query, params)
             rows = cursor.fetchall()
+            if order_by_last_active and rows:
+                # Defer preview/last_active to after LIMIT: ordering by the
+                # chain-projected recency forces SQLite to evaluate the select
+                # list for every candidate row, and the preview subquery reads
+                # each session's first-user-message content page. On a DB with
+                # ~1.6k sessions and large message payloads that made the
+                # dashboard sidebar's order=recent query take ~19s; fetching
+                # previews only for the page's rows brings it to ~30ms warm
+                # (measured; see PR description). The created-order path above
+                # is untouched -- its ORDER BY s.started_at lets LIMIT apply
+                # early, so the inline subqueries only ever run for page rows.
+                _desc = [d[0] for d in cursor.description]
+                _id_i = _desc.index("id")
+                _ids = [r[_id_i] for r in rows]
+                # Chunk the IN(...) fetch: the dashboard router caps pages at
+                # 100, but CLI callers (sessions_cmd multiplies the requested
+                # limit by 4; console_engine passes the raw CLI limit) can
+                # exceed the classic 999 host-variable cap on SQLite builds
+                # that still default to it.
+                _bf = {}
+                for _i in range(0, len(_ids), 500):
+                    _chunk = _ids[_i:_i + 500]
+                    _ph = ",".join("?" * len(_chunk))
+                    _cur2 = conn.execute(
+                        "SELECT s.id AS _bid,"
+                        " COALESCE((SELECT " + _PREVIEW_RAW_SELECT + " FROM messages m"
+                        " WHERE m.session_id = s.id AND m.role = 'user' AND m.content IS NOT NULL"
+                        " AND " + _PREVIEW_ELIGIBLE_SQL +
+                        " ORDER BY m.timestamp, m.id LIMIT 1), '') AS _preview_raw,"
+                        " " + _sql_session_last_active("s") + " AS last_active"
+                        " FROM sessions s WHERE s.id IN (" + _ph + ")", _chunk)
+                    _bf.update({r[0]: (r[1], r[2]) for r in _cur2.fetchall()})
+                rows = [
+                    dict(zip(_desc + ["_preview_raw", "last_active"],
+                             tuple(r) + _bf.get(r[_id_i], ("", None))))
+                    for r in rows
+                ]
         sessions = []
         for row in rows:
             s = self._session_row_dict(row)
