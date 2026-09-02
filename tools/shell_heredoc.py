@@ -40,17 +40,32 @@ from __future__ import annotations
 
 import re
 
-# Non-shell interpreters whose (quoted, inert) heredoc bodies are safe to
-# mask: the body is program text or plain data for THAT interpreter, not
-# shell syntax executed by this command line. Optional VAR=... assignments,
-# an ``env`` prefix, and a path prefix are allowed. Deliberately narrow:
-# anything not matched keeps its body visible (fail-closed).
-_INERT_HEREDOC_CONSUMER_RE = re.compile(
+# Shared opener prefix for every allowlisted heredoc consumer. Keep assignment,
+# ``env``, and executable-path handling in one place so the general and
+# data-sink-only policies cannot drift apart.
+_HEREDOC_CONSUMER_PREFIX = (
     r"^\s*"
     r"(?:[A-Z_][A-Z0-9_]*=\S+\s+)*"
     r"(?:env\s+)?"
     r"(?:[A-Za-z0-9_./-]+/)?"
-    r"(?:python(?:3(?:\.\d+)*)?|osascript|cat)(?=\s|$)",
+)
+
+# Non-shell interpreters whose (quoted, inert) heredoc bodies are safe to
+# mask: the body is program text or plain data for THAT interpreter, not
+# shell syntax executed by this command line. Deliberately narrow: anything
+# not matched keeps its body visible (fail-closed).
+_INERT_HEREDOC_CONSUMER_RE = re.compile(
+    _HEREDOC_CONSUMER_PREFIX
+    + r"(?:python(?:3(?:\.\d+)*)?|osascript|cat)(?=\s|$)",
+    re.IGNORECASE,
+)
+
+# A stricter subset for scanners whose dangerous syntax may execute inside
+# interpreter source. Python and AppleScript heredocs are inert to the outer
+# shell, but they can still launch shell commands; plain ``cat`` only consumes
+# its stdin as data during this command.
+_INERT_DATA_SINK_HEREDOC_CONSUMER_RE = re.compile(
+    _HEREDOC_CONSUMER_PREFIX + r"cat(?=\s|$)",
     re.IGNORECASE,
 )
 
@@ -278,7 +293,9 @@ def _find_heredoc_close(
         cursor = after
 
 
-def strip_inert_heredoc_bodies(command: str) -> str:
+def strip_inert_heredoc_bodies(
+    command: str, *, data_sinks_only: bool = False
+) -> str:
     """Mask heredoc bodies that are provably inert data; keep the rest.
 
     See the module docstring for the qualification rules. Masked bodies are
@@ -288,8 +305,17 @@ def strip_inert_heredoc_bodies(command: str) -> str:
     compound opener, nested shell scope, unknown consumer) the original
     command is returned unchanged — a scanner false positive is acceptable,
     hiding real shell syntax is not.
+
+    Set ``data_sinks_only`` for semantic scanners whose dangerous syntax may
+    execute inside interpreter source. In that mode Python and AppleScript
+    bodies remain visible while quoted ``cat`` input can still be masked.
     """
     ranges: list[tuple[int, int]] = []
+    consumer_re = (
+        _INERT_DATA_SINK_HEREDOC_CONSUMER_RE
+        if data_sinks_only
+        else _INERT_HEREDOC_CONSUMER_RE
+    )
     command_start = 0
 
     # Fast path: no '<<' anywhere means no heredoc can exist — skip the state
@@ -339,7 +365,7 @@ def strip_inert_heredoc_bodies(command: str) -> str:
         if all(quoted for _delimiter, _strip_tabs, quoted in specs) and not has_list_operator:
             masked_opener = _mask_simple_quotes(command[command_start:command_end])
             if not _contains_nested_shell_scope(masked_opener) and (
-                _INERT_HEREDOC_CONSUMER_RE.search(masked_opener)
+                consumer_re.search(masked_opener)
             ):
                 ranges.extend(body_ranges)
         command_start = body_cursor
