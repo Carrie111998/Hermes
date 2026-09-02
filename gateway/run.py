@@ -391,20 +391,27 @@ async def run_codex_hygiene_compaction(
     loop = asyncio.get_running_loop()
     compressor = getattr(agent, "context_compressor", None)
     count_before = getattr(compressor, "compression_count", 0)
+    worker_future = loop.run_in_executor(
+        None,
+        # Keep the caller's multiplexed profile secret scope and HERMES_HOME
+        # override in the worker. The default executor does not propagate
+        # ContextVars on the Python runtimes Hermes currently ships.
+        copy_context().run,
+        lambda: agent._compress_context(
+            history,
+            "",
+            approx_tokens=approx_tokens,
+        ),
+    )
+    track_worker = getattr(gateway, "_track_deferred_agent_worker", None)
+    if callable(track_worker):
+        # ``wait_for`` only cancels the asyncio wrapper; the executor thread
+        # keeps running. Keep it visible to gateway shutdown until the real
+        # worker finishes, just like the detached local-compressor path.
+        track_worker(worker_future, agent)
     try:
         await asyncio.wait_for(
-            # copy_context().run: keep the caller's profile secret scope /
-            # HERMES_HOME override in the worker (multiplex_profiles) — same
-            # class as the detached-agent hygiene path below.
-            loop.run_in_executor(
-                None,
-                copy_context().run,
-                lambda: agent._compress_context(
-                    history,
-                    "",
-                    approx_tokens=approx_tokens,
-                ),
-            ),
+            asyncio.shield(worker_future),
             timeout=max(float(timeout_seconds), 1.0),
         )
     except asyncio.TimeoutError:
@@ -3191,6 +3198,13 @@ from gateway.whatsapp_identity import (
 
 
 logger = logging.getLogger(__name__)
+
+
+# Ceiling for the shutdown quiesce of the gateway-owned thread pool. Drain has
+# already waited for the agents, so what is left here is short blocking work
+# (a transcript append, a routing save); anything slower is a stuck worker we
+# must not wait on, and the caller clamps this to the watchdog leash anyway.
+_EXECUTOR_QUIESCE_TIMEOUT = 2.0
 
 
 _OWN_POLICY_OPEN_ENV = {
@@ -9428,6 +9442,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             self._running_agent_count()
             + self._active_cron_job_count()
             + self._active_api_run_count()
+            + self._active_deferred_agent_worker_count()
         )
 
     def _active_cron_job_count(self) -> int:
@@ -9480,6 +9495,66 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         except Exception as exc:
             logger.debug("Failed interrupting api_server runs during shutdown: %s", exc)
             return 0
+
+    def _active_deferred_agent_worker_count(self) -> int:
+        """Count executor workers that outlived their owning gateway turn.
+
+        A timed-out hygiene compression keeps running in its executor thread.
+        Some paths defer agent cleanup; the live Codex path keeps its cached
+        agent. In both cases the turn can finish before the worker does, so
+        ``_running_agents`` no longer represents it. Count the worker itself.
+        """
+        workers = getattr(self, "_deferred_agent_workers", None)
+        if not isinstance(workers, dict):
+            return 0
+        return sum(1 for future in list(workers) if not future.done())
+
+    def _track_deferred_agent_worker(
+        self,
+        future: asyncio.Future,
+        agent: Any,
+    ) -> None:
+        """Expose an executor worker to drain/interrupt until it really exits."""
+        workers = getattr(self, "_deferred_agent_workers", None)
+        if workers is None:
+            workers = {}
+            self._deferred_agent_workers = workers
+        workers[future] = agent
+
+        def _discard_worker(done_future: asyncio.Future) -> None:
+            workers.pop(done_future, None)
+            # Some tracked workers intentionally outlive the coroutine that
+            # started them and therefore have no later waiter. Consume their
+            # terminal exception so asyncio does not emit an unhandled-future
+            # warning after the worker eventually unwinds (#98973).
+            if not done_future.cancelled():
+                try:
+                    done_future.exception()
+                except Exception:
+                    pass
+
+        future.add_done_callback(_discard_worker)
+
+    def _interrupt_deferred_agent_workers(self, reason: str) -> int:
+        """Request cancellation of detached executor-backed agent work."""
+        workers = getattr(self, "_deferred_agent_workers", None)
+        if not isinstance(workers, dict):
+            return 0
+        interrupted = 0
+        seen: set[int] = set()
+        for future, agent in list(workers.items()):
+            if future.done() or agent is None or id(agent) in seen:
+                continue
+            seen.add(id(agent))
+            try:
+                request_hard_interrupt(agent, reason)
+                interrupted += 1
+            except Exception as exc:
+                logger.debug(
+                    "Failed interrupting deferred agent worker during shutdown: %s",
+                    exc,
+                )
+        return interrupted
 
     # ── scale-to-zero idle detection / dormant-quiesce (Phase 0) ──────────────
     # The gateway-side BEHAVIOUR that consumes the relay scale-to-zero primitives
@@ -11645,25 +11720,30 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         last_active_count = self._running_agent_count()
         last_cron_count = self._active_cron_job_count()
         last_api_count = self._active_api_run_count()
+        last_deferred_count = self._active_deferred_agent_worker_count()
         last_status_at = 0.0
 
         def _maybe_update_status(force: bool = False) -> None:
-            nonlocal last_active_count, last_cron_count, last_api_count, last_status_at
+            nonlocal last_active_count, last_cron_count, last_api_count
+            nonlocal last_deferred_count, last_status_at
             now = asyncio.get_running_loop().time()
             active_count = self._running_agent_count()
             cron_count = self._active_cron_job_count()
             api_count = self._active_api_run_count()
+            deferred_count = self._active_deferred_agent_worker_count()
             if (
                 force
                 or active_count != last_active_count
                 or cron_count != last_cron_count
                 or api_count != last_api_count
+                or deferred_count != last_deferred_count
                 or (now - last_status_at) >= 1.0
             ):
                 self._update_runtime_status("draining")
                 last_active_count = active_count
                 last_cron_count = cron_count
                 last_api_count = api_count
+                last_deferred_count = deferred_count
                 last_status_at = now
 
         # Cron jobs run on the scheduler's own thread pool, outside
@@ -11672,7 +11752,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # or a cron job's tool work gets killed with zero warning the
         # instant it's the only active thing running (#60432).
         # API-server / desk sessions have the same structural gap (#63529).
-        if not self._running_agents and last_cron_count == 0 and last_api_count == 0:
+        if (
+            not self._running_agents
+            and last_cron_count == 0
+            and last_api_count == 0
+            and last_deferred_count == 0
+        ):
             _maybe_update_status(force=True)
             return snapshot, False
 
@@ -11693,7 +11778,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         def _still_draining() -> bool:
             now = loop.time()
             if (
-                len(self._running_agents) or self._active_api_run_count()
+                len(self._running_agents)
+                or self._active_api_run_count()
+                or self._active_deferred_agent_worker_count()
             ) and now < deadline:
                 return True
             return bool(self._active_cron_job_count()) and now < cron_deadline
@@ -11709,6 +11796,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             bool(len(self._running_agents))
             or bool(self._active_cron_job_count())
             or bool(self._active_api_run_count())
+            or bool(self._active_deferred_agent_worker_count())
         )
         _maybe_update_status(force=True)
         return snapshot, timed_out
@@ -11728,6 +11816,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         interrupted_api = self._interrupt_api_server_runs(reason)
         if interrupted_api:
             logger.debug("Interrupted %d api_server run(s) during shutdown", interrupted_api)
+        interrupted_deferred = self._interrupt_deferred_agent_workers(reason)
+        if interrupted_deferred:
+            logger.debug(
+                "Interrupted %d deferred agent worker(s) during shutdown",
+                interrupted_deferred,
+            )
 
     async def _notify_interrupted_cron_jobs(self, job_ids) -> int:
         """Tell the owner of each just-interrupted cron job that its run died.
@@ -12166,6 +12260,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     exc,
                 )
             await self._cleanup_agent_resources_off_loop(agent, context=context)
+
+        self._track_deferred_agent_worker(future, agent)
 
         task = asyncio.create_task(_cleanup_when_done())
         tasks = getattr(self, "_deferred_agent_cleanup_tasks", None)
@@ -16405,6 +16501,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     "active_agents": self._running_agent_count(),
                     "active_cron_jobs": self._active_cron_job_count(),
                     "active_api_runs": self._active_api_run_count(),
+                    "active_deferred_agent_workers": getattr(
+                        self,
+                        "_active_deferred_agent_worker_count",
+                        lambda: 0,
+                    )(),
                     "restart_drain_timeout": self._restart_drain_timeout,
                     "watchdog_delay_s": resolve_shutdown_watchdog_delay(
                         self._restart_drain_timeout
@@ -16431,6 +16532,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _watchdog_done.set()
 
         async def _stop_impl_body(_kill_tool_subprocesses, _stop_started_at_box) -> None:
+            # Shutdown-path tests and third-party runner doubles may only
+            # implement the older drain-count surface.
+            _deferred_worker_count = getattr(
+                self,
+                "_active_deferred_agent_worker_count",
+                lambda: 0,
+            )
             logger.info(
                 "Stopping gateway%s...",
                 " for restart" if self._restart_requested else "",
@@ -16496,6 +16604,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             _cron_at_start = self._active_cron_job_count()
             _api_at_start = self._active_api_run_count()
+            _deferred_at_start = _deferred_worker_count()
             # In-flight cron work gets its own floor, clamped to the watchdog
             # leash we're already running under so the extra wait can never
             # cost us the post-drain cleanup window (#82161).
@@ -16530,7 +16639,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "Shutdown phase: drain done at +%.2fs (drain took %.2fs, "
                 "timed_out=%s, active_at_start=%d, active_now=%d, "
                 "cron_at_start=%d, cron_now=%d, "
-                "api_at_start=%d, api_now=%d)",
+                "api_at_start=%d, api_now=%d, "
+                "deferred_at_start=%d, deferred_now=%d)",
                 _phase_elapsed(),
                 _drain_elapsed,
                 timed_out,
@@ -16540,6 +16650,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 self._active_cron_job_count(),
                 _api_at_start,
                 self._active_api_run_count(),
+                _deferred_at_start,
+                _deferred_worker_count(),
             )
 
             if not timed_out:
@@ -16559,12 +16671,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if timed_out:
                 logger.warning(
                     "Gateway drain timed out after %.1fs with %d active agent(s), "
-                    "%d in-flight cron job(s), and %d api_server run(s); "
+                    "%d in-flight cron job(s), %d api_server run(s), and "
+                    "%d deferred agent worker(s); "
                     "interrupting remaining work.",
                     _drain_elapsed,
                     self._running_agent_count(),
                     self._active_cron_job_count(),
                     self._active_api_run_count(),
+                    _deferred_worker_count(),
                 )
                 # Mark forcibly-interrupted sessions as resume_pending BEFORE
                 # interrupting the agents.  This preserves each session's
@@ -16619,7 +16733,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # to stop gets its tool subprocesses killed below before it can
                 # unwind — the exact amputation this interrupt exists to avoid.
                 while (
-                    self._running_agents or self._active_api_run_count()
+                    self._running_agents
+                    or self._active_api_run_count()
+                    or _deferred_worker_count()
                 ) and asyncio.get_running_loop().time() < interrupt_deadline:
                     self._update_runtime_status("draining")
                     await asyncio.sleep(0.1)
@@ -16634,7 +16750,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # at settle-loop exit, re-signal so a late-materializing
                 # agent gets a cooperative interrupt instead of going
                 # straight to the tool-subprocess kill.
-                if self._running_agents or self._active_api_run_count():
+                if (
+                    self._running_agents
+                    or self._active_api_run_count()
+                    or _deferred_worker_count()
+                ):
                     self._interrupt_running_agents(
                         _INTERRUPT_REASON_GATEWAY_RESTART
                         if self._restart_requested
@@ -16806,58 +16926,115 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             except Exception as _e:
                 logger.debug("shutdown_cached_clients error: %s", _e)
 
-            # Close SQLite session DBs so the WAL write lock is released.
-            # Without this, --replace and similar restart flows leave the
-            # old gateway's connection holding the WAL lock until Python
-            # actually exits — causing 'database is locked' errors when
-            # the new gateway tries to open the same file.
-            # ``self`` holds the DB at ``_session_db`` (an AsyncSessionDB facade);
-            # unwrap to the sync handle. ``session_store`` holds it at ``_db``.
-            _self_db = getattr(self, "_session_db", None)
-            _self_db = getattr(_self_db, "_db", _self_db)
-            for _db in (_self_db, getattr(getattr(self, "session_store", None), "_db", None)):
-                if _db is None or not hasattr(_db, "close"):
-                    continue
-                try:
-                    _db.close()
-                except Exception as _e:
-                    logger.debug("SessionDB close error: %s", _e)
-            # A multiplexed session_store caches one SessionDB per profile
-            # path (#88532); reading ``_db`` above only resolved the handle
-            # for the shutdown task's own (root) scope. Sweep the rest so
-            # secondary profiles' WAL locks are released before --replace
-            # brings a new gateway up on the same files.
-            _sweep = getattr(
-                getattr(self, "session_store", None), "close_all_db_handles", None
+            # Quiesce the gateway thread pool BEFORE the session databases
+            # are closed.  This used to run *after* the close block below,
+            # which left two holes:
+            #
+            #   (a) `_executor_closing` was still False during the close, so
+            #       any coroutine reaching `_run_in_executor_with_context`
+            #       minted a brand-new pool and ran more blocking DB work
+            #       against handles that had just been closed;
+            #   (b) cancelling `self._background_tasks` above does not stop a
+            #       `run_in_executor` future that already started — the task
+            #       dies, the worker thread keeps writing.
+            #
+            # Either way a write lands after `SessionDB.close()`, which has
+            # already checkpointed the WAL and let SQLite unlink the sidecar.
+            # The late write silently reopens the handle (#94736) and mints a
+            # fresh WAL generation behind that checkpoint, so teardown
+            # checkpoints the same file a second time from a connection the
+            # shutdown log never accounts for — the close-time page-write
+            # damage in #101093 and the split WAL generation in #101064.
+            #
+            # The wait is bounded and clamped to what is left of the shutdown
+            # watchdog leash (minus a second for the close itself), so a stuck
+            # worker can never cost us the post-close cleanup window (#82161).
+            _exec_quiesce_budget = max(
+                0.0,
+                min(
+                    _EXECUTOR_QUIESCE_TIMEOUT,
+                    resolve_shutdown_watchdog_delay(timeout)
+                    - _phase_elapsed()
+                    - 1.0,
+                ),
             )
-            if _sweep is not None:
-                try:
-                    _sweep()
-                except Exception as _e:
-                    logger.debug("SessionDB handle sweep error: %s", _e)
-            # Same sweep for the runner's own per-profile session_search
-            # handles (slash commands resolve them under profile scopes).
-            try:
-                GatewayRunner.close_all_session_db_handles(self)
-            except Exception as _e:
-                logger.debug("Runner SessionDB handle sweep error: %s", _e)
-            # Final sweep: close any shared SessionDB instances still held by
-            # the process-wide registry (in-process tools, cron, mirror, etc.
-            # that opened via get_shared_session_db but weren't released by
-            # the sweeps above).  This is the safety net that guarantees no
-            # WAL write lock survives past gateway shutdown (#90837).
-            try:
-                from hermes_state import close_shared_session_dbs
-                closed = close_shared_session_dbs()
-                if closed:
-                    logger.debug("Closed %d shared SessionDB instance(s) at shutdown", closed)
-            except Exception as _e:
-                logger.debug("Shared SessionDB close error: %s", _e)
-            GatewayRunner._shutdown_executor(self)
-            logger.info(
-                "Shutdown phase: SessionDB close done at +%.2fs",
-                _phase_elapsed(),
+            _exec_live = GatewayRunner._shutdown_executor(
+                self, drain_timeout=_exec_quiesce_budget
             )
+            if _exec_live:
+                # A live worker can still be mid-write against a SessionDB
+                # handle. Checkpointing/closing it now is exactly the
+                # sequence that produced the wrong-page-number corruption in
+                # #101093, so the close path below is skipped entirely
+                # rather than raced — the handle is left open for SQLite to
+                # recover from its own WAL on the next open, which is a
+                # transient "database is locked" on an immediate --replace
+                # at worst, not a corrupt file.
+                logger.warning(
+                    "Shutdown phase: %d executor worker(s) still running after "
+                    "a %.2fs quiesce — skipping the SessionDB close/checkpoint "
+                    "to avoid racing a live write (#101093); handles are left "
+                    "open for SQLite to recover on next open",
+                    _exec_live,
+                    _exec_quiesce_budget,
+                )
+            else:
+                logger.info(
+                    "Shutdown phase: executor quiesced at +%.2fs",
+                    _phase_elapsed(),
+                )
+
+                # Close SQLite session DBs so the WAL write lock is released.
+                # Without this, --replace and similar restart flows leave the
+                # old gateway's connection holding the WAL lock until Python
+                # actually exits — causing 'database is locked' errors when
+                # the new gateway tries to open the same file.
+                # ``self`` holds the DB at ``_session_db`` (an AsyncSessionDB facade);
+                # unwrap to the sync handle. ``session_store`` holds it at ``_db``.
+                _self_db = getattr(self, "_session_db", None)
+                _self_db = getattr(_self_db, "_db", _self_db)
+                for _db in (_self_db, getattr(getattr(self, "session_store", None), "_db", None)):
+                    if _db is None or not hasattr(_db, "close"):
+                        continue
+                    try:
+                        _db.close()
+                    except Exception as _e:
+                        logger.debug("SessionDB close error: %s", _e)
+                # A multiplexed session_store caches one SessionDB per profile
+                # path (#88532); reading ``_db`` above only resolved the handle
+                # for the shutdown task's own (root) scope. Sweep the rest so
+                # secondary profiles' WAL locks are released before --replace
+                # brings a new gateway up on the same files.
+                _sweep = getattr(
+                    getattr(self, "session_store", None), "close_all_db_handles", None
+                )
+                if _sweep is not None:
+                    try:
+                        _sweep()
+                    except Exception as _e:
+                        logger.debug("SessionDB handle sweep error: %s", _e)
+                # Same sweep for the runner's own per-profile session_search
+                # handles (slash commands resolve them under profile scopes).
+                try:
+                    GatewayRunner.close_all_session_db_handles(self)
+                except Exception as _e:
+                    logger.debug("Runner SessionDB handle sweep error: %s", _e)
+                # Final sweep: close any shared SessionDB instances still held by
+                # the process-wide registry (in-process tools, cron, mirror, etc.
+                # that opened via get_shared_session_db but weren't released by
+                # the sweeps above).  This is the safety net that guarantees no
+                # WAL write lock survives past gateway shutdown (#90837).
+                try:
+                    from hermes_state import close_shared_session_dbs
+                    closed = close_shared_session_dbs()
+                    if closed:
+                        logger.debug("Closed %d shared SessionDB instance(s) at shutdown", closed)
+                except Exception as _e:
+                    logger.debug("Shared SessionDB close error: %s", _e)
+                logger.info(
+                    "Shutdown phase: SessionDB close done at +%.2fs",
+                    _phase_elapsed(),
+                )
 
             from gateway.status import remove_pid_file, release_gateway_runtime_lock
             remove_pid_file()
@@ -27415,11 +27592,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 self._executor = executor
             return executor
 
-    def _shutdown_executor(self) -> None:
-        """Stop the gateway-owned executor without touching the loop default."""
+    def _shutdown_executor(self, drain_timeout: float = 0.0) -> int:
+        """Stop the gateway-owned executor without touching the loop default.
+
+        Returns the number of worker threads still running when this returns.
+        With the default ``drain_timeout`` of 0 this is the historical
+        fire-and-forget teardown; shutdown passes a bounded budget so blocking
+        DB work cannot outlive ``SessionDB.close()`` (see ``_stop_impl``).
+
+        ``cancel_futures`` only drops work that has not started yet, and a
+        cancelled ``run_in_executor`` awaitable does not stop the thread behind
+        it, so the running futures have to be waited on explicitly.
+        """
         lock = getattr(self, "_executor_lock", None)
         if lock is None:
-            return
+            return 0
 
         with lock:
             self._executor_closing = True
@@ -27427,12 +27614,24 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             self._executor = None
 
         if executor is None:
-            return
+            return 0
 
         try:
             executor.shutdown(wait=False, cancel_futures=True)
         except TypeError:
             executor.shutdown(wait=False)
+
+        # ThreadPoolExecutor.shutdown() has no timeout, so join the worker
+        # threads directly.  `_threads` is absent on the doubles some tests
+        # pass in, which just means no wait.
+        workers = list(getattr(executor, "_threads", None) or ())
+        deadline = time.monotonic() + max(float(drain_timeout or 0.0), 0.0)
+        for worker in workers:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            worker.join(remaining)
+        return sum(1 for worker in workers if worker.is_alive())
 
     def _decide_image_input_mode(
         self,
