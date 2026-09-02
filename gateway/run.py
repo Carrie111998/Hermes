@@ -5042,11 +5042,11 @@ class TurnRunner:
             _code_block_full = f"{_block_header}```\n{_cmd_full}\n```"
             # Single-line, capped preview for non-verbose modes.
             _pl = get_tool_preview_max_len()
-            _cap = _pl if _pl > 0 else 40
+            _cap: int | None = _pl if _pl > 0 else None
             _lines = _cmd_full.splitlines()
             _cmd_short = _lines[0] if _lines else _cmd_full
             _multiline = len(_lines) > 1
-            if len(_cmd_short) > _cap:
+            if _cap is not None and len(_cmd_short) > _cap:
                 _cmd_short = _cmd_short[:_cap - 3] + "..."
             elif _multiline:
                 _cmd_short = _cmd_short + " ..."
@@ -5093,12 +5093,11 @@ class TurnRunner:
                 verb_drops_preview,
             )
             _pl = get_tool_preview_max_len()
-            _cap = _pl if _pl > 0 else 40
             _prepared_preview = prepare_tool_preview(
                 tool_name,
                 args,
                 fallback=preview,
-                max_len=_cap,
+                max_len=_pl,
             )
             if _progress_adapter is not None:
                 preview = _progress_adapter.format_tool_preview(_prepared_preview)
