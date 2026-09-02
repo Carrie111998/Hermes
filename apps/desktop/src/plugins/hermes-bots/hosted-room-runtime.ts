@@ -63,6 +63,11 @@ import {
   surfaceHostedRoomCommandFailure
 } from './hosted-room-command-failures'
 import {
+  createHostedRoomControlEnrollment,
+  type HostedRoomServerMember,
+  type HostedRoomServerState
+} from './hosted-room-control-enrollment'
+import {
   mutateHostedRoomOutbox,
   recoverHostedRoomOutbox,
   resetHostedRoomOutboxLocksForTests,
@@ -89,11 +94,7 @@ const hostedRoomPollGenerations = new Map<string, number>()
 const hostedRoomMutationGenerations = new Map<string, number>()
 const hostedRoomLocallyDeleted = new Set<string>()
 const hostedRoomInventoriedConnections = new Set<string>()
-const hostedRoomControlEnrolled = new Set<string>()
-const hostedRoomControlPending = new Map<string, number>()
-const hostedRoomControlRetryAfter = new Map<string, number>()
-let hostedRoomControlQueue: Promise<void> = Promise.resolve()
-let hostedRoomControlGeneration = 0
+const hostedRoomControlEnrollment = createHostedRoomControlEnrollment(requestHostedConnection)
 let hostedRoomSyncTimer: ReturnType<typeof setTimeout> | null = null
 let hostedRoomSyncRunning = false
 let hostedRoomSyncDisposed = true
@@ -214,33 +215,8 @@ interface AutonomousHostedRoomCreateInput {
   roomId: string
 }
 
-interface HostedRoomServerMember {
-  display_name?: unknown
-  handle?: unknown
-  member_id?: unknown
-  profile?: unknown
-  target?: unknown
-}
-
-interface HostedRoomServerState {
-  authority_epoch?: unknown
-  authority_gateway_id?: unknown
-  disbanded_at?: unknown
-  latest_seq?: unknown
-  members?: unknown
-  name?: unknown
-  room_id?: unknown
-}
-
 function record(value: unknown): Record<string, unknown> | null {
   return value && typeof value === 'object' && !Array.isArray(value) ? (value as Record<string, unknown>) : null
-}
-
-async function roomControlRequestId(roomId: string, memberId: string): Promise<string> {
-  const material = new TextEncoder().encode(`room-control-v1\0${roomId}\0${memberId}`)
-  const digest = await globalThis.crypto.subtle.digest('SHA-256', material)
-
-  return `room-control:${Array.from(new Uint8Array(digest), byte => byte.toString(16).padStart(2, '0')).join('')}`
 }
 
 function activeConnectionId() {
@@ -400,139 +376,6 @@ function hostedRoomContinuityMode(room: HostedRoomServerState) {
   return (Array.isArray(room?.members) ? room.members : []).some(raw => record(record(raw)?.target)?.kind === 'peer')
     ? ('distributed' as const)
     : ('gateway' as const)
-}
-
-async function ensureReciprocalRoomControls(
-  room: HostedRoomServerState,
-  homeRoute: ProfileRoute,
-  routes: Record<string, ProfileRoute>,
-  capabilities: Record<string, HostedRoomCapability>,
-  generation: number
-) {
-  const isCurrent = () => !hostedRoomSyncDisposed && generation === hostedRoomControlGeneration
-  const roomId = String(room.room_id || '')
-  const authorityEpoch = Number(room.authority_epoch || 0)
-  const homeConnectionId = String(homeRoute.connectionId || '')
-
-  if (
-    !isCurrent() ||
-    !roomId ||
-    !Number.isSafeInteger(authorityEpoch) ||
-    authorityEpoch < 1 ||
-    capabilities[homeConnectionId]?.reciprocalControl !== true
-  ) {
-    return
-  }
-
-  for (const raw of Array.isArray(room.members) ? room.members : []) {
-    const member = (record(raw) || {}) as HostedRoomServerMember
-    const target = record(member.target)
-
-    if (target?.kind !== 'peer') {
-      continue
-    }
-
-    const memberId = String(member.member_id || '')
-    const targetProfile = String(member.profile || member.member_id || 'default')
-    const targetAuthority = String(target.installation_id || target.peer_id || '')
-
-    const peerConnectionId = Object.entries(capabilities).find(
-      ([, capability]) => capability.authorityId === targetAuthority
-    )?.[0]
-
-    const peerRoute = peerConnectionId ? routes[peerConnectionId] : null
-    const key = `${roomId}:${authorityEpoch}:${memberId}:${targetAuthority}`
-
-    if (
-      !memberId ||
-      !targetAuthority ||
-      !peerConnectionId ||
-      !peerRoute ||
-      capabilities[peerConnectionId]?.reciprocalControl !== true ||
-      hostedRoomControlEnrolled.has(key) ||
-      Number(hostedRoomControlRetryAfter.get(key) || 0) > Date.now()
-    ) {
-      continue
-    }
-
-    try {
-      const control = record(
-        await requestHostedConnection(homeRoute, 'groups.control.invite', {
-          room_id: roomId,
-          member_id: memberId,
-          caller_install_id: targetAuthority,
-          request_id: await roomControlRequestId(roomId, memberId)
-        })
-      )
-
-      if (!isCurrent()) {
-        return
-      }
-
-      if (
-        !control?.control_token ||
-        !control.home_url ||
-        !control.authority_gateway_id ||
-        !control.authority_epoch ||
-        !control.room_name ||
-        !control.member_count ||
-        !control.expires_at
-      ) {
-        throw new Error('Group Chat control invitation is incomplete.')
-      }
-
-      await requestHostedConnection(peerRoute, 'groups.control.register', {
-        room_id: roomId,
-        member_id: memberId,
-        authority_gateway_id: control.authority_gateway_id,
-        authority_epoch: control.authority_epoch,
-        room_name: control.room_name,
-        member_count: control.member_count,
-        profile: targetProfile,
-        home_url: control.home_url,
-        control_token: control.control_token,
-        expires_at: control.expires_at
-      })
-
-      if (!isCurrent()) {
-        return
-      }
-      hostedRoomControlEnrolled.add(key)
-      hostedRoomControlRetryAfter.delete(key)
-    } catch {
-      if (isCurrent()) {
-        hostedRoomControlRetryAfter.set(key, Date.now() + 30_000)
-      }
-    }
-  }
-}
-
-function scheduleReciprocalRoomControls(
-  room: HostedRoomServerState,
-  homeRoute: ProfileRoute,
-  routes: Record<string, ProfileRoute>,
-  capabilities: Record<string, HostedRoomCapability>
-) {
-  const key = `${String(room.room_id || '')}:${Number(room.authority_epoch || 0)}`
-
-  if (hostedRoomControlPending.has(key)) {
-    return
-  }
-
-  const generation = hostedRoomControlGeneration
-  hostedRoomControlPending.set(key, generation)
-  hostedRoomControlQueue = hostedRoomControlQueue
-    .then(async () => {
-      if (!hostedRoomSyncDisposed && generation === hostedRoomControlGeneration) {
-        await ensureReciprocalRoomControls(room, homeRoute, routes, capabilities, generation)
-      }
-    })
-    .catch(() => undefined)
-    .finally(() => {
-      if (hostedRoomControlPending.get(key) === generation) {
-        hostedRoomControlPending.delete(key)
-      }
-    })
 }
 
 function markHostedConnectionUnavailable(connectionId: string, unsupported = false) {
@@ -847,7 +690,7 @@ export async function refreshHostedRooms() {
           continue
         }
 
-        scheduleReciprocalRoomControls(listedRoom, route, routesByConnection, capabilities)
+        hostedRoomControlEnrollment.schedule(listedRoom, route, routesByConnection, capabilities)
 
         const existingEntry = Object.entries($groupChats.get()).find(
           ([, room]) => String(room?.roomId || '') === roomId
@@ -1689,6 +1532,7 @@ export async function createAutonomousHostedGroupChat({
 
   const hostedMembers: Array<Record<string, unknown>> = []
   const peerRegistrations: Array<Record<string, unknown>> = []
+  const controls = hostedRoomControlEnrollment.forCreation(homeRoute, roomId, probe.capabilities)
 
   try {
     await addHostedRoomCleanup({
@@ -1773,10 +1617,8 @@ export async function createAutonomousHostedGroupChat({
           capability_digest: catalog.catalog_digest
         }
       })
+      controls.add(memberId, item.member, connectionId, catalog.installation_id, invitation.target_profile)
       peerRegistrations.push({
-        member: item.member,
-        connection_id: connectionId,
-        caller_install_id: catalog.installation_id,
         room_id: roomId,
         member_id: memberId,
         target_url: scopedTargetUrl,
@@ -1794,45 +1636,7 @@ export async function createAutonomousHostedGroupChat({
     })
 
     for (const registration of peerRegistrations) {
-      const member = registration.member as GroupMember
-      const homeControl = probe.capabilities[homeConnectionId]?.reciprocalControl === true
-      const peerControl = probe.capabilities[String(registration.connection_id || '')]?.reciprocalControl === true
-
-      if (homeControl && peerControl) {
-        const control = record(
-          await requestHostedConnection(homeRoute, 'groups.control.invite', {
-            room_id: roomId,
-            member_id: registration.member_id,
-            caller_install_id: registration.caller_install_id,
-            request_id: await roomControlRequestId(roomId, String(registration.member_id))
-          })
-        )
-
-        if (
-          !control?.control_token ||
-          !control.home_url ||
-          !control.authority_gateway_id ||
-          !control.authority_epoch ||
-          !control.room_name ||
-          !control.member_count ||
-          !control.expires_at
-        ) {
-          throw new Error('One selected Bot could not prepare remote Group Chat control.')
-        }
-
-        await requestForBot(member, 'groups.control.register', {
-          room_id: roomId,
-          member_id: registration.member_id,
-          authority_gateway_id: control.authority_gateway_id,
-          authority_epoch: control.authority_epoch,
-          room_name: control.room_name,
-          member_count: control.member_count,
-          profile: registration.target_profile,
-          home_url: control.home_url,
-          control_token: control.control_token,
-          expires_at: control.expires_at
-        })
-      }
+      await controls.enroll(registration.member_id)
 
       await requestHostedConnection(homeRoute, 'groups.peer.register', {
         room_id: registration.room_id,
@@ -1851,14 +1655,7 @@ export async function createAutonomousHostedGroupChat({
       continuityMode: plan.kind === 'multi-gateway' ? ('distributed' as const) : ('gateway' as const)
     }
   } catch (error) {
-    await Promise.allSettled(
-      peerRegistrations.map(registration =>
-        requestForBot(registration.member as GroupMember, 'groups.control.revoke', {
-          room_id: roomId,
-          member_id: registration.member_id
-        })
-      )
-    )
+    await controls.revoke()
     await armHostedRoomCleanup(roomId).catch(() => undefined)
     await dispatchHostedRoomCleanup().catch(() => undefined)
 
@@ -2137,11 +1934,7 @@ export async function startHostedRoomRuntime(storage: PluginContext['storage'], 
   hostedRoomMutationGenerations.clear()
   hostedRoomLocallyDeleted.clear()
   hostedRoomInventoriedConnections.clear()
-  hostedRoomControlGeneration += 1
-  hostedRoomControlEnrolled.clear()
-  hostedRoomControlPending.clear()
-  hostedRoomControlRetryAfter.clear()
-  hostedRoomControlQueue = Promise.resolve()
+  hostedRoomControlEnrollment.reset(true)
   let persisted = createHostedRoomOutbox()
 
   try {
@@ -2175,7 +1968,7 @@ export function stopHostedRoomRuntime() {
   hostedRoomLifecycleGeneration += 1
   hostedRoomSyncDisposed = true
   stopHostedRoomCleanup()
-  hostedRoomControlGeneration += 1
+  hostedRoomControlEnrollment.reset(false)
   hostedRoomStorage = null
   hostedRoomHooks = {}
   hostedRoomPollCache.clear()
@@ -2183,10 +1976,6 @@ export function stopHostedRoomRuntime() {
   hostedRoomMutationGenerations.clear()
   hostedRoomLocallyDeleted.clear()
   hostedRoomInventoriedConnections.clear()
-  hostedRoomControlEnrolled.clear()
-  hostedRoomControlPending.clear()
-  hostedRoomControlRetryAfter.clear()
-  hostedRoomControlQueue = Promise.resolve()
   hostedUnsupportedUntil.clear()
 
   if (hostedRoomSyncTimer) {
