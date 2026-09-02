@@ -2941,6 +2941,150 @@ def _apply_tui_python_env(env: dict) -> None:
         env["HERMES_PYTHON"] = sys.executable
 
 
+def _run_tui_under_pty(argv, cwd, env) -> int:
+    """Run the TUI child on a PTY so it renders at the true tmux pane size.
+
+    The Python wrapper is the tmux pane's foreground process, but the Ink
+    child renders on the PTY slave. tmux keys pane size to the pane PID
+    (== our pid), so a poller forwards pane resizes — grow AND shrink — to
+    the PTY. The PTY master is pumped to our stdout and our (raw-mode) stdin
+    into the master, so the child renders and reads keys as on a real tty
+    (#88096 review: no unread master buffer, no forced resize, no global
+    SIGWINCH handler, prompt poller teardown).
+    """
+    import errno
+    import fcntl
+    import ptyprocess
+    import select
+    import struct
+    import termios
+    import threading
+    import tty
+
+    def _outer_tty_size():
+        # tmux resizes the pane tty itself; reading OUR ctty winsize needs no
+        # subprocess and works no matter how deeply hermes is nested under
+        # shells in the pane (unlike pane_pid matching).
+        for stream in (sys.stdin, sys.stdout):
+            try:
+                fd = stream.fileno()
+            except (AttributeError, ValueError, OSError):
+                continue
+            try:
+                buf = bytearray(4)  # struct winsize { rows: u16, cols: u16 }
+                fcntl.ioctl(fd, termios.TIOCGWINSZ, buf)
+                rows, cols = struct.unpack("HH", bytes(buf))
+                if rows > 0 and cols > 0:
+                    return cols, rows
+            except OSError:
+                continue
+        return None
+
+    start_size = _outer_tty_size() or (120, 40)
+    proc = ptyprocess.PtyProcess.spawn(
+        argv, cwd=str(cwd), env=env,
+        dimensions=(start_size[1], start_size[0]),
+    )
+    stop = threading.Event()
+    stdin_fd = sys.stdin.fileno()
+
+    saved_attrs = termios.tcgetattr(stdin_fd)
+    try:
+        # The child owns the PTY slave's termios; the OUTER tty must go raw or
+        # its line discipline line-buffers/echoes the keys we forward.
+        tty.setraw(stdin_fd)
+
+        def _pump_stdin():
+            while not stop.is_set():
+                try:
+                    r, _, _ = select.select([stdin_fd], [], [], 0.2)
+                except (OSError, ValueError):
+                    return
+                if not r:
+                    continue
+                try:
+                    data = os.read(stdin_fd, 4096)
+                except OSError:
+                    return
+                if not data:
+                    return
+                try:
+                    os.write(proc.fd, data)
+                except OSError:
+                    return
+
+        def _poll_tty_size():
+            last = start_size
+            first_failure_logged = False
+            while not stop.is_set():
+                try:
+                    size = _outer_tty_size()
+                    if size and size != last:
+                        # Forward grow AND shrink; the outer tty is the truth.
+                        proc.setwinsize(size[1], size[0])
+                        last = size
+                except Exception as exc:
+                    if not first_failure_logged:
+                        logger.debug("tty size poll failed: %s", exc)
+                        first_failure_logged = True
+                stop.wait(0.3)
+
+        in_thread = threading.Thread(
+            target=_pump_stdin, daemon=True, name="tui-pty-stdin")
+        poll_thread = threading.Thread(
+            target=_poll_tty_size, daemon=True, name="tui-pty-resize")
+        in_thread.start()
+        poll_thread.start()
+
+        try:
+            while proc.isalive():
+                try:
+                    r, _, _ = select.select([proc.fd], [], [], 0.2)
+                except InterruptedError:
+                    continue
+                if not r:
+                    continue
+                try:
+                    data = os.read(proc.fd, 65536)
+                except OSError as exc:
+                    if exc.errno == errno.EIO:
+                        break
+                    raise
+                if not data:
+                    break
+                sys.stdout.buffer.write(data)
+                sys.stdout.buffer.flush()
+            # Final drain: the child may have written just before exiting.
+            try:
+                r, _, _ = select.select([proc.fd], [], [], 0.1)
+                if r:
+                    data = os.read(proc.fd, 65536)
+                    if data:
+                        sys.stdout.buffer.write(data)
+                        sys.stdout.buffer.flush()
+            except OSError:
+                pass
+        finally:
+            stop.set()
+            in_thread.join(timeout=1)
+            poll_thread.join(timeout=1)
+    except BaseException:
+        # We own the child's only tty pipe; on any unwinding (SIGINT from
+        # outside the pane, errors) don't leave an orphaned Ink process.
+        try:
+            proc.terminate(force=True)
+        except Exception:
+            pass
+        raise
+    finally:
+        termios.tcsetattr(stdin_fd, termios.TCSADRAIN, saved_attrs)
+
+    code = proc.wait()
+    if code is None:
+        code = 128 + (proc.signalstatus or 0)
+    return int(code)
+
+
 def _launch_tui(
     resume_session_id: Optional[str] = None,
     tui_dev: bool = False,
@@ -2962,11 +3106,15 @@ def _launch_tui(
     tui_dir = PROJECT_ROOT / "ui-tui"
 
     import tempfile
+    import os
+    import subprocess
+    import signal
 
     # TUI child is a hermes process: propagate the profile-home contract via
     # the single factory; keep secrets (the TUI/agent needs provider creds).
     from tools.environments.local import build_subprocess_env
     env = build_subprocess_env(scrub_secrets=False, inherit_profile_home=True)
+
     try:
         from hermes_cli.config import apply_terminal_config_to_env
         apply_terminal_config_to_env(env=env)
@@ -3086,15 +3234,22 @@ def _launch_tui(
         env["HERMES_TUI_RESUME"] = resume_session_id
 
     argv, cwd = _make_tui_argv(tui_dir, tui_dev)
-    code: Optional[int] = None
     try:
-        try:
+        if sys.stdin.isatty():
+            # PTY: the TUI renders at the true pane size and gets resize
+            # events (see _run_tui_under_pty — no forced startup resize,
+            # grow+shrink forwarding with prompt poller teardown, no
+            # global SIGWINCH handler).
+            code = _run_tui_under_pty(argv, cwd, env)
+        else:
+            # No controlling tty (pipes/CI): nothing to forward and
+            # ptyprocess would fail on tcgetattr; run plain.
             code = subprocess.call(argv, cwd=str(cwd), env=env)
-        except KeyboardInterrupt:
-            code = 130
 
         if code in {0, 130}:
             _print_tui_exit_summary(resume_session_id, active_session_file)
+    except KeyboardInterrupt:
+        code = 130
     finally:
         try:
             os.unlink(active_session_file)
