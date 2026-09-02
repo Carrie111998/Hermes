@@ -495,7 +495,10 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     # per-session, so cache-safe either way.
     _has_skill_view = "skill_view" in (agent.valid_tool_names or set())
     _help_guidance_slot = len(stable_parts)
-    stable_parts.append(HERMES_AGENT_HELP_GUIDANCE_NO_SKILLS)
+    if getattr(agent, "_help_guidance", True):
+        stable_parts.append(HERMES_AGENT_HELP_GUIDANCE_NO_SKILLS)
+    else:
+        stable_parts.append("")  # preserve slot index for downstream code
 
     # Universal task-completion / no-fabrication guidance.  Applied to ALL
     # models regardless of tool_use_enforcement gating — the failure modes
@@ -653,7 +656,8 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     # rendered index line keeps this a pure string check — no second
     # filesystem scan, and it inherits the index cache's stability).
     if _has_skill_view and "- hermes-agent:" in skills_prompt:
-        stable_parts[_help_guidance_slot] = HERMES_AGENT_HELP_GUIDANCE
+        if getattr(agent, "_help_guidance", True):
+            stable_parts[_help_guidance_slot] = HERMES_AGENT_HELP_GUIDANCE
 
     # Alibaba Coding Plan API always returns "glm-4.7" as model name regardless
     # of the requested model. Inject explicit model identity into the system prompt
@@ -672,9 +676,11 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     # Environment hints (WSL, Termux, etc.) — tell the agent about the
     # execution environment so it can translate paths and adapt behavior.
     # Stable for the lifetime of the process.
-    _env_hints = _r.build_environment_hints()
-    if _env_hints:
-        stable_parts.append(_env_hints)
+    # Gated by config.yaml ``agent.environment_hints`` (default True).
+    if getattr(agent, "_environment_hints", True):
+        _env_hints = _r.build_environment_hints()
+        if _env_hints:
+            stable_parts.append(_env_hints)
 
     # Coding posture (base Hermes, any interactive coding surface in a code
     # workspace — see agent/coding_context.py). Keep the operating brief in
@@ -796,14 +802,15 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     else:
         _home_str = _root_str = str(get_hermes_home())
     if active_profile == "default":
-        post_workspace_parts.append(
-            "Active Hermes profile: default. Other profiles (if any) live "
-            "under " + _root_str + "/profiles/<name>/. Each profile has its own "
-            "skills/, plugins/, cron/, and memories/ that affect a different "
-            "session than this one. Do not modify another profile's "
-            "skills/plugins/cron/memories unless the user explicitly directs "
-            "you to."
-        )
+        if getattr(agent, "_profile_hint", True):
+            post_workspace_parts.append(
+                "Active Hermes profile: default. Other profiles (if any) live "
+                "under " + _root_str + "/profiles/<name>/. Each profile has its own "
+                "skills/, plugins/, cron/, and memories/ that affect a different "
+                "session than this one. Do not modify another profile's "
+                "skills/plugins/cron/memories unless the user explicitly directs "
+                "you to."
+            )
     else:
         # A non-default name is only ever returned when the resolved home is
         # ALREADY <root>/profiles/<name> — that is exactly how both
@@ -812,17 +819,18 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
         # /profiles/<name> again doubled it (#72894). The default profile's
         # data sits at the ROOT (get_default_hermes_root()), which in ambient
         # profile mode is NOT get_hermes_home().
-        profile_home = _home_str
-        default_root = get_default_hermes_root()
-        post_workspace_parts.append(
-            f"Active Hermes profile: {active_profile}. This session reads "
-            f"and writes {profile_home}/. The default "
-            f"profile's data lives at {default_root}/skills/, {default_root}/plugins/, "
-            f"{default_root}/cron/, {default_root}/memories/ — those belong to a "
-            f"different session run from a different shell. Do NOT modify "
-            f"another profile's skills/plugins/cron/memories unless the user "
-            f"explicitly directs you to."
-        )
+        if getattr(agent, "_profile_hint", True):
+            profile_home = _home_str
+            default_root = get_default_hermes_root()
+            post_workspace_parts.append(
+                f"Active Hermes profile: {active_profile}. This session reads "
+                f"and writes {profile_home}/. The default "
+                f"profile's data lives at {default_root}/skills/, {default_root}/plugins/, "
+                f"{default_root}/cron/, {default_root}/memories/ — those belong to a "
+                f"different session run from a different shell. Do NOT modify "
+                f"another profile's skills/plugins/cron/memories unless the user "
+                f"explicitly directs you to."
+            )
 
     platform_key = (agent.platform or "").lower().strip()
     # Resolve the built-in/plugin default hint for this platform, then apply
@@ -978,53 +986,55 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     # ``get_timezone()`` returns None when no timezone is configured, in which
     # case we fall back to the abbreviation of the server-local (still tz-aware)
     # time.
-    _tz = _hermes_tz()
-    _zone_bits = []
-    _iana = getattr(_tz, "key", None)
-    if _iana:
-        _zone_bits.append(_iana)
-    _abbrev = now.strftime("%Z")
-    if _abbrev and _abbrev != _iana:
-        _zone_bits.append(_abbrev)
-    _offset = now.strftime("%z")
-    if _offset:  # '-0400' -> 'UTC-04:00'
-        _zone_bits.append(f"UTC{_offset[:3]}:{_offset[3:]}")
-    _zone_suffix = f" ({', '.join(_zone_bits)})" if _zone_bits else ""
-    _start = _session_start_like(agent, now)
-    timestamp_line = (
-        f"Conversation started: {_start.strftime('%A, %B %d, %Y')}{_zone_suffix}"
-    )
-    # Second line (maintainer design, salvaging #96224's anchor): long-lived
-    # sessions — Bot Mode forever-chats, messenger channels people never
-    # close — span many days and many compactions. A lone birth date leads
-    # the model to believe it is still living in that old day. The prompt is
-    # rebuilt at every compaction boundary, so stamp the rebuild day too:
-    # 'started' stays anchored and byte-stable, 'as of' refreshes exactly
-    # when the cache prefix is already being invalidated (compaction), so
-    # the added line costs no extra cache churn. Same-day sessions skip the
-    # second line entirely — nothing to correct, and the single-line shape
-    # stays byte-identical for the day (prefix-cache safe).
-    if now.strftime("%Y%m%d") != _start.strftime("%Y%m%d"):
-        timestamp_line += (
-            f"\nToday's date (as of the last context rebuild): "
-            f"{now.strftime('%A, %B %d, %Y')} — trust this over the start "
-            f"date for what day it is now; query tools for exact time."
+    # Gated by config.yaml ``agent.timestamp_line`` (default True).
+    if getattr(agent, "_timestamp_line", True):
+        _tz = _hermes_tz()
+        _zone_bits = []
+        _iana = getattr(_tz, "key", None)
+        if _iana:
+            _zone_bits.append(_iana)
+        _abbrev = now.strftime("%Z")
+        if _abbrev and _abbrev != _iana:
+            _zone_bits.append(_abbrev)
+        _offset = now.strftime("%z")
+        if _offset:  # '-0400' -> 'UTC-04:00'
+            _zone_bits.append(f"UTC{_offset[:3]}:{_offset[3:]}")
+        _zone_suffix = f" ({', '.join(_zone_bits)})" if _zone_bits else ""
+        _start = _session_start_like(agent, now)
+        timestamp_line = (
+            f"Conversation started: {_start.strftime('%A, %B %d, %Y')}{_zone_suffix}"
         )
-    # Bot Chat sessions are effectively eternal — a birth date frozen in the
-    # prompt becomes confidently-wrong misinformation within days. Timeless
-    # prompts keep the identity lines but drop the date (the timezone still
-    # rides workspace context; live time comes from the terminal tool).
-    if getattr(agent, "_bot_chat_timeless_prompt", False):
-        timestamp_line = f"Timezone: {', '.join(_zone_bits)}" if _zone_bits else ""
-    if agent.pass_session_id and agent.session_id:
-        timestamp_line += f"\nSession ID: {agent.session_id}"
-    if agent.model:
-        timestamp_line += f"\nModel: {agent.model}"
-    if agent.provider:
-        timestamp_line += f"\nProvider: {agent.provider}"
-    if agent.platform:
-        timestamp_line += f"\nPlatform: {agent.platform}"
-    volatile_parts.append(timestamp_line)
+        # Second line (maintainer design, salvaging #96224's anchor): long-lived
+        # sessions — Bot Mode forever-chats, messenger channels people never
+        # close — span many days and many compactions. A lone birth date leads
+        # the model to believe it is still living in that old day. The prompt is
+        # rebuilt at every compaction boundary, so stamp the rebuild day too:
+        # 'started' stays anchored and byte-stable, 'as of' refreshes exactly
+        # when the cache prefix is already being invalidated (compaction), so
+        # the added line costs no extra cache churn. Same-day sessions skip the
+        # second line entirely — nothing to correct, and the single-line shape
+        # stays byte-identical for the day (prefix-cache safe).
+        if now.strftime("%Y%m%d") != _start.strftime("%Y%m%d"):
+            timestamp_line += (
+                f"\nToday's date (as of the last context rebuild): "
+                f"{now.strftime('%A, %B %d, %Y')} — trust this over the start "
+                f"date for what day it is now; query tools for exact time."
+            )
+        # Bot Chat sessions are effectively eternal — a birth date frozen in the
+        # prompt becomes confidently-wrong misinformation within days. Timeless
+        # prompts keep the identity lines but drop the date (the timezone still
+        # rides workspace context; live time comes from the terminal tool).
+        if getattr(agent, "_bot_chat_timeless_prompt", False):
+            timestamp_line = f"Timezone: {', '.join(_zone_bits)}" if _zone_bits else ""
+        if agent.pass_session_id and agent.session_id:
+            timestamp_line += f"\nSession ID: {agent.session_id}"
+        if agent.model:
+            timestamp_line += f"\nModel: {agent.model}"
+        if agent.provider:
+            timestamp_line += f"\nProvider: {agent.provider}"
+        if agent.platform:
+            timestamp_line += f"\nPlatform: {agent.platform}"
+        volatile_parts.append(timestamp_line)
 
     return {
         "stable":   "\n\n".join(p.strip() for p in stable_parts   if p and p.strip()),

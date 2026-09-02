@@ -2115,6 +2115,15 @@ def init_agent(
     # set this so the gate doesn't depend on write ordering.
     agent._session_title_hint = None
 
+    # System-prompt injection toggles — opt-out for blocks that are
+    # unconditionally injected today.  All default True (zero behavior
+    # change).  Set False to suppress the corresponding block and save
+    # tokens in the cached system prompt.
+    agent._help_guidance = bool(_agent_section.get("help_guidance", True))
+    agent._profile_hint = bool(_agent_section.get("profile_hint", True))
+    agent._timestamp_line = bool(_agent_section.get("timestamp_line", True))
+    agent._environment_hints = bool(_agent_section.get("environment_hints", True))
+
     # Per-platform prompt-hint overrides (config.yaml → platform_hints).
     # Lets an enterprise admin append to or replace Hermes' built-in
     # platform hint for a single messaging platform (e.g. WhatsApp) without

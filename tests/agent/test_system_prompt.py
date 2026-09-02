@@ -763,3 +763,89 @@ class TestConversationStartedTwoLine:
         assert "Conversation started:" not in vol
         assert "as of the last context rebuild" not in vol
 
+
+class TestInjectionToggles:
+    """Verify that the four new ``agent.*`` config toggles suppress their
+    corresponding system-prompt blocks when set to False."""
+
+    def _build(self, **overrides):
+        base = dict(
+            load_soul_identity=False,
+            skip_context_files=False,
+            valid_tool_names=[],
+            _task_completion_guidance=False,
+            _tool_use_enforcement=False,
+            _environment_probe=False,
+            _kanban_worker_guidance="",
+            _memory_store=None,
+            _memory_manager=None,
+            model="test-model",
+            provider="test-provider",
+            platform="cli",
+            pass_session_id=True,
+            session_id="20260101_120000_test",
+            _emit_status=lambda *_a, **_kw: None,
+            _help_guidance=True,
+            _profile_hint=True,
+            _timestamp_line=True,
+            _environment_hints=True,
+            _bot_mode_protocol=False,
+            _parallel_tool_call_guidance=False,
+        )
+        base.update(overrides)
+        return SimpleNamespace(**base)
+
+    def _parts(self, agent):
+        import agent.system_prompt as sp
+        with (
+            patch("run_agent.load_soul_md", return_value=""),
+            patch("run_agent.build_environment_hints", return_value="HOST_HINT"),
+            patch("run_agent.build_context_files_prompt", return_value=""),
+            patch("run_agent.build_skills_system_prompt", return_value=""),
+        ):
+            return sp.build_system_prompt_parts(agent)
+
+    # --- help_guidance ---
+
+    def test_help_guidance_enabled_by_default(self):
+        parts = self._parts(self._build())
+        assert "hermes-agent.nousresearch.com/docs" in parts["stable"]
+
+    def test_help_guidance_disabled(self):
+        parts = self._parts(self._build(_help_guidance=False))
+        assert "hermes-agent.nousresearch.com/docs" not in parts["stable"]
+
+    # --- profile_hint ---
+
+    def test_profile_hint_enabled_by_default(self):
+        parts = self._parts(self._build())
+        full = "\n\n".join(parts[k] for k in ("stable", "context", "volatile"))
+        assert "Active Hermes profile:" in full
+
+    def test_profile_hint_disabled(self):
+        parts = self._parts(self._build(_profile_hint=False))
+        full = "\n\n".join(parts[k] for k in ("stable", "context", "volatile"))
+        assert "Active Hermes profile:" not in full
+
+    # --- timestamp_line ---
+
+    def test_timestamp_line_enabled_by_default(self):
+        parts = self._parts(self._build())
+        assert "Conversation started:" in parts["volatile"]
+
+    def test_timestamp_line_disabled(self):
+        parts = self._parts(self._build(_timestamp_line=False))
+        assert "Conversation started:" not in parts["volatile"]
+        assert "Model:" not in parts["volatile"]
+        assert "Provider:" not in parts["volatile"]
+
+    # --- environment_hints ---
+
+    def test_environment_hints_enabled_by_default(self):
+        parts = self._parts(self._build())
+        assert "HOST_HINT" in parts["stable"]
+
+    def test_environment_hints_disabled(self):
+        parts = self._parts(self._build(_environment_hints=False))
+        assert "HOST_HINT" not in parts["stable"]
+
