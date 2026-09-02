@@ -113,6 +113,34 @@ from utils import base_url_host_matches, env_var_enabled
 logger = logging.getLogger(__name__)
 
 
+def _append_ephemeral_user_context(content: Any, user_context: Optional[str]) -> Any:
+    """Return an API-only copy of a user message with volatile context appended.
+
+    ``messages`` is Hermes' canonical transcript and must never contain this
+    context. This helper therefore operates only on the API message copy
+    assembled in :func:`run_conversation`. Native image turns use OpenAI-style
+    content lists, so preserve their image blocks while extending the first
+    text block (or append one when no text block exists).
+    """
+    context = user_context.strip() if isinstance(user_context, str) else ""
+    if not context:
+        return content
+
+    suffix = f"\n\n{context}"
+    if isinstance(content, str):
+        return f"{content}{suffix}"
+
+    if isinstance(content, list):
+        copied = [dict(part) if isinstance(part, dict) else part for part in content]
+        for part in copied:
+            if isinstance(part, dict) and part.get("type") in {"text", "input_text"}:
+                part["text"] = f"{part.get('text', '')}{suffix}"
+                return copied
+        return copied + [{"type": "text", "text": context}]
+
+    return content
+
+
 # Scaffold marker used by _apply_active_turn_redirect and the ghost-row filter
 # in the api_messages loop. Module-level so both sites can never drift.
 _INTERRUPT_SCAFFOLD_MARKER = "[This response was interrupted by a user correction.]"
@@ -1990,6 +2018,7 @@ def run_conversation(
     persist_user_display_metadata: Optional[Dict[str, Any]] = None,
     persist_user_platform_id: Optional[str] = None,
     moa_config: Optional[dict[str, Any]] = None,
+    ephemeral_user_context: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Run a complete conversation with tool calling until completion.
@@ -2018,7 +2047,9 @@ def run_conversation(
             Discord/Telegram message id) to store as metadata on that
             persisted user message, so restart drain-window recovery can
             dedup an interrupted turn against the transcript.
-                or queuing follow-up prefetch work.
+        ephemeral_user_context: Volatile platform context appended only to the
+            API representation of the current user turn. It is never added to
+            canonical conversation messages or transcript persistence.
 
     Returns:
         Dict: Complete conversation result with final response and message history
@@ -2456,6 +2487,13 @@ def run_conversation(
         )
         repaired_seq = repair_message_sequence_with_cursor(agent, messages)
         if repaired_seq > 0:
+            # Repair can delete or merge entries before the live user turn.
+            # Re-anchor both trackers before deciding which API copy receives
+            # current-turn-only context or which DB row gets the clean override.
+            current_turn_user_idx = reanchor_current_turn_user_idx(
+                messages, user_message
+            )
+            agent._persist_user_message_idx = current_turn_user_idx
             request_logger.info(
                 "Repaired %s message-alternation violations before request (session=%s)",
                 repaired_seq,
@@ -2530,6 +2568,15 @@ def run_conversation(
                 # would rewrite on reload — see the capture in
                 # ``_flush_messages_to_session_db``).
                 api_msg["content"] = _api_content
+
+            # Platform context is intentionally current-turn-only. Apply it
+            # after the persisted api_content sidecar has been substituted so
+            # exact coordinates never become durable transcript data.
+            if idx == current_turn_user_idx and msg.get("role") == "user":
+                api_msg["content"] = _append_ephemeral_user_context(
+                    api_msg.get("content", ""),
+                    ephemeral_user_context,
+                )
 
             # For ALL assistant messages, pass reasoning back to the API
             # This ensures multi-turn reasoning context is preserved
@@ -3117,6 +3164,14 @@ def run_conversation(
                 conversation_history = conversation_history_after_compression(
                     agent, messages, conversation_history
                 )
+                # The compressor rebuilds ``messages`` and may move the
+                # surviving current user turn. Re-anchor before the next loop
+                # rebuilds the API copy; otherwise volatile current-turn
+                # context can be omitted or attached to a historical user row.
+                current_turn_user_idx = reanchor_current_turn_user_idx(
+                    messages, user_message
+                )
+                agent._persist_user_message_idx = current_turn_user_idx
                 # This preflight iteration never reaches the provider whether
                 # we skip the turn (handoff guard below) or re-run the loop —
                 # refund the consumed call/budget in BOTH cases, mirroring the
@@ -8184,6 +8239,13 @@ def run_conversation(
                         conversation_history = conversation_history_after_compression(
                             agent, messages, conversation_history
                         )
+                        # Post-tool compaction can move the surviving live user
+                        # turn. Keep API-only platform context anchored to that
+                        # turn before the next provider request is assembled.
+                        current_turn_user_idx = reanchor_current_turn_user_idx(
+                            messages, user_message
+                        )
+                        agent._persist_user_message_idx = current_turn_user_idx
                         if _should_skip_model_call_for_reference_handoff(
                             messages, user_message
                         ):
