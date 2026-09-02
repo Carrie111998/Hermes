@@ -8209,6 +8209,13 @@ def run_conversation(
                 if (
                     agent.compression_enabled
                     and compression_attempts < max_compression_attempts
+                    and not bool(
+                        getattr(
+                            _compressor,
+                            "awaiting_real_usage_after_compression",
+                            False,
+                        )
+                    )
                     and _compressor.should_compress(_real_tokens)
                 ):
                     compression_attempts += 1

@@ -2494,6 +2494,27 @@ def build_assistant_message(agent, assistant_message, finish_reason: str) -> dic
     codex_items = getattr(assistant_message, "codex_reasoning_items", None)
     if codex_items:
         msg["codex_reasoning_items"] = codex_items
+        from agent.codex_responses_adapter import classify_responses_route
+        from agent.native_compaction import (
+            has_compaction_checkpoint,
+            native_compaction_context_management,
+        )
+
+        if has_compaction_checkpoint(codex_items):
+            note_checkpoint = getattr(
+                agent.context_compressor,
+                "note_native_compaction_checkpoint",
+                None,
+            )
+            route = classify_responses_route(agent)
+            native_compaction_active = native_compaction_context_management(
+                agent,
+                is_codex_backend=route.is_codex_backend,
+                is_xai_responses=route.is_xai_responses,
+                is_github_responses=route.is_github_responses,
+            )
+            if native_compaction_active and callable(note_checkpoint):
+                note_checkpoint()
 
     # Codex Responses API: preserve exact assistant message items (with
     # id/phase) so follow-up turns can replay structured items instead of

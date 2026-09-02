@@ -3781,6 +3781,20 @@ class ContextCompressor(ContextEngine):
         except (TypeError, ValueError):
             self._pending_request_rough_tokens = 0
 
+    def note_native_compaction_checkpoint(self) -> None:
+        """Wait for real usage before trusting a newly checkpointed request.
+
+        Native Responses compaction replaces durable history with an opaque
+        encrypted checkpoint. Its serialized size is unrelated to the token
+        count billed by the provider, so the first rough estimate after capture
+        can jump by more than the whole context window. Reuse the one-response
+        compaction latch and discard any stale local-compression baseline; the
+        next provider response then pairs its real usage with the rough estimate
+        for the checkpointed request.
+        """
+        self.awaiting_real_usage_after_compression = True
+        self.last_compression_rough_tokens = 0
+
     def should_defer_preflight_to_real_usage(self, rough_tokens: int) -> bool:
         """Return True when a high rough preflight estimate is known-noisy.
 
@@ -3822,7 +3836,7 @@ class ContextCompressor(ContextEngine):
         """
         if rough_tokens < self.threshold_tokens:
             return False
-        # Immediately after a compaction the post-compression path sets
+        # Immediately after local compaction the post-compression path sets
         # ``awaiting_real_usage_after_compression`` and parks
         # ``last_prompt_tokens = -1``, but ``last_real_prompt_tokens`` still
         # holds the STALE pre-compression value (above threshold — that's why
@@ -3831,7 +3845,10 @@ class ContextCompressor(ContextEngine):
         # preflight fires a SECOND compaction before the provider has reported
         # real token usage for the now-shorter conversation.  Defer for exactly
         # one turn; update_from_response() clears the flag when real usage
-        # arrives.  (#36718)
+        # arrives. Native Responses checkpoints use the same one-response
+        # latch because their opaque ciphertext also makes rough preflight
+        # estimates untrustworthy until the provider reports real usage.
+        # (#36718)
         if self.awaiting_real_usage_after_compression:
             return True
         if self.last_real_prompt_tokens <= 0:
