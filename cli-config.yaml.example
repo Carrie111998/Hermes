@@ -1818,6 +1818,18 @@ display:
   # Show [HH:MM] timestamps on user input and assistant response labels.
   # timestamps: false
 
+  # Clamp the response/reasoning box width for cleaner copy-paste (#37293).
+  # The default ("auto") fills the full terminal width.  When you paste a
+  # response into a narrower editor, email, or chat, the long horizontal
+  # box rules wrap ugly.  Set "fixed:<N>" to clamp the box to N columns
+  # (min 32, max terminal width).  Markdown tables inside the box follow
+  # the clamp automatically.
+  #   auto:        Full terminal width (default)
+  #   fixed:80:    Clamp to 80 columns (typical paste target)
+  #   fixed:100:   Clamp to 100 columns (code-heavy pastes)
+  # Malformed values silently fall back to "auto".
+  # response_box_width: "fixed:80"
+
   # ───────────────────────────────────────────────────────────────────────────
   # Skin / Theme
   # ───────────────────────────────────────────────────────────────────────────

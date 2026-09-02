@@ -3095,6 +3095,8 @@ _ACCENT_ANSI_DEFAULT = "\033[1;38;2;255;215;0m"  # True-color #FFD700 bold — f
 _BOLD = "\033[1m"
 _RST = "\033[0m"
 _STREAM_PAD = ""  # No indent for streamed response text — leading whitespace pollutes
+# Active box-width cap for the streaming realigner (set by HermesCLI init).
+_active_box_width_cap: int | None = None
 # terminal copy/paste (every selected line carried 4 spaces).  Matches the
 # response Panel's flush-left padding.
 _STREAM_PARTIAL_PREVIEW_LEN = 60  # tail of an unfinished logical line mirrored
@@ -3626,6 +3628,11 @@ def _terminal_width_for_streaming() -> int:
         cols = shutil.get_terminal_size((80, 24)).columns
     except Exception:
         cols = 80
+    # When a fixed-width response-box policy is active, shrink the table
+    # realigner budget so tables don't overflow the clamped box.
+    cap = _active_box_width_cap
+    if cap is not None and cap < cols:
+        cols = cap
     return max(20, cols - len(_STREAM_PAD) - 2)
 
 
@@ -5300,6 +5307,24 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         if self.final_response_markdown not in {"render", "strip", "raw"}:
             self.final_response_markdown = "strip"
 
+        # Response/reasoning box width for scrollback copy-paste (display.response_box_width)
+        self.response_box_width = str(
+            CLI_CONFIG["display"].get("response_box_width", "auto")
+        ).strip().lower() or "auto"
+        _p = self.response_box_width
+        if _p != "auto":
+            if not (_p.startswith("fixed:") and _p[6:].isdigit() and int(_p[6:]) >= 32):
+                self.response_box_width = "auto"
+        # Compute active cap for module-level streaming realigner
+        global _active_box_width_cap
+        _cap = None
+        if self.response_box_width != "auto" and self.response_box_width.startswith("fixed:"):
+            try:
+                _cap = int(self.response_box_width.split(":", 1)[1])
+            except ValueError:
+                pass
+        _active_box_width_cap = _cap
+
         # Inline diff previews for write actions (display.inline_diffs in config.yaml)
         self._inline_diffs_enabled = CLI_CONFIG["display"].get("inline_diffs", True)
 
@@ -6939,19 +6964,28 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             width = self._get_tui_terminal_width()
         return width < 64
 
-    @staticmethod
-    def _scrollback_box_width(width: Optional[int] = None) -> int:
-        """Return the full viewport width for printed scrollback box rules.
+    def _scrollback_box_width(self, width: Optional[int] = None) -> int:
+        """Return the width to use when printing scrollback box rules.
 
-        Previously this clamped to ``max(32, min(width, 56))`` as a defense
-        against terminal-emulator reflow on column-shrink (#25975, salvaging
-        #24403).  That clamp made response/reasoning borders look stubby on
-        any modern wide terminal.  We now trust the prompt_toolkit
-        ``_output_screen_diff`` monkey-patch landed in #26137 (salvaging
-        #25981) to keep chrome out of scrollback in the first place, and
-        accept that an aggressive column-shrink may visually reflow already
-        printed Panel borders — that's a cosmetic artifact of stamped
-        scrollback history, not a live-render bug.
+        Reads ``self.response_box_width`` (the ``display.response_box_width``
+        config key) and applies an opt-in cap:
+
+        * ``"auto"`` (default) — full viewport width.  Wide terminals get
+          full-width borders; nothing to break on paste.
+        * ``"fixed:<N>"`` — clamp to ``N`` columns (min 32, max terminal
+          width).  Useful for users who paste responses into narrower
+          editors/email/Slack and want box headers to survive the trip
+          (#37293).  Malformed values silently fall back to ``"auto"``.
+
+        Previously this method always returned ``max(32, min(width, 56))`` as
+        a defense against terminal-emulator reflow on column-shrink (#25975,
+        salvaging #24403).  That clamp made response/reasoning borders look
+        stubby on any modern wide terminal, so #26163 reverted it.  We now
+        trust the prompt_toolkit ``_output_screen_diff`` monkey-patch landed
+        in #26137 (salvaging #25981) to keep chrome out of scrollback in the
+        first place, and accept that an aggressive column-shrink may
+        visually reflow already printed Panel borders — that's a cosmetic
+        artifact of stamped scrollback history, not a live-render bug.
 
         A small floor (32 cols) is kept so the box still renders on tiny
         terminals without negative ``'─' * (w - 2)`` math.
@@ -6961,7 +6995,18 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 width = shutil.get_terminal_size((80, 24)).columns
             except Exception:
                 width = 80
-        return max(32, int(width or 80))
+        raw = max(32, int(width or 80))
+        policy = getattr(self, "response_box_width", "auto")
+        if isinstance(policy, str):
+            p = policy.strip().lower()
+            if p.startswith("fixed:"):
+                try:
+                    cap = int(p.split(":", 1)[1])
+                    if cap >= 32:
+                        return max(32, min(raw, cap))
+                except ValueError:
+                    pass
+        return raw
 
     def _tui_input_rule_height(self, position: str, width: Optional[int] = None) -> int:
         """Return the visible height for the top/bottom input separator rules."""
