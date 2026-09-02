@@ -9667,8 +9667,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             return
         from agent.session_activity import ActivityProvenance
 
-        # No-op fast path: skip the transaction when there is nothing to
-        # clear. Read-only, no write lock.
+        # No-op fast path: skip the transaction when there is nothing to clear.
         try:
             with self._read_ctx() as conn:
                 row = conn.execute(
