@@ -20023,7 +20023,29 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 plugin_handler = get_plugin_command_handler(command.replace("_", "-"))
                 if plugin_handler:
                     user_args = event.get_command_args().strip()
-                    result = plugin_handler(user_args)
+                    # Preserve the historical handler(raw_args) contract, while
+                    # allowing plugins that explicitly accept ``event`` to make
+                    # chat-scoped gateway changes (for example Telegram menus).
+                    import inspect
+                    try:
+                        params = inspect.signature(plugin_handler).parameters.values()
+                        accepts_event = any(
+                            (
+                                p.name == "event"
+                                and p.kind
+                                in (
+                                    inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                                    inspect.Parameter.KEYWORD_ONLY,
+                                )
+                            )
+                            or p.kind is inspect.Parameter.VAR_KEYWORD
+                            for p in params
+                        )
+                    except (TypeError, ValueError):
+                        # Some valid callables do not expose a Python signature.
+                        # Preserve the established one-argument plugin contract.
+                        accepts_event = False
+                    result = plugin_handler(user_args, event=event) if accepts_event else plugin_handler(user_args)
                     if asyncio.iscoroutine(result):
                         result = await result
                     return str(result) if result else None
