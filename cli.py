@@ -17166,6 +17166,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 except Exception:
                     pass
 
+            # Track whether TTS displayed content this turn — used to suppress
+            # the final Rich Panel when TTS is the sole display path.
+            self._tts_displayed_this_turn = False
+
             if use_streaming_tts:
                 text_queue = queue.Queue()
                 stop_event = threading.Event()
@@ -17181,6 +17185,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     def display_callback(sentence: str):
                         """Called by TTS consumer when a sentence is ready to display + speak."""
                         nonlocal _streaming_box_opened
+                        self._tts_displayed_this_turn = True
                         if not _streaming_box_opened:
                             _streaming_box_opened = True
                             w = self._scrollback_box_width(getattr(self.console, "width", 80))
@@ -17626,7 +17631,15 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
 
                 is_error_response = result and (result.get("failed") or result.get("partial"))
                 already_streamed = self._stream_started and self._stream_box_opened and not is_error_response
-                if use_streaming_tts and _streaming_box_opened and not is_error_response:
+                # TTS display callback (when streaming_enabled=False) is the sole
+                # display path. It sets _streaming_box_opened locally AND
+                # self._tts_displayed_this_turn as a thread-safe indicator.
+                tts_already_displayed = (
+                    use_streaming_tts
+                    and (self._tts_displayed_this_turn or _streaming_box_opened)
+                    and not is_error_response
+                )
+                if tts_already_displayed:
                     # Text was already printed sentence-by-sentence; just close the box
                     w = self._scrollback_box_width()
                     _cprint(f"\n{_ACCENT}╰{'─' * (w - 2)}╯{_RST}")
