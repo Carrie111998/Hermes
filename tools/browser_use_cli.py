@@ -124,6 +124,15 @@ def _base_subprocess_env() -> dict:
     # the PATH so coreutils are always reachable (see below).
     env["PATH"] = _floor_subprocess_path(env.get("PATH", ""))
     env.setdefault("ANONYMIZED_TELEMETRY", "false")
+    # Browser Use CLI 3 delegates to Browser Harness. Keep every supported
+    # telemetry alias off, avoid background update traffic, and
+    # never foreground or print a credential-bearing Cloud live-view URL.
+    # Older Harness releases ignore unknown variables; 0.1.10+ honors all of
+    # them, so this remains safe across the Browser Use release transition.
+    env.setdefault("BH_TELEMETRY", "0")
+    env.setdefault("BROWSER_HARNESS_TELEMETRY", "0")
+    env.setdefault("BH_UPDATE_CHECK", "0")
+    env.setdefault("BH_OPEN_LIVE_URL", "0")
     return env
 
 
@@ -973,7 +982,11 @@ _HELPERS_DIGEST = (
     "a bare '() => {...}' returns the function itself, uncalled), "
     "fill_input(selector, text) types into inputs, click_at_xy(x, y) clicks "
     "viewport coordinates, capture_screenshot() saves and prints a "
-    "screenshot path, cdp('Domain.method', **kwargs) is raw CDP — "
+    "screenshot path, wait_for_element(selector, timeout=10, visible=False) "
+    "waits for DOM readiness, wait_for_network_idle(timeout=10, idle_ms=500) "
+    "waits for quiet network activity, list_tabs()/current_tab() inspect tab "
+    "state, activate_tab(tab)/close_tab(tab) manage tabs, upload_file(selector, "
+    "path) uploads a workspace file, cdp('Domain.method', **kwargs) is raw CDP — "
     "cdp('Accessibility.getFullAXTree')['nodes'] lists every element's "
     "role/name/backendDOMNodeId (filter in Python before printing; it is "
     "thousands of nodes), then cdp('DOM.getBoxModel', backendNodeId=n) gives "
