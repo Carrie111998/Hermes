@@ -223,6 +223,11 @@ from htr.events import (
     submit_manual_verification,
     verify_run_execution_result,
 )
+from htr.attempt_execute import (
+    AttemptExecuteError,
+    execute_attempt_canary,
+    verify_attempt_canary,
+)
 from htr.ids import (
     generate_id,
     generate_project_id,
@@ -376,6 +381,7 @@ __all__ = [
     "ApprovalValidationError",
     "ArtifactConflict",
     "AttemptAlreadyRegistered",
+    "AttemptExecuteError",
     "ProjectIdentityConflict",
     "ProjectInvalidInput",
     "ProjectNotRegistered",
@@ -588,6 +594,7 @@ __all__ = [
     "default_runs_root",
     "ensure_dir",
     "ensure_project_registry",
+    "execute_attempt_canary",
     "execute_run_execution_request",
     "derive_post_verification_execution_request_items",
     "derive_post_verification_followup_items",
@@ -681,6 +688,7 @@ __all__ = [
     "validate_run_final_closure_sources_correspond",
     "validate_schema",
     "verification_fingerprint",
+    "verify_attempt_canary",
     "verify_run_execution_result",
     "write_artifact_manifest",
     "write_task_card",
