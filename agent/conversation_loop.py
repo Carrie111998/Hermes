@@ -95,8 +95,10 @@ from agent.prompt_caching import (
 from agent.provider_projection import splice_provider_projection
 from agent.retry_utils import (
     adaptive_rate_limit_backoff,
+    is_daily_quota_exhaustion,
     is_zai_coding_overload_error,
     jittered_backoff,
+    provider_retry_after_seconds,
     zai_coding_overload_retry_ceiling,
 )
 from agent.repetition_guard import is_repetition_dominated
@@ -3802,19 +3804,9 @@ def run_conversation(
                     # upstream server error, or malformed response.
                     retry_count += 1
                     
-                    # Eager fallback: empty/malformed responses are a common
-                    # rate-limit symptom.  Switch to fallback immediately
-                    # rather than retrying with extended backoff.
-                    if agent._fallback_index < len(agent._fallback_chain):
-                        agent._buffer_status("⚠️ Empty/malformed response — switching to fallback...")
-                    if agent._try_activate_fallback():
-                        active_system_prompt = _sync_failover_system_message(
-                            agent, api_messages, active_system_prompt)
-                        retry_count = 0
-                        compression_attempts = 0
-                        _retry.primary_recovery_attempted = False
-                        _retry.restart_with_rebuilt_messages = True
-                        break
+                    # Eager fallback is deferred until after response.error is
+                    # inspected below.  A provider-supplied retry hint must win
+                    # over the generic malformed-response fallback path.
 
                     # Check for error field in response (some providers include this)
                     error_msg = "Unknown"
@@ -3850,6 +3842,26 @@ def run_conversation(
                             except (TypeError, ValueError):
                                 pass
 
+                    # Provider error responses can carry the same Retry-After
+                    # guidance as raised exceptions. Parse it before deciding
+                    # whether to switch fallback or terminate this invalid turn.
+                    _invalid_response_retry_hint = provider_retry_after_seconds(error_msg)
+                    if _invalid_response_retry_hint is None:
+                        _invalid_response_retry_hint = provider_retry_after_seconds(
+                            getattr(response, "error", None)
+                        )
+                    if _invalid_response_retry_hint is None:
+                        if agent._fallback_index < len(agent._fallback_chain):
+                            agent._buffer_status("⚠️ Empty/malformed response — switching to fallback...")
+                        if agent._try_activate_fallback():
+                            active_system_prompt = _sync_failover_system_message(
+                                agent, api_messages, active_system_prompt)
+                            retry_count = 0
+                            compression_attempts = 0
+                            _retry.primary_recovery_attempted = False
+                            _retry.restart_with_rebuilt_messages = True
+                            break
+
                     # Build a human-readable failure hint from the error code
                     # and response time, instead of always assuming rate limiting.
                     if _resp_error_code == 524:
@@ -3877,7 +3889,7 @@ def run_conversation(
                     agent._buffer_vprint(f"   📝 Provider message: {cleaned_provider_error}")
                     agent._buffer_vprint(f"   ⏱️  {_failure_hint}")
                     
-                    if retry_count >= max_retries:
+                    if retry_count >= max_retries and _invalid_response_retry_hint is None:
                         # Try fallback before giving up
                         if agent._has_pending_fallback():
                             agent._buffer_status(f"⚠️ Max retries ({max_retries}) for invalid responses — trying fallback...")
@@ -3904,8 +3916,13 @@ def run_conversation(
                             "failed": True  # Mark as failure for filtering
                         }
                     
-                    # Backoff before retry — jittered exponential: 5s base, 120s cap
-                    wait_time = jittered_backoff(retry_count, base_delay=5.0, max_delay=120.0)
+                    # Backoff before retry — honor provider hints first, then
+                    # use jittered exponential backoff for malformed responses.
+                    wait_time = (
+                        _invalid_response_retry_hint
+                        if _invalid_response_retry_hint is not None
+                        else jittered_backoff(retry_count, base_delay=5.0, max_delay=120.0)
+                    )
                     agent._buffer_vprint(f"⏳ Retrying in {wait_time:.1f}s ({_failure_hint})...")
                     logger.warning("Invalid API response (retry %d/%d): %s | Provider: %s", retry_count, max_retries, ', '.join(error_details), provider_name)
                     
@@ -5946,11 +5963,38 @@ def run_conversation(
                 _is_zai_coding_overload = is_zai_coding_overload_error(
                     base_url=str(_base), model=_model, error=api_error
                 )
+                _response = getattr(api_error, "response", None)
+                _status_code = getattr(api_error, "status_code", None)
+                if _status_code is None:
+                    _status_code = getattr(_response, "status_code", None)
+                if _status_code is None:
+                    _status_code = status_code
+                _provider_retry_hint = provider_retry_after_seconds(api_error)
+                if _provider_retry_hint is None:
+                    _provider_retry_hint = provider_retry_after_seconds(error_msg)
                 if _is_zai_coding_overload:
                     max_retries = max(max_retries, zai_coding_overload_retry_ceiling())
+                # A provider-supplied retry-after hint normally means "wait
+                # it out, the primary will recover in the retry window" and
+                # suppresses eager fallback below. That assumption breaks for
+                # a hard per-DAY quota ceiling (e.g. Gemini free-tier's
+                # generate_content_free_tier_requests, limit 500/day): the
+                # body still carries a short "Please retry in ~59s" hint (it
+                # reflects the per-minute sub-bucket, not the daily reset),
+                # so honouring it makes the loop re-hit the identical 429
+                # every retry and never reach the fallback chain. Detect that
+                # case and treat it as if no retry hint were present so
+                # eager fallback proceeds. Fixes daily-quota 429s stalling
+                # every retry attempt with a configured fallback never tried.
+                _is_daily_quota_exhaustion = is_daily_quota_exhaustion(api_error) or (
+                    is_daily_quota_exhaustion(error_msg) if error_msg else False
+                )
+                _effective_provider_retry_hint = (
+                    None if _is_daily_quota_exhaustion else _provider_retry_hint
+                )
                 _should_fallback = (
-                    (is_rate_limited and _wrapped_output_cap_budget is None)
-                    or (_is_transport_failure and retry_count >= 2)
+                    (is_rate_limited and _wrapped_output_cap_budget is None and _effective_provider_retry_hint is None)
+                    or (_is_transport_failure and retry_count >= 2 and _effective_provider_retry_hint is None)
                 )
                 if _should_fallback and agent._fallback_index < len(agent._fallback_chain):
                     # Don't eagerly fallback if credential pool rotation may
@@ -6693,6 +6737,7 @@ def run_conversation(
                             FailoverReason.long_context_tier,
                             FailoverReason.thinking_signature,
                         }
+                        and _provider_retry_hint is None
                     )
                 ) and not is_context_length_error
 
@@ -6929,7 +6974,7 @@ def run_conversation(
                         "error": _nonretryable_summary,
                     }
 
-                if retry_count >= max_retries:
+                if retry_count >= max_retries and _provider_retry_hint is None:
                     # Before falling back, try rebuilding the primary
                     # client once for transient transport errors (stale
                     # connection pool, TCP reset).  Only attempted once
@@ -7155,25 +7200,13 @@ def run_conversation(
                         "billing_block": _billing_block,
                     }
 
-                # For rate limits, respect the Retry-After header if present
-                _retry_after = None
-                if is_rate_limited:
-                    _resp_headers = getattr(getattr(api_error, "response", None), "headers", None)
-                    if _resp_headers and hasattr(_resp_headers, "get"):
-                        _ra_raw = _resp_headers.get("retry-after") or _resp_headers.get("Retry-After")
-                        if _ra_raw:
-                            try:
-                                # Cap at 10 minutes. Anthropic Tier 1 input-token
-                                # buckets reset in ~171s, so a 120s cap caused us to
-                                # retry before the actual reset window and re-trip the
-                                # limit. 600s covers all realistic provider reset
-                                # windows while still rejecting pathological values. (#26293)
-                                _retry_after = min(float(_ra_raw), 600)
-                            except (TypeError, ValueError):
-                                pass
-                wait_time = _retry_after if _retry_after else jittered_backoff(retry_count, base_delay=2.0, max_delay=60.0)
+                # Honor provider retry hints for both rate limits and transient
+                # overloads (notably Gemini 503s). Gemini may put the hint in
+                # the body rather than a Retry-After header.
+                _retry_after = _provider_retry_hint
+                wait_time = _retry_after if _retry_after is not None else jittered_backoff(retry_count, base_delay=2.0, max_delay=60.0)
                 _backoff_policy = None
-                if (is_rate_limited or _is_zai_coding_overload) and not _retry_after:
+                if (is_rate_limited or _is_zai_coding_overload) and _retry_after is None:
                     wait_time, _backoff_policy = adaptive_rate_limit_backoff(
                         retry_count,
                         base_url=str(_base),
@@ -7181,7 +7214,7 @@ def run_conversation(
                         error=api_error,
                         default_wait=wait_time,
                     )
-                if is_rate_limited or _is_zai_coding_overload:
+                if is_rate_limited or _is_zai_coding_overload or _retry_after is not None:
                     _policy_note = ""
                     if _backoff_policy == "zai_coding_overload_long":
                         _policy_note = " (Z.AI Coding overload adaptive long backoff)"
