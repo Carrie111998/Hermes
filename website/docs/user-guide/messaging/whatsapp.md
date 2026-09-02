@@ -222,6 +222,33 @@ The Baileys-bridge adapter (bot mode) supports several native WhatsApp message t
 
 All of this works out of the box in bot (Baileys) mode; no configuration needed.
 
+### Emergency Send Lock
+
+To keep receiving WhatsApp messages while suppressing Hermes replies and typing
+indicators, disable outbound activity in `~/.hermes/config.yaml`:
+
+```yaml
+gateway:
+  platforms:
+    whatsapp:
+      extra:
+        outbound_enabled: false
+```
+
+This blocks text, media, edits, polls, locations, typing indicators, and scheduled
+or tool-driven sends through Hermes. Inbound collection remains active.
+
+For an immediate bridge-wide send lock that also rejects direct send requests to the
+local bridge, create this file:
+
+```bash
+mkdir -p ~/.hermes/locks
+touch ~/.hermes/locks/whatsapp-outbound.lock
+```
+
+Remove `~/.hermes/locks/whatsapp-outbound.lock` to restore the configured behavior.
+The lock file takes precedence over configuration.
+
 ### Message Batching (Debounce)
 
 WhatsApp delivers each message individually, so a rapid burst (forwarded batches, paste-splits, multi-line text) would otherwise trigger a separate agent invocation per fragment — wasting tokens and producing several disjointed replies. The adapter buffers successive text messages from the same chat and dispatches them as one combined request after a short quiet period (default **5s**, extended to **10s** for very long fragments). Tune via `config.yaml`:
