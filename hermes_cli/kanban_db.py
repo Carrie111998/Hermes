@@ -3443,9 +3443,10 @@ def create_task(
 
     # Idempotency check — return the existing task instead of creating a
     # duplicate. Done BEFORE entering write_txn to keep the fast path fast
-    # and to avoid holding a write lock during the lookup. Race is
-    # acceptable: two concurrent creators with the same key might both
-    # insert, at which point both rows exist but the next lookup stabilises.
+    # and to avoid holding a write lock during the lookup. A same-key
+    # creator that slips past this lookup races into the UNIQUE
+    # idx_tasks_idempotency and CONVERGES on the winning row (see the
+    # IntegrityError handler below) — exactly one row per key, ever.
     if idempotency_key:
         row = conn.execute(
             "SELECT id FROM tasks WHERE idempotency_key = ? "
