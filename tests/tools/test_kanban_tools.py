@@ -111,6 +111,73 @@ def test_list_filters_tasks(monkeypatch, worker_env):
     assert tenant_ids == [c]
 
 
+def _board_snapshot(conn) -> dict[str, list[str]]:
+    """Every row of every table, order-independent and type-safe.
+
+    Repr-sorting sidesteps both SQLite's unspecified scan order and
+    Python's refusal to compare ``None`` with a string, so an unchanged
+    database compares equal without pinning a row order the schema never
+    promised.
+    """
+    tables = [
+        row[0] for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' "
+            "AND name NOT LIKE 'sqlite_%' ORDER BY name"
+        ).fetchall()
+    ]
+    return {
+        name: sorted(repr(tuple(r)) for r in conn.execute(f"SELECT * FROM {name}"))
+        for name in tables
+    }
+
+
+def test_list_does_not_write_to_the_board(monkeypatch, worker_env):
+    """Listing is discovery, not dispatch.
+
+    ``kanban_list`` ran ``recompute_ready`` before rendering, so merely
+    looking at the board promoted every eligible ``todo`` card to ``ready``
+    and appended a ``promoted`` event for it — an orchestrator could not
+    read the board without changing it, and the lane a card was in depended
+    on who had listed it last. Eligibility promotion belongs to the
+    dispatcher and to the lifecycle writes that clear a dependency.
+    """
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    from hermes_cli import kanban_db as kb
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="eligible", assignee="factory")
+        # create_task promotes a parentless card itself; put it back in the
+        # lane recompute_ready would pull it out of.
+        conn.execute("UPDATE tasks SET status = 'todo' WHERE id = ?", (tid,))
+        conn.commit()
+        before = _board_snapshot(conn)
+    finally:
+        conn.close()
+
+    from tools import kanban_tools as kt
+    payload = json.loads(kt._handle_list({"limit": 10}))
+
+    # The card is listed as it actually sits, not as a promotion would leave it.
+    listed = {t["id"]: t for t in payload["tasks"]}
+    assert listed[tid]["status"] == "todo"
+    # The counter stays in the response for callers that read it, and a read
+    # surface has nothing to count.
+    assert payload["promoted"] == 0
+
+    conn = kb.connect()
+    try:
+        assert _board_snapshot(conn) == before, "kanban_list wrote to the database"
+        assert kb.get_task(conn, tid).status == "todo"
+        assert conn.execute(
+            "SELECT COUNT(*) FROM task_events "
+            "WHERE task_id = ? AND kind = 'promoted'",
+            (tid,),
+        ).fetchone()[0] == 0
+    finally:
+        conn.close()
+
+
 def test_complete_happy_path(worker_env):
     from tools import kanban_tools as kt
     out = kt._handle_complete({

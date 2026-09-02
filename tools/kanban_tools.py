@@ -623,9 +623,10 @@ def _handle_list(args: dict, **kw) -> str:
     try:
         kb, conn = _connect(board=board)
         try:
-            # Match CLI list: dependencies that cleared since the last
-            # dispatcher tick should be visible to orchestrators immediately.
-            promoted = kb.recompute_ready(conn)
+            # Listing is a read. Promoting eligible tasks belongs to the
+            # dispatcher and to the lifecycle writes that clear a
+            # dependency, so discovering work never moves a card between
+            # lanes or appends a `promoted` event for it.
             # Fetch one extra row so model-facing output can report that
             # a bounded listing was truncated without dumping the board.
             rows = kb.list_tasks(
@@ -647,7 +648,10 @@ def _handle_list(args: dict, **kw) -> str:
                     min(limit * 2, KANBAN_LIST_MAX_LIMIT)
                     if truncated and limit < KANBAN_LIST_MAX_LIMIT else None
                 ),
-                "promoted": promoted,
+                # Kept so existing callers keep reading a field that is
+                # still there; a read surface promotes nothing, so it is
+                # now always zero.
+                "promoted": 0,
             })
         finally:
             conn.close()
@@ -1744,8 +1748,8 @@ KANBAN_LIST_SCHEMA = {
         "status, tenant, include_archived, and limit. Returns compact rows "
         "with ids, title, status, assignee, priority, parent/child ids, and "
         "counts. Bounded to 50 rows by default, 200 max, with truncation "
-        "metadata. Also recomputes ready tasks before listing, matching the "
-        "CLI. Orchestrator-only — dispatcher-spawned task workers never see "
+        "metadata. Read-only: listing never changes a task's lane. "
+        "Orchestrator-only — dispatcher-spawned task workers never see "
         "this tool."
     ),
     "parameters": {

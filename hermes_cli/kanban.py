@@ -1743,9 +1743,10 @@ def _cmd_list(args: argparse.Namespace) -> int:
     if args.mine and not assignee:
         assignee = _profile_author()
     with kb.connect_closing() as conn:
-        # Cheap "mini-dispatch": recompute ready so list output reflects
-        # dependencies that may have cleared since the last dispatcher tick.
-        kb.recompute_ready(conn)
+        # No "mini-dispatch" here: listing is a read. Promoting eligible
+        # tasks belongs to the dispatcher and to the lifecycle writes that
+        # clear a dependency, so `kanban list` never moves a card between
+        # lanes or appends a `promoted` event for it.
         tasks = kb.list_tasks(
             conn,
             assignee=assignee,

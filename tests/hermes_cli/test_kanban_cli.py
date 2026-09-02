@@ -57,6 +57,39 @@ def test_kanban_list_json_includes_session_id(kanban_home):
     )
 
 
+def test_kanban_list_does_not_promote_ready_tasks(kanban_home):
+    """`hermes kanban list` is a read, not a "mini-dispatch".
+
+    The command ran ``recompute_ready`` before rendering, so listing the
+    board moved eligible ``todo`` cards into ``ready`` and logged a
+    ``promoted`` event for each. Promotion is the dispatcher's job (and
+    that of the lifecycle writes which clear a dependency); looking at the
+    board must leave every card in the lane it was already in.
+    """
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="eligible", assignee="alice")
+        # create_task promotes a parentless card itself; put it back in the
+        # lane recompute_ready would pull it out of.
+        conn.execute("UPDATE tasks SET status = 'todo' WHERE id = ?", (tid,))
+        conn.commit()
+        promotions_before = conn.execute(
+            "SELECT COUNT(*) FROM task_events "
+            "WHERE task_id = ? AND kind = 'promoted'",
+            (tid,),
+        ).fetchone()[0]
+
+    payload = json.loads(kc.run_slash("list --json"))
+    assert [row["status"] for row in payload if row["id"] == tid] == ["todo"]
+
+    with kb.connect() as conn:
+        assert kb.get_task(conn, tid).status == "todo"
+        assert conn.execute(
+            "SELECT COUNT(*) FROM task_events "
+            "WHERE task_id = ? AND kind = 'promoted'",
+            (tid,),
+        ).fetchone()[0] == promotions_before
+
+
 def test_kanban_show_text_renders_graph_with_open_connection(kanban_home):
     with kb.connect_closing() as conn:
         parent_id = kb.create_task(conn, title="parent task")
