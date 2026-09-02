@@ -338,3 +338,72 @@ class TestGitHubCommentDelivery:
         # Delivery info is retained after send() so interim status messages
         # don't strand the final response (TTL-based cleanup happens on POST).
         assert chat_id in adapter._delivery_info
+
+
+# ===================================================================
+# Test 5: Post-restart redelivery (delivery-ledger recovery)
+# ===================================================================
+
+class TestRedeliveryAfterRestart:
+
+    @pytest.mark.asyncio
+    async def test_send_reconstructs_delivery_config_after_restart(self):
+        """After a gateway restart the in-memory _delivery_info is gone,
+        but the delivery-ledger recovery replays the interrupted final
+        response by calling send() with the same webhook source chat_id.
+        send() must reconstruct the deliver config from the route
+        definition so the recovered response still reaches its
+        cross-platform target instead of silently falling into the log
+        branch (which would mark the obligation 'delivered' without ever
+        sending)."""
+        routes = {
+            "alerts": {
+                "secret": _INSECURE_NO_AUTH,
+                "prompt": "Alert: {message}",
+                "deliver": "telegram",
+                "deliver_extra": {"chat_id": "12345"},
+            }
+        }
+        adapter = _make_adapter(routes)
+
+        mock_tg_adapter = AsyncMock()
+        mock_tg_adapter.send = AsyncMock(return_value=SendResult(success=True))
+        mock_runner = MagicMock()
+        mock_runner.adapters = {Platform.TELEGRAM: mock_tg_adapter}
+        mock_runner.config = GatewayConfig(
+            platforms={Platform.TELEGRAM: PlatformConfig(enabled=True, token="fake")}
+        )
+        adapter.gateway_runner = mock_runner
+
+        # Simulate a post-restart redelivery: NO webhook POST happened in
+        # this process, so _delivery_info is empty for this chat.
+        chat_id = "webhook:alerts:alert-001"
+        assert chat_id not in adapter._delivery_info
+
+        result = await adapter.send(
+            chat_id,
+            "Recovered final response",
+            metadata={"thread_id": "777"},
+        )
+
+        assert result.success is True
+        # The deliver config came from the route definition, and the
+        # caller-provided metadata supplied the thread_id.
+        mock_tg_adapter.send.assert_awaited_once_with(
+            "12345", "Recovered final response", metadata={"thread_id": "777"}
+        )
+
+    @pytest.mark.asyncio
+    async def test_send_without_route_after_restart_falls_back_to_log(self):
+        """A redelivered chat_id whose route no longer exists must not
+        crash or invent a target — it falls back to the log branch and
+        reports success (the response is preserved in the ledger)."""
+        adapter = _make_adapter({})
+        mock_runner = MagicMock()
+        mock_runner.adapters = {}
+        adapter.gateway_runner = mock_runner
+
+        chat_id = "webhook:vanished-route:delivery-001"
+        result = await adapter.send(chat_id, "Recovered response")
+
+        assert result.success is True

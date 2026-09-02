@@ -376,6 +376,32 @@ class WebhookAdapter(BasePlatformAdapter):
             return SendResult(success=True)
 
         delivery = self._delivery_info.get(chat_id, {})
+        if not delivery:
+            # Restart-recovery fallback: the delivery ledger replays an
+            # interrupted final response on the next boot, calling send()
+            # with the SAME webhook source chat_id, but the in-memory
+            # _delivery_info is gone after a restart. Without this,
+            # deliver_type defaults to "log" and the recovered response is
+            # silently logged + marked delivered instead of reaching its
+            # cross-platform target (e.g. Telegram). Reconstruct the config
+            # from the route definition — dynamic subscriptions are reloaded
+            # at startup, so the route IS present on a fresh process.
+            route_name = None
+            parts = str(chat_id).split(":")
+            if len(parts) >= 2 and parts[0] == "webhook":
+                route_name = parts[1]
+            if route_name:
+                route_config = self._routes.get(route_name) or {}
+                delivery = {
+                    "deliver": route_config.get("deliver", "log"),
+                    "deliver_extra": route_config.get("deliver_extra", {}),
+                }
+                if delivery["deliver"] != "log":
+                    logger.info(
+                        "[webhook] Reconstructed delivery config for %s from "
+                        "route '%s' (post-restart redelivery)",
+                        chat_id, route_name,
+                    )
         deliver_type = delivery.get("deliver", "log")
 
         if deliver_type == "log":
@@ -396,7 +422,7 @@ class WebhookAdapter(BasePlatformAdapter):
                 pass
         if self.gateway_runner and _is_known_platform:
             return await self._deliver_cross_platform(
-                deliver_type, content, delivery
+                deliver_type, content, delivery, metadata=metadata
             )
 
         logger.warning("[webhook] Unknown deliver type: %s", deliver_type)
@@ -1451,7 +1477,8 @@ class WebhookAdapter(BasePlatformAdapter):
             return SendResult(success=False, error=str(e))
 
     async def _deliver_cross_platform(
-        self, platform_name: str, content: str, delivery: dict
+        self, platform_name: str, content: str, delivery: dict,
+        metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
         """Route response to another platform (telegram, discord, etc.)."""
         if not self.gateway_runner:
@@ -1498,10 +1525,16 @@ class WebhookAdapter(BasePlatformAdapter):
                     error=f"No chat_id or home channel for {platform_name}",
                 )
 
-        # Pass thread_id from deliver_extra so Telegram forum topics work
-        metadata = None
+        # Pass thread_id from deliver_extra so Telegram forum topics work.
+        # Fall back to the caller-provided metadata (the delivery-ledger
+        # redelivery path passes the obligation's thread_id) so a recovered
+        # final response keeps its topic routing even when deliver_extra
+        # carries no thread_id.
+        out_metadata = None
         thread_id = extra.get("message_thread_id") or extra.get("thread_id")
+        if not thread_id and metadata:
+            thread_id = metadata.get("thread_id") or metadata.get("message_thread_id")
         if thread_id:
-            metadata = {"thread_id": thread_id}
+            out_metadata = {"thread_id": thread_id}
 
-        return await adapter.send(chat_id, content, metadata=metadata)
+        return await adapter.send(chat_id, content, metadata=out_metadata)
