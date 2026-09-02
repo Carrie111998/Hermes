@@ -6604,6 +6604,13 @@ class TurnRunner:
                 question=question,
                 choices=list(choices) if choices else None,
                 multi_select=bool(multi_select),
+                route_scope=_clarify_mod.build_route_scope(
+                    platform=ctx.source.platform,
+                    chat_id=ctx.source.chat_id,
+                    chat_type=ctx.source.chat_type,
+                    thread_id=ctx.source.thread_id,
+                    message_id=ctx.event_message_id,
+                ),
             )
 
             # For WeCom native streaming: finalize the current stream before
@@ -16496,6 +16503,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     await self.async_session_store.mark_resume_pending(
                         _sk,
                         "restart_timeout" if self._restart_requested else "shutdown_timeout",
+                        source=self._get_cached_session_source(_sk),
                     )
                     _pre_drain_keys.append(_sk)
                 except Exception as _e:
@@ -16601,7 +16609,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     if _agent is _AGENT_PENDING_SENTINEL:
                         continue
                     try:
-                        await self.async_session_store.mark_resume_pending(_sk, _resume_reason)
+                        await self.async_session_store.mark_resume_pending(
+                            _sk,
+                            _resume_reason,
+                            source=self._get_cached_session_source(_sk),
+                        )
                     except Exception as _e:
                         logger.debug(
                             "mark_resume_pending failed for %s: %s",
@@ -19037,8 +19049,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         _clarify_mod = None
         try:
             from tools import clarify_gateway as _clarify_mod
+            _clarify_route_scope = _clarify_mod.build_route_scope(
+                platform=source.platform,
+                chat_id=source.chat_id,
+                chat_type=source.chat_type,
+                thread_id=source.thread_id,
+                message_id=event.message_id,
+            )
             _pending_clarify = _clarify_mod.get_pending_for_session(
-                _quick_key, include_choice_prompts=True,
+                _quick_key,
+                include_choice_prompts=True,
+                route_scope=_clarify_route_scope,
             )
         except Exception:
             _pending_clarify = None
@@ -19063,7 +19084,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # with an empty response.
             if _raw_clarify_reply and not _raw_clarify_reply.startswith("/"):
                 _text_outcome = _clarify_mod.attempt_text_response_for_session(
-                    _quick_key, _raw_clarify_reply,
+                    _quick_key,
+                    _raw_clarify_reply,
+                    route_scope=_clarify_route_scope,
                 )
                 if _text_outcome == _clarify_mod.TEXT_RESOLVED:
                     logger.info(
