@@ -508,6 +508,24 @@ _CMDPOS = (
     r'\s*'
 )
 
+# Command-position anchor for Windows-native, bare-name-dangerous commands
+# (disk/volume destruction below) that routinely run as the payload of a
+# Windows shell wrapper rather than bare. Plain _CMDPOS alone is not enough
+# here: _command_detection_variants only lifts a wrapper's payload out into
+# its own _CMDPOS-anchored variant for bash/sh/zsh/ksh -c (see
+# _execution_flag_findings), not for `cmd /c "..."` or
+# `powershell -Command "..."` — so anchoring one of these rules to bare
+# _CMDPOS would stop matching `cmd /c "diskpart"` entirely while still
+# fixing the quoted-prose false positive. Union in the same two wrapper
+# shapes the del/erase/rd/rmdir and remove-item rules above already match
+# on, so a verb reached through either wrapper is still caught.
+_WIN_DISK_CMDPOS = (
+    r'(?:' + _CMDPOS + r'|'
+    r'\bcmd(?:\.exe)?\s+/[ck]\s+["\']?|'
+    r'\b(?:powershell|pwsh)(?:\.exe)?\b(?:\s+-\S+)*\s+(?:-(?:command|c)\s+)?["\']?'
+    r')'
+)
+
 # Destructive-path argument matcher for the rm hardline rules.
 #
 # The path token in `rm -rf /` is almost always written quoted in real
@@ -1000,12 +1018,25 @@ DANGEROUS_PATTERNS = [
     # Force process kills — Windows analogue of pkill -9.
     (r'\btaskkill\b[^\n]*\s/f\b', "force kill processes (taskkill /F)"),
     (r'\bstop-process\b[^\n]*\s-force\b', "force kill processes (Stop-Process -Force)"),
-    # Volume/disk destruction — Windows analogue of mkfs / dd.
-    (r'\bformat-volume\b', "format filesystem (Format-Volume)"),
-    (r'\bclear-disk\b', "wipe disk (Clear-Disk)"),
-    (r'\bdiskpart\b', "disk partitioning (diskpart)"),
-    (r'\bformat(?:\.com)?\s+[a-z]:', "format drive (format.com)"),
-    (r'\bcipher\s+/w\b', "wipe free space (cipher /w)"),
+    # Volume/disk destruction — Windows analogue of mkfs / dd. Anchored to
+    # command position like their POSIX twins (#93392/#93640): a bare `\b`
+    # here matches "format-volume"/"diskpart"/etc. anywhere in the text, so
+    # quoted prose merely mentioning one of these tools (a commit message, a
+    # doc edit, `echo "never run diskpart on prod"`) required approval to
+    # echo. Unlike mkfs/dd (POSIX tools that never run under a Windows
+    # wrapper), these are Windows-native commands routinely invoked as
+    # `cmd /c "diskpart"` or `powershell -Command "diskpart"` — reusing the
+    # plain _CMDPOS anchor here would stop matching those wrapped forms
+    # entirely (verified: _command_detection_variants only extracts a
+    # separately-anchorable payload variant for bash/sh/zsh/ksh -c, not for
+    # cmd /c or powershell -Command). _WIN_DISK_CMDPOS additionally
+    # recognizes those two wrapper shapes, mirroring the cmd/powershell
+    # prefix forms already used above for del/erase/rd/rmdir/remove-item.
+    (_WIN_DISK_CMDPOS + r'format-volume\b', "format filesystem (Format-Volume)"),
+    (_WIN_DISK_CMDPOS + r'clear-disk\b', "wipe disk (Clear-Disk)"),
+    (_WIN_DISK_CMDPOS + r'diskpart\b', "disk partitioning (diskpart)"),
+    (_WIN_DISK_CMDPOS + r'format(?:\.com)?\s+[a-z]:', "format drive (format.com)"),
+    (_WIN_DISK_CMDPOS + r'cipher\s+/w\b', "wipe free space (cipher /w)"),
     # ACL destruction — Windows analogue of chmod 777.
     (r'\bicacls\b[^\n]*\s/grant\b[^\n]*\b(?:everyone|todos|jeder|tout\s+le\s+monde|\*s-1-1-0)\b', "grant Everyone access (icacls)"),
     (r'\bicacls\b[^\n]*\s/reset\b', "reset ACLs recursively (icacls /reset)"),
