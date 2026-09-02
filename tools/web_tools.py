@@ -346,16 +346,17 @@ def _get_capability_backend(capability: str) -> str:
     """Shared helper for per-capability backend selection.
 
     Reads ``web.{capability}_backend`` from config; a stored value is
-    returned unconditionally (strict selection — no availability probe).
-    A selected-but-broken backend surfaces the vendor path's honest error
-    instead of being silently replaced by whatever the credential ladder
-    finds. Falls through to the shared ``_get_backend()`` only when no
-    per-capability override is stored.
+    returned only if it actually supports the requested capability.
+    Falls through to the shared ``_get_backend()`` only when no
+    per-capability override is stored or the override does not support
+    the capability.
     """
     cfg = _load_web_config()
     specific = (cfg.get(f"{capability}_backend") or "").lower().strip()
     if specific:
-        return specific
+        if _is_backend_available(specific, capability):
+            return specific
+        # Fall through so the credential ladder can select an available backend
     return _get_backend()
 
 
@@ -367,7 +368,7 @@ def _tavily_explicitly_configured() -> bool:
     )
 
 
-def _is_backend_available(backend: str) -> bool:
+def _is_backend_available(backend: str, capability: str = "") -> bool:
     """Return True when the selected backend is currently usable.
 
     For plugin-registered backends (any name outside
@@ -378,6 +379,11 @@ def _is_backend_available(backend: str) -> bool:
     availability — fixing custom-provider discovery for every caller at once
     (issues #28651, #31873, #32698). Built-in backends keep their cheap
     hardcoded probes below.
+
+    When *capability* is set (e.g. ``"search"`` or ``"extract"``), the
+    backend is also checked for support of that capability. A search-only
+    backend like ``ddgs`` will return False for the ``"extract"``
+    capability (issue #98618).
     """
     backend = (backend or "").lower().strip()
     if backend not in _LEGACY_WEB_BACKENDS:
@@ -399,6 +405,8 @@ def _is_backend_available(backend: str) -> bool:
     if backend == "brave-free":
         return _has_env("BRAVE_SEARCH_API_KEY")
     if backend == "ddgs":
+        if capability and capability != "search":
+            return False
         return _ddgs_package_importable()
     if backend == "xai":
         # Cheap probe — env var OR auth.json has OAuth tokens. Must not
