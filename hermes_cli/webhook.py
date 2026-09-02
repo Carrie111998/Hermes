@@ -26,6 +26,7 @@ from hermes_cli.config import cfg_get
 
 _SUBSCRIPTIONS_FILENAME = "webhook_subscriptions.json"
 _SUBSCRIPTIONS_FILE_MODE = 0o600
+_MAX_SECRET_BYTES = 4096
 
 
 def _hermes_home() -> Path:
@@ -137,6 +138,33 @@ def _require_webhook_enabled() -> bool:
     return False
 
 
+def _read_secret_fd(fd: int) -> str | None:
+    """Read and normalize a bounded UTF-8 secret without taking ownership of *fd*."""
+    data = bytearray()
+    try:
+        while len(data) <= _MAX_SECRET_BYTES:
+            chunk = os.read(fd, min(4096, _MAX_SECRET_BYTES + 1 - len(data)))
+            if not chunk:
+                break
+            data.extend(chunk)
+    except (OSError, OverflowError):
+        print("Error: Could not read --secret-fd.")
+        return None
+
+    if len(data) > _MAX_SECRET_BYTES:
+        print(f"Error: --secret-fd input exceeds {_MAX_SECRET_BYTES} bytes.")
+        return None
+    try:
+        secret = data.decode("utf-8").rstrip()
+    except UnicodeDecodeError:
+        print("Error: --secret-fd input must be valid UTF-8.")
+        return None
+    if not secret:
+        print("Error: --secret-fd input is empty after trimming trailing whitespace.")
+        return None
+    return secret
+
+
 def webhook_command(args):
     """Entry point for 'hermes webhook' subcommand."""
     sub = getattr(args, "webhook_action", None)
@@ -165,10 +193,23 @@ def _cmd_subscribe(args):
         print(f"Error: Invalid name '{name}'. Use lowercase alphanumeric with hyphens/underscores.")
         return
 
+    secret_arg = getattr(args, "secret", "") or ""
+    secret_fd = getattr(args, "secret_fd", None)
+    if secret_arg and secret_fd is not None:
+        print("Error: --secret and --secret-fd are mutually exclusive.")
+        return
+    if secret_fd is not None:
+        if not isinstance(secret_fd, int) or isinstance(secret_fd, bool) or secret_fd < 0:
+            print("Error: --secret-fd must be a non-negative integer.")
+            return
+        secret = _read_secret_fd(secret_fd)
+        if secret is None:
+            return
+    else:
+        secret = secret_arg or secrets.token_urlsafe(32)
+
     subs = _load_subscriptions()
     is_update = name in subs
-
-    secret = args.secret or secrets.token_urlsafe(32)
     events = [e.strip() for e in args.events.split(",")] if args.events else []
 
     route = {
@@ -205,7 +246,7 @@ def _cmd_subscribe(args):
 
     print(f"\n  {status} webhook subscription: {name}")
     print(f"  URL:    {base_url}/webhooks/{name}")
-    print(f"  Secret: {secret}")
+    print(f"  HMAC secret stored in {_subscriptions_path()} (mode 0600).")
     if events:
         print(f"  Events: {', '.join(events)}")
     else:

@@ -6,7 +6,20 @@ Handler injected to avoid importing ``main``.
 
 from __future__ import annotations
 
+import argparse
 from typing import Callable
+
+
+def _non_negative_fd(value: str) -> int:
+    if not value.isascii() or not value.isdecimal():
+        raise argparse.ArgumentTypeError("must be a non-negative integer")
+    try:
+        fd = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be a non-negative integer") from exc
+    if fd < 0:
+        raise argparse.ArgumentTypeError("must be a non-negative integer")
+    return fd
 
 
 def build_webhook_parser(subparsers, *, cmd_webhook: Callable) -> None:
@@ -45,8 +58,16 @@ def build_webhook_parser(subparsers, *, cmd_webhook: Callable) -> None:
         default="",
         help="Target chat ID for cross-platform delivery",
     )
-    wh_sub.add_argument(
+    secret_group = wh_sub.add_mutually_exclusive_group()
+    secret_group.add_argument(
         "--secret", default="", help="HMAC secret (auto-generated if omitted)"
+    )
+    secret_group.add_argument(
+        "--secret-fd",
+        type=_non_negative_fd,
+        default=None,
+        metavar="FD",
+        help="Read HMAC secret from FD (UTF-8, max 4096 bytes; avoids argv exposure)",
     )
     wh_sub.add_argument(
         "--deliver-only",

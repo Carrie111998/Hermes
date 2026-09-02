@@ -409,10 +409,17 @@ hermes webhook subscribe github-issues \
   --prompt "New issue #{issue.number}: {issue.title}\nBy: {issue.user.login}\n\n{issue.body}" \
   --deliver telegram \
   --deliver-chat-id "-100123456789" \
-  --description "Triage new GitHub issues"
+  --description "Triage new GitHub issues" \
+  --secret-fd 3 3< /path/to/webhook-secret
 ```
 
-This returns the webhook URL and an auto-generated HMAC secret. Configure your service to POST to that URL.
+`--secret-fd` reads at most 4096 bytes of UTF-8, trims trailing whitespace,
+and keeps the HMAC secret out of the command line and process listings. It is
+mutually exclusive with the legacy `--secret` option. If neither option is
+given, Hermes continues to generate a secret automatically. Secret values are
+stored in the owner-only `~/.hermes/webhook_subscriptions.json` file and are
+not printed by this command or by `hermes webhook list`. Configure your service
+to POST to the returned URL using the same secret.
 
 ### List subscriptions
 

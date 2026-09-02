@@ -64,10 +64,15 @@ hermes webhook subscribe <name> \
   --skills "skill1,skill2" \
   --deliver telegram \
   --deliver-chat-id "12345" \
-  --secret "optional-custom-secret"
+  --secret-fd 3 3< /path/to/webhook-secret
 ```
 
-Returns the webhook URL and HMAC secret. The user configures their service to POST to that URL.
+`--secret-fd` reads at most 4096 bytes of UTF-8, trims trailing whitespace,
+and keeps the HMAC secret out of the command line and process listings. It is
+mutually exclusive with the legacy `--secret` option. If neither option is
+given, Hermes continues to generate a secret automatically. Secret values are
+stored in the owner-only `~/.hermes/webhook_subscriptions.json` file and are
+not printed by the command or by `hermes webhook list`.
 
 ### Filter or transform payloads before the agent runs
 
