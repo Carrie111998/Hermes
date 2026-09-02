@@ -100,13 +100,71 @@ def _watchdog_loop(proc: subprocess.Popen, original_ppid: int) -> None:
         time.sleep(_POLL_INTERVAL_S)
 
 
+def _read_pgids(pgid_file: str) -> set[int]:
+    try:
+        with open(pgid_file, "r", encoding="utf-8") as f:
+            out: set[int] = set()
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    out.add(int(line))
+                except ValueError:
+                    continue
+            return out
+    except Exception:
+        return set()
+
+
+def _terminate_pgid(pgid: int) -> None:
+    killpg = getattr(os, "killpg", None)
+    if killpg is None:
+        return
+    try:
+        os.killpg(pgid, signal.SIGTERM)
+    except (ProcessLookupError, PermissionError, OSError):
+        return
+    time.sleep(_TERM_GRACE_S)
+    try:
+        os.killpg(pgid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError, OSError):
+        pass
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Parent-death watchdog for a stdio MCP subprocess.",
     )
     parser.add_argument("--ppid", type=int, required=True)
+    parser.add_argument("--multi", action="store_true", help="shared watchdog for multiple pgids (ponytail: 1 process for N servers)")
+    parser.add_argument("--pgid-file", type=str, default=None)
     parser.add_argument("command", nargs=argparse.REMAINDER)
     args = parser.parse_args(argv)
+
+    if args.multi:
+        pgid_file = args.pgid_file
+        if not pgid_file:
+            print("mcp_stdio_watchdog: --multi requires --pgid-file", file=sys.stderr)
+            return 2
+
+        def _forward_multi(signum, frame):  # noqa: ARG001
+            for pgid in _read_pgids(pgid_file):
+                _terminate_pgid(pgid)
+            sys.exit(128 + signum)
+
+        signal.signal(signal.SIGTERM, _forward_multi)
+        signal.signal(signal.SIGINT, _forward_multi)
+        while True:
+            if _is_orphaned(args.ppid):
+                for pgid in _read_pgids(pgid_file):
+                    _terminate_pgid(pgid)
+                try:
+                    os.unlink(pgid_file)
+                except Exception:
+                    pass
+                return 0
+            time.sleep(_POLL_INTERVAL_S)
 
     real_argv = list(args.command)
     if real_argv and real_argv[0] == "--":

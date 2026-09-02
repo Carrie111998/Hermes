@@ -107,10 +107,12 @@ import os
 import random
 import re
 import shutil
+import subprocess
 import sys
 import threading
 import time
 from contextlib import asynccontextmanager
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Callable
 from datetime import datetime
@@ -1073,12 +1075,121 @@ def _resolve_stdio_command(command: str, env: dict) -> tuple[str, dict]:
     return resolved_command, resolved_env
 
 
+# ponytail: single shared watchdog replaces N per-server python processes (fixed RSS)
+_single_watchdog_proc: Optional[subprocess.Popen] = None
+_single_watchdog_lock = threading.Lock()  # ponytail: global lock, per-server locks if throughput matters
+_single_watchdog_pgid_file: Optional[Path] = None
+
+
+def _single_watchdog_pgid_file_path() -> Optional[Path]:
+    try:
+        from hermes_constants import get_hermes_home
+        import pathlib as _pl
+        PathCls = _pl.WindowsPath if sys.platform == "win32" else _pl.PosixPath
+        home = get_hermes_home()
+        try:
+            p = PathCls(str(home)) / "logs" / f"mcp-watchdog-{os.getpid()}.pgids"
+        except Exception:
+            import os as _os
+            p = PathCls(_os.path.join(str(home), "logs", f"mcp-watchdog-{_os.getpid()}.pgids"))
+        try:
+            p.parent.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
+        return p
+    except Exception:
+        try:
+            import tempfile
+            import pathlib as _pl2
+            PathCls2 = _pl2.WindowsPath if sys.platform == "win32" else _pl2.PosixPath
+            return PathCls2(tempfile.gettempdir()) / f"hermes-mcp-watchdog-{os.getpid()}.pgids"
+        except Exception:
+            return None
+
+
+def _ensure_single_watchdog() -> None:
+    if os.name != "posix":
+        return
+    with _single_watchdog_lock:
+        global _single_watchdog_proc, _single_watchdog_pgid_file
+        if _single_watchdog_proc is not None and _single_watchdog_proc.poll() is None:
+            return
+        pgid_file = _single_watchdog_pgid_file_path()
+        if pgid_file is None:
+            return
+        try:
+            pgid_file.write_text("", encoding="utf-8")
+        except Exception:
+            pass
+        try:
+            my_pid = os.getpid()
+            proc = subprocess.Popen(
+                [sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)), "mcp_stdio_watchdog.py"), "--ppid", str(my_pid), "--multi", "--pgid-file", str(pgid_file)],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+            _single_watchdog_proc = proc
+            _single_watchdog_pgid_file = pgid_file
+        except Exception:
+            logger.debug("failed to start single MCP watchdog", exc_info=True)
+
+
+def _sync_watchdog_pgid_file() -> None:
+    if os.name != "posix":
+        return
+    try:
+        with _single_watchdog_lock:
+            pgid_file = _single_watchdog_pgid_file
+        if pgid_file is None:
+            return
+        with _lock:
+            pgids = set(_stdio_pgids.values())
+            # include orphans whose pgid may still be in _stdio_pgids or as pid fallback
+            for pid in list(_orphan_stdio_pids):
+                pgid = _stdio_pgids.get(pid)
+                if pgid is not None:
+                    pgids.add(pgid)
+                else:
+                    pgids.add(pid)
+        content = "\n".join(str(p) for p in sorted(pgids))
+        if content:
+            content += "\n"
+        pgid_file.write_text(content, encoding="utf-8")
+    except Exception:
+        pass
+
+
+def _stop_single_watchdog() -> None:
+    with _single_watchdog_lock:
+        global _single_watchdog_proc, _single_watchdog_pgid_file
+        proc = _single_watchdog_proc
+        pgid_file = _single_watchdog_pgid_file
+        _single_watchdog_proc = None
+        _single_watchdog_pgid_file = None
+    if proc is not None and proc.poll() is None:
+        try:
+            proc.terminate()
+            try:
+                proc.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+        except Exception:
+            pass
+    if pgid_file is not None:
+        try:
+            pgid_file.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+
 def _wrap_command_with_watchdog(command: str, args: list) -> tuple[str, list]:
     """Wrap a stdio MCP server command in the parent-death watchdog supervisor.
 
-    On POSIX, the watchdog records this process's PID and later detects parent
-    death directly through ``getppid()``. Returns the (command, args) unchanged
-    on non-POSIX platforms or if the PID cannot be read.
+    Ponytail: single shared watchdog (global lock) replaces one python process
+    per stdio server. The old per-server wrapper is kept as fallback only if
+    the singleton fails to start.
     """
     if os.name != "posix":
         # Relies on process groups (os.getpgid/os.killpg); no POSIX
@@ -1087,18 +1198,12 @@ def _wrap_command_with_watchdog(command: str, args: list) -> tuple[str, list]:
         # os.kill there too).
         return command, args
     try:
-        my_pid = os.getpid()
+        _ensure_single_watchdog()
     except Exception:
-        # Never let watchdog bookkeeping failure block a real MCP connection.
-        return command, args
-    watchdog_args = [
-        os.path.join(os.path.dirname(os.path.abspath(__file__)), "mcp_stdio_watchdog.py"),
-        "--ppid", str(my_pid),
-        "--",
-        command,
-        *args,
-    ]
-    return sys.executable, watchdog_args
+        pass
+    # single watchdog now owns parent-death responsibility; spawn the real
+    # server directly so N servers cost 1 watchdog process total (3→1)
+    return command, args
 
 
 # ---------------------------------------------------------------------------
@@ -3348,6 +3453,10 @@ class MCPServerTask:
                         for _pid in new_pids:
                             _stdio_pids[_pid] = self.name
                         _stdio_pgids.update(new_pgids)
+                    try:
+                        _sync_watchdog_pgid_file()
+                    except Exception:
+                        pass
                     # Positive identity for the machine spawn ledger (#61514):
                     # record each helper child as (pid, create_time,
                     # 'mcp-helper', spawner=this process) so startup sweeps
@@ -3443,6 +3552,10 @@ class MCPServerTask:
                             # Nothing left to reap — drop the pgid entry so
                             # PID-reuse can't surface stale pgroup state later.
                             _stdio_pgids.pop(pid, None)
+                    try:
+                        _sync_watchdog_pgid_file()
+                    except Exception:
+                        pass
 
     # Content types a real MCP Streamable-HTTP endpoint may return on the
     # initial POST/GET. Anything else on a 2xx response means the URL is not
@@ -8576,6 +8689,10 @@ def shutdown_mcp_servers():
         _server_connect_failures.clear()
 
     _stop_mcp_loop()
+    try:
+        _stop_single_watchdog()
+    except Exception:
+        pass
 
 
 def _kill_orphaned_mcp_children(
@@ -8636,6 +8753,11 @@ def _kill_orphaned_mcp_children(
         pgids: Dict[int, int] = {pid: _stdio_pgids[pid] for pid in pids if pid in _stdio_pgids}
         for pid in pgids:
             _stdio_pgids.pop(pid, None)
+
+    try:
+        _sync_watchdog_pgid_file()
+    except Exception:
+        pass
 
     # Fast path: no tracked stdio PIDs to reap. Skip the SIGTERM/sleep/SIGKILL
     # dance entirely — otherwise every MCP-free shutdown pays a 2s sleep tax.
@@ -8704,6 +8826,11 @@ def _kill_orphaned_mcp_children(
             "Force-killed MCP process %d (%s) after SIGTERM timeout",
             pid, server_name,
         )
+
+    try:
+        _sync_watchdog_pgid_file()
+    except Exception:
+        pass
 
 
 def _stop_mcp_loop_if_idle() -> bool:
@@ -8830,4 +8957,8 @@ def _stop_mcp_loop(*, only_if_idle: bool = False) -> bool:
         # graceful shutdown are now orphaned — include active PIDs too
         # since the loop is gone and no session can still be in flight.
         _kill_orphaned_mcp_children(include_active=True)
+        try:
+            _stop_single_watchdog()
+        except Exception:
+            pass
     return True
