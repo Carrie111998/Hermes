@@ -252,9 +252,21 @@ def update_room_link_status(
     member_id: str,
     status: str,
     now: float | None = None,
+    expected_grant_sha256: str | None = None,
 ) -> bool:
     """Persist a non-secret route health classification."""
     with _transaction(db_path, immediate=True) as conn:
+        if expected_grant_sha256 is not None:
+            row = conn.execute(
+                "SELECT grant FROM hosted_room_links WHERE room_id=? AND member_id=?",
+                (room_id, member_id),
+            ).fetchone()
+            if (
+                row is None
+                or hashlib.sha256(row["grant"].encode()).hexdigest()
+                != expected_grant_sha256
+            ):
+                return False
         cursor = conn.execute(
             """UPDATE hosted_room_links SET status=?, updated_at=?
                  WHERE room_id=? AND member_id=?""",

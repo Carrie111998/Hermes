@@ -44,6 +44,7 @@ from tui_gateway.hosted_room_artifact_service import (
 )
 from tui_gateway.hosted_room_server_rpc import HostedRoomServerRPC
 from tui_gateway.hosted_room_peer_http import PeerRunsHTTPClient, PeerRunsHTTPError
+from tui_gateway.hosted_room_peer_status import _RouteStatusPeerClient
 from tui_gateway.hosted_room_peer_transport import (
     HostedRoomPeerClient,
     PeerHostedRoomTransport,
@@ -619,15 +620,20 @@ class HostedRoomService(HostedRoomArtifactMixin):
             client,
             capability_digest=route.capability_digest,
             execution_policy_digest=route.execution_policy_digest,
-            on_ready=lambda: self._set_route_status(room_id, member_id, "ready"),
-            on_reauthorization=lambda: self._set_route_status(
-                room_id, member_id, "needs_reauthorization"
+            grant=route.grant,
+            on_ready=lambda **observation: self._set_route_status(
+                room_id, member_id, "ready", **observation
             ),
-            on_unavailable=lambda: self._set_route_status(
-                room_id, member_id, "unavailable"
+            on_reauthorization=lambda **observation: self._set_route_status(
+                room_id, member_id, "needs_reauthorization", **observation
             ),
-            on_refreshed=lambda grant, catalog=None: self._rotate_route_grant(
-                room_id, member_id, grant, catalog
+            on_unavailable=lambda **observation: self._set_route_status(
+                room_id, member_id, "unavailable", **observation
+            ),
+            on_refreshed=lambda grant, catalog=None, **observation: (
+                self._rotate_route_grant(
+                    room_id, member_id, grant, catalog, **observation
+                )
             ),
         )
 
@@ -722,18 +728,34 @@ class HostedRoomService(HostedRoomArtifactMixin):
             return isinstance(target, Mapping) and target.get("kind") == "peer"
         return False
 
-    def _set_route_status(self, room_id: str, member_id: str, status: str) -> None:
+    def _set_route_status(
+        self,
+        room_id: str,
+        member_id: str,
+        status: str,
+        *,
+        expected_grant_sha256: str | None = None,
+    ) -> None:
         key = (room_id, member_id)
         with self._policy_lock:
+            route = self.peer_routes.get(key)
+            if expected_grant_sha256 is not None and (
+                route is None
+                or hashlib.sha256(route.grant.encode()).hexdigest()
+                != expected_grant_sha256
+            ):
+                return
             if self._peer_route_status.get(key) == status:
                 return
-            self._peer_route_status[key] = status
-        hosted_room_links.mark_room_link_status(
-            self.db_path,
-            room_id=room_id,
-            member_id=member_id,
-            status=status,
-        )
+            changed = hosted_room_links.mark_room_link_status(
+                self.db_path,
+                room_id=room_id,
+                member_id=member_id,
+                status=status,
+                expected_grant_sha256=expected_grant_sha256,
+            )
+            if changed or key not in self._persisted_peer_route_keys:
+                self._peer_route_status[key] = status
 
     def _set_pending_action(
         self,
@@ -938,66 +960,76 @@ class HostedRoomService(HostedRoomArtifactMixin):
         member_id: str,
         grant: str,
         catalog: GatewayRoomCatalog | None = None,
+        *,
+        expected_grant_sha256: str | None = None,
     ) -> None:
         """Persist a target-refreshed scoped grant before publishing it live."""
-        key = (room_id, member_id)
-        route = self.peer_routes.get(key)
-        if route is None:
-            raise RuntimeError("peer room route is unavailable")
-        stored = hosted_room_links.load_room_link(
-            self.db_path,
-            room_id=room_id,
-            member_id=member_id,
-        )
-        if stored is None:
-            raise RuntimeError("peer room route cannot be renewed before persistence")
-        effective_catalog = catalog or stored.catalog
-        if catalog is not None and (
-            catalog.installation_id != route.target_install_id
-            or catalog.execution_policy.target_profile != route.target_profile
-            or PROTOCOL_VERSION not in catalog.protocol_versions
-            or "direct" not in catalog.link_modes
-            or not catalog.text
-            or catalog.execution_policy.policy_digest != route.execution_policy_digest
-        ):
-            self._set_route_status(room_id, member_id, "needs_reauthorization")
-            raise RuntimeError(
-                "peer room execution policy changed; reauthorization is required"
-            )
-        rotated_route = replace(
-            route,
-            grant=grant,
-            capability_digest=(
-                catalog.catalog_digest
-                if catalog is not None
-                else route.capability_digest
-            ),
-            execution_policy_digest=(
-                catalog.execution_policy.policy_digest
-                if catalog is not None
-                else route.execution_policy_digest
-            ),
-        )
-        hosted_room_links.save_room_link(
-            self.db_path,
-            hosted_room_links.make_stored_link(
+        with self._policy_lock:
+            key = (room_id, member_id)
+            route = self.peer_routes.get(key)
+            if route is None:
+                raise RuntimeError("peer room route is unavailable")
+            if expected_grant_sha256 is None:
+                expected_grant_sha256 = hashlib.sha256(route.grant.encode()).hexdigest()
+            stored = hosted_room_links.load_room_link(
+                self.db_path,
                 room_id=room_id,
                 member_id=member_id,
-                target_url=stored.target_url,
-                target_profile=stored.target_profile,
+            )
+            if stored is None:
+                raise RuntimeError(
+                    "peer room route cannot be renewed before persistence"
+                )
+            effective_catalog = catalog or stored.catalog
+            if catalog is not None and (
+                catalog.installation_id != route.target_install_id
+                or catalog.execution_policy.target_profile != route.target_profile
+                or PROTOCOL_VERSION not in catalog.protocol_versions
+                or "direct" not in catalog.link_modes
+                or not catalog.text
+                or catalog.execution_policy.policy_digest
+                != route.execution_policy_digest
+            ):
+                self._set_route_status(
+                    room_id,
+                    member_id,
+                    "needs_reauthorization",
+                    expected_grant_sha256=expected_grant_sha256,
+                )
+                raise RuntimeError(
+                    "peer room execution policy changed; reauthorization is required"
+                )
+            rotated_route = replace(
+                route,
                 grant=grant,
-                catalog=effective_catalog,
-                cancellation_scope_id=stored.cancellation_scope_id,
-                trace_id=stored.trace_id,
-            ),
-            expected_grant_sha256=hashlib.sha256(
-                route.grant.encode("utf-8")
-            ).hexdigest(),
-        )
-        with self._policy_lock:
+                capability_digest=(
+                    catalog.catalog_digest
+                    if catalog is not None
+                    else route.capability_digest
+                ),
+                execution_policy_digest=(
+                    catalog.execution_policy.policy_digest
+                    if catalog is not None
+                    else route.execution_policy_digest
+                ),
+            )
+            hosted_room_links.save_room_link(
+                self.db_path,
+                hosted_room_links.make_stored_link(
+                    room_id=room_id,
+                    member_id=member_id,
+                    target_url=stored.target_url,
+                    target_profile=stored.target_profile,
+                    grant=grant,
+                    catalog=effective_catalog,
+                    cancellation_scope_id=stored.cancellation_scope_id,
+                    trace_id=stored.trace_id,
+                ),
+                expected_grant_sha256=expected_grant_sha256,
+            )
             self.peer_routes[key] = rotated_route
             self._peer_route_status[key] = "ready"
-        self._unblock_artifact_retries(room_id, member_id)
+            self._unblock_artifact_retries(room_id, member_id)
 
     def _refresh_peer_attachment_catalog(
         self,
@@ -1824,146 +1856,3 @@ class HostedRoomService(HostedRoomArtifactMixin):
             "pending_actions": pending_actions,
             "peer_routes": self._route_statuses(room_id),
         }
-
-
-class _RouteStatusPeerClient:
-    """Classify scoped-auth failures without exposing route credentials."""
-
-    def __init__(
-        self,
-        client,
-        *,
-        on_ready,
-        on_reauthorization,
-        on_unavailable,
-        on_refreshed,
-        capability_digest="",
-        execution_policy_digest="",
-    ) -> None:
-        self._client = client
-        self._on_ready = on_ready
-        self._on_reauthorization = on_reauthorization
-        self._on_unavailable = on_unavailable
-        self._on_refreshed = on_refreshed
-        self._capability_digest = str(capability_digest or "")
-        self._execution_policy_digest = str(execution_policy_digest or "")
-
-    def __getattr__(self, name):
-        value = getattr(self._client, name)
-        if not callable(value):
-            return value
-
-        def tracked(*args, **kwargs):
-            if (
-                name
-                in {
-                    "acknowledge_artifacts",
-                    "discard_artifacts",
-                    "dispatch",
-                    "read_artifact",
-                    "recover_dispatch",
-                    "stage_attachments",
-                }
-                and "grant" in kwargs
-            ):
-                from gateway.hosted_room_peer import (
-                    room_grant_needs_dispatch_refresh,
-                )
-
-                grant = kwargs["grant"]
-                if room_grant_needs_dispatch_refresh(grant):
-                    checked = (
-                        HostedMemberDispatch.from_mapping(kwargs["dispatch"])
-                        if "dispatch" in kwargs
-                        else None
-                    )
-                    capability_digest = (
-                        checked.capability_digest
-                        if checked is not None
-                        else self._capability_digest
-                    )
-                    execution_policy_digest = (
-                        checked.execution_policy_digest
-                        if checked is not None
-                        else self._execution_policy_digest
-                    )
-                    refresh = getattr(self._client, "refresh_grant", None)
-                    if callable(refresh):
-                        try:
-                            refreshed = refresh(
-                                grant=grant,
-                                capability_digest=capability_digest,
-                                execution_policy_digest=execution_policy_digest,
-                            )
-                        except Exception as exc:
-                            if bool(getattr(exc, "needs_reauthorization", False)):
-                                self._on_reauthorization()
-                                raise
-                            if room_grant_needs_dispatch_refresh(
-                                grant, leeway_seconds=0
-                            ):
-                                self._on_reauthorization()
-                                raise
-                        else:
-                            replacement = str(refreshed.get("grant") or "")
-                            if not replacement:
-                                raise RuntimeError(
-                                    "peer returned no refreshed room grant"
-                                )
-                            try:
-                                refreshed_catalog = None
-                                if refreshed.get("catalog") is not None:
-                                    refreshed_catalog = GatewayRoomCatalog.from_mapping(
-                                        refreshed.get("catalog")
-                                    )
-                                    if (
-                                        refreshed_catalog.execution_policy.policy_digest
-                                        != execution_policy_digest
-                                    ):
-                                        raise PeerRunsHTTPError(
-                                            "peer room execution policy needs reauthorization",
-                                            status_code=403,
-                                            error_code="room_execution_policy_changed",
-                                            not_admitted=True,
-                                        )
-                                    if (
-                                        refreshed_catalog.catalog_digest
-                                        != capability_digest
-                                    ):
-                                        raise PeerRunsHTTPError(
-                                            "peer room capabilities need reauthorization",
-                                            status_code=403,
-                                            error_code="room_capability_catalog_changed",
-                                            not_admitted=True,
-                                        )
-                                self._on_refreshed(replacement, refreshed_catalog)
-                            except Exception:
-                                revoke = getattr(
-                                    self._client, "revoke_grant_exact", None
-                                )
-                                self._on_reauthorization()
-                                try:
-                                    if callable(revoke):
-                                        revoke(grant=replacement)
-                                    else:
-                                        logger.warning("Peer cannot retire an unpublished grant exactly")
-                                except Exception:
-                                    logger.warning("Exact unpublished-grant cleanup could not be confirmed")
-                                raise
-                            kwargs = {**kwargs, "grant": replacement}
-            try:
-                result = value(*args, **kwargs)
-            except Exception as exc:
-                if bool(getattr(exc, "needs_reauthorization", False)):
-                    self._on_reauthorization()
-                    raise
-                elif bool(getattr(exc, "not_admitted", False)):
-                    self._on_unavailable()
-                    raise
-                else:
-                    raise
-            if name != "prepare":
-                self._on_ready()
-            return result
-
-        return tracked

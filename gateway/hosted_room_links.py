@@ -220,6 +220,7 @@ def mark_room_link_status(
     room_id: str,
     member_id: str,
     status: str,
+    expected_grant_sha256: str | None = None,
 ) -> bool:
     if status not in _STATUSES:
         raise HostedRoomPeerError("stored room link status is invalid")
@@ -228,6 +229,7 @@ def mark_room_link_status(
         room_id=_short_string(room_id, "room_id"),
         member_id=_short_string(member_id, "member_id"),
         status=status,
+        expected_grant_sha256=expected_grant_sha256,
     )
 
 
