@@ -2944,6 +2944,17 @@ def _rebuild_drifted_tables(conn: sqlite3.Connection) -> None:
     if not drifted:
         return
 
+    # SQLite rewrites references to a renamed table inside triggers and
+    # views, so ``ALTER TABLE task_events RENAME TO task_events_legacy``
+    # silently repoints the ``tasks_status_transition_history`` trigger at
+    # the legacy table -- which this function then DROPs, leaving a trigger
+    # that raises "no such table: main.task_events_legacy" on the next
+    # status update. A board migrates cleanly and then breaks on its first
+    # transition. ``legacy_alter_table`` suppresses that rewrite, which is
+    # what a rename-based rebuild wants: the trigger keeps naming
+    # ``task_events`` and the freshly created table takes over that name.
+    prior_legacy_alter = conn.execute("PRAGMA legacy_alter_table").fetchone()[0]
+    conn.execute("PRAGMA legacy_alter_table=ON")
     conn.execute("BEGIN IMMEDIATE")
     try:
         for table in drifted:
@@ -2980,6 +2991,10 @@ def _rebuild_drifted_tables(conn: sqlite3.Connection) -> None:
         except sqlite3.OperationalError:
             pass
         raise
+    finally:
+        conn.execute(
+            "PRAGMA legacy_alter_table=" + ("ON" if prior_legacy_alter else "OFF")
+        )
 
 
 def _check_file_length_invariant(conn: sqlite3.Connection) -> None:
