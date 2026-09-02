@@ -2168,6 +2168,102 @@ def _build_skills_system_prompt_inner(
 # Context files (SOUL.md, AGENTS.md, .cursorrules)
 # =========================================================================
 
+CONTEXT_INCLUDE_MAX_DEPTH = 10
+
+
+def _expand_context_includes(
+    content: str,
+    base_dir: Path,
+    *,
+    confine: bool = False,
+    _depth: int = 0,
+    _visited: Optional[set] = None,
+) -> str:
+    """Expand ``@path`` include directives in a context file.
+
+    A line whose only non-whitespace content is ``@<path>`` is replaced by the
+    contents of ``<path>``, resolved relative to ``base_dir`` (the directory of
+    the file the directive appears in). Includes nest: an included file's own
+    ``@`` directives are expanded relative to that file's directory. This lets a
+    single ``SOUL.md`` compose separate, independently-edited files (a global
+    identity, an agent role, a project overlay) that stay live on disk - editing
+    an included file changes the next prompt build with no reinstall.
+
+    Robustness is deliberate: only a whole-line ``@path`` (no space after the
+    ``@``) is a directive, so an email address or an inline ``@handle`` is never
+    mistaken for one. Every file is expanded at most once across the whole
+    tree - a repeated include, a diamond, or a cycle collapses to a single copy
+    and later encounters leave a visible ``[include skipped ...]`` marker rather
+    than duplicating content or looping. Missing, unreadable, over-deep, and
+    (when ``confine``) out-of-tree targets each leave their own visible marker
+    instead of raising. The single shared visited set also bounds total work:
+    each file is read once, so a fan-out cannot amplify into N**depth copies.
+
+    ``confine`` controls the trust boundary. Operator-owned files (``SOUL.md``)
+    leave it False so an include may reach across the filesystem (e.g. a vault
+    checked out elsewhere) - that author can already put anything in the prompt.
+    Files discovered from the working directory (``.hermes.md``, ``AGENTS.md``,
+    ``CLAUDE.md``) may come from an untrusted cloned repo, so they set it True:
+    absolute paths and ``..``/symlink escapes out of ``base_dir`` are refused,
+    which stops a hostile checked-in context file from reading host secrets
+    (``@/etc/passwd``, ``@~/.ssh/id_rsa``) into the model's context.
+    """
+    if "@" not in content:
+        return content
+    if _visited is None:
+        _visited = set()
+    if _depth >= CONTEXT_INCLUDE_MAX_DEPTH:
+        return content
+
+    out_lines: List[str] = []
+    for line in content.splitlines():
+        stripped = line.strip()
+        if not stripped.startswith("@"):
+            out_lines.append(line)
+            continue
+        # A directive is a bare @path on its own line: no space after the @ and
+        # no whitespace inside. Prose that merely starts with @, or "@ foo", is
+        # left untouched.
+        rel = stripped[1:]
+        if not rel or any(c.isspace() for c in rel):
+            out_lines.append(line)
+            continue
+        target = (base_dir / rel).resolve()
+        if confine:
+            try:
+                target.relative_to(base_dir.resolve())
+            except ValueError:
+                out_lines.append(f"[include outside base dir: {rel}]")
+                continue
+        key = str(target)
+        if key in _visited:
+            # Already expanded somewhere in the tree (repeat, diamond, or cycle):
+            # emit once, skip the rest - this is what bounds total work.
+            out_lines.append(f"[include skipped (already included): {rel}]")
+            continue
+        if not target.is_file():
+            out_lines.append(f"[include not found: {rel}]")
+            continue
+        try:
+            included = target.read_text(encoding="utf-8").strip()
+        except Exception as e:
+            logger.debug("Could not read include %s: %s", target, e)
+            out_lines.append(f"[include unreadable: {rel}]")
+            continue
+        _visited.add(key)
+        expanded = _expand_context_includes(
+            included,
+            target.parent,
+            confine=confine,
+            _depth=_depth + 1,
+            _visited=_visited,
+        )
+        if _depth + 1 >= CONTEXT_INCLUDE_MAX_DEPTH and "@" in expanded:
+            expanded += f"\n[include depth limit reached at: {rel}]"
+        out_lines.append(expanded)
+    return "\n".join(out_lines)
+
+
 def _truncate_content(
     content: str,
     filename: str,
@@ -2238,6 +2334,7 @@ def load_soul_md(
         content = soul_path.read_text(encoding="utf-8").strip()
         if not content:
             return None
+        content = _expand_context_includes(content, soul_path.parent)
         content = _scan_context_content(content, "SOUL.md")
         content = _truncate_content(
             content, "SOUL.md", context_length=context_length,
@@ -2258,6 +2355,7 @@ def _load_hermes_md(cwd_path: Path, context_length: Optional[int] = None) -> str
         content = hermes_md_path.read_text(encoding="utf-8").strip()
         if not content:
             return ""
+        content = _expand_context_includes(content, hermes_md_path.parent, confine=True)
         content = _strip_yaml_frontmatter(content)
         rel = hermes_md_path.name
         try:
@@ -2334,6 +2432,7 @@ def _load_agents_md(cwd_path: Path, context_length: Optional[int] = None) -> str
             if content in seen_content:
                 break  # identical copy along the chain — skip duplicate
             seen_content.add(content)
+            content = _expand_context_includes(content, directory, confine=True)
             if directory == cwd_resolved:
                 label = name
             else:
@@ -2368,6 +2467,7 @@ def _load_claude_md(cwd_path: Path, context_length: Optional[int] = None) -> str
             try:
                 content = candidate.read_text(encoding="utf-8").strip()
                 if content:
+                    content = _expand_context_includes(content, cwd_path, confine=True)
                     content = _scan_context_content(content, name)
                     result = f"## {name}\n\n{content}"
                     return _truncate_content(
