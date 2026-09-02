@@ -10,11 +10,15 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from dataclasses import dataclass, field
 from typing import Any, Mapping
 
 from utils import safe_json_loads
 from agent.tool_result_classification import file_mutation_result_landed
+
+
+_NULL_ERROR_FIELD_RE = re.compile(r'"error"\s*:\s*null\b', re.IGNORECASE)
 
 
 IDEMPOTENT_TOOL_NAMES = frozenset(
@@ -323,7 +327,18 @@ def classify_tool_failure(tool_name: str, result: str | None) -> tuple[bool, str
             if data.get("success") is False and "exceed the limit" in data.get("error", ""):
                 return True, " [full]"
 
+    data = safe_json_loads(result)
+    if isinstance(data, dict):
+        err = data.get("error")
+        if not err and data.get("success") is False:
+            err = data.get("message")
+        if err:
+            return True, " [error]"
     lower = result[:500].lower()
+    if isinstance(data, (dict, list)):
+        # Ignore only the parsed success shape from #91166. Keep the legacy
+        # fallback for every other error/failed key and value.
+        lower = _NULL_ERROR_FIELD_RE.sub("", lower)
     if '"error"' in lower or '"failed"' in lower or result.startswith("Error"):
         return True, " [error]"
 
