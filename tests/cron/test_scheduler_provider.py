@@ -200,6 +200,13 @@ def test_default_config_cron_provider_is_empty():
     assert DEFAULT_CONFIG["cron"]["provider"] == ""
 
 
+def test_default_config_preserves_desktop_only_cron_fallback():
+    """Existing Desktop-only installs keep their scheduler by default."""
+    from hermes_cli.config import DEFAULT_CONFIG
+
+    assert DEFAULT_CONFIG["cron"]["desktop_fallback"] is True
+
+
 def test_discover_cron_schedulers_returns_list():
     """Discovery returns bundled non-default providers.
 
@@ -638,7 +645,6 @@ def test_multiplex_ticker_ticks_each_profile_once(tmp_path, monkeypatch):
     # With 2 profiles and multiple iterations, we should have seen at least 2 calls.
     assert len(tick_count) >= len(profile_homes), \
         f"Expected >= {len(profile_homes)} tick calls, got {len(tick_count)}"
-
 
 def test_multiplex_ticker_skips_deleted_profile_from_startup_snapshot(tmp_path):
     """A stale profile_homes entry must not recreate a deleted profile."""
