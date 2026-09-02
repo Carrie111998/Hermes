@@ -2827,6 +2827,10 @@ class ShellFileOperations(FileOperations):
             SearchResult with matches or file list
         """
         offset, limit = normalize_search_pagination(offset, limit)
+        # ``context`` bypasses normalize_search_pagination but is compared
+        # (``context > 0``) and interpolated (``-C {context}```) below, so a
+        # string-typed value from a schema-loose caller dies with TypeError.
+        context = max(0, _coerce_int(context, 0))
 
         # Expand ~ and other shell paths
         path = self._expand_path(path)
