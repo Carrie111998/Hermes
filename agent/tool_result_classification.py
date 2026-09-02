@@ -9,6 +9,19 @@ from typing import Any
 FILE_MUTATING_TOOL_NAMES = frozenset({"write_file", "patch"})
 
 
+# Back-reference placeholder written by
+# ``agent.context_compressor._prune_old_tool_results`` when an older tool
+# result is byte-identical to a newer one. Defined here (rather than in the
+# compressor) because both the compressor that WRITES it and the loop
+# guardrails that READ it need the same string, and this module is the
+# dependency-free leaf both already import.
+DUPLICATE_OUTPUT_MARKER = "[Duplicate tool output — same content as a more recent call]"
+
+# Prefix used for recognition, so the marker can gain a suffix later without
+# silently breaking every consumer that matches on it.
+DUPLICATE_OUTPUT_MARKER_PREFIX = "[Duplicate tool output"
+
+
 # Tools whose interrupted/dangling execution is safe to discard because they
 # cannot mutate either external state or Hermes session state. Unknown/plugin/
 # MCP tools stay effect-capable by default.

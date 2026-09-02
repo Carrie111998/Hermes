@@ -14,7 +14,10 @@ from dataclasses import dataclass, field
 from typing import Any, Mapping
 
 from utils import safe_json_loads
-from agent.tool_result_classification import file_mutation_result_landed
+from agent.tool_result_classification import (
+    DUPLICATE_OUTPUT_MARKER_PREFIX,
+    file_mutation_result_landed,
+)
 
 
 IDEMPOTENT_TOOL_NAMES = frozenset(
@@ -316,6 +319,40 @@ def normalize_tool_args_for_guardrail(tool_name: str, args: Mapping[str, Any]) -
     return normalized
 
 
+def is_no_progress_marker_result(result: Any) -> bool:
+    """Whether a result explicitly states its content is unchanged.
+
+    Three emitters produce such a marker, and all three establish identity by
+    comparison rather than by guess, so the marker is *evidence* of an
+    unchanged read rather than a heuristic about one:
+
+    * ``agent.context_compressor._prune_old_tool_results`` replaces an older
+      byte-identical tool result with ``[Duplicate tool output — ...]`` after
+      matching content hashes.
+    * ``tools.file_tools.read_file`` returns a ``dedup`` envelope after
+      confirming the file's mtime is unchanged since the served read.
+    * ``tools.skills_tool.skill_view`` returns the same envelope shape after
+      confirming (mtime_ns, size) is unchanged.
+
+    Loop detection keys on result identity, and these markers are deliberately
+    *not* byte-identical to the payload they stand in for. Without this
+    predicate an alternating full/marker sequence reads as a changed result on
+    every other call, so the streak restarts forever and never reaches a
+    threshold — the measured hole this predicate closes.
+    """
+    if not isinstance(result, str):
+        return False
+    if result.lstrip().startswith(DUPLICATE_OUTPUT_MARKER_PREFIX):
+        return True
+    parsed = safe_json_loads(result)
+    return bool(
+        isinstance(parsed, dict)
+        and parsed.get("status") == "unchanged"
+        and parsed.get("dedup") is True
+        and parsed.get("content_returned") is False
+    )
+
+
 def canonical_tool_args(args: Mapping[str, Any]) -> str:
     """Return sorted compact JSON for parsed tool arguments."""
     if not isinstance(args, Mapping):
@@ -561,12 +598,17 @@ class ToolCallGuardrailController:
         previous = self._no_progress.get(signature)
         repeat_count = 1
         if previous is not None and (
-            previous[0] == result_hash or _is_explicit_no_progress_result(result)
+            previous[0] == result_hash or is_no_progress_marker_result(result)
         ):
-            # A dedup stub is explicit evidence that the underlying result is
-            # unchanged even though its envelope hashes differently. Every
-            # other changed result is progress and restarts the streak.
+            # An unchanged-marker result is positive evidence that the payload
+            # did not change, even though the marker's own hash differs from
+            # the payload it stands in for. Without this, an alternating
+            # payload/marker sequence restarts the streak on every other call
+            # and never reaches a threshold. The marker is kept OUT of the
+            # stored hash below so the streak survives the alternation.
             repeat_count = previous[1] + 1
+            if is_no_progress_marker_result(result):
+                result_hash = previous[0]
         self._no_progress[signature] = (result_hash, repeat_count)
 
         if self.config.warnings_enabled and repeat_count >= self.config.no_progress_warn_after:
@@ -649,6 +691,19 @@ class ToolCallGuardrailController:
         is_plain_str = isinstance(result, str)
         signature = ToolCallSignature.from_call(tool_name, _coerce_args(args))
         result_hash = _result_hash(result) if is_plain_str else ""
+
+        # An unchanged-marker result stands in for the payload it replaced, so
+        # for streak purposes it IS the previous result. Continuing the streak
+        # on the previous hash keeps an alternating payload/marker sequence
+        # counted as one streak instead of restarting it on every other call.
+        marker_continues_streak = (
+            is_plain_str
+            and self._identical_streak_sig == signature
+            and self._identical_streak_count > 0
+            and is_no_progress_marker_result(result)
+        )
+        if marker_continues_streak:
+            result_hash = self._identical_streak_result_hash
 
         if (
             is_plain_str
@@ -861,21 +916,6 @@ def _result_hash(result: str | None) -> str:
     else:
         canonical = result or ""
     return _sha256(canonical)
-
-
-def _is_explicit_no_progress_result(result: str | None) -> bool:
-    """Return whether a result explicitly denotes a duplicate/unchanged read."""
-    if not isinstance(result, str):
-        return False
-    if result.lstrip().startswith("[Duplicate tool output"):
-        return True
-    parsed = safe_json_loads(result)
-    return bool(
-        isinstance(parsed, dict)
-        and parsed.get("status") == "unchanged"
-        and parsed.get("dedup") is True
-        and parsed.get("content_returned") is False
-    )
 
 
 def _as_bool(value: Any, default: bool) -> bool:
