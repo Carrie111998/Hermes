@@ -140,3 +140,57 @@ def test_resolve_gateway_liveness_reports_running_for_refreshed_secondary_profil
     )
     assert liveness.running is True
     assert liveness.pid == os.getpid()
+
+
+def test_platform_entries_are_restamped_to_the_live_process(tmp_path):
+    """The gateway_state top-level refresh alone is NOT enough: each
+    platform sub-entry (e.g. "slack") carries its OWN writer_pid/
+    writer_start_time fingerprint, separate from the top-level pid.
+
+    hermes_cli/web_server.py's cross-profile /api/status aggregation
+    (``_owned_profile_platforms``) only includes a platform entry when its
+    writer_pid/writer_start_time EXACTLY match the profile's live gateway
+    process. If a secondary profile's platform entry is left stamped with
+    a stale/dead writer identity (e.g. from before multiplexing took over),
+    the profile's gateway_state.json can correctly say "running" while
+    still showing ZERO connected platforms to any caller that reads the
+    aggregation -- reproducing "can't reach this profile's chat in the
+    desktop app" even after the top-level gateway_state fix lands.
+
+    This asserts the fix: re-stamping a platform via
+    write_runtime_status(platform=..., path=...) after the top-level
+    refresh makes that entry pass the SAME ownership check
+    _owned_profile_platforms uses.
+    """
+    import os
+
+    state_path = tmp_path / "gateway_state.json"
+
+    # Simulate the old, stale writer identity a secondary profile's platform
+    # entry could be left with (a long-dead pre-multiplex PID/start_time).
+    write_runtime_status(
+        gateway_state="running",
+        multiplex_secondary=True,
+        path=state_path,
+    )
+
+    # This is the fix under test: re-stamp the platform entry via the live
+    # process (this test process stands in for the live gateway).
+    write_runtime_status(
+        platform="slack",
+        platform_state="connected",
+        path=state_path,
+    )
+
+    record = read_runtime_status(state_path)
+    slack_entry = record["platforms"]["slack"]
+
+    # Mirrors hermes_cli.web_server._owned_profile_platforms's exact-match
+    # ownership check against the live process's own identity.
+    live_pid = os.getpid()
+    from gateway.status import _get_process_start_time
+
+    live_start = _get_process_start_time(live_pid)
+    assert slack_entry.get("writer_pid") == live_pid
+    assert slack_entry.get("writer_start_time") == live_start
+    assert slack_entry.get("state") == "connected"

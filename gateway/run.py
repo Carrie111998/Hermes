@@ -17247,16 +17247,50 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         for profile_name, profile_home in profile_homes:
             if profile_name == active:
                 continue
+            secondary_state_path = Path(profile_home) / "gateway_state.json"
             try:
                 write_runtime_status(
                     gateway_state="running",
                     multiplex_secondary=True,
-                    path=Path(profile_home) / "gateway_state.json",
+                    path=secondary_state_path,
                 )
             except Exception:
                 logger.debug(
                     "could not refresh gateway_state.json for secondary "
                     "profile '%s'",
+                    profile_name,
+                    exc_info=True,
+                )
+                continue
+            # Also re-stamp each of this profile's CONNECTED platforms with
+            # the live process's (writer_pid, writer_start_time) identity.
+            # The top-level refresh above only touches gateway_state/pid —
+            # each platform sub-entry carries its OWN writer_pid/
+            # writer_start_time fingerprint, and /api/status's cross-profile
+            # aggregation (_owned_platform_entries in hermes_cli/web_server.py)
+            # requires an EXACT match against the live gateway process before
+            # including that platform in the aggregated view. Without this,
+            # a secondary profile's platform entries stay fingerprinted to
+            # whatever process last wrote them (e.g. a dead pre-multiplex
+            # PID), so the profile shows as running but with NO connected
+            # platforms anywhere that reads the aggregation — exactly the
+            # "can't reach this profile's chat" symptom the gateway_state
+            # top-level fix alone does not cover (found 2026-09-02 while
+            # investigating a recurrence of the same desktop-connectivity
+            # report).
+            try:
+                profile_platform_map = self._profile_adapters.get(profile_name) or {}
+                for platform_enum in profile_platform_map:
+                    platform_name = getattr(platform_enum, "value", platform_enum)
+                    write_runtime_status(
+                        platform=platform_name,
+                        platform_state="connected",
+                        path=secondary_state_path,
+                    )
+            except Exception:
+                logger.debug(
+                    "could not refresh platform writer identity for "
+                    "secondary profile '%s'",
                     profile_name,
                     exc_info=True,
                 )
