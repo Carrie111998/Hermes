@@ -1088,6 +1088,7 @@ def skill_view(
     file_path: str = None,
     task_id: str = None,
     preprocess: bool = True,
+    include_project_skills: bool = True,
 ) -> str:
     """
     View the content of a skill or a specific file within a skill directory.
@@ -1100,6 +1101,9 @@ def skill_view(
         preprocess: Apply configured SKILL.md template and inline shell rendering
             to main skill content. Internal slash/preload callers disable this
             because they render the skill message themselves.
+        include_project_skills: Include trusted skills from the current project.
+            Internal cross-profile validation disables this so a creator's
+            project skill cannot satisfy a target profile's capability check.
 
     Returns:
         JSON string with skill content or error message
@@ -1242,7 +1246,7 @@ def skill_view(
         # Build list of all skill directories to search. Project dirs first —
         # they're the highest-precedence tier and the collision resolver
         # below uses this ordering.
-        project_dirs = get_project_skills_dirs()
+        project_dirs = get_project_skills_dirs() if include_project_skills else []
         all_dirs = list(project_dirs)
         active_skills_dir = _skills_dir()
         if active_skills_dir.exists():

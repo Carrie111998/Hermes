@@ -3404,6 +3404,13 @@ def create_task(
             )
         skills_list = cleaned
 
+    if assignee and skills_list:
+        missing_skills = missing_profile_skills(assignee, skills_list)
+        if missing_skills:
+            raise ValueError(
+                missing_profile_skills_reason(assignee, missing_skills)
+            )
+
     # Idempotency check — return the existing task instead of creating a
     # duplicate. Done BEFORE entering write_txn to keep the fast path fast
     # and to avoid holding a write lock during the lookup. Race is
@@ -8024,6 +8031,73 @@ _RESPAWN_GUARD_PR_URL_RE = re.compile(
 )
 
 
+def missing_profile_skills(
+    assignee: str,
+    skills: Optional[Iterable[str]],
+) -> Optional[list[str]]:
+    """Return forced skills unavailable in the assignee's profile.
+
+    ``None`` means the assignee is not a resolvable Hermes profile. The
+    dispatcher's existing profile gate handles that case separately.
+
+    Project-local skills are deliberately excluded. A task's ``skills`` field
+    crosses a profile boundary and therefore may only name skills available to
+    the target profile itself (including its configured external directories
+    and plugins). This prevents a creator's project or profile skill from being
+    mistaken for a capability of the worker that will receive ``--skills``.
+    """
+    if isinstance(skills, str):
+        skills = [skills]
+    requested = list(dict.fromkeys(
+        name
+        for raw in (skills or [])
+        if (name := str(raw).strip())
+    ))
+    if not requested:
+        return []
+
+    try:
+        from hermes_cli.profiles import resolve_profile_env
+
+        profile_home = resolve_profile_env(assignee)
+    except (FileNotFoundError, ValueError):
+        return None
+
+    from hermes_constants import (
+        reset_hermes_home_override,
+        set_hermes_home_override,
+    )
+    from tools.skills_tool import skill_view
+
+    token = set_hermes_home_override(profile_home)
+    try:
+        missing: list[str] = []
+        for name in requested:
+            try:
+                payload = json.loads(skill_view(
+                    name,
+                    preprocess=False,
+                    include_project_skills=False,
+                ))
+            except Exception:
+                payload = {"success": False}
+            if not payload.get("success"):
+                missing.append(name)
+        return missing
+    finally:
+        reset_hermes_home_override(token)
+
+
+def missing_profile_skills_reason(assignee: str, missing: Iterable[str]) -> str:
+    """Build the operator-facing capability blocker for a task handoff."""
+    names = ", ".join(repr(name) for name in missing)
+    return (
+        f"Assignee profile {assignee!r} cannot load required skill(s): {names}. "
+        "Remove them from task.skills or install the appropriate skill in "
+        f"the {assignee!r} profile."
+    )
+
+
 @dataclass
 class DispatchResult:
     """Outcome of a single ``dispatch`` pass."""
@@ -8063,7 +8137,7 @@ class DispatchResult:
     crashed: list[str] = field(default_factory=list)
     """Task ids reclaimed because their worker PID disappeared."""
     auto_blocked: list[str] = field(default_factory=list)
-    """Task ids auto-blocked by the spawn-failure circuit breaker."""
+    """Task ids auto-blocked by capability preflight or the failure breaker."""
     timed_out: list[str] = field(default_factory=list)
     """Task ids whose workers exceeded ``max_runtime_seconds``."""
     stale: list[str] = field(default_factory=list)
@@ -10241,6 +10315,22 @@ def _dispatch_once_locked(
         claimed = claim_task(conn, row["id"], ttl_seconds=ttl_seconds)
         if claimed is None:
             continue
+        missing_skills = missing_profile_skills(
+            claimed.assignee or "", claimed.skills,
+        )
+        if missing_skills:
+            reason = missing_profile_skills_reason(
+                claimed.assignee or "", missing_skills,
+            )
+            if block_task(
+                conn,
+                claimed.id,
+                reason=reason,
+                kind="capability",
+                expected_run_id=claimed.current_run_id,
+            ):
+                result.auto_blocked.append(claimed.id)
+            continue
         try:
             resolved_branch_name = None
             if claimed.workspace_kind == "worktree":
@@ -10368,6 +10458,28 @@ def _dispatch_once_locked(
         claimed = claim_review_task(conn, row["id"], ttl_seconds=ttl_seconds)
         if claimed is None:
             continue
+        # Review workers also receive the bundled review workflow as a forced
+        # skill, so include it in the same target-profile preflight as the
+        # task's explicit skills.
+        claimed.skills = list(
+            dict.fromkeys([*(claimed.skills or []), "sdlc-review"])
+        )
+        missing_skills = missing_profile_skills(
+            claimed.assignee or "", claimed.skills,
+        )
+        if missing_skills:
+            reason = missing_profile_skills_reason(
+                claimed.assignee or "", missing_skills,
+            )
+            if block_task(
+                conn,
+                claimed.id,
+                reason=reason,
+                kind="capability",
+                expected_run_id=claimed.current_run_id,
+            ):
+                result.auto_blocked.append(claimed.id)
+            continue
         try:
             resolved_branch_name = None
             if claimed.workspace_kind == "worktree":
@@ -10387,14 +10499,6 @@ def _dispatch_once_locked(
         if claimed.workspace_kind == "worktree":
             set_branch_name(conn, claimed.id, resolved_branch_name or (claimed.branch_name or "").strip() or f"wt/{claimed.id}")
         _maybe_emit_scratch_tip(conn, claimed.id, claimed.workspace_kind)
-        # Force-load the sdlc-review skill for review agents — it carries
-        # the review logic (AC verification, merge, etc.). The mandatory
-        # kanban lifecycle is already injected into every worker's system
-        # prompt via KANBAN_GUIDANCE, so this is the only extra skill the
-        # review agent needs.
-        claimed.skills = list(
-            dict.fromkeys([*(claimed.skills or []), "sdlc-review"])
-        )
         _spawn = spawn_fn if spawn_fn is not None else _default_spawn
         try:
             import inspect

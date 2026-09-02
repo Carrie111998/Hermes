@@ -416,6 +416,76 @@ def test_create_happy_path(worker_env):
         conn.close()
 
 
+def test_create_rejects_skill_missing_from_assignee_profile(
+    monkeypatch, worker_env, tmp_path,
+):
+    """A creator-only skill must not be forwarded to a different profile."""
+    from tools import kanban_tools as kt
+
+    creator_skill = (
+        tmp_path
+        / ".hermes"
+        / "profiles"
+        / "ceo"
+        / "skills"
+        / "software-development"
+        / "coding-project-orchestrator"
+    )
+    creator_skill.mkdir(parents=True)
+    (creator_skill / "SKILL.md").write_text(
+        "---\nname: coding-project-orchestrator\ndescription: CEO workflow\n---\n",
+        encoding="utf-8",
+    )
+    (tmp_path / ".hermes" / "profiles" / "cto" / "skills").mkdir(parents=True)
+    monkeypatch.setenv("HERMES_PROFILE", "ceo")
+
+    out = json.loads(kt._handle_create({
+        "title": "Plan implementation",
+        "assignee": "cto",
+        "skills": ["coding-project-orchestrator"],
+    }))
+
+    assert "error" in out
+    assert "coding-project-orchestrator" in out["error"]
+    assert "cto" in out["error"]
+    from hermes_cli import kanban_db as kb
+    with kb.connect() as conn:
+        assert all(
+            task.title != "Plan implementation"
+            for task in kb.list_tasks(conn, limit=100)
+        )
+
+
+def test_create_accepts_skill_installed_in_assignee_profile(
+    worker_env, tmp_path,
+):
+    """The guard preserves valid target-profile skill handoffs."""
+    from tools import kanban_tools as kt
+
+    target_skill = (
+        tmp_path
+        / ".hermes"
+        / "profiles"
+        / "cto"
+        / "skills"
+        / "planning"
+        / "implementation-planner"
+    )
+    target_skill.mkdir(parents=True)
+    (target_skill / "SKILL.md").write_text(
+        "---\nname: implementation-planner\ndescription: CTO planning\n---\n",
+        encoding="utf-8",
+    )
+
+    out = json.loads(kt._handle_create({
+        "title": "Plan implementation",
+        "assignee": "cto",
+        "skills": ["implementation-planner"],
+    }))
+
+    assert out["ok"] is True
+
+
 def test_link_happy_path(worker_env):
     from hermes_cli import kanban_db as kb
     conn = kb.connect()

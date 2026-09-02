@@ -753,6 +753,90 @@ def test_default_spawn_does_not_auto_load_any_skill(kanban_home, monkeypatch):
 
 
 
+def test_dispatch_blocks_task_when_assignee_profile_lacks_forced_skill(
+    kanban_home,
+):
+    """A stale invalid card is blocked before a worker is spawned."""
+    spawned = []
+
+    with kb.connect() as conn:
+        # Legacy cards and cards whose target profile changed after creation
+        # can pre-date the create-time validation.
+        task_id = kb.create_task(
+            conn,
+            title="Legacy invalid handoff",
+            assignee="cto",
+            skills=["coding-project-orchestrator"],
+        )
+        (kanban_home / "profiles" / "cto" / "skills").mkdir(parents=True)
+        creator_skill = (
+            kanban_home
+            / "profiles"
+            / "ceo"
+            / "skills"
+            / "software-development"
+            / "coding-project-orchestrator"
+        )
+        creator_skill.mkdir(parents=True)
+        (creator_skill / "SKILL.md").write_text(
+            "---\nname: coding-project-orchestrator\ndescription: CEO workflow\n---\n",
+            encoding="utf-8",
+        )
+        result = kb.dispatch_once(
+            conn,
+            spawn_fn=lambda task, workspace: spawned.append(task.id),
+        )
+        task = kb.get_task(conn, task_id)
+        run = kb.latest_run(conn, task_id)
+
+    assert spawned == []
+    assert result.auto_blocked == [task_id]
+    assert task is not None
+    assert task.status == "blocked"
+    assert task.block_kind == "capability"
+    assert task.consecutive_failures == 0
+    assert run is not None
+    assert "coding-project-orchestrator" in (run.summary or "")
+    assert "cto" in (run.summary or "")
+
+
+def test_dispatch_spawns_task_when_assignee_profile_has_forced_skill(
+    kanban_home,
+):
+    """A valid target-profile skill remains force-loaded for the worker."""
+    target_skill = (
+        kanban_home
+        / "profiles"
+        / "cto"
+        / "skills"
+        / "planning"
+        / "implementation-planner"
+    )
+    target_skill.mkdir(parents=True)
+    (target_skill / "SKILL.md").write_text(
+        "---\nname: implementation-planner\ndescription: CTO planning\n---\n",
+        encoding="utf-8",
+    )
+    spawned = []
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="Valid handoff",
+            assignee="cto",
+            skills=["implementation-planner"],
+        )
+        result = kb.dispatch_once(
+            conn,
+            spawn_fn=lambda task, workspace: spawned.append(
+                list(task.skills or [])
+            ),
+        )
+
+    assert task_id in [item[0] for item in result.spawned]
+    assert spawned == [["implementation-planner"]]
+
+
 def test_legacy_db_without_skills_column_migrates(tmp_path):
     """_migrate_add_optional_columns is idempotent and adds skills
     when absent. Run it twice on a pared-down schema to confirm."""
@@ -1406,5 +1490,3 @@ def test_notify_sub_starts_caught_up_on_active_task(kanban_home):
         assert events == [], "historical events must not replay to a new sub"
     finally:
         conn.close()
-
-

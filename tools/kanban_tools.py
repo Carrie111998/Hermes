@@ -2277,7 +2277,8 @@ KANBAN_CREATE_SCHEMA = {
                     "context — e.g. ['translation'] for a translation "
                     "task, ['github-code-review'] for a reviewer task. "
                     "The names must match skills installed on the "
-                    "assignee's profile."
+                    "assignee's profile; do not attach a creator-only or "
+                    "orchestrator skill merely because it informed the handoff."
                 ),
             },
             "goal_mode": {

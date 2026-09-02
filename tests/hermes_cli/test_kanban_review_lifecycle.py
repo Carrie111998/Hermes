@@ -527,6 +527,43 @@ def test_review_dispatch_preserves_task_skills_and_adds_reviewer_skill(
     assert captured == [["domain-specific-review", "sdlc-review"]]
 
 
+def test_review_dispatch_blocks_when_reviewer_profile_lacks_review_skill(
+    kanban_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The implicit review skill is checked before a reviewer is spawned."""
+    (kanban_home / "profiles" / "cto" / "skills").mkdir(parents=True)
+    monkeypatch.setattr(kb, "review_dispatch_enabled", lambda: True)
+    spawned: list[str] = []
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="review without capability",
+            assignee="cto",
+        )
+        implementation = kb.claim_task(conn, task_id)
+        assert implementation is not None
+        assert kb.request_review(
+            conn,
+            task_id,
+            summary="ready",
+            expected_run_id=implementation.current_run_id,
+        )
+
+        result = kb.dispatch_once(
+            conn,
+            spawn_fn=lambda task, workspace: spawned.append(task.id),
+        )
+        task = kb.get_task(conn, task_id)
+
+    assert spawned == []
+    assert result.auto_blocked == [task_id]
+    assert task is not None
+    assert task.status == "blocked"
+    assert task.block_kind == "capability"
+
+
 def test_review_dispatch_honors_global_and_per_profile_caps(
     kanban_home: Path,
     monkeypatch: pytest.MonkeyPatch,
