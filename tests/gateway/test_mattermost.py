@@ -65,6 +65,35 @@ class TestMattermostDisplayHygiene:
 
 class TestMattermostConfigLoading:
 
+    def test_yaml_reply_modes_are_profile_scoped_extras(self):
+        from plugins.platforms.mattermost.adapter import _apply_yaml_config
+
+        extras = _apply_yaml_config(
+            {},
+            {"reply_mode": "thread", "dm_reply_mode": "off"},
+        )
+
+        assert extras == {"reply_mode": "thread", "dm_reply_mode": "off"}
+
+    def test_legacy_reply_mode_env_overrides_yaml_extra(self, monkeypatch):
+        from plugins.platforms.mattermost.adapter import MattermostAdapter
+
+        monkeypatch.setenv("MATTERMOST_REPLY_MODE", "off")
+        adapter = MattermostAdapter(
+            PlatformConfig(
+                enabled=True,
+                token="test-token",
+                extra={
+                    "url": "https://mm.example.com",
+                    "reply_mode": "thread",
+                    "dm_reply_mode": "off",
+                },
+            )
+        )
+
+        assert adapter._reply_mode == "off"
+        assert adapter._dm_reply_mode == "off"
+
 
     def test_mattermost_home_channel(self, monkeypatch):
         monkeypatch.setenv("MATTERMOST_TOKEN", "mm-tok-abc123")
@@ -196,6 +225,97 @@ class TestMattermostSend:
 
 
     @pytest.mark.asyncio
+    async def test_dm_reply_mode_off_keeps_top_level_dm_flat(self):
+        """A top-level DM should stay flat when dm_reply_mode is off."""
+        self.adapter._reply_mode = "thread"
+        self.adapter._dm_reply_mode = "off"
+        self.adapter._channel_type_cache["dm_1"] = "D"
+        self.adapter._api_get = AsyncMock(
+            return_value={"id": "dm_post", "root_id": ""}
+        )
+        self.adapter._api_post = AsyncMock(return_value={"id": "bot_post"})
+
+        result = await self.adapter.send(
+            "dm_1",
+            "Flat DM reply",
+            reply_to="dm_post",
+        )
+
+        assert result.success is True
+        payload = self.adapter._api_post.call_args.args[1]
+        assert "root_id" not in payload
+
+
+    @pytest.mark.asyncio
+    async def test_dm_reply_mode_off_resolves_uncached_dm_type(self):
+        """Outbound paths without an inbound cache may resolve the channel once."""
+        self.adapter._reply_mode = "thread"
+        self.adapter._dm_reply_mode = "off"
+        self.adapter._api_get = AsyncMock(
+            side_effect=[
+                {"id": "dm_post", "root_id": ""},
+                {"id": "dm_1", "type": "D"},
+            ]
+        )
+        self.adapter._api_post = AsyncMock(return_value={"id": "bot_post"})
+
+        result = await self.adapter.send(
+            "dm_1",
+            "Flat uncached DM reply",
+            reply_to="dm_post",
+        )
+
+        assert result.success is True
+        payload = self.adapter._api_post.call_args.args[1]
+        assert "root_id" not in payload
+        assert self.adapter._channel_type_cache["dm_1"] == "D"
+
+
+    @pytest.mark.asyncio
+    async def test_dm_reply_mode_off_preserves_existing_dm_thread(self):
+        """Opting out of new DM threads must not break an existing one."""
+        self.adapter._reply_mode = "thread"
+        self.adapter._dm_reply_mode = "off"
+        self.adapter._channel_type_cache["dm_1"] = "D"
+        self.adapter._api_get = AsyncMock(
+            return_value={"id": "dm_reply", "root_id": "dm_root"}
+        )
+        self.adapter._api_post = AsyncMock(return_value={"id": "bot_post"})
+
+        result = await self.adapter.send(
+            "dm_1",
+            "Continue existing DM thread",
+            reply_to="dm_reply",
+        )
+
+        assert result.success is True
+        payload = self.adapter._api_post.call_args.args[1]
+        assert payload["root_id"] == "dm_root"
+
+
+    @pytest.mark.asyncio
+    async def test_dm_reply_mode_off_does_not_change_channel_threading(self):
+        """Channel replies still thread under the triggering post."""
+        self.adapter._reply_mode = "thread"
+        self.adapter._dm_reply_mode = "off"
+        self.adapter._channel_type_cache["channel_1"] = "O"
+        self.adapter._api_get = AsyncMock(
+            return_value={"id": "channel_post", "root_id": ""}
+        )
+        self.adapter._api_post = AsyncMock(return_value={"id": "bot_post"})
+
+        result = await self.adapter.send(
+            "channel_1",
+            "Threaded channel reply",
+            reply_to="channel_post",
+        )
+
+        assert result.success is True
+        payload = self.adapter._api_post.call_args.args[1]
+        assert payload["root_id"] == "channel_post"
+
+
+    @pytest.mark.asyncio
     async def test_progress_send_with_invalid_thread_root_never_falls_back_flat(self):
         """Tool/status/progress bubbles must stay quiet when the thread is broken."""
         self.adapter._reply_mode = "thread"
@@ -298,6 +418,7 @@ class TestMattermostWebSocketParsing:
         # @mention is stripped from the message text
         assert msg_event.text == "Hello from Matrix!"
         assert msg_event.message_id == "post_abc"
+        assert self.adapter._channel_type_cache["chan_456"] == "O"
 
 
     @pytest.mark.asyncio
@@ -592,5 +713,3 @@ async def test_mattermost_top_level_channel_post_is_thread_root():
     assert msg_event.source.thread_id == "top_post_123"
     assert msg_event.source.message_id == "top_post_123"
     assert msg_event.message_id == "top_post_123"
-
-

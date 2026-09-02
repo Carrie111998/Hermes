@@ -16,7 +16,7 @@ Before setup, here's the part most people want to know: how Hermes behaves once 
 
 | Context | Behavior |
 |---------|----------|
-| **DMs** | Hermes responds to every message. No `@mention` needed. Each DM has its own session. |
+| **DMs** | Hermes responds to every message. No `@mention` needed. Each DM has its own session. Set `mattermost.dm_reply_mode: off` to keep top-level DM replies flat while channel replies stay threaded. |
 | **Public/private channels** | Hermes responds when you `@mention` it. Without a mention, Hermes ignores the message. |
 | **Threads** | If `MATTERMOST_REPLY_MODE=thread`, Hermes replies in a thread under your message. Thread context stays isolated from the parent channel. |
 | **Shared channels with multiple users** | By default, Hermes isolates session history per user inside the channel. Two people talking in the same channel do not share one transcript unless you explicitly disable that. |
@@ -147,9 +147,6 @@ MATTERMOST_ALLOWED_USERS=3uo8dkh1p7g1mfk49ear5fzs5c
 # Multiple allowed users (comma-separated)
 # MATTERMOST_ALLOWED_USERS=3uo8dkh1p7g1mfk49ear5fzs5c,8fk2jd9s0a7bncm1xqw4tp6r3e
 
-# Optional: reply mode (thread or off, default: off)
-# MATTERMOST_REPLY_MODE=thread
-
 # Optional: respond without @mention (default: true = require mention)
 # MATTERMOST_REQUIRE_MENTION=false
 
@@ -161,9 +158,14 @@ Optional behavior settings in `~/.hermes/config.yaml`:
 
 ```yaml
 group_sessions_per_user: true
+mattermost:
+  reply_mode: thread      # thread | off
+  dm_reply_mode: off      # inherit | off | thread
 ```
 
 - `group_sessions_per_user: true` keeps each participant's context isolated inside shared channels and threads
+- `reply_mode: thread` keeps team-channel conversations in Mattermost threads
+- `dm_reply_mode: off` keeps top-level one-to-one DMs flat while preserving replies inside an existing DM thread
 
 ### Start the Gateway
 
@@ -199,18 +201,42 @@ Replace the ID with the actual channel ID (click the channel name → View Info 
 
 ## Reply Mode
 
-The `MATTERMOST_REPLY_MODE` setting controls how Hermes posts responses:
+The `mattermost.reply_mode` setting controls how Hermes posts responses:
 
 | Mode | Behavior |
 |------|----------|
 | `off` (default) | Hermes posts flat messages in the channel, like a normal user. |
 | `thread` | Hermes replies in a thread under your original message. Keeps channels clean when there's lots of back-and-forth. |
 
-Set it in your `~/.hermes/.env`:
+Set it in `~/.hermes/config.yaml`:
 
-```bash
-MATTERMOST_REPLY_MODE=thread
+```yaml
+mattermost:
+  reply_mode: thread
 ```
+
+`MATTERMOST_REPLY_MODE` remains supported as a legacy compatibility override
+and takes precedence when it is set.
+
+### DM reply mode
+
+Use `mattermost.dm_reply_mode` when DMs and team channels should use different
+reply placement:
+
+```yaml
+mattermost:
+  reply_mode: thread
+  dm_reply_mode: off
+```
+
+| Value | DM behavior |
+|------|-------------|
+| `inherit` (default) | Follow `reply_mode` and preserve the historical behavior. |
+| `off` | Keep replies to top-level DM messages flat. Existing DM threads remain threaded. |
+| `thread` | Explicitly thread replies in DMs. |
+
+This setting does not change channel behavior. With the example above, channel
+mentions open or continue threads while normal one-to-one DMs stay linear.
 
 ## Mention Behavior
 
