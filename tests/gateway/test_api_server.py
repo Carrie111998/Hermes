@@ -33,6 +33,7 @@ from gateway.platforms.api_server import (
     _IdempotencyCache,
     _derive_chat_session_id,
     _hermes_version,
+    _make_request_fingerprint,
     _redact_api_error_text,
     _request_agent_overrides,
     check_api_server_requirements,
@@ -114,6 +115,44 @@ class TestResponseStore:
         store.delete("resp_1")
         assert store.get_conversation("chat-a") is None
 
+    def test_large_excess_eviction_exceeding_sql_variable_limit(self):
+        """Evicting >1000 items in a single put must not crash with too many SQL variables."""
+        store = ResponseStore(max_size=5)
+        # Pre-populate 1200 items in the store
+        for i in range(1200):
+            store.put(f"resp_{i}", {"output": f"data_{i}"})
+            store.set_conversation(f"conv_{i}", f"resp_{i}")
+        assert len(store) == 5
+        # The latest 5 should remain
+        for i in range(1195, 1200):
+            assert store.get(f"resp_{i}") is not None
+            assert store.get_conversation(f"conv_{i}") == f"resp_{i}"
+        # The earlier ones should be cleanly evicted
+        assert store.get("resp_0") is None
+        assert store.get_conversation("conv_0") is None
+
+    def test_concurrent_response_store_access(self):
+        """Concurrent threads executing get, put, and set_conversation must be thread-safe."""
+        import concurrent.futures
+        store = ResponseStore(max_size=50)
+
+        def worker(worker_id: int):
+            for i in range(50):
+                resp_id = f"resp_{worker_id}_{i}"
+                store.put(resp_id, {"val": i, "worker": worker_id})
+                store.set_conversation(f"conv_{worker_id}_{i}", resp_id)
+                res = store.get(resp_id)
+                if res is not None:
+                    assert res["worker"] == worker_id
+                store.get_conversation(f"conv_{worker_id}_{i}")
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+            futures = [executor.submit(worker, w) for w in range(8)]
+            for f in concurrent.futures.as_completed(futures):
+                f.result()
+
+        assert len(store) <= 50
+
 
 # ---------------------------------------------------------------------------
 # _IdempotencyCache
@@ -121,6 +160,24 @@ class TestResponseStore:
 
 
 class TestIdempotencyCache:
+    def test_request_fingerprint_deterministic_key_ordering(self):
+        """_make_request_fingerprint must produce identical hashes regardless of dict key order."""
+        body1 = {
+            "model": "hermes-3",
+            "messages": [{"role": "user", "content": "hello"}],
+            "temperature": 0.7,
+            "stream": False,
+        }
+        body2 = {
+            "stream": False,
+            "temperature": 0.7,
+            "messages": [{"content": "hello", "role": "user"}],
+            "model": "hermes-3",
+        }
+        keys = ["model", "messages", "temperature", "stream"]
+        fp1 = _make_request_fingerprint(body1, keys)
+        fp2 = _make_request_fingerprint(body2, keys)
+        assert fp1 == fp2
     @pytest.mark.asyncio
     async def test_concurrent_same_key_and_fingerprint_runs_once(self):
         cache = _IdempotencyCache()
