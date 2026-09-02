@@ -540,3 +540,8 @@ class SubagentLifecycleService:
                 raise SubagentLifecycleError(
                     "Requested toolsets would broaden parent permissions."
                 )
+            disabled = getattr(parent, "disabled_toolsets", None)
+            if disabled and (set(request.allowed_toolsets) & set(disabled)):
+                raise SubagentLifecycleError(
+                    "Requested toolsets would broaden parent permissions."
+                )
