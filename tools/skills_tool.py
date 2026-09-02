@@ -684,13 +684,82 @@ def _is_skill_disabled(name: str, platform: str = None) -> bool:
         return False
 
 
-def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any]]:
+def _routing_metadata_values(frontmatter: Dict[str, Any], key: str) -> List[str]:
+    """Return stable string values for a routing-only frontmatter field."""
+    metadata = frontmatter.get("metadata")
+    hermes_metadata = (
+        metadata.get("hermes", {}) if isinstance(metadata, dict) else {}
+    )
+    nested = hermes_metadata.get(key) if isinstance(hermes_metadata, dict) else None
+    values = _parse_tags(nested) + _parse_tags(frontmatter.get(key))
+    return sorted(set(values), key=lambda value: (value.casefold(), value))
+
+
+def _routing_document(
+    *,
+    name: str,
+    description: str,
+    display_description: str,
+    category: str | None,
+    frontmatter: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Build a path-free routing document from declared skill metadata."""
+    try:
+        legacy_environment, legacy_commands = _collect_prerequisite_values(
+            frontmatter
+        )
+    except (TypeError, ValueError):
+        legacy_environment, legacy_commands = [], []
+    required_environment = _get_required_environment_variables(
+        frontmatter, legacy_environment
+    )
+    required_commands = _routing_metadata_values(frontmatter, "required_commands")
+    required_commands.extend(legacy_commands)
+    required_command_names = sorted(
+        {value for value in required_commands if value},
+        key=lambda value: (value.casefold(), value),
+    )
+    qualified_name = (
+        name if ":" in name else "/".join(filter(None, (category, name)))
+    )
+    return {
+        "qualified_name": qualified_name,
+        "name": name,
+        "category": category,
+        "description": description,
+        "display_description": display_description,
+        "triggers": _routing_metadata_values(frontmatter, "triggers"),
+        "tags": _routing_metadata_values(frontmatter, "tags"),
+        "related_skills": _routing_metadata_values(frontmatter, "related_skills"),
+        "required_commands": required_command_names,
+        "required_environment_variables": [
+            item["name"] for item in required_environment if item.get("name")
+        ],
+    }
+
+
+def _copy_skill_catalog(
+    skills: List[Dict[str, Any]], *, include_routing: bool
+) -> List[Dict[str, Any]]:
+    copied = [dict(skill) for skill in skills]
+    if not include_routing:
+        for skill in copied:
+            skill.pop("_routing", None)
+    return copied
+
+
+def _find_all_skills(
+    *, skip_disabled: bool = False, include_routing: bool = False
+) -> List[Dict[str, Any]]:
     """Recursively find all skills in ~/.hermes/skills/ and external dirs.
 
     Args:
         skip_disabled: If True, return ALL skills regardless of disabled
             state (used by ``hermes skills`` config UI). Default False
             filters out disabled skills.
+        include_routing: Include private, path-free routing metadata for the
+            ``skills_list`` query path. Default False preserves the public
+            catalog shape.
 
     Returns:
         List of skill metadata dicts (name, description, category).
@@ -706,7 +775,10 @@ def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any]]:
         iter_skill_index_files,
     )
 
-    cache_key = _SKILLS_CACHE_KEY_DISABLED if skip_disabled else _SKILLS_CACHE_KEY_FILTERED
+    visibility_key = (
+        _SKILLS_CACHE_KEY_DISABLED if skip_disabled else _SKILLS_CACHE_KEY_FILTERED
+    )
+    cache_key = (visibility_key, include_routing)
 
     # Load disabled set once (not per-skill). Part of the cache signature:
     # disabling a skill is a config change with no filesystem mtime bump.
@@ -736,7 +808,7 @@ def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any]]:
         # Per-call shallow copies: callers mutate the returned dicts
         # (e.g. web_server annotates s["enabled"]/s["usage"]) — handing
         # out the cached objects would poison the cache for everyone else.
-        return [dict(s) for s in cached[2]]
+        return _copy_skill_catalog(cached[2], include_routing=include_routing)
 
     skills = []
     seen_names: set = set()
@@ -773,7 +845,8 @@ def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any]]:
                 if name in disabled:
                     continue
 
-                description = frontmatter.get("description", "")
+                frontmatter_description = frontmatter.get("description", "")
+                description = frontmatter_description
                 if not description:
                     for line in body.strip().split("\n"):
                         line = line.strip()
@@ -787,11 +860,20 @@ def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any]]:
                 category = _get_category_from_path(skill_md)
 
                 seen_names.add(name)
-                skills.append({
+                skill = {
                     "name": name,
                     "description": description,
                     "category": category,
-                })
+                }
+                if include_routing:
+                    skill["_routing"] = _routing_document(
+                        name=name,
+                        description=frontmatter_description,
+                        display_description=description,
+                        category=category,
+                        frontmatter=frontmatter,
+                    )
+                skills.append(skill)
 
             except (UnicodeDecodeError, PermissionError) as e:
                 logger.debug("Failed to read skill file %s: %s", skill_md, e)
@@ -807,7 +889,7 @@ def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any]]:
     # re-scans rather than serving the torn result past the TTL). Same
     # shallow-copy contract as the hit path — the caller may mutate.
     _SKILLS_CACHE[cache_key] = (signature, now, skills)
-    return [dict(s) for s in skills]
+    return _copy_skill_catalog(skills, include_routing=include_routing)
 
 
 def _sort_skills(skills: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -815,7 +897,12 @@ def _sort_skills(skills: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return sorted(skills, key=lambda s: (s.get("category") or "", s["name"]))
 
 
-def skills_list(category: str = None, task_id: str = None) -> str:
+def skills_list(
+    category: str | None = None,
+    query: str | None = None,
+    limit: int = 8,
+    task_id: str | None = None,
+) -> str:
     """
     List all available skills (progressive disclosure tier 1 - minimal metadata).
 
@@ -824,18 +911,33 @@ def skills_list(category: str = None, task_id: str = None) -> str:
 
     Args:
         category: Optional category filter (e.g., "mlops")
+        query: Optional natural-language routing query
+        limit: Maximum ranked candidates in query mode (1-50)
         task_id: Optional task identifier used to probe the active backend
 
     Returns:
         JSON string with minimal skill info: name, description, category
     """
     try:
+        if query is not None and not isinstance(query, str):
+            return tool_error("query must be a string", success=False)
+        routing_query = query.strip() if query is not None else ""
+        query_mode = bool(routing_query)
+        if query_mode and (
+            isinstance(limit, bool)
+            or not isinstance(limit, int)
+            or not 1 <= limit <= 50
+        ):
+            return tool_error(
+                "limit must be an integer between 1 and 50", success=False
+            )
+
         active_skills_dir = _skills_dir()
         if not active_skills_dir.exists():
             active_skills_dir.mkdir(parents=True, exist_ok=True)
 
         # Find all skills
-        all_skills = _find_all_skills()
+        all_skills = _find_all_skills(include_routing=query_mode)
         try:
             from hermes_cli.plugins import discover_plugins, get_plugin_manager
 
@@ -844,13 +946,23 @@ def skills_list(category: str = None, task_id: str = None) -> str:
                 frontmatter = plugin_skill.pop("frontmatter", {})
                 if not skill_matches_platform(frontmatter):
                     continue
+                if not skill_matches_environment(frontmatter):
+                    continue
                 if _is_skill_disabled(plugin_skill["name"]):
                     continue
+                if query_mode:
+                    plugin_skill["_routing"] = _routing_document(
+                        name=plugin_skill["name"],
+                        description=plugin_skill.get("description", ""),
+                        display_description=plugin_skill.get("description", ""),
+                        category=plugin_skill.get("category"),
+                        frontmatter=frontmatter,
+                    )
                 all_skills.append(plugin_skill)
         except Exception:
             logger.debug("Plugin skill listing failed", exc_info=True)
 
-        if not all_skills:
+        if not all_skills and not query_mode:
             return json.dumps(
                 {
                     "success": True,
@@ -864,6 +976,26 @@ def skills_list(category: str = None, task_id: str = None) -> str:
         # Filter by category if specified
         if category:
             all_skills = [s for s in all_skills if s.get("category") == category]
+
+        if query_mode:
+            from agent.skill_routing import rank_skills
+
+            ranking = rank_skills(
+                [skill["_routing"] for skill in all_skills], routing_query, limit
+            )
+            ranked_skills = ranking["skills"]
+            return json.dumps(
+                {
+                    "success": True,
+                    "mode": "bm25",
+                    "skills": ranked_skills,
+                    "count": len(ranked_skills),
+                    "total_candidates": ranking["total_candidates"],
+                    "index_fingerprint": ranking["index_fingerprint"],
+                    "hint": "Use skill_view(name) to load a candidate skill",
+                },
+                ensure_ascii=False,
+            )
 
         # Sort by category then name
         all_skills = _sort_skills(all_skills)
@@ -1993,7 +2125,20 @@ SKILLS_LIST_SCHEMA = {
             "category": {
                 "type": "string",
                 "description": "Optional category filter to narrow results",
-            }
+            },
+            "query": {
+                "type": "string",
+                "description": (
+                    "Optional query for deterministic local BM25 skill routing"
+                ),
+            },
+            "limit": {
+                "type": "integer",
+                "description": "Maximum ranked skills to return in query mode",
+                "default": 8,
+                "minimum": 1,
+                "maximum": 50,
+            },
         },
         "required": [],
     },
@@ -2023,7 +2168,10 @@ registry.register(
     toolset="skills",
     schema=SKILLS_LIST_SCHEMA,
     handler=lambda args, **kw: skills_list(
-        category=args.get("category"), task_id=kw.get("task_id")
+        category=args.get("category"),
+        query=args.get("query"),
+        limit=args.get("limit", 8),
+        task_id=kw.get("task_id"),
     ),
     check_fn=check_skills_requirements,
     emoji="📚",
