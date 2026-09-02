@@ -3637,7 +3637,37 @@ class BasePlatformAdapter(ABC):
         self._fatal_error_code = None
         self._fatal_error_message = None
         self._fatal_error_retryable = True
+        self._platform_state_degraded = False
         self._write_runtime_status_safe("connected", platform_state="connected", error_code=None, error_message=None)
+
+    def _mark_connected_degraded(self, code: str, message: str) -> None:
+        """Mark the adapter up but with its receive path known-unhealthy.
+
+        For polling adapters: connect() succeeded but the long-poll did not
+        start (bootstrap conflict, transient network failure on reconnect,
+        lifecycle abort). The gateway is alive and the background recovery
+        ladder will retry, but the published state must not claim
+        ``connected`` — a ``connected`` Telegram for hours while
+        ``getUpdates`` is unclaimed made the platform health check and
+        ``hermes send`` both report a lie (#101391). Recovery flips the
+        state back to ``connected`` on the first successful poll.
+
+        Consumers already handle the value: the dashboard's platform
+        health gate counts only connected/running/ok, so ``degraded``
+        correctly reports not-OK without a consumer change.
+        """
+        self._running = True
+        self._fatal_error_code = None
+        self._fatal_error_message = None
+        self._fatal_error_retryable = True
+        # Adapter subclasses (polling adapters with a recovery ladder) use
+        # this to flip the published state back to connected once the
+        # receive path actually recovers (#101391).
+        self._platform_state_degraded = True
+        self._write_runtime_status_safe(
+            "degraded", platform_state="degraded",
+            error_code=code, error_message=message,
+        )
 
     def _mark_disconnected(self) -> None:
         self._running = False

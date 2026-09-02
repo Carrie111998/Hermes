@@ -2695,6 +2695,19 @@ class TelegramAdapter(BasePlatformAdapter):
         else:
             self._polling_conflict_count = 0
         self._send_path_degraded = False
+        # First successful poll after a degraded connect: the published state
+        # was "degraded" while the recovery ladder retried — now that
+        # getUpdates is actually progressing, flip it to connected so the
+        # state file tells the truth again (#101391).
+        if getattr(self, "_platform_state_degraded", False):
+            logger.info(
+                "[%s] Telegram polling recovered: flipping published state "
+                "degraded -> connected (generation %d)",
+                self.name,
+                generation,
+            )
+            self._platform_state_degraded = False
+            self._mark_connected()
 
     def _observe_polling_request_result(self, request, generation, result):
         """Record getUpdates progress from an observed do_request result.
@@ -4913,6 +4926,9 @@ class TelegramAdapter(BasePlatformAdapter):
 
             # Decide between webhook and polling mode
             webhook_url = os.getenv("TELEGRAM_WEBHOOK_URL", "").strip()
+            # Defined in both branches below so the degraded-skip check after
+            # the mode split can read it without a NameError in webhook mode.
+            polling_started = True
 
             if webhook_url:
                 # ── Webhook mode ─────────────────────────────────────
@@ -5045,9 +5061,31 @@ class TelegramAdapter(BasePlatformAdapter):
                         "polling will be retried in the background",
                         self.name,
                     )
-            
-            self._mark_connected()
-            mode = "webhook" if self._webhook_mode else "polling"
+                    # The adapter is up but its receive path is known-unhealthy:
+                    # publishing plain "connected" here kept gateway_state.json
+                    # reporting connected for hours while getUpdates was
+                    # unclaimed — health checks and `hermes send` both read
+                    # the lie (#101391). The recovery ladder flips the state
+                    # back to connected on the first successful poll.
+                    self._mark_connected_degraded(
+                        "telegram_polling_not_started",
+                        "Long-polling did not start; background recovery is retrying. "
+                        "Inbound messages are not being received until it succeeds.",
+                    )
+
+            if not polling_started and not self._webhook_mode:
+                # Degraded polling: skip the plain-connected stamp below so
+                # only the degraded state stands.
+                mode = "polling"
+                logger.warning(
+                    "[%s] Telegram up in degraded state (%s mode): polling "
+                    "recovering in background; state stays 'degraded' until "
+                    "the first successful poll",
+                    self.name, mode,
+                )
+            else:
+                self._mark_connected()
+                mode = "webhook" if self._webhook_mode else "polling"
             # WARNING, not INFO: the "Connecting to Telegram (attempt N/8)…"
             # line above is emitted at WARNING and reaches the terminal (the
             # gateway's default stderr handler is WARNING-only), but this
