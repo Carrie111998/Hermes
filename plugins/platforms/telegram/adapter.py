@@ -250,11 +250,15 @@ _TELEGRAM_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
 
 # Max seconds a send/edit coroutine may sleep inline on a Telegram
 # flood-control RetryAfter. Longer server penalties fail closed with a
-# ``flood_control:{wait}`` SendResult so the caller's retry machinery
-# (delivery ledger, streaming fallback) owns the wait instead of the
-# coroutine pinning its worker — a 97-minute penalty on the boot path
-# froze inbound on every platform (#91969).
+# ``flood_control:{wait}`` SendResult so the caller's bounded retry machinery
+# owns moderate waits instead of this coroutine. Very large penalties remain
+# non-retryable — a 97-minute wait on the boot path froze inbound on every
+# platform (#91969).
 _FLOOD_INLINE_WAIT_CAP_SECS = 5.0
+# Moderate penalties can be handed to BasePlatformAdapter's bounded retry
+# loop. Larger waits still fail closed: sleeping a multi-minute/hour server
+# penalty in a delivery task can pin gateway work just like the inline path.
+_FLOOD_CALLER_RETRY_CAP_SECS = 60.0
 
 
 def _flood_cap_result(wait: float) -> "SendResult":
@@ -262,6 +266,8 @@ def _flood_cap_result(wait: float) -> "SendResult":
     return SendResult(
         success=False,
         error=f"flood_control:{wait}",
+        error_kind="rate_limited",
+        retryable=wait <= _FLOOD_CALLER_RETRY_CAP_SECS,
         retry_after=float(wait),
     )
 
@@ -653,6 +659,10 @@ class TelegramAdapter(BasePlatformAdapter):
     # non-durable preview. Commit empty-tail fallbacks as a fresh final message
     # instead of trusting the preview as completed delivery.
     RESEND_FINAL_ON_EMPTY_STREAM_FALLBACK: bool = True
+
+    # Bound the total caller-side sleep for consecutive moderate Telegram
+    # cooldowns while preserving the per-wait fail-closed cap above.
+    retry_after_sleep_budget_secs: Optional[float] = _FLOOD_CALLER_RETRY_CAP_SECS
 
     # Adaptive text-batch ingress: short messages need a tighter delay so the
     # first token reaches the agent fast.  Numbers tuned for "feels instant":

@@ -3109,6 +3109,11 @@ class BasePlatformAdapter(ABC):
     # never see these calls.
     supports_status_text: bool = False
 
+    # Cumulative server-directed sleep budget for one _send_with_retry()
+    # delivery. None preserves the existing unlimited behavior. Regular
+    # exponential backoff does not draw from this adapter-specific budget.
+    retry_after_sleep_budget_secs: Optional[float] = None
+
     def set_status_text(self, chat_id: str, text: Optional[str]) -> None:
         """Set or clear (``None``) the live working-state phrase for a chat.
 
@@ -5836,9 +5841,27 @@ class BasePlatformAdapter(ABC):
             # Honor server-requested retry_after (e.g. Telegram FloodWait)
             # when present — it is authoritative over our backoff schedule.
             server_retry_after = result.retry_after
+            retry_after_spent = 0.0
             for attempt in range(1, max_retries + 1):
                 if server_retry_after is not None:
-                    delay = server_retry_after + random.uniform(0, 1)
+                    raw_wait = float(server_retry_after)
+                    budget = self.retry_after_sleep_budget_secs
+                    remaining = max(0.0, budget - retry_after_spent) if budget is not None else None
+                    if remaining is not None and raw_wait > remaining:
+                        logger.error(
+                            "[%s] Server-directed retry_after %.1fs would exceed the "
+                            "%.1fs sleep budget (%.1fs already spent) — giving up: %s",
+                            self.name,
+                            raw_wait,
+                            budget,
+                            retry_after_spent,
+                            error_str,
+                        )
+                        return result
+                    delay = raw_wait + random.uniform(0, 1)
+                    if remaining is not None:
+                        delay = min(delay, remaining)
+                    retry_after_spent += delay
                     server_retry_after = None  # only honor once per send
                 else:
                     delay = base_delay * (2 ** (attempt - 1)) + random.uniform(0, 1)
