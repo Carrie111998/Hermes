@@ -12,6 +12,7 @@ import { useInRouterContext, useNavigate } from 'react-router'
 
 import { useSessionView } from '@/app/chat/session-view'
 import { SETTINGS_ROUTE } from '@/app/routes'
+import { deliveryTargetFromCommand } from '@/components/assistant-ui/thread/agent-delivery'
 import { ChangedFilesCard } from '@/components/assistant-ui/thread/changed-files-card'
 import {
   contentHasVisibleText,
@@ -187,6 +188,22 @@ const AssistantMessageBody: FC<AssistantMessageProps & { collapsedNotice?: null 
   // the markdown part and the tiny status leaves — not the footer, the
   // preview block, or this root.
   const hasVisibleText = useAuiState(s => contentHasVisibleText(s.message.content))
+
+  const hasAgentDeliveryNotice = useAuiState(s =>
+    s.message.parts.some(part => {
+      const candidate = part as { args?: { command?: unknown }; isError?: unknown; toolName?: unknown; type?: unknown }
+      const command = candidate.args?.command
+
+      return (
+        candidate.type === 'tool-call' &&
+        candidate.toolName === 'terminal' &&
+        candidate.isError !== true &&
+        typeof command === 'string' &&
+        Boolean(deliveryTargetFromCommand(command))
+      )
+    })
+  )
+
   // Sealed mid-turn commentary keeps its text but not the footer, so a
   // tool-heavy turn doesn't grow a copy/refresh bar per paragraph (see
   // ChatMessage.interim).
@@ -262,7 +279,11 @@ const AssistantMessageBody: FC<AssistantMessageProps & { collapsedNotice?: null 
               </ErrorPrimitive.Root>
             </MessagePrimitive.Error>
           </div>
-          <MessageTimelineTimestamp className="px-(--message-text-indent) pt-0.5" />
+          {/* Delivery-only rows contain distinct outbound/reply notices, each
+          with its own clock. Do not add a third aggregate stamp beneath them. */}
+          {(!hasAgentDeliveryNotice || hasVisibleText) && (
+            <MessageTimelineTimestamp className="px-(--message-text-indent) pt-0.5" />
+          )}
           {hasVisibleText && !isInterim && (
             <AssistantFooter
               durationS={turnDurationS}

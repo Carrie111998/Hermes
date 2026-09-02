@@ -240,7 +240,7 @@ describe('message timeline timestamps', () => {
     expect(stamps.filter(stamp => stamp === formatClockTimestamp(landedAt))).toHaveLength(1)
   })
 
-  it('shows one clock on an outbound agent delivery notice', async () => {
+  it('shows one clock on each outbound agent delivery notice', async () => {
     const startedAt = createdAt.getTime() / 1000
     const landedAt = startedAt + 130
 
@@ -272,8 +272,120 @@ describe('message timeline timestamps', () => {
     const assistantRow = container.querySelector('[data-slot="aui_assistant-message-root"]')
     const stamps = Array.from(assistantRow?.querySelectorAll('[data-slot="timeline-timestamp"]') ?? [])
 
+    expect(stamps).toHaveLength(2)
+    expect(stamps.map(stamp => stamp.textContent?.trim())).toEqual([
+      formatClockTimestamp(startedAt),
+      formatClockTimestamp(landedAt)
+    ])
+  })
+
+  it('shows one clock while an outbound agent delivery is pending', async () => {
+    const startedAt = createdAt.getTime() / 1000
+
+    const assistant = {
+      ...assistantMessage(),
+      content: [
+        {
+          args: {
+            command: 'hermes -p badr chat --in ~ -c "Bot Chat" -Q -q "Message from 🤖 Abu Saud: review"'
+          },
+          argsText: '{}',
+          timestamp: startedAt,
+          toolCallId: 'delivery-pending',
+          toolName: 'terminal',
+          type: 'tool-call'
+        }
+      ],
+      status: { type: 'running' },
+      metadata: {
+        ...assistantMessage().metadata,
+        custom: { timelineTimestamp: startedAt }
+      }
+    } as unknown as ThreadMessage
+
+    const { container } = render(<Harness assistant={assistant} />)
+    await screen.findByText(/Messaging badr/)
+
+    const assistantRow = container.querySelector('[data-slot="aui_assistant-message-root"]')
+    const stamps = Array.from(assistantRow?.querySelectorAll('[data-slot="timeline-timestamp"]') ?? [])
+
     expect(stamps).toHaveLength(1)
-    expect(stamps[0]?.textContent?.trim()).toBe(formatClockTimestamp(landedAt))
+    expect(stamps[0]?.textContent?.trim()).toBe(formatClockTimestamp(startedAt))
+  })
+
+  it('keeps the aggregate prose clock beside delivery notice clocks', async () => {
+    const startedAt = createdAt.getTime() / 1000
+    const landedAt = startedAt + 130
+
+    const assistant = {
+      ...assistantMessage(),
+      content: [
+        { completedAt: startedAt + 1, text: 'I sent this for review.', timestamp: startedAt + 0.5, type: 'text' },
+        {
+          args: {
+            command: 'hermes -p badr chat --in ~ -c "Bot Chat" -Q -q "Message from 🤖 Abu Saud: review"'
+          },
+          argsText: '{}',
+          completedAt: landedAt,
+          result: { exit_code: 0, output: 'reviewed' },
+          timestamp: startedAt + 1,
+          toolCallId: 'delivery-with-prose',
+          toolName: 'terminal',
+          type: 'tool-call'
+        }
+      ],
+      metadata: {
+        ...assistantMessage().metadata,
+        custom: { timelineCompletedAt: landedAt, timelineTimestamp: startedAt }
+      }
+    } as unknown as ThreadMessage
+
+    const { container } = render(<Harness assistant={assistant} />)
+    await screen.findByText('I sent this for review.')
+    await screen.findByText('Messaged badr')
+
+    const assistantRow = container.querySelector('[data-slot="aui_assistant-message-root"]')
+    const stamps = Array.from(assistantRow?.querySelectorAll('[data-slot="timeline-timestamp"]') ?? [])
+
+    expect(stamps).toHaveLength(3)
+    expect(stamps.filter(stamp => stamp.textContent?.trim() === formatClockTimestamp(landedAt))).toHaveLength(2)
+  })
+
+  it('keeps the aggregate clock when an agent delivery tool fails', async () => {
+    const startedAt = createdAt.getTime() / 1000
+    const landedAt = startedAt + 130
+
+    const assistant = {
+      ...assistantMessage(),
+      content: [
+        {
+          args: {
+            command: 'hermes -p badr chat --in ~ -c "Bot Chat" -Q -q "Message from 🤖 Abu Saud: review"'
+          },
+          argsText: '{}',
+          completedAt: landedAt,
+          isError: true,
+          result: { error: 'delivery failed' },
+          timestamp: startedAt,
+          toolCallId: 'delivery-failed',
+          toolName: 'terminal',
+          type: 'tool-call'
+        }
+      ],
+      metadata: {
+        ...assistantMessage().metadata,
+        custom: { timelineCompletedAt: landedAt, timelineTimestamp: startedAt }
+      }
+    } as unknown as ThreadMessage
+
+    const { container } = render(<Harness assistant={assistant} />)
+    await screen.findByText(/Ran hermes -p badr/)
+
+    const assistantRow = container.querySelector('[data-slot="aui_assistant-message-root"]')
+    const stamps = Array.from(assistantRow?.querySelectorAll('[data-slot="timeline-timestamp"]') ?? [])
+
+    expect(stamps.filter(stamp => stamp.textContent?.trim() === formatClockTimestamp(landedAt))).toHaveLength(1)
+    expect(stamps.map(stamp => stamp.textContent?.trim())).toContain(formatTimelineRange(startedAt, landedAt))
   })
 
   it('shows one clock on a settled inter-agent reply notice', async () => {
