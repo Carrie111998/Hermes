@@ -1,0 +1,29 @@
+{
+  "checks": {
+    "buildings_do_not_overlap": true,
+    "buildings_touch_ground": true,
+    "collections_present": true,
+    "lods_present": true,
+    "roads_conform_to_terrain": true,
+    "terrain_anchors_valid": true,
+    "textures_declared": true
+  },
+  "failures": [],
+  "passed": true,
+  "sceneScaleMeters": {
+    "radius": 42,
+    "roadClearance": 0.08
+  },
+  "summary": {
+    "buildingCount": 8,
+    "renderedCollections": [
+      "Buildings",
+      "Characters",
+      "Lighting",
+      "Props",
+      "Roads",
+      "Terrain"
+    ],
+    "roadAnchorCount": 7
+  }
+}
