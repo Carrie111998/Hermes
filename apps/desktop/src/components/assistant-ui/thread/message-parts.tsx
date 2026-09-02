@@ -12,10 +12,7 @@ import { ClarifyTool } from '@/components/assistant-ui/clarify-tool'
 import { MarkdownText, MarkdownTextContent } from '@/components/assistant-ui/markdown-text'
 import { McpSetupTool } from '@/components/assistant-ui/mcp-setup-tool'
 import { AgentDeliveryNotice, deliveryTargetFromCommand } from '@/components/assistant-ui/thread/agent-delivery'
-import {
-  MessageTimelineTimestamp,
-  TimelineTimestamp
-} from '@/components/assistant-ui/thread/timeline-timestamp'
+import { TimelineTimestamp } from '@/components/assistant-ui/thread/timeline-timestamp'
 import { DelegateTool } from '@/components/assistant-ui/tool/delegate'
 import { ToolFallback, ToolGroupSlot } from '@/components/assistant-ui/tool/fallback'
 import { formatElapsed, useElapsedSeconds, useMeasuredDuration } from '@/components/chat/activity-timer'
@@ -114,20 +111,7 @@ const ChainToolFallback: FC<TimelineToolCallProps> = props => {
   return <ToolFallback {...props} />
 }
 
-type TimelineTextPartProps = TextMessagePartProps & { completedAt?: number; timestamp?: number }
-
-const TimelineMarkdownText: FC<TimelineTextPartProps> = () => (
-  <>
-    {/*
-      Prose is the bubble, not an activity boundary: it answers "when did this
-      land", so it uses the assistant message's completion clock. Reasoning and
-      tool rows below keep `exact` — they measure duration, where seconds and
-      milliseconds are the point.
-    */}
-    <MessageTimelineTimestamp className="mb-0.5 block" />
-    <MarkdownText />
-  </>
-)
+const TimelineMarkdownText: FC<TextMessagePartProps> = () => <MarkdownText />
 
 const ThinkingDisclosure: FC<{
   children: ReactNode

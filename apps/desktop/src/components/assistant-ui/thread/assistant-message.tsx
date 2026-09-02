@@ -133,6 +133,7 @@ const InterAgentCollapsedNotice: FC<{ sender: string }> = ({ sender }) => (
       <Codicon className="shrink-0 text-muted-foreground/55" name="arrow-small-right" size="0.8125rem" />
       <span className="wrap-anywhere">Replied to {sender}</span>
     </span>
+    <MessageTimelineTimestamp className="self-center" />
     <details className="self-center">
       <summary className="cursor-pointer select-none text-center text-muted-foreground/45 hover:text-muted-foreground/70">
         show reply
@@ -261,7 +262,7 @@ const AssistantMessageBody: FC<AssistantMessageProps & { collapsedNotice?: null 
               </ErrorPrimitive.Root>
             </MessagePrimitive.Error>
           </div>
-          <MessageTimelineTimestamp className="px-(--message-text-indent) pt-0.5" suppressIfPartClock />
+          <MessageTimelineTimestamp className="px-(--message-text-indent) pt-0.5" />
           {hasVisibleText && !isInterim && (
             <AssistantFooter
               durationS={turnDurationS}

@@ -78,11 +78,10 @@ describe('formatClockTimestamp', () => {
     const local = new Date(2026, 4, 1, 16, 30, 3, 456)
     const seconds = local.getTime() / 1000
 
-    // Assert against the locale's own hour+minute rendering rather than
-    // literal digits: under ar-SA this owner's clock is "٤:٣٠ م", so a
-    // toContain('30') check would be a false failure.
+    // Assert against the locale's own digits/day-period rendering while forcing
+    // the owner's requested 12-hour clock contract in every locale.
     expect(formatClockTimestamp(seconds)).toBe(
-      new Intl.DateTimeFormat(undefined, { hour: 'numeric', minute: '2-digit' }).format(local)
+      new Intl.DateTimeFormat(undefined, { hour: 'numeric', hour12: true, minute: '2-digit' }).format(local)
     )
 
     // The distinguishing contract: two instants in the same minute collapse to
