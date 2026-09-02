@@ -139,6 +139,111 @@ class TestClarifyDictChoices:
         assert "{" not in result["user_response"]
         assert all("{" not in c for c in result["choices_offered"])
 
+    def test_single_key_list_wrapper_unpacks_to_choices(self):
+        """A wrapper dict packing several options must unpack, not drop.
+
+        The #95904 shape: the model packed 4 options into one dict under a
+        non-whitelisted key (``{"item": ["a", "b", "c", "d"]}``). The old
+        flatten dropped the dict, ``choices`` emptied out, and the clarify
+        silently degraded to open-ended — no buttons on any platform.
+        """
+        seen = []
+
+        def cb(question, choices):
+            seen.extend(choices or [])
+            return choices[0]
+
+        result = json.loads(clarify_tool(
+            "Which environment?",
+            choices=[{"item": ["staging", "production", "local dev", "cancel"]}],
+            callback=cb,
+        ))  # type: ignore
+        assert seen == [
+            "staging (Recommended)",
+            "production",
+            "local dev",
+            "cancel",
+        ]
+        assert result["user_response"] == "staging"
+
+    def test_opaque_single_key_dict_without_list_still_drops(self):
+        """The unpack is structural: opaque single-key values stay dropped."""
+        seen = []
+
+        def cb(question, choices):
+            seen.extend(choices or [])
+            return "typed"
+
+        clarify_tool(
+            "Pick",
+            choices=[{"count": 3}, "a real choice"],
+            callback=cb,
+        )
+        # single surviving choice carries no (Recommended) label by design
+        assert seen == ["a real choice"]
+
+    def test_multi_key_wrapper_dict_does_not_unpack(self):
+        """Only the strict single-key {k: [...]} wrapper expands.
+
+        A dict carrying extra keys is component-shaped (id/type/label
+        style), so the conservative "a garbage label is worse than no
+        choice" drop still applies — it must not secretly expand via a
+        list-valued key.
+        """
+        seen = []
+
+        def cb(question, choices):
+            seen.extend(choices or [])
+            return choices[0]
+
+        result = json.loads(clarify_tool(
+            "Pick",
+            choices=[{"item": ["a", "b"], "note": "not a wrapper"}, "fallback"],
+            callback=cb,
+        ))  # type: ignore
+        assert seen == ["fallback"]
+        assert result["user_response"] == "fallback"
+
+    def test_nested_list_inside_wrapper_flattens_not_expands(self):
+        """Only the outer wrapper level expands.
+
+        A list nested inside the wrapper value keeps _flatten_choice
+        semantics — it joins into ONE display string instead of expanding
+        into separate buttons, so {"item": [["a", "b"], "c"]} offers
+        "a b" and "c".
+        """
+        seen = []
+
+        def cb(question, choices):
+            seen.extend(choices or [])
+            return choices[0]
+
+        result = json.loads(clarify_tool(
+            "Pick",
+            choices=[{"item": [["a", "b"], "c"]}],
+            callback=cb,
+        ))  # type: ignore
+        assert seen == ["a b (Recommended)", "c"]
+        assert result["user_response"] == "a b"
+
+    def test_questions_batch_path_unpacks_wrapper_too(self):
+        """The questions[] batch normalizer uses the same expansion."""
+        seen = []
+
+        def cb(question, choices, multi_select=False):
+            seen.extend(choices or [])
+            return choices[0]
+
+        clarify_tool(
+            "batch",
+            questions=[{
+                "question": "Which environment?",
+                "choices": [{"item": ["staging", "production"]}],
+            }],
+            callback=cb,
+        )
+        assert seen == ["staging (Recommended)", "production"]
+
 
 class TestClarifySchema:
     """Tests for the OpenAI function-calling schema."""

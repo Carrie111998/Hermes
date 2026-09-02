@@ -73,6 +73,30 @@ def _flatten_choice(c) -> str:
     return str(c).strip()
 
 
+def _expand_choice(c) -> List[str]:
+    """Expand ONE raw ``choices`` element into zero or more display strings.
+
+    Wraps :func:`_flatten_choice` with the one shape it cannot express from a
+    single string: a model that packs SEVERAL options into one wrapper dict
+    under a non-whitelisted key, e.g. ``[{"item": ["a", "b", "c"]}]``
+    (observed in #95904). The whitelist unwrap drops that dict entirely, and
+    when it is the only element the whole ``choices`` list empties out and the
+    clarify silently degrades to open-ended — no buttons anywhere.
+
+    The unpack is deliberately keyed on STRUCTURE, not on key names: only a
+    single-key dict whose value is a list/tuple gets expanded (a component-
+    shaped dict carries id/type/label and never has exactly one key), so the
+    "a garbage label is worse than no choice" drop still applies to genuinely
+    opaque dicts.
+    """
+    if isinstance(c, dict) and len(c) == 1:
+        (only_value,) = c.values()
+        if isinstance(only_value, (list, tuple)):
+            return [s for s in (_flatten_choice(x) for x in only_value) if s]
+    flattened = _flatten_choice(c)
+    return [flattened] if flattened else []
+
+
 def mark_recommended(choices: List[str]) -> List[str]:
     """Label the first choice as the agent's recommendation.
 
@@ -208,7 +232,7 @@ def _normalize_questions(questions) -> tuple:
         if choices is not None:
             if not isinstance(choices, list):
                 return None, f"questions[{index}].choices must be a list."
-            choices = [s for s in (_flatten_choice(c) for c in choices) if s]
+            choices = [s for c in choices for s in _expand_choice(c) if s]
             if len(choices) > MAX_CHOICES:
                 choices = choices[:MAX_CHOICES]
             if not choices:
@@ -392,11 +416,13 @@ def clarify_tool(
         if not isinstance(choices, list):
             return tool_error("choices must be a list of strings.")
         # LLMs sometimes emit dict-shaped choices (e.g. [{"description": "..."}])
-        # instead of bare strings. _flatten_choice unwraps them to their
-        # user-facing text here — the single platform-agnostic entry point —
-        # so the CLI panel, Discord buttons, and Telegram list all render clean
-        # text and the resolved answer is never a raw Python dict repr.
-        choices = [s for s in (_flatten_choice(c) for c in choices) if s]
+        # instead of bare strings, and sometimes pack several options into one
+        # wrapper dict ({"item": ["a", "b", ...]}, #95904). _expand_choice
+        # unwraps or unpacks them to their user-facing text here — the single
+        # platform-agnostic entry point — so the CLI panel, Discord buttons,
+        # and Telegram list all render clean text and the resolved answer is
+        # never a raw Python dict repr.
+        choices = [s for c in choices for s in _expand_choice(c) if s]
         if len(choices) > MAX_CHOICES:
             choices = choices[:MAX_CHOICES]
         if not choices:
