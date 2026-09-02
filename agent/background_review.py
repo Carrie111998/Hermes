@@ -462,9 +462,25 @@ def _digest_history(messages_snapshot: List[Dict], tail: int = 24) -> List[Dict]
 # the user-message that the forked review agent receives.  AIAgent exposes
 # them as class attributes (``_MEMORY_REVIEW_PROMPT`` etc.) for back-compat;
 # the actual text lives here so future edits are one-place.
+_MEMORY_MAINTENANCE_POLICY = (
+    "Memory maintenance policy: audit the existing memory entries before "
+    "deciding what to write. Classify candidates as exact duplicates, fully "
+    "subsumed entries, safe semantic unions, contradictions, or unrelated "
+    "context-dependent preferences. Consolidate only exact duplicates or "
+    "entries whose union preserves every unique fact, qualifier, exception, "
+    "preference strength, and temporal condition. Use one atomic operations "
+    "batch to replace redundant entries with the lossless union and remove "
+    "only the sources it replaces. Never merge contradictions or context-"
+    "dependent preferences speculatively; when equivalence is uncertain, "
+    "leave the entries unchanged and report the uncertainty. Then save any "
+    "new durable facts.\n\n"
+)
+
+
 _MEMORY_REVIEW_PROMPT = (
     "Review the conversation above and consider saving to memory if appropriate.\n\n"
-    "Focus on:\n"
+    + _MEMORY_MAINTENANCE_POLICY
+    + "Focus on:\n"
     "1. Has the user revealed things about themselves — their persona, desires, "
     "preferences, or personal details worth remembering?\n"
     "2. Has the user expressed expectations about how you should behave, their work "
@@ -618,7 +634,8 @@ _COMBINED_REVIEW_PROMPT = (
     "desires, preferences, personal details, or expectations about "
     "how you should behave? Save facts about the user and durable "
     "preferences with the memory tool.\n\n"
-    "**Skills**: how to do this class of task. Be ACTIVE — most "
+    + _MEMORY_MAINTENANCE_POLICY
+    + "**Skills**: how to do this class of task. Be ACTIVE — most "
     "sessions produce at least one skill update. A pass that does "
     "nothing is a missed learning opportunity, not a neutral outcome.\n\n"
     "Target shape of the skill library: CLASS-LEVEL skills with a rich "
