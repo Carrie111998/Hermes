@@ -674,6 +674,29 @@ def test_committed_relay_with_unavailable_watcher_is_not_reported_failed(
     assert "failed to start" not in result["detail"]
 
 
+def test_committed_relay_with_watcher_exception_is_not_reported_failed(monkeypatch):
+    import tools.terminal_tool as terminal_tool_module
+
+    def fail_watcher(command, **kwargs):
+        raise RuntimeError("terminal registry unavailable")
+
+    monkeypatch.setattr(terminal_tool_module, "terminal_tool", fail_watcher)
+    result = json.loads(
+        bot_mode_dm._spawn_delivery(
+            "unused",
+            "@researcher on Spark01",
+            task_id=None,
+            agent=None,
+            delivery_committed=True,
+        )
+    )
+
+    assert result["status"] == "sent_unwatched"
+    assert "terminal registry unavailable" in result["detail"]
+    assert "Do not resend blindly" in result["detail"]
+    assert "could not be started" not in result["detail"]
+
+
 def test_write_dm_file_unlinks_partial_file_on_write_exception(tmp_path, monkeypatch):
     dm_file = tmp_path / "partial.txt"
     real_mkstemp = bot_mode_dm.tempfile.mkstemp

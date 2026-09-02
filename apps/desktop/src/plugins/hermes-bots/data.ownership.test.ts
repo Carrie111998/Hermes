@@ -2,12 +2,14 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 import type { RosterRow } from './types'
 
-const { hostMock } = vi.hoisted(() => ({
+const { hostMock, useQueryMock } = vi.hoisted(() => ({
   hostMock: {
     request: vi.fn(),
     requestProfile: vi.fn(),
+    agents: undefined as undefined | ReturnType<typeof vi.fn>,
     state: { connectionId: { get: () => 'local' }, profile: { get: () => 'default' } }
-  }
+  },
+  useQueryMock: vi.fn()
 }))
 
 vi.mock('@hermes/plugin-sdk', async () => {
@@ -17,20 +19,22 @@ vi.mock('@hermes/plugin-sdk', async () => {
     atom,
     host: hostMock,
     queryClient: {},
-    useQuery: vi.fn(),
-    useValue: vi.fn()
+    useQuery: useQueryMock,
+    useValue: vi.fn(() => 'local')
   }
 })
 
 vi.mock('./shared', () => ({ getPluginCtx: () => null, ID: 'hermes-bots' }))
 
-const { reconcileBotModeOwnership, resetBotModeOwnershipReconciliationForTests } = await import('./data')
+const { reconcileBotModeOwnership, resetBotModeOwnershipReconciliationForTests, useRoster } = await import('./data')
 
 const remote = (connectionId: string): RosterRow =>
   ({ connectionId, name: 'default', remoteSource: true, sourceScoped: true }) as RosterRow
 
 beforeEach(() => {
   vi.clearAllMocks()
+  hostMock.agents = undefined
+  useQueryMock.mockImplementation(options => options)
   resetBotModeOwnershipReconciliationForTests()
 })
 
@@ -78,5 +82,39 @@ describe('Bot Mode ownership reconciliation', () => {
 
     const writes = hostMock.requestProfile.mock.calls.filter(([, method]) => method === 'profiles.configure')
     expect(writes.map(([route]) => route.connectionId)).toEqual(['spark01', 'spark02', 'spark01', 'spark02'])
+  })
+
+  it('repairs the active gateway when multi-source discovery is unavailable', async () => {
+    hostMock.request
+      .mockResolvedValueOnce({ profiles: [{ name: 'default', ui_meta: {} }] })
+      .mockResolvedValueOnce({ profiles: [{ name: 'default', ui_meta: {} }] })
+      .mockResolvedValueOnce({ applied: { ui_meta: true } })
+      .mockResolvedValueOnce({ profiles: [{ name: 'default', ui_meta: { 'hermes-bots': {} } }] })
+
+    const query = useRoster() as unknown as { queryFn: () => Promise<unknown> }
+    await query.queryFn()
+
+    expect(hostMock.request).toHaveBeenNthCalledWith(3, 'profiles.configure', {
+      name: 'default',
+      ui_meta: { 'hermes-bots': {} }
+    })
+  })
+
+  it('repairs the active gateway after union-roster discovery rejects', async () => {
+    hostMock.agents = vi.fn().mockRejectedValue(new Error('roster unavailable'))
+    hostMock.request
+      .mockResolvedValueOnce({ profiles: [{ name: 'default', ui_meta: {} }] })
+      .mockResolvedValueOnce({ profiles: [{ name: 'default', ui_meta: {} }] })
+      .mockResolvedValueOnce({ applied: { ui_meta: true } })
+      .mockResolvedValueOnce({ profiles: [{ name: 'default', ui_meta: { 'hermes-bots': {} } }] })
+
+    const query = useRoster() as unknown as { queryFn: () => Promise<unknown> }
+    await query.queryFn()
+
+    expect(hostMock.agents).toHaveBeenCalledTimes(1)
+    expect(hostMock.request).toHaveBeenNthCalledWith(3, 'profiles.configure', {
+      name: 'default',
+      ui_meta: { 'hermes-bots': {} }
+    })
   })
 })

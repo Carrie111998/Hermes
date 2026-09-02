@@ -777,6 +777,13 @@ export function useRoster() {
         }
       }
 
+      // Single-source/legacy Desktop builds do not expose host.agents, and a
+      // transient union-roster failure must not suppress the install-level
+      // ownership repair. Reconcile the active gateway before returning the
+      // local snapshot; successful multi-source reads return above after
+      // reconciling every merged source.
+      await reconcileBotModeOwnership(local?.profiles || [])
+
       return {
         ...(local && typeof local === 'object' ? local : {}),
         fetchedAt: issuedAt
