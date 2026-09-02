@@ -190,6 +190,13 @@ def _provision_libpython(
 
     Provision-if-present: a surplus hardlink on a statically-linked build is
     free; a missed detection is the only way #95425 returns.
+
+    Staged into a unique temp name and swapped in with ``os.replace`` — the
+    same atomic pattern ``_copy_alias``/``_write_marker`` use. An existing
+    ``dst`` on the refresh path is never unlinked before a replacement is
+    ready, so a hardlink/copy failure mid-refresh cannot leave the
+    interpreter without its libpython (the #95425 crash shape, for an
+    already-installed anchor rather than a fresh one).
     """
     src_lib = _store_root(source_file) / "lib"
     if not src_lib.is_dir():
@@ -201,20 +208,28 @@ def _provision_libpython(
             if not src.is_file():
                 continue
             dst = dst_lib / src.name
-            if dst.exists() or dst.is_symlink():
-                if not refresh:
-                    continue
-                try:
-                    dst.unlink()
-                except OSError:
-                    continue
+            if (dst.exists() or dst.is_symlink()) and not refresh:
+                continue
+            tmp_path: Path | None = None
             try:
-                os.link(src, dst)
-            except OSError:
+                fd, tmp_name = tempfile.mkstemp(prefix=f".{src.name}.tcc-", dir=str(dst_lib))
+                os.close(fd)
+                tmp_path = Path(tmp_name)
+                tmp_path.unlink()  # free the reserved name for os.link
                 try:
-                    shutil.copy2(src, dst)
+                    os.link(src, tmp_path)
                 except OSError:
-                    logger.debug("libpython provision failed for %s", src, exc_info=True)
+                    shutil.copy2(src, tmp_path)
+                os.replace(tmp_path, dst)
+                tmp_path = None
+            except OSError:
+                logger.debug("libpython provision failed for %s", src, exc_info=True)
+            finally:
+                if tmp_path is not None:
+                    try:
+                        tmp_path.unlink(missing_ok=True)
+                    except OSError:
+                        pass
     except OSError:
         logger.debug("libpython provision skipped", exc_info=True)
 
