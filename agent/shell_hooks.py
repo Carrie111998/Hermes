@@ -77,6 +77,8 @@ with ``hook <command> failed closed: <reason>``.  Use this for
 security-gating hooks (secret scanners, policy checks) where a crashed
 hook must not silently allow the action.  On non-blocking events
 ``fail_closed`` is ignored with a warning.
+If that hook is not yet allowlisted, Hermes installs a non-executing blocker
+for matching tool calls until the command is approved.
 
 Per-event ``extra`` keys
 ~~~~~~~~~~~~~~~~~~~~~~~~
@@ -262,8 +264,10 @@ def register_from_config(
     pick them up.
 
     Returns the list of :class:`ShellHookSpec` entries that ended up wired
-    up on the plugin manager.  Skipped entries (unknown events, malformed,
-    not allowlisted, already registered) are logged but not returned.
+    up on the plugin manager.  An unapproved fail-closed blocking hook is
+    wired as a non-executing blocker so its matcher cannot silently fail
+    open.  Other skipped entries (unknown events, malformed, not allowlisted,
+    already registered) are logged but not returned.
     """
     if not isinstance(cfg, dict):
         return []
@@ -296,6 +300,7 @@ def register_from_config(
     # re-check in case two callers ever race through the prompt.
     for spec in specs:
         key = (spec.event, spec.matcher, spec.command)
+        callback = _make_callback(spec)
         with _registered_lock:
             if key in _registered:
                 continue
@@ -305,19 +310,30 @@ def register_from_config(
             if not _prompt_and_record(
                 spec.event, spec.command, accept_hooks=effective_accept,
             ):
-                logger.warning(
-                    "shell hook for %s (%s) not allowlisted — skipped. "
-                    "Use --accept-hooks / HERMES_ACCEPT_HOOKS=1 / "
-                    "hooks_auto_accept: true, or approve at the TTY "
-                    "prompt next run.",
-                    spec.event, spec.command,
-                )
-                continue
+                if spec.fail_closed and spec.event in _BLOCKING_EVENTS:
+                    callback = _make_unapproved_callback(spec)
+                    logger.error(
+                        "fail-closed shell hook for %s (%s) is not "
+                        "allowlisted — matching actions will be blocked "
+                        "without executing the hook. Use --accept-hooks / "
+                        "HERMES_ACCEPT_HOOKS=1 / hooks_auto_accept: true, "
+                        "or approve at the TTY prompt next run.",
+                        spec.event, spec.command,
+                    )
+                else:
+                    logger.warning(
+                        "shell hook for %s (%s) not allowlisted — skipped. "
+                        "Use --accept-hooks / HERMES_ACCEPT_HOOKS=1 / "
+                        "hooks_auto_accept: true, or approve at the TTY "
+                        "prompt next run.",
+                        spec.event, spec.command,
+                    )
+                    continue
 
         with _registered_lock:
             if key in _registered:
                 continue
-            manager._hooks.setdefault(spec.event, []).append(_make_callback(spec))
+            manager._hooks.setdefault(spec.event, []).append(callback)
             _registered.add(key)
             registered.append(spec)
             logger.info(
@@ -634,6 +650,21 @@ def _make_callback(spec: ShellHookSpec) -> Callable[..., Optional[Dict[str, Any]
         return _evaluate_result(spec, r)
 
     _callback.__name__ = f"shell_hook[{spec.event}:{spec.command}]"
+    _callback.__qualname__ = _callback.__name__
+    return _callback
+
+
+def _make_unapproved_callback(
+    spec: ShellHookSpec,
+) -> Callable[..., Optional[Dict[str, Any]]]:
+    """Block matching actions without executing an unapproved hook."""
+
+    def _callback(**kwargs: Any) -> Optional[Dict[str, Any]]:
+        if not spec.matches_tool(kwargs.get("tool_name")):
+            return None
+        return _fail_closed_block(spec, "not allowlisted")
+
+    _callback.__name__ = f"shell_hook_unapproved[{spec.event}:{spec.command}]"
     _callback.__qualname__ = _callback.__name__
     return _callback
 
