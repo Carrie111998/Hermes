@@ -113,6 +113,22 @@ def peek_nous_access_token() -> Optional[str]:
     access_token = nous_provider.get("access_token")
     if isinstance(access_token, str) and access_token.strip():
         return access_token.strip()
+
+    # Device-code login stores the active Nous credential in the pooled
+    # credential store.  Use the same profile-aware/global-fallback reader as
+    # the rest of the auth stack, but keep this path read-only and
+    # refresh-free so availability probes remain cheap.
+    try:
+        from hermes_cli.auth import read_credential_pool
+
+        for entry in read_credential_pool("nous"):
+            if not isinstance(entry, dict):
+                continue
+            pooled_token = entry.get("access_token")
+            if isinstance(pooled_token, str) and pooled_token.strip():
+                return pooled_token.strip()
+    except Exception:
+        logger.debug("unable to inspect pooled Nous credentials", exc_info=True)
     return None
 
 
@@ -449,4 +465,3 @@ def build_managed_media_uploader(
         return f"nous-upload:{token}"
 
     return upload
-
