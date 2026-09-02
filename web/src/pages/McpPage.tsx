@@ -61,9 +61,22 @@ export default function McpPage() {
   const [command, setCommand] = useState("");
   const [args, setArgs] = useState("");
   const [env, setEnv] = useState("");
+  // Service account (M2M OAuth) fields — non-secret only
+  const [saTokenUrl, setSaTokenUrl] = useState("");
+  const [saClientId, setSaClientId] = useState("");
+  const [saUsername, setSaUsername] = useState("");
+  const [saPasswordEnv, setSaPasswordEnv] = useState("");
+  const [saScope, setSaScope] = useState("");
+  const [saClientSecretEnv, setSaClientSecretEnv] = useState("");
   const [creating, setCreating] = useState(false);
   const closeCreateModal = useCallback(() => {
     setBearerToken("");
+    setSaTokenUrl("");
+    setSaClientId("");
+    setSaUsername("");
+    setSaPasswordEnv("");
+    setSaScope("");
+    setSaClientSecretEnv("");
     setCreateModalOpen(false);
   }, []);
   const createModalRef = useModalBehavior({
@@ -129,6 +142,12 @@ export default function McpPage() {
         command,
         args,
         env,
+        saTokenUrl,
+        saClientId,
+        saUsername,
+        saPasswordEnv,
+        saScope,
+        saClientSecretEnv,
       });
     } catch (error) {
       showToast(
@@ -154,6 +173,12 @@ export default function McpPage() {
       setCommand("");
       setArgs("");
       setEnv("");
+      setSaTokenUrl("");
+      setSaClientId("");
+      setSaUsername("");
+      setSaPasswordEnv("");
+      setSaScope("");
+      setSaClientSecretEnv("");
       setTransport("http");
       setCreateModalOpen(false);
       loadServers();
@@ -427,6 +452,7 @@ export default function McpPage() {
                       <SelectOption value="none">None</SelectOption>
                       <SelectOption value="header">Bearer token</SelectOption>
                       <SelectOption value="oauth">OAuth</SelectOption>
+                      <SelectOption value="service_account">Service account (Authentik app password)</SelectOption>
                     </Select>
                   </div>
                   {httpAuth === "header" && (
@@ -452,6 +478,84 @@ export default function McpPage() {
                       OAuth browser on the machine running the Dashboard
                       backend.
                     </p>
+                  )}
+                  {httpAuth === "service_account" && (
+                    <>
+                      <p className="text-xs text-muted-foreground">
+                        Exchanges an Authentik service-account app password for a
+                        short-lived Bearer token. This is Authentik&apos;s
+                        service-account extension — providers whose M2M flow is
+                        plain client authentication (Keycloak service accounts,
+                        Auth0 M2M) are not supported here.
+                      </p>
+                      <div className="grid gap-2">
+                        <Label htmlFor="sa-token-url">Token URL</Label>
+                        <Input
+                          id="sa-token-url"
+                          placeholder="https://idp.example/o/myapp/token/"
+                          value={saTokenUrl}
+                          onChange={(e) => setSaTokenUrl(e.target.value)}
+                        />
+                        <p className="text-xs text-muted-foreground">
+                          Must be <code>https://</code> — the token request carries
+                          the service-account password.
+                        </p>
+                      </div>
+                      <div className="grid gap-2">
+                        <Label htmlFor="sa-client-id">Client ID</Label>
+                        <Input
+                          id="sa-client-id"
+                          placeholder="my-client"
+                          value={saClientId}
+                          onChange={(e) => setSaClientId(e.target.value)}
+                        />
+                      </div>
+                      <div className="grid gap-2">
+                        <Label htmlFor="sa-username">Username</Label>
+                        <Input
+                          id="sa-username"
+                          placeholder="service-user"
+                          value={saUsername}
+                          onChange={(e) => setSaUsername(e.target.value)}
+                        />
+                      </div>
+                      <div className="grid gap-2">
+                        <Label htmlFor="sa-password-env">Password env-var name</Label>
+                        <Input
+                          id="sa-password-env"
+                          placeholder="MY_SERVICE_PASSWORD"
+                          value={saPasswordEnv}
+                          onChange={(e) => setSaPasswordEnv(e.target.value)}
+                        />
+                        <p className="text-xs text-muted-foreground">
+                          Name of the environment variable that holds the password — not the password itself.
+                          Set the actual value in your active profile&apos;s .env file
+                          (e.g. <code>hermes config env-path</code> to find the path).
+                        </p>
+                      </div>
+                      <div className="grid gap-2">
+                        <Label htmlFor="sa-scope">Scope (optional)</Label>
+                        <Input
+                          id="sa-scope"
+                          placeholder="openid profile"
+                          value={saScope}
+                          onChange={(e) => setSaScope(e.target.value)}
+                        />
+                      </div>
+                      <div className="grid gap-2">
+                        <Label htmlFor="sa-client-secret-env">Client-secret env-var name (optional)</Label>
+                        <Input
+                          id="sa-client-secret-env"
+                          placeholder="MY_CLIENT_SECRET"
+                          value={saClientSecretEnv}
+                          onChange={(e) => setSaClientSecretEnv(e.target.value)}
+                        />
+                        <p className="text-xs text-muted-foreground">
+                          Only needed if the token endpoint requires a client secret.
+                          Set the actual value in your profile&apos;s .env file.
+                        </p>
+                      </div>
+                    </>
                   )}
                 </>
               ) : (
@@ -634,7 +738,11 @@ export default function McpPage() {
                     {server.auth && (
                       <Badge tone="outline">
                         auth:{" "}
-                        {server.auth === "header" ? "bearer" : server.auth}
+                        {server.auth === "header"
+                          ? "bearer"
+                          : server.auth === "service_account"
+                            ? "service account"
+                            : server.auth}
                       </Badge>
                     )}
                     {!server.enabled && <Badge tone="outline">disabled</Badge>}

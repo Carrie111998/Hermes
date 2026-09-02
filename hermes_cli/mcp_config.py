@@ -534,6 +534,31 @@ def cmd_mcp_add(args):
                 _info("Cancelled.")
                 return
 
+    elif url and auth_type == "service_account":
+        # Service-account M2M: validate the sub-block; secrets stay in env vars.
+        print()
+        _info(f"Configuring service-account auth for '{name}'...")
+        sa_cfg = server_config.get("service_account") or {}
+        from tools.mcp_service_account import validate_service_account_config
+        sa_errors = validate_service_account_config(name, sa_cfg)
+        if sa_errors:
+            for err in sa_errors:
+                _warning(err)
+            _warning(
+                "Fix the service_account block in config.yaml and re-run. "
+                "Secrets must be in environment variables, not in config."
+            )
+            return
+        server_config["auth"] = "service_account"
+        _success(
+            f"Service-account auth configured — token will be acquired from "
+            f"{sa_cfg.get('token_url', '(token_url)')} on first connection"
+        )
+        _info(
+            f"Ensure ${sa_cfg.get('password_env', 'PASSWORD_ENV')} is set "
+            "in your shell or in $HERMES_HOME/.env before connecting."
+        )
+
     elif url:
         # Prompt for API key / Bearer token for HTTP servers
         print()
@@ -671,6 +696,13 @@ def cmd_mcp_remove(args):
     except Exception:
         pass
 
+    # Clean up service-account token cache if present.
+    try:
+        from tools.mcp_service_account import remove_service_account_tokens
+        remove_service_account_tokens(name)
+    except Exception:
+        pass
+
 
 # ─── hermes mcp list ──────────────────────────────────────────────────────────
 
@@ -771,6 +803,23 @@ def cmd_mcp_test(args):
     headers = cfg.get("headers", {})
     if auth_type == "oauth":
         _info("Auth: OAuth 2.1 PKCE")
+    elif auth_type == "service_account":
+        sa = cfg.get("service_account") or {}
+        token_url = sa.get("token_url", "(token_url not set)")
+        client_id = sa.get("client_id", "?")
+        username = sa.get("username", "?")
+        password_env = sa.get("password_env", "?")
+        grant_type = sa.get("grant_type", "(grant_type not set)")
+        _info(f"Auth: service account (M2M)")
+        _info(f"  grant_type:   {grant_type}")
+        _info(f"  token_url:    {token_url}")
+        _info(f"  client_id:    {client_id}")
+        _info(f"  username:     {username}")
+        _info(f"  password_env: {password_env}  (value read from env at connect time)")
+        if sa.get("scope"):
+            _info(f"  scope:        {sa['scope']}")
+        if sa.get("client_secret_env"):
+            _info(f"  client_secret_env: {sa['client_secret_env']}  (value read from env)")
     elif headers:
         for k, v in headers.items():
             if isinstance(v, str) and ("key" in k.lower() or "auth" in k.lower()):

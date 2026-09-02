@@ -435,10 +435,13 @@ class MCPServerCreate(BaseModel):
     args: List[str] = []
     # env: KEY=VALUE map for stdio servers (API keys, etc.)
     env: Dict[str, str] = {}
-    # auth: "none" | "oauth" | "header" | None
+    # auth: "none" | "oauth" | "header" | "service_account" | None
     auth: Optional[str] = None
     # One-time provisioning input; persisted only to the profile's .env.
     bearer_token: Optional[SecretStr] = None
+    # Non-secret service-account fields (token_url, client_id, username, scope,
+    # password_env, client_secret_env). Secrets are referenced by env-var name only.
+    service_account: Optional[Dict[str, Any]] = None
     profile: Optional[str] = None
 
 

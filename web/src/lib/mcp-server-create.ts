@@ -1,4 +1,4 @@
-import type { McpHttpAuth, McpServerCreate } from "@/lib/api";
+import type { McpHttpAuth, McpServerCreate, McpServiceAccountConfig } from "@/lib/api";
 
 export type McpTransport = "http" | "stdio";
 
@@ -11,6 +11,13 @@ export interface McpServerDraft {
   command: string;
   args: string;
   env: string;
+  // Service account (M2M OAuth) — non-secret fields only.
+  saTokenUrl: string;
+  saClientId: string;
+  saUsername: string;
+  saPasswordEnv: string;
+  saScope: string;
+  saClientSecretEnv: string;
 }
 
 export function emptyMcpServerDraft(): McpServerDraft {
@@ -23,6 +30,12 @@ export function emptyMcpServerDraft(): McpServerDraft {
     command: "",
     args: "",
     env: "",
+    saTokenUrl: "",
+    saClientId: "",
+    saUsername: "",
+    saPasswordEnv: "",
+    saScope: "",
+    saClientSecretEnv: "",
   };
 }
 
@@ -57,11 +70,37 @@ export function buildMcpServerCreate(draft: McpServerDraft): McpServerCreate {
     if (draft.httpAuth === "header" && !draft.bearerToken.trim()) {
       throw new Error("Bearer token required");
     }
+    if (draft.httpAuth === "service_account") {
+      const tokenUrl = draft.saTokenUrl.trim();
+      if (!tokenUrl) throw new Error("Token URL required");
+      // The token request carries the service-account password, so refuse a
+      // plaintext endpoint here rather than letting the backend reject it later.
+      if (!tokenUrl.startsWith("https://")) {
+        throw new Error("Token URL must be an https:// URL");
+      }
+      if (!draft.saClientId.trim()) throw new Error("Client ID required");
+      if (!draft.saUsername.trim()) throw new Error("Username required");
+      if (!draft.saPasswordEnv.trim()) throw new Error("Password env-var name required");
+    }
 
     const server: McpServerCreate = { name, url };
     if (draft.httpAuth !== "none") server.auth = draft.httpAuth;
     if (draft.httpAuth === "header") {
       server.bearer_token = draft.bearerToken;
+    }
+    if (draft.httpAuth === "service_account") {
+      const sa: McpServiceAccountConfig = {
+        // The form collects Authentik service-account fields, so it states
+        // that strategy outright instead of leaving it to be inferred.
+        grant_type: "authentik_app_password",
+        token_url: draft.saTokenUrl.trim(),
+        client_id: draft.saClientId.trim(),
+        username: draft.saUsername.trim(),
+        password_env: draft.saPasswordEnv.trim(),
+      };
+      if (draft.saScope.trim()) sa.scope = draft.saScope.trim();
+      if (draft.saClientSecretEnv.trim()) sa.client_secret_env = draft.saClientSecretEnv.trim();
+      server.service_account = sa;
     }
     return server;
   }

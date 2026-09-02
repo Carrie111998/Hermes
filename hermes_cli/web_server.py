@@ -13812,7 +13812,7 @@ def _normalize_mcp_server_create(
 
     if bool(url) == bool(command):
         raise ValueError("Provide exactly one of URL (HTTP/SSE) or command (stdio)")
-    if auth not in {"none", "header", "oauth"}:
+    if auth not in {"none", "header", "oauth", "service_account"}:
         raise ValueError(f"Unsupported auth mode: {auth}")
 
     server_config: Dict[str, Any] = {}
@@ -13828,12 +13828,32 @@ def _normalize_mcp_server_create(
             if not normalized or normalized.lower() == "bearer":
                 raise ValueError("Bearer token is required")
             server_config["headers"] = _bearer_auth_headers(name)
+        elif auth == "service_account":
+            if body.bearer_token is not None:
+                raise ValueError("Bearer token is not used with service_account auth")
+            from tools.mcp_service_account import validate_service_account_config
+            sa_cfg = body.service_account or {}
+            # Reject any secret-value fields: only env-var names are accepted.
+            _SA_SECRET_FIELDS = {"password", "client_secret"}
+            for _f in _SA_SECRET_FIELDS:
+                if _f in sa_cfg:
+                    raise ValueError(
+                        f"service_account.{_f} must not be sent to the server. "
+                        f"Use {_f}_env (an environment-variable name) instead, "
+                        f"and set the value in your profile's .env file."
+                    )
+            sa_errors = validate_service_account_config(name, sa_cfg)
+            if sa_errors:
+                raise ValueError("; ".join(sa_errors))
         elif body.bearer_token is not None:
             raise ValueError("Bearer token requires header authentication")
 
         server_config["url"] = url
         if auth == "oauth":
             server_config["auth"] = "oauth"
+        elif auth == "service_account":
+            server_config["auth"] = "service_account"
+            server_config["service_account"] = dict(body.service_account or {})
     else:
         if auth != "none" or body.bearer_token is not None:
             raise ValueError(
@@ -13870,7 +13890,7 @@ def _mcp_server_summary(name: str, cfg: Dict[str, Any]) -> Dict[str, Any]:
         str(key).lower() == "authorization" for key in headers
     ):
         auth = "header"
-    return {
+    summary: Dict[str, Any] = {
         "name": name,
         "transport": transport,
         "url": cfg.get("url"),
@@ -13882,6 +13902,14 @@ def _mcp_server_summary(name: str, cfg: Dict[str, Any]) -> Dict[str, Any]:
         # Tool selection: list of enabled tool names, or None = all.
         "tools": cfg.get("tools"),
     }
+    if auth == "service_account":
+        sa = cfg.get("service_account") or {}
+        # Only non-secret fields: env-var names, not values.
+        summary["service_account"] = {
+            k: v for k, v in sa.items()
+            if k not in {"password", "client_secret"}
+        }
+    return summary
 
 
 from hermes_cli.web_routers import mcp as _mcp_routes  # noqa: E402
