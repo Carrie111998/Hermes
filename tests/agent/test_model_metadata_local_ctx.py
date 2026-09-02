@@ -646,6 +646,56 @@ class TestDetectLocalServerTypeLocalhostIPv4:
             assert "192.168.1.100" in url
 
 
+class TestLocalProbeProxyPolicy:
+    def test_server_detection_bypasses_environment_proxies(self):
+        from agent.model_metadata import detect_local_server_type
+
+        direct = MagicMock()
+        with patch("httpx.HTTPTransport", return_value=direct), \
+             patch("httpx.Client", side_effect=RuntimeError("stop")) as client:
+            detect_local_server_type("http://127.0.0.1:49647")
+
+        assert client.call_args.kwargs["transport"] is direct
+
+    @pytest.mark.parametrize("probe", [
+        lambda mm: mm.query_ollama_num_ctx("model", "http://127.0.0.1:49648"),
+        lambda mm: mm.query_ollama_supports_vision("model", "http://192.168.1.20:11434"),
+        lambda mm: mm._query_ollama_api_show_uncached("model", "http://localhost:11434"),
+        lambda mm: mm._query_local_context_length_uncached("model", "http://10.0.0.5:8000"),
+    ])
+    def test_local_metadata_probes_bypass_environment_proxies(self, probe):
+        import agent.model_metadata as mm
+
+        direct = MagicMock()
+        with patch.object(mm, "detect_local_server_type", return_value="ollama"), \
+             patch("httpx.HTTPTransport", return_value=direct), \
+             patch("httpx.Client", side_effect=RuntimeError("stop")) as client:
+            probe(mm)
+
+        assert client.call_args.kwargs["transport"] is direct
+
+    def test_hosted_ollama_probe_preserves_environment_proxies(self):
+        from agent.model_metadata import _query_ollama_api_show_uncached
+
+        with patch("httpx.Client", side_effect=RuntimeError("stop")) as client:
+            _query_ollama_api_show_uncached("model", "https://ollama.example.com")
+
+        assert client.call_args.kwargs["transport"] is None
+
+    def test_local_direct_transport_honors_environment_ca_bundle(self, monkeypatch):
+        from agent.model_metadata import _local_probe_transport
+
+        monkeypatch.setenv("SSL_CERT_FILE", "C:/certs/private-ca.pem")
+        ssl_context = MagicMock()
+        with patch("ssl.create_default_context", return_value=ssl_context) as create_context:
+            transport = _local_probe_transport("https://ollama:11434")
+
+        try:
+            create_context.assert_called_once_with(cafile="C:/certs/private-ca.pem")
+        finally:
+            transport.close()
+
+
 
 class TestFetchEndpointModelMetadataLmStudio:
     """fetch_endpoint_model_metadata should use LM Studio's native models endpoint."""
