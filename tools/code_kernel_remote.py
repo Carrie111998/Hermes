@@ -158,8 +158,12 @@ class RemoteKernel:
     cell_seq: int = 0
 
 
-def _kernel_key(owner: str, env_type: str, task_env_id: str) -> Tuple:
-    return (owner, "remote", env_type, task_env_id)
+def _kernel_key(owner: str, env_type: str, task_env_id: str,
+                sandbox_tools: frozenset) -> Tuple:
+    return (
+        owner, "remote", env_type, task_env_id,
+        tuple(sorted(sandbox_tools)),
+    )
 
 
 def _is_alive(kernel: RemoteKernel) -> bool:
@@ -324,7 +328,7 @@ def execute_in_remote_kernel(
     from tools.thread_context import propagate_context_to_thread
 
     owner = _resolve_owner(task_env_id)
-    key = _kernel_key(owner, env_type, task_env_id)
+    key = _kernel_key(owner, env_type, task_env_id, sandbox_tools)
     state_lost = False
     state_reset = False
 
