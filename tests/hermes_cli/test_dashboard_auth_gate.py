@@ -410,6 +410,41 @@ def test_start_server_loopback_public_url_without_provider_fails_closed(monkeypa
     assert web_server.app.state.auth_required is True
 
 
+def test_desktop_headless_loopback_ignores_external_dashboard_public_url(monkeypatch):
+    """Desktop's private backend must not inherit the public dashboard gate."""
+    from hermes_cli.dashboard_auth import clear_providers, register_provider
+    from tests.hermes_cli.conftest_dashboard_auth import StubAuthProvider
+
+    monkeypatch.setenv("HERMES_DESKTOP", "1")
+    monkeypatch.setenv(
+        "HERMES_DASHBOARD_PUBLIC_URL",
+        "https://dashboard.example.test:9443",
+    )
+    clear_providers()
+    register_provider(StubAuthProvider())
+    captured = _stub_uvicorn_run(monkeypatch)
+    _restore_app_state_after_test(
+        monkeypatch,
+        "auth_required",
+        "bound_host",
+        "bound_port",
+        "trusted_public_hosts",
+    )
+    try:
+        web_server.start_server(
+            host="127.0.0.1",
+            port=9119,
+            open_browser=False,
+            allow_public=False,
+            headless=True,
+        )
+        assert web_server.app.state.auth_required is False
+        assert web_server.app.state.trusted_public_hosts == frozenset()
+        assert captured["kwargs"].get("proxy_headers") is False
+    finally:
+        clear_providers()
+
+
 def test_loopback_public_url_fail_closed_message_is_actionable(monkeypatch):
     """The refusal must name public_url, print its value, and give both exits.
 
