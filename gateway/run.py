@@ -31518,6 +31518,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     except Exception:
                         pass
                 return True
+            if getattr(consumer, "final_content_delivered", False):
+                return True
             if previewed:
                 has_delivered_text = getattr(consumer, "has_delivered_text", None)
                 if callable(has_delivered_text):
