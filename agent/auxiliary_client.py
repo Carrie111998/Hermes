@@ -8241,13 +8241,10 @@ def _client_cache_key(
     pool_hint = _pool_cache_hint(provider, main_runtime=main_runtime)
     # The model MUST participate in the key. Two concurrent auxiliary calls to
     # the SAME provider/base_url/key but DIFFERENT models (e.g. a MoA reference
-    # fan-out running opus + gpt-5.5 in parallel threads) would otherwise share
-    # one cache entry. On a cache MISS both build a client for the same key; the
-    # second's _store_cached_client sees the first as the "old" entry and CLOSES
-    # it — while the first call is still mid-request on it — yielding a spurious
-    # APIConnectionError that fails the sibling advisor (root cause of the run2
-    # double-advisor "Connection error" collapse). Keying on model gives each
-    # model its own client, so concurrent fan-out calls never cross-close.
+    # fan-out running opus + gpt-5.5 in parallel threads) need distinct cache
+    # entries. Otherwise one call can reuse the client/default-model pairing
+    # created for its sibling. Keying on model keeps each call bound to the
+    # client configuration selected for that model.
     model_key = model or runtime.get("model", "")
     api_key_key = _runtime_cache_discriminator("api_key", api_key or "")
     return (provider, async_mode, base_url or "", api_key_key, api_mode or "", runtime_key, is_vision, task_key, pool_hint, model_key)
@@ -8259,9 +8256,10 @@ def _store_cached_client(cache_key: tuple, client: Any, default_model: Optional[
         # receive a non-functional client on the next cache hit.
         return
     with _client_cache_lock:
-        old_entry = _client_cache.get(cache_key)
-        if old_entry is not None and old_entry[0] is not client:
-            _close_cached_client(old_entry[0])
+        # Cache lookups hand the raw client to callers without a usage lease,
+        # so a displaced entry may still own an in-flight request.  Replacing
+        # the cache reference is safe; closing the old transport here is not.
+        # Its remaining callers retain it until their requests complete.
         _client_cache[cache_key] = (client, default_model, bound_loop)
 
 
