@@ -234,6 +234,18 @@ TOOLSETS = {
         "includes": []
     },
 
+    "git": {
+        "description": "Git operations: branch management",
+        "tools": ["git_branch"],
+        "includes": []
+    },
+
+    "monitoring": {
+        "description": "Monitoring and observability tools",
+        "tools": ["log_analyze"],
+        "includes": []
+    },
+
     "project": {
         "description": "Desktop Projects — create/switch named workspaces (GUI sessions only)",
         "tools": ["desktop_project"],
