@@ -8,7 +8,7 @@
  * answer instead of each deriving its own.
  */
 
-import { botActivitySession, botHandle, botRosterKey, isActiveRosterBot } from './data'
+import { botActivitySession, botHandle, botRosterKey, botSourceStatus, isActiveRosterBot } from './data'
 import type { RosterActivityFilter, RosterRow } from './types'
 
 // ── human-readable row helpers ───────────────────────────────────────────────
@@ -59,7 +59,7 @@ export const BOT_ROSTER_SEARCH_THRESHOLD = 8
 
 /** Rows the Group Chat picker can seat from the complete gateway roster. */
 export function selectableGroupChatBots(roster: null | RosterRow[] | undefined): RosterRow[] {
-  return (roster || []).filter(bot => !bot?.ghost)
+  return (roster || []).filter(bot => !bot?.ghost && botSourceStatus(bot).available)
 }
 
 export function canCreateGroupChat(roster: null | RosterRow[] | undefined): boolean {
