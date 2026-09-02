@@ -8551,6 +8551,17 @@ def _get_cached_client(
         # For async clients, remember which loop they were created on so we
         # can detect stale entries later.
         bound_loop = current_loop
+        if isinstance(client, _AuxProbeClientStub):
+            # Availability probes must never populate the cache — same guard as
+            # _store_cached_client(). A cached stub is handed to the NEXT
+            # resolution for this key, including a real runtime caller, and
+            # raises on first attribute access. Concretely: the second
+            # resolution hits _compat_model() → _is_openrouter_client(stub) →
+            # stub._client → RuntimeError, so check_vision_requirements()
+            # returned False forever after the first probe and vision_analyze
+            # silently disappeared from the tool schema for the life of the
+            # process (long-lived gateway / desktop backend).
+            return client, model or default_model
         with _client_cache_lock:
             if cache_key not in _client_cache:
                 # Safety belt: if the cache has grown beyond the max, evict
