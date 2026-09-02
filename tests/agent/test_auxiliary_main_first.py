@@ -51,6 +51,30 @@ class TestResolveAutoMainFirst:
         assert model == main_model
         assert mock_resolve.call_args.args[:2] == ("opencode-zen", main_model)
 
+    def test_partial_runtime_does_not_mix_provider_with_config_model(self):
+        """Provider and model fall back as one identity, never independently."""
+        resolved_client = MagicMock()
+
+        with (
+            patch("agent.auxiliary_client._read_main_provider", return_value="zai"),
+            patch("agent.auxiliary_client._read_main_model", return_value="glm-5"),
+            patch(
+                "agent.auxiliary_client.resolve_provider_client",
+                return_value=(resolved_client, "glm-5"),
+            ) as resolve_client,
+            patch("agent.auxiliary_client._is_provider_unhealthy", return_value=False),
+        ):
+            from agent.auxiliary_client import _resolve_auto
+
+            client, model = _resolve_auto(
+                main_runtime={"provider": "anthropic", "model": ""},
+                task="title_generation",
+            )
+
+        assert client is resolved_client
+        assert model == "glm-5"
+        assert resolve_client.call_args.args[:2] == ("zai", "glm-5")
+
     def test_title_generation_can_opt_into_provider_fast_model(self):
         """The latency optimization remains available as an explicit opt-in."""
         fast_model = "gemini-3-flash"

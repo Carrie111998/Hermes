@@ -1934,6 +1934,12 @@ def restore_primary_runtime(agent) -> bool:
         from agent.chat_completion_helpers import rewrite_prompt_model_identity
         rewrite_prompt_model_identity(agent, rt["model"], rt["provider"])
 
+        # Auxiliary work may run immediately after this helper returns, outside
+        # the shared turn prologue. Replace any fallback-era or partial binding
+        # with the same coherent runtime snapshot restored above.
+        from agent.auxiliary_client import set_runtime_main_from_agent
+        set_runtime_main_from_agent(agent)
+
         logger.info(
             "Primary runtime restored for new turn: %s (%s)",
             agent.model, agent.provider,

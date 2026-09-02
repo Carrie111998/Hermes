@@ -3966,6 +3966,32 @@ def set_runtime_main(
     return token
 
 
+def set_runtime_main_from_agent(
+    agent: Any,
+    *,
+    cache_scope: Optional[str] = None,
+) -> contextvars.Token:
+    """Publish one coherent auxiliary-runtime snapshot from a live agent."""
+    if cache_scope is None:
+        current = _RUNTIME_MAIN_CONTEXT.get()
+        cache_scope = (
+            str(current.get("cache_scope") or "")
+            if isinstance(current, dict)
+            else ""
+        )
+    return set_runtime_main(
+        getattr(agent, "provider", "") or "",
+        getattr(agent, "model", "") or "",
+        requested_provider=getattr(agent, "requested_provider", "") or "",
+        base_url=getattr(agent, "base_url", "") or "",
+        api_key=getattr(agent, "api_key", "") or "",
+        api_mode=getattr(agent, "api_mode", "") or "",
+        auth_mode=getattr(agent, "auth_mode", "") or "",
+        session_id=getattr(agent, "session_id", "") or "",
+        cache_scope=cache_scope,
+    )
+
+
 def reset_runtime_main(token: contextvars.Token) -> None:
     """Restore the runtime binding that preceded one scoped turn."""
     if token is None:
@@ -4456,6 +4482,15 @@ def _normalize_main_runtime(main_runtime: Optional[Dict[str, Any]]) -> Dict[str,
         if isinstance(identity, str):
             normalized[identity_field] = identity.lower()
     return normalized
+
+
+def _resolve_main_identity(runtime: Dict[str, Any]) -> Tuple[str, str]:
+    """Resolve provider/model atomically from runtime or persistent config."""
+    runtime_provider = str(runtime.get("provider") or "")
+    runtime_model = str(runtime.get("model") or "")
+    if runtime_provider and runtime_model:
+        return runtime_provider, runtime_model
+    return str(_read_main_provider() or ""), str(_read_main_model() or "")
 
 
 def _get_provider_chain() -> List[tuple]:
@@ -6420,7 +6455,6 @@ def _resolve_auto_route(
     auxiliary_is_nous = False  # Reset — _try_nous() will set True if it wins
     runtime = _normalize_main_runtime(main_runtime)
     runtime_provider = runtime.get("provider", "")
-    runtime_model = str(runtime.get("model") or "")
     runtime_base_url = str(runtime.get("base_url") or "")
     runtime_api_key = runtime.get("api_key", "")
     runtime_api_mode = str(runtime.get("api_mode") or "")
@@ -6451,8 +6485,7 @@ def _resolve_auto_route(
     # on aggregators (OpenRouter, Nous) who previously got routed to a
     # cheap provider-side default.  Explicit per-task overrides set via
     # config.yaml (auxiliary.<task>.provider) still win over this.
-    main_provider = str(runtime_provider or _read_main_provider() or "")
-    main_model = str(runtime_model or _read_main_model() or "")
+    main_provider, main_model = _resolve_main_identity(runtime)
 
     # Latency-critical tasks can explicitly prefer the provider's registered
     # fast model over the main chat model. Titling is the only eligible task:
@@ -7880,8 +7913,7 @@ def resolve_vision_provider_client(
         #                   live from the catalog — tried when
         #                   DEEPINFRA_API_KEY is set)
         #   5. Stop
-        main_provider = str(runtime.get("provider") or _read_main_provider())
-        main_model = str(runtime.get("model") or _read_main_model())
+        main_provider, main_model = _resolve_main_identity(runtime)
         if main_provider.strip().lower() == "moa":
             # MoA virtual provider: main_model is a preset NAME, and every
             # capability probe below (_PROVIDERS_WITHOUT_VISION,

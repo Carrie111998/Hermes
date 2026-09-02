@@ -169,6 +169,70 @@ class TestRestorePrimaryRuntime:
         assert agent.model == original_model
         assert agent.provider == original_provider
 
+    def test_restore_rebinds_auxiliary_vision_to_coherent_primary_runtime(self):
+        """A restored primary must replace a partial stale auxiliary runtime."""
+        from agent import auxiliary_client as aux
+
+        agent = _make_agent(
+            provider="zai",
+            base_url="https://api.z.ai/api/paas/v4",
+            fallback_model={"provider": "anthropic", "model": "claude-opus-4-6"},
+        )
+        agent.model = "glm-5"
+        agent._primary_runtime.update(
+            provider="zai",
+            model="glm-5",
+            base_url="https://api.z.ai/api/paas/v4",
+        )
+
+        fallback_client = _mock_resolve(
+            base_url="https://api.anthropic.com",
+            api_key="fallback-key-1234",
+        )
+        with patch(
+            "agent.auxiliary_client.resolve_provider_client",
+            return_value=(fallback_client, "claude-opus-4-6"),
+        ):
+            assert agent._try_activate_fallback() is True
+
+        # Reproduce a partial stale snapshot: provider survived from fallback,
+        # while the model is reconstructed from the restored primary config.
+        aux.set_runtime_main("anthropic", "", cache_scope="root-session")
+        resolved_client = MagicMock()
+
+        def vision_default(provider):
+            return "glm-4.6v" if provider == "zai" else None
+
+        try:
+            with patch("run_agent.OpenAI", return_value=MagicMock()):
+                assert agent._restore_primary_runtime() is True
+
+            with (
+                patch("agent.auxiliary_client._read_main_provider", return_value="zai"),
+                patch("agent.auxiliary_client._read_main_model", return_value="glm-5"),
+                patch(
+                    "agent.auxiliary_client._resolve_provider_vision_default",
+                    side_effect=vision_default,
+                ),
+                patch(
+                    "agent.auxiliary_client._resolve_task_provider_model",
+                    return_value=("auto", None, None, None, None),
+                ),
+                patch(
+                    "agent.auxiliary_client.resolve_provider_client",
+                    return_value=(resolved_client, "glm-4.6v"),
+                ) as resolve_client,
+            ):
+                provider, client, model = aux.resolve_vision_provider_client()
+                cache_scope = aux._runtime_main_value("cache_scope")
+        finally:
+            aux.clear_runtime_main()
+
+        assert (provider, model) == ("zai", "glm-4.6v")
+        assert client is resolved_client
+        assert cache_scope == "root-session"
+        assert resolve_client.call_args.args[:2] == ("zai", "glm-4.6v")
+
     def test_emits_user_visible_primary_restore_notice(self):
         agent = _make_agent(
             fallback_model={"provider": "openrouter", "model": "anthropic/claude-sonnet-4"},

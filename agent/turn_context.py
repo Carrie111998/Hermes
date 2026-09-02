@@ -606,7 +606,7 @@ def build_turn_context(
     # Tell auxiliary_client what the live main provider/model are for this turn
     # after primary restoration has settled the runtime.
     try:
-        from agent.auxiliary_client import set_runtime_main
+        from agent.auxiliary_client import set_runtime_main_from_agent
         from agent.prompt_cache_scope import resolve_prompt_cache_scope_safe
         # Rotation-stable prompt-cache scope. Memoized per segment on the
         # agent, so this is a DB walk at most once per segment — except a
@@ -618,17 +618,7 @@ def build_turn_context(
         # never-raising variant OUTSIDE the argument list, so a resolution
         # failure can only lose the scope — never the whole runtime binding.
         _cache_scope = resolve_prompt_cache_scope_safe(agent) or ""
-        set_runtime_main(
-            getattr(agent, "provider", "") or "",
-            getattr(agent, "model", "") or "",
-            requested_provider=getattr(agent, "requested_provider", "") or "",
-            base_url=getattr(agent, "base_url", "") or "",
-            api_key=getattr(agent, "api_key", "") or "",
-            api_mode=getattr(agent, "api_mode", "") or "",
-            auth_mode=getattr(agent, "auth_mode", "") or "",
-            session_id=getattr(agent, "session_id", "") or "",
-            cache_scope=_cache_scope,
-        )
+        set_runtime_main_from_agent(agent, cache_scope=_cache_scope)
     except Exception:
         pass
 
