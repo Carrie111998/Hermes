@@ -136,8 +136,18 @@ class TestPlatformDefaults:
         """Signal, BlueBubbles, etc. default to 'off' tool progress."""
         from gateway.display_config import resolve_display_setting
 
-        for plat in ("signal", "bluebubbles", "weixin", "wecom", "dingtalk", "whatsapp_cloud"):
+        for plat in ("signal", "bluebubbles", "weixin", "wecom", "dingtalk", "whatsapp_cloud", "fmsg"):
             assert resolve_display_setting({}, plat, "tool_progress") == "off", plat
+
+    def test_fmsg_defaults_quiet_no_edit_support(self):
+        """fmsg has no message-edit API — every heartbeat/status/tool-progress
+        update would otherwise post as a permanent, separate fmsg message."""
+        from gateway.display_config import resolve_display_setting
+
+        assert resolve_display_setting({}, "fmsg", "tool_progress") == "off"
+        assert resolve_display_setting({}, "fmsg", "busy_ack_detail") is False
+        assert resolve_display_setting({}, "fmsg", "long_running_notifications") is False
+        assert resolve_display_setting({}, "fmsg", "interim_assistant_messages") is False
 
 
     def test_telegram_mobile_chatter_defaults(self):

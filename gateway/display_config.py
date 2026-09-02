@@ -174,6 +174,14 @@ _PLATFORM_DEFAULTS: dict[str, dict[str, Any]] = {
     "photon":          _TIER_LOW,
     "bluebubbles":     _TIER_LOW,
     "weixin":          _TIER_LOW,
+    # fmsg (federated messaging plugin, hermes-fmsg): the fmsg-webapi REST
+    # surface has no edit-message route, so every progress heartbeat
+    # ("⏳ Working — N min", tool-progress bubbles, busy-ack iteration
+    # detail) posts as a new, permanent fmsg message instead of editing one
+    # bubble in place. Without this entry fmsg inherited the noisy global
+    # ("all"/True) defaults and flooded threads with status noise on any
+    # multi-turn/long-running request (markmnl/hermes-fmsg).
+    "fmsg":            _TIER_LOW,
     # WeCom is technically non-editable but exposes a native streaming
     # transport (msgtype: "stream" via aibot_respond_msg) that the gateway
     # consumer routes mid-stream content through. Enable streaming by default
