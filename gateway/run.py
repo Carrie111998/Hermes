@@ -11927,7 +11927,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     adapter=adapter,
                 )
 
-                result = await adapter.send(chat_id, msg, metadata=metadata)
+                # Fires while a turn may still be streaming — must carry the
+                # interim marker so a stream-is-the-message adapter doesn't
+                # seal the user's in-flight answer with this advisory (#98432).
+                result = await adapter.send(
+                    chat_id, msg, metadata=_interim_metadata(metadata)
+                )
                 if result is not None and getattr(result, "success", True) is False:
                     logger.debug(
                         "Failed to send shutdown notification to %s:%s: %s",
@@ -12007,10 +12012,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     home.thread_id,
                     adapter=adapter,
                 )
-                if metadata:
-                    result = await adapter.send(str(home.chat_id), msg, metadata=metadata)
-                else:
-                    result = await adapter.send(str(home.chat_id), msg)
+                # Same interim-marker requirement as the per-session sends
+                # above: the broadcast races live turns on stream-is-the-
+                # message adapters (#98432).
+                result = await adapter.send(
+                    str(home.chat_id), msg, metadata=_interim_metadata(metadata)
+                )
                 if result is not None and getattr(result, "success", True) is False:
                     logger.debug(
                         "Failed to send shutdown notification to home channel %s:%s: %s",

@@ -388,8 +388,45 @@ async def test_shutdown_notifications_use_cached_live_thread_source_when_origin_
     adapter.send.assert_awaited_once_with(
         "parent-42",
         "⚠️ Gateway shutting down — Your current task will be interrupted.",
-        metadata={"thread_id": "topic-7"},
+        metadata={"thread_id": "topic-7", "_interim_send": True},
     )
+
+
+@pytest.mark.asyncio
+async def test_shutdown_home_channel_broadcast_carries_interim_marker():
+    """The home-channel shutdown broadcast must be an interim send (#98432).
+
+    ``_notify_active_sessions_of_shutdown`` fires at the start of stop(),
+    while turns may still be streaming. Stream-is-the-message adapters
+    (relay Slack native streaming) intercept the first *unmarked* send to an
+    armed (chat, turn) key and seal the live stream with its content — so the
+    shutdown advisory would otherwise seal the user's in-flight answer with
+    status text. Both the per-active-session sends and the home-channel
+    broadcast must carry the ``_interim_send`` marker, including when no
+    thread routing metadata exists.
+    """
+    runner, adapter = make_restart_runner()
+    source = make_restart_source(chat_id="active-42", chat_type="dm")
+    session_key = build_session_key(source)
+
+    runner.config.platforms[Platform.TELEGRAM].home_channel = HomeChannel(
+        platform=Platform.TELEGRAM,
+        chat_id="home-42",
+        name="Ops Home",
+    )
+    runner._running_agents[session_key] = object()
+    runner.session_store._entries[session_key] = MagicMock(origin=source)
+    adapter.send = AsyncMock(return_value=SendResult(success=True, message_id="m"))
+
+    await runner._notify_active_sessions_of_shutdown()
+
+    targets = [c.args[0] for c in adapter.send.await_args_list]
+    assert targets == ["active-42", "home-42"]
+    for call in adapter.send.await_args_list:
+        assert call.kwargs["metadata"]["_interim_send"] is True, (
+            f"send to {call.args[0]} must be marked interim, got "
+            f"metadata={call.kwargs['metadata']}"
+        )
 
 
 @pytest.mark.asyncio
