@@ -26612,6 +26612,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if profile and metadata is not None:
             metadata = dict(metadata)
             metadata["hermes_profile"] = profile
+        # Persist the exact routing anchors alongside synthetic/background
+        # delivery metadata. Kanban auto-subscriptions replay this dictionary
+        # after the originating MessageEvent is gone; without guild/scope and
+        # parent-channel identity, a guild or parent-channel profile route
+        # cannot be re-established safely and must fail closed.
+        for key in ("scope_id", "guild_id", "parent_chat_id"):
+            value = getattr(source, key, None)
+            if value:
+                metadata = dict(metadata or {})
+                metadata.setdefault(key, str(value))
         return metadata
 
     def _thread_metadata_for_target(
@@ -27373,6 +27383,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             user_id_alt=str(context.source.user_id_alt) if context.source.user_id_alt else "",
             user_name=str(context.source.user_name) if context.source.user_name else "",
             scope_id=str(getattr(context.source, "scope_id", "") or ""),
+            parent_chat_id=str(
+                getattr(context.source, "parent_chat_id", "") or ""
+            ),
             session_key=context.session_key,
             message_id=str(context.source.message_id) if context.source.message_id else "",
             profile=getattr(context.source, "profile", "") or "",
