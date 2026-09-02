@@ -17225,6 +17225,42 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         except Exception:
             logger.debug("could not record served_profiles", exc_info=True)
 
+        # Refresh EACH secondary profile's OWN gateway_state.json so the
+        # dashboard's per-profile liveness check (gateway/status.py
+        # resolve_gateway_liveness, scoped to that profile's home) reports
+        # it running instead of falling through to a stale/dead-PID record
+        # left over from before multiplexing took over (or before this
+        # profile was ever brought up standalone). Without this, only the
+        # ACTIVE profile's status file is ever refreshed post-startup — a
+        # secondary profile's own file just rots at whatever it last said,
+        # so a genuinely healthy secondary profile can show "not running"
+        # in any UI that scopes its liveness check to that profile
+        # specifically (reported 2026-09-02 as "can't reach a secondary
+        # profile's bot in the desktop app" while its jobs/bot were fine).
+        #
+        # write_runtime_status's ``path=`` is required here, NOT
+        # _profile_runtime_scope: that scope only overrides the HERMES_HOME
+        # CONTEXTVAR, and gateway/status.py's identity-file paths
+        # deliberately read the process-level HERMES_HOME instead (#56986),
+        # so the contextvar override would silently no-op and rewrite the
+        # ACTIVE profile's own file again.
+        for profile_name, profile_home in profile_homes:
+            if profile_name == active:
+                continue
+            try:
+                write_runtime_status(
+                    gateway_state="running",
+                    multiplex_secondary=True,
+                    path=Path(profile_home) / "gateway_state.json",
+                )
+            except Exception:
+                logger.debug(
+                    "could not refresh gateway_state.json for secondary "
+                    "profile '%s'",
+                    profile_name,
+                    exc_info=True,
+                )
+
         return connected
 
     async def _start_one_profile_adapters(
