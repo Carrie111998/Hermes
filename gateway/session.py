@@ -1258,10 +1258,17 @@ class SessionStore:
     Falls back to legacy JSONL files if SQLite is unavailable.
     """
     
-    def __init__(self, sessions_dir: Path, config: GatewayConfig,
-                 has_active_processes_fn=None):
+    def __init__(
+        self,
+        sessions_dir: Path,
+        config: GatewayConfig,
+        has_active_processes_fn=None,
+        initial_cwd: Optional[str] = None,
+    ):
         self.sessions_dir = sessions_dir
         self.config = config
+        normalized_initial_cwd = str(initial_cwd or "").strip()
+        self._initial_cwd = normalized_initial_cwd or None
         self._entries: Dict[str, SessionEntry] = {}
         self._loaded = False
         # A fallback-only initial load must be reconciled with state.db after
@@ -3176,6 +3183,7 @@ class SessionStore:
                     "chat_type": source.chat_type,
                     "thread_id": source.thread_id,
                     "profile_name": source.profile,
+                    "cwd": self._initial_cwd,
                     # Identity lands atomically in the INSERT (#82616): a
                     # crash after this write can no longer strand the row
                     # unroutable, and lineage survives resets (#12857).
