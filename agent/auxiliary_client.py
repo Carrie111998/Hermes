@@ -3324,10 +3324,15 @@ def _warn_paid_lane_once(model: str) -> None:
     )
 
 
-def _try_openrouter(explicit_api_key: str = None, model: str = None) -> Tuple[Optional[OpenAI], Optional[str]]:
+def _try_openrouter(
+    explicit_api_key: str = None,
+    model: str = None,
+    *,
+    enforce_free_only: bool = True,
+) -> Tuple[Optional[OpenAI], Optional[str]]:
     free_only, cfg_model = _aux_openrouter_settings()
     or_model = model or cfg_model
-    if free_only and not _is_free_model(or_model):
+    if enforce_free_only and free_only and not _is_free_model(or_model):
         logger.warning(
             "Auxiliary client: auxiliary.free_only is enabled but the "
             "OpenRouter fallback model %r is not a :free SKU — skipping the "
@@ -3337,7 +3342,7 @@ def _try_openrouter(explicit_api_key: str = None, model: str = None) -> Tuple[Op
             or_model,
         )
         return None, None
-    if not _is_free_model(or_model):
+    if enforce_free_only and not _is_free_model(or_model):
         _warn_paid_lane_once(or_model)
 
     pool_present, entry = _select_pool_entry("openrouter")
@@ -3361,11 +3366,15 @@ def _try_openrouter(explicit_api_key: str = None, model: str = None) -> Tuple[Op
                    default_headers=build_or_headers()), or_model
 
 
-def _describe_openrouter_unavailable(model: str = None) -> str:
+def _describe_openrouter_unavailable(
+    model: str = None,
+    *,
+    enforce_free_only: bool = True,
+) -> str:
     """Return the policy or credential reason OpenRouter was unavailable."""
     free_only, cfg_model = _aux_openrouter_settings()
     or_model = model or cfg_model
-    if free_only and not _is_free_model(or_model):
+    if enforce_free_only and free_only and not _is_free_model(or_model):
         return (
             f"auxiliary.free_only rejected non-free model {or_model!r}; "
             "the request was skipped before provider availability checks"
@@ -6788,6 +6797,7 @@ def resolve_provider_client(
     main_runtime: Optional[Dict[str, Any]] = None,
     is_vision: bool = False,
     task: Optional[str] = None,
+    enforce_auxiliary_free_only: bool = True,
 ) -> Tuple[Optional[Any], Optional[str]]:
     """Central router: given a provider name and optional model, return a
     configured client with the correct auth, base URL, and API format.
@@ -6815,6 +6825,10 @@ def resolve_provider_client(
             "codex_responses", or None (auto-detect).  When set to
             "codex_responses", the client is wrapped in
             CodexAuxiliaryClient to route through the Responses API.
+        enforce_auxiliary_free_only: Apply ``auxiliary.free_only`` to an
+            OpenRouter route. Main-agent provider and fallback resolution set
+            this to False because the auxiliary cost policy does not govern
+            the user's explicit main inference chain.
 
     Returns:
         (client, resolved_model) or (None, None) if auth is unavailable.
@@ -6982,11 +6996,15 @@ def resolve_provider_client(
         client, default = _try_openrouter(
             explicit_api_key=explicit_api_key,
             model=model,
+            enforce_free_only=enforce_auxiliary_free_only,
         )
         if client is None:
             logger.warning(
                 "resolve_provider_client: openrouter requested but %s",
-                _describe_openrouter_unavailable(model=model),
+                _describe_openrouter_unavailable(
+                    model=model,
+                    enforce_free_only=enforce_auxiliary_free_only,
+                ),
             )
             return None, None
         final_model = _normalize_resolved_model(model or default, provider)

@@ -2819,7 +2819,9 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
             fb_provider, model=fb_model, raw_codex=True,
             explicit_base_url=fb_base_url_hint,
             explicit_api_key=fb_api_key_hint,
-            api_mode=fb_api_mode)
+            api_mode=fb_api_mode,
+            enforce_auxiliary_free_only=False,
+        )
         if fb_client is None:
             logger.warning(
                 "Fallback to %s failed: provider not configured",

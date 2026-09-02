@@ -157,6 +157,40 @@ class TestFallbackChainAdvancement:
             "⚠️ Model fallback: glm-5.2 via zai unavailable "
             "(provider overloaded); using deepseek-v4-flash via deepseek.",
         ]
+
+    def test_paid_openrouter_chain_ignores_auxiliary_free_only(self, monkeypatch):
+        """Main fallbacks are explicit routes, not auxiliary auto-fallbacks."""
+        agent = _make_agent(
+            fallback_model=[
+                {"provider": "openrouter", "model": "xiaomi/mimo-v2.5"},
+                {"provider": "openrouter", "model": "deepseek/deepseek-v4-flash-0731"},
+            ],
+        )
+        agent.provider = "alibaba"
+        agent.model = "qwen/qwen3.7-flash"
+        agent.base_url = "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"
+        monkeypatch.setenv("OPENROUTER_API_KEY", "synthetic-openrouter-key")
+
+        clients = [_mock_client(), _mock_client()]
+        with (
+            patch("agent.auxiliary_client._select_pool_entry", return_value=(False, None)),
+            patch(
+                "hermes_cli.config.load_config_readonly",
+                return_value={"auxiliary": {"free_only": True}},
+            ),
+            patch("agent.auxiliary_client.OpenAI", side_effect=clients) as mock_openai,
+            patch(
+                "hermes_cli.model_normalize.normalize_model_for_provider",
+                side_effect=lambda model, provider: model,
+            ),
+        ):
+            assert agent._try_activate_fallback(FailoverReason.upstream_rate_limit) is True
+            assert agent.model == "xiaomi/mimo-v2.5"
+            assert agent._try_activate_fallback(FailoverReason.rate_limit) is True
+            assert agent.model == "deepseek/deepseek-v4-flash-0731"
+
+        assert mock_openai.call_count == 2
+
     def test_skips_unconfigured_provider_to_next(self):
         """If resolve_provider_client returns None, skip to next in chain."""
         fbs = [
