@@ -769,6 +769,7 @@ class WebhookAdapter(BasePlatformAdapter):
             request.headers.get("X-GitHub-Event", "")
             or request.headers.get("X-GitLab-Event", "")
             or payload.get("event_type", "")
+            or payload.get("event", "")
             or payload.get("type", "")
             or "unknown"
         )
@@ -1143,7 +1144,8 @@ class WebhookAdapter(BasePlatformAdapter):
             return _hmac_str_equal(linear_sig, expected_linear)
 
         # GitHub: X-Hub-Signature-256 = sha256=<hex>
-        gh_sig = request.headers.get("X-Hub-Signature-256", "")
+        # Also check X-Hub-Signature (Fireflies V2 uses this header)
+        gh_sig = request.headers.get("X-Hub-Signature-256", "") or request.headers.get("X-Hub-Signature", "")
         if gh_sig:
             expected = "sha256=" + hmac.new(
                 secret.encode(), body, hashlib.sha256
