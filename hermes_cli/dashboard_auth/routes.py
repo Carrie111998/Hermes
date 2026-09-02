@@ -605,7 +605,14 @@ async def auth_callback(
     # that lets attacker-controlled bytes into the cookie would otherwise
     # produce an open redirect.
     landing = _validate_post_login_target(next_from_cookie) or "/"
-    resp = RedirectResponse(url=landing, status_code=302)
+    # ``landing`` is a back-end-relative path (the proxy already stripped
+    # the mount prefix before the request reached us), so it must be
+    # re-prefixed here — every other dashboard-internal redirect in this
+    # file already goes through ``_prefix(request)``; the post-login
+    # landing is not an exemption (#99123).
+    resp = RedirectResponse(
+        url=f"{_prefix(request)}{landing}", status_code=302
+    )
     set_session_cookies(
         resp,
         access_token=session.access_token,

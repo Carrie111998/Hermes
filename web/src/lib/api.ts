@@ -369,8 +369,10 @@ export const api = {
     }).then((r) => {
       // /auth/logout returns 302 → /login. Follow that with a full-page
       // navigation rather than letting fetch() opaquely consume the
-      // redirect — the SPA needs to leave the protected area.
-      window.location.assign("/login");
+      // redirect — the SPA needs to leave the protected area. Route the
+      // navigation through BASE like every other dashboard URL, so a
+      // path-prefix reverse proxy deploy lands on /<prefix>/login (#99123).
+      window.location.assign(`${BASE}/login`);
       return r;
     }),
   getSessions: (
