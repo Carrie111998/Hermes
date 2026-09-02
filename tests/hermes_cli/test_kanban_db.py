@@ -528,6 +528,86 @@ def test_delete_task_removes_task_and_cascades(kanban_home):
 
 
 
+def test_create_rejects_worktree_without_path_or_board_default(kanban_home):
+    """An unresolvable worktree card must fail at CREATE, not at spawn.
+
+    Regression for the routing gap where ``create_task`` happily returned a
+    card with ``workspace_path=None``; the defect only surfaced minutes later
+    inside the dispatcher as a repeated spawn failure on a card that looked
+    healthy on the board.
+    """
+    with kb.connect() as conn:
+        with pytest.raises(ValueError) as exc:
+            kb.create_task(conn, title="ship", workspace_kind="worktree")
+    msg = str(exc.value)
+    # Both remedies must be named, or the operator has to go read the source.
+    assert "workspace_path" in msg
+    assert "set-default-workdir" in msg
+
+
+def test_create_rejects_dir_without_path_or_board_default(kanban_home):
+    """``dir`` has the same unresolvable-at-spawn shape as ``worktree``."""
+    with kb.connect() as conn:
+        with pytest.raises(ValueError) as exc:
+            kb.create_task(conn, title="ship", workspace_kind="dir")
+    assert "set-default-workdir" in str(exc.value)
+
+
+def test_create_resolves_worktree_path_from_board_default_workdir(kanban_home, tmp_path):
+    """With a board default configured, the path is stored ON THE CARD.
+
+    Resolving at create time (rather than at each spawn) matters because the
+    stored ``workspace_path`` is what gets injected into every future
+    claimant's worker_context and is never refreshed later.
+    """
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    kb.write_board_metadata(kb.get_current_board(), default_workdir=str(repo))
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="ship", workspace_kind="worktree")
+        task = kb.get_task(conn, task_id)
+    assert task is not None
+    assert task.workspace_path == str(repo)
+
+
+def test_create_scratch_without_path_is_unaffected_by_the_guard(kanban_home):
+    """No regression for scratch: it resolves its own per-board root later."""
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="ship", workspace_kind="scratch")
+        task = kb.get_task(conn, task_id)
+    assert task is not None
+    assert task.workspace_kind == "scratch"
+    assert task.workspace_path is None
+
+
+def test_create_scratch_does_not_inherit_board_default_workdir(kanban_home, tmp_path):
+    """Scratch must never inherit the board default (#28818 cleanup safety)."""
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    kb.write_board_metadata(kb.get_current_board(), default_workdir=str(repo))
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="ship", workspace_kind="scratch")
+        task = kb.get_task(conn, task_id)
+    assert task is not None
+    assert task.workspace_path is None
+
+
+def test_create_worktree_with_explicit_path_ignores_missing_board_default(kanban_home, tmp_path):
+    """An explicit path is always sufficient; no board default needed."""
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="ship",
+            workspace_kind="worktree",
+            workspace_path=str(repo / ".worktrees" / "explicit"),
+        )
+        task = kb.get_task(conn, task_id)
+    assert task is not None
+    assert task.workspace_path == str(repo / ".worktrees" / "explicit")
+
+
 def test_worktree_workspace_explicit_target_materializes_linked_worktree(kanban_home, tmp_path):
     repo = tmp_path / "repo"
     _init_git_repo(repo)
