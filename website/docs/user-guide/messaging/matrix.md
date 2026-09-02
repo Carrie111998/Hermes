@@ -393,7 +393,7 @@ MATRIX_E2EE_MODE=required
 |------|----------|
 | `off` | Do not initialize Matrix E2EE. |
 | `optional` | Try E2EE when dependencies are available, but keep unencrypted rooms working if crypto cannot initialize. |
-| `required` | Fail closed if E2EE dependencies or crypto setup are not available. |
+| `required` | Fail closed unless runtime room state is `m.megolm.v1.aes-sha2`; missing/unknown state, crypto failure, decrypt failure, or another algorithm blocks join, inbound processing, text, edits, media, reactions, approvals, and proactive delivery. |
 
 Optional mode may fall back to non-E2EE operation when crypto setup is unavailable. Required mode fails closed instead of silently downgrading.
 
@@ -405,6 +405,21 @@ When E2EE is enabled, Hermes:
 - Uploads device keys on first connection
 - Decrypts incoming messages and encrypts outgoing messages automatically
 - Auto-joins encrypted rooms when invited
+
+For a gateway installed through Hermes' systemd integration, generated units set
+`UMask=0077`. In `required` mode startup creates only new Matrix storage paths
+with owner-only modes and refuses to start if an existing crypto database,
+SQLite WAL/SHM, or decrypted cache has broader permissions; it does not repair
+existing files automatically.
+
+### Required-mode deployment verification
+
+TODO before merge or any live deployment: run the Matrix required-mode pytest
+module through `scripts/run_tests.sh`, the repository lint, type, and secret
+scans, then verify an invited encrypted room, an unencrypted room, an unknown
+algorithm, a missing inviter, an unlisted DM, outbound media, approvals, and
+restart persistence against a non-production Matrix homeserver. Offline source
+checks do not prove those runtime and live-service properties.
 
 ### Matrix Tools and Controls
 
@@ -521,7 +536,9 @@ MATRIX_HOME_ROOM=!abc123def456:matrix.example.org
 
 Restrict the bot to a fixed set of Matrix rooms. When set, the bot **only** responds in rooms whose ID appears in the list — messages from any other room are silently ignored, even if the bot is mentioned.
 
-**DMs (direct chat rooms) are exempt** from this filter, so authorized users can always reach the bot one-on-one.
+**DMs (direct chat rooms) are exempt** from this filter in `off` and `optional`
+mode. In `required` mode, a non-empty allowlist has no DM bypass: the DM room
+must be listed and satisfy the runtime encrypted-room gate.
 
 ```yaml
 matrix:

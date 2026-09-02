@@ -59,6 +59,7 @@ import mimetypes
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import time
@@ -599,6 +600,50 @@ from hermes_constants import get_hermes_dir as _get_hermes_dir
 
 _STORE_DIR = _get_hermes_dir("platforms/matrix/store", "matrix/store")
 _CRYPTO_DB_PATH = _STORE_DIR / "crypto.db"
+_REQUIRED_E2EE_ALGORITHM = "m.megolm.v1.aes-sha2"
+
+
+def _matrix_private_storage_preflight() -> bool:
+    """Create only new Matrix storage paths privately and reject weak existing ones."""
+    cache_root = _get_hermes_dir("cache", "cache")
+    required_dirs = (
+        _STORE_DIR.parent.parent,
+        _STORE_DIR.parent,
+        _STORE_DIR,
+    )
+    for directory in required_dirs:
+        existed = directory.exists()
+        try:
+            directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+            if not existed:
+                os.chmod(directory, 0o700)
+            if stat.S_IMODE(directory.stat().st_mode) != 0o700:
+                logger.error("Matrix: refusing insecure existing storage directory %s", directory)
+                return False
+        except OSError as exc:
+            logger.error("Matrix: cannot validate private storage directory %s: %s", directory, exc)
+            return False
+
+    for db_path in (_CRYPTO_DB_PATH, _CRYPTO_DB_PATH.with_name("crypto.db-wal"), _CRYPTO_DB_PATH.with_name("crypto.db-shm")):
+        if db_path.exists() and stat.S_IMODE(db_path.stat().st_mode) != 0o600:
+            logger.error("Matrix: refusing insecure existing crypto store file %s", db_path)
+            return False
+
+    for cache_dir in (cache_root / "images", cache_root / "audio", cache_root / "videos", cache_root / "documents"):
+        if not cache_dir.exists():
+            continue
+        try:
+            if stat.S_IMODE(cache_dir.stat().st_mode) != 0o700:
+                logger.error("Matrix: refusing insecure existing decrypted cache directory %s", cache_dir)
+                return False
+            for cached_file in cache_dir.iterdir():
+                if cached_file.is_file() and stat.S_IMODE(cached_file.stat().st_mode) != 0o600:
+                    logger.error("Matrix: refusing insecure existing decrypted cache file %s", cached_file)
+                    return False
+        except OSError as exc:
+            logger.error("Matrix: cannot validate decrypted cache %s: %s", cache_dir, exc)
+            return False
+    return True
 
 # Grace period: ignore messages older than this many seconds before startup.
 _STARTUP_GRACE_SECONDS = 5
@@ -1252,6 +1297,12 @@ class MatrixAdapter(BasePlatformAdapter):
 
         self._processed_events: deque = deque(maxlen=1000)
         self._processed_events_set: set = set()
+        # Required E2EE mode dispatches only entries recorded by
+        # _on_encrypted_event after crypto successfully decrypts the exact
+        # Matrix event. Room state alone is never enough provenance for an
+        # inbound command or approval control.
+        self._verified_decrypted_events: deque = deque(maxlen=1000)
+        self._verified_decrypted_events_set: set[tuple[str, str]] = set()
 
         # Buffer for undecrypted events pending key receipt.
         # Each entry: (room_id, event, timestamp)
@@ -1436,6 +1487,99 @@ class MatrixAdapter(BasePlatformAdapter):
     # ------------------------------------------------------------------
     # E2EE helpers
     # ------------------------------------------------------------------
+
+    async def _required_e2ee_room_allowed(self, room_id: str) -> bool:
+        """Fail closed unless a required-mode room has the supported encryption state."""
+        if getattr(self, "_e2ee_mode", "off") != "required":
+            return True
+        client = self._client
+        if not client or not getattr(client, "crypto", None) or not room_id:
+            return False
+        if not hasattr(client, "get_state_event"):
+            return False
+        try:
+            event = await asyncio.wait_for(
+                client.get_state_event(RoomID(room_id), "m.room.encryption"),
+                timeout=5.0,
+            )
+        except Exception as exc:
+            logger.debug("Matrix: required E2EE state unavailable for %s: %s", room_id, exc)
+            return False
+        return self._state_event_value(event, "algorithm") == _REQUIRED_E2EE_ALGORITHM
+
+    async def _required_e2ee_local_room_encrypted(self, room_id: str) -> bool:
+        """Confirm local crypto state before required-mode media encryption.
+
+        The homeserver state query is authoritative about a room's configured
+        algorithm, but attachment encryption also depends on the local
+        StateStore. A stale, missing, or failing local result must deny instead
+        of falling through to a plaintext upload.
+        """
+        if getattr(self, "_e2ee_mode", "off") != "required":
+            return True
+        client = self._client
+        state_store = getattr(client, "state_store", None) if client else None
+        if state_store is None or not hasattr(state_store, "is_encrypted"):
+            return False
+        try:
+            return bool(await state_store.is_encrypted(RoomID(room_id)))
+        except Exception as exc:
+            logger.debug("Matrix: required local E2EE state unavailable for %s: %s", room_id, exc)
+            return False
+
+    def _record_verified_decrypted_event(self, room_id: str, event_id: str) -> None:
+        """Record bounded provenance for one successfully decrypted event."""
+        key = (room_id, event_id)
+        if not room_id or not event_id or key in self._verified_decrypted_events_set:
+            return
+        if len(self._verified_decrypted_events) == self._verified_decrypted_events.maxlen:
+            self._verified_decrypted_events_set.discard(self._verified_decrypted_events.popleft())
+        self._verified_decrypted_events.append(key)
+        self._verified_decrypted_events_set.add(key)
+
+    async def _required_e2ee_event_allowed(self, room_id: str, event: Any) -> bool:
+        """Require exact successful-decryption provenance for required intake."""
+        if getattr(self, "_e2ee_mode", "off") != "required":
+            return True
+        if not await self._required_e2ee_room_allowed(room_id):
+            return False
+        event_id = str(getattr(event, "event_id", ""))
+        return bool(event_id and (room_id, event_id) in self._verified_decrypted_events_set)
+
+    async def _on_encrypted_event(self, event: Any) -> None:
+        """Decrypt and dispatch one required-mode Matrix event with provenance.
+
+        TODO(verification-before-merge): exercise this handler against the
+        supported mautrix runtime and an encrypted test room. Offline tests
+        cover denial semantics only; they cannot prove SDK dispatcher ordering.
+        """
+        room_id = str(getattr(event, "room_id", ""))
+        event_id = str(getattr(event, "event_id", ""))
+        if not event_id or not await self._is_allowed_matrix_room_event(room_id):
+            return
+        if not await self._required_e2ee_room_allowed(room_id):
+            return
+        crypto = getattr(self._client, "crypto", None) if self._client else None
+        if crypto is None or not hasattr(crypto, "decrypt_megolm_event"):
+            return
+        try:
+            decrypted = await crypto.decrypt_megolm_event(event)
+        except Exception as exc:
+            logger.info("Matrix: denying encrypted event %s after decrypt failure: %s", event_id, exc)
+            return
+        decrypted_event_id = str(getattr(decrypted, "event_id", ""))
+        decrypted_room_id = str(getattr(decrypted, "room_id", ""))
+        if decrypted_event_id != event_id or decrypted_room_id != room_id:
+            logger.warning("Matrix: denying decrypted event with mismatched provenance")
+            return
+        self._record_verified_decrypted_event(room_id, event_id)
+        event_type = str(getattr(decrypted, "type", ""))
+        if event_type == EventType.ROOM_MESSAGE:
+            await self._on_room_message(decrypted)
+        elif event_type == EventType.REACTION:
+            await self._on_reaction(decrypted)
+        else:
+            logger.debug("Matrix: ignoring unsupported decrypted event type %s", event_type)
 
     @staticmethod
     def _extract_server_ed25519(device_keys_obj: Any) -> Optional[str]:
@@ -1728,7 +1872,13 @@ class MatrixAdapter(BasePlatformAdapter):
             logger.error("Matrix: homeserver URL not configured")
             return False
 
-        # Ensure store dir exists for E2EE key persistence.
+        # Required mode must never create or use a weak crypto/cache location.
+        # Existing paths are verified, not repaired, to avoid silently changing
+        # ownership-sensitive deployment state at startup.
+        if self._e2ee_mode == "required" and not _matrix_private_storage_preflight():
+            return False
+
+        # Ensure store dir exists for E2EE key persistence in non-required modes.
         _STORE_DIR.mkdir(parents=True, exist_ok=True)
 
         # Create the HTTP API layer.
@@ -1914,12 +2064,25 @@ class MatrixAdapter(BasePlatformAdapter):
                         )
                         legacy_pickle.unlink()
 
+                    if self._e2ee_mode == "required" and not _CRYPTO_DB_PATH.exists():
+                        fd = os.open(
+                            _CRYPTO_DB_PATH,
+                            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                            0o600,
+                        )
+                        os.close(fd)
+
                     crypto_db = Database.create(
                         f"sqlite:///{_CRYPTO_DB_PATH}",
                         upgrade_table=PgCryptoStore.upgrade_table,
                     )
                     await crypto_db.start()
                     self._crypto_db = crypto_db
+                    if self._e2ee_mode == "required" and not _matrix_private_storage_preflight():
+                        await crypto_db.stop()
+                        self._crypto_db = None
+                        await api.session.close()
+                        return False
 
                     _acct_id = self._user_id or "hermes"
                     # Use the resolved client.device_id (from whoami or password
@@ -2071,16 +2234,23 @@ class MatrixAdapter(BasePlatformAdapter):
         # Without this the INVITE handler below never fires.
         client.add_dispatcher(MembershipEventDispatcher)
 
-        client.add_event_handler(
-            EventType.ROOM_MESSAGE,
-            self._on_room_message,
-            wait_sync=True,
-        )
-        client.add_event_handler(
-            EventType.REACTION,
-            self._on_reaction,
-            wait_sync=True,
-        )
+        if self._e2ee_mode == "required":
+            client.add_event_handler(
+                EventType.ROOM_ENCRYPTED,
+                self._on_encrypted_event,
+                wait_sync=True,
+            )
+        else:
+            client.add_event_handler(
+                EventType.ROOM_MESSAGE,
+                self._on_room_message,
+                wait_sync=True,
+            )
+            client.add_event_handler(
+                EventType.REACTION,
+                self._on_reaction,
+                wait_sync=True,
+            )
         client.add_event_handler(
             IntEvt.INVITE,
             self._on_invite,
@@ -2200,6 +2370,8 @@ class MatrixAdapter(BasePlatformAdapter):
 
         if not content:
             return SendResult(success=True)
+        if not await self._required_e2ee_room_allowed(chat_id):
+            return SendResult(success=False, error="Required E2EE room state unavailable")
 
         formatted = self.format_message(content)
         chunks = self.truncate_message(formatted, self.max_message_length)
@@ -2336,6 +2508,8 @@ class MatrixAdapter(BasePlatformAdapter):
     ) -> SendResult:
         """Edit an existing message (via m.replace)."""
 
+        if not await self._required_e2ee_room_allowed(chat_id):
+            return SendResult(success=False, error="Required E2EE room state unavailable")
         formatted = self.format_message(content)
         new_content = self._build_text_message_content(formatted)
         msg_content: Dict[str, Any] = {
@@ -2883,6 +3057,10 @@ class MatrixAdapter(BasePlatformAdapter):
         voice_metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
         """Upload bytes to Matrix and send as a media message."""
+        if not await self._required_e2ee_room_allowed(room_id):
+            return SendResult(success=False, error="Required E2EE room state unavailable")
+        if not await self._required_e2ee_local_room_encrypted(room_id):
+            return SendResult(success=False, error="Required local E2EE state unavailable")
         if len(data) > self._max_media_bytes:
             return SendResult(
                 success=False,
@@ -2891,7 +3069,20 @@ class MatrixAdapter(BasePlatformAdapter):
 
         upload_data = data
         encrypted_file = None
-        if self._encryption and getattr(self._client, "crypto", None):
+        required_file_payload = None
+        if self._e2ee_mode == "required":
+            try:
+                from mautrix.crypto.attachments import encrypt_attachment
+                upload_data, encrypted_file = encrypt_attachment(data)
+                required_file_payload = encrypted_file.serialize()
+                if not isinstance(required_file_payload, dict) or not all(
+                    required_file_payload.get(key) for key in ("key", "iv", "hashes", "v")
+                ):
+                    raise ValueError("attachment encryption returned incomplete Matrix file metadata")
+            except Exception as exc:
+                logger.error("Matrix: required attachment encryption failed: %s", exc)
+                return SendResult(success=False, error=str(exc))
+        elif self._encryption and getattr(self._client, "crypto", None):
             state_store = getattr(self._client, "state_store", None)
             if state_store:
                 try:
@@ -2927,7 +3118,10 @@ class MatrixAdapter(BasePlatformAdapter):
                 "size": len(data),
             },
         }
-        if encrypted_file is not None:
+        if required_file_payload is not None:
+            required_file_payload["url"] = str(mxc_url)
+            msg_content["file"] = required_file_payload
+        elif encrypted_file is not None:
             file_payload = encrypted_file.serialize()
             file_payload["url"] = str(mxc_url)
             msg_content["file"] = file_payload
@@ -3191,12 +3385,13 @@ class MatrixAdapter(BasePlatformAdapter):
     async def _is_allowed_matrix_room_event(self, room_id: str) -> bool:
         """Return True when a room event may proceed past intake filters.
 
-        MATRIX_ALLOWED_ROOMS constrains shared rooms. Matrix DMs are exempt so
-        personal chats still work when operators use a room allowlist for
-        project rooms.
+        MATRIX_ALLOWED_ROOMS constrains shared rooms. Required E2EE mode has no
+        DM exception because an unlisted DM cannot satisfy locked-down policy.
         """
         if self._is_allowed_matrix_room(room_id):
             return True
+        if self._e2ee_mode == "required":
+            return False
         try:
             return await self._is_dm_room(room_id)
         except Exception as exc:
@@ -3250,6 +3445,9 @@ class MatrixAdapter(BasePlatformAdapter):
                 "Matrix: ignoring message from unauthorized room %s",
                 room_id,
             )
+            return
+        if not await self._required_e2ee_event_allowed(room_id, event):
+            logger.info("Matrix: ignoring inbound event without required decrypt provenance in %s", room_id)
             return
 
         # Deduplicate by event ID.
@@ -3780,6 +3978,33 @@ class MatrixAdapter(BasePlatformAdapter):
 
         await self.handle_message(msg_event)
 
+    def _is_authorized_inviter(self, inviter: str) -> bool:
+        """Return whether an exact Matrix MXID is allowed to invite this bot."""
+        allow_all = os.getenv("GATEWAY_ALLOW_ALL_USERS", "").lower() in {
+            "true",
+            "1",
+            "yes",
+        }
+        return allow_all or bool(inviter and self._allowed_user_ids and inviter in self._allowed_user_ids)
+
+    @staticmethod
+    def _pending_invite_details(invite_data: Any) -> tuple[str, bool]:
+        """Read the exact inviter and direct flag from a Matrix initial-sync invite."""
+        if not isinstance(invite_data, dict):
+            return "", False
+        events = (invite_data.get("invite_state") or {}).get("events") or []
+        if not isinstance(events, list):
+            return "", False
+        for event in events:
+            if not isinstance(event, dict) or event.get("type") != "m.room.member":
+                continue
+            content = event.get("content") or {}
+            if not isinstance(content, dict) or content.get("membership") != "invite":
+                continue
+            inviter = str(event.get("sender") or "")
+            return inviter, bool(content.get("is_direct"))
+        return "", False
+
     async def _on_invite(self, event: Any) -> None:
         """Auto-join rooms when invited, recording DM rooms in m.direct."""
 
@@ -3792,19 +4017,15 @@ class MatrixAdapter(BasePlatformAdapter):
         # federated Matrix user could invite the bot into arbitrary rooms,
         # exposing its presence and metadata. Mirrors the allow-list gate
         # used on the message/reaction paths.
-        allow_all = os.getenv("GATEWAY_ALLOW_ALL_USERS", "").lower() in {
-            "true",
-            "1",
-            "yes",
-        }
-        if not allow_all and not (
-            self._allowed_user_ids and inviter in self._allowed_user_ids
-        ):
+        if not self._is_authorized_inviter(inviter):
             logger.warning(
                 "Matrix: rejecting invite to %s from unauthorized user %s",
                 room_id,
                 inviter,
             )
+            return
+        if not await self._required_e2ee_room_allowed(room_id):
+            logger.warning("Matrix: rejecting invite to %s without required E2EE state", room_id)
             return
 
         logger.info(
@@ -3869,6 +4090,9 @@ class MatrixAdapter(BasePlatformAdapter):
 
         async def _join_invite() -> None:
             try:
+                if not await self._required_e2ee_room_allowed(room_id):
+                    logger.warning("Matrix: declining invite to %s without required E2EE state", room_id)
+                    return
                 joined = await asyncio.wait_for(
                     self._join_room_by_id(room_id), timeout=45.0
                 )
@@ -3889,11 +4113,15 @@ class MatrixAdapter(BasePlatformAdapter):
         invites = rooms.get("invite", {})
         if not isinstance(invites, dict):
             return
-        for room_id in invites:
+        for room_id, invite_data in invites.items():
             if room_id in self._joined_rooms:
                 continue
+            inviter, is_direct = self._pending_invite_details(invite_data)
+            if not self._is_authorized_inviter(inviter):
+                logger.warning("Matrix: rejecting pending invite to %s without authorized inviter", room_id)
+                continue
             logger.info("Matrix: reconciling pending invite for %s", room_id)
-            self._schedule_invite_join(str(room_id))
+            self._schedule_invite_join(str(room_id), is_direct=is_direct, inviter=inviter)
 
     # ------------------------------------------------------------------
     # Reactions (send, receive, processing lifecycle)
@@ -3910,6 +4138,8 @@ class MatrixAdapter(BasePlatformAdapter):
         """
 
         if not self._client:
+            return None
+        if not await self._required_e2ee_room_allowed(room_id):
             return None
         content = {
             "m.relates_to": {
@@ -4017,6 +4247,10 @@ class MatrixAdapter(BasePlatformAdapter):
             return
 
         room_id = str(getattr(event, "room_id", ""))
+        if not await self._is_allowed_matrix_room_event(room_id):
+            return
+        if not await self._required_e2ee_event_allowed(room_id, event):
+            return
         content = getattr(event, "content", None)
         if content:
             relates_to = (
@@ -4384,6 +4618,8 @@ class MatrixAdapter(BasePlatformAdapter):
         """Redact (delete) a message or event from a room."""
         if not self._client:
             return False
+        if not await self._required_e2ee_room_allowed(room_id):
+            return False
         try:
             await self._client.redact(
                 RoomID(room_id),
@@ -4551,6 +4787,8 @@ class MatrixAdapter(BasePlatformAdapter):
         """Send a simple message (emote, notice) with optional HTML formatting."""
         if not self._client or not text:
             return SendResult(success=False, error="No client or empty text")
+        if not await self._required_e2ee_room_allowed(chat_id):
+            return SendResult(success=False, error="Required E2EE room state unavailable")
 
         msg_content = self._build_text_message_content(text, msgtype=msgtype)
 

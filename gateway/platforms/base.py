@@ -875,8 +875,35 @@ async def _read_httpx_body_with_limit(response, *, media_type: str) -> bytes:
 def get_image_cache_dir() -> Path:
     """Return the image cache directory, creating it if it doesn't exist."""
     d = _resolve_cache_dir("IMAGE_CACHE_DIR", "cache/images", "image_cache")
-    d.mkdir(parents=True, exist_ok=True)
+    _ensure_private_cache_dir(d)
     return d
+
+
+def _ensure_private_cache_dir(path: Path) -> None:
+    """Create a decrypted-media cache directory with owner-only permissions."""
+    existed = path.exists()
+    path.mkdir(parents=True, exist_ok=True, mode=0o700)
+    # New directories honor ``mode`` only after umask masking. These caches may
+    # contain plaintext downloaded from encrypted messaging rooms, so do not
+    # inherit a permissive process umask. Existing paths are intentionally not
+    # repaired here; required Matrix startup rejects them for explicit operator
+    # remediation instead of mutating deployment state behind their back.
+    if not existed:
+        os.chmod(path, 0o700)
+
+
+def _write_private_cache_bytes(path: Path, data: bytes) -> None:
+    """Write a newly generated decrypted cache file without inheriting umask."""
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(data)
+    except BaseException:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+        raise
 
 
 def _looks_like_image(data: bytes) -> bool:
@@ -921,7 +948,7 @@ def cache_image_from_bytes(data: bytes, ext: str = ".jpg") -> str:
     cache_dir = get_image_cache_dir()
     filename = f"img_{uuid.uuid4().hex[:12]}{ext}"
     filepath = cache_dir / filename
-    filepath.write_bytes(data)
+    _write_private_cache_bytes(filepath, data)
     return str(filepath)
 
 
@@ -1031,7 +1058,7 @@ AUDIO_CACHE_DIR = get_hermes_dir("cache/audio", "audio_cache")
 def get_audio_cache_dir() -> Path:
     """Return the audio cache directory, creating it if it doesn't exist."""
     d = _resolve_cache_dir("AUDIO_CACHE_DIR", "cache/audio", "audio_cache")
-    d.mkdir(parents=True, exist_ok=True)
+    _ensure_private_cache_dir(d)
     return d
 
 
@@ -1063,7 +1090,7 @@ def cache_audio_from_bytes(data: bytes, ext: str = ".ogg") -> str:
     sniffed_ext = _sniff_audio_ext(data, ext)
     filename = f"audio_{uuid.uuid4().hex[:12]}{sniffed_ext}"
     filepath = cache_dir / filename
-    filepath.write_bytes(data)
+    _write_private_cache_bytes(filepath, data)
     return str(filepath)
 
 
@@ -1160,7 +1187,7 @@ SUPPORTED_VIDEO_TYPES = {
 def get_video_cache_dir() -> Path:
     """Return the video cache directory, creating it if it doesn't exist."""
     d = _resolve_cache_dir("VIDEO_CACHE_DIR", "cache/videos", "video_cache")
-    d.mkdir(parents=True, exist_ok=True)
+    _ensure_private_cache_dir(d)
     return d
 
 
@@ -1170,7 +1197,7 @@ def cache_video_from_bytes(data: bytes, ext: str = ".mp4") -> str:
     cache_dir = get_video_cache_dir()
     filename = f"video_{uuid.uuid4().hex[:12]}{ext}"
     filepath = cache_dir / filename
-    filepath.write_bytes(data)
+    _write_private_cache_bytes(filepath, data)
     return str(filepath)
 
 
@@ -2244,7 +2271,7 @@ def _strip_media_tag_directives(text: str) -> str:
 def get_document_cache_dir() -> Path:
     """Return the document cache directory, creating it if it doesn't exist."""
     d = _resolve_cache_dir("DOCUMENT_CACHE_DIR", "cache/documents", "document_cache")
-    d.mkdir(parents=True, exist_ok=True)
+    _ensure_private_cache_dir(d)
     return d
 
 
@@ -2276,7 +2303,7 @@ def cache_document_from_bytes(data: bytes, filename: str) -> str:
     # Final safety check: ensure path stays inside cache dir
     if not filepath.resolve().is_relative_to(cache_dir.resolve()):
         raise ValueError(f"Path traversal rejected: {filename!r}")
-    filepath.write_bytes(data)
+    _write_private_cache_bytes(filepath, data)
     return str(filepath)
 
 
