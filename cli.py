@@ -12895,6 +12895,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             self._handle_fast_command(cmd_original)
         elif canonical == "compress":
             self._manual_compress(cmd_original)
+        elif canonical == "compthreshold":
+            self._handle_compthreshold_command(cmd_original)
         elif canonical == "usage":
             self._handle_usage_command(cmd_original)
         elif canonical == "subscription":
@@ -13974,6 +13976,61 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             return
         self._reasoning_preview_buf = getattr(self, "_reasoning_preview_buf", "") + reasoning_text
         self._flush_reasoning_preview(force=False)
+
+    def _handle_compthreshold_command(self, cmd_original: str = ""):
+        """Set or show the compression trigger threshold for THIS session only.
+
+        Usage:
+          /compthreshold              — show current session threshold
+          /compthreshold 80           — trigger at ~80,000 tokens (80K)
+          /compthreshold 350k          — same: 350K (explicit k accepted)
+          /compthreshold 1.5m          — trigger at ~1,500,000 tokens
+          /compthreshold reset        — restore the global / per-model value
+
+        The value is a token count with default unit K (thousands). Only the
+        ``m`` suffix changes the unit to millions. It overrides the global
+        ``compression.threshold`` and per-model ``compression.model_thresholds``
+        for THIS session only; other sessions and the config file are
+        untouched. /new or /reset clears it. The override is clamped to
+        [64K, 95% of the model's context window] so it always fires.
+        """
+        if not self.agent:
+            print("(._.) No active agent -- send a message first.")
+            return
+        compressor = getattr(self.agent, "context_compressor", None)
+        if compressor is None:
+            print("(._.) No context compressor available in this session.")
+            return
+
+        raw_args = ""
+        if cmd_original:
+            _parts = cmd_original.strip().split(None, 1)
+            if len(_parts) > 1:
+                raw_args = _parts[1].strip()
+        # ---- Delegate parse/clamp/assign to the shared engine method ----
+        # (CLI + TUI gateway share one code path so behavior can't drift.)
+        result = compressor.apply_session_threshold_override(raw_args)
+        if not result.get("ok"):
+            print(f"(._.) {result.get('message', 'compthreshold failed')}")
+            return
+        if result.get("action") == "show":
+            _ovr = result.get("override")
+            if _ovr is not None:
+                _desc = f"{_ovr:,} tokens"
+            else:
+                _pct = result.get("base_percent")
+                _desc = f"({_pct * 100:.0f}% of window)" if _pct else ""
+            _ctx = result.get("context_length") or 0
+            _ctx_desc = f"{_ctx:,} tokens" if _ctx else "unknown context"
+            _cprint(
+                f"  🗜️  Compression threshold (this session):\n"
+                f"     {_DIM}source:    {result['source']}{_RST}\n"
+                f"     {_DIM}override:  {_desc}{_RST}\n"
+                f"     {_DIM}effective: {result['effective']:,} tokens "
+                f"of {_ctx_desc}{_RST}"
+            )
+        else:
+            _cprint(f"  {_DIM}🗜️  {result.get('message')}{_RST}")
 
     def _manual_compress(self, cmd_original: str = ""):
         """Manually trigger context compression on the current conversation.

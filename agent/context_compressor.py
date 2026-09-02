@@ -2321,6 +2321,8 @@ class ContextCompressor(ContextEngine):
         self._last_compression_made_progress = False
         self._summary_failure_cooldown_until = 0.0  # transient errors must not block a fresh session
         self._cooldown_persist_failed = False
+        # Session-scoped threshold override does NOT survive /new|/reset.
+        self.session_threshold_tokens = None
         self._last_summary_error = None
         self._last_compress_aborted = False
         self._last_compress_refused_would_grow = False
@@ -2533,6 +2535,13 @@ class ContextCompressor(ContextEngine):
 
     @property
     def threshold_tokens(self) -> int:
+        # Session-scoped token override (set via /compthreshold 350k) wins
+        # over every ratio-derived trigger. Checked first so the override
+        # survives window re-resolution and model switches without having to
+        # intercept every recompute path.
+        _session_tokens = self._resolve_session_threshold_tokens()
+        if _session_tokens is not None:
+            return _session_tokens
         if self._threshold_tokens is None:
             # Resolve the window FIRST (may apply the small-context floor to
             # threshold_percent as a side effect) so the percent read below
@@ -2551,6 +2560,27 @@ class ContextCompressor(ContextEngine):
 
     @threshold_tokens.setter
     def threshold_tokens(self, value: int) -> None:
+        # If a session-scoped token override is active, the auto-lower path
+        # (conversation_compression.py:1804) writes through this setter to
+        # correct the trigger for a small-aux-model situation. The override
+        # would shadow the write (getter returns session_threshold_tokens,
+        # ignoring _threshold_tokens), so update the override itself to keep
+        # the auto-lower correction effective.
+        #
+        # BUT: update_model() (line ~2929) also writes through this setter
+        # to store the ratio-derived threshold for the new model. That write
+        # is a recompute, NOT a correction — it should NOT overwrite the
+        # user's explicit override. We distinguish the two by checking if
+        # the new value differs from the override: auto-lower writes a
+        # *different* (lower) value; update_model writes the ratio-derived
+        # value which happens to equal what _compute_threshold_tokens just
+        # returned. The safest heuristic: only update the override when the
+        # setter value is LOWER than the current override (auto-lower only
+        # ever lowers). A recompute that happens to be higher leaves the
+        # override alone so the user's setting survives model switches.
+        _session = getattr(self, "session_threshold_tokens", None)
+        if _session is not None and value < _session:
+            self.session_threshold_tokens = value
         self._threshold_tokens = value
 
     @property
@@ -3361,6 +3391,176 @@ class ContextCompressor(ContextEngine):
             return max(threshold_percent, _SMALL_CTX_THRESHOLD_PERCENT)
         return threshold_percent
 
+    def _resolve_session_threshold_tokens(self) -> int | None:
+        """Resolve the session-scoped threshold override in tokens, if set.
+
+        ``session_threshold_tokens`` (set via /compthreshold 350k) wins over
+        every ratio-derived trigger: per-model override, global config, and
+        the small-context floor. Reading it never recomputes and never
+        mutates ``threshold_percent`` — the override is applied at the *token*
+        level, which is the actual comparison point for firing compression.
+
+        Clamped to [MINIMUM_CONTEXT_LENGTH, 95% of the window] so a value
+        below the floor still fires (not swallowed by the global floor) and
+        one above the window never creates an unsatisfiable trigger.
+        """
+        tokens = getattr(self, "session_threshold_tokens", None)
+        if tokens is None:
+            return None
+        _ctx = self.context_length
+        if not _ctx or _ctx <= 0:
+            return int(tokens)
+        ceiling = max(1, int(_ctx * 0.95))
+        return max(1, min(int(tokens), ceiling))
+
+    def apply_session_threshold_override(self, arg_text: str = "") -> Dict[str, Any]:
+        """Parse and apply a ``/compthreshold``-style session override.
+
+        ``arg_text`` is the raw argument string: empty / ``show`` / ``status``
+        = show current state; ``reset`` = restore the global/per-model value;
+        otherwise a token count with default unit K (``80`` -> 80,000 tokens,
+        ``350k`` / ``1.5m`` accepted). Returns a structured dict shared by the
+        CLI slash command and the TUI gateway RPC so both surfaces use one
+        parse/clamp/assign code path:
+
+        ``ok`` (bool), ``action`` (``show``/``set``/``reset``/``error``),
+        ``message`` (plain-text human-readable line, no ANSI codes),
+        ``source`` (``global/per-model`` or ``THIS session (override)``),
+        ``override`` (session override in tokens or None), ``effective``
+        (the value the trigger compares against), ``context_length``, and
+        ``base_percent`` (effective threshold percent when no override).
+        """
+        arg = (arg_text or "").strip().lower()
+        ctx_len = self.context_length or 0
+        # ---- Show current state ----
+        if not arg or arg in {"show", "status"}:
+            session_tok = getattr(self, "session_threshold_tokens", None)
+            eff_tokens = self.threshold_tokens or 0
+            if session_tok is None:
+                source = "global/per-model"
+                base_pct = getattr(self, "threshold_percent", None)
+                override_desc = f"({base_pct * 100:.0f}% of window)" if base_pct else ""
+            else:
+                source = "THIS session (override)"
+                override_desc = f"{session_tok:,} tokens"
+            ctx_desc = f"{ctx_len:,} tokens" if ctx_len else "unknown context"
+            return {
+                "ok": True,
+                "action": "show",
+                "message": (
+                    f"Compression threshold (this session): "
+                    f"source: {source}; "
+                    f"override: {override_desc or '—'}; "
+                    f"effective: {eff_tokens:,} tokens of {ctx_desc}."
+                ),
+                "source": source,
+                "override": session_tok,
+                "effective": eff_tokens,
+                "context_length": ctx_len,
+                "base_percent": getattr(self, "threshold_percent", None),
+            }
+        # ---- Reset to global ----
+        if arg == "reset":
+            self.session_threshold_tokens = None
+            # Invalidate cached budgets so the base ratio-derived value recompute.
+            self._threshold_tokens = None
+            self._tail_token_budget = None
+            # Restore threshold_percent from the base — the auto-lower path
+            # (conversation_compression.py) may have mutated it directly,
+            # and without this restore the post-reset percent would be stuck
+            # at the auto-lowered value instead of the global/per-model base.
+            _base = getattr(self, "_base_threshold_percent", None)
+            if _base is not None:
+                _ctx = self.context_length or 0
+                self.threshold_percent = self._effective_threshold_percent(
+                    _ctx, _base,
+                )
+            _eff = self.threshold_tokens
+            return {
+                "ok": True,
+                "action": "reset",
+                "message": f"Restored global compression threshold ({_eff:,} tokens).",
+                "source": "global/per-model",
+                "override": None,
+                "effective": _eff,
+                "context_length": self.context_length or 0,
+                "base_percent": getattr(self, "threshold_percent", None),
+            }
+        # ---- Parse token count (default unit = K; m = millions) ----
+        arg_clean = arg.replace(",", "").strip()
+        multiplier = 1_000  # bare number defaults to K
+        if arg_clean.endswith("k"):
+            multiplier = 1_000
+            arg_clean = arg_clean[:-1]
+        elif arg_clean.endswith("m"):
+            multiplier = 1_000_000
+            arg_clean = arg_clean[:-1]
+        try:
+            value = int(float(arg_clean) * multiplier)
+        except (ValueError, TypeError):
+            return {
+                "ok": False,
+                "action": "error",
+                "message": (
+                    "Usage: /compthreshold <N>[k|m] | reset  "
+                    "(e.g. /compthreshold 80, /compthreshold 1.5m)"
+                ),
+                "source": "global/per-model",
+                "override": None,
+                "effective": 0,
+                "context_length": ctx_len,
+                "base_percent": None,
+            }
+        if value < 64_000:
+            return {
+                "ok": False,
+                "action": "error",
+                "message": (
+                    "Threshold must be >= 64,000 tokens (64 in K units). "
+                    "Use a smaller value with care — compressing too early "
+                    "wastes context."
+                ),
+                "source": "global/per-model",
+                "override": None,
+                "effective": 0,
+                "context_length": ctx_len,
+                "base_percent": None,
+            }
+        clamped = False
+        if ctx_len > 0:
+            ceiling = int(ctx_len * 0.95)
+            if value > ceiling:
+                value = ceiling
+                clamped = True
+        self.session_threshold_tokens = value
+        # Invalidate cached budgets so the new trigger is used immediately.
+        self._threshold_tokens = None
+        self._tail_token_budget = None
+        eff_tokens = self.threshold_tokens
+        if clamped:
+            msg = (
+                f"Threshold exceeds 95% of the model's context window; "
+                f"clamped. This session's compression threshold set to "
+                f"{eff_tokens:,} tokens (override {value:,})."
+            )
+        else:
+            msg = (
+                f"This session's compression threshold set to "
+                f"{eff_tokens:,} tokens ({value:,} override). "
+                f"Applies to this session only; /new or /reset restores the "
+                f"global value."
+            )
+        return {
+            "ok": True,
+            "action": "set",
+            "message": msg,
+            "source": "THIS session (override)",
+            "override": value,
+            "effective": eff_tokens,
+            "context_length": ctx_len,
+            "base_percent": None,
+        }
+
     @staticmethod
     def _compute_threshold_tokens(
         context_length: int, threshold_percent: float, max_tokens: int | None = None,
@@ -3457,6 +3657,13 @@ class ContextCompressor(ContextEngine):
         # override or small-context floor). Used as the fallback when switching
         # to a model with no matching override.
         self._config_threshold_percent = threshold_percent
+        # Session-scoped threshold override in TOKENS (set via
+        # /compthreshold 350k). When set it wins over the per-model override,
+        # global config, and the small-context floor for the REST of this
+        # session, but is dropped on /new|/reset (see on_session_reset).
+        # Applied at the token level in threshold_tokens; see
+        # _resolve_session_threshold_tokens() for clamping.
+        self.session_threshold_tokens: int | None = None
         # Resolve per-model override first, then apply the small-context floor.
         self._base_threshold_percent = resolve_model_threshold(
             model, self.model_thresholds, threshold_percent,
