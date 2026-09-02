@@ -18738,6 +18738,14 @@ def _discover_dashboard_plugins() -> list:
                     tab_info["override"] = override_path
                 if bool(raw_tab.get("hidden")):
                     tab_info["hidden"] = True
+                # Route-scoped exclusive shell: when the active route equals
+                # the overridden route and shell is "exclusive", the plugin
+                # owns the full product shell for that route only (no built-in
+                # sidebar/header chrome). Preserved exactly like override/hidden
+                # — generic, no per-plugin special cases. See #100149.
+                raw_shell = raw_tab.get("shell")
+                if isinstance(raw_shell, str) and raw_shell == "exclusive":
+                    tab_info["shell"] = "exclusive"
                 # Slots: list of named slot locations this plugin populates.
                 # The frontend exposes ``registerSlot(pluginName, slotName, Component)``
                 # on window; plugins with non-empty slots call it from their JS bundle.

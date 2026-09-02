@@ -100,7 +100,7 @@ import { LanguageSwitcher } from "@/components/LanguageSwitcher";
 import { ThemeSwitcher } from "@/components/ThemeSwitcher";
 import { useI18n } from "@/i18n";
 import type { Translations } from "@/i18n/types";
-import { PluginPage, PluginSlot, usePlugins } from "@/plugins";
+import { PluginPage, PluginSlot, usePlugins, getExclusiveShellManifest, getCachedManifests } from "@/plugins";
 import type { PluginManifest } from "@/plugins";
 import { useTheme } from "@/themes";
 import { isDashboardEmbeddedChatEnabled } from "@/lib/dashboard-flags";
@@ -400,6 +400,15 @@ export default function App() {
   const isDocsRoute = pathname === "/docs" || pathname === "/docs/";
   const normalizedPath = pathname.replace(/\/$/, "") || "/";
   const isChatRoute = normalizedPath === "/chat";
+  // Route-scoped exclusive shell: when a plugin's tab.shell === "exclusive"
+  // and its tab.override equals the active normalized route, that plugin
+  // owns the full product shell for that route only — no built-in sidebar/
+  // header/nav chrome. Generic, no per-plugin special cases (#100149).
+  const exclusiveManifest = useMemo(
+    () => getExclusiveShellManifest(manifests, normalizedPath),
+    [manifests, normalizedPath],
+  );
+  const isExclusiveShell = !!exclusiveManifest;
   const embeddedChat = isDashboardEmbeddedChatEnabled();
   // Defer mounting the persistent chat host (and its xterm chunk) until the
   // user has actually opened /chat at least once. Sticky after that so the
@@ -508,6 +517,79 @@ export default function App() {
     mql.addEventListener("change", onChange);
     return () => mql.removeEventListener("change", onChange);
   }, []);
+
+  // Avoid flash of built-in shell when "/" exclusivity is still unknown on
+  // first visit with empty cache (manifests not yet fetched). In that window
+  // we can't know if "/" is exclusive, so render a neutral loading state
+  // without sidebar/header chrome. For subsequent visits the cache seeds
+  // manifests synchronously and this branch is never taken — normal users
+  // with empty cache after first fetch get loading=false immediately.
+  const isExclusivePendingForRoot =
+    pluginsLoading &&
+    manifests.length === 0 &&
+    normalizedPath === "/" &&
+    getCachedManifests() === null;
+
+  if (isExclusivePendingForRoot) {
+    return (
+      <ProfileProvider>
+        <div
+          data-layout-variant={layoutVariant}
+          className="flex h-dvh max-h-dvh min-h-0 flex-col overflow-hidden bg-background-base text-text-primary antialiased"
+        >
+          <div className="flex min-h-0 min-w-0 flex-1 items-center justify-center" aria-busy="true" aria-live="polite">
+            <div className="flex items-center gap-2 text-sm text-muted-foreground">
+              <Spinner />
+              <span>Loading…</span>
+            </div>
+          </div>
+        </div>
+      </ProfileProvider>
+    );
+  }
+
+  // Route-scoped exclusive shell: render plugin page as full product shell
+  // without built-in sidebar/header/navigation, still inside Profile/Auth/
+  // Theme providers. Native routes automatically restore standard shell.
+  if (isExclusiveShell) {
+    return (
+      <ProfileProvider>
+        <div
+          data-layout-variant={layoutVariant}
+          className="flex h-dvh max-h-dvh min-h-0 flex-col overflow-hidden bg-background-base text-text-primary antialiased"
+          data-exclusive-shell={exclusiveManifest?.name ?? "true"}
+        >
+          <SelectionSwitcher />
+          <div aria-hidden className="pointer-events-none fixed inset-0 z-0">
+            <PluginSlot name="backdrop" />
+          </div>
+          <PageHeaderProvider pluginTabs={pluginTabMeta}>
+            <div className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
+              {/* No mobile header, no sidebar, no banners — plugin owns chrome */}
+              <div className="flex min-h-0 min-w-0 flex-1">
+                <div className="relative z-2 flex min-w-0 min-h-0 flex-1 flex-col">
+                  <ProfileKeyedRoutes>
+                    <Suspense fallback={<RouteFallback />}>
+                      <Routes>
+                        {routes.map(({ key, path, element }) => (
+                          <Route key={key} path={path} element={element} />
+                        ))}
+                        <Route
+                          path="*"
+                          element={<UnknownRouteFallback pluginsLoading={pluginsLoading} />}
+                        />
+                      </Routes>
+                    </Suspense>
+                  </ProfileKeyedRoutes>
+                </div>
+              </div>
+            </div>
+          </PageHeaderProvider>
+          <PluginSlot name="overlay" />
+        </div>
+      </ProfileProvider>
+    );
+  }
 
   return (
     <ProfileProvider>

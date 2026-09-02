@@ -57,6 +57,44 @@ export function canSeedLoadedFromCache(
   return !cached.some((m) => m.tab?.override === "/chat");
 }
 
+/**
+ * Normalize a route path for comparison (strip trailing slash, keep root as "/").
+ */
+function normalizeRoutePath(path: string): string {
+  if (!path) return "/";
+  const n = path.replace(/\/$/, "");
+  return n || "/";
+}
+
+/**
+ * Return the manifest that owns an exclusive shell for the given active route,
+ * if any. Exclusive shell is route-scoped: only when `tab.shell === "exclusive"`
+ * and `tab.override` exactly equals the active normalized route does the plugin
+ * take over the full product shell for that route.
+ * Exported for App.tsx and tests — pure, no side effects.
+ */
+export function getExclusiveShellManifest(
+  manifests: PluginManifest[],
+  activePath: string,
+): PluginManifest | undefined {
+  const normalizedActive = normalizeRoutePath(activePath);
+  return manifests.find((m) => {
+    const override = m.tab?.override;
+    if (!override || m.tab?.shell !== "exclusive") return false;
+    return normalizeRoutePath(override) === normalizedActive;
+  });
+}
+
+/**
+ * Whether the active route is an exclusive-shell route owned by a plugin.
+ */
+export function isExclusiveShellRoute(
+  manifests: PluginManifest[],
+  activePath: string,
+): boolean {
+  return !!getExclusiveShellManifest(manifests, activePath);
+}
+
 export function usePlugins() {
   // Lazy initialisers run once at mount — safe to read sessionStorage here.
   // This avoids the "cannot access ref during render" lint error that would

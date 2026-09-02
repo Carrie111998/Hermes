@@ -142,3 +142,101 @@ describe("canSeedLoadedFromCache (loading seed gate)", () => {
     expect(canSeedLoadedFromCache(malformed)).toBe(true);
   });
 });
+
+describe("exclusive shell (route-scoped)", () => {
+  it("returns undefined when no exclusive manifest matches", async () => {
+    const { getExclusiveShellManifest, isExclusiveShellRoute } = await import("./usePlugins");
+    const list: PluginManifest[] = [exampleManifest];
+    expect(getExclusiveShellManifest(list, "/")).toBeUndefined();
+    expect(isExclusiveShellRoute(list, "/")).toBe(false);
+  });
+
+  it("matches exclusive shell only when override equals active route", async () => {
+    const { getExclusiveShellManifest, isExclusiveShellRoute } = await import("./usePlugins");
+    const exclusive: PluginManifest = {
+      ...exampleManifest,
+      name: "worker-studio",
+      label: "Worker Studio",
+      tab: { path: "/worker-studio", override: "/", shell: "exclusive" },
+    };
+    const list: PluginManifest[] = [exclusive];
+    expect(getExclusiveShellManifest(list, "/")?.name).toBe("worker-studio");
+    expect(isExclusiveShellRoute(list, "/")).toBe(true);
+    // Not active on other routes
+    expect(getExclusiveShellManifest(list, "/sessions")).toBeUndefined();
+    expect(isExclusiveShellRoute(list, "/sessions")).toBe(false);
+    // Back to exclusive
+    expect(isExclusiveShellRoute(list, "/")).toBe(true);
+  });
+
+  it("normalizes trailing slashes", async () => {
+    const { getExclusiveShellManifest } = await import("./usePlugins");
+    const exclusive: PluginManifest = {
+      ...exampleManifest,
+      name: "ws",
+      tab: { path: "/ws", override: "/", shell: "exclusive" },
+    };
+    expect(getExclusiveShellManifest([exclusive], "/")?.name).toBe("ws");
+    expect(getExclusiveShellManifest([exclusive], "/")?.name).toBe("ws");
+    // Manifest with trailing slash override still matches normalized "/"
+    const exclusive2: PluginManifest = {
+      ...exampleManifest,
+      name: "ws2",
+      tab: { path: "/ws2", override: "/sessions", shell: "exclusive" },
+    };
+    expect(getExclusiveShellManifest([exclusive2], "/sessions/")?.name).toBe("ws2");
+    expect(getExclusiveShellManifest([exclusive2], "/sessions")?.name).toBe("ws2");
+  });
+
+  it("ignores standard shell and manifests without override", async () => {
+    const { getExclusiveShellManifest } = await import("./usePlugins");
+    const standard: PluginManifest = {
+      ...exampleManifest,
+      name: "std",
+      tab: { path: "/std", override: "/", shell: "standard" },
+    };
+    const noShell: PluginManifest = {
+      ...exampleManifest,
+      name: "no-shell",
+      tab: { path: "/no-shell", override: "/" },
+    };
+    const exclusiveButNoOverride: PluginManifest = {
+      ...exampleManifest,
+      name: "orphan",
+      tab: { path: "/orphan", shell: "exclusive" },
+    };
+    expect(getExclusiveShellManifest([standard], "/")).toBeUndefined();
+    expect(getExclusiveShellManifest([noShell], "/")).toBeUndefined();
+    expect(getExclusiveShellManifest([exclusiveButNoOverride], "/")).toBeUndefined();
+    expect(getExclusiveShellManifest([exclusiveButNoOverride], "/orphan")).toBeUndefined();
+  });
+
+  it("picks the first exclusive manifest that matches active route", async () => {
+    const { getExclusiveShellManifest } = await import("./usePlugins");
+    const a: PluginManifest = {
+      ...exampleManifest,
+      name: "a",
+      tab: { path: "/a", override: "/", shell: "exclusive" },
+    };
+    const b: PluginManifest = {
+      ...exampleManifest,
+      name: "b",
+      tab: { path: "/b", override: "/", shell: "exclusive" },
+    };
+    expect(getExclusiveShellManifest([a, b], "/")?.name).toBe("a");
+  });
+
+  it("exclusive shell is route-scoped: native routes remain non-exclusive", async () => {
+    const { isExclusiveShellRoute } = await import("./usePlugins");
+    const exclusive: PluginManifest = {
+      ...exampleManifest,
+      name: "ws",
+      tab: { path: "/ws", override: "/", shell: "exclusive" },
+    };
+    const nativeRoutes = ["/sessions", "/cron", "/skills", "/plugins", "/mcp", "/config", "/channels", "/webhooks", "/system", "/profiles", "/docs", "/files", "/analytics", "/logs"];
+    for (const route of nativeRoutes) {
+      expect(isExclusiveShellRoute([exclusive], route)).toBe(false);
+    }
+    expect(isExclusiveShellRoute([exclusive], "/")).toBe(true);
+  });
+});

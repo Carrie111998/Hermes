@@ -459,7 +459,8 @@ None of them are required; include only the layers you need.
     "path": "/my-plugin",
     "position": "after:skills",
     "override": "/",
-    "hidden": false
+    "hidden": false,
+    "shell": "exclusive"
   },
   "slots": ["sidebar", "header-left"],
   "entry": "dist/index.js",
@@ -479,6 +480,7 @@ None of them are required; include only the layers you need.
 | `tab.position` | No | Where to insert the tab. `"end"` (default), `"after:<path>"`, or `"before:<path>"` — value after the colon is the **path segment** of the target tab (no leading slash). Examples: `"after:skills"`, `"before:config"`. |
 | `tab.override` | No | Set to a built-in route path (`"/"`, `"/sessions"`, `"/config"`, ...) to **replace** that page instead of adding a new tab. See [Replacing built-in pages](#replacing-built-in-pages-taboverride). |
 | `tab.hidden` | No | When true, register the component and any slots without adding a tab to the nav. Used by slot-only plugins. See [Slot-only plugins](#slot-only-plugins-tabhidden). |
+| `tab.shell` | No | `"standard"` (default) or `"exclusive"` — when `override` is set and `shell: "exclusive"`, the plugin owns the full product shell for that overridden route only (no built-in sidebar/header navigation). Route-scoped: every other route renders the normal Hermes shell. See [Route-scoped exclusive shell](#route-scoped-exclusive-shell-tabshellexclusive). |
 | `slots` | No | Named shell slots this plugin populates. **Documentation aid only** — actual registration happens from the JS bundle via `registerSlot()`. Listing slots here makes discovery surfaces more informative. |
 | `entry` | Yes | Path to the JS bundle relative to `dashboard/`. Defaults to `dist/index.js`. |
 | `css` | No | Path to a CSS file to inject as a `<link>` tag. |
@@ -650,6 +652,34 @@ With `override` set:
 Only one plugin can override a given path. If two plugins claim the same override, the first wins and the second is ignored with a dev-mode warning.
 
 If you only need to add a card or toolbar to an existing page without taking it over, use [page-scoped slots](#augmenting-built-in-pages-page-scoped-slots) instead.
+
+### Route-scoped exclusive shell (`tab.shell: "exclusive"`)
+
+A product-shell plugin may want to fully own the dashboard shell for **one** route (e.g. `/`) while leaving every other native route (`/sessions`, `/cron`, `/skills`, `/plugins`, `/mcp`, `/config`, etc.) untouched. That is expressed as a route-scoped exclusive shell — a small generic extension to the `tab` contract, not global control over navigation.
+
+```json
+// ~/.hermes/plugins/worker-studio/dashboard/manifest.json
+{
+  "name": "worker-studio",
+  "label": "Worker Studio",
+  "tab": {
+    "path": "/worker-studio",
+    "override": "/",
+    "shell": "exclusive"
+  },
+  "entry": "dist/index.js"
+}
+```
+
+**Semantics (generic, no per-plugin special cases):**
+
+1. When the active route equals the plugin's `override` path **and** `shell: "exclusive"`, the plugin page renders as the dashboard product shell **without** built-in sidebar/header navigation chrome. The plugin provides its own navigation/header/composer.
+2. On every other route the normal Hermes dashboard shell (sidebar, header, banners) renders unchanged. Navigating from the plugin's menu to a native route (e.g. `/sessions`) automatically restores the standard shell; navigating back to `/` restores the exclusive plugin shell. No plugin-side cleanup is required.
+3. Native routes remain authoritative and reachable — the plugin does not delete or hide Hermes routes, it only controls chrome while its own overridden route is active.
+4. Deep-linking, browser history (back/forward), plugin loading gates, auth/theme/profile providers, and route ownership are preserved. No DOM/CSS monkey-patching is needed.
+5. Existing manifests without `tab.shell` keep current behavior (`"standard"` is the implicit default). Mobile sidebar and collapsed desktop sidebar do not leak onto an exclusive route. No flash of built-in navigation is shown while plugin manifests are still loading, especially for `/` overrides.
+
+Use `tab.shell: "exclusive"` only together with `tab.override`. When `override` is absent the field is ignored. Only one plugin can own a given overridden route; the first match wins for both standard and exclusive shells.
 
 ### Augmenting built-in pages (page-scoped slots)
 

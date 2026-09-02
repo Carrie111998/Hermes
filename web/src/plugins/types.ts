@@ -16,6 +16,13 @@ export interface PluginManifest {
     override?: string;
     /** When true, the plugin may register without a sidebar tab (slot-only, etc.). */
     hidden?: boolean;
+    /**
+     * Shell mode for an overridden route.
+     * - "standard" (default): plugin content renders inside the normal Hermes sidebar/header chrome.
+     * - "exclusive": when the active route equals `override`, the plugin owns the full product shell for that route only — built-in sidebar/header navigation is not rendered. Navigating to any other native route restores the standard shell.
+     * Only meaningful together with `override`. Ignored otherwise.
+     */
+    shell?: "standard" | "exclusive";
   };
   /** Declared for discovery; actual slots use registerSlot in the plugin bundle. */
   slots?: string[];
