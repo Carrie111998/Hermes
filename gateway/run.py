@@ -3441,6 +3441,9 @@ def _resolve_gateway_model_context(model: Optional[str] = None) -> _GatewayModel
         provider = runtime.get("provider") or provider
         base_url = runtime.get("base_url") or base_url
         api_key = runtime.get("api_key")
+        runtime_model = runtime.get("model")
+        if runtime_model:
+            resolved_model = runtime_model
     except Exception:
         pass
 
