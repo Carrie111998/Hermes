@@ -23,7 +23,7 @@ import threading
 import time
 import unicodedata
 import uuid
-from typing import Optional
+from typing import Any, Optional
 from hermes_cli.config import cfg_get
 
 from tools.interrupt import is_interrupted
@@ -237,6 +237,43 @@ def get_current_session_key(default: str = "default") -> str:
         return session_key
     from gateway.session_context import get_session_env
     return get_session_env("HERMES_SESSION_KEY", default)
+
+
+def _with_master_task_metadata(approval_data: dict[str, Any]) -> dict[str, Any]:
+    """Attach authoritative kanban-task identity when the caller is a worker."""
+    task_id = str(os.environ.get("HERMES_KANBAN_TASK") or "").strip()
+    if not task_id:
+        return approval_data
+
+    enriched = dict(approval_data)
+    master_task = dict(enriched.get("master_task") or {})
+    master_task["task_id"] = task_id
+
+    run_id = str(os.environ.get("HERMES_KANBAN_RUN_ID") or "").strip()
+    if run_id:
+        master_task["run_id"] = run_id
+
+    try:
+        from hermes_cli import kanban_db as kb
+
+        conn = kb.connect()
+        try:
+            task = kb.get_task(conn, task_id)
+        finally:
+            conn.close()
+    except Exception:
+        task = None
+
+    if task is not None:
+        task_name = str(getattr(task, "title", "") or "").strip()
+        if task_name:
+            master_task["task_name"] = task_name
+        session_id = str(getattr(task, "session_id", "") or "").strip()
+        if session_id:
+            master_task["session_id"] = session_id
+
+    enriched["master_task"] = master_task
+    return enriched
 
 
 def _get_session_platform() -> str:
@@ -3925,14 +3962,14 @@ def _run_approval_gate(
 
         if notify_cb is not None:
             from agent.redact import redact_sensitive_text
-            approval_data = {
+            approval_data = _with_master_task_metadata({
                 "command": redact_sensitive_text(display_target),
                 "pattern_key": pattern_key,
                 "pattern_keys": [pattern_key],
                 "description": redact_sensitive_text(description),
                 "allow_permanent": True,
                 "allow_session": True,
-            }
+            })
             decision = _await_gateway_decision(
                 session_key, notify_cb, approval_data, surface="gateway"
             )
@@ -5217,7 +5254,7 @@ def check_all_command_guards(command: str, env_type: str,
             # persistence keys off pattern_key (not the command text), so the
             # allowlist is unaffected.
             from agent.redact import redact_sensitive_text
-            approval_data = {
+            approval_data = _with_master_task_metadata({
                 "command": redact_sensitive_text(command),
                 "pattern_key": primary_key,
                 "pattern_keys": all_keys,
@@ -5232,7 +5269,7 @@ def check_all_command_guards(command: str, env_type: str,
                 # already caps scope at session. Adapters use this to render
                 # a session tier independently of the permanent tier.
                 "allow_session": not smart_denied_for_owner,
-            }
+            })
             if smart_denied_for_owner:
                 approval_data["smart_denied"] = True
             decision = _await_gateway_decision(
@@ -5808,14 +5845,14 @@ def check_execute_code_guard(code: str, env_type: str,
             result.update(smart_denied=True, allow_permanent=False)
         return result
 
-    approval_data = {
+    approval_data = _with_master_task_metadata({
         "command": display_command,
         "pattern_key": pattern_key,
         "pattern_keys": [pattern_key],
         "description": display_description,
         "allow_permanent": not smart_denied_for_owner,
         "allow_session": not smart_denied_for_owner,
-    }
+    })
     if smart_denied_for_owner:
         approval_data["smart_denied"] = True
     decision = _await_gateway_decision(
@@ -5918,12 +5955,12 @@ def request_elicitation_consent(
             )
             return "decline"
 
-        approval_data = {
+        approval_data = _with_master_task_metadata({
             "command": message,
             "description": description,
             "pattern_key": "mcp_elicitation",
             "pattern_keys": ["mcp_elicitation"],
-        }
+        })
         try:
             decision = _await_gateway_decision(
                 session_key, notify_cb, approval_data, surface=surface,

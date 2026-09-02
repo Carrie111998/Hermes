@@ -114,6 +114,7 @@ _USER_BOUNDARY_END_REASONS = (
 # transport cannot block the session-stall watcher pass (notify-only path;
 # on timeout the latch stays clear and the next tick retries).
 _STALL_NOTIFY_SEND_TIMEOUT_SECONDS = 15.0
+_TERMINAL_NOTIFY_ON_COMPLETE_SUBPROCESS_TELEMETRY_ONLY = True
 _GATEWAY_PROXY_SSE_BUFFER_MAX_CHARS = 16 * 1024 * 1024
 _TELEGRAM_COMMAND_MENTION_RE = re.compile(r"(?<![\w:/])/([A-Za-z0-9][A-Za-z0-9_-]*)")
 _GATEWAY_HYGIENE_PLATFORM = "gateway_hygiene"
@@ -6823,6 +6824,41 @@ class TurnRunner:
             # (send_exec_approval) and plain-text fallback paths below use
             # the redacted value.
             cmd = _redact_approval_command(cmd)
+
+            if getattr(ctx.source, "platform", None) == Platform.TELEGRAM:
+                try:
+                    from gateway.master_task_notifications import (
+                        build_master_task_consent_event,
+                        get_canonical_notification_router,
+                    )
+
+                    master_task_router = get_canonical_notification_router(self._runner)
+                    consent_event = build_master_task_consent_event(approval_data)
+                    if consent_event is not None:
+                        decision = master_task_router.decide(consent_event)
+                        if not decision.SHOULD_NOTIFY:
+                            return
+                        _approval_send_fut = safe_schedule_threadsafe(
+                            ctx._status_adapter.send(
+                                ctx._status_chat_id,
+                                decision.MESSAGE,
+                                metadata=_interim_metadata(ctx._status_thread_metadata),
+                            ),
+                            ctx._loop_for_step,
+                            logger=logger,
+                            log_message="Master-task consent notification scheduling error",
+                        )
+                        if _approval_send_fut is None:
+                            raise RuntimeError("master-task consent notification: loop unavailable")
+                        _approval_send_fut.result(timeout=15)
+                        master_task_router.remember_delivery(decision.DEDUP_KEY)
+                        return
+                except Exception as _e:
+                    logger.error(
+                        "Failed to send Telegram master-task consent notification: %s",
+                        _e,
+                    )
+                    raise
 
             # Prefer button-based approval when the adapter supports it.
             # Check the *class* for the method, not the instance — avoids
@@ -28955,6 +28991,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # Skip if the agent already consumed the result via wait/log.
                 # poll() is read-only and intentionally does NOT mark consumed
                 # (#10156) — a status check must not suppress this delivery turn.
+                # This path is SUBPROCESS_TELEMETRY_ONLY by design. Even when a
+                # kanban worker spawned the process, notify_on_complete must
+                # never become master-task completion authority; the durable
+                # kanban lifecycle owns that decision.
                 from tools.process_registry import format_process_notification, process_registry as _pr_check
                 if agent_notify and not _pr_check.is_completion_consumed(session_id):
                     from agent.redact import redact_terminal_output
