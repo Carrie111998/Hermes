@@ -1783,6 +1783,7 @@ def build_skills_system_prompt(
     available_toolsets: "set[str] | None" = None,
     compact_categories: "frozenset[str] | None" = None,
     skills_dir_override: "Path | None" = None,
+    platform: "str | None" = None,
 ) -> str:
     """Build a compact skill index for the system prompt.
 
@@ -1804,6 +1805,13 @@ def build_skills_system_prompt(
     the rendered index. Nothing is ever hidden: every skill name stays
     visible and loadable via ``skill_view`` / ``skills_list``; only the
     descriptions are dropped, and a footer note explains the demotion.
+
+    Args:
+        platform: Explicit platform hint for disabled-skill lookups
+            (e.g. ``"cli"``, ``"telegram"``).  When *None*, resolves from
+            ``HERMES_PLATFORM`` / ``HERMES_SESSION_PLATFORM`` env vars.
+            Callers should pass ``agent.platform`` to avoid the process-global
+            env-var side-effect that leaks ``"cli"`` into gateway turns.
     """
     # Home resolution is EXPLICIT when a caller passes skills_dir_override
     # (the agent knows its own profile home from its session_db path). This
@@ -1837,6 +1845,7 @@ def build_skills_system_prompt(
             available_toolsets,
             compact_categories,
             project_dirs=project_dirs,
+            platform=platform,
         )
     finally:
         if _home_token is not None:
@@ -1850,10 +1859,11 @@ def _build_skills_system_prompt_inner(
     available_toolsets: "set[str] | None",
     compact_categories: "frozenset[str] | None",
     project_dirs: "list[Path] | None" = None,
+    platform: "str | None" = None,
 ) -> str:
     # Include the resolved platform so per-platform disabled-skill lists
     # produce distinct cache entries (gateway serves multiple platforms).
-    _platform_hint = _current_session_platform_hint()
+    _platform_hint = platform or _current_session_platform_hint()
     disabled = get_disabled_skill_names(_platform_hint or None)
     project_dirs = project_dirs or []
     cache_key = (
