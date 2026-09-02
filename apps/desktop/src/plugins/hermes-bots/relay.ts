@@ -212,8 +212,18 @@ async function relayConnections(): Promise<RelayConnection[]> {
  * The caller has already claimed the envelope, so this waits in place and
  * never re-enqueues or duplicates it. A genuinely removed connection still
  * receives the existing terminal error after the bounded grace window. */
-async function waitForRelayConnection(connectionId: string): Promise<RelayConnection | undefined> {
+async function waitForRelayConnection(
+  connectionId: string,
+  profile: string
+): Promise<RelayConnection | undefined> {
   const deadline = Date.now() + RELAY_ROUTE_RECONNECT_GRACE_MS
+
+  // profileRoutes is an inventory read; it does not itself re-open a dropped
+  // SSH/backend socket. Ask the existing non-foregrounding warm path to dial
+  // the target, then poll only for its credential-free route to reappear.
+  if (typeof host.warmAgent === 'function') {
+    host.warmAgent(connectionId, profile)
+  }
 
   while (!relay.disposed && Date.now() < deadline) {
     await new Promise<void>(resolve => setTimeout(resolve, RELAY_ROUTE_RECONNECT_POLL_MS))
@@ -410,7 +420,10 @@ async function drainRelayOutboxes() {
         }
 
         if (!target) {
-          target = await waitForRelayConnection(targetConnectionId)
+          target = await waitForRelayConnection(
+            targetConnectionId,
+            String(envelope?.target_profile || 'default')
+          )
         }
 
         if (!target) {

@@ -32,7 +32,8 @@ const { clearBotAttentionMock, hostMock, noteBotAttentionMock, UnboundedCache } 
     onEvent: vi.fn(),
     profileRoutes: vi.fn(),
     requestProfile: vi.fn(),
-    retainProfileSocket: vi.fn()
+    retainProfileSocket: vi.fn(),
+    warmAgent: vi.fn()
   } as Record<string, unknown>,
   noteBotAttentionMock: vi.fn(),
   // Stand-in for the SDK's LruCache. Its ceiling has its own unit test and no
@@ -133,6 +134,7 @@ beforeEach(() => {
   hostMock.profileRoutes = vi.fn(async () => [route('a'), route('b')])
   hostMock.requestProfile = vi.fn(async () => ({}))
   hostMock.retainProfileSocket = vi.fn(() => vi.fn())
+  hostMock.warmAgent = vi.fn()
 })
 
 afterEach(() => {
@@ -562,6 +564,7 @@ describe('the drain loop wires drain → deliver → reply', () => {
     await pushAndSettle()
     await vi.advanceTimersByTimeAsync(1000)
 
+    expect(hostMock.warmAgent).toHaveBeenCalledWith('b', 'ops')
     expect(calls.filter(call => call.method === 'bot_relay.deliver')).toEqual([
       expect.objectContaining({ connectionId: 'b', params: { message: 'status?', profile: 'ops' } })
     ])
