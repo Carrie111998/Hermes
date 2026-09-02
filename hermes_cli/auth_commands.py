@@ -3,6 +3,7 @@
 from __future__ import annotations
 from hermes_cli.cli_output import line_input
 
+import json
 import math
 import sys
 import time
@@ -886,6 +887,37 @@ def _interactive_strategy() -> None:
     print(f"Set {provider} strategy to: {strategy}")
 
 
+def auth_token_usage_command(args) -> None:
+    """Show forward-only local token totals for supported account-aware paths."""
+    provider = str(getattr(args, "provider", "openai-codex") or "").strip().lower()
+    if provider != "openai-codex":
+        raise SystemExit(
+            "Per-account token usage currently supports only openai-codex."
+        )
+
+    from agent.account_token_usage import (
+        build_codex_account_usage_report,
+        format_codex_account_usage_report,
+    )
+    from hermes_state import SessionDB
+
+    db = SessionDB()
+    try:
+        local_rows = db.account_usage_totals(provider=provider)
+        entries = load_pool(provider).entries()
+        report = build_codex_account_usage_report(
+            entries=entries,
+            local_rows=local_rows,
+        )
+    finally:
+        db.close()
+
+    if bool(getattr(args, "json", False)):
+        print(json.dumps(report, ensure_ascii=False, indent=2))
+    else:
+        print(format_codex_account_usage_report(report))
+
+
 def auth_command(args) -> None:
     action = getattr(args, "auth_action", "")
     if action == "add":
@@ -893,6 +925,9 @@ def auth_command(args) -> None:
         return
     if action == "list":
         auth_list_command(args)
+        return
+    if action == "token-usage":
+        auth_token_usage_command(args)
         return
     if action == "remove":
         auth_remove_command(args)

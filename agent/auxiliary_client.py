@@ -1712,9 +1712,16 @@ class _CodexCompletionsAdapter:
     """Drop-in shim that accepts chat.completions.create() kwargs and
     routes them through the Codex Responses streaming API."""
 
-    def __init__(self, real_client: OpenAI, model: str):
+    def __init__(
+        self,
+        real_client: OpenAI,
+        model: str,
+        *,
+        account_provider: Optional[str] = None,
+    ):
         self._client = real_client
         self._model = model
+        self._account_provider = account_provider
 
     def create(self, **kwargs) -> Any:
         messages = kwargs.get("messages", [])
@@ -2291,13 +2298,24 @@ class _CodexCompletionsAdapter:
 
             resp_usage = getattr(final, "usage", None)
             if resp_usage:
+                input_details = _item_get(resp_usage, "input_tokens_details", None)
+                output_details = _item_get(resp_usage, "output_tokens_details", None)
+                cache_write_tokens = _item_get(
+                    input_details, "cache_write_tokens", 0
+                ) or _item_get(input_details, "cache_creation_tokens", 0)
                 usage = SimpleNamespace(
-                    prompt_tokens=getattr(resp_usage, "input_tokens", 0)
-                        or (resp_usage.get("input_tokens", 0) if isinstance(resp_usage, dict) else 0),
-                    completion_tokens=getattr(resp_usage, "output_tokens", 0)
-                        or (resp_usage.get("output_tokens", 0) if isinstance(resp_usage, dict) else 0),
-                    total_tokens=getattr(resp_usage, "total_tokens", 0)
-                        or (resp_usage.get("total_tokens", 0) if isinstance(resp_usage, dict) else 0),
+                    prompt_tokens=_item_get(resp_usage, "input_tokens", 0),
+                    completion_tokens=_item_get(resp_usage, "output_tokens", 0),
+                    total_tokens=_item_get(resp_usage, "total_tokens", 0),
+                    prompt_tokens_details=SimpleNamespace(
+                        cached_tokens=_item_get(input_details, "cached_tokens", 0),
+                        cache_write_tokens=cache_write_tokens,
+                    ),
+                    completion_tokens_details=SimpleNamespace(
+                        reasoning_tokens=_item_get(
+                            output_details, "reasoning_tokens", 0
+                        ),
+                    ),
                 )
         except Exception as exc:
             if timed_out.is_set():
@@ -2339,10 +2357,28 @@ class _CodexCompletionsAdapter:
             message=message,
             finish_reason="stop" if not tool_calls_raw else "tool_calls",
         )
+        from agent.account_token_usage import codex_account_identity
+
+        account_identity = None
+        if self._account_provider == "openai-codex":
+            account_identity = codex_account_identity(
+                getattr(self._client, "api_key", "")
+            )
         return SimpleNamespace(
             choices=[choice],
             model=model,
             usage=usage,
+            _hermes_account_key=(
+                account_identity.account_key if account_identity is not None else None
+            ),
+            _hermes_billing_provider=(
+                self._account_provider if account_identity is not None else None
+            ),
+            _hermes_billing_base_url=(
+                str(getattr(self._client, "base_url", "") or "")
+                if account_identity is not None
+                else None
+            ),
         )
 
 
@@ -2360,9 +2396,19 @@ class CodexAuxiliaryClient:
     Also exposes .api_key and .base_url for introspection by async wrappers.
     """
 
-    def __init__(self, real_client: OpenAI, model: str):
+    def __init__(
+        self,
+        real_client: OpenAI,
+        model: str,
+        *,
+        account_provider: Optional[str] = None,
+    ):
         self._real_client = real_client
-        adapter = _CodexCompletionsAdapter(real_client, model)
+        adapter = _CodexCompletionsAdapter(
+            real_client,
+            model,
+            account_provider=account_provider,
+        )
         self.chat = _CodexChatShim(adapter)
         self.api_key = real_client.api_key
         self.base_url = real_client.base_url
@@ -4228,7 +4274,11 @@ def _build_codex_client(model: str) -> Tuple[Optional[Any], Optional[str]]:
         base_url=base_url,
         default_headers=_codex_cloudflare_headers(codex_token, base_url=base_url),
     )
-    return CodexAuxiliaryClient(real_client, model), model
+    return CodexAuxiliaryClient(
+        real_client,
+        model,
+        account_provider="openai-codex",
+    ), model
 
 
 def _try_azure_foundry(

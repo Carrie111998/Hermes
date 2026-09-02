@@ -2317,6 +2317,8 @@ class MoAChatCompletions:
 
 
 class MoAClient:
+    is_moa_client = True
+
     def __init__(self, preset_name: str, reference_callback: Any = None, agent: Any = None):
         self.chat = type("_MoAChat", (), {})()
         self.chat.completions = MoAChatCompletions(

@@ -1799,13 +1799,22 @@ def spawn_background_review_thread(
         )
 
     def _target() -> None:
-        _run_review_in_thread(
-            agent,
-            messages_snapshot,
-            prompt,
-            task_cfg=task_cfg,
-            review_run=review_run,
+        from agent.aux_accounting import (
+            reset_account_attribution_suppressed,
+            set_account_attribution_suppressed,
         )
+
+        suppression_token = set_account_attribution_suppressed()
+        try:
+            _run_review_in_thread(
+                agent,
+                messages_snapshot,
+                prompt,
+                task_cfg=task_cfg,
+                review_run=review_run,
+            )
+        finally:
+            reset_account_attribution_suppressed(suppression_token)
 
     return _target, prompt
 
