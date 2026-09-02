@@ -229,3 +229,100 @@ def test_in_dir_expands_user_home(main_mod, launched, monkeypatch, tmp_path):
         assert os.getcwd() == str((home / "proj").resolve())
     finally:
         os.chdir(start)
+
+
+# ---------------------------------------------------------------------------
+# --in DIR for one-shot (-z)
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def oneshot_harness(main_mod, monkeypatch):
+    """Drive _run_and_exit_oneshot without os._exit() or a real agent."""
+    seen = {}
+
+    def fake_run_oneshot(prompt, **kwargs):
+        import os
+
+        seen["cwd"] = os.getcwd()
+        seen["prompt"] = prompt
+        seen["kwargs"] = kwargs
+        return 0
+
+    # _run_and_exit_oneshot imports this lazily, inside the call.
+    monkeypatch.setattr("hermes_cli.oneshot.run_oneshot", fake_run_oneshot)
+    monkeypatch.setattr(main_mod, "_cleanup_oneshot_runtime", lambda: None)
+
+    def fake_exit(rc):
+        raise SystemExit(rc)
+
+    monkeypatch.setattr(main_mod, "_exit_after_oneshot", fake_exit)
+    return seen
+
+
+def test_oneshot_in_dir_chdirs_before_agent_runs(main_mod, oneshot_harness, tmp_path):
+    """`hermes -z ... --in WS` must run with WS as the process cwd.
+
+    Regression: --in was consumed only by cmd_chat, so a one-shot parsed the
+    flag and silently ignored it — "create SUMMARY.md" landed in the
+    launcher's cwd (the repo root) instead of the assigned workspace.
+    """
+    import os
+
+    target = tmp_path / "workspace"
+    target.mkdir()
+    start = os.getcwd()
+
+    try:
+        with pytest.raises(SystemExit) as exc:
+            main_mod._run_and_exit_oneshot("create SUMMARY.md", in_dir=str(target))
+    finally:
+        os.chdir(start)
+
+    assert exc.value.code == 0
+    assert oneshot_harness["cwd"] == str(target.resolve())
+
+
+def test_oneshot_without_in_dir_keeps_process_cwd(main_mod, oneshot_harness):
+    import os
+
+    start = os.getcwd()
+    with pytest.raises(SystemExit) as exc:
+        main_mod._run_and_exit_oneshot("hello")
+
+    assert exc.value.code == 0
+    assert oneshot_harness["cwd"] == start
+
+
+def test_oneshot_in_dir_missing_directory_exits_1_on_stderr(
+    main_mod, oneshot_harness, tmp_path, capsys
+):
+    """A bad --in fails the run, and the message must not pollute -z's stdout."""
+    with pytest.raises(SystemExit) as exc:
+        main_mod._run_and_exit_oneshot("x", in_dir=str(tmp_path / "nope"))
+
+    assert exc.value.code == 1
+    captured = capsys.readouterr()
+    assert "--in directory not found" in captured.err
+    assert captured.out == ""
+    assert "cwd" not in oneshot_harness  # the agent never ran
+
+
+def test_every_oneshot_dispatch_site_forwards_in_dir():
+    """Every `-z` dispatch site must forward --in.
+
+    There are three (fast-CLI, Termux fast-CLI, full dispatch); a new one that
+    forgets the kwarg silently reintroduces the wrong-workspace bug.
+    """
+    import inspect
+
+    import hermes_cli.main as mod
+
+    # Split on the call marker; a dispatch site is the one whose first
+    # argument is ``args.oneshot`` (the helper's own def line is not).
+    chunks = inspect.getsource(mod).split("_run_and_exit_oneshot(")[1:]
+    sites = [c for c in chunks if c.lstrip().startswith("args.oneshot,")]
+    assert sites, "no -z dispatch sites found"
+    # The call ends at the first dedented closing paren.
+    missing = [c for c in sites if "in_dir=" not in c.split("        )")[0]]
+    assert not missing, f"{len(missing)} of {len(sites)} -z dispatch site(s) drop --in"

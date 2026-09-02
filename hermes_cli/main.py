@@ -202,6 +202,45 @@ def _cleanup_oneshot_runtime() -> None:
         pass
 
 
+def _enter_in_dir(in_dir: object, *, stream=None) -> str | None:
+    """Apply ``--in DIR``: chdir into DIR, or exit(1) with a clear message.
+
+    Shared by ``cmd_chat`` and ``_run_and_exit_oneshot`` so ``--in`` means the
+    same thing for every launch mode. The process cwd is the LAST anchor the
+    file tools fall back to when resolving a relative path
+    (``tools.file_tools._resolve_base_dir``, step 4), so a launch mode that
+    parsed ``--in`` but never chdir'd wrote relative paths into the launcher's
+    cwd instead of the assigned workspace.
+
+    ``stream`` selects where the error text goes; defaults to stdout to match
+    the rest of the CLI. ``-z`` passes stderr because one-shot reserves stdout
+    for the final response.
+
+    Returns the absolute directory entered, or ``None`` when *in_dir* is unset.
+    """
+    if not in_dir:
+        return None
+    # Git Bash / MSYS hands the CLI POSIX-style paths (`--in ~` expands to
+    # `/c/Users/x` before Python ever sees it; MSYS2's path conversion is
+    # disabled for native executables). Translate the MSYS/Cygwin/WSL
+    # drive-root spellings to native Windows form first — no-op elsewhere.
+    from tools.environments.local import _msys_to_windows_path
+
+    _target_dir = os.path.abspath(
+        os.path.expanduser(_msys_to_windows_path(str(in_dir)))
+    )
+    _out = stream or sys.stdout
+    if not os.path.isdir(_target_dir):
+        print(f"Error: --in directory not found: {in_dir}", file=_out)
+        sys.exit(1)
+    try:
+        os.chdir(_target_dir)
+    except OSError as e:
+        print(f"Error: cannot enter --in directory {in_dir}: {e}", file=_out)
+        sys.exit(1)
+    return _target_dir
+
+
 def _run_and_exit_oneshot(
     prompt: str,
     *,
@@ -210,8 +249,17 @@ def _run_and_exit_oneshot(
     toolsets: object = None,
     skills: object = None,
     usage_file: object = None,
+    in_dir: object = None,
 ) -> None:
     try:
+        # --in DIR must take effect BEFORE the agent is constructed: the run's
+        # session cwd record and the file tools' relative-path anchor are both
+        # seeded from the process cwd. Without this, `-z ... --in WS` parsed
+        # the flag and silently ignored it, so "create SUMMARY.md" landed in
+        # the launcher's cwd. Errors go to stderr — one-shot reserves stdout
+        # for the final response.
+        _enter_in_dir(in_dir, stream=sys.stderr)
+
         from hermes_cli.oneshot import run_oneshot
 
         rc = run_oneshot(
@@ -3216,25 +3264,7 @@ def cmd_chat(args):
     # workspace-scoped "latest"/-c lookups key off DIR, and it pins the
     # session there — an explicit --in wins over a resumed session's
     # recorded cwd (so the restore step below is skipped).
-    in_dir = getattr(args, "in_dir", None)
-    if in_dir:
-        # Git Bash / MSYS hands the CLI POSIX-style paths (`--in ~` expands to
-        # `/c/Users/x` before Python ever sees it; MSYS2's path conversion is
-        # disabled for native executables). Translate the MSYS/Cygwin/WSL
-        # drive-root spellings to native Windows form first — no-op elsewhere.
-        from tools.environments.local import _msys_to_windows_path
-
-        _target_dir = os.path.abspath(
-            os.path.expanduser(_msys_to_windows_path(in_dir))
-        )
-        if not os.path.isdir(_target_dir):
-            print(f"Error: --in directory not found: {in_dir}")
-            sys.exit(1)
-        try:
-            os.chdir(_target_dir)
-        except OSError as e:
-            print(f"Error: cannot enter --in directory {in_dir}: {e}")
-            sys.exit(1)
+    if _enter_in_dir(getattr(args, "in_dir", None)) is not None:
         args.no_restore_cwd = True
 
     # --resume latest: keyword for "most recent session" — same resolution
@@ -13073,6 +13103,7 @@ def _try_fast_chat_launch() -> bool:
             toolsets=getattr(args, "toolsets", None),
             skills=getattr(args, "skills", None),
             usage_file=getattr(args, "usage_file", None),
+            in_dir=getattr(args, "in_dir", None),
         )
 
     if (args.resume or args.continue_last) and args.command is None:
@@ -13131,6 +13162,7 @@ def _try_termux_fast_cli_launch() -> bool:
             toolsets=getattr(args, "toolsets", None),
             skills=getattr(args, "skills", None),
             usage_file=getattr(args, "usage_file", None),
+            in_dir=getattr(args, "in_dir", None),
         )
 
     if (args.resume or args.continue_last) and args.command is None:
@@ -15130,6 +15162,7 @@ def main():
             toolsets=getattr(args, "toolsets", None),
             skills=getattr(args, "skills", None),
             usage_file=getattr(args, "usage_file", None),
+            in_dir=getattr(args, "in_dir", None),
         )
 
     # Handle top-level --resume / --continue as shortcut to chat
