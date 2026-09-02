@@ -63,6 +63,8 @@ from typing import Any, Callable, Dict, Iterator, List, Optional, Set, Tuple, Ty
 from hermes_state_common import (  # noqa: F401  (re-exported for back-compat)
     _BRANCH_CHILD_SQL,
     _COMPRESSION_CHILD_SQL,
+    _COMPRESSION_MARKER_CHILD_EDGE_SQL,
+    _COMPRESSION_MARKER_PARENT_EDGE_SQL,
     _FTS_CJK_TRIGGERS,
     _FTS_TRIGGERS,
     _LISTABLE_CHILD_SQL,
@@ -7416,6 +7418,31 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                        )""",
                     (session_id,),
                 )
+                # Durable compression-lineage marker (mirrors the ``_reset_from``
+                # pattern used by reopen_session): the parent's mutable
+                # ``end_reason`` is cleared when a row is later reopened after a
+                # mistaken reaper close (``ws_orphan_reap``) or stale-route
+                # recovery, which would silently break every lineage walk that
+                # keys on ``end_reason = 'compression'``. Stamp the child at
+                # creation time so archive/pin/tip walks can still follow the
+                # raw parent edge afterwards.
+                conn.execute(
+                    """UPDATE sessions
+                       SET model_config = json_set(
+                               COALESCE(sessions.model_config, '{}'),
+                               '$._compression_from',
+                               sessions.parent_session_id)
+                     WHERE id = ? AND parent_session_id IS NOT NULL
+                       AND json_extract(COALESCE(sessions.model_config, '{}'),
+                                        '$._compression_from') IS NULL
+                       AND EXISTS (
+                           SELECT 1 FROM sessions p
+                           WHERE p.id = sessions.parent_session_id
+                             AND p.end_reason = 'compression'
+                             AND p.ended_at IS NOT NULL
+                       )""",
+                    (session_id,),
+                )
         # Session-row creation is transcript-critical: if it fails, the
         # first flush of a new session fails and the turn is aborted as
         # session_persistence_failed. Ride out long sibling holds.
@@ -8561,6 +8588,29 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 raise RuntimeError(
                     f"Compression parent changed during publication: {parent_session_id}"
                 )
+
+            # Belt-and-suspenders marker stamping (mirrors the ``_reset_from``
+            # pattern in reopen_session): the parent's mutable ``end_reason``
+            # is cleared when a row is later reopened after a mistaken reaper
+            # close (``ws_orphan_reap``) or stale-route recovery, which would
+            # silently break every lineage walk keyed on
+            # ``end_reason = 'compression'``. Stamp the continuation child at
+            # rotation time — including the race where the child row was
+            # inserted before the parent's ``ended_at`` landed, which is why
+            # this backfill exists alongside the creation-time stamp in
+            # _insert_session_row.
+            conn.execute(
+                """UPDATE sessions
+                   SET model_config = json_set(
+                           COALESCE(sessions.model_config, '{}'),
+                           '$._compression_from',
+                           parent_session_id)
+                 WHERE id = ?
+                   AND parent_session_id IS NOT NULL
+                   AND json_extract(COALESCE(sessions.model_config, '{}'),
+                                    '$._compression_from') IS NULL""",
+                (child_session_id,),
+            )
 
         self._execute_write(_do)
 
@@ -9723,16 +9773,64 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         Uses COALESCE so that passing model=None leaves the stored model
         column unchanged.  Routes through _execute_write for the standard
         BEGIN IMMEDIATE + jitter-retry + lock guarantee.
+
+        Reserved lineage markers: keys beginning with ``_`` in the stored
+        config (``_reset_from``, ``_branched_from``, ``_compression_from``,
+        ``_delegate_from``) survive this wholesale replacement — callers
+        pass a complete user-facing metadata dict (cwd, provider, ...) and
+        must not be required to know about internal markers. A future
+        dedicated column would retire this shim.
         """
         # Barrier against queued token deltas — see update_session_model.
         self.flush_token_counts()
 
         def _do(conn):
+            merged = self._preserve_reserved_model_config_keys(
+                conn, session_id, model_config_json
+            )
             conn.execute(
                 "UPDATE sessions SET model_config = ?, model = COALESCE(?, model) WHERE id = ?",
-                (model_config_json, model, session_id),
+                (merged, model, session_id),
             )
         self._execute_write(_do)
+
+    @staticmethod
+    def _preserve_reserved_model_config_keys(
+        conn, session_id: str, incoming_json: str
+    ) -> Optional[str]:
+        """Merge ``_``-prefixed keys from the stored config into *incoming_json*.
+
+        ``update_session_meta`` replaces the whole ``model_config`` document;
+        without this guard a replacement silently drops the immutable
+        compression-lineage stamp (and its ``_reset_from`` / ``_branched_from``
+        predecessors), reintroducing the cleared-end_reason lineage break.
+        """
+        try:
+            incoming = json.loads(incoming_json) if incoming_json else {}
+            if not isinstance(incoming, dict):
+                incoming = {}
+        except (json.JSONDecodeError, TypeError):
+            incoming = {}
+        row = conn.execute(
+            "SELECT model_config FROM sessions WHERE id = ?",
+            (session_id,),
+        ).fetchone()
+        reserved: Dict[str, Any] = {}
+        if row is not None:
+            raw = row["model_config"] if isinstance(row, sqlite3.Row) else row[0]
+            if isinstance(raw, str) and raw.strip():
+                try:
+                    stored = json.loads(raw)
+                    if isinstance(stored, dict):
+                        reserved = {
+                            k: v for k, v in stored.items() if k.startswith("_")
+                        }
+                except (json.JSONDecodeError, TypeError):
+                    pass
+            elif isinstance(raw, dict):
+                reserved = {k: v for k, v in raw.items() if k.startswith("_")}
+        merged = {**incoming, **reserved}
+        return json.dumps(merged) if merged else None
 
     def update_system_prompt(
         self, session_id: str, system_prompt: Optional[str]
@@ -11448,7 +11546,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         """
         def _do(conn):
             cursor = conn.execute(
-                """
+                f"""
                 WITH RECURSIVE
                   ancestors(id) AS (
                     SELECT ?
@@ -11457,7 +11555,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     FROM ancestors a
                     JOIN sessions child ON child.id = a.id
                     JOIN sessions parent ON parent.id = child.parent_session_id
-                    WHERE parent.end_reason = 'compression'
+                    WHERE {_COMPRESSION_CHILD_SQL.format(a="child")}
+                       OR {_COMPRESSION_MARKER_PARENT_EDGE_SQL.format(a="child")}
                   ),
                   descendants(id) AS (
                     SELECT ?
@@ -11467,6 +11566,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     JOIN sessions parent ON parent.id = d.id
                     JOIN sessions child ON child.parent_session_id = parent.id
                     WHERE parent.end_reason = 'compression'
+                       OR {_COMPRESSION_MARKER_CHILD_EDGE_SQL.format(a="parent")}
                   ),
                   lineage(id) AS (
                     SELECT id FROM ancestors
@@ -11557,7 +11657,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         """
         def _do(conn):
             cursor = conn.execute(
-                """
+                f"""
                 WITH RECURSIVE
                   ancestors(id) AS (
                     SELECT ?
@@ -11566,7 +11666,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     FROM ancestors a
                     JOIN sessions child ON child.id = a.id
                     JOIN sessions parent ON parent.id = child.parent_session_id
-                    WHERE parent.end_reason = 'compression'
+                    WHERE {_COMPRESSION_CHILD_SQL.format(a="child")}
+                       OR {_COMPRESSION_MARKER_PARENT_EDGE_SQL.format(a="child")}
                   ),
                   descendants(id) AS (
                     SELECT ?
@@ -11576,6 +11677,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     JOIN sessions parent ON parent.id = d.id
                     JOIN sessions child ON child.parent_session_id = parent.id
                     WHERE parent.end_reason = 'compression'
+                       OR {_COMPRESSION_MARKER_CHILD_EDGE_SQL.format(a="parent")}
                   ),
                   lineage(id) AS (
                     SELECT id FROM ancestors
@@ -11611,7 +11713,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         """
         def _do(conn):
             cursor = conn.execute(
-                """
+                f"""
                 WITH RECURSIVE
                   ancestors(id) AS (
                     SELECT ?
@@ -11620,7 +11722,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     FROM ancestors a
                     JOIN sessions child ON child.id = a.id
                     JOIN sessions parent ON parent.id = child.parent_session_id
-                    WHERE parent.end_reason = 'compression'
+                    WHERE {_COMPRESSION_CHILD_SQL.format(a="child")}
+                       OR {_COMPRESSION_MARKER_PARENT_EDGE_SQL.format(a="child")}
                   ),
                   descendants(id) AS (
                     SELECT ?
@@ -11630,6 +11733,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     JOIN sessions parent ON parent.id = d.id
                     JOIN sessions child ON child.parent_session_id = parent.id
                     WHERE parent.end_reason = 'compression'
+                       OR {_COMPRESSION_MARKER_CHILD_EDGE_SQL.format(a="parent")}
                   ),
                   lineage(id) AS (
                     SELECT id FROM ancestors
@@ -11671,7 +11775,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         """
         def _do(conn):
             cursor = conn.execute(
-                """
+                f"""
                 WITH RECURSIVE
                   ancestors(id) AS (
                     SELECT ?
@@ -11680,7 +11784,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     FROM ancestors a
                     JOIN sessions child ON child.id = a.id
                     JOIN sessions parent ON parent.id = child.parent_session_id
-                    WHERE parent.end_reason = 'compression'
+                    WHERE {_COMPRESSION_CHILD_SQL.format(a="child")}
+                       OR {_COMPRESSION_MARKER_PARENT_EDGE_SQL.format(a="child")}
                   ),
                   descendants(id) AS (
                     SELECT ?
@@ -11690,6 +11795,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     JOIN sessions parent ON parent.id = d.id
                     JOIN sessions child ON child.parent_session_id = parent.id
                     WHERE parent.end_reason = 'compression'
+                       OR {_COMPRESSION_MARKER_CHILD_EDGE_SQL.format(a="parent")}
                   ),
                   lineage(id) AS (
                     SELECT id FROM ancestors
