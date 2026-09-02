@@ -1083,9 +1083,11 @@ async def _send_or_update_status_coro(adapter, chat_id, status_key, content, met
     appending a new one. Adapters without the method fall back to plain send.
     """
     sender = getattr(adapter, "send_or_update_status", None)
+    delivery_metadata = dict(metadata or {})
+    delivery_metadata.setdefault("_gateway_delivery_surface", "status")
     if callable(sender):
-        return await sender(chat_id, status_key, content, metadata=metadata)
-    return await adapter.send(chat_id, content, metadata=metadata)
+        return await sender(chat_id, status_key, content, metadata=delivery_metadata)
+    return await adapter.send(chat_id, content, metadata=delivery_metadata)
 
 
 def _approval_send_outcome(future, timeout: float) -> str:
@@ -6081,11 +6083,13 @@ class TurnRunner:
                 return
             if already_streamed or not ctx._status_adapter or not str(display_text or "").strip():
                 return
+            interim_metadata = _interim_metadata(ctx._status_thread_metadata)
+            interim_metadata["_gateway_delivery_surface"] = "interim_assistant"
             safe_schedule_threadsafe(
                 ctx._status_adapter.send(
                     ctx._status_chat_id,
                     display_text,
-                    metadata=ctx._status_thread_metadata,
+                    metadata=interim_metadata,
                 ),
                 ctx._loop_for_step,
                 logger=logger,
