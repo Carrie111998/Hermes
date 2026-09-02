@@ -23442,7 +23442,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 watchers = process_registry.pending_watchers
                 process_registry.pending_watchers = []
                 for i, watcher in enumerate(watchers):
-                    asyncio.create_task(self._run_process_watcher(watcher))
+                    # Retain a strong ref: the loop holds only weak refs to
+                    # tasks, so an unreferenced watcher can be GC-reaped and
+                    # its notify_on_complete completion silently lost.
+                    _watcher_task = asyncio.create_task(self._run_process_watcher(watcher))
+                    if not hasattr(self, "_background_tasks"):
+                        self._background_tasks = set()
+                    self._background_tasks.add(_watcher_task)
+                    if hasattr(_watcher_task, "add_done_callback"):
+                        _watcher_task.add_done_callback(self._background_tasks.discard)
                     if i % 100 == 99:
                         await asyncio.sleep(0)
             except Exception as e:
@@ -34158,7 +34166,14 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
                 )
             except Exception as _e:
                 logger.debug("spawn_async_diagnostic failed: %s", _e)
-        asyncio.create_task(runner.stop())
+        # Retain the task: an unreferenced stop() can be GC-reaped before it
+        # finishes, leaving the gateway half-shutdown with no recovery.
+        _stop_task = asyncio.create_task(runner.stop())
+        if not hasattr(runner, "_background_tasks"):
+            runner._background_tasks = set()
+        runner._background_tasks.add(_stop_task)
+        if hasattr(_stop_task, "add_done_callback"):
+            _stop_task.add_done_callback(runner._background_tasks.discard)
 
     def restart_signal_handler():
         runner.request_restart(detached=False, via_service=True)
