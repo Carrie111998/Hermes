@@ -315,10 +315,17 @@ def evaluate_gate(subsystem: str, *, inline_summary: str = "",
 def _interactive_approval_available() -> bool:
     """True when a foreground memory write can be approved inline.
 
-    Inline prompting requires a per-thread approval callback registered by the
-    interactive CLI (``tools.terminal_tool.set_approval_callback``). Every
-    other surface stages instead:
+    Inline prompting requires both a live interactive surface and a per-thread
+    approval callback registered by the interactive CLI
+    (``tools.terminal_tool.set_approval_callback``). A callback alone is not
+    sufficient: headless ``hermes chat -q`` runs also register one, but have no
+    human available to answer it. Kanban workers inherit this behavior because
+    the dispatcher launches them through ``hermes chat -q``.
 
+    Every other surface stages instead:
+
+    * **Single-query runs (including Kanban workers)** — headless even though a
+      CLI callback is registered; inline prompting would wait until timeout.
     * **Gateway/API sessions** — the dangerous-command ``/approve`` round-trip
       lives in the pending-approval queue (``submit_pending`` +
       ``_await_gateway_decision``), which ``prompt_dangerous_approval`` never
@@ -328,7 +335,22 @@ def _interactive_approval_available() -> bool:
     * Scripts, cron, and background threads — no user present.
     """
     try:
+        from tools.approval import _is_single_query_approval_context
+    except ImportError:
+        # Keep the pre-existing callback path available if the optional context
+        # probe cannot be imported during early startup.
+        pass
+    else:
+        try:
+            if _is_single_query_approval_context():
+                return False
+        except Exception:
+            # An unreadable headless-context probe must fail safe to staging.
+            return False
+
+    try:
         from tools.terminal_tool import _get_approval_callback
+
         return _get_approval_callback() is not None
     except Exception:
         return False
