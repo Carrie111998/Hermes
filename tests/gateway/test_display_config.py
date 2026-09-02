@@ -133,11 +133,22 @@ class TestPlatformDefaults:
 
 
     def test_low_tier_platforms(self):
-        """Signal, BlueBubbles, etc. default to 'off' tool progress."""
+        """Signal, BlueBubbles, ntfy, etc. default to 'off' tool progress."""
         from gateway.display_config import resolve_display_setting
 
-        for plat in ("signal", "bluebubbles", "weixin", "wecom", "dingtalk", "whatsapp_cloud"):
+        for plat in ("signal", "bluebubbles", "weixin", "wecom", "dingtalk", "whatsapp_cloud", "ntfy"):
             assert resolve_display_setting({}, plat, "tool_progress") == "off", plat
+
+    def test_ntfy_low_tier_silences_chatter(self):
+        """ntfy (no message editing) must not inherit the noisy global defaults."""
+        from gateway.display_config import resolve_display_setting
+
+        # Each of these defaults to the "noisy" global value without the
+        # platform entry — exactly the ntfy-spam bug this guards against.
+        assert resolve_display_setting({}, "ntfy", "interim_assistant_messages") is False
+        assert resolve_display_setting({}, "ntfy", "long_running_notifications") is False
+        assert resolve_display_setting({}, "ntfy", "tool_progress") == "off"
+        assert resolve_display_setting({}, "ntfy", "streaming") is False
 
 
     def test_telegram_mobile_chatter_defaults(self):
