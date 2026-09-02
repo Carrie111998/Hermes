@@ -1207,6 +1207,12 @@ class WeixinAdapter(BasePlatformAdapter):
         self._send_session: Optional[aiohttp.ClientSession] = None
         self._poll_task: Optional[asyncio.Task] = None
         self._dedup = MessageDeduplicator(ttl_seconds=MESSAGE_DEDUP_TTL_SECONDS)
+        # getUpdates returns an ordered batch, but each message is processed in
+        # its own task.  Media download happens before BasePlatformAdapter's
+        # session guard, so a faster later download can otherwise enter that
+        # guard first.  Refcounts let idle entries disappear without racing a
+        # waiter that has already selected the same lock.
+        self._inbound_order_locks: Dict[str, Tuple[asyncio.Lock, int]] = {}
 
         self._account_id = str(extra.get("account_id") or _wx_secret("WEIXIN_ACCOUNT_ID", "")).strip()
         self._token = str(config.token or extra.get("token") or _wx_secret("WEIXIN_TOKEN", "")).strip()
@@ -1476,10 +1482,46 @@ class WeixinAdapter(BasePlatformAdapter):
                 logger.debug("[%s] old poll session close failed: %s", self.name, exc)
 
     async def _process_message_safe(self, message: Dict[str, Any]) -> None:
+        order_key = self._inbound_order_key(message)
+        entry = self._inbound_order_locks.get(order_key)
+        if entry is None:
+            lock = asyncio.Lock()
+            users = 0
+        else:
+            lock, users = entry
+        self._inbound_order_locks[order_key] = (lock, users + 1)
         try:
-            await self._process_message(message)
+            async with lock:
+                await self._process_message(message)
         except Exception as exc:
             logger.error("[%s] unhandled inbound error from=%s: %s", self.name, _safe_id(message.get("from_user_id")), exc, exc_info=True)
+        finally:
+            current = self._inbound_order_locks.get(order_key)
+            if current is not None and current[0] is lock:
+                remaining = current[1] - 1
+                if remaining:
+                    self._inbound_order_locks[order_key] = (lock, remaining)
+                else:
+                    self._inbound_order_locks.pop(order_key, None)
+
+    def _inbound_order_key(self, message: Dict[str, Any]) -> str:
+        """Return the same session key used by the generic inbound guard."""
+        from gateway.session import build_session_key
+
+        sender_id = str(message.get("from_user_id") or "").strip()
+        chat_type, effective_chat_id = _guess_chat_type(message, self._account_id)
+        source = self.build_source(
+            chat_id=effective_chat_id,
+            chat_type=chat_type,
+            user_id=sender_id,
+            user_name=sender_id,
+        )
+        return build_session_key(
+            source,
+            group_sessions_per_user=self.config.extra.get("group_sessions_per_user", True),
+            thread_sessions_per_user=self.config.extra.get("thread_sessions_per_user", False),
+            profile=self._session_key_profile(source),
+        )
 
     async def _process_message(self, message: Dict[str, Any]) -> None:
         assert self._poll_session is not None

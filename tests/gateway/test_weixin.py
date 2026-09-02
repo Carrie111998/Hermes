@@ -597,6 +597,105 @@ class TestWeixinContentDedup:
         assert event.text == "hello world"
 
 
+class TestWeixinInboundPreprocessingOrder:
+    @staticmethod
+    def _message(sender: str, message_id: str, *, room_id: str = "") -> dict:
+        message = {
+            "from_user_id": sender,
+            "message_id": message_id,
+            "item_list": [{"type": weixin.ITEM_IMAGE, "image_item": {}}],
+        }
+        if room_id:
+            message["room_id"] = room_id
+        return message
+
+    def test_same_session_preprocessing_stays_in_poll_order(self):
+        adapter = _make_adapter()
+        events = []
+
+        async def fake_process(message):
+            message_id = message["message_id"]
+            events.append(f"start:{message_id}")
+            if message_id == "first":
+                await asyncio.sleep(0.05)
+            events.append(f"end:{message_id}")
+
+        adapter._process_message = fake_process
+
+        async def drive():
+            first = asyncio.create_task(
+                adapter._process_message_safe(self._message("wxid-user", "first"))
+            )
+            await asyncio.sleep(0)
+            second = asyncio.create_task(
+                adapter._process_message_safe(self._message("wxid-user", "second"))
+            )
+            await asyncio.gather(first, second)
+
+        asyncio.run(drive())
+
+        assert events == ["start:first", "end:first", "start:second", "end:second"]
+        assert adapter._inbound_order_locks == {}
+
+    def test_different_sessions_still_preprocess_concurrently(self):
+        adapter = _make_adapter()
+        both_started = asyncio.Event()
+        release = asyncio.Event()
+        started = []
+
+        async def fake_process(message):
+            started.append(message["message_id"])
+            if len(started) == 2:
+                both_started.set()
+            await release.wait()
+
+        adapter._process_message = fake_process
+
+        async def drive():
+            tasks = [
+                asyncio.create_task(
+                    adapter._process_message_safe(
+                        self._message("wxid-user", "a", room_id="room-a")
+                    )
+                ),
+                asyncio.create_task(
+                    adapter._process_message_safe(
+                        self._message("wxid-user", "b", room_id="room-b")
+                    )
+                ),
+            ]
+            await asyncio.wait_for(both_started.wait(), timeout=1)
+            release.set()
+            await asyncio.gather(*tasks)
+
+        asyncio.run(drive())
+
+        assert set(started) == {"a", "b"}
+        assert adapter._inbound_order_locks == {}
+
+    def test_failed_preprocessing_releases_session_queue(self):
+        adapter = _make_adapter()
+        processed = []
+
+        async def fake_process(message):
+            processed.append(message["message_id"])
+            if message["message_id"] == "first":
+                raise RuntimeError("broken media")
+
+        adapter._process_message = fake_process
+
+        async def drive():
+            await asyncio.gather(
+                adapter._process_message_safe(self._message("wxid-user", "first")),
+                adapter._process_message_safe(self._message("wxid-user", "second")),
+            )
+
+        asyncio.run(drive())
+
+        assert processed == ["first", "second"]
+        assert adapter._inbound_order_locks == {}
+
+
 class TestWeixinTextDebounce:
     """Text-debounce batching for rapid multi-message bursts (issue #35301).
 
@@ -878,4 +977,3 @@ class TestWeixinVoiceGatewayHandoff:
             "VOICE event body leaked Tencent's STT text — runner would trust "
             "the wrong transcript instead of re-transcribing (#27300)."
         )
-
