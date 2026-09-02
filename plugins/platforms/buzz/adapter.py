@@ -300,16 +300,32 @@ def _attachment_origin(value: str) -> Optional[tuple[str, int]]:
 # WebSocket transport (NIP-42 authenticated Nostr subscription).
 # kind 44100 is Buzz's channel-membership event — used for live DM discovery.
 _WS_AUTH_TIMEOUT = 20.0
-# Last-resort bound on how long the read loop may wait for a frame. The
-# library keepalive (ping_interval/ping_timeout below) should catch a dead
-# relay first, but a relay-side close the transport never surfaces (observed
-# as a CLOSE_WAIT socket with the loop parked on recv, #98097) leaves the
-# gateway "connected" while inbound stops; this timeout forces the normal
-# reconnect path instead.
-_WS_READ_IDLE_TIMEOUT = 300.0
+# Last-resort liveness probe for the read loop. The library keepalive
+# (ping_interval/ping_timeout below) should catch a dead relay first, but a
+# relay-side close the transport never surfaces (observed as a CLOSE_WAIT
+# socket with the loop parked on recv, #98097) leaves the gateway
+# "connected" while inbound stops: in that state the pending pong waiter
+# never completes, so a manual ping round-trip times out and forces the
+# normal reconnect path. A quiet-but-healthy relay answers the ping and the
+# connection is kept — silence alone is not death.
+_WS_LIVENESS_INTERVAL = 60.0
+_WS_LIVENESS_TIMEOUT = 45.0
 _WS_MAX_MESSAGE_BYTES = 2_000_000
 _WS_MEMBERSHIP_KIND = 44100
 _WS_MEMBERSHIP_SUB_ID = "hermes-buzz-membership"
+
+
+def _ws_clean_close_error():
+    """The websockets clean-close exception class (version-portable).
+
+    websockets 15.x raises ``ConnectionClosedOK`` when the server closes
+    cleanly — normally surfaced as the iterator ending, but a close racing
+    the liveness ping instead raises it from ``ping()``/``recv()``.
+    Resolved lazily so adapter import never needs websockets present.
+    """
+    from websockets.exceptions import ConnectionClosedOK
+
+    return ConnectionClosedOK
 
 # Where to look for a credentials JSON (keys: nsec / private_key_hex) when
 # BUZZ_PRIVATE_KEY is not set.  Module-level so tests can point it at a tmpdir.
@@ -1873,6 +1889,39 @@ class BuzzAdapter(BasePlatformAdapter):
             except Exception:
                 logger.warning("Buzz: WebSocket discovery sweep failed", exc_info=True)
 
+    async def _probe_liveness(self, websocket) -> None:
+        """Require proof of transport life via a ping/pong round-trip."""
+        ping_fn = getattr(websocket, "ping", None)
+        if not callable(ping_fn):
+            return
+        pong_waiter = await ping_fn()
+        if pong_waiter is not None:
+            await pong_waiter
+
+    async def _read_frame_or_probe(self, frame_iter, websocket) -> str:
+        """Read a frame, probing the connection while it remains quiet."""
+        read_task = asyncio.ensure_future(frame_iter.__anext__())
+        try:
+            while True:
+                done, _ = await asyncio.wait({read_task}, timeout=_WS_LIVENESS_INTERVAL)
+                if done:
+                    return read_task.result()
+                try:
+                    await asyncio.wait_for(
+                        self._probe_liveness(websocket), timeout=_WS_LIVENESS_TIMEOUT
+                    )
+                except asyncio.TimeoutError:
+                    raise ConnectionError(
+                        "relay did not answer a liveness ping within "
+                        f"{_WS_LIVENESS_TIMEOUT:.0f}s; assuming the connection went silent"
+                    ) from None
+        finally:
+            read_task.cancel()
+            try:
+                await read_task
+            except (asyncio.CancelledError, Exception):
+                pass
+
     async def _websocket_loop(self) -> None:
         """Persistent authenticated subscription with bounded reconnect
         backoff. Events route through _handle_event() — identical semantics
@@ -1909,16 +1958,18 @@ class BuzzAdapter(BasePlatformAdapter):
                             frame_iter = websocket.__aiter__()
                             while True:
                                 try:
-                                    raw = await asyncio.wait_for(
-                                        frame_iter.__anext__(),
-                                        timeout=_WS_READ_IDLE_TIMEOUT,
+                                    raw = await self._read_frame_or_probe(
+                                        frame_iter, websocket
                                     )
                                 except StopAsyncIteration:
                                     break
+                                except _ws_clean_close_error():
+                                    # A clean close racing the liveness probe is
+                                    # normal relay lifecycle, not a failure.
+                                    break
                                 except asyncio.TimeoutError:
                                     raise ConnectionError(
-                                        f"no WebSocket frame for {_WS_READ_IDLE_TIMEOUT:.0f}s; "
-                                        "assuming the connection went silent"
+                                        "WebSocket liveness probe timed out"
                                     ) from None
                                 try:
                                     message = json.loads(raw)
