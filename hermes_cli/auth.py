@@ -1836,9 +1836,17 @@ _OAUTH_TOKEN_FIELDS = (
 )
 
 _oauth_heal_notices: List[str] = []
-# provider -> (profile auth.json path, auth.json mtime_ns, singleton mtime_ns)
-# of the last store verified fork-free; lets load_pool() skip the locked scan.
-_oauth_heal_clean_marks: Dict[str, Tuple[str, Optional[int], Optional[int]]] = {}
+# provider -> (profile auth.json path, auth.json content digest, singleton
+# content digest) of the last store verified fork-free; lets load_pool() skip
+# the locked scan. Content-digest-keyed, not mtime-keyed: this cache guards
+# whether a credential fork needs healing, and an external metadata-preserving
+# copy (dotfile sync, backup/restore) can replace a forked auth.json's bytes
+# while restoring its original mtime, which a stat-only key would never
+# detect — the mark would keep saying "clean" and the auto-heal (whose whole
+# purpose is fixing exactly this kind of forked grant) would never re-scan
+# (same class of bug as _global_auth_store_cache above and the Vertex SA
+# credential cache — see agent/vertex_adapter.py's _read_sa_file).
+_oauth_heal_clean_marks: Dict[str, Tuple[str, Optional[str], Optional[str]]] = {}
 
 
 def consume_oauth_heal_notices() -> List[str]:
@@ -2000,14 +2008,15 @@ def _heal_forked_single_use_oauth_grants(provider_id: str) -> Optional[Dict[str,
 
     # Hot-path short-circuit: load_pool() runs per model call. Once this
     # profile's store was verified clean for *provider_id*, skip the locked
-    # read-modify-write until the profile's own files change (mtime key).
-    def _stamp(p: Optional[Path]) -> Optional[int]:
+    # read-modify-write until the profile's own files change (content-digest
+    # key — see the type comment above for why not mtime).
+    def _digest(p: Optional[Path]) -> Optional[str]:
         try:
-            return p.stat().st_mtime_ns if p is not None else None
+            return hashlib.sha256(p.read_bytes()).hexdigest() if p is not None else None
         except OSError:
             return None
 
-    fingerprint = (str(profile_path), _stamp(profile_path), _stamp(profile_singleton))
+    fingerprint = (str(profile_path), _digest(profile_path), _digest(profile_singleton))
     if _oauth_heal_clean_marks.get(provider_id) == fingerprint:
         return None
     if fingerprint[1] is None and fingerprint[2] is None:
