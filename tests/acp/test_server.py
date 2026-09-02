@@ -446,6 +446,29 @@ class TestPrompt:
 
         assert captured.get("child") == resp.session_id
 
+    @pytest.mark.asyncio
+    async def test_prompt_persists_explicitly_empty_messages(self, agent, mock_manager):
+        """An empty result history is a clear-history instruction, not absence."""
+        resp = await agent.new_session(cwd=".")
+        state = mock_manager.get_session(resp.session_id)
+        state.history = [{"role": "user", "content": "stale"}]
+
+        def _run(*args, **kwargs):
+            return {"final_response": "cleared", "messages": []}
+
+        state.agent.run_conversation = _run
+        state.agent.model = "test-model"
+        state.agent.provider = "openrouter"
+        agent.session_manager.save_session = MagicMock()
+
+        await agent.prompt(
+            prompt=[TextContentBlock(type="text", text="clear")],
+            session_id=resp.session_id,
+        )
+
+        assert state.history == []
+        agent.session_manager.save_session.assert_called_once_with(resp.session_id)
+
 
 
 
