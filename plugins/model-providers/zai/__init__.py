@@ -22,17 +22,79 @@ two enabled levels — ``high`` and ``max`` — on the OpenAI-compatible endpoin
 (per Z.AI / BigModel docs).  Hermes' richer effort scale is collapsed onto
 those two so the user's effort preference actually reaches the model instead
 of being silently dropped.
+
+Vision routing is endpoint-aware: the Coding Plan endpoint serves
+``glm-4.5v`` but not the general API's ``glm-5v-turbo`` (429 code 1311 —
+not in subscription).  :meth:`ZaiProfile.default_vision_model` picks the
+vision default for the billing pool the request actually lands on (issue
+#92817).
 """
 
 from __future__ import annotations
 
 import re
 from typing import Any
+from urllib.parse import urlparse
 
 from providers import register_provider
 from providers.base import ProviderProfile
 
 _GLM_VERSION_RE = re.compile(r"^glm-(\d+)(?:\.(\d+))?")
+
+#: Z.AI / BigModel hosts — the single source of truth for Z.AI host facts.
+#: The shared aux client does NOT keep its own copy: ``agent.auxiliary_client.
+#: _is_zai_host_url`` delegates to :meth:`ZaiProfile.is_zai_host_url` (its
+#: local host pair is only a fallback for contexts where this plugin is not
+#: loaded).  Add any new Z.AI/BigModel endpoint here so every consumer picks
+#: it up in one edit (#92817).  Host-anchored matching so a lookalike host
+#: (``api.z.ai.evil.example.com``) or a path marker on a gateway URL never
+#: triggers endpoint-specific routing.
+_ZAI_HOSTS = ("api.z.ai", "open.bigmodel.cn")
+
+
+def _is_zai_host_url(base_url: str | None) -> bool:
+    """True when *base_url* points at a Z.AI / BigModel host.
+
+    Host-anchored (never path-anchored) and subdomain-tolerant — mirrors
+    ``utils.base_url_host_matches`` semantics — so a lookalike host
+    (``api.z.ai.evil.example.com``) or a path marker on a gateway URL never
+    matches, while a genuine ``*.api.z.ai`` endpoint still does.  The aux
+    client reaches this through :meth:`ZaiProfile.is_zai_host_url`.
+    """
+    url = str(base_url or "").strip()
+    if not url:
+        return False
+    try:
+        host = (urlparse(url).hostname or "").lower()
+    except ValueError:
+        return False
+    if not host:
+        return False
+    return any(host == h or host.endswith("." + h) for h in _ZAI_HOSTS)
+
+
+def _is_zai_coding_endpoint(base_url: str | None) -> bool:
+    """True when *base_url* is a Z.AI Coding Plan endpoint.
+
+    Covers the OpenAI-wire form ``/api/coding/paas/v4`` and the
+    Anthropic-wire form ``/api/anthropic`` (whose OpenAI sibling is the
+    coding endpoint — see ``_to_openai_base_url``).  The general API
+    (``/api/paas/v4``) is billed independently and is NOT a coding endpoint.
+    """
+    url = str(base_url or "").strip().rstrip("/")
+    if not url:
+        return False
+    try:
+        host = (urlparse(url).hostname or "").lower()
+    except ValueError:
+        return False
+    if host not in _ZAI_HOSTS:
+        return False
+    return (
+        "/coding/" in url
+        or url.endswith("/coding")
+        or url.endswith("/api/anthropic")
+    )
 
 
 def _model_supports_thinking(model: str | None) -> bool:
@@ -121,6 +183,28 @@ def _glm_5_2_reasoning_effort(
 
 class ZaiProfile(ProviderProfile):
     """Z.AI / GLM — extra_body.thinking on/off + GLM-5.2 reasoning_effort."""
+
+    def is_zai_host_url(self, base_url: str | None = None) -> bool:
+        """Host check delegated from ``agent.auxiliary_client._is_zai_host_url``.
+
+        Public so the shared aux client asks the profile instead of
+        re-deriving Z.AI host facts — when a new Z.AI/BigModel endpoint is
+        added to :data:`_ZAI_HOSTS`, aux picks it up with no change there.
+        """
+        return _is_zai_host_url(base_url)
+
+    def default_vision_model(self, base_url: str | None = None) -> str | None:
+        """Vision default for the billing pool *base_url* lands on.
+
+        The Coding Plan endpoint (``/api/coding/paas/v4``, or its
+        Anthropic-wire form ``/api/anthropic``) does not serve
+        ``glm-5v-turbo`` — it answers 429 code 1311 ("not in subscription").
+        It serves ``glm-4.5v``, which is included in the plan (measured live,
+        issue #92817).  The general API keeps ``glm-5v-turbo``.
+        """
+        if _is_zai_coding_endpoint(base_url):
+            return "glm-4.5v"
+        return "glm-5v-turbo"
 
     def build_api_kwargs_extras(
         self, *, reasoning_config: dict | None = None, model: str | None = None, **context

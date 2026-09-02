@@ -1259,22 +1259,32 @@ def _task_prefers_fast_model(task: Optional[str]) -> bool:
 # When the user's main provider has a dedicated vision/multimodal model that
 # differs from their main chat model, map it here.  The vision auto-detect
 # "exotic provider" branch checks this before falling back to the main model.
+# Providers whose vision default depends on the endpoint (Z.AI's Coding Plan
+# serves glm-4.5v, the general API serves glm-5v-turbo) live in their
+# ProviderProfile's ``default_vision_model()`` hook instead — a static entry
+# here cannot know the caller's billing pool (see #92817).
 _PROVIDER_VISION_MODELS: Dict[str, str] = {
     "xiaomi": "mimo-v2.5",
-    "zai": "glm-5v-turbo",
 }
 
 
-def _resolve_provider_vision_default(provider: str) -> Optional[str]:
+def _resolve_provider_vision_default(
+    provider: str, *, base_url: Optional[str] = None
+) -> Optional[str]:
     """Return the provider's preferred default vision model id, or None.
 
-    Static entries in :data:`_PROVIDER_VISION_MODELS` win first (xiaomi /
-    zai have dedicated vision-only model names that don't live in any
-    discoverable catalog). Otherwise the provider's :class:`ProviderProfile`
-    gets a chance to supply one via its ``default_vision_model()`` hook —
-    that's where catalog-backed providers (DeepInfra) resolve a live default,
+    Static entries in :data:`_PROVIDER_VISION_MODELS` win first (xiaomi has
+    a dedicated vision-only model name that doesn't live in any discoverable
+    catalog). Otherwise the provider's :class:`ProviderProfile` gets a chance
+    to supply one via its ``default_vision_model()`` hook — that's where
+    catalog-backed providers (DeepInfra) resolve a live default and where
+    endpoint-aware providers (Z.AI) pick the vision model their billing pool
+    actually serves (coding plan → glm-4.5v, general API → glm-5v-turbo),
     keeping the discovery logic inside their plugin instead of a name-check
     branch here.
+
+    ``base_url`` carries the live main-runtime endpoint for endpoint-aware
+    hooks; hooks that predate the parameter ignore it.
     """
     static = _PROVIDER_VISION_MODELS.get(provider)
     if static:
@@ -1287,6 +1297,12 @@ def _resolve_provider_vision_default(provider: str) -> Optional[str]:
     if profile is None:
         return None
     try:
+        if base_url:
+            try:
+                return profile.default_vision_model(base_url=base_url)
+            except TypeError:
+                # Out-of-tree profile predating the base_url parameter.
+                return profile.default_vision_model()
         return profile.default_vision_model()
     except Exception:
         return None
@@ -1537,7 +1553,9 @@ def _to_openai_base_url(base_url: str) -> str:
     if url.endswith("/anthropic"):
         # ZAI uses /api/anthropic for the Coding Plan's Anthropic wire.  The
         # matching OpenAI-wire endpoint is /api/coding/paas/v4; /api/paas/v4
-        # is the independently billed general API.
+        # is the independently billed general API.  Covers both Z.AI hosts
+        # (api.z.ai and open.bigmodel.cn — the host pair lives in the zai
+        # plugin's _ZAI_HOSTS; keep this table in sync, see #92817).
         if base_url_host_matches(url, "open.bigmodel.cn") or base_url_host_matches(url, "api.z.ai"):
             rewritten = url[: -len("/anthropic")] + "/coding/paas/v4"
             logger.debug("Auxiliary client: rewrote ZAI base URL %s → %s", url, rewritten)
@@ -6029,9 +6047,14 @@ def _try_main_agent_model_fallback(
         return None, None, ""
 
     label = f"main-agent({main_provider})"
+    # Name the endpoint the fallback degraded to: a vision routing miss on
+    # Z.ai surfaces as a confusing 1210 content-type error unless the log
+    # shows which model AND which billing pool the fallback actually used.
+    main_base = _read_main_base_url()
     logger.info(
-        "Auxiliary %s: %s on %s — falling back to main agent model %s (%s)",
+        "Auxiliary %s: %s on %s — falling back to main agent model %s (%s) at %s",
         task or "call", reason, failed_provider, label, resolved_model or main_model,
+        main_base or "default endpoint",
     )
     return client, resolved_model or main_model, label
 
@@ -7814,6 +7837,68 @@ def get_available_vision_backends() -> List[str]:
     return available
 
 
+def _is_zai_host_url(base_url: Optional[str]) -> bool:
+    """True when *base_url* points at a Z.AI / BigModel host.
+
+    Host-anchored (never path-anchored) so a lookalike host or a path
+    marker on a gateway URL cannot trigger Z.ai-specific routing.
+
+    Z.AI host facts live in exactly one place: ``_ZAI_HOSTS`` in the zai
+    plugin (plugins/model-providers/zai/__init__.py).  This helper delegates
+    to the registered profile's ``is_zai_host_url()`` so an endpoint added
+    there is picked up here automatically.  The local pair below is only a
+    fallback for contexts where provider plugins are not loaded (e.g. CLI
+    surfaces) — keep it in sync with the plugin (#92817).
+    """
+    url = str(base_url or "").strip()
+    if not url:
+        return False
+    try:
+        from providers import get_provider_profile
+
+        profile = get_provider_profile("zai")
+        if profile is not None:
+            checker = getattr(profile, "is_zai_host_url", None)
+            if callable(checker):
+                return bool(checker(url))
+    except Exception:
+        logger.debug(
+            "Auxiliary client: zai host check via profile unavailable; "
+            "using local host pair",
+            exc_info=True,
+        )
+    return base_url_host_matches(url, "api.z.ai") or base_url_host_matches(
+        url, "open.bigmodel.cn"
+    )
+
+
+def _zai_main_endpoint_base_url(runtime: Dict[str, Any]) -> Optional[str]:
+    """Return the Z.ai host endpoint of the live main runtime, or None.
+
+    Only meaningful when the main provider IS a zai-family provider — the
+    runtime endpoint of any other provider belongs to a different billing
+    pool and must never be reused.  Falls back to the configured main
+    endpoint only when the runtime records no provider at all (non-gateway
+    callers), so a zai Coding Plan base_url in config still drives vision
+    routing. (#92817)
+    """
+    rt_provider = _normalize_aux_provider(str(runtime.get("provider") or ""))
+    if rt_provider == "zai":
+        base = str(runtime.get("base_url") or "").strip().rstrip("/")
+        if base and _is_zai_host_url(base):
+            return base
+        return None
+    if rt_provider not in {"", "auto"}:
+        # A concrete non-zai main provider is authoritative — never borrow
+        # config state that belongs to a different provider.
+        return None
+    if _normalize_aux_provider((_read_main_provider() or "").strip().lower()) == "zai":
+        base = (_read_main_base_url() or "").strip().rstrip("/")
+        if base and _is_zai_host_url(base):
+            return base
+    return None
+
+
 def resolve_vision_provider_client(
     provider: Optional[str] = None,
     model: Optional[str] = None,
@@ -7865,13 +7950,12 @@ def resolve_vision_provider_client(
     if requested == "auto":
         # Vision auto-detection order:
         #   1. User's main provider + main model (including aggregators).
-        #      _PROVIDER_VISION_MODELS provides per-provider vision model
-        #      overrides when the provider has a dedicated multimodal model
-        #      that differs from the chat model (e.g. xiaomi → mimo-v2-omni,
-        #      zai → glm-5v-turbo). DeepInfra is similar but resolves its
-        #      default vision model live from the catalog (see
-        #      :func:`_resolve_provider_vision_default`). Nous is the
-        #      exception: it has a dedicated strict vision backend with
+        #      Provider-specific vision models come from
+        #      _resolve_provider_vision_default: the xiaomi static entry or
+        #      the ProviderProfile's default_vision_model() hook (DeepInfra
+        #      resolves live from the catalog; Z.AI picks per billing pool —
+        #      coding plan → glm-4.5v, general API → glm-5v-turbo). Nous is
+        #      the exception: it has a dedicated strict vision backend with
         #      tier-aware defaults, so it must not fall through to the
         #      user's text chat model here.
         #   2. OpenRouter (vision-capable aggregator fallback)
@@ -7901,13 +7985,19 @@ def resolve_vision_provider_client(
                 runtime["api_mode"] = ""
         if main_provider and main_provider not in {"auto", "", "moa"}:
             # A provider-specific vision default wins over the user's chat model:
-            # static overrides (xiaomi/zai) and catalog-backed discovery (the
+            # static overrides (xiaomi) and catalog-backed discovery (the
             # DeepInfra profile hook) both yield a *known* vision-capable model,
             # whereas the pinned chat model is usually NOT multimodal (e.g. the
             # DeepSeek-V4-Flash default) and _main_model_supports_vision can't be
-            # trusted to catch that. Only fall back to the chat model when no
-            # provider default is available (catalog unreachable).
-            provider_vision_default = _resolve_provider_vision_default(main_provider)
+            # trusted to catch that. Endpoint-aware providers (Z.AI) resolve the
+            # vision model their billing pool actually serves via the same hook
+            # (coding plan → glm-4.5v, general API → glm-5v-turbo). Only fall
+            # back to the chat model when no provider default is available
+            # (catalog unreachable).
+            zai_main_base = _zai_main_endpoint_base_url(runtime)
+            provider_vision_default = _resolve_provider_vision_default(
+                main_provider, base_url=zai_main_base
+            )
             vision_model = provider_vision_default or main_model
             if main_provider == "nous":
                 # Nous resolves its vision model from the Portal's tier-aware
@@ -7985,6 +8075,26 @@ def resolve_vision_provider_client(
                             rpc_base_url = custom_base
                             rpc_api_key = custom_key
                             rpc_api_mode = resolved_api_mode or custom_mode or None
+                if zai_main_base and rpc_base_url is None:
+                    # Reuse the live Z.ai main endpoint so vision consumes the
+                    # same billing pool as the main model.  A Coding Plan key
+                    # is rejected by the general API (1113) and the coding
+                    # endpoint rejects glm-5v-turbo (1311), so pairing the
+                    # endpoint-aware vision model (glm-4.5v) with the runtime
+                    # endpoint is what actually works (#92817).  The OpenAI
+                    # wire is mandatory for Z.ai vision (the Anthropic wire
+                    # rejects multimodal calls with error 1210).
+                    #
+                    # Precedence: the guard above means an explicit custom
+                    # vision base_url (set in the custom-provider branch from
+                    # user config, above) wins over the runtime-derived
+                    # endpoint — user-explicit config is never silently
+                    # clobbered by the live Z.ai runtime (#92817 review).
+                    rpc_base_url = _to_openai_base_url(zai_main_base)
+                    rpc_api_key = runtime.get("api_key") or None
+                    if isinstance(rpc_api_key, str):
+                        rpc_api_key = rpc_api_key.strip() or None
+                    rpc_api_mode = "chat_completions"
                 rpc_client, rpc_model = resolve_provider_client(
                     main_provider, vision_model,
                     api_mode=rpc_api_mode,
@@ -8023,15 +8133,42 @@ def resolve_vision_provider_client(
     # The Anthropic wire rejects max_tokens on multimodal calls (error 1210),
     # while the OpenAI wire handles it correctly.
     if requested == "zai" and not resolved_base_url:
+        # When the live main runtime is a Z.ai endpoint, try it FIRST so the
+        # vision call consumes the same billing pool as the main model: a
+        # Coding Plan key is billed from the coding pool, and the general API
+        # answers it with 429 code 1113 (insufficient balance) even though
+        # the key is valid (#92817). The runtime endpoint is rewritten to the
+        # OpenAI wire (e.g. /api/anthropic → /api/coding/paas/v4) and the
+        # general-API list remains as the ordered fallback for
+        # non-subscription keys.
+        zai_main_base = _zai_main_endpoint_base_url(runtime)
         zai_openai_urls = [
             "https://open.bigmodel.cn/api/paas/v4",
             "https://api.z.ai/api/paas/v4",
         ]
-        for _zai_url in zai_openai_urls:
+        zai_urls: List[str] = []
+        runtime_key: Optional[str] = None
+        if zai_main_base:
+            _derived = _to_openai_base_url(zai_main_base)
+            zai_urls.append(_derived)
+            zai_urls.extend(u for u in zai_openai_urls if u != _derived)
+            _rt_key = runtime.get("api_key")
+            if isinstance(_rt_key, str):
+                runtime_key = _rt_key.strip() or None
+        else:
+            zai_urls.extend(zai_openai_urls)
+        for _zai_url in zai_urls:
+            # Without an explicit auxiliary.vision.model, pick the vision
+            # model the endpoint actually serves (glm-4.5v on coding,
+            # glm-5v-turbo on general) instead of the text-only aux default
+            # (glm-4.5-flash), which would always fail with error 1210.
+            effective_model = resolved_model or _resolve_provider_vision_default(
+                "zai", base_url=_zai_url
+            )
             client, final_model = _get_cached_client(
-                requested, resolved_model, async_mode,
+                requested, effective_model, async_mode,
                 base_url=_zai_url,
-                api_key=resolved_api_key or None,
+                api_key=resolved_api_key or runtime_key,
                 api_mode="chat_completions",
                 main_runtime=runtime,
                 is_vision=True,
@@ -8039,7 +8176,8 @@ def resolve_vision_provider_client(
             if client is not None:
                 return _finalize(requested, client, final_model)
         # Fallback: try without explicit base_url (old behavior)
-        client, final_model = _get_cached_client(requested, resolved_model, async_mode,
+        effective_model = resolved_model or _resolve_provider_vision_default("zai")
+        client, final_model = _get_cached_client(requested, effective_model, async_mode,
                                                  api_mode=resolved_api_mode,
                                                  main_runtime=runtime,
                                                  is_vision=True)
