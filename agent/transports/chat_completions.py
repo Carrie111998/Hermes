@@ -23,6 +23,7 @@ from agent.reasoning_effort import (
     requested_effort,
 )
 from agent.moonshot_schema import is_moonshot_model, sanitize_moonshot_tools
+from agent.gigachat_schema import is_gigachat_model, sanitize_gigachat_tools
 from agent.prompt_builder import DEVELOPER_ROLE_MODELS
 from agent.transports.base import ProviderTransport
 from agent.transports.types import NormalizedResponse, ToolCall, Usage
@@ -640,6 +641,9 @@ class ChatCompletionsTransport(ProviderTransport):
             # etc.) compatible, in addition to direct moonshot.ai endpoints.
             if is_moonshot_model(model):
                 tools = sanitize_moonshot_tools(tools)
+            # GigaChat's decoder drops required keys on wide schemas.
+            if is_gigachat_model(model):
+                tools = sanitize_gigachat_tools(tools)
             api_kwargs["tools"] = tools
 
         # max_tokens resolution — priority: ephemeral > user > provider default
@@ -861,10 +865,12 @@ class ChatCompletionsTransport(ProviderTransport):
         if timeout is not None:
             api_kwargs["timeout"] = timeout
 
-        # Tools — apply Moonshot/Kimi schema sanitization regardless of path
+        # Tools — apply provider-specific schema sanitization regardless of path
         if tools:
             if is_moonshot_model(model):
                 tools = sanitize_moonshot_tools(tools)
+            if is_gigachat_model(model) or getattr(profile, "name", "") == "gigachat":
+                tools = sanitize_gigachat_tools(tools)
             api_kwargs["tools"] = tools
 
         # max_tokens resolution — priority: ephemeral > user > profile default
