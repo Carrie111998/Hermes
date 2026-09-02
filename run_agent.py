@@ -2513,23 +2513,33 @@ class AIAgent:
                 # Store the sidecar only when it actually differs.
                 if _row_api_content == content:
                     _row_api_content = None
-                # Load-time sanitize divergence: get_messages_as_conversation
+                # Load-time reload divergence: get_messages_as_conversation
                 # replays user/assistant rows through
-                # ``sanitize_context(content).strip()``, so content that
-                # sanitize would rewrite (echoed/pasted <memory-context>
-                # fences or system notes) replays different bytes after a
-                # session reload even though THIS turn sent it verbatim.
+                # ``sanitize_context(content).strip()``, so content the
+                # reload would rewrite — echoed/pasted <memory-context>
+                # fences and system notes (sanitize), or plain surrounding
+                # whitespace (strip) — replays different bytes after a
+                # session rebuild even though THIS turn sent it verbatim.
                 # Capture the sent bytes in the sidecar so a reloaded session
-                # replays what was actually on the wire. Compared in wire form
-                # (both sides .strip()-ed — the api_messages build strips
-                # every outgoing content string) so plain surrounding
-                # whitespace doesn't grow redundant sidecars.
+                # replays what was actually on the wire.
+                #
+                # Compared against ``content`` UNSTRIPPED (#100795): nothing
+                # on the outgoing path strips message content. The wire copy
+                # is a structural clone of this dict and the transports only
+                # drop non-provider keys, so a user turn carrying a trailing
+                # newline goes out with it while its rebuilt-from-state.db
+                # replay does not — the state-rebuild payload divergence that
+                # breaks a provider's exact-prefix cache at that message for
+                # one shot after any agent teardown/eviction. Comparing both
+                # sides ``.strip()``-ed (the previous shape) assumed a
+                # wire-side strip that does not exist and let that whole
+                # class through.
                 if (
                     _row_api_content is None
                     and role in ("user", "assistant")
                     and isinstance(content, str)
                     and content
-                    and sanitize_context(content).strip() != content.strip()
+                    and sanitize_context(content).strip() != content
                 ):
                     _row_api_content = content
                 # Persist multimodal tool results as their text summary only —
