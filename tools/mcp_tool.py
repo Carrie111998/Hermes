@@ -615,6 +615,40 @@ _MIN_KEEPALIVE_INTERVAL = 5        # clamp floor for configured intervals
 # immediately; cancellation-resistant tasks must not hang process exit.
 _MCP_LOOP_DRAIN_TIMEOUT = 3.0
 
+# Hard ceiling for waiting on server.shutdown() during shutdown_mcp_servers().
+# This call gates the gateway's clean-exit funnel (lifecycle_ledger
+# mark_exited), and container supervisors (s6-overlay, etc.) typically grant
+# only ~3s of kill grace before SIGKILL. A 15s wait here held the exit funnel
+# open past the grace period, so a wedged MCP server silently cost the
+# gateway its clean-exit record (#82874). 2s is ample for well-behaved
+# server.shutdown() implementations (they self-enforce their own close
+# timeouts); a server that hasn't returned in 2s won't return in 15s either.
+_MCP_SHUTDOWN_DRAIN_SECONDS = 2
+
+# Total wall-clock budget for the whole MCP teardown funnel in
+# shutdown_mcp_servers(): the server-shutdown drain plus the loop drain and
+# the thread join inside _stop_mcp_loop(). The funnel sits on the gateway's
+# clean-exit critical path: on SIGTERM a container supervisor (s6-overlay,
+# etc.) grants only ~3s of kill grace before SIGKILL, so a teardown that
+# exceeds it silently loses the clean-exit record (#82874). Each blocking
+# segment derives its own wait from this ONE budget (see _teardown_clamp), so
+# no sub-wait can push the TOTAL past the budget. The orphan-PID reap at the
+# end of _stop_mcp_loop() is deliberately EXCLUDED: it runs on its own
+# detached thread the exit path never joins, so its SIGTERM -> 2s -> SIGKILL
+# dance cannot hold the funnel open right when a slow stdio child most needs
+# its graceful window.
+_MCP_TEARDOWN_BUDGET_SECONDS = 2.75
+
+
+def _teardown_clamp(seconds: float, budget_remaining: float) -> float:
+    """Clamp a teardown segment's own wait to the budget left for it.
+
+    Returns 0.0 when the budget is empty (min/max stop negatives). Used by
+    every bounded wait in shutdown_mcp_servers()/_stop_mcp_loop() so no
+    sub-wait can push the TOTAL teardown past _MCP_TEARDOWN_BUDGET_SECONDS.
+    """
+    return max(0.0, min(seconds, budget_remaining))
+
 # Environment variables that are safe to pass to stdio subprocesses
 _SAFE_ENV_KEYS = frozenset({
     "PATH", "HOME", "USER", "LANG", "LC_ALL", "TERM", "SHELL", "TMPDIR",
@@ -8360,6 +8394,12 @@ def shutdown_mcp_servers():
     with _lock:
         servers_snapshot = list(_servers.values())
 
+    # Single budget common to the whole teardown funnel. Segment 1 (the server
+    # drain below) keeps _MCP_SHUTDOWN_DRAIN_SECONDS as its ceiling but must
+    # not exceed it; the leftover is handed to _stop_mcp_loop() for the
+    # loop-drain and thread-join segments that follow (#82874 round-2).
+    teardown_budget = _MCP_TEARDOWN_BUDGET_SECONDS
+
     # Fast path: nothing to shut down. The connect-cooldown maps can still
     # be populated here — a server that failed to connect is never recorded
     # in ``_servers`` (that is the very premise of the #50394 cooldown), so
@@ -8401,10 +8441,16 @@ def shutdown_mcp_servers():
             log_message="MCP shutdown: failed to schedule",
         )
         if future is not None:
+            # Segment 1: the server-shutdown drain. Derives its wait from the
+            # shared teardown budget, not a bare fixed timeout.
+            drain_wait = _teardown_clamp(
+                _MCP_SHUTDOWN_DRAIN_SECONDS, teardown_budget,
+            )
             try:
-                future.result(timeout=15)
+                future.result(timeout=drain_wait)
             except BaseException as exc:
                 logger.debug("Error during MCP shutdown: %s", exc)
+            teardown_budget = max(0.0, teardown_budget - drain_wait)
 
     # Unconditional final sweep: whether the async ``_shutdown`` ran,
     # timed out, or was never scheduled (loop already stopped), a full
@@ -8414,7 +8460,27 @@ def shutdown_mcp_servers():
         _server_connect_retry_after.clear()
         _server_connect_failures.clear()
 
-    _stop_mcp_loop()
+    _stop_mcp_loop(teardown_budget=teardown_budget)
+
+
+def _start_orphan_reaper() -> None:
+    """Reap orphaned MCP stdio children off the teardown critical path.
+
+    Called once the MCP loop is closed. Its _kill_orphaned_mcp_children()
+    does a SIGTERM -> 2s -> SIGKILL dance; running that inline here would add
+    ~2s to a funnel that must stay under _MCP_TEARDOWN_BUDGET_SECONDS. It is
+    dispatched on a short daemon thread the exit path never joins — best
+    effort, never waited on, failures just logged (#82874 review feedback).
+    """
+    def _reap() -> None:
+        try:
+            _kill_orphaned_mcp_children(include_active=True)
+        except BaseException:
+            logger.warning("MCP orphan reaping failed", exc_info=True)
+
+    threading.Thread(
+        target=_reap, name="mcp-orphan-reaper", daemon=True,
+    ).start()
 
 
 def _kill_orphaned_mcp_children(
@@ -8609,9 +8675,17 @@ async def _drain_and_stop_mcp_loop() -> None:
         loop.call_soon(loop.stop)
 
 
-def _stop_mcp_loop(*, only_if_idle: bool = False) -> bool:
-    """Stop the background event loop and join its thread."""
+def _stop_mcp_loop(*, only_if_idle: bool = False, teardown_budget: Optional[float] = None) -> bool:
+    """Stop the background event loop and join its thread.
+
+    ``teardown_budget`` is the remaining seconds from the single shared MCP
+    teardown budget (_MCP_TEARDOWN_BUDGET_SECONDS); the loop-drain and
+    thread-join waits clamp to it so the whole funnel stays under one ceiling.
+    Defaults to the full budget for standalone callers.
+    """
     global _mcp_loop, _mcp_thread
+    if teardown_budget is None:
+        teardown_budget = _MCP_TEARDOWN_BUDGET_SECONDS
     with _lock:
         if only_if_idle and (_servers or _server_connecting):
             logger.debug("Leaving MCP event loop running; active servers are registered or connecting")
@@ -8638,19 +8712,27 @@ def _stop_mcp_loop(*, only_if_idle: bool = False) -> bool:
             )
             if future is not None:
                 stop_owned_by_loop = True
+                drain_wait = _teardown_clamp(
+                    _MCP_LOOP_DRAIN_TIMEOUT + 1, teardown_budget,
+                )
                 try:
-                    future.result(timeout=_MCP_LOOP_DRAIN_TIMEOUT + 1)
+                    future.result(timeout=drain_wait)
                 except TimeoutError:
                     logger.warning(
                         "Timed out waiting for MCP loop drain after %.1fs",
-                        _MCP_LOOP_DRAIN_TIMEOUT + 1,
+                        drain_wait,
                     )
                 except BaseException as exc:
                     logger.warning("Error draining MCP loop tasks: %s", exc)
+                teardown_budget = max(0.0, teardown_budget - drain_wait)
         elif not loop.is_closed():
             try:
                 loop.run_until_complete(
-                    _drain_mcp_loop_tasks(timeout=_MCP_LOOP_DRAIN_TIMEOUT)
+                    _drain_mcp_loop_tasks(
+                        timeout=_teardown_clamp(
+                            _MCP_LOOP_DRAIN_TIMEOUT, teardown_budget,
+                        ),
+                    ),
                 )
             except BaseException as exc:
                 logger.warning("Error draining stopped MCP loop tasks: %s", exc)
@@ -8658,15 +8740,23 @@ def _stop_mcp_loop(*, only_if_idle: bool = False) -> bool:
         if not stop_owned_by_loop and loop.is_running():
             loop.call_soon_threadsafe(loop.stop)
         if thread is not None:
-            thread.join(timeout=5)
+            join_wait = _teardown_clamp(5.0, teardown_budget)
+            thread.join(timeout=join_wait)
             if thread.is_alive():
-                logger.warning("MCP event loop thread did not stop within 5.0s")
+                logger.warning(
+                    "MCP event loop thread did not stop within %.1fs",
+                    join_wait,
+                )
+            teardown_budget = max(0.0, teardown_budget - join_wait)
         try:
             loop.close()
         except Exception as exc:
             logger.warning("Unable to close MCP event loop cleanly: %s", exc)
         # After closing the loop, any stdio subprocesses that survived the
-        # graceful shutdown are now orphaned — include active PIDs too
-        # since the loop is gone and no session can still be in flight.
-        _kill_orphaned_mcp_children(include_active=True)
+        # graceful shutdown are now orphaned — include active PIDs too since
+        # the loop is gone and no session can still be in flight. This reap runs
+        # OUTSIDE the teardown budget via its own detached thread, so its
+        # SIGTERM -> 2s -> SIGKILL dance (2s) cannot hold the clean exit funnel
+        # open past the supervisor kill grace (#82874 review feedback).
+        _start_orphan_reaper()
     return True
