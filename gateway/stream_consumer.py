@@ -48,6 +48,15 @@ _COMMENTARY = object()
 # Sentinel for tool-progress lines injected into the native stream bubble.
 # Enqueued as ``(_TOOL_PROGRESS, line_text)`` by ``on_tool_progress()``.
 _TOOL_PROGRESS = object()
+# Sentinel for the tool-timer tick — imported from gateway.tool_timer.
+# Re-exported here so existing imports keep working.
+from gateway.tool_timer import (  # noqa: F401 — re-exported
+    _TIMER_TICK,
+    _SPINNER_CHARS,
+    _TOOL_NAME_RE,
+    _parse_tool_name,
+    ToolTimerMixin,
+)
 # Authoritative turn-final payload, enqueued by ``finish(final_text=...)``
 # just before ``_DONE``.  Carries the completed ``final_response`` —
 # including post-stream augmentation (file-mutation verifier footer,
@@ -83,6 +92,9 @@ _REOPEN_SEED = object()
 # accumulated yet.  Callers may override per-boundary (e.g. clarify passes its
 # own) via close_for_approval_prompt(placeholder=...).
 _DEFAULT_BOUNDARY_PLACEHOLDER = "⏸ 等待审批中..."
+
+# _SPINNER_CHARS, _TOOL_NAME_RE, _parse_tool_name — imported from
+# gateway.tool_timer (re-exported above).
 
 
 def escape_code_fences_for_display(text: str) -> str:
@@ -184,7 +196,7 @@ class StreamConsumerConfig:
     chat_type: str = ""
 
 
-class GatewayStreamConsumer:
+class GatewayStreamConsumer(ToolTimerMixin):
     """Async consumer that progressively edits a platform message with streamed tokens.
 
     Usage::
@@ -431,6 +443,9 @@ class GatewayStreamConsumer:
         self._tool_progress_lines: list[str] = []
         self._tool_progress_active: bool = False
 
+        # Tool-timer animation state — initialised by mixin.
+        self._init_tool_timer()
+
 
     def _stream_is_message(self) -> bool:
         """Whether THIS chat's transport treats the stream as the message.
@@ -454,23 +469,13 @@ class GatewayStreamConsumer:
     def accepts_tool_progress(self) -> bool:
         """Whether this consumer can absorb tool progress into its stream.
 
-        True only when native streaming is resolved and active. Callers use
-        this to decide the progress routing path (in-stream vs progress_queue).
+        True only when native streaming is resolved and active AND the
+        adapter supports the tool timer feature. Callers use this to decide
+        the progress routing path (in-stream vs progress_queue).
         """
-        return self._use_native_streaming
-
-    def on_tool_progress(self, line: str) -> None:
-        """Inject a tool-progress status line into the native stream bubble.
-
-        Thread-safe (called from agent worker thread via queue.Queue). Only
-        meaningful when native streaming is active — callers should gate on
-        ``accepts_tool_progress``.
-
-        The line is displayed as an overlay until the next text delta arrives,
-        at which point real content overwrites the tool-progress lines.
-        """
-        if line:
-            self._queue.put((_TOOL_PROGRESS, line))
+        if not self._use_native_streaming:
+            return False
+        return bool(getattr(self.adapter, "SUPPORTS_TOOL_TIMER", False))
 
     def _compose_frame_content(self) -> str:
         """Compose the current frame content for native streaming.
@@ -479,14 +484,19 @@ class GatewayStreamConsumer:
         append tool lines below the text separated by a horizontal rule.
         On finalize, only accumulated text is sent (no tool lines).
         """
-        if self._accumulated and self._tool_progress_lines:
+        # Build the tool overlay via the ToolTimerMixin helper.
+        tool_lines = self._compose_tool_overlay()
+
+        if self._accumulated and tool_lines:
             # Text + active tool status at the bottom
-            return self._accumulated + "\n\n---\n" + "\n".join(self._tool_progress_lines)
+            return self._accumulated + "\n\n---\n" + "\n".join(tool_lines)
         elif self._accumulated:
             return self._accumulated
-        elif self._tool_progress_lines:
-            return "\n".join(self._tool_progress_lines)
+        elif tool_lines:
+            return "\n".join(tool_lines)
         return ""
+
+    # ── Tool-timer animation ─────────────────────────────────────────
 
     def _metadata_for_send(
         self,
@@ -587,6 +597,15 @@ class GatewayStreamConsumer:
         if self._tool_progress_lines:
             self._tool_progress_lines.clear()
             self._tool_progress_active = False
+        # Keep _tool_completed_lines — they persist below the text until
+        # finalize so the user sees tool history throughout the turn.
+        # Stop the tool-timer animation — text means tools are done.
+        # Check under lock, but call _stop_tool_timer outside (it acquires
+        # its own lock).
+        with self._timer_lock:
+            has_active_tools = bool(self._tool_start_times)
+        if has_active_tools:
+            self._stop_tool_timer()
         self._accumulated += text
         self._stream_ledger += text
 
@@ -882,6 +901,9 @@ class GatewayStreamConsumer:
         # starts clean.
         self._tool_progress_lines = []
         self._tool_progress_active = False
+        # Stop the tool-timer animation on segment reset (also clears
+        # _tool_completed_lines under _timer_lock).
+        self._stop_tool_timer()
         # #29346: a tool/segment boundary means what we delivered was an interim
         # preamble, not the final answer — clear the flags so a premature setter
         # can't fool the gateway. Safe: got_done returns before any reset, and
@@ -1300,6 +1322,10 @@ class GatewayStreamConsumer:
                     self.chat_id, self._draft_id,
                 )
 
+        # Capture the running event loop so the tool-timer can schedule ticks
+        # via call_later (only meaningful when native streaming is active).
+        self._tool_timer_loop = asyncio.get_event_loop()
+
         try:
             while True:
                 # Abandon the stream early if the session has been reset
@@ -1347,7 +1373,7 @@ class GatewayStreamConsumer:
                                 or self._message_id
                                 or self._last_sent_text
                             )
-                            if _streamed_something and not self._turn_split_delivery:
+                            if _streamed_something and not self._turn_split_delivery and not self._use_native_streaming:
                                 _final_payload = self._clean_for_display(item[1])
                                 _visible = self._clean_for_display(self._accumulated)
                                 if _final_payload and _final_payload != _visible:
@@ -1407,6 +1433,12 @@ class GatewayStreamConsumer:
                                 self._tool_progress_lines.append(item[1])
                                 self._tool_progress_active = True
                             continue  # continue draining to batch simultaneous progress lines
+                        if item is _TIMER_TICK:
+                            # No-op wake-up from the tool-timer tick — the tick
+                            # already updated _tool_progress_lines and set
+                            # _tool_progress_active. Just drain it.
+                            logger.debug("[timer] drain-loop received TIMER_TICK, tool_progress_active=%s", self._tool_progress_active)
+                            continue
                         self._filter_and_accumulate(item)
                     except queue.Empty:
                         break
@@ -1481,6 +1513,8 @@ class GatewayStreamConsumer:
                 # tag is not lost.
                 if got_done:
                     self._flush_think_buffer()
+                    # Stop the tool-timer animation — stream is done.
+                    self._stop_tool_timer()
 
                     # Intentional-silence suppression.  When the agent chose
                     # not to reply it emits a bare control marker (NO_REPLY /
@@ -1986,6 +2020,8 @@ class GatewayStreamConsumer:
                 await asyncio.sleep(0.05)  # Small yield to not busy-loop
 
         except asyncio.CancelledError:
+            # Stop the tool-timer on cancellation.
+            self._stop_tool_timer()
             # Best-effort final edit on cancellation.  finalize=True so
             # REQUIRES_EDIT_FINALIZE platforms (Telegram) apply final
             # formatting — a plain edit here would leave the entire reply
@@ -3113,7 +3149,14 @@ class GatewayStreamConsumer:
                     )
                     if ok:
                         self._final_response_sent = True
-                        self._final_content_delivered = True
+                        # Indeterminate settlement: frame sent but delivery
+                        # unconfirmed — don't claim content was delivered.
+                        _indet = (
+                            hasattr(ok, "value")
+                            and getattr(ok, "value", None) == "indeterminate"
+                        )
+                        if not _indet:
+                            self._final_content_delivered = True
                 except Exception as e:
                     logger.debug("Finalize empty stream failed: %s", e)
             return True  # cursor-only / whitespace-only update
@@ -3191,6 +3234,8 @@ class GatewayStreamConsumer:
             # connection mode has no polling cadence, so every cumulative
             # update is pushed as soon as it arrives.
             if not finalize and text == self._last_sent_text:
+                if self._tool_progress_active:
+                    logger.debug("[timer] frame suppressed by dedup (len=%d)", len(text))
                 return True  # unchanged — skip
 
             # B2 — timeout-inversion race fix. For a finalize frame, mark
@@ -3207,15 +3252,14 @@ class GatewayStreamConsumer:
             # (see tests/gateway/test_wecom_double_send.py and
             # docs/rca-wecom-stream-final-ack-timeout-duplicate.md).
             #
-            # A DEFINITIVE dispatch failure (ok is False below: stream never
-            # opened, 846608 expired, errcode 6000, or the call raised) rolls
-            # the mark back so the edit/send fallback still delivers exactly
-            # once. Residual window: if the consumer is cancelled between this
-            # optimistic mark and the control worker actually writing the bytes
-            # (queue latency, sub-ms in practice), the message could be
-            # suppressed without being sent — far rarer than the guaranteed
-            # duplicate this replaces, and the send-path idempotency guard
-            # cannot help there (nothing was sent). Accepted trade-off.
+            # A DEFINITIVE dispatch failure (ok is FAILED / False below:
+            # stream never opened, 846608 expired, errcode 6000, or the call
+            # raised) rolls the mark back so the edit/send fallback still
+            # delivers exactly once.
+            #
+            # INDETERMINATE settlement: the optimistic _final_content_delivered
+            # is rolled back (delivery unconfirmed), but _final_response_sent
+            # stays True (frame was sent — don't retry / duplicate).
             _optimistic_finalize = bool(finalize)
             if _optimistic_finalize:
                 self._final_response_sent = True
@@ -3241,13 +3285,34 @@ class GatewayStreamConsumer:
                 )
                 ok = False
 
+            # Tri-state handling: StreamFrameResult enum (WeComAdapter) or
+            # bare bool (other adapters).  The enum's __bool__ makes
+            # DELIVERED/INDETERMINATE truthy and FAILED falsy, so the `if ok`
+            # gate still works for backward compat.  We distinguish
+            # INDETERMINATE from DELIVERED by checking the enum value.
+            _is_indeterminate = (
+                hasattr(ok, "value") and getattr(ok, "value", None) == "indeterminate"
+            )
+
             if ok:
                 self._already_sent = True
                 self._last_sent_text = text
                 self._native_last_pushed_len = len(text)
                 if finalize:
                     self._final_response_sent = True
-                    self._final_content_delivered = True
+                    if _is_indeterminate:
+                        # Frame was sent (don't retry) but delivery
+                        # unconfirmed — roll back the optimistic
+                        # _final_content_delivered so the caller knows.
+                        self._final_content_delivered = False
+                        logger.info(
+                            "[stream] indeterminate settlement on finalize "
+                            "(turn=%s) — _final_response_sent=True, "
+                            "_final_content_delivered=False",
+                            self._turn_id,
+                        )
+                    else:
+                        self._final_content_delivered = True
                 return True
 
             # Dispatch failed definitively — roll back the optimistic finalize
