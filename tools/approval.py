@@ -1238,6 +1238,46 @@ DANGEROUS_PATTERNS = [
     # later command in the same script.
     (r'\bgit\s+branch\b[^;|&\n]*?(?:-d\b|--delete\b)[^;|&\n]*?(?:-f\b|--force\b)', "git branch force delete (long flags)"),
     (r'\bgit\s+branch\b[^;|&\n]*?(?:-f\b|--force\b)[^;|&\n]*?(?:-d\b|--delete\b)', "git branch force delete (long flags, force-first)"),
+    # The two remaining ways to destroy uncommitted work, which the block
+    # above names in its own heading and does not cover. `git reset --hard`
+    # and `git clean -f` are gated; `git restore <pathspec>` and
+    # `git checkout -- <pathspec>` do the same thing to the working tree and
+    # were not. Neither is recoverable: the reflog holds commits, not
+    # unstaged edits.
+    #
+    # `git restore` writes the WORKING TREE unless `--staged` is given
+    # alone -- `--staged` restores only the index (the unstage idiom), and
+    # `--staged --worktree` together restore both. So: dangerous unless the
+    # segment carries `--staged` without `--worktree`. Only the long
+    # spellings are excluded, deliberately: `_normalize_command_for_detection`
+    # lowercases before matching, and git's short flags distinguish `-S`
+    # (--staged) from `-s` (--source) by case alone, so a short-flag spelling
+    # is indistinguishable after folding and is treated as dangerous. Failing
+    # closed there costs one prompt on `git restore -S f`; failing open costs
+    # the file.
+    # `--staged` and `--worktree` must be their own tokens: a bare substring
+    # scan lets a path that merely CONTAINS the text suppress the prompt for
+    # the whole segment (`git restore -- ./--staged`). Residual, stated rather
+    # than hidden: a file named exactly `--staged` after the `--` separator is
+    # still indistinguishable from the flag by regex alone.
+    (r'\bgit\s+restore\b(?:(?![^\n;|&`]*\s--staged\b)|(?=[^\n;|&`]*\s--worktree\b))', "git restore (discards uncommitted working-tree changes)"),
+    # `git checkout` only overwrites the working tree when it is given a
+    # pathspec or forced, so match those three spellings and nothing else --
+    # `git checkout <branch>` and `git checkout -b <new>` refuse rather than
+    # discard, and gating them would prompt on the single most common git
+    # command there is. `--` is git's explicit pathspec separator; a bare `.`
+    # operand is a pathspec (a ref cannot be named `.`); `-f`/`--force` is
+    # documented as "throw away local modifications".
+    # `--pathspec-from-file` reads the pathspec from a file, and `--ours` /
+    # `--theirs` write a conflicted path back over the working tree; all three
+    # overwrite without ever spelling `--`.
+    (r'\bgit\s+checkout\b(?:[^\n;|&`]*?\s--\s|[^\n;|&`]*?\s(?:--force|--pathspec-from-file|--ours|--theirs)\b|[^\n;|&`]*?\s-f\b|\s+\.(?:\s|$))', "git checkout with pathspec or --force (discards uncommitted working-tree changes)"),
+    # `git switch` is git's modern replacement for the branch half of
+    # `checkout`, and `--discard-changes` (aliased `-f`/`--force`) is
+    # documented as "throw away local modifications". An agent steered away
+    # from `checkout -f` reaches for this one. Plain `git switch <branch>` and
+    # `git switch -c <new>` refuse rather than discard and stay ungated.
+    (r'\bgit\s+switch\b[^\n;|&`]*?\s(?:--discard-changes|--force|-f)\b', "git switch --discard-changes (discards uncommitted working-tree changes)"),
     # Script execution after chmod +x — catches the two-step pattern where
     # a script is first made executable then immediately run. The script
     # content may contain dangerous commands that individual patterns miss.
