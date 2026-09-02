@@ -6533,6 +6533,15 @@ class BasePlatformAdapter(ABC):
                 typing_task,
                 metadata=_thread_metadata,
             )
+
+        typing_stopped_for_delivery = False
+
+        async def _stop_typing_before_delivery() -> None:
+            nonlocal typing_stopped_for_delivery
+            if typing_stopped_for_delivery:
+                return
+            typing_stopped_for_delivery = True
+            await _stop_typing_task()
         
         try:
             await self._run_processing_hook("on_processing_start", event)
@@ -6707,6 +6716,25 @@ class BasePlatformAdapter(ABC):
                                 _tts_path = _tts_paths[0] if _tts_paths else None
                     except Exception as tts_err:
                         logger.warning("[%s] Auto-TTS failed: %s", self.name, tts_err)
+
+                # Stop typing before every final delivery, including slash
+                # commands. A command send can still stall after Telegram has
+                # accepted the message but before its HTTP acknowledgement
+                # returns; leaving typing alive until the coroutine tail would
+                # then refresh the indicator indefinitely.
+                # Fire-and-forget: awaiting inline here stalls the ephemeral
+                # delete scheduling path (its detached task must be spawned
+                # while this turn still owns the loop; a 0.5s inline wait
+                # reordered the scheduler in test_ephemeral_reply). The stop
+                # still starts before the send below yields to the network.
+                if _tts_path or text_content or images or media_files or local_files:
+                    typing_stop_task = asyncio.create_task(
+                        _stop_typing_before_delivery()
+                    )
+                    self._background_tasks.add(typing_stop_task)
+                    typing_stop_task.add_done_callback(
+                        self._background_tasks.discard
+                    )
 
                 # Play TTS audio before text (voice-first experience)
                 _tts_caption_delivered = False

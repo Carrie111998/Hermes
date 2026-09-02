@@ -1426,6 +1426,18 @@ def _canonical_model_variants(model: str) -> list[str]:
     return variants
 
 
+def _is_opencode_provider(provider: str) -> bool:
+    """Return True for OpenCode Free/Go/Zen and their custom-family aliases."""
+    value = str(provider or "").strip().lower().replace("_", "-")
+    if value.startswith("custom:"):
+        value = value[7:]
+    return value in {"opencode-free", "opencode-go", "opencode-zen", "opencode"} or (
+        (value.startswith("opencode-go") or value.startswith("opencode-zen"))
+        and len(value) > len("opencode-go")
+        and value[len("opencode-go")] == "-"
+    )
+
+
 def resolve_per_model_reasoning_effort(model: str, overrides: dict | None) -> dict | None:
     """Lookup a per-model reasoning_effort override with spelling-tolerance.
 
@@ -1461,7 +1473,9 @@ def resolve_per_model_reasoning_effort(model: str, overrides: dict | None) -> di
     return None
 
 
-def resolve_reasoning_config(cfg: dict | None, model: str = "") -> dict | None:
+def resolve_reasoning_config(
+    cfg: dict | None, model: str = "", provider: str = ""
+) -> dict | None:
     """Resolve the effective reasoning config for *model* from a config dict.
 
     Single chokepoint for reasoning-effort resolution, shared by every
@@ -1508,6 +1522,12 @@ def resolve_reasoning_config(cfg: dict | None, model: str = "") -> dict | None:
     per_model = resolve_per_model_reasoning_effort(model, overrides)
     if per_model is not None:
         return per_model
+
+    # OpenCode Free/Go/Zen default to the strongest provider-level ask. The
+    # existing per-model wire clamping then maps this to the top tier each
+    # model actually accepts, without overriding an explicit user choice.
+    if _is_opencode_provider(provider):
+        return parse_reasoning_effort("max")
 
     # Global fallback — keep the raw value; coercing with ``or ""`` turns a
     # YAML boolean False into "", silently re-enabling thinking for users

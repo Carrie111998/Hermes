@@ -5281,9 +5281,20 @@ def _xai_oauth_state_has_usable_tokens(state: Optional[Dict[str, Any]]) -> bool:
     )
 
 
+def _xai_oauth_refresh_lock_timeout_seconds() -> float:
+    """Outwait a legitimate xAI refresh that holds the shared auth lock."""
+    refresh_timeout_seconds = env_float("HERMES_XAI_REFRESH_TIMEOUT_SECONDS", 20)
+    return max(
+        float(AUTH_LOCK_TIMEOUT_SECONDS),
+        float(refresh_timeout_seconds) + 5.0,
+    )
+
+
 def _read_xai_oauth_tokens(*, _lock: bool = True) -> Dict[str, Any]:
     if _lock:
-        with _auth_store_lock():
+        with _auth_store_lock(
+            timeout_seconds=_xai_oauth_refresh_lock_timeout_seconds()
+        ):
             auth_store = _load_auth_store()
     else:
         auth_store = _load_auth_store()
@@ -5810,7 +5821,9 @@ def resolve_xai_oauth_runtime_credentials(
     if (not should_refresh) and refresh_if_expiring:
         should_refresh = _xai_access_token_is_expiring(access_token, effective_skew)
     if should_refresh:
-        with _auth_store_lock(timeout_seconds=max(float(AUTH_LOCK_TIMEOUT_SECONDS), refresh_timeout_seconds + 5.0)):
+        with _auth_store_lock(
+            timeout_seconds=_xai_oauth_refresh_lock_timeout_seconds()
+        ):
             data = _read_xai_oauth_tokens(_lock=False)
             tokens = dict(data["tokens"])
             access_token = str(tokens.get("access_token", "") or "").strip()
