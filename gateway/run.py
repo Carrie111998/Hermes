@@ -33787,6 +33787,25 @@ def _looks_like_profile_conflict_from_cmdline(command: str, our_home) -> bool:
 
 
 
+def _register_gateway_spawn_ledger() -> None:
+    """Register the authoritative gateway process in the machine ledger.
+
+    The spawn ledger is identity metadata for reapers and update tooling, not
+    a startup dependency.  Registration therefore remains best-effort: a
+    ledger failure must never prevent the gateway from serving messages.
+    """
+    try:
+        from hermes_cli.process_identity import register_self
+        from hermes_cli.profiles import get_active_profile_name
+
+        register_self(
+            "gateway",
+            detail={"profile": get_active_profile_name() or "default"},
+        )
+    except Exception as exc:
+        logger.debug("Gateway spawn ledger registration failed: %s", exc)
+
+
 async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = False, verbosity: Optional[int] = 0) -> bool:
     """
     Start the gateway and run until interrupted.
@@ -34244,6 +34263,10 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
         return False
     atexit.register(remove_pid_file)
     atexit.register(release_gateway_runtime_lock)
+
+    # Record only after the PID/lock claim: this process is now the
+    # authoritative gateway for its HERMES_HOME.
+    _register_gateway_spawn_ledger()
 
     # Control socket (#92091 step 1) — the gateway-owned identify/status
     # surface. Started immediately after the PID-file claim: winning that
