@@ -4625,11 +4625,31 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
         surface=surface,
     )
 
+    # Birth record for the approval gate (#91980): the BLOCKED outcome only
+    # lands in logs after the full timeout window, and a notify write onto a
+    # dead client transport drops silently — without this line a delivery
+    # failure leaves no trace and is indistinguishable from user silence.
+    # INFO, not WARNING: a routine prompt is not an anomaly — the notify
+    # failure path below escalates to WARNING on its own. request_id joins
+    # birth → ack → outcome in one grep; every matching pattern is listed
+    # (not just the primary) so the audit shows the full ruleset in play.
+    # Structured fields only; the raw command stays out of logs.
+    logger.info(
+        "Approval prompt raised: request_id=%s session=%s patterns=%s surface=%s",
+        entry.data.get("request_id"),
+        session_key,
+        ",".join(str(k) for k in all_keys),
+        surface,
+    )
+
     # Notify the user (bridges sync agent thread → async gateway)
     try:
         notify_cb(dict(entry.data))
     except Exception as exc:
-        logger.warning("Gateway approval notify failed: %s", exc)
+        logger.warning(
+            "Gateway approval notify failed (request_id=%s): %s",
+            entry.data.get("request_id"), exc,
+        )
         _drop_entry()
         _fire_approval_hook(
             "post_approval_response",
