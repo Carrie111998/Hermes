@@ -852,6 +852,20 @@ def check_command_security(command: str) -> dict:
             findings = []
             summary = ""
 
+    # When the only finding is analysis_incomplete (tirith's threat-intel
+    # lookups exceeded their per-lookup deadline), the scan completed but
+    # could not verify the command.  In a non-interactive context (cron)
+    # this becomes a hard denial with no user to approve it.  Honouring
+    # tirith_fail_open for this case gives operators the same escape hatch
+    # for incomplete scans that they already have for outright tirith
+    # process failures (#97949).
+    if action == "warn" and fail_open and findings:
+        incomplete_only = all(
+            f.get("rule_id") == "analysis_incomplete" for f in findings
+        )
+        if incomplete_only:
+            action = "allow"
+
     return {"action": action, "findings": findings, "summary": summary}
 
 
