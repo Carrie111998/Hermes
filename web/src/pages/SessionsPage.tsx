@@ -34,6 +34,10 @@ import {
 } from "lucide-react";
 import { api } from "@/lib/api";
 import { formatSessionPruneResult } from "@/lib/session-prune";
+import {
+  sessionDeleteTarget,
+  type SessionDeleteTarget,
+} from "@/lib/session-delete";
 import { shouldRefreshSessions } from "@/lib/session-refresh";
 import {
   importSummary,
@@ -1274,11 +1278,11 @@ export default function SessionsPage() {
     };
   }, [search, sessionQueryOptions]);
 
-  const sessionDelete = useConfirmDelete({
+  const sessionDelete = useConfirmDelete<SessionDeleteTarget>({
     onDelete: useCallback(
-      async (id: string) => {
+      async ({ id, profile }: SessionDeleteTarget) => {
         try {
-          await api.deleteSession(id);
+          await api.deleteSession(id, profile);
           setSessions((prev) => prev.filter((s) => s.id !== id));
           setTotal((prev) => prev - 1);
           if (expandedId === id) setExpandedId(null);
@@ -1512,10 +1516,6 @@ export default function SessionsPage() {
     }
   }, [pruneDays, showToast, loadSessions, loadStats]);
 
-  const pendingSession = sessionDelete.pendingId
-    ? sessions.find((s) => s.id === sessionDelete.pendingId)
-    : null;
-
   // Build snippet map from search results (session_id → snippet)
   const snippetMap = new Map<string, string>();
   if (searchResults) {
@@ -1526,6 +1526,9 @@ export default function SessionsPage() {
   }
 
   const filtered = searchResults ?? sessions;
+  const pendingSession = sessionDelete.pendingId
+    ? filtered.find((s) => s.id === sessionDelete.pendingId?.id)
+    : null;
 
   const platformEntries = status
     ? Object.entries(status.gateway_platforms ?? {})
@@ -2085,7 +2088,9 @@ export default function SessionsPage() {
                   onSelectClick={(event) =>
                     handleSelectClick(event, index, filtered)
                   }
-                  onDelete={() => sessionDelete.requestDelete(s.id)}
+                  onDelete={() =>
+                    sessionDelete.requestDelete(sessionDeleteTarget(s))
+                  }
                   onRename={handleRename}
                   onExport={handleExport}
                   resumeInChatEnabled={resumeInChatEnabled}

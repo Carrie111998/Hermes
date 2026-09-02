@@ -1935,6 +1935,8 @@ export interface DiskPressureStatus {
 
 export interface SessionInfo {
   id: string;
+  /** Canonical profile that owns this row's state.db entry. */
+  profile: string;
   source: string | null;
   model: string | null;
   title: string | null;

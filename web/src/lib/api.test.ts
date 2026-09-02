@@ -119,6 +119,20 @@ describe("api.getModelOptions", () => {
   });
 });
 
+describe("api.deleteSession", () => {
+  it("targets the profile that owns the session row", async () => {
+    const fetchMock = jsonFetchMock();
+    vi.stubGlobal("fetch", fetchMock);
+
+    await api.deleteSession("session-1", "worker");
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/sessions/session-1?profile=worker",
+      expect.objectContaining({ method: "DELETE" }),
+    );
+  });
+});
+
 describe("api OAuth helpers", () => {
   it("starts OAuth login in gated mode without requiring an injected session token", async () => {
     vi.stubGlobal("window", { __HERMES_AUTH_REQUIRED__: true });
