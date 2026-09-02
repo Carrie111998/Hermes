@@ -48,12 +48,35 @@ def test_unassigned_ready_skip_is_recorded_as_a_task_event(isolated_kanban_home)
             default_assignee=None,
         )
         events = conn.execute(
-            "SELECT kind FROM task_events WHERE task_id = ? ORDER BY id",
+            "SELECT kind, payload FROM task_events "
+            "WHERE task_id = ? AND kind = 'skipped_unassigned' ORDER BY id",
             (task_id,),
         ).fetchall()
 
     assert result.skipped_unassigned == [task_id]
-    assert "skipped_unassigned" in [event["kind"] for event in events]
+    assert len(events) == 1
+    assert json.loads(events[0]["payload"]) == {"reason": "no_assignee"}
+
+
+def test_unassigned_ready_dry_run_does_not_record_skip_event(isolated_kanban_home):
+    kb, _home = isolated_kanban_home
+    with kb.connect_closing() as conn:
+        kb.create_board(slug="default", name="Test")
+        task_id = kb.create_task(conn, title="needs routing", assignee=None)
+        result = kb.dispatch_once(
+            conn,
+            spawn_fn=_fake_spawn,
+            dry_run=True,
+            default_assignee=None,
+        )
+        events = conn.execute(
+            "SELECT kind FROM task_events "
+            "WHERE task_id = ? AND kind = 'skipped_unassigned'",
+            (task_id,),
+        ).fetchall()
+
+    assert result.skipped_unassigned == [task_id]
+    assert events == []
 
 
 

@@ -10174,7 +10174,7 @@ def _dispatch_once_locked(
                             conn,
                             row["id"],
                             "skipped_unassigned",
-                            {"reason": "no assignee or kanban.default_assignee"},
+                            {"reason": "no_assignee"},
                         )
                 continue
         # Skip ready tasks whose assignee is not a real Hermes profile.
