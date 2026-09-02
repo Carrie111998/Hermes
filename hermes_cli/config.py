@@ -1111,6 +1111,7 @@ ENV_VARS_BY_VERSION: Dict[int, List[str]] = {
     4: ["VOICE_TOOLS_OPENAI_KEY", "ELEVENLABS_API_KEY"],
     5: ["WHATSAPP_ENABLED", "WHATSAPP_MODE", "WHATSAPP_ALLOWED_USERS",
         "SLACK_BOT_TOKEN", "SLACK_APP_TOKEN", "SLACK_ALLOWED_USERS"],
+    10: ["TAVILY_API_KEY"],
     11: ["TERMINAL_MODAL_MODE"],
 }
 
@@ -1456,7 +1457,7 @@ def _is_env_config_key(key: str) -> bool:
         'OPENROUTER_API_KEY', 'OPENAI_API_KEY', 'ANTHROPIC_API_KEY', 'VOICE_TOOLS_OPENAI_KEY',
         'EXA_API_KEY', 'PARALLEL_API_KEY', 'FIRECRAWL_API_KEY', 'FIRECRAWL_API_URL',
         'FIRECRAWL_GATEWAY_URL', 'TOOL_GATEWAY_DOMAIN', 'TOOL_GATEWAY_SCHEME',
-        'TOOL_GATEWAY_USER_TOKEN',
+        'TOOL_GATEWAY_USER_TOKEN', 'TAVILY_API_KEY',
         'BROWSERBASE_API_KEY', 'BROWSERBASE_PROJECT_ID', 'BROWSER_USE_API_KEY',
         'FAL_KEY', 'TELEGRAM_BOT_TOKEN', 'DISCORD_BOT_TOKEN',
         'TERMINAL_SSH_HOST', 'TERMINAL_SSH_USER', 'TERMINAL_SSH_KEY',
@@ -2525,6 +2526,32 @@ def validate_config_structure(config: Optional[Dict[str, Any]] = None) -> List["
                 f"Root-level key '{key}' looks misplaced — should it be under 'model:' or inside a 'custom_providers' entry?",
                 f"Move '{key}' under the appropriate section",
             ))
+
+    # ── web backends that no longer ship in-tree ─────────────────────────
+    # A stale selection (e.g. web.backend: tavily after the #99199 removal)
+    # otherwise fails only at the first web_search/web_extract call, with a
+    # generic "no registered provider" error. Warn at startup instead.
+    web_cfg = config.get("web")
+    if isinstance(web_cfg, dict):
+        try:
+            from tools.tool_backend_helpers import removed_backend_note
+        except Exception:
+            removed_backend_note = None
+        if removed_backend_note is not None:
+            seen: set = set()
+            for _key in ("backend", "search_backend", "extract_backend"):
+                _val = str(web_cfg.get(_key) or "").strip().lower()
+                if not _val or _val in seen:
+                    continue
+                seen.add(_val)
+                note = removed_backend_note("web", _val)
+                if note:
+                    issues.append(ConfigIssue(
+                        "warning",
+                        f"web.{_key} is set to '{_val}', but {note} — "
+                        "web_search/web_extract will fail until it is changed",
+                        "Run 'hermes tools' and pick a different Web Search & Extract provider",
+                    ))
 
     return issues
 
@@ -5064,6 +5091,7 @@ def show_config():
         ("EXA_API_KEY", "Exa"),
         ("PARALLEL_API_KEY", "Parallel"),
         ("FIRECRAWL_API_KEY", "Firecrawl"),
+        ("TAVILY_API_KEY", "Tavily"),
         ("BROWSERBASE_API_KEY", "Browserbase"),
         ("BROWSER_USE_API_KEY", "Browser Use"),
         ("FAL_KEY", "FAL"),
@@ -5813,6 +5841,37 @@ def _coerce_float(value: str):
     return f
 
 
+def _redirect_platform_display_key(key: str) -> tuple[str, Optional[str]]:
+    """Canonicalize ``platforms.<name>.<display_setting>`` → ``display.platforms.<name>.<setting>``.
+
+    Per-platform *display* settings (streaming, show_reasoning, tool_progress,
+    …) are resolved by the gateway from ``display.platforms.<name>.<setting>``
+    (``gateway/display_config.py::resolve_display_setting``), while the
+    top-level ``platforms.<name>`` block holds only connection config (token,
+    enabled, reply_to_mode, extra, …).  Before #71047 a write such as
+    ``hermes config set platforms.telegram.streaming false`` landed on a key
+    the gateway never reads: ``config get`` echoed the new value back while
+    the runtime kept the old ``display.platforms`` one — a silent no-op that
+    looks like a duplicated key to the user.
+
+    Only known display settings (``OVERRIDEABLE_KEYS``) are redirected so real
+    connection keys stay put.  Returns ``(canonical_key, note_or_None)``.
+    The gateway import is guarded: the CLI must keep working where the
+    gateway package is not importable.
+    """
+    segs = _split_key_path(key)
+    if len(segs) != 3 or segs[0] != "platforms":
+        return key, None
+    try:
+        from gateway.display_config import OVERRIDEABLE_KEYS as _display_keys
+    except Exception:
+        return key, None
+    if segs[2] not in _display_keys:
+        return key, None
+    canonical = f"display.platforms.{segs[1]}.{segs[2]}"
+    return canonical, f"  (note: per-platform display setting — saved as {canonical})"
+
+
 def set_config_value(key: str, value: str, force: bool = False):
     """Set a configuration value.
 
@@ -5878,6 +5937,12 @@ def set_config_value(key: str, value: str, force: bool = False):
     # bare success and left the user debugging behavior that never changed.
     # Warn after the write so the user gets immediate feedback plus a
     # "did you mean" hint, without blocking legitimate unknown keys.
+    # Per-platform display settings live under display.platforms (#71047,
+    # Problem A) — canonicalize BEFORE validation/coercion so the type-aware
+    # coercion and the unknown-key hint both see the path the runtime reads.
+    key, _redirect_note = _redirect_platform_display_key(key)
+    if _redirect_note:
+        print(_redirect_note)
     is_known, suggestion = _validate_config_key(key)
 
     # Otherwise it goes to config.yaml
@@ -6093,6 +6158,9 @@ def get_config_value(key: str, *, as_json: bool = False):
         env_value = get_env_value(key.upper())
         value = _MISSING if env_value is None else env_value
     else:
+        # Mirror set_config_value: read the canonical display.platforms path
+        # so ``config get`` reports what the gateway resolves (#71047).
+        key, _ = _redirect_platform_display_key(key)
         value = _get_nested(load_config(), key)
 
     if value is _MISSING:
@@ -6138,6 +6206,10 @@ def unset_config_value(key: str):
     # refuse-write); returns the mapping so we do not re-parse / collapse.
     user_config = require_readable_config_before_write(config_path)
 
+    # Mirror set_config_value's display.platforms canonicalization (#71047).
+    key, _redirect_note = _redirect_platform_display_key(key)
+    if _redirect_note:
+        print(_redirect_note.replace("saved as", "resolved as"))
     removed = _unset_nested(user_config, key)
 
     # Keep .env in sync for keys that terminal_tool reads directly from env vars.

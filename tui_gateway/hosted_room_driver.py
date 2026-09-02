@@ -601,6 +601,7 @@ class HostedRoomRuntime:
 
     def _report_pending_action(
         self,
+        binding: HostedRoomBinding,
         task: Mapping[str, Any],
         *,
         session_id: str,
@@ -613,7 +614,25 @@ class HostedRoomRuntime:
             payload.get("target_member_id") or payload.get("target_profile") or ""
         )
         approval = info.get("pending_approval") or info.get("approval")
-        action = None
+        lease = self._leases.get(task["identity"].room_id)
+        observer_lease_generation = (
+            lease.lease_generation
+            if lease is not None
+            and lease.gateway_id == binding.gateway_id
+            and lease.authority_epoch == binding.authority_epoch
+            and lease.process_generation == self.process_generation
+            else 0
+        )
+        action = {
+            "kind": "approval_clear",
+            "authority_gateway_id": binding.gateway_id,
+            "authority_epoch": binding.authority_epoch,
+            "task_id": task["identity"].task_id,
+            "execution_generation": int(task["execution_generation"]),
+            "session_id": session_id,
+            "observer_generation": self.process_generation,
+            "observer_lease_generation": observer_lease_generation,
+        }
         if isinstance(approval, Mapping):
             safe_approval = dict(approval)
             choices = [
@@ -624,10 +643,14 @@ class HostedRoomRuntime:
             safe_approval["choices"] = choices or ["once", "deny"]
             action = {
                 "kind": "approval",
+                "authority_gateway_id": binding.gateway_id,
+                "authority_epoch": binding.authority_epoch,
                 "task_id": task["identity"].task_id,
                 "execution_generation": int(task["execution_generation"]),
                 "run_id": info.get("run_id"),
                 "session_id": session_id,
+                "observer_generation": self.process_generation,
+                "observer_lease_generation": observer_lease_generation,
                 "request_id": safe_approval.get("request_id"),
                 "approval": safe_approval,
             }
@@ -1101,7 +1124,12 @@ class HostedRoomRuntime:
                 session_id=session_id,
                 source=ROOM_SESSION_SOURCE,
             )
-            self._report_pending_action(task, session_id=session_id, info=info)
+            self._report_pending_action(
+                binding,
+                task,
+                session_id=session_id,
+                info=info,
+            )
             remaining = max(0.0, deadline_monotonic - time.monotonic())
             self._wake.wait(min(self.active_poll_interval_seconds, remaining))
             self._wake.clear()
@@ -1205,7 +1233,7 @@ class HostedRoomRuntime:
                 continue
             transport = self._transport_for(binding, task)
             inspection = (
-                self._inspect_local_recovery_session(task)
+                self._inspect_local_recovery_session(binding, task)
                 if transport is self.rpc
                 else self._inspect_recovery_session(binding, task)
             )
@@ -1251,7 +1279,12 @@ class HostedRoomRuntime:
                 session_id=session_id,
                 source=ROOM_SESSION_SOURCE,
             )
-            self._report_pending_action(task, session_id=session_id, info=info)
+            self._report_pending_action(
+                binding,
+                task,
+                session_id=session_id,
+                info=info,
+            )
             return _RecoveryInspection(
                 terminal=receipt,
                 active=_info_is_active_for(info, task["identity"]),
@@ -1260,6 +1293,7 @@ class HostedRoomRuntime:
 
     def _inspect_local_recovery_session(
         self,
+        binding: HostedRoomBinding,
         task: Mapping[str, Any],
     ) -> _RecoveryInspection:
         """Check only live process state before explicit local recovery.
@@ -1286,7 +1320,12 @@ class HostedRoomRuntime:
                 session_id=session_id,
                 source=ROOM_SESSION_SOURCE,
             )
-            self._report_pending_action(task, session_id=session_id, info=info)
+            self._report_pending_action(
+                binding,
+                task,
+                session_id=session_id,
+                info=info,
+            )
             return _RecoveryInspection(
                 terminal=None,
                 active=_info_is_active_for(info, task["identity"]),
@@ -1318,7 +1357,7 @@ class HostedRoomRuntime:
                 self._transport_for(binding, task) is self.rpc
                 and attempt_key not in self._inspected_indeterminate_attempts
             ):
-                inspection = self._inspect_local_recovery_session(task)
+                inspection = self._inspect_local_recovery_session(binding, task)
                 self._inspected_indeterminate_attempts.add(attempt_key)
                 if inspection.terminal is not None:
                     resolved = state.resolve_indeterminate_task(

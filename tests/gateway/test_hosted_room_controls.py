@@ -88,9 +88,7 @@ def test_home_stores_only_sha256_and_never_exposes_token(tmp_path):
     assert issued.control_token.encode() not in db.read_bytes()
 
 
-def test_home_invitation_replay_recovers_the_same_opaque_token(
-    tmp_path, monkeypatch
-):
+def test_home_invitation_replay_recovers_the_same_opaque_token(tmp_path, monkeypatch):
     db = tmp_path / "state.db"
     _create_room(db)
     monkeypatch.setattr(
@@ -112,9 +110,12 @@ def test_home_invitation_replay_recovers_the_same_opaque_token(
 
     assert replay.control_token == first.control_token
     with sqlite3.connect(db) as conn:
-        assert conn.execute(
-            "SELECT COUNT(*) FROM hosted_room_control_tokens"
-        ).fetchone()[0] == 1
+        assert (
+            conn.execute("SELECT COUNT(*) FROM hosted_room_control_tokens").fetchone()[
+                0
+            ]
+            == 1
+        )
     with pytest.raises(controls.HostedRoomControlConflictError):
         controls.issue_home_control_token(
             db,
@@ -530,6 +531,74 @@ def test_remote_retry_plan_and_result_are_idempotent_and_conflict_safe(tmp_path)
         )
 
 
+def test_completed_control_retries_make_room_at_the_cap(tmp_path, monkeypatch):
+    db = tmp_path / "state.db"
+    monkeypatch.setattr(controls, "MAX_CONTROL_COMMANDS", 2)
+    controls.begin_control_retry(
+        db,
+        command_id="completed",
+        room_id="room-1",
+        member_id="member-1",
+        task_ids=["task-1"],
+        now=1,
+    )
+    controls.complete_control_retry(
+        db,
+        command_id="completed",
+        result={"retried": 1},
+        now=2,
+    )
+    controls.begin_control_retry(
+        db,
+        command_id="pending",
+        room_id="room-1",
+        member_id="member-1",
+        task_ids=["task-2"],
+        now=3,
+    )
+
+    admitted = controls.begin_control_retry(
+        db,
+        command_id="new",
+        room_id="room-1",
+        member_id="member-1",
+        task_ids=["task-3"],
+        now=4,
+    )
+
+    assert admitted.task_ids == ("task-3",)
+    with sqlite3.connect(db) as conn:
+        rows = conn.execute(
+            "SELECT command_id, state FROM hosted_room_control_commands "
+            "ORDER BY command_id"
+        ).fetchall()
+    assert rows == [("new", "pending"), ("pending", "pending")]
+
+
+def test_pending_control_retries_fail_closed_at_the_cap(tmp_path, monkeypatch):
+    db = tmp_path / "state.db"
+    monkeypatch.setattr(controls, "MAX_CONTROL_COMMANDS", 2)
+    for index in range(2):
+        controls.begin_control_retry(
+            db,
+            command_id=f"pending-{index}",
+            room_id="room-1",
+            member_id="member-1",
+            task_ids=[f"task-{index}"],
+            now=index + 1,
+        )
+
+    with pytest.raises(controls.HostedRoomControlError, match="limit reached"):
+        controls.begin_control_retry(
+            db,
+            command_id="pending-3",
+            room_id="room-1",
+            member_id="member-1",
+            task_ids=["task-3"],
+            now=3,
+        )
+
+
 @pytest.mark.parametrize(
     "stored_task_ids",
     ["not-json", '{"task-real":true}', '"task-real"'],
@@ -583,7 +652,9 @@ def test_failed_retry_rotation_does_not_starve_newer_commands(tmp_path):
             now=20 + index,
         )
     first = controls.load_pending_control_retries(db, room_id="room-1", limit=8)
-    assert [item.command_id for item in first] == [f"retry-{index}" for index in range(8)]
+    assert [item.command_id for item in first] == [
+        f"retry-{index}" for index in range(8)
+    ]
     for item in first:
         assert controls.defer_control_retry(
             db,

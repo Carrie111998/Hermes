@@ -13,6 +13,7 @@ export interface DesktopRoomDescriptor {
 
 export interface DesktopRoomCommand {
   action?: string
+  attempts?: number
   command_id?: string
   lease_token?: string
   payload?: Record<string, unknown>
@@ -156,7 +157,7 @@ export async function runDesktopRoomCommandCycle({
         }
 
         const commands = Array.isArray((claimed as { commands?: unknown[] } | null)?.commands)
-          ? ((claimed as { commands: DesktopRoomCommand[] }).commands || [])
+          ? (claimed as { commands: DesktopRoomCommand[] }).commands || []
           : []
 
         remaining -= commands.length

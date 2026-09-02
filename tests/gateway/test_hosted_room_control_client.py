@@ -28,23 +28,17 @@ class ControlHandler(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
     def do_GET(self):
-        type(self).requests.append(
-            ("GET", self.path, dict(self.headers), None)
-        )
+        type(self).requests.append(("GET", self.path, dict(self.headers), None))
         self._reply({"room": {"room_id": "room-1"}, "events": []})
 
     def do_POST(self):
         length = int(self.headers.get("Content-Length", 0))
         body = json.loads(self.rfile.read(length) or b"{}")
-        type(self).requests.append(
-            ("POST", self.path, dict(self.headers), body)
-        )
+        type(self).requests.append(("POST", self.path, dict(self.headers), body))
         self._reply({"action": body["action"], "summary": {"events": []}})
 
     def do_DELETE(self):
-        type(self).requests.append(
-            ("DELETE", self.path, dict(self.headers), None)
-        )
+        type(self).requests.append(("DELETE", self.path, dict(self.headers), None))
         self._reply({"revoked": 1})
 
     def log_message(self, *_args):
@@ -86,12 +80,15 @@ def test_summary_and_mutation_keep_the_token_in_headers(control_server):
     client = RoomControlHTTPClient(_link(control_server))
 
     assert client.summary()["room"]["room_id"] == "room-1"
-    assert client.mutate(
-        action="send",
-        command_id="command-1",
-        text="hello",
-        actor_display_name="Signal",
-    )["action"] == "send"
+    assert (
+        client.mutate(
+            action="send",
+            command_id="command-1",
+            text="hello",
+            actor_display_name="Signal",
+        )["action"]
+        == "send"
+    )
     client.revoke()
 
     assert [request[0] for request in ControlHandler.requests] == [
@@ -128,9 +125,7 @@ def test_control_client_refuses_cross_origin_redirects():
         thread.join(timeout=5)
 
 
-def test_stored_peer_revoke_contacts_home_before_erasing_bearer(
-    tmp_path, monkeypatch
-):
+def test_stored_peer_revoke_contacts_home_before_erasing_bearer(tmp_path, monkeypatch):
     db = tmp_path / "state.db"
     saved = hosted_room_controls.save_peer_control_link(
         db,
@@ -152,10 +147,13 @@ def test_stored_peer_revoke_contacts_home_before_erasing_bearer(
         lambda self: revoked.append(self.link.room_id),
     )
 
-    assert revoke_stored_peer_control(
-        db, room_id="room-1", member_id="member-peer"
-    ) == 1
+    assert (
+        revoke_stored_peer_control(db, room_id="room-1", member_id="member-peer") == 1
+    )
     assert revoked == [saved.link.room_id]
-    assert hosted_room_controls.load_peer_control_links(
-        db, include_inactive=True, now=30
-    ).links == ()
+    assert (
+        hosted_room_controls.load_peer_control_links(
+            db, include_inactive=True, now=30
+        ).links
+        == ()
+    )

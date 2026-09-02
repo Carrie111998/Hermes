@@ -22,6 +22,7 @@ from typing import Any, Iterator
 MAX_ROOM_IDS = 128
 MAX_QUERY_ROOM_IDS = 4096
 MAX_COMMANDS_PER_CLAIM = 8
+MAX_AUTOMATIC_SEND_CLAIMS = 2
 MAX_PAYLOAD_BYTES = 64 * 1024
 # Desktop refreshes classic-room presence on a 60s retained-socket backstop;
 # push events handle command latency. Keep enough overlap for scheduler jitter
@@ -210,9 +211,7 @@ def _initialize(conn: sqlite3.Connection) -> None:
         row[1] for row in conn.execute("PRAGMA table_info(desktop_room_authorities)")
     }
     if "consumer_id" not in authority_columns:
-        conn.execute(
-            "ALTER TABLE desktop_room_authorities ADD COLUMN consumer_id TEXT"
-        )
+        conn.execute("ALTER TABLE desktop_room_authorities ADD COLUMN consumer_id TEXT")
 
 
 def _schema_is_current(conn: sqlite3.Connection) -> bool:
@@ -222,9 +221,7 @@ def _schema_is_current(conn: sqlite3.Connection) -> bool:
     presence = {
         row[1] for row in conn.execute("PRAGMA table_info(desktop_room_presence)")
     }
-    owners = {
-        row[1] for row in conn.execute("PRAGMA table_info(desktop_room_owners)")
-    }
+    owners = {row[1] for row in conn.execute("PRAGMA table_info(desktop_room_owners)")}
     authorities = {
         row[1] for row in conn.execute("PRAGMA table_info(desktop_room_authorities)")
     }
@@ -332,12 +329,10 @@ def _expire_stale_state(
     conn.execute("DELETE FROM desktop_room_presence WHERE expires_at <= ?", (now,))
     conn.execute("DELETE FROM desktop_room_owners WHERE expires_at <= ?", (now,))
     cutoff = now - max(1.0, float(pending_ttl))
-    expired_result = _payload_json(
-        {
-            "code": "command_expired",
-            "message": "This Group Chat command expired before Desktop could apply it.",
-        }
-    )
+    expired_result = _payload_json({
+        "code": "command_expired",
+        "message": "This Group Chat command expired before Desktop could apply it.",
+    })
     conn.execute(
         """UPDATE desktop_room_commands
            SET state = 'failed', result_json = ?, lease_owner = NULL,
@@ -352,6 +347,21 @@ def _expire_stale_state(
            WHERE state = 'claimed' AND created_at <= ?
              AND COALESCE(lease_expires_at, 0) <= ?""",
         (expired_result, now, cutoff, now),
+    )
+    exhausted_result = _payload_json({
+        "code": "automatic_attempts_exhausted",
+        "message": "This Group Chat command needs an explicit Retry.",
+    })
+    conn.execute(
+        """UPDATE desktop_room_commands
+           SET state='failed', result_json=?, lease_owner=NULL,
+               lease_token=NULL, lease_expires_at=NULL, updated_at=?
+           WHERE action='send' AND attempts>=?
+             AND (
+                 state='pending'
+                 OR (state='claimed' AND COALESCE(lease_expires_at, 0)<=?)
+             )""",
+        (exhausted_result, now, MAX_AUTOMATIC_SEND_CLAIMS, now),
     )
     conn.execute(
         """DELETE FROM desktop_room_commands
@@ -377,7 +387,10 @@ def _owned_rooms(
                FROM desktop_room_authorities WHERE room_id = ?""",
             (room_id,),
         ).fetchone()
-        if authority is None or str(authority["authority_hash"] or "") != authority_hash:
+        if (
+            authority is None
+            or str(authority["authority_hash"] or "") != authority_hash
+        ):
             continue
         bound_consumer = str(authority["consumer_id"] or "")
         if bound_consumer and bound_consumer != consumer_id:
@@ -435,10 +448,7 @@ def _owned_rooms(
                ) VALUES (?, ?, ?)
                ON CONFLICT(consumer_id, room_id) DO UPDATE
                SET expires_at = excluded.expires_at""",
-            (
-                (consumer_id, room_id, now + float(presence_ttl))
-                for room_id in owned
-            ),
+            ((consumer_id, room_id, now + float(presence_ttl)) for room_id in owned),
         )
     return owned
 
@@ -532,12 +542,10 @@ def enqueue_command(
             result = _command(existing, idempotent=True)
         else:
             if action == "stop":
-                superseded_result = _payload_json(
-                    {
-                        "code": "superseded_by_stop",
-                        "message": "Canceled before Desktop started it.",
-                    }
-                )
+                superseded_result = _payload_json({
+                    "code": "superseded_by_stop",
+                    "message": "Canceled before Desktop started it.",
+                })
                 conn.execute(
                     """UPDATE desktop_room_commands
                        SET state = 'failed', result_json = ?, lease_owner = NULL,
@@ -680,7 +688,9 @@ def claim_commands(
                             if target["result_json"]
                             else {}
                         )
-                        if isinstance(target_result, dict) and target_result.get("code"):
+                        if isinstance(target_result, dict) and target_result.get(
+                            "code"
+                        ):
                             command["target_result_code"] = str(target_result["code"])
             claimed.append(command)
         return claimed
@@ -872,7 +882,8 @@ def retry_failed_command(
             raise DesktopRoomMailboxError("that Group Chat command is not retryable")
         conn.execute(
             """UPDATE desktop_room_commands
-                  SET state='pending', lease_token=NULL, lease_owner=NULL,
+                  SET state='pending', attempts=0,
+                      lease_token=NULL, lease_owner=NULL,
                       lease_expires_at=NULL, result_json=NULL,
                       created_at=?, updated_at=?
                 WHERE command_id=? AND state='failed'""",
@@ -947,7 +958,8 @@ def retry_failed_commands(
                 continue
             conn.execute(
                 """UPDATE desktop_room_commands
-                      SET state='pending', lease_token=NULL, lease_owner=NULL,
+                      SET state='pending', attempts=0,
+                          lease_token=NULL, lease_owner=NULL,
                           lease_expires_at=NULL, result_json=NULL,
                           created_at=?, updated_at=?
                     WHERE command_id=? AND state='failed'""",
@@ -1016,9 +1028,7 @@ def failed_command_counts(
                       GROUP BY room_id""",
                 tuple(batch),
             ).fetchall()
-            counts.update(
-                {str(row["room_id"]): int(row["count"]) for row in rows}
-            )
+            counts.update({str(row["room_id"]): int(row["count"]) for row in rows})
     return counts
 
 
