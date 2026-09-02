@@ -34,6 +34,7 @@ from agent.secret_scope import UnscopedSecretError as _UnscopedSecretError
 from agent.secret_scope import get_secret as _scoped_get_secret
 import ssl
 import uuid
+from collections import OrderedDict
 from email.header import decode_header
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
@@ -660,7 +661,7 @@ class EmailAdapter(BasePlatformAdapter):
         # Map chat_id (sender email) -> last subject + message-id for threading.
         # Persisted to disk (state/email_thread_context_<addr>.json) so replies
         # keep their thread's subject/Message-ID across gateway restarts.
-        self._thread_context: Dict[str, Dict[str, Any]] = {}
+        self._thread_context: OrderedDict[str, Dict[str, Any]] = OrderedDict()
 
         # Session lifecycle knobs (config.yaml platforms.email.*):
         #   max_messages_per_session: 0 disables auto-rotation (default 1000 —
@@ -736,22 +737,42 @@ class EmailAdapter(BasePlatformAdapter):
     # JSON file on every mutation and reload on adapter construction.
     _thread_context_max_entries: int = 500
 
-    def _load_thread_context(self) -> Dict[str, Dict[str, Any]]:
+    def _load_thread_context(self) -> OrderedDict[str, Dict[str, Any]]:
         """Load persisted thread context (subject/message_id per chat key)."""
         if not self._thread_context_path or not self._thread_context_path.exists():
-            return {}
+            return OrderedDict()
         try:
             raw = json.loads(self._thread_context_path.read_text("utf-8"))
             if not isinstance(raw, dict):
-                return {}
-            return {
-                str(k): dict(v)
+                return OrderedDict()
+            entries = OrderedDict(
+                (str(k), dict(v))
                 for k, v in raw.items()
                 if isinstance(v, dict) and isinstance(v.get("subject"), str)
-            }
+            )
+            while len(entries) > self._thread_context_max_entries:
+                entries.popitem(last=False)
+            return entries
         except Exception as e:  # corrupt/partial file — start fresh
             logger.warning("[Email] Thread-context load failed (%s); starting fresh", e)
-            return {}
+            return OrderedDict()
+
+    def _get_thread_context(self, key: str) -> Optional[Dict[str, Any]]:
+        """Retrieve thread context by key, refreshing LRU position."""
+        ctx = self._thread_context.get(key)
+        if ctx is not None:
+            if isinstance(self._thread_context, OrderedDict):
+                self._thread_context.move_to_end(key)
+            return ctx
+        return None
+
+    def _set_thread_context(self, key: str, entry: Dict[str, Any]) -> None:
+        """Store thread context by key, refreshing LRU order and trimming live bounds."""
+        self._thread_context[key] = entry
+        if isinstance(self._thread_context, OrderedDict):
+            self._thread_context.move_to_end(key)
+            while len(self._thread_context) > self._thread_context_max_entries:
+                self._thread_context.popitem(last=False)
 
     def _save_thread_context(self) -> None:
         """Persist the thread-context map atomically (tmp + rename)."""
@@ -759,10 +780,11 @@ class EmailAdapter(BasePlatformAdapter):
             return
         try:
             self._thread_context_path.parent.mkdir(parents=True, exist_ok=True)
+            if isinstance(self._thread_context, OrderedDict):
+                while len(self._thread_context) > self._thread_context_max_entries:
+                    self._thread_context.popitem(last=False)
             data = dict(self._thread_context)
             if len(data) > self._thread_context_max_entries:
-                # Keep the most recent entries (dict preserves insertion order
-                # — re-inserted keys move to the end, so drop the head).
                 data = dict(list(data.items())[-self._thread_context_max_entries:])
             tmp = self._thread_context_path.with_suffix(".json.tmp")
             tmp.write_text(json.dumps(data), "utf-8")
@@ -1315,10 +1337,10 @@ class EmailAdapter(BasePlatformAdapter):
             "epoch": _epoch,
             "msg_count": _msg_count,
         }
-        self._thread_context[_ctx_key] = _ctx_entry
-        self._thread_context[_base_key] = dict(_ctx_entry)
-        self._thread_context[sender_addr] = dict(_ctx_entry)
-        self._save_thread_context()
+        self._set_thread_context(_ctx_key, _ctx_entry)
+        self._set_thread_context(_base_key, dict(_ctx_entry))
+        self._set_thread_context(sender_addr, dict(_ctx_entry))
+        await asyncio.to_thread(self._save_thread_context)
 
         # A bare "/new" body resets the thread without running the agent —
         # send a short confirmation and skip dispatch (saves tokens; the
@@ -1334,6 +1356,8 @@ class EmailAdapter(BasePlatformAdapter):
                     "✅ New session started for this thread. "
                     "Send your next email to begin."
                 ),
+                reply_to=msg_data.get("message_id"),
+                metadata={"thread_id": _thread_id} if _thread_id else None,
             )
             return
 
@@ -1414,9 +1438,9 @@ class EmailAdapter(BasePlatformAdapter):
         # subject, or Gmail threads the report into that conversation.
         ctx = {}
         if thread_id:
-            ctx = self._thread_context.get(f"{recipient}:{thread_id}", {}) or {}
+            ctx = self._get_thread_context(f"{recipient}:{thread_id}") or {}
         if not ctx and reply_to_msg_id:
-            ctx = self._thread_context.get(to_addr) or self._thread_context.get(recipient, {})
+            ctx = self._get_thread_context(to_addr) or self._get_thread_context(recipient) or {}
         if explicit_subject:
             # Outbound-only send (cron/standalone): verbatim subject, fresh
             # conversation — no Re: prefix, no thread-context threading headers.
@@ -1481,14 +1505,10 @@ class EmailAdapter(BasePlatformAdapter):
         reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
-        """Send an image URL as part of an email body.
-
-        ``metadata`` is accepted to honor the base-class contract; the
-        email body send doesn't use it.
-        """
+        """Send an image URL as part of an email body."""
         text = caption or ""
         text += f"\n\nImage: {image_url}"
-        return await self.send(chat_id, text.strip(), reply_to)
+        return await self.send(chat_id, text.strip(), reply_to=reply_to, metadata=metadata)
 
     async def send_multiple_images(
         self,
@@ -1568,7 +1588,7 @@ class EmailAdapter(BasePlatformAdapter):
         # conversation instead of inheriting the sender's last subject.
         ctx = {}
         if thread_id:
-            ctx = self._thread_context.get(f"{recipient}:{thread_id}", {}) or {}
+            ctx = self._get_thread_context(f"{recipient}:{thread_id}") or {}
         if explicit_subject:
             msg["Subject"] = explicit_subject
             original_msg_id = None
@@ -1667,7 +1687,7 @@ class EmailAdapter(BasePlatformAdapter):
         # conversation instead of inheriting the sender's last subject.
         ctx = {}
         if thread_id:
-            ctx = self._thread_context.get(f"{recipient}:{thread_id}", {}) or {}
+            ctx = self._get_thread_context(f"{recipient}:{thread_id}") or {}
         if explicit_subject:
             msg["Subject"] = explicit_subject
             original_msg_id = None
@@ -1713,7 +1733,7 @@ class EmailAdapter(BasePlatformAdapter):
 
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
         """Return basic info about the email chat."""
-        ctx = self._thread_context.get(chat_id, {})
+        ctx = self._get_thread_context(chat_id) or {}
         return {
             "name": chat_id,
             "type": "dm",
