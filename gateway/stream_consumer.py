@@ -2114,8 +2114,33 @@ class GatewayStreamConsumer:
         return self._clean_for_display(prefix)
 
     def _continuation_text(self, final_text: str) -> str:
-        """Return only the part of final_text the user has not already seen."""
+        """Return only the part of final_text the user has not already seen.
+
+        A visible prefix that ends with the streaming cursor is not reliable
+        delivered content: the cursor glyph is a synthetic tail that is not
+        part of ``final_text``, and a stuck cursor (left by a failed final
+        edit) means the user saw ``...pass`` while ``final_text`` is
+        ``...pass.``.  Computing a tail from that prefix would post a lone
+        ``.`` as a fresh message while the frozen ``...pass`` (with its
+        visible ``▉``) stays on screen — the duplicate/truncated-symptom.
+        When the prefix ends with the cursor, return the full ``final_text``
+        so the caller's fallback re-sends the complete answer and cleans up
+        the stale partial (its full-resend delete path).
+        """
         prefix = self._fallback_prefix or self._visible_prefix()
+        # The stuck cursor is only visible in the RAW last-sent text enough
+        # to matter; _visible_prefix() already stripped the glyph, so check
+        # the raw text directly.
+        if (
+            self.cfg.cursor
+            and self._last_sent_text
+            and self._last_sent_text.endswith(self.cfg.cursor)
+            and final_text != self._clean_for_display(
+                self._last_sent_text[: -len(self.cfg.cursor)]
+            ).strip()
+        ):
+            # Cursor-stuck prefix: not trustworthy content — resend all.
+            return final_text
         if prefix and final_text.startswith(prefix):
             return final_text[len(prefix):].lstrip()
         return final_text

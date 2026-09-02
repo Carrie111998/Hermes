@@ -516,6 +516,47 @@ class TestSegmentBreakOnToolBoundary:
         assert consumer._final_response_sent is True
 
     @pytest.mark.asyncio
+    async def test_fallback_final_full_resend_on_stuck_cursor_partial(self):
+        """A frozen partial left with a stuck streaming cursor (failed final
+        edit) must not produce a partial + lone tail: the cursor is not real
+        content, so the fallback re-sends the COMPLETE final and deletes the
+        stale partial — the user sees one coherent answer instead of a
+        truncated head + stray tail (the duplicate/truncated-symptom)."""
+        adapter = MagicMock()
+        adapter.send = AsyncMock(
+            return_value=SimpleNamespace(success=True, message_id="msg_new"),
+        )
+        adapter.edit_message = AsyncMock(
+            return_value=SimpleNamespace(success=True),
+        )
+        adapter.delete_message = AsyncMock(return_value=None)
+        adapter.MAX_MESSAGE_LENGTH = 4096
+
+        config = StreamConsumerConfig(
+            edit_interval=0.01, buffer_threshold=5, cursor=" \u2589",
+        )
+        consumer = GatewayStreamConsumer(adapter, "chat_123", config)
+
+        # Visible partial froze with a stuck cursor ("...scoring pass ▉") —
+        # the exact failed-final-edit scenario.  final_text adds the period.
+        consumer._message_id = "msg_partial"
+        consumer._last_sent_text = "Live ... scoring pass \u2589"
+
+        await consumer._send_fallback_final("Live ... scoring pass.")
+
+        # The COMPLETE final was re-sent as a fresh message...
+        sent_contents = [
+            c.kwargs.get("content", "") for c in adapter.send.call_args_list
+        ]
+        assert "Live ... scoring pass." in sent_contents
+        assert not any(
+            s.strip() == "." and "Live" not in s for s in sent_contents
+        ), "must not post a lone tail while the frozen partial stays"
+        # ...and the stale partial was deleted.
+        adapter.delete_message.assert_awaited_once_with("chat_123", "msg_partial")
+        assert consumer._final_response_sent is True
+
+    @pytest.mark.asyncio
     async def test_fallback_final_keeps_partial_after_tail_only_send(self):
         """When the fallback sends only the missing TAIL (visible prefix
         matches the final text), the partial message IS the head of the
