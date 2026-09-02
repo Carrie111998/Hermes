@@ -717,6 +717,7 @@ from cron.jobs import (
     claim_job_for_fire,
     fire_claim_fence,
     clear_run_claim,
+    FireFenceUnavailableError,
     get_due_jobs,
     heartbeat_fire_claim,
     heartbeat_run_claim,
@@ -6986,6 +6987,25 @@ def _run_with_fire_claim_heartbeat(job: dict, run) -> bool:
 
     try:
         owns_fire_claim = heartbeat_fire_claim(job_id, expected_owner=owner)
+    except FireFenceUnavailableError:
+        # A contended fence proves nothing at entry: every takeover path
+        # serializes through the fence itself, so whoever holds it may be
+        # THIS job's own bookkeeping (or a sibling worker's). Previously an
+        # `is False` check here skipped the run only on an explicit loss,
+        # silently running when the probe could not decide; failing closed
+        # on undecided entry is the honest posture — the run is skipped
+        # without discarding anything, and the claim expires or the next
+        # tick re-fires (t_0ce0b31e).
+        logger.warning(
+            "Job '%s': fire fence contended before execution; skipping this "
+            "fire because ownership could not be validated",
+            job_id,
+        )
+        _finish_unstarted(
+            "Fire fence unavailable; ownership could not be validated "
+            "before execution started."
+        )
+        return True
     except Exception:
         logger.warning(
             "Job '%s': initial fire_claim validation failed",
@@ -7164,6 +7184,11 @@ def _run_one_job_body(
             if heartbeat_fire_claim(job["id"], expected_owner=fire_owner):
                 return False
         except Exception:
+            # Store I/O failure: ownership cannot be confirmed but nothing
+            # proves it was lost. Fencing that undecided probe into an
+            # interruption would demote healthy runs on transient jobs.json
+            # errors (t_0ce0b31e); let the caller's later terminal write
+            # (mark_job_run with expected_fire_owner) arbitrate instead.
             logger.debug(
                 "Job '%s': fire_claim ownership validation failed",
                 job["id"],
@@ -7267,10 +7292,26 @@ def _run_one_job_body(
             # latter case WE still own the claim, and silently discarding
             # would leave fire_claim lingering until TTL and last_status
             # stale. Probe ownership once; if still ours, record the
-            # interruption through the owner-fenced terminal write.
-            if fire_owner is not None and heartbeat_fire_claim(
-                job["id"], expected_owner=fire_owner,
-            ):
+            # interruption through the owner-fenced terminal write. An
+            # UNDECIDABLE probe (FireFenceUnavailableError) is not a loss:
+            # discarding a delivered result on fence contention would repeat
+            # the t_0ce0b31e demotion, so treat it as still-owned and record
+            # through the fenced terminal write.
+            probe_verdict = None
+            if fire_owner is not None:
+                try:
+                    probe_verdict = heartbeat_fire_claim(
+                        job["id"], expected_owner=fire_owner,
+                    )
+                except FireFenceUnavailableError:
+                    logger.warning(
+                        "Job '%s': fire fence contended during ownership "
+                        "probe; treating claim as still owned and recording "
+                        "the interruption through the fenced terminal write",
+                        job["id"],
+                    )
+                    probe_verdict = True
+            if probe_verdict:
                 mark_job_run(
                     job["id"],
                     False,
@@ -7298,6 +7339,8 @@ def _run_one_job_body(
         # swallow the error and leak the agent's subprocesses/clients (#10200).
         blocked_config = False
         side_effect_ownership_lost = False
+        should_deliver = False
+        unresolved_origin = False
         try:
             with _side_effect_fence() as owns_output:
                 if not owns_output:
@@ -7453,10 +7496,21 @@ def _run_one_job_body(
         if side_effect_ownership_lost or _fire_claim_ownership_lost():
             # Same transport-cancel distinction as the pre-side-effect path:
             # if WE still own the claim, record the interruption instead of
-            # discarding silently (lingering claim + stale last_status).
-            if fire_owner is not None and heartbeat_fire_claim(
-                job["id"], expected_owner=fire_owner,
-            ):
+            # silently discarding (lingering claim + stale last_status).
+            # An UNDECIDABLE probe (fence contention, store I/O error) must
+            # not demote a delivered, successful run: fall through to the
+            # normal fenced bookkeeping below, whose terminal write either
+            # confirms ownership and records the run honestly or rejects a
+            # genuinely stale owner (t_0ce0b31e).
+            ownership_verdict = None
+            if fire_owner is not None:
+                try:
+                    ownership_verdict = heartbeat_fire_claim(
+                        job["id"], expected_owner=fire_owner,
+                    )
+                except FireFenceUnavailableError:
+                    ownership_verdict = None
+            if ownership_verdict is True:
                 mark_job_run(
                     job["id"],
                     False,
@@ -7468,12 +7522,19 @@ def _run_one_job_body(
                     success=False,
                     error="Interrupted by shutdown before terminal completion.",
                 )
-            else:
+            elif ownership_verdict is False:
                 finish_execution(
                     execution_id,
                     success=False,
                     error="Fire claim ownership lost; stale result was discarded.",
                 )
+            else:
+                # Undecided: record the honest outcome through the fenced
+                # terminal write below instead of a synthetic interruption.
+                pass
+        else:
+            ownership_verdict = True
+        if ownership_verdict is False:
             return True
 
         # Treat empty final_response as a soft failure so last_status
