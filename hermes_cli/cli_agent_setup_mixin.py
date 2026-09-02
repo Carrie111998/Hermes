@@ -103,6 +103,14 @@ class CLIAgentSetupMixin:
                         _cprint(f"⚠️  Primary auth failed — switching to fallback: {_fb_provider} / {_fb_model}")
                         self.requested_provider = _fb_provider
                         self.model = _fb_model
+                        # Carry the resolved credentials forward so a later
+                        # re-resolution (e.g. _init_agent's own call to this
+                        # method) re-derives the same runtime instead of
+                        # resolving requested_provider from scratch with no
+                        # explicit key/base_url, which fails for a bare
+                        # `provider: custom` fallback entry (#92732).
+                        self._explicit_api_key = _fb_kwargs.get("explicit_api_key")
+                        self._explicit_base_url = _fb_kwargs.get("explicit_base_url")
                         _primary_exc = None
                         break
                     except Exception:
