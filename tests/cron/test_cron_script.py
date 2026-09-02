@@ -70,6 +70,87 @@ class TestJobScriptField:
         updated = update_job(job["id"], {"script": "/new/script.py"})
         assert updated["script"] == "/new/script.py"
 
+    def test_script_delivery_source_is_explicit_and_validated(self, cron_env):
+        from cron.jobs import create_job
+
+        default_job = create_job(prompt="Analyze", schedule="every 1h")
+        assert "delivery_source" not in default_job
+
+        job = create_job(
+            prompt="Analyze",
+            schedule="every 1h",
+            delivery_source="script",
+            delivery_script="report.py",
+        )
+        assert job["delivery_source"] == "script"
+        assert job["delivery_script"] == "report.py"
+
+        with pytest.raises(ValueError, match="requires a post-run delivery script"):
+            create_job(
+                prompt="Analyze",
+                schedule="every 1h",
+                delivery_source="script",
+            )
+
+        with pytest.raises(ValueError, match="cannot be combined with no_agent"):
+            create_job(
+                prompt="Analyze",
+                schedule="every 1h",
+                script="report.py",
+                delivery_script="report.py",
+                no_agent=True,
+                delivery_source="script",
+            )
+
+    def test_update_revalidates_script_delivery_source(self, cron_env):
+        from cron.jobs import create_job, get_job, update_job
+
+        job = create_job(
+            prompt="Analyze",
+            schedule="every 1h",
+            delivery_source="script",
+            delivery_script="report.py",
+        )
+
+        with pytest.raises(ValueError, match="requires a post-run delivery script"):
+            update_job(job["id"], {"delivery_script": None})
+        assert get_job(job["id"])["delivery_script"] == "report.py"
+
+        updated = update_job(job["id"], {"delivery_source": "agent"})
+        assert updated.get("delivery_source") is None
+
+    def test_update_rescans_dormant_delivery_script_when_activated(self, cron_env):
+        from cron.jobs import create_job, get_job, update_job
+        from cron.lifecycle_guard import GatewayLifecycleBlocked
+
+        script = cron_env / "scripts" / "report.py"
+        script.write_text("print('safe report')\n", encoding="utf-8")
+        job = create_job(
+            prompt="Analyze",
+            schedule="every 1h",
+            delivery_script="report.py",
+        )
+        script.write_text(
+            "import os\nos.system('hermes gateway restart')\n",
+            encoding="utf-8",
+        )
+
+        with pytest.raises(GatewayLifecycleBlocked):
+            update_job(job["id"], {"delivery_source": "script"})
+
+        assert get_job(job["id"]).get("delivery_source") is None
+
+    def test_invalid_delivery_source_is_rejected(self, cron_env):
+        from cron.jobs import create_job
+
+        with pytest.raises(ValueError, match="must be one of: agent, script"):
+            create_job(
+                prompt="Analyze",
+                schedule="every 1h",
+                delivery_script="report.py",
+                delivery_source="model",
+            )
+
 
 def test_cronjob_tool_rejects_stale_past_one_shot(cron_env, monkeypatch):
     from tools.cronjob_tools import cronjob
@@ -106,6 +187,91 @@ class TestRunJobScript:
         success, output = _run_job_script("relative.py")
         assert success is True
         assert output == "relative works"
+
+    def test_expected_delivery_script_sha_rejects_last_moment_replacement(
+        self, cron_env
+    ):
+        import hashlib
+
+        from cron.scheduler import _run_job_script
+
+        script = cron_env / "scripts" / "report.py"
+        original = b"print('operator report')\n"
+        script.write_bytes(original)
+        expected_sha256 = hashlib.sha256(original).hexdigest()
+        script.write_text("print('replacement report')\n", encoding="utf-8")
+
+        success, output = _run_job_script(
+            str(script),
+            preserve_stdout=True,
+            expected_sha256=expected_sha256,
+        )
+
+        assert success is False
+        assert "changed before execution" in output
+        assert "replacement report" not in output
+
+    def test_delivery_snapshot_lifecycle_scan_uses_exact_bytes(self, cron_env):
+        from cron.lifecycle_guard import (
+            GatewayLifecycleBlocked,
+            check_gateway_lifecycle_bytes,
+        )
+
+        with pytest.raises(GatewayLifecycleBlocked):
+            check_gateway_lifecycle_bytes(
+                "Analyze",
+                b"import os\nos.system('hermes gateway restart')\n",
+                script_suffix=".py",
+                script_dir=str(cron_env / "scripts"),
+            )
+
+        check_gateway_lifecycle_bytes(
+            "Analyze",
+            b"print('safe report')\n",
+            script_suffix=".py",
+            script_dir=str(cron_env / "scripts"),
+        )
+
+    @pytest.mark.parametrize("invalid_source", ["Script", "script ", "model"])
+    def test_noncanonical_runtime_delivery_source_fails_closed(
+        self, cron_env, invalid_source
+    ):
+        import cron.scheduler as scheduler
+
+        success, _doc, final, error = scheduler.run_job(
+            {
+                "id": "invalid-source",
+                "name": "invalid-source",
+                "prompt": "Analyze",
+                "delivery_script": "report.py",
+                "delivery_source": invalid_source,
+            }
+        )
+
+        assert success is False
+        assert final == ""
+        assert "Invalid delivery_source" in error
+        assert "Refusing agent-response fallback" in error
+
+    @pytest.mark.parametrize(
+        "detail",
+        [
+            "Script timed out after 60s: report.py",
+            "HTTP 429: rate limit exceeded",
+            "authentication failed",
+        ],
+    )
+    def test_delivery_script_failure_summary_names_script_not_provider(self, detail):
+        from cron.scheduler import _summarize_cron_failure_for_delivery
+
+        summary = _summarize_cron_failure_for_delivery(
+            {"id": "delivery-timeout", "name": "research"},
+            f"Post-run delivery script failed: {detail}",
+        )
+
+        assert "post-run delivery script failed" in summary
+        assert "agent response was not delivered" in summary
+        assert "provider" not in summary.lower()
 
 
     def test_script_subprocess_env_sanitized(self, cron_env, monkeypatch):

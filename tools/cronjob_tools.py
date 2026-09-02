@@ -429,6 +429,13 @@ def _mode_guidance_notes(job: Dict[str, Any], user_deliver: Optional[str]) -> Li
             "there is nothing to report). Non-zero exit or timeout sends an "
             "error alert. prompt/skills are ignored."
         )
+    if job.get("delivery_source") == "script":
+        notes.append(
+            "Script delivery source: the agent still runs and its transcript "
+            "is saved, then the operator-owned delivery script runs exactly "
+            "once. Its stdout is authoritative; failure never falls back to "
+            "agent text."
+        )
     _deliver = (user_deliver or "").strip().lower()
     if _deliver:
         if "all" in _deliver.split(","):
@@ -779,6 +786,10 @@ def _format_job(job: Dict[str, Any]) -> Dict[str, Any]:
     }
     if job.get("script"):
         result["script"] = job["script"]
+    if job.get("delivery_source"):
+        result["delivery_source"] = job["delivery_source"]
+    if job.get("delivery_script"):
+        result["delivery_script"] = job["delivery_script"]
     if job.get("reasoning_effort"):
         result["reasoning_effort"] = job["reasoning_effort"]
     if job.get("monitor_script"):
@@ -1353,10 +1364,17 @@ def _try_dispatch_background_run(
         ]
         if refreshed.get("next_run_at"):
             lines.append(f"Next scheduled run: {refreshed['next_run_at']}")
-        excerpt = _latest_job_output_excerpt(job_id)
-        if excerpt:
-            lines.append("--- JOB OUTPUT ---")
-            lines.append(excerpt)
+        if job.get("delivery_source") == "script":
+            lines.append(
+                "Job output excerpt omitted: this operator-owned job delivers "
+                "only its script output; the full agent transcript remains in "
+                "cron storage."
+            )
+        else:
+            excerpt = _latest_job_output_excerpt(job_id)
+            if excerpt:
+                lines.append("--- JOB OUTPUT ---")
+                lines.append(excerpt)
         return {
             "status": "completed" if res.get("success") else "error",
             "summary": "\n".join(lines),
@@ -1484,6 +1502,8 @@ def cronjob(
     reasoning_effort: Optional[str] = None,
     task_id: str = None,
     session_id: Optional[str] = None,
+    delivery_source: Optional[str] = None,
+    delivery_script: Optional[str] = None,
 ) -> str:
     """Unified cron job management tool."""
     del task_id  # unused but kept for handler signature compatibility
@@ -1524,6 +1544,10 @@ def cronjob(
                 script_error = _validate_cron_script_path(script)
                 if script_error:
                     return tool_error(script_error, success=False)
+            if delivery_script:
+                delivery_script_error = _validate_cron_script_path(delivery_script)
+                if delivery_script_error:
+                    return tool_error(delivery_script_error, success=False)
 
             # Validate monitor source (same containment rules as script).
             if monitor_script:
@@ -1585,6 +1609,8 @@ def cronjob(
                     provider=_normalize_optional_job_value(provider),
                     base_url=_normalize_optional_job_value(base_url, strip_trailing_slash=True),
                     script=_normalize_optional_job_value(script),
+                    delivery_source=delivery_source,
+                    delivery_script=_normalize_optional_job_value(delivery_script),
                     context_from=context_from,
                     enabled_toolsets=enabled_toolsets or None,
                     workdir=_normalize_optional_job_value(workdir),
@@ -1840,6 +1866,18 @@ def cronjob(
                     if script_error:
                         return tool_error(script_error, success=False)
                 updates["script"] = _normalize_optional_job_value(script) if script else None
+            if delivery_source is not None:
+                updates["delivery_source"] = delivery_source
+            if delivery_script is not None:
+                if delivery_script:
+                    delivery_script_error = _validate_cron_script_path(delivery_script)
+                    if delivery_script_error:
+                        return tool_error(delivery_script_error, success=False)
+                updates["delivery_script"] = (
+                    _normalize_optional_job_value(delivery_script)
+                    if delivery_script
+                    else None
+                )
             if monitor_script is not None:
                 # Pass empty string to clear an existing monitor_script
                 if monitor_script:
@@ -1956,7 +1994,7 @@ CRONJOB_SCHEMA = {
     "name": "cronjob",
     "description": """Manage scheduled cron jobs: action='create' schedules a job from a prompt and/or skills; 'list' inspects jobs; 'update'/'pause'/'resume'/'remove' manage one by job_id (always list first — never guess job IDs); 'run' fires a job immediately in the BACKGROUND (returns a handle at once, outcome re-enters the conversation when done — do not wait or poll; optional 'prompt' adds transient context for that fire only).
 
-Jobs run in a fresh session with no current-chat context, so prompts must be self-contained, and the agent's FINAL RESPONSE is what gets delivered — cron runs are autonomous and cannot ask questions. Prefer updating an existing job over creating near-duplicates.""",
+Jobs run in a fresh session with no current-chat context, so prompts must be self-contained. By default the agent's FINAL RESPONSE is delivered; operator-owned jobs may instead expose read-only `delivery_source='script'` and `delivery_script` status, where post-run script output is authoritative and agent narration stays in cron storage. Cron runs are autonomous and cannot ask questions. Prefer updating an existing job over creating near-duplicates.""",
     "parameters": {
         "type": "object",
         "properties": {

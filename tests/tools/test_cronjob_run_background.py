@@ -122,6 +122,49 @@ class TestBackgroundDispatch:
         assert "bg run" in (found.get("summary") or "")
         assert "Next scheduled run" in found["summary"]
 
+    def test_script_delivery_completion_omits_agent_output_excerpt(self):
+        import time
+
+        from tools.process_registry import process_registry
+
+        script_job = {
+            **_job("job-bg-script-source"),
+            "delivery_source": "script",
+            "delivery_script": "report.py",
+        }
+        with _bound_session_key("agent:main:telegram:dm:779"):
+            with patch(
+                "tools.cronjob_tools.claim_job_for_fire",
+                return_value={**script_job, "fire_claim": {"by": "bg-owner"}},
+            ), patch(
+                "cron.scheduler.run_one_job", return_value=True
+            ), patch(
+                "tools.cronjob_tools.get_job",
+                return_value={"last_status": "ok", "last_error": None},
+            ), patch(
+                "tools.cronjob_tools._latest_job_output_excerpt",
+                return_value="unsafe agent narration",
+            ):
+                res = _try_dispatch_background_run(script_job)
+                assert res["dispatched"] is True
+
+                found = None
+                for _ in range(100):
+                    try:
+                        evt = process_registry.completion_queue.get_nowait()
+                    except Exception:
+                        time.sleep(0.05)
+                        continue
+                    if evt.get("delegation_id") == res["delegation_id"]:
+                        found = evt
+                        break
+                    process_registry.completion_queue.put(evt)
+                    time.sleep(0.05)
+
+        assert found is not None
+        assert "unsafe agent narration" not in found["summary"]
+        assert "output excerpt omitted" in found["summary"].lower()
+
     def test_failed_run_reports_error_status_in_event(self):
         import time
 

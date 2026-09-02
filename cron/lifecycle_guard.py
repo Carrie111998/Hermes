@@ -1214,6 +1214,7 @@ def check_gateway_lifecycle(
     """
     combined = prompt or ""
     python_script = False
+    script_dir = None
     if script:
         resolved_script = _resolve_script_path(script)
         if resolved_script is not None:
@@ -1240,10 +1241,51 @@ def check_gateway_lifecycle(
                     "(e.g. ~/.hermes/scripts/) and recreate the job."
                 )
         python_script = resolved_script is not None and resolved_script.suffix == ".py"
+        script_dir = _resolve_script_directory(script)
         script_text = _read_script_for_scanning(script)
         if script_text:
             combined = f"{combined}\n{script_text}"
 
+    _check_gateway_lifecycle_text(
+        combined,
+        python_script=python_script,
+        script_dir=script_dir,
+    )
+
+
+def check_gateway_lifecycle_bytes(
+    prompt: Optional[str],
+    script_bytes: bytes,
+    *,
+    script_suffix: str,
+    script_dir: Optional[str],
+) -> None:
+    """Validate the exact bounded script bytes that will later execute."""
+    if len(script_bytes) > _MAX_REFERENCED_SCRIPT_BYTES or _has_binary_magic(
+        script_bytes
+    ):
+        raise GatewayLifecycleBlocked(
+            "Blocked: delivery script snapshot is oversized or binary and cannot "
+            "be lifecycle-validated."
+        )
+    script_text = script_bytes.replace(b"\x00", b"").decode(
+        "utf-8", errors="replace"
+    )
+    combined = f"{prompt or ''}\n{script_text}" if script_text else (prompt or "")
+    _check_gateway_lifecycle_text(
+        combined,
+        python_script=script_suffix.casefold() == ".py",
+        script_dir=script_dir,
+    )
+
+
+def _check_gateway_lifecycle_text(
+    combined: str,
+    *,
+    python_script: bool,
+    script_dir: Optional[str],
+) -> None:
+    """Apply the lifecycle policy to already captured source text."""
     if python_script:
         # Python is executed by the interpreter, never through a POSIX
         # shell: the shell-script reference walk is a false-positive
@@ -1256,7 +1298,6 @@ def check_gateway_lifecycle(
         # via the lifecycle-shaped sentinel in _read_script_for_scanning.
         unsafe = _lifecycle_command_scan_with_data_exemption(combined)
     else:
-        script_dir = _resolve_script_directory(script) if script else None
         unsafe = contains_gateway_lifecycle_command_or_referenced_script(
             combined,
             cwd=script_dir,

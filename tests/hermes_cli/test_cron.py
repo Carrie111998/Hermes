@@ -17,10 +17,83 @@ def tmp_cron_dir(tmp_path, monkeypatch):
     monkeypatch.setattr("cron.jobs.CRON_DIR", tmp_path / "cron")
     monkeypatch.setattr("cron.jobs.JOBS_FILE", tmp_path / "cron" / "jobs.json")
     monkeypatch.setattr("cron.jobs.OUTPUT_DIR", tmp_path / "cron" / "output")
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    (tmp_path / "scripts").mkdir()
     return tmp_path
 
 
 class TestCronCommandLifecycle:
+
+    def test_create_and_edit_script_delivery_source(self, tmp_cron_dir, capsys):
+        (tmp_cron_dir / "scripts" / "report.py").write_text(
+            "print('report')\n", encoding="utf-8"
+        )
+        parser = argparse.ArgumentParser(prog="hermes")
+        subparsers = parser.add_subparsers(dest="command")
+        build_cron_parser(subparsers, cmd_cron=cron_command)
+
+        create_args = parser.parse_args(
+            [
+                "cron",
+                "create",
+                "every 1h",
+                "Analyze the report",
+                "--delivery-script",
+                "report.py",
+                "--delivery-source",
+                "script",
+            ]
+        )
+        assert cron_command(create_args) == 0
+        job = list_jobs()[0]
+        assert job["delivery_source"] == "script"
+
+        edit_args = parser.parse_args(
+            [
+                "cron",
+                "edit",
+                job["id"],
+                "--delivery-source",
+                "agent",
+            ]
+        )
+        assert cron_command(edit_args) == 0
+        assert get_job(job["id"]).get("delivery_source") is None
+
+        enable_args = parser.parse_args(
+            [
+                "cron",
+                "edit",
+                job["id"],
+                "--delivery-source",
+                "script",
+            ]
+        )
+        assert cron_command(enable_args) == 0
+        assert get_job(job["id"])["delivery_source"] == "script"
+        assert "Delivery source: post-run script stdout" in capsys.readouterr().out
+
+    def test_create_script_delivery_without_delivery_script_fails_closed(
+        self, tmp_cron_dir, capsys
+    ):
+        parser = argparse.ArgumentParser(prog="hermes")
+        subparsers = parser.add_subparsers(dest="command")
+        build_cron_parser(subparsers, cmd_cron=cron_command)
+
+        args = parser.parse_args(
+            [
+                "cron",
+                "create",
+                "every 1h",
+                "Analyze the report",
+                "--delivery-source",
+                "script",
+            ]
+        )
+
+        assert cron_command(args) == 1
+        assert list_jobs() == []
+        assert "requires a post-run delivery script" in capsys.readouterr().out
 
     def test_edit_persists_user_owned_inference_pins(self, tmp_cron_dir, capsys):
         job = create_job(prompt="Daily report", schedule="every 1h")
@@ -150,7 +223,7 @@ class TestCronDoctor:
 
     def test_doctor_reports_healthy_jobs(self, tmp_cron_dir, capsys):
         scripts_dir = tmp_cron_dir / "scripts"
-        scripts_dir.mkdir()
+        scripts_dir.mkdir(exist_ok=True)
         (scripts_dir / "ok.py").write_text("print('ok')\n", encoding="utf-8")
         create_job(prompt="Daily digest", schedule="every 1h", script="ok.py")
 
@@ -159,6 +232,20 @@ class TestCronDoctor:
         out = capsys.readouterr().out
         assert rc == 0
         assert "✓ Cron doctor found no issues" in out
+
+    def test_doctor_ignores_missing_dormant_delivery_script(
+        self, tmp_cron_dir, capsys
+    ):
+        create_job(
+            prompt="Analyze",
+            schedule="every 1h",
+            delivery_script="unused.py",
+        )
+
+        rc = cron_command(Namespace(cron_command="doctor"))
+
+        assert rc == 0
+        assert "✓ Cron doctor found no issues" in capsys.readouterr().out
 
     def test_doctor_flags_overdue_next_run(self, tmp_cron_dir, capsys):
         from datetime import datetime, timedelta, timezone

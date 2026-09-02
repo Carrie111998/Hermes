@@ -76,6 +76,9 @@ def _install_agent_stubs(monkeypatch, observed: dict):
         def run_conversation(self, prompt, *_a, **_kw):
             observed["agent_runs"] += 1
             observed["prompts"].append(prompt)
+            callback = observed.get("on_agent_run")
+            if callback:
+                callback()
             return {"final_response": "agent done", "messages": []}
 
         def get_activity_summary(self):
@@ -268,11 +271,11 @@ def test_unified_diff_is_capped(hermes_env):
 def _make_monitor_job(hermes_env, script_body: str):
     from cron.jobs import create_job
 
-    _write_script(hermes_env, "mon.sh", script_body)
+    _write_script(hermes_env, "mon.py", script_body)
     return create_job(
         prompt="Summarize what changed",
         schedule="every 5m",
-        monitor_script="mon.sh",
+        monitor_script="mon.py",
         deliver="local",
     )
 
@@ -280,7 +283,7 @@ def _make_monitor_job(hermes_env, script_body: str):
 def test_first_run_always_runs_agent(hermes_env, monkeypatch):
     from cron.scheduler import run_job
 
-    job = _make_monitor_job(hermes_env, "echo 'state A'\n")
+    job = _make_monitor_job(hermes_env, "print('state A')\n")
     observed: dict = {}
     _install_agent_stubs(monkeypatch, observed)
 
@@ -292,11 +295,215 @@ def test_first_run_always_runs_agent(hermes_env, monkeypatch):
     assert "state A" in observed["prompts"][0]
 
 
+def test_monitor_job_runs_delivery_script_once_after_agent(
+    hermes_env, monkeypatch
+):
+    from cron.jobs import create_job, get_job
+    from cron.scheduler import SILENT_MARKER, run_job
+
+    _write_script(hermes_env, "mon.py", "print('active packet')\n")
+    state_path = hermes_env / "agent-state.txt"
+    count_path = hermes_env / "delivery-count.txt"
+    _write_script(
+        hermes_env,
+        "deliver.py",
+        "from pathlib import Path\n"
+        f"state = Path({str(state_path)!r})\n"
+        f"count = Path({str(count_path)!r})\n"
+        "n = int(count.read_text() or '0') + 1 if count.exists() else 1\n"
+        "count.write_text(str(n))\n"
+        "print(state.read_text())\n",
+    )
+    job = create_job(
+        prompt="Process the active packet",
+        schedule="every 5m",
+        monitor_script="mon.py",
+        delivery_source="script",
+        delivery_script="deliver.py",
+        deliver="local",
+    )
+    observed = {"on_agent_run": lambda: state_path.write_text("exact report")}
+    _install_agent_stubs(monkeypatch, observed)
+
+    capture = []
+    success, doc, final, error = run_job(
+        job, script_delivery_capture=capture
+    )
+    assert success is True
+    assert error is None
+    assert final == "agent done"
+    assert capture == [(True, "exact report\n")]
+    assert count_path.read_text() == "1"
+    assert "## Delivery Script Output" in doc
+    assert "exact report" in doc
+
+    # An unchanged monitor tick suppresses both the agent and the post-run
+    # delivery script. The previously rendered report is not replayed.
+    capture = []
+    success, doc, final, error = run_job(
+        get_job(job["id"]), script_delivery_capture=capture
+    )
+    assert success is True
+    assert error is None
+    assert final == SILENT_MARKER
+    assert "no_change" in doc
+    assert capture == [(True, SILENT_MARKER)]
+    assert observed["agent_runs"] == 1
+    assert count_path.read_text() == "1"
+
+
+def test_delivery_script_change_during_agent_turn_fails_closed(
+    hermes_env, monkeypatch
+):
+    from cron.jobs import create_job
+    from cron.scheduler import run_job
+
+    _write_script(hermes_env, "mon.py", "print('active packet')\n")
+    _write_script(hermes_env, "deliver.py", "print('operator report')\n")
+    delivery_path = hermes_env / "scripts" / "deliver.py"
+    job = create_job(
+        prompt="Process the active packet",
+        schedule="every 5m",
+        monitor_script="mon.py",
+        delivery_source="script",
+        delivery_script="deliver.py",
+        deliver="local",
+    )
+    observed = {
+        "on_agent_run": lambda: delivery_path.write_text(
+            "print('model-controlled report')\n", encoding="utf-8"
+        )
+    }
+    _install_agent_stubs(monkeypatch, observed)
+
+    capture = []
+    success, doc, final, error = run_job(
+        job, script_delivery_capture=capture
+    )
+
+    assert success is False
+    assert final == ""
+    assert "changed during the agent turn" in error
+    assert "model-controlled report" not in doc
+    assert capture == [(False, error)]
+
+
+def test_delivery_script_uses_job_workdir_without_capture(hermes_env, monkeypatch):
+    from cron.jobs import create_job
+    from cron.scheduler import run_job
+
+    _write_script(hermes_env, "mon.py", "print('active packet')\n")
+    _write_script(
+        hermes_env,
+        "deliver.py",
+        "from pathlib import Path\nprint(Path('projection.txt').read_text())\n",
+    )
+    workdir = hermes_env / "research"
+    workdir.mkdir()
+    projection = workdir / "projection.txt"
+    job = create_job(
+        prompt="Process the active packet",
+        schedule="every 5m",
+        monitor_script="mon.py",
+        delivery_source="script",
+        delivery_script="deliver.py",
+        workdir=str(workdir),
+        deliver="local",
+    )
+    observed = {"on_agent_run": lambda: projection.write_text("workdir report")}
+    _install_agent_stubs(monkeypatch, observed)
+
+    success, doc, final, error = run_job(job)
+
+    assert success is True
+    assert error is None
+    assert final == "agent done"
+    assert "## Delivery Script Output" in doc
+    assert "workdir report" in doc
+
+
+@pytest.mark.parametrize(
+    ("script_body", "expected_delivery", "expected_silent"),
+    [
+        ("pass\n", [], True),
+        ("print('[SILENT]')\n", [], True),
+        ("print('{\"wakeAgent\": false}')\n", ['{"wakeAgent": false}\n'], False),
+    ],
+)
+def test_real_delivery_script_stdout_contract(
+    hermes_env, monkeypatch, script_body, expected_delivery, expected_silent
+):
+    from cron.jobs import create_job, get_job
+    from cron.scheduler import run_one_job
+
+    _write_script(hermes_env, "mon.py", "print('active packet')\n")
+    _write_script(hermes_env, "deliver.py", script_body)
+    job = create_job(
+        prompt="Process the active packet",
+        schedule="every 5m",
+        monitor_script="mon.py",
+        delivery_source="script",
+        delivery_script="deliver.py",
+        deliver="local",
+    )
+    observed: dict = {}
+    _install_agent_stubs(monkeypatch, observed)
+    delivered = []
+    usage_audits = []
+    monkeypatch.setattr(
+        "cron.scheduler._deliver_result",
+        lambda _job, content, **_kw: delivered.append(content) or None,
+    )
+    monkeypatch.setattr("cron.scheduler._write_usage_audit", usage_audits.append)
+
+    assert run_one_job(job) is True
+    assert delivered == expected_delivery
+    assert observed["agent_runs"] == 1
+    assert get_job(job["id"])["last_status"] == "ok"
+    assert usage_audits[-1]["response_silent"] is expected_silent
+
+
+def test_post_run_delivery_script_failure_never_returns_agent_text(
+    hermes_env, monkeypatch
+):
+    from cron.jobs import create_job
+    from cron.scheduler import run_job
+
+    _write_script(hermes_env, "mon.py", "print('active packet')\n")
+    _write_script(
+        hermes_env,
+        "deliver.py",
+        "raise SystemExit('renderer unavailable')\n",
+    )
+    job = create_job(
+        prompt="Process the active packet",
+        schedule="every 5m",
+        monitor_script="mon.py",
+        delivery_source="script",
+        delivery_script="deliver.py",
+        deliver="local",
+    )
+    observed: dict = {}
+    _install_agent_stubs(monkeypatch, observed)
+
+    capture = []
+    success, doc, final, error = run_job(
+        job, script_delivery_capture=capture
+    )
+    assert success is False
+    assert final == ""
+    assert "agent done" in doc
+    assert "renderer unavailable" in doc
+    assert "Post-run delivery script failed" in error
+    assert capture and capture[0][0] is False
+    assert observed["agent_runs"] == 1
+
+
 def test_unchanged_output_suppresses_agent_run(hermes_env, monkeypatch):
     from cron.jobs import get_job
     from cron.scheduler import SILENT_MARKER, run_job
 
-    job = _make_monitor_job(hermes_env, "echo 'state A'\n")
+    job = _make_monitor_job(hermes_env, "print('state A')\n")
     observed: dict = {}
     _install_agent_stubs(monkeypatch, observed)
 
@@ -317,14 +524,14 @@ def test_changed_output_injects_diff(hermes_env, monkeypatch):
     from cron.jobs import get_job
     from cron.scheduler import run_job
 
-    job = _make_monitor_job(hermes_env, "echo 'state A'\n")
+    job = _make_monitor_job(hermes_env, "print('state A')\n")
     observed: dict = {}
     _install_agent_stubs(monkeypatch, observed)
 
     run_job(job)
 
     # Mutate the monitored source, then fire again.
-    _write_script(hermes_env, "mon.sh", "echo 'state B'\n")
+    _write_script(hermes_env, "mon.py", "print('state B')\n")
     job = get_job(job["id"])
     success, doc, final, error = run_job(job)
     assert success is True
@@ -342,7 +549,7 @@ def test_hash_persists_across_scheduler_restart(hermes_env, monkeypatch):
 
     from cron.scheduler import run_job
 
-    job = _make_monitor_job(hermes_env, "echo 'state A'\n")
+    job = _make_monitor_job(hermes_env, "print('state A')\n")
     observed: dict = {}
     _install_agent_stubs(monkeypatch, observed)
 
@@ -370,7 +577,7 @@ def test_monitor_script_failure_is_error_not_change(hermes_env, monkeypatch):
     from cron.jobs import get_job
     from cron.scheduler import run_job
 
-    job = _make_monitor_job(hermes_env, "echo 'state A'\n")
+    job = _make_monitor_job(hermes_env, "print('state A')\n")
     observed: dict = {}
     _install_agent_stubs(monkeypatch, observed)
 
@@ -378,7 +585,11 @@ def test_monitor_script_failure_is_error_not_change(hermes_env, monkeypatch):
     stored_hash = get_job(job["id"])["monitor_state"]["last_output_hash"]
 
     # Break the source: non-zero exit must be an error, never a "change".
-    _write_script(hermes_env, "mon.sh", "echo boom >&2\nexit 3\n")
+    _write_script(
+        hermes_env,
+        "mon.py",
+        "import sys\nprint('boom', file=sys.stderr)\nraise SystemExit(3)\n",
+    )
     job = get_job(job["id"])
     success, doc, final, error = run_job(job)
     assert success is False

@@ -354,6 +354,33 @@ def test_run_one_job_refreshes_fire_claim_in_profile_store(tmp_path, monkeypatch
     assert refreshed["by"] == original_claim["by"]
 
 
+def test_fire_claim_heartbeat_pauses_while_side_effect_fence_is_active(monkeypatch):
+    import cron.scheduler as scheduler
+
+    calls = []
+    monkeypatch.setattr(scheduler, "_RUN_CLAIM_HEARTBEAT_SECONDS", 0.01)
+    monkeypatch.setattr(
+        scheduler,
+        "heartbeat_fire_claim",
+        lambda *_a, **_kw: calls.append(time.monotonic()) or True,
+    )
+
+    def run(lost_ownership):
+        fence_active = lost_ownership._hermes_side_effect_fence_active
+        fence_active.set()
+        try:
+            time.sleep(0.06)
+            assert lost_ownership.is_set() is False
+            assert len(calls) == 1
+        finally:
+            fence_active.clear()
+        return True
+
+    assert scheduler._run_with_fire_claim_heartbeat(
+        {"id": "fenced", "fire_claim": {"by": "owner"}}, run
+    ) is True
+
+
 def test_lost_fire_claim_stops_stale_delivery(monkeypatch):
     """A runner that loses its durable owner must not deliver its stale result."""
     import cron.scheduler as scheduler

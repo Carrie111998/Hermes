@@ -246,6 +246,9 @@ def cron_list(show_all: bool = False):
         script = job.get("script")
         if script:
             print(f"    Script:    {script}")
+        delivery_script = job.get("delivery_script")
+        if delivery_script:
+            print(f"    Delivery script: {delivery_script}")
         monitor_source = job.get("monitor_script") or job.get("monitor_url")
         if monitor_source:
             print(f"    Monitor:   {monitor_source} (agent runs only on output change)")
@@ -254,6 +257,8 @@ def cron_list(show_all: bool = False):
                 print(f"    Changed:   {mon_state['last_changed_at']}")
         if job.get("no_agent"):
             print(f"    Mode:      {color('no-agent', Colors.DIM)} (script stdout delivered directly)")
+        elif job.get("delivery_source") == "script":
+            print("    Delivery source: post-run script stdout (agent transcript saved)")
         workdir = job.get("workdir")
         if workdir:
             print(f"    Workdir:   {workdir}")
@@ -706,12 +711,26 @@ def _cron_doctor_issues_for_job(job: Dict[str, Any]) -> List[str]:
                 issues.append(overdue)
 
     script = str(job.get("script") or "").strip()
+    delivery_script = str(job.get("delivery_script") or "").strip()
+    delivery_source = job.get("delivery_source")
+    if delivery_source not in {None, "", "agent", "script"}:
+        issues.append(
+            f"invalid delivery_source {delivery_source!r}; expected agent or script"
+        )
     if job.get("no_agent") and not script:
         issues.append("no-agent job has no script")
+    if job.get("delivery_source") == "script" and not delivery_script:
+        issues.append("script delivery source has no post-run delivery script")
+    if job.get("delivery_source") == "script" and job.get("no_agent"):
+        issues.append("script delivery source is redundant with no-agent mode")
     if script:
         script_issue = _script_health_issue(script)
         if script_issue:
             issues.append(script_issue)
+    if job.get("delivery_source") == "script" and delivery_script:
+        delivery_script_issue = _script_health_issue(delivery_script)
+        if delivery_script_issue:
+            issues.append(delivery_script_issue)
 
     workdir = str(job.get("workdir") or "").strip()
     if workdir and not Path(workdir).expanduser().exists():
@@ -770,6 +789,8 @@ def cron_create(args):
         skill=getattr(args, "skill", None),
         skills=_normalize_skills(getattr(args, "skill", None), getattr(args, "skills", None)),
         script=getattr(args, "script", None),
+        delivery_source=getattr(args, "delivery_source", None),
+        delivery_script=getattr(args, "delivery_script", None),
         workdir=getattr(args, "workdir", None),
         model=getattr(args, "model", None),
         provider=getattr(args, "model_provider", None),
@@ -790,12 +811,16 @@ def cron_create(args):
     job_data = result.get("job", {})
     if job_data.get("script"):
         print(f"  Script: {job_data['script']}")
+    if job_data.get("delivery_script"):
+        print(f"  Delivery script: {job_data['delivery_script']}")
     if job_data.get("monitor_script"):
         print(f"  Monitor: {job_data['monitor_script']} (agent runs only on output change)")
     if job_data.get("monitor_url"):
         print(f"  Monitor: {job_data['monitor_url']} (agent runs only on output change)")
     if job_data.get("no_agent"):
         print("  Mode: no-agent (script stdout delivered directly)")
+    elif job_data.get("delivery_source") == "script":
+        print("  Delivery source: post-run script stdout (agent transcript remains saved)")
     if job_data.get("continuity"):
         print("  Continuity: on (each run sees the previous run's output)")
     if job_data.get("workdir"):
@@ -845,6 +870,8 @@ def cron_edit(args):
         repeat=getattr(args, "repeat", None),
         skills=final_skills,
         script=getattr(args, "script", None),
+        delivery_source=getattr(args, "delivery_source", None),
+        delivery_script=getattr(args, "delivery_script", None),
         workdir=getattr(args, "workdir", None),
         model=getattr(args, "model", None),
         provider=getattr(args, "model_provider", None),
@@ -868,12 +895,16 @@ def cron_edit(args):
         print("  Skills: none")
     if updated.get("script"):
         print(f"  Script: {updated['script']}")
+    if updated.get("delivery_script"):
+        print(f"  Delivery script: {updated['delivery_script']}")
     if updated.get("monitor_script"):
         print(f"  Monitor: {updated['monitor_script']} (agent runs only on output change)")
     if updated.get("monitor_url"):
         print(f"  Monitor: {updated['monitor_url']} (agent runs only on output change)")
     if updated.get("no_agent"):
         print("  Mode: no-agent (script stdout delivered directly)")
+    elif updated.get("delivery_source") == "script":
+        print("  Delivery source: post-run script stdout (agent transcript remains saved)")
     if updated.get("continuity"):
         print("  Continuity: on (each run sees the previous run's output)")
     if updated.get("workdir"):
