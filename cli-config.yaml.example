@@ -1174,6 +1174,15 @@ agent:
 # Gateway Lifecycle
 # =============================================================================
 gateway:
+  # Inbound voice-note routing:
+  #   auto   = send audio natively when the active model supports it;
+  #            otherwise use the configured STT provider (default)
+  #   native = prefer native audio regardless of capability metadata
+  #   stt    = always transcribe before invoking the model
+  # If a native attachment cannot be read, encoded, or transcoded safely,
+  # Hermes falls back to STT for that attachment instead of dropping it.
+  audio_mode: auto
+
   # Post-interrupt grace for running agents during an unexpected SIGTERM.
   # Adapter, bridge, and database teardown starts after this many seconds even
   # if an agent has not unwound. Keep it below the service-manager stop budget.
@@ -1185,15 +1194,6 @@ gateway:
   # use (e.g. a Windows Scheduled Task picking up a local Clash/V2Ray proxy that
   # isn't running). Explicit per-platform vars like DISCORD_PROXY still apply.
   # trust_env: true
-
-  # Inbound voice-note routing:
-  #   auto   = send audio natively when the active model supports it;
-  #            otherwise use the configured STT provider (default)
-  #   native = prefer native audio regardless of capability metadata
-  #   stt    = always transcribe before invoking the model
-  # If a native attachment cannot be read, encoded, or transcoded safely,
-  # Hermes falls back to STT for that attachment instead of dropping it.
-  audio_mode: auto
 
 # =============================================================================
 # Toolsets
