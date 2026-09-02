@@ -13,6 +13,7 @@ stays authoritative.
 import asyncio
 import logging
 import sys  # noqa: F401 — used by handlers
+from pathlib import Path
 from typing import Any, Dict, List, Optional  # noqa: F401
 
 from fastapi import APIRouter, HTTPException  # noqa: F401
@@ -725,27 +726,49 @@ async def get_terminal_backends(profile: Optional[str] = None):
     status, never an error response.
     """
     def _read():
-        with _profile_scope(profile):
-            config = load_config()
-            terminal_cfg = config.get("terminal")
-            if not isinstance(terminal_cfg, dict):
-                terminal_cfg = {}
-            rows = _terminal_backend_rows()
-            active = str(terminal_cfg.get("backend") or "local").strip().lower()
-            if active not in {row["name"] for row in rows}:
-                active = "local"
+        with _profile_scope(profile) as profile_dir:
+            secret_token = None
+            if profile_dir is not None:
+                # A named profile is an isolation boundary: its probes must
+                # resolve credentials from that profile's own secrets, never
+                # from whatever the dashboard process inherited. Install the
+                # profile's secret scope so anything resolving through
+                # agent.secret_scope.get_secret (plugin provider probes,
+                # scoped credential helpers) answers for the requested
+                # profile for the duration of the config read + probe loop.
+                from agent.secret_scope import (
+                    build_profile_secret_scope,
+                    reset_secret_scope,
+                    set_secret_scope,
+                )
 
-            backends = []
-            for row in rows:
-                status, detail = _probe_terminal_backend(row["name"], terminal_cfg)
-                backends.append({
-                    "name": row["name"],
-                    "label": row["label"],
-                    "description": row["description"],
-                    "active": row["name"] == active,
-                    "status": status,
-                    "detail": detail,
-                })
+                secret_token = set_secret_scope(
+                    build_profile_secret_scope(Path(profile_dir))
+                )
+            try:
+                config = load_config()
+                terminal_cfg = config.get("terminal")
+                if not isinstance(terminal_cfg, dict):
+                    terminal_cfg = {}
+                rows = _terminal_backend_rows()
+                active = str(terminal_cfg.get("backend") or "local").strip().lower()
+                if active not in {row["name"] for row in rows}:
+                    active = "local"
+
+                backends = []
+                for row in rows:
+                    status, detail = _probe_terminal_backend(row["name"], terminal_cfg)
+                    backends.append({
+                        "name": row["name"],
+                        "label": row["label"],
+                        "description": row["description"],
+                        "active": row["name"] == active,
+                        "status": status,
+                        "detail": detail,
+                    })
+            finally:
+                if secret_token is not None:
+                    reset_secret_scope(secret_token)
         return {"active": active, "backends": backends}
 
     return await asyncio.to_thread(_read)

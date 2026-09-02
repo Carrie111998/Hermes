@@ -2970,6 +2970,92 @@ class TestNewEndpoints:
         assert ssh["status"] == "ready"
         assert "hermes@devbox.example.com" in ssh["detail"]
 
+    def test_terminal_probe_isolates_named_profile_secrets(self, monkeypatch):
+        """A target profile's probes must resolve that profile's own secrets
+        and never borrow the dashboard process's environment values — while
+        the detail honors the probe() contract and carries no credential
+        material (it reaches dashboard clients verbatim)."""
+        import json
+
+        from agent import terminal_env_registry as reg
+        from agent.secret_scope import current_secret_scope, get_secret
+        from agent.terminal_env_provider import TerminalEnvironmentProvider
+        from hermes_cli.profiles import get_profile_dir
+
+        class _ScopedProvider(TerminalEnvironmentProvider):
+            name = "fakebox"
+            display_name = "FakeBox"
+
+            # Non-secret account labels keyed by the resolved token: the
+            # probe reports WHICH credential answered without ever echoing
+            # the credential itself into the detail.
+            _TOKEN_ACCOUNTS = {
+                "alpha-secret-token": "alpha-account",
+                "beta-secret-token": "beta-account",
+                "process-secret-token": "process-account",
+            }
+
+            def is_available(self):
+                return bool(get_secret("FAKEBOX_API_TOKEN"))
+
+            def probe(self):
+                token = get_secret("FAKEBOX_API_TOKEN") or ""
+                account = self._TOKEN_ACCOUNTS.get(token)
+                if account is None:
+                    return ("needs_setup", "Set FAKEBOX_API_TOKEN.")
+                return ("ready", f"account:{account}")
+
+            def create_environment(self, *, cwd, timeout, task_id="default",
+                                   image=None, container_config=None, **kwargs):
+                raise NotImplementedError
+
+        monkeypatch.setenv("FAKEBOX_API_TOKEN", "process-secret-token")
+
+        alpha = get_profile_dir("fakebox-alpha")
+        alpha.mkdir(parents=True)
+        (alpha / ".env").write_text(
+            "FAKEBOX_API_TOKEN=alpha-secret-token\n", encoding="utf-8"
+        )
+
+        beta = get_profile_dir("fakebox-beta")
+        beta.mkdir(parents=True)
+        (beta / ".env").write_text(
+            "FAKEBOX_API_TOKEN=beta-secret-token\n", encoding="utf-8"
+        )
+
+        provider = _ScopedProvider()
+        reg.register_provider(provider)
+        try:
+            alpha_body = self.client.get(
+                "/api/tools/terminal/backends?profile=fakebox-alpha"
+            ).json()
+            beta_body = self.client.get(
+                "/api/tools/terminal/backends?profile=fakebox-beta"
+            ).json()
+            # No-profile request AFTER the scoped ones: the dashboard's own
+            # environment must answer, proving no profile scope lingered.
+            process_body = self.client.get("/api/tools/terminal/backends").json()
+        finally:
+            reg.restore_registration("fakebox", provider, None)
+
+        alpha_row = next(r for r in alpha_body["backends"] if r["name"] == "fakebox")
+        beta_row = next(r for r in beta_body["backends"] if r["name"] == "fakebox")
+        process_row = next(
+            r for r in process_body["backends"] if r["name"] == "fakebox"
+        )
+
+        assert alpha_row["status"] == "ready"
+        assert alpha_row["detail"] == "account:alpha-account"
+        assert beta_row["status"] == "ready"
+        assert beta_row["detail"] == "account:beta-account"
+        assert process_row["detail"] == "account:process-account"
+        # The scope is installed per request and reset afterwards.
+        assert current_secret_scope() is None
+        # No response may carry credential material anywhere (every token
+        # above shares the "secret-token" suffix, so one sweep covers all).
+        for body in (alpha_body, beta_body, process_body):
+            assert "secret-token" not in json.dumps(body)
+
 
 
 
