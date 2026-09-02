@@ -380,3 +380,56 @@ async def test_unlisted_group_is_dropped_without_authorization(monkeypatch):
     await adapter._handle_chat_item(_group_item(99, 7, "not authorized"))
     assert adapter._pending_text_batch_tasks == {}
     adapter.handle_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_allowed_group_file_keeps_intake_authorization(monkeypatch):
+    monkeypatch.setenv("SIMPLEX_GROUP_ALLOWED", "12")
+    adapter = _adapter()
+    adapter._receive_file = AsyncMock()
+    adapter.set_authorization_check(lambda *_args: False)
+    wrapper = _group_item(12, 99, "authorized attachment")
+    wrapper["chatItem"]["file"] = {
+        "fileId": 7,
+        "fileName": "report.pdf",
+        "fileStatus": {"type": "rcvInvitation"},
+    }
+
+    await adapter._handle_event(
+        {
+            "resp": {
+                "type": "rcvFileDescrReady",
+                "rcvFileTransfer": {"fileId": 7, "fileName": "report.pdf"},
+                "chatItem": wrapper,
+            }
+        }
+    )
+    await asyncio.gather(*list(adapter._command_tasks))
+
+    adapter._receive_file.assert_awaited_once_with(7, None)
+
+
+@pytest.mark.asyncio
+async def test_unlisted_group_file_is_rejected_before_receive(monkeypatch):
+    monkeypatch.setenv("SIMPLEX_GROUP_ALLOWED", "12")
+    adapter = _adapter()
+    adapter._receive_file = AsyncMock()
+    adapter.set_authorization_check(lambda *_args: True)
+    wrapper = _group_item(99, 7, "unapproved attachment")
+    wrapper["chatItem"]["file"] = {
+        "fileId": 8,
+        "fileName": "report.pdf",
+        "fileStatus": {"type": "rcvInvitation"},
+    }
+
+    await adapter._handle_event(
+        {
+            "resp": {
+                "type": "rcvFileDescrReady",
+                "rcvFileTransfer": {"fileId": 8, "fileName": "report.pdf"},
+                "chatItem": wrapper,
+            }
+        }
+    )
+
+    adapter._receive_file.assert_not_awaited()

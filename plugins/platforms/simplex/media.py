@@ -9,7 +9,6 @@ import logging
 import os
 import tempfile
 import time
-import uuid
 from pathlib import Path
 from typing import Optional
 
@@ -126,6 +125,14 @@ class SimplexMediaMixin:
         user_id, chat_type, chat_id = self._file_sender_context(wrapper)
         if not user_id or not chat_id:
             return False
+        if chat_type == "group":
+            # ``_file_sender_context`` returns a group chat_id only after the
+            # exact group has passed ``SIMPLEX_GROUP_ALLOWED``. Preserve that
+            # adapter-owned decision here just as ``_handle_chat_item`` does
+            # with ``role_authorized=True``; rebuilding a generic gateway
+            # source would otherwise discard it and reject allowed-group
+            # attachment transfers.
+            return True
         return self._is_sender_authorized(user_id, chat_type, chat_id) is True
 
     def _cancel_file_timeout(self, file_id: int) -> None:

@@ -51,14 +51,11 @@ is present, so the gateway will not attempt to instantiate the adapter.
 """
 
 import asyncio
-import base64
-import copy
 import json
 import logging
 import os
 import random
 import re
-import tempfile
 import time
 import uuid
 from datetime import datetime, timezone
