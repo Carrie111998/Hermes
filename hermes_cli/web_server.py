@@ -19862,6 +19862,16 @@ def start_server(
             except Exception:
                 pass
 
+            try:
+                from plugins.dashboard_auth import ldap as _ldap_plugin
+
+                if _ldap_plugin.LAST_SKIP_REASON:
+                    skip_reasons.append(
+                        f"  • ldap: {_ldap_plugin.LAST_SKIP_REASON}"
+                    )
+            except Exception:
+                pass
+
             # Name the exact reason the gate engaged. When the bind itself is
             # loopback the ONLY trigger is dashboard.public_url — an operator
             # (or a stale config.yaml entry) declared external exposure. Say
