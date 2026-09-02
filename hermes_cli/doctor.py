@@ -3360,9 +3360,9 @@ def run_doctor(args):
         try:
             from plugins.memory import load_memory_provider
             _provider = load_memory_provider(_active_memory_provider)
-            if _provider and _provider.is_available():
+            if _provider is not None and _provider.is_available():
                 check_ok(f"{_active_memory_provider} provider active")
-            elif _provider:
+            elif _provider is not None:
                 check_warn(f"{_active_memory_provider} configured but not available", "run: hermes memory status")
             else:
                 check_warn(f"{_active_memory_provider} plugin not found", "run: hermes memory setup")

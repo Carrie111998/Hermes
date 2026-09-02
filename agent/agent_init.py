@@ -1953,7 +1953,7 @@ def init_agent(
                 from plugins.memory import load_memory_provider as _load_mem
                 agent._memory_manager = _MemoryManager()
                 _mp = _load_mem(_mem_provider_name)
-                if _mp and _mp.is_available():
+                if _mp is not None and _mp.is_available():
                     agent._memory_manager.add_provider(_mp)
                 elif _mp is not None:
                     # Skip the (potentially expensive) unavailable_reason() call

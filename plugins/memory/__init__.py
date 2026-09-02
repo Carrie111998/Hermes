@@ -285,7 +285,7 @@ def discover_memory_providers() -> List[Tuple[str, str, bool]]:
         available = True
         try:
             provider = _load_provider_from_dir(child, register_skills=False)
-            if provider:
+            if provider is not None:
                 available = provider.is_available()
             else:
                 available = False
@@ -306,7 +306,7 @@ def discover_memory_providers() -> List[Tuple[str, str, bool]]:
                 entry_point,
                 register_skills=False,
             )
-            if provider:
+            if provider is not None:
                 available = provider.is_available()
             else:
                 available = False
@@ -357,7 +357,7 @@ def load_memory_provider(
                 register_skills=register_skills,
             )
         )
-        if provider:
+        if provider is not None:
             return provider
         logger.warning("Memory provider '%s' loaded but no provider instance found", name)
         return None
@@ -388,7 +388,7 @@ def _load_provider_from_entry_point(
     if hasattr(loaded, "register"):
         collector = _ProviderCollector(entry_point.name, register_skills=register_skills)
         loaded.register(collector)
-        if collector.provider:
+        if collector.provider is not None:
             return collector.provider
 
     if callable(loaded):
@@ -525,7 +525,7 @@ def _load_provider_from_dir(
                     "using the registered provider; later registrations were skipped",
                     name, e,
                 )
-        if collector.provider:
+        if collector.provider is not None:
             return collector.provider
 
     # Fallback: find a MemoryProvider subclass and instantiate it
