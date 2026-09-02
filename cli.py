@@ -13318,7 +13318,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         session split).
         """
         try:
-            from hermes_cli.goals import GoalManager
+            from hermes_cli.goals import GoalManager, consume_goal_state_dirty
             from hermes_cli.config import load_config
         except Exception as exc:
             logging.debug("goal manager unavailable: %s", exc)
@@ -13328,9 +13328,14 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         if not sid:
             return None
 
+        dirty = consume_goal_state_dirty(sid)
         existing = getattr(self, "_goal_manager", None)
         if existing is not None and getattr(existing, "session_id", None) == sid:
-            return existing
+            if not dirty:
+                return existing
+            # A session-scoped tool mutated the durable GoalManager state
+            # outside this CLI object's cached instance. Rebuild from SessionDB
+            # before the post-turn continuation hook inspects it.
 
         try:
             cfg = load_config() or {}

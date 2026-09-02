@@ -2135,6 +2135,39 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             tool_duration = time.time() - tool_start_time
             if agent._should_emit_quiet_tool_messages():
                 agent._vprint(f"  {_get_cute_tool_message_impl('message_agent', function_args, tool_duration, result=function_result)}")
+        elif function_name == "goal_manage":
+            # Bot Mode bridge to the existing persistent GoalManager. Like
+            # message_agent, this schema is injected only into canonical Bot
+            # Chat and is not globally registered. The calling session id is
+            # supplied server-side so the model cannot target another session.
+            def _execute(next_args: dict) -> Any:
+                from tools.bot_mode_goal import goal_manage_tool as _goal_manage_tool
+                return _goal_manage_tool(
+                    action=next_args.get("action", ""),
+                    session_id=str(getattr(agent, "session_id", "") or ""),
+                    agent=agent,
+                    goal=next_args.get("goal", ""),
+                    max_turns=next_args.get("max_turns"),
+                    outcome=next_args.get("outcome", ""),
+                    verification=next_args.get("verification", ""),
+                    constraints=next_args.get("constraints", ""),
+                    boundaries=next_args.get("boundaries", ""),
+                    stop_when=next_args.get("stop_when", ""),
+                    criterion=next_args.get("criterion", ""),
+                )
+            function_result, function_args, middleware_trace, _execution_blocked, _execution_dispatched = _managed_values(_run_agent_tool_execution_middleware(
+                agent,
+                function_name=function_name,
+                function_args=function_args,
+                effective_task_id=effective_task_id,
+                tool_call_id=getattr(tool_call, "id", "") or "",
+                execute=_execute,
+                scope_block=_ts_scope_block,
+                display_index=i,
+            ))
+            tool_duration = time.time() - tool_start_time
+            if agent._should_emit_quiet_tool_messages():
+                agent._vprint(f"  {_get_cute_tool_message_impl('goal_manage', function_args, tool_duration, result=function_result)}")
         elif function_name == "session_search":
             def _execute(next_args: dict) -> Any:
                 session_db = agent._get_session_db_for_recall()

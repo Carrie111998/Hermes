@@ -895,6 +895,13 @@ def build_turn_context(
     except Exception:
         logger.debug("message_agent injection skipped", exc_info=True)
 
+    try:
+        from tools.bot_mode_goal import ensure_goal_manage_tool
+
+        ensure_goal_manage_tool(agent)
+    except Exception:
+        logger.debug("goal_manage injection skipped", exc_info=True)
+
     # Create the DB session row now that _cached_system_prompt is populated, so
     # the persisted snapshot is written non-NULL on the first turn (Issue
     # #45499). Idempotent: _ensure_db_session() no-ops once the row exists.

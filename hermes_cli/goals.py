@@ -44,6 +44,35 @@ from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
+# In-process cache invalidation for session-scoped goal mutations that happen
+# outside the CLI/gateway command object (for example the Bot Chat
+# ``goal_manage`` bridge). Goal state itself remains durable in SessionDB; this
+# marker only tells a long-lived host to rebuild a cached GoalManager before it
+# reads the state again. It is intentionally process-local and best-effort.
+_GOAL_DIRTY_SESSIONS: set[str] = set()
+_GOAL_DIRTY_LOCK = threading.Lock()
+
+
+def mark_goal_state_dirty(session_id: str) -> None:
+    """Mark *session_id* so a host refreshes its cached GoalManager."""
+    sid = str(session_id or "").strip()
+    if not sid:
+        return
+    with _GOAL_DIRTY_LOCK:
+        _GOAL_DIRTY_SESSIONS.add(sid)
+
+
+def consume_goal_state_dirty(session_id: str) -> bool:
+    """Consume and return the process-local dirty marker for *session_id*."""
+    sid = str(session_id or "").strip()
+    if not sid:
+        return False
+    with _GOAL_DIRTY_LOCK:
+        if sid not in _GOAL_DIRTY_SESSIONS:
+            return False
+        _GOAL_DIRTY_SESSIONS.remove(sid)
+        return True
+
 
 # ──────────────────────────────────────────────────────────────────────
 # Constants & defaults
@@ -2366,6 +2395,8 @@ __all__ = [
     "KANBAN_GOAL_CONTINUATION_TEMPLATE",
     "KANBAN_GOAL_FINALIZE_TEMPLATE",
     "DEFAULT_MAX_TURNS",
+    "mark_goal_state_dirty",
+    "consume_goal_state_dirty",
     "load_goal",
     "save_goal",
     "clear_goal",
