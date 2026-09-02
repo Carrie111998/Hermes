@@ -325,6 +325,42 @@ class SubdirectoryHintTracker:
             except Exception as exc:
                 logger.debug("Could not read %s: %s", hint_path, exc)
 
+        # A README is descriptive documentation, not an instruction file. Only
+        # use it when this directory has no authoritative context hint, and
+        # label it explicitly so it cannot silently take the same priority.
+        if not found_hints:
+            readme_path = directory / "README.md"
+            try:
+                if readme_path.is_file():
+                    content = readme_path.read_text(encoding="utf-8").strip()
+                    if content:
+                        digest = hashlib.sha256(content.encode("utf-8")).hexdigest()
+                        if digest not in self._loaded_digests:
+                            self._loaded_digests.add(digest)
+                            content = _scan_context_content(content, "README.md")
+                            if len(content) > _MAX_HINT_CHARS:
+                                content = (
+                                    content[:_MAX_HINT_CHARS]
+                                    + f"\n\n[...truncated README.md: {len(content):,} chars total]"
+                                )
+                            rel_path = str(readme_path)
+                            try:
+                                rel_path = str(readme_path.relative_to(self.working_dir))
+                            except (ValueError, RuntimeError):
+                                try:
+                                    rel_path = "~/" + readme_path.relative_to(Path.home()).as_posix()
+                                except (ValueError, RuntimeError):
+                                    pass
+                            found_hints.append(
+                                (
+                                    rel_path,
+                                    "[README.md contextual documentation; not project instructions]\n"
+                                    + content,
+                                )
+                            )
+            except Exception as exc:
+                logger.debug("Could not read %s: %s", readme_path, exc)
+
         if not found_hints:
             return None
 

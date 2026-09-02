@@ -297,3 +297,47 @@ class TestExcludedDirectories:
         assert result is not None
         assert "Personal backend override" in result
         assert "Committed backend rules" not in result
+
+    def test_readme_is_loaded_as_labeled_context_without_hints(self, tmp_path):
+        """README.md supplies bounded context when no instruction file exists."""
+        sub = tmp_path / "docs"
+        sub.mkdir()
+        (sub / "README.md").write_text("Documentation for this subtree")
+
+        tracker = SubdirectoryHintTracker(working_dir=str(tmp_path))
+        result = tracker.check_tool_call("read_file", {"path": str(sub / "guide.md")})
+
+        assert result is not None
+        assert "Documentation for this subtree" in result
+        assert "contextual documentation; not project instructions" in result
+
+    def test_authoritative_hint_suppresses_readme(self, tmp_path):
+        """An instruction hint keeps priority over descriptive README content."""
+        sub = tmp_path / "backend"
+        sub.mkdir()
+        (sub / "AGENTS.md").write_text("Backend instructions")
+        (sub / "README.md").write_text("Backend documentation")
+
+        tracker = SubdirectoryHintTracker(working_dir=str(tmp_path))
+        result = tracker.check_tool_call("read_file", {"path": str(sub / "app.py")})
+
+        assert result is not None
+        assert "Backend instructions" in result
+        assert "Backend documentation" not in result
+
+    def test_identical_readme_content_is_deduplicated(self, tmp_path):
+        """Identical README copies do not consume context twice."""
+        first = tmp_path / "one"
+        second = tmp_path / "two"
+        first.mkdir()
+        second.mkdir()
+        (first / "README.md").write_text("Shared documentation")
+        (second / "README.md").write_text("Shared documentation")
+
+        tracker = SubdirectoryHintTracker(working_dir=str(tmp_path))
+        first_result = tracker.check_tool_call("read_file", {"path": str(first / "a.py")})
+        second_result = tracker.check_tool_call("read_file", {"path": str(second / "b.py")})
+
+        assert first_result is not None
+        assert "Shared documentation" in first_result
+        assert second_result is None
