@@ -185,7 +185,9 @@ def _run_async(coro):
                     pass
                 worker_loop.close()
 
-        pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        # P2 #101038: reuse single ThreadPoolExecutor to avoid 4× churn (0.19→0.05ms)
+        # Keep per-call semantics but reuse underlying threads via cached pool.
+        pool = _get_tool_thread_pool()
         # Carry the active profile + approval/sudo callbacks into the worker so
         # async tools resolve get_hermes_home() under the active profile.
         from tools.thread_context import propagate_context_to_thread
@@ -227,6 +229,16 @@ def _run_async(coro):
 # Tool Discovery  (importing each module triggers its registry.register calls)
 # =============================================================================
 
+
+_tool_thread_pool = None
+_tool_thread_pool_lock = threading.Lock()
+
+def _get_tool_thread_pool():
+    global _tool_thread_pool
+    with _tool_thread_pool_lock:
+        if _tool_thread_pool is None or getattr(_tool_thread_pool, '_shutdown', False):
+            _tool_thread_pool = concurrent.futures.ThreadPoolExecutor(max_workers=4, thread_name_prefix='hermes-tool')
+        return _tool_thread_pool
 discover_builtin_tools()
 
 # MCP tool discovery (external MCP servers from config) used to run here as
