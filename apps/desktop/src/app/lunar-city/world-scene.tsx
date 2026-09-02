@@ -3,6 +3,7 @@ import { useMemo } from 'react'
 import type { WorldProjection } from '@/store/lunar-city'
 
 import type { DialogueSubject } from './dialogue-tray'
+import { resolveWorldAnimation } from './world-animation'
 import { LUNAR_CITY_ASSET_MANIFEST } from './world-assets'
 import type { WorldCondition, WorldEvent } from './world-events'
 import { resolveWorldPresentation } from './world-presentation'
@@ -131,8 +132,15 @@ export function WorldScene({ onSelectSubject, projection }: WorldSceneProps) {
                 </span>
                 <span aria-label="NPC activity" className="mt-3 block space-y-1 border-t border-white/10 pt-2">
                   {presentation.npcActivities.map(activity => (
+                    (() => {
+                      const animation = resolveWorldAnimation(activity, presentation)
+
+                      return (
                     <span
                       className="flex items-center justify-between gap-2 text-[0.65rem] text-slate-300"
+                      data-animation-clip={animation.clip}
+                      data-animation-intensity={animation.intensity}
+                      data-animation-loop={animation.loop}
                       data-animation-tags={activity.animationTags.join(',')}
                       data-personality={activity.personality}
                       data-testid={`world-npc-${condition.id}-${activity.state}`}
@@ -145,6 +153,8 @@ export function WorldScene({ onSelectSubject, projection }: WorldSceneProps) {
                         <span className="truncate text-slate-400">“{activity.groundedDialogue}”</span>
                       )}
                     </span>
+                      )
+                    })()
                   ))}
                 </span>
               </button>

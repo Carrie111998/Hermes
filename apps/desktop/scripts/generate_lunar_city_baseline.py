@@ -92,7 +92,7 @@ def terrain(target, mat):
             px = (x / steps - 0.5) * size
             py = (y / steps - 0.5) * size
             radius = (px * px + py * py) ** 0.5
-            height = -0.35 - 0.007 * radius * radius + 0.16 * sin(px * 0.45) * cos(py * 0.33)
+            height = ground_height(px, py)
             verts.append((px, py, height))
     for y in range(steps):
         for x in range(steps):
@@ -111,18 +111,24 @@ def terrain(target, mat):
     return obj
 
 
+def ground_height(x, y):
+    radius = (x * x + y * y) ** 0.5
+    return -0.35 - 0.007 * radius * radius + 0.16 * sin(x * 0.45) * cos(y * 0.33)
+
+
 def building(asset_id, role, location, accent, buildings, mats):
     x, y = location
-    shell = cube(f"{asset_id}_shell", (x, y, 1.0), (2.9, 2.25, 1.2), mats["shell"], buildings, 0.28)
-    inner = cube(f"{asset_id}_inner", (x, y - 0.18, 1.05), (2.45, 1.76, 1.0), mats["interior"], buildings, 0.2)
-    roof = cube(f"{asset_id}_roof", (x, y, 2.35), (2.6, 1.95, 0.18), mats["shell"], buildings, 0.16)
-    sign = cube(f"{asset_id}_sign", (x, y - 2.34, 1.65), (1.35, 0.06, 0.35), mats[accent], buildings, 0.06)
+    base = ground_height(x, y)
+    shell = cube(f"{asset_id}_shell", (x, y, base + 1.2), (2.9, 2.25, 1.2), mats["shell"], buildings, 0.28)
+    inner = cube(f"{asset_id}_inner", (x, y - 0.18, base + 1.0), (2.45, 1.76, 1.0), mats["interior"], buildings, 0.2)
+    roof = cube(f"{asset_id}_roof", (x, y, base + 2.55), (2.6, 1.95, 0.18), mats["shell"], buildings, 0.16)
+    sign = cube(f"{asset_id}_sign", (x, y - 2.34, base + 1.65), (1.35, 0.06, 0.35), mats[accent], buildings, 0.06)
     sign["asset_id"] = asset_id
     sign["role"] = role
     for dx in (-1.75, 0, 1.75):
-        cube(f"{asset_id}_window_{dx}", (x + dx, y - 2.31, 0.85), (0.42, 0.05, 0.28), mats["glass"], buildings, 0.04)
+        cube(f"{asset_id}_window_{dx}", (x + dx, y - 2.31, base + 0.85), (0.42, 0.05, 0.28), mats["glass"], buildings, 0.04)
     for dx in (-2.55, 2.55):
-        cylinder(f"{asset_id}_vent_{dx}", (x + dx, y, 2.7), 0.24, 0.35, mats[accent], buildings)
+        cylinder(f"{asset_id}_vent_{dx}", (x + dx, y, base + 2.7), 0.24, 0.35, mats[accent], buildings)
     return shell
 
 
@@ -138,6 +144,45 @@ def character(name, location, leader, characters, mats):
     visor = cube(f"{name}_visor", (x, y - 0.39, z + 1.35), (0.2, 0.04, 0.11), mats["glass"], characters, 0.05)
     body["role"] = "leader" if leader else "worker"
     body["personality"] = "bold" if leader else "curious"
+    add_animation_library(body, name, leader)
+
+
+def add_animation_library(body, name, leader):
+    """Add small reusable actions so the baseline is animation-ready.
+
+    The desktop world resolves Hermes events to these stable clip names. The
+    actions deliberately stay on the prototype body rather than baking motion
+    into every generated worker instance.
+    """
+    clips = {
+        "idle": (0.0, 0.0, 0.0),
+        "walk": (0.0, 0.12, 0.0),
+        "work": (0.0, -0.18, 0.0),
+        "carry": (0.0, 0.08, 0.08),
+        "inspect": (0.0, -0.08, -0.12),
+        "repair": (0.0, -0.25, 0.18),
+        "talk": (0.0, 0.05, -0.16),
+        "wait": (0.0, 0.02, 0.0),
+        "panic": (0.0, 0.35, 0.3),
+        "celebrate": (0.0, -0.3, -0.3),
+        "rest": (0.0, -0.12, 0.0),
+        "return": (0.0, 0.12, -0.08),
+    }
+    body["animation_clips"] = ",".join(clips)
+    body["animation_role"] = "leader" if leader else "worker"
+    for clip, (_, pitch, roll) in clips.items():
+        action = bpy.data.actions.new(f"{name}.{clip}")
+        action.use_fake_user = True
+        body.animation_data_create()
+        body.animation_data.action = action
+        body.rotation_euler = (pitch, 0.0, roll)
+        body.keyframe_insert(data_path="rotation_euler", frame=1)
+        body.rotation_euler = (-pitch, 0.0, -roll)
+        body.keyframe_insert(data_path="rotation_euler", frame=12)
+        body.rotation_euler = (pitch, 0.0, roll)
+        body.keyframe_insert(data_path="rotation_euler", frame=24)
+        action.frame_start = 1
+        action.frame_end = 24
 
 
 def main():
@@ -172,7 +217,10 @@ def main():
     }
 
     terrain(terrain_col, mats["terrain"])
-    roads_points = [(-17, -9, -0.05), (-10, -5, 0.02), (-4, -3, 0.04), (0, 0, 0.08), (6, 2, 0.1), (12, 7, 0.02), (18, 11, -0.06)]
+    roads_points = [
+        (x, y, ground_height(x, y) + 0.18)
+        for x, y in [(-17, -9), (-10, -5), (-4, -3), (0, 0), (6, 2), (12, 7), (18, 11)]
+    ]
     curve("road-network-primary", roads_points, 0.55, mats["road"], roads)
     curve("road-network-glow", [(x, y, z + 0.12) for x, y, z in roads_points], 0.07, mats["glass"], roads)
     for index, (x, y, z) in enumerate(roads_points[1:-1]):
@@ -240,6 +288,8 @@ def main():
     scene["design_reference"] = "Hermes Lunar City approved reference"
     scene["grounded_roads"] = True
     scene["concave_terrain"] = True
+    scene["animation_contract"] = "world-animation.ts"
+    scene["animation_clips"] = "idle,walk,work,carry,inspect,repair,talk,wait,panic,celebrate,rest,return"
 
     bpy.ops.wm.save_as_mainfile(filepath=str(OUTPUT / "lunar-city-baseline.blend"))
     bpy.ops.object.select_all(action="SELECT")
