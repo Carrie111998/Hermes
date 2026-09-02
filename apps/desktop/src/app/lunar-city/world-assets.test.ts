@@ -6,6 +6,9 @@ describe('Lunar City asset manifest', () => {
   it('covers the full interactive world asset contract', () => {
     expect(LUNAR_CITY_ASSET_MANIFEST.schemaVersion).toBe(2)
     expect(LUNAR_CITY_ASSET_MANIFEST.glb).toBe('lunar-city/lunar-city-baseline.glb')
+    expect(LUNAR_CITY_ASSET_MANIFEST.heroAssetGlb).toBe('lunar-city/hero-assets/lunar-city-hero-assets.glb')
+    expect(LUNAR_CITY_ASSET_MANIFEST.heroAssetManifest).toBe('lunar-city/hero-assets/hero-assets-manifest.json')
+    expect(LUNAR_CITY_ASSET_MANIFEST.heroAssetPreview).toBe('lunar-city/hero-assets/lunar-city-hero-assets.png')
     expect(LUNAR_CITY_ASSET_MANIFEST.profileManifest).toBe('lunar-city/profile-assets.json')
     expect(LUNAR_CITY_ASSET_MANIFEST.assets.filter(asset => asset.kind === 'building')).toHaveLength(8)
     expect(LUNAR_CITY_ASSET_MANIFEST.assets.filter(asset => asset.kind === 'character')).toHaveLength(19)

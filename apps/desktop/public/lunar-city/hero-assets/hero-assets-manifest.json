@@ -1,0 +1,347 @@
+{
+  "assetCount": 26,
+  "blend": "lunar-city/hero-assets/lunar-city-hero-assets.blend",
+  "buildings": [
+    {
+      "id": "library",
+      "lod": [
+        "hero",
+        "high",
+        "medium",
+        "low"
+      ],
+      "role": "knowledge",
+      "title": "LIBRARY"
+    },
+    {
+      "id": "research-lab",
+      "lod": [
+        "hero",
+        "high",
+        "medium",
+        "low"
+      ],
+      "role": "research",
+      "title": "RESEARCH LAB"
+    },
+    {
+      "id": "arts-studio",
+      "lod": [
+        "hero",
+        "high",
+        "medium",
+        "low"
+      ],
+      "role": "creative",
+      "title": "ARTS STUDIO"
+    },
+    {
+      "id": "council-hall",
+      "lod": [
+        "hero",
+        "high",
+        "medium",
+        "low"
+      ],
+      "role": "governance",
+      "title": "COUNCIL HALL"
+    },
+    {
+      "id": "engineering-workshop",
+      "lod": [
+        "hero",
+        "high",
+        "medium",
+        "low"
+      ],
+      "role": "engineering",
+      "title": "ENGINEERING"
+    },
+    {
+      "id": "triage-clinic",
+      "lod": [
+        "hero",
+        "high",
+        "medium",
+        "low"
+      ],
+      "role": "medical",
+      "title": "TRIAGE"
+    },
+    {
+      "id": "review-office",
+      "lod": [
+        "hero",
+        "high",
+        "medium",
+        "low"
+      ],
+      "role": "review",
+      "title": "REVIEW OFFICE"
+    },
+    {
+      "id": "archive",
+      "lod": [
+        "hero",
+        "high",
+        "medium",
+        "low"
+      ],
+      "role": "archive",
+      "title": "ARCHIVE"
+    }
+  ],
+  "characterPreview": "lunar-city/hero-assets/lunar-city-hero-characters.png",
+  "children": [
+    {
+      "animationClips": [
+        "idle",
+        "walk",
+        "talk",
+        "panic",
+        "celebrate",
+        "rest"
+      ],
+      "id": "child-curious",
+      "personality": "curious",
+      "role": "child"
+    },
+    {
+      "animationClips": [
+        "idle",
+        "walk",
+        "talk",
+        "panic",
+        "celebrate",
+        "rest"
+      ],
+      "id": "child-social",
+      "personality": "social",
+      "role": "child"
+    },
+    {
+      "animationClips": [
+        "idle",
+        "walk",
+        "talk",
+        "panic",
+        "celebrate",
+        "rest"
+      ],
+      "id": "child-bold",
+      "personality": "bold",
+      "role": "child"
+    },
+    {
+      "animationClips": [
+        "idle",
+        "walk",
+        "talk",
+        "panic",
+        "celebrate",
+        "rest"
+      ],
+      "id": "child-cautious",
+      "personality": "cautious",
+      "role": "child"
+    }
+  ],
+  "glb": "lunar-city/hero-assets/lunar-city-hero-assets.glb",
+  "heroMeshComponentCount": 586,
+  "leaders": [
+    {
+      "animationClips": [
+        "idle",
+        "walk",
+        "work",
+        "talk",
+        "panic",
+        "celebrate"
+      ],
+      "id": "leader-knowledge",
+      "identity": "owl archivist",
+      "role": "knowledge"
+    },
+    {
+      "animationClips": [
+        "idle",
+        "walk",
+        "work",
+        "talk",
+        "panic",
+        "celebrate"
+      ],
+      "id": "leader-research",
+      "identity": "fox scientist",
+      "role": "research"
+    },
+    {
+      "animationClips": [
+        "idle",
+        "walk",
+        "work",
+        "talk",
+        "panic",
+        "celebrate"
+      ],
+      "id": "leader-creative",
+      "identity": "raccoon artist",
+      "role": "creative"
+    },
+    {
+      "animationClips": [
+        "idle",
+        "walk",
+        "work",
+        "talk",
+        "panic",
+        "celebrate"
+      ],
+      "id": "leader-governance",
+      "identity": "eagle councillor",
+      "role": "governance"
+    },
+    {
+      "animationClips": [
+        "idle",
+        "walk",
+        "work",
+        "talk",
+        "panic",
+        "celebrate"
+      ],
+      "id": "leader-engineering",
+      "identity": "badger engineer",
+      "role": "engineering"
+    },
+    {
+      "animationClips": [
+        "idle",
+        "walk",
+        "work",
+        "talk",
+        "panic",
+        "celebrate"
+      ],
+      "id": "leader-medical",
+      "identity": "gold medic",
+      "role": "medical"
+    },
+    {
+      "animationClips": [
+        "idle",
+        "walk",
+        "work",
+        "talk",
+        "panic",
+        "celebrate"
+      ],
+      "id": "leader-review",
+      "identity": "hawk reviewer",
+      "role": "review"
+    },
+    {
+      "animationClips": [
+        "idle",
+        "walk",
+        "work",
+        "talk",
+        "panic",
+        "celebrate"
+      ],
+      "id": "leader-archive",
+      "identity": "owl historian",
+      "role": "archive"
+    }
+  ],
+  "preview": "lunar-city/hero-assets/lunar-city-hero-assets.png",
+  "referenceTarget": "approved_lunar_city_reference_images",
+  "schemaVersion": 1,
+  "source": "local_blender_hero_asset_generation",
+  "validation": {
+    "allAssetsVisibleInReviewScene": true,
+    "freeLocalGenerationOnly": true,
+    "noRawSoulContent": true,
+    "usesSeparateHeroAssetScene": true
+  },
+  "workers": [
+    {
+      "animationClips": [
+        "idle",
+        "walk",
+        "work",
+        "carry",
+        "repair",
+        "celebrate"
+      ],
+      "id": "worker-audit",
+      "personality": "methodical",
+      "role": "audit"
+    },
+    {
+      "animationClips": [
+        "idle",
+        "walk",
+        "work",
+        "carry",
+        "repair",
+        "celebrate"
+      ],
+      "id": "worker-operations",
+      "personality": "protective",
+      "role": "operations"
+    },
+    {
+      "animationClips": [
+        "idle",
+        "walk",
+        "work",
+        "carry",
+        "repair",
+        "celebrate"
+      ],
+      "id": "worker-release",
+      "personality": "bold",
+      "role": "release"
+    },
+    {
+      "animationClips": [
+        "idle",
+        "walk",
+        "work",
+        "carry",
+        "repair",
+        "celebrate"
+      ],
+      "id": "worker-research",
+      "personality": "curious",
+      "role": "research"
+    },
+    {
+      "animationClips": [
+        "idle",
+        "walk",
+        "work",
+        "carry",
+        "repair",
+        "celebrate"
+      ],
+      "id": "worker-review",
+      "personality": "methodical",
+      "role": "review"
+    },
+    {
+      "animationClips": [
+        "idle",
+        "walk",
+        "work",
+        "carry",
+        "repair",
+        "celebrate"
+      ],
+      "id": "worker-support",
+      "personality": "social",
+      "role": "support"
+    }
+  ]
+}

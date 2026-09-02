@@ -58,6 +58,9 @@ export interface WorldAssetManifest {
   assets: WorldAssetManifestEntry[]
   collections: WorldCollectionManifestEntry[]
   glb: string
+  heroAssetGlb?: string
+  heroAssetManifest?: string
+  heroAssetPreview?: string
   profileManifest: string
   renderProfile: string
   scene: string
@@ -228,6 +231,9 @@ export const LUNAR_CITY_ASSET_MANIFEST: WorldAssetManifest = {
     { id: 'Character Asset Library', purpose: 'Hidden source prototypes for runtime instancing.', render: false }
   ],
   glb: 'lunar-city/lunar-city-baseline.glb',
+  heroAssetGlb: 'lunar-city/hero-assets/lunar-city-hero-assets.glb',
+  heroAssetManifest: 'lunar-city/hero-assets/hero-assets-manifest.json',
+  heroAssetPreview: 'lunar-city/hero-assets/lunar-city-hero-assets.png',
   profileManifest: 'lunar-city/profile-assets.json',
   renderProfile: 'desktop-interactive',
   scene: 'lunar-city-baseline',
