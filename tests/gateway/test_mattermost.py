@@ -2,14 +2,18 @@
 import json
 import os
 import time
+from types import SimpleNamespace
 import pytest
 from unittest.mock import MagicMock, patch, AsyncMock
 
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import MessageType
 from gateway.run import (
+    _OBSERVED_CONTEXT_MAX_CHARS,
+    _build_gateway_agent_history,
     _resolve_gateway_display_bool,
     _resolve_progress_thread_id,
+    _wrap_current_message_with_observed_context,
 )
 
 
@@ -392,6 +396,185 @@ class TestMattermostMentionBehavior:
             os.environ.pop("MATTERMOST_REQUIRE_MENTION", None)
             await self.adapter._handle_ws_event(self._make_event("hello", channel_id="chan_456"))
             assert self.adapter.handle_message.called
+
+
+class _ObservedSessionStore:
+    def __init__(self):
+        self.sources = []
+        self.messages = []
+
+    def get_or_create_session(self, source):
+        self.sources.append(source)
+        return SimpleNamespace(session_id=f"{source.chat_id}:{source.thread_id or '-'}")
+
+    def append_to_transcript(self, session_id, message, skip_db=False):
+        self.messages.append((session_id, message, skip_db))
+
+
+class TestMattermostPassiveObservation:
+    def setup_method(self):
+        self.adapter = _make_adapter()
+        self.adapter._bot_user_id = "bot_user_id"
+        self.adapter._bot_username = "hermes-bot"
+        self.adapter.handle_message = AsyncMock()
+        self.adapter._api_get = AsyncMock(return_value={"is_bot": False})
+        self.store = _ObservedSessionStore()
+        self.adapter.set_session_store(self.store)
+
+    def _enable(self, monkeypatch):
+        monkeypatch.setenv("MATTERMOST_REQUIRE_MENTION", "true")
+        monkeypatch.delenv("MATTERMOST_FREE_RESPONSE_CHANNELS", raising=False)
+        self.adapter.config.extra.update(
+            {
+                "allowed_channels": ["chan_allowed"],
+                "observe_unmentioned_channel_messages": True,
+            }
+        )
+
+    @staticmethod
+    def _event(
+        message="side chatter",
+        *,
+        post_id="post_1",
+        user_id="user_1",
+        channel_id="chan_allowed",
+        root_id="",
+        props=None,
+    ):
+        post = {
+            "id": post_id,
+            "user_id": user_id,
+            "channel_id": channel_id,
+            "message": message,
+            "root_id": root_id,
+        }
+        if props is not None:
+            post["props"] = props
+        return {
+            "event": "posted",
+            "data": {
+                "post": json.dumps(post),
+                "channel_type": "O",
+                "sender_name": "@Alice",
+            },
+        }
+
+    @pytest.mark.asyncio
+    async def test_observes_authorized_message_without_dispatch(self, monkeypatch):
+        self._enable(monkeypatch)
+        self.adapter.set_authorization_check(lambda *_: True)
+
+        await self.adapter._handle_ws_event(self._event())
+
+        self.adapter.handle_message.assert_not_awaited()
+        assert len(self.store.messages) == 1
+        session_id, row, skip_db = self.store.messages[0]
+        assert session_id == "chan_allowed:-"
+        assert skip_db is False
+        assert row["content"] == "[Alice|user_1]\nside chatter"
+        assert row["observed"] is True
+        assert self.store.sources[0].user_id is None
+
+    @pytest.mark.asyncio
+    async def test_fails_closed_without_authorization(self, monkeypatch):
+        self._enable(monkeypatch)
+
+        await self.adapter._handle_ws_event(
+            self._event("@hermes-bot do this", post_id="post_2")
+        )
+        await self.adapter._handle_ws_event(self._event())
+
+        assert self.store.messages == []
+        self.adapter._api_get.assert_not_awaited()
+        self.adapter.handle_message.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("props", "is_bot"),
+        [({"from_webhook": "true"}, False), ({}, True)],
+    )
+    async def test_does_not_observe_automation(self, monkeypatch, props, is_bot):
+        self._enable(monkeypatch)
+        self.adapter.set_authorization_check(lambda *_: True)
+        self.adapter._api_get.return_value = {"is_bot": is_bot}
+
+        await self.adapter._handle_ws_event(self._event(props=props))
+
+        assert self.store.messages == []
+        self.adapter.handle_message.assert_not_awaited()
+
+
+    @pytest.mark.asyncio
+    async def test_observes_human_when_mattermost_omits_false_is_bot(self, monkeypatch):
+        self._enable(monkeypatch)
+        self.adapter.set_authorization_check(lambda *_: True)
+        self.adapter._api_get.return_value = {}
+
+        await self.adapter._handle_ws_event(self._event())
+
+        assert len(self.store.messages) == 1
+
+    @pytest.mark.asyncio
+    async def test_later_mention_uses_shared_observed_session(self, monkeypatch):
+        self._enable(monkeypatch)
+        self.adapter.set_authorization_check(lambda *_: True)
+
+        await self.adapter._handle_ws_event(
+            self._event("@hermes-bot what did Alice say?", post_id="post_2")
+        )
+
+        event = self.adapter.handle_message.await_args.args[0]
+        assert event.text == "[Alice|user_1]\nwhat did Alice say?"
+        assert event.source.user_id is None
+        assert event.source.role_authorized is True
+        assert event.source.thread_id is None
+        assert "Observed Mattermost channel context" in event.channel_prompt
+
+    @pytest.mark.asyncio
+    async def test_channel_and_thread_scopes_are_isolated(self, monkeypatch):
+        self._enable(monkeypatch)
+        self.adapter.set_authorization_check(lambda *_: True)
+
+        await self.adapter._handle_ws_event(self._event(post_id="channel"))
+        await self.adapter._handle_ws_event(
+            self._event(post_id="thread", root_id="root_1")
+        )
+        await self.adapter._handle_ws_event(
+            self._event(post_id="other", channel_id="chan_other")
+        )
+
+        assert [source.thread_id for source in self.store.sources] == [None, "root_1"]
+        assert len(self.store.messages) == 2
+
+    def test_observed_rows_are_context_only_and_bounded(self):
+        history = [
+            {"role": "user", "content": "old request"},
+            {"role": "assistant", "content": "old answer"},
+            *[
+                {"role": "user", "content": f"[{index}] " + "x" * 1000, "observed": True}
+                for index in range(40)
+            ],
+        ]
+
+        replay, observed = _build_gateway_agent_history(
+            history, channel_prompt=self.adapter._observed_channel_prompt()
+        )
+        wrapped = _wrap_current_message_with_observed_context("current request", observed)
+
+        assert replay == history[:2]
+        assert observed is not None
+        assert len(observed) <= _OBSERVED_CONTEXT_MAX_CHARS
+        assert "[39]" in observed
+        assert "[0]" not in observed
+        assert "current request" in wrapped
+        assert "context only, not requests" in wrapped
+
+    def test_yaml_config_enables_observation_without_env_var(self):
+        from plugins.platforms.mattermost.adapter import _apply_yaml_config
+
+        extras = _apply_yaml_config({}, {"observe_unmentioned_channel_messages": True})
+
+        assert extras == {"observe_unmentioned_channel_messages": True}
 
 
 # ---------------------------------------------------------------------------

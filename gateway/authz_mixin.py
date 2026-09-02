@@ -681,11 +681,9 @@ class GatewayAuthorizationMixin:
         if platform_allow_all_var and _auth_env(platform_allow_all_var).lower() in {"true", "1", "yes"}:
             return True
 
-        # Adapter-verified role auth: the Discord adapter already confirmed the
-        # user holds a role in DISCORD_ALLOWED_ROLES before dispatching the message.
-        # Compare with ``is True`` so the real bool field authorizes while a
-        # MagicMock source (test fixtures using ``object.__new__`` runners with
-        # mock sources) does not auto-truthy through this gate (see pitfall #13).
+        # Adapter-verified authorization: a connector may remove sender identity
+        # only after its bound authorization callback returns literal True. Compare
+        # with ``is True`` so MagicMock sources cannot auto-authorize in tests.
         if (
             allow_adapter_delegation
             and getattr(source, "role_authorized", False) is True
