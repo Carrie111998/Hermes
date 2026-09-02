@@ -1419,6 +1419,7 @@ def _get_file_ops(task_id: str = "default") -> ShellFileOperations:
         _creation_locks_lock,
         _resolve_container_task_id,
         _resolve_task_host_cwd,
+        _ssh_config_from_config,
         _is_unusable_container_cwd,
         _CONTAINER_BACKENDS,
     )
@@ -1482,8 +1483,8 @@ def _get_file_ops(task_id: str = "default") -> ShellFileOperations:
             from tools.terminal_tool import resolve_task_overrides
 
             config = _get_env_config()
-            env_type = config["env_type"]
             overrides = resolve_task_overrides(raw_task_id)
+            env_type = overrides.get("env_type") or config["env_type"]
 
             if env_type == "docker":
                 image = overrides.get("docker_image") or config["docker_image"]
@@ -1543,13 +1544,7 @@ def _get_file_ops(task_id: str = "default") -> ShellFileOperations:
 
             ssh_config = None
             if env_type == "ssh":
-                ssh_config = {
-                    "host": config.get("ssh_host", ""),
-                    "user": config.get("ssh_user", ""),
-                    "port": config.get("ssh_port", 22),
-                    "key": config.get("ssh_key", ""),
-                    "persistent": config.get("ssh_persistent", False),
-                }
+                ssh_config = _ssh_config_from_config(config, overrides)
 
             local_config = None
             if env_type == "local":
