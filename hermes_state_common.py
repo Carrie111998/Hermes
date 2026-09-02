@@ -70,6 +70,16 @@ def _sql_literal(text: str) -> str:
     return "'" + text.replace("'", "''") + "'"
 
 
+def _sql_json_extract(expression: str, path: str) -> str:
+    """Build a non-throwing JSON marker lookup for a JSON TEXT column."""
+
+    safe_json = (
+        f"(CASE WHEN json_valid({expression}) "
+        f"THEN {expression} ELSE json_object() END)"
+    )
+    return f"json_extract({safe_json}, {_sql_literal(path)})"
+
+
 _SQL_WHITESPACE = "CHAR(9) || CHAR(10) || CHAR(13) || CHAR(32)"
 
 
@@ -176,7 +186,7 @@ def _shape_preview(raw: Any) -> str:
 # A child session counts as a /branch (kept visible, never cascade-deleted) if
 # it carries the stable marker OR the legacy end_reason heuristic holds.
 _BRANCH_CHILD_SQL = (
-    "json_extract(COALESCE({a}.model_config, '{{}}'), '$._branched_from') IS NOT NULL"
+    f"{_sql_json_extract('{a}.model_config', '$._branched_from')} IS NOT NULL"
     " OR EXISTS (SELECT 1 FROM sessions p"
     "            WHERE p.id = {a}.parent_session_id"
     "            AND p.end_reason = 'branched'"
@@ -278,7 +288,7 @@ def _legacy_reset_child_sql(alias: str, reasons_sql: str) -> str:
 # Requiring the exact non-empty routing key keeps ordinary child/subagent rows
 # out even when their parent is later reset.
 _RESET_CHILD_SQL = (
-    "json_extract(COALESCE({a}.model_config, '{{}}'), '$._reset_from') IS NOT NULL"
+    f"{_sql_json_extract('{a}.model_config', '$._reset_from')} IS NOT NULL"
     " OR " + _legacy_reset_child_sql("{a}", _RESET_END_REASONS_SQL)
 )
 

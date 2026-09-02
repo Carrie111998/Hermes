@@ -76,6 +76,7 @@ from hermes_state_common import (  # noqa: F401  (re-exported for back-compat)
     _RESET_END_REASONS_SQL,
     _ephemeral_child_sql,
     _legacy_reset_child_sql,
+    _sql_json_extract,
     _shape_preview,
     _sql_session_last_active,
     _sql_session_last_active_by_id,
@@ -278,7 +279,7 @@ def workspace_key(row: Dict[str, Any]) -> Optional[str]:
 
 
 def _delegate_from_json(col: str = "model_config") -> str:
-    return f"json_extract(COALESCE({col}, '{{}}'), '$._delegate_from')"
+    return _sql_json_extract(col, "$._delegate_from")
 
 
 # Sentinel returned by SessionDB._merge_model_config_json when the session row
@@ -7301,7 +7302,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             target_clause = "WHERE id = ?"
             query_params = []
             if include_compression_ancestors:
-                lineage_cte = """
+                lineage_cte = f"""
                     WITH RECURSIVE compression_lineage(id) AS (
                         SELECT ?
                         UNION
@@ -7310,14 +7311,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                         JOIN sessions child ON child.id = lineage.id
                         JOIN sessions parent ON parent.id = child.parent_session_id
                         WHERE parent.end_reason = 'compression'
-                          AND json_extract(
-                              COALESCE(child.model_config, '{}'),
-                              '$._branched_from'
-                          ) IS NULL
-                          AND json_extract(
-                              COALESCE(child.model_config, '{}'),
-                              '$._delegate_from'
-                          ) IS NULL
+                          AND {_sql_json_extract('child.model_config', '$._branched_from')} IS NULL
+                          AND {_sql_json_extract('child.model_config', '$._delegate_from')} IS NULL
                           AND COALESCE(child.source, '') != 'tool'
                     )
                 """
@@ -7882,10 +7877,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                   AND EXISTS (SELECT 1 FROM messages m
                                WHERE m.session_id = o.id)
                   AND COALESCE(o.source, '') != 'tool'
-                  AND json_extract(COALESCE(o.model_config, '{{}}'),
-                                   '$._branched_from') IS NULL
-                  AND json_extract(COALESCE(o.model_config, '{{}}'),
-                                   '$._delegate_from') IS NULL
+                  AND {_sql_json_extract('o.model_config', '$._branched_from')} IS NULL
+                  AND {_sql_json_extract('o.model_config', '$._delegate_from')} IS NULL
                 ORDER BY o.started_at ASC
                 """
             ).fetchall()
@@ -8061,10 +8054,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
     # continuations as delegate children (fail-open for orphan reopen,
     # fail-closed for adoption). Bind the parent id for both markers.
     _NON_CONTINUATION_CHILD_FILTER_SQL = (
-        "  AND COALESCE(json_extract(COALESCE({alias}model_config, '{{}}'),"
-        " '$._branched_from'), '') != ?\n"
-        "  AND COALESCE(json_extract(COALESCE({alias}model_config, '{{}}'),"
-        " '$._delegate_from'), '') != ?\n"
+        f"  AND COALESCE({_sql_json_extract('{alias}model_config', '$._branched_from')}, '') != ?\n"
+        f"  AND COALESCE({_sql_json_extract('{alias}model_config', '$._delegate_from')}, '') != ?\n"
         "  AND COALESCE({alias}source, '') != 'tool'\n"
     )
 
@@ -11672,8 +11663,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     JOIN sessions child ON child.parent_session_id = parent.id
                     WHERE parent.id = ?
                       AND parent.end_reason = 'compression'
-                      AND json_extract(COALESCE(child.model_config, '{{}}'), '$._branched_from') IS NULL
-                      AND json_extract(COALESCE(child.model_config, '{{}}'), '$._delegate_from') IS NULL
+                      AND {_sql_json_extract('child.model_config', '$._branched_from')} IS NULL
+                      AND {_sql_json_extract('child.model_config', '$._delegate_from')} IS NULL
                       AND COALESCE(child.source, '') != 'tool'
                     ORDER BY
                       CASE
@@ -12172,8 +12163,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     JOIN sessions parent ON parent.id = c.cur_id
                     JOIN sessions child ON child.parent_session_id = c.cur_id
                     WHERE parent.end_reason = 'compression'
-                      AND json_extract(COALESCE(child.model_config, '{{}}'), '$._branched_from') IS NULL
-                      AND json_extract(COALESCE(child.model_config, '{{}}'), '$._delegate_from') IS NULL
+                      AND {_sql_json_extract('child.model_config', '$._branched_from')} IS NULL
+                      AND {_sql_json_extract('child.model_config', '$._delegate_from')} IS NULL
                       AND COALESCE(child.source, '') != 'tool'
                 ),
                 chain_max AS (
@@ -13938,9 +13929,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     child_row = conn.execute(
                         "SELECT id FROM sessions AS child "
                         "WHERE child.parent_session_id = ? "
-                        "  AND json_extract(COALESCE(child.model_config, '{}'), '$._branched_from') IS NULL "
-                        "  AND json_extract(COALESCE(child.model_config, '{}'), '$._delegate_from') IS NULL "
-                        "  AND json_extract(COALESCE(child.model_config, '{}'), '$._reset_from') IS NULL "
+                        f"  AND {_sql_json_extract('child.model_config', '$._branched_from')} IS NULL "
+                        f"  AND {_sql_json_extract('child.model_config', '$._delegate_from')} IS NULL "
+                        f"  AND {_sql_json_extract('child.model_config', '$._reset_from')} IS NULL "
                         f"  AND NOT {_legacy_reset_child_sql('child', _RESET_END_REASONS_SQL)} "
                         "  AND COALESCE(child.source, '') != 'tool' "
                         "ORDER BY child.started_at DESC, child.id DESC LIMIT 1",
