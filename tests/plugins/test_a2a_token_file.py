@@ -9,7 +9,7 @@ from plugins.platforms.a2a.tools import _auth_header
 
 
 def test_1221_bearer_token_file_is_loaded_without_putting_value_in_config(tmp_path: Path) -> None:
-    token_file = tmp_path / "arthur-to-abel.token"
+    token_file = tmp_path / "sender-to-receiver.token"
     token_file.write_text("peer-secret-value-0123456789abcdef\n", encoding="utf-8")
     token_file.chmod(0o600)
 
