@@ -2783,6 +2783,31 @@ def _prefetch_provider_models_parallel(provider_slugs: list[str]) -> None:
         list(executor.map(_fetch_one, stale_slugs))
 
 
+def _expanded_excluded_provider_set(entries) -> set:
+    """Lowercase an excluded-providers list and expand provider aliases.
+
+    ``model_catalog.excluded_providers`` accepts alias spellings ("grok",
+    "zhipu"). The CLI picker (``hermes_cli.main``) hides a canonical row when
+    its slug OR any alias mapping to it is listed; these shared filters are
+    what the gateway/TUI pickers call, so they must apply the same expansion
+    or an aliased exclusion works in the CLI but not on those surfaces.
+    """
+    try:
+        from hermes_cli.providers import ALIASES as _alias_table
+    except Exception:
+        _alias_table = {}
+    out: set = set()
+    for p in entries or ():
+        s = str(p).strip().lower()
+        if not s:
+            continue
+        out.add(s)
+        canon = _alias_table.get(s)
+        if canon:
+            out.add(str(canon).strip().lower())
+    return out
+
+
 def _collect_authed_provider_slugs(
     models_dev_data: dict,
     curated: dict[str, list[str]],
@@ -2807,7 +2832,7 @@ def _collect_authed_provider_slugs(
     from hermes_cli.providers import HERMES_OVERLAYS, ALIASES as _PROVIDER_ALIAS_TABLE
     from hermes_cli.models import _AGGREGATOR_PROVIDERS as _AGG_PROVIDERS, CANONICAL_PROVIDERS
 
-    _excluded_set = {str(p).strip().lower() for p in excluded if p}
+    _excluded_set = _expanded_excluded_provider_set(excluded)
     slugs: list[str] = []
     seen: set[str] = set()
 
@@ -3045,7 +3070,9 @@ def list_authenticated_providers(
     # Compared against hermes_id / mdev_id (section 1), pid / hermes_slug
     # (section 2) and canonical slug (section 2b) so a single entry like
     # ``copilot`` hides the provider regardless of which key it surfaces under.
-    _excluded: set = {str(p).strip().lower() for p in (excluded_providers or []) if p}
+    # Aliases are expanded so ``grok`` also hides the xai row — same rule the
+    # CLI picker applies (parity; see _expanded_excluded_provider_set).
+    _excluded: set = _expanded_excluded_provider_set(excluded_providers)
     # Effective base URLs of every built-in row we emit (normalized lower+rstrip).
     # Section 4 uses this to hide ``custom_providers`` entries that point at the
     # same endpoint as a built-in (e.g. a user-defined "my-dashscope" on
