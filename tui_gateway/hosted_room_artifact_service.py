@@ -485,6 +485,7 @@ class HostedRoomArtifactMixin:
         peer_client = None
         if target.get("kind") == "peer":
             key = (str(room["room_id"]), plan.member.member_id)
+            self._hydrate_persisted_peer_route(*key)
             peer_route = self.peer_routes.get(key)
             peer_client = self.peer_clients.get(key)
             if peer_route is None or peer_client is None:
@@ -707,6 +708,7 @@ class HostedRoomArtifactMixin:
                 "room output artifact target cannot be retired"
             )
         key = (str(room["room_id"]), plan.member.member_id)
+        self._hydrate_persisted_peer_route(*key)
         route = self.peer_routes.get(key)
         client = self.peer_clients.get(key)
         run_id = str(result.get("run_id") or "")
