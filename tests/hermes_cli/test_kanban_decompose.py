@@ -161,3 +161,66 @@ def test_decompose_returns_false_when_task_not_triage(kanban_home):
     assert "not in triage" in outcome.reason
 
 
+def test_decompose_skips_task_that_already_ran(kanban_home):
+    """A card sent BACK to triage after real work is a hold, not fresh intake.
+
+    `started_at` is set on first claim and never cleared, so it survives
+    review -> changes_requested -> blocked -> triage. Without this guard the
+    decomposer re-specifies work that already exists and the dispatcher
+    spawns a duplicate worker into the same workspace as the live card.
+    """
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="already worked", triage=True)
+        # Simulate a prior run, then a human parking it back in triage.
+        conn.execute(
+            "UPDATE tasks SET started_at = ? WHERE id = ?", (1_700_000_000, tid)
+        )
+        conn.commit()
+        assert kb.get_task(conn, tid).status == "triage"
+
+    patches = _patch_list_profiles(["orchestrator"])
+    for p in patches:
+        p.start()
+    try:
+        # No aux client patch: the guard must return BEFORE any LLM call.
+        outcome = decomp.decompose_task(tid, author="me")
+    finally:
+        for p in patches:
+            p.stop()
+
+    assert outcome.ok is False
+    assert "prior runs" in outcome.reason
+    assert outcome.child_ids in (None, [])
+
+    with kb.connect() as conn:
+        assert kb.get_task(conn, tid).status == "triage"
+        assert kb.list_tasks(conn, limit=100) and len(kb.list_tasks(conn, limit=100)) == 1
+
+
+def test_decompose_still_runs_for_fresh_triage_task(kanban_home):
+    """Guard must not block genuine intake: started_at is None before any run."""
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="fresh intake", triage=True)
+        assert kb.get_task(conn, tid).started_at is None
+
+    llm_payload = jsonlib.dumps({
+        "fanout": False,
+        "rationale": "single unit",
+        "title": "Specified title",
+        "body": "Specified body.",
+        "assignee": "orchestrator",
+    })
+
+    patches = _patch_list_profiles(["orchestrator"])
+    for p in patches:
+        p.start()
+    try:
+        with _patch_aux_client(llm_payload), _patch_extra_body():
+            outcome = decomp.decompose_task(tid, author="me")
+    finally:
+        for p in patches:
+            p.stop()
+
+    assert outcome.ok is True, outcome.reason
+
+
