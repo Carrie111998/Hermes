@@ -3902,10 +3902,11 @@ DEFAULT_CONFIG = {
         "capture_after_mode": "som",
         # Disable the cursor overlay rendered by cua-driver. The overlay
         # shows where agent actions land but can peg a core when idle
-        # (macOS vImage redraw loop #47032; Linux/WSL2 idle spin #28152).
+        # (macOS vImage redraw loop #47032; Linux/WSL2 idle spin #28152;
+        # elevated Windows daemon orphan overlay #98052).
         # cua-driver ≥ 0.6.x supports --no-overlay; Hermes also calls
         # set_agent_cursor_enabled(false) after start_session when this is on.
-        #   None  = auto-detect (off on macOS + headless/WSL2 Linux; on elsewhere)
+        #   None  = auto-detect (off on macOS, Windows, and headless/WSL2/X11 Linux)
         #   True  = always disable the overlay
         #   False = always enable the overlay
         "no_overlay": None,

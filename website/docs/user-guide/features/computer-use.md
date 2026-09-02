@@ -216,12 +216,13 @@ private lifecycle session inside the runtime; the public name does not.
 
 The overlay cursor is cosmetic — captures, clicks, and typing all work
 without it. Hermes disables it automatically where it is a known failure
-mode: macOS (idle CPU burn), headless Linux / WSL2 / containers, and
-**Linux X11 desktops** (the overlay is a fullscreen always-on-top window
-that can get stuck over every workspace after an unclean session end,
-wedging desktop input). Linux Wayland and Windows keep the overlay. Set
-`computer_use.no_overlay: false` in `config.yaml` to force the cursor on
-(or `true` to force it off) on any platform.
+mode: macOS (idle CPU burn), **Windows** (an elevated autostart daemon can
+leave a fullscreen overlay that a normal-integrity Hermes process cannot
+dismiss), headless Linux / WSL2 / containers, and **Linux X11 desktops**
+(the overlay can get stuck over every workspace after an unclean session
+end, wedging desktop input). Linux Wayland keeps the overlay. Set
+`computer_use.no_overlay: false` in `config.yaml` to force the cursor on (or
+`true` to force it off) on any platform.
 
 Tune the cursor with `cua-driver`'s CLI flags or the runtime
 `set_agent_cursor_style` MCP tool — see
