@@ -75,6 +75,7 @@ describe('Lunar City asset manifest', () => {
       proceduralPbrMaterialCount: number
       proceduralPbrMaterials: string[]
       sculptedCharacterCoreComponentCount: number
+      sculptedCharacterLimbComponentCount: number
       sculptedSurfaceComponentCount: number
       validation: Record<string, boolean>
       workers: Array<{ collection: string; id: string }>
@@ -88,13 +89,15 @@ describe('Lunar City asset manifest', () => {
     expect(manifest.workers).toHaveLength(6)
     expect(manifest.children).toHaveLength(4)
     expect(manifest.heroMeshComponentCount).toBeGreaterThan(600)
-    expect(manifest.sculptedSurfaceComponentCount).toBeGreaterThanOrEqual(76)
+    expect(manifest.sculptedSurfaceComponentCount).toBeGreaterThanOrEqual(148)
     expect(manifest.sculptedCharacterCoreComponentCount).toBeGreaterThanOrEqual(36)
+    expect(manifest.sculptedCharacterLimbComponentCount).toBeGreaterThanOrEqual(72)
     expect(manifest.proceduralPbrMaterialCount).toBeGreaterThanOrEqual(12)
     expect(manifest.proceduralPbrMaterials).toContain('Hero white hull PBR')
     expect(manifest.proceduralPbrMaterials).toContain('Hero leader fur')
     expect(manifest.validation.usesContinuousSculptedSurfaces).toBe(true)
     expect(manifest.validation.usesContinuousCharacterCoreMeshes).toBe(true)
+    expect(manifest.validation.usesContinuousCharacterLimbMeshes).toBe(true)
     expect(manifest.validation.usesProceduralPbrMaterials).toBe(true)
     expect(manifest.validation.freeLocalGenerationOnly).toBe(true)
     expect(manifest.validation.noRawSoulContent).toBe(true)

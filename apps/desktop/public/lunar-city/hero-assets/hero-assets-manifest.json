@@ -302,14 +302,16 @@
   ],
   "referenceTarget": "approved_lunar_city_reference_images",
   "schemaVersion": 1,
-  "sculptedCharacterCoreComponentCount": 36,
-  "sculptedSurfaceComponentCount": 76,
+  "sculptedCharacterCoreComponentCount": 108,
+  "sculptedCharacterLimbComponentCount": 72,
+  "sculptedSurfaceComponentCount": 158,
   "source": "local_blender_hero_asset_generation",
   "validation": {
     "allAssetsVisibleInReviewScene": true,
     "freeLocalGenerationOnly": true,
     "noRawSoulContent": true,
     "usesContinuousCharacterCoreMeshes": true,
+    "usesContinuousCharacterLimbMeshes": true,
     "usesContinuousSculptedSurfaces": true,
     "usesProceduralPbrMaterials": true,
     "usesSeparateHeroAssetScene": true

@@ -433,6 +433,59 @@ def sculpted_head(name, x, y, z, mat, target, asset_id, role, label_text, kind):
     return polish_surface(obj, subdivision=1, bevel=0.004)
 
 
+def sculpted_limb(name, start, end, radius_a, radius_b, mat, target, asset_id, role, component, segments=14):
+    start_v = Vector(start)
+    end_v = Vector(end)
+    axis = end_v - start_v
+    length = max(axis.length, 0.001)
+    direction = axis.normalized()
+    reference = Vector((0, 0, 1))
+    if abs(direction.dot(reference)) > 0.96:
+        reference = Vector((1, 0, 0))
+    tangent = direction.cross(reference).normalized()
+    bitangent = direction.cross(tangent).normalized()
+    verts = []
+    faces = []
+    rings = 6
+    for ring in range(rings + 1):
+        t = ring / rings
+        center = start_v.lerp(end_v, t)
+        radius = radius_a * (1 - t) + radius_b * t
+        squash = 0.76 + 0.16 * sin(pi * t)
+        for segment in range(segments):
+            angle = 2 * pi * segment / segments
+            offset = tangent * (cos(angle) * radius) + bitangent * (sin(angle) * radius * squash)
+            verts.append(tuple(center + offset))
+    for ring in range(rings):
+        for segment in range(segments):
+            a = ring * segments + segment
+            b = ring * segments + (segment + 1) % segments
+            c = (ring + 1) * segments + (segment + 1) % segments
+            d = (ring + 1) * segments + segment
+            faces.append((a, b, c, d))
+    faces.append(tuple(reversed(range(segments))))
+    top_start = rings * segments
+    faces.append(tuple(range(top_start, top_start + segments)))
+    mesh = bpy.data.meshes.new(f"{name}_mesh")
+    mesh.from_pydata(verts, [], faces)
+    mesh.update()
+    mesh.materials.append(mat)
+    obj = bpy.data.objects.new(name, mesh)
+    target.objects.link(obj)
+    mark(obj, asset_id, "character", role, component)
+    obj["mesh_construction"] = "continuous_tapered_limb_skin"
+    obj["retopology_target"] = "quad_tube_limb"
+    return polish_surface(obj, subdivision=1, bevel=0.003)
+
+
+def sculpted_antenna(name, x, y, z, height, mat, target, asset_id, role):
+    stem = lunar.curve(name, [(x, y, z), (x + 0.02, y, z + height * 0.45), (x, y, z + height)], 0.012, mat, target)
+    add_asset_metadata(stem, asset_id, "character", role, "flexible-antenna-rig")
+    stem["mesh_construction"] = "curve_skin_antenna"
+    stem["retopology_target"] = "curve_runtime_bone"
+    return stem
+
+
 def add_species_detail(asset_id, role, label_text, x, y, height, accent_mat, target, mats):
     lower = label_text.lower()
     if "owl" in lower:
@@ -554,8 +607,12 @@ def make_character(asset_id, role, label_text, accent, x, y, target, mats, kind)
     visor = chamfer(f"{asset_id}_visor_mesh", (x, y - 0.27, height + 0.18), (0.16, 0.018, 0.07), mats["glass"], target, asset_id, "character", role, "visor")
     visor["animation_binding"] = f"{asset_id}:look"
     for side in (-1, 1):
-        cylinder(f"{asset_id}_upper_arm_{side}_mesh", (x + side * (body_w + 0.12), y - 0.02, height * 0.55), 0.045 if leader else 0.032, height * 0.34, mats["suit"] if not leader else accent_mat, target, asset_id, "character", role, "upper-arm", 16, rotation=(0.42, side * 0.35, 0.0))
-        cylinder(f"{asset_id}_leg_{side}_mesh", (x + side * body_w * 0.45, y, height * 0.13), 0.052 if leader else 0.038, height * 0.26, mats["suit"], target, asset_id, "character", role, "leg", 16)
+        arm_start = (x + side * body_w * 0.82, y - 0.02, height * 0.58)
+        arm_end = (x + side * (body_w + 0.3), y - 0.12, height * 0.34)
+        sculpted_limb(f"{asset_id}_upper_arm_{side}_skin", arm_start, arm_end, 0.065 if leader else 0.045, 0.042 if leader else 0.03, mats["suit"] if not leader else accent_mat, target, asset_id, role, "single-piece-upper-arm")
+        leg_start = (x + side * body_w * 0.34, y, height * 0.2)
+        leg_end = (x + side * body_w * 0.48, y - 0.04, 0.08)
+        sculpted_limb(f"{asset_id}_leg_{side}_skin", leg_start, leg_end, 0.065 if leader else 0.047, 0.045 if leader else 0.032, mats["suit"], target, asset_id, role, "single-piece-leg")
         ellipsoid(f"{asset_id}_foot_{side}_mesh", (x + side * body_w * 0.48, y - 0.1, 0.05), (0.1, 0.16, 0.045), mats["black"], target, asset_id, "character", role, "foot", 20, 10)
     if leader:
         sculpted_robe(f"{asset_id}_robe_cloth_skin", x, y, height, accent_mat, target, asset_id, role)
@@ -593,7 +650,7 @@ def make_character(asset_id, role, label_text, accent, x, y, target, mats, kind)
         add_asset_metadata(rig, asset_id, "character", role, "animation-wire-rig")
         rig["animation_clips"] = "idle,walk,work,carry,inspect,repair,talk,wait,panic,celebrate,rest,return"
     if not leader:
-        cylinder(f"{asset_id}_antenna_stem_mesh", (x, y, height + 0.5), 0.014, 0.28, mats["shell"], target, asset_id, "character", role, "antenna", 10)
+        sculpted_antenna(f"{asset_id}_antenna_stem_skin", x, y, height + 0.38, 0.28, mats["shell"], target, asset_id, role)
         mark(lunar.sphere(f"{asset_id}_antenna_light_mesh", (x, y, height + 0.66), 0.045, accent_mat, target, 12, 6), asset_id, "character", role, "antenna-light")
         chamfer(f"{asset_id}_backpack_powerpack_mesh", (x, y + 0.22, height * 0.5), (0.17, 0.08, 0.19), accent_mat, target, asset_id, "character", role, "powerpack")
     label(f"{asset_id}_asset_label", label_text, (x, y - 1.05, 0.18), mats["text"], target, 0.13)
@@ -676,6 +733,7 @@ def main():
     scene["hero_mesh_components"] = sum(1 for obj in bpy.data.objects if obj.get("hero_asset"))
     scene["sculpted_surface_components"] = sum(1 for obj in bpy.data.objects if obj.get("mesh_construction"))
     scene["sculpted_character_core_components"] = sum(1 for obj in bpy.data.objects if str(obj.get("mesh_construction", "")).startswith("continuous_") and obj.get("asset_kind") == "character")
+    scene["sculpted_character_limb_components"] = sum(1 for obj in bpy.data.objects if obj.get("mesh_construction") == "continuous_tapered_limb_skin")
     pbr_materials = sorted({mat.name for mat in bpy.data.materials if mat.get("surface_pipeline")})
 
     manifest = {
@@ -691,6 +749,7 @@ def main():
         "heroMeshComponentCount": scene["hero_mesh_components"],
         "sculptedSurfaceComponentCount": scene["sculpted_surface_components"],
         "sculptedCharacterCoreComponentCount": scene["sculpted_character_core_components"],
+        "sculptedCharacterLimbComponentCount": scene["sculpted_character_limb_components"],
         "proceduralPbrMaterialCount": len(pbr_materials),
         "proceduralPbrMaterials": pbr_materials,
         "buildings": [
@@ -734,6 +793,7 @@ def main():
             "freeLocalGenerationOnly": True,
             "usesContinuousSculptedSurfaces": scene["sculpted_surface_components"] >= len(BUILDINGS) * 4 + len(LEADERS),
             "usesContinuousCharacterCoreMeshes": scene["sculpted_character_core_components"] >= (len(LEADERS) + len(WORKERS) + len(CHILDREN)) * 2,
+            "usesContinuousCharacterLimbMeshes": scene["sculpted_character_limb_components"] >= (len(LEADERS) + len(WORKERS) + len(CHILDREN)) * 4,
             "usesProceduralPbrMaterials": len(pbr_materials) >= 12,
         },
     }
