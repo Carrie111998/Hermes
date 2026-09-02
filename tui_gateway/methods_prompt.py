@@ -13,6 +13,24 @@ method = _registry.method
 _profile_scoped = _registry.profile_scoped
 
 
+def _prompt_extra_system(params: dict) -> tuple[str | None, str | None]:
+    """Return `prompt.submit`'s optional one-turn system context.
+
+    `system_message` takes precedence over `instructions`; a present key must
+    be a non-blank string. During a busy turn the overlay queues as a distinct
+    model request instead of steering or redirecting the live turn.
+    """
+    for key in ("system_message", "instructions"):
+        if key not in params:
+            continue
+        raw = params[key]
+        if not isinstance(raw, str):
+            return None, f"{key} must be a string"
+        if not raw.strip():
+            return None, f"{key} must not be blank"
+        return raw, None
+    return None, None
+
 def _history_user_indices(history: list) -> list:
     """Indices of canonical live-user turns, including composite carriers."""
     from agent.context_compressor import user_originated_turn_view
@@ -295,6 +313,9 @@ def _(rid, params: dict) -> dict:
     # client renders it as a bubble. Whitelisted to "hidden" — display_kind
     # is a DB-only sidecar and this RPC must not mint arbitrary kinds.
     display_kind = "hidden" if params.get("display_kind") == "hidden" else None
+    extra_system, extra_system_error = _prompt_extra_system(params)
+    if extra_system_error:
+        return _err(rid, 4004, extra_system_error)
     # Typed bare stop phrase while backend voice mode is active ends the
     # voice chat instead of sending "stop" to the agent — the typed twin of
     # the spoken stop phrase (PR #73106), applied at the ONE server-side
@@ -487,8 +508,13 @@ def _(rid, params: dict) -> dict:
             else:
                 break
         busy_response = _handle_busy_submit(
-            rid, sid, session, text, busy_transport,
+            rid,
+            sid,
+            session,
+            text,
+            busy_transport,
             queued=bool(params.get("queued")),
+            extra_system=extra_system,
         )
         if busy_response is not None:
             return busy_response
@@ -931,7 +957,12 @@ def _(rid, params: dict) -> dict:
 
     if turn_isolation:
         isolated_response = _submit_prompt_to_compute_host(
-            rid, sid, session, text, display_kind=display_kind
+            rid,
+            sid,
+            session,
+            text,
+            display_kind=display_kind,
+            **({"extra_system": extra_system} if extra_system else {}),
         )
         if not isolated_response.get("error"):
             if survivor_user_row_ids is not None and requested_rebind_ids is None:
@@ -1051,6 +1082,7 @@ def _(rid, params: dict) -> dict:
             text,
             display_kind=display_kind,
             terminal_callback=hosted_terminal_callback,
+            **({"extra_system": extra_system} if extra_system else {}),
         )
 
     run_thread = threading.Thread(target=run_after_agent_ready, daemon=True)
@@ -1917,6 +1949,7 @@ def register(server) -> None:
     # sites) resolve the same free names after the split.
     g = vars(server)
     for helper in (
+        _prompt_extra_system,
         _history_user_indices,
         _message_row_id,
         _mem_db_pair_agrees,

@@ -2719,6 +2719,7 @@ def _compute_host_turn_frame(
     image_paths: list[str] | None = None,
     queued_prompt_generation: int | None = None,
     display_kind: str | None = None,
+    extra_system: str | None = None,
 ) -> dict:
     with session["history_lock"]:
         history = list(session.get("history", []))
@@ -2735,6 +2736,7 @@ def _compute_host_turn_frame(
         "session_key": session.get("session_key") or sid,
         "text": text,
         **({"display_kind": display_kind} if display_kind else {}),
+        **({"extra_system": extra_system} if extra_system else {}),
         "history": history,
         "history_version": history_version,
         "cols": int(session.get("cols", 80) or 80),
@@ -2907,6 +2909,7 @@ def _submit_prompt_to_compute_host(
     image_paths: list[str] | None = None,
     queued_prompt_generation: int | None = None,
     display_kind: str | None = None,
+    extra_system: str | None = None,
 ) -> dict:
     cfg = _load_dashboard_process_isolation_config()
     frame = _compute_host_turn_frame(
@@ -2916,6 +2919,7 @@ def _submit_prompt_to_compute_host(
         text,
         image_paths=image_paths,
         queued_prompt_generation=queued_prompt_generation,
+        extra_system=extra_system,
         display_kind=display_kind,
     )
 
@@ -8726,36 +8730,43 @@ def _apply_personality_to_session(
     """
     if not session:
         return False, None
-    session["personality"] = personality
+    # Inject a pivot marker into history so the model sees the change point.
+    # This prevents it from pattern-matching its prior style.
+    if new_prompt:
+        marker = (
+            "[System: The user has changed the assistant's personality. "
+            "From this point forward, adopt the following persona and respond "
+            f"accordingly: {new_prompt}]"
+        )
+    else:
+        marker = (
+            "[System: The user has cleared the personality overlay. "
+            "From this point forward, respond in your normal default style.]"
+        )
 
-    agent = session.get("agent")
-    if agent:
-        agent.ephemeral_system_prompt = new_prompt or None
-        # Inject a pivot marker into history so the model sees the change point.
-        # This prevents it from pattern-matching its prior style.
-        if new_prompt:
-            marker = (
-                "[System: The user has changed the assistant's personality. "
-                "From this point forward, adopt the following persona and respond "
-                f"accordingly: {new_prompt}]"
-            )
-        else:
-            marker = (
-                "[System: The user has cleared the personality overlay. "
-                "From this point forward, respond in your normal default style.]"
-            )
-        # Tagged like the model-switch marker (`_append_model_switch_marker`):
-        # the marker rides as role=user so strict OpenAI-compatible providers
-        # accept it mid-conversation, but `display_kind` keeps it out of the
-        # `truncate_before_user_ordinal` addressing space. Untagged, it counts
-        # as a real user turn on the gateway side while no client counts it, so
-        # every later rewind resolves one turn too early and `replace_messages`
-        # hard-deletes the difference (#82756).
-        with session["history_lock"]:
+    # Prompt ownership is session-scoped: a one-turn extra-system overlay can
+    # be normalized in place by provider retry paths, so string equality cannot
+    # tell it apart from a user-initiated personality mutation. Serialize both
+    # mutations and stamp only real personality changes with this revision.
+    with session["history_lock"]:
+        session["personality"] = personality
+        session["_ephemeral_system_prompt_revision"] = (
+            int(session.get("_ephemeral_system_prompt_revision", 0)) + 1
+        )
+        agent = session.get("agent")
+        if agent:
+            agent.ephemeral_system_prompt = new_prompt or None
+            # Tagged like the model-switch marker (`_append_model_switch_marker`):
+            # the marker rides as role=user so strict OpenAI-compatible providers
+            # accept it mid-conversation, but `display_kind` keeps it out of the
+            # `truncate_before_user_ordinal` addressing space. Untagged, it
+            # counts as a real user turn on the gateway side while no client
+            # counts it, so every later rewind resolves one turn too early.
             session["history"].append(
                 {"role": "user", "content": marker, "display_kind": "personality_switch"}
             )
             session["history_version"] = int(session.get("history_version", 0)) + 1
+    if agent:
         info = _session_info(agent)
         _emit("session.info", sid, info)
         return False, info
@@ -10397,6 +10408,7 @@ def _enqueue_prompt(
     text: Any,
     transport: Any,
     image_paths: list[str] | None = None,
+    extra_system: str | None = None,
 ) -> None:
     """Stash a message to run as the very next turn once the live one ends.
 
@@ -10412,10 +10424,11 @@ def _enqueue_prompt(
     # merge below cannot glue "{original}\\n\\n{later}" and re-fire original
     # on drain after a later correction settles.
     _drop_queued_duplicates_of_inflight_user(session)
-    # Never queue a text-only self-copy of the live inflight user prompt. The
-    # live turn already owns that text; draining it after settle would restart
-    # the same user turn as a fresh agent invocation.
-    if not image_paths and isinstance(text, str):
+    # Never queue a text-only self-copy of the live inflight user prompt unless
+    # it carries a one-turn system override. The live turn already owns plain
+    # text, but an instruction-bearing copy is a distinct model request and
+    # must run after the active turn.
+    if not image_paths and not extra_system and isinstance(text, str):
         turn = session.get("inflight_turn")
         original = (
             str(turn.get("user") or "").strip() if isinstance(turn, dict) else ""
@@ -10423,6 +10436,8 @@ def _enqueue_prompt(
         if original and text.strip() == original:
             return
     queued = {"text": text, "transport": transport}
+    if extra_system:
+        queued["extra_system"] = extra_system
     if image_paths:
         queued["image_paths"] = image_paths
     existing = session.get("queued_prompt")
@@ -10432,6 +10447,8 @@ def _enqueue_prompt(
         and isinstance(text, str)
         and not existing.get("image_paths")
         and not image_paths
+        and not existing.get("extra_system")
+        and not extra_system
         and not session.get("queued_prompts")
     ):
         prev = existing["text"]
@@ -10449,15 +10466,16 @@ def _sanitize_queued_entry_vs_inflight_user(
     """Drop or rewrite a queue envelope that re-carries the live user text.
 
     Returns ``None`` to drop the envelope, or a (possibly rewritten) dict to
-    keep. Text-only self-duplicates of ``original`` are dropped. A merged
-    slot ``"{original}\\n\\n{later}"`` (from ``_enqueue_prompt``'s consecutive
-    text merge) is rewritten to just ``later`` so a later correction is not
-    lost and the original is not re-fired (#84417). Image-bearing envelopes
-    are left alone — their chronology/ownership is load-bearing.
+    keep. Text-only self-duplicates of ``original`` are dropped unless they
+    carry a one-turn system override. A merged slot
+    ``"{original}\\n\\n{later}"`` (from ``_enqueue_prompt``'s consecutive text
+    merge) is rewritten to just ``later`` so a later correction is not lost and
+    the original is not re-fired (#84417). Image-bearing and instruction-bearing
+    envelopes are left alone — their request identity is load-bearing.
     """
     if not original or not isinstance(entry, dict):
         return entry if isinstance(entry, dict) else None
-    if entry.get("image_paths"):
+    if entry.get("image_paths") or entry.get("extra_system"):
         return entry
     text = entry.get("text")
     if not isinstance(text, str):
@@ -10555,7 +10573,13 @@ def _interrupt_busy_session(sid: str, session: dict, agent: Any) -> None:
 
 
 def _handle_busy_submit(
-    rid, sid: str, session: dict, text: Any, transport: Any, queued: bool = False
+    rid,
+    sid: str,
+    session: dict,
+    text: Any,
+    transport: Any,
+    queued: bool = False,
+    extra_system: str | None = None,
 ) -> dict | None:
     """Apply the ``display.busy_input_mode`` policy to a prompt that lands while
     a turn is in flight, instead of rejecting it with ``session busy``.
@@ -10568,6 +10592,13 @@ def _handle_busy_submit(
     Modes: ``interrupt`` (default) → redirect the live turn, falling back to
     hard interrupt + queue for older agents; ``queue`` → queue without
     interrupting; ``steer`` → inject after the current atomic action.
+
+    Payloads carrying a one-turn ``extra_system`` overlay never steer or
+    redirect in place — ``steer()``/``redirect()`` carry only text, so the
+    overlay would be dropped; they queue as a distinct model request
+    (interrupt mode still hard-interrupts the live turn so the queued prompt
+    drains immediately; steer mode queues without interrupting, per the
+    #86134 invariant).
 
     ``queued=True`` (client's queue drain, ``prompt.submit`` param) overrides
     the mode entirely: the message was explicitly queued as "run after", so it
@@ -10593,7 +10624,14 @@ def _handle_busy_submit(
             session["attached_images"] = []
     text_only = not image_paths and _is_text_only_busy_payload(text)
     plain_text = _coerce_message_text(text).strip() if text_only else ""
-    if mode == "steer" and text_only and plain_text and agent is not None and hasattr(agent, "steer"):
+    if (
+        mode == "steer"
+        and not extra_system
+        and text_only
+        and plain_text
+        and agent is not None
+        and hasattr(agent, "steer")
+    ):
         try:
             if agent.steer(plain_text):
                 with session["history_lock"]:
@@ -10609,6 +10647,7 @@ def _handle_busy_submit(
     if (
         mode == "interrupt"
         and text_only
+        and not extra_system
         and plain_text
         and agent is not None
         and getattr(agent, "_supports_active_turn_redirect", False) is True
@@ -10633,7 +10672,13 @@ def _handle_busy_submit(
             if image_paths:
                 session["attached_images"] = image_paths + list(session.get("attached_images", []))
             return None
-        _enqueue_prompt(session, text, transport, image_paths=image_paths)
+        _enqueue_prompt(
+            session,
+            text,
+            transport,
+            image_paths=image_paths,
+            extra_system=extra_system,
+        )
         session["last_active"] = time.time()
 
     # Attachments need a separate model invocation. Queue them without
@@ -10704,10 +10749,24 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
                     queued["text"],
                     image_paths=queued["image_paths"],
                     queued_prompt_generation=queue_generation,
+                    **(
+                        {"extra_system": queued["extra_system"]}
+                        if queued.get("extra_system")
+                        else {}
+                    ),
                 )
             else:
                 resp = _submit_prompt_to_compute_host(
-                    rid, sid, session, queued["text"], queued_prompt_generation=queue_generation
+                    rid,
+                    sid,
+                    session,
+                    queued["text"],
+                    queued_prompt_generation=queue_generation,
+                    **(
+                        {"extra_system": queued["extra_system"]}
+                        if queued.get("extra_system")
+                        else {}
+                    ),
                 )
             if resp.get("error"):
                 message = str(((resp.get("error") or {}).get("message")) or "queued prompt failed")
@@ -10725,6 +10784,11 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
                     queued["text"],
                     image_paths=queued["image_paths"],
                     queued_prompt_generation=queue_generation,
+                    **(
+                        {"extra_system": queued["extra_system"]}
+                        if queued.get("extra_system")
+                        else {}
+                    ),
                 )
             else:
                 _run_prompt_submit(
@@ -10733,6 +10797,11 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
                     session,
                     queued["text"],
                     queued_prompt_generation=queue_generation,
+                    **(
+                        {"extra_system": queued["extra_system"]}
+                        if queued.get("extra_system")
+                        else {}
+                    ),
                 )
     except Exception as exc:
         print(
@@ -13165,6 +13234,7 @@ def _run_prompt_submit(
     image_paths: list[str] | None = None,
     queued_prompt_generation: int | None = None,
     terminal_callback: Callable[[dict[str, Any]], None] | None = None,
+    extra_system: str | None = None,
 ) -> bool:
     # Ownership admission at the ONE chokepoint every fresh turn source must
     # cross. prompt.submit already claims the slot in its RPC handler (so this
@@ -13264,6 +13334,12 @@ def _run_prompt_submit(
         # rather than read from the turn body because the exception path can
         # fire before the prompt is resolved.
         turn_prompt_text = ""
+        # Per-message system-context override (prompt.submit's `extra_system`):
+        # revision tracks session-level prompt mutations independently from
+        # transient provider-side normalization of the temporary overlay.
+        prior_ephemeral_system_prompt = None
+        ephemeral_system_prompt_revision = None
+        ephemeral_system_prompt_overridden = False
         # Durable crash marker: written before the turn runs, retired the
         # moment its outcome reaches the client (see _retire_turn_marker).
         # Any concluded turn — success, handled error, interrupt — retires
@@ -13342,6 +13418,24 @@ def _run_prompt_submit(
             # the turn runs. No-op for every other session shape.
             _sync_bot_capabilities(sid, session)
             agent = session["agent"]
+            if extra_system:
+                # The temporary overlay is API-call-only. Capture its owning
+                # session revision under the same lock personality changes use;
+                # cleanup restores after internal normalization, but never over
+                # a newer user-selected personality.
+                with session["history_lock"]:
+                    prior_ephemeral_system_prompt = getattr(
+                        agent, "ephemeral_system_prompt", None
+                    )
+                    ephemeral_system_prompt_revision = int(
+                        session.get("_ephemeral_system_prompt_revision", 0)
+                    )
+                    agent.ephemeral_system_prompt = (
+                        f"{prior_ephemeral_system_prompt}\n\n{extra_system}"
+                        if prior_ephemeral_system_prompt
+                        else extra_system
+                    )
+                    ephemeral_system_prompt_overridden = True
             # Snapshot after turn-start model sync. A deferred switch mutates
             # history and its version; that mutation belongs to this turn.
             with session["history_lock"]:
@@ -14083,6 +14177,12 @@ def _run_prompt_submit(
                     _persist_live_session_system_prompt(session)
                 except Exception:
                     logger.debug("TUI one-turn model restore failed", exc_info=True)
+            if ephemeral_system_prompt_overridden:
+                with session["history_lock"]:
+                    if int(
+                        session.get("_ephemeral_system_prompt_revision", 0)
+                    ) == ephemeral_system_prompt_revision:
+                        agent.ephemeral_system_prompt = prior_ephemeral_system_prompt
             try:
                 if approval_token is not None:
                     reset_current_session_key(approval_token)
