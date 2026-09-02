@@ -2993,6 +2993,16 @@ class APIServerAdapter(BasePlatformAdapter):
         except RuntimeError as exc:
             raise _ProviderAuthResolutionError(str(exc)) from exc
         model = _resolve_gateway_model()
+        user_config = _load_gateway_config()
+        from hermes_cli.fallback_config import (
+            compose_fallback_chain,
+            get_configured_default_route,
+        )
+
+        configured_default_route = get_configured_default_route(
+            user_config,
+            runtime=runtime_kwargs,
+        )
 
         # When the primary provider's auth fails (expired token / 429 quota
         # cap), _resolve_runtime_agent_kwargs() falls through to the fallback
@@ -3199,7 +3209,6 @@ class APIServerAdapter(BasePlatformAdapter):
                     self._last_resolved_model[_resolved_key] = model
                 self._last_resolved_model["*"] = model
 
-        user_config = _load_gateway_config()
         enabled_toolsets = sorted(_get_platform_tools(user_config, "api_server"))
         max_iterations = _current_max_iterations()
         if room_dispatch is not None:
@@ -3211,11 +3220,19 @@ class APIServerAdapter(BasePlatformAdapter):
 
         # Load fallback provider chain so the API server platform has the
         # same fallback behaviour as Telegram/Discord/Slack (fixes #4954).
-        fallback_model = (
-            None
-            if confirmed_runtime_lock
-            else GatewayRunner._load_fallback_model()
-        )
+        if confirmed_runtime_lock:
+            fallback_model = None
+        else:
+            fallback_model = compose_fallback_chain(
+                GatewayRunner._load_fallback_model(),
+                primary={
+                    "provider": runtime_kwargs.get("requested_provider")
+                    or runtime_kwargs.get("provider"),
+                    "model": model,
+                    "base_url": runtime_kwargs.get("base_url"),
+                },
+                configured_default=configured_default_route,
+            ) or None
 
         # Resolve reasoning against the model this request will actually
         # run. Per-model ``agent.reasoning_overrides`` key off that model,
@@ -3255,6 +3272,7 @@ class APIServerAdapter(BasePlatformAdapter):
             agent_kwargs["service_tier"] = request_service_tier
 
         agent = AIAgent(**agent_kwargs)
+        agent._configured_default_route = configured_default_route
         agent._hermes_api_runtime = {
             "provider": runtime_kwargs.get("provider") or getattr(agent, "provider", "") or "",
             "model": getattr(agent, "model", None) or model,

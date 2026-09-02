@@ -2550,6 +2550,52 @@ class TestModelRoutesHandlers:
 
 class TestModelRoutesAgentCreation:
 
+    def test_equal_model_auth_fallback_does_not_manufacture_default_route(
+        self, monkeypatch
+    ):
+        captured = {}
+
+        class FakeAgent:
+            def __init__(self, **kwargs):
+                captured.update(kwargs)
+                self.model = kwargs["model"]
+                self.provider = kwargs["provider"]
+
+        _patch_create_agent_runtime(monkeypatch, captured, FakeAgent)
+        fallback_route = {
+            "provider": "fallback-b",
+            "requested_provider": "fallback-b",
+            "model": "shared-model",
+            "api_key": "fallback-key",
+            "base_url": "https://fallback.example/v1",
+            "api_mode": "chat_completions",
+        }
+        monkeypatch.setattr(
+            "gateway.run._resolve_runtime_agent_kwargs",
+            lambda: fallback_route.copy(),
+        )
+        monkeypatch.setattr(
+            "gateway.run._resolve_gateway_model", lambda: "shared-model"
+        )
+        monkeypatch.setattr(
+            "gateway.run._load_gateway_config",
+            lambda: {"model": {"default": "shared-model"}},
+        )
+        monkeypatch.setattr(
+            "gateway.run.GatewayRunner._load_fallback_model",
+            staticmethod(lambda: [fallback_route]),
+        )
+        adapter = _make_routing_adapter({})
+        monkeypatch.setattr(adapter, "_ensure_session_db", lambda: None)
+        monkeypatch.setattr(adapter, "_session_model_override_for", lambda *_: None)
+
+        agent = adapter._create_agent(session_id="s1")
+
+        assert captured["provider"] == "fallback-b"
+        assert captured["model"] == "shared-model"
+        assert captured["fallback_model"] is None
+        assert agent._configured_default_route is None
+
     def test_route_provider_resolves_provider_credentials(self, monkeypatch):
         captured = {}
 
@@ -2609,6 +2655,57 @@ class TestModelRoutesAgentCreation:
         assert captured["model"] == "session/override-model"
         assert captured["provider"] == "sessionprov"
         assert captured["api_key"] == "sk-session"
+
+
+    def test_session_model_override_falls_back_through_configured_default(self, monkeypatch):
+        captured = {}
+
+        class FakeAgent:
+            def __init__(self, **kwargs):
+                captured.update(kwargs)
+
+        _patch_create_agent_runtime(monkeypatch, captured, FakeAgent)
+        monkeypatch.setattr(
+            "gateway.run._load_gateway_config",
+            lambda: {
+                "model": {
+                    "default": "global/model",
+                    "provider": "openrouter",
+                    "base_url": "https://openrouter.ai/api/v1",
+                }
+            },
+        )
+        monkeypatch.setattr(
+            "gateway.run.GatewayRunner._load_fallback_model",
+            staticmethod(
+                lambda: [{"provider": "nous", "model": "Hermes-4"}]
+            ),
+        )
+        adapter = _make_routing_adapter({})
+        monkeypatch.setattr(adapter, "_ensure_session_db", lambda: None)
+        monkeypatch.setattr(
+            adapter,
+            "_session_model_override_for",
+            lambda _key: {
+                "model": "session/override-model",
+                "provider": "sessionprov",
+                "api_key": "sk-session",
+                "base_url": "https://session.example/v1",
+            },
+        )
+
+        agent = adapter._create_agent(session_id="s1")
+
+        assert captured["fallback_model"] == [
+            {
+                "provider": "openrouter",
+                "model": "global/model",
+                "base_url": "https://openrouter.ai/api/v1",
+                "api_mode": "chat_completions",
+            },
+            {"provider": "nous", "model": "Hermes-4"},
+        ]
+        assert agent._configured_default_route == captured["fallback_model"][0]
 
 
 class TestStoredSessionModelFilter:

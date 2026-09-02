@@ -3396,6 +3396,19 @@ def switch_model(
             entry for entry in fallback_chain
             if (entry.get("provider") or "").strip().lower() not in {old_norm, new_norm}
         ]
+    configured_default = getattr(agent, "_configured_default_route", None)
+    if configured_default:
+        from hermes_cli.fallback_config import compose_fallback_chain
+
+        fallback_chain = compose_fallback_chain(
+            fallback_chain,
+            primary={
+                "provider": getattr(agent, "requested_provider", None) or new_provider,
+                "model": new_model,
+                "base_url": agent.base_url,
+            },
+            configured_default=configured_default,
+        )
     agent._fallback_chain = fallback_chain
     agent._fallback_model = fallback_chain[0] if fallback_chain else None
 

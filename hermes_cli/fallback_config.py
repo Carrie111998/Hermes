@@ -77,6 +77,99 @@ def _entry_identity(entry: dict[str, Any]) -> tuple[str, str, str]:
     )
 
 
+def get_configured_default_route(
+    config: dict[str, Any] | None,
+    *,
+    runtime: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
+    """Return the configured primary route in fallback-entry form."""
+
+    config = config or {}
+    runtime = runtime or {}
+    model_cfg = config.get("model", {})
+    if isinstance(model_cfg, str):
+        model = model_cfg.strip()
+        model_route: dict[str, Any] = {}
+    elif isinstance(model_cfg, dict):
+        raw_default = model_cfg.get("default") or model_cfg.get("model")
+        if isinstance(raw_default, dict):
+            model_route = raw_default
+            model = str(
+                raw_default.get("model")
+                or raw_default.get("name")
+                or raw_default.get("default")
+                or ""
+            ).strip()
+        else:
+            model_route = {}
+            model = str(raw_default or "").strip()
+    else:
+        return None
+
+    runtime_model = str(runtime.get("model") or "").strip()
+    if runtime_model:
+        # Gateway auth recovery returns the selected fallback model alongside
+        # its runtime. That provider describes the fallback route, not a
+        # provider-less configured default. This remains true when both routes
+        # use the same model ID, so combining them would invent a route that
+        # was never configured.
+        runtime = {}
+
+    provider = str(
+        model_route.get("provider")
+        or (model_cfg.get("provider") if isinstance(model_cfg, dict) else "")
+        or runtime.get("requested_provider")
+        or runtime.get("provider")
+        or ""
+    ).strip()
+    if not model or not provider:
+        return None
+
+    route: dict[str, Any] = {"provider": provider, "model": model}
+    base_url = _normalized_base_url(
+        model_route.get("base_url")
+        or (model_cfg.get("base_url") if isinstance(model_cfg, dict) else "")
+        or runtime.get("base_url")
+    )
+    if base_url:
+        route["base_url"] = base_url
+    api_mode = str(
+        model_route.get("api_mode")
+        or (model_cfg.get("api_mode") if isinstance(model_cfg, dict) else "")
+        or runtime.get("api_mode")
+        or ""
+    ).strip()
+    if api_mode:
+        route["api_mode"] = api_mode
+    return route
+
+
+def compose_fallback_chain(
+    chain: Any,
+    *,
+    primary: dict[str, Any] | None,
+    configured_default: dict[str, Any] | None,
+) -> list[dict[str, Any]]:
+    """Seat the configured default behind an overridden primary.
+
+    Routes are de-duplicated by provider/model/base URL. The active primary is
+    omitted, while a distinct configured default precedes configured fallbacks.
+    """
+
+    primary_entries = _iter_fallback_entries(primary)
+    primary_identity = _entry_identity(primary_entries[0]) if primary_entries else None
+    candidates = [*_iter_fallback_entries(configured_default), *_iter_fallback_entries(chain)]
+    result: list[dict[str, Any]] = []
+    seen: set[tuple[str, str, str]] = set()
+    for entry in candidates:
+        identity = _entry_identity(entry)
+        if identity == primary_identity or identity in seen:
+            continue
+        seen.add(identity)
+        result.append(entry)
+    return result
+
+
 def get_fallback_chain(config: dict[str, Any] | None) -> list[dict[str, Any]]:
     """Return the effective fallback chain merged across old and new config keys.
 

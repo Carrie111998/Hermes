@@ -70,33 +70,142 @@ def test_apply_fallback_chain_skips_while_cooldown_holds_fallback():
     assert agent._fallback_activated is True
 
 
-def test_background_and_main_agent_paths_call_refresh():
-    """Both AIAgent construction sites must pass a refreshed chain, not the
-    startup snapshot, and the cached-agent reuse path must apply the refreshed
-    chain. Source-level invariant for call sites that resist unit testing.
-    """
-    from pathlib import Path
+def test_refresh_composes_configured_default_for_session_override(tmp_path, monkeypatch):
+    from gateway.run import GatewayRunner
 
-    source = (
-        Path(__file__).resolve().parent.parent.parent / "gateway" / "run.py"
-    ).read_text(encoding="utf-8")
-    # The agent-construction site inside TurnRunner.run_sync (extracted from
-    # the old _run_agent_inner closure) references the runner as
-    # ``self._runner``; the background-agent site still uses bare ``self``.
-    _refresh_calls = (
-        source.count("fallback_model=self._refresh_fallback_model()")
-        + source.count("fallback_model=self._runner._refresh_fallback_model()")
+    monkeypatch.setattr("gateway.run._hermes_home", tmp_path)
+    (tmp_path / "config.yaml").write_text(
+        "fallback_providers:\n"
+        "  - provider: openai-codex\n"
+        "    model: gpt-5.6-luna\n"
     )
-    assert _refresh_calls >= 2
-    # The cached-agent reuse path (the load-bearing fix for a long-lived
-    # session in a running gateway) must apply the refreshed chain.
-    assert (
-        "self._apply_fallback_chain_to_agent(" in source
-        or "self._runner._apply_fallback_chain_to_agent(" in source
+    runner = SimpleNamespace(_fallback_model=None)
+    bound = GatewayRunner._refresh_fallback_model.__get__(runner)
+
+    chain = bound(
+        primary_route={"provider": "openrouter", "model": "override-model"},
+        configured_default_route={"provider": "commandcode", "model": "model-a"},
     )
-    # The stale startup-snapshot form must not remain at create sites.
-    assert "fallback_model=self._fallback_model," not in source
-    assert "fallback_model=self._runner._fallback_model," not in source
+
+    assert chain == [
+        {"provider": "commandcode", "model": "model-a"},
+        {"provider": "openai-codex", "model": "gpt-5.6-luna"},
+    ]
+
+
+def test_refresh_preserves_last_known_default_on_transient_parse_failure(
+    tmp_path, monkeypatch
+):
+    from gateway.run import GatewayRunner
+
+    monkeypatch.setattr("gateway.run._hermes_home", tmp_path)
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text(
+        "fallback_providers:\n"
+        "  - provider: openai-codex\n"
+        "    model: gpt-5.6-luna\n"
+    )
+    runner = SimpleNamespace(
+        _fallback_model=None,
+        _configured_default_route=None,
+    )
+    primary = {"provider": "openrouter", "model": "override-model"}
+    configured_default = {"provider": "commandcode", "model": "model-a"}
+
+    initial, initial_default = GatewayRunner._refresh_fallback_state.__get__(runner)(
+        primary_route=primary,
+        configured_default_route=configured_default,
+    )
+    cfg.write_text("model: [unterminated")
+    retained, retained_default = GatewayRunner._refresh_fallback_state.__get__(runner)(
+        primary_route=primary,
+        configured_default_route=None,
+    )
+
+    assert initial == retained == [
+        configured_default,
+        {"provider": "openai-codex", "model": "gpt-5.6-luna"},
+    ]
+    assert initial_default == retained_default == configured_default
+
+
+def test_refresh_clears_last_known_default_after_successful_removal(
+    tmp_path, monkeypatch
+):
+    from gateway.run import GatewayRunner
+
+    monkeypatch.setattr("gateway.run._hermes_home", tmp_path)
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text("fallback_providers: []\n")
+    configured_default = {"provider": "commandcode", "model": "model-a"}
+    runner = SimpleNamespace(
+        _fallback_model=None,
+        _configured_default_route=configured_default,
+    )
+    chain, effective_default = GatewayRunner._refresh_fallback_state.__get__(runner)(
+        primary_route={"provider": "openrouter", "model": "override-model"},
+        configured_default_route=None,
+    )
+
+    assert chain is None
+    assert effective_default is None
+
+
+def test_refresh_state_isolated_by_multiplex_profile_home(tmp_path, monkeypatch):
+    from gateway.run import GatewayRunner
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+    homes = {name: tmp_path / name for name in ("profile-a", "profile-b")}
+    for home in homes.values():
+        home.mkdir()
+    (homes["profile-a"] / "config.yaml").write_text(
+        "fallback_providers:\n  - provider: fallback-a\n    model: rescue-a\n"
+    )
+    (homes["profile-b"] / "config.yaml").write_text(
+        "fallback_providers:\n  - provider: fallback-b\n    model: rescue-b\n"
+    )
+    runner = SimpleNamespace(_fallback_model=None)
+    refresh = GatewayRunner._refresh_fallback_state.__get__(runner)
+    primary = {"provider": "override", "model": "session-model"}
+    defaults = {
+        "profile-a": {"provider": "provider-a", "model": "default-a"},
+        "profile-b": {"provider": "provider-b", "model": "default-b"},
+    }
+
+    token = set_hermes_home_override(str(homes["profile-a"]))
+    try:
+        refresh(primary_route=primary, configured_default_route=defaults["profile-a"])
+    finally:
+        reset_hermes_home_override(token)
+    token = set_hermes_home_override(str(homes["profile-b"]))
+    try:
+        chain_b, effective_b = refresh(
+            primary_route=primary,
+            configured_default_route=defaults["profile-b"],
+        )
+    finally:
+        reset_hermes_home_override(token)
+
+    (homes["profile-a"] / "config.yaml").write_text("model: [unterminated")
+    token = set_hermes_home_override(str(homes["profile-a"]))
+    try:
+        chain_a, effective_a = refresh(
+            primary_route=primary,
+            configured_default_route=None,
+        )
+    finally:
+        reset_hermes_home_override(token)
+
+    assert effective_b == defaults["profile-b"]
+    assert chain_b == [
+        defaults["profile-b"],
+        {"provider": "fallback-b", "model": "rescue-b"},
+    ]
+    assert effective_a == defaults["profile-a"]
+    assert chain_a == [
+        defaults["profile-a"],
+        {"provider": "fallback-a", "model": "rescue-a"},
+    ]
 
 
 def test_load_fallback_model_static_unchanged_contract(tmp_path, monkeypatch):

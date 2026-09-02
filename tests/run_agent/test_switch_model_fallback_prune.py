@@ -37,6 +37,26 @@ def _make_agent(chain):
     return agent
 
 
+def _make_initialized_agent(chain):
+    with (
+        patch("run_agent.get_tool_definitions", return_value=[]),
+        patch("run_agent.check_toolset_requirements", return_value={}),
+        patch("run_agent.OpenAI"),
+    ):
+        agent = AIAgent(
+            provider="openrouter",
+            model="x-ai/grok-4",
+            api_key="or-key",
+            base_url="https://openrouter.ai/api/v1",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+            fallback_model=chain,
+        )
+    agent.client = MagicMock()
+    return agent
+
+
 def _switch_to_anthropic(agent):
     with (
         patch("agent.anthropic_adapter.build_anthropic_client", return_value=MagicMock()),
@@ -67,6 +87,43 @@ def test_switch_drops_old_primary_from_fallback_chain():
     assert "anthropic" not in providers, "new primary is redundant in the chain"
     assert providers == ["nous"]
     assert agent._fallback_model == {"provider": "nous", "model": "hermes-4"}
+
+
+def test_initialized_generic_agent_does_not_restore_old_primary_on_switch():
+    agent = _make_initialized_agent([
+        {"provider": "openrouter", "model": "x-ai/grok-4"},
+        {"provider": "nous", "model": "hermes-4"},
+    ])
+
+    assert agent._configured_default_route is None
+
+    _switch_to_anthropic(agent)
+
+    assert agent._fallback_chain == [
+        {"provider": "nous", "model": "hermes-4"},
+    ]
+
+
+def test_switch_retains_configured_default_as_first_fallback():
+    default = {
+        "provider": "openrouter",
+        "model": "x-ai/grok-4",
+        "base_url": "https://openrouter.ai/api/v1",
+    }
+    agent = _make_agent([
+        default,
+        {"provider": "nous", "model": "hermes-4"},
+        default.copy(),
+    ])
+    agent._configured_default_route = default
+
+    _switch_to_anthropic(agent)
+
+    assert agent._fallback_chain == [
+        default,
+        {"provider": "nous", "model": "hermes-4"},
+    ]
+    assert agent._fallback_model == default
 
 
 def test_switch_with_empty_chain_stays_empty():
