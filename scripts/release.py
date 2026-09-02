@@ -28,6 +28,25 @@ import subprocess
 import sys
 from collections import defaultdict
 from datetime import datetime
+
+# Windows release hosts run cp1252 consoles where the script's Unicode
+# status glyphs (✓/✗/📎/🎉) and the box-drawing in comments crash print()
+# with UnicodeEncodeError BEFORE the message is shown (#100600 v6 review:
+# the flag-matrix rejection printed ✗ and crashed instead of informing).
+# stdout/stderr are switched to errors="replace" so every glyph degrades
+# visibly on legacy consoles and never takes the release path down.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _b = _stream.buffer if hasattr(_stream, "buffer") else None
+        import io as _io
+        if _b is not None and hasattr(_stream, "reconfigure"):
+            _stream.reconfigure(encoding="utf-8", errors="replace")
+        elif _b is not None:
+            _wrapped = _io.TextIOWrapper(_b, encoding="utf-8", errors="replace")
+            sys.stdout = _wrapped if _stream is sys.stdout else sys.stderr
+            _stream = _wrapped
+    except Exception:  # pragma: no cover - reconfigure unavailable
+        pass
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -2778,8 +2797,19 @@ def main():
         # The post-commit witness cannot detect that (the tree looks clean
         # after the absorbed change rode along), so prove cleanliness BEFORE
         # update_version_files() writes a single byte.
+        #
+        # FAIL-CLOSED on the status call itself (#100600 v6 review): a
+        # returncode != 0 previously fell through to "clean" — inability to
+        # establish cleanliness authorized mutation and emitted a false
+        # witness. A status probe that cannot run is indistinguishable from
+        # a dirty tree for safety purposes: abort with the stderr diagnostic.
         _preflight = git_result("status", "--porcelain")
-        if _preflight.returncode == 0 and _preflight.stdout.strip():
+        if _preflight.returncode != 0:
+            print("  X REFUSING to start: git status failed — cleanliness "
+                  "cannot be established, so mutation is not authorized.")
+            print(f"    stderr: {_preflight.stderr.strip() or '(empty)'}")
+            sys.exit(1)
+        if _preflight.stdout.strip():
             print("  X REFUSING to start: the working tree is not clean.")
             print("    A staged change would be absorbed into the version-bump")
             print("    commit (plain `git commit -m` commits the whole index).")
@@ -2818,8 +2848,17 @@ def main():
             # Post-prepare cleanliness witness: the build hook refuses on a
             # dirty tree, so prove the prepare left the tree clean — or fail
             # loudly HERE rather than at the macOS build host hours later.
+            # FAIL-CLOSED on the status call itself (#100600 v6 review): a
+            # failed probe previously reported a false clean witness.
             status_result = git_result("status", "--porcelain")
-            if status_result.returncode == 0 and status_result.stdout.strip():
+            if status_result.returncode != 0:
+                print("  X Post-commit witness FAILED: git status errored — "
+                      "cannot verify the prepare left the tree clean.")
+                print(f"    stderr: {status_result.stderr.strip() or '(empty)'}")
+                print("    The bump commit was made; DO NOT build until this "
+                      "is resolved.")
+                sys.exit(1)
+            if status_result.stdout.strip():
                 print("  X Version-bump commit left the tree dirty - the build "
                       "hook will refuse to write a manifest. Dirty entries:")
                 for line in status_result.stdout.strip().splitlines()[:5]:

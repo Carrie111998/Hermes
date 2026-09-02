@@ -338,6 +338,58 @@ class TestCleanTreePreFlight:
         )
         assert not gitlog.ran("add"), "no staging may happen on a dirty tree"
 
+    def test_status_probe_failure_blocks_mutation(self, tmp_path, monkeypatch):
+        """v6 review: 'git status --porcelain' returning 128 (fatal) previously
+        fell through to 'Pre-flight: working tree clean' — inability to
+        establish cleanliness authorized mutation AND emitted a false clean
+        witness. The reviewer drove production main() with exactly this stub.
+        Must abort exit(1) with ZERO git add / git commit calls."""
+        monkeypatch.chdir(tmp_path)
+
+        gitlog = _GitCallLog()
+
+        def _failing_status(*args, cwd=None):
+            call = list(args)
+            gitlog.calls.append(call)
+            m = MagicMock()
+            if args[0] == "rev-parse":
+                m.returncode = 0; m.stdout = gitlog.head_sha; m.stderr = ""
+            elif args[0] == "status":
+                m.returncode = 128  # fatal: status unavailable
+                m.stdout = ""
+                m.stderr = "fatal: not a git repository (or any of the parent directories): .git"
+            else:
+                m.returncode = 0; m.stdout = ""; m.stderr = ""
+            return m
+
+        with (
+            patch.object(sys, "argv",
+                         ["release.py", "--bump", "minor", "--prepare-only", "--date", "2026.9.2"]),
+            patch.object(release, "git_result", _failing_status),
+            patch.object(release, "next_available_tag", lambda b: (b, b[1:])),
+            patch.object(release, "get_current_version", lambda: "0.20.0"),
+            patch.object(release, "get_last_tag", lambda: "v2026.8.31"),
+            patch.object(release, "get_commits", lambda since_tag=None: [
+                {"sha": "abc", "author_name": "T", "author_email": "t@x",
+                 "subject": "s", "body": "", "github_author": "t"}]),
+            patch.object(release, "generate_changelog", lambda *a, **k: "c"),
+        ):
+            with pytest.raises(SystemExit) as e:
+                release.main()
+
+        assert e.value.code == 1, (
+            "a failed cleanliness probe must fail CLOSED — never authorize "
+            "mutation on inability to establish cleanliness"
+        )
+        assert not gitlog.ran("add"), (
+            "returncode-128 status must abort with ZERO add calls (reviewer: "
+            "'git add <three version files>' ran on the fail-open head)"
+        )
+        assert not gitlog.ran("commit"), (
+            "returncode-128 status must abort with ZERO commit calls (reviewer: "
+            "'git commit -m chore: bump version...' ran on the fail-open head)"
+        )
+
 
 class TestPushFailureAborts:
     """Push failure must abort BEFORE gh release create (#100600 v4)."""
