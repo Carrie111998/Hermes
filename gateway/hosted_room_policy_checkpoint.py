@@ -340,14 +340,26 @@ class HostedRoomPolicyCheckpoint:
                    WHERE room_id=? AND discussion_event_id=? LIMIT 1""",
                 (room_id, discussion_event_id),
             ).fetchone()
+            source_compacted = source is None
             if source is None:
-                return
-            self._store_active_event(
-                conn,
-                event=event,
-                thread_id=thread_id,
-                discussion_event_id=discussion_event_id,
-            )
+                source = conn.execute(
+                    """SELECT payload_json FROM hosted_room_events
+                       WHERE room_id=? AND event_id=? AND kind='message.user'""",
+                    (room_id, discussion_event_id),
+                ).fetchone()
+                if source is None or str(
+                    json.loads(source["payload_json"]).get("thread_id") or ""
+                ) != thread_id:
+                    return
+                if kind not in _TERMINAL_KINDS:
+                    return
+            else:
+                self._store_active_event(
+                    conn,
+                    event=event,
+                    thread_id=thread_id,
+                    discussion_event_id=discussion_event_id,
+                )
             if kind in _TERMINAL_KINDS:
                 task_id = str(payload.get("task_id") or "")
                 execution_generation = (
@@ -368,6 +380,8 @@ class HostedRoomPolicyCheckpoint:
                             seq,
                         ),
                     )
+                if source_compacted:
+                    return
                 member_id = str(payload.get("member_id") or "")
                 seen_through_seq = int(payload.get("seen_through_seq") or 0)
                 if kind == "turn.settled" and payload.get("message_event_id"):

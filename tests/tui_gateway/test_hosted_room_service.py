@@ -513,6 +513,82 @@ def test_restart_republishes_terminal_task_before_admitting_more(tmp_path: Path)
     assert replayed == events
 
 
+def test_restart_indexes_terminal_task_after_policy_compaction(tmp_path: Path):
+    db = tmp_path / "state.db"
+    service = HostedRoomService(_server(), db_path=db)
+    service.local_profiles = lambda: ("default", "ops")
+    service.create_room(
+        room_id="room-1",
+        name="Release room",
+        members=[
+            {"member_id": "default", "profile": "default", "handle": "hermes"},
+            {"member_id": "ops", "profile": "ops", "handle": "ops"},
+        ],
+    )
+    source = _append_room_event(
+        db,
+        room_id="room-1",
+        event_id="user-1",
+        kind="message.user",
+        actor={"kind": "user", "id": "desktop"},
+        payload={"text": "@ops inspect", "thread_id": "thread-1"},
+    )
+    binding = service.bindings()[0]
+    service.prepare_room(binding)
+    task = driver.list_tasks(db, room_id="room-1", status="queued")[0]
+    lease = driver.acquire_lease(
+        db,
+        room_id="room-1",
+        gateway_id=binding.gateway_id,
+        authority_epoch=binding.authority_epoch,
+        process_generation="crashed",
+        ttl_seconds=30,
+        clock=time.time,
+    )
+    attempt = driver.start_task(
+        db,
+        task["identity"],
+        lease,
+        expected_cancel_generation=0,
+        clock=time.time,
+    )
+    driver.settle_task(
+        db,
+        attempt,
+        settlement_id="reply-1",
+        status="settled",
+        result={"text": "done"},
+        clock=time.time,
+    )
+    current = hosted_rooms.room_state(db, room_id="room-1")
+    _append_room_event(
+        db,
+        room_id="room-1",
+        event_id="activity-1",
+        kind="room.activity",
+        actor={"kind": "gateway", "id": current["authority_gateway_id"]},
+        payload={
+            "status": "settled",
+            "reason_code": "silent_round",
+            "thread_id": "thread-1",
+            "discussion_event_id": "user-1",
+        },
+        authority_gateway_id=current["authority_gateway_id"],
+        authority_epoch=current["authority_epoch"],
+    )
+    service._policy_snapshot(hosted_rooms.room_state(db, room_id="room-1"))
+
+    service.prepare_room(binding)
+    service._policy_snapshot(hosted_rooms.room_state(db, room_id="room-1"))
+
+    assert service.policy_checkpoint.publication_exists(
+        room_id="room-1",
+        task_id=task["identity"].task_id,
+        status="settled",
+        execution_generation=0,
+    )
+
+
 def test_policy_checkpoint_bounds_replay_after_completed_room_history(
     tmp_path: Path,
     monkeypatch,
