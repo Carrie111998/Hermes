@@ -4759,15 +4759,42 @@ def run_conversation(
                     except Exception:
                         pass
 
-                    # Log API call details for debugging/observability
-                    _cache_pct = ""
-                    if canonical_usage.cache_read_tokens and prompt_tokens:
-                        _cache_pct = f" cache={canonical_usage.cache_read_tokens}/{prompt_tokens} ({100*canonical_usage.cache_read_tokens/prompt_tokens:.0f}%)"
+                    # Log API call details for debugging/observability.
+                    # Emit a stable, content-free cache state so an explicit
+                    # zero is distinguishable from a provider that never
+                    # surfaced cache telemetry (#84460).
+                    if canonical_usage.cache_telemetry_present:
+                        if canonical_usage.cache_read_tokens:
+                            # Keep the cache-hit percentage available for
+                            # capacity monitoring (dropped by the old
+                            # cache=<read>/<prompt> (<pct>%) → cache_state
+                            # switch); the percentage is cache-read relative
+                            # to billed prompt tokens.
+                            hit_pct = (
+                                canonical_usage.cache_read_tokens * 100.0
+                                / prompt_tokens
+                                if prompt_tokens > 0
+                                else 0.0
+                            )
+                            _cache_state = (
+                                f" cache_state=hit cache_read={canonical_usage.cache_read_tokens}"
+                                f" ({hit_pct:.0f}%)"
+                                f" cache_write={canonical_usage.cache_write_tokens}"
+                            )
+                        elif canonical_usage.cache_write_tokens:
+                            _cache_state = (
+                                f" cache_state=cold_write cache_read=0"
+                                f" cache_write={canonical_usage.cache_write_tokens}"
+                            )
+                        else:
+                            _cache_state = " cache_state=miss cache_read=0 cache_write=0"
+                    else:
+                        _cache_state = " cache_state=no_field"
                     logger.info(
                         "API call #%d: model=%s provider=%s in=%d out=%d total=%d latency=%.1fs%s",
                         agent.session_api_calls, agent.model, agent.provider or "unknown",
                         prompt_tokens, completion_tokens, total_tokens,
-                        api_duration, _cache_pct,
+                        api_duration, _cache_state,
                     )
 
                     # On the MoA path, agent.model/provider are the virtual
