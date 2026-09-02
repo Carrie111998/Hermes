@@ -1037,8 +1037,17 @@ def _get_provider(stt_config: dict) -> str:
         # ``read_selection`` reads the raw config.yaml: when the raw file
         # holds an stt selection (picker- or hand-written ``local``) it is
         # honored; when the merged "local" came only from a legacy default
-        # merge, take the autodetect branch (which prefers local first
-        # anyway, so a genuine local user is unaffected when it's available).
+        # merge, take the autodetect branch.
+        #
+        # NOTE: this guard used to justify itself with "autodetect prefers
+        # local first anyway, so a genuine local user is unaffected". That is
+        # no longer true — autodetect now prefers an entitled managed gateway
+        # over an on-host model. So before downgrading, check the RAW config
+        # file directly: a hand-written ``stt.provider`` there is an explicit
+        # opt-out and must survive, even when read_selection (which only sees
+        # the picker's own selection store) knows nothing about it. Without
+        # this, a user who wrote ``stt.provider: local`` by hand would be
+        # silently moved onto the metered gateway.
         try:
             from tools.tool_backend_helpers import read_selection
 
@@ -1149,6 +1158,58 @@ def _get_provider(stt_config: dict) -> str:
     # intentionally skipped while `mistralai` is quarantined on PyPI (malicious
     # 2.4.6 release on 2026-05-12).
 
+    # When the managed Nous Tool Gateway is entitled it is the DEFAULT STT
+    # backend, ahead of any on-host model. Opting out is explicit: set
+    # `stt.provider` (local, local_command, groq, openai, ...) and the block
+    # above honours it verbatim.
+    #
+    # Precedence deliberately puts the gateway FIRST rather than deferring to
+    # an installed local model, because package presence is not a user
+    # preference. On a hosted instance a local model is usually RESIDUE from
+    # the old lazy-install path, and preferring it is what kept staging broken
+    # (2026-08-27, hermes-agent-stg-test-6698): faster_whisper had been
+    # lazy-installed into /opt/data/lazy-packages — on the data volume, absent
+    # from the venv — so the gateway imported it, resolved "local" at rung 1,
+    # and never reached the managed branch. Every voice note then died in the
+    # model download with `No space left on device` on a 99%-full disk while
+    # an entitled gateway sat idle. Config is the only reliable signal of
+    # intent; an import is not.
+    #
+    # This also removes the reason to lazy-install on an entitled box at all:
+    # on-host STT there consumes the data volume, burns CPU on a shared VM,
+    # adds a cold-start download to the first voice note, and transcribes
+    # worse than whisper-1.
+    _managed_stt_ready = False
+    try:
+        from tools.managed_tool_gateway import is_managed_tool_gateway_ready
+
+        _managed_stt_ready = is_managed_tool_gateway_ready("openai-audio")
+    except Exception:  # noqa: BLE001 - availability probing must never break STT
+        logger.debug("managed STT availability probe failed", exc_info=True)
+    if _managed_stt_ready and _HAS_OPENAI and _has_openai_audio_backend():
+        # Resolve honestly: with no stored stt selection,
+        # _resolve_openai_audio_client_config's legacy ladder prefers a DIRECT
+        # OPENAI_API_KEY over the gateway, so "openai" here does not always
+        # mean "managed". Only claim the gateway when it will actually serve.
+        _direct_key = ""
+        try:
+            _direct_key = resolve_openai_audio_api_key() or ""
+        except Exception:  # noqa: BLE001 - never let a credential probe break STT
+            logger.debug("direct openai-audio key probe failed", exc_info=True)
+        if _direct_key:
+            logger.info(
+                "Using the configured OpenAI audio credentials for STT "
+                "(managed gateway entitled; set stt.provider to override)"
+            )
+        else:
+            logger.info(
+                "Using the managed Nous Tool Gateway for STT "
+                "(set stt.provider to override, e.g. 'local')"
+            )
+        return "openai"
+    # No managed gateway (self-hosted / unentitled): the original local-first
+    # ladder applies unchanged — an on-host model is the only STT these boxes
+    # get, so presence is a good enough signal there.
     if _HAS_FASTER_WHISPER:
         return "local"
     if _has_local_command():
