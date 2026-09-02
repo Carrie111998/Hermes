@@ -14,7 +14,7 @@ import {
 test('fromCI reads GITHUB_SHA / GITHUB_REF_NAME', () => {
   assert.deepEqual(
     fromCI({ GITHUB_SHA: 'a'.repeat(40), GITHUB_REF_NAME: 'release' }),
-    { commit: 'a'.repeat(40), branch: 'release', dirty: false, source: 'ci' }
+    { commit: 'a'.repeat(40), branch: 'release', refType: null, dirty: false, source: 'ci' }
   )
   assert.equal(fromCI({}), null)
 })

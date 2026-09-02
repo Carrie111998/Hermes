@@ -131,6 +131,66 @@ test('fallback install stamps use an unpinned branch ref', () => {
   )
 })
 
+test('tag build stamp does not pass the tag as --branch (refType=tag)', () => {
+  const stamp = { commit: 'a'.repeat(40), branch: 'v1.0.0', refType: 'tag' }
+
+  assert.equal(isPinnedCommit(stamp.commit), true)
+  // Commit pin must still be passed
+  assert.deepEqual(buildPinArgs(stamp), ['-Commit', stamp.commit])
+  assert.deepEqual(
+    buildPosixPinArgs({
+      installStamp: stamp,
+      activeRoot: '/tmp/hermes-agent',
+      hermesHome: '/tmp/hermes'
+    }),
+    ['--dir', '/tmp/hermes-agent', '--hermes-home', '/tmp/hermes', '--commit', stamp.commit]
+  )
+})
+
+test('branch build stamp passes --branch (refType=branch)', () => {
+  const stamp = { commit: 'a'.repeat(40), branch: 'release/1.2', refType: 'branch' }
+
+  assert.equal(isPinnedCommit(stamp.commit), true)
+  assert.deepEqual(buildPinArgs(stamp), ['-Commit', stamp.commit, '-Branch', 'release/1.2'])
+  assert.deepEqual(
+    buildPosixPinArgs({
+      installStamp: stamp,
+      activeRoot: '/tmp/hermes-agent',
+      hermesHome: '/tmp/hermes'
+    }),
+    ['--dir', '/tmp/hermes-agent', '--hermes-home', '/tmp/hermes', '--branch', 'release/1.2', '--commit', stamp.commit]
+  )
+})
+
+test('legacy stamp without refType passes branch for backward compatibility', () => {
+  const stamp = { commit: 'a'.repeat(40), branch: 'main' }
+
+  assert.equal(isPinnedCommit(stamp.commit), true)
+  assert.deepEqual(buildPinArgs(stamp), ['-Commit', stamp.commit, '-Branch', 'main'])
+  assert.deepEqual(
+    buildPosixPinArgs({
+      installStamp: stamp,
+      activeRoot: '/tmp/hermes-agent',
+      hermesHome: '/tmp/hermes'
+    }),
+    ['--dir', '/tmp/hermes-agent', '--hermes-home', '/tmp/hermes', '--branch', 'main', '--commit', stamp.commit]
+  )
+})
+
+test('fallback stamp without refType passes branch', () => {
+  const stamp = { commit: ZERO_COMMIT, branch: 'main' }
+
+  assert.deepEqual(buildPinArgs(stamp), ['-Branch', 'main'])
+  assert.deepEqual(
+    buildPosixPinArgs({
+      installStamp: stamp,
+      activeRoot: '/tmp/hermes',
+      hermesHome: '/tmp/home'
+    }),
+    ['--dir', '/tmp/hermes', '--hermes-home', '/tmp/home', '--branch', 'main']
+  )
+})
+
 test('resolveMarkerPinnedCommit prefers real HEAD over fallback stamp zeros', () => {
   const realHead = 'c'.repeat(40)
   assert.equal(

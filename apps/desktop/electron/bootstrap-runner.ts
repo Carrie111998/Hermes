@@ -662,6 +662,32 @@ function spawnBash(scriptPath, args, { emit, stageName, abortSignal, hermesHome 
 // a repair/update path and must not let an old packaged app detach the checkout
 // back to the commit baked into that app. All-zero fallback stamps are never
 // passed as -Commit/--commit — only the branch is used (#50823 / #50864 review).
+//
+// refType (from install-stamp.json) controls whether we pass the branch to the
+// installer. GitHub Actions sets GITHUB_REF_TYPE=branch|tag. For tag builds we
+// must NOT pass the tag name as --branch, because `git clone --branch <tag>`
+// clones only the tag and leaves the checkout detached with no origin/main.
+// The --commit pin handles the exact release commit.
+function shouldPassBranch(installStamp) {
+  if (!installStamp) {
+    return false
+  }
+  // Explicit refType from GitHub Actions CI: only pass branch for branch builds.
+  if (installStamp.refType === 'branch') {
+    return true
+  }
+  if (installStamp.refType === 'tag') {
+    return false
+  }
+  // Legacy stamps / local builds / fallback: preserve existing behavior.
+  return !!installStamp.branch
+}
+
+// Build the installer branch/pin args from the install stamp. The commit pin
+// is fresh-install only: once a managed checkout already exists, bootstrap is
+// a repair/update path and must not let an old packaged app detach the checkout
+// back to the commit baked into that app. All-zero fallback stamps are never
+// passed as -Commit/--commit — only the branch is used (#50823 / #50864 review).
 function buildPinArgs(installStamp, { pinCommit = true } = {}) {
   const args = []
 
@@ -669,7 +695,7 @@ function buildPinArgs(installStamp, { pinCommit = true } = {}) {
     args.push('-Commit', installStamp.commit)
   }
 
-  if (installStamp && installStamp.branch) {
+  if (shouldPassBranch(installStamp)) {
     args.push('-Branch', installStamp.branch)
   }
 
@@ -679,7 +705,7 @@ function buildPinArgs(installStamp, { pinCommit = true } = {}) {
 function buildPosixPinArgs({ installStamp, activeRoot, hermesHome, pinCommit = true }) {
   const args = ['--dir', activeRoot, '--hermes-home', hermesHome]
 
-  if (installStamp && installStamp.branch) {
+  if (shouldPassBranch(installStamp)) {
     args.push('--branch', installStamp.branch)
   }
 
