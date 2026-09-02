@@ -8903,7 +8903,7 @@ def _restart_managed_dashboard_service(
     reason: str,
     unit: str = _DASHBOARD_SYSTEMD_UNIT,
 ) -> bool:
-    """Restart a systemd-managed dashboard instead of raw-killing its PID.
+    """Restart a systemd/launchd-managed dashboard instead of raw-killing its PID.
 
     Returns True when a dashboard unit was found and handled (successfully or
     with a printed actionable failure).  Returning True deliberately prevents
@@ -8912,6 +8912,62 @@ def _restart_managed_dashboard_service(
     will not bring the dashboard back.
     """
     if sys.platform == "win32":
+        return False
+
+    if sys.platform == "darwin":
+        # macOS has no systemd; try a launchd kickstart for a Hermes
+        # dashboard/serve job if one is loaded.  The dashboard is usually a
+        # bare ``hermes dashboard``/``hermes serve`` process rather than a
+        # dedicated launchd job, so a missing job is not an error — return
+        # False so the caller falls through to the pkill path (#101561).
+        try:
+            from hermes_cli.gateway import get_launchd_label
+
+            label = get_launchd_label()
+            # Only attempt the dashboard label if it is actually loaded; the
+            # gateway label doubles as the dashboard label on single-service
+            # installs.  Probing with ``launchctl list <label>`` is cheap and
+            # distinguishes \"job not loaded\" from a real failure.
+            result = subprocess.run(
+                ["launchctl", "list", label],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=10,
+            )
+            if result.returncode == 0:
+                print()
+                print(f"⟲ Restarting managed dashboard service via launchd ({reason})")
+                kick = subprocess.run(
+                    ["launchctl", "kickstart", "-k", f"gui/{os.getuid()}/{label}"],
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    timeout=30,
+                )
+                if kick.returncode == 0:
+                    print(f"    ✓ kickstarted {label}")
+                    return True
+                # Fallback to bare label form (some launchd configs use system domain)
+                kick2 = subprocess.run(
+                    ["launchctl", "kickstart", "-k", label],
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    timeout=30,
+                )
+                if kick2.returncode == 0:
+                    print(f"    ✓ kickstarted {label}")
+                    return True
+                msg = (kick.stderr or kick.stdout or "").strip()
+                if msg:
+                    print(f"    ✗ launchctl kickstart failed: {msg}")
+                return True
+        except Exception:
+            pass
         return False
 
     def _systemctl(*args: str, timeout: int = 10) -> subprocess.CompletedProcess:
