@@ -29,6 +29,7 @@ _MAX_CONTEXT_CHARS = 32_000
 _MAX_METADATA_BYTES = 8_192
 _MAX_RESULT_CHARS = 32_000
 _TERMINAL_RETENTION_SECONDS = 3_600
+_MAX_INTERRUPTION_EVIDENCE = 8
 
 
 class SubagentLifecycleError(ValueError):
@@ -45,6 +46,49 @@ class SubagentState(str, enum.Enum):
     CANCEL_REQUESTED = "CANCEL_REQUESTED"
     CANCELLED = "CANCELLED"
     UNKNOWN = "UNKNOWN"
+
+
+class SubagentInterruptionCause(str, enum.Enum):
+    """Authoritative reason associated with an interruption observation."""
+
+    USER_CANCEL = "user_cancel"
+    USER = "user_cancel"  # intentional alias of USER_CANCEL; same wire value
+    TIMEOUT = "timeout"
+    RESET = "reset"
+    LEASE_LOSS = "lease_loss"
+    WORKER_INTERRUPT = "worker_interrupt"
+    LATE_CALLBACK = "late_callback"
+    UNKNOWN = "unknown"
+
+
+class SubagentInterruptionStage(str, enum.Enum):
+    """Progress of an interruption request through the worker boundary."""
+
+    REQUESTED = "requested"
+    SIGNAL_ACCEPTED = "signal_accepted"
+    SIGNAL = "signal_accepted"  # intentional alias of SIGNAL_ACCEPTED; same wire value
+    OBSERVED = "observed"
+    ACKNOWLEDGED = "acknowledged"
+    VERIFIED_TERMINATION = "verified_termination"
+    UNKNOWN = "unknown"
+
+
+@dataclasses.dataclass(frozen=True)
+class SubagentInterruptionEvidence:
+    """Immutable, bounded evidence for one interruption observation."""
+
+    cause: SubagentInterruptionCause = SubagentInterruptionCause.UNKNOWN
+    stage: SubagentInterruptionStage = SubagentInterruptionStage.UNKNOWN
+    source: str = "unknown"
+    occurred_at: float = dataclasses.field(default_factory=time.time)
+    detail: Optional[str] = None
+    generation: int = 0
+    callback_id: Optional[str] = None
+
+    @property
+    def first_cause(self) -> SubagentInterruptionCause:
+        """Compatibility-friendly access to the typed cause."""
+        return self.cause
 
 
 @dataclasses.dataclass(frozen=True)
@@ -74,6 +118,8 @@ class SubagentHandle:
     role: str
     depth: int
     capability: str
+    # Added at the end so serialized and positional v1 handles remain readable.
+    generation: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         return dataclasses.asdict(self)
@@ -92,6 +138,21 @@ class SubagentStatus:
     state: SubagentState
     updated_at: float
     diagnostic: Optional[str] = None
+    interruption: Optional[SubagentInterruptionEvidence] = None
+    later_interruptions: tuple[SubagentInterruptionEvidence, ...] = ()
+    dropped_interruptions: int = 0
+
+    @property
+    def generation(self) -> int:
+        return self.handle.generation
+
+    @property
+    def first_cause(self) -> Optional[SubagentInterruptionCause]:
+        return self.interruption.cause if self.interruption else None
+
+    @property
+    def later_causes(self) -> tuple[SubagentInterruptionCause, ...]:
+        return tuple(evidence.cause for evidence in self.later_interruptions)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -101,6 +162,21 @@ class SubagentTerminalState:
     completed: bool
     timed_out: bool = False
     diagnostic: Optional[str] = None
+    interruption: Optional[SubagentInterruptionEvidence] = None
+    later_interruptions: tuple[SubagentInterruptionEvidence, ...] = ()
+    dropped_interruptions: int = 0
+
+    @property
+    def generation(self) -> int:
+        return self.handle.generation
+
+    @property
+    def first_cause(self) -> Optional[SubagentInterruptionCause]:
+        return self.interruption.cause if self.interruption else None
+
+    @property
+    def later_causes(self) -> tuple[SubagentInterruptionCause, ...]:
+        return tuple(evidence.cause for evidence in self.later_interruptions)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -110,6 +186,8 @@ class SubagentCancelResult:
     unknown_handle: bool = False
     unsupported: bool = False
     state: SubagentState = SubagentState.UNKNOWN
+    generation: int = 0
+    interruption: Optional[SubagentInterruptionEvidence] = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -126,6 +204,21 @@ class SubagentResult:
     usage_metadata: Mapping[str, Any] = dataclasses.field(default_factory=dict)
     tool_execution_summary: Mapping[str, Any] = dataclasses.field(default_factory=dict)
     result_hash: Optional[str] = None
+    interruption: Optional[SubagentInterruptionEvidence] = None
+    later_interruptions: tuple[SubagentInterruptionEvidence, ...] = ()
+    dropped_interruptions: int = 0
+
+    @property
+    def generation(self) -> int:
+        return self.handle.generation
+
+    @property
+    def first_cause(self) -> Optional[SubagentInterruptionCause]:
+        return self.interruption.cause if self.interruption else None
+
+    @property
+    def later_causes(self) -> tuple[SubagentInterruptionCause, ...]:
+        return tuple(evidence.cause for evidence in self.later_interruptions)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -145,6 +238,14 @@ class _Record:
     started_at: Optional[float] = None
     completed_at: Optional[float] = None
     result: Optional[SubagentResult] = None
+    generation: int = 1
+    interruption: Optional[SubagentInterruptionEvidence] = None
+    later_interruptions: list[SubagentInterruptionEvidence] = dataclasses.field(
+        default_factory=list
+    )
+    dropped_interruptions: int = 0
+    # Replay fences are deliberately not evicted with presentation evidence.
+    callback_digests: dict[str, str] = dataclasses.field(default_factory=dict)
 
 
 class _Registry:
@@ -250,8 +351,11 @@ class SubagentLifecycleService:
             getattr(child, "_delegate_role", request.role),
             int(getattr(child, "_delegate_depth", 1) or 1),
             self._capability(subagent_id, parent_session_id, created),
+            1,
         )
-        record = _Record(handle, SubagentState.PENDING, created, agent=child)
+        record = _Record(
+            handle, SubagentState.PENDING, created, agent=child, generation=1
+        )
         with _REGISTRY.lock:
             _REGISTRY.records[subagent_id] = record
             if request.correlation_id:
@@ -266,7 +370,14 @@ class SubagentLifecycleService:
                 handle, SubagentState.UNKNOWN, time.time(), "UNKNOWN_HANDLE"
             )
         with _REGISTRY.lock:
-            return SubagentStatus(record.handle, record.state, record.updated_at)
+            return SubagentStatus(
+                record.handle,
+                record.state,
+                record.updated_at,
+                interruption=record.interruption,
+                later_interruptions=tuple(record.later_interruptions),
+                dropped_interruptions=record.dropped_interruptions,
+            )
 
     def wait(
         self, handle: SubagentHandle, *, timeout_seconds: Optional[float] = None
@@ -286,7 +397,12 @@ class SubagentLifecycleService:
                 pass
         with _REGISTRY.lock:
             return SubagentTerminalState(
-                record.handle, record.state, record.result is not None
+                record.handle,
+                record.state,
+                record.result is not None,
+                interruption=record.interruption,
+                later_interruptions=tuple(record.later_interruptions),
+                dropped_interruptions=record.dropped_interruptions,
             )
 
     def cancel(self, handle: SubagentHandle, *, reason: str) -> SubagentCancelResult:
@@ -298,12 +414,25 @@ class SubagentLifecycleService:
                 return SubagentCancelResult(
                     False, already_terminal=True, state=record.state
                 )
+            if not isinstance(reason, str):
+                raise SubagentLifecycleError("reason must be a string.")
             agent = record.agent
             record.state = SubagentState.CANCEL_REQUESTED
             record.updated_at = time.time()
+            first = self._record_interruption_locked(
+                record,
+                SubagentInterruptionCause.USER_CANCEL,
+                SubagentInterruptionStage.REQUESTED,
+                source="lifecycle.cancel",
+                detail=reason,
+            )
         if agent is None:
             return SubagentCancelResult(
-                False, unsupported=True, state=SubagentState.CANCEL_REQUESTED
+                False,
+                unsupported=True,
+                state=SubagentState.CANCEL_REQUESTED,
+                generation=record.generation,
+                interruption=first,
             )
         try:
             accepted = request_hard_interrupt(
@@ -313,13 +442,34 @@ class SubagentLifecycleService:
             )
         except Exception:
             return SubagentCancelResult(
-                False, unsupported=True, state=SubagentState.CANCEL_REQUESTED
+                False,
+                unsupported=True,
+                state=SubagentState.CANCEL_REQUESTED,
+                generation=record.generation,
+                interruption=first,
             )
         if not accepted:
             return SubagentCancelResult(
-                False, unsupported=True, state=SubagentState.CANCEL_REQUESTED
+                False,
+                unsupported=True,
+                state=SubagentState.CANCEL_REQUESTED,
+                generation=record.generation,
+                interruption=first,
             )
-        return SubagentCancelResult(True, state=SubagentState.CANCEL_REQUESTED)
+        with _REGISTRY.lock:
+            self._record_interruption_locked(
+                record,
+                SubagentInterruptionCause.USER_CANCEL,
+                SubagentInterruptionStage.SIGNAL_ACCEPTED,
+                source="lifecycle.cancel",
+                detail=reason,
+            )
+        return SubagentCancelResult(
+            True,
+            state=SubagentState.CANCEL_REQUESTED,
+            generation=record.generation,
+            interruption=first,
+        )
 
     def result(self, handle: SubagentHandle) -> SubagentResult:
         record = self._record(handle)
@@ -334,8 +484,172 @@ class SubagentLifecycleService:
             if record.result is not None:
                 return record.result
             return SubagentResult(
-                record.handle, record.state, False, error_classification="NOT_READY"
+                record.handle,
+                record.state,
+                False,
+                error_classification="NOT_READY",
+                interruption=record.interruption,
+                later_interruptions=tuple(record.later_interruptions),
+                dropped_interruptions=record.dropped_interruptions,
             )
+
+    def _finalize_record(
+        self,
+        record: _Record,
+        result: SubagentResult,
+        *,
+        generation: Optional[int] = None,
+        callback_id: Optional[str] = None,
+    ) -> SubagentResult:
+        """Commit one terminal callback, or return the already committed one.
+
+        The registry lock is the linearization point.  A callback from an older
+        generation, or a duplicate callback with a conflicting payload, can
+        add bounded diagnostic evidence but can never replace the terminal
+        snapshot.  Callback digests are retained for the lifetime of the
+        bounded terminal record, independently of presentation evidence.
+        """
+        if not isinstance(result, SubagentResult):
+            raise SubagentLifecycleError("result must be a SubagentResult.")
+        if result.terminal_state not in {
+            SubagentState.SUCCEEDED,
+            SubagentState.FAILED,
+            SubagentState.INTERRUPTED,
+            SubagentState.CANCELLED,
+            SubagentState.UNKNOWN,
+        }:
+            raise SubagentLifecycleError("Only terminal states can be finalized.")
+        callback_generation = generation
+        if callback_generation in (None, 0):
+            callback_generation = record.generation
+        if type(callback_generation) is not int or callback_generation < 0:
+            raise SubagentLifecycleError("generation must be a non-negative integer.")
+        if callback_id is not None and (
+            not isinstance(callback_id, str) or not callback_id
+        ):
+            raise SubagentLifecycleError("callback_id must be a non-empty string.")
+
+        payload = dataclasses.asdict(result)
+        payload.pop("result_hash", None)
+        digest = hashlib.sha256(
+            json.dumps(payload, sort_keys=True, default=str).encode("utf-8")
+        ).hexdigest()
+
+        with _REGISTRY.lock:
+            if callback_id is not None:
+                previous_digest = record.callback_digests.get(callback_id)
+                if previous_digest is not None:
+                    if previous_digest != digest:
+                        self._record_interruption_locked(
+                            record,
+                            SubagentInterruptionCause.LATE_CALLBACK,
+                            SubagentInterruptionStage.UNKNOWN,
+                            source="lifecycle.finalize",
+                            detail="conflicting duplicate callback payload",
+                            generation=callback_generation,
+                            callback_id=callback_id,
+                            authoritative=False,
+                        )
+                    return record.result or result
+
+            if callback_generation != record.generation:
+                self._record_interruption_locked(
+                    record,
+                    SubagentInterruptionCause.LATE_CALLBACK,
+                    SubagentInterruptionStage.UNKNOWN,
+                    source="lifecycle.finalize",
+                    detail="stale callback generation",
+                    generation=callback_generation,
+                    callback_id=callback_id,
+                    authoritative=False,
+                )
+                if callback_id is not None:
+                    record.callback_digests[callback_id] = digest
+                return record.result or result
+
+            if record.result is not None:
+                if callback_id is not None:
+                    if callback_id not in record.callback_digests:
+                        self._record_interruption_locked(
+                            record,
+                            SubagentInterruptionCause.LATE_CALLBACK,
+                            SubagentInterruptionStage.UNKNOWN,
+                            source="lifecycle.finalize",
+                            detail="callback after terminal finalization",
+                            generation=callback_generation,
+                            callback_id=callback_id,
+                            authoritative=False,
+                        )
+                    record.callback_digests[callback_id] = digest
+                return record.result
+
+            committed = dataclasses.replace(
+                result,
+                handle=record.handle,
+                result_hash=None,
+                interruption=record.interruption,
+                later_interruptions=tuple(record.later_interruptions),
+                dropped_interruptions=record.dropped_interruptions,
+            )
+            committed_payload = dataclasses.asdict(committed)
+            committed_payload.pop("result_hash", None)
+            committed = dataclasses.replace(
+                committed,
+                result_hash=hashlib.sha256(
+                    json.dumps(
+                        committed_payload, sort_keys=True, default=str
+                    ).encode("utf-8")
+                ).hexdigest(),
+            )
+            if callback_id is not None:
+                record.callback_digests[callback_id] = digest
+            record.result = committed
+            record.state = committed.terminal_state
+            record.completed_at = committed.completed_at
+            record.updated_at = committed.completed_at or time.time()
+            record.agent = None
+            return committed
+
+    def _record_interruption_locked(
+        self,
+        record: _Record,
+        cause: SubagentInterruptionCause,
+        stage: SubagentInterruptionStage,
+        *,
+        source: str,
+        detail: Optional[str] = None,
+        generation: Optional[int] = None,
+        callback_id: Optional[str] = None,
+        authoritative: bool = True,
+    ) -> SubagentInterruptionEvidence:
+        """Record first-writer-wins cause and bounded subsequent evidence."""
+        if not isinstance(cause, SubagentInterruptionCause):
+            try:
+                cause = SubagentInterruptionCause(cause)
+            except (TypeError, ValueError) as exc:
+                raise SubagentLifecycleError("Unknown interruption cause.") from exc
+        if not isinstance(stage, SubagentInterruptionStage):
+            try:
+                stage = SubagentInterruptionStage(stage)
+            except (TypeError, ValueError) as exc:
+                raise SubagentLifecycleError("Unknown interruption stage.") from exc
+        evidence = SubagentInterruptionEvidence(
+            cause=cause,
+            stage=stage,
+            source=str(source)[:128],
+            occurred_at=time.time(),
+            detail=str(detail)[:_MAX_RESULT_CHARS] if detail is not None else None,
+            generation=record.generation if generation in (None, 0) else generation,
+            callback_id=callback_id,
+        )
+        if record.interruption is None and authoritative:
+            record.interruption = evidence
+        elif len(record.later_interruptions) < _MAX_INTERRUPTION_EVIDENCE:
+            record.later_interruptions.append(evidence)
+        else:
+            record.dropped_interruptions += 1
+        record.updated_at = evidence.occurred_at
+        return record.interruption
 
     def reconnect(self, handle: SubagentHandle) -> SubagentReconnectResult:
         record = self._record(handle)
@@ -372,6 +686,8 @@ class SubagentLifecycleService:
             or not isinstance(handle.role, str)
             or type(handle.depth) is not int
             or not isinstance(handle.capability, str)
+            or type(handle.generation) is not int
+            or handle.generation < 0
         ):
             return None
         if not hmac.compare_digest(
@@ -386,7 +702,15 @@ class SubagentLifecycleService:
         if active_parent_id != handle.parent_session_id:
             return None
         with _REGISTRY.lock:
-            return _REGISTRY.records.get(handle.subagent_id)
+            record = _REGISTRY.records.get(handle.subagent_id)
+            if record is None:
+                return None
+            # generation == 0 is a pre-field wildcard for serialized handles.
+            # It is not a freshness proof; authenticity is the capability HMAC
+            # and the active-parent session check above.
+            if handle.generation not in (0, record.generation):
+                return None
+            return record
 
     @staticmethod
     def _cleanup_locked() -> None:
@@ -423,11 +747,32 @@ class SubagentLifecycleService:
             if status == "completed":
                 state = SubagentState.SUCCEEDED
             elif status == "interrupted":
-                state = (
-                    SubagentState.CANCELLED
-                    if record.state == SubagentState.CANCEL_REQUESTED
-                    else SubagentState.INTERRUPTED
-                )
+                with _REGISTRY.lock:
+                    if record.interruption is None:
+                        self._record_interruption_locked(
+                            record,
+                            SubagentInterruptionCause.WORKER_INTERRUPT,
+                            SubagentInterruptionStage.OBSERVED,
+                            source="worker.callback",
+                            detail=(
+                                raw.get("error")
+                                if isinstance(raw, dict)
+                                else None
+                            ),
+                        )
+                    else:
+                        self._record_interruption_locked(
+                            record,
+                            record.interruption.cause,
+                            SubagentInterruptionStage.OBSERVED,
+                            source="worker.callback",
+                        )
+                    state = (
+                        SubagentState.CANCELLED
+                        if record.interruption.cause
+                        is SubagentInterruptionCause.USER_CANCEL
+                        else SubagentState.INTERRUPTED
+                    )
             else:
                 state = SubagentState.FAILED
             summary = raw.get("summary") if isinstance(raw, dict) else None
@@ -463,26 +808,20 @@ class SubagentLifecycleService:
                 error_classification=type(exc).__name__,
                 error_message=str(exc)[:_MAX_RESULT_CHARS],
             )
-        payload = dataclasses.asdict(result)
-        payload.pop("result_hash", None)
-        result = dataclasses.replace(
+        self._finalize_record(
+            record,
             result,
-            result_hash=hashlib.sha256(
-                json.dumps(payload, sort_keys=True, default=str).encode()
-            ).hexdigest(),
+            generation=record.generation,
+            callback_id=f"run:{record.handle.subagent_id}",
         )
-        with _REGISTRY.lock:
-            record.agent = None
-            record.result = result
-            record.state = result.terminal_state
-            record.completed_at = result.completed_at
-            record.updated_at = result.completed_at or time.time()
 
     @staticmethod
     def _capability(
         subagent_id: str, parent_session_id: Optional[str], created_at: float
     ) -> str:
-        value = f"{subagent_id}|{parent_session_id or ''}|{created_at:.6f}".encode()
+        value = f"{subagent_id}|{parent_session_id or ''}|{created_at:.6f}".encode(
+            "utf-8"
+        )
         return hmac.new(_SECRET, value, hashlib.sha256).hexdigest()
 
     @staticmethod
@@ -519,7 +858,7 @@ class SubagentLifecycleService:
             )
         try:
             metadata_bytes = len(
-                json.dumps(dict(request.metadata), sort_keys=True).encode()
+                json.dumps(dict(request.metadata), sort_keys=True).encode("utf-8")
             )
         except (TypeError, ValueError) as exc:
             raise SubagentLifecycleError("metadata must be JSON-serializable.") from exc

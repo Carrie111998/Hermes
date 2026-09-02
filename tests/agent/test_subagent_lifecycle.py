@@ -6,7 +6,12 @@ from unittest.mock import Mock
 
 import pytest
 
+from agent import subagent_lifecycle as lifecycle_module
 from agent.subagent_lifecycle import (
+    SubagentHandle,
+    SubagentInterruptionCause,
+    SubagentInterruptionEvidence,
+    SubagentInterruptionStage,
     SubagentLaunchRequest,
     SubagentLifecycleError,
     SubagentLifecycleService,
@@ -178,3 +183,134 @@ def test_agent_turn_binds_and_clears_lifecycle_parent(monkeypatch):
     assert agent.run_conversation("hello") == {"final_response": "ok"}
     assert observed == [agent]
     assert get_active_subagent_parent() is None
+
+
+def test_cancellation_exposes_typed_first_and_later_evidence(lifecycle):
+    handle = lifecycle.launch(SubagentLaunchRequest(goal="evidence"))
+
+    cancellation = lifecycle.cancel(handle, reason="user stopped this")
+    assert cancellation.accepted
+    status = lifecycle.status(handle)
+    assert status.interruption is not None
+    assert status.interruption.cause is SubagentInterruptionCause.USER_CANCEL
+    assert status.interruption.stage is SubagentInterruptionStage.REQUESTED
+    assert status.interruption.detail == "user stopped this"
+    assert status.later_interruptions
+    assert all(
+        isinstance(evidence, SubagentInterruptionEvidence)
+        for evidence in status.later_interruptions
+    )
+
+    terminal = lifecycle.wait(handle, timeout_seconds=1)
+    assert terminal.state is SubagentState.CANCELLED
+    result = lifecycle.result(handle)
+    assert result.interruption == status.interruption
+    assert result.later_interruptions == terminal.later_interruptions
+
+
+def test_terminal_finalization_is_generation_aware_and_idempotent(lifecycle):
+    handle = lifecycle.launch(SubagentLaunchRequest(goal="finalize"))
+    record = lifecycle._record(handle)
+    assert record is not None
+    lifecycle.wait(handle, timeout_seconds=1)
+    original = lifecycle.result(handle)
+
+    late = lifecycle._finalize_record(
+        record,
+        original,
+        generation=handle.generation + 1,
+        callback_id="late-generation",
+    )
+    duplicate = lifecycle._finalize_record(
+        record,
+        original,
+        generation=handle.generation,
+        callback_id="run:duplicate",
+    )
+    assert late == original
+    assert duplicate == original
+    assert lifecycle.result(handle) == original
+    status = lifecycle.status(handle)
+    assert status.first_cause is None
+    assert status.later_causes
+    assert all(
+        cause is SubagentInterruptionCause.LATE_CALLBACK
+        for cause in status.later_causes
+    )
+
+
+def test_later_interruption_evidence_is_bounded(lifecycle):
+    handle = lifecycle.launch(SubagentLaunchRequest(goal="bounded"))
+    record = lifecycle._record(handle)
+    assert record is not None
+    lifecycle.wait(handle, timeout_seconds=1)
+
+    with lifecycle_module._REGISTRY.lock:
+        for index in range(11):
+            lifecycle._record_interruption_locked(
+                record,
+                SubagentInterruptionCause.TIMEOUT,
+                SubagentInterruptionStage.OBSERVED,
+                source="test",
+                detail=str(index),
+                authoritative=index == 0,
+            )
+
+    status = lifecycle.status(handle)
+    assert status.first_cause is SubagentInterruptionCause.TIMEOUT
+    assert len(status.later_interruptions) == 8
+    assert status.dropped_interruptions == 2
+
+
+def test_conflicting_duplicate_callback_cannot_replace_terminal_result(lifecycle):
+    handle = lifecycle.launch(SubagentLaunchRequest(goal="callback"))
+    record = lifecycle._record(handle)
+    assert record is not None
+    lifecycle.wait(handle, timeout_seconds=1)
+    original = lifecycle.result(handle)
+    conflicting = type(original)(
+        **{
+            **original.__dict__,
+            "summary": "late conflicting callback",
+        }
+    )
+
+    lifecycle._finalize_record(
+        record,
+        original,
+        generation=handle.generation,
+        callback_id="same-callback",
+    )
+    lifecycle._finalize_record(
+        record,
+        conflicting,
+        generation=handle.generation,
+        callback_id="same-callback",
+    )
+    assert lifecycle.result(handle) == original
+
+
+def test_handle_serialization_round_trips_generation(lifecycle):
+    handle = lifecycle.launch(SubagentLaunchRequest(goal="round-trip"))
+    assert handle.generation == 1
+    restored = SubagentHandle.from_dict(handle.to_dict())
+    assert restored == handle
+    assert restored.generation == 1
+    lifecycle.wait(handle, timeout_seconds=1)
+
+
+def test_legacy_handle_without_generation_is_accepted(lifecycle):
+    handle = lifecycle.launch(SubagentLaunchRequest(goal="legacy"))
+    payload = handle.to_dict()
+    payload.pop("generation")
+    legacy = SubagentHandle.from_dict(payload)
+    assert legacy.generation == 0
+    assert lifecycle.status(legacy).state is not SubagentState.UNKNOWN
+    lifecycle.wait(handle, timeout_seconds=1)
+
+
+def test_stale_generation_handle_is_rejected(lifecycle):
+    handle = lifecycle.launch(SubagentLaunchRequest(goal="stale-generation"))
+    stale = handle.__class__(**{**handle.to_dict(), "generation": handle.generation + 1})
+    assert lifecycle.status(stale).state is SubagentState.UNKNOWN
+    lifecycle.wait(handle, timeout_seconds=1)
