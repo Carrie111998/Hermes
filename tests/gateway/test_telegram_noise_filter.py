@@ -241,6 +241,33 @@ def test_blocked_overflow_match_accepts_full_emitted_reason_domain(reason):
     )
 
 
+@pytest.mark.parametrize("tokens", ["1,,2", "07,200", "８５,０００", "1000"])
+def test_malformed_token_counts_are_not_suppressed(tokens):
+    warning = CONTEXT_OVERFLOW_BLOCKED_WARNING_TEMPLATE.format(
+        tokens=85_000, threshold=72_000, reason="cooldown:30"
+    ).replace("85,000", tokens)
+    assert (
+        _prepare_gateway_status_message(
+            Platform.TELEGRAM, "warn", warning, chat_type="group"
+        )
+        == warning
+    )
+
+
+def test_credential_shaped_reason_is_suppressed_before_redaction():
+    warning = CONTEXT_OVERFLOW_BLOCKED_WARNING_TEMPLATE.format(
+        tokens=85_000,
+        threshold=72_000,
+        reason="plugin credential sk-ABCDEFGHIJKLMNOPQRSTUVWXYZ123456",
+    )
+    assert (
+        _prepare_gateway_status_message(
+            Platform.TELEGRAM, "warn", warning, chat_type="group"
+        )
+        is None
+    )
+
+
 @pytest.mark.parametrize("platform", ["slack", "matrix"])
 def test_chat_gateways_redact_secret_in_provider_error(platform):
     """Provider-error bodies carrying secrets must never reach chat users.

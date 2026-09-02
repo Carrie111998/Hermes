@@ -1039,8 +1039,9 @@ def _blocked_overflow_status_regex(template: str) -> re.Pattern[str]:
     source = source.replace("{threshold:,}", marker_threshold)
     source = source.replace("{reason}", marker_reason)
     source = re.escape(source)
-    source = source.replace(re.escape(marker_tokens), r"[\d,]+")
-    source = source.replace(re.escape(marker_threshold), r"[\d,]+")
+    canonical_count = r"(?:0|[1-9][0-9]{0,2}(?:,[0-9]{3})*)"
+    source = source.replace(re.escape(marker_tokens), canonical_count)
+    source = source.replace(re.escape(marker_threshold), canonical_count)
     source = source.replace(re.escape(marker_reason), r"[\s\S]+?")
     return re.compile(rf"^{source}$")
 
@@ -1070,7 +1071,6 @@ def _prepare_gateway_status_message(
     if _gateway_surface_passes_raw_text(platform):
         return text
 
-    text = _redact_gateway_user_facing_secrets(text)
     normalized_chat_type = str(getattr(chat_type, "value", chat_type) or "").strip().lower()
     if (
         normalized_chat_type in _MULTI_USER_CHAT_TYPES
@@ -1078,6 +1078,7 @@ def _prepare_gateway_status_message(
         and _CONTEXT_OVERFLOW_BLOCKED_STATUS_RE.fullmatch(text)
     ):
         return None
+    text = _redact_gateway_user_facing_secrets(text)
     if _TELEGRAM_NOISY_STATUS_RE.search(text):
         # Opt-in #52995: `compression.progress_notices: true` lets ROUTINE
         # compression progress statuses through to chat platforms. The
