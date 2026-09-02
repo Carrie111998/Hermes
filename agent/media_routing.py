@@ -10,9 +10,9 @@ from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 logger = logging.getLogger(__name__)
 
-# Maximum file size allowed for inline base64 embedding (25 MB).
-# Files exceeding this threshold fall back to STT / tool execution to prevent
-# memory spikes and provider HTTP 413 (Payload Too Large) errors.
+# Maximum encoded Base64 payload allowed for one inline attachment (25 MiB).
+# The raw-file ceiling is therefore about 18.75 MiB; accounting for Base64
+# expansion keeps the request from silently exceeding this guard after read.
 MAX_ATTACHMENT_SIZE_BYTES = 25 * 1024 * 1024
 
 AUDIO_FORMAT_TO_MIME: Dict[str, str] = {
@@ -151,17 +151,32 @@ def _read_as_base64(
     path: Path,
     max_size_bytes: int = MAX_ATTACHMENT_SIZE_BYTES,
 ) -> Optional[str]:
+    """Read *path* as Base64 while enforcing the encoded payload ceiling."""
     try:
         size = path.stat().st_size
-        if size > max_size_bytes:
+        encoded_size = 4 * ((size + 2) // 3)
+        if encoded_size > max_size_bytes:
             logger.warning(
-                "media_routing: file %s exceeds %d MB limit (%d bytes), skipping native attachment",
+                "media_routing: encoded file %s exceeds %d-byte inline payload limit "
+                "(%d raw bytes, %d Base64 bytes), skipping native attachment",
                 path,
-                max_size_bytes // (1024 * 1024),
+                max_size_bytes,
                 size,
+                encoded_size,
             )
             return None
-        return base64.b64encode(path.read_bytes()).decode("ascii")
+        encoded = base64.b64encode(path.read_bytes())
+        # The file can grow between stat() and read_bytes(); enforce the limit
+        # again against the bytes that will actually enter the request.
+        if len(encoded) > max_size_bytes:
+            logger.warning(
+                "media_routing: encoded file %s grew past %d-byte inline payload "
+                "limit while reading, skipping native attachment",
+                path,
+                max_size_bytes,
+            )
+            return None
+        return encoded.decode("ascii")
     except Exception as exc:
         logger.warning("media_routing: failed to read %s: %s", path, exc)
         return None
@@ -216,10 +231,6 @@ def build_native_media_content_parts(
             skipped.append(raw_path)
             continue
 
-        encoded = _read_as_base64(path, max_size_bytes=max_size_bytes)
-        if encoded is None:
-            skipped.append(raw_path)
-            continue
         mime = _mime_type(path, str(attachment.get("mime_type") or ""))
 
         modality = str(attachment.get("modality") or "").lower()
@@ -234,11 +245,34 @@ def build_native_media_content_parts(
                 modality = "pdf"
 
         if modality == "image":
-            media_parts.append({
-                "type": "image_url",
-                "image_url": {"url": f"data:{mime};base64,{encoded}"},
-            })
-        elif modality == "pdf":
+            # Preserve the established image pipeline's safety checks, MIME
+            # sniffing, format transcoding, and reactive provider-size retry.
+            # A voice attachment in the same turn must not downgrade images to
+            # this module's stricter non-image inline payload ceiling.
+            from agent.image_routing import build_native_content_parts
+
+            image_parts, _ = build_native_content_parts("", [raw_path])
+            image_part = next(
+                (part for part in image_parts if part.get("type") == "image_url"),
+                None,
+            )
+            if image_part is None:
+                skipped.append(raw_path)
+                continue
+            media_parts.append(image_part)
+            image_url = (image_part.get("image_url") or {}).get("url") or ""
+            if image_url.startswith("data:"):
+                mime = image_url.split(":", 1)[1].split(";", 1)[0] or mime
+        elif modality not in {"pdf", "audio", "video"}:
+            skipped.append(raw_path)
+            continue
+        else:
+            encoded = _read_as_base64(path, max_size_bytes=max_size_bytes)
+            if encoded is None:
+                skipped.append(raw_path)
+                continue
+
+        if modality == "pdf":
             media_parts.append({
                 "type": "file",
                 "file": {
@@ -250,18 +284,37 @@ def build_native_media_content_parts(
             audio_format = normalize_audio_format(path, mime)
             audio_data = encoded
             # Transcode to mp3 if required by OpenAI direct input_audio schema
-            if target_provider in ("openai", "azure") and audio_format not in (
+            provider = (target_provider or "").strip().lower()
+            if provider in ("openai", "azure") and audio_format not in (
                 "wav",
                 "mp3",
             ):
                 transcoded = transcode_audio_to_supported_format(
                     path, target_format="mp3"
                 )
-                if transcoded:
-                    t_bytes, t_fmt = transcoded
-                    audio_data = base64.b64encode(t_bytes).decode("ascii")
-                    audio_format = t_fmt
-                    mime = "audio/mpeg"
+                if transcoded is None:
+                    logger.warning(
+                        "media_routing: %s audio %s could not be transcoded to "
+                        "an OpenAI-compatible format; skipping native attachment",
+                        provider,
+                        path,
+                    )
+                    skipped.append(raw_path)
+                    continue
+                t_bytes, t_fmt = transcoded
+                encoded_transcode = base64.b64encode(t_bytes)
+                if len(encoded_transcode) > max_size_bytes:
+                    logger.warning(
+                        "media_routing: transcoded audio %s exceeds %d-byte "
+                        "inline payload limit, skipping native attachment",
+                        path,
+                        max_size_bytes,
+                    )
+                    skipped.append(raw_path)
+                    continue
+                audio_data = encoded_transcode.decode("ascii")
+                audio_format = t_fmt
+                mime = "audio/mpeg"
 
             media_parts.append({
                 "type": "input_audio",
@@ -272,10 +325,6 @@ def build_native_media_content_parts(
                 "type": "video_url",
                 "video_url": {"url": f"data:{mime};base64,{encoded}"},
             })
-        else:
-            skipped.append(raw_path)
-            continue
-
         file_size_bytes = path.stat().st_size if path.is_file() else 0
         size_str = (
             f"{file_size_bytes / 1024:.1f} KB"

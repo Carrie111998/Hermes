@@ -6916,6 +6916,34 @@ class TurnRunner:
             _native_audio = self._runner._consume_pending_native_audio_attachments(
                 ctx.session_key
             )
+            _run_message: Any = ctx.message
+
+            def _build_native_image_message() -> Optional[List[Dict[str, Any]]]:
+                """Build the established image-only path after mixed-media failure."""
+                if not _native_imgs:
+                    return None
+                try:
+                    from agent.image_routing import build_native_content_parts
+
+                    _image_parts, _image_skipped = build_native_content_parts(
+                        ctx.message,
+                        _native_imgs,
+                    )
+                    if _image_skipped:
+                        logger.warning(
+                            "Native image attachment: skipped %d unreadable path(s): %s",
+                            len(_image_skipped),
+                            _image_skipped,
+                        )
+                    if any(p.get("type") == "image_url" for p in _image_parts):
+                        return _image_parts
+                except Exception as _img_exc:
+                    logger.warning(
+                        "Native image attachment failed, falling back to text: %s",
+                        _img_exc,
+                    )
+                return None
+
             if _native_audio:
                 try:
                     from agent.media_routing import build_native_media_content_parts
@@ -6933,55 +6961,37 @@ class TurnRunner:
                     )
                     if _skipped:
                         logger.warning(
-                            "Native media attachment: skipped %d unreadable path(s): %s",
+                            "Native media attachment: skipped %d attachment(s): %s",
                             len(_skipped), _skipped,
                         )
                     if any(
                         p.get("type") in {"image_url", "file", "input_audio", "video_url"}
                         for p in _parts
                     ):
-                        _run_message: Any = _parts
+                        _run_message = _parts
                         # Persist a compact marker instead of embedding Base64
-                        # audio in the session database/history.
-                        if _persist_user_message_override is None:
+                        # audio in the session database/history. Do not stamp a
+                        # voice marker when audio failed and only an image made
+                        # it through the mixed-media turn.
+                        if (
+                            any(p.get("type") == "input_audio" for p in _parts)
+                            and _persist_user_message_override is None
+                        ):
                             _persist_user_message_override = (
                                 ctx.message.strip()
                                 if isinstance(ctx.message, str) and ctx.message.strip()
                                 else "[Voice message attached natively]"
                             )
                     else:
-                        _run_message = ctx.message
+                        _run_message = _build_native_image_message() or ctx.message
                 except Exception as _media_exc:
                     logger.warning(
                         "Native media attachment failed, falling back to text: %s",
                         _media_exc,
                     )
-                    _run_message = ctx.message
+                    _run_message = _build_native_image_message() or ctx.message
             elif _native_imgs:
-                try:
-                    from agent.image_routing import build_native_content_parts
-                    _parts, _skipped = build_native_content_parts(
-                        ctx.message,
-                        _native_imgs,
-                    )
-                    if _skipped:
-                        logger.warning(
-                            "Native image attachment: skipped %d unreadable path(s): %s",
-                            len(_skipped), _skipped,
-                        )
-                    if any(p.get("type") == "image_url" for p in _parts):
-                        _run_message: Any = _parts
-                    else:
-                        # All images failed to read — fall back to plain text.
-                        _run_message = ctx.message
-                except Exception as _img_exc:
-                    logger.warning(
-                        "Native image attachment failed, falling back to text: %s",
-                        _img_exc,
-                    )
-                    _run_message = ctx.message
-            else:
-                _run_message = ctx.message
+                _run_message = _build_native_image_message() or ctx.message
 
             _api_run_message = _wrap_current_message_with_observed_context(
                 _run_message,

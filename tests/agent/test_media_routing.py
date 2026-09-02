@@ -104,6 +104,20 @@ def test_attachment_exceeding_size_ceiling_is_skipped(tmp_path):
     assert skipped == [str(oversized)]
 
 
+def test_attachment_size_ceiling_includes_base64_expansion(tmp_path):
+    audio = tmp_path / "voice.mp3"
+    audio.write_bytes(b"x" * 76)  # 104 bytes after Base64 encoding.
+
+    parts, skipped = build_native_media_content_parts(
+        "listen",
+        [{"path": str(audio), "mime_type": "audio/mpeg", "modality": "audio"}],
+        max_size_bytes=100,
+    )
+
+    assert parts == [{"type": "text", "text": "listen"}]
+    assert skipped == [str(audio)]
+
+
 def test_audio_format_and_mime_normalization():
     from agent.media_routing import normalize_audio_format, normalize_audio_mime
     from pathlib import Path
@@ -190,6 +204,67 @@ def test_openai_target_provider_triggers_audio_transcoding(tmp_path, monkeypatch
     assert audio_part["input_audio"]["data"] == base64.b64encode(
         b"fake-mp3-bytes"
     ).decode("ascii")
+
+
+def test_openai_transcode_failure_skips_unsupported_audio(tmp_path, monkeypatch):
+    import agent.media_routing as mr
+
+    audio = tmp_path / "voice.ogg"
+    audio.write_bytes(b"OggS" + b"\x00" * 28)
+    monkeypatch.setattr(
+        mr, "transcode_audio_to_supported_format", lambda *_a, **_k: None
+    )
+
+    for target_provider in ("openai", "azure"):
+        parts, skipped = build_native_media_content_parts(
+            "listen to voice",
+            [{"path": str(audio), "mime_type": "audio/ogg", "modality": "audio"}],
+            target_provider=target_provider,
+        )
+
+        assert parts == [{"type": "text", "text": "listen to voice"}]
+        assert skipped == [str(audio)]
+
+
+def test_failed_audio_keeps_images_on_existing_native_pipeline(tmp_path):
+    image = tmp_path / "photo.png"
+    image.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 32)
+    missing_audio = tmp_path / "missing.ogg"
+
+    parts, skipped = build_native_media_content_parts(
+        "look and listen",
+        [
+            {"path": str(image), "mime_type": "image/png", "modality": "image"},
+            {
+                "path": str(missing_audio),
+                "mime_type": "audio/ogg",
+                "modality": "audio",
+            },
+        ],
+        # The established image pipeline handles provider limits reactively;
+        # this ceiling applies to newly inlined non-image payloads only.
+        max_size_bytes=16,
+    )
+
+    assert any(part.get("type") == "image_url" for part in parts)
+    assert not any(part.get("type") == "input_audio" for part in parts)
+    assert skipped == [str(missing_audio)]
+
+
+def test_gemini_adapter_does_not_fetch_arbitrary_remote_media_urls():
+    parts = _extract_multimodal_parts([
+        {"type": "text", "text": "inspect these references"},
+        {
+            "type": "video_url",
+            "video_url": {"url": "https://example.com/video.mp4"},
+        },
+        {
+            "type": "file",
+            "file": {"file_data": "https://example.com/document.pdf"},
+        },
+    ])
+
+    assert parts == [{"text": "inspect these references"}]
 
 
 def test_transcode_audio_when_ffmpeg_missing(tmp_path, monkeypatch):

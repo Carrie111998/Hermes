@@ -317,3 +317,66 @@ async def test_agent_pipeline_sends_mixed_image_and_audio(
     assert "input_audio" in types_in_msg
     assert runner._consume_pending_native_image_paths(session_key) == []
     assert runner._consume_pending_native_audio_attachments(session_key) == []
+
+
+@pytest.mark.asyncio
+async def test_agent_pipeline_falls_back_to_native_image_when_all_audio_is_skipped(
+    monkeypatch,
+    tmp_path,
+):
+    _CaptureAgent.calls = []
+
+    fake_dotenv = types.ModuleType("dotenv")
+    fake_dotenv.load_dotenv = lambda *_, **__: None
+    monkeypatch.setitem(sys.modules, "dotenv", fake_dotenv)
+
+    fake_run_agent = types.ModuleType("run_agent")
+    fake_run_agent.AIAgent = _CaptureAgent
+    monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
+
+    gateway_run = importlib.import_module("gateway.run")
+    media_routing = importlib.import_module("agent.media_routing")
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setattr(
+        gateway_run,
+        "_resolve_runtime_agent_kwargs",
+        lambda: {"api_key": "***", "provider": "openrouter"},
+    )
+    monkeypatch.setattr(
+        media_routing,
+        "build_native_media_content_parts",
+        lambda text, *_args, **_kwargs: (
+            [{"type": "text", "text": text}],
+            ["voice.ogg"],
+        ),
+    )
+
+    runner = _pipeline_runner()
+    source = _source()
+    session_key = build_session_key(source)
+    image_path = tmp_path / "photo.png"
+    image_path.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 32)
+    runner._session_state(session_key).persistent.native_image_paths = [str(image_path)]
+    runner._session_state(session_key).persistent.native_audio_attachments = [
+        {
+            "path": str(tmp_path / "voice.ogg"),
+            "mime_type": "audio/ogg",
+            "modality": "audio",
+        }
+    ]
+
+    result = await runner._run_agent(
+        message="look and listen",
+        context_prompt="",
+        history=[],
+        source=source,
+        session_id="sess-image-fallback",
+        session_key=session_key,
+    )
+
+    assert result["final_response"] == "done"
+    message, kwargs = _CaptureAgent.calls[0]
+    assert isinstance(message, list)
+    assert any(part.get("type") == "image_url" for part in message)
+    assert not any(part.get("type") == "input_audio" for part in message)
+    assert kwargs.get("persist_user_message") is None
