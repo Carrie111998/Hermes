@@ -15467,10 +15467,13 @@ def _project_tree_row(r: dict) -> dict:
     return {
         "id": r.get("id"),
         "_lineage_root_id": r.get("_lineage_root_id"),
-        # The sidebar nests branch/fork sessions under their parent
-        # (flattenSessionsWithBranches keys on this); without it, lane rows can't
-        # draw the └─ connector the flat Recents list shows.
+        # The sidebar nests genuine /branch forks under their parent
+        # (flattenSessionsWithBranches keys on parent_session_id + these
+        # markers). /new and idle/daily resets also write parent_session_id
+        # for durable lineage, but stamp _reset_from so they render as siblings.
         "parent_session_id": r.get("parent_session_id"),
+        "_reset_from": r.get("_reset_from"),
+        "_branched_from": r.get("_branched_from"),
         "title": r.get("title"),
         "preview": r.get("preview"),
         "started_at": r.get("started_at") or 0,
