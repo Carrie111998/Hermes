@@ -128,6 +128,24 @@ class GatewaySlashCommandsMixin:
 
     async_session_store: AsyncSessionStore
 
+    def _refresh_discord_activity(self) -> None:
+        """Trigger an immediate Discord activity update if the adapter is connected.
+
+        Called after model switches so the bot status stays in sync with
+        the active model without waiting for the 60s watchdog cycle.
+        """
+        adapter = self.adapters.get(Platform.DISCORD) if getattr(self, "adapters", None) else None
+        if adapter is None:
+            return
+        try:
+            apply_activity = getattr(adapter, "_apply_activity", None)
+            if callable(apply_activity):
+                # Fire-and-forget on the loop so the switch reply isn't
+                # awaited against the presence update.
+                asyncio.create_task(apply_activity())
+        except Exception:
+            logger.debug("Discord activity refresh failed", exc_info=True)
+
     def _typed_command_prefix_for(self, platform) -> str:
         """Return the prefix users can always type to reach Hermes commands.
 
@@ -2365,6 +2383,9 @@ class GatewaySlashCommandsMixin:
             # Evict cached agent so the next turn creates a fresh agent from the
             # override rather than relying on cache signature mismatch detection.
             self._evict_cached_agent(session_key)
+
+            # Refresh Discord activity so it stays in sync with the new model.
+            self._refresh_discord_activity()
 
             # Persist to config (default) unless --session opted out
             if persist_global:
