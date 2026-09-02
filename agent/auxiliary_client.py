@@ -10463,7 +10463,6 @@ def call_llm(
     semaphore = _acquire_sync_aux_semaphore(task)
     if semaphore is not None:
         semaphore.acquire()
-<<<<<<< HEAD
     request_started_at = time.monotonic()
     if latency_info is not None:
         latency_info["queue_wait_ms"] = max(
