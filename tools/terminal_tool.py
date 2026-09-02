@@ -2737,7 +2737,6 @@ def _strip_quotes(command: str) -> str:
 
 _LONG_LIVED_FOREGROUND_PATTERNS = (
     re.compile(r"\b(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?(?:dev|start|serve|watch)\b", re.IGNORECASE),
-    re.compile(r"\bdocker\s+compose\s+up\b", re.IGNORECASE),
     re.compile(r"\bnext\s+dev\b", re.IGNORECASE),
     re.compile(r"\bvite(?:\s|$)", re.IGNORECASE),
     re.compile(r"\bnodemon\b", re.IGNORECASE),
@@ -2745,6 +2744,19 @@ _LONG_LIVED_FOREGROUND_PATTERNS = (
     re.compile(r"\bgunicorn\b", re.IGNORECASE),
     re.compile(r"\bpython(?:3)?\s+-m\s+http\.server\b", re.IGNORECASE),
 )
+
+_DOCKER_COMPOSE_UP_RE = re.compile(r"\bdocker\s+compose\s+up\b", re.IGNORECASE)
+_DOCKER_COMPOSE_DETACH_RE = re.compile(r"(?:^|\s)(?:-d|--detach)(?=\s|$)", re.IGNORECASE)
+_SHELL_COMMAND_SEPARATOR_RE = re.compile(r"&&|\|\||[;|\n]")
+
+
+def _has_attached_docker_compose_up(command: str) -> bool:
+    """Return True when any Compose up invocation runs in attached mode."""
+    for match in _DOCKER_COMPOSE_UP_RE.finditer(command):
+        trailing_segment = _SHELL_COMMAND_SEPARATOR_RE.split(command[match.end() :], maxsplit=1)[0]
+        if _DOCKER_COMPOSE_DETACH_RE.search(trailing_segment) is None:
+            return True
+    return False
 
 
 def _looks_like_help_or_version_command(command: str) -> bool:
@@ -2784,6 +2796,13 @@ def _foreground_background_guidance(command: str) -> str | None:
             "Foreground command uses '&' backgrounding. Re-send WITHOUT the '&' as "
             "terminal(command=\"<cmd>\", background=true) — add notify_on_complete=true "
             "for bounded jobs — then run health checks and tests in follow-up terminal calls."
+        )
+
+    if _has_attached_docker_compose_up(unquoted):
+        return (
+            "This foreground command appears to start a long-lived server/watch process. "
+            "Run it with background=true, verify readiness (health endpoint/log signal), "
+            "then execute tests in a separate command."
         )
 
     for pattern in _LONG_LIVED_FOREGROUND_PATTERNS:

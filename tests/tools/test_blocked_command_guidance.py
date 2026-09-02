@@ -20,7 +20,7 @@ class TestParserLimitRecovery:
         from pathlib import Path
         saved = Path(m.group(1))
         assert saved.exists()
-        body = saved.read_text()
+        body = saved.read_text(encoding="utf-8")
         assert cmd in body
         assert body.startswith("#!/bin/bash")
         assert f"bash {saved}" in r["message"]
@@ -55,7 +55,7 @@ class TestParserLimitRecovery:
         d = tmp_path / ".hermes" / "cache" / "blocked-scripts"
         d.mkdir(parents=True)
         stale = d / "blocked-1-dead.sh"
-        stale.write_text("old")
+        stale.write_text("old", encoding="utf-8")
         os.utime(stale, (1, 1))
         _hardline_block_result(_PARSER_LIMIT_DESCRIPTION, "python3 -c 'y'")
         assert not stale.exists()
@@ -79,3 +79,16 @@ class TestBackgroundGuidanceRecipes:
 
     def test_quoted_ampersand_not_flagged(self):
         assert _foreground_background_guidance('git commit -m "a & b"') is None
+
+    def test_attached_docker_compose_up_is_blocked(self):
+        msg = _foreground_background_guidance("docker compose up nextcloud-app")
+        assert msg is not None
+        assert "long-lived server/watch process" in msg
+
+    @pytest.mark.parametrize("detach_flag", ["-d", "--detach"])
+    def test_detached_docker_compose_up_is_allowed(self, detach_flag):
+        command = (
+            f"docker compose up {detach_flag} --no-deps "
+            "--force-recreate nextcloud-app"
+        )
+        assert _foreground_background_guidance(command) is None
