@@ -539,6 +539,13 @@ class TestValidateConfigKey:
         "model",
         "terminal.backend",
         "agent.max_turns",
+        "agent.reasoning_effort",
+        "stt.provider",
+        "image_gen.provider",
+        "image_gen.xai.storage.public_url",
+        "video_gen.provider",
+        "gateway.streaming",
+        "write_sessions_json",
         "discord.gateway_restart_notification",
         "telegram.bot_token",
         "mcp_servers.foo.command",
@@ -557,6 +564,10 @@ class TestValidateConfigKey:
         ("gateway.discord.gateway_restart_notification", None),  # no close suggestion
         ("disco", "discord"),
         ("agent.max_turn", "agent.max_turns"),
+        ("agent.reasoning_effotr", "agent.reasoning_effort"),
+        ("stt.providers", "stt.provider"),
+        ("image_gen.providr", "image_gen.provider"),
+        ("image_gen.xai.storage.public_urls", "image_gen.xai.storage.public_url"),
     ])
     def test_unknown_keys_with_suggestion(self, key, expected_in_suggestion):
         from hermes_cli.config import _validate_config_key

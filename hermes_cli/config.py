@@ -5694,6 +5694,250 @@ _DYNAMIC_TOP_LEVEL_KEYS = frozenset({
     "custom_providers",  # list-shaped, but indexed by position
 })
 
+# Runtime-consumed paths that intentionally have no entry in DEFAULT_CONFIG.
+# Adding them to the defaults would change merge/runtime behavior merely to
+# satisfy the `config set` validator. Keep this exact supplement instead:
+# parents of a declared path are valid containers, while undeclared siblings
+# remain typos and still receive same-level suggestions.
+_RUNTIME_CONFIG_PATHS = frozenset({
+    "a2a.served_agents",
+    "a2a.trusted_peers",
+    "a2a_agents",
+    "a2a_served_agents",
+    "agent.prefill_messages_file",
+    "agent.reasoning_effort",
+    "agent.system_prompt",
+    "always_log_local",
+    "approvals.discord_prompt_timeout",
+    "auxiliary.compression.context_length",
+    "auxiliary.video.model",
+    "auxiliary.vision.max_concurrency",
+    "auxiliary.vision.temperature",
+    "browser.cloud_provider",
+    "browser.use_gateway",
+    "clarify.timeout",
+    "computer_use.backend",
+    "cron.bot_chat_delivery_timeout_seconds",
+    "cron.cleanup_timeout_seconds",
+    "cron.completed_retention_days",
+    "cron.failure_nudge_threshold",
+    "cron.inflight_max_minutes",
+    "cron.misfire_grace_minutes",
+    "curator.auxiliary.api_key",
+    "curator.auxiliary.base_url",
+    "curator.auxiliary.extra_body",
+    "curator.auxiliary.model",
+    "curator.auxiliary.provider",
+    "dashboard.font",
+    "dashboard.hidden_plugins",
+    "dashboard.kanban.default_tenant",
+    "dashboard.kanban.include_archived_by_default",
+    "dashboard.kanban.lane_by_profile",
+    "dashboard.kanban.render_markdown",
+    "dashboard.oauth.self_hosted.client_id",
+    "dashboard.oauth.self_hosted.client_secret",
+    "dashboard.oauth.self_hosted.issuer",
+    "dashboard.oauth.self_hosted.scopes",
+    "database.cache_size",
+    "database.mmap_size",
+    "database.synchronous",
+    "database.temp_store",
+    "delegation.max_async_children",
+    "delegation.worktree_isolation",
+    "display.busy_ack_detail",
+    "display.busy_ack_enabled",
+    "display.busy_text_mode",
+    "display.cleanup_progress",
+    "display.details_mode",
+    "display.generic_status_phrases",
+    "display.live_status",
+    "display.long_running_notifications",
+    "display.message_reactions",
+    "display.sections",
+    "display.thinking_mode",
+    "display.tool_progress",
+    "display.tool_progress_overrides",
+    "fallback_model.model",
+    "fallback_model.provider",
+    "filter_silence_narration",
+    "gateway.always_log_local",
+    "gateway.filter_silence_narration",
+    "gateway.group_sessions_per_user",
+    "gateway.idp.client_id",
+    "gateway.idp.client_secret",
+    "gateway.idp.scope",
+    "gateway.idp.token_url",
+    "gateway.max_concurrent_sessions",
+    "gateway.max_live_sessions",
+    "gateway.multiplex_profiles",
+    "gateway.profile_routes",
+    "gateway.proxy_url",
+    "gateway.relay_url",
+    "gateway.reset_triggers",
+    "gateway.session_reset",
+    "gateway.streaming",
+    "gateway.stt_echo_transcripts",
+    "gateway.systemd_watchdog_seconds",
+    "gateway.thread_sessions_per_user",
+    "gateway.unauthorized_dm_behavior",
+    "group_sessions_per_user",
+    "honcho.base_url",
+    "honcho.request_timeout",
+    "honcho.timeout",
+    "image_gen.deepinfra.model",
+    "image_gen.krea.creativity",
+    "image_gen.krea.model",
+    "image_gen.krea.upscale",
+    "image_gen.max_parallel_requests",
+    "image_gen.model",
+    "image_gen.openai-codex.model",
+    "image_gen.openai.model",
+    "image_gen.provider",
+    "image_gen.use_gateway",
+    "image_gen.xai.model",
+    "image_gen.xai.resolution",
+    "image_gen.xai.storage.enabled",
+    "image_gen.xai.storage.expires_after",
+    "image_gen.xai.storage.public_url",
+    "kanban.auto_promote_children",
+    "kanban.diagnostics.failure_limit",
+    "kanban.diagnostics.failure_threshold",
+    "kanban.diagnostics.spawn_failure_threshold",
+    "kanban.max_spawn",
+    "loop_watchdog",
+    "loop_watchdog_max_strikes",
+    "loop_watchdog_probe_interval_s",
+    "loop_watchdog_probe_timeout_s",
+    "max_turns",
+    "mcp.servers",
+    "memory.byterover",
+    "memory.enabled",
+    "memory.openviking",
+    "memory.provider_config",
+    "memory.retaindb",
+    "moa.aggregator",
+    "moa.reference_models",
+    "model_aliases",
+    "multiplex_profile_allowlist",
+    "multiplex_profiles",
+    "platform_toolsets",
+    "principal.model",
+    "profile_routes",
+    "provider_routing.data_collection",
+    "provider_routing.ignore",
+    "provider_routing.only",
+    "provider_routing.order",
+    "provider_routing.require_parameters",
+    "provider_routing.sort",
+    "reset_triggers",
+    "session_reset",
+    "session_reset.at_hour",
+    "session_reset.idle_minutes",
+    "session_reset.mode",
+    "skills.creation_nudge_interval",
+    "skills.disabled",
+    "skills.platform_disabled",
+    "streaming.mode",
+    "stt.elevenlabs.base_url",
+    "stt.elevenlabs.model",
+    "stt.local.compute_type",
+    "stt.local.device",
+    "stt.model",
+    "stt.openai.api_key",
+    "stt.openai.base_url",
+    "stt.prompt",
+    "stt.provider",
+    "stt.use_gateway",
+    "stt.xai.base_url",
+    "stt.xai.diarize",
+    "stt.xai.format",
+    "stt_echo_transcripts",
+    "sync.base_url",
+    "sync.default_opt_in",
+    "sync.enabled",
+    "sync.org_auto_propose",
+    "terminal.credential_files",
+    "terminal.docker_orphan_reaper",
+    "terminal.docker_persist_across_processes",
+    "terminal.env_type",
+    "terminal.lifetime_seconds",
+    "terminal.sandbox_dir",
+    "terminal.ssh_host",
+    "terminal.ssh_key",
+    "terminal.ssh_port",
+    "terminal.ssh_user",
+    "terminal.sudo_password",
+    "thread_sessions_per_user",
+    "timeouts.tools.concurrent_batch",
+    "timeouts.tools.sequential_call",
+    "tool_budget.mcp_result_size_chars",
+    "tool_loop_guardrails.exact_failure_block_after",
+    "tool_loop_guardrails.exact_failure_warn_after",
+    "tool_loop_guardrails.no_progress_block_after",
+    "tool_loop_guardrails.no_progress_warn_after",
+    "tool_loop_guardrails.same_tool_failure_halt_after",
+    "tool_loop_guardrails.same_tool_failure_warn_after",
+    "tools.enabled_toolsets",
+    "tts.deepinfra.speed",
+    "tts.delivery_profiles",
+    "tts.edge.speed",
+    "tts.elevenlabs.base_url",
+    "tts.elevenlabs.wss_url",
+    "tts.gemini.base_url",
+    "tts.kittentts.clean_text",
+    "tts.kittentts.speed",
+    "tts.minimax.base_url",
+    "tts.minimax.bitrate",
+    "tts.minimax.emotion",
+    "tts.minimax.group_id",
+    "tts.minimax.pitch",
+    "tts.minimax.region",
+    "tts.minimax.sample_rate",
+    "tts.minimax.speed",
+    "tts.minimax.vol",
+    "tts.mistral.base_url",
+    "tts.model",
+    "tts.openai.api_key",
+    "tts.openai.base_url",
+    "tts.openai.language",
+    "tts.openai.speed",
+    "tts.optimize_streaming_latency",
+    "tts.output_format",
+    "tts.piper.length_scale",
+    "tts.piper.noise_scale",
+    "tts.piper.noise_w_scale",
+    "tts.piper.normalize_audio",
+    "tts.piper.speaker_id",
+    "tts.piper.use_cuda",
+    "tts.piper.voices_dir",
+    "tts.piper.volume",
+    "tts.speed",
+    "tts.streaming.provider",
+    "tts.use_gateway",
+    "tts.voice",
+    "tts.xai.base_url",
+    "tts.xai.model",
+    "tts.xai.speech_tags",
+    "tts.xai.streaming_url",
+    "tts.xai.text_normalization",
+    "unauthorized_dm_behavior",
+    "video_gen.fal.model",
+    "video_gen.model",
+    "video_gen.provider",
+    "video_gen.use_gateway",
+    "video_gen.xai.storage.enabled",
+    "video_gen.xai.storage.expires_after",
+    "video_gen.xai.storage.public_url",
+    "web.use_gateway",
+    "web.xai.allowed_domains",
+    "web.xai.excluded_domains",
+    "web.xai.model",
+    "web.xai.timeout",
+    "worktree",
+    "worktree_sync",
+    "write_sessions_json",
+})
+
 # Container keys whose immediate child IS a user-supplied platform name
 # (``platforms.<name>.<field>``).  These appear both at the top level and
 # nested under ``gateway`` — current docs configure platforms under
@@ -5716,7 +5960,27 @@ def _known_top_level_keys() -> set[str]:
     keys.update(_OPEN_DICT_TOP_LEVEL_KEYS)
     keys.update(_DYNAMIC_TOP_LEVEL_KEYS)
     keys.update(_SCHEMA_DEFINED_DICT_KEYS)
+    keys.update(path.split(".", 1)[0] for path in _RUNTIME_CONFIG_PATHS)
     return keys
+
+
+def _runtime_config_children(segments: list[str]) -> set[str]:
+    """Return declared runtime-only children immediately below *segments*."""
+    prefix = ".".join(segments)
+    if prefix:
+        prefix += "."
+    return {
+        path[len(prefix):].split(".", 1)[0]
+        for path in _RUNTIME_CONFIG_PATHS
+        if path.startswith(prefix) and len(path) > len(prefix)
+    }
+
+
+def _is_runtime_config_path(key: str) -> bool:
+    """Accept an exact runtime path or a container leading to one."""
+    return key in _RUNTIME_CONFIG_PATHS or any(
+        path.startswith(f"{key}.") for path in _RUNTIME_CONFIG_PATHS
+    )
 
 
 def _suggest_closest_key(key: str, candidates: set[str], cutoff: float = 0.6) -> Optional[str]:
@@ -5770,6 +6034,11 @@ def _validate_config_key(key: str) -> tuple[bool, Optional[str]]:
     if top.startswith("_"):
         return True, None
 
+    # Some runtime settings deliberately have no default. Their exact paths
+    # (and only the containers leading to them) are still part of the schema.
+    if _is_runtime_config_path(key):
+        return True, None
+
     known = _known_top_level_keys()
 
     # ── First-segment validation ─────────────────────────────────────
@@ -5808,21 +6077,32 @@ def _validate_config_key(key: str) -> tuple[bool, Optional[str]]:
         # user-supplied platform name, so accept everything below it.
         if seg in _PLATFORM_CONTAINER_KEYS:
             return True, None
+        runtime_siblings = _runtime_config_children(consumed)
         if not isinstance(node, dict):
+            if runtime_siblings:
+                if seg in runtime_siblings:
+                    consumed.append(seg)
+                    node = None
+                    continue
+                sibling_suggestion = _suggest_closest_key(seg, runtime_siblings)
+                if sibling_suggestion is not None:
+                    return False, ".".join(consumed + [sibling_suggestion])
+                return False, None
             # We hit a scalar leaf before consuming the user's full path —
             # they're trying to set ``foo.bar`` where ``foo`` is a string.
             # Accept it (set_config_value's coercion will replace the
             # leaf with a dict, matching pre-existing behavior).
             return True, None
-        if seg not in node:
+        siblings = set(node.keys()) | runtime_siblings
+        if seg not in siblings:
             # Suggest the closest sibling at this depth.
-            sibling_suggestion = _suggest_closest_key(seg, set(node.keys()))
+            sibling_suggestion = _suggest_closest_key(seg, siblings)
             if sibling_suggestion is not None:
                 fixed_path = ".".join(consumed + [sibling_suggestion])
                 return False, fixed_path
             return False, None
         consumed.append(seg)
-        node = node[seg]
+        node = node.get(seg)
 
     # Walked the entire user-supplied path without hitting an unknown
     # segment — it's known.
