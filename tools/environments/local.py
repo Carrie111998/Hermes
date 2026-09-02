@@ -1481,10 +1481,13 @@ def _append_missing_sane_path_entries(existing_path: str) -> str:
         except Exception:
             return existing_path
         sep = os.pathsep
-        entries = [e for e in existing_path.split(sep) if e] if existing_path else []
-        if uv_dir and uv_dir not in entries:
-            entries.append(uv_dir)
-        return sep.join(entries)
+        parts = existing_path.split(sep) if existing_path else []
+        # Windows PATH matching is case-insensitive, so guard the dedup with
+        # casefold() — otherwise a differently-cased entry (e.g. the user
+        # having ...\\Hermes\\uv) would append a duplicate alongside it.
+        if uv_dir and uv_dir.casefold() not in [p.casefold() for p in parts]:
+            parts.append(uv_dir)
+        return sep.join(parts)
 
     sane_entries = [entry for entry in _SANE_PATH.split(":") if entry]
     sane_entries.extend(
