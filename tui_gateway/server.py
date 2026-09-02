@@ -4863,6 +4863,7 @@ def _block(
     payload: dict,
     timeout: float | None = 300,
     batch_qids: list[str] | None = None,
+    single_batch_qid: str | None = None,
 ) -> str:
     rid = uuid.uuid4().hex[:8]
     ev = threading.Event()
@@ -4894,6 +4895,22 @@ def _block(
             batch_state = _batch_clarify.pop(rid, None)
             if batch_state is not None:
                 batch_answers = dict(batch_state["answers"])
+
+    if single_batch_qid is not None:
+        # One tool question sent over the single-card wire still owes the
+        # batch caller a qid-keyed result.  Build that envelope from lifecycle
+        # state here; never inspect user text to guess whether it is JSON.
+        result: dict[str, object] = {
+            "answers": {single_batch_qid: answer} if answer_present and answer else {},
+        }
+        if not answered and not answer_present:
+            result["timed_out"] = True
+            _emit(
+                f"{event.removesuffix('.request')}.expire",
+                sid,
+                {"request_id": rid},
+            )
+        return json.dumps(result, ensure_ascii=False)
 
     if batch_qids is not None:
         # Cancel-all (respond with no question_id) resolves via _answers with
@@ -4963,6 +4980,34 @@ def _clarify_block(sid: str, q, c, multi_select=False, questions=None) -> str:
     The tool decodes the JSON reply via its batch answer parser.
     """
     if questions:
+        # A one-item tool batch has no multi-question interaction to preserve.
+        # Send it over the proven single-question wire shape. A one-question
+        # card needs only one request_id; the batch wire shape additionally
+        # requires qids from the request event, so a missed/rebound event can
+        # leave released clients waiting on an unanswerable batch spinner.
+        #
+        # Have _block build the qid-keyed response from its answer/timeout
+        # lifecycle state.  This preserves timeout vs explicit-skip semantics
+        # without parsing user text as an internal JSON envelope.
+        if len(questions) == 1:
+            entry = questions[0]
+            payload = (
+                {
+                    "question": entry["question"],
+                    "choices": entry["choices"],
+                    "multi_select": True,
+                }
+                if entry["multi_select"]
+                else {"question": entry["question"], "choices": entry["choices"]}
+            )
+            return _block(
+                "clarify.request",
+                sid,
+                payload,
+                timeout=_clarify_timeout_seconds(),
+                single_batch_qid=entry["qid"],
+            )
+
         wire = [
             {
                 "qid": entry["qid"],
