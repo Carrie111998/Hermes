@@ -94,6 +94,26 @@ describe('useComposerMetrics', () => {
     expect(surface?.style.getPropertyValue('--thread-settled-clearance-height')).toBe('0px')
   })
 
+  it('keeps the running floor active when status cleanup shrinks the dock before settlement', () => {
+    vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockImplementation(function (this: HTMLElement) {
+      return rect(this.dataset.slot === 'composer-dock' ? dockHeight : 72, 480)
+    })
+
+    const view = renderHarness(true)
+    const surface = view.container.querySelector<HTMLElement>('[data-chat-surface]')
+
+    act(() => syncMetrics?.())
+    dockHeight = 120
+    act(() => syncMetrics?.())
+
+    expect(surface?.style.getPropertyValue('--composer-measured-height')).toBe('120px')
+    expect(surface?.style.getPropertyValue('--thread-settled-clearance-height')).toBe('320px')
+
+    view.rerender(<MetricsHarness running={false} />)
+
+    expect(surface?.style.getPropertyValue('--thread-settled-clearance-height')).toBe('320px')
+  })
+
   it('releases stale settled clearance when an idle hard newline expands without a resize delivery', () => {
     vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockImplementation(function (this: HTMLElement) {
       return rect(this.dataset.slot === 'composer-dock' ? dockHeight : 72, 480)

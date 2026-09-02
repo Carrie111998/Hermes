@@ -460,9 +460,10 @@
 
     /* Space under last message vs overlay composer — driven by the measured composer DOCK height (see
        composer/index.tsx), which covers the micro-action strip, the status stack, the composer, and the
-       underside strip in one number. A settled turn retains the largest dock
-       height from its run so status cleanup cannot clamp the transcript upward;
-       the next run releases that floor before following its new bottom.
+       underside strip in one number. A turn retains the largest dock height
+       through status cleanup and settlement so cleanup cannot clamp the
+       transcript upward; the next run releases that floor before following its
+       new bottom.
        This is the default; each chat surface re-declares the calc against its own measurement (see below). */
     --thread-settled-clearance-height: 0px;
     --thread-last-message-clearance: calc(

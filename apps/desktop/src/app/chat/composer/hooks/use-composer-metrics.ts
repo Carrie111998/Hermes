@@ -202,21 +202,26 @@ export function useComposerMetrics({
         setSurfaceVar(composer, COMPOSER_HEIGHT_VAR, `${bucket}px`)
       }
 
+      // The in-flow status stack can be almost half a viewport tall. Keep the
+      // largest dock reached by this run. If transient status UI disappears
+      // before the terminal running=false render, publish that maximum
+      // immediately: otherwise the active layout contracts first and settlement
+      // reintroduces the old maximum as an inverse scroll jump.
+      const previousRunningDockHeight = lastRunningDockHeightRef.current
+
       if (runningRef.current) {
-        // The in-flow status stack can be almost half a viewport tall. If its
-        // clearance disappears with the terminal event, the browser clamps a
-        // bottom-following transcript upward by the same amount. Remember the
-        // largest dock from this run so the settled turn keeps its visual
-        // anchor. A new run releases the floor deliberately; an idle composer
-        // reflow below also releases it once that retained geometry is stale.
-        lastRunningDockHeightRef.current = Math.max(lastRunningDockHeightRef.current, bucket)
+        lastRunningDockHeightRef.current = Math.max(previousRunningDockHeight, bucket)
       }
 
-      const settledClearance = runningRef.current ? 0 : lastRunningDockHeightRef.current
+      const clearanceFloor = runningRef.current
+        ? !startedRun && bucket < previousRunningDockHeight
+          ? previousRunningDockHeight
+          : 0
+        : lastRunningDockHeightRef.current
 
-      if (settledClearance !== lastSettledClearanceRef.current) {
-        lastSettledClearanceRef.current = settledClearance
-        setSurfaceVar(composer, THREAD_SETTLED_CLEARANCE_VAR, `${settledClearance}px`)
+      if (clearanceFloor !== lastSettledClearanceRef.current) {
+        lastSettledClearanceRef.current = clearanceFloor
+        setSurfaceVar(composer, THREAD_SETTLED_CLEARANCE_VAR, `${clearanceFloor}px`)
       }
     }
 
