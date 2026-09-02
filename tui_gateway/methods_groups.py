@@ -248,6 +248,7 @@ def _(rid, params: dict) -> dict:
         from gateway.platforms.api_server_room_attachments import (
             roomlink_attachments_available,
         )
+
         catalog = local_catalog_mapping(
             installation_id=local_authority_gateway_id(),
             protocol_versions=(ROOM_LINK_PROTOCOL_VERSION,),
@@ -495,13 +496,12 @@ def _(rid, params: dict) -> dict:
         reserve_grant_state(
             _profile_state_db_paths(profile),
             claims=claims,
-            expires_at=float(
-                claims.get("status_expires_at", claims["expires_at"])
-            ),
+            expires_at=float(claims.get("status_expires_at", claims["expires_at"])),
         )
         from gateway.platforms.api_server_room_attachments import (
             roomlink_attachments_available,
         )
+
         catalog = local_catalog_mapping(
             installation_id=installation_id,
             protocol_versions=(ROOM_LINK_PROTOCOL_VERSION,),
@@ -552,9 +552,7 @@ def _(rid, params: dict) -> dict:
             claims=claims,
             expires_at=float(claims.get("status_expires_at", claims["expires_at"])),
         )
-        _revoke_peer_room_control(
-            str(claims["room_id"]), str(claims["member_id"])
-        )
+        _revoke_peer_room_control(str(claims["room_id"]), str(claims["member_id"]))
         try:
             from gateway.platforms.api_server_room_attachments import (
                 _default_spool,
@@ -697,7 +695,9 @@ def _(rid, params: dict) -> dict:
             or target.get("kind") != "peer"
             or str(target.get("installation_id") or "") != caller_install_id
         ):
-            raise ValueError("control participant does not match the frozen room member")
+            raise ValueError(
+                "control participant does not match the frozen room member"
+            )
         profile = _requested_profile(params)
         catalog = local_catalog_mapping(
             installation_id=local_authority_gateway_id(),
@@ -1001,12 +1001,12 @@ def _(rid, params: dict) -> dict:
                     state["authority_epoch"] if state is not None else 1
                 ),
             )
-            service.attachments.mark_room_disbanded(params.get("room_id"))
-            service.attachments.prune()
             hosted_room_controls.revoke_home_control_tokens(
                 service.db_path,
                 room_id=params.get("room_id"),
             )
+            service.attachments.mark_room_disbanded(params.get("room_id"))
+            service.attachments.prune()
             return tombstone
 
         try:

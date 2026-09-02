@@ -136,9 +136,11 @@ class _ArtifactPeerClient(_FakePeerClient):
 
         self.manifest = {
             "version": 1,
-            "manifest_digest": __import__("hashlib").sha256(
+            "manifest_digest": __import__("hashlib")
+            .sha256(
                 json.dumps([self.item], sort_keys=True, separators=(",", ":")).encode()
-            ).hexdigest(),
+            )
+            .hexdigest(),
             "items": [self.item],
         }
         self.acks = []
@@ -148,16 +150,18 @@ class _ArtifactPeerClient(_FakePeerClient):
         if not self.dispatches:
             return []
         dispatch = self.dispatches[-1]
-        return [{
-            "role": "assistant",
-            "task_id": dispatch["task_id"],
-            "execution_generation": dispatch["execution_generation"],
-            "status": "settled",
-            "message_id": f"peer:{dispatch['task_id']}",
-            "content": "Remote draft attached.",
-            "artifacts": self.manifest,
-            "run_id": "run-remote-1",
-        }]
+        return [
+            {
+                "role": "assistant",
+                "task_id": dispatch["task_id"],
+                "execution_generation": dispatch["execution_generation"],
+                "status": "settled",
+                "message_id": f"peer:{dispatch['task_id']}",
+                "content": "Remote draft attached.",
+                "artifacts": self.manifest,
+                "run_id": "run-remote-1",
+            }
+        ]
 
     def read_artifact(self, **kwargs):
         assert kwargs["run_id"] == "run-remote-1"
@@ -233,8 +237,7 @@ def test_bot_file_is_imported_before_member_message_and_reaches_next_bot(
     )
     _wait_for(
         lambda: any(
-            event["kind"] == "message.member"
-            and event["payload"].get("attachments")
+            event["kind"] == "message.member" and event["payload"].get("attachments")
             for event in service._events("room-1")
         )
     )
@@ -253,17 +256,23 @@ def test_bot_file_is_imported_before_member_message_and_reaches_next_bot(
         recipient_member_id="ops",
     )
     assert stored.data == b"# Review handoff\n"
-    assert service.read_attachment(
-        room_id="room-1",
-        attachment_id=attachment["attachment_id"],
-        recipient_member_id="viewer",
-    ).data == b"# Review handoff\n"
-    assert service.read_attachment(
-        room_id="room-1",
-        attachment_id=attachment["attachment_id"],
-        recipient_member_id=None,
-        viewer=True,
-    ).data == b"# Review handoff\n"
+    assert (
+        service.read_attachment(
+            room_id="room-1",
+            attachment_id=attachment["attachment_id"],
+            recipient_member_id="viewer",
+        ).data
+        == b"# Review handoff\n"
+    )
+    assert (
+        service.read_attachment(
+            room_id="room-1",
+            attachment_id=attachment["attachment_id"],
+            recipient_member_id=None,
+            viewer=True,
+        ).data
+        == b"# Review handoff\n"
+    )
     assert RoomArtifactOutbox(db).list(rpc.scope) == []
 
 
@@ -304,8 +313,7 @@ def test_local_verification_failure_discards_source_before_failed_publication(
     profile_db = db.parent / "profiles" / "reviewer" / "state.db"
     assert RoomArtifactOutbox(profile_db).list(rpc.scope) == []
     assert not any(
-        event["kind"] == "message.member"
-        and event["payload"].get("attachments")
+        event["kind"] == "message.member" and event["payload"].get("attachments")
         for event in service._events("room-1")
     )
 
@@ -376,8 +384,7 @@ def test_upgrade_replays_legacy_terminal_task_then_admits_new_work(tmp_path: Pat
 
     service.prepare_room(binding)
     assert any(
-        row["kind"] == "message.member"
-        and row["payload"].get("text") == "legacy done"
+        row["kind"] == "message.member" and row["payload"].get("text") == "legacy done"
         for row in service._events("room-1")
     )
     hosted_rooms.append_event(
@@ -480,13 +487,18 @@ def test_upgrade_fails_legacy_file_output_closed_then_continues(tmp_path: Path):
 def test_upgrade_retires_legacy_peer_file_before_failing_closed(tmp_path: Path):
     db = tmp_path / "state.db"
     peer = _ReauthAckArtifactPeerClient()
+    catalog = GatewayRoomCatalog.from_mapping(
+        catalog_mapping(
+            installation_id="install-peer", persistent_process=True, attachments=True
+        )
+    )
     route = PeerMemberRoute(
         home_install_id=hosted_rooms.local_authority_gateway_id(),
         member_id="member-reviewer",
         target_install_id="install-peer",
         target_profile="reviewer",
-        capability_digest="a" * 64,
-        execution_policy_digest="b" * 64,
+        capability_digest=catalog.catalog_digest,
+        execution_policy_digest=catalog.execution_policy.policy_digest,
         cancellation_scope_id="cancel-room-1",
         trace_id="trace-room-1",
         grant="signed-room-grant",
@@ -512,7 +524,7 @@ def test_upgrade_retires_legacy_peer_file_before_failing_closed(tmp_path: Path):
                     "peer_id": "peer-review",
                     "installation_id": "install-peer",
                     "profile": "reviewer",
-                    "capability_digest": "a" * 64,
+                    "capability_digest": catalog.catalog_digest,
                 },
             },
             {"member_id": "ops", "profile": "ops", "handle": "ops"},
@@ -542,8 +554,10 @@ def test_upgrade_retires_legacy_peer_file_before_failing_closed(tmp_path: Path):
     service.start()
     _wait_for(lambda: bool(peer.acks))
     _wait_for(
-        lambda: service.status("room-1")["peer_routes"][0]["status"]
-        == "needs_reauthorization"
+        lambda: (
+            service.status("room-1")["peer_routes"][0]["status"]
+            == "needs_reauthorization"
+        )
     )
     assert not any(
         row["kind"] == "turn.failed"
@@ -554,9 +568,12 @@ def test_upgrade_retires_legacy_peer_file_before_failing_closed(tmp_path: Path):
         "needs_reauthorization"
     )
     with service._artifact_retry_connection() as conn:
-        assert conn.execute(
-            "SELECT blocked FROM hosted_room_artifact_retries"
-        ).fetchone()["blocked"] == 1
+        assert (
+            conn.execute("SELECT blocked FROM hosted_room_artifact_retries").fetchone()[
+                "blocked"
+            ]
+            == 1
+        )
 
     replacement = _ArtifactPeerClient()
     service.register_peer_route(
@@ -564,6 +581,8 @@ def test_upgrade_retires_legacy_peer_file_before_failing_closed(tmp_path: Path):
         member_id="member-reviewer",
         route=route,
         client=replacement,
+        target_url="https://peer.example.test",
+        catalog=catalog,
     )
     _wait_for(lambda: bool(replacement.acks))
 
@@ -731,13 +750,10 @@ def test_peer_verification_failure_discards_source_before_failed_publication(
         )
     )
     assert service.stop(timeout=1.0)
-    assert peer.discards == [
-        {"run_id": "run-remote-1", "grant": "signed-room-grant"}
-    ]
+    assert peer.discards == [{"run_id": "run-remote-1", "grant": "signed-room-grant"}]
     assert peer.acks == []
     assert not any(
-        event["kind"] == "message.member"
-        and event["payload"].get("attachments")
+        event["kind"] == "message.member" and event["payload"].get("attachments")
         for event in service._events("room-1")
     )
 
@@ -867,16 +883,22 @@ def test_lost_peer_artifact_ack_retries_without_duplicate_member_message(
     resumed.prepare_room(binding)
     _wait_for(lambda: len(peer.acks) == 2)
     events = resumed._events("room-1")
-    assert sum(
-        event["kind"] == "message.member"
-        and event["payload"].get("member_id") == "member-reviewer"
-        for event in events
-    ) == 1
-    assert sum(
-        event["kind"] == "turn.settled"
-        and event["payload"].get("member_id") == "member-reviewer"
-        for event in events
-    ) == 1
+    assert (
+        sum(
+            event["kind"] == "message.member"
+            and event["payload"].get("member_id") == "member-reviewer"
+            for event in events
+        )
+        == 1
+    )
+    assert (
+        sum(
+            event["kind"] == "turn.settled"
+            and event["payload"].get("member_id") == "member-reviewer"
+            for event in events
+        )
+        == 1
+    )
     assert peer.dispatches[0]["target_profile"] == "reviewer"
 
 

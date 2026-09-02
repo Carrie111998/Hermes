@@ -674,6 +674,31 @@ def terminalize_unowned_approval_commands(
     return completed
 
 
+def terminalize_room_approval_commands(
+    db_path: Path | str,
+    *,
+    room_id: str,
+    result: str,
+) -> int:
+    completed = 0
+    for command in list_pending_approval_commands(db_path, room_id=room_id):
+        clear_pending_approval(
+            db_path,
+            room_id=room_id,
+            member_id=command["member_id"],
+            request_id=command["request_id"],
+            authority_gateway_id=command["authority_gateway_id"],
+            authority_epoch=command["authority_epoch"],
+        )
+        complete_approval_command(
+            db_path,
+            command_id=command["command_id"],
+            result=result,
+        )
+        completed += 1
+    return completed
+
+
 def approval_command(
     db_path: Path | str,
     *,

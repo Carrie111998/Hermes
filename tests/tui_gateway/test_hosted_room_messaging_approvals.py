@@ -220,6 +220,45 @@ def test_room_disappearance_terminally_completes_queued_decision(tmp_path):
     assert approvals.list_pending_approval_commands(db, room_id="room-1") == []
 
 
+def test_disband_fence_terminally_completes_cross_process_decision(tmp_path):
+    db = tmp_path / "state.db"
+    service = HostedRoomService(_server(), db_path=db)
+    _create_local_room(service)
+    binding = service.bindings()[0]
+    service._set_pending_action(
+        "room-1",
+        "ops",
+        {
+            "kind": "approval",
+            "task_id": "task-1",
+            "execution_generation": 1,
+            "session_id": "ops-session",
+            "request_id": "request-1",
+            "approval": {"choices": ["once", "deny"]},
+        },
+    )
+    pending = approvals.list_pending_approvals(db, room_id="room-1")[0]
+    approvals.submit_approval(
+        db,
+        service=None,
+        command_id="approval-command-1",
+        pending=pending,
+        choice="once",
+    )
+    service.begin_room_disband("room-1")
+
+    service.runtime._run_room_once(binding)
+
+    receipt = approvals.approval_command(
+        db,
+        command_id="approval-command-1",
+    )
+    assert receipt["state"] == "completed"
+    assert "no longer available" in receipt["result_text"]
+    assert approvals.list_pending_approval_commands(db, room_id="room-1") == []
+    assert approvals.list_pending_approvals(db, room_id="room-1") == []
+
+
 def test_late_pending_callback_keeps_its_original_authority_epoch(tmp_path):
     db = tmp_path / "state.db"
     service = HostedRoomService(_server(), db_path=db)

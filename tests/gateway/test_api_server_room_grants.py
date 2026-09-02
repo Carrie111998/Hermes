@@ -145,9 +145,7 @@ async def test_grant_refresh_rechecks_authority_after_mint(monkeypatch):
     minted.assert_called_once()
 
 
-def test_room_grant_secret_stays_gateway_owned_on_named_profile(
-    tmp_path, monkeypatch
-):
+def test_room_grant_secret_stays_gateway_owned_on_named_profile(tmp_path, monkeypatch):
     from gateway.hosted_room_peer import gateway_room_grant_secret
 
     adapter = api_server.APIServerAdapter.__new__(api_server.APIServerAdapter)
@@ -206,9 +204,10 @@ def test_superseded_room_authority_cannot_reuse_its_grant(tmp_path, monkeypatch)
 
     adapter = api_server.APIServerAdapter.__new__(api_server.APIServerAdapter)
     request = MagicMock(headers={"Authorization": f"HermesRoom {old_grant}"})
-    assert adapter._room_grant_claims(request, permission="status")[
-        "authority_gateway_id"
-    ] == "gateway-old"
+    assert (
+        adapter._room_grant_claims(request, permission="status")["authority_gateway_id"]
+        == "gateway-old"
+    )
 
     hosted_rooms.reserve_peer_room(
         hosted_rooms.default_db_path(),
@@ -262,15 +261,18 @@ async def test_grant_revoke_discards_only_matching_output_scope(
     )
 
     matching = RoomArtifactScope.from_mapping({
-        **{key: claims[key] for key in (
-            "room_id",
-            "home_install_id",
-            "authority_gateway_id",
-            "authority_epoch",
-            "member_id",
-            "target_install_id",
-            "target_profile",
-        )},
+        **{
+            key: claims[key]
+            for key in (
+                "room_id",
+                "home_install_id",
+                "authority_gateway_id",
+                "authority_epoch",
+                "member_id",
+                "target_install_id",
+                "target_profile",
+            )
+        },
         "task_id": "task-matching",
         "execution_generation": 1,
     })
@@ -342,8 +344,18 @@ async def test_capability_handler_uses_legacy_claims_monkeypatch(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_grant_revoke_cleans_reciprocal_control_on_the_target(monkeypatch):
+async def test_grant_revoke_cleans_reciprocal_control_on_the_target(
+    monkeypatch, tmp_path
+):
     from gateway import hosted_room_control_client, hosted_room_peer, hosted_rooms
+    from gateway import hosted_room_grant_state
+
+    shared_db = tmp_path / "state.db"
+    profile_db = tmp_path / "profiles" / "reviewer" / "state.db"
+    monkeypatch.setattr(hosted_rooms, "default_db_path", lambda: shared_db)
+    monkeypatch.setattr(
+        hosted_room_grant_state, "grant_state_db_paths", lambda: (shared_db, profile_db)
+    )
 
     adapter = api_server.APIServerAdapter.__new__(api_server.APIServerAdapter)
     adapter._read_json_body = AsyncMock(return_value=({}, None))
@@ -354,15 +366,17 @@ async def test_grant_revoke_cleans_reciprocal_control_on_the_target(monkeypatch)
         "member_id": "member-peer",
         "target_profile": "reviewer",
         "target_install_id": "install-target",
-        "expires_at": 200,
-        "status_expires_at": 300,
+        "home_install_id": "install-home",
+        "authority_gateway_id": "install-home",
+        "authority_epoch": 1,
+        "issued_at": time.time() - 60,
+        "expires_at": time.time() + 200,
+        "status_expires_at": time.time() + 300,
     }
     monkeypatch.setattr(hosted_room_peer, "decode_room_grant", lambda *_a, **_k: claims)
     monkeypatch.setattr(
         hosted_rooms, "local_authority_gateway_id", lambda: "install-target"
     )
-    revoke_grant = MagicMock()
-    monkeypatch.setattr(hosted_rooms, "revoke_room_grant_scope", revoke_grant)
     revoke_control = MagicMock(return_value=1)
     monkeypatch.setattr(
         hosted_room_control_client,
@@ -381,7 +395,8 @@ async def test_grant_revoke_cleans_reciprocal_control_on_the_target(monkeypatch)
         api_server._api_request_profile.reset(profile_token)
 
     assert response.status == 200
-    revoke_grant.assert_called_once()
+    assert hosted_rooms.room_grant_is_revoked(shared_db, claims=claims)
+    assert hosted_rooms.room_grant_is_revoked(profile_db, claims=claims)
     revoke_control.assert_called_once_with(
         hosted_rooms.default_db_path(),
         room_id="room-1",

@@ -18,10 +18,8 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-import unicodedata
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
-from html.parser import HTMLParser
 from typing import Any, Literal
 
 from gateway import hosted_room_driver as driver
@@ -30,6 +28,7 @@ from gateway.hosted_room_attachments import (
     MAX_TASK_ATTACHMENT_BYTES,
     MAX_TASK_ATTACHMENTS,
 )
+from gateway.hosted_room_mention_text import _has_mention_boundary, visible_mention_text
 
 
 MAX_DISCUSSION_MEMBERS = 6
@@ -59,21 +58,21 @@ _MIME_RE = re.compile(
     r"^[A-Za-z0-9][A-Za-z0-9!#$&^_.+-]*/[A-Za-z0-9][A-Za-z0-9!#$&^_.+-]*$"
 )
 _ATTACHMENT_ID_RE = re.compile(r"^att_[0-9a-f]{32}$")
-_FENCE_START_RE = re.compile(r"^ {0,3}(`{3,}|~{3,})")
-_BARE_URI_START_RE = re.compile(r"(?i)(?:https?://|ftp://|mailto:|www\.)")
 _TURN_ID_RE = re.compile(
     r"^d(?P<source>[1-9][0-9]*)\.r(?P<round>[0-2])\."
     r"p(?P<position>[0-5])\.s(?P<seen>[1-9][0-9]*)\."
     r"m(?P<member>[0-9a-f]{24})$"
 )
 
-_MEMBER_FIELDS = frozenset(
-    {"member_id", "profile", "handle", "display_name", "target"}
-)
+_MEMBER_FIELDS = frozenset({"member_id", "profile", "handle", "display_name", "target"})
 _LOCAL_TARGET_FIELDS = frozenset({"kind", "profile"})
-_PEER_TARGET_FIELDS = frozenset(
-    {"kind", "peer_id", "installation_id", "profile", "capability_digest"}
-)
+_PEER_TARGET_FIELDS = frozenset({
+    "kind",
+    "peer_id",
+    "installation_id",
+    "profile",
+    "capability_digest",
+})
 _REMOTE_MEMBER_FIELDS = frozenset({
     "connectionId",
     "connectionKind",
@@ -432,9 +431,7 @@ def validate_user_payload(
         raise DiscussionValidationError("user payload text must be a string")
     text = text.strip()
     if not text and not payload.get("attachments"):
-        raise DiscussionValidationError(
-            "user payload must contain text or attachments"
-        )
+        raise DiscussionValidationError("user payload must contain text or attachments")
     if len(text.encode("utf-8")) > MAX_USER_TEXT_BYTES:
         raise DiscussionValidationError("user payload text is too large")
     thread_id = _identifier(payload["thread_id"], label="thread_id")
@@ -491,18 +488,15 @@ def _validate_member_target(
                 f"member {index} peer target profile does not match member profile"
             )
         capability_digest = target["capability_digest"]
-        if (
-            not isinstance(capability_digest, str)
-            or not re.fullmatch(r"[0-9a-f]{64}", capability_digest)
+        if not isinstance(capability_digest, str) or not re.fullmatch(
+            r"[0-9a-f]{64}", capability_digest
         ):
             raise DiscussionValidationError(
                 f"member {index} capability_digest must be a sha256 digest"
             )
         return {
             "kind": "peer",
-            "peer_id": _identifier(
-                target["peer_id"], label=f"member {index} peer_id"
-            ),
+            "peer_id": _identifier(target["peer_id"], label=f"member {index} peer_id"),
             "installation_id": _identifier(
                 target["installation_id"],
                 label=f"member {index} installation_id",
@@ -510,9 +504,7 @@ def _validate_member_target(
             "profile": target_profile,
             "capability_digest": capability_digest,
         }
-    raise DiscussionValidationError(
-        f"member {index} target kind must be local or peer"
-    )
+    raise DiscussionValidationError(f"member {index} target kind must be local or peer")
 
 
 def validate_roster(
@@ -660,282 +652,6 @@ def resolve_mentions(
     return _mention_resolution(texts, members, default_all=default_all)[0]
 
 
-def _masked_markdown_code(value: str) -> str:
-    """Replace Markdown code with spaces while preserving mention boundaries."""
-
-    chars = list(value)
-
-    def mask(start: int, end: int) -> None:
-        for index in range(start, end):
-            if chars[index] not in "\r\n":
-                chars[index] = " "
-
-    offset = 0
-    fence: tuple[str, int, int] | None = None
-    for line in value.splitlines(keepends=True):
-        body = line.rstrip("\r\n")
-        match = _FENCE_START_RE.match(body)
-        if fence is None and match is not None:
-            marker = match.group(1)
-            fence = (marker[0], len(marker), offset)
-        elif fence is not None and match is not None:
-            marker = match.group(1)
-            trailing = body[match.end():]
-            if (
-                marker[0] == fence[0]
-                and len(marker) >= fence[1]
-                and not trailing.strip(" \t")
-            ):
-                mask(fence[2], offset + len(line))
-                fence = None
-        offset += len(line)
-    if fence is not None:
-        mask(fence[2], len(value))
-
-    visible = "".join(chars)
-    chars = list(visible)
-    escaped = _escaped_positions(visible)
-    index = 0
-    while index < len(visible):
-        if visible[index] != "`":
-            index += 1
-            continue
-        if escaped[index]:
-            index += 1
-            continue
-        run_end = index + 1
-        while run_end < len(visible) and visible[run_end] == "`":
-            run_end += 1
-        run_length = run_end - index
-        cursor = run_end
-        closing_end = None
-        while cursor < len(visible):
-            if visible[cursor] != "`":
-                cursor += 1
-                continue
-            candidate_end = cursor + 1
-            while candidate_end < len(visible) and visible[candidate_end] == "`":
-                candidate_end += 1
-            if candidate_end - cursor == run_length:
-                closing_end = candidate_end
-                break
-            cursor = candidate_end
-        mask(index, closing_end if closing_end is not None else len(visible))
-        index = closing_end if closing_end is not None else len(visible)
-    return "".join(chars)
-
-
-def _escaped_positions(value: str) -> tuple[bool, ...]:
-    """Return whether each character has an odd preceding backslash run."""
-
-    result: list[bool] = []
-    backslashes = 0
-    for char in value:
-        result.append(backslashes % 2 == 1)
-        backslashes = backslashes + 1 if char == "\\" else 0
-    return tuple(result)
-
-
-def _masked_markdown_destinations(value: str) -> str:
-    """Hide inline link destinations while retaining their visible labels."""
-
-    chars = list(value)
-    escaped = _escaped_positions(value)
-    brackets: list[int] = []
-    index = 0
-    while index < len(value):
-        if escaped[index]:
-            index += 1
-            continue
-        if value[index] == "[":
-            brackets.append(index)
-            index += 1
-            continue
-        if value[index] != "]" or not brackets:
-            index += 1
-            continue
-        brackets.pop()
-        if index + 1 >= len(value) or value[index + 1] != "(" or escaped[index + 1]:
-            index += 1
-            continue
-        depth = 1
-        cursor = index + 2
-        angle = False
-        quote = ""
-        title_position = False
-        while cursor < len(value):
-            if escaped[cursor]:
-                cursor += 1
-                continue
-            char = value[cursor]
-            if angle:
-                if char == ">":
-                    angle = False
-            elif quote:
-                if char == quote:
-                    quote = ""
-            elif char == "<":
-                angle = True
-            elif char in {'"', "'"} and title_position:
-                quote = char
-            elif char == "(":
-                depth += 1
-            elif char == ")":
-                depth -= 1
-                if depth == 0:
-                    for masked in range(index + 1, cursor + 1):
-                        if chars[masked] not in "\r\n":
-                            chars[masked] = " "
-                    index = cursor
-                    break
-            if not angle and not quote:
-                title_position = depth == 1 and char in " \t\r\n"
-            cursor += 1
-        if depth:
-            for masked in range(index + 1, len(value)):
-                if chars[masked] not in "\r\n":
-                    chars[masked] = " "
-            break
-        index += 1
-    return "".join(chars)
-
-
-def _masked_bare_uris(value: str) -> str:
-    chars = list(value)
-    cursor = 0
-    while match := _BARE_URI_START_RE.search(value, cursor):
-        end = match.end()
-        parentheses = 0
-        brackets = 0
-        while end < len(value) and value[end] not in "\r\n\t <>{}":
-            char = value[end]
-            if char == "(":
-                parentheses += 1
-            elif char == ")":
-                if end + 1 < len(value) and value[end + 1] == "@" and parentheses == 0:
-                    break
-                parentheses = max(0, parentheses - 1)
-            elif char == "[":
-                brackets += 1
-            elif char == "]":
-                if end + 1 < len(value) and value[end + 1] == "@" and brackets == 0:
-                    break
-                brackets = max(0, brackets - 1)
-            elif (
-                char in {",", "!"}
-                and end + 1 < len(value)
-                and value[end + 1] == "@"
-            ):
-                break
-            end += 1
-        for index in range(match.start(), end):
-            if chars[index] not in "\r\n":
-                chars[index] = " "
-        cursor = max(end, match.end())
-    return "".join(chars)
-
-
-class _VisibleHTMLParser(HTMLParser):
-    """Collect only rendered text from Markdown's embedded HTML."""
-
-    _HIDDEN = frozenset({"script", "style", "template"})
-    _BREAKS = frozenset({
-        "address",
-        "article",
-        "aside",
-        "blockquote",
-        "br",
-        "caption",
-        "dd",
-        "details",
-        "dialog",
-        "div",
-        "dl",
-        "dt",
-        "fieldset",
-        "figcaption",
-        "figure",
-        "footer",
-        "form",
-        "h1",
-        "h2",
-        "h3",
-        "h4",
-        "h5",
-        "h6",
-        "header",
-        "hgroup",
-        "hr",
-        "li",
-        "legend",
-        "main",
-        "menu",
-        "nav",
-        "ol",
-        "p",
-        "pre",
-        "search",
-        "section",
-        "summary",
-        "table",
-        "tbody",
-        "td",
-        "tfoot",
-        "th",
-        "thead",
-        "tr",
-        "ul",
-    })
-
-    def __init__(self) -> None:
-        super().__init__(convert_charrefs=True)
-        self.parts: list[str] = []
-        self.hidden: list[str] = []
-
-    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
-        del attrs
-        if tag in self._HIDDEN:
-            self.hidden.append(tag)
-        elif not self.hidden and tag in self._BREAKS:
-            self.parts.append(" ")
-
-    def handle_startendtag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
-        del attrs
-        if tag in self._HIDDEN:
-            self.hidden.append(tag)
-            if tag in {"script", "style"}:
-                self.set_cdata_mode(tag)
-        elif not self.hidden and tag in self._BREAKS:
-            self.parts.append(" ")
-
-    def handle_endtag(self, tag: str) -> None:
-        if self.hidden:
-            if self.hidden[-1] == tag:
-                self.hidden.pop()
-            return
-        if tag in self._BREAKS:
-            self.parts.append(" ")
-
-    def handle_data(self, data: str) -> None:
-        if not self.hidden:
-            self.parts.append(data)
-
-
-def _visible_html_text(value: str) -> str:
-    parser = _VisibleHTMLParser()
-    parser.feed(value)
-    parser.close()
-    return "".join(parser.parts)
-
-
-def _has_mention_boundary(value: str, index: int) -> bool:
-    if index == 0:
-        return True
-    previous = value[index - 1]
-    category = unicodedata.category(previous)
-    return previous not in "._%+\\-/:?#=&" and category[0] not in {"L", "M", "N"}
-
-
 def _mention_resolution(
     texts: Iterable[str],
     members: Sequence[DiscussionMember],
@@ -945,22 +661,18 @@ def _mention_resolution(
     """Return resolved members and whether an explicit token was unresolved."""
 
     by_handle = {member.handle.casefold(): member for member in members}
-    candidates = tuple(sorted(
-        (*by_handle, "all", "everyone"),
-        key=len,
-        reverse=True,
-    ))
+    candidates = tuple(
+        sorted(
+            (*by_handle, "all", "everyone"),
+            key=len,
+            reverse=True,
+        )
+    )
     mentioned: set[str] = set()
     everyone = False
     unresolved = False
     for text in texts:
-        visible = _masked_bare_uris(
-            _masked_markdown_destinations(
-                _visible_html_text(
-                    _masked_markdown_code(str(text or ""))
-                )
-            )
-        )
+        visible = visible_mention_text(str(text or ""))
         for match in _MENTION_RE.finditer(visible):
             if not _has_mention_boundary(visible, match.start()):
                 continue
@@ -970,7 +682,7 @@ def _mention_resolution(
                     candidate
                     for candidate in candidates
                     if token.startswith(candidate)
-                    and set(token[len(candidate):]) <= {".", ":"}
+                    and set(token[len(candidate) :]) <= {".", ":"}
                 ),
                 "",
             )
@@ -1345,9 +1057,7 @@ def _member_digest(member: DiscussionMember) -> str:
         sort_keys=True,
         separators=(",", ":"),
     )
-    seed = (
-        f"{member.member_id}\0{member.profile}\0{member.handle}\0{target}"
-    )
+    seed = f"{member.member_id}\0{member.profile}\0{member.handle}\0{target}"
     return hashlib.sha256(seed.encode("utf-8")).hexdigest()[:24]
 
 
@@ -1397,9 +1107,7 @@ def _attachment_prompt_lines(
                 continue
             queued_media = True
             label = "image" if attachment["kind"] == "image" else "PDF"
-            entries.append(
-                f"- Queued {label} {name} ({metadata}) for this turn."
-            )
+            entries.append(f"- Queued {label} {name} ({metadata}) for this turn.")
     if not entries:
         return []
     lines = ["", "Attachments available to you for this turn:", *entries]
@@ -1449,9 +1157,7 @@ def _build_prompt(
         "- To hand off a local file, call share_group_file; never paste a local path into chat.",
         "- Never reveal content from private conversations. Your reply is published verbatim.",
     ]
-    fixed_bytes = len(
-        "\n".join([*opening, *attachment_lines, *rules]).encode("utf-8")
-    )
+    fixed_bytes = len("\n".join([*opening, *attachment_lines, *rules]).encode("utf-8"))
     available = max(0, driver.MAX_PROMPT_BYTES - fixed_bytes - 1)
     selected: list[str] = []
     omitted = False
@@ -1598,8 +1304,7 @@ def _bounded_task_delta(
             int(attachment["size"]) for attachment in event_attachments
         )
         if event_attachments and (
-            next_count > MAX_TASK_ATTACHMENTS
-            or next_bytes > MAX_TASK_ATTACHMENT_BYTES
+            next_count > MAX_TASK_ATTACHMENTS or next_bytes > MAX_TASK_ATTACHMENT_BYTES
         ):
             if selected:
                 break
@@ -1876,8 +1581,13 @@ def reconstruct_task_plan(
     if member is None or _member_digest(member) != match.group("member"):
         raise DiscussionReconstructionError("task target member does not match turn_id")
     frozen_recipient_ids = payload.get("recipient_member_ids")
-    if frozen_recipient_ids is not None and member.member_id not in frozen_recipient_ids:
-        raise DiscussionReconstructionError("task target is missing from recipient roster")
+    if (
+        frozen_recipient_ids is not None
+        and member.member_id not in frozen_recipient_ids
+    ):
+        raise DiscussionReconstructionError(
+            "task target is missing from recipient roster"
+        )
     prompt = payload.get("prompt")
     if not isinstance(prompt, str) or not prompt.strip():
         raise DiscussionReconstructionError("task prompt is missing")
