@@ -4264,8 +4264,27 @@ def request_tool_approval(
 def _format_tirith_description(tirith_result: dict) -> str:
     """Build a human-readable description from tirith findings.
 
-    Includes severity, title, and description for each finding so users
-    can make an informed approval decision.
+    Composes from the structured ``remediation`` field when present,
+    falling back to the free-text ``description`` only for findings that
+    carry no remediation. tirith (upstream, by design since v0.2.5)
+    stuffs third-party promotional hints into ``description`` — e.g. the
+    getvet.sh cross-promotion appended to the "safer alternative" line —
+    and Hermes renders this text verbatim into approval prompts and
+    platform approval cards (Slack), where it reads as the agent
+    recommending an unrelated product (#93839). ``remediation`` is the
+    clean structured guidance field for exactly this purpose; preferring
+    it keeps approvals to security content without hardcoding filters
+    against specific promo strings (which upstream wording changes would
+    silently defeat).
+
+    Information trade-off, accepted deliberately: when ``remediation``
+    exists the free-text ``description`` is dropped entirely — including
+    the finding's explanation of *why* it is risky — because that is where
+    the promotional hints live, so appending description would reintroduce
+    them. Title plus remediation advice is kept as the decision-relevant
+    minimum. Only string remediations are honored; a structured (list/dict)
+    value from a future tirith version would otherwise render as a Python
+    repr into approval prompts, so non-strings fall back to description.
     """
     findings = tirith_result.get("findings") or []
     if not findings:
@@ -4276,9 +4295,14 @@ def _format_tirith_description(tirith_result: dict) -> str:
     for f in findings:
         severity = f.get("severity", "")
         title = f.get("title", "")
-        desc = f.get("description", "")
-        if title and desc:
-            parts.append(f"[{severity}] {title}: {desc}" if severity else f"{title}: {desc}")
+        remediation = f.get("remediation")
+        detail = (
+            remediation
+            if isinstance(remediation, str) and remediation
+            else (f.get("description") or "")
+        )
+        if title and detail:
+            parts.append(f"[{severity}] {title}: {detail}" if severity else f"{title}: {detail}")
         elif title:
             parts.append(f"[{severity}] {title}" if severity else title)
     if not parts:
