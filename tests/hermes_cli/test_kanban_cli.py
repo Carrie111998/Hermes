@@ -70,6 +70,36 @@ def test_kanban_show_text_renders_graph_with_open_connection(kanban_home):
     assert "Cannot operate on a closed database" not in output
 
 
+def test_kanban_show_event_truncation_is_announced(kanban_home):
+    """`show` keeps the most recent 20 events but must say how many older
+    ones were dropped; `--all-events` lists them all (#99578)."""
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="long history")
+        for i in range(21):
+            kb.add_comment(conn, tid, "alice", f"note {i}")
+
+    out = kc.run_slash(f"show {tid}")
+
+    assert "Events (22):" in out
+    assert "2 earlier events not shown" in out
+    assert "use --all-events" in out
+
+    out_all = kc.run_slash(f"show {tid} --all-events")
+
+    assert "earlier events not shown" not in out_all
+    assert out_all.count("commented") == 21
+
+
+def test_kanban_show_short_history_has_no_truncation_notice(kanban_home):
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="short history")
+
+    out = kc.run_slash(f"show {tid}")
+
+    assert "Events (1):" in out
+    assert "earlier events not shown" not in out
+
+
 def test_board_override_is_isolated_per_concurrent_call(kanban_home, monkeypatch):
     kb.create_board("alpha")
     kb.create_board("beta")
