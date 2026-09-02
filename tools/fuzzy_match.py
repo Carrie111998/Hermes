@@ -256,6 +256,18 @@ def fuzzy_find_and_replace(content: str, old_string: str, new_string: str,
             )
             return new_content, len(matches), strategy_name, None
 
+    # A weak block-anchor candidate is no longer safe to replace, but it can
+    # still provide the matched file region needed for the more actionable
+    # escape-drift diagnostic. Never apply this candidate.
+    if "\\" in old_string:
+        weak_matches = _strategy_block_anchor(content, old_string, threshold=0.50)
+        if weak_matches:
+            drift_err = _detect_escape_drift(
+                content, weak_matches, old_string, new_string
+            )
+            if drift_err:
+                return content, 0, None, drift_err
+
     # No strategy found a match
     return content, 0, None, "Could not find a match for old_string in the file"
 
@@ -813,7 +825,8 @@ def _strategy_unicode_normalized(content: str, pattern: str) -> List[Tuple[int, 
     return _map_positions_norm_to_orig(orig_to_norm, norm_matches)
 
 
-def _strategy_block_anchor(content: str, pattern: str) -> List[Tuple[int, int]]:
+def _strategy_block_anchor(content: str, pattern: str,
+                           threshold: float = 0.70) -> List[Tuple[int, int]]:
     """
     Strategy 8: Match by anchoring on first and last lines.
     Adjusted with permissive thresholds and unicode normalization.
@@ -843,12 +856,10 @@ def _strategy_block_anchor(content: str, pattern: str) -> List[Tuple[int, int]]:
             potential_matches.append(i)
             
     matches = []
-    candidate_count = len(potential_matches)
-    
-    # Thresholding logic: 0.50 for unique matches, 0.70 for multiple candidates.
-    # Previous values (0.10 / 0.30) were dangerously loose — a 10% middle-section
-    # similarity could match completely unrelated blocks.
-    threshold = 0.50 if candidate_count == 1 else 0.70
+    # Uniqueness is not evidence that an approximate block is the intended
+    # target. A nearby block can be the only one with matching boundary lines
+    # while its middle describes different content, so the default confidence
+    # floor is the same regardless of the number of anchored candidates.
 
     for i in potential_matches:
         if pattern_line_count <= 2:

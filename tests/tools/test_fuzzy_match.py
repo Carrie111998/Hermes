@@ -1,5 +1,7 @@
 """Tests for the fuzzy matching module."""
 
+from difflib import SequenceMatcher
+
 from tools.fuzzy_match import IDENTICAL_STRINGS_ERROR, fuzzy_find_and_replace
 
 
@@ -269,7 +271,7 @@ class TestBlockAnchorThreshold:
     """Tests for the raised block_anchor threshold (Bug 4)."""
 
     def test_high_similarity_matches(self):
-        """A block with >50% middle similarity should match."""
+        """A block with high middle similarity should match."""
         content = "def foo():\n    x = 1\n    y = 2\n    return x + y\n"
         pattern = "def foo():\n    x = 1\n    y = 9\n    return x + y"
         new, count, strategy, err = fuzzy_find_and_replace(content, pattern, "def foo():\n    return 0\n")
@@ -278,7 +280,7 @@ class TestBlockAnchorThreshold:
 
     def test_completely_different_middle_does_not_match(self):
         """A block where only first+last lines match but middle is completely different
-        should NOT match under the raised 0.50 threshold."""
+        should NOT match under the raised threshold."""
         content = (
             "class Foo:\n"
             "    completely = 'unrelated'\n"
@@ -295,11 +297,39 @@ class TestBlockAnchorThreshold:
             "    pass"
         )
         new, count, strategy, err = fuzzy_find_and_replace(content, pattern, "replaced")
-        # With threshold=0.50, this near-zero-similarity middle should not match
+        # A near-zero-similarity middle should not match.
         assert count == 0, (
-            f"Block with unrelated middle should not match under threshold=0.50, "
+            f"Block with unrelated middle should not match, "
             f"but matched via strategy={strategy}"
         )
+
+    def test_unique_markdown_block_with_weak_middle_does_not_match(self):
+        """A unique boundary match must not make a weak middle safe to replace."""
+        content = (
+            "# Tasks\n\n"
+            "- [ ] Publish report\n"
+            "  - Source: [paper](https://example.com/source)\n"
+            "  - Status: queued\n"
+            "  - Owner: Alice\n"
+            "  - Notes: preserve metadata\n"
+            "  <!-- task-end -->\n"
+        )
+        old = (
+            "- [ ] Publish report\n"
+            "  - Source: [pdf](https://files.test/final.pdf)\n"
+            "  - Status: complete\n"
+            "  - Reviewer: Bob\n"
+            "  - Notes: add download\n"
+            "  <!-- task-end -->"
+        )
+
+        new, count, strategy, err = fuzzy_find_and_replace(
+            content, old, "- [x] Publish report\n  <!-- task-end -->"
+        )
+
+        assert count == 0, f"Weak middle matched via strategy={strategy}"
+        assert err is not None
+        assert new == content
 
 
 class TestStrategyNameSurfaced:
@@ -352,6 +382,35 @@ class TestEscapeDriftGuard:
         new, count, strategy, err = fuzzy_find_and_replace(content, old_string, new_string)
         assert count == 0
         assert err is not None and "Escape-drift" in err
+
+    def test_backslash_doubling_diagnosed_for_weak_block_candidate(self):
+        """A rejected weak anchor still supplies escape-drift diagnostics."""
+        content_middle = (
+            "path_a = C:\\Users\\alice\n"
+            "path_b = D:\\Temp\\cache\n"
+            "mode = production"
+        )
+        old_middle = (
+            "first = C:\\\\Users\\\\alice\n"
+            "second = D:\\\\Temp\\\\cache\n"
+            "requested = staging"
+        )
+        similarity = SequenceMatcher(None, content_middle, old_middle).ratio()
+        assert 0.50 <= similarity < 0.70
+
+        content = f"settings:\n{content_middle}\nend settings"
+        old_string = f"settings:\n{old_middle}\nend settings"
+        new_string = old_string.replace("staging", "complete")
+
+        new, count, strategy, err = fuzzy_find_and_replace(
+            content, old_string, new_string
+        )
+
+        assert count == 0
+        assert strategy is None
+        assert new == content
+        assert err is not None
+        assert "Escape-drift detected: every backslash run" in err
 
     def test_drift_allowed_when_file_genuinely_has_backslash_escapes(self):
         """If the file already contains \\' (e.g. inside an existing escaped
