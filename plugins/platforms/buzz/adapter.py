@@ -543,10 +543,10 @@ def _credentials_candidates(extra: Optional[dict] = None) -> List[Path]:
     # never the default profile's os.environ); unscoped reads keep env
     # precedence plus the external-secret rung.
     configured = str(_get_scoped_secret("BUZZ_CREDENTIALS_FILE", "") or "").strip() or str(
-        (extra or {}).get("credentials_file", "")
+        (extra or {}).get("credentials_file", "") or ""
     ).strip()
     if not configured and not _profile_scoped():
-        configured = str((_read_profile_buzz_extra() or {}).get("credentials_file", "")).strip()
+        configured = str((_read_profile_buzz_extra() or {}).get("credentials_file", "") or "").strip()
     if configured:
         return [Path(configured).expanduser()]
     if _is_multiplex_active():
@@ -3157,7 +3157,7 @@ def check_requirements() -> bool:
     # Scope-aware read: the gate runs before per-profile scopes install, and
     # BUZZ_RELAY_URL can be externally managed just like the key (#95216).
     if not (_get_scoped_secret("BUZZ_RELAY_URL", "") or "").strip():
-        relay = str(_read_profile_buzz_extra().get("relay_url", "")).strip()
+        relay = str(_read_profile_buzz_extra().get("relay_url") or "").strip()
         if not relay:
             return False
     return bool(_resolve_private_key())
