@@ -13766,6 +13766,14 @@ def main():
     _secrets_cli.register_cli(secrets_bw)
     _op_secrets_cli.register_cli(secrets_op)
 
+    # Set fallback func on each sub-subparser so argparse does not inherit
+    # _dispatch_secrets from the parent secrets_parser via set_defaults
+    # propagation.  Without this, ``hermes secrets onepassword`` (no
+    # sub-subcommand) resolves args.func = _dispatch_secrets, which calls
+    # args.func(args) = itself → RecursionError (#92799).
+    secrets_bw.set_defaults(func=lambda a: (secrets_bw.print_help(), 0)[-1])
+    secrets_op.set_defaults(func=lambda a: (secrets_op.print_help(), 0)[-1])
+
     def _dispatch_secrets(args):  # noqa: ANN001
         sub = getattr(args, "secrets_command", None)
         if sub is None:
