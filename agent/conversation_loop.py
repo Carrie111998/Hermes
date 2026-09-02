@@ -7677,7 +7677,15 @@ def run_conversation(
                     if tc.function.name not in agent.valid_tool_names:
                         repaired = agent._repair_tool_call(tc.function.name)
                         if repaired:
-                            print(f"{agent.log_prefix}🔧 Auto-repaired tool name: '{tc.function.name}' -> '{repaired}'")
+                            # _vprint, not bare print: this fires on every
+                            # hallucinated name of every headless turn and
+                            # must honor --quiet like the neighbouring
+                            # diagnostics (#95803 — one deployment measured
+                            # 4.8K ungated lines/24h in --quiet runs).
+                            agent._vprint(
+                                f"{agent.log_prefix}🔧 Auto-repaired tool name: "
+                                f"'{tc.function.name}' -> '{repaired}'"
+                            )
                             tc.function.name = repaired
                 invalid_tool_calls = [
                     tc.function.name for tc in assistant_message.tool_calls
