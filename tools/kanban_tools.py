@@ -752,6 +752,25 @@ def _handle_complete(args: dict, **kw) -> str:
     try:
         kb, conn = _connect(board=board)
         try:
+            # A dispatcher-owned worker may have registered a bounded gate,
+            # build, or test run with terminal(background=True). Completing
+            # would immediately call kb._cleanup_workspace(), deleting the
+            # worktree before that child can finish its own cleanup/release
+            # path. Do not apply this lifecycle guard to in-process cron or
+            # delegated contexts: they do not own the dispatcher's task.
+            if _is_dispatcher_owned_worker():
+                from tools.process_registry import process_registry
+
+                if process_registry.has_active_processes(tid):
+                    return tool_error(
+                        f"kanban_complete refused: task {tid} still has a "
+                        "registered background process running. Your task is "
+                        "still in-flight and its workspace was not cleaned up. "
+                        "Call process(action='wait') or process(action='poll') "
+                        "until it exits, or deliberately stop only your own "
+                        "process before retrying kanban_complete."
+                    )
+
             # Goal-mode pre-completion judge gate (Issue #38367).
             # Prevent workers from bypassing the auxiliary judge by
             # calling kanban_complete before acceptance criteria are met.

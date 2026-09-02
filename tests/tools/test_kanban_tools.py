@@ -132,6 +132,61 @@ def test_complete_happy_path(worker_env):
         conn.close()
 
 
+def test_complete_refuses_active_dispatcher_process_until_it_exits(
+    monkeypatch, worker_env,
+):
+    """A live task-owned process must keep dispatcher completion from cleanup."""
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+    from tools.process_registry import ProcessSession, process_registry
+
+    tracked = ProcessSession(
+        id="proc_completion_guard",
+        command="scripts/gate-sperre nehmen",
+        task_id=worker_env,
+    )
+    monkeypatch.setitem(process_registry._running, tracked.id, tracked)
+
+    complete_calls = []
+    cleanup_calls = []
+    original_complete = kb.complete_task
+
+    def observed_complete(conn, task_id, **kwargs):
+        complete_calls.append(task_id)
+        return original_complete(conn, task_id, **kwargs)
+
+    def observed_cleanup(_conn, task_id):
+        cleanup_calls.append(task_id)
+
+    monkeypatch.setattr(kb, "complete_task", observed_complete)
+    monkeypatch.setattr(kb, "_cleanup_workspace", observed_cleanup)
+
+    rejected = json.loads(kt._handle_complete({"summary": "gate passed"}))
+    assert "error" in rejected
+    assert "process(action='wait')" in rejected["error"]
+    assert complete_calls == []
+    assert cleanup_calls == []
+
+    conn = kb.connect()
+    try:
+        assert kb.get_task(conn, worker_env).status == "running"
+    finally:
+        conn.close()
+
+    # The same task can close only after its registered child has exited.
+    tracked.exited = True
+    completed = json.loads(kt._handle_complete({"summary": "gate passed"}))
+    assert completed["ok"] is True
+    assert complete_calls == [worker_env]
+    assert cleanup_calls == [worker_env]
+
+    conn = kb.connect()
+    try:
+        assert kb.get_task(conn, worker_env).status == "done"
+    finally:
+        conn.close()
+
+
 def test_complete_retry_with_empty_created_cards_succeeds(worker_env):
     """After a phantom rejection, retrying kanban_complete with
     created_cards=[] (the documented escape hatch) must complete the
