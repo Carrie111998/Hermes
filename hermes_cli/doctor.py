@@ -9,6 +9,8 @@ import sys
 import subprocess
 import shutil
 import importlib.util
+import hashlib
+import json
 from pathlib import Path
 
 from hermes_cli.config import (
@@ -1232,9 +1234,115 @@ def check_macos_full_disk_access() -> None:
         "grant survives every update."
     )
 
+def _routing_redact(value: object) -> str | None:
+    """Return a deterministic digest display value for an ID.
+
+    This is display redaction, not strong anonymization: low-entropy IDs can
+    be guessed by hashing candidate values. The raw identifier is never
+    emitted by this diagnostic.
+    """
+    if value is None or not str(value).strip():
+        return None
+    normalized = str(value).strip()
+    digest = hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:12]
+    return f"<redacted:{digest}>"
+
+
+def _print_routing_result(result: dict, args) -> None:
+    """Render routing diagnostics as JSON only when explicitly requested."""
+    if getattr(args, "json", False):
+        print(json.dumps(result, sort_keys=True, separators=(",", ":")))
+        return
+    print("Routing diagnosis")
+    dimensions = result["dimensions"]
+    print(f"  Platform: {dimensions['platform'] or '(unspecified)'}")
+    for key in ("guild_id", "chat_id", "thread_id", "user_id"):
+        if dimensions[key] is not None:
+            print(f"  {key}: {dimensions[key]}")
+    error = result.get("error")
+    if error:
+        print(f"  Error: {error['code']}")
+        if "routes" in error:
+            print(f"  Conflicting routes: {', '.join(error['routes'])}")
+    match = result["match"]
+    print(f"  Match: {match['route'] or '(none)'} ({match['reason']})")
+    print(f"  Precedence: {match['precedence']}")
+    print(f"  Selected profile: {result['selected_profile'] or '(none)'}")
+
+
+def _run_routing_doctor(args) -> int:
+    """Explain one routing decision without constructing or contacting a gateway."""
+    from gateway.profile_routing import match_profile_route, parse_profile_routes
+    import yaml
+
+    dimensions = {
+        "platform": str(getattr(args, "routing_platform", "") or "").strip().lower(),
+        "guild_id": _routing_redact(getattr(args, "routing_guild_id", None)),
+        "chat_id": _routing_redact(getattr(args, "routing_chat_id", None)),
+        "thread_id": _routing_redact(getattr(args, "routing_thread_id", None)),
+        "user_id": _routing_redact(getattr(args, "routing_user_id", None)),
+    }
+    raw_config = HERMES_HOME / "config.yaml"
+    result = {
+        "schema": "hermes.routing-doctor.v1",
+        "dimensions": dimensions,
+        "selected_profile": None,
+        "match": {"route": None, "reason": "default", "precedence": "default profile"},
+        "side_effects": {"network": False, "gateway": False, "writes": False},
+    }
+    try:
+        with raw_config.open("r", encoding="utf-8") as handle:
+            config = yaml.safe_load(handle) or {}
+        if not isinstance(config, dict):
+            raise ValueError("config.yaml root must be a mapping")
+    except Exception:
+        result["error"] = {"code": "invalid_config", "message": "unable to read or parse config.yaml"}
+        result["selected_profile"] = getattr(args, "routing_profile", None) or "default"
+        _print_routing_result(result, args)
+        return 2
+
+    nested = config.get("gateway") if isinstance(config.get("gateway"), dict) else {}
+    raw_routes = config.get("profile_routes") or nested.get("profile_routes", [])
+    if raw_routes is not None and not isinstance(raw_routes, list):
+        result["error"] = {"code": "invalid_route_config", "message": "profile_routes must be a list"}
+        _print_routing_result(result, args)
+        return 2
+    parse_errors: list[str] = []
+    routes = parse_profile_routes(raw_routes, errors=parse_errors)
+    if parse_errors:
+        result["error"] = {"code": "invalid_route_config", "messages": sorted(parse_errors)}
+        _print_routing_result(result, args)
+        return 2
+
+    platform = dimensions["platform"]
+    guild_id = str(getattr(args, "routing_guild_id", None) or "").strip() or None
+    chat_id = str(getattr(args, "routing_chat_id", None) or "").strip() or None
+    thread_id = str(getattr(args, "routing_thread_id", None) or "").strip() or None
+    matching = [
+        route for route in routes
+        if route.matches(platform, guild_id=guild_id, chat_id=chat_id, thread_id=thread_id)
+    ]
+    if matching:
+        best_specificity = matching[0].specificity
+        best = [route for route in matching if route.specificity == best_specificity]
+        if len(best) > 1:
+            result["error"] = {"code": "ambiguous_route", "routes": sorted(route.name for route in best)}
+            result["match"] = {"route": None, "reason": "ambiguous", "precedence": f"specificity {best_specificity}"}
+            _print_routing_result(result, args)
+            return 2
+        selected = match_profile_route(routes, platform, guild_id=guild_id, chat_id=chat_id, thread_id=thread_id)
+        result["selected_profile"] = selected.profile if selected else None
+        result["match"] = {"route": selected.name if selected else None, "reason": "specificity", "precedence": f"specificity {selected.specificity}" if selected else "default"}
+    else:
+        result["selected_profile"] = getattr(args, "routing_profile", None) or "default"
+    _print_routing_result(result, args)
+    return 0
+
 
 def run_doctor(args):
     """Run diagnostic checks."""
+    if getattr(args, "routing", False):
+        return _run_routing_doctor(args)
     should_fix = getattr(args, 'fix', False)
     ack_target = getattr(args, 'ack', None)
 
@@ -2288,7 +2396,7 @@ def run_doctor(args):
         check_info(f"Install for faster search: {_system_package_install_cmd('ripgrep')}")
     
     # Docker (optional)
-    terminal_env = os.getenv("TERMINAL_ENV", "local")
+    terminal_env = os.getenv("TERMINAL_ENV") or "local"
     try:
         from hermes_constants import is_container as _is_container
         running_in_container = _is_container()
@@ -2302,7 +2410,7 @@ def run_doctor(args):
         # not found" warning. If the user has explicitly chosen
         # TERMINAL_ENV=docker inside the container they likely mounted
         # /var/run/docker.sock, so fall through to the normal check.
-        if terminal_env != "docker":
+        if terminal_env == "local":
             check_info(
                 "Running inside a container — using local terminal backend "
                 "(docker-in-docker is not configured by default)"

@@ -51,6 +51,28 @@ class TestParseProfileRoutes:
         assert parse_profile_routes([]) == []
 
 
+def test_gateway_config_prefers_nested_routes_when_top_level_routes_are_empty(tmp_path, monkeypatch):
+    from gateway.config import GatewayConfig
+    import yaml
+
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        """profile_routes: []
+gateway:
+  profile_routes:
+    - name: nested
+      platform: telegram
+      chat_id: '42'
+      profile: support
+"""
+    )
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    config = GatewayConfig.from_dict(yaml.safe_load(config_path.read_text()))
+
+    assert [route.name for route in config.profile_routes] == ["nested"]
+
+
 class TestMatchProfileRoute:
 
 
