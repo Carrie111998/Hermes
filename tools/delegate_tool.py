@@ -955,6 +955,15 @@ def _get_worktree_isolation() -> bool:
     return bool(cfg.get("worktree_isolation", False))
 
 
+def _get_worktree_repo_root() -> Optional[str]:
+    """Return the optional explicit repository anchor for child worktrees."""
+    value = _load_config().get("worktree_repo_root")
+    if not isinstance(value, str):
+        return None
+    value = value.strip()
+    return value or None
+
+
 _LEGACY_MAX_ASYNC_WARNED = False
 
 
@@ -1333,14 +1342,9 @@ def _build_child_system_prompt(
     return "\n".join(parts)
 
 
-def _resolve_workspace_hint(parent_agent) -> Optional[str]:
-    """Best-effort local workspace hint for child prompts.
-
-    We only inject a path when we have a concrete absolute directory. This avoids
-    teaching subagents a fake container path while still helping them avoid
-    guessing `/workspace/...` for local repo tasks.
-    """
-    candidates = [
+def _workspace_hint_candidates(parent_agent) -> List[str]:
+    """Return concrete local workspace candidates in precedence order."""
+    raw_candidates = [
         os.getenv("TERMINAL_CWD"),
         getattr(
             getattr(parent_agent, "_subdirectory_hints", None), "working_dir", None
@@ -1348,16 +1352,31 @@ def _resolve_workspace_hint(parent_agent) -> Optional[str]:
         getattr(parent_agent, "terminal_cwd", None),
         getattr(parent_agent, "cwd", None),
     ]
-    for candidate in candidates:
+    candidates: List[str] = []
+    seen = set()
+    for candidate in raw_candidates:
         if not candidate:
             continue
         try:
             text = os.path.abspath(os.path.expanduser(str(candidate)))
         except Exception:
             continue
-        if os.path.isabs(text) and os.path.isdir(text):
-            return text
-    return None
+        identity = os.path.normcase(text)
+        if os.path.isabs(text) and os.path.isdir(text) and identity not in seen:
+            candidates.append(text)
+            seen.add(identity)
+    return candidates
+
+
+def _resolve_workspace_hint(parent_agent) -> Optional[str]:
+    """Best-effort first local workspace hint for child prompts.
+
+    We only inject a path when we have a concrete absolute directory. This avoids
+    teaching subagents a fake container path while still helping them avoid
+    guessing `/workspace/...` for local repo tasks.
+    """
+    candidates = _workspace_hint_candidates(parent_agent)
+    return candidates[0] if candidates else None
 
 
 def _strip_blocked_tools(toolsets: List[str]) -> List[str]:
@@ -2841,9 +2860,12 @@ def _run_single_child(
     # Worktree-isolation state: populated inside the try once the child's
     # task id is known; the default no-op keeps every early error path safe.
     _worktree_info: Optional[Dict[str, str]] = None
+    _worktree_warning: Optional[str] = None
 
     def _attach_worktree(entry_dict: Dict[str, Any]) -> None:
         """Inspect + prune the child worktree, reporting into the entry."""
+        if _worktree_warning:
+            entry_dict["worktree_warning"] = _worktree_warning
         if _worktree_info is None:
             return
         try:
@@ -2924,8 +2946,8 @@ def _run_single_child(
         # Opt-in worktree isolation (delegation.worktree_isolation, inspired
         # by Muse Code's --subagent-worktree-isolation): give this child its
         # own git worktree branched from the parent repo's HEAD, and start its
-        # terminal there. Git-only and local-backend-only; any failure
-        # degrades silently to the shared-workspace behavior above.
+        # terminal there. Git-only and local-backend-only; any degradation is
+        # reported to the child, the parent result, and the application log.
         if _get_worktree_isolation():
             try:
                 from tools import subagent_worktree
@@ -2938,16 +2960,41 @@ def _run_single_child(
                         _parent_cwd = _gsc(parent_task_id)
                     except Exception:
                         pass
-                    _worktree_info = subagent_worktree.create_subagent_worktree(
-                        _parent_cwd or _resolve_workspace_hint(parent_agent),
-                        subagent_id=_subagent_id,
+                    _repo_anchor, _worktree_warning = (
+                        subagent_worktree.resolve_worktree_anchor(
+                            _get_worktree_repo_root(),
+                            _parent_cwd,
+                            _workspace_hint_candidates(parent_agent),
+                        )
                     )
+                    if _repo_anchor:
+                        _worktree_info = subagent_worktree.create_subagent_worktree(
+                            _repo_anchor, subagent_id=_subagent_id
+                        )
+                        if _worktree_info is None:
+                            _worktree_warning = (
+                                "worktree isolation was requested and repository "
+                                f"anchor {_repo_anchor} resolved, but git worktree "
+                                "creation failed; the child is using the shared "
+                                "workspace. See the Hermes logs for the git error."
+                            )
                 else:
-                    logger.debug(
-                        "worktree isolation skipped: non-local terminal backend"
+                    _worktree_warning = (
+                        "worktree isolation was requested but the terminal backend "
+                        "is not local; the child is using the shared workspace."
                     )
             except Exception as e:
-                logger.debug("worktree isolation setup failed: %s", e)
+                _worktree_warning = (
+                    "worktree isolation setup failed; the child is using the "
+                    f"shared workspace: {e}"
+                )
+            if _worktree_warning:
+                logger.warning("%s", _worktree_warning)
+                goal = (
+                    goal
+                    + "\n\n[WORKTREE ISOLATION WARNING] "
+                    + _worktree_warning
+                )
             if _worktree_info is not None:
                 try:
                     from tools.terminal_tool import record_session_cwd as _rsc

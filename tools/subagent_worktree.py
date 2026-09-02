@@ -42,7 +42,7 @@ import os
 import subprocess
 import uuid
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Iterable, Optional, Tuple, Union
 
 from hermes_cli._subprocess_compat import harden_git_argv, noninteractive_git_env
 
@@ -107,6 +107,70 @@ def resolve_repo_root(path: Optional[str]) -> Optional[str]:
         return None
     root = result.stdout.strip()
     return root or None
+
+
+def resolve_worktree_anchor(
+    configured_root: Optional[str],
+    recorded_cwd: Optional[str],
+    workspace_hints: Union[Optional[str], Iterable[str]],
+) -> Tuple[Optional[str], Optional[str]]:
+    """Resolve the first usable repo anchor and explain any degradation.
+
+    An explicit ``delegation.worktree_repo_root`` wins. A stale session cwd
+    must not mask a valid workspace hint, which is the failure mode persistent
+    owner sessions hit. Invalid explicit configuration is visible even when a
+    lower-priority candidate succeeds.
+    """
+    if isinstance(workspace_hints, str) or workspace_hints is None:
+        workspace_values = [workspace_hints] if workspace_hints else []
+    else:
+        workspace_values = list(workspace_hints)
+    candidates = [
+        ("delegation.worktree_repo_root", configured_root),
+        ("recorded parent cwd", recorded_cwd),
+        *[("parent workspace", value) for value in workspace_values],
+    ]
+    configured_failed = False
+    seen = set()
+    for label, candidate in candidates:
+        if not candidate:
+            continue
+        text = str(candidate)
+        if label == "delegation.worktree_repo_root" and not os.path.isabs(
+            os.path.expanduser(text)
+        ):
+            configured_failed = True
+            continue
+        try:
+            identity = os.path.normcase(
+                os.path.abspath(os.path.expanduser(text))
+            )
+        except Exception:
+            identity = text
+        if identity in seen:
+            continue
+        seen.add(identity)
+        root = resolve_repo_root(text)
+        if root:
+            warning = None
+            if configured_failed:
+                warning = (
+                    "delegation.worktree_repo_root "
+                    f"({configured_root}) is not a usable git repository; "
+                    f"using {label} ({root}) instead."
+                )
+            return root, warning
+        if label == "delegation.worktree_repo_root":
+            configured_failed = True
+
+    tried = ", ".join(
+        f"{label}={value}" for label, value in candidates if value
+    ) or "no candidate paths"
+    return None, (
+        "worktree isolation was requested but no usable git repository anchor "
+        f"resolved ({tried}); the child is using the shared workspace. Set "
+        "delegation.worktree_repo_root to an absolute checkout path."
+    )
 
 
 def _ensure_gitignore_entry(repo_root: str) -> None:

@@ -525,6 +525,46 @@ class TestToolNamePreservation(unittest.TestCase):
 class TestDelegateObservability(unittest.TestCase):
     """Tests for enriched metadata returned by _run_single_child."""
 
+    def test_worktree_degradation_is_visible_to_child_and_parent(self):
+        parent = _make_mock_parent(depth=0)
+        captured = {}
+
+        with (
+            patch("run_agent.AIAgent") as MockAgent,
+            patch("tools.delegate_tool._get_worktree_isolation", return_value=True),
+            patch("tools.subagent_worktree.local_backend_active", return_value=True),
+            patch(
+                "tools.subagent_worktree.resolve_worktree_anchor",
+                return_value=(None, "no usable repository; using shared workspace"),
+            ),
+        ):
+            mock_child = MagicMock()
+            mock_child.model = "claude-sonnet-4-6"
+            mock_child.session_prompt_tokens = 0
+            mock_child.session_completion_tokens = 0
+
+            def run_child(user_message, **_kwargs):
+                captured["message"] = user_message
+                return {
+                    "final_response": "done",
+                    "completed": True,
+                    "interrupted": False,
+                    "api_calls": 1,
+                    "messages": [],
+                }
+
+            mock_child.run_conversation.side_effect = run_child
+            MockAgent.return_value = mock_child
+
+            result = json.loads(
+                delegate_task(goal="Test warning visibility", parent_agent=parent)
+            )
+
+        entry = result["results"][0]
+        self.assertIn("shared workspace", entry["worktree_warning"])
+        self.assertIn("[WORKTREE ISOLATION WARNING]", captured["message"])
+        self.assertIn(entry["worktree_warning"], captured["message"])
+
     def test_observability_fields_present(self):
         """Completed child should return tool_trace, tokens, model, exit_reason."""
         parent = _make_mock_parent(depth=0)

@@ -463,6 +463,7 @@ worktree, branched from the repo's current `HEAD` (inspired by Muse Code's
 ```yaml
 delegation:
   worktree_isolation: true   # default: false
+  # worktree_repo_root: /srv/hermes-agent  # optional absolute repo anchor
 ```
 
 With isolation on:
@@ -483,10 +484,15 @@ With isolation on:
   defaults, not measurements, so inspect the worktree rather than assuming
   the child produced nothing.
 
+Hermes resolves the repository from `worktree_repo_root` first, then the
+parent session's recorded cwd, then every available local workspace hint. The
+explicit anchor is useful for persistent owner sessions whose recorded cwd may
+be a home directory or stale. It must be an absolute path to a git checkout.
+
 Scope: opt-in, git-only, and local-terminal-backend-only. In a non-git
 directory, on docker/ssh/modal backends, or if worktree creation fails, the
-setting degrades silently to today's shared-workspace behavior — never an
-error.
+child still uses today's shared-workspace behavior, but Hermes emits a warning
+in the child context, application log, and delegation result.
 
 ## Delegation vs execute_code
 
@@ -510,6 +516,7 @@ delegation:
   max_iterations: 50                        # Max turns per child (default: 50)
   # max_concurrent_children: 3              # Parallel children per batch (default: 3)
   # worktree_isolation: false               # Give each child its own git worktree (see Worktree Isolation above)
+  # worktree_repo_root: /srv/hermes-agent    # Optional absolute checkout anchor for persistent sessions
   # max_spawn_depth: 1                      # Tree depth (floor 1, no ceiling, default 1 = flat). Raise to 2 to allow orchestrator children to spawn leaves; 3+ for deeper trees.
   # orchestrator_enabled: true              # Disable to force all children to leaf role.
   model: "google/gemini-3-flash-preview"             # Optional provider/model override

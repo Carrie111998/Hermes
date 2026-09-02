@@ -11,6 +11,7 @@ import tempfile
 import shutil
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))
@@ -26,7 +27,7 @@ def _git(args, cwd, check=True):
 
 def _make_repo(root: Path) -> Path:
     repo = root / "repo"
-    repo.mkdir()
+    repo.mkdir(parents=True)
     _git(["init", "-q"], repo)
     _git(["config", "user.email", "test@test"], repo)
     _git(["config", "user.name", "Test"], repo)
@@ -67,6 +68,70 @@ class SubagentWorktreeTests(unittest.TestCase):
     def test_resolve_repo_root_none_and_missing(self):
         self.assertIsNone(sw.resolve_repo_root(None))
         self.assertIsNone(sw.resolve_repo_root(str(self.tmp / "nope")))
+
+    def test_resolve_anchor_prefers_configured_repo_over_recorded_cwd(self):
+        configured = _make_repo(self.tmp / "configured-parent")
+        recorded = _make_repo(self.tmp / "recorded-parent")
+
+        root, warning = sw.resolve_worktree_anchor(
+            str(configured), str(recorded), None
+        )
+
+        self.assertEqual(Path(root).resolve(), configured.resolve())
+        self.assertIsNone(warning)
+
+    def test_resolve_anchor_falls_back_from_stale_recorded_cwd(self):
+        recorded = self.tmp / "owner-home"
+        recorded.mkdir()
+        workspace = _make_repo(self.tmp / "workspace-parent")
+
+        root, warning = sw.resolve_worktree_anchor(
+            None, str(recorded), str(workspace)
+        )
+
+        self.assertEqual(Path(root).resolve(), workspace.resolve())
+        self.assertIsNone(warning)
+
+    def test_resolve_anchor_warns_when_no_candidate_is_a_repo(self):
+        recorded = self.tmp / "owner-home"
+        recorded.mkdir()
+
+        root, warning = sw.resolve_worktree_anchor(None, str(recorded), None)
+
+        self.assertIsNone(root)
+        self.assertIn("shared workspace", warning)
+        self.assertIn("delegation.worktree_repo_root", warning)
+
+    def test_invalid_configured_anchor_warns_and_uses_workspace_repo(self):
+        configured = self.tmp / "not-a-repo"
+        configured.mkdir()
+        workspace = _make_repo(self.tmp / "workspace-parent")
+
+        root, warning = sw.resolve_worktree_anchor(
+            str(configured), None, str(workspace)
+        )
+
+        self.assertEqual(Path(root).resolve(), workspace.resolve())
+        self.assertIn(str(configured), warning)
+        self.assertIn("using parent workspace", warning)
+
+    def test_resolve_anchor_checks_all_workspace_hints(self):
+        stale = self.tmp / "stale-terminal-cwd"
+        stale.mkdir()
+        workspace = _make_repo(self.tmp / "agent-cwd")
+
+        root, warning = sw.resolve_worktree_anchor(
+            None, None, [str(stale), str(workspace)]
+        )
+
+        self.assertEqual(Path(root).resolve(), workspace.resolve())
+        self.assertIsNone(warning)
+
+    def test_relative_configured_anchor_is_rejected_with_warning(self):
+        root, warning = sw.resolve_worktree_anchor("relative/repo", None, None)
+
+        self.assertIsNone(root)
+        self.assertIn("absolute checkout path", warning)
 
     # ── create_subagent_worktree ───────────────────────────────────────
 
@@ -402,6 +467,49 @@ class DelegationConfigGateTests(unittest.TestCase):
             return_value={"worktree_isolation": True},
         ):
             self.assertTrue(delegate_tool._get_worktree_isolation())
+
+    def test_worktree_repo_root_reads_explicit_config(self):
+        from tools import delegate_tool
+
+        with mock.patch.object(
+            delegate_tool,
+            "_load_config",
+            return_value={"worktree_repo_root": "/srv/hermes-agent"},
+        ):
+            self.assertEqual(
+                delegate_tool._get_worktree_repo_root(), "/srv/hermes-agent"
+            )
+
+    def test_worktree_repo_root_ignores_non_string_config(self):
+        from tools import delegate_tool
+
+        with mock.patch.object(
+            delegate_tool, "_load_config", return_value={"worktree_repo_root": True}
+        ):
+            self.assertIsNone(delegate_tool._get_worktree_repo_root())
+
+    def test_workspace_candidates_preserve_later_repo_after_stale_terminal_cwd(self):
+        from tools import delegate_tool
+
+        with tempfile.TemporaryDirectory(prefix="hermes-sw-hints-") as temp:
+            root = Path(temp)
+            stale = root / "owner-home"
+            stale.mkdir()
+            repo = _make_repo(root / "agent")
+            parent = SimpleNamespace(
+                _subdirectory_hints=None,
+                terminal_cwd=None,
+                cwd=str(repo),
+            )
+
+            with mock.patch.dict(os.environ, {"TERMINAL_CWD": str(stale)}):
+                candidates = delegate_tool._workspace_hint_candidates(parent)
+                resolved, warning = sw.resolve_worktree_anchor(
+                    None, str(stale), candidates
+                )
+
+            self.assertEqual(Path(resolved).resolve(), repo.resolve())
+            self.assertIsNone(warning)
 
 
 if __name__ == "__main__":

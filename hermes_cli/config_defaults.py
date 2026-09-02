@@ -2195,6 +2195,9 @@ DEFAULT_CONFIG = {
                                        # delegation units. New async dispatches beyond the cap
                                        # fall back to synchronous execution. Floor of 1, no ceiling.
                                        # (Replaces the deprecated max_async_children.)
+        "worktree_isolation": False,  # opt-in local git worktree per child
+        "worktree_repo_root": "",  # optional absolute checkout anchor; useful for
+                                    # persistent sessions whose recorded cwd is stale
         # Orchestrator role controls (see tools/delegate_tool.py:_get_max_spawn_depth
         # and _get_orchestrator_enabled).  Floored at 1, no upper ceiling —
         # raise deliberately, each level multiplies API cost.
