@@ -3424,6 +3424,16 @@ DEFAULT_CONFIG = {
         # Only consulted when ``strict`` is true.
         "trust_recent_files_seconds": 600,
 
+        # Media delivery settings
+        "media": {
+            # Extra file extensions to recognize and deliver as native gateway
+            # attachments (e.g. [".dwg", ".blend", ".step"]). Appended to the
+            # built-in DEFAULT_MEDIA_DELIVERY_EXTS. Accepts a list of strings
+            # or a comma/semicolon-separated string. Leading dots are added
+            # automatically if omitted.
+            "extra_extensions": [],
+        },
+
         # OpenAI-compatible API server platform
         # (gateway/platforms/api_server.py).
         "api_server": {

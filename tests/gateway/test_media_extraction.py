@@ -571,5 +571,56 @@ class TestStaleToolMediaLeak:
         )
 
 
+def test_hwp_and_hwpx_in_media_delivery_extensions():
+    from gateway.platforms.base import MEDIA_DELIVERY_EXTS, DEFAULT_MEDIA_DELIVERY_EXTS
+    assert ".hwp" in DEFAULT_MEDIA_DELIVERY_EXTS
+    assert ".hwpx" in DEFAULT_MEDIA_DELIVERY_EXTS
+    assert ".hwp" in MEDIA_DELIVERY_EXTS
+    assert ".hwpx" in MEDIA_DELIVERY_EXTS
+
+
+def test_extra_media_extensions_configuration(monkeypatch):
+    from gateway.platforms.base import get_media_delivery_extensions, _parse_extra_media_extensions
+    from gateway.media_policy import apply_media_policy_env
+
+    # Test explicit sequence
+    parsed = _parse_extra_media_extensions(["dwg", ".blend", "  .STEP  "])
+    assert parsed == (".dwg", ".blend", ".step")
+
+    # Test env var string parsing
+    monkeypatch.setenv("HERMES_EXTRA_MEDIA_EXTENSIONS", "dwg, .blend; step, .3ds")
+    exts = get_media_delivery_extensions()
+    assert ".dwg" in exts
+    assert ".blend" in exts
+    assert ".step" in exts
+    assert ".3ds" in exts
+    assert ".hwp" in exts
+    assert ".pdf" in exts
+
+    # Test config.yaml policy bridge
+    monkeypatch.delenv("HERMES_EXTRA_MEDIA_EXTENSIONS", raising=False)
+    fake_config = {
+        "gateway": {
+            "media": {
+                "extra_extensions": [".cad", ".dxf"]
+            }
+        }
+    }
+    apply_media_policy_env(fake_config)
+    exts_from_cfg = get_media_delivery_extensions()
+    assert ".cad" in exts_from_cfg
+    assert ".dxf" in exts_from_cfg
+
+
+def test_path_lacks_deliverable_extension_consistency():
+    from gateway.platforms.base import _path_lacks_deliverable_extension, MEDIA_DELIVERY_EXTS
+
+    assert not _path_lacks_deliverable_extension("/tmp/document.hwp")
+    assert not _path_lacks_deliverable_extension("/tmp/document.hwpx")
+    assert not _path_lacks_deliverable_extension("/tmp/document.pdf")
+    assert _path_lacks_deliverable_extension("/tmp/Makefile")
+    assert _path_lacks_deliverable_extension("/tmp/script.unregistered_ext_123")
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
