@@ -2508,6 +2508,57 @@ def _platform_toolset_summary(config: dict, platforms: Optional[List[str]] = Non
     return summary
 
 
+def _prune_platform_toolsets_after_agent_disabled(
+    enabled_toolsets: set[str],
+    disabled_toolsets,
+) -> set[str]:
+    """Drop platform toolset names with no surviving tools after disabled subtraction.
+
+    ``_get_platform_tools`` historically subtracted ``agent.disabled_toolsets``
+    by *name* only, which is a no-op for composite entries like ``debugging``
+    when the platform holds constituent keys (``terminal``, ``web``, …).
+    Inspection surfaces must mirror runtime tool-level subtraction (#97015).
+    """
+    if not disabled_toolsets:
+        return enabled_toolsets
+
+    from agent.skill_utils import parse_config_string_list
+    from model_tools import _LEGACY_TOOLSET_MAP, apply_disabled_toolsets_to_tool_names
+    from toolsets import resolve_toolset, validate_toolset
+
+    disabled_names = [
+        name.strip() for name in parse_config_string_list(disabled_toolsets) if name.strip()
+    ]
+    if not disabled_names:
+        return enabled_toolsets
+
+    result = set(enabled_toolsets)
+    result -= set(disabled_names)
+
+    tools: set[str] = set()
+    for ts_key in result:
+        if validate_toolset(ts_key):
+            tools.update(resolve_toolset(ts_key))
+        elif ts_key in _LEGACY_TOOLSET_MAP:
+            tools.update(_LEGACY_TOOLSET_MAP[ts_key])
+
+    surviving = apply_disabled_toolsets_to_tool_names(tools, disabled_names)
+
+    pruned: set[str] = set()
+    passthrough: set[str] = set()
+    for ts_key in result:
+        if validate_toolset(ts_key):
+            ts_tools = set(resolve_toolset(ts_key))
+        elif ts_key in _LEGACY_TOOLSET_MAP:
+            ts_tools = set(_LEGACY_TOOLSET_MAP[ts_key])
+        else:
+            passthrough.add(ts_key)
+            continue
+        if ts_tools & surviving:
+            pruned.add(ts_key)
+    return pruned | passthrough
+
+
 def _parse_enabled_flag(value, default: bool = True) -> bool:
     """Parse bool-like config values used by tool/platform settings."""
     if value is None:
@@ -2916,12 +2967,9 @@ def _get_platform_tools(
     agent_cfg = config.get("agent") or {}
     disabled_toolsets = agent_cfg.get("disabled_toolsets") or []
     if disabled_toolsets:
-        from agent.skill_utils import parse_config_string_list
-
-        disabled_set = {
-            name.strip() for name in parse_config_string_list(disabled_toolsets) if name.strip()
-        }
-        enabled_toolsets -= disabled_set
+        enabled_toolsets = _prune_platform_toolsets_after_agent_disabled(
+            enabled_toolsets, disabled_toolsets
+        )
 
     # #38798: if this platform was explicitly configured but every toolset name
     # is invalid (e.g. a migration or hand-edit left `hermes` instead of

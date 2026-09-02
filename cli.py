@@ -9032,7 +9032,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     try:
                         from model_tools import get_toolset_for_tool
                         tools = get_tool_definitions(
-                            enabled_toolsets=self.enabled_toolsets, quiet_mode=True
+                            enabled_toolsets=self.enabled_toolsets,
+                            disabled_toolsets=getattr(self, "disabled_toolsets", None),
+                            quiet_mode=True,
                         )
                         availability = compute_toolset_availability(self.enabled_toolsets)
                         tmap = {
@@ -9059,7 +9061,11 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 # Cold path: compute everything live, then persist the snapshot
                 # so the next launch replays it.
                 from model_tools import get_toolset_for_tool
-                tools = get_tool_definitions(enabled_toolsets=self.enabled_toolsets, quiet_mode=True)
+                tools = get_tool_definitions(
+                    enabled_toolsets=self.enabled_toolsets,
+                    disabled_toolsets=getattr(self, "disabled_toolsets", None),
+                    quiet_mode=True,
+                )
                 availability = compute_toolset_availability(self.enabled_toolsets)
 
                 build_welcome_banner(
@@ -9717,7 +9723,11 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         if os.environ.get("HERMES_DEFER_AGENT_STARTUP") == "1":
             tool_status = "tools deferred"
         else:
-            tools = get_tool_definitions(enabled_toolsets=self.enabled_toolsets, quiet_mode=True)
+            tools = get_tool_definitions(
+                enabled_toolsets=self.enabled_toolsets,
+                disabled_toolsets=getattr(self, "disabled_toolsets", None),
+                quiet_mode=True,
+            )
             tool_count = len(tools) if tools else 0
             tool_status = f"{tool_count} tools"
 
@@ -10016,8 +10026,12 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         # Pre-assembly list: /tools is a discovery/inspection surface, so it
         # must show the full catalog including tools deferred behind the
         # tool_search bridge (users check this to verify an MCP installed).
-        tools = get_tool_definitions(enabled_toolsets=self.enabled_toolsets, quiet_mode=True,
-                                     skip_tool_search_assembly=True)
+        tools = get_tool_definitions(
+            enabled_toolsets=self.enabled_toolsets,
+            disabled_toolsets=getattr(self, "disabled_toolsets", None),
+            quiet_mode=True,
+            skip_tool_search_assembly=True,
+        )
         
         if not tools:
             print("(;_;) No tools available")
@@ -12660,7 +12674,11 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 if self.compact or term_w < 80:
                     cc.print(_build_compact_banner())
                 else:
-                    tools = get_tool_definitions(enabled_toolsets=self.enabled_toolsets, quiet_mode=True)
+                    tools = get_tool_definitions(
+                        enabled_toolsets=self.enabled_toolsets,
+                        disabled_toolsets=getattr(self, "disabled_toolsets", None),
+                        quiet_mode=True,
+                    )
                     cwd = os.getenv("TERMINAL_CWD", os.getcwd())
                     ctx_len = None
                     if hasattr(self, 'agent') and self.agent and hasattr(self.agent, 'context_compressor'):

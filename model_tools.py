@@ -414,6 +414,33 @@ def get_tool_definitions(
     return result
 
 
+def apply_disabled_toolsets_to_tool_names(
+    tools_to_include: set[str],
+    disabled_toolsets: Optional[List[str]] = None,
+) -> set[str]:
+    """Subtract tools belonging to ``agent.disabled_toolsets`` at tool granularity.
+
+    Composite/scenario toolsets (e.g. ``debugging``) resolve to their member
+    tools; platform bundles and posture toolsets only subtract their non-core
+    delta so shared core tools stay available (#17309, #33924, #57315).
+    """
+    if not disabled_toolsets:
+        return set(tools_to_include)
+
+    result = set(tools_to_include)
+    for toolset_name in disabled_toolsets:
+        if validate_toolset(toolset_name):
+            from toolsets import bundle_non_core_tools, get_toolset
+
+            if toolset_name.startswith("hermes-") or (get_toolset(toolset_name) or {}).get("posture"):
+                result.difference_update(bundle_non_core_tools(toolset_name))
+            else:
+                result.difference_update(resolve_toolset(toolset_name))
+        elif toolset_name in _LEGACY_TOOLSET_MAP:
+            result.difference_update(_LEGACY_TOOLSET_MAP[toolset_name])
+    return result
+
+
 def _compute_tool_definitions(
     enabled_toolsets: Optional[List[str]] = None,
     disabled_toolsets: Optional[List[str]] = None,
@@ -462,43 +489,45 @@ def _compute_tool_definitions(
     # is enabled, any tools belonging to a disabled toolset are strictly
     # stripped out. See issue #17309.
     if disabled_toolsets:
-        for toolset_name in disabled_toolsets:
-            if validate_toolset(toolset_name):
-                from toolsets import bundle_non_core_tools, get_toolset
-                if toolset_name.startswith("hermes-") or (get_toolset(toolset_name) or {}).get("posture"):
-                    # Platform bundles (hermes-*) include _HERMES_CORE_TOOLS, and
-                    # posture toolsets (`posture: True`, e.g. `coding`) re-list
-                    # those same core tools without owning them, so subtracting
-                    # the whole toolset would strip core tools shared by other
-                    # enabled toolsets and empty the tool list (#33924, #57315).
-                    # Subtract only the non-core delta; keep core.
-                    to_remove = bundle_non_core_tools(toolset_name)
-                    tools_to_include.difference_update(to_remove)
-                    resolved = sorted(to_remove)
-                    if (not quiet_mode and toolset_name.startswith("hermes-")
-                            and toolset_name not in _WARNED_DISABLED_BUNDLES):
-                        _WARNED_DISABLED_BUNDLES.add(toolset_name)
-                        logger.info(
-                            "agent.disabled_toolsets contains platform-bundle "
-                            "name '%s'; core tools are preserved and only its "
-                            "platform-specific tools (%s) are removed. Bundle "
-                            "names usually belong in `toolsets:`, not "
-                            "`disabled_toolsets` (#33924).",
-                            toolset_name,
-                            ", ".join(resolved) if resolved else "none",
-                        )
+        tools_to_include = apply_disabled_toolsets_to_tool_names(
+            tools_to_include, disabled_toolsets
+        )
+        if not quiet_mode:
+            for toolset_name in disabled_toolsets:
+                if validate_toolset(toolset_name):
+                    from toolsets import bundle_non_core_tools, get_toolset
+
+                    if toolset_name.startswith("hermes-") or (get_toolset(toolset_name) or {}).get("posture"):
+                        to_remove = bundle_non_core_tools(toolset_name)
+                        resolved = sorted(to_remove)
+                        if (
+                            toolset_name.startswith("hermes-")
+                            and toolset_name not in _WARNED_DISABLED_BUNDLES
+                        ):
+                            _WARNED_DISABLED_BUNDLES.add(toolset_name)
+                            logger.info(
+                                "agent.disabled_toolsets contains platform-bundle "
+                                "name '%s'; core tools are preserved and only its "
+                                "platform-specific tools (%s) are removed. Bundle "
+                                "names usually belong in `toolsets:`, not "
+                                "`disabled_toolsets` (#33924).",
+                                toolset_name,
+                                ", ".join(resolved) if resolved else "none",
+                            )
+                    else:
+                        resolved = sorted(resolve_toolset(toolset_name))
+                    print(
+                        f"🚫 Disabled toolset '{toolset_name}': "
+                        f"{', '.join(resolved) if resolved else 'no tools'}"
+                    )
+                elif toolset_name in _LEGACY_TOOLSET_MAP:
+                    legacy_tools = _LEGACY_TOOLSET_MAP[toolset_name]
+                    print(
+                        f"🚫 Disabled legacy toolset '{toolset_name}': "
+                        f"{', '.join(legacy_tools)}"
+                    )
                 else:
-                    resolved = resolve_toolset(toolset_name)
-                    tools_to_include.difference_update(resolved)
-                if not quiet_mode:
-                    print(f"🚫 Disabled toolset '{toolset_name}': {', '.join(resolved) if resolved else 'no tools'}")
-            elif toolset_name in _LEGACY_TOOLSET_MAP:
-                legacy_tools = _LEGACY_TOOLSET_MAP[toolset_name]
-                tools_to_include.difference_update(legacy_tools)
-                if not quiet_mode:
-                    print(f"🚫 Disabled legacy toolset '{toolset_name}': {', '.join(legacy_tools)}")
-            elif not quiet_mode:
-                print(f"⚠️  Unknown toolset: {toolset_name}")
+                    print(f"⚠️  Unknown toolset: {toolset_name}")
 
     # Plugin-registered tools are now resolved through the normal toolset
     # path — validate_toolset() / resolve_toolset() / get_all_toolsets()
