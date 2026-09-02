@@ -3405,6 +3405,29 @@ class MCPServerTask:
         safe_env = _build_safe_env(user_env)
         command, safe_env = _resolve_stdio_command(command, safe_env)
 
+        # Apply the cua-driver overlay policy to *user-registered* MCP
+        # launches (#81220). A ``mcp_servers.cua-driver`` entry with
+        # ``args: [mcp]`` otherwise spawns verbatim, bypassing the
+        # normalization the embedded cua-backend performs at
+        # ``_resolve_mcp_invocation`` — so on Linux/X11 the fullscreen
+        # cursor-overlay window (an InputOutput override-redirect surface)
+        # can map across the whole virtual desktop and swallow every click
+        # outside Hermes until a manual recovery call. The helper is a
+        # strict no-op for any non-cua-driver command; it honours an
+        # explicit ``computer_use.no_overlay: false`` opt-in and never
+        # duplicates a user-supplied ``--no-overlay``. Runs BEFORE the OSV
+        # preflight and the watchdog wrap so both see the real launch line.
+        try:
+            from tools.computer_use.cua_backend import (
+                normalize_user_cua_driver_args,
+            )
+
+            args = normalize_user_cua_driver_args(command, args)
+        except ImportError:
+            # cua_backend is an optional module surface; without it there is
+            # no overlay policy to apply and the launch proceeds as before.
+            pass
+
         # Check package against OSV malware database before spawning.
         # Run off the event loop (the urllib HTTPS call is blocking) and bound
         # it with a wall-clock timeout so a stalled SSL handshake can't freeze
