@@ -11,6 +11,7 @@ from pathlib import Path
 
 from tools.approval import (
     _bash_exec_payload,
+    _command_parser_limit_exceeded,
     _deobfuscate_shell_word_for_detection,
     _iter_shell_command_starts,
     _read_shell_word,
@@ -34,6 +35,7 @@ _WORKTREE_MUTATIONS = frozenset({
 _WORKTREE_TARGET_ACTIONS = frozenset({"move", "remove"})
 _STASH_SAFE_ACTIONS = frozenset({"list", "show", "create", "store", "drop", "clear"})
 _RESET_WORKTREE_MODES = frozenset({"--hard", "--merge", "--keep"})
+_PARSER_LIMIT_OPERATION = "__parser_limit__"
 _KNOWN_GIT_BUILTINS = frozenset({
     "add",
     "am",
@@ -602,7 +604,7 @@ def _inspect_git(
     if subcommand in _KNOWN_GIT_BUILTINS:
         return None
     if depth >= _MAX_RECURSION:
-        return None
+        return _PARSER_LIMIT_OPERATION
 
     alias = inline_aliases.get(subcommand)
     if alias is None:
@@ -641,8 +643,10 @@ def _inspect_github_cli(
 
 
 def _find_mutation(command: str, cwd: Path, root: Path, depth: int = 0) -> str | None:
+    if _command_parser_limit_exceeded(command):
+        return _PARSER_LIMIT_OPERATION
     if depth > _MAX_RECURSION:
-        return None
+        return _PARSER_LIMIT_OPERATION
 
     masked_command, heredoc_scripts = _mask_heredocs(command)
     for script in heredoc_scripts:
@@ -723,6 +727,12 @@ def detect_self_repo_git_mutation(
     operation = _find_mutation(command, base, root)
     if operation is None:
         return False, None
+    if operation == _PARSER_LIMIT_OPERATION:
+        return True, (
+            "Blocked: command exceeded the parser safety limit while checking "
+            f"whether it would rewrite Hermes's live source checkout ({root}). "
+            "Split the command into smaller operations and retry."
+        )
     return True, _block_message(operation, root)
 
 

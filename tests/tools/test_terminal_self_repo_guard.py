@@ -1,6 +1,7 @@
 """terminal_tool wiring tests for the self-repo git mutation guard."""
 
 import json
+import subprocess
 from contextlib import ExitStack
 from unittest.mock import MagicMock, patch
 
@@ -78,6 +79,74 @@ class TestSelfRepoGuardWiring:
             "git reset --hard origin/main", config, monkeypatch, repo, force=True
         )
         assert result["status"] == "blocked"
+        env.execute.assert_not_called()
+
+    def test_force_cannot_bypass_parser_limit(self, repo, monkeypatch):
+        config = _make_env_config(cwd=str(repo))
+        payload = "${x:-a}" * 257 + "; git reset --hard"
+
+        result, env = _run(payload, config, monkeypatch, repo, force=True)
+
+        assert result["status"] == "blocked"
+        assert "parser safety limit" in result["error"]
+        env.execute.assert_not_called()
+
+    def test_force_cannot_bypass_command_substitution_limit(
+        self, repo, monkeypatch
+    ):
+        config = _make_env_config(cwd=str(repo))
+        payload = "$(" * 257 + "printf safe" + ")" * 257 + "; git reset --hard"
+
+        result, env = _run(payload, config, monkeypatch, repo, force=True)
+
+        assert result["status"] == "blocked"
+        assert "parser safety limit" in result["error"]
+        env.execute.assert_not_called()
+
+    def test_force_cannot_bypass_configured_alias_parser_limit(
+        self, repo, monkeypatch
+    ):
+        subprocess.run(["git", "init", "-q", str(repo)], check=True)
+        payload = "${x:-a}" * 257 + "; git reset --hard"
+        subprocess.run(
+            ["git", "-C", str(repo), "config", "alias.boom", f"!{payload}"],
+            check=True,
+        )
+        config = _make_env_config(cwd=str(repo))
+
+        result, env = _run("git boom", config, monkeypatch, repo, force=True)
+
+        assert result["status"] == "blocked"
+        assert "parser safety limit" in result["error"]
+        env.execute.assert_not_called()
+
+    def test_force_cannot_bypass_deep_alias_parser_limit(
+        self, repo, monkeypatch
+    ):
+        subprocess.run(["git", "init", "-q", str(repo)], check=True)
+        for index in range(6):
+            subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(repo),
+                    "config",
+                    f"alias.deep{index}",
+                    f"!git deep{index + 1}",
+                ],
+                check=True,
+            )
+        payload = "${x:-a}" * 257 + "; git reset --hard"
+        subprocess.run(
+            ["git", "-C", str(repo), "config", "alias.deep6", f"!{payload}"],
+            check=True,
+        )
+        config = _make_env_config(cwd=str(repo))
+
+        result, env = _run("git deep0", config, monkeypatch, repo, force=True)
+
+        assert result["status"] == "blocked"
+        assert "parser safety limit" in result["error"]
         env.execute.assert_not_called()
 
     def test_workdir_targeting_repo_is_blocked(self, repo, monkeypatch, tmp_path):

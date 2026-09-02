@@ -17,6 +17,7 @@ from tools.approval import (
     detect_hardline_command,
     disable_session_yolo,
     enable_session_yolo,
+    _iter_shell_command_starts,
     reset_current_session_key,
     set_current_session_key,
 )
@@ -654,6 +655,123 @@ def test_quoted_paren_brace_prose_not_blocked_under_yolo(clean_session, monkeypa
         assert detect_hardline_command(cmd)[0] is False, (
             f"quoted prose false-positived on the hardline floor: {cmd!r}"
         )
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        r'''grep -o "[^\"]*" f''',
+        r'''grep -o "C:\Users\UPC\Desktop[^\"]*" file.py''',
+        r'''grep -Po "(?<=href=\")[^\"]*" index.html''',
+    ],
+)
+def test_escaped_quotes_in_grep_bracket_classes_are_not_malformed(command):
+    """Normalization must not corrupt valid shell quoting before parsing grep."""
+    assert detect_hardline_command(command) == (False, None)
+
+
+def test_unescaped_quote_in_grep_bracket_class_remains_malformed():
+    malformed = '''grep -o "[^"]*" f'''
+    assert detect_hardline_command(malformed) == (
+        True,
+        "command parser limit or malformed executable payload",
+    )
+
+
+def test_destructive_command_after_valid_quoted_grep_remains_blocked():
+    destructive = r'''grep -o "[^\"]*" f; rm -rf /'''
+    assert detect_hardline_command(destructive) == (
+        True,
+        "recursive delete of root filesystem",
+    )
+
+
+@pytest.mark.parametrize(
+    "suffix",
+    [
+        r"(rm${IFS}-rf${IFS}/)",
+        r"{ rm${IFS}-rf${IFS}/; }",
+        r"${missing:-$(rm -rf /)}",
+        r"${missing:-`rm -rf /`}",
+        r"${outer:-${inner:-$(rm -rf /)}}",
+        r'''"${missing:-'$(printf safe; rm -rf /)'}"''',
+    ],
+)
+def test_valid_quoted_grep_cannot_hide_expanded_root_delete(
+    suffix, clean_session, monkeypatch
+):
+    monkeypatch.setenv("HERMES_YOLO_MODE", "1")
+    command = rf'''grep -o "[^\"]*" f; {suffix}'''
+    assert detect_hardline_command(command) == (
+        True,
+        "recursive delete of root filesystem",
+    )
+    result = check_all_command_guards(command, "local")
+    assert result["approved"] is False
+    assert result.get("hardline") is True
+
+
+def test_faithful_command_marker_survives_backslash_line_normalization():
+    command = r'''grep -o "[^\"]*" f; printf \\''' + "\nreboot"
+    assert detect_hardline_command(command) == (True, "system shutdown/reboot")
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        r'''grep -o "[^\"]*" f; printf '%s' '${missing:-$(printf safe)}' ''',
+        r'''grep -o "[^\"]*" f; echo "${missing:-literal}"''',
+    ],
+)
+def test_parameter_expansion_text_after_valid_grep_stays_safe(command):
+    assert detect_hardline_command(command) == (False, None)
+
+
+@pytest.mark.parametrize("closed", [True, False])
+def test_excessive_parameter_expansion_nesting_fails_closed(
+    closed, clean_session, monkeypatch
+):
+    monkeypatch.setenv("HERMES_YOLO_MODE", "1")
+    command = "${" * 257 + "value" + ("}" * 257 if closed else "")
+
+    assert detect_hardline_command(command) == (
+        True,
+        "command parser limit exceeded",
+    )
+    result = check_all_command_guards(command, "local")
+    assert result["approved"] is False
+    assert result.get("hardline") is True
+    assert list(_iter_shell_command_starts(command)) == []
+
+
+def test_excessive_command_substitution_nesting_fails_closed(
+    clean_session, monkeypatch
+):
+    monkeypatch.setenv("HERMES_YOLO_MODE", "1")
+    command = "$(" * 257 + "printf safe" + ")" * 257
+
+    assert detect_hardline_command(command) == (
+        True,
+        "command parser limit exceeded",
+    )
+    result = check_all_command_guards(command, "local")
+    assert result["approved"] is False
+    assert result.get("hardline") is True
+    assert list(_iter_shell_command_starts(command)) == []
+
+
+def test_valid_quoted_grep_passes_yolo_and_approvals_off_guards(
+    clean_session, monkeypatch
+):
+    import tools.approval as approval_mod
+
+    command = r'''grep -o "[^\"]*" f'''
+    enable_session_yolo("hardline_test")
+    assert check_all_command_guards(command, "local")["approved"] is True
+
+    disable_session_yolo("hardline_test")
+    monkeypatch.setattr(approval_mod, "_get_approval_mode", lambda: "off")
+    assert check_all_command_guards(command, "local")["approved"] is True
 
 
 def test_line_continuation_root_wipe_cannot_bypass_hardline(clean_session, monkeypatch):

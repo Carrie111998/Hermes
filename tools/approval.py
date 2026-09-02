@@ -761,8 +761,11 @@ def detect_hardline_command(command: str) -> tuple:
     """
     if _command_parser_limit_exceeded(command):
         return (True, _PARSER_LIMIT_DESCRIPTION)
-    normalized = _normalize_command_for_detection(command)
-    _, malformed_grep = _grep_safe_detection_variant(normalized)
+    # Validate grep's shell grammar before normalization strips escapes such
+    # as the \" in a valid double-quoted regex (`grep "[^\"]*"`). Parsing
+    # the normalized spelling would turn that escaped data quote into a shell
+    # delimiter and falsely report an unterminated executable payload.
+    _, malformed_grep = _grep_safe_detection_variant(command)
     if malformed_grep:
         return (True, _MALFORMED_EXEC_DESCRIPTION)
     for command_variant in _command_detection_variants(command):
@@ -1573,6 +1576,8 @@ _SHELL_PUNCTUATION = {";", "&", "&&", "|", "||", "(", ")", "{", "}"}
 _MAX_DETECTION_COMMAND_CHARS = 128_000
 _MAX_SEPARATOR_FREE_COMMAND_CHARS = 4_096
 _MAX_DETECTION_SEGMENTS = 25_000
+_MAX_PARAMETER_EXPANSIONS = 256
+_MAX_COMMAND_SUBSTITUTIONS = 256
 _PARSER_LIMIT_DESCRIPTION = "command parser limit exceeded"
 _MALFORMED_EXEC_DESCRIPTION = "command parser limit or malformed executable payload"
 
@@ -1586,6 +1591,14 @@ def _command_parser_limit_exceeded(command: str) -> bool:
     closed rather than allowing an uninspected suffix to execute.
     """
     if len(command) > _MAX_DETECTION_COMMAND_CHARS:
+        return True
+    # Parameter-expansion and command-substitution scanners recurse for nested
+    # shell constructs. Bound their input before parsing so adversarial nesting
+    # fails closed instead of reaching Python's recursion limit or repeatedly
+    # rescanning nested spans.
+    if command.count("${") > _MAX_PARAMETER_EXPANSIONS:
+        return True
+    if command.count("$(") > _MAX_COMMAND_SUBSTITUTIONS:
         return True
     # Long separator-free input has no compound-command utility and otherwise
     # makes every legacy regex inspect one giant token. Reject it before any
@@ -2036,6 +2049,68 @@ def _scan_dollar_paren_end(command: str, start: int) -> int | None:
     return None
 
 
+def _scan_parameter_expansion_end(
+    command: str,
+    start: int,
+    limit: int | None = None,
+    outer_double_quoted: bool = False,
+) -> int | None:
+    """Return the offset after a balanced ``${...}`` parameter expansion."""
+    end = len(command) if limit is None else min(limit, len(command))
+    quote: str | None = None
+    i = start + 2
+    while i < end:
+        ch = command[i]
+        if quote == "'":
+            if ch == "'":
+                quote = None
+            i += 1
+            continue
+        if quote == '"':
+            if ch == "\\" and i + 1 < end:
+                i += 2
+                continue
+            if ch == '"':
+                quote = None
+                i += 1
+                continue
+        elif ch == '"' or (ch == "'" and not outer_double_quoted):
+            quote = ch
+            i += 1
+            continue
+        elif ch == "\\" and i + 1 < end:
+            i += 2
+            continue
+
+        if command.startswith("$(", i):
+            nested_end = _scan_dollar_paren_end(command, i)
+            if nested_end is None or nested_end > end:
+                return None
+            i = nested_end
+            continue
+        if command.startswith("${", i):
+            nested_end = _scan_parameter_expansion_end(
+                command,
+                i,
+                end,
+                outer_double_quoted=outer_double_quoted or quote == '"',
+            )
+            if nested_end is None:
+                return None
+            i = nested_end
+            continue
+        if ch == "`":
+            nested_end = _scan_backtick_end(command, i)
+            if nested_end is None or nested_end > end:
+                return None
+            i = nested_end
+            continue
+        if ch == "}":
+            return i + 1
+        i += 1
+    return None
+
+
 def _scan_backtick_end(command: str, start: int) -> int | None:
     i = start + 1
     while i < len(command):
@@ -2217,7 +2292,73 @@ def _deobfuscate_shell_word_for_detection(word: str) -> str:
 
 
 def _iter_shell_command_starts(command: str):
+    # This scanner also has direct callers that run before the public approval
+    # detectors. Enforce the recursion bound here as well so none can enter the
+    # nested parameter-expansion parser with an over-limit command.
+    if _command_parser_limit_exceeded(command):
+        return
     starts = [0]
+
+    def scan_parameter_expansion(
+        start: int, end: int, outer_double_quoted: bool = False
+    ) -> None:
+        """Record executable substitutions without treating ``${`` as a group."""
+        quote: str | None = None
+        i = start
+        while i < end:
+            ch = command[i]
+            if quote == "'":
+                if ch == "'":
+                    quote = None
+                i += 1
+                continue
+            if quote == '"':
+                if ch == "\\" and i + 1 < end:
+                    i += 2
+                    continue
+                if ch == '"':
+                    quote = None
+                    i += 1
+                    continue
+            elif ch == '"' or (ch == "'" and not outer_double_quoted):
+                quote = ch
+                i += 1
+                continue
+            elif ch == "\\" and i + 1 < end:
+                i += 2
+                continue
+
+            if command.startswith("$(", i):
+                nested_end = _scan_dollar_paren_end(command, i)
+                nested_limit = nested_end - 1 if nested_end is not None else end
+                starts.append(i + 2)
+                scan(i + 2, nested_limit)
+                i = nested_end if nested_end is not None else end
+                continue
+            if command.startswith("${", i):
+                nested_double_quoted = outer_double_quoted or quote == '"'
+                nested_end = _scan_parameter_expansion_end(
+                    command,
+                    i,
+                    end,
+                    outer_double_quoted=nested_double_quoted,
+                )
+                nested_limit = nested_end - 1 if nested_end is not None else end
+                scan_parameter_expansion(
+                    i + 2,
+                    nested_limit,
+                    outer_double_quoted=nested_double_quoted,
+                )
+                i = nested_end if nested_end is not None else end
+                continue
+            if ch == "`":
+                nested_end = _scan_backtick_end(command, i)
+                nested_limit = nested_end - 1 if nested_end is not None else end
+                starts.append(i + 1)
+                scan(i + 1, nested_limit)
+                i = nested_end if nested_end is not None else end
+                continue
+            i += 1
 
     def scan(start: int, end: int) -> None:
         quote: str | None = None
@@ -2249,6 +2390,16 @@ def _iter_shell_command_starts(command: str):
                     scan(i + 1, nested_end - 1 if nested_end is not None else end)
                     i = nested_end if nested_end is not None else end
                     continue
+                if command.startswith("${", i):
+                    nested_end = _scan_parameter_expansion_end(
+                        command, i, end, outer_double_quoted=True
+                    )
+                    nested_limit = nested_end - 1 if nested_end is not None else end
+                    scan_parameter_expansion(
+                        i + 2, nested_limit, outer_double_quoted=True
+                    )
+                    i = nested_end if nested_end is not None else end
+                    continue
                 i += 1
                 continue
             if ch in ("'", '"'):
@@ -2268,6 +2419,12 @@ def _iter_shell_command_starts(command: str):
                 nested_end = _scan_backtick_end(command, i)
                 starts.append(i + 1)
                 scan(i + 1, nested_end - 1 if nested_end is not None else end)
+                i = nested_end if nested_end is not None else end
+                continue
+            if command.startswith("${", i):
+                nested_end = _scan_parameter_expansion_end(command, i, end)
+                nested_limit = nested_end - 1 if nested_end is not None else end
+                scan_parameter_expansion(i + 2, nested_limit)
                 i = nested_end if nested_end is not None else end
                 continue
             if ch in ("(", "{"):
@@ -2291,7 +2448,9 @@ def _iter_shell_command_starts(command: str):
             yield start
 
 
-def _mark_command_starts(command: str) -> str:
+def _mark_command_starts(
+    command: str, marker: str = "\n", protect_line_continuations: bool = False
+) -> str:
     """Insert a newline before each real (quote-aware) command start.
 
     ``\\n`` is already a ``_CMDPOS`` separator, so this rewrites subshell
@@ -2313,7 +2472,12 @@ def _mark_command_starts(command: str) -> str:
     parts: list[str] = []
     previous = 0
     for offset in offsets:
-        parts.extend((command[previous:offset], "\n"))
+        effective_marker = (
+            f" {marker}"
+            if protect_line_continuations and command[offset - 1] == "\\"
+            else marker
+        )
+        parts.extend((command[previous:offset], effective_marker))
         previous = offset
     parts.append(command[previous:])
     return "".join(parts)
@@ -2416,7 +2580,8 @@ def _command_detection_variants(command: str):
     # unterminated quote), so masking the normalized text could swallow a
     # REAL unquoted newline separator that follows. The raw command carries
     # faithful shell quote state.
-    normalized = _normalize_command_for_detection(_mask_quoted_newlines(command))
+    quote_faithful = _mask_quoted_newlines(command)
+    normalized = _normalize_command_for_detection(quote_faithful)
     # Quote-aware grep parsing hides only structurally identified pattern
     # operands. Malformed/ambiguous input remains byte-for-byte intact.
     grep_safe, _ = _grep_safe_detection_variant(normalized)
@@ -2467,8 +2632,16 @@ def _command_detection_variants(command: str):
     # untouched, while `(reboot)` / `{ shutdown -h now; }` now anchor. This
     # covers every `_CMDPOS` rule (shutdown/reboot/init/systemctl/telinit and
     # the rm root/home/system floor) in one place.
-    marked = _mark_command_starts(grep_safe)
-    if marked != grep_safe and marked not in seen:
+    # Find command boundaries while the original escape/quote structure is
+    # still intact, then normalize the already-marked spelling. Otherwise a
+    # valid data escape such as grep's `[^\"]` can become a quote delimiter
+    # before this pass and hide a real command that follows the grep segment.
+    # Protect only markers preceded by a backslash; adding spaces at every
+    # boundary needlessly inflates the hot path for long compound commands.
+    marked = _normalize_command_for_detection(
+        _mark_command_starts(quote_faithful, protect_line_continuations=True)
+    )
+    if marked != normalized and marked not in seen:
         seen.add(marked)
         yield marked
     # Shell quoting/escaping can spell a dangerous executable name in pieces
