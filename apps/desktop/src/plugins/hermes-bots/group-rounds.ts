@@ -587,10 +587,7 @@ export async function stopGroupThread(group: string, thread: null | string, memb
 /** Fence a classic-room turn after this Desktop loses its gateway command
  * lease. Unlike a user Stop, this adds no durable holds, so the same command
  * can be leased to the current owner and resumed idempotently. */
-export async function cancelGroupThreadForLeaseLoss(
-  group: string,
-  members: GroupMember[] | null = null
-) {
+export async function cancelGroupThreadForLeaseLoss(group: string, members: GroupMember[] | null = null) {
   const room = $groupChats.get()[group] || {}
   const roster = Array.isArray(members) && members.length ? members : room.members || []
   const turnName = room.turn || null
@@ -1016,10 +1013,7 @@ export async function runGroupChatRounds(group: string, members: GroupMember[], 
     // the round cap ended the drive, not consensus. (#94478)
     exitKind = 'capped'
   } finally {
-    const externalIds = (Array.isArray(($groupChats.get()[group] || {}).log)
-      ? $groupChats.get()[group].log
-      : []
-    )
+    const externalIds = (Array.isArray(($groupChats.get()[group] || {}).log) ? $groupChats.get()[group].log : [])
       .filter(entry => entry?.external && groupThreadOf(entry) === thread && entry?.id)
       .map(entry => String(entry.id))
 
@@ -1197,7 +1191,10 @@ export function sendToGroupChat(
   const hosted = groupChatHostedGateway(roomBeforeSend)
   const connectionName = hostedConnectionName(roomBeforeSend)
   const externalId = String(options.entryId || '').trim()
-  const userName = String(options.userName || 'You').trim().slice(0, 128) || 'You'
+  const userName =
+    String(options.userName || 'You')
+      .trim()
+      .slice(0, 128) || 'You'
 
   if ((!trimmed && !attached.length) || !members.length) {
     return null
@@ -1227,7 +1224,9 @@ export function sendToGroupChat(
   const target = thread || mintGroupThreadId()
 
   if (externalId) {
-    const existing = (Array.isArray(roomBeforeSend?.log) ? roomBeforeSend.log : []).find(entry => entry?.id === externalId)
+    const existing = (Array.isArray(roomBeforeSend?.log) ? roomBeforeSend.log : []).find(
+      entry => entry?.id === externalId
+    )
 
     if (existing) {
       const existingThread = existing.thread || 'legacy'

@@ -338,7 +338,7 @@ export function groupChatSyncSnapshot(
         ? {
             thread: String(entry.thread).slice(0, 128)
           }
-        : {}),
+        : {})
     }))
 
     const compact: GroupChatSyncRoom = {
@@ -1025,7 +1025,9 @@ export function durableGroupChatRooms(all: Record<string, GroupChat> = $groupCha
       desktopCoordinatorId:
         typeof room.desktopCoordinatorId === 'string' && room.desktopCoordinatorId ? room.desktopCoordinatorId : null,
       desktopAuthorityToken:
-        typeof room.desktopAuthorityToken === 'string' && room.desktopAuthorityToken ? room.desktopAuthorityToken : null,
+        typeof room.desktopAuthorityToken === 'string' && room.desktopAuthorityToken
+          ? room.desktopAuthorityToken
+          : null,
       desktopCommandSettled: boundedDesktopCommandSettled(room.desktopCommandSettled),
       hosted: groupChatHostedGateway(room) || null,
       hostedEpoch: groupChatHostedEpoch(room) || null,
@@ -1634,7 +1636,9 @@ export function updateGroupChat(
         desktopCoordinatorId:
           typeof room.desktopCoordinatorId === 'string' && room.desktopCoordinatorId ? room.desktopCoordinatorId : null,
         desktopAuthorityToken:
-          typeof room.desktopAuthorityToken === 'string' && room.desktopAuthorityToken ? room.desktopAuthorityToken : null,
+          typeof room.desktopAuthorityToken === 'string' && room.desktopAuthorityToken
+            ? room.desktopAuthorityToken
+            : null,
         desktopCommandSettled: boundedDesktopCommandSettled(room.desktopCommandSettled),
         hosted: groupChatHostedGateway(room) || null,
         hostedEpoch: groupChatHostedEpoch(room) || null,

@@ -137,12 +137,15 @@ def test_active_worker_applies_retry_queued_by_another_process(
     if mode == "lease_takeover":
         with pytest.raises(driver.StaleLeaseError):
             service.runtime._process_room(service.bindings()[0])
-        assert len(
-            hosted_room_controls.load_pending_control_retries(
-                db,
-                room_id="room-1",
+        assert (
+            len(
+                hosted_room_controls.load_pending_control_retries(
+                    db,
+                    room_id="room-1",
+                )
             )
-        ) == 1
+            == 1
+        )
         service.runtime.process_generation = "takeover-worker"
         service.runtime._leases.clear()
         service.runtime._process_room(service.bindings()[0])
@@ -159,9 +162,7 @@ def test_active_worker_applies_retry_queued_by_another_process(
     )
     assert completed.result == {"action": "retry", "processed": 1}
     assert driver.get_task(db, task["identity"])["status"] == (
-        "cancelled"
-        if mode in {"stopped", "already_cancelled"}
-        else "settled"
+        "cancelled" if mode in {"stopped", "already_cancelled"} else "settled"
     )
     if mode not in {"stopped", "already_cancelled"}:
         assert driver.retry_receipt_exists(
@@ -175,8 +176,7 @@ def test_active_worker_applies_retry_queued_by_another_process(
         )
     if mode in {"stopped", "already_cancelled"}:
         assert not any(
-            event["kind"] == "message.member"
-            for event in service._events("room-1")
+            event["kind"] == "message.member" for event in service._events("room-1")
         )
 
 
@@ -283,9 +283,10 @@ def test_worker_retry_redelivery_does_not_requeue_a_later_generation(
         retry_id=retry_id,
     )
     assert driver.get_task(db, task["identity"])["status"] == "queued"
-    assert len(
-        hosted_room_controls.load_pending_control_retries(db, room_id="room-1")
-    ) == 1
+    assert (
+        len(hosted_room_controls.load_pending_control_retries(db, room_id="room-1"))
+        == 1
+    )
 
     second_attempt = driver.start_task(
         db,
@@ -319,7 +320,10 @@ def test_worker_retry_redelivery_does_not_requeue_a_later_generation(
     service._apply_pending_control_retries(service.bindings()[0], next_lease)
 
     assert driver.get_task(db, task["identity"])["status"] == "deferred"
-    assert hosted_room_controls.load_pending_control_retries(
-        db,
-        room_id="room-1",
-    ) == ()
+    assert (
+        hosted_room_controls.load_pending_control_retries(
+            db,
+            room_id="room-1",
+        )
+        == ()
+    )

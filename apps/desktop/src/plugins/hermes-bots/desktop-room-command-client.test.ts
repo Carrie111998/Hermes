@@ -1,10 +1,6 @@
 import { describe, expect, it, vi } from 'vitest'
 
-import {
-  desktopRoomDescriptors,
-  desktopRoomIdentity,
-  runDesktopRoomCommandCycle
-} from './desktop-room-command-client'
+import { desktopRoomDescriptors, desktopRoomIdentity, runDesktopRoomCommandCycle } from './desktop-room-command-client'
 import type { GroupChat, ProfileRoute } from './types'
 
 const route = (connectionId: string): ProfileRoute => ({

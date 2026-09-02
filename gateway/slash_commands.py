@@ -34,6 +34,7 @@ from agent.i18n import t
 from agent.turn_context import extract_api_content_sidecar
 from gateway.config import HomeChannel, Platform, PlatformConfig, persist_home_channel
 from gateway.group_chat_slash import GroupChatSlashCommandsMixin
+from gateway.slash_dispatch import GatewaySlashDispatchMixin
 from gateway.platforms.base import EphemeralReply, MessageEvent, MessageType
 from gateway.session import (
     AsyncSessionStore,
@@ -123,7 +124,10 @@ def _home_thread_from_source(source) -> Optional[str]:
     return str(thread_id)
 
 
-class GatewaySlashCommandsMixin(GroupChatSlashCommandsMixin):
+class GatewaySlashCommandsMixin(
+    GroupChatSlashCommandsMixin,
+    GatewaySlashDispatchMixin,
+):
     """In-session slash-command handlers for GatewayRunner."""
 
     async_session_store: AsyncSessionStore
@@ -3884,47 +3888,6 @@ class GatewaySlashCommandsMixin(GroupChatSlashCommandsMixin):
             ]
         )
         return choices
-
-    async def _try_send_choice_picker(
-        self,
-        event: MessageEvent,
-        session_key: str,
-        title: str,
-        choices: list,
-        on_choice_selected,
-    ) -> bool:
-        """Send an interactive choice picker when the platform supports it.
-
-        Mirrors the `/model` picker gate: the capability is detected on the
-        adapter *type* (``send_choice_picker``), and a failed send falls back
-        to the text path (returns False) instead of erroring the command.
-        """
-        adapter = getattr(self, "_adapter_for_source")(event.source)
-        has_picker = (
-            adapter is not None
-            and getattr(type(adapter), "send_choice_picker", None) is not None
-        )
-        if not has_picker:
-            return False
-        try:
-            metadata = dict(self._thread_metadata_for_source(
-                event.source, self._reply_anchor_for_event(event)
-            ) or {})
-            requester_user_id = getattr(event.source, "user_id", None)
-            if requester_user_id is not None:
-                metadata["requester_user_id"] = str(requester_user_id)
-            result = await adapter.send_choice_picker(
-                chat_id=event.source.chat_id,
-                title=title,
-                choices=choices,
-                session_key=session_key,
-                on_choice_selected=on_choice_selected,
-                metadata=metadata,
-            )
-            return bool(getattr(result, "success", False))
-        except Exception as e:
-            logger.warning("send_choice_picker failed, falling back to text: %s", e)
-            return False
 
     async def _handle_reasoning_command(self, event: MessageEvent) -> Optional[str]:
         """Handle /reasoning command — manage reasoning effort and display toggle.

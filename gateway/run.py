@@ -18501,33 +18501,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         "moa": "Agent is running — wait or /stop first, then run /moa.",
     }
 
-    def _gateway_plain_command_handlers(self):
-        """Return ordinary slash handlers shared by idle and busy dispatch."""
-        return {
-            "status": self._handle_status_command,
-            "context": self._handle_context_command,
-            "restart": self._handle_restart_command,
-            "approve": self._handle_approve_command,
-            "deny": self._handle_deny_command,
-            "pause": self._handle_pause_command,
-            "agents": self._handle_agents_command,
-            "bg": self._handle_background_command,
-            "btw": self._handle_btw_command,
-            "kanban": self._handle_kanban_command,
-            "group": self._handle_rooms_command,
-            "subgoal": self._handle_subgoal_command,
-            "heartbeat": self._handle_heartbeat_command,
-            "busy": self._handle_busy_command,
-            "yolo": self._handle_yolo_command,
-            "verbose": self._handle_verbose_command,
-            "footer": self._handle_footer_command,
-            "help": self._handle_help_command,
-            "commands": self._handle_commands_command,
-            "profile": self._handle_profile_command,
-            "update": self._handle_update_command,
-            "version": self._handle_version_command,
-        }
-
     async def _dispatch_busy_slash_command(
         self, event: MessageEvent, cmd_def, quick_key: str, source,
     ):
@@ -19882,12 +19855,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         if canonical == "personality":
             return await self._handle_personality_command(event)
-
-        if canonical == "kanban":
-            return await self._handle_kanban_command(event)
-
-        if canonical == "group":
-            return await self._handle_rooms_command(event)
 
         if canonical == "suggestions":
             return await self._handle_suggestions_command(event)

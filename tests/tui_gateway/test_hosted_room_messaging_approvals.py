@@ -118,9 +118,10 @@ def test_zero_resolution_keeps_messaging_approval_pending(tmp_path):
         )
 
     assert service.status("room-1")["pending_actions"][0]["request_id"] == "request-1"
-    assert approvals.list_pending_approvals(db, room_id="room-1")[0][
-        "request_id"
-    ] == "request-1"
+    assert (
+        approvals.list_pending_approvals(db, room_id="room-1")[0]["request_id"]
+        == "request-1"
+    )
 
 
 def test_approval_is_fenced_to_the_authority_epoch(tmp_path):
@@ -160,7 +161,9 @@ def test_approval_is_fenced_to_the_authority_epoch(tmp_path):
         event_id="authority-transfer-1",
     )
 
-    with pytest.raises(approvals.MessagingApprovalTerminalError, match="authority changed"):
+    with pytest.raises(
+        approvals.MessagingApprovalTerminalError, match="authority changed"
+    ):
         service.approve_room_task(
             "room-1",
             member_id="ops",
@@ -315,9 +318,10 @@ def test_old_epoch_empty_callback_cannot_clear_newer_approval(tmp_path):
     assert service.status("room-1")["pending_actions"][0]["request_id"] == (
         "request-new"
     )
-    assert approvals.list_pending_approvals(db, room_id="room-1")[0][
-        "request_id"
-    ] == "request-new"
+    assert (
+        approvals.list_pending_approvals(db, room_id="room-1")[0]["request_id"]
+        == "request-new"
+    )
 
 
 def test_old_process_empty_callback_cannot_clear_replacement_observation(tmp_path):
@@ -432,9 +436,10 @@ def test_old_process_empty_callback_cannot_clear_replacement_observation(tmp_pat
     assert service._pending_actions[("room-1", "ops")]["observer_generation"] == (
         "worker-new"
     )
-    assert approvals.list_pending_approvals(db, room_id="room-1")[0][
-        "observer_generation"
-    ] == "worker-new"
+    assert (
+        approvals.list_pending_approvals(db, room_id="room-1")[0]["observer_generation"]
+        == "worker-new"
+    )
 
 
 def test_new_worker_clear_retires_hydrated_old_observation(tmp_path):
@@ -617,9 +622,10 @@ def test_failed_first_persist_rolls_back_memory_and_retries(tmp_path, monkeypatc
     service._set_pending_action("room-1", "ops", action)
     assert len(calls) == 2
     assert service.status("room-1")["pending_actions"][0]["request_id"] == "request-1"
-    assert approvals.list_pending_approvals(db, room_id="room-1")[0][
-        "request_id"
-    ] == "request-1"
+    assert (
+        approvals.list_pending_approvals(db, room_id="room-1")[0]["request_id"]
+        == "request-1"
+    )
 
 
 def test_missing_room_retires_stale_approval_without_contacting_target(tmp_path):
@@ -788,12 +794,8 @@ def test_stale_local_approval_cannot_resolve_replacement_request(tmp_path):
         "session_id": "local-session",
         "approval": {"choices": ["once", "deny"]},
     }
-    service._set_pending_action(
-        "room-1", "ops", {**action, "request_id": "approval-A"}
-    )
-    service._set_pending_action(
-        "room-1", "ops", {**action, "request_id": "approval-B"}
-    )
+    service._set_pending_action("room-1", "ops", {**action, "request_id": "approval-A"})
+    service._set_pending_action("room-1", "ops", {**action, "request_id": "approval-B"})
 
     with pytest.raises(RuntimeError, match="no longer pending"):
         service.approve_room_task(

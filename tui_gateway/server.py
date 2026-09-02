@@ -140,6 +140,13 @@ except Exception:
     pass
 
 from tui_gateway.render import make_stream_renderer, render_diff, render_message
+from tui_gateway.change_signatures import (
+    cron_signature,
+    desktop_room_mailbox_signature,
+    pairing_signature,
+    platforms_signature,
+    sessions_signature,
+)
 
 _sessions: dict[str, dict] = {}
 _methods: dict[str, callable] = {}
@@ -5204,10 +5211,7 @@ def _pet_changed_payload() -> dict:
 def _cron_sig():
     """mtime of the profile's cron/jobs.json — moves on create/edit/pause/
     remove AND on scheduler tick bookkeeping (last_run/next_run)."""
-    try:
-        return (_watcher_home() / "cron" / "jobs.json").stat().st_mtime_ns
-    except OSError:
-        return None
+    return cron_signature(_watcher_home())
 
 
 def _sessions_sig():
@@ -5217,25 +5221,14 @@ def _sessions_sig():
     file is the one thing they all move (#58671). A backend serving several
     profiles owns one store per profile, so every served sibling home is
     probed too — otherwise a routed profile's Bot Chat never refreshes."""
-    sig = None
-    for root in (_watcher_home(), *_served_profile_homes):
-        for name in ("state.db", "state.db-wal"):
-            try:
-                mtime = (root / name).stat().st_mtime_ns
-            except OSError:
-                continue
-            sig = mtime if sig is None else max(sig, mtime)
-    return sig
+    return sessions_signature(_watcher_home(), _served_profile_homes)
 
 
 def _platforms_sig():
     """mtime of gateway_state.json — the messaging gateway process persists
     platform connect/disconnect/health there, so its movement is the
     "connection status changed" signal for the Messaging page."""
-    try:
-        return (_watcher_home() / "gateway_state.json").stat().st_mtime_ns
-    except OSError:
-        return None
+    return platforms_signature(_watcher_home())
 
 
 def _pairing_sig():
@@ -5247,35 +5240,7 @@ def _pairing_sig():
     for this: it tracks connect/disconnect/health, and a pairing request
     moves nothing in gateway_state.json.
     """
-    home = _watcher_home()
-    sig = None
-    # Global store (legacy `pairing/` and consolidated `platforms/pairing/`)
-    # plus every named profile's own — the Messaging page can be scoped to any
-    # of them, and a request landing in a profile store must still tick.
-    roots = [home / "pairing", home / "platforms" / "pairing"]
-    try:
-        for profile_dir in (home / "profiles").iterdir():
-            roots.append(profile_dir / "pairing")
-            roots.append(profile_dir / "platforms" / "pairing")
-    except OSError:
-        pass
-
-    for root in roots:
-        try:
-            entries = list(root.iterdir())
-        except OSError:
-            continue
-        for entry in entries:
-            # Only the pending/approved ledgers — _rate_limits.json moves on
-            # every unauthorized DM, including ones that produce no new row.
-            if not entry.name.endswith(("-pending.json", "-approved.json")):
-                continue
-            try:
-                mtime = entry.stat().st_mtime_ns
-            except OSError:
-                continue
-            sig = mtime if sig is None else max(sig, mtime)
-    return sig
+    return pairing_signature(_watcher_home())
 
 
 # Newest outbox-envelope mtime the watcher has EVER seen (monotone). A drain
@@ -5317,12 +5282,7 @@ def _bot_relay_outbox_sig():
 def _desktop_room_mailbox_sig():
     """mtime of commands written by a messaging process for Desktop rooms."""
 
-    home = _watcher_home()
-    root = home.parent.parent if home.parent.name == "profiles" else home
-    try:
-        return (root / "desktop_room_mailbox.pending").stat().st_mtime_ns
-    except OSError:
-        return None
+    return desktop_room_mailbox_signature(_watcher_home())
 
 
 # Watched change signals: event → (check interval, signature fn, payload fn).

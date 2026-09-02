@@ -106,7 +106,9 @@ def _backend() -> MessagingRoomBackend:
 
     service = get_hosted_room_service()
     return MessagingRoomBackend(
-        db_path=(service.db_path if service is not None else hosted_rooms.default_db_path()),
+        db_path=(
+            service.db_path if service is not None else hosted_rooms.default_db_path()
+        ),
         service=service,
     )
 
@@ -130,19 +132,17 @@ def _visible_events(room_id: str) -> list[dict[str, Any]]:
         actor = raw_actor if isinstance(raw_actor, Mapping) else {}
         raw_payload = event.get("payload")
         payload = raw_payload if isinstance(raw_payload, Mapping) else {}
-        visible.append(
-            {
-                "kind": event["kind"],
-                "actor": {
-                    "id": str(actor.get("id") or "")[:256],
-                    "display_name": str(actor.get("display_name") or "")[:128],
-                },
-                "payload": {
-                    "member_id": str(payload.get("member_id") or "")[:256],
-                    "text": str(payload.get("text") or "")[:MAX_CONTROL_TEXT_CHARS],
-                },
-            }
-        )
+        visible.append({
+            "kind": event["kind"],
+            "actor": {
+                "id": str(actor.get("id") or "")[:256],
+                "display_name": str(actor.get("display_name") or "")[:128],
+            },
+            "payload": {
+                "member_id": str(payload.get("member_id") or "")[:256],
+                "text": str(payload.get("text") or "")[:MAX_CONTROL_TEXT_CHARS],
+            },
+        })
     return visible[-MAX_CONTROL_EVENTS:]
 
 
@@ -155,13 +155,11 @@ def _summary(room: Mapping[str, Any], backend: MessagingRoomBackend) -> dict[str
     for raw_member in list(room.get("members") or []):
         if not isinstance(raw_member, Mapping):
             continue
-        members.append(
-            {
-                "member_id": str(raw_member.get("member_id") or "")[:256],
-                "handle": str(raw_member.get("handle") or "")[:128],
-                "display_name": str(raw_member.get("display_name") or "")[:128],
-            }
-        )
+        members.append({
+            "member_id": str(raw_member.get("member_id") or "")[:256],
+            "handle": str(raw_member.get("handle") or "")[:128],
+            "display_name": str(raw_member.get("display_name") or "")[:128],
+        })
     return {
         "room": {
             "room_id": room_id,
