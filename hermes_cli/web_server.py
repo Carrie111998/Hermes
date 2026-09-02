@@ -15494,6 +15494,12 @@ def _config_profile_scope(profile: Optional[str]):
 
 
 app.include_router(_skills_routes.router)
+
+# Skill evolution dashboard — outcome telemetry + reflection queue
+from hermes_cli.web_routers import skill_evolution as _skill_evolution_routes  # noqa: E402
+
+app.include_router(_skill_evolution_routes.router)
+
 from hermes_cli.web_routers.skills import (  # noqa: E402,F401 — legacy re-exports; tests call these via web_server.<name>
     get_skills,
     toggle_skill,

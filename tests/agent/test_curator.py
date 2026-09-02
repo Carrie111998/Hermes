@@ -278,8 +278,8 @@ def test_unresolvable_reference_is_kept_verbatim(curator_env, tmp_path, monkeypa
     }
 
 
-def test_unreferenced_skill_is_still_archived(curator_env, monkeypatch):
-    """Guard against over-protecting: a skill no job mentions still ages out."""
+def test_unreferenced_skill_without_outcome_is_staled_not_archived(curator_env, monkeypatch):
+    """No cron protection does not turn missing outcome evidence into archive proof."""
     c = curator_env["curator"]
     u = curator_env["usage"]
     skills_dir = curator_env["home"] / "skills"
@@ -293,7 +293,8 @@ def test_unreferenced_skill_is_still_archived(curator_env, monkeypatch):
 
     usage = u.load_usage()
     assert usage["quarterly-report"]["state"] == u.STATE_ACTIVE
-    assert usage["orphan"]["state"] == u.STATE_ARCHIVED
+    assert usage["orphan"]["state"] == u.STATE_STALE
+    assert (skills_dir / "orphan" / "SKILL.md").exists()
 
 
 
@@ -527,6 +528,17 @@ def test_curator_does_not_instruct_model_to_pin():
 
 
 
+
+
+def test_curator_has_no_archive_quota_and_requires_evidence():
+    from agent.curator import CURATOR_REVIEW_PROMPT
+
+    prompt = CURATOR_REVIEW_PROMPT.lower()
+    assert "fewer than 10 archives" not in prompt
+    assert "never target an archive count" in prompt
+    assert "zero archives is a valid result" in prompt
+    assert "missing outcome" in prompt
+    assert "low utility alone is also not permission to archive" in prompt
 
 
 def test_review_prompt_tells_reviewer_to_read_before_writing(curator_env, monkeypatch):

@@ -369,6 +369,18 @@ def apply_automatic_transitions(now: Optional[datetime] = None) -> Dict[str, int
             continue
 
         if anchor <= archive_cutoff and current != _u.STATE_ARCHIVED:
+            # Absence of use is not outcome evidence. A skill that has never
+            # been tried, or only has unknown outcomes, stays stale so routing
+            # and servicing can gather evidence before any archive decision.
+            known_outcomes = int(row.get("success_count", 0) or 0) + int(
+                row.get("failure_count", 0) or 0
+            )
+            if known_outcomes == 0:
+                if current == _u.STATE_ACTIVE:
+                    _u.set_state(name, _u.STATE_STALE)
+                    counts["marked_stale"] += 1
+                continue
+
             # Tag the ledger entry with the curator actor: this archive is an
             # autonomous curator transition, not a foreground agent/user call.
             try:
@@ -461,14 +473,12 @@ CURATOR_REVIEW_PROMPT = (
     "run. You MAY still consolidate it into an umbrella — but only because "
     "the curator rewrites cron job skill references to follow consolidations; "
     "never simply prune it.\n"
-    "4. DO NOT use usage counters as a reason to skip consolidation. The "
-    "counters are new and often mostly zero. Judge overlap on CONTENT, "
-    "not on use_count. 'use=0' is not evidence a skill is valuable; it's "
-    "absence of evidence either way. Corollary: 'use=0' is ALSO not a "
-    "reason to PRUNE a skill. Never archive a never-used skill (use=0) "
-    "unless it is at least 30 days old (check last_activity / created date) "
-    "AND its content is genuinely obsolete or fully absorbed elsewhere — a "
-    "recently-created skill simply may not have had its trigger come up yet.\n"
+    "4. Usage counters are discovery evidence, not quality evidence. Judge "
+    "overlap on CONTENT and preserve every unique instruction, support file, "
+    "and trigger. A zero use count or missing outcome means the skill may not "
+    "have been surfaced yet; it is never enough evidence to prune or absorb "
+    "that skill. Known outcomes may inform review, but low utility alone is "
+    "also not permission to archive: diagnose and propose a repair first.\n"
     "5. DO NOT reject consolidation on the grounds that 'each skill has "
     "a distinct trigger'. Pairwise distinctness is the wrong bar. The "
     "right bar is: 'would a human maintainer write this as N separate "
@@ -567,10 +577,9 @@ CURATOR_REVIEW_PROMPT = (
     "discoverability. 'This is narrow but distinct from its siblings' "
     "is NOT a reason to keep — it's a reason to move it under an "
     "umbrella as a subsection or support file.\n\n"
-    "Expected output: real umbrella-ification. Process every obvious "
-    "cluster. If you end the pass with fewer than 10 archives, you "
-    "stopped too early — go back and look at the clusters you left "
-    "alone.\n\n"
+    "Expected output: evidence-backed umbrella-ification. Process every "
+    "obvious cluster, but never target an archive count. Zero archives is a "
+    "valid result when the evidence does not justify a safe consolidation.\n\n"
     "When done, write a human summary AND a structured machine-readable "
     "block so downstream tooling can distinguish consolidation from "
     "pruning. Format EXACTLY:\n\n"

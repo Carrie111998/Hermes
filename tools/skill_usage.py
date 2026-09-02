@@ -1396,3 +1396,207 @@ def usage_report() -> List[Dict[str, Any]]:
         row["activity_count"] = activity_count(row)
         rows.append(row)
     return sorted(rows, key=lambda r: r["name"])
+
+
+# ===========================================================================
+# Skill outcome telemetry + utility scoring (2026-08)
+#
+# Extends the sidecar telemetry with an *effectiveness* signal — not just
+# "how often was this skill used" (use_count) but "how well did it work"
+# (success/failure outcomes). The derived utility score feeds:
+#   1. Retrieval re-ranking  — prefer skills with enough known outcomes over
+#      alternatives that only matched textually. This is global per-skill
+#      utility, not task-type attribution: no raw task text is stored.
+#   2. Curator evidence      — archive/consolidate decisions backed by
+#      effectiveness data instead of activity counts alone.
+#   3. Reflection loop       — failure-heavy skills become candidates for
+#      trace-driven improvement (skill_reflection.py).
+#
+# Design notes (mirroring the module's existing conventions):
+#   - Sidecar JSON, atomic writes via _usage_file_lock / save_usage.
+#   - Best-effort: a broken sidecar never breaks the caller.
+#   - Outcome records live in .usage.json under record["outcomes"] with a
+#     bounded per-skill ring buffer so the file cannot grow unboundedly.
+# ===========================================================================
+
+OUTCOME_SUCCESS = "success"
+OUTCOME_FAILURE = "failure"
+OUTCOME_UNKNOWN = "unknown"
+_VALID_OUTCOMES = {OUTCOME_SUCCESS, OUTCOME_FAILURE, OUTCOME_UNKNOWN}
+
+# Bounded outcome history per skill (newest first). Keeps .usage.json small
+# while retaining enough samples for a meaningful moving estimate.
+_MAX_OUTCOME_HISTORY = 50
+
+# Utility EMA smoothing — recent outcomes matter more than ancient ones.
+_UTILITY_ALPHA = 0.3
+
+# Confidence floor: with fewer than this many outcomes, the utility score is
+# treated as "no signal" (None) so retrieval does not over-trust sparse data.
+_UTILITY_MIN_SAMPLES = 3
+
+
+def _empty_outcome_record() -> Dict[str, Any]:
+    return {
+        "success_count": 0,
+        "failure_count": 0,
+        "unknown_count": 0,
+        "outcomes": [],  # ring buffer, newest first: [{"ts","outcome","task_id?","error_type?"}]
+        "utility_score": None,
+        "last_outcome_at": None,
+    }
+
+
+def _backfill_outcome_keys(rec: Dict[str, Any]) -> Dict[str, Any]:
+    """Ensure every record carries the outcome/utility keys (old files)."""
+    base = _empty_outcome_record()
+    for k, v in base.items():
+        rec.setdefault(k, v)
+    # Defensive: outcome ring buffer must be a list of dicts
+    if not isinstance(rec.get("outcomes"), list):
+        rec["outcomes"] = []
+    rec["outcomes"] = [o for o in rec["outcomes"] if isinstance(o, dict)][:_MAX_OUTCOME_HISTORY]
+    return rec
+
+
+def _compute_utility(rec: Dict[str, Any]) -> Optional[float]:
+    """Compute the EMA utility score from the outcome ring buffer.
+
+    Returns None when there is not enough signal yet (< _UTILITY_MIN_SAMPLES
+    outcomes) — callers should treat None as "no preference" rather than a
+    neutral 0.5, so sparse data never distorts retrieval ranking.
+    """
+    outcomes = rec.get("outcomes") or []
+    scored = [o.get("outcome") for o in outcomes if o.get("outcome") in _VALID_OUTCOMES]
+    scored = [o for o in scored if o != OUTCOME_UNKNOWN]
+    if len(scored) < _UTILITY_MIN_SAMPLES:
+        return None
+    # Newest first → iterate reversed for chronological EMA
+    score = 0.5
+    for outcome in reversed(scored):
+        target = 1.0 if outcome == OUTCOME_SUCCESS else 0.0
+        score = (1 - _UTILITY_ALPHA) * score + _UTILITY_ALPHA * target
+    return round(score, 4)
+
+
+def _recompute_utility(rec: Dict[str, Any]) -> None:
+    """Recompute and store utility_score + counters from the ring buffer."""
+    outcomes = rec.get("outcomes") or []
+    success_count = sum(1 for o in outcomes if o.get("outcome") == OUTCOME_SUCCESS)
+    failure_count = sum(1 for o in outcomes if o.get("outcome") == OUTCOME_FAILURE)
+    unknown_count = sum(1 for o in outcomes if o.get("outcome") == OUTCOME_UNKNOWN)
+    rec["success_count"] = success_count
+    rec["failure_count"] = failure_count
+    rec["unknown_count"] = unknown_count
+    rec["utility_score"] = _compute_utility(rec)
+
+
+def record_outcome(
+    skill_name: str,
+    outcome: str,
+    *,
+    task_id: Optional[str] = None,
+    error_type: Optional[str] = None,
+) -> Optional[float]:
+    """Record one task outcome for *skill_name* and return the updated utility.
+
+    ``outcome`` must be one of "success" | "failure" | "unknown". The ring
+    buffer is bounded to ``_MAX_OUTCOME_HISTORY`` entries (newest first).
+    Returns the recomputed utility score (None when below the confidence
+    floor). Best-effort: returns None on any storage failure.
+    """
+    if outcome not in _VALID_OUTCOMES:
+        logger.debug("record_outcome: invalid outcome %r", outcome)
+        return None
+    if not skill_name:
+        return None
+
+    entry: Dict[str, Any] = {"ts": _now_iso(), "outcome": outcome}
+    if task_id:
+        entry["task_id"] = str(task_id)
+    if error_type:
+        entry["error_type"] = str(error_type)
+
+    def _apply(rec: Dict[str, Any]) -> Dict[str, Any]:
+        rec = _backfill_outcome_keys(rec)
+        rec["outcomes"].insert(0, entry)
+        rec["outcomes"] = rec["outcomes"][:_MAX_OUTCOME_HISTORY]
+        rec["last_outcome_at"] = _now_iso()
+        _recompute_utility(rec)
+        return {"utility_score": rec.get("utility_score")}
+
+    result = _mutate(skill_name, _apply)
+    if isinstance(result, dict):
+        return result.get("utility_score")
+    return None
+
+
+def get_utility_score(skill_name: str) -> Optional[float]:
+    """Return the current utility score for *skill_name* (None = no signal)."""
+    rec = get_record(skill_name)
+    rec = _backfill_outcome_keys(rec)
+    return rec.get("utility_score")
+
+
+def get_outcome_summary(skill_name: str) -> Dict[str, Any]:
+    """Return the outcome summary dict for *skill_name* (never raises)."""
+    rec = get_record(skill_name)
+    rec = _backfill_outcome_keys(rec)
+    return {
+        "skill": skill_name,
+        "success_count": rec.get("success_count", 0),
+        "failure_count": rec.get("failure_count", 0),
+        "unknown_count": rec.get("unknown_count", 0),
+        "utility_score": rec.get("utility_score"),
+        "last_outcome_at": rec.get("last_outcome_at"),
+        "outcomes": rec.get("outcomes", []),
+    }
+
+
+def list_low_utility_skills(min_samples: int = _UTILITY_MIN_SAMPLES, max_score: float = 0.4) -> List[Dict[str, Any]]:
+    """Return skills with poor effectiveness — candidates for the reflection loop.
+
+    A skill qualifies when it has at least *min_samples* scored outcomes and
+    its utility score is at or below *max_score* (i.e. it fails more than it
+    succeeds). Used by the failure-driven skill-reflection pass to choose
+    which skills deserve a trace-driven improvement proposal.
+    """
+    data = load_usage()
+    rows: List[Dict[str, Any]] = []
+    for name, raw in data.items():
+        if not isinstance(raw, dict):
+            continue
+        rec = _backfill_outcome_keys(raw)
+        score = rec.get("utility_score")
+        if score is None:
+            continue
+        if score <= max_score:
+            rows.append(
+                {
+                    "skill": str(name),
+                    "utility_score": score,
+                    "success_count": rec.get("success_count", 0),
+                    "failure_count": rec.get("failure_count", 0),
+                    "last_outcome_at": rec.get("last_outcome_at"),
+                }
+            )
+    return sorted(rows, key=lambda r: r["utility_score"])
+
+
+def utility_rerank(skill_names: List[str]) -> List[str]:
+    """Re-rank retrieved skill names by global per-skill utility.
+
+    Skills with a utility signal (score is not None) are preferred, ordered
+    best-first; skills with no signal keep their original relative order and
+    sort after the scored ones. Outcome records deliberately omit raw task
+    text, so this is not task-type-specific attribution.
+    """
+    if not skill_names:
+        return skill_names
+    scored: List[tuple[Optional[float], int, str]] = []
+    for i, name in enumerate(skill_names):
+        score = get_utility_score(name)
+        scored.append((score, i, name))
+    # None scores sort last; ties broken by original index (stable)
+    scored.sort(key=lambda t: (t[0] is None, -(t[0] or 0.0), t[1]))
+    return [name for _, _, name in scored]

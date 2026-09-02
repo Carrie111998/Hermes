@@ -2320,6 +2320,14 @@ DEFAULT_CONFIG = {
         # before the agent sees it.  Lets skill authors reference bundled
         # scripts without the agent having to join paths.
         "template_vars": True,
+        # Optional settings for the richer background SkillRetriever. The
+        # default skills_list(query=...) path remains deterministic BM25 and
+        # does not require sentence-transformers or a model download.
+        "retrieval": {
+            "enabled": True,
+            "top_k": 5,
+            "embedding_model": "shibing624/text2vec-base-chinese-paraphrase",
+        },
         # Pre-execute inline shell snippets written as !`cmd` in SKILL.md
         # body.  Their stdout is inlined into the skill message before the
         # agent reads it, so skills can inject dynamic context (dates, git

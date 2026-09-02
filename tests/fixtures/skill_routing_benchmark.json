@@ -1,0 +1,228 @@
+{
+  "schema_version": 1,
+  "description": "Synthetic public-safe skill routing benchmark with hard negatives.",
+  "skills": [
+    {
+      "qualified_name": "research/grounded-citations",
+      "name": "grounded-citations",
+      "category": "research",
+      "description": "Ground answers in cited verifiable sources.",
+      "triggers": ["verify claims and citations", "trace evidence to primary sources"],
+      "tags": ["citations", "provenance"],
+      "related_skills": ["research-source-intelligence"],
+      "required_commands": [],
+      "required_environment_variables": []
+    },
+    {
+      "qualified_name": "research/research-source-intelligence",
+      "name": "research-source-intelligence",
+      "category": "research",
+      "description": "Source-grounded web research and synthesis.",
+      "triggers": ["research a topic across authoritative sources"],
+      "tags": ["research", "sources"],
+      "related_skills": ["grounded-citations"],
+      "required_commands": [],
+      "required_environment_variables": []
+    },
+    {
+      "qualified_name": "research/generic-research-notes",
+      "name": "generic-research-notes",
+      "category": "research",
+      "description": "Verify claims citations citations evidence primary sources and citations for broad research notes.",
+      "triggers": ["organize generic notes"],
+      "tags": ["notes"],
+      "related_skills": [],
+      "required_commands": [],
+      "required_environment_variables": []
+    },
+    {
+      "qualified_name": "github/github-pr-workflow",
+      "name": "github-pr-workflow",
+      "category": "github",
+      "description": "Manage the GitHub pull request lifecycle.",
+      "triggers": ["open a pull request and monitor CI", "merge a reviewed branch"],
+      "tags": ["github", "pull-request", "ci"],
+      "related_skills": ["requesting-code-review"],
+      "required_commands": ["gh", "git"],
+      "required_environment_variables": []
+    },
+    {
+      "qualified_name": "github/release-notes-helper",
+      "name": "release-notes-helper",
+      "category": "github",
+      "description": "Open pull request pull request and monitor CI checks before merge for release notes.",
+      "triggers": ["draft release notes"],
+      "tags": ["writing"],
+      "related_skills": [],
+      "required_commands": [],
+      "required_environment_variables": []
+    },
+    {
+      "qualified_name": "devops/hermes-gateway-operations",
+      "name": "hermes-gateway-operations",
+      "category": "devops",
+      "description": "Operate and troubleshoot Hermes messaging gateway channels.",
+      "triggers": ["restart WhatsApp gateway and prove channel health", "repair Telegram gateway"],
+      "tags": ["gateway", "whatsapp", "telegram"],
+      "related_skills": ["hermes-agent"],
+      "required_commands": ["systemctl"],
+      "required_environment_variables": []
+    },
+    {
+      "qualified_name": "devops/service-status-report",
+      "name": "service-status-report",
+      "category": "devops",
+      "description": "Restart WhatsApp gateway gateway channel health status and Telegram gateway reporting.",
+      "triggers": ["write a service status summary"],
+      "tags": ["report"],
+      "related_skills": [],
+      "required_commands": [],
+      "required_environment_variables": []
+    },
+    {
+      "qualified_name": "software-development/beads-work-ledger",
+      "name": "beads-work-ledger",
+      "category": "software-development",
+      "description": "Durable work tracking for nontrivial development.",
+      "triggers": ["track nontrivial development work", "record durable implementation status"],
+      "tags": ["beads", "ledger"],
+      "related_skills": ["beads-kanban-workflow"],
+      "required_commands": ["bd"],
+      "required_environment_variables": []
+    },
+    {
+      "qualified_name": "productivity/daily-task-manager",
+      "name": "daily-task-manager",
+      "category": "productivity",
+      "description": "Track nontrivial development work and record durable implementation status in daily task notes.",
+      "triggers": ["manage today's tasks"],
+      "tags": ["tasks"],
+      "related_skills": [],
+      "required_commands": [],
+      "required_environment_variables": []
+    },
+    {
+      "qualified_name": "quality-engineering/mr-tester-handoff",
+      "name": "mr-tester-handoff",
+      "category": "quality-engineering",
+      "description": "Route substantive testing judgment to the named QA profile.",
+      "triggers": ["independent release QA", "adversarial verification and test design"],
+      "tags": ["testing", "qa", "review"],
+      "related_skills": ["source-bound-release-gates"],
+      "required_commands": [],
+      "required_environment_variables": []
+    },
+    {
+      "qualified_name": "writing/release-summary",
+      "name": "release-summary",
+      "category": "writing",
+      "description": "Independent release QA testing review adversarial verification and test design summary.",
+      "triggers": ["write a release summary"],
+      "tags": ["writing"],
+      "related_skills": [],
+      "required_commands": [],
+      "required_environment_variables": []
+    },
+    {
+      "qualified_name": "productivity/maps",
+      "name": "maps",
+      "category": "productivity",
+      "description": "Geocode places and find nearby points of interest.",
+      "triggers": ["find a nearby restaurant", "calculate a route"],
+      "tags": ["maps", "nearby", "route"],
+      "related_skills": [],
+      "required_commands": [],
+      "required_environment_variables": []
+    },
+    {
+      "qualified_name": "leisure/travel-itinerary-planning",
+      "name": "travel-itinerary-planning",
+      "category": "leisure",
+      "description": "Find a nearby restaurant restaurant and calculate a route while planning a trip.",
+      "triggers": ["fit activities into a trip"],
+      "tags": ["travel"],
+      "related_skills": [],
+      "required_commands": [],
+      "required_environment_variables": []
+    },
+    {
+      "qualified_name": "productivity/product-price-monitor",
+      "name": "product-price-monitor",
+      "category": "productivity",
+      "description": "Watch listings and alert on a target price.",
+      "triggers": ["alert when a product price drops", "monitor a listing price"],
+      "tags": ["price", "monitor", "alert"],
+      "related_skills": [],
+      "required_commands": [],
+      "required_environment_variables": []
+    },
+    {
+      "qualified_name": "productivity/shop",
+      "name": "shop",
+      "category": "productivity",
+      "description": "Alert when product price drops and monitor listing price while searching products.",
+      "triggers": ["search a product catalog"],
+      "tags": ["shopping"],
+      "related_skills": [],
+      "required_commands": [],
+      "required_environment_variables": []
+    },
+    {
+      "qualified_name": "media/youtube-content",
+      "name": "youtube-content",
+      "category": "media",
+      "description": "Turn YouTube transcripts into summaries and articles.",
+      "triggers": ["summarize a YouTube transcript", "extract a video transcript"],
+      "tags": ["youtube", "transcript"],
+      "related_skills": [],
+      "required_commands": [],
+      "required_environment_variables": []
+    },
+    {
+      "qualified_name": "writing/blog-post-editing",
+      "name": "blog-post-editing",
+      "category": "writing",
+      "description": "Summarize YouTube transcript transcript content into an article and edit the draft.",
+      "triggers": ["edit a technical blog post"],
+      "tags": ["writing"],
+      "related_skills": [],
+      "required_commands": [],
+      "required_environment_variables": []
+    },
+    {
+      "qualified_name": "mcp/skill-surface-mining",
+      "name": "skill-surface-mining",
+      "category": "mcp",
+      "description": "Mine source trees for recurring workflows suitable for skills.",
+      "triggers": ["mine a codebase for reusable skill workflows"],
+      "tags": ["skills", "source", "mining"],
+      "related_skills": ["hermes-agent-skill-authoring"],
+      "required_commands": [],
+      "required_environment_variables": []
+    },
+    {
+      "qualified_name": "github/codebase-inspection",
+      "name": "codebase-inspection",
+      "category": "github",
+      "description": "Mine a codebase source tree for reusable skill workflows and inspect language statistics.",
+      "triggers": ["count lines of code"],
+      "tags": ["codebase"],
+      "related_skills": [],
+      "required_commands": [],
+      "required_environment_variables": []
+    }
+  ],
+  "queries": [
+    {"query": "verify claims and citations against primary sources", "relevant": ["grounded-citations"]},
+    {"query": "open a pull request and monitor CI", "relevant": ["github-pr-workflow"]},
+    {"query": "restart WhatsApp gateway and prove channel health", "relevant": ["hermes-gateway-operations"]},
+    {"query": "track nontrivial development work in a durable ledger", "relevant": ["beads-work-ledger"]},
+    {"query": "independent release QA and adversarial test design", "relevant": ["mr-tester-handoff"]},
+    {"query": "find a nearby restaurant and calculate a route", "relevant": ["maps"]},
+    {"query": "alert when a product price drops", "relevant": ["product-price-monitor"]},
+    {"query": "summarize a YouTube transcript", "relevant": ["youtube-content"]},
+    {"query": "mine a codebase for reusable skill workflows", "relevant": ["skill-surface-mining"]},
+    {"query": "github-pr-workflow", "relevant": ["github-pr-workflow"]},
+    {"query": "completely unmatched quantum orchard phrase", "relevant": []}
+  ]
+}
