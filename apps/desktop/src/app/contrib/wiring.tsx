@@ -541,11 +541,11 @@ export function ContribWiring({ children }: { children: ReactNode }) {
     }
 
     lastGatewayScopeRef.current = gatewayScope
-    // Force: the new source/profile pair has its own defaults, so reseed the
-    // selector even if the composer already shows values from the previous
-    // backend. These refreshes carry intent tokens so an in-flight picker
-    // click still wins.
-    void refreshCurrentModel(true)
+    // The connection activation seam has already re-scoped the persisted
+    // composer selection to this exact source/profile owner. Preserve a manual
+    // pick from that scope; an empty or default-derived selection still seeds
+    // from the new profile default.
+    void refreshCurrentModel()
     void refreshHermesConfig(true)
     void refreshActiveProfile()
     resetProjectTreeState()
