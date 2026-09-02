@@ -120,6 +120,9 @@ COMMON_LOCAL_BIN_DIRS = ("/opt/homebrew/bin", "/usr/local/bin")
 GROQ_BASE_URL = os.getenv("GROQ_BASE_URL", "https://api.groq.com/openai/v1")
 OPENAI_BASE_URL = os.getenv("STT_OPENAI_BASE_URL", "https://api.openai.com/v1")
 XAI_STT_BASE_URL = os.getenv("XAI_STT_BASE_URL", "https://api.x.ai/v1")
+# Empty by default: unset, the mistralai SDK keeps its own endpoint, so an
+# absent override behaves exactly as before.
+MISTRAL_STT_BASE_URL = os.getenv("STT_MISTRAL_BASE_URL", "")
 ELEVENLABS_STT_BASE_URL = os.getenv("ELEVENLABS_STT_BASE_URL", "https://api.elevenlabs.io/v1")
 # DeepInfra STT base URL now resolved via hermes_cli.models.deepinfra_base_url (shared).
 
@@ -2391,6 +2394,17 @@ def _transcribe_mistral(
     if not api_key:
         return {"success": False, "transcript": "", "error": "MISTRAL_API_KEY not set"}
 
+    # Endpoint parity with every other STT provider and with tts.mistral: the
+    # Mistral SDK calls it server_url. Left unset the SDK keeps its own
+    # default, so this changes nothing for an install that does not configure
+    # it.
+    mistral_config = _load_stt_config().get("mistral") or {}
+    base_url = str(
+        mistral_config.get("base_url")
+        or get_env_value("STT_MISTRAL_BASE_URL")
+        or MISTRAL_STT_BASE_URL
+    ).strip().rstrip("/")
+
     try:
         try:
             from tools.lazy_deps import ensure as _lazy_ensure
@@ -2399,7 +2413,11 @@ def _transcribe_mistral(
             pass
         from mistralai.client import Mistral
 
-        with Mistral(api_key=api_key) as client:
+        client_kwargs: Dict[str, Any] = {"api_key": api_key}
+        if base_url:
+            client_kwargs["server_url"] = base_url
+
+        with Mistral(**client_kwargs) as client:
             with open(file_path, "rb") as audio_file:
                 complete_kwargs: Dict[str, Any] = {
                     "model": model_name,
