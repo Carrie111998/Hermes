@@ -1156,6 +1156,25 @@ def _format_interrupted_output(stdout_text: str) -> str:
     return f"{stdout_text}\n{marker}" if stdout_text else marker
 
 
+def _redact_exec_output(text: str) -> str:
+    """Redact sandbox output without losing the ENV-assignment pass.
+
+    ``execute_code`` output used ``code_file=True`` so echoed source code
+    wouldn't hit false positives, but that skip also let ``.env``-shaped
+    ``KEY=value`` dumps (produced by script logic reading credential stores,
+    not by shell command shape) pass through with their opaque values
+    verbatim — the terminal tool solves the same class by switching to
+    ``code_file=False`` for env-dump commands (#95509). The ENV pass's own
+    guards keep programmatic lookups (``KEY=os.getenv('X')``, #2852)
+    readable; the residual cost is constants with secret-shaped names
+    (``MAX_TOKENS=100`` → ``***``), which is strictly better than leaking
+    real credentials at a security boundary.
+    """
+    from agent.redact import redact_sensitive_text
+
+    return redact_sensitive_text(text, code_file=False)
+
+
 def _finish_remote_kernel_result(kernel_result: Dict[str, Any], *,
                                  timeout: int, exec_start: float) -> str:
     """Post-process a remote-kernel cell result into the tool's JSON reply.
@@ -1165,7 +1184,6 @@ def _finish_remote_kernel_result(kernel_result: Dict[str, Any], *,
     (kernel killed, state lost, next call fresh).
     """
     from tools.ansi_strip import strip_ansi
-    from agent.redact import redact_sensitive_text
 
     stdout_text = kernel_result.get("stdout", "") or ""
     stderr_text = kernel_result.get("stderr", "") or ""
@@ -1178,9 +1196,13 @@ def _finish_remote_kernel_result(kernel_result: Dict[str, Any], *,
             stdout_text + "\n--- stderr ---\n" + stderr_text + traceback_text
         )
 
-    stdout_text, stdout_metadata = _truncate_stdout_text(stdout_text)
+    # Redact before truncation so the spillover file for truncated output
+    # carries redacted text (read_file implies code_file=True, which would
+    # skip the ENV pass on spilled plaintext otherwise) — same order as the
+    # per-call path.
     stdout_text = strip_ansi(stdout_text)
-    stdout_text = redact_sensitive_text(stdout_text, code_file=True)
+    stdout_text = _redact_exec_output(stdout_text)
+    stdout_text, stdout_metadata = _truncate_stdout_text(stdout_text)
 
     duration = round(time.monotonic() - exec_start, 2)
     result: Dict[str, Any] = {
@@ -1388,17 +1410,19 @@ def _execute_remote(
 
     # --- Post-process output (same as local path) ---
 
-    stdout_text, stdout_metadata = _truncate_stdout_text(stdout_text)
-
     # Strip ANSI escape sequences
     from tools.ansi_strip import strip_ansi
     stdout_text = strip_ansi(stdout_text)
 
-    # Redact secrets. code_file=True: execute_code output is code-execution
-    # output that often echoes source/config — skip false-positive ENV/JSON/
-    # f-string-template redaction while still masking real credentials.
-    from agent.redact import redact_sensitive_text
-    stdout_text = redact_sensitive_text(stdout_text, code_file=True)
+    # Redact secrets. _redact_exec_output keeps the ENV-assignment pass on
+    # so .env-shaped dumps printed by script logic are masked (#95509).
+    # Redaction runs before truncation so the spillover file written for
+    # truncated output carries redacted text — read_file uses file_read=True,
+    # which implies code_file=True and would skip the ENV pass on spilled
+    # plaintext otherwise.
+    stdout_text = _redact_exec_output(stdout_text)
+
+    stdout_text, stdout_metadata = _truncate_stdout_text(stdout_text)
 
     # Build response
     result: Dict[str, Any] = {
@@ -1922,14 +1946,13 @@ def execute_code(
         stderr_text = strip_ansi(stderr_text)
 
         # Redact secrets (API keys, tokens, etc.) from sandbox output.
-        # The sandbox env-var filter (lines 434-454) blocks os.environ access,
-        # but scripts can still read secrets from disk (e.g. open('~/.hermes/.env')).
+        # The sandbox env-var filter blocks os.environ access, but scripts
+        # can still read secrets from disk (e.g. open('~/.hermes/.env')).
         # This ensures leaked secrets never enter the model context.
-        # code_file=True: this is code-execution output — skip false-positive
-        # ENV/JSON/f-string-template redaction; real credentials still masked.
-        from agent.redact import redact_sensitive_text
-        stdout_text = redact_sensitive_text(stdout_text, code_file=True)
-        stderr_text = redact_sensitive_text(stderr_text, code_file=True)
+        # _redact_exec_output keeps the ENV-assignment pass on so .env-shaped
+        # dumps printed by script logic are masked (#95509).
+        stdout_text = _redact_exec_output(stdout_text)
+        stderr_text = _redact_exec_output(stderr_text)
 
         # Build response
         result: Dict[str, Any] = {

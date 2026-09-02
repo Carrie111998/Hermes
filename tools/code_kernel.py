@@ -650,10 +650,10 @@ def execute_in_session_kernel(
     host stays bounded even for owners that never toggle or reset.
     """
     from tools.code_execution_tool import (
+        _redact_exec_output,
         _sandbox_failure_hint,
         _truncate_stdout_text,
     )
-    from agent.redact import redact_sensitive_text
     from tools.ansi_strip import strip_ansi
 
     owner = _resolve_owner(task_id)
@@ -746,8 +746,12 @@ def execute_in_session_kernel(
             if stderr_raw:
                 cell_stderr = cell_stderr + stderr_raw
 
-            stdout_text = redact_sensitive_text(strip_ansi(stdout_text), code_file=True)
-            cell_stderr = redact_sensitive_text(strip_ansi(cell_stderr), code_file=True)
+            # ENV-assignment redaction stays on (#95509): cell output can
+            # carry .env-shaped dumps produced by script logic, same as the
+            # per-call path. Redaction runs before truncation so the
+            # host-side spillover file carries redacted text.
+            stdout_text = _redact_exec_output(strip_ansi(stdout_text))
+            cell_stderr = _redact_exec_output(strip_ansi(cell_stderr))
             stdout_text, stdout_metadata = _truncate_stdout_text(stdout_text)
 
             cell_status = payload.get("status", "")
@@ -768,17 +772,34 @@ def execute_in_session_kernel(
 
             # Cell-side spill (runner clipped before replying): surface the
             # full-output path with the same read_file recipe as the
-            # host-side spill in _truncate_stdout_text.
+            # host-side spill in _truncate_stdout_text. The runner writes
+            # raw stdout, so scrub the spill file in place before handing
+            # the path to the model — read_file implies code_file=True and
+            # would skip the ENV-assignment pass on spilled plaintext.
             cell_spill = str(payload.get("stdout_spill_path", "") or "")
             if cell_spill and payload.get("stdout_clipped"):
-                result["stdout_spill_path"] = cell_spill
-                result["warning"] = (
-                    "Cell stdout exceeded the inline cap; head shown. FULL "
-                    f"output saved to {cell_spill} — page it with "
-                    f'read_file(path="{cell_spill}", offset=...) instead of '
-                    "re-running. (Kernel state persists: printing a narrower "
-                    "slice next call is often cheaper.)"
-                )
+                try:
+                    with open(cell_spill, "r", encoding="utf-8",
+                              errors="replace") as f:
+                        spill_text = f.read()
+                    redacted_spill = _redact_exec_output(spill_text)
+                    tmp_spill = cell_spill + ".redacted"
+                    with open(tmp_spill, "w", encoding="utf-8") as f:
+                        f.write(redacted_spill)
+                    os.replace(tmp_spill, cell_spill)
+                except OSError:
+                    # Best-effort like the runner's own spill write: surface
+                    # the path only when it exists and is readable.
+                    cell_spill = ""
+                if cell_spill:
+                    result["stdout_spill_path"] = cell_spill
+                    result["warning"] = (
+                        "Cell stdout exceeded the inline cap; head shown. FULL "
+                        f"output saved to {cell_spill} — page it with "
+                        f'read_file(path="{cell_spill}", offset=...) instead of '
+                        "re-running. (Kernel state persists: printing a narrower "
+                        "slice next call is often cheaper.)"
+                    )
 
             if status == "timeout":
                 message = (
@@ -796,7 +817,7 @@ def execute_in_session_kernel(
                 result["output"] = _format_interrupted_output(stdout_text)
                 result["error"] = "Interrupted; the session kernel was killed and its state was lost."
             elif cell_status == "error":
-                trace = redact_sensitive_text(strip_ansi(str(payload.get("traceback", ""))), code_file=True)
+                trace = _redact_exec_output(strip_ansi(str(payload.get("traceback", ""))))
                 result["status"] = "error"
                 result["exit_code"] = 1
                 result["error"] = trace or "Cell raised an exception."

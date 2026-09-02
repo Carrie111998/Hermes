@@ -349,8 +349,12 @@ class TestSecurityInvariantsAcrossModes(unittest.TestCase):
         }):
             result = self._run(code, mode="strict")
         self.assertEqual(result["status"], "success")
-        self.assertIn("KEY=MISSING", result["output"])
-        self.assertIn("TOK=MISSING", result["output"])
+        # The env filter emits 'MISSING', but the output redaction's
+        # ENV-assignment pass may mask that sentinel itself when the key name
+        # is a secret keyword like KEY (#95509) — either form proves the real
+        # value never reached the output, which the assertNotIn checks pin.
+        self.assertRegex(result["output"], r"KEY=(?:MISSING|\*{2,})")
+        self.assertRegex(result["output"], r"TOK=(?:MISSING|\*{2,})")
         self.assertNotIn("sk-should-not-leak", result["output"])
         self.assertNotIn("ant-should-not-leak", result["output"])
 
@@ -369,8 +373,12 @@ class TestSecurityInvariantsAcrossModes(unittest.TestCase):
         }):
             result = self._run(code, mode="project")
         self.assertEqual(result["status"], "success")
-        for needle in ("KEY=MISSING", "TOK=MISSING", "SEC=MISSING"):
-            self.assertIn(needle, result["output"])
+        # Sentinel 'MISSING' may itself be masked by the output redaction's
+        # ENV pass for secret-keyword key names (#95509); the regex pins that
+        # either the sentinel or the mask actively replaced the value, and
+        # the assertNotIn checks pin the actual no-leak invariant.
+        for needle in ("KEY=", "TOK=", "SEC="):
+            self.assertRegex(result["output"], needle + r"(?:MISSING|\*{2,})")
         for leaked in ("sk-should-not-leak", "ant-should-not-leak", "ghp-should-not-leak"):
             self.assertNotIn(leaked, result["output"])
 
