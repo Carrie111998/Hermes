@@ -4886,9 +4886,16 @@ def _block(
         # session.interrupt), 0 → return immediately, > 0 → bounded wait.
         answered = ev.wait(timeout)
     finally:
+        # Extract the answer state only — leave ``_pending`` and
+        # ``_pending_prompt_payloads`` populated until AFTER the
+        # ``.expire`` notification has been emitted. ``_pending`` is the
+        # authoritative registry ``_pending_clarify_request_payload``
+        # iterates for the ``session.activate`` snapshot, so dropping it
+        # here would let a reconnecting client observe ``pending_clarify =
+        # None`` even though the corresponding ``.expire`` has not yet
+        # been delivered (and would be silently dropped by request-id
+        # correlation on the client). See issue #96173.
         with _prompt_lock:
-            _pending.pop(rid, None)
-            _pending_prompt_payloads.pop(rid, None)
             answer_present = rid in _answers
             answer = _answers.pop(rid, "")
             batch_state = _batch_clarify.pop(rid, None)
@@ -4899,18 +4906,29 @@ def _block(
         # Cancel-all (respond with no question_id) resolves via _answers with
         # an empty string — that stays a plain cancel, not a partial result.
         if answer_present:
+            # No expire to emit; safe to drop the registry entries now.
+            with _prompt_lock:
+                _pending.pop(rid, None)
+                _pending_prompt_payloads.pop(rid, None)
             return answer
         result: dict[str, object] = {"answers": batch_answers or {}}
         if not answered:
             # Deadline hit: keep whatever was locked, tell the tool the rest
             # are absences (not skips), and still fire the expire
-            # notification so live cards tear down.
+            # notification so live cards tear down. The expire is emitted
+            # BEFORE the registry pop so any concurrent session.activate
+            # either sees the snapshot AND the expire, or sees neither —
+            # never the broken pre-fix state where the snapshot was gone
+            # but the expire had not been delivered yet (issue #96173).
             result["timed_out"] = True
             _emit(
                 f"{event.removesuffix('.request')}.expire",
                 sid,
                 {"request_id": rid},
             )
+        with _prompt_lock:
+            _pending.pop(rid, None)
+            _pending_prompt_payloads.pop(rid, None)
         return json.dumps(result, ensure_ascii=False)
 
     # Emit an `.expire` notification on timeout for every blocking request type
@@ -4936,6 +4954,12 @@ def _block(
             sid,
             {"request_id": rid},
         )
+    # Registry pop happens AFTER the expire emit so concurrent readers
+    # (``_pending_clarify_request_payload`` for session.activate) observe
+    # a consistent view. See issue #96173.
+    with _prompt_lock:
+        _pending.pop(rid, None)
+        _pending_prompt_payloads.pop(rid, None)
     return answer
 
 
