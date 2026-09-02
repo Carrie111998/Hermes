@@ -173,6 +173,16 @@ _oauth_interactive_forced: "contextvars.ContextVar[bool]" = contextvars.ContextV
     "_oauth_interactive_forced", default=False
 )
 
+# Tracks server names for which the redirect handler has already opened a
+# browser during the current ``force_interactive_oauth()`` scope. Cleared on
+# scope exit. Prevents a single user-driven auth attempt from spawning
+# multiple tabs when the MCP SDK re-enters ``redirect_handler()`` (stale-token
+# retries, redirect-loop detection, parked probes waking mid-flow). Process-
+# global is fine — re-entering ``force_interactive_oauth()`` for a fresh
+# user-driven attempt is the only path that should reset it, and that path
+# snapshots/restores the set (#96320).
+_oauth_browser_opened_for_flow: set[str] = set()
+
 
 # Skip tokens accepted at the paste prompt — exit OAuth without auth.
 _SKIP_TOKENS = frozenset({"skip", "cancel", "s", "n", "no", "q", "quit"})
@@ -357,12 +367,23 @@ def force_interactive_oauth():
     — just not on stdin. Opens the browser + localhost callback flow that the
     TTY heuristic would otherwise refuse. Same ContextVar propagation story as
     suppress_interactive_oauth() (#35927).
+
+    The scope also owns the per-flow browser-open dedup set so the MCP SDK's
+    mid-flow re-entry into ``redirect_handler()`` (stale-token retries,
+    redirect-loop detection) cannot multiply tabs within one user-driven
+    attempt. A fresh ``force_interactive_oauth()`` invocation snapshots the
+    existing dedup set and restores it on exit, so back-to-back user clicks
+    (e.g. authorize, time out, click again) each get their own single-open
+    window without inheriting or losing previous dedup state (#96320).
     """
     token = _oauth_interactive_forced.set(True)
+    snapshot = set(_oauth_browser_opened_for_flow)
     try:
         yield
     finally:
         _oauth_interactive_forced.reset(token)
+        _oauth_browser_opened_for_flow.clear()
+        _oauth_browser_opened_for_flow.update(snapshot)
 
 
 @contextmanager
@@ -797,7 +818,11 @@ def _make_callback_handler() -> tuple[type, dict]:
 # ---------------------------------------------------------------------------
 
 
-def _make_redirect_handler(port: int, redirect_uri: str | None = None):
+def _make_redirect_handler(
+    port: int,
+    redirect_uri: str | None = None,
+    server_name: str | None = None,
+):
     """Return a redirect handler closure that closes over the given port.
 
     Using a closure instead of reading the module-level ``_oauth_port`` avoids
@@ -808,12 +833,27 @@ def _make_redirect_handler(port: int, redirect_uri: str | None = None):
     URL), or ``None`` for the loopback default. It tailors the remote-session
     hint: a proxied callback reaches this machine on its own, so the loopback
     SSH-tunnel guidance would be misleading.
+
+    ``server_name`` keys the per-flow browser-open dedup set
+    (``_oauth_browser_opened_for_flow``) so the MCP SDK's mid-flow re-entry
+    into ``redirect_handler()`` cannot spawn multiple tabs for one user-driven
+    ``force_interactive_oauth()`` scope. ``None`` disables dedup but still
+    honours the explicit-context gate (#96320).
     """
     async def _redirect_handler(authorization_url: str) -> None:
         """Show the authorization URL to the user.
 
-        Opens the browser automatically when possible; always prints the URL
-        as a fallback for headless/SSH/gateway environments.
+        Opens the browser ONLY when the current execution context entered
+        ``force_interactive_oauth()`` — the explicit user-driven path
+        (``hermes mcp login``, dashboard Authorize button, dashboard OAuth
+        re-auth endpoint). Reconnect attempts, background parked-self-probes,
+        and other non-interactive triggers print the URL for manual paste and
+        instruct the operator to run ``hermes mcp login <server>`` instead of
+        silently launching a browser tab. This is the #96320 browser-storm
+        guard: a desktop gateway satisfies ``_is_interactive() &&
+        _can_open_browser()`` on stdin-TTY + os.name=='nt', so a single
+        reconnect path was firing ``webbrowser.open()`` dozens of times
+        while the parked MCP server self-probed every ~5 min.
         """
         from tools.mcp_dashboard_oauth import get_dashboard_oauth_flow
 
@@ -879,10 +919,45 @@ def _make_redirect_handler(port: int, redirect_uri: str | None = None):
                 file=sys.stderr,
             )
 
+        # Browser-open gate (#96320): the URL is always printed above so an
+        # operator with a terminal can paste it manually. The browser only
+        # launches when the caller is in an explicit user-driven OAuth scope
+        # (``force_interactive_oauth()`` — entered by `hermes mcp login`,
+        # dashboard Authorize, dashboard re-auth). Reconnect / parked-self-
+        # probe paths never enter that scope and therefore never open a
+        # browser, even though they satisfy ``_is_interactive() &&
+        # _can_open_browser()`` on a Windows desktop gateway (stdin TTY +
+        # os.name == 'nt').
+        if not _oauth_interactive_forced.get():
+            server_label = server_name or "this server"
+            print(
+                f"  (Skipped auto-open: redirect handler fired outside an explicit "
+                f"`hermes mcp login {server_label}` scope. Reconnect / parked-probe "
+                f"paths must not launch a browser. Run "
+                f"`hermes mcp login {server_label}` to authorize.)\n",
+                file=sys.stderr,
+            )
+            return
+
+        # Per-flow dedup (#96320): the MCP SDK may re-enter this handler
+        # during a single user-driven auth attempt (stale-token retries,
+        # redirect-loop detection, parked probes that wake mid-flow). One
+        # ``force_interactive_oauth()`` scope opens at most one tab per
+        # server — the second re-entry prints "already opened" and returns.
+        if server_name is not None and server_name in _oauth_browser_opened_for_flow:
+            print(
+                f"  (Browser already opened for '{server_name}' in this "
+                f"flow — skipping re-entry to avoid a tab storm.)\n",
+                file=sys.stderr,
+            )
+            return
+
         if _can_open_browser():
             try:
                 opened = webbrowser.open(authorization_url)
                 if opened:
+                    if server_name is not None:
+                        _oauth_browser_opened_for_flow.add(server_name)
                     print("  (Browser opened automatically.)\n", file=sys.stderr)
                 else:
                     print("  (Could not open browser — please open the URL manually.)\n", file=sys.stderr)
@@ -1929,7 +2004,9 @@ def build_oauth_auth(
     # Use closure factories to avoid global state pollution (#44588, #34260).
     resolved_port = cfg.get("_resolved_port", _oauth_port)
     redirect_handler = _make_redirect_handler(
-        resolved_port, redirect_uri=cfg.get("redirect_uri") or None
+        resolved_port,
+        redirect_uri=cfg.get("redirect_uri") or None,
+        server_name=server_name,
     )
     callback_handler = _make_callback_waiter(
         resolved_port, cfg.get("_cimd_url"), timeout=float(cfg.get("timeout", 300))

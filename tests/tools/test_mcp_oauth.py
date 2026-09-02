@@ -1112,3 +1112,158 @@ def test_humanize_non_registration_403_passthrough():
         )
         is None
     )
+
+
+# ---------------------------------------------------------------------------
+# #96320 — Reconnect / parked-self-probe must NOT open a browser.
+#
+# Salesforce hosted MCP self-probes every ~5 min while parked. On Windows
+# every probe used to invoke webbrowser.open() because the redirect handler
+# only gated on `_is_interactive() && _can_open_browser()`, and a desktop
+# gateway session satisfies both (stdin TTY + os.name == "nt"). The fix
+# narrows the browser-opening gate to explicit user-driven flows
+# (force_interactive_oauth context), which reconnect paths never enter.
+# ---------------------------------------------------------------------------
+
+
+class TestBrowserStormGuard:
+    """Regression coverage for issue #96320 — Salesforce browser-storm."""
+
+    def test_redirect_handler_does_not_open_browser_on_reconnect(self, monkeypatch, capsys):
+        """Parked self-probe / reconnect: webbrowser.open() must not be called.
+
+        Pre-fix bug: with stdin TTY (desktop) and os.name == "nt", the
+        redirect handler fired webbrowser.open() on every probe — dozens of
+        Salesforce login tabs while the machine was unattended. The fix
+        requires explicit force_interactive_oauth() context for any browser
+        open.
+        """
+        import tools.mcp_oauth as mod
+
+        # Simulate an interactive Windows desktop: stdin is a TTY and the
+        # platform can open a browser. Without force_interactive_oauth(),
+        # this is the exact reconnect / parked-probe path.
+        monkeypatch.setattr(mod, "_is_interactive", lambda: True)
+        monkeypatch.setattr(mod, "_oauth_interactive_forced", _FreshContextVar(False))
+        monkeypatch.setattr(mod, "_can_open_browser", lambda: True)
+        monkeypatch.setattr(
+            "webbrowser.open",
+            MagicMock(side_effect=AssertionError("must not open browser on reconnect (#96320)")),
+        )
+
+        handler = _make_redirect_handler(49201, server_name="salesforce")
+        asyncio.run(handler("https://login.salesforce.com/services/oauth2/authorize?x=1"))
+
+        err = capsys.readouterr().err
+        # URL must still be printed so an operator with a terminal can paste
+        # it manually — but the browser MUST NOT be launched.
+        assert "login.salesforce.com" in err
+
+    def test_redirect_handler_opens_browser_under_force_interactive(self, monkeypatch, capsys):
+        """force_interactive_oauth() context: explicit user-driven flow opens browser.
+
+        `hermes mcp login` and the dashboard Authorize button both enter
+        force_interactive_oauth(); only then must the redirect handler
+        open a browser. This is the positive control: pre-fix this also
+        worked (under the wrong gate); post-fix the gate is the explicit
+        context, not stdin-TTY alone.
+        """
+        import tools.mcp_oauth as mod
+        from tools.mcp_oauth import force_interactive_oauth
+
+        monkeypatch.setattr(mod, "_is_interactive", lambda: True)
+        monkeypatch.setattr(mod, "_can_open_browser", lambda: True)
+        opened = MagicMock(return_value=True)
+        monkeypatch.setattr("webbrowser.open", opened)
+
+        with force_interactive_oauth():
+            handler = _make_redirect_handler(49202, server_name="salesforce")
+            asyncio.run(handler("https://login.salesforce.com/services/oauth2/authorize"))
+
+        opened.assert_called_once()
+
+    def test_redirect_handler_dedup_within_one_flow(self, monkeypatch, capsys):
+        """Two SDK calls under one force_interactive_oauth() must open ONE browser.
+
+        The MCP SDK may re-enter redirect_handler() during one user-driven
+        reauth (stale-token retries, redirect-loop detection, etc.). Without
+        per-flow dedup a single Authorize click still spawns multiple tabs
+        — same storm class, smaller scale.
+        """
+        import tools.mcp_oauth as mod
+        from tools.mcp_oauth import force_interactive_oauth
+
+        monkeypatch.setattr(mod, "_is_interactive", lambda: True)
+        monkeypatch.setattr(mod, "_can_open_browser", lambda: True)
+        opened = MagicMock(return_value=True)
+        monkeypatch.setattr("webbrowser.open", opened)
+
+        with force_interactive_oauth():
+            handler = _make_redirect_handler(49203, server_name="salesforce")
+            url = "https://login.salesforce.com/services/oauth2/authorize"
+            asyncio.run(handler(url))
+            asyncio.run(handler(url))
+            asyncio.run(handler(url))
+
+        assert opened.call_count == 1
+
+    def test_force_interactive_reentry_resets_dedup(self, monkeypatch):
+        """Two SEPARATE force_interactive_oauth() invocations open two browsers.
+
+        A user who clicks Authorize, lets it expire, and clicks Authorize
+        again is starting a fresh authorization attempt — they get a fresh
+        browser tab, not the second attempt silently no-oping because of
+        stale dedup state from the first.
+        """
+        import tools.mcp_oauth as mod
+        from tools.mcp_oauth import force_interactive_oauth
+
+        monkeypatch.setattr(mod, "_is_interactive", lambda: True)
+        monkeypatch.setattr(mod, "_can_open_browser", lambda: True)
+        opened = MagicMock(return_value=True)
+        monkeypatch.setattr("webbrowser.open", opened)
+
+        with force_interactive_oauth():
+            asyncio.run(_make_redirect_handler(49204, server_name="salesforce")(
+                "https://login.salesforce.com/services/oauth2/authorize"
+            ))
+        with force_interactive_oauth():
+            asyncio.run(_make_redirect_handler(49204, server_name="salesforce")(
+                "https://login.salesforce.com/services/oauth2/authorize"
+            ))
+
+        assert opened.call_count == 2
+
+    def test_dashboard_flow_skips_browser_open(self, monkeypatch):
+        """Dashboard Authorize publishes the URL to the web UI — no browser opens.
+
+        The dashboard flow handles the auth URL itself (publish_authorization_url);
+        the redirect handler must NOT also open a system browser, otherwise the
+        user sees a duplicate tab outside the web UI.
+        """
+        import tools.mcp_oauth as mod
+        from tools.mcp_dashboard_oauth import DashboardOAuthFlow
+
+        sentinel_flow = MagicMock(spec=DashboardOAuthFlow)
+
+        monkeypatch.setattr(
+            "tools.mcp_dashboard_oauth.get_dashboard_oauth_flow",
+            lambda: sentinel_flow,
+        )
+        opened = MagicMock(return_value=True)
+        monkeypatch.setattr("webbrowser.open", opened)
+
+        asyncio.run(_make_redirect_handler(49205, server_name="salesforce")(
+            "https://login.salesforce.com/services/oauth2/authorize"
+        ))
+
+        opened.assert_not_called()
+        sentinel_flow.publish_authorization_url.assert_called_once()
+
+
+def _FreshContextVar(default):
+    """Standalone ContextVar factory — module-level ContextVars are
+    process-global and monkeypatch.setattr on the module binding can't
+    replace them across tests. Build a fresh one for isolation."""
+    import contextvars
+    return contextvars.ContextVar("_oauth_interactive_forced_test", default=default)
