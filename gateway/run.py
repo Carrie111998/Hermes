@@ -2476,6 +2476,13 @@ def _multiplex_profile_homes(config: object) -> list[tuple[str, "Path"]]:
     )
 
 
+# Cap for concurrent handoff dispatches in the watcher. Each dispatch runs
+# a FULL agent turn plus delivery, the same class of work delegation caps
+# its children for. Without a cap, a post-outage backlog of N pending rows
+# opens N parallel model calls at once.
+_HANDOFF_MAX_CONCURRENT = 3
+
+
 def _handoff_watch_scopes(runner: object) -> list:
     """``(profile_name, home)`` pairs whose ``state.db`` the watcher must poll.
 
@@ -14664,14 +14671,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # out purely because another profile was ahead of it in the queue.
         # Dispatch is therefore fire-and-forget; the poll loop only claims.
         inflight: Dict[str, "asyncio.Task"] = {}
+        # Concurrency cap for those dispatches. A closure local on purpose:
+        # the watcher's test stand-ins provide only _session_db, _running
+        # and _process_handoff, so anything hung on self would AttributeError
+        # into the loop's except and silently no-op the watcher.
+        _dispatch_slots = asyncio.Semaphore(_HANDOFF_MAX_CONCURRENT)
 
         async def _dispatch(row, session_id, session_db, profile_name) -> None:
             """Run one claimed handoff to a terminal state, off the poll path."""
             try:
-                if _process_takes_profile:
-                    await self._process_handoff(row, profile_name)
-                else:
-                    await self._process_handoff(row)
+                # The agent turn holds a slot; the cheap terminal-state
+                # bookkeeping below does not, so completion never waits on
+                # the cap.
+                async with _dispatch_slots:
+                    if _process_takes_profile:
+                        await self._process_handoff(row, profile_name)
+                    else:
+                        await self._process_handoff(row)
                 await session_db.complete_handoff(session_id)
             except asyncio.CancelledError:
                 # Gateway shutting down: leave the row 'running' so the next
