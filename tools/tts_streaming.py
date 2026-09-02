@@ -25,6 +25,7 @@ import logging
 import re
 import time
 from abc import ABC, abstractmethod
+from functools import cached_property
 from typing import Callable, Dict, Iterator, List, Optional
 
 from tools.tool_backend_helpers import resolve_openai_audio_api_key
@@ -271,10 +272,22 @@ class OpenAIStreamer(StreamingTTSProvider):
     def available() -> bool:
         return bool(_openai_config_api_key() or resolve_openai_audio_api_key())
 
-    def stream(self, text: str) -> Iterator[bytes]:
+    @cached_property
+    def _client(self):
+        """Return a lazily-created OpenAI client, cached per instance.
+
+        The OpenAI client owns a persistent HTTP/2 connection pool, so
+        constructing one per ``stream()`` call forces a fresh TCP+TLS
+        handshake for every sentence. Caching the client lets all
+        ``stream()`` calls on this streamer share a single connection.
+
+        Returns:
+            An ``openai.OpenAI`` client configured with the resolved
+            API key and base URL for this streamer's section.
+        """
         from openai import OpenAI
 
-        client = OpenAI(
+        return OpenAI(
             api_key=(self.section.get("api_key") or resolve_openai_audio_api_key()),
             base_url=(
                 self.section.get("base_url")
@@ -282,6 +295,9 @@ class OpenAIStreamer(StreamingTTSProvider):
                 or None
             ),
         )
+
+    def stream(self, text: str) -> Iterator[bytes]:
+        client = self._client
         model = self.section.get("model", "gpt-4o-mini-tts")
         voice = self.section.get("voice", "alloy")
         with client.audio.speech.with_streaming_response.create(
