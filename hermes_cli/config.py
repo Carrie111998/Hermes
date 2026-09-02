@@ -1825,9 +1825,17 @@ def _normalize_custom_provider_entry(
             if not isinstance(model_id, str) or not model_id.strip():
                 model_id = item.get("name")
             if not isinstance(model_id, str) or not model_id.strip():
+                # ``model:`` is the row-level spelling hand-edited configs
+                # reach for (it mirrors the entry-level singular ``model:``
+                # key). Rows keyed only by ``model:`` used to fall through
+                # to this ``continue``, silently dropping the entire models
+                # block — including per-model context_length/max_tokens —
+                # so downstream dict-only readers saw nothing (#95416).
+                model_id = item.get("model")
+            if not isinstance(model_id, str) or not model_id.strip():
                 continue
             model_meta = {
-                k: v for k, v in item.items() if k not in {"id", "name"}
+                k: v for k, v in item.items() if k not in {"id", "name", "model"}
             }
             normalized_models[model_id.strip()] = model_meta
         if normalized_models:
