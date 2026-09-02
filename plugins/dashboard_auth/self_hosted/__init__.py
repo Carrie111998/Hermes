@@ -223,6 +223,14 @@ class SelfHostedOIDCProvider(DashboardAuthProvider):
         )
         state = _b64url_no_pad(secrets.token_bytes(32))
 
+        # Google's OAuth2 (when used via self_hosted against
+        # accounts.google.com) only issues a refresh_token when
+        # access_type=offline is requested; prompt=consent ensures the
+        # consent screen re-issues it on re-auth. Without these the
+        # dashboard gets only a 1h access token and forces full
+        # re-login on expiry (#100147). Generic OIDC providers ignore
+        # unknown authorize params per RFC 6749, so this is safe to
+        # send unconditionally.
         params = {
             "response_type": "code",
             "client_id": self._client_id,
@@ -231,6 +239,8 @@ class SelfHostedOIDCProvider(DashboardAuthProvider):
             "state": state,
             "code_challenge": code_challenge,
             "code_challenge_method": "S256",
+            "access_type": "offline",
+            "prompt": "consent",
         }
         redirect_url = (
             f"{disco['authorization_endpoint']}?{urllib.parse.urlencode(params)}"
