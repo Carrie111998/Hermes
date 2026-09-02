@@ -3,8 +3,8 @@ display handling — friendly verbs, single-task previews (not counts), and
 the compact progress-tree rendering.
 
 Ported from Solar's live-validated WIP in agent/display.py (2026-08-20).
-Deliberately NOT aliased onto native `todo`: these tools take one task per
-call and carry no `todos` array, so routing them through todo's preview
+Deliberately NOT aliased onto native `todo_list`: these tools take one task per
+call and carry no `todos` array, so routing them through todo_list's preview
 logic would misrender e.g. a TaskCreate call as "reading task list".
 """
 

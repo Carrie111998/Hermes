@@ -52,6 +52,12 @@ PATCH_LANES = [
     ),
 ]
 
+TODO_LANES = [
+    ("native", "todo_list", {"todos": [{"content": "Ship it"}]}),
+    ("claude-agent-sdk", "TodoWrite", {"todos": [{"content": "Ship it"}]}),
+    ("legacy", "todo", {"todos": [{"content": "Ship it"}]}),
+]
+
 
 class TestCanonicalToolName:
     """Foreign names map onto native ones; everything else is left alone."""
@@ -69,13 +75,20 @@ class TestCanonicalToolName:
             ("Grep", "search_files"),
             ("Glob", "search_files"),
             ("Task", "delegate_task"),
-            ("TodoWrite", "todo"),
+            ("TodoWrite", "todo_list"),
+            ("todo", "todo_list"),
+            ("cronjob", "cronjob_manage"),
+            ("process", "process_manage"),
+            ("tour", "gui_tour"),
+            ("tip", "show_tip"),
         ],
     )
     def test_foreign_names_map_to_native(self, foreign, native):
         assert canonical_tool_name(foreign) == native
 
-    @pytest.mark.parametrize("native", ["terminal", "read_file", "patch", "todo"])
+    @pytest.mark.parametrize(
+        "native", ["terminal", "read_file", "patch", "todo_list"]
+    )
     def test_native_names_are_unchanged(self, native):
         assert canonical_tool_name(native) == native
 
@@ -188,7 +201,9 @@ class TestCanonicalToolArgs:
 class TestThreeLaneDisplayParity:
     """The same operation renders identically on every runtime."""
 
-    @pytest.mark.parametrize("lanes", [TERMINAL_LANES, READ_LANES, PATCH_LANES])
+    @pytest.mark.parametrize(
+        "lanes", [TERMINAL_LANES, READ_LANES, PATCH_LANES, TODO_LANES]
+    )
     def test_verb_preview_and_emoji_match_across_lanes(self, lanes):
         rendered = [
             (

@@ -13,7 +13,7 @@ operations::
     search_files    Grep / Glob                  --
     web_search      WebSearch                    web_search
     delegate_task   Task / Agent                 --
-    todo            TodoWrite                    --
+    todo_list       TodoWrite                    --
 
 The display layer historically matched on native names only, so the verb
 table (``_TOOL_VERBS``), the argument-preview table (``build_tool_preview``)
@@ -123,6 +123,12 @@ def display_tool_label(tool_name: str) -> str:
 # under its own name rather than being forced into a verb that would
 # misdescribe it.
 _TOOL_NAME_ALIASES: dict[str, str] = {
+    # --- Legacy Hermes names (accepted by dispatch for resumed sessions) ---
+    "todo": "todo_list",
+    "cronjob": "cronjob_manage",
+    "process": "process_manage",
+    "tour": "gui_tour",
+    "tip": "show_tip",
     # --- Claude Agent SDK / Claude Code CLI ---
     "Bash": "terminal",
     "Read": "read_file",
@@ -137,7 +143,7 @@ _TOOL_NAME_ALIASES: dict[str, str] = {
     "WebFetch": "web_extract",
     "Task": "delegate_task",
     "Agent": "delegate_task",
-    "TodoWrite": "todo",
+    "TodoWrite": "todo_list",
     "Skill": "skill_view",
     # --- Codex app-server ---
     "exec_command": "terminal",
