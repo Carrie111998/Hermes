@@ -13366,10 +13366,26 @@ def _run_prompt_submit(
                         agent, "_config_context_length", None
                     ),
                 )
+                # Allowlist the workspace plus the session's attachment staging
+                # dir: file.attach stages uploads into the profile home's
+                # attachments/ dir — deliberately OUTSIDE the workspace so
+                # container bind mounts can see them (#76577) — and hands back
+                # absolute @file: refs. Without the staging dir in the allowed
+                # roots, the expansion would refuse the gateway's own refs and
+                # staged uploads would never inline (#98634). That dir holds
+                # only files uploaded through the authenticated file.attach
+                # RPC; the credential deny-list in _ensure_reference_path_allowed
+                # still applies on top of it.
+                allowed_roots: list[str | Path] = [cwd]
+                try:
+                    allowed_roots.append(_desktop_attachment_dir(session))
+                except Exception:
+                    # Staging-dir resolution must never break the submit itself.
+                    pass
                 ctx = preprocess_context_references(
                     prompt,
                     cwd=cwd,
-                    allowed_root=cwd,
+                    allowed_root=allowed_roots,
                     context_length=ctx_len,
                 )
                 if ctx.blocked:

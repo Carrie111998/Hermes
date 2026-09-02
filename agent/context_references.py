@@ -9,7 +9,7 @@ import re
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Awaitable, Callable
+from typing import Awaitable, Callable, Sequence
 
 from agent.model_metadata import estimate_tokens_rough
 from hermes_cli._subprocess_compat import IS_WINDOWS, windows_hide_flags
@@ -215,7 +215,7 @@ def preprocess_context_references(
     cwd: str | Path,
     context_length: int,
     url_fetcher: Callable[[str], str | Awaitable[str]] | None = None,
-    allowed_root: str | Path | None = None,
+    allowed_root: str | Path | Sequence[str | Path] | None = None,
 ) -> ContextReferenceResult:
     coro = preprocess_context_references_async(
         message,
@@ -242,7 +242,7 @@ async def preprocess_context_references_async(
     cwd: str | Path,
     context_length: int,
     url_fetcher: Callable[[str], str | Awaitable[str]] | None = None,
-    allowed_root: str | Path | None = None,
+    allowed_root: str | Path | Sequence[str | Path] | None = None,
 ) -> ContextReferenceResult:
     refs = parse_context_references(message)
     if not refs:
@@ -250,10 +250,10 @@ async def preprocess_context_references_async(
 
     cwd_path = Path(cwd).expanduser().resolve()
     # Default to the current working directory so @ references cannot escape
-    # the active workspace unless a caller explicitly widens the root.
-    allowed_root_path = (
-        Path(allowed_root).expanduser().resolve() if allowed_root is not None else cwd_path
-    )
+    # the active workspace unless a caller explicitly widens the root. A
+    # sequence widens the boundary to several roots at once (e.g. the
+    # gateway's workspace plus the session's attachment staging dir, #98634).
+    allowed_roots = _normalize_allowed_roots(allowed_root) or (cwd_path,)
     warnings: list[str] = []
     blocks: list[str] = []
     injected_tokens = 0
@@ -270,7 +270,7 @@ async def preprocess_context_references_async(
                 ref,
                 cwd_path,
                 url_fetcher=url_fetcher,
-                allowed_root=allowed_root_path,
+                allowed_root=allowed_roots,
             )
             for ref in refs
         )
@@ -330,7 +330,7 @@ async def _expand_reference(
     cwd: Path,
     *,
     url_fetcher: Callable[[str], str | Awaitable[str]] | None = None,
-    allowed_root: Path | None = None,
+    allowed_root: tuple[Path, ...] | None = None,
 ) -> tuple[str | None, str | None]:
     try:
         if ref.kind == "file":
@@ -369,7 +369,7 @@ def _expand_file_reference(
     ref: ContextReference,
     cwd: Path,
     *,
-    allowed_root: Path | None = None,
+    allowed_root: tuple[Path, ...] | None = None,
 ) -> tuple[str | None, str | None]:
     path = _resolve_path(cwd, ref.target, allowed_root=allowed_root)
     _ensure_reference_path_allowed(path)
@@ -403,7 +403,7 @@ def _expand_folder_reference(
     ref: ContextReference,
     cwd: Path,
     *,
-    allowed_root: Path | None = None,
+    allowed_root: tuple[Path, ...] | None = None,
 ) -> tuple[str | None, str | None]:
     path = _resolve_path(cwd, ref.target, allowed_root=allowed_root)
     _ensure_reference_path_allowed(path)
@@ -468,16 +468,32 @@ async def _default_url_fetcher(url: str) -> str:
     return str(doc.get("content") or doc.get("raw_content") or "").strip()
 
 
-def _resolve_path(cwd: Path, target: str, *, allowed_root: Path | None = None) -> Path:
+def _normalize_allowed_roots(
+    allowed_root: str | Path | Sequence[str | Path] | None,
+) -> tuple[Path, ...] | None:
+    """Coerce a single allowed root or a sequence of them into resolved paths.
+
+    A sequence never *narrows* the boundary — each entry widens it, and a
+    resolved path under ANY root passes (see ``_resolve_path``).
+    """
+    if allowed_root is None:
+        return None
+    if isinstance(allowed_root, (str, Path)):
+        allowed_root = (allowed_root,)
+    return tuple(Path(root).expanduser().resolve() for root in allowed_root)
+
+
+def _resolve_path(
+    cwd: Path, target: str, *, allowed_root: tuple[Path, ...] | None = None
+) -> Path:
     path = Path(os.path.expanduser(target))
     if not path.is_absolute():
         path = cwd / path
     resolved = path.resolve()
-    if allowed_root is not None:
-        try:
-            resolved.relative_to(allowed_root)
-        except ValueError as exc:
-            raise ValueError("path is outside the allowed workspace") from exc
+    if allowed_root is not None and not any(
+        resolved.is_relative_to(root) for root in allowed_root
+    ):
+        raise ValueError("path is outside the allowed workspace")
     return resolved
 
 
