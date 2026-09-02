@@ -567,6 +567,83 @@ class TestCallbackPortReservation:
 
 
 # ---------------------------------------------------------------------------
+# Configured redirect_uri port derivation (#99503)
+# ---------------------------------------------------------------------------
+
+class TestConfiguredRedirectUriPort:
+    """A configured loopback oauth.redirect_uri pins the listener port.
+
+    ``hermes mcp login`` wipes the cached client registration before
+    probing, so a server with ``oauth.redirect_uri:
+    http://localhost:<N>/callback`` and no ``redirect_port`` used to bind a
+    random ephemeral port while the authorize URL advertised ``<N>`` —
+    every approval then died on a connection-refused redirect and the
+    login timed out after the full 300s callback window (#99503).
+    """
+
+    def test_loopback_uri_port_beats_ephemeral(self):
+        import tools.mcp_oauth as mod
+
+        cfg: dict = {
+            "cimd": False,
+            "redirect_uri": "http://localhost:3118/callback",
+        }
+        port = mod._configure_callback_port(cfg)
+        assert port == 3118
+        assert cfg["_resolved_port"] == 3118
+        # Fixed, known port — no ephemeral reservation is left parked.
+        assert 3118 not in mod._reserved_sockets
+
+    def test_explicit_redirect_port_still_wins(self):
+        import tools.mcp_oauth as mod
+
+        cfg: dict = {
+            "cimd": False,
+            "redirect_port": 49399,
+            "redirect_uri": "http://localhost:3118/callback",
+        }
+        assert mod._configure_callback_port(cfg) == 49399
+
+    def test_https_proxy_uri_falls_through_to_ephemeral(self):
+        import tools.mcp_oauth as mod
+
+        # A proxied redirect_uri (e.g. Tailscale Funnel → localhost) must
+        # keep the ephemeral listener: the funnel, not the URI, decides the
+        # local port.
+        cfg: dict = {
+            "cimd": False,
+            "redirect_uri": "https://funnel.example.com/callback",
+        }
+        port = mod._configure_callback_port(cfg)
+        assert port in mod._reserved_sockets
+        reserved = mod._reserved_sockets.pop(port)
+        reserved.close()
+
+    def test_portless_and_nonstandard_uris_fall_through(self):
+        import tools.mcp_oauth as mod
+
+        for uri in (
+            "http://localhost/callback",  # portless loopback
+            "http://localhost:3118/oauth/callback",  # non-standard path
+            "http://192.168.1.4:3118/callback",  # non-loopback host
+        ):
+            cfg: dict = {"cimd": False, "redirect_uri": uri}
+            port = mod._configure_callback_port(cfg)
+            assert port in mod._reserved_sockets, uri
+            reserved = mod._reserved_sockets.pop(port)
+            reserved.close()
+
+    def test_without_configured_uri_ephemeral_stays(self):
+        import tools.mcp_oauth as mod
+
+        cfg: dict = {"cimd": False}
+        port = mod._configure_callback_port(cfg)
+        assert port in mod._reserved_sockets
+        reserved = mod._reserved_sockets.pop(port)
+        reserved.close()
+
+
+# ---------------------------------------------------------------------------
 # remove_oauth_tokens
 # ---------------------------------------------------------------------------
 
