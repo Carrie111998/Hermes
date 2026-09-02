@@ -7,15 +7,40 @@ skips when no C toolchain / extension loading is available.
 import shutil
 import sqlite3
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
 
-from hermes_state import FTS_CJK_STALE_KEY, SessionDB
+from hermes_state import FTS_CJK_STALE_KEY, SessionDB, fts5_cjk_so_path
 
 REPO = Path(__file__).resolve().parent.parent
 SRC = REPO / "native" / "fts5_cjk" / "fts5_cjk.c"
 VENDOR = REPO / "native" / "fts5_cjk" / "vendor"
+
+
+@pytest.mark.parametrize("platform,expected_name", [
+    ("win32", "libfts5_cjk.dll"),
+    ("linux", "libfts5_cjk.so"),
+    ("darwin", "libfts5_cjk.so"),
+])
+def test_default_so_path_matches_platform(platform, expected_name, monkeypatch, tmp_path):
+    """The default extension filename must match what a builder on that
+    platform produces. The old hardcoded libfts5_cjk.so meant a Windows
+    build installed as ~/.hermes/lib/ was never found without the env
+    override."""
+    fake_home = tmp_path / "hermes-home"
+    fake_home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(fake_home))
+    monkeypatch.delenv("HERMES_FTS5_CJK_SO", raising=False)
+    monkeypatch.setattr(sys, "platform", platform)
+    assert fts5_cjk_so_path() == fake_home / "lib" / expected_name
+
+
+def test_env_override_wins_over_platform_default(monkeypatch, tmp_path):
+    override = tmp_path / "custom" / "tokenizer.dll"
+    monkeypatch.setenv("HERMES_FTS5_CJK_SO", str(override))
+    assert fts5_cjk_so_path() == override
 
 
 @pytest.fixture(scope="session")

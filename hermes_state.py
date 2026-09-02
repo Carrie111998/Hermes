@@ -4243,11 +4243,19 @@ END;
 """
 
 def fts5_cjk_so_path() -> Path:
-    """Location of the cjk_unicode61 loadable extension."""
+    """Location of the cjk_unicode61 loadable extension.
+
+    Platform-aware default name: Windows builds produce a .dll (LoadLibrary
+    has no fixed extension convention, but a POSIX-named ".so" file would
+    never match what a Windows builder produces), POSIX builds keep the
+    libfts5_cjk.so name from native/fts5_cjk/build.sh. The
+    HERMES_FTS5_CJK_SO env override wins over either default.
+    """
     env = os.getenv("HERMES_FTS5_CJK_SO")
     if env:
         return Path(env).expanduser()
-    return get_hermes_home() / "lib" / "libfts5_cjk.so"
+    name = "libfts5_cjk.dll" if sys.platform == "win32" else "libfts5_cjk.so"
+    return get_hermes_home() / "lib" / name
 
 
 def _cjk_fts_config_enabled() -> bool:
