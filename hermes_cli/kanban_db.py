@@ -5528,13 +5528,15 @@ def complete_task(
             )
         # Carry the handoff summary in the event payload so gateway
         # notifiers and dashboard WS consumers can render it without a
-        # second SQL round-trip. First line only, 400 char cap — the
-        # full summary stays on the run row.
+        # second SQL round-trip. First line only, capped to match the
+        # notifier's ``kanban.notify_max_chars`` ceiling (3500 — see
+        # gateway.kanban_watchers._NOTIFY_CHARS_MAX) — the full summary
+        # stays on the run row.
         event_summary = summary if summary is not None else result
         if prior_status == "review" and not event_summary:
             event_summary = "Review approved without additional evidence."
         _ev_lines = (event_summary or "").strip().splitlines()
-        ev_summary = _ev_lines[0][:400] if _ev_lines else ""
+        ev_summary = _ev_lines[0][:3500] if _ev_lines else ""
         completed_payload: dict = {
             "result_len": len(result) if result else 0,
             "summary": ev_summary or None,
@@ -6238,7 +6240,8 @@ def edit_completed_task_result(
                     (json.dumps(metadata, ensure_ascii=False), run_id),
                 )
         _ev_lines = (handoff_summary or "").strip().splitlines()
-        ev_summary = _ev_lines[0][:400] if _ev_lines else ""
+        # 3500 cap mirrors gateway.kanban_watchers._NOTIFY_CHARS_MAX.
+        ev_summary = _ev_lines[0][:3500] if _ev_lines else ""
         _append_event(
             conn, task_id, "edited",
             {
@@ -6645,7 +6648,8 @@ def request_review(
                 metadata=metadata,
             )
         lines = (summary or "").strip().splitlines()
-        event_summary = lines[0][:400] if lines else ""
+        # 3500 cap mirrors gateway.kanban_watchers._NOTIFY_CHARS_MAX.
+        event_summary = lines[0][:3500] if lines else ""
         _append_event(
             conn,
             task_id,

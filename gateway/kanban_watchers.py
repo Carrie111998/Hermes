@@ -33,6 +33,64 @@ _LOCAL_PATH_RE = re.compile(
 )
 
 
+_NOTIFY_CHARS_DEFAULT = 200
+_NOTIFY_CHARS_MAX = 3500  # Slack hard-caps a message at 4000 chars; leave headroom.
+
+
+def _first_line_excerpt(value: Any, limit: int) -> str:
+    """Return the first non-empty line of *value*, bounded to *limit* chars."""
+    text = "" if value is None else str(value)
+    lines = text.strip().splitlines()
+    head = lines[0] if lines else text
+    if len(head) <= limit:
+        return head
+    return head[:limit]
+
+
+def _mobile_excerpt(value: Any, limit: int) -> str:
+    """Bound *value* to *limit* chars, reserving room for an ellipsis."""
+    text = "" if value is None else str(value)
+    if len(text) <= limit:
+        return text
+    return text[: max(1, limit - 1)].rstrip() + "…"
+
+
+def _notify_max_chars_from_config(cfg: Any) -> int:
+    """Resolve ``kanban.notify_max_chars`` with fail-safe bounds.
+
+    One shared budget for every notification excerpt (summaries, reasons,
+    errors). Defaults to the historical 200; clamps to ``[1, 3500]`` — the
+    ceiling keeps even a maxed-out ping safely under Slack's 4000-char
+    message cap. Junk values (strings, lists, None, NaN) fall back to the
+    default rather than raising: a typo'd config must not kill delivery.
+    """
+    kcfg = cfg.get("kanban", {}) if isinstance(cfg, dict) else {}
+    raw = kcfg.get("notify_max_chars", _NOTIFY_CHARS_DEFAULT)
+    try:
+        value = int(float(raw))
+    except (TypeError, ValueError, OverflowError):
+        return _NOTIFY_CHARS_DEFAULT
+    return max(1, min(value, _NOTIFY_CHARS_MAX))
+
+
+def _resolve_notify_max_chars(runner: Any) -> int:
+    """Read the excerpt budget once at notifier boot and stamp it on the runner.
+
+    Same boot-captured pattern as every other background watcher here: users
+    who flip the value restart the gateway. Missing config loader or a failed
+    read is not fatal — delivery proceeds with the default budget.
+    """
+    try:
+        from hermes_cli.config import load_config as _load_config
+
+        cfg = _load_config()
+    except Exception:
+        cfg = {}
+    resolved = _notify_max_chars_from_config(cfg)
+    runner._kanban_notify_max_chars = resolved
+    return resolved
+
+
 def _safe_review_reason(value: Any, limit: int = 160) -> str:
     """Return a mobile-friendly review reason safe for external delivery."""
     from agent.redact import redact_sensitive_text
@@ -256,6 +314,12 @@ class GatewayKanbanWatchersMixin:
         except Exception:
             logger.warning("kanban notifier: kanban_db not importable; notifier disabled")
             return
+
+        # Excerpt budget for every notification this watcher sends. Resolved
+        # once per watcher start (boot-captured, same pattern as the other
+        # watchers here); ``kanban.notify_max_chars`` in config.yaml raises
+        # the historical 200-char excerpt cap up to 3500.
+        limit = _resolve_notify_max_chars(self)
 
         # "status" covers dashboard drag-drop and `_set_status_direct()`
         # writes — surface those transitions to subscribers too.
@@ -589,13 +653,11 @@ class GatewayKanbanWatchersMixin:
                             if ev.payload and ev.payload.get("summary"):
                                 payload_summary = str(ev.payload["summary"])
                             if payload_summary:
-                                lines = payload_summary.strip().splitlines()
-                                h = lines[0][:200] if lines else payload_summary[:200]
+                                h = _first_line_excerpt(payload_summary, limit)
                                 handoff = f"\n{h}"
                                 wake_handoff = h
                             elif task and task.result:
-                                lines = task.result.strip().splitlines()
-                                r = lines[0][:160] if lines else task.result[:160]
+                                r = _first_line_excerpt(task.result, limit)
                                 handoff = f"\n{r}"
                                 wake_handoff = r
                             msg = (
@@ -605,12 +667,12 @@ class GatewayKanbanWatchersMixin:
                         elif kind == "blocked":
                             reason = ""
                             if ev.payload and ev.payload.get("reason"):
-                                reason = f": {str(ev.payload['reason'])[:160]}"
+                                reason = f": {_mobile_excerpt(ev.payload['reason'], limit)}"
                             msg = f"⏸ {board_tag}{tag}Kanban {sub['task_id']} blocked{reason}"
                         elif kind == "gave_up":
                             err = ""
                             if ev.payload and ev.payload.get("error"):
-                                err = f"\n{str(ev.payload['error'])[:200]}"
+                                err = f"\n{_mobile_excerpt(ev.payload['error'], limit)}"
                             msg = (
                                 f"✖ {board_tag}{tag}Kanban {sub['task_id']} gave up "
                                 f"after repeated spawn failures{err}"
@@ -639,15 +701,12 @@ class GatewayKanbanWatchersMixin:
                             handoff = ""
                             if ev.payload and ev.payload.get("summary"):
                                 summary = str(ev.payload["summary"])
-                                handoff = f"\n{summary[:200]}"
+                                handoff = f"\n{_first_line_excerpt(summary, limit)}"
                                 # Carry the worker's handoff into the wake turn
                                 # like ``completed`` does: a reviewer woken with
                                 # a bare "ready for review" has to re-read the
                                 # board to learn what was implemented.
-                                lines = summary.strip().splitlines()
-                                wake_handoff = (
-                                    lines[0][:200] if lines else summary[:200]
-                                )
+                                wake_handoff = _first_line_excerpt(summary, limit)
                             msg = (
                                 f"👀 {board_tag}{tag}Kanban {sub['task_id']} ready for review"
                                 f" — {title}{handoff}"

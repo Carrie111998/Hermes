@@ -2888,6 +2888,13 @@ DEFAULT_CONFIG = {
     # each claimable ready task. One dispatcher per profile is sufficient;
     # running more than one on the same kanban.db will race for claims.
     "kanban": {
+        # Max characters for a kanban notification excerpt (completion
+        # summaries, blocked reasons, errors, review handoffs). The
+        # historical default is 200; raise it for longer handoffs on
+        # platforms that allow bigger messages. Clamped to [1, 3500] —
+        # Slack hard-caps a chat message at 4000 chars. Junk values fall
+        # back to the default. Takes effect at the next gateway restart.
+        "notify_max_chars": 200,
         # Auto-subscribe the originating gateway/TUI session to task
         # completion + block events when ``kanban_create`` is called from
         # inside a session that has a persistent delivery channel. The
