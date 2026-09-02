@@ -43,8 +43,20 @@ def _ensure_discord_mock():
 
 
 _ensure_discord_mock()
+_DISCORD_DEPENDENCY = sys.modules["discord"]
 
 from plugins.platforms.discord.adapter import DiscordAdapter  # noqa: E402
+
+@pytest.fixture(autouse=True)
+def _restore_discord_dependency(monkeypatch):
+    """Keep send tests independent of optional-import tests collected first."""
+    adapter_module = sys.modules["plugins.platforms.discord.adapter"]
+    monkeypatch.setattr(adapter_module, "discord", _DISCORD_DEPENDENCY)
+    monkeypatch.setitem(
+        DiscordAdapter.send.__globals__,
+        "discord",
+        _DISCORD_DEPENDENCY,
+    )
 
 
 @pytest.mark.asyncio
@@ -149,6 +161,135 @@ async def test_send_retries_without_reference_when_reply_target_is_deleted():
     assert send_calls[0]["reference"] is _discord_mod.MessageReference.return_value
     assert send_calls[1]["reference"] is None
     assert send_calls[2]["reference"] is None
+
+
+@pytest.mark.asyncio
+async def test_send_recreates_stale_origin_dm_channel_from_exact_user(monkeypatch):
+    """A stale cron-origin DM channel can be recreated for that exact user."""
+    class Forbidden(Exception):
+        pass
+
+    class NotFound(Exception):
+        pass
+
+    monkeypatch.setitem(
+        DiscordAdapter.send.__globals__,
+        "discord",
+        SimpleNamespace(Forbidden=Forbidden, NotFound=NotFound),
+    )
+
+    sent = SimpleNamespace(id=7001)
+    dm_channel = SimpleNamespace(send=AsyncMock(return_value=sent))
+    user = SimpleNamespace(dm_channel=None, create_dm=AsyncMock(return_value=dm_channel))
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
+    client = SimpleNamespace(
+        get_channel=MagicMock(return_value=None),
+        fetch_channel=AsyncMock(side_effect=Forbidden("Missing Access")),
+        get_user=MagicMock(return_value=None),
+        fetch_user=AsyncMock(return_value=user),
+    )
+    adapter._client = client
+
+    result = await adapter.send(
+        "555",
+        "Merge-ready packet",
+        metadata={"_cron_origin_dm_user_id": "42"},
+    )
+
+    assert result.success is True
+    assert result.message_id == "7001"
+    client.get_user.assert_called_once_with(42)
+    client.fetch_user.assert_awaited_once_with(42)
+    user.create_dm.assert_awaited_once()
+    dm_channel.send.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_send_recovers_when_cached_origin_channel_is_inaccessible(monkeypatch):
+    """A cached stale channel must not bypass exact-user DM recovery."""
+    class Forbidden(Exception):
+        pass
+
+    class NotFound(Exception):
+        pass
+
+    monkeypatch.setitem(
+        DiscordAdapter.send.__globals__,
+        "discord",
+        SimpleNamespace(Forbidden=Forbidden, NotFound=NotFound),
+    )
+
+    sent = SimpleNamespace(id=7002)
+    stale_channel = SimpleNamespace(
+        id=555,
+        send=AsyncMock(side_effect=Forbidden("Missing Access")),
+    )
+    dm_channel = SimpleNamespace(send=AsyncMock(return_value=sent))
+    state = SimpleNamespace(_remove_private_channel=MagicMock())
+    user = SimpleNamespace(
+        dm_channel=stale_channel,
+        create_dm=AsyncMock(return_value=dm_channel),
+        _state=state,
+    )
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
+    client = SimpleNamespace(
+        get_channel=MagicMock(return_value=stale_channel),
+        fetch_channel=AsyncMock(),
+        get_user=MagicMock(return_value=user),
+        fetch_user=AsyncMock(),
+    )
+    adapter._client = client
+
+    result = await adapter.send(
+        "555",
+        "Merge-ready packet",
+        metadata={"_cron_origin_dm_user_id": "42"},
+    )
+
+    assert result.success is True
+    assert result.message_id == "7002"
+    stale_channel.send.assert_awaited_once()
+    client.fetch_channel.assert_not_awaited()
+    client.get_user.assert_called_once_with(42)
+    client.fetch_user.assert_not_awaited()
+    state._remove_private_channel.assert_called_once_with(stale_channel)
+    user.create_dm.assert_awaited_once()
+    dm_channel.send.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_send_does_not_fallback_guild_channel_to_user_dm(monkeypatch):
+    """A missing guild/group target must fail closed, never leak into a DM."""
+    class Forbidden(Exception):
+        pass
+
+    class NotFound(Exception):
+        pass
+
+    monkeypatch.setitem(
+        DiscordAdapter.send.__globals__,
+        "discord",
+        SimpleNamespace(Forbidden=Forbidden, NotFound=NotFound),
+    )
+
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
+    client = SimpleNamespace(
+        get_channel=MagicMock(return_value=None),
+        fetch_channel=AsyncMock(side_effect=Forbidden("Missing Access")),
+        get_user=MagicMock(),
+        fetch_user=AsyncMock(),
+    )
+    adapter._client = client
+
+    result = await adapter.send(
+        "555",
+        "Do not reroute me",
+        metadata={"chat_type": "dm", "user_id": "42"},
+    )
+
+    assert result.success is False
+    client.get_user.assert_not_called()
+    client.fetch_user.assert_not_awaited()
 
 
 # ---------------------------------------------------------------------------
@@ -283,8 +424,6 @@ async def test_send_video_uses_path_based_files_kwarg(tmp_path, monkeypatch):
     message with zero attachments after an earlier image batch on the same
     channel — silent drop from the user's perspective.
     """
-    import plugins.platforms.discord.adapter as discord_platform
-
     video = tmp_path / "clip.mp4"
     video.write_bytes(b"\x00\x00\x00\x18ftypmp42fake")
 
@@ -295,7 +434,7 @@ async def test_send_video_uses_path_based_files_kwarg(tmp_path, monkeypatch):
             captured["fp"] = fp
             captured["filename"] = filename
 
-    monkeypatch.setattr(discord_platform.discord, "File", _FakeFile)
+    monkeypatch.setattr(DiscordAdapter.send.__globals__["discord"], "File", _FakeFile)
 
     adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
     sent_msg = SimpleNamespace(
@@ -327,13 +466,11 @@ async def test_send_video_uses_path_based_files_kwarg(tmp_path, monkeypatch):
 @pytest.mark.asyncio
 async def test_send_video_fails_loud_when_message_has_no_attachments(tmp_path, monkeypatch):
     """If Discord accepts the message but attaches nothing, fail loud (#66797)."""
-    import plugins.platforms.discord.adapter as discord_platform
-
     video = tmp_path / "clip.mp4"
     video.write_bytes(b"fake-mp4")
 
     monkeypatch.setattr(
-        discord_platform.discord,
+        DiscordAdapter.send.__globals__["discord"],
         "File",
         lambda fp, filename=None, **kwargs: SimpleNamespace(fp=fp, filename=filename),
     )
@@ -380,13 +517,11 @@ async def test_send_file_attachment_forum_uses_files_kwarg(tmp_path, monkeypatch
     """Forum-parent delivery must also route the path-based file through the
     plural ``files=[...]`` kwarg (#66797), so the create_thread starter message
     carries the attachment rather than silently dropping it."""
-    import plugins.platforms.discord.adapter as discord_platform
-
     video = tmp_path / "clip.mp4"
     video.write_bytes(b"fake-mp4")
 
     monkeypatch.setattr(
-        discord_platform.discord,
+        DiscordAdapter.send.__globals__["discord"],
         "File",
         lambda fp, filename=None, **kwargs: SimpleNamespace(fp=fp, filename=filename),
     )
