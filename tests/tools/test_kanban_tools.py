@@ -55,13 +55,21 @@ def worker_env(monkeypatch, tmp_path):
     monkeypatch.delenv("HERMES_SESSION_ID", raising=False)
     from pathlib import Path as _Path
     monkeypatch.setattr(_Path, "home", lambda: tmp_path)
+    profiles = home / "profiles"
+    for name in ("test-worker", "dev", "reviewer", "qa"):
+        (profiles / name).mkdir(parents=True, exist_ok=True)
 
     from hermes_cli import kanban_db as kb
     kb._INITIALIZED_PATHS.clear()
     kb.init_db()
     conn = kb.connect()
     try:
-        tid = kb.create_task(conn, title="worker-test", assignee="test-worker")
+        tid = kb.create_task(
+            conn,
+            title="worker-test",
+            assignee="test-worker",
+            completion_policy="independent",
+        )
         kb.claim_task(conn, tid)
     finally:
         conn.close()
@@ -133,6 +141,51 @@ def test_distinct_worker_can_complete_scoped_task(monkeypatch, worker_env):
         conn.close()
 
 
+def test_assigned_worker_can_complete_worker_policy_task(monkeypatch, worker_env):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    conn = kb.connect()
+    try:
+        ordinary = kb.create_task(
+            conn,
+            title="ordinary worker card",
+            assignee="test-worker",
+            completion_policy="worker",
+        )
+        kb.claim_task(conn, ordinary)
+    finally:
+        conn.close()
+    monkeypatch.setenv("HERMES_KANBAN_TASK", ordinary)
+
+    completed = json.loads(kt._handle_complete({"summary": "ordinary done"}))
+
+    assert completed.get("ok") is True
+
+
+def test_independent_same_card_reviewer_can_complete(monkeypatch, worker_env):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    conn = kb.connect()
+    try:
+        task = kb.get_task(conn, worker_env)
+        assert kb.request_review(
+            conn,
+            worker_env,
+            reviewer="reviewer",
+            expected_run_id=task.current_run_id,
+        )
+        kb.claim_task(conn, worker_env)
+    finally:
+        conn.close()
+    monkeypatch.setenv("HERMES_PROFILE", "reviewer")
+
+    completed = json.loads(kt._handle_complete({"summary": "approved"}))
+
+    assert completed.get("ok") is True
+
+
 def test_worker_cannot_complete_own_assigned_task(worker_env):
     from hermes_cli import kanban_db as kb
     from tools import kanban_tools as kt
@@ -140,7 +193,7 @@ def test_worker_cannot_complete_own_assigned_task(worker_env):
     rejected = json.loads(kt._handle_complete({"summary": "self-attested"}))
 
     assert rejected.get("ok") is not True
-    assert "distinct actor" in rejected.get("error", "")
+    assert "independent completion policy" in rejected.get("error", "")
     conn = kb.connect()
     try:
         assert kb.get_task(conn, worker_env).status == "running"
@@ -429,11 +482,11 @@ def test_comment_ignores_caller_supplied_author(worker_env):
         conn.close()
 
 
-def test_worker_create_same_profile_happy_path(worker_env):
+def test_worker_create_linked_specialist_happy_path(worker_env):
     from tools import kanban_tools as kt
     out = kt._handle_create({
         "title": "child task",
-        "assignee": "test-worker",
+        "assignee": "reviewer",
         "parents": [worker_env],
     })
     d = json.loads(out)
@@ -445,7 +498,7 @@ def test_worker_create_same_profile_happy_path(worker_env):
     try:
         child = kb.get_task(conn, d["task_id"])
         assert child.title == "child task"
-        assert child.assignee == "test-worker"
+        assert child.assignee == "reviewer"
     finally:
         conn.close()
 
@@ -460,7 +513,7 @@ def test_worker_create_rejects_cross_profile_assignee(worker_env):
     }))
 
     assert rejected.get("ok") is not True
-    assert "own profile" in rejected.get("error", "")
+    assert "must either be linked" in rejected.get("error", "")
     conn = kb.connect()
     try:
         assert all(
@@ -490,6 +543,31 @@ def test_worker_create_fails_closed_without_profile(monkeypatch, worker_env):
         conn.close()
 
 
+def test_worker_create_rejects_unknown_linked_profile(worker_env):
+    from tools import kanban_tools as kt
+
+    rejected = json.loads(kt._handle_create({
+        "title": "unknown specialist",
+        "assignee": "missing-profile",
+        "parents": [worker_env],
+    }))
+
+    assert rejected.get("ok") is not True
+    assert "unknown assignee profile" in rejected.get("error", "")
+
+
+def test_worker_create_allows_explicit_unlinked_approval_card(worker_env):
+    from tools import kanban_tools as kt
+
+    created = json.loads(kt._handle_create({
+        "title": "review this work",
+        "assignee": "reviewer",
+        "completion_policy": "approval",
+    }))
+
+    assert created.get("ok") is True
+
+
 def test_orchestrator_create_cross_profile_allowed(monkeypatch, worker_env):
     from hermes_cli import kanban_db as kb
     from tools import kanban_tools as kt
@@ -506,6 +584,56 @@ def test_orchestrator_create_cross_profile_allowed(monkeypatch, worker_env):
         assert kb.get_task(conn, created["task_id"]).assignee == "peer"
     finally:
         conn.close()
+
+
+def test_independent_task_graph_releases_after_review_approval(monkeypatch, worker_env):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    conn = kb.connect()
+    try:
+        review = kb.create_task(
+            conn,
+            title="review implementation",
+            assignee="reviewer",
+            created_by="dev",
+            completion_policy="approval",
+        )
+        implementation = kb.create_task(
+            conn,
+            title="implementation",
+            assignee="dev",
+            completion_policy="independent",
+            parents=[review],
+        )
+    finally:
+        conn.close()
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", implementation)
+    monkeypatch.setenv("HERMES_PROFILE", "dev")
+    denied = json.loads(kt._handle_complete({"summary": "self-attested"}))
+    assert denied.get("ok") is not True
+
+    conn = kb.connect()
+    try:
+        kb.claim_task(conn, review)
+    finally:
+        conn.close()
+    monkeypatch.setenv("HERMES_KANBAN_TASK", review)
+    monkeypatch.setenv("HERMES_PROFILE", "reviewer")
+    approved = json.loads(kt._handle_complete({"summary": "review passed"}))
+    assert approved.get("ok") is True
+
+    conn = kb.connect()
+    try:
+        assert kb.get_task(conn, implementation).status == "ready"
+        kb.claim_task(conn, implementation)
+    finally:
+        conn.close()
+    monkeypatch.setenv("HERMES_KANBAN_TASK", implementation)
+    monkeypatch.setenv("HERMES_PROFILE", "dev")
+    completed = json.loads(kt._handle_complete({"summary": "approved work"}))
+    assert completed.get("ok") is True
 
 
 def test_link_happy_path(worker_env):
@@ -601,7 +729,7 @@ def test_worker_lifecycle_through_tools(monkeypatch, worker_env):
     # 4. spawn a child task for follow-up
     child_out = json.loads(kt._handle_create({
         "title": "write integration test",
-        "assignee": "test-worker",
+        "assignee": "qa",
         "parents": [worker_env],
     }))
     assert child_out["ok"]

@@ -101,6 +101,7 @@ _log = logging.getLogger(__name__)
 
 VALID_STATUSES = {"triage", "todo", "scheduled", "ready", "running", "blocked", "review", "done", "archived"}
 VALID_INITIAL_STATUSES = {"running", "blocked"}
+VALID_COMPLETION_POLICIES = {"worker", "independent", "approval"}
 
 # Typed block reasons. Distinguishes the two fundamentally different things a
 # worker (or human) means by "blocked", so each can be routed differently
@@ -1141,6 +1142,9 @@ class Task:
     # Unblock-loop counter. See the column comment in SCHEMA_SQL and
     # ``BLOCK_RECURRENCE_LIMIT``. Reset only on successful completion.
     block_recurrences: int = 0
+    # Completion authority. Kept at the end with a default so older tests and
+    # plugins that construct Task directly remain source-compatible.
+    completion_policy: str = "worker"
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
@@ -1162,6 +1166,11 @@ class Task:
             status=row["status"],
             priority=row["priority"],
             created_by=row["created_by"],
+            completion_policy=(
+                row["completion_policy"]
+                if "completion_policy" in keys
+                else "worker"
+            ),
             created_at=row["created_at"],
             started_at=row["started_at"],
             completed_at=row["completed_at"],
@@ -1338,6 +1347,8 @@ CREATE TABLE IF NOT EXISTS tasks (
     status               TEXT NOT NULL,
     priority             INTEGER DEFAULT 0,
     created_by           TEXT,
+    -- ``approval`` is worker-completable and may approve an independent child.
+    completion_policy    TEXT NOT NULL DEFAULT 'worker',
     created_at           INTEGER NOT NULL,
     started_at           INTEGER,
     completed_at         INTEGER,
@@ -2557,6 +2568,15 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         _add_column_if_missing(
             conn, "tasks", "idempotency_key", "idempotency_key TEXT"
         )
+    if "completion_policy" not in cols:
+        # Legacy rows retain assigned-worker completion. User-created cards
+        # opt into independent approval at the CLI ingress.
+        _add_column_if_missing(
+            conn,
+            "tasks",
+            "completion_policy",
+            "completion_policy TEXT NOT NULL DEFAULT 'worker'",
+        )
     # ``idx_tasks_idempotency`` is created unconditionally below alongside
     # the other additive-column indexes — see the block after the
     # legacy-column migration. Creating it here too would be redundant.
@@ -3173,6 +3193,7 @@ def create_task(
     body: Optional[str] = None,
     assignee: Optional[str] = None,
     created_by: Optional[str] = None,
+    completion_policy: str = "worker",
     workspace_kind: str = "scratch",
     workspace_path: Optional[str] = None,
     branch_name: Optional[str] = None,
@@ -3236,6 +3257,12 @@ def create_task(
     """
     model_override = (model_override or "").strip() or None
     provider_override = (provider_override or "").strip() or None
+    completion_policy = str(completion_policy or "").strip().lower()
+    if completion_policy not in VALID_COMPLETION_POLICIES:
+        raise ValueError(
+            "completion_policy must be one of "
+            f"{sorted(VALID_COMPLETION_POLICIES)}"
+        )
     reasoning_effort = normalize_reasoning_effort(reasoning_effort)
     if provider_override and not model_override:
         raise ValueError("provider_override requires a model_override")
@@ -3503,13 +3530,14 @@ def create_task(
                     """
                     INSERT INTO tasks (
                         id, title, body, assignee, status, priority,
-                        created_by, created_at, workspace_kind, workspace_path,
+                        created_by, completion_policy, created_at,
+                        workspace_kind, workspace_path,
                         branch_name, project_id, tenant, idempotency_key,
                         max_runtime_seconds,
                         skills, max_retries, model_override, provider_override,
                         reasoning_effort,
                         goal_mode, goal_max_turns, session_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -3519,6 +3547,7 @@ def create_task(
                         task_status,
                         priority,
                         created_by,
+                        completion_policy,
                         now,
                         workspace_kind,
                         workspace_path,

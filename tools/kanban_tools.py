@@ -212,27 +212,58 @@ def _enforce_worker_task_ownership(tid: str) -> Optional[str]:
     return None
 
 
-def _enforce_distinct_completion_actor(task: Any) -> Optional[str]:
-    """Require task-scoped completion to come from a distinct profile."""
+def _enforce_completion_policy(conn: Any, task: Any) -> Optional[str]:
+    """Enforce explicit independent approval without breaking worker cards."""
     if not os.environ.get("HERMES_KANBAN_TASK"):
         return None
     profile = (os.environ.get("HERMES_PROFILE") or "").strip()
     if not profile:
         return tool_error(
             "task-scoped kanban_complete requires HERMES_PROFILE to verify "
-            "a distinct completion actor"
+            "the completion actor"
         )
+    if getattr(task, "completion_policy", "worker") != "independent":
+        return None
     assignee = (getattr(task, "assignee", None) or "").strip()
-    if assignee and profile == assignee:
-        return tool_error(
-            f"profile {profile} is assigned to this task and cannot complete "
-            "its own work; a distinct actor must complete the handoff"
-        )
-    return None
+    if not assignee or profile != assignee:
+        return None
+
+    review_event = conn.execute(
+        "SELECT payload FROM task_events WHERE task_id = ? "
+        "AND kind = 'review_requested' ORDER BY id DESC LIMIT 1",
+        (task.id,),
+    ).fetchone()
+    if review_event and review_event["payload"]:
+        try:
+            implementer = json.loads(review_event["payload"]).get("implementer")
+        except (TypeError, json.JSONDecodeError):
+            implementer = None
+        if implementer and profile != implementer:
+            return None
+
+    approval = conn.execute(
+        "SELECT 1 FROM task_links l JOIN tasks p ON p.id = l.parent_id "
+        "WHERE l.child_id = ? AND p.status = 'done' "
+        "AND p.completion_policy = 'approval' "
+        "AND COALESCE(p.assignee, '') <> ? LIMIT 1",
+        (task.id, profile),
+    ).fetchone()
+    if approval:
+        return None
+    return tool_error(
+        f"profile {profile} cannot self-complete task {task.id}; its independent "
+        "completion policy requires another profile or a completed approval parent"
+    )
 
 
-def _enforce_worker_create_assignee(assignee: str) -> Optional[str]:
-    """Keep task-scoped workers from injecting work into another queue."""
+def _enforce_worker_create_scope(
+    conn: Any,
+    assignee: str,
+    parents: list[str],
+    tenant: Optional[str],
+    completion_policy: str,
+) -> Optional[str]:
+    """Allow linked specialist delegation, but reject cross-queue injection."""
     if not os.environ.get("HERMES_KANBAN_TASK"):
         return None
     profile = (os.environ.get("HERMES_PROFILE") or "").strip()
@@ -241,12 +272,26 @@ def _enforce_worker_create_assignee(assignee: str) -> Optional[str]:
             "task-scoped kanban_create requires HERMES_PROFILE to verify "
             "the target assignee"
         )
-    if assignee != profile:
+    if assignee == profile:
+        return None
+    current_tid = os.environ.get("HERMES_KANBAN_TASK")
+    current = conn.execute(
+        "SELECT tenant FROM tasks WHERE id = ?", (current_tid,)
+    ).fetchone()
+    same_tenant = current is not None and current["tenant"] == tenant
+    from hermes_cli.profiles import list_profile_names
+    known_profile = assignee in set(list_profile_names())
+    explicit_delegate = current_tid in parents or completion_policy == "approval"
+    if explicit_delegate and same_tenant and known_profile:
+        return None
+    if not explicit_delegate:
         return tool_error(
-            f"task-scoped workers may only create cards assigned to their own "
-            f"profile ({profile}); refusing assignee {assignee}"
+            "task-scoped cross-profile delegation must either be linked with "
+            f"parents=[{current_tid}] or use completion_policy='approval'"
         )
-    return None
+    if not same_tenant:
+        return tool_error("task-scoped delegation cannot cross tenant boundaries")
+    return tool_error(f"unknown assignee profile {assignee}")
 
 
 def _connect(board: Optional[str] = None):
@@ -529,6 +574,7 @@ def _task_summary_dict(kb, conn, task) -> dict[str, Any]:
         "assignee": task.assignee,
         "status": task.status,
         "priority": task.priority,
+        "completion_policy": task.completion_policy,
         "tenant": task.tenant,
         "workspace_kind": task.workspace_kind,
         "workspace_path": task.workspace_path,
@@ -789,7 +835,7 @@ def _handle_complete(args: dict, **kw) -> str:
             # Only enforce when a judge is actually reachable — see
             # _goal_judge_available for why an unavailable judge fails open.
             task = kb.get_task(conn, tid)
-            actor_err = _enforce_distinct_completion_actor(task)
+            actor_err = _enforce_completion_policy(conn, task)
             if actor_err:
                 return actor_err
             rejection = _goal_mode_handoff_rejection(
@@ -1398,10 +1444,11 @@ def _handle_create(args: dict, **kw) -> str:
             "assignee is required — name the profile that should execute this "
             "task (the dispatcher will only spawn tasks with an assignee)"
         )
-    assignee = str(assignee).strip()
-    assignee_err = _enforce_worker_create_assignee(assignee)
-    if assignee_err:
-        return assignee_err
+    from hermes_cli.profiles import normalize_profile_name
+    try:
+        assignee = normalize_profile_name(str(assignee).strip())
+    except ValueError as e:
+        return tool_error(f"kanban_create: {e}")
     body = args.get("body")
     parents = args.get("parents") or []
     tenant = args.get("tenant") or os.environ.get("HERMES_TENANT")
@@ -1441,6 +1488,7 @@ def _handle_create(args: dict, **kw) -> str:
     idempotency_key = args.get("idempotency_key")
     max_runtime_seconds = args.get("max_runtime_seconds")
     initial_status = args.get("initial_status") or "running"
+    completion_policy = args.get("completion_policy") or "worker"
     skills = args.get("skills")
     if isinstance(skills, str):
         # Accept a single skill name as a string for convenience.
@@ -1467,6 +1515,11 @@ def _handle_create(args: dict, **kw) -> str:
     try:
         kb, conn = _connect(board=board)
         try:
+            assignee_err = _enforce_worker_create_scope(
+                conn, assignee, list(parents), tenant, str(completion_policy)
+            )
+            if assignee_err:
+                return assignee_err
             # A project link is safe to inherit because ``create_task`` turns
             # it into a fresh per-task worktree. Never inherit the parent's
             # literal workspace kind/path; directory sharing must be explicit.
@@ -1503,6 +1556,7 @@ def _handle_create(args: dict, **kw) -> str:
                     int(goal_max_turns) if goal_max_turns is not None else None
                 ),
                 initial_status=str(initial_status),
+                completion_policy=str(completion_policy),
                 created_by=os.environ.get("HERMES_PROFILE") or "worker",
                 session_id=session_id,
             )
@@ -2289,6 +2343,16 @@ KANBAN_CREATE_SCHEMA = {
                     "require immediate human ops (R3 gate) to skip the "
                     "brief running-to-blocked transition. Defaults to "
                     "'running', which preserves the usual dispatch path."
+                ),
+            },
+            "completion_policy": {
+                "type": "string",
+                "enum": ["worker", "independent", "approval"],
+                "description": (
+                    "Completion authority. 'worker' (default) lets the assigned "
+                    "worker close the card; 'independent' requires another "
+                    "profile or a completed 'approval' parent; 'approval' marks "
+                    "a reviewer/verifier card that may release such a child."
                 ),
             },
             "skills": {

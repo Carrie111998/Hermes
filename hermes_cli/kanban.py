@@ -64,6 +64,7 @@ def _task_to_dict(t: kb.Task) -> dict[str, Any]:
         "assignee": t.assignee,
         "status": t.status,
         "priority": t.priority,
+        "completion_policy": t.completion_policy,
         "tenant": t.tenant,
         "workspace_kind": t.workspace_kind,
         "workspace_path": t.workspace_path,
@@ -394,6 +395,16 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                                "and re-queues the task.")
     p_create.add_argument("--created-by", default="user",
                           help="Author name recorded on the task (default: user)")
+    p_create.add_argument(
+        "--completion-policy",
+        choices=sorted(kb.VALID_COMPLETION_POLICIES),
+        default="independent",
+        help=(
+            "Who may close the card: independent (default) requires another "
+            "profile or completed approval parent; worker allows self-completion; "
+            "approval marks a reviewer/verifier parent"
+        ),
+    )
     p_create.add_argument("--skill", action="append", default=[], dest="skills",
                           help="Skill to force-load into the worker "
                                "(repeatable). The kanban lifecycle is already "
@@ -1669,6 +1680,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
             body=args.body,
             assignee=args.assignee,
             created_by=args.created_by or _profile_author(),
+            completion_policy=args.completion_policy,
             workspace_kind=ws_kind,
             workspace_path=ws_path,
             branch_name=branch_name,
