@@ -6932,9 +6932,41 @@ async def get_env_vars(profile: Optional[str] = None):
 
 
 @app.put("/api/env")
+
+def _is_masked_writeback(key: str, value: str) -> bool:
+    """True when ``value`` is exactly the redacted form of the on-disk secret.
+
+    Dashboard Keys inputs are pre-filled with ``redact_key(stored)``. Saving an
+    untouched field would otherwise overwrite the real credential with the mask
+    (issue #54708). Compare against ``load_env()`` (profile ``.env``), not
+    ``os.environ``, so a stale inherited env cannot bypass the guard.
+    """
+    if value is None:
+        return False
+    value = str(value)
+    if not value:
+        return False
+    stored = (load_env() or {}).get(key)
+    if not stored:
+        return False
+    try:
+        masked = redact_key(str(stored))
+    except Exception:
+        return False
+    return value == masked
+
+
 async def set_env_var(body: EnvVarUpdate, profile: Optional[str] = None):
     try:
         with _profile_scope(body.profile or profile):
+            if _is_masked_writeback(body.key, body.value):
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        "Refusing to write a masked/redacted credential value "
+                        "back to .env; re-enter the full secret to rotate."
+                    ),
+                )
             # Unified credential lifecycle: writes .env AND reconciles any
             # config.yaml mirror still holding the previous value of this var
             # (model.api_key / auxiliary.*.api_key / custom_providers[*]),

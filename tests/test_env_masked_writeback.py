@@ -74,9 +74,13 @@ def test_put_env_rejects_masked_writeback(monkeypatch):
 
     saved = {}
     monkeypatch.setattr(web_server, "load_env", lambda: {"SLACK_BOT_TOKEN": real})
-    monkeypatch.setattr(
-        web_server, "save_env_value", lambda k, v: saved.__setitem__(k, v)
-    )
+
+    def _boom(k, v):
+        saved[k] = v
+        raise AssertionError("save must not run for masked write-back")
+
+    import hermes_cli.credential_lifecycle as cl
+    monkeypatch.setattr(cl, "save_provider_env_credential", _boom)
 
     with pytest.raises(HTTPException) as exc:
         asyncio.run(set_env_var(EnvVarUpdate(key="SLACK_BOT_TOKEN", value=masked)))
@@ -88,12 +92,17 @@ def test_put_env_rejects_masked_writeback(monkeypatch):
 def test_put_env_allows_real_value(monkeypatch):
     saved = {}
     monkeypatch.setattr(web_server, "load_env", lambda: {"SLACK_BOT_TOKEN": "old-but-real-value"})
-    monkeypatch.setattr(
-        web_server, "save_env_value", lambda k, v: saved.__setitem__(k, v)
-    )
+
+    def _save(k, v):
+        saved[k] = v
+        return {"ok": True, "key": k, "config_updates": []}
+
+    import hermes_cli.credential_lifecycle as cl
+    monkeypatch.setattr(cl, "save_provider_env_credential", _save)
 
     result = asyncio.run(
         set_env_var(EnvVarUpdate(key="SLACK_BOT_TOKEN", value="xoxb-brand-new-token-9999"))
     )
-    assert result == {"ok": True, "key": "SLACK_BOT_TOKEN"}
+    assert result["ok"] is True
+    assert result["key"] == "SLACK_BOT_TOKEN"
     assert saved["SLACK_BOT_TOKEN"] == "xoxb-brand-new-token-9999"
