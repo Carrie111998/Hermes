@@ -4,12 +4,13 @@ Tests the _handle_resume_command handler (switch to a previously-named session)
 across gateway messenger platforms.
 """
 
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from gateway.config import Platform
+from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.platforms.base import MessageEvent
 from gateway.session import SessionSource, build_session_key
 
@@ -897,6 +898,139 @@ class TestSameOriginChatGroupScoping:
         assert await runner._resume_target_allowed(
             self._src("alice"), "bobs_live_sid", allow_override=False
         ) is False
+
+    @staticmethod
+    def _configure_qq_group_override(runner, *, global_value, platform_value):
+        runner.config.group_sessions_per_user = global_value
+        runner.config.thread_sessions_per_user = False
+        runner.config.platforms = {
+            Platform.QQBOT: SimpleNamespace(
+                extra={"group_sessions_per_user": platform_value}
+            )
+        }
+
+    def test_qq_override_isolates_live_group_when_global_is_shared(self):
+        runner = _make_runner()
+        self._configure_qq_group_override(
+            runner, global_value=False, platform_value=True
+        )
+        alice = self._src("alice", platform=Platform.QQBOT, chat_id="qq-group")
+        bob = self._src("bob", platform=Platform.QQBOT, chat_id="qq-group")
+
+        assert runner._same_origin_chat(alice, bob) is False
+
+    def test_qq_override_shares_live_group_when_global_is_per_user(self):
+        runner = _make_runner()
+        self._configure_qq_group_override(
+            runner, global_value=True, platform_value=False
+        )
+        alice = self._src("alice", platform=Platform.QQBOT, chat_id="qq-group")
+        bob = self._src("bob", platform=Platform.QQBOT, chat_id="qq-group")
+
+        assert runner._same_origin_chat(alice, bob) is True
+
+    def test_secondary_profile_uses_its_own_isolation_policy(self):
+        runner = _make_runner()
+        runner.config.group_sessions_per_user = False
+        secondary = GatewayConfig(group_sessions_per_user=True)
+        runner._profile_configs = {"secondary": secondary}
+        alice = replace(
+            self._src("alice", platform=Platform.QQBOT, chat_id="qq-group"),
+            profile="secondary",
+        )
+        bob = replace(alice, user_id="bob")
+
+        assert runner._same_origin_chat(alice, bob) is False
+
+    def test_secondary_profile_admin_override_uses_secondary_policy(self):
+        runner = _make_runner()
+        runner.config = GatewayConfig(
+            platforms={
+                Platform.QQBOT: PlatformConfig(
+                    enabled=True,
+                    extra={"group_allow_admin_from": ["primary-admin"]},
+                )
+            },
+            multiplex_profiles=True,
+        )
+        secondary = GatewayConfig(
+            platforms={
+                Platform.QQBOT: PlatformConfig(
+                    enabled=True,
+                    extra={"group_allow_admin_from": ["secondary-admin"]},
+                )
+            },
+            multiplex_profiles=True,
+        )
+        runner._profile_configs = {
+            "default": runner.config,
+            "secondary": secondary,
+        }
+        source = replace(
+            self._src(
+                "primary-admin",
+                platform=Platform.QQBOT,
+                chat_id="qq-group",
+            ),
+            profile="secondary",
+        )
+
+        assert runner._resume_caller_is_admin(source) is False
+        assert runner._resume_caller_is_admin(
+            replace(source, user_id="secondary-admin")
+        ) is True
+
+    @pytest.mark.asyncio
+    async def test_qq_override_isolates_persisted_group_when_global_is_shared(
+        self, tmp_path
+    ):
+        from hermes_state import SessionDB
+
+        db = SessionDB(db_path=tmp_path / "state.db")
+        db.create_session(
+            "bobs_group",
+            "qqbot",
+            user_id="bob",
+            chat_id="qq-group",
+            chat_type="group",
+        )
+        runner = _make_runner(session_db=db)
+        runner._gateway_session_origin_for_id = lambda _sid: None
+        self._configure_qq_group_override(
+            runner, global_value=False, platform_value=True
+        )
+        alice = self._src("alice", platform=Platform.QQBOT, chat_id="qq-group")
+
+        assert await runner._resume_target_allowed(
+            alice, "bobs_group", allow_override=False
+        ) is False
+        db.close()
+
+    @pytest.mark.asyncio
+    async def test_qq_override_shares_persisted_group_when_global_is_per_user(
+        self, tmp_path
+    ):
+        from hermes_state import SessionDB
+
+        db = SessionDB(db_path=tmp_path / "state.db")
+        db.create_session(
+            "bobs_group",
+            "qqbot",
+            user_id="bob",
+            chat_id="qq-group",
+            chat_type="group",
+        )
+        runner = _make_runner(session_db=db)
+        runner._gateway_session_origin_for_id = lambda _sid: None
+        self._configure_qq_group_override(
+            runner, global_value=True, platform_value=False
+        )
+        alice = self._src("alice", platform=Platform.QQBOT, chat_id="qq-group")
+
+        assert await runner._resume_target_allowed(
+            alice, "bobs_group", allow_override=False
+        ) is True
+        db.close()
 
     # --- thread scoping: thread_id is part of the session key, so a session in
     # one thread must never match a caller in another thread of the same chat,

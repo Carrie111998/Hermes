@@ -61,6 +61,7 @@ except ImportError:
     httpx = None  # type: ignore[assignment]
 
 from gateway.config import Platform, PlatformConfig
+from hermes_constants import get_hermes_home
 from gateway.platforms.base import (
     gateway_trust_env,
     BasePlatformAdapter,
@@ -73,6 +74,7 @@ from gateway.platforms.base import (
 )
 from gateway.platforms.helpers import strip_markdown
 from gateway.platforms.media_cache import ext_for_mime
+from gateway.platforms.qqbot.identity import QQIdentityStore
 
 logger = logging.getLogger(__name__)
 
@@ -245,6 +247,14 @@ class QQAdapter(BasePlatformAdapter):
         self._group_allow_from = _coerce_list(
             extra.get("group_allow_from") or extra.get("groupAllowFrom")
         )
+        identity_store_path = extra.get("identity_store_path")
+        self._identity_store = QQIdentityStore(
+            Path(identity_store_path).expanduser()
+            if identity_store_path
+            else get_hermes_home() / "platform_data" / "qqbot" / "identities.json"
+        )
+        self._identity_probe = bool(extra.get("identity_probe", False))
+        self._identity_probe_shapes: set[Tuple[str, ...]] = set()
 
         # Connection state
         self._session: Optional[aiohttp.ClientSession] = None
@@ -1337,6 +1347,39 @@ class QQAdapter(BasePlatformAdapter):
         )
         await self.handle_message(event)
 
+    def _log_group_identity_probe(
+            self,
+            sender_id: str,
+            author: Dict[str, Any],
+    ) -> None:
+        """Log one safe sample per QQ author shape for field discovery."""
+        if not self._identity_probe:
+            return
+        shape = tuple(sorted(str(key) for key in author))
+        if shape in self._identity_probe_shapes:
+            return
+        self._identity_probe_shapes.add(shape)
+        candidate_keys = (
+            "username",
+            "nickname",
+            "qq_nickname",
+            "nick",
+            "card",
+            "member_name",
+        )
+        name_fields = {
+            key: " ".join(str(author[key]).split())[:80]
+            for key in candidate_keys
+            if author.get(key) not in (None, "")
+        }
+        logger.info(
+            "[%s] Group sender identity probe: sender_id=%s author_keys=%s name_fields=%s",
+            self._log_tag,
+            sender_id,
+            list(shape),
+            name_fields,
+        )
+
     async def _handle_group_message(
             self,
             d: Dict[str, Any],
@@ -1349,9 +1392,15 @@ class QQAdapter(BasePlatformAdapter):
         group_openid = str(d.get("group_openid", ""))
         if not group_openid:
             return
-        if not self._is_group_allowed(
-                group_openid, str(author.get("member_openid", ""))
-        ):
+        member_openid = str(author.get("member_openid") or "").strip()
+        if not member_openid:
+            logger.warning(
+                "[%s] Dropping QQ group message %s without member_openid",
+                self._log_tag,
+                msg_id,
+            )
+            return
+        if not self._is_group_allowed(group_openid, member_openid):
             return
 
         # Strip the @bot mention prefix from content
@@ -1386,10 +1435,17 @@ class QQAdapter(BasePlatformAdapter):
             return
 
         self._chat_type_map[group_openid] = "group"
+        identity = await asyncio.to_thread(
+            self._identity_store.resolve,
+            group_openid,
+            author,
+        )
+        self._log_group_identity_probe(identity.stable_id, author)
         event = MessageEvent(
             source=self.build_source(
                 chat_id=group_openid,
-                user_id=str(author.get("member_openid", "")),
+                user_id=member_openid,
+                user_name=identity.label,
                 chat_type="group",
             ),
             text=text,
@@ -1419,7 +1475,15 @@ class QQAdapter(BasePlatformAdapter):
         # Without this check any member of any guild the bot is in could
         # bypass the configured allowlist.
         guild_id = str(d.get("guild_id", ""))
-        author_id = str(author.get("id", ""))
+        raw_author_id = author.get("id")
+        author_id = str(raw_author_id).strip() if raw_author_id is not None else ""
+        if not author_id:
+            logger.warning(
+                "[%s] Guild message missing author id: channel=%s",
+                self._log_tag,
+                channel_id,
+            )
+            return
         if not self._is_group_allowed(guild_id or channel_id, author_id):
             logger.debug(
                 "[%s] Guild message blocked by ACL: channel=%s user=%s",
@@ -1463,7 +1527,7 @@ class QQAdapter(BasePlatformAdapter):
         event = MessageEvent(
             source=self.build_source(
                 chat_id=channel_id,
-                user_id=str(author.get("id", "")),
+                user_id=author_id,
                 user_name=nick or None,
                 chat_type="group",
             ),
