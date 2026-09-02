@@ -9365,6 +9365,18 @@ def _build_call_kwargs(
             _deduped.append(_t)
         kwargs["tools"] = _deduped
 
+    # Task-level auxiliary reasoning is folded into extra_body.reasoning by
+    # _get_task_extra_body(). Promote that canonical config back into the
+    # provider-profile input so native projections (for example DeepSeek's
+    # extra_body.thinking toggle) see it too. Direct per-call reasoning_config
+    # remains higher priority.
+    reasoning_from_extra_body = False
+    if reasoning_config is None and isinstance(extra_body, dict):
+        task_reasoning = extra_body.get("reasoning")
+        if isinstance(task_reasoning, dict):
+            reasoning_config = dict(task_reasoning)
+            reasoning_from_extra_body = True
+
     # Build provider-aware reasoning kwargs through the same profile hooks used
     # by the standard chat-completions transport. Some providers require
     # top-level controls (Kimi/custom ``reasoning_effort``), others use nested
@@ -9422,6 +9434,7 @@ def _build_call_kwargs(
         reasoning_config
         and isinstance(reasoning_config, dict)
         and not profile_handles_reasoning
+        and not reasoning_from_extra_body
     ):
         if reasoning_config.get("enabled") is False:
             merged_extra["reasoning"] = {"enabled": False}
