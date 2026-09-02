@@ -513,6 +513,14 @@ class ToolCallGuardrailController:
         restart its streak at 1 on every lap and never reach
         ``no_progress_block_after`` — which is exactly how the 2026-08-19
         twenty-turn skill-reload loop stayed invisible to this controller.
+
+        DORMANT AS SHIPPED: no production caller passes
+        ``new_user_input=False`` today. The only call site
+        (``agent.turn_context``) uses the default, and a compaction restart
+        ``continue``s inside the loop without re-entering it, so the carry
+        cannot currently engage. The parameter and its tests pin the intended
+        semantics for the follow-up that threads an internal-turn signal
+        through; until then this branch is exercised only by tests.
         """
         self._exact_failure_counts: dict[ToolCallSignature, int] = {}
         self._same_tool_failure_counts: dict[str, int] = {}
