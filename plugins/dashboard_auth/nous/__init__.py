@@ -643,7 +643,7 @@ def register(ctx) -> None:
             "config.yaml), or pass --insecure to skip the OAuth gate "
             "entirely."
         )
-        logger.debug("dashboard-auth-nous: %s", LAST_SKIP_REASON)
+        logger.warning("dashboard-auth-nous: %s", LAST_SKIP_REASON)
         return
 
     if not client_id.startswith("agent:"):
