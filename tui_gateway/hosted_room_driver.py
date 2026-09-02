@@ -408,79 +408,112 @@ class HostedRoomRuntime:
         return self._info_acknowledges_peer_cancel(info, task)
 
     def retry_indeterminate(self, identity: state.TaskIdentity) -> dict[str, Any]:
-        """Explicitly retry one uncertain attempt under the current room lease."""
-        task = state.get_task(self.db_path, identity)
-        if task["status"] not in {"indeterminate", "deferred"}:
-            raise state.InvalidTaskTransitionError(
-                f"cannot retry task in state '{task['status']}'"
-            )
+        """Explicitly retry one uncertain attempt under the current room lease.
+
+        The background reconcile pass (``_reconcile_indeterminate``) runs on
+        every poll cycle for any room with an indeterminate task, so it can
+        settle/defer/requeue the same task concurrently with an explicit
+        Retry call. Mirror ``cancel()``'s routing-retry loop: every
+        fast-path failure caused by a concurrent transition re-reads and
+        re-routes instead of surfacing a transient
+        `InvalidTaskTransitionError`/`StaleTaskError` to the caller.
+        """
         binding = self._binding_for_room(identity.room_id)
         if binding is None:
             raise state.RoomUnavailableError("hosted room is unavailable")
         lease = self._ensure_lease(binding)
-        if task["status"] == "deferred":
-            retried = state.requeue_deferred_task(
-                self.db_path,
-                identity,
-                lease,
-                expected_execution_generation=task["execution_generation"],
-                expected_cancel_generation=task["cancel_generation"],
-                clock=self.clock,
-            )
+        for _ in range(_CANCEL_ROUTE_RETRIES):
+            task = state.get_task(self.db_path, identity)
+            if task["status"] not in {"indeterminate", "deferred"}:
+                raise state.InvalidTaskTransitionError(
+                    f"cannot retry task in state '{task['status']}'"
+                )
+            if task["status"] == "deferred":
+                try:
+                    retried = state.requeue_deferred_task(
+                        self.db_path,
+                        identity,
+                        lease,
+                        expected_execution_generation=task["execution_generation"],
+                        expected_cancel_generation=task["cancel_generation"],
+                        clock=self.clock,
+                    )
+                except (state.InvalidTaskTransitionError, state.StaleTaskError):
+                    # Lost the race with the worker; re-read and re-route.
+                    continue
+                with self._status_lock:
+                    self._blocked_rooms.discard(identity.room_id)
+                self.wakeup()
+                return retried
+            # Explicit Retry may resume the exact stored session. Use the
+            # returned runtime id for every subsequent history/info probe; an
+            # automatic abandoned-attempt scan remains non-resuming for local
+            # sessions.
+            inspection = self._inspect_recovery_session(binding, task)
+            if inspection.terminal is not None:
+                try:
+                    resolved = state.resolve_indeterminate_task(
+                        self.db_path,
+                        identity,
+                        lease,
+                        expected_execution_generation=task["execution_generation"],
+                        expected_cancel_generation=task["cancel_generation"],
+                        settlement_id=inspection.terminal.settlement_id,
+                        status=inspection.terminal.status,
+                        result=inspection.terminal.result,
+                        clock=self.clock,
+                    )
+                except (state.InvalidTaskTransitionError, state.StaleTaskError):
+                    continue
+                if self.publish_terminal is not None:
+                    self.publish_terminal(binding, resolved)
+                return resolved
+            if inspection.status == "cancelled":
+                try:
+                    resolved = state.resolve_indeterminate_cancellation(
+                        self.db_path,
+                        identity,
+                        lease,
+                        expected_execution_generation=task["execution_generation"],
+                        expected_cancel_generation=task["cancel_generation"],
+                        cancel_id=f"remote-cancel:{task['execution_generation']}",
+                        clock=self.clock,
+                    )
+                except (state.InvalidTaskTransitionError, state.StaleTaskError):
+                    continue
+                if self.publish_terminal is not None:
+                    self.publish_terminal(binding, resolved)
+                return resolved
+            if inspection.active:
+                with self._status_lock:
+                    self._blocked_rooms.add(identity.room_id)
+                raise state.InvalidTaskTransitionError(
+                    "cannot retry while the original task attempt is still active"
+                )
+            try:
+                retried = state.requeue_indeterminate_task(
+                    self.db_path,
+                    identity,
+                    lease,
+                    expected_execution_generation=task["execution_generation"],
+                    expected_cancel_generation=task["cancel_generation"],
+                    clock=self.clock,
+                )
+            except (state.InvalidTaskTransitionError, state.StaleTaskError):
+                continue
             with self._status_lock:
                 self._blocked_rooms.discard(identity.room_id)
             self.wakeup()
             return retried
-        # Explicit Retry may resume the exact stored session. Use the returned
-        # runtime id for every subsequent history/info probe; an automatic
-        # abandoned-attempt scan remains non-resuming for local sessions.
-        inspection = self._inspect_recovery_session(binding, task)
-        if inspection.terminal is not None:
-            resolved = state.resolve_indeterminate_task(
-                self.db_path,
-                identity,
-                lease,
-                expected_execution_generation=task["execution_generation"],
-                expected_cancel_generation=task["cancel_generation"],
-                settlement_id=inspection.terminal.settlement_id,
-                status=inspection.terminal.status,
-                result=inspection.terminal.result,
-                clock=self.clock,
-            )
-            if self.publish_terminal is not None:
-                self.publish_terminal(binding, resolved)
-            return resolved
-        if inspection.status == "cancelled":
-            resolved = state.resolve_indeterminate_cancellation(
-                self.db_path,
-                identity,
-                lease,
-                expected_execution_generation=task["execution_generation"],
-                expected_cancel_generation=task["cancel_generation"],
-                cancel_id=f"remote-cancel:{task['execution_generation']}",
-                clock=self.clock,
-            )
-            if self.publish_terminal is not None:
-                self.publish_terminal(binding, resolved)
-            return resolved
-        if inspection.active:
-            with self._status_lock:
-                self._blocked_rooms.add(identity.room_id)
-            raise state.InvalidTaskTransitionError(
-                "cannot retry while the original task attempt is still active"
-            )
-        retried = state.requeue_indeterminate_task(
-            self.db_path,
-            identity,
-            lease,
-            expected_execution_generation=task["execution_generation"],
-            expected_cancel_generation=task["cancel_generation"],
-            clock=self.clock,
+        # Exhausted routing retries under sustained contention: surface the
+        # live status honestly rather than a transient transition error.
+        final = state.get_task(self.db_path, identity)
+        if final["status"] not in {"indeterminate", "deferred"}:
+            return final
+        raise state.InvalidTaskTransitionError(
+            f"retry kept losing races with task transitions "
+            f"(last observed state '{final['status']}')"
         )
-        with self._status_lock:
-            self._blocked_rooms.discard(identity.room_id)
-        self.wakeup()
-        return retried
 
     def _interrupt_stopping_task(
         self,
