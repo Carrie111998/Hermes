@@ -10142,6 +10142,33 @@ async function teardownSshConnection(profile) {
   )
 }
 
+// The primary-reuse shortcut in ensureRegistryBackend serves a registry
+// connection that doubles as the primary from the primary backend, whose SSH
+// transport is registered only under the primary profile scope — never under
+// the conn:<id>::<profile> scope the terminal computes. Fall back to a live
+// transport for the same SSH host so the terminal can still attach.
+function sshTerminalTargetForScope(scope: string, connectionId?: string | null) {
+  const state = sshConnections.get(scope)
+
+  if (state && state.ssh) {
+    return { ssh: state.ssh, scope }
+  }
+
+  const source = connectionId
+    ? readDesktopConnectionsRegistry().connections.find((connection) => connection.id === connectionId)
+    : null
+
+  if (source && source.kind === 'ssh' && source.host) {
+    for (const [fallbackScope, fallbackState] of sshConnections) {
+      if (fallbackState && fallbackState.ssh && fallbackState.host === source.host) {
+        return { ssh: fallbackState.ssh, scope: fallbackScope }
+      }
+    }
+  }
+
+  return 'pending'
+}
+
 // CRITICAL: this must mirror resolveRemoteBackend's precedence, not just return
 // any cached SSH state. A per-profile token/OAuth override wins over a global
 // SSH connection — so if the active profile resolves to a NON-SSH backend, the
@@ -10156,9 +10183,7 @@ function activeSshTerminalTarget(webContentsId?: number) {
       return null
     }
 
-    const state = sshConnections.get(scope)
-
-    return state && state.ssh ? { ssh: state.ssh, scope } : 'pending'
+    return sshTerminalTargetForScope(scope, windowRoute.connectionId)
   }
 
   const profile = windowRoute?.profile ?? primaryProfileKey()
@@ -10182,9 +10207,7 @@ function activeSshTerminalTarget(webContentsId?: number) {
     ? backendScopeKey(route.connectionId, profile)
     : sshScopeKey(route.source === 'profile' ? profile : null)
 
-  const state = sshConnections.get(scope)
-
-  return state && state.ssh ? { ssh: state.ssh, scope } : 'pending'
+  return sshTerminalTargetForScope(scope, route.connectionId)
 }
 
 async function ensureTerminalBackend(webContentsId: number) {

@@ -1229,6 +1229,61 @@ describe('applyBackendUpdate recovery', () => {
     expect(getActionStatusSpy).toHaveBeenCalledTimes(3)
   })
 
+  it('recovers when the start call hangs up because the update killed the backend', async () => {
+    // ``hermes update`` kills the backend serving this very request, so the POST
+    // can die before answering even though the update started fine.
+    updateHermesSpy
+      .mockRejectedValueOnce(new Error('socket hang up'))
+      .mockResolvedValueOnce({ action_id: 'b'.repeat(32), already_running: true, ok: true, name: 'hermes-update', pid: 7 })
+
+    getActionStatusSpy.mockResolvedValue({
+      exit_code: 0,
+      lines: ['=== hermes-update started now ===', 'Update complete!'],
+      name: 'hermes-update',
+      pid: 7,
+      running: false
+    })
+
+    const promise = applyBackendUpdate()
+    await vi.advanceTimersByTimeAsync(5000)
+
+    await expect(promise).resolves.toMatchObject({ ok: true })
+    expect(updateHermesSpy).toHaveBeenCalledTimes(2)
+  })
+
+  it('completes after a hung-up start even when the retry never answers', async () => {
+    // Nothing recovers the descriptor, so polling falls back to the stable
+    // action name and the completion receipt still settles the update.
+    updateHermesSpy.mockRejectedValue(new Error('socket hang up'))
+
+    getActionStatusSpy.mockResolvedValue({
+      exit_code: 0,
+      lines: ['=== hermes-update started now ===', 'Update complete!'],
+      name: 'hermes-update',
+      pid: 7,
+      running: false
+    })
+
+    const promise = applyBackendUpdate()
+    await vi.advanceTimersByTimeAsync(10_000)
+
+    await expect(promise).resolves.toMatchObject({ ok: true })
+    expect(getActionStatusSpy).toHaveBeenCalledWith('hermes-update', 2000)
+  })
+
+  it('still fails on a real API error from the start call', async () => {
+    // A status-prefixed message is the backend refusing, not the socket dying —
+    // it must not be mistaken for a restart.
+    updateHermesSpy.mockRejectedValue(new Error('401: {"detail":"Unauthorized"}'))
+
+    const promise = applyBackendUpdate()
+    await vi.advanceTimersByTimeAsync(5000)
+
+    await expect(promise).resolves.toMatchObject({ error: 'apply-failed', ok: false })
+    expect(updateHermesSpy).toHaveBeenCalledTimes(1)
+    expect(getActionStatusSpy).not.toHaveBeenCalled()
+  })
+
   it('restores the fixed action deadline after reconnecting', async () => {
     updateHermesSpy.mockResolvedValue({ action_id: 'a'.repeat(32), ok: true, name: 'hermes-update', pid: 1 })
 

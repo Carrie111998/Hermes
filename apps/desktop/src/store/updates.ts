@@ -557,6 +557,9 @@ export async function applyUpdates(opts: DesktopUpdateApplyOptions = {}): Promis
 const BACKEND_ACTION_POLL_MS = 1500
 const BACKEND_ACTION_MAX_MS = 6 * 60 * 1000
 const BACKEND_RETURN_MAX_MS = 4 * 60 * 1000
+/** Server-assigned name for the update action (``web_server.py``). Stable, so
+ *  it lets us resume polling when a hang-up costs us the start response. */
+const BACKEND_UPDATE_ACTION_NAME = 'hermes-update'
 
 function finishBackendApply(returned: boolean): DesktopUpdateApplyResult {
   if (returned) {
@@ -640,6 +643,23 @@ function receiptProvesOutcome(status: Awaited<ReturnType<typeof getActionStatus>
   return Number.isFinite(startedMs) && startedMs >= applyStartedAtMs - 60_000
 }
 
+/** Did this rejection come from the transport dying rather than the API saying no?
+ *
+ *  Error identity does not survive IPC — ``preload.ts`` uses a bare
+ *  ``ipcRenderer.invoke``, so Electron serializes only the message. The main
+ *  process formats HTTP failures as ``<status>: <body>``, so a leading status
+ *  code is the reliable discriminator. Anything else ("socket hang up",
+ *  "ECONNRESET", "Timed out connecting to Hermes backend…") is the connection
+ *  going away underneath us.
+ *
+ *  Fail closed: an unrecognized shape is treated as a real error, so a genuine
+ *  401/500 can never be mistaken for a restart. */
+function isTransportFailure(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error)
+
+  return !/\b[45]\d{2}:/.test(message)
+}
+
 function legacyBackendReachedTarget(
   status: BackendUpdateCheckResponse,
   targetSha: string | undefined,
@@ -654,6 +674,32 @@ function legacyBackendReachedTarget(
   }
 
   return !!targetSha && !!status.commits?.length && !status.commits.some(commit => commit.sha === targetSha)
+}
+
+/** Try to re-acquire the action descriptor after the start call hung up.
+ *
+ *  ``POST /api/hermes/update`` is idempotent: while an update is live it
+ *  answers ``{ok: true, already_running: true, action_id}``, which is exactly
+ *  what the poll loop needs. The backend is mid-restart, so give it a few
+ *  attempts before falling back to name-only polling. */
+async function recoverStartedUpdate(): Promise<Awaited<ReturnType<typeof updateHermes>> | null> {
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    await new Promise(resolve => globalThis.setTimeout(resolve, BACKEND_ACTION_POLL_MS))
+
+    try {
+      const retried = await updateHermes()
+
+      if (retried.ok) {
+        return retried
+      }
+    } catch (error) {
+      if (!isTransportFailure(error)) {
+        throw error
+      }
+    }
+  }
+
+  return null
 }
 
 let backendUpdateInFlight: Promise<DesktopUpdateApplyResult> | null = null
@@ -675,10 +721,22 @@ async function runBackendUpdate(): Promise<DesktopUpdateApplyResult> {
       ? previousStatus.targetSha.slice('backend:'.length)
       : undefined
 
-    const started = await updateHermes()
+    let started: Awaited<ReturnType<typeof updateHermes>> | null = null
     const applyStartedAtMs = Date.now()
 
-    if (!started.ok) {
+    try {
+      started = await updateHermes()
+    } catch (error) {
+      // The update kills the backend that is serving this very request, so the
+      // POST can hang up before a response is written even though the update
+      // started fine. Losing the receipt is not the same as failing — fall
+      // through to the restart path below and let the backend tell us.
+      if (!isTransportFailure(error)) {
+        throw error
+      }
+    }
+
+    if (started && !started.ok) {
       const message = (started as { message?: string }).message || translateNow('updates.applyStatus.notAvailable')
       const command = (started as { update_command?: string }).update_command || 'hermes update'
       $backendUpdateApply.set({ ...IDLE, applying: false, stage: 'manual', message, command })
@@ -686,25 +744,37 @@ async function runBackendUpdate(): Promise<DesktopUpdateApplyResult> {
       return { ok: false, error: 'manual', manual: true, message, command }
     }
 
+    if (!started) {
+      // Re-issue the start: the endpoint is idempotent and answers
+      // ``already_running`` with the live action_id, which restores normal
+      // polling (and the completion receipt) on the far side of the restart.
+      started = await recoverStartedUpdate()
+    }
+
     $backendUpdateApply.set({
       ...IDLE,
       applying: true,
-      stage: 'pull',
-      message: translateNow('updates.applyStatus.pulling')
+      stage: started ? 'pull' : 'restart',
+      message: translateNow(started ? 'updates.applyStatus.pulling' : 'updates.applyStatus.restarting')
     })
 
     let last: Awaited<ReturnType<typeof getActionStatus>> | null = null
     // Backups, dependency repair, and builds can legitimately take several
     // minutes. Keep the generous cap only as a guard against a stuck action.
     const actionDeadline = Date.now() + BACKEND_ACTION_MAX_MS
-    let deadline = actionDeadline
-    let reconnecting = false
+    // Without a descriptor we are already waiting on a restart, so start on the
+    // shorter come-back budget rather than the full action cap.
+    let deadline = started ? actionDeadline : Date.now() + BACKEND_RETURN_MAX_MS
+    let reconnecting = !started
+    // The action name is server-assigned and stable, so polling still works
+    // even when the hang-up cost us the descriptor.
+    const actionName = started?.name ?? BACKEND_UPDATE_ACTION_NAME
 
     while (Date.now() < deadline) {
       await new Promise(resolve => globalThis.setTimeout(resolve, BACKEND_ACTION_POLL_MS))
 
       try {
-        last = await getActionStatus(started.name, 2000)
+        last = await getActionStatus(actionName, 2000)
         ingestBackendActionStatus(last)
       } catch {
         if (!reconnecting) {
@@ -736,7 +806,7 @@ async function runBackendUpdate(): Promise<DesktopUpdateApplyResult> {
         continue
       }
 
-      if (last.exit_code === 0 || (last.exit_code === null && completedAfterRestart(last, started.action_id))) {
+      if (last.exit_code === 0 || (last.exit_code === null && completedAfterRestart(last, started?.action_id))) {
         return finishBackendApply(true)
       }
 
@@ -748,7 +818,7 @@ async function runBackendUpdate(): Promise<DesktopUpdateApplyResult> {
         return finishBackendApply(last.receipt!.outcome === 'success')
       }
 
-      if (!started.action_id && last.exit_code === null) {
+      if (!started?.action_id && last.exit_code === null) {
         try {
           const status = await checkHermesUpdate(true)
 

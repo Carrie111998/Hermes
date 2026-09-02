@@ -147,7 +147,13 @@ export function updateHermes(): Promise<ActionResponse> {
   return hermesApi<ActionResponse>({
     ...profileScoped(),
     path: '/api/hermes/update',
-    method: 'POST'
+    method: 'POST',
+    // ``hermes update`` ends by killing every matching ``hermes serve`` — which,
+    // for a backend reached over SSH, is the very process serving this request
+    // (the HERMES_DESKTOP_CHILD_PID guard only covers locally-spawned children).
+    // The spawn itself returns fast, but the socket can die first; a longer
+    // budget keeps the common case from tripping the 15s default.
+    timeoutMs: 60_000
   })
 }
 
