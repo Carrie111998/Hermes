@@ -3599,6 +3599,24 @@ def create_task(
                 _inherit_notify_subs(conn, task_id, parents, created_at=now)
             return task_id
         except sqlite3.IntegrityError:
+            # A same-key racing creator that slipped past the pre-check above
+            # now hits the UNIQUE idx_tasks_idempotency (issue #64). Converge
+            # on the winning row instead of raising: by the time this INSERT
+            # fails, the winner's transaction has already committed
+            # (write_txn serializes writers via BEGIN IMMEDIATE), so a
+            # re-select by key is guaranteed to find it. Status-blind, like
+            # the pre-check: archived rows match too (admitted-once means
+            # admitted-forever). A miss here means the constraint that fired
+            # was the task-id PK collision, so fall through to the fresh-id
+            # retry below.
+            if idempotency_key:
+                row = conn.execute(
+                    "SELECT id FROM tasks WHERE idempotency_key = ? "
+                    "ORDER BY created_at DESC LIMIT 1",
+                    (idempotency_key,),
+                ).fetchone()
+                if row:
+                    return row["id"]
             if attempt == 1:
                 raise
             # Retry with a fresh id.
