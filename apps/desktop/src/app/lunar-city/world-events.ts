@@ -111,6 +111,8 @@ function eventSpec(kind: string): {
       return { actionKinds: ['inspect', 'reclaim_task', 'reassign_task'], scope: 'task', severity: 'warning', worldKind: 'worker.timed_out' }
     case 'completed':
       return { actionKinds: ['inspect', 'show_source'], scope: 'task', severity: 'success', worldKind: 'task.completed' }
+    case 'done':
+      return { actionKinds: ['inspect', 'show_source'], scope: 'task', severity: 'success', worldKind: 'task.completed' }
     case 'unblocked':
       return { actionKinds: ['inspect', 'show_source'], scope: 'task', severity: 'success', worldKind: 'task.recovered' }
     case 'archived':
