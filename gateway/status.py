@@ -949,6 +949,18 @@ def _cleanup_invalid_pid_path(pid_path: Path, *, cleanup_stale: bool) -> bool:
         # no gateway record exists.
         return False
     lock_path = _get_gateway_lock_path(pid_path)
+
+    # A pid record explicitly stamped with a FOREIGN profile's home is not
+    # "maybe ours, probe uncertain" — it is positive proof of cross-profile
+    # contamination, and the owning profile reaps it even when the foreign
+    # gateway is alive and holding the lock (#89315).  Releasing our attempt
+    # immediately after the unlink keeps the window atomic-enough: the
+    # foreign owner's next write re-creates its record, and crucially we
+    # never unlink the LOCK file itself (a stable rendezvous), so no live
+    # flock is silently released (#101532).
+    pid_record = _read_pid_record(pid_path)
+    foreign_record = pid_record is not None and not _pid_record_belongs_to_current_profile(pid_record)
+
     try:
         handle = open(lock_path, "a+", encoding="utf-8")
     except OSError:
@@ -958,7 +970,7 @@ def _cleanup_invalid_pid_path(pid_path: Path, *, cleanup_stale: bool) -> bool:
     lock_acquired = False
     try:
         lock_acquired = _try_acquire_file_lock(handle)
-        if not lock_acquired:
+        if not lock_acquired and not foreign_record:
             return False
         _clear_running_pid_cache()
         try:
