@@ -71,6 +71,15 @@ def _make_agent(monkeypatch):
         def _has_stream_consumers(self):
             return False
 
+        def _tool_result_content_for_active_model(self, _name, result):
+            return result
+
+        def _append_guardrail_observation(self, _name, _args, result, **_kwargs):
+            return result
+
+        def _record_file_mutation_result(self, *_args, **_kwargs):
+            pass
+
     stub = _Stub()
     # Bind the real methods under test
     stub._execute_tool_calls_concurrent = _ra.AIAgent._execute_tool_calls_concurrent.__get__(stub)
@@ -80,6 +89,8 @@ def _make_agent(monkeypatch):
     # tool batch. Stub it as a no-op — this test exercises interrupt
     # fanout, not steer injection.
     stub._apply_pending_steer_to_tool_results = lambda *a, **kw: None
+    stub._subdirectory_hints.check_tool_call.return_value = ""
+    stub._flush_messages_to_session_db = lambda *a, **kw: True
     stub._invoke_tool = MagicMock(side_effect=lambda *a, **kw: '{"ok": true}')
     return stub
 
@@ -142,4 +153,60 @@ def test_clear_interrupt_clears_worker_tids(monkeypatch):
         "clear_interrupt() did not clear the interrupt bit for a tracked "
         "worker tid — stale interrupt can leak into the next turn"
     )
+
+
+def test_interrupt_detaches_noncooperative_concurrent_batch(monkeypatch):
+    """An interrupted batch returns promptly and suppresses late completions."""
+    import agent.tool_executor as tool_executor
+    from agent.tool_executor import _ManagedToolResult
+
+    agent = _make_agent(monkeypatch)
+    started = threading.Event()
+    release = threading.Event()
+
+    def _blocking_middleware(agent_arg, **kwargs):
+        started.set()
+        release.wait(timeout=10)
+        return _ManagedToolResult(
+            result='{"late": true}',
+            args=kwargs.get("function_args", {}),
+            middleware_trace=[],
+            blocked=False,
+            dispatched=True,
+        )
+
+    monkeypatch.setattr(
+        tool_executor,
+        "_run_agent_tool_execution_middleware",
+        _blocking_middleware,
+    )
+    monkeypatch.setattr(tool_executor, "_resolve_concurrent_tool_timeout", lambda: None)
+
+    messages = []
+    worker = threading.Thread(
+        target=agent._execute_tool_calls_concurrent,
+        args=(_FakeAssistantMsg([
+            _FakeToolCall("tool_a", call_id="tc_a"),
+            _FakeToolCall("tool_b", call_id="tc_b"),
+        ]), messages, "test_task"),
+        daemon=True,
+    )
+    worker.start()
+    assert started.wait(timeout=2.0)
+
+    started_at = time.monotonic()
+    agent.interrupt("user stop")
+    worker.join(timeout=2.0)
+    elapsed = time.monotonic() - started_at
+
+    assert not worker.is_alive()
+    assert elapsed < 1.5
+    assert messages
+    assert all("cancelled" in str(message.get("content", "")) for message in messages)
+
+    # Let the abandoned daemon workers finish. Their result must not be
+    # appended or projected after the interrupted turn has moved on.
+    release.set()
+    time.sleep(0.1)
+    assert all("late" not in str(message) for message in messages)
 

@@ -126,6 +126,7 @@ _DEFAULT_IMAGE_PARALLEL_REQUESTS = 4
 # Generous ceiling for slow-but-valid tool work (large page fetches, slow
 # remote backends) so the batch guard does not preempt a legitimate attempt.
 _DEFAULT_CONCURRENT_TOOL_TIMEOUT_S = 420.0
+_CONCURRENT_TOOL_POLL_INTERVAL_S = 0.2
 # Upper bound a concurrent worker will wait at the start-order gate for all
 # earlier-ordered tools to advance before proceeding out of order. Long enough
 # to cover slow-but-legitimate authorization (e.g. an approval round-trip),
@@ -1419,6 +1420,8 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                 )
                 return
             except KeyboardInterrupt:
+                if batch_abandoned.is_set():
+                    return
                 try:
                     agent.interrupt("keyboard interrupt")
                 except Exception:
@@ -1448,6 +1451,14 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                 result = f"Error executing tool '{function_name}': {tool_error}"
                 logger.error("_invoke_tool raised for %s: %s", function_name, tool_error, exc_info=True)
             duration = time.time() - start
+            if batch_abandoned.is_set():
+                logger.info(
+                    "discarding late completion from abandoned concurrent tool "
+                    "batch (tool=%s, %.2fs)",
+                    function_name,
+                    duration,
+                )
+                return
             if not blocked and not dispatched:
                 _emit_terminal_post_tool_call(
                     agent,
@@ -1464,6 +1475,12 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                 logger.info("tool %s failed (%.2fs): %s", function_name, duration, result[:200])
             else:
                 logger.info("tool %s completed (%.2fs, %d chars)", function_name, duration, len(result))
+            if batch_abandoned.is_set():
+                logger.info(
+                    "discarding completion that raced batch abandonment (tool=%s)",
+                    function_name,
+                )
+                return
             results[index] = (
                 function_name,
                 function_args,
@@ -1584,7 +1601,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                 _conc_start = time.time()
                 _interrupt_logged = False
                 while True:
-                    wait_timeout = 5.0
+                    wait_timeout = _CONCURRENT_TOOL_POLL_INTERVAL_S
                     if deadline is not None:
                         effective_deadline = (
                             deadline + authorization_gate.excluded_seconds()
@@ -1664,7 +1681,9 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                         _abandon_batch()
                         # Give already-running tools a moment to notice the
                         # per-thread interrupt signal and exit gracefully.
-                        concurrent.futures.wait(not_done, timeout=3.0)
+                        concurrent.futures.wait(
+                            not_done, timeout=_CONCURRENT_TOOL_POLL_INTERVAL_S
+                        )
                         break
 
                     _conc_elapsed = int(time.time() - _conc_start)
