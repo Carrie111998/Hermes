@@ -832,6 +832,8 @@ def init_agent(
         api_mode is None
         and agent.api_mode == "chat_completions"
         and agent.provider != "copilot-acp"
+        and agent._base_url_hostname
+        not in {"localhost", "127.0.0.1", "::1", "0.0.0.0"}
         and not str(agent.base_url or "").lower().startswith("acp://")
         and not str(agent.base_url or "").lower().startswith("acp+tcp://")
         and not agent._is_azure_openai_url()
@@ -846,6 +848,19 @@ def init_agent(
         agent.api_mode = "codex_responses"
         # Invalidate the eager-warmed transport cache — api_mode changed
         # from chat_completions to codex_responses after the warm at __init__.
+        if hasattr(agent, "_transport_cache"):
+            agent._transport_cache.clear()
+
+    # A persisted/provider-derived codex_responses mode can reach this layer
+    # without passing through the fallback resolver.  Loopback endpoints are
+    # OpenAI-compatible local daemons and must stay on chat completions.
+    if agent.api_mode == "codex_responses" and agent._base_url_hostname in {
+        "localhost",
+        "127.0.0.1",
+        "::1",
+        "0.0.0.0",
+    }:
+        agent.api_mode = "chat_completions"
         if hasattr(agent, "_transport_cache"):
             agent._transport_cache.clear()
 

@@ -9288,7 +9288,19 @@ def _make_agent(
             if override_api_key:
                 runtime["api_key"] = override_api_key
             if override_api_mode:
-                runtime["api_mode"] = override_api_mode
+                from hermes_cli.runtime_provider import (
+                    _loopback_hostname,
+                    base_url_hostname,
+                )
+
+                effective_url = runtime.get("base_url") or override_base_url or ""
+                if (
+                    str(override_api_mode).strip().lower() == "codex_responses"
+                    and _loopback_hostname(base_url_hostname(effective_url))
+                ):
+                    runtime["api_mode"] = "chat_completions"
+                else:
+                    runtime["api_mode"] = override_api_mode
     else:
         model, requested_provider = _resolve_startup_runtime()
         if isinstance(model_override, str) and model_override:

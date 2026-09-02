@@ -75,6 +75,20 @@ class TestHostMandatedMetaResponses:
         # generic still chat
         assert rp._fallback_api_mode("custom", "https://generic.example.com/v1", "muse-spark-1.2") == "chat_completions"
 
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "http://localhost:8000/v1",
+            "http://127.0.0.1:8003/v1",
+            "http://[::1]:8000/v1",
+            "http://0.0.0.0:8000/v1",
+        ],
+    )
+    def test_loopback_openai_api_stays_on_chat_completions(self, url):
+        model = "local-tool-model"
+        assert rp._fallback_api_mode("openai-api", url, model) == "chat_completions"
+        assert determine_api_mode("openai-api", url, model) == "chat_completions"
+
 
 class TestMetaConfigRoundtrip:
     def test_providers_meta_api_mode_roundtrip(self):

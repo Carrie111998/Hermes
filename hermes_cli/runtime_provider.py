@@ -204,6 +204,10 @@ def _fallback_api_mode(provider: str, base_url: str, model: str = "") -> str:
     detected = _detect_api_mode_for_url(base_url)
     if detected:
         return detected
+    # Provider overlays such as ``openai-api`` prefer the Responses API, but
+    # local OpenAI-compatible servers generally expose chat completions only.
+    if _loopback_hostname(base_url_hostname(base_url)):
+        return "chat_completions"
     from hermes_cli.providers import determine_api_mode
 
     return determine_api_mode(provider, base_url, model) or "chat_completions"

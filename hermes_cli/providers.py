@@ -768,6 +768,13 @@ def determine_api_mode(provider: str, base_url: str = "", model: str = "") -> st
     if mandated is not None:
         return mandated
 
+    # Local OpenAI-compatible daemons commonly identify as ``openai-api``
+    # while only implementing /v1/chat/completions.  Do not let the provider
+    # overlay force those loopback endpoints onto /v1/responses.
+    hostname = base_url_hostname(base_url)
+    if hostname in {"localhost", "127.0.0.1", "::1", "0.0.0.0"}:
+        return "chat_completions"
+
     # Nous is dual-wire: anthropic/* → Messages, everything else →
     # chat_completions. The Hermes overlay still advertises openai_chat
     # (the majority of the Portal catalog), so the transport lookup below
