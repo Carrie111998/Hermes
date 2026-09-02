@@ -3976,7 +3976,7 @@ class FeishuAdapter(BasePlatformAdapter):
     ) -> tuple[str, MessageType, List[str], List[str], List[FeishuMentionRef]]:
         raw_content = getattr(message, "content", "") or ""
         raw_type = getattr(message, "message_type", "") or ""
-        message_id = str(getattr(message, "message_id", "") or "")
+        message_id = str(getattr(message, "message_id", "") or "").strip()
         logger.info("[Feishu] Received raw message type=%s message_id=%s", raw_type, message_id)
 
         normalized = normalize_feishu_message(
@@ -3991,6 +3991,12 @@ class FeishuAdapter(BasePlatformAdapter):
         )
         inbound_type = self._resolve_normalized_message_type(normalized, media_types)
         text = normalized.text_content
+        if (
+            normalized.relation_kind == "merge_forward"
+            and message_id
+            and text == FALLBACK_FORWARD_TEXT
+        ):
+            text = f"{FALLBACK_FORWARD_TEXT}\n\n[Message ID: `{message_id}`]"
 
         if (
             inbound_type in {MessageType.DOCUMENT, MessageType.AUDIO, MessageType.VIDEO, MessageType.PHOTO}

@@ -67,6 +67,68 @@ class TestConfigEnvOverrides(unittest.TestCase):
 
 class TestFeishuMessageNormalization(unittest.TestCase):
 
+    @patch.dict(os.environ, {}, clear=True)
+    def test_extract_merge_forward_fallback_includes_message_id(self):
+        from gateway.config import PlatformConfig
+        from plugins.platforms.feishu.adapter import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        message = SimpleNamespace(
+            message_type="merge_forward",
+            content="{}",
+            message_id="om_merged_forward",
+        )
+
+        text, _message_type, _media_urls, _media_types, _mentions = asyncio.run(
+            adapter._extract_message_content(message)
+        )
+
+        self.assertEqual(
+            text,
+            "[Merged forward message]\n\n[Message ID: `om_merged_forward`]",
+        )
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_extract_merge_forward_parsed_content_does_not_include_message_id(self):
+        from gateway.config import PlatformConfig
+        from plugins.platforms.feishu.adapter import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        for content, expected in (
+            ({"title": "Forwarded incident"}, "Forwarded incident"),
+            ({"messages": [{"text": "Forwarded body"}]}, "- Forwarded body"),
+        ):
+            with self.subTest(content=content):
+                message = SimpleNamespace(
+                    message_type="merge_forward",
+                    content=json.dumps(content),
+                    message_id="om_merged_forward",
+                )
+
+                text, _message_type, _media_urls, _media_types, _mentions = asyncio.run(
+                    adapter._extract_message_content(message)
+                )
+
+                self.assertEqual(text, expected)
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_extract_merge_forward_fallback_without_message_id_is_unchanged(self):
+        from gateway.config import PlatformConfig
+        from plugins.platforms.feishu.adapter import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        message = SimpleNamespace(
+            message_type="merge_forward",
+            content="{}",
+            message_id="",
+        )
+
+        text, _message_type, _media_urls, _media_types, _mentions = asyncio.run(
+            adapter._extract_message_content(message)
+        )
+
+        self.assertEqual(text, "[Merged forward message]")
+
 
     def test_normalize_interactive_card_preserves_title_body_and_actions(self):
         from plugins.platforms.feishu.adapter import normalize_feishu_message
@@ -2465,5 +2527,4 @@ class TestChatLockEviction(unittest.TestCase):
 
         adapter = self._make_adapter()
         self.assertIsInstance(adapter._chat_locks, _collections.OrderedDict)
-
 
