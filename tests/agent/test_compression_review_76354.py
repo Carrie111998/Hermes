@@ -183,7 +183,64 @@ class _InjectingExecutor:
         )
 
 
+class TestAttemptClockStart:
+    def test_parent_context_setup_does_not_consume_attempt_budget(self, monkeypatch):
+        """Only summary work, not wrapper setup, is charged to the attempt."""
+        real_propagate = __import__(
+            "tools.thread_context", fromlist=["propagate_context_to_thread"]
+        ).propagate_context_to_thread
+
+        def slow_setup(worker):
+            time.sleep(0.06)
+            return real_propagate(worker)
+
+        monkeypatch.setattr(
+            "tools.thread_context.propagate_context_to_thread", slow_setup
+        )
+        compressed = [{"role": "assistant", "content": "summary"}]
+        result = run_compress_context_with_progress_timeout(
+            worker=lambda _fence: (compressed, "summarized-prompt"),
+            messages=[{"role": "user", "content": "original"}],
+            system_prompt_fallback="fallback",
+            idle_timeout_seconds=0.05,
+            total_ceiling_seconds=0.05,
+        )
+        assert result == (compressed, "summarized-prompt")
+        _drain_admission_slots()
+
+
 class TestF2HostUnwindRevokesAdmission:
+    def test_wrapper_setup_failure_releases_admission(self, monkeypatch):
+        """Parent-side context setup can fail before a future exists."""
+        balance = 0
+
+        def admit():
+            nonlocal balance
+            balance += 1
+            return True
+
+        def release():
+            nonlocal balance
+            balance -= 1
+
+        def fail_setup(_worker):
+            raise RuntimeError("context setup failed")
+
+        monkeypatch.setattr(cc, "_try_admit_compression_job", admit)
+        monkeypatch.setattr(cc, "_release_compression_admission", release)
+        monkeypatch.setattr(
+            "tools.thread_context.propagate_context_to_thread", fail_setup
+        )
+        with pytest.raises(RuntimeError, match="context setup failed"):
+            run_compress_context_with_progress_timeout(
+                worker=lambda _fence: ([], ""),
+                messages=[],
+                system_prompt_fallback="fallback",
+                idle_timeout_seconds=1.0,
+                total_ceiling_seconds=1.0,
+            )
+        assert balance == 0
+
     @pytest.mark.parametrize(
         "exc_type", [KeyboardInterrupt, RuntimeError], ids=["ki", "generic"]
     )
