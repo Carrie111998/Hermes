@@ -160,6 +160,18 @@ def create_execution(job_id: str, *, source: str) -> Dict[str, Any]:
     return record  # type: ignore[return-value]
 
 
+def discard_unstarted_execution(execution_id: str) -> bool:
+    """Delete this process's exact claimed placeholder before work starts."""
+    with _transaction() as conn:
+        cur = conn.execute(
+            """DELETE FROM executions
+               WHERE id=? AND process_id=? AND status='claimed'
+                 AND started_at IS NULL""",
+            (execution_id, _PROCESS_ID),
+        )
+    return cur.rowcount == 1
+
+
 def mark_execution_running(execution_id: str) -> Optional[Dict[str, Any]]:
     """Transition one claimed attempt to running exactly once."""
     now = _hermes_now().isoformat()

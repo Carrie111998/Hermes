@@ -725,7 +725,12 @@ from cron.jobs import (
     save_job_output,
     use_cron_store,
 )
-from cron.executions import create_execution, finish_execution, mark_execution_running
+from cron.executions import (
+    create_execution,
+    discard_unstarted_execution,
+    finish_execution,
+    mark_execution_running,
+)
 
 # Sentinel: when a cron agent has nothing new to report, it can start its
 # response with this marker to suppress delivery.  Output is still saved
@@ -8368,11 +8373,12 @@ def tick(
             # This prevents a queued lease from expiring before execution.
             claimed = claim_job_for_fire(job["id"], return_job=True)
             if not claimed:
-                finish_execution(
-                    job["execution_id"],
-                    success=False,
-                    error="Fire claim lost; execution was not started.",
-                )
+                if not discard_unstarted_execution(job["execution_id"]):
+                    logger.error(
+                        "Job '%s': refused to discard fire-claim loser because "
+                        "its execution placeholder was no longer owned and unstarted",
+                        job["id"],
+                    )
                 return True
             # Production CAS returns the exact persisted record with its unique
             # owner. Bool fallback keeps older test doubles/API overrides
