@@ -220,6 +220,8 @@ _MAX_TEXT_INJECT_BYTES = 100 * 1024
 _FEISHU_CONNECT_ATTEMPTS = 3
 _FEISHU_SEND_ATTEMPTS = 3
 _FEISHU_APP_LOCK_SCOPE = "feishu-app-id"
+_FEISHU_WS_CLOSE_TIMEOUT_SECONDS = 1.0
+_FEISHU_WS_STOP_TIMEOUT_SECONDS = 1.0
 _DEFAULT_TEXT_BATCH_DELAY_SECONDS = 0.6
 _DEFAULT_TEXT_BATCH_MAX_MESSAGES = 8
 _DEFAULT_TEXT_BATCH_MAX_CHARS = 4000
@@ -1322,14 +1324,118 @@ def _strip_edge_self_mentions(
             return remaining
 
 
-def _run_official_feishu_ws_client(ws_client: Any, adapter: Any) -> None:
+@dataclass
+class _FeishuWSRuntime:
+    """Ownership record for one official-SDK websocket worker."""
+
+    client: Any
+    loop: Optional[asyncio.AbstractEventLoop] = None
+    thread: Optional[threading.Thread] = None
+    loop_ready: threading.Event = field(default_factory=threading.Event)
+    stop_requested: threading.Event = field(default_factory=threading.Event)
+    stopped: threading.Event = field(default_factory=threading.Event)
+    lock: threading.Lock = field(default_factory=threading.Lock)
+
+
+def _abort_cancel_and_stop_feishu_ws_loop(
+    loop: asyncio.AbstractEventLoop,
+    ws_client: Any,
+) -> None:
+    """Run on the websocket thread to abort I/O and stop its event loop."""
+    # A loop.stop() alone cannot wake a selector blocked inside some websocket
+    # implementations. Abort whichever transport shape the installed
+    # lark/websockets version exposes, then stop the loop.
+    connection = getattr(ws_client, "_conn", None)
+    for candidate in (connection, getattr(connection, "protocol", None)):
+        transport = getattr(candidate, "transport", None)
+        if transport is None:
+            continue
+        try:
+            transport.abort()
+        except Exception:
+            logger.debug(
+                "[Feishu] Failed to abort websocket transport",
+                exc_info=True,
+            )
+        break
+    tasks = [task for task in asyncio.all_tasks(loop) if not task.done()]
+    logger.debug("[Feishu] Found %d pending websocket tasks", len(tasks))
+    for task in tasks:
+        task.cancel()
+    loop.stop()
+
+
+def _request_feishu_ws_loop_stop(
+    loop: Optional[asyncio.AbstractEventLoop],
+    ws_client: Any,
+) -> None:
+    """Abort the socket, cancel loop tasks, and stop without awaiting I/O."""
+    if loop is None or loop.is_closed():
+        return
+
+    try:
+        loop.call_soon_threadsafe(
+            _abort_cancel_and_stop_feishu_ws_loop,
+            loop,
+            ws_client,
+        )
+    except RuntimeError:
+        # The worker may have closed the loop between is_closed() and this
+        # call.  Its finally block has already completed the required cleanup.
+        pass
+
+
+def _arm_feishu_ws_loop_hard_stop(
+    loop: Optional[asyncio.AbstractEventLoop],
+    ws_client: Any,
+    delay: float,
+) -> None:
+    """Guarantee WS teardown even if a graceful CLOSE await never unwinds."""
+    if loop is None or loop.is_closed():
+        return
+
+    def _arm() -> None:
+        loop.call_later(
+            max(0.0, delay),
+            _abort_cancel_and_stop_feishu_ws_loop,
+            loop,
+            ws_client,
+        )
+
+    try:
+        loop.call_soon_threadsafe(_arm)
+    except RuntimeError:
+        pass
+
+
+def _request_feishu_ws_runtime_stop(runtime: _FeishuWSRuntime) -> None:
+    runtime.stop_requested.set()
+    with runtime.lock:
+        loop = runtime.loop
+    _request_feishu_ws_loop_stop(loop, runtime.client)
+
+
+def _run_official_feishu_ws_client(
+    ws_client: Any,
+    adapter: Any,
+    runtime: Optional[_FeishuWSRuntime] = None,
+) -> None:
     """Run the official Lark WS client in its own thread-local event loop."""
     import lark_oapi.ws.client as ws_client_module
 
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
+    original_module_loop = getattr(ws_client_module, "loop", None)
     ws_client_module.loop = loop
-    adapter._ws_thread_loop = loop
+    if runtime is None:
+        adapter._ws_thread_loop = loop
+    else:
+        with runtime.lock:
+            runtime.loop = loop
+        runtime.loop_ready.set()
+        publish_loop = getattr(adapter, "_publish_ws_runtime_loop", None)
+        if callable(publish_loop):
+            publish_loop(runtime, loop)
 
     original_connect = ws_client_module.websockets.connect
     original_configure = getattr(ws_client, "_configure", None)
@@ -1362,18 +1468,30 @@ def _run_official_feishu_ws_client(ws_client: Any, adapter: Any) -> None:
         setattr(ws_client, "_configure", _configure_with_overrides)
     _apply_runtime_ws_overrides()
     try:
-        ws_client.start()
+        # disconnect() can win the race before this daemon publishes its loop.
+        # In that case never enter the SDK's permanent run_forever() call.
+        if runtime is None or not runtime.stop_requested.is_set():
+            ws_client.start()
     except Exception:
-        pass
+        logger.debug("[Feishu] Websocket worker exited", exc_info=True)
     finally:
-        ws_client_module.websockets.connect = original_connect
-        if original_configure is not None:
+        if ws_client_module.websockets.connect is _connect_with_overrides:
+            ws_client_module.websockets.connect = original_connect
+        if (
+            original_configure is not None
+            and getattr(ws_client, "_configure", None) is _configure_with_overrides
+        ):
             setattr(ws_client, "_configure", original_configure)
+        if getattr(ws_client_module, "loop", None) is loop:
+            ws_client_module.loop = original_module_loop
         pending = [t for t in asyncio.all_tasks(loop) if not t.done()]
         for task in pending:
             task.cancel()
         if pending:
-            loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+            # One bounded loop turn delivers cancellation without allowing a
+            # task that swallows CancelledError to wedge worker teardown.
+            loop.call_soon(loop.stop)
+            loop.run_forever()
         try:
             loop.stop()
         except Exception:
@@ -1382,7 +1500,15 @@ def _run_official_feishu_ws_client(ws_client: Any, adapter: Any) -> None:
             loop.close()
         except Exception:
             pass
-        adapter._ws_thread_loop = None
+        if runtime is None:
+            adapter._ws_thread_loop = None
+        else:
+            with runtime.lock:
+                runtime.loop = None
+            runtime.stopped.set()
+            finish_runtime = getattr(adapter, "_finish_ws_runtime", None)
+            if callable(finish_runtime):
+                finish_runtime(runtime)
 
 
 def _load_lark_oapi() -> bool:
@@ -1516,6 +1642,19 @@ class FeishuAdapter(BasePlatformAdapter):
         # by the recreate-on-shutdown path; cleared on connect for reconnects.
         self._sdk_executor_closing = False
         self._ws_client: Optional[Any] = None
+        # The official Lark websocket client owns a permanent event loop.  It
+        # must run in a raw daemon thread rather than asyncio's default
+        # executor: asyncio.run() joins default-executor workers at exit and a
+        # wedged client would otherwise prevent gateway restart indefinitely.
+        self._ws_lifecycle_lock = threading.Lock()
+        self._ws_operation_lock = asyncio.Lock()
+        self._ws_lifecycle_epoch = 0
+        self._ws_connect_epoch: Optional[int] = None
+        self._ws_runtime: Optional[_FeishuWSRuntime] = None
+        self._ws_thread: Optional[threading.Thread] = None
+        self._ws_disconnect_count = 0
+        # Kept for compatibility with adapters/tests created by older code.
+        # New websocket workers are tracked by _ws_runtime, not this future.
         self._ws_future: Optional[asyncio.Future] = None
         self._ws_thread_loop: Optional[asyncio.AbstractEventLoop] = None
         self._loop: Optional[asyncio.AbstractEventLoop] = None
@@ -1771,7 +1910,115 @@ class FeishuAdapter(BasePlatformAdapter):
         except TypeError:
             executor.shutdown(wait=False)
 
+    def _publish_ws_runtime_loop(
+        self,
+        runtime: _FeishuWSRuntime,
+        loop: asyncio.AbstractEventLoop,
+    ) -> None:
+        """Publish a worker loop only if it still belongs to this adapter."""
+        with self._ws_lifecycle_lock:
+            if self._ws_runtime is runtime:
+                self._ws_thread_loop = loop
+
+    def _finish_ws_runtime(self, runtime: _FeishuWSRuntime) -> None:
+        """Drop a completed worker without clearing a newer generation."""
+        with self._ws_lifecycle_lock:
+            if self._ws_runtime is not runtime:
+                return
+            self._ws_thread_loop = None
+            if self._ws_disconnect_count == 0:
+                self._ws_runtime = None
+                self._ws_thread = None
+
+    def _start_ws_runtime(self, ws_client: Any) -> _FeishuWSRuntime:
+        """Start one daemon-owned Lark websocket runtime."""
+        with self._ws_lifecycle_lock:
+            if self._ws_disconnect_count > 0:
+                raise RuntimeError("Feishu websocket disconnect is still in progress")
+            if (
+                self._ws_connect_epoch is not None
+                and self._ws_connect_epoch != self._ws_lifecycle_epoch
+            ):
+                raise RuntimeError("Feishu connect was superseded by disconnect")
+            previous = self._ws_runtime
+            # Runtime ownership starts before Thread.start().  is_alive() is
+            # false in that small publication window, so using it here would
+            # allow two concurrent connects to start SDK workers that share
+            # module-global loop/monkeypatch state.
+            if previous is not None and not previous.stopped.is_set():
+                raise RuntimeError("Previous Feishu websocket worker is still stopping")
+
+            runtime = _FeishuWSRuntime(client=ws_client)
+            thread = threading.Thread(
+                target=_run_official_feishu_ws_client,
+                args=(ws_client, self, runtime),
+                name="hermes-feishu-ws",
+                daemon=True,
+            )
+            runtime.thread = thread
+            self._ws_runtime = runtime
+            self._ws_thread = thread
+            self._ws_thread_loop = None
+            self._ws_future = None
+            self._ws_client = ws_client
+
+        try:
+            thread.start()
+        except BaseException:
+            with self._ws_lifecycle_lock:
+                if self._ws_runtime is runtime:
+                    self._ws_runtime = None
+                    self._ws_thread = None
+                    self._ws_client = None
+            raise
+        return runtime
+
+    async def _wait_for_ws_runtime_stop(
+        self,
+        runtime: _FeishuWSRuntime,
+        timeout: float,
+    ) -> bool:
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + max(0.0, timeout)
+        while not runtime.stopped.is_set() and loop.time() < deadline:
+            await asyncio.sleep(0.01)
+        return runtime.stopped.is_set()
+
     async def connect(self, *, is_reconnect: bool = False) -> bool:
+        """Serialize transport publication against every disconnect request."""
+        with self._ws_lifecycle_lock:
+            if self._ws_disconnect_count > 0:
+                logger.warning("[Feishu] Connect rejected while disconnect is pending")
+                return False
+            connect_epoch = self._ws_lifecycle_epoch
+        async with self._ws_operation_lock:
+            with self._ws_lifecycle_lock:
+                if (
+                    self._ws_disconnect_count > 0
+                    or connect_epoch != self._ws_lifecycle_epoch
+                ):
+                    logger.warning(
+                        "[Feishu] Connect rejected while disconnect is pending"
+                    )
+                    return False
+                runtime = self._ws_runtime
+                if runtime is not None and not runtime.stopped.is_set():
+                    logger.warning("[Feishu] Connect rejected: websocket already active")
+                    return False
+                self._ws_connect_epoch = connect_epoch
+            if self._running:
+                with self._ws_lifecycle_lock:
+                    if self._ws_connect_epoch == connect_epoch:
+                        self._ws_connect_epoch = None
+                return True
+            try:
+                return await self._connect_impl(is_reconnect=is_reconnect)
+            finally:
+                with self._ws_lifecycle_lock:
+                    if self._ws_connect_epoch == connect_epoch:
+                        self._ws_connect_epoch = None
+
+    async def _connect_impl(self, *, is_reconnect: bool = False) -> bool:
         """Connect to Feishu/Lark."""
         # A fresh connect (or reconnect) re-arms the SDK executor after a prior
         # disconnect set the closing flag.
@@ -1814,6 +2061,12 @@ class FeishuAdapter(BasePlatformAdapter):
 
             self._loop = asyncio.get_running_loop()
             await self._connect_with_retry()
+            with self._ws_lifecycle_lock:
+                if (
+                    self._ws_disconnect_count > 0
+                    or self._ws_connect_epoch != self._ws_lifecycle_epoch
+                ):
+                    raise RuntimeError("Feishu disconnect requested during connect")
             self._mark_connected()
             logger.info("[Feishu] Connected in %s mode (%s)", self._connection_mode, self._domain_name)
             # Plugin-registered native handlers (lark_oapi client).
@@ -1827,89 +2080,165 @@ class FeishuAdapter(BasePlatformAdapter):
             return False
 
     async def disconnect(self) -> None:
-        """Disconnect from Feishu/Lark."""
-        self._running = False
-        await self._cancel_pending_tasks(self._pending_text_batch_tasks)
-        await self._cancel_pending_tasks(self._pending_media_batch_tasks)
-        self._reset_batch_buffers()
-
-        # Send a WebSocket CLOSE frame to Feishu BEFORE tearing down the
-        # thread loop. Without this, Feishu's server never learns the
-        # connection is dead and continues routing messages to the stale
-        # endpoint — the channel goes silent until the server-side
-        # CLOSE-WAIT expires (minutes to hours). See issue #10202.
-        #
-        # ``_disable_websocket_auto_reconnect()`` nils ``self._ws_client``,
-        # so capture the client reference first.
-        ws_client = self._ws_client
-        ws_thread_loop = self._ws_thread_loop
-        self._disable_websocket_auto_reconnect()
-        await self._stop_webhook_server()
-
-        if (
-            ws_client is not None
-            and ws_thread_loop is not None
-            and not ws_thread_loop.is_closed()
-            and hasattr(ws_client, "_disconnect")
-        ):
-            try:
-                future = asyncio.run_coroutine_threadsafe(
-                    ws_client._disconnect(), ws_thread_loop
+        """Queue one teardown and keep connect closed until all callers exit."""
+        with self._ws_lifecycle_lock:
+            self._ws_disconnect_count += 1
+            self._ws_lifecycle_epoch += 1
+        try:
+            async with self._ws_operation_lock:
+                await self._disconnect_impl()
+        finally:
+            with self._ws_lifecycle_lock:
+                self._ws_disconnect_count = max(
+                    0,
+                    self._ws_disconnect_count - 1,
                 )
-                # 5s is generous — the CLOSE frame is a single WebSocket
-                # control frame. If it takes longer than that the
-                # connection is already wedged and we gain nothing by
-                # waiting further.
-                await asyncio.wait_for(asyncio.wrap_future(future), timeout=5.0)
-                logger.debug("[Feishu] Sent WebSocket CLOSE frame to Feishu")
+
+    async def _disconnect_impl(self) -> None:
+        """Disconnect from Feishu/Lark with a bounded WS hard-stop path."""
+        self._running = False
+        with self._ws_lifecycle_lock:
+            runtime = self._ws_runtime
+            ws_client = runtime.client if runtime is not None else self._ws_client
+            legacy_ws_loop = self._ws_thread_loop
+        # Publish shutdown intent before the first await.  If disconnect wins
+        # the startup race, the worker observes this after creating its loop
+        # and exits without entering the SDK's permanent run_forever().
+        if runtime is not None:
+            runtime.stop_requested.set()
+        self._disable_websocket_auto_reconnect()
+
+        if runtime is not None:
+            with runtime.lock:
+                ws_thread_loop = runtime.loop
+        else:
+            # Compatibility path for an adapter started by an older build or
+            # a focused test that still provides _ws_future directly.
+            ws_thread_loop = legacy_ws_loop
+
+        # Arm the hard boundary before the first await.  Task.cancel() can get
+        # stuck propagating into a child that swallows CancelledError, which
+        # means a coroutine finally block is not by itself a timely shutdown
+        # guarantee.  The WS loop owns this timer and will stop independently.
+        _arm_feishu_ws_loop_hard_stop(
+            ws_thread_loop,
+            ws_client,
+            _FEISHU_WS_CLOSE_TIMEOUT_SECONDS,
+        )
+
+        try:
+            # Best-effort CLOSE before the hard stop prevents Feishu from
+            # routing messages to a stale endpoint (#10202).  Keep this inner
+            # budget below the gateway runner's 5s outer disconnect deadline;
+            # otherwise outer cancellation can interrupt before loop cleanup.
+            try:
+                if (
+                    ws_client is not None
+                    and ws_thread_loop is not None
+                    and not ws_thread_loop.is_closed()
+                    and hasattr(ws_client, "_disconnect")
+                ):
+                    close_future = asyncio.run_coroutine_threadsafe(
+                        ws_client._disconnect(), ws_thread_loop
+                    )
+                    # Do not bridge this cross-loop future with
+                    # asyncio.wrap_future().  wait_for() cancels the wrapped
+                    # concurrent future on timeout; if the independently
+                    # armed hard-stop has just closed the WS loop, that
+                    # cancellation tries to callback into the closed loop and
+                    # logs RuntimeError("Event loop is closed").  Polling is
+                    # still bounded and deliberately leaves cancellation to
+                    # the WS loop's hard-stop path.
+                    gateway_loop = asyncio.get_running_loop()
+                    close_deadline = (
+                        gateway_loop.time()
+                        + _FEISHU_WS_CLOSE_TIMEOUT_SECONDS
+                    )
+                    while not close_future.done():
+                        remaining = close_deadline - gateway_loop.time()
+                        if remaining <= 0:
+                            raise asyncio.TimeoutError
+                        await asyncio.sleep(min(0.01, remaining))
+                    close_future.result()
+                    logger.debug("[Feishu] Sent WebSocket CLOSE frame to Feishu")
             except asyncio.TimeoutError:
                 logger.warning(
-                    "[Feishu] CLOSE frame not acknowledged within 5s — "
-                    "Feishu may briefly route messages to the stale "
-                    "connection until server-side timeout"
+                    "[Feishu] CLOSE frame not acknowledged within %.1fs — "
+                    "forcing websocket shutdown",
+                    _FEISHU_WS_CLOSE_TIMEOUT_SECONDS,
                 )
+            except asyncio.CancelledError:
+                raise
             except Exception as exc:
                 logger.debug(
                     "[Feishu] Could not send WebSocket CLOSE frame: %s",
                     exc,
                     exc_info=True,
                 )
+            finally:
+                # Synchronous and ahead of every batch/webhook await: even if
+                # those tasks swallow cancellation, they cannot retain the WS
+                # worker and wedge asyncio.run() during process exit.
+                if runtime is not None:
+                    _request_feishu_ws_runtime_stop(runtime)
+                else:
+                    _request_feishu_ws_loop_stop(ws_thread_loop, ws_client)
 
-        if ws_thread_loop is not None and not ws_thread_loop.is_closed():
-            logger.debug("[Feishu] Cancelling websocket thread tasks and stopping loop")
+            if runtime is not None:
+                if not await self._wait_for_ws_runtime_stop(
+                    runtime,
+                    _FEISHU_WS_STOP_TIMEOUT_SECONDS,
+                ):
+                    logger.warning(
+                        "[Feishu] Websocket worker did not exit within %.1fs; "
+                        "leaving its daemon thread detached",
+                        _FEISHU_WS_STOP_TIMEOUT_SECONDS,
+                    )
+            else:
+                ws_future = self._ws_future
+                if ws_future is not None:
+                    try:
+                        await asyncio.wait_for(
+                            asyncio.shield(ws_future),
+                            timeout=_FEISHU_WS_STOP_TIMEOUT_SECONDS,
+                        )
+                    except asyncio.TimeoutError:
+                        logger.warning(
+                            "[Feishu] Legacy websocket worker did not exit "
+                            "within %.1fs",
+                            _FEISHU_WS_STOP_TIMEOUT_SECONDS,
+                        )
 
-            def cancel_all_tasks() -> None:
-                tasks = [t for t in asyncio.all_tasks(ws_thread_loop) if not t.done()]
-                logger.debug("[Feishu] Found %d pending tasks in websocket thread", len(tasks))
-                for task in tasks:
-                    task.cancel()
-                ws_thread_loop.call_later(0.1, ws_thread_loop.stop)
+            await self._cancel_pending_tasks(self._pending_text_batch_tasks)
+            await self._cancel_pending_tasks(self._pending_media_batch_tasks)
+            self._reset_batch_buffers()
+            await self._stop_webhook_server()
+        finally:
+            # Belt-and-suspenders for exceptions outside the CLOSE stage.
+            if runtime is not None:
+                _request_feishu_ws_runtime_stop(runtime)
+            else:
+                _request_feishu_ws_loop_stop(legacy_ws_loop, ws_client)
 
-            ws_thread_loop.call_soon_threadsafe(cancel_all_tasks)
-
-        ws_future = self._ws_future
-        if ws_future is not None:
+            self._ws_future = None
+            self._loop = None
+            self._event_handler = None
+            self._shutdown_sdk_executor()
             try:
-                logger.debug("[Feishu] Waiting for websocket thread to exit (timeout=10s)")
-                await asyncio.wait_for(asyncio.shield(ws_future), timeout=10.0)
-                logger.debug("[Feishu] Websocket thread exited cleanly")
-            except asyncio.TimeoutError:
-                logger.warning("[Feishu] Websocket thread did not exit within 10s - may be stuck")
-            except asyncio.CancelledError:
-                logger.debug("[Feishu] Websocket thread cancelled during disconnect")
-            except Exception as exc:
-                logger.debug("[Feishu] Websocket thread exited with error: %s", exc, exc_info=True)
+                self._persist_seen_message_ids()
+            except Exception:
+                logger.debug("[Feishu] Failed to persist dedup state", exc_info=True)
+            await self._release_app_lock()
+            self._mark_disconnected()
 
-        self._ws_future = None
-        self._ws_thread_loop = None
-        self._loop = None
-        self._event_handler = None
-        self._shutdown_sdk_executor()
-        self._persist_seen_message_ids()
-        await self._release_app_lock()
-
-        self._mark_disconnected()
-        logger.info("[Feishu] Disconnected")
+            with self._ws_lifecycle_lock:
+                if self._ws_runtime is runtime and (
+                    runtime is None or runtime.stopped.is_set()
+                ):
+                    self._ws_runtime = None
+                    self._ws_thread = None
+                    self._ws_thread_loop = None
+            logger.info("[Feishu] Disconnected")
 
     async def _cancel_pending_tasks(self, tasks: Dict[str, asyncio.Task]) -> None:
         pending = [task for task in tasks.values() if task and not task.done()]
@@ -4934,6 +5263,16 @@ class FeishuAdapter(BasePlatformAdapter):
                 self._disable_websocket_auto_reconnect()
                 self._ws_future = None
                 await self._stop_webhook_server()
+                with self._ws_lifecycle_lock:
+                    superseded = (
+                        self._ws_disconnect_count > 0
+                        or (
+                            self._ws_connect_epoch is not None
+                            and self._ws_connect_epoch != self._ws_lifecycle_epoch
+                        )
+                    )
+                if superseded:
+                    raise
                 if attempt >= _FEISHU_CONNECT_ATTEMPTS - 1:
                     raise
                 wait_seconds = 2 ** attempt
@@ -4958,7 +5297,7 @@ class FeishuAdapter(BasePlatformAdapter):
         if loop is None or loop.is_closed():
             raise RuntimeError("adapter loop is not ready")
         await self._hydrate_bot_identity()
-        self._ws_client = FeishuWSClient(
+        ws_client = FeishuWSClient(
             app_id=self._app_id,
             app_secret=self._app_secret,
             log_level=lark.LogLevel.INFO,
@@ -4971,12 +5310,7 @@ class FeishuAdapter(BasePlatformAdapter):
             # See https://github.com/NousResearch/hermes-agent/issues/50656
             extra_ua_tags=["channel"],
         )
-        self._ws_future = loop.run_in_executor(
-            None,
-            _run_official_feishu_ws_client,
-            self._ws_client,
-            self,
-        )
+        self._start_ws_runtime(ws_client)
 
     async def _connect_webhook(self) -> None:
         if not FEISHU_WEBHOOK_AVAILABLE:
