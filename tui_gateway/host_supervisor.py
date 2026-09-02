@@ -93,15 +93,14 @@ def _default_registry_path() -> Path:
 def _pid_alive(pid: int) -> bool:
     if pid <= 0:
         return False
-    try:
-        os.kill(pid, 0)
-        return True
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    except Exception:
-        return False
+    # Delegate to the canonical cross-platform probe (psutil, with a
+    # Win32 OpenProcess fallback). Do NOT probe with os.kill(pid, 0):
+    # on Windows that is not a no-op — sig=0 maps to TerminateProcess /
+    # console-group Ctrl+C, so the "probe" kills the host it is
+    # checking (bpo-14484).
+    from gateway.status import _pid_exists
+
+    return bool(_pid_exists(int(pid)))
 
 
 def _pid_command(pid: int) -> str:
