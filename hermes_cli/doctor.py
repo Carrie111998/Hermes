@@ -1447,33 +1447,44 @@ def run_doctor(args):
     check_certificates(should_fix=should_fix, issues=manual_issues)
 
     _section("Required Packages")
+    # (import module, display name, pip install spec). The pip spec is spelled
+    # out because the install name diverges from the import name for some
+    # packages (dotenv -> python-dotenv, yaml -> pyyaml), so a naive
+    # `pip install <module>` would install the wrong package or nothing useful.
     required_packages = [
-        ("openai", "OpenAI SDK"),
-        ("rich", "Rich (terminal UI)"),
-        ("dotenv", "python-dotenv"),
-        ("yaml", "PyYAML"),
-        ("httpx", "HTTPX"),
+        ("openai", "OpenAI SDK", "openai"),
+        ("rich", "Rich (terminal UI)", "rich"),
+        ("dotenv", "python-dotenv", "python-dotenv"),
+        ("yaml", "PyYAML", "pyyaml"),
+        ("httpx", "HTTPX", "httpx"),
     ]
-    
+
+    # Same (import module, display name, pip install spec) shape as
+    # required_packages: discord -> discord.py, telegram -> python-telegram-bot.
     optional_packages = [
-        ("croniter", "Croniter (cron expressions)"),
-        ("telegram", "python-telegram-bot"),
-        ("discord", "discord.py"),
+        ("croniter", "Croniter (cron expressions)", "croniter"),
+        ("telegram", "python-telegram-bot", "python-telegram-bot"),
+        ("discord", "discord.py", "discord.py"),
     ]
-    
-    for module, name in required_packages:
+
+    install_cmd = _python_install_cmd()
+
+    for module, name, pip_spec in required_packages:
         try:
             __import__(module)
             check_ok(name)
         except ImportError:
-            _fail_and_issue(name, "(missing)", f"Install {name}: {_python_install_cmd()} {module}", issues)
-    
-    for module, name in optional_packages:
+            _fail_and_issue(name, "(missing)", f"Install {name}: {install_cmd} {pip_spec}", issues)
+
+    for module, name, pip_spec in optional_packages:
         try:
             __import__(module)
             check_ok(name, "(optional)")
         except ImportError:
-            check_warn(name, "(optional, not installed)")
+            check_warn(
+                name,
+                f"(optional, not installed) — install with: {install_cmd} {pip_spec}",
+            )
     
     _section("Configuration Files")
     # Managed scope (administrator-pinned config/env), when present.
