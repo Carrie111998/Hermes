@@ -4,6 +4,7 @@ import { test } from 'vitest'
 
 import {
   assertLocalProfileCanStart,
+  awaitProfileSpawnPreparation,
   decideProfileDeleteAction,
   dispatchConnectionScopedProfileDelete,
   localProfilePoolKeys,
@@ -142,6 +143,40 @@ test('assertLocalProfileCanStart rejects a delayed retry after the profile direc
   assert.throws(() => assertLocalProfileCanStart('selena', gate, () => false), /Profile "selena" no longer exists/)
   assert.doesNotThrow(() => assertLocalProfileCanStart('default', gate, () => false))
   assert.doesNotThrow(() => assertLocalProfileCanStart('selena', gate, profile => profile === 'selena'))
+})
+
+test('awaitProfileSpawnPreparation runs the final guard after async preparation', async () => {
+  const gate = new ProfileDeletionGate()
+
+  let continuePreparation = (_marker: string) => undefined
+
+  const preparation = new Promise<string>(resolve => {
+    continuePreparation = resolve
+  })
+
+  const start = awaitProfileSpawnPreparation('selena', gate, () => true, () => preparation)
+  const release = gate.acquire('selena')
+
+  continuePreparation('marker')
+  await assert.rejects(start, /Profile "selena" is being deleted/)
+  release()
+})
+
+test('awaitProfileSpawnPreparation rejects when the profile directory disappears during preparation', async () => {
+  const gate = new ProfileDeletionGate()
+  let exists = true
+
+  let continuePreparation = (_marker: string) => undefined
+
+  const preparation = new Promise<string>(resolve => {
+    continuePreparation = resolve
+  })
+
+  const start = awaitProfileSpawnPreparation('selena', gate, () => exists, () => preparation)
+  exists = false
+  continuePreparation('marker')
+
+  await assert.rejects(start, /Profile "selena" no longer exists/)
 })
 
 test('localProfilePoolKeys returns every local process scope for one profile', () => {
