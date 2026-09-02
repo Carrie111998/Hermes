@@ -39,6 +39,149 @@ class TestCodexTransportBasic:
 
 class TestCodexBuildKwargs:
 
+    @pytest.mark.parametrize(
+        ("capture_model", "replay_model"),
+        [
+            ("gpt-5.6-sol-900k", "gpt-5.6-sol"),
+            ("gpt-5.6-sol", "gpt-5.6-sol-900k"),
+        ],
+    )
+    def test_custom_endpoint_reasoning_replay_is_scoped_to_model(
+        self, capture_model, replay_model
+    ):
+        """Encrypted reasoning from one routed model must not reach another."""
+        from agent.transports.codex import ResponsesApiTransport
+
+        transport = ResponsesApiTransport()
+        base_url = "http://localhost:20129/v1"
+        transport.build_kwargs(
+            model=capture_model,
+            messages=[{"role": "user", "content": "first"}],
+            tools=[],
+            base_url=base_url,
+        )
+        normalized = transport.normalize_response(SimpleNamespace(
+            status="completed",
+            output=[
+                SimpleNamespace(
+                    type="reasoning",
+                    id="rs_model_a",
+                    encrypted_content="model-a-blob",
+                    summary=[],
+                ),
+                SimpleNamespace(
+                    type="message",
+                    role="assistant",
+                    status="completed",
+                    content=[SimpleNamespace(type="output_text", text="done")],
+                    id="msg_model_a",
+                ),
+            ],
+        ))
+        captured_reasoning = normalized.provider_data["codex_reasoning_items"]
+        assert captured_reasoning[0]["_issuer_model"] == "gpt-5.6-sol"
+        history = [
+            {"role": "user", "content": "first"},
+            {
+                "role": "assistant",
+                "content": normalized.content,
+                "codex_reasoning_items": captured_reasoning,
+            },
+            {"role": "user", "content": "next"},
+        ]
+
+        same_model = transport.build_kwargs(
+            model=replay_model,
+            messages=history,
+            tools=[],
+            base_url=base_url,
+        )
+        other_model = transport.build_kwargs(
+            model="gpt-5.7-sol",
+            messages=history,
+            tools=[],
+            base_url=base_url,
+        )
+
+        same_model_reasoning = [
+            item for item in same_model["input"] if item.get("type") == "reasoning"
+        ]
+        converted = transport.convert_messages(
+            history, model=replay_model, base_url=base_url
+        )
+        converted_reasoning = [
+            item for item in converted if item.get("type") == "reasoning"
+        ]
+        assert same_model["model"] == "gpt-5.6-sol"
+        assert [item["encrypted_content"] for item in same_model_reasoning] == [
+            "model-a-blob"
+        ]
+        assert [item["encrypted_content"] for item in converted_reasoning] == [
+            "model-a-blob"
+        ]
+        assert "_issuer_model" not in same_model_reasoning[0]
+        assert not any(item.get("type") == "reasoning" for item in other_model["input"])
+
+    def test_reasoning_replay_uses_request_override_wire_model(self):
+        """Model overrides must govern both the wire and reasoning provenance."""
+        from agent.transports.codex import ResponsesApiTransport
+
+        transport = ResponsesApiTransport()
+        base_url = "http://localhost:20129/v1"
+        captured = transport.build_kwargs(
+            model="model-a",
+            messages=[{"role": "user", "content": "first"}],
+            tools=[],
+            base_url=base_url,
+            request_overrides={"model": "gpt-5.6-sol-900k"},
+        )
+        normalized = transport.normalize_response(SimpleNamespace(
+            status="completed",
+            output=[
+                SimpleNamespace(
+                    type="reasoning",
+                    id="rs_model_b",
+                    encrypted_content="model-b-blob",
+                    summary=[],
+                ),
+                SimpleNamespace(
+                    type="message",
+                    role="assistant",
+                    status="completed",
+                    content=[SimpleNamespace(type="output_text", text="done")],
+                    id="msg_model_b",
+                ),
+            ],
+        ))
+        captured_reasoning = normalized.provider_data["codex_reasoning_items"]
+        history = [
+            {"role": "user", "content": "first"},
+            {
+                "role": "assistant",
+                "content": normalized.content,
+                "codex_reasoning_items": captured_reasoning,
+            },
+            {"role": "user", "content": "next"},
+        ]
+
+        same_model = transport.build_kwargs(
+            model="gpt-5.6-sol", messages=history, tools=[], base_url=base_url
+        )
+        other_model = transport.build_kwargs(
+            model="model-c", messages=history, tools=[], base_url=base_url
+        )
+        converted = transport.convert_messages(
+            history, model="gpt-5.6-sol", base_url=base_url
+        )
+
+        assert captured["model"] == "gpt-5.6-sol"
+        assert captured_reasoning[0]["_issuer_model"] == "gpt-5.6-sol"
+        assert [item["encrypted_content"] for item in same_model["input"]
+                if item.get("type") == "reasoning"] == ["model-b-blob"]
+        assert [item["encrypted_content"] for item in converted
+                if item.get("type") == "reasoning"] == ["model-b-blob"]
+        assert not any(item.get("type") == "reasoning" for item in other_model["input"])
+
     def test_900k_context_variant_suffix_stripped_on_wire(self, transport):
         """``-900k`` large-context picker variants are Hermes-side aliases —
         the Codex backend only knows the base slug, so build_kwargs must
@@ -748,7 +891,7 @@ class TestCodexBuildKwargs:
 
         monkeypatch.setattr(
             "agent.codex_responses_adapter._normalize_codex_response",
-            lambda resp, issuer_kind=None: (msg, "tool_calls"),
+            lambda resp, issuer_kind=None, issuer_model=None: (msg, "tool_calls"),
         )
         normalized = transport.normalize_response(response)
 
@@ -930,7 +1073,7 @@ class TestOpencodeReservedToolAliases:
         response = SimpleNamespace(output=[], status="completed")
         monkeypatch.setattr(
             "agent.codex_responses_adapter._normalize_codex_response",
-            lambda resp, issuer_kind=None: (msg, "tool_calls"),
+            lambda resp, issuer_kind=None, issuer_model=None: (msg, "tool_calls"),
         )
         normalized = transport.normalize_response(response)
         names = [tc.name for tc in normalized.tool_calls]

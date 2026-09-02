@@ -458,6 +458,7 @@ class ResponsesApiTransport(ProviderTransport):
     # response are stamped with the endpoint that minted them. Plain class
     # attribute default; mutated on the instance, not the class.
     _last_issuer_kind: Optional[str] = None
+    _last_issuer_model: Optional[str] = None
 
     # Wire-alias provenance of the most recent build_kwargs call:
     # ``{alias_sent_on_wire: original_tool_name}``. ``None`` means "no
@@ -474,6 +475,7 @@ class ResponsesApiTransport(ProviderTransport):
     def _resolve_issuer_kind(self, params: Dict[str, Any]) -> str:
         """Classify the current Responses endpoint from transport params."""
         from agent.codex_responses_adapter import _classify_responses_issuer
+
         return _classify_responses_issuer(
             is_xai_responses=params.get("is_xai_responses") is True,
             is_github_responses=params.get("is_github_responses") is True,
@@ -484,8 +486,15 @@ class ResponsesApiTransport(ProviderTransport):
     def convert_messages(self, messages: List[Dict[str, Any]], **kwargs) -> Any:
         """Convert OpenAI chat messages to Responses API input items."""
         from agent.codex_responses_adapter import _chat_messages_to_responses_input
+        from agent.model_metadata import strip_codex_context_variant_suffix
+
         issuer = self._resolve_issuer_kind(kwargs)
+        issuer_model = (
+            str(strip_codex_context_variant_suffix(kwargs.get("model") or "")).strip()
+            or None
+        )
         self._last_issuer_kind = issuer
+        self._last_issuer_model = issuer_model
         return _chat_messages_to_responses_input(
             messages,
             is_xai_responses=kwargs.get("is_xai_responses") is True,
@@ -494,6 +503,7 @@ class ResponsesApiTransport(ProviderTransport):
                 kwargs.get("replay_encrypted_reasoning", True)
             ),
             current_issuer_kind=issuer,
+            current_issuer_model=issuer_model,
             native_compaction_eligible=_native_compaction_active(
                 kwargs.get("context_management")
             ),
@@ -589,8 +599,21 @@ class ResponsesApiTransport(ProviderTransport):
         # items captured from the response, and passed to the input
         # converter so foreign-issuer reasoning blocks in history are
         # dropped before the API rejects them.
+        from agent.model_metadata import (
+            strip_codex_context_variant_suffix as _strip_ctx_variant,
+        )
+
+        request_overrides = params.get("request_overrides")
+        override_model = (
+            request_overrides.get("model", model)
+            if request_overrides
+            else model
+        )
+        wire_model = _strip_ctx_variant(override_model)
         issuer_kind = self._resolve_issuer_kind(params)
+        issuer_model = str(wire_model or "").strip() or None
         self._last_issuer_kind = issuer_kind
+        self._last_issuer_model = issuer_model
 
         # Resolve reasoning effort
         reasoning_effort = "medium"
@@ -720,17 +743,11 @@ class ResponsesApiTransport(ProviderTransport):
         # request is issued (openai==2.24.0).  Reported for the
         # ``openai-codex`` / ``gpt-5.5`` combo on chatgpt.com/backend-api/codex
         # (#32892) when the agent runs without external tools registered.
-        # Function-level import: agent.model_metadata is imported lazily
-        # because provider plugins import this transport during
-        # model_metadata's own module init (circular otherwise).
-        from agent.model_metadata import (
-            strip_codex_context_variant_suffix as _strip_ctx_variant,
-        )
         kwargs = {
             # ``-900k`` large-context picker variants are Hermes-side aliases
             # (gpt-5.6-sol-900k etc.) — the Codex/OpenAI backend only knows
             # the base slug, so strip the suffix before it hits the wire.
-            "model": _strip_ctx_variant(model),
+            "model": wire_model,
             "instructions": instructions,
             "input": _chat_messages_to_responses_input(
                 payload_messages,
@@ -738,6 +755,7 @@ class ResponsesApiTransport(ProviderTransport):
                 is_github_responses=is_github_responses,
                 replay_encrypted_reasoning=replay_encrypted_reasoning,
                 current_issuer_kind=issuer_kind,
+                current_issuer_model=issuer_model,
                 native_compaction_eligible=native_compaction_active,
             ),
             "store": False,
@@ -812,9 +830,11 @@ class ResponsesApiTransport(ProviderTransport):
         elif not is_github_responses and not is_xai_responses:
             kwargs["include"] = []
 
-        request_overrides = params.get("request_overrides")
         if request_overrides:
             kwargs.update(request_overrides)
+            # The canonical model governs both the outgoing request and the
+            # provenance used to decide which encrypted reasoning can replay.
+            kwargs["model"] = wire_model
 
         if "prompt_cache_key" in kwargs:
             bounded_cache_key = _bounded_prompt_cache_key(kwargs["prompt_cache_key"])
@@ -935,8 +955,13 @@ class ResponsesApiTransport(ProviderTransport):
         # call. Either way it gets stamped onto reasoning items so future
         # turns can detect a model swap and drop foreign-issuer blobs.
         issuer_kind = kwargs.get("issuer_kind") or self._last_issuer_kind
+        issuer_model = kwargs.get("issuer_model") or self._last_issuer_model
         # _normalize_codex_response returns (SimpleNamespace, finish_reason_str)
-        msg, finish_reason = _normalize_codex_response(response, issuer_kind=issuer_kind)
+        msg, finish_reason = _normalize_codex_response(
+            response,
+            issuer_kind=issuer_kind,
+            issuer_model=issuer_model,
+        )
 
         tool_calls = None
         if msg and msg.tool_calls:
