@@ -16670,6 +16670,7 @@ def _resolve_chat_argv(
     sidecar_url: Optional[str] = None,
     profile: Optional[str] = None,
     active_session_file: Optional[str] = None,
+    automatic_resume: bool = False,
 ) -> tuple[list[str], Optional[str], Optional[dict]]:
     """Resolve the argv + cwd + env for the chat PTY.
 
@@ -16766,6 +16767,19 @@ def _resolve_chat_argv(
     # setdefault so an explicit operator value still wins.
     env.setdefault("COLORTERM", "truecolor")
     env["HERMES_TUI_DASHBOARD"] = "1"
+
+    if resume and automatic_resume:
+        _resume_db = _open_session_db_for_profile(
+            requested if profile_dir is not None else None,
+            read_only=False,
+        )
+        try:
+            if _resume_db.archive_if_unreachable_local_endpoint(resume):
+                resume = None
+                if active_session_file:
+                    _forget_active_session_file(Path(active_session_file))
+        finally:
+            _resume_db.close()
 
     if resume:
         _resume_db = _open_session_db_for_profile(
@@ -16873,6 +16887,7 @@ async def _resolve_chat_argv_async(
     sidecar_url: Optional[str] = None,
     profile: Optional[str] = None,
     active_session_file: Optional[str] = None,
+    automatic_resume: bool = False,
 ) -> tuple[list[str], Optional[str], Optional[dict]]:
     """Resolve chat argv without blocking the dashboard event loop.
 
@@ -16891,6 +16906,8 @@ async def _resolve_chat_argv_async(
     }
     if active_session_file is not None:
         kwargs["active_session_file"] = active_session_file
+    if automatic_resume:
+        kwargs["automatic_resume"] = True
 
     async with _get_chat_argv_lock(app):
         return await asyncio.to_thread(
@@ -17631,6 +17648,7 @@ async def pty_ws(ws: WebSocket) -> None:
         "on",
     }
     active_session_file: Optional[Path] = None
+    automatic_resume = False
 
     if channel:
         active_session_file = _active_session_file_for_channel(ws.app, channel)
@@ -17639,12 +17657,7 @@ async def pty_ws(ws: WebSocket) -> None:
             _forget_active_session_file(active_session_file)
         elif not resume:
             resume = _read_active_session_file(active_session_file)
-            if resume:
-                # The client only knows to pin the viewport to the bottom
-                # when it requested `?resume=`. Tell it a replay is coming
-                # anyway so the implicit active-session fallback gets the
-                # same follow-scroll treatment as an explicit resume (#93518).
-                await ws.send_json({"type": "resume", "id": resume})
+            automatic_resume = bool(resume)
 
     resolve_kwargs = {
         "resume": resume,
@@ -17653,6 +17666,8 @@ async def pty_ws(ws: WebSocket) -> None:
     }
     if active_session_file is not None:
         resolve_kwargs["active_session_file"] = str(active_session_file)
+    if automatic_resume:
+        resolve_kwargs["automatic_resume"] = True
 
     try:
         argv, cwd, env = await _resolve_chat_argv_async(**resolve_kwargs)
@@ -17666,6 +17681,13 @@ async def pty_ws(ws: WebSocket) -> None:
         await ws.send_text(f"\r\n\x1b[31mChat unavailable: {exc}\x1b[0m\r\n")
         await ws.close(code=1011)
         return
+
+    if automatic_resume and env and env.get("HERMES_TUI_RESUME") == resume:
+        # The client only knows to pin the viewport to the bottom when it
+        # requested `?resume=`. Tell it about an implicit active-session
+        # fallback only after resolution confirms the local endpoint is still
+        # reachable; a stale fallback is archived and omitted from the env.
+        await ws.send_json({"type": "resume", "id": resume})
 
 
     attach_token = ws.query_params.get("attach") or None
