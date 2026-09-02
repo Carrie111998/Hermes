@@ -293,6 +293,14 @@ class TestPostStopInterruptSwallow:
         runner._invalidate_session_run_generation = (
             lambda key, reason=None: invalidated.append((key, reason))
         )
+        from tools import clarify_gateway
+
+        cleared_clarify_sessions = []
+        monkeypatch.setattr(
+            clarify_gateway,
+            "clear_session",
+            lambda key: cleared_clarify_sessions.append(key),
+        )
         released = []
         runner._release_running_agent_state = (
             lambda key, **kw: released.append(key)
@@ -316,6 +324,7 @@ class TestPostStopInterruptSwallow:
         )
 
         assert agent.interrupt_reasons == [_INTERRUPT_REASON_STOP]
+        assert cleared_clarify_sessions == [session_key]
         assert released == [session_key]
         assert reaped_event.wait(1)
         assert reaped == [

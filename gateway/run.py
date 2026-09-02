@@ -23639,7 +23639,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
                 response = ""
 
-            # Auto voice reply: send TTS audio before the text response
+            # Auto voice reply: send TTS audio. Runs as a background task so a
+            # slow local TTS (e.g. Qwen3-TTS on ROCm) never delays the text
+            # reply — the voice message arrives when synthesis finishes.
             _already_sent = bool(agent_result.get("already_sent"))
             # Skip when streaming TTS already delivered audio for this turn (#60671).
             _stts_adapter = self._adapter_for_source(source)
@@ -23651,7 +23653,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 not _streaming_tts_done
                 and self._should_send_voice_reply(event, response, agent_messages, already_sent=_already_sent)
             ):
-                await self._send_voice_reply(event, response)
+                try:
+                    asyncio.ensure_future(self._send_voice_reply(event, response))
+                except Exception as _voice_sched_exc:  # noqa: BLE001
+                    logger.warning("Auto voice reply scheduling failed: %s", _voice_sched_exc)
 
             # If streaming already delivered the response, extract and
             # deliver any MEDIA: files before returning None.  Streaming
@@ -29800,6 +29805,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 await adapter.interrupt_session_activity(session_key, source.chat_id)
         if adapter and hasattr(adapter, "get_pending_message"):
             adapter.get_pending_message(session_key)  # consume and discard
+        # A control interrupt (/stop, /new, /reset) is a hard conversation
+        # boundary.  Clear pending clarify entries immediately rather than
+        # waiting for the interrupted turn's finalizer: that finalizer may
+        # still be draining while the next user message arrives, causing the
+        # stale clarify interceptor to swallow the new turn.
+        try:
+            from tools.clarify_gateway import clear_session as _clear_clarify_session
+
+            _clear_clarify_session(session_key)
+        except Exception:
+            logger.debug(
+                "Failed to clear pending clarify during session interrupt",
+                exc_info=True,
+            )
         if _iac_state is not None:
             _iac_state.persistent.pending_command_text = None
         if release_running_state:
