@@ -2135,6 +2135,128 @@ def git_result(*args, cwd=None):
     )
 
 
+# ─── macOS DMG attachment gate (#85422) ────────────────────────────────────
+
+_BUNDLE_DMG_DIR = (
+    REPO_ROOT / "apps" / "bootstrap-installer" / "src-tauri"
+    / "target" / "release" / "bundle" / "dmg"
+)
+_BUILD_RECEIPT_NAME = ".build-receipt.json"
+
+
+class DmgAttachmentResult:
+    """Outcome of the macOS-DMG release gate.
+
+    ``attachments`` — verified DMG paths to append to ``gh release create``
+    (empty list when none qualified).
+    ``evidence`` — (path, proof-note) pairs, one per attachment, describing
+    WHY each DMG was accepted (receipt SHA match + age), for the release log.
+    ``blocking_reason`` — when non-None, publishing with zero macOS assets
+    is about to recreate the #85422 terminal state, and the reason is this
+    string.  The caller decides fail-closed vs explicit bypass.
+    """
+
+    def __init__(self):
+        self.attachments: list[str] = []
+        self.evidence: list[tuple[str, str]] = []
+        self.blocking_reason: str | None = None
+
+
+def collect_release_dmg_attachments(
+    *, release_sha: str, release_tag: str, max_age_hours: float = 72.0,
+) -> DmgAttachmentResult:
+    """Verify and collect macOS DMG release assets with build provenance.
+
+    The provenance authority is the BUILD RECEIPT —
+    ``bundle/dmg/.build-receipt.json``, written by the build host at
+    ``npm run tauri:build`` time — not file mtime.  A receipt records the
+    exact git SHA and build timestamp the DMG was built from; a DMG is
+    attachable only when:
+
+    1. a receipt exists and its ``sha`` equals the release SHA (the DMG was
+       built from this exact tree, not copied from another tag/branch/arch),
+    2. the receipt's build time is within ``max_age_hours``,
+    3. and the DMG file's own mtime agrees within a small tolerance with
+       the receipt (a touched/copied file drifts).
+
+    mtime alone can be forged by ``cp``/``touch`` (the #100600 review's
+    copied-DMG attack); the SHA receipt cannot be forged without editing
+    the tree.
+
+    Missing / SHA-mismatched / stale receipts set ``blocking_reason`` so
+    the release path can refuse to publish zero macOS assets (#85422).
+    """
+    import time as _time
+
+    result = DmgAttachmentResult()
+    dmg_dir = _BUNDLE_DMG_DIR
+    if not dmg_dir.is_dir():
+        result.blocking_reason = (
+            f"no Tauri bundle directory ({dmg_dir}) — no macOS DMG was built "
+            "on this host"
+        )
+        return result
+
+    receipt_path = dmg_dir / _BUILD_RECEIPT_NAME
+    if not receipt_path.is_file():
+        result.blocking_reason = (
+            f"no build receipt at {receipt_path.name} in the bundle dir — "
+            "the DMG's build provenance (source SHA) cannot be verified"
+        )
+        return result
+
+    try:
+        import json as _json
+        receipt = _json.loads(receipt_path.read_text(encoding="utf-8"))
+    except (ValueError, OSError) as exc:
+        result.blocking_reason = f"build receipt unreadable/corrupt: {exc}"
+        return result
+
+    receipt_sha = str(receipt.get("sha") or "").strip()
+    if not receipt_sha or receipt_sha != release_sha:
+        result.blocking_reason = (
+            f"build receipt SHA mismatch: built from "
+            f"{receipt_sha[:10] or '<missing>'} but releasing {release_sha[:10]} "
+            "— rebuild the DMG from the release tree "
+            "(cd apps/bootstrap-installer && npm run tauri:build)"
+        )
+        return result
+
+    built_at = receipt.get("built_at_unix") or 0
+    now = _time.time()
+    age_hours = (now - built_at) / 3600.0
+    if age_hours > max_age_hours:
+        result.blocking_reason = (
+            f"build receipt is {int(age_hours)}h old (>{int(max_age_hours)}h) — "
+            "the DMG predates the release window; rebuild before publishing"
+        )
+        return result
+
+    candidates = sorted(dmg_dir.glob("*.dmg"))
+    if not candidates:
+        result.blocking_reason = "bundle directory has a receipt but no .dmg files"
+        return result
+
+    for dmg in candidates:
+        # mtime must agree with the receipt within a tolerance — a copied
+        # or touched DMG drifts from its recorded build time.
+        mtime_skew_hours = abs(dmg.stat().st_mtime - built_at) / 3600.0
+        if mtime_skew_hours > 2.0:
+            continue  # stale straggler from an older build in the same dir
+        result.attachments.append(str(dmg))
+        result.evidence.append((
+            str(dmg),
+            f"receipt sha {receipt_sha[:10]} == release, built {int(age_hours)}h ago",
+        ))
+
+    if not result.attachments:
+        result.blocking_reason = (
+            "bundle directory DMGs all have mtimes inconsistent with the "
+            "build receipt — none can be proven to be the receipted build"
+        )
+    return result
+
+
 def get_last_tag():
     """Get the most recent CalVer tag."""
     tags = git("tag", "--list", "v20*", "--sort=-v:refname")
@@ -2489,6 +2611,10 @@ def main():
                         help="Override CalVer date (format: YYYY.M.D)")
     parser.add_argument("--first-release", action="store_true",
                         help="Mark as first release (no previous tag expected)")
+    parser.add_argument("--allow-no-mac-asset", action="store_true",
+                        help="Explicitly publish without a verified macOS DMG "
+                             "asset (bypasses the #85422 fail-closed gate; "
+                             "releases cut from non-macOS hosts)")
     parser.add_argument("--output", type=str,
                         help="Write changelog to file instead of stdout")
     args = parser.parse_args()
@@ -2606,51 +2732,48 @@ def main():
             "--notes-file", str(changelog_file),
         ]
 
-        # Attach a freshly-built macOS bootstrap DMG when one is present in the
-        # Tauri bundle directory (#85422).  Every revalidation of the stale
-        # public artifact — across v0.20.2, v0.20.4, v0.20.5, v0.20.6 and
-        # v2026.8.31 — notes the GitHub release carries NO attached assets,
-        # leaving users no alternate official macOS artifact while the CDN
-        # serves the June-6 bootstrap that predates Desktop's remote-client
-        # onboarding (#60489).  The CDN upload is external infra; the release
-        # attachment is in-tree and this is the step that closes that gap.
+        # ── macOS DMG attachment with build provenance (#85422) ──────────
+        # Every revalidation of the stale public artifact — across v0.20.2
+        # through v2026.8.31 — notes the GitHub release carries NO attached
+        # assets, leaving no alternate official macOS artifact while the CDN
+        # serves the June-6 bootstrap.  A bare `gh release create` guarantees
+        # that zero-asset terminal state forever; this gate makes it an
+        # explicit, opt-out-able failure instead.
         #
-        # The DMG must be built on macOS BEFORE running release.py --publish:
-        #   cd apps/bootstrap-installer && npm run tauri:build
-        # Tauri emits to src-tauri/target/release/bundle/dmg/.  Both
-        # architectures are attached when present; a missing DMG is a skip
-        # (with a warning), not a release failure — releases cut from hosts
-        # without a macOS build must keep working.
-        _bundle_dmg_dir = (
-            REPO_ROOT / "apps" / "bootstrap-installer" / "src-tauri"
-            / "target" / "release" / "bundle" / "dmg"
+        # Provenance authority is the BUILD RECEIPT, not mtime: the DMG build
+        # helper writes bundle/dmg/.build-receipt.json recording the git SHA
+        # and build time at build time.  mtime alone can be forged by a copy
+        # or touch; the receipt must match the exact release SHA AND be
+        # fresh, and both must agree.
+        _head_sha = (git_result("rev-parse", "HEAD") or "").strip()
+        _dmg_result = collect_release_dmg_attachments(
+            release_sha=_head_sha, release_tag=tag_name,
+            max_age_hours=72,
         )
-        _dmg_attachments: list[str] = []
-        if _bundle_dmg_dir.is_dir():
-            for _dmg in sorted(_bundle_dmg_dir.glob("*.dmg")):
-                _age_hours = 72
-                _mtime = _dmg.stat().st_mtime
-                import time as _time
-                _hours_old = (_time.time() - _mtime) / 3600.0
-                if _hours_old > _age_hours:
-                    print(
-                        f"  ⚠ Skipping stale DMG {_dmg.name} "
-                        f"({int(_hours_old)}h old — older than {_age_hours}h; "
-                        f"rebuild with `npm run tauri:build` before publishing)"
-                    )
-                    continue
-                _dmg_attachments.append(str(_dmg))
-        if _dmg_attachments:
-            gh_cmd.extend(_dmg_attachments)
-            for _p in _dmg_attachments:
-                print(f"  📎 Attaching macOS bootstrap DMG: {Path(_p).name}")
-        else:
-            print(
-                "  ⚠ No fresh macOS DMG found in "
-                f"{_bundle_dmg_dir} — GitHub release will have no macOS asset "
-                "again (#85422).  Build on macOS first: "
-                "`cd apps/bootstrap-installer && npm run tauri:build`"
-            )
+        if _dmg_result.attachments:
+            gh_cmd.extend(_dmg_result.attachments)
+            for _p, _note in _dmg_result.evidence:
+                print(f"  📎 Attaching macOS bootstrap DMG: {Path(_p).name} ({_note})")
+        if _dmg_result.blocking_reason:
+            # Fail-closed: a `--publish` run that would recreate the
+            # zero-asset #85422 state aborts BEFORE gh release create, unless
+            # the releaser explicitly accepts it with --allow-no-mac-asset
+            # (Linux CI hosts without a macOS build use this, and it prints
+            # loud instructions rather than failing silently).
+            if getattr(args, "allow_no_mac_asset", False):
+                print(f"  ⚠ macOS asset gate BYPASSED (--allow-no-mac-asset): "
+                      f"{_dmg_result.blocking_reason}")
+                print("    GitHub release will publish with no macOS asset — "
+                      "the exact #85422 state.  Build on macOS and attach "
+                      "manually, or rerun without the bypass.")
+            else:
+                print(f"  ✗ REFUSING to publish: {_dmg_result.blocking_reason}")
+                print("    Build on macOS first:  cd apps/bootstrap-installer "
+                      "&& npm run tauri:build")
+                print("    (or rerun with --allow-no-mac-asset to explicitly "
+                      "publish without a macOS asset)")
+                changelog_file.unlink(missing_ok=True)
+                sys.exit(1)
 
         gh_bin = shutil.which("gh")
         if gh_bin:

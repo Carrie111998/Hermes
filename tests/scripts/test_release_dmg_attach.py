@@ -1,143 +1,188 @@
-"""Regression tests for #85422: release script attaches fresh macOS DMG assets.
+"""Regression tests for #85422: release gate attaches only provenance-verified
+macOS DMGs and refuses zero-asset publishes.
 
-Every revalidation of the stale public macOS installer (v0.20.2 through
-v2026.8.31) documents that the GitHub release carries ZERO attached assets —
-no alternate official artifact exists while the CDN serves the June-6
-bootstrap that predates Desktop's remote-client onboarding (#60489).
+Reviews of the first iteration (#100600) established two contracts this suite
+pins:
 
-The fix: `gh release create` in scripts/release.py now attaches fresh DMGs
-from the Tauri bundle directory when present, skips DMGs older than 72h
-(the stale CDN object is exactly this shape — June 6), and warns-with-skip
-rather than failing when no DMG exists (releases cut from non-mac hosts
-must keep working).
+1. mtime is not provenance — a copied/touched DMG must NOT attach, and a
+   publish with no verifiable DMG must be a blocking outcome the caller can
+   fail closed on (not a warning the release path ignores).
+2. Tests must exercise the PRODUCTION selector —
+   scripts/release.py::collect_release_dmg_attachments — not a mirrored
+   local copy that can stay green while the real code diverges.
 
-These tests exercise the attachment-selection logic in isolation — the
-pure decision of WHICH files qualify — without invoking the real `gh`
-binary or the release flow.
+The provenance authority is the build receipt (.build-receipt.json: source
+git SHA + build timestamp, written by the build host), with the DMG mtime
+as corroborating evidence within a tolerance.
 """
 
+import json
+import os
 import sys
 import time
 from pathlib import Path
-from unittest.mock import patch
+
+import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT / "scripts"))
 
+from release import (  # noqa: E402  — production import, deliberately
+    DmgAttachmentResult,
+    collect_release_dmg_attachments,
+)
 
-def _make_bundle(tmp_path: Path, names_with_ages: dict[str, float]) -> Path:
-    """Create a fake Tauri bundle/dmg directory with DMGs of given ages (hours)."""
+
+def _make_bundle(tmp_path: Path, *, receipt: dict | None,
+                 dmgs: dict[str, float] | None = None,
+                 receipt_mtime_offset: float = 0.0) -> Path:
+    """Create a fake Tauri bundle/dmg directory with receipt and DMGs.
+
+    ``dmgs`` maps filename -> mtime offset from the receipt build time in
+    SECONDS (positive = newer than receipt, negative = older).
+    """
+    import release as _rel
     dmg_dir = tmp_path / "apps" / "bootstrap-installer" / "src-tauri" / "target" / "release" / "bundle" / "dmg"
     dmg_dir.mkdir(parents=True)
-    now = time.time()
-    for name, age_hours in names_with_ages.items():
+    built_at = receipt.get("built_at_unix", time.time()) if receipt else time.time()
+
+    if receipt is not None:
+        rp = dmg_dir / ".build-receipt.json"
+        rp.write_text(json.dumps(receipt), encoding="utf-8")
+        m = built_at + receipt_mtime_offset
+        os.utime(rp, (m, m))
+
+    for name, offset in (dmgs or {}).items():
         p = dmg_dir / name
         p.write_bytes(b"fake dmg")
-        mtime = now - age_hours * 3600
-        import os
-        os.utime(p, (mtime, mtime))
-    return dmg_dir
+        m = built_at + offset
+        os.utime(p, (m, m))
+
+    # Point the production module at this fake bundle dir.
+    orig = _rel._BUNDLE_DMG_DIR
+    _rel._BUNDLE_DMG_DIR = dmg_dir
+    return dmg_dir, orig
 
 
-def _select_attachments(dmg_dir: Path):
-    """The selection logic from release.py, extracted contract: returns
-    (attachments, printed_lines). Mirrors the branch in the release script —
-    fresh DMGs attach, >72h DMGs skip with a warning."""
-    attachments: list[str] = []
-    lines: list[str] = []
-    if dmg_dir.is_dir():
-        for _dmg in sorted(dmg_dir.glob("*.dmg")):
-            import time as _time
-            _hours_old = (_time.time() - _dmg.stat().st_mtime) / 3600.0
-            if _hours_old > 72:
-                lines.append(f"skip-stale:{_dmg.name}")
-                continue
-            attachments.append(str(_dmg))
-    if attachments:
-        for p in attachments:
-            lines.append(f"attach:{Path(p).name}")
-    else:
-        lines.append("no-mac-asset-warning")
-    return attachments, lines
+@pytest.fixture()
+def patched_bundle_dir():
+    """Restore the production bundle dir path after each test."""
+    import release as _rel
+    yield
+    # each _make_bundle call stashes orig; restore via a fresh marker
+    if getattr(_rel, "_BUNDLE_DMG_DIR", None) != (
+        REPO_ROOT / "apps" / "bootstrap-installer" / "src-tauri"
+        / "target" / "release" / "bundle" / "dmg"
+    ):
+        _rel._BUNDLE_DMG_DIR = (
+            REPO_ROOT / "apps" / "bootstrap-installer" / "src-tauri"
+            / "target" / "release" / "bundle" / "dmg"
+        )
 
 
-class TestDmgAttachmentSelection:
-    def test_fresh_dmg_attaches(self, tmp_path):
-        dmg_dir = _make_bundle(tmp_path, {"Hermes_0.0.1_aarch64.dmg": 1.0})
-        attachments, lines = _select_attachments(dmg_dir)
-        assert len(attachments) == 1
-        assert any("attach:Hermes_0.0.1_aarch64.dmg" in l for l in lines)
+class TestProvenanceGate:
+    def test_matching_receipt_fresh_dmg_attaches(self, tmp_path):
+        sha = "abc123def4567890"
+        built = time.time() - 3600  # 1h ago
+        _make_bundle(tmp_path, receipt={"sha": sha, "built_at_unix": built},
+                    dmgs={"Hermes_0.0.1_aarch64.dmg": 0.0})
+        r = collect_release_dmg_attachments(release_sha=sha, release_tag="vX")
+        assert len(r.attachments) == 1
+        assert r.blocking_reason is None
+        assert any("receipt sha" in note for _, note in r.evidence)
 
-    def test_both_architectures_attach_in_order(self, tmp_path):
-        dmg_dir = _make_bundle(tmp_path, {
-            "Hermes_0.0.1_aarch64.dmg": 2.0,
-            "Hermes_0.0.1_x64.dmg": 2.0,
-        })
-        attachments, lines = _select_attachments(dmg_dir)
-        assert len(attachments) == 2
-        # sorted() order: aarch64 before x64
-        assert "aarch64" in attachments[0]
-        assert "x64" in attachments[1]
-        assert sum(1 for l in lines if l.startswith("attach:")) == 2
+    def test_sha_mismatch_blocks(self, tmp_path):
+        """DMG built from a DIFFERENT tree must not attach (#100600 review)."""
+        built = time.time() - 3600
+        _make_bundle(tmp_path, receipt={"sha": "ffffffffffff", "built_at_unix": built},
+                    dmgs={"H.dmg": 0.0})
+        r = collect_release_dmg_attachments(release_sha="abc123def4567", release_tag="vX")
+        assert r.attachments == []
+        assert r.blocking_reason and "mismatch" in r.blocking_reason
 
-    def test_stale_dmg_skips_with_warning(self, tmp_path):
-        """The June-6 CDN object shape: an old DMG must NOT attach (#85422)."""
-        dmg_dir = _make_bundle(tmp_path, {"Hermes_0.0.1_aarch64.dmg": 100.0})
-        attachments, lines = _select_attachments(dmg_dir)
-        assert attachments == []
-        assert any("skip-stale:Hermes_0.0.1_aarch64.dmg" in l for l in lines)
-        assert any("no-mac-asset-warning" in l for l in lines)
+    def test_missing_receipt_blocks(self, tmp_path):
+        """No receipt = no provenance = blocking, not warning."""
+        _make_bundle(tmp_path, receipt=None, dmgs={"H.dmg": 0.0})
+        r = collect_release_dmg_attachments(release_sha="abc", release_tag="vX")
+        assert r.attachments == []
+        assert r.blocking_reason and "no build receipt" in r.blocking_reason
 
-    def test_mixed_fresh_and_stale_attaches_only_fresh(self, tmp_path):
-        """A rebuilt DMG beside an old one attaches the new one only."""
-        dmg_dir = _make_bundle(tmp_path, {
-            "Hermes_0.0.1_aarch64.dmg": 0.5,   # rebuilt
-            "Hermes_0.0.1_x64.dmg": 200.0,     # stale
-        })
-        attachments, lines = _select_attachments(dmg_dir)
-        assert len(attachments) == 1
-        assert "aarch64" in attachments[0]
-        assert any("skip-stale:" in l for l in lines)
+    def test_stale_receipt_blocks(self, tmp_path):
+        """Receipt older than the release window (the June-6 shape)."""
+        sha = "abc123def456"
+        built = time.time() - 100 * 3600  # 100h ago
+        _make_bundle(tmp_path, receipt={"sha": sha, "built_at_unix": built},
+                    dmgs={"H.dmg": 0.0})
+        r = collect_release_dmg_attachments(release_sha=sha, release_tag="vX", max_age_hours=72)
+        assert r.attachments == []
+        assert r.blocking_reason and "h old" in r.blocking_reason
 
-    def test_missing_bundle_dir_warns_not_fails(self, tmp_path):
-        """No bundle dir (non-mac release host) → warning, empty attachments."""
-        attachments, lines = _select_attachments(tmp_path / "nonexistent")
-        assert attachments == []
-        assert any("no-mac-asset-warning" in l for l in lines)
+    def test_touched_copied_dmg_not_attached(self, tmp_path):
+        """mtime drift beyond tolerance from the receipt = provenance broken.
 
-    def test_boundary_exactly_72h_attaches(self, tmp_path):
-        """A DMG exactly at the 72h boundary is still fresh (>= comparison)."""
-        dmg_dir = _make_bundle(tmp_path, {"Hermes_0.0.1_aarch64.dmg": 71.0})
-        attachments, _ = _select_attachments(dmg_dir)
-        assert len(attachments) == 1
+        This is the copied-DMG attack from the #100600 review: a file touched
+        NOW in a directory whose receipt is 1h old must not attach.
+        """
+        sha = "abc123def456"
+        built = time.time() - 3600
+        _make_bundle(tmp_path, receipt={"sha": sha, "built_at_unix": built},
+                    dmgs={"H.dmg": 86400.0})  # mtime 24h AFTER receipt time
+        r = collect_release_dmg_attachments(release_sha=sha, release_tag="vX")
+        assert r.attachments == []
+        assert r.blocking_reason  # no provable DMG -> blocking
+
+    def test_missing_bundle_dir_blocks(self, tmp_path):
+        """Non-macOS release host: blocking_reason set (caller bypasses via flag)."""
+        import release as _rel
+        orig = _rel._BUNDLE_DMG_DIR
+        _rel._BUNDLE_DMG_DIR = tmp_path / "nonexistent"
+        try:
+            r = collect_release_dmg_attachments(release_sha="abc", release_tag="vX")
+            assert r.attachments == []
+            assert r.blocking_reason and "no Tauri bundle" in r.blocking_reason
+        finally:
+            _rel._BUNDLE_DMG_DIR = orig
+
+    def test_corrupt_receipt_blocks(self, tmp_path):
+        d, orig = _make_bundle(tmp_path, receipt={"sha": "abc", "built_at_unix": 1})
+        (d / ".build-receipt.json").write_text("not json{", encoding="utf-8")
+        import release as _rel
+        _rel._BUNDLE_DMG_DIR = d
+        try:
+            r = collect_release_dmg_attachments(release_sha="abc", release_tag="vX")
+            assert r.blocking_reason and "unreadable" in r.blocking_reason
+        finally:
+            _rel._BUNDLE_DMG_DIR = orig
+
+    def test_both_architectures_attach_ordered(self, tmp_path):
+        sha = "abc123def456"
+        built = time.time() - 600
+        _make_bundle(tmp_path, receipt={"sha": sha, "built_at_unix": built},
+                    dmgs={"H_aarch64.dmg": 0.0, "H_x64.dmg": 0.0})
+        r = collect_release_dmg_attachments(release_sha=sha, release_tag="vX")
+        assert len(r.attachments) == 2
+        assert "aarch64" in r.attachments[0]  # sorted order
+        assert "x64" in r.attachments[1]
+        assert r.blocking_reason is None
 
     def test_non_dmg_files_ignored(self, tmp_path):
-        """Only *.dmg files in the bundle dir attach — no other artifacts."""
-        dmg_dir = _make_bundle(tmp_path, {"Hermes_0.0.1_aarch64.dmg": 1.0})
-        (dmg_dir / "Hermes.app").mkdir()
-        (dmg_dir / "notes.txt").write_text("x")
-        attachments, _ = _select_attachments(dmg_dir)
-        assert len(attachments) == 1
-        assert attachments[0].endswith(".dmg")
+        sha = "abc123def456"
+        built = time.time() - 600
+        _make_bundle(tmp_path, receipt={"sha": sha, "built_at_unix": built},
+                    dmgs={"H.dmg": 0.0})
+        (d, orig) = (None, None)
+        # add junk files
+        bd = __import__("release")._BUNDLE_DMG_DIR
+        (bd / "notes.txt").write_text("x")
+        (bd / "H.app").mkdir()
+        r = collect_release_dmg_attachments(release_sha=sha, release_tag="vX")
+        assert len(r.attachments) == 1
+        assert r.attachments[0].endswith(".dmg")
 
 
-class TestGhCommandConstruction:
-    """The gh release create invocation must carry the attachments positionally."""
-
-    def test_gh_cmd_includes_dmg_paths(self):
-        """Contract: gh release create <tag> --title ... --notes-file ... <dmg1> <dmg2>.
-        Verified by reading the script's behavior via import — the attachment
-        extension happens between gh_cmd construction and the subprocess call."""
-        # The structural assertion that matters for review: the release
-        # script's gh_cmd.extend(_dmg_attachments) ordering means DMGs land
-        # AFTER all flags, which is the positional-asset position for
-        # `gh release create`. We assert the ordering contract directly.
-        gh_cmd = ["gh", "release", "create", "v2026.8.31",
-                  "--title", "Hermes Agent v0.21.0",
-                  "--notes-file", ".release_notes.md"]
-        attachments = ["a/Hermes_0.0.1_aarch64.dmg", "a/Hermes_0.0.1_x64.dmg"]
-        gh_cmd.extend(attachments)
-        # Flags come first, positional assets last — gh CLI contract
-        assert gh_cmd[0] == "gh"
-        assert "--notes-file" in gh_cmd
-        assert gh_cmd[-2:] == attachments
+class TestResultShape:
+    def test_result_type_contract(self):
+        r = DmgAttachmentResult()
+        assert r.attachments == []
+        assert r.evidence == []
+        assert r.blocking_reason is None
