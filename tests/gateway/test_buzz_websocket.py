@@ -161,6 +161,93 @@ async def _unresolved_pong():
 
 
 @pytest.mark.asyncio
+async def test_frame_wins_over_pending_liveness_probe(monkeypatch):
+    monkeypatch.setattr(_buzz_mod, "_WS_LIVENESS_INTERVAL", 0.01)
+    monkeypatch.setattr(_buzz_mod, "_WS_LIVENESS_TIMEOUT", 1)
+    frame_ready = asyncio.Event()
+    pong_started = asyncio.Event()
+    pong_waiter = None
+
+    async def anext_behavior():
+        await frame_ready.wait()
+        return "frame"
+
+    async def ping_behavior():
+        nonlocal pong_waiter
+        pong_waiter = asyncio.get_running_loop().create_future()
+        pong_started.set()
+        return pong_waiter
+
+    websocket = _ScriptedWebSocket(anext_behavior, ping_behavior)
+    frame_task = asyncio.create_task(
+        BuzzAdapter._read_frame_or_probe(_make_adapter(), websocket.__aiter__(), websocket)
+    )
+    await asyncio.wait_for(pong_started.wait(), 1)
+    frame_ready.set()
+
+    assert await asyncio.wait_for(frame_task, 1) == "frame"
+    assert pong_waiter.cancelled()
+
+
+@pytest.mark.asyncio
+async def test_failed_probe_wins_simultaneous_frame_completion(monkeypatch):
+    monkeypatch.setattr(_buzz_mod, "_WS_LIVENESS_INTERVAL", 0.01)
+    monkeypatch.setattr(_buzz_mod, "_WS_LIVENESS_TIMEOUT", 1)
+    frame_ready = asyncio.Event()
+    probe_started = asyncio.Event()
+    probe_failed = asyncio.Event()
+
+    async def anext_behavior():
+        await frame_ready.wait()
+        return "frame"
+
+    async def ping_behavior():
+        probe_started.set()
+        await asyncio.sleep(0)
+        probe_failed.set()
+        raise ConnectionError("transport failed")
+
+    websocket = _ScriptedWebSocket(anext_behavior, ping_behavior)
+    frame_task = asyncio.create_task(
+        BuzzAdapter._read_frame_or_probe(_make_adapter(), websocket.__aiter__(), websocket)
+    )
+    await asyncio.wait_for(probe_started.wait(), 1)
+    frame_ready.set()
+    await asyncio.wait_for(probe_failed.wait(), 1)
+    await asyncio.sleep(0)
+
+    with pytest.raises(ConnectionError, match="transport failed"):
+        await asyncio.wait_for(frame_task, 1)
+
+
+@pytest.mark.asyncio
+async def test_liveness_race_cancellation_settles_pending_tasks(monkeypatch):
+    monkeypatch.setattr(_buzz_mod, "_WS_LIVENESS_INTERVAL", 0.01)
+    monkeypatch.setattr(_buzz_mod, "_WS_LIVENESS_TIMEOUT", 1)
+    pong_waiter = None
+    probe_started = asyncio.Event()
+
+    async def anext_behavior():
+        await asyncio.Event().wait()
+
+    async def ping_behavior():
+        nonlocal pong_waiter
+        pong_waiter = asyncio.get_running_loop().create_future()
+        probe_started.set()
+        return pong_waiter
+
+    websocket = _ScriptedWebSocket(anext_behavior, ping_behavior)
+    task = asyncio.create_task(
+        BuzzAdapter._read_frame_or_probe(_make_adapter(), websocket.__aiter__(), websocket)
+    )
+    await asyncio.wait_for(probe_started.wait(), 1)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, 1)
+    assert pong_waiter.cancelled()
+
+
+@pytest.mark.asyncio
 async def test_websocket_loop_keeps_a_quiet_healthy_connection(monkeypatch):
     adapter = _make_adapter()
     monkeypatch.setattr(_buzz_mod, "_WS_LIVENESS_INTERVAL", 0.02)

@@ -308,24 +308,11 @@ _WS_AUTH_TIMEOUT = 20.0
 # never completes, so a manual ping round-trip times out and forces the
 # normal reconnect path. A quiet-but-healthy relay answers the ping and the
 # connection is kept — silence alone is not death.
-_WS_LIVENESS_INTERVAL = 60.0
-_WS_LIVENESS_TIMEOUT = 45.0
+_WS_LIVENESS_INTERVAL = 300.0
+_WS_LIVENESS_TIMEOUT = 15.0
 _WS_MAX_MESSAGE_BYTES = 2_000_000
 _WS_MEMBERSHIP_KIND = 44100
 _WS_MEMBERSHIP_SUB_ID = "hermes-buzz-membership"
-
-
-def _ws_clean_close_error():
-    """The websockets clean-close exception class (version-portable).
-
-    websockets 15.x raises ``ConnectionClosedOK`` when the server closes
-    cleanly — normally surfaced as the iterator ending, but a close racing
-    the liveness ping instead raises it from ``ping()``/``recv()``.
-    Resolved lazily so adapter import never needs websockets present.
-    """
-    from websockets.exceptions import ConnectionClosedOK
-
-    return ConnectionClosedOK
 
 # Where to look for a credentials JSON (keys: nsec / private_key_hex) when
 # BUZZ_PRIVATE_KEY is not set.  Module-level so tests can point it at a tmpdir.
@@ -1891,36 +1878,62 @@ class BuzzAdapter(BasePlatformAdapter):
 
     async def _probe_liveness(self, websocket) -> None:
         """Require proof of transport life via a ping/pong round-trip."""
-        ping_fn = getattr(websocket, "ping", None)
-        if not callable(ping_fn):
-            return
-        pong_waiter = await ping_fn()
+        pong_waiter = await websocket.ping()
         if pong_waiter is not None:
             await pong_waiter
 
     async def _read_frame_or_probe(self, frame_iter, websocket) -> str:
-        """Read a frame, probing the connection while it remains quiet."""
+        """Read a frame, probing the connection while it remains quiet.
+
+        The pending read is kept across idle/probe cycles — cancelling and
+        re-creating it per cycle would drop frames that arrive while the
+        probe is in flight.
+        """
         read_task = asyncio.ensure_future(frame_iter.__anext__())
+        probe_task = None
         try:
             while True:
-                done, _ = await asyncio.wait({read_task}, timeout=_WS_LIVENESS_INTERVAL)
+                done, _ = await asyncio.wait(
+                    {read_task}, timeout=_WS_LIVENESS_INTERVAL
+                )
                 if done:
                     return read_task.result()
-                try:
-                    await asyncio.wait_for(
-                        self._probe_liveness(websocket), timeout=_WS_LIVENESS_TIMEOUT
-                    )
-                except asyncio.TimeoutError:
+                probe_task = asyncio.ensure_future(
+                    self._probe_liveness(websocket)
+                )
+                done, _ = await asyncio.wait(
+                    {read_task, probe_task},
+                    timeout=_WS_LIVENESS_TIMEOUT,
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if not done:
                     raise ConnectionError(
                         "relay did not answer a liveness ping within "
                         f"{_WS_LIVENESS_TIMEOUT:.0f}s; assuming the connection went silent"
                     ) from None
+                if probe_task in done:
+                    # A failed probe wins even when a frame also completed:
+                    # the transport error must reach the reconnect path.
+                    probe_task.result()
+                    if read_task in done:
+                        return read_task.result()
+                    probe_task = None
+                    continue
+                # Only the frame is ready: return it without waiting for the
+                # pong; the finally block cancels and settles the probe.
+                return read_task.result()
         finally:
-            read_task.cancel()
-            try:
-                await read_task
-            except (asyncio.CancelledError, Exception):
-                pass
+            for task in (read_task, probe_task):
+                if task is None or task.done():
+                    continue
+                task.cancel()
+                try:
+                    await task
+                except (asyncio.CancelledError, Exception):
+                    pass
+            for task in (read_task, probe_task):
+                if task is not None and not task.cancelled():
+                    task.exception()  # retrieve, so nothing is left un-retrieved
 
     async def _websocket_loop(self) -> None:
         """Persistent authenticated subscription with bounded reconnect
@@ -1929,6 +1942,7 @@ class BuzzAdapter(BasePlatformAdapter):
         from the last observed timestamps (same-second overlap de-duped by
         event id)."""
         import websockets
+        from websockets.exceptions import ConnectionClosedOK
 
         backoff = 1.0
         try:
@@ -1963,9 +1977,9 @@ class BuzzAdapter(BasePlatformAdapter):
                                     )
                                 except StopAsyncIteration:
                                     break
-                                except _ws_clean_close_error():
-                                    # A clean close racing the liveness probe is
-                                    # normal relay lifecycle, not a failure.
+                                # A clean close racing the liveness probe is
+                                # normal relay lifecycle, not a failure.
+                                except ConnectionClosedOK:
                                     break
                                 try:
                                     message = json.loads(raw)
