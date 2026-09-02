@@ -120,6 +120,21 @@ _GATEWAY_RETRY_FAILURE_REPLY = (
     "⚠️ Something went wrong while generating a response. Please try again."
 )
 
+_GATEWAY_RETRY_FINAL_DIAGNOSTIC_RE = re.compile(
+    r"^\s*(?:[⚠❌]\ufe0f?\s*)?(?:"
+    r"empty\s+response\s+from\s+model\s+[—-]\s+retrying"
+    r"(?:\s+\(\d+/\d+\))?\s+in\s+\d+(?:\.\d+)?s"
+    r"(?:\s+[—-]\s+high-cost\s+request,\s+reduced\s+retry\s+budget)?"
+    r"|model\s+returning\s+empty\s+responses\s+[—-]\s+switching\s+to\s+fallback\s+provider\.\.\."
+    r"|model\s+returned\s+no\s+content\s+after\s+all\s+retries"
+    r"(?:\s+and\s+fallback\s+attempts)?\."
+    r"(?:\s+no\s+fallback\s+providers\s+configured\.)?"
+    r"|no\s+reply:\s+the\s+model\s+returned\s+empty\s+content\.\s+"
+    r"try\s+again,\s+switch\s+model/provider,\s+or\s+inspect\s+the\s+tool\s+output\s+above\."
+    r")\s*$",
+    re.IGNORECASE,
+)
+
 _TELEGRAM_NOISY_STATUS_RE = re.compile(
     r"("  # transient/auxiliary status that should stay in logs, not gateway chats
     r"auxiliary\s+.+\s+failed"
@@ -1030,12 +1045,11 @@ def _sanitize_gateway_final_response(platform: Any, text: str) -> str:
         return ""
 
     redacted = _redact_gateway_user_facing_secrets(str(text))
-    noisy_status = _TELEGRAM_NOISY_STATUS_RE.search(redacted)
-    if noisy_status is not None and noisy_status.start() <= 4:
+    if _GATEWAY_RETRY_FINAL_DIAGNOSTIC_RE.fullmatch(redacted):
         # Status callbacks suppress transient retry chatter, but a final reply
         # cannot disappear without making the user's message look lost. Replace
-        # a status-shaped final diagnostic with one short recovery prompt. The
-        # near-start guard preserves normal answers that quote a retry message.
+        # an emitted retry diagnostic with one short recovery prompt. Matching
+        # the complete emitter shape preserves assistant prose about the error.
         return _GATEWAY_RETRY_FAILURE_REPLY
     if _looks_like_gateway_provider_error(redacted):
         return _gateway_provider_error_reply(redacted)

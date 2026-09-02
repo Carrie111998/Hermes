@@ -258,8 +258,13 @@ def test_chat_gateways_keep_normal_answers(platform):
     "message",
     [
         "⚠️ Empty response from model — retrying (1/3) in 6s",
+        (
+            "⚠️ Empty response from model — retrying (1/1) in 6s — "
+            "high-cost request, reduced retry budget"
+        ),
         "⚠️ Model returning empty responses — switching to fallback provider...",
         "❌ Model returned no content after all retries. No fallback providers configured.",
+        "❌ Model returned no content after all retries and fallback attempts.",
         (
             "No reply: the model returned empty content. Try again, switch "
             "model/provider, or inspect the tool output above."
@@ -282,12 +287,17 @@ def test_programmatic_surfaces_keep_retry_chatter_used_as_final_response():
         assert _sanitize_gateway_final_response(platform, message) == message
 
 
-def test_chat_gateway_keeps_answer_that_explains_retry_chatter():
-    answer = (
-        "The log line `Empty response from model — retrying (1/3) in 6s` "
-        "means the provider returned no visible content."
-    )
-
+@pytest.mark.parametrize(
+    "answer",
+    [
+        (
+            "The log line `Empty response from model — retrying (1/3) in 6s` "
+            "means the provider returned no visible content."
+        ),
+        "Empty response from model is a common name for a provider failure mode.",
+    ],
+)
+def test_chat_gateway_keeps_answer_that_explains_retry_chatter(answer):
     assert _sanitize_gateway_final_response("telegram", answer) == answer
 
 
