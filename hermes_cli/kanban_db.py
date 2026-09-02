@@ -11685,20 +11685,28 @@ def purge_stale_done_notify_subs(
     *,
     max_age_days: int = 30,
 ) -> int:
-    """Delete notify subscriptions whose task has sat in ``done`` untouched
-    for longer than ``max_age_days``.
+    """Delete notify subscriptions whose task has sat **idle** untouched
+    for longer than ``max_age_days``, whatever its status.
 
     The notifier keeps subscriptions alive through ``done`` because a
     completed task can be reopened (review corrections, continuation) and
     the reopened cycle must still notify its origin session. On boards
     that never archive, that retention would otherwise accumulate
     subscription rows forever — each one scanned every notifier tick.
-    This GC bounds that: a task that has been ``done`` with no new events
-    for the retention window is treated as settled and its subscriptions
-    are purged. Age is measured from the task's most recent event
-    (falling back to ``completed_at`` then ``created_at``), so ANY
-    activity — including a reopen, which also moves the task off
-    ``done`` — resets or exempts it.
+    This GC bounds that on task idleness rather than status: a task that
+    has had no new events for the retention window — and no live-worker
+    heartbeat — is treated as abandoned and its subscriptions are
+    purged. That covers a stale ``done``, a stuck ``blocked``, an
+    abandoned ``review``, and a ``running`` task whose worker died
+    without a final state transition. Age is measured from the task's
+    most recent event (falling back to ``completed_at`` then
+    ``created_at``), so ANY activity — including a reopen, which also
+    moves the task off ``done`` — resets or exempts it.
+
+    A live worker is always exempt: ``heartbeat_worker`` refreshes
+    ``last_heartbeat_at`` (and appends a heartbeat event) at least once
+    a minute, so an actively running task never ages out no matter how
+    far back its other events reach.
 
     ``max_age_days <= 0`` disables the sweep entirely. Returns the number
     of subscription rows deleted.
@@ -11714,13 +11722,13 @@ def purge_stale_done_notify_subs(
         cur = conn.execute(
             "DELETE FROM kanban_notify_subs WHERE task_id IN ("
             " SELECT t.id FROM tasks t"
-            " WHERE t.status = 'done'"
-            " AND COALESCE("
+            " WHERE COALESCE("
             "  (SELECT MAX(e.created_at) FROM task_events e"
             "   WHERE e.task_id = t.id),"
             "  t.completed_at, t.created_at, 0"
-            " ) < ?)",
-            (cutoff,),
+            " ) < ?"
+            " AND COALESCE(t.last_heartbeat_at, 0) < ?)",
+            (cutoff, cutoff),
         )
     return int(cur.rowcount or 0)
 

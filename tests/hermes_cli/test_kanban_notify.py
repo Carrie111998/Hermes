@@ -1092,22 +1092,152 @@ def test_gc_honors_configured_retention_days(kanban_home):
         conn.close()
 
 
-def test_gc_spares_reopened_task_even_when_old(kanban_home):
+def test_gc_spares_fresh_reopen_even_when_history_old(kanban_home):
     import hermes_cli.kanban_db as kb
 
     conn = kb.connect()
     try:
         tid = _make_done_task_with_sub(kb, conn, title="reopened", chat_id="c-reopen")
         _backdate_task(kb, conn, tid, days=90)
-        # Reopen: the task leaves ``done``, so even with an ancient event
-        # history the GC must not touch its subscription.
+        # Reopen: the task leaves ``done``. The reopen itself is fresh
+        # activity, so even with an ancient done-era event history the
+        # GC must not touch its subscription — the reopened cycle still
+        # has to notify its origin session.
         with kb.write_txn(conn):
             conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (tid,))
             kb._append_event(conn, tid, "status", {"status": "ready"})
-        # Backdate the reopen event too — status alone must protect it.
-        _backdate_task(kb, conn, tid, days=90)
 
         assert kb.purge_stale_done_notify_subs(conn, max_age_days=30) == 0
+        assert len(kb.list_notify_subs(conn, tid)) == 1
+    finally:
+        conn.close()
+
+
+def test_gc_purges_reopened_task_abandoned_past_retention(kanban_home):
+    import hermes_cli.kanban_db as kb
+
+    conn = kb.connect()
+    try:
+        tid = _make_done_task_with_sub(kb, conn, title="reopened", chat_id="c-reopen")
+        _backdate_task(kb, conn, tid, days=90)
+        # Reopen, then nothing. Status alone must NOT protect the sub:
+        # total idleness past the retention window is the abandonment
+        # signal, whatever the task's status.
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (tid,))
+            kb._append_event(conn, tid, "status", {"status": "ready"})
+        # Backdate the reopen event too — the reopened cycle was never
+        # picked back up.
+        _backdate_task(kb, conn, tid, days=90)
+
+        assert kb.purge_stale_done_notify_subs(conn, max_age_days=30) == 1
+        assert kb.list_notify_subs(conn, tid) == []
+    finally:
+        conn.close()
+
+
+def _set_task_status(kb, conn, tid, status):
+    """Force a task into ``status`` with a matching status event."""
+    with kb.write_txn(conn):
+        conn.execute("UPDATE tasks SET status = ? WHERE id = ?", (status, tid))
+        kb._append_event(conn, tid, "status", {"status": status})
+
+
+def test_gc_purges_blocked_task_that_never_done(kanban_home):
+    import hermes_cli.kanban_db as kb
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="stuck blocked", assignee="worker1")
+        kb.add_notify_sub(
+            conn, task_id=tid, platform="telegram", chat_id="c-blocked",
+            notifier_profile="default",
+        )
+        _set_task_status(kb, conn, tid, "blocked")
+        _backdate_task(kb, conn, tid, days=45)
+
+        purged = kb.purge_stale_done_notify_subs(conn, max_age_days=30)
+
+        assert purged == 1
+        assert kb.list_notify_subs(conn, tid) == []
+    finally:
+        conn.close()
+
+
+def test_gc_purges_running_task_with_dead_worker(kanban_home):
+    import hermes_cli.kanban_db as kb
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="orphaned running", assignee="worker1")
+        kb.add_notify_sub(
+            conn, task_id=tid, platform="telegram", chat_id="c-dead-run",
+            notifier_profile="default",
+        )
+        _set_task_status(kb, conn, tid, "running")
+        # Simulate a worker whose last heartbeat happened before it died:
+        # stale heartbeat + stale events => abandoned, must be reaped.
+        past = int(__import__("time").time()) - 45 * 86400
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET last_heartbeat_at = ? WHERE id = ?", (past, tid),
+            )
+        _backdate_task(kb, conn, tid, days=45)
+
+        purged = kb.purge_stale_done_notify_subs(conn, max_age_days=30)
+
+        assert purged == 1
+        assert kb.list_notify_subs(conn, tid) == []
+    finally:
+        conn.close()
+
+
+def test_gc_spares_running_task_with_live_worker(kanban_home):
+    import hermes_cli.kanban_db as kb
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="live running", assignee="worker1")
+        kb.add_notify_sub(
+            conn, task_id=tid, platform="telegram", chat_id="c-live-run",
+            notifier_profile="default",
+        )
+        _set_task_status(kb, conn, tid, "running")
+        _backdate_task(kb, conn, tid, days=45)
+        # heartbeat_worker refreshes last_heartbeat_at at least once a
+        # minute; the GC must exempt it even though the task's event
+        # history is far older than the retention window.
+        assert kb.heartbeat_worker(conn, tid)
+        # Age every event back out again — only the fresh
+        # last_heartbeat_at (touched above, untouched by the backdate)
+        # keeps this task out of the sweep.
+        _backdate_task(kb, conn, tid, days=45)
+
+        purged = kb.purge_stale_done_notify_subs(conn, max_age_days=30)
+
+        assert purged == 0
+        assert len(kb.list_notify_subs(conn, tid)) == 1
+    finally:
+        conn.close()
+
+
+def test_gc_spares_active_review_task(kanban_home):
+    import hermes_cli.kanban_db as kb
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="in review", assignee="worker1")
+        kb.add_notify_sub(
+            conn, task_id=tid, platform="telegram", chat_id="c-review",
+            notifier_profile="default",
+        )
+        # The review request itself is recent activity: an active review
+        # is NOT abandoned and must keep its subscription.
+        _set_task_status(kb, conn, tid, "review")
+
+        purged = kb.purge_stale_done_notify_subs(conn, max_age_days=30)
+
+        assert purged == 0
         assert len(kb.list_notify_subs(conn, tid)) == 1
     finally:
         conn.close()
@@ -1120,8 +1250,8 @@ def test_gc_archived_rows_already_removed_by_unsub(kanban_home):
     try:
         tid = _make_done_task_with_sub(kb, conn, title="archived", chat_id="c-arch")
         assert kb.archive_task(conn, tid)
-        # The notifier removes the sub at archive time; the GC targets only
-        # ``done`` tasks, so an archived task contributes nothing to purge.
+        # The notifier removes the sub at archive time; once removed the
+        # GC contributes nothing further for that task.
         kb.remove_notify_sub(
             conn, task_id=tid, platform="telegram", chat_id="c-arch",
         )
