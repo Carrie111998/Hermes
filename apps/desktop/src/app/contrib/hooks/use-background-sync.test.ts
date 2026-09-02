@@ -14,9 +14,11 @@ import {
 } from '@/store/session'
 import {
   $attentionSessionIds,
+  $sessionStates,
   $stalledSessionIds,
   $workingSessionIds,
   clearAllSessionStates,
+  publishSessionState,
   SESSION_WATCHDOG_TIMEOUT_MS
 } from '@/store/session-states'
 
@@ -247,9 +249,16 @@ describe('active transcript refresh', () => {
     // Seed a tile so reconcileTileTranscripts has a target.
     setSessions([]) // bot chats are hidden from $sessions — the whole point
 
+    const ownerRoute = {
+      connectionId: 'bot-connection',
+      mode: 'remote' as const,
+      profile: 'bot-route',
+      targetProfile: 'bot-profile'
+    }
+
     await act(async () => {
       await reconcileTileTranscriptsForTest({
-        tiles: [{ storedSessionId: TILE_STORED_ID, runtimeId: TILE_RUNTIME_ID }],
+        tiles: [{ ownerRoute, storedSessionId: TILE_STORED_ID, runtimeId: TILE_RUNTIME_ID }],
         busyRef,
         requestSequenceRef,
         signatureRef,
@@ -259,7 +268,233 @@ describe('active transcript refresh', () => {
 
     // Behavior assertions:
     expect(updaterCallCount).toBeGreaterThan(0)
-    expect(getLatestSessionMessages).toHaveBeenCalledWith(TILE_STORED_ID)
+    expect(getLatestSessionMessages).toHaveBeenCalledWith(TILE_STORED_ID, {
+      connectionId: ownerRoute.connectionId,
+      profile: ownerRoute.targetProfile
+    })
+  })
+
+  it('isolates tile transcript reads by connection and profile while preserving the legacy local path', async () => {
+    vi.mocked(getLatestSessionMessages).mockImplementation(async storedId => transcript(storedId, storedId) as never)
+
+    const updateSessionState: Parameters<typeof reconcileTileTranscriptsForTest>[0]['updateSessionState'] = vi.fn(
+      (_sessionId, updater) => updater({} as Parameters<typeof updater>[0])
+    )
+
+    await act(async () => {
+      await reconcileTileTranscriptsForTest({
+        tiles: [
+          {
+            ownerRoute: {
+              connectionId: 'connection-a',
+              mode: 'remote',
+              profile: 'shared-profile',
+              targetProfile: 'target-a'
+            },
+            runtimeId: 'runtime-a',
+            storedSessionId: 'stored-a'
+          },
+          {
+            ownerRoute: {
+              connectionId: 'connection-b',
+              mode: 'remote',
+              profile: 'shared-profile'
+            },
+            runtimeId: 'runtime-b',
+            storedSessionId: 'stored-b'
+          },
+          { runtimeId: 'runtime-local', storedSessionId: 'stored-local' }
+        ],
+        busyRef: { current: false },
+        requestSequenceRef: { current: 0 },
+        signatureRef: { current: new Map<string, string>() },
+        updateSessionState
+      })
+    })
+
+    expect(getLatestSessionMessages).toHaveBeenCalledWith('stored-a', {
+      connectionId: 'connection-a',
+      profile: 'target-a'
+    })
+    expect(getLatestSessionMessages).toHaveBeenCalledWith('stored-b', {
+      connectionId: 'connection-b',
+      profile: 'shared-profile'
+    })
+    expect(getLatestSessionMessages).toHaveBeenCalledWith('stored-local', undefined)
+    expect(updateSessionState).toHaveBeenCalledWith('runtime-a', expect.any(Function), 'stored-a')
+    expect(updateSessionState).toHaveBeenCalledWith('runtime-b', expect.any(Function), 'stored-b')
+    expect(updateSessionState).toHaveBeenCalledWith('runtime-local', expect.any(Function), 'stored-local')
+  })
+
+  it('discards a tile transcript when the tile closes during the read', async () => {
+    let resolve: ((value: unknown) => void) | undefined
+    vi.mocked(getLatestSessionMessages).mockReturnValueOnce(
+      new Promise(currentResolve => {
+        resolve = currentResolve
+      }) as never
+    )
+    const tiles = [{ runtimeId: 'runtime-closing', storedSessionId: 'stored-closing' }]
+    const signatureRef = { current: new Map<string, string>() }
+    const updateSessionState = vi.fn()
+
+    const pending = reconcileTileTranscriptsForTest({
+      tiles,
+      busyRef: { current: false },
+      requestSequenceRef: { current: 0 },
+      signatureRef,
+      updateSessionState
+    })
+
+    await waitFor(() => expect(getLatestSessionMessages).toHaveBeenCalledWith('stored-closing', undefined))
+
+    tiles.length = 0
+    resolve?.(transcript('stale answer', 'stored-closing'))
+    await pending
+
+    expect(updateSessionState).not.toHaveBeenCalled()
+    expect(signatureRef.current).toEqual(new Map())
+  })
+
+  it('discards a tile transcript when the owner route changes during the read', async () => {
+    let resolve: ((value: unknown) => void) | undefined
+    vi.mocked(getLatestSessionMessages).mockReturnValueOnce(
+      new Promise(currentResolve => {
+        resolve = currentResolve
+      }) as never
+    )
+
+    const tiles = [
+      {
+        ownerRoute: { connectionId: 'connection-old', mode: 'remote' as const, profile: 'profile-old' },
+        runtimeId: 'runtime-rebound',
+        storedSessionId: 'stored-rebound'
+      }
+    ]
+
+    const signatureRef = { current: new Map<string, string>() }
+    const updateSessionState = vi.fn()
+
+    const pending = reconcileTileTranscriptsForTest({
+      tiles,
+      busyRef: { current: false },
+      requestSequenceRef: { current: 0 },
+      signatureRef,
+      updateSessionState
+    })
+
+    await waitFor(() =>
+      expect(getLatestSessionMessages).toHaveBeenCalledWith('stored-rebound', {
+        connectionId: 'connection-old',
+        profile: 'profile-old'
+      })
+    )
+
+    tiles[0] = {
+      ...tiles[0],
+      ownerRoute: { connectionId: 'connection-new', mode: 'remote', profile: 'profile-new' }
+    }
+    resolve?.(transcript('stale answer', 'stored-rebound'))
+    await pending
+
+    expect(updateSessionState).not.toHaveBeenCalled()
+    expect(signatureRef.current).toEqual(new Map())
+  })
+
+  it('discards a tile transcript when its runtime changes during the read', async () => {
+    let resolve: ((value: unknown) => void) | undefined
+    vi.mocked(getLatestSessionMessages).mockReturnValueOnce(
+      new Promise(currentResolve => {
+        resolve = currentResolve
+      }) as never
+    )
+
+    const tiles = [{ runtimeId: 'runtime-old', storedSessionId: 'stored-rebound-runtime' }]
+    const signatureRef = { current: new Map<string, string>() }
+    const updateSessionState = vi.fn()
+
+    const pending = reconcileTileTranscriptsForTest({
+      tiles,
+      busyRef: { current: false },
+      requestSequenceRef: { current: 0 },
+      signatureRef,
+      updateSessionState
+    })
+
+    await waitFor(() => expect(getLatestSessionMessages).toHaveBeenCalledWith('stored-rebound-runtime', undefined))
+
+    tiles[0] = { runtimeId: 'runtime-new', storedSessionId: 'stored-rebound-runtime' }
+    resolve?.(transcript('stale answer', 'stored-rebound-runtime'))
+    await pending
+
+    expect(updateSessionState).not.toHaveBeenCalled()
+    expect(signatureRef.current).toEqual(new Map())
+  })
+
+  it('does not fetch a tile transcript while its local submit is busy', async () => {
+    const runtimeId = 'runtime-busy-tile'
+    const storedSessionId = 'stored-busy-tile'
+
+    const optimistic = {
+      ...createClientSessionState(storedSessionId),
+      awaitingResponse: true,
+      busy: true,
+      messages: [{ id: 'optimistic-user', parts: [{ text: 'keep me', type: 'text' as const }], role: 'user' as const }]
+    }
+
+    publishSessionState(runtimeId, optimistic)
+
+    const updateSessionState = vi.fn()
+
+    await reconcileTileTranscriptsForTest({
+      tiles: [{ runtimeId, storedSessionId }],
+      busyRef: { current: false },
+      requestSequenceRef: { current: 0 },
+      signatureRef: { current: new Map<string, string>() },
+      updateSessionState
+    })
+
+    expect(getLatestSessionMessages).not.toHaveBeenCalled()
+    expect(updateSessionState).not.toHaveBeenCalled()
+    expect($sessionStates.get()[runtimeId]).toEqual(optimistic)
+  })
+
+  it('does not apply a durable tile snapshot when a local submit starts during the read', async () => {
+    const runtimeId = 'runtime-submitting-tile'
+    const storedSessionId = 'stored-submitting-tile'
+    let resolve: ((value: unknown) => void) | undefined
+
+    publishSessionState(runtimeId, createClientSessionState(storedSessionId))
+    vi.mocked(getLatestSessionMessages).mockReturnValueOnce(
+      new Promise(currentResolve => {
+        resolve = currentResolve
+      }) as never
+    )
+
+    const updateSessionState = vi.fn()
+
+    const pending = reconcileTileTranscriptsForTest({
+      tiles: [{ runtimeId, storedSessionId }],
+      busyRef: { current: false },
+      requestSequenceRef: { current: 0 },
+      signatureRef: { current: new Map<string, string>() },
+      updateSessionState
+    })
+
+    await waitFor(() => expect(getLatestSessionMessages).toHaveBeenCalledWith(storedSessionId, undefined))
+
+    const optimistic = {
+      ...createClientSessionState(storedSessionId),
+      awaitingResponse: true,
+      busy: true,
+      messages: [{ id: 'optimistic-user', parts: [{ text: 'keep me', type: 'text' as const }], role: 'user' as const }]
+    }
+
+    publishSessionState(runtimeId, optimistic)
+    resolve?.(transcript('stale durable answer', storedSessionId))
+    await pending
+
+    expect(updateSessionState).not.toHaveBeenCalled()
+    expect($sessionStates.get()[runtimeId]).toEqual(optimistic)
   })
 
   it('skips the tile fetch entirely when nothing changed (signature-gated)', async () => {
@@ -284,7 +519,10 @@ describe('active transcript refresh', () => {
     // Compute the same signature the reconcile will compute, and pre-seed it.
     const preSignature = sessionMessagesSignature(pre.messages as never)
 
-    signatureRef.current.set(`tile:${TILE_STORED_ID}`, preSignature)
+    signatureRef.current.set(
+      `tile:${JSON.stringify([TILE_STORED_ID, TILE_RUNTIME_ID, '', '', '', ''])}`,
+      preSignature
+    )
 
     const updateSessionState = vi.fn()
     const busyRef = { current: false }
@@ -301,6 +539,57 @@ describe('active transcript refresh', () => {
     })
 
     expect(updateSessionState).not.toHaveBeenCalled()
+  })
+
+  it('prunes signatures for tiles closed between refresh passes without touching active-pane signatures', async () => {
+    const signatureRef = {
+      current: new Map([
+        [`tile:${JSON.stringify(['stored-closed', 'runtime-closed', '', '', '', ''])}`, 'closed-signature'],
+        ['default:active-pane', 'active-signature']
+      ])
+    }
+
+    await reconcileTileTranscriptsForTest({
+      tiles: [],
+      busyRef: { current: false },
+      requestSequenceRef: { current: 0 },
+      signatureRef,
+      updateSessionState: vi.fn()
+    })
+
+    expect(signatureRef.current).toEqual(new Map([['default:active-pane', 'active-signature']]))
+    expect(getLatestSessionMessages).not.toHaveBeenCalled()
+  })
+
+  it('does not reuse a previous runtime signature after a durable tile rebind', async () => {
+    const storedSessionId = 'stored-rebound-runtime'
+    const previous = transcript('same durable tail', storedSessionId)
+    const signature = sessionMessagesSignature(previous.messages as never)
+
+    const signatureRef = {
+      current: new Map([
+        [`tile:${JSON.stringify([storedSessionId, 'runtime-old', '', '', '', ''])}`, signature]
+      ])
+    }
+
+    const updateSessionState: Parameters<typeof reconcileTileTranscriptsForTest>[0]['updateSessionState'] = vi.fn(
+      (_sessionId, updater) => updater({} as Parameters<typeof updater>[0])
+    )
+
+    vi.mocked(getLatestSessionMessages).mockResolvedValue(previous as never)
+
+    await reconcileTileTranscriptsForTest({
+      tiles: [{ runtimeId: 'runtime-new', storedSessionId }],
+      busyRef: { current: false },
+      requestSequenceRef: { current: 0 },
+      signatureRef,
+      updateSessionState
+    })
+
+    expect(updateSessionState).toHaveBeenCalledWith('runtime-new', expect.any(Function), storedSessionId)
+    expect(signatureRef.current).toEqual(
+      new Map([[`tile:${JSON.stringify([storedSessionId, 'runtime-new', '', '', '', ''])}`, signature]])
+    )
   })
 
   it('refreshes a local/Desktop session when sessions.changed ticks', async () => {
