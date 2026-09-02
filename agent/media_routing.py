@@ -106,14 +106,15 @@ def transcode_audio_to_supported_format(
             stderr=subprocess.DEVNULL,
             timeout=15,
         )
-        if res.returncode == 0 and tmp_out_path.is_file() and tmp_out_path.stat().st_size > 0:
-            data = tmp_out_path.read_bytes()
-            tmp_out_path.unlink(missing_ok=True)
-            return data, target_format
-        if tmp_out_path and tmp_out_path.exists():
-            tmp_out_path.unlink(missing_ok=True)
+        if (
+            res.returncode == 0
+            and tmp_out_path.is_file()
+            and tmp_out_path.stat().st_size > 0
+        ):
+            return tmp_out_path.read_bytes(), target_format
     except Exception as exc:
         logger.debug("media_routing: audio transcoding failed: %s", exc)
+    finally:
         if tmp_out_path and tmp_out_path.exists():
             tmp_out_path.unlink(missing_ok=True)
     return None
@@ -134,9 +135,15 @@ def supported_input_modalities(provider: str, model: str) -> Set[str]:
             info = get_model_info(vendor, bare_model)
         if info is None:
             return set()
-        return {str(item).strip().lower() for item in info.input_modalities if item}
+        modalities = getattr(info, "input_modalities", ()) or ()
+        return {str(item).strip().lower() for item in modalities if item}
     except Exception as exc:  # pragma: no cover - defensive
-        logger.debug("media_routing: capability lookup failed for %s:%s: %s", provider, model, exc)
+        logger.debug(
+            "media_routing: capability lookup failed for %s:%s: %s",
+            provider,
+            model,
+            exc,
+        )
         return set()
 
 
@@ -195,8 +202,15 @@ def build_native_media_content_parts(
     hints: List[str] = []
     skipped: List[str] = []
 
-    for attachment in attachments:
-        raw_path = str(attachment.get("path") or "")
+    for item in attachments:
+        if isinstance(item, (str, Path)):
+            raw_path = str(item)
+            attachment: Dict[str, Any] = {"path": raw_path}
+        elif isinstance(item, dict):
+            attachment = item
+            raw_path = str(attachment.get("path") or "")
+        else:
+            continue
         path = Path(raw_path)
         if not raw_path or not path.is_file():
             skipped.append(raw_path)
@@ -236,11 +250,13 @@ def build_native_media_content_parts(
             audio_format = normalize_audio_format(path, mime)
             audio_data = encoded
             # Transcode to mp3 if required by OpenAI direct input_audio schema
-            if (
-                target_provider in ("openai", "azure")
-                and audio_format not in ("wav", "mp3")
+            if target_provider in ("openai", "azure") and audio_format not in (
+                "wav",
+                "mp3",
             ):
-                transcoded = transcode_audio_to_supported_format(path, target_format="mp3")
+                transcoded = transcode_audio_to_supported_format(
+                    path, target_format="mp3"
+                )
                 if transcoded:
                     t_bytes, t_fmt = transcoded
                     audio_data = base64.b64encode(t_bytes).decode("ascii")
@@ -278,7 +294,9 @@ def build_native_media_content_parts(
         return ([{"type": "text", "text": text}] if text else []), skipped
 
     prompt = text or "Analyze the attached media."
-    parts: List[Dict[str, Any]] = [{"type": "text", "text": f"{prompt}\n\n" + "\n".join(hints)}]
+    parts: List[Dict[str, Any]] = [
+        {"type": "text", "text": f"{prompt}\n\n" + "\n".join(hints)}
+    ]
     parts.extend(media_parts)
     return parts, skipped
 
@@ -292,5 +310,3 @@ __all__ = [
     "supported_input_modalities",
     "transcode_audio_to_supported_format",
 ]
-
-

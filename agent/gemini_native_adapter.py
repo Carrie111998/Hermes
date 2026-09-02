@@ -30,6 +30,7 @@ import httpx
 
 from agent.bounded_response import read_streaming_error_body
 from agent.gemini_schema import sanitize_gemini_tool_parameters
+from agent.media_routing import normalize_audio_mime
 
 logger = logging.getLogger(__name__)
 
@@ -309,16 +310,14 @@ def _extract_multimodal_parts(content: Any) -> List[Dict[str, Any]]:
             audio_info = item.get("input_audio") or {}
             encoded = audio_info.get("data")
             fmt = str(audio_info.get("format") or "").strip().lower()
-            if not isinstance(encoded, str) or not encoded:
+            if not isinstance(encoded, str) or not encoded.strip():
                 continue
-            from agent.media_routing import normalize_audio_mime
-
             mime = normalize_audio_mime(fmt)
             parts.append(
                 {
                     "inlineData": {
                         "mimeType": mime,
-                        "data": encoded,
+                        "data": encoded.strip(),
                     }
                 }
             )

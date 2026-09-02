@@ -1,15 +1,23 @@
 import base64
 
 from agent.gemini_native_adapter import _extract_multimodal_parts
-from agent.media_routing import build_native_media_content_parts, supported_input_modalities
+from agent.media_routing import (
+    build_native_media_content_parts,
+    supported_input_modalities,
+)
 
 
-def test_active_gemini_flash_lite_declares_all_multimodal_inputs(monkeypatch):
+def test_active_gemini_flash_lite_declares_all_multimodal_inputs():
     from types import SimpleNamespace
     from unittest.mock import patch
-    fake_info = SimpleNamespace(input_modalities=["text", "image", "pdf", "video", "audio"])
+
+    fake_info = SimpleNamespace(
+        input_modalities=["text", "image", "pdf", "video", "audio"]
+    )
     with patch("agent.models_dev.get_model_info", return_value=fake_info):
-        modalities = supported_input_modalities("openrouter", "google/gemini-3.5-flash-lite")
+        modalities = supported_input_modalities(
+            "openrouter", "google/gemini-3.5-flash-lite"
+        )
         assert {"text", "image", "pdf", "video", "audio"} <= modalities
 
 
@@ -33,7 +41,11 @@ def test_builds_openrouter_native_parts_for_all_media(tmp_path):
 
     assert skipped == []
     assert [part["type"] for part in parts] == [
-        "text", "image_url", "file", "input_audio", "video_url",
+        "text",
+        "image_url",
+        "file",
+        "input_audio",
+        "video_url",
     ]
     assert parts[1]["image_url"]["url"].startswith("data:image/png;base64,")
     assert parts[2]["file"]["file_data"].startswith("data:application/pdf;base64,")
@@ -62,7 +74,9 @@ def test_gemini_native_adapter_converts_non_image_media_to_inline_data(tmp_path)
     native = _extract_multimodal_parts(parts)
     assert native[0] == {"text": parts[0]["text"]}
     assert [part["inlineData"]["mimeType"] for part in native[1:]] == [
-        "application/pdf", "audio/mpeg", "video/mp4",
+        "application/pdf",
+        "audio/mpeg",
+        "video/mp4",
     ]
 
 
@@ -153,3 +167,140 @@ def test_rich_hint_contains_size_and_mime(tmp_path):
     assert "image/png" in hint_text
 
 
+def test_openai_target_provider_triggers_audio_transcoding(tmp_path, monkeypatch):
+    import agent.media_routing as mr
+
+    audio = tmp_path / "voice.ogg"
+    audio.write_bytes(b"OggS" + b"\x00" * 28)
+
+    monkeypatch.setattr(
+        mr,
+        "transcode_audio_to_supported_format",
+        lambda *args, **kwargs: (b"fake-mp3-bytes", "mp3"),
+    )
+
+    parts, skipped = build_native_media_content_parts(
+        "listen to voice",
+        [{"path": str(audio), "mime_type": "audio/ogg", "modality": "audio"}],
+        target_provider="openai",
+    )
+    assert skipped == []
+    audio_part = next(p for p in parts if p.get("type") == "input_audio")
+    assert audio_part["input_audio"]["format"] == "mp3"
+    assert audio_part["input_audio"]["data"] == base64.b64encode(
+        b"fake-mp3-bytes"
+    ).decode("ascii")
+
+
+def test_transcode_audio_when_ffmpeg_missing(tmp_path, monkeypatch):
+    import shutil
+    from agent.media_routing import transcode_audio_to_supported_format
+
+    audio = tmp_path / "voice.ogg"
+    audio.write_bytes(b"OggS" + b"\x00" * 28)
+
+    monkeypatch.setattr(shutil, "which", lambda *_: None)
+    assert transcode_audio_to_supported_format(audio) is None
+
+
+def test_transcode_audio_successful_subprocess(tmp_path, monkeypatch):
+    from pathlib import Path
+    import shutil
+    import subprocess
+    from agent.media_routing import transcode_audio_to_supported_format
+
+    audio = tmp_path / "voice.ogg"
+    audio.write_bytes(b"OggS" + b"\x00" * 28)
+
+    monkeypatch.setattr(shutil, "which", lambda *_: "/usr/bin/ffmpeg")
+
+    def fake_run(cmd, **kwargs):
+        out_file = Path(cmd[-1])
+        out_file.write_bytes(b"fake-mp3-output")
+        return subprocess.CompletedProcess(cmd, returncode=0)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    result = transcode_audio_to_supported_format(audio, target_format="mp3")
+    assert result is not None
+    data, fmt = result
+    assert data == b"fake-mp3-output"
+    assert fmt == "mp3"
+
+
+def test_transcode_audio_subprocess_failure(tmp_path, monkeypatch):
+    import shutil
+    import subprocess
+    from agent.media_routing import transcode_audio_to_supported_format
+
+    audio = tmp_path / "voice.ogg"
+    audio.write_bytes(b"OggS" + b"\x00" * 28)
+
+    monkeypatch.setattr(shutil, "which", lambda *_: "/usr/bin/ffmpeg")
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda cmd, **kwargs: subprocess.CompletedProcess(cmd, returncode=1),
+    )
+    assert transcode_audio_to_supported_format(audio, target_format="mp3") is None
+
+
+def test_rich_hint_formats_megabytes_for_large_files(tmp_path):
+    big_file = tmp_path / "recording.wav"
+    big_file.write_bytes(b"x" * int(2.5 * 1024 * 1024))
+
+    parts, skipped = build_native_media_content_parts(
+        "listen",
+        [{"path": str(big_file), "mime_type": "audio/wav", "modality": "audio"}],
+    )
+    assert skipped == []
+    assert len(parts) == 2
+    hint_text = parts[0]["text"]
+    assert "2.5 MB" in hint_text
+    assert "audio/wav" in hint_text
+
+
+def test_supported_input_modalities_openrouter_vendor_fallback():
+    from types import SimpleNamespace
+    from unittest.mock import patch
+
+    fake_info = SimpleNamespace(input_modalities=["text", "audio"])
+
+    def mock_get_info(provider, model):
+        if provider == "openrouter":
+            return None
+        if provider == "openai" and model == "gpt-4o":
+            return fake_info
+        return None
+
+    with patch("agent.models_dev.get_model_info", side_effect=mock_get_info):
+        modalities = supported_input_modalities("openrouter", "openai/gpt-4o")
+        assert "audio" in modalities
+        assert "text" in modalities
+
+    with patch("agent.models_dev.get_model_info", return_value=None):
+        modalities = supported_input_modalities("openrouter", "unknown/model")
+        assert modalities == set()
+
+
+def test_unsupported_modality_is_skipped(tmp_path):
+    f = tmp_path / "unknown.bin"
+    f.write_bytes(b"binary-data")
+    parts, skipped = build_native_media_content_parts(
+        "check",
+        [{"path": str(f), "mime_type": "application/octet-stream", "modality": "custom_binary"}],
+    )
+    assert skipped == [str(f)]
+    assert parts == [{"type": "text", "text": "check"}]
+
+
+def test_bare_string_paths_accepted_in_attachments(tmp_path):
+    img = tmp_path / "simple.png"
+    img.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 32)
+
+    parts, skipped = build_native_media_content_parts(
+        "look",
+        [str(img)],
+    )
+    assert skipped == []
+    assert len(parts) == 2
+    assert parts[1]["type"] == "image_url"

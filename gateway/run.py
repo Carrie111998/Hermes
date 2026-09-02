@@ -6925,9 +6925,11 @@ class TurnRunner:
                         for path in _native_imgs
                     ]
                     _media_attachments.extend(_native_audio)
+                    _target_provider = getattr(agent, "provider", "") or ""
                     _parts, _skipped = build_native_media_content_parts(
                         ctx.message,
                         _media_attachments,
+                        target_provider=_target_provider,
                     )
                     if _skipped:
                         logger.warning(

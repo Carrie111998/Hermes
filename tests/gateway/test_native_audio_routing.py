@@ -40,37 +40,49 @@ def test_audio_routing_uses_native_only_for_audio_capable_model(monkeypatch):
     monkeypatch.setattr(
         media_routing,
         "supported_input_modalities",
-        lambda provider, model: {"text", "audio"},
+        lambda *_: {"text", "audio"},
     )
-    assert runner._decide_audio_input_mode(
-        provider="openrouter",
-        model="google/gemini-test",
-        user_config={},
-    ) == "native"
+    assert (
+        runner._decide_audio_input_mode(
+            provider="openrouter",
+            model="google/gemini-test",
+            user_config={},
+        )
+        == "native"
+    )
 
     monkeypatch.setattr(
         media_routing,
         "supported_input_modalities",
-        lambda provider, model: {"text", "image"},
+        lambda *_: {"text", "image"},
     )
-    assert runner._decide_audio_input_mode(
-        provider="openrouter",
-        model="text-only-test",
-        user_config={},
-    ) == "stt"
+    assert (
+        runner._decide_audio_input_mode(
+            provider="openrouter",
+            model="text-only-test",
+            user_config={},
+        )
+        == "stt"
+    )
 
     # User explicit config overrides
-    assert runner._decide_audio_input_mode(
-        provider="openrouter",
-        model="text-only-test",
-        user_config={"gateway": {"audio_mode": "native"}},
-    ) == "native"
+    assert (
+        runner._decide_audio_input_mode(
+            provider="openrouter",
+            model="text-only-test",
+            user_config={"gateway": {"audio_mode": "native"}},
+        )
+        == "native"
+    )
 
-    assert runner._decide_audio_input_mode(
-        provider="openrouter",
-        model="google/gemini-test",
-        user_config={"gateway": {"audio_mode": "stt"}},
-    ) == "stt"
+    assert (
+        runner._decide_audio_input_mode(
+            provider="openrouter",
+            model="google/gemini-test",
+            user_config={"gateway": {"audio_mode": "stt"}},
+        )
+        == "stt"
+    )
 
 
 @pytest.mark.asyncio
@@ -102,12 +114,17 @@ async def test_voice_message_stages_native_audio_without_stt(tmp_path):
     attachments = runner._consume_pending_native_audio_attachments(
         build_session_key(source)
     )
-    assert attachments == [{
-        "path": str(audio_path),
-        "mime_type": "audio/ogg",
-        "modality": "audio",
-    }]
-    assert runner._consume_pending_native_audio_attachments(build_session_key(source)) == []
+    assert attachments == [
+        {
+            "path": str(audio_path),
+            "mime_type": "audio/ogg",
+            "modality": "audio",
+        }
+    ]
+    assert (
+        runner._consume_pending_native_audio_attachments(build_session_key(source))
+        == []
+    )
 
 
 class _CaptureAgent:
@@ -154,7 +171,7 @@ async def test_agent_pipeline_sends_input_audio_and_persists_compact_marker(
     _CaptureAgent.calls = []
 
     fake_dotenv = types.ModuleType("dotenv")
-    fake_dotenv.load_dotenv = lambda *args, **kwargs: None
+    fake_dotenv.load_dotenv = lambda *_, **__: None
     monkeypatch.setitem(sys.modules, "dotenv", fake_dotenv)
 
     fake_run_agent = types.ModuleType("run_agent")
@@ -174,11 +191,13 @@ async def test_agent_pipeline_sends_input_audio_and_persists_compact_marker(
     session_key = build_session_key(source)
     audio_path = tmp_path / "voice.ogg"
     audio_path.write_bytes(b"OggS-test-audio")
-    runner._session_state(session_key).persistent.native_audio_attachments = [{
-        "path": str(audio_path),
-        "mime_type": "audio/ogg",
-        "modality": "audio",
-    }]
+    runner._session_state(session_key).persistent.native_audio_attachments = [
+        {
+            "path": str(audio_path),
+            "mime_type": "audio/ogg",
+            "modality": "audio",
+        }
+    ]
 
     result = await runner._run_agent(
         message="",
@@ -197,4 +216,104 @@ async def test_agent_pipeline_sends_input_audio_and_persists_compact_marker(
     audio_part = next(part for part in message if part.get("type") == "input_audio")
     assert audio_part["input_audio"]["format"] == "ogg"
     assert kwargs["persist_user_message"] == "[Voice message attached natively]"
+    assert runner._consume_pending_native_audio_attachments(session_key) == []
+
+
+def test_audio_routing_forces_stt_for_meta_and_muse_spark(monkeypatch):
+    runner = _bare_runner()
+    media_routing = importlib.import_module("agent.media_routing")
+
+    monkeypatch.setattr(
+        media_routing,
+        "supported_input_modalities",
+        lambda *_: {"text", "audio"},
+    )
+
+    # Meta providers forced to STT
+    assert (
+        runner._decide_audio_input_mode(
+            provider="meta",
+            model="llama-3.2-audio",
+            user_config={},
+        )
+        == "stt"
+    )
+    assert (
+        runner._decide_audio_input_mode(
+            provider="meta-ai",
+            model="llama-3.2-audio",
+            user_config={},
+        )
+        == "stt"
+    )
+
+    # Muse spark model forced to STT
+    assert (
+        runner._decide_audio_input_mode(
+            provider="openrouter",
+            model="vendor/muse-spark-v1",
+            user_config={},
+        )
+        == "stt"
+    )
+
+
+@pytest.mark.asyncio
+async def test_agent_pipeline_sends_mixed_image_and_audio(
+    monkeypatch,
+    tmp_path,
+):
+    _CaptureAgent.calls = []
+
+    fake_dotenv = types.ModuleType("dotenv")
+    fake_dotenv.load_dotenv = lambda *_, **__: None
+    monkeypatch.setitem(sys.modules, "dotenv", fake_dotenv)
+
+    fake_run_agent = types.ModuleType("run_agent")
+    fake_run_agent.AIAgent = _CaptureAgent
+    monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
+
+    gateway_run = importlib.import_module("gateway.run")
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setattr(
+        gateway_run,
+        "_resolve_runtime_agent_kwargs",
+        lambda: {"api_key": "***", "provider": "openrouter"},
+    )
+
+    runner = _pipeline_runner()
+    source = _source()
+    session_key = build_session_key(source)
+    audio_path = tmp_path / "voice.ogg"
+    audio_path.write_bytes(b"OggS-test-audio")
+    img_path = tmp_path / "photo.png"
+    img_path.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 32)
+
+    runner._session_state(session_key).persistent.native_image_paths = [str(img_path)]
+    runner._session_state(session_key).persistent.native_audio_attachments = [
+        {
+            "path": str(audio_path),
+            "mime_type": "audio/ogg",
+            "modality": "audio",
+        }
+    ]
+
+    result = await runner._run_agent(
+        message="look and listen",
+        context_prompt="",
+        history=[],
+        source=source,
+        session_id="sess-mixed-media",
+        session_key=session_key,
+    )
+
+    assert result["final_response"] == "done"
+    assert len(_CaptureAgent.calls) == 1
+    message, kwargs = _CaptureAgent.calls[0]
+    assert isinstance(message, list)
+    types_in_msg = [part.get("type") for part in message]
+    assert "text" in types_in_msg
+    assert "image_url" in types_in_msg
+    assert "input_audio" in types_in_msg
+    assert runner._consume_pending_native_image_paths(session_key) == []
     assert runner._consume_pending_native_audio_attachments(session_key) == []
