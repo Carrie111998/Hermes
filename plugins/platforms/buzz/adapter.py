@@ -300,13 +300,23 @@ def _attachment_origin(value: str) -> Optional[tuple[str, int]]:
 # WebSocket transport (NIP-42 authenticated Nostr subscription).
 # kind 44100 is Buzz's channel-membership event — used for live DM discovery.
 _WS_AUTH_TIMEOUT = 20.0
-# Last-resort bound on how long the read loop may wait for a frame. The
-# library keepalive (ping_interval/ping_timeout below) should catch a dead
-# relay first, but a relay-side close the transport never surfaces (observed
-# as a CLOSE_WAIT socket with the loop parked on recv, #98097) leaves the
-# gateway "connected" while inbound stops; this timeout forces the normal
-# reconnect path instead.
+# Last-resort bound on how long the read loop may wait for an application
+# frame before probing the transport. The library keepalive
+# (ping_interval/ping_timeout below) should catch a dead relay first, but a
+# relay-side close the transport never surfaces (observed as a CLOSE_WAIT
+# socket with the loop parked on recv, #98097) leaves the gateway "connected"
+# while inbound stops; this timeout forces a liveness probe and, when the
+# probe goes unanswered, the normal reconnect path instead.
 _WS_READ_IDLE_TIMEOUT = 300.0
+# Bound on the protocol-level liveness probe run after a read-idle window
+# (#101160): a healthy but quiet relay sends no application frames for hours
+# (Nostr relays emit EVENT frames only when a subscribed filter matches), yet
+# still answers the transport keepalive pings every 20s.  An unanswered probe
+# within this window therefore means the socket is wedged (the #98097
+# CLOSE_WAIT class) rather than merely quiet, and the read loop raises to
+# take the reconnect path.  Shorter than _WS_READ_IDLE_TIMEOUT by design:
+# this is the last resort AFTER the library's own ping_timeout has failed.
+_WS_READ_IDLE_PROBE_TIMEOUT = 15.0
 _WS_MAX_MESSAGE_BYTES = 2_000_000
 _WS_MEMBERSHIP_KIND = 44100
 _WS_MEMBERSHIP_SUB_ID = "hermes-buzz-membership"
@@ -1880,6 +1890,7 @@ class BuzzAdapter(BasePlatformAdapter):
         from the last observed timestamps (same-second overlap de-duped by
         event id)."""
         import websockets
+        from websockets.exceptions import ConnectionClosedOK
 
         backoff = 1.0
         try:
@@ -1915,11 +1926,49 @@ class BuzzAdapter(BasePlatformAdapter):
                                     )
                                 except StopAsyncIteration:
                                     break
+                                except ConnectionClosedOK:
+                                    # A clean server-side close is a normal
+                                    # lifecycle event (subscription exhausted,
+                                    # relay restart), not a failure: exit the
+                                    # connection context quietly so the
+                                    # reconnect path starts fresh without a
+                                    # disconnect warning or backoff (#101160).
+                                    break
                                 except asyncio.TimeoutError:
-                                    raise ConnectionError(
-                                        f"no WebSocket frame for {_WS_READ_IDLE_TIMEOUT:.0f}s; "
-                                        "assuming the connection went silent"
-                                    ) from None
+                                    # Application-frame silence is not transport
+                                    # death: healthy quiet relays legitimately
+                                    # go hours without an EVENT frame.  Probe
+                                    # the transport's own protocol (ping/pong)
+                                    # before declaring the connection dead — a
+                                    # live transport resolves the probe and the
+                                    # read loop simply keeps waiting for the
+                                    # next frame.  The probe pings the
+                                    # CONNECTION, not the frame iterator: in
+                                    # websockets 15.x ``Connection.__aiter__()``
+                                    # returns a distinct async generator that
+                                    # does not expose ``ping()`` (#101160).
+                                    try:
+                                        await asyncio.wait_for(
+                                            websocket.ping(),
+                                            timeout=_WS_READ_IDLE_PROBE_TIMEOUT,
+                                        )
+                                    except asyncio.TimeoutError:
+                                        raise ConnectionError(
+                                            f"no WebSocket frame for "
+                                            f"{_WS_READ_IDLE_TIMEOUT:.0f}s and ping probe "
+                                            f"unanswered for "
+                                            f"{_WS_READ_IDLE_PROBE_TIMEOUT:.0f}s; "
+                                            "assuming the connection went silent"
+                                        ) from None
+                                    except ConnectionClosedOK:
+                                        # Clean close raced the probe — treat
+                                        # it like a clean close above.
+                                        break
+                                    # Probe answered: the transport is alive and
+                                    # merely quiet — skip frame processing and
+                                    # keep waiting for the next application
+                                    # frame instead of declaring death.
+                                    continue
                                 try:
                                     message = json.loads(raw)
                                 except (ValueError, TypeError):
