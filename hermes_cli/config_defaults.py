@@ -2496,6 +2496,10 @@ DEFAULT_CONFIG = {
         # list_roles, member_info, search_members, fetch_messages, list_pins,
         # pin_message, unpin_message, create_thread, add_role, remove_role.
         "server_actions": "",
+        # User IDs always granted VIEW_CHANNEL + SEND_MESSAGES when the
+        # discord_admin tool creates a private channel. Empty preserves the
+        # request exactly; accepts a comma-separated string or YAML list.
+        "default_private_channel_user_ids": [],
         # DEPRECATED / no-op. Any uploaded file is now always cached and
         # surfaced to the agent regardless of file type — authorization to
         # message the agent is the gate, not the extension. Kept so existing

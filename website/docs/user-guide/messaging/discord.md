@@ -348,6 +348,7 @@ discord:
     limit: 100                    # Global scan cap per reconnect
     max_dispatches: 10            # Recovery dispatch cap per reconnect
   channel_prompts: {}             # Per-channel ephemeral system prompts
+  default_private_channel_user_ids: []  # Always grant access on private channel creation
   voice_channel_inactivity_timeout_seconds: 300  # Set 0 to stay in VC until explicit /voice leave
   voice_playback_timeout_seconds: 120             # Minimum playback watchdog; long clips get duration+padding
   allow_mentions:                 # What the bot is allowed to ping (safe defaults)
@@ -359,6 +360,20 @@ discord:
 # Session isolation (applies to all gateway platforms, not just Discord)
 group_sessions_per_user: true     # Isolate sessions per user in shared channels
 ```
+
+#### `discord.default_private_channel_user_ids`
+
+**Type:** string or list — **Default:** `[]`
+
+Discord user IDs that the `discord_admin` tool always grants **View Channel** and **Send Messages** when it creates a private text channel. Hermes appends these IDs to any `user_ids` supplied by the model and removes duplicates, so configured users retain access even when the model omits them.
+
+```yaml
+discord:
+  default_private_channel_user_ids:
+    - "123456789012345678"
+```
+
+This setting affects only newly created private channels; it does not modify public or existing channels. Leave it empty or unset to preserve the generic behavior, where a private `create_channel` request must supply at least one role or user itself.
 
 #### `discord.require_mention`
 

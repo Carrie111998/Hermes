@@ -308,6 +308,235 @@ class TestCreateThread:
 
 
 # ---------------------------------------------------------------------------
+# Action: create_channel
+# ---------------------------------------------------------------------------
+
+class TestCreateChannel:
+    @patch("tools.discord_tool._discord_request")
+    def test_create_private_text_channel_with_role_and_user_overwrites(
+        self, mock_req, monkeypatch,
+    ):
+        monkeypatch.setenv("DISCORD_BOT_TOKEN", "test-token")
+        mock_req.return_value = {"id": "900", "name": "project-room", "type": 0}
+
+        result = json.loads(discord_admin_handler(
+            action="create_channel",
+            guild_id="100",
+            name="project-room",
+            private=True,
+            role_ids=["200", "201"],
+            user_ids=["300"],
+        ))
+
+        assert result == {
+            "success": True,
+            "channel_id": "900",
+            "name": "project-room",
+            "private": True,
+        }
+        mock_req.assert_called_once_with(
+            "POST",
+            "/guilds/100/channels",
+            "test-token",
+            body={
+                "name": "project-room",
+                "type": 0,
+                "permission_overwrites": [
+                    {"id": "100", "type": 0, "allow": "0", "deny": "1024"},
+                    {"id": "200", "type": 0, "allow": "3072", "deny": "0"},
+                    {"id": "201", "type": 0, "allow": "3072", "deny": "0"},
+                    {"id": "300", "type": 1, "allow": "3072", "deny": "0"},
+                ],
+            },
+        )
+
+    @patch("tools.discord_tool._discord_request")
+    def test_configured_default_user_is_added_when_model_omits_targets(
+        self, mock_req, monkeypatch,
+    ):
+        monkeypatch.setenv("DISCORD_BOT_TOKEN", "test-token")
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config",
+            lambda: {"discord": {"default_private_channel_user_ids": ["400"]}},
+        )
+        mock_req.return_value = {"id": "902", "name": "operators", "type": 0}
+
+        result = json.loads(discord_admin_handler(
+            action="create_channel",
+            guild_id="100",
+            name="operators",
+            private=True,
+        ))
+
+        assert result["success"] is True
+        mock_req.assert_called_once_with(
+            "POST",
+            "/guilds/100/channels",
+            "test-token",
+            body={
+                "name": "operators",
+                "type": 0,
+                "permission_overwrites": [
+                    {"id": "100", "type": 0, "allow": "0", "deny": "1024"},
+                    {"id": "400", "type": 1, "allow": "3072", "deny": "0"},
+                ],
+            },
+        )
+
+    @patch("tools.discord_tool._discord_request")
+    def test_configured_default_users_are_deduped_with_requested_users(
+        self, mock_req, monkeypatch,
+    ):
+        monkeypatch.setenv("DISCORD_BOT_TOKEN", "test-token")
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config",
+            lambda: {
+                "discord": {
+                    "default_private_channel_user_ids": ["300", "400", "300"],
+                },
+            },
+        )
+        mock_req.return_value = {"id": "903", "name": "operators", "type": 0}
+
+        result = json.loads(discord_admin_handler(
+            action="create_channel",
+            guild_id="100",
+            name="operators",
+            private=True,
+            user_ids=["300"],
+        ))
+
+        assert result["success"] is True
+        body = mock_req.call_args.kwargs["body"]
+        user_overwrites = [
+            overwrite
+            for overwrite in body["permission_overwrites"]
+            if overwrite["type"] == 1
+        ]
+        assert user_overwrites == [
+            {"id": "300", "type": 1, "allow": "3072", "deny": "0"},
+            {"id": "400", "type": 1, "allow": "3072", "deny": "0"},
+        ]
+
+    @patch("tools.discord_tool._discord_request")
+    def test_create_public_text_channel_without_overwrites(self, mock_req, monkeypatch):
+        monkeypatch.setenv("DISCORD_BOT_TOKEN", "test-token")
+        mock_req.return_value = {"id": "901", "name": "announcements", "type": 0}
+
+        result = json.loads(discord_admin_handler(
+            action="create_channel",
+            guild_id="100",
+            name="announcements",
+        ))
+
+        assert result["private"] is False
+        mock_req.assert_called_once_with(
+            "POST",
+            "/guilds/100/channels",
+            "test-token",
+            body={"name": "announcements", "type": 0},
+        )
+
+    @pytest.mark.parametrize("name", ["", "   "])
+    @patch("tools.discord_tool._discord_request")
+    def test_channel_name_is_required(self, mock_req, monkeypatch, name):
+        monkeypatch.setenv("DISCORD_BOT_TOKEN", "test-token")
+
+        result = json.loads(discord_admin_handler(
+            action="create_channel",
+            guild_id="100",
+            name=name,
+        ))
+
+        assert "name" in result["error"]
+        mock_req.assert_not_called()
+
+    @patch("tools.discord_tool._discord_request")
+    def test_private_flag_must_be_boolean(self, mock_req, monkeypatch):
+        monkeypatch.setenv("DISCORD_BOT_TOKEN", "test-token")
+
+        result = json.loads(discord_admin_handler(
+            action="create_channel",
+            guild_id="100",
+            name="project-room",
+            private="true",
+            role_ids=["200"],
+        ))
+
+        assert "private" in result["error"]
+        mock_req.assert_not_called()
+
+    @pytest.mark.parametrize(
+        ("argument", "value"),
+        [
+            ("role_ids", "200"),
+            ("role_ids", ["not-a-snowflake"]),
+            ("user_ids", [300]),
+        ],
+    )
+    @patch("tools.discord_tool._discord_request")
+    def test_visibility_targets_must_be_snowflake_string_lists(
+        self, mock_req, monkeypatch, argument, value,
+    ):
+        monkeypatch.setenv("DISCORD_BOT_TOKEN", "test-token")
+
+        result = json.loads(discord_admin_handler(
+            action="create_channel",
+            guild_id="100",
+            name="project-room",
+            private=True,
+            **{argument: value},
+        ))
+
+        assert argument in result["error"]
+        mock_req.assert_not_called()
+
+    @patch("tools.discord_tool._discord_request")
+    def test_private_channel_requires_an_allowed_role_or_user(
+        self, mock_req, monkeypatch,
+    ):
+        monkeypatch.setenv("DISCORD_BOT_TOKEN", "test-token")
+
+        result = json.loads(discord_admin_handler(
+            action="create_channel",
+            guild_id="100",
+            name="project-room",
+            private=True,
+        ))
+
+        assert "role_ids or user_ids" in result["error"]
+        mock_req.assert_not_called()
+
+    @patch("tools.discord_tool._discord_request")
+    def test_private_channel_rejects_everyone_as_allowed_role(
+        self, mock_req, monkeypatch,
+    ):
+        monkeypatch.setenv("DISCORD_BOT_TOKEN", "test-token")
+
+        result = json.loads(discord_admin_handler(
+            action="create_channel",
+            guild_id="100",
+            name="project-room",
+            private=True,
+            role_ids=["100"],
+        ))
+
+        assert "@everyone" in result["error"]
+        mock_req.assert_not_called()
+
+    def test_admin_schema_describes_channel_creation_parameters(self):
+        from tools.registry import registry
+
+        schema = registry._tools["discord_admin"].schema
+        properties = schema["parameters"]["properties"]
+
+        assert "create_channel" in properties["action"]["enum"]
+        assert properties["private"]["type"] == "boolean"
+        assert properties["role_ids"]["items"]["type"] == "string"
+        assert properties["user_ids"]["items"]["type"] == "string"
+
+
+# ---------------------------------------------------------------------------
 # Error handling
 # ---------------------------------------------------------------------------
 

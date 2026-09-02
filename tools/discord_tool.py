@@ -45,6 +45,9 @@ DISCORD_API_BASE = "https://discord.com/api/v10"
 _DISCORD_RESPONSE_BODY_MAX_BYTES = 4 * 1024 * 1024
 _DISCORD_ERROR_BODY_MAX_BYTES = 64 * 1024
 
+_VIEW_CHANNEL_PERMISSION = 1 << 10
+_SEND_MESSAGES_PERMISSION = 1 << 11
+
 # Application flag bits (from GET /applications/@me → "flags").
 # Source: https://discord.com/developers/docs/resources/application#application-object-application-flags
 _FLAG_GATEWAY_GUILD_MEMBERS = 1 << 14
@@ -613,6 +616,121 @@ def _create_thread(
     })
 
 
+def _validate_snowflake_ids(
+    values: Optional[List[str]],
+    parameter: str,
+) -> Tuple[Optional[List[str]], Optional[str]]:
+    if values is None:
+        return [], None
+    if not isinstance(values, list):
+        return None, f"{parameter} must be a list of Discord snowflake strings."
+    if any(not isinstance(value, str) or not value.isdigit() for value in values):
+        return None, f"{parameter} must contain only Discord snowflake strings."
+    return values, None
+
+
+def _load_default_private_channel_user_ids_config() -> Tuple[List[str], Optional[str]]:
+    """Read user IDs always granted access to newly created private channels."""
+    try:
+        from hermes_cli.config import load_config
+        cfg = load_config()
+    except Exception as exc:
+        logger.debug("discord: could not load config (%s); using no default users.", exc)
+        return [], None
+
+    raw = (cfg.get("discord") or {}).get("default_private_channel_user_ids")
+    if raw is None or raw == "":
+        return [], None
+    if isinstance(raw, str):
+        values = [value.strip() for value in raw.split(",") if value.strip()]
+    elif isinstance(raw, (list, tuple)):
+        values = [str(value).strip() for value in raw if str(value).strip()]
+    else:
+        return [], (
+            "discord.default_private_channel_user_ids must be a comma-separated "
+            "string or list of Discord snowflake IDs."
+        )
+
+    values, error = _validate_snowflake_ids(
+        values,
+        "discord.default_private_channel_user_ids",
+    )
+    if error:
+        return [], error
+    return list(dict.fromkeys(values or [])), None
+
+
+def _create_channel(
+    token: str,
+    guild_id: str,
+    name: str,
+    private: bool = False,
+    role_ids: Optional[List[str]] = None,
+    user_ids: Optional[List[str]] = None,
+    **_kwargs: Any,
+) -> str:
+    """Create a text channel, optionally private to selected roles and users."""
+    if not isinstance(name, str) or not name.strip():
+        return tool_error("name is required for 'create_channel'.")
+    name = name.strip()
+    if len(name) > 100:
+        return tool_error("name must be 100 characters or fewer.")
+    if not isinstance(private, bool):
+        return tool_error("private must be a boolean.")
+
+    role_ids, error = _validate_snowflake_ids(role_ids, "role_ids")
+    if error:
+        return tool_error(error)
+    if private and guild_id in (role_ids or []):
+        return tool_error("role_ids must not include the @everyone role.")
+    user_ids, error = _validate_snowflake_ids(user_ids, "user_ids")
+    if error:
+        return tool_error(error)
+    if private:
+        default_user_ids, error = _load_default_private_channel_user_ids_config()
+        if error:
+            return tool_error(error)
+        user_ids = list(dict.fromkeys([*(user_ids or []), *default_user_ids]))
+        if not role_ids and not user_ids:
+            return tool_error("private channels require at least one allowed role_ids or user_ids.")
+
+    body: Dict[str, Any] = {"name": name, "type": 0}
+    if private:
+        allowed = str(_VIEW_CHANNEL_PERMISSION | _SEND_MESSAGES_PERMISSION)
+        overwrites = [{
+            "id": guild_id,
+            "type": 0,
+            "allow": "0",
+            "deny": str(_VIEW_CHANNEL_PERMISSION),
+        }]
+        overwrites.extend({
+            "id": role_id,
+            "type": 0,
+            "allow": allowed,
+            "deny": "0",
+        } for role_id in role_ids or [])
+        overwrites.extend({
+            "id": user_id,
+            "type": 1,
+            "allow": allowed,
+            "deny": "0",
+        } for user_id in user_ids or [])
+        body["permission_overwrites"] = overwrites
+
+    channel = _discord_request(
+        "POST",
+        f"/guilds/{guild_id}/channels",
+        token,
+        body=body,
+    )
+    return json.dumps({
+        "success": True,
+        "channel_id": channel["id"],
+        "name": channel.get("name"),
+        "private": private,
+    })
+
+
 def _add_role(token: str, guild_id: str, user_id: str, role_id: str, **_kwargs: Any) -> str:
     """Add a role to a guild member."""
     _discord_request("PUT", f"/guilds/{guild_id}/members/{user_id}/roles/{role_id}", token)
@@ -643,6 +761,7 @@ _ACTIONS = {
     "unpin_message": _unpin_message,
     "delete_message": _delete_message,
     "create_thread": _create_thread,
+    "create_channel": _create_channel,
     "add_role": _add_role,
     "remove_role": _remove_role,
 }
@@ -670,6 +789,7 @@ _ACTION_MANIFEST: List[Tuple[str, str, str]] = [
     ("unpin_message", "(channel_id, message_id)", "unpin a message"),
     ("delete_message", "(channel_id, message_id)", "delete a message"),
     ("create_thread", "(channel_id, name)", "create a public thread; optional message_id anchor"),
+    ("create_channel", "(guild_id, name)", "create a text channel; optional private role/user access"),
     ("add_role", "(guild_id, user_id, role_id)", "assign a role"),
     ("remove_role", "(guild_id, user_id, role_id)", "remove a role"),
 ]
@@ -691,6 +811,7 @@ _REQUIRED_PARAMS: Dict[str, List[str]] = {
     "unpin_message": ["channel_id", "message_id"],
     "delete_message": ["channel_id", "message_id"],
     "create_thread": ["channel_id", "name"],
+    "create_channel": ["guild_id", "name"],
     "add_role": ["guild_id", "user_id", "role_id"],
     "remove_role": ["guild_id", "user_id", "role_id"],
 }
@@ -850,7 +971,9 @@ def _build_schema(
         },
         "name": {
             "type": "string",
-            "description": "New thread name (create_thread).",
+            "minLength": 1,
+            "maxLength": 100,
+            "description": "New channel or thread name (create_channel, create_thread).",
         },
         "limit": {
             "type": "integer",
@@ -870,6 +993,22 @@ def _build_schema(
             "type": "integer",
             "enum": [60, 1440, 4320, 10080],
             "description": "Thread archive duration in minutes (create_thread, default 1440).",
+        },
+        "private": {
+            "type": "boolean",
+            "description": "Create a private channel (create_channel, default false).",
+        },
+        "role_ids": {
+            "type": "array",
+            "items": {"type": "string", "pattern": "^[0-9]+$"},
+            "uniqueItems": True,
+            "description": "Role IDs allowed to view and send in a private channel.",
+        },
+        "user_ids": {
+            "type": "array",
+            "items": {"type": "string", "pattern": "^[0-9]+$"},
+            "uniqueItems": True,
+            "description": "User IDs allowed to view and send in a private channel.",
         },
     }
 
@@ -931,6 +1070,9 @@ _ACTION_403_HINT = {
     ),
     "create_thread": (
         "Bot lacks CREATE_PUBLIC_THREADS in this channel, or cannot view it."
+    ),
+    "create_channel": (
+        "Bot lacks MANAGE_CHANNELS permission in this server."
     ),
     "add_role": (
         "Either the bot lacks MANAGE_ROLES, or the target role sits higher "
@@ -994,6 +1136,9 @@ def _run_discord_action(
     message_id: str = "",
     query: str = "",
     name: str = "",
+    private: bool = False,
+    role_ids: Optional[List[str]] = None,
+    user_ids: Optional[List[str]] = None,
     limit: int = 50,
     before: str = "",
     after: str = "",
@@ -1029,6 +1174,9 @@ def _run_discord_action(
         "message_id": message_id,
         "query": query,
         "name": name,
+        "private": private,
+        "role_ids": role_ids,
+        "user_ids": user_ids,
     }
 
     missing = [p for p in _REQUIRED_PARAMS.get(action, []) if not local_vars.get(p)]
@@ -1051,6 +1199,9 @@ def _run_discord_action(
             before=before,
             after=after,
             auto_archive_duration=auto_archive_duration,
+            private=private,
+            role_ids=role_ids,
+            user_ids=user_ids,
         )
     except DiscordAPIError as e:
         logger.warning("Discord API error in %s action '%s': %s", tool_label, action, e)
@@ -1080,6 +1231,7 @@ _HANDLER_DEFAULTS = {
     "action": "", "guild_id": "", "channel_id": "", "user_id": "",
     "role_id": "", "message_id": "", "query": "", "name": "",
     "limit": 50, "before": "", "after": "", "auto_archive_duration": 1440,
+    "private": False, "role_ids": None, "user_ids": None,
 }
 
 
