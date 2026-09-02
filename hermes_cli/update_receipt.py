@@ -71,6 +71,9 @@ class UpdateReceipt:
             "gateway_restart": {},
             "fleet": [],
         }
+        correlation_id = os.getenv("HERMES_UPDATE_CORRELATION_ID")
+        if correlation_id:
+            self.data["correlation_id"] = correlation_id
         try:
             from hermes_cli.build_info import get_code_identity
 
