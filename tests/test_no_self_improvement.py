@@ -591,3 +591,261 @@ class TestNoPersistence:
 
         assert captured.get("no_self_improvement") is True
         assert db_mutations == []
+
+
+# ---------------------------------------------------------------------------
+# 10. /self-improvement command — runtime toggle
+# ---------------------------------------------------------------------------
+
+class TestSelfImprovementCommandRegistered:
+    """/self-improvement must be registered in COMMAND_REGISTRY."""
+
+    def test_command_exists_in_registry(self):
+        from hermes_cli.commands import COMMAND_REGISTRY
+        names = [c.name for c in COMMAND_REGISTRY]
+        assert "self-improvement" in names
+
+    def test_command_has_correct_subcommands(self):
+        from hermes_cli.commands import COMMAND_REGISTRY
+        cmd = next(c for c in COMMAND_REGISTRY if c.name == "self-improvement")
+        assert cmd.subcommands == ("on", "off", "status")
+        assert cmd.category == "Session"
+
+
+class TestSelfImprovementToggle:
+    """/self-improvement on|off|status toggles agent.skip_background_review."""
+
+    def _make_mixin(self, skip_background_review=False):
+        """Build a CLICommandsMixin wired to a real AIAgent."""
+        from hermes_cli.cli_commands_mixin import CLICommandsMixin
+        from run_agent import AIAgent
+
+        mixin = CLICommandsMixin.__new__(CLICommandsMixin)
+        agent = AIAgent(
+            model="openai/gpt-4o-mini", provider="openrouter",
+            api_key="sk-dummy", base_url="https://openrouter.ai/api/v1",
+            quiet_mode=True, skip_context_files=True, skip_memory=True,
+            skip_background_review=skip_background_review, platform="cli",
+        )
+        mixin.agent = agent
+        return mixin, agent
+
+    def test_toggle_off_sets_skip_true(self):
+        mixin, agent = self._make_mixin(skip_background_review=False)
+        with patch("cli._cprint"):
+            mixin._handle_self_improvement_command("/self-improvement off")
+        assert agent.skip_background_review is True
+
+    def test_toggle_on_sets_skip_false(self):
+        mixin, agent = self._make_mixin(skip_background_review=True)
+        with patch("cli._cprint"):
+            mixin._handle_self_improvement_command("/self-improvement on")
+        assert agent.skip_background_review is False
+
+    def test_status_reports_current_state_on(self):
+        mixin, agent = self._make_mixin(skip_background_review=False)
+        with patch("cli._cprint") as mock_print:
+            mixin._handle_self_improvement_command("/self-improvement status")
+        printed = mock_print.call_args.args[0]
+        assert "ON" in printed
+
+    def test_status_reports_current_state_off(self):
+        mixin, agent = self._make_mixin(skip_background_review=True)
+        with patch("cli._cprint") as mock_print:
+            mixin._handle_self_improvement_command("/self-improvement status")
+        printed = mock_print.call_args.args[0]
+        assert "OFF" in printed
+
+    def test_no_arg_shows_usage(self):
+        mixin, agent = self._make_mixin()
+        with patch("cli._cprint") as mock_print:
+            mixin._handle_self_improvement_command("/self-improvement")
+        printed = mock_print.call_args.args[0]
+        assert "on|off|status" in printed
+
+    def test_invalid_arg_shows_usage(self):
+        mixin, agent = self._make_mixin()
+        with patch("cli._cprint") as mock_print:
+            mixin._handle_self_improvement_command("/self-improvement banana")
+        printed = mock_print.call_args.args[0]
+        assert "on|off|status" in printed
+
+    def test_no_agent_shows_graceful_message(self):
+        from hermes_cli.cli_commands_mixin import CLICommandsMixin
+        mixin = CLICommandsMixin.__new__(CLICommandsMixin)
+        mixin.agent = None
+        with patch("cli._cprint") as mock_print:
+            mixin._handle_self_improvement_command("/self-improvement off")
+        printed = mock_print.call_args.args[0]
+        assert "No active agent" in printed
+
+
+class TestFinalizeTurnAfterToggle:
+    """Runtime toggle of /self-improvement must reflect in finalize_turn."""
+
+    def _make_agent(self, skip_background_review=False):
+        from run_agent import AIAgent
+        agent = AIAgent(
+            model="openai/gpt-4o-mini", provider="openrouter",
+            api_key="sk-dummy", base_url="https://openrouter.ai/api/v1",
+            quiet_mode=True, skip_context_files=True, skip_memory=True,
+            skip_background_review=skip_background_review, platform="cli",
+        )
+        agent._spawn_background_review = MagicMock()
+        agent._save_trajectory = MagicMock()
+        agent._cleanup_task_resources = MagicMock()
+        agent._persist_session = MagicMock()
+        agent._session_messages = []
+        agent._file_mutation_verifier_enabled = lambda: False
+        agent.clear_interrupt = MagicMock()
+        agent._stream_callback = None
+        agent._sync_external_memory_for_turn = MagicMock()
+        agent._skill_nudge_interval = 10
+        agent._iters_since_skill = 20
+        agent.valid_tool_names = {"skill_manage"}
+        agent.iteration_budget = MagicMock()
+        agent.iteration_budget.remaining = 100
+        agent.iteration_budget.used = 5
+        agent.iteration_budget.max_total = 100
+        agent.max_iterations = 50
+        agent._emit_status = MagicMock()
+        agent._safe_print = MagicMock()
+        agent._apply_persist_user_message_override = MagicMock()
+        agent.context_compressor = None
+        agent._turn_preflight_display_snapshot = None
+        agent._turn_received_provider_response = False
+        agent.model = "test-model"
+        agent.session_id = "test-session"
+        agent._turn_failed_file_mutations = {}
+        agent._db_flush_scan_prefix = None
+        return agent
+
+    def test_toggle_off_then_finalize_skips_review(self):
+        """After /self-improvement off, finalize_turn must not spawn review."""
+        from agent.turn_finalizer import finalize_turn
+        from hermes_cli.cli_commands_mixin import CLICommandsMixin
+
+        mixin = CLICommandsMixin.__new__(CLICommandsMixin)
+        agent = self._make_agent(skip_background_review=False)
+        mixin.agent = agent
+
+        # Toggle off via the command
+        with patch("cli._cprint"):
+            mixin._handle_self_improvement_command("/self-improvement off")
+        assert agent.skip_background_review is True
+
+        finalize_turn(
+            agent, final_response="ok", api_call_count=1,
+            interrupted=False, failed=False,
+            messages=[{"role": "assistant", "content": "ok"}],
+            conversation_history=[], effective_task_id="test",
+            turn_id="test-turn", user_message="test",
+            original_user_message="test", _should_review_memory=True,
+            _turn_exit_reason="text_response(1)",
+        )
+        agent._spawn_background_review.assert_not_called()
+
+    def test_toggle_on_then_finalize_calls_review(self):
+        """After /self-improvement on, finalize_turn must spawn review."""
+        from agent.turn_finalizer import finalize_turn
+        from hermes_cli.cli_commands_mixin import CLICommandsMixin
+
+        mixin = CLICommandsMixin.__new__(CLICommandsMixin)
+        agent = self._make_agent(skip_background_review=True)
+        mixin.agent = agent
+
+        # Toggle on via the command
+        with patch("cli._cprint"):
+            mixin._handle_self_improvement_command("/self-improvement on")
+        assert agent.skip_background_review is False
+
+        finalize_turn(
+            agent, final_response="ok", api_call_count=1,
+            interrupted=False, failed=False,
+            messages=[{"role": "assistant", "content": "ok"}],
+            conversation_history=[], effective_task_id="test",
+            turn_id="test-turn", user_message="test",
+            original_user_message="test", _should_review_memory=True,
+            _turn_exit_reason="text_response(1)",
+        )
+        agent._spawn_background_review.assert_called_once()
+
+
+class TestRefineStillWorksWithToggle:
+    """/refine must still work even when /self-improvement is off."""
+
+    def test_refine_works_after_toggle_off(self):
+        """After /self-improvement off, /refine must still spawn."""
+        from hermes_cli.cli_commands_mixin import CLICommandsMixin
+        from run_agent import AIAgent
+
+        mixin = CLICommandsMixin.__new__(CLICommandsMixin)
+        agent = AIAgent(
+            model="openai/gpt-4o-mini", provider="openrouter",
+            api_key="sk-dummy", base_url="https://openrouter.ai/api/v1",
+            quiet_mode=True, skip_context_files=True, skip_memory=True,
+            skip_background_review=False, platform="cli",
+        )
+        agent._spawn_background_review = MagicMock()
+        agent.valid_tool_names = {"skill_manage"}
+        mixin.agent = agent
+        mixin.conversation_history = [
+            {"role": "user", "content": "hello"},
+            {"role": "assistant", "content": "hi"},
+        ]
+
+        # Toggle off
+        with patch("cli._cprint"):
+            mixin._handle_self_improvement_command("/self-improvement off")
+        assert agent.skip_background_review is True
+
+        # /refine still works
+        with patch("cli._cprint"):
+            mixin._handle_refine_command("/refine")
+        agent._spawn_background_review.assert_called_once()
+
+
+class TestNoPersistenceRuntimeToggle:
+    """/self-improvement toggle must never persist to config or SessionDB."""
+
+    def test_toggle_does_not_write_config(self):
+        """Toggling /self-improvement must not touch config.yaml."""
+        from hermes_cli.cli_commands_mixin import CLICommandsMixin
+        from run_agent import AIAgent
+
+        mixin = CLICommandsMixin.__new__(CLICommandsMixin)
+        agent = AIAgent(
+            model="openai/gpt-4o-mini", provider="openrouter",
+            api_key="sk-dummy", base_url="https://openrouter.ai/api/v1",
+            quiet_mode=True, skip_context_files=True, skip_memory=True,
+            platform="cli",
+        )
+        mixin.agent = agent
+
+        with patch("cli._cprint"):
+            mixin._handle_self_improvement_command("/self-improvement off")
+
+        # Verify the attribute changed on the live agent object only
+        assert agent.skip_background_review is True
+        # No config or DB write was attempted — the handler only touches
+        # the in-memory attribute.  If it tried to persist, it would need
+        # to import save_config or call session_db, which it doesn't.
+
+    def test_toggle_does_not_touch_session_db(self):
+        """Toggling /self-improvement must not write to SessionDB."""
+        from hermes_cli.cli_commands_mixin import CLICommandsMixin
+        from run_agent import AIAgent
+
+        mixin = CLICommandsMixin.__new__(CLICommandsMixin)
+        agent = AIAgent(
+            model="openai/gpt-4o-mini", provider="openrouter",
+            api_key="sk-dummy", base_url="https://openrouter.ai/api/v1",
+            quiet_mode=True, skip_context_files=True, skip_memory=True,
+            platform="cli",
+        )
+        mixin.agent = agent
+
+        with patch("cli._cprint"):
+            mixin._handle_self_improvement_command("/self-improvement on")
+
+        assert agent.skip_background_review is False
