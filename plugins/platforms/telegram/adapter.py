@@ -8,7 +8,9 @@ Uses python-telegram-bot library for:
 """
 
 import asyncio
+import copy
 import dataclasses
+import functools
 import inspect
 import json
 import logging
@@ -22,6 +24,15 @@ from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, Dict, Iterator, List, Optional, Set
 
 logger = logging.getLogger(__name__)
+
+_TELEGRAM_DEDUP_INIT_LOCK = threading.Lock()
+_DURABLE_UPDATE_IDS_KEY = "telegram_durable_update_ids"
+_DURABLE_EVENT_DEFERRED_KEY = "telegram_inbound_dispatch_deferred"
+_DURABLE_DISPATCH_DEFERRED = object()
+_DURABLE_DISPATCH_FAILED = object()
+_DURABLE_DISPATCH_ASYNC = object()
+_DURABLE_BUSY_RETRY_DELAY_SECONDS = 1.0
+_DURABLE_WRAPPER_MARKER = "_hermes_telegram_durable_wrapper"
 
 from agent.deadline import run_bounded_async
 
@@ -236,6 +247,13 @@ from gateway.platforms.base import (
 )
 from plugins.platforms.telegram.telegram_ids import (
     normalize_telegram_chat_id,
+)
+from plugins.platforms.telegram.inbound_store import (
+    CaptureDecision,
+    DurableTelegramUpdateQueue,
+    TelegramQueueLifecycleRegistry,
+    TelegramInboundStore,
+    bot_account_id_from_token,
 )
 from plugins.platforms.telegram.telegram_network import (
     SEED_FALLBACK_IPS,
@@ -601,6 +619,31 @@ class _PollingLifecycleAbort(RuntimeError):
     """Internal control flow for polling startup fenced by teardown."""
 
 
+class _TelegramPluginApplicationProxy:
+    """Expose PTB registration while fencing plugin callbacks durably."""
+
+    def __init__(self, application, adapter: "TelegramAdapter") -> None:
+        self._application = application
+        self._adapter = adapter
+
+    def __getattr__(self, name):
+        return getattr(self._application, name)
+
+    def add_handler(self, handler, group=0) -> None:
+        self._application.add_handler(
+            self._adapter._wrap_plugin_handler(handler), group=group
+        )
+
+    def add_handlers(self, handlers) -> None:
+        if isinstance(handlers, dict):
+            for group, group_handlers in handlers.items():
+                for handler in group_handlers:
+                    self.add_handler(handler, group=group)
+            return
+        for handler in handlers:
+            self.add_handler(handler)
+
+
 class TelegramAdapter(BasePlatformAdapter):
     """
     Telegram bot adapter.
@@ -702,6 +745,25 @@ class TelegramAdapter(BasePlatformAdapter):
         super().__init__(config, Platform.TELEGRAM)
         self._app: Optional[Application] = None
         self._bot: Optional[Bot] = None
+        # Handler deduplication is adapter-scoped.  The account is included in
+        # the key as an explicit guard because a process may host more than one
+        # Telegram bot and update ids are only unique within one bot account.
+        self._seen_update_ids: Dict[tuple[str, int], None] = {}
+        self._seen_platform_update_ids: Dict[tuple[str, int], None] = {}
+        self._seen_update_ids_lock = threading.RLock()
+        self._seen_update_ids_max = 4096
+        self._inbound_store: Optional[TelegramInboundStore] = None
+        self._inbound_queue: Optional[DurableTelegramUpdateQueue] = None
+        # A same-instance reconnect replaces a queue that clean disconnect
+        # terminally closed. Keep the predecessor alive until registry recovery
+        # transfers any durable ownership to the fresh queue.
+        self._retired_inbound_queue: Optional[DurableTelegramUpdateQueue] = None
+        self._bot_account_id: Optional[str] = None
+        self._durable_queue_bound = False
+        self._deferred_inbound_update_ids: set[int] = set()
+        # Serialize adapter ingress per session so the durable busy-cap check
+        # and the inherited FIFO reservation share one admission boundary.
+        self._durable_admission_locks: Dict[str, asyncio.Lock] = {}
         self._webhook_mode: bool = False
         self._mention_patterns = self._compile_mention_patterns()
         self._reply_to_mode: str = getattr(config, 'reply_to_mode', 'first') or 'first'
@@ -996,6 +1058,46 @@ class TelegramAdapter(BasePlatformAdapter):
         """
         return bool(getattr(self, "_drop_delayed_deliveries", False))
 
+    def _inbound_queue_handoff_target(self) -> Optional[DurableTelegramUpdateQueue]:
+        """Return the replacement queue after this adapter has been retired."""
+        queue = getattr(self, "_inbound_queue", None)
+        if not getattr(queue, "_lifecycle_retired", False):
+            return None
+        target = getattr(queue, "_handoff_target", None)
+        return target if isinstance(target, DurableTelegramUpdateQueue) else None
+
+    def _on_inbound_queue_handoff(
+        self, replacement_queue: DurableTelegramUpdateQueue
+    ) -> None:
+        """Retire held projections after their durable claims are handed off."""
+        pending_task = getattr(self, "_held_inbound_redispatch_task", None)
+        try:
+            current_task = asyncio.current_task()
+        except RuntimeError:
+            current_task = None
+        if (
+            pending_task is not None
+            and not pending_task.done()
+            and pending_task is not current_task
+        ):
+            pending_task.cancel()
+
+        held = getattr(self, "_held_inbound_events", None)
+        if not held:
+            return
+        events = list(held)
+        held.clear()
+        receiver = replacement_queue._handoff_receiver()
+        if receiver is None or receiver is self:
+            return
+        for event in events:
+            # Durable held events were made replayable in SQLite by handoff;
+            # retaining their old MessageEvent would bypass the replacement
+            # queue and could deliver it a second time.
+            if self._durable_update_ids(event):
+                continue
+            receiver._hold_inbound_event(event, where="queue-handoff", schedule=False)
+
     def _schedule_held_inbound_redispatch(self) -> None:
         """Ensure a tracked drain runs when held events exist and delivery is live.
 
@@ -1006,6 +1108,8 @@ class TelegramAdapter(BasePlatformAdapter):
 
         No-ops while disconnected/tearing down or after permanent fatal.
         """
+        if self._inbound_queue_handoff_target() is not None:
+            return
         if self._is_permanent_fatal():
             return
         if self._should_drop_delayed_delivery():
@@ -1062,6 +1166,38 @@ class TelegramAdapter(BasePlatformAdapter):
             )
             return
 
+        handoff_target = self._inbound_queue_handoff_target()
+        if handoff_target is not None:
+            durable_update_ids = self._durable_update_ids(event)
+            receiver = handoff_target._handoff_receiver()
+            if not durable_update_ids:
+                if receiver is not None and receiver is not self:
+                    receiver._hold_inbound_event(
+                        event, where="queue-handoff", schedule=False
+                    )
+                return
+            target_claimed = any(
+                handoff_target.claim_for_update(update_id) is not None
+                for update_id in durable_update_ids
+            )
+            if (
+                target_claimed
+                and not getattr(event, "_telegram_processing_started", False)
+                and receiver is not None
+                and receiver is not self
+            ):
+                receiver._hold_inbound_event(
+                    event, where="queue-handoff", schedule=False
+                )
+            # A buffered durable event was requeued by handoff. A transferred
+            # claim remains owned by the replacement, so only move it to the
+            # replacement's hold list when dispatch had not started yet.
+            return
+
+        # A held event has already passed Telegram's acknowledgement boundary;
+        # keep its durable claim deferred until a later dispatch attempt.
+        self._defer_durable_event(event)
+        self._mark_durable_event_buffered(event)
         held = getattr(self, "_held_inbound_events", None)
         if held is None:
             self._held_inbound_events = []
@@ -1072,7 +1208,23 @@ class TelegramAdapter(BasePlatformAdapter):
 
         max_n = int(getattr(self, "HELD_INBOUND_MAX", 64) or 64)
         while len(held) >= max_n:
-            dropped = held.pop(0)
+            dropped = held[0]
+            durable_update_ids = self._durable_update_ids(dropped)
+            if durable_update_ids:
+                if not self._schedule_durable_requeue(dropped):
+                    logger.error(
+                        "[Telegram] Cannot release durable held event during overflow; retaining it"
+                    )
+                else:
+                    logger.warning(
+                        "[Telegram] Deferring durable held-event overflow eviction (%d ids)",
+                        len(durable_update_ids),
+                    )
+                # Do not trade a bounded-memory preference for a stranded
+                # durable claim. Retain the old event until every durable
+                # requeue transition has been confirmed.
+                break
+            held.pop(0)
             logger.warning(
                 "[Telegram] Held-inbound queue full (%d); dropping oldest (%d chars)",
                 max_n,
@@ -1110,6 +1262,8 @@ class TelegramAdapter(BasePlatformAdapter):
             except asyncio.CancelledError:
                 pass
 
+        if self._inbound_queue_handoff_target() is not None:
+            return
         if self._is_permanent_fatal():
             held = getattr(self, "_held_inbound_events", None)
             if held:
@@ -1147,7 +1301,7 @@ class TelegramAdapter(BasePlatformAdapter):
                         )
                     return
                 try:
-                    await self.handle_message(event)
+                    await self._dispatch_and_complete_durable_event(event)
                 except asyncio.CancelledError:
                     self._hold_inbound_event(
                         event, where="redispatch-cancelled", schedule=False
@@ -3351,6 +3505,11 @@ class TelegramAdapter(BasePlatformAdapter):
                 # CLOSE-WAIT symptoms — let PTB's own handlers surface them.
                 pass
 
+    def _durable_ingress_paused(self) -> bool:
+        """Return whether local durable admission intentionally holds PTB."""
+        queue = getattr(self, "_inbound_queue", None)
+        return bool(queue is not None and getattr(queue, "ingress_paused", False))
+
     async def _probe_pending_updates(self, bot, probe_timeout: float) -> None:
         """Detect a wedged getUpdates consumer via pending_update_count.
 
@@ -3424,6 +3583,13 @@ class TelegramAdapter(BasePlatformAdapter):
                 )
             return
         self._polling_not_running_count = 0
+        if self._durable_ingress_paused():
+            # PTB deliberately has not acknowledged the fetched update yet.
+            # Restarting the network consumer cannot repair a local SQLite
+            # backpressure condition and used to reset the recovery counter in
+            # a loop while leaving the same update server-side.
+            self._polling_pending_stuck_count = 0
+            return
         get_webhook_info = getattr(bot, "get_webhook_info", None)
         if not callable(get_webhook_info):
             return
@@ -3485,6 +3651,11 @@ class TelegramAdapter(BasePlatformAdapter):
         if self.has_fatal_error:
             return
         if self._polling_error_task and not self._polling_error_task.done():
+            return
+        if self._durable_ingress_paused():
+            # The HTTP getUpdates request completed, but durable admission is
+            # intentionally holding its PTB queue acknowledgment. The queue
+            # owns retry and emits payload-free pause/recovery diagnostics.
             return
         now = time.monotonic()
         last_progress = getattr(self, "_polling_last_progress_monotonic", None)
@@ -4482,6 +4653,1066 @@ class TelegramAdapter(BasePlatformAdapter):
             },
         }
 
+    def _dedup_account_key(self) -> str:
+        """Return the account identity used by adapter-local deduplication."""
+        account = getattr(self, "_bot_account_id", None)
+        if account:
+            return str(account)
+        bot_id = getattr(getattr(self, "_bot", None), "id", None)
+        if bot_id is not None and not isinstance(bot_id, bool):
+            return str(bot_id)
+        return "unknown"
+
+    def _dedup_cache(self, *, platform: bool = False):
+        """Return the process-local dedup cache and its shared lock.
+
+        Some tests and recovery paths construct an adapter without running its
+        normal initializer.  Lazy initialization keeps those paths safe while
+        the lock makes the check-and-set operation one atomic boundary across
+        PTB handler threads.
+        """
+        with _TELEGRAM_DEDUP_INIT_LOCK:
+            lock = getattr(self, "_seen_update_ids_lock", None)
+            if lock is None:
+                lock = threading.RLock()
+                self._seen_update_ids_lock = lock
+            attr = "_seen_platform_update_ids" if platform else "_seen_update_ids"
+            cache = getattr(self, attr, None)
+            if not isinstance(cache, dict):
+                cache = {}
+                setattr(self, attr, cache)
+            if not hasattr(self, "_seen_update_ids_max"):
+                self._seen_update_ids_max = 4096
+        return lock, cache
+
+    def _remember_update_id(
+        self,
+        update: Any,
+        cache: Optional[Dict[tuple[str, int], None]] = None,
+        *,
+        platform: bool = False,
+    ) -> bool:
+        """Return True after the same account/update id has been seen."""
+        update_id = getattr(update, "update_id", None)
+        if isinstance(update_id, bool) or not isinstance(update_id, int):
+            return False
+        key = (self._dedup_account_key(), update_id)
+        lock, owned_cache = self._dedup_cache(platform=platform)
+        # Preserve the old optional-cache signature for callers outside this
+        # module, but always protect the operation with the adapter lock.
+        target = cache if cache is not None else owned_cache
+        with lock:
+            if key in target:
+                return True
+            target[key] = None
+            maximum = max(1, int(getattr(self, "_seen_update_ids_max", 4096)))
+            while len(target) > maximum:
+                target.pop(next(iter(target)))
+            return False
+
+    def _is_duplicate_update(self, update: Any) -> bool:
+        """Return whether a core Telegram handler already entered this update."""
+        return self._remember_update_id(update)
+
+    def _is_duplicate_platform_update(self, update: Any) -> bool:
+        """Return whether the catch-all observer already saw this update."""
+        return self._remember_update_id(update, platform=True)
+
+    def _forget_update_id(
+        self,
+        update: Any,
+        cache: Optional[Dict[tuple[str, int], None]] = None,
+        *,
+        platform: bool = False,
+    ) -> None:
+        """Allow a failed handler invocation to be retried."""
+        update_id = getattr(update, "update_id", None)
+        if isinstance(update_id, bool) or not isinstance(update_id, int):
+            return
+        lock, owned_cache = self._dedup_cache(platform=platform)
+        target = cache if cache is not None else owned_cache
+        with lock:
+            target.pop((self._dedup_account_key(), update_id), None)
+
+    def _forget_durable_update_ids(
+        self, update_ids: tuple[int, ...] | list[int] | set[int]
+    ) -> None:
+        """Allow requeued durable updates through the local dedup cache."""
+        lock, cache = self._dedup_cache()
+        account = self._dedup_account_key()
+        with lock:
+            for update_id in update_ids:
+                cache.pop((account, update_id), None)
+
+    def _gateway_runner(self) -> Any:
+        """Find the owning GatewayRunner behind direct or scoped handlers."""
+        candidates = (
+            getattr(self, "_message_handler", None),
+            getattr(self, "_busy_session_handler", None),
+        )
+        for handler in candidates:
+            owner = getattr(handler, "__self__", None)
+            if owner is not None and callable(getattr(owner, "_queue_depth", None)):
+                return owner
+            try:
+                nonlocals = inspect.getclosurevars(handler).nonlocals.values()
+            except (TypeError, ValueError):
+                nonlocals = ()
+            for value in nonlocals:
+                if callable(getattr(value, "_queue_depth", None)):
+                    return value
+                value_owner = getattr(value, "__self__", None)
+                if value_owner is not None and callable(
+                    getattr(value_owner, "_queue_depth", None)
+                ):
+                    return value_owner
+        return None
+
+    def _inbound_session_key(self, event: Any) -> str:
+        """Resolve the adapter session key used by the gateway busy path."""
+        metadata = getattr(event, "metadata", None) or {}
+        session_key = str(metadata.get("gateway_session_key") or "")
+        runner = self._gateway_runner()
+        if not session_key and runner is not None:
+            resolver = getattr(runner, "_session_key_for_source", None)
+            if callable(resolver):
+                try:
+                    session_key = str(resolver(event.source) or "")
+                except Exception:
+                    session_key = ""
+        if not session_key:
+            try:
+                from gateway.session import build_session_key
+
+                extra = getattr(getattr(self, "config", None), "extra", {}) or {}
+                session_key = build_session_key(
+                    event.source,
+                    group_sessions_per_user=extra.get("group_sessions_per_user", True),
+                    thread_sessions_per_user=extra.get("thread_sessions_per_user", False),
+                    profile=self._session_key_profile(event.source),
+                )
+            except Exception:
+                session_key = ""
+        return session_key
+
+    def _durable_admission_lock(self, session_key: str) -> asyncio.Lock:
+        """Return the per-session lock guarding durable busy admission."""
+        locks = getattr(self, "_durable_admission_locks", None)
+        if not isinstance(locks, dict):
+            locks = {}
+            self._durable_admission_locks = locks
+        lock_key = session_key or "<unknown-session>"
+        lock = locks.get(lock_key)
+        if lock is None:
+            lock = asyncio.Lock()
+            locks[lock_key] = lock
+        return lock
+
+    def _durable_busy_cap_reached(self, event: Any, session_key: str) -> bool:
+        """Return whether this durable event must wait for ordinary queue room."""
+        if not self._durable_update_ids(event) or not session_key:
+            return False
+        active_sessions = getattr(self, "_active_sessions", None)
+        if not isinstance(active_sessions, dict) or session_key not in active_sessions:
+            return False
+
+        runner = self._gateway_runner()
+        if runner is None:
+            return False
+        try:
+            if event.get_command():
+                # Active-session commands have their own direct/bypass path;
+                # they are not ordinary FIFO follow-ups.
+                return False
+        except Exception:
+            pass
+
+        modes = []
+        for name in ("_effective_busy_text_mode", "_effective_busy_input_mode"):
+            resolver = getattr(runner, name, None)
+            if callable(resolver):
+                try:
+                    modes.append(resolver(event.source))
+                except Exception:
+                    continue
+        if "queue" not in modes:
+            return False
+
+        queue_depth = getattr(runner, "_queue_depth", None)
+        if not callable(queue_depth):
+            # An active queue-mode durable event cannot be safely admitted when
+            # the inherited depth boundary is unavailable.
+            return True
+        try:
+            cap = int(getattr(runner, "_BUSY_QUEUE_MAX_PENDING", 32))
+            return queue_depth(session_key, adapter=self) >= cap
+        except Exception:
+            logger.warning(
+                "Deferring durable Telegram event because busy queue depth "
+                "could not be verified for %s",
+                session_key,
+            )
+            return True
+
+    async def handle_message(self, event: MessageEvent) -> None:
+        """Serialize Telegram ingress around durable busy-cap admission."""
+        session_key = self._inbound_session_key(event)
+        durable_ids = self._durable_update_ids(event)
+        lock = self._durable_admission_lock(session_key)
+        if durable_ids:
+            setattr(event, "_telegram_durable_dispatch_result", None)
+        async with lock:
+            if durable_ids and self._durable_busy_cap_reached(event, session_key):
+                # The inherited runner's FIFO helper intentionally returns no
+                # value when its ordinary cap is full. Defer before entering
+                # that path so the durable claim cannot be marked successful.
+                self._defer_durable_event(event)
+                setattr(event, "_telegram_durable_dispatch_result", _DURABLE_DISPATCH_DEFERRED)
+                return
+            await super().handle_message(event)
+
+    @staticmethod
+    def _durable_update_ids(event: Any) -> tuple[int, ...]:
+        """Return validated durable update ids carried by a MessageEvent."""
+        metadata = getattr(event, "metadata", None)
+        raw_ids = metadata.get(_DURABLE_UPDATE_IDS_KEY) if isinstance(metadata, dict) else None
+        if not isinstance(raw_ids, (list, tuple, set)):
+            return ()
+        result: list[int] = []
+        for value in raw_ids:
+            if isinstance(value, bool):
+                continue
+            if isinstance(value, int):
+                update_id = value
+            elif isinstance(value, str) and value.strip().lstrip("+-").isdigit():
+                update_id = int(value.strip(), 10)
+            else:
+                continue
+            if update_id not in result:
+                result.append(update_id)
+        return tuple(result)
+
+    def _mark_durable_event(self, event: Any, update_id: Optional[int]) -> Any:
+        """Attach the durable claim identity to a freshly built event."""
+        if update_id is None:
+            return event
+        queue = getattr(self, "_inbound_queue", None)
+        claim_for_update = getattr(queue, "claim_for_update", None)
+        if not callable(claim_for_update) or claim_for_update(update_id) is None:
+            return event
+        metadata = dict(getattr(event, "metadata", None) or {})
+        ids = list(self._durable_update_ids(event))
+        if update_id not in ids:
+            ids.append(update_id)
+        metadata[_DURABLE_UPDATE_IDS_KEY] = ids
+        metadata["telegram_inbound_claimed"] = True
+        event.metadata = metadata
+        return event
+
+    def _defer_durable_event(self, event: Any) -> None:
+        """Mark a buffered event so its claim stays live until flush dispatch."""
+        ids = self._durable_update_ids(event)
+        if not ids:
+            return
+        deferred = getattr(self, "_deferred_inbound_update_ids", None)
+        if deferred is None:
+            deferred = set()
+            self._deferred_inbound_update_ids = deferred
+        deferred.update(ids)
+        metadata = dict(getattr(event, "metadata", None) or {})
+        metadata[_DURABLE_UPDATE_IDS_KEY] = list(ids)
+        metadata[_DURABLE_EVENT_DEFERRED_KEY] = True
+        event.metadata = metadata
+
+    def _mark_durable_event_buffered(self, event: Any) -> None:
+        """Tell the queue that this event waits outside active processing."""
+        queue = getattr(self, "_inbound_queue", None)
+        mark_buffered = getattr(queue, "mark_event_buffered", None)
+        if callable(mark_buffered):
+            # A cancellation can retain an event after gateway processing has
+            # started. It is no longer live while held, so handoff must requeue
+            # its claim rather than transfer a lease with no local driver.
+            mark_buffered(self._durable_update_ids(event))
+
+    def _mark_durable_event_active(self, event: Any) -> bool:
+        """Tell the queue that a held event has entered actual dispatch."""
+        queue = getattr(self, "_inbound_queue", None)
+        mark_active = getattr(queue, "mark_event_active", None)
+        if not callable(mark_active):
+            return False
+        return bool(mark_active(self._durable_update_ids(event)))
+
+    def _remove_held_inbound_event(self, event: Any) -> None:
+        """Remove one held projection by identity after durable release."""
+        held = getattr(self, "_held_inbound_events", None)
+        if not isinstance(held, list):
+            return
+        for index, existing in enumerate(held):
+            if existing is event:
+                held.pop(index)
+                return
+
+    def _schedule_durable_requeue(self, event: Any) -> bool:
+        """Schedule safe release for a durable event displaced by overflow."""
+        update_ids = self._durable_update_ids(event)
+        if not update_ids:
+            return True
+        queue = getattr(self, "_inbound_queue", None)
+        complete = getattr(queue, "complete_update", None)
+        register = getattr(queue, "register_lifecycle_task", None)
+        if not callable(complete) or not callable(register):
+            return False
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return False
+
+        pending = getattr(self, "_durable_overflow_cleanup_events", None)
+        if pending is None:
+            pending = set()
+            self._durable_overflow_cleanup_events = pending
+        event_identity = id(event)
+        if event_identity in pending:
+            return True
+        pending.add(event_identity)
+
+        async def requeue() -> bool:
+            return await self._complete_durable_event(
+                event,
+                success=False,
+                delay=0.0,
+                defer=True,
+            )
+
+        task = loop.create_task(requeue())
+        register(task)
+
+        def observe(completed: asyncio.Task[Any]) -> None:
+            pending.discard(event_identity)
+            try:
+                transitioned = bool(completed.result())
+            except asyncio.CancelledError:
+                logger.error(
+                    "[Telegram] Durable held-event overflow cleanup was cancelled"
+                )
+                return
+            except Exception:
+                logger.exception(
+                    "[Telegram] Durable held-event overflow cleanup failed"
+                )
+                return
+            if not transitioned:
+                logger.error(
+                    "[Telegram] Durable held-event overflow cleanup was not confirmed"
+                )
+                return
+            self._remove_held_inbound_event(event)
+
+        task.add_done_callback(observe)
+        return True
+
+    def _merge_durable_event_metadata(self, target: Any, source: Any) -> None:
+        """Merge durable claim ids when two batched events become one."""
+        source_ids = self._durable_update_ids(source)
+        target_ids = list(self._durable_update_ids(target))
+        for update_id in source_ids:
+            if update_id not in target_ids:
+                target_ids.append(update_id)
+        if not target_ids:
+            return
+        source_metadata = getattr(source, "metadata", None) or {}
+        target_metadata = dict(getattr(target, "metadata", None) or {})
+        target_metadata[_DURABLE_UPDATE_IDS_KEY] = target_ids
+        if (
+            bool(source_metadata.get(_DURABLE_EVENT_DEFERRED_KEY))
+            or bool(target_metadata.get(_DURABLE_EVENT_DEFERRED_KEY))
+            or any(update_id in getattr(self, "_deferred_inbound_update_ids", set()) for update_id in target_ids)
+        ):
+            target_metadata[_DURABLE_EVENT_DEFERRED_KEY] = True
+            deferred = getattr(self, "_deferred_inbound_update_ids", None)
+            if deferred is None:
+                deferred = set()
+                self._deferred_inbound_update_ids = deferred
+            deferred.update(target_ids)
+        target.metadata = target_metadata
+
+    def _update_durable_event_after_completion(
+        self,
+        event: Any,
+        update_ids: tuple[int, ...],
+        transitioned_ids: list[int],
+    ) -> None:
+        """Retain only durable IDs whose completion was not confirmed."""
+        transitioned = set(transitioned_ids)
+        unresolved = [update_id for update_id in update_ids if update_id not in transitioned]
+        metadata = dict(getattr(event, "metadata", None) or {})
+        deferred = getattr(self, "_deferred_inbound_update_ids", None)
+        was_deferred = bool(metadata.get(_DURABLE_EVENT_DEFERRED_KEY))
+        if deferred is not None:
+            was_deferred = was_deferred or bool(set(update_ids).intersection(deferred))
+        if was_deferred:
+            if deferred is None:
+                deferred = set()
+                self._deferred_inbound_update_ids = deferred
+            for update_id in transitioned:
+                deferred.discard(update_id)
+            deferred.update(unresolved)
+
+        if unresolved:
+            metadata[_DURABLE_UPDATE_IDS_KEY] = unresolved
+            if was_deferred:
+                metadata[_DURABLE_EVENT_DEFERRED_KEY] = True
+            else:
+                metadata.pop(_DURABLE_EVENT_DEFERRED_KEY, None)
+        else:
+            metadata.pop(_DURABLE_UPDATE_IDS_KEY, None)
+            metadata.pop(_DURABLE_EVENT_DEFERRED_KEY, None)
+        event.metadata = metadata
+
+    async def _complete_durable_update_ids(
+        self,
+        update_ids: tuple[int, ...] | list[int] | set[int],
+        *,
+        success: bool,
+        delay: float = 0.0,
+        defer: bool = False,
+        _transitioned_ids: Optional[list[int]] = None,
+    ) -> bool:
+        """Complete each durable claim only after dispatch accepts the event."""
+        unique_update_ids = tuple(dict.fromkeys(update_ids))
+        if not unique_update_ids:
+            return True
+        queue = getattr(self, "_inbound_queue", None)
+        complete = getattr(queue, "complete_update", None)
+        if not callable(complete):
+            return False
+        transitioned_ids: list[int] = []
+        for update_id in unique_update_ids:
+            if not success and (delay > 0 or defer):
+                result = complete(
+                    update_id,
+                    success=False,
+                    delay=delay,
+                    defer=defer,
+                )
+            else:
+                result = complete(update_id, success=success)
+            if inspect.isawaitable(result):
+                result = await asyncio.shield(result)
+            if bool(result):
+                transitioned_ids.append(update_id)
+        if not success and transitioned_ids:
+            deferred = getattr(self, "_deferred_inbound_update_ids", None)
+            if deferred is not None:
+                for update_id in transitioned_ids:
+                    deferred.discard(update_id)
+            self._forget_durable_update_ids(transitioned_ids)
+        if _transitioned_ids is not None:
+            _transitioned_ids.extend(transitioned_ids)
+        return len(transitioned_ids) == len(unique_update_ids)
+
+    async def _complete_durable_event(
+        self,
+        event: Any,
+        *,
+        success: bool,
+        delay: float = 0.0,
+        defer: bool = False,
+    ) -> bool:
+        """Complete all claims represented by a batched MessageEvent."""
+        update_ids = self._durable_update_ids(event)
+        transitioned_ids: list[int] = []
+        transitioned = await self._complete_durable_update_ids(
+            update_ids,
+            success=success,
+            delay=delay,
+            defer=defer,
+            _transitioned_ids=transitioned_ids,
+        )
+        self._update_durable_event_after_completion(
+            event,
+            update_ids,
+            transitioned_ids,
+        )
+        return transitioned
+
+    def _schedule_durable_processing_completion(
+        self, event: MessageEvent, outcome: ProcessingOutcome
+    ) -> None:
+        """Commit a durable result after the detached gateway owner finishes."""
+        if not getattr(event, "_telegram_durable_completion_pending", False):
+            return
+        setattr(event, "_telegram_durable_completion_pending", False)
+        existing = getattr(event, "_telegram_durable_completion_task", None)
+        if existing is not None and not existing.done():
+            return
+
+        async def complete() -> None:
+            success = outcome == ProcessingOutcome.SUCCESS
+            try:
+                transitioned = await self._complete_durable_event(event, success=success)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("[Telegram] Durable processing completion failed")
+                return
+            if not transitioned:
+                logger.warning("[Telegram] Durable processing completion was not confirmed")
+
+        task = asyncio.create_task(complete())
+        setattr(event, "_telegram_durable_completion_task", task)
+        queue = getattr(self, "_inbound_queue", None)
+        register = getattr(queue, "register_lifecycle_task", None)
+        if callable(register):
+            register(task)
+
+    @staticmethod
+    def _durable_processing_complete_event(event: Any) -> asyncio.Event:
+        """Return the per-event signal raised by the processing hook."""
+        signal = getattr(event, "_telegram_processing_complete", None)
+        if not isinstance(signal, asyncio.Event):
+            signal = asyncio.Event()
+            setattr(event, "_telegram_processing_complete", signal)
+        return signal
+
+    def _gateway_fifo_events(self, session_key: str) -> tuple[Any, ...]:
+        """Return events staged in the inherited GatewayRunner busy FIFO."""
+        if not session_key:
+            return ()
+        events: list[Any] = []
+        pending = getattr(self, "_pending_messages", None)
+        if isinstance(pending, dict):
+            pending_event = pending.get(session_key)
+            if pending_event is not None:
+                events.append(pending_event)
+
+        runner = self._gateway_runner()
+        if runner is None:
+            return tuple(events)
+        state = None
+        resolver = getattr(runner, "_peek_session_state", None)
+        if callable(resolver):
+            try:
+                state = resolver(session_key)
+            except Exception:
+                state = None
+        conversation = getattr(state, "conversation", None)
+        overflow = getattr(conversation, "queued_events", None)
+        if isinstance(overflow, (list, tuple)):
+            events.extend(overflow)
+        return tuple(events)
+
+    def _durable_event_in_gateway_fifo(self, event: Any, session_key: str) -> bool:
+        """Return whether a durable event is awaiting the volatile busy FIFO."""
+        durable_ids = set(self._durable_update_ids(event))
+        for candidate in self._gateway_fifo_events(session_key):
+            if candidate is event:
+                return True
+            if durable_ids.intersection(self._durable_update_ids(candidate)):
+                setattr(
+                    candidate,
+                    "_telegram_processing_complete",
+                    self._durable_processing_complete_event(event),
+                )
+                return True
+        return False
+
+    def _remove_durable_event_from_gateway_fifo(
+        self, event: Any, session_key: str
+    ) -> bool:
+        """Remove an externally-cancelled event before placing it on hold."""
+        removed = False
+        pending = getattr(self, "_pending_messages", None)
+        if isinstance(pending, dict) and pending.get(session_key) is event:
+            pending.pop(session_key, None)
+            removed = True
+
+        runner = self._gateway_runner()
+        resolver = getattr(runner, "_peek_session_state", None) if runner else None
+        state = None
+        if callable(resolver):
+            try:
+                state = resolver(session_key)
+            except Exception:
+                state = None
+        conversation = getattr(state, "conversation", None)
+        overflow = getattr(conversation, "queued_events", None)
+        if isinstance(overflow, list):
+            for index, candidate in enumerate(overflow):
+                if candidate is event:
+                    del overflow[index]
+                    removed = True
+                    break
+        return removed
+
+    async def _await_durable_processing(
+        self, session_key: str
+    ) -> ProcessingOutcome | None:
+        """Wait for a durable session owner and return its final outcome."""
+        observed_task_ids: set[int] = set()
+        outcome = None
+        while True:
+            task = getattr(self, "_session_tasks", {}).get(session_key)
+            if task is None or task is asyncio.current_task():
+                return outcome
+            task_id = id(task)
+            if task_id in observed_task_ids:
+                return outcome
+            observed_task_ids.add(task_id)
+            if not inspect.isawaitable(task):
+                return outcome
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                current_task = asyncio.current_task()
+                if current_task is not None and current_task.cancelling():
+                    raise
+                outcome = getattr(task, "_telegram_processing_outcome", None)
+            except Exception:
+                outcome = None
+            else:
+                outcome = getattr(task, "_telegram_processing_outcome", None)
+            if getattr(self, "_session_tasks", {}).get(session_key) is task:
+                return outcome
+
+    async def _await_durable_event_processing(
+        self, event: Any, session_key: str
+    ) -> object:
+        """Wait for this event, not merely the preceding session owner."""
+        signal = self._durable_processing_complete_event(event)
+        owner_outcome = await self._await_durable_processing(session_key)
+        if signal.is_set():
+            return event
+        if (
+            owner_outcome == ProcessingOutcome.SUCCESS
+            and not self._durable_event_in_gateway_fifo(event, session_key)
+        ):
+            return event
+        self._remove_durable_event_from_gateway_fifo(event, session_key)
+        self._defer_durable_event(event)
+        return _DURABLE_DISPATCH_DEFERRED
+
+    def _schedule_durable_fifo_completion(
+        self, event: MessageEvent, session_key: str
+    ) -> None:
+        """Finalize a durable event drained inside an existing session owner."""
+        existing = getattr(event, "_telegram_durable_fifo_completion_task", None)
+        if existing is not None and not existing.done():
+            return
+
+        async def complete() -> None:
+            try:
+                result = await self._await_durable_event_processing(event, session_key)
+                if self._durable_processing_complete_event(event).is_set():
+                    return
+                setattr(event, "_telegram_durable_completion_pending", False)
+                if result is _DURABLE_DISPATCH_DEFERRED:
+                    transitioned = await self._complete_durable_event(
+                        event,
+                        success=False,
+                        delay=_DURABLE_BUSY_RETRY_DELAY_SECONDS,
+                        defer=True,
+                    )
+                else:
+                    transitioned = await self._complete_durable_event(
+                        event, success=True
+                    )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("[Telegram] Durable FIFO completion failed")
+                return
+            if not transitioned:
+                logger.warning("[Telegram] Durable FIFO completion was not confirmed")
+
+        task = asyncio.create_task(complete())
+        setattr(event, "_telegram_durable_fifo_completion_task", task)
+        queue = getattr(self, "_inbound_queue", None)
+        register = getattr(queue, "register_lifecycle_task", None)
+        if callable(register):
+            register(task)
+
+    async def _dispatch_inbound_event(self, event: MessageEvent) -> object:
+        """Dispatch durable work only after its actual processing boundary."""
+        durable_ids = self._durable_update_ids(event)
+        session_key = self._inbound_session_key(event)
+        if durable_ids:
+            self._durable_processing_complete_event(event)
+            # PTB's default processor is sequential. Completion must follow
+            # the gateway owner task, not keep this handler awaiting that task.
+            setattr(event, "_telegram_durable_completion_pending", True)
+        await self.handle_message(event)
+        if (
+            durable_ids
+            and getattr(event, "_telegram_durable_dispatch_result", None)
+            is _DURABLE_DISPATCH_DEFERRED
+        ):
+            setattr(event, "_telegram_durable_completion_pending", False)
+            return _DURABLE_DISPATCH_DEFERRED
+        if durable_ids:
+            fifo_admitted = bool(
+                getattr(event, "_gateway_busy_fifo_admitted", False)
+            )
+            steer_admitted = bool(
+                getattr(event, "_gateway_busy_steer_admitted", False)
+            )
+            if fifo_admitted or steer_admitted or self._durable_event_in_gateway_fifo(
+                event, session_key
+            ):
+                self._schedule_durable_fifo_completion(event, session_key)
+                return _DURABLE_DISPATCH_ASYNC
+            if session_key in getattr(self, "_session_tasks", {}):
+                return _DURABLE_DISPATCH_ASYNC
+            if callable(getattr(self, "_message_handler", None)):
+                # BasePlatformAdapter should create a task for a new durable
+                # session. A missing task means the event was not admitted.
+                setattr(event, "_telegram_durable_completion_pending", False)
+                self._defer_durable_event(event)
+                return _DURABLE_DISPATCH_DEFERRED
+            # Small integration adapters can dispatch synchronously without a
+            # BasePlatformAdapter owner. They still need a direct completion.
+            setattr(event, "_telegram_durable_completion_pending", False)
+        return event
+
+    async def _dispatch_and_complete_durable_event(self, event: MessageEvent) -> None:
+        """Dispatch a buffered event and commit its durable outcome."""
+        durable_ids = self._durable_update_ids(event)
+        handoff_target = self._inbound_queue_handoff_target()
+        if (
+            handoff_target is not None
+            and not getattr(event, "_telegram_processing_started", False)
+        ):
+            self._hold_inbound_event(event, where="durable-dispatch-handoff")
+            return
+        claim_active = self._mark_durable_event_active(event)
+        if (
+            self._inbound_queue_handoff_target() is not None
+            and durable_ids
+            and not getattr(event, "_telegram_processing_started", False)
+            and not claim_active
+        ):
+            self._hold_inbound_event(event, where="durable-dispatch-handoff")
+            return
+        try:
+            dispatch_result = await self._dispatch_inbound_event(event)
+        except asyncio.CancelledError:
+            durable_ids = self._durable_update_ids(event)
+            processing_outcome = getattr(event, "_telegram_processing_outcome", None)
+            if durable_ids and processing_outcome == ProcessingOutcome.CANCELLED:
+                # The owner task ran its cancellation lifecycle and reported
+                # that outcome. Its claim is safe to requeue; do not also hold
+                # the same event for a second dispatch attempt.
+                await self._complete_durable_event(event, success=False)
+                return
+            self._remove_durable_event_from_gateway_fifo(
+                event, self._inbound_session_key(event)
+            )
+            self._hold_inbound_event(event, where="durable-dispatch-cancelled")
+            raise
+        except BaseException:
+            await self._complete_durable_event(event, success=False)
+            raise
+        if dispatch_result is _DURABLE_DISPATCH_ASYNC:
+            return
+        if dispatch_result is _DURABLE_DISPATCH_FAILED:
+            await self._complete_durable_event(event, success=False)
+            return
+        if dispatch_result is _DURABLE_DISPATCH_DEFERRED:
+            await self._complete_durable_event(
+                event,
+                success=False,
+                delay=_DURABLE_BUSY_RETRY_DELAY_SECONDS,
+                defer=True,
+            )
+            return
+        await self._complete_durable_event(event, success=True)
+
+    def _wrap_inbound_handler(
+        self, callback: Callable[..., Awaitable[Any]]
+    ) -> Callable[..., Awaitable[Any]]:
+        """Deduplicate a registered handler before downloads or dispatch."""
+        if getattr(callback, _DURABLE_WRAPPER_MARKER, False):
+            return callback
+
+        @functools.wraps(callback)
+        async def wrapped(update, context):
+            queue = getattr(self, "_inbound_queue", None)
+            if queue is not None and self._inbound_queue_handoff_target() is not None:
+                # A retired adapter must never execute replacement work through
+                # its stale handler graph. Recovery projects the durable row on
+                # the replacement queue instead.
+                logger.debug(
+                    "[Telegram] Ignoring Telegram update %s after adapter handoff",
+                    getattr(update, "update_id", None),
+                )
+                return None
+            update_id = getattr(update, "update_id", None)
+            duplicate = self._is_duplicate_update(update)
+            handler_claimed = getattr(queue, "handler_claimed", None)
+            if not duplicate and callable(handler_claimed):
+                duplicate = bool(handler_claimed(update_id))
+            if duplicate:
+                logger.debug(
+                    "[Telegram] Ignoring duplicate Telegram update %s",
+                    getattr(update, "update_id", None),
+                )
+                return None
+            claim = queue.mark_handler_claim(update_id) if queue is not None else None
+            if claim is None and queue is not None:
+                handler_claim_fenced = getattr(queue, "handler_claim_fenced", None)
+                if callable(handler_claim_fenced) and handler_claim_fenced(update_id):
+                    logger.debug(
+                        "[Telegram] Ignoring Telegram update %s after queue handoff",
+                        update_id,
+                    )
+                    return None
+            try:
+                if claim is not None and getattr(claim, "update_kind", None) == "callback_query":
+                    mark_control_started = getattr(queue, "mark_control_started", None)
+                    if callable(mark_control_started):
+                        started = mark_control_started(update_id)
+                        if inspect.isawaitable(started):
+                            started = await asyncio.shield(started)
+                        if not started:
+                            await self._complete_durable_update_ids((update_id,), success=False)
+                            self._forget_update_id(update)
+                            return None
+                result = await callback(update, context)
+            except BaseException:
+                try:
+                    if claim is not None:
+                        await self._complete_durable_update_ids((update_id,), success=False)
+                finally:
+                    self._forget_update_id(update)
+                raise
+            if result is _DURABLE_DISPATCH_FAILED:
+                if claim is not None and update_id is not None:
+                    await self._complete_durable_update_ids((update_id,), success=False)
+                self._forget_update_id(update)
+                return result
+            if result is _DURABLE_DISPATCH_DEFERRED:
+                if claim is not None and update_id is not None:
+                    await self._complete_durable_update_ids(
+                        (update_id,),
+                        success=False,
+                        delay=_DURABLE_BUSY_RETRY_DELAY_SECONDS,
+                        defer=True,
+                    )
+                self._forget_update_id(update)
+                return result
+            if result is _DURABLE_DISPATCH_ASYNC:
+                return result
+            if (
+                claim is not None
+                and update_id is not None
+                and update_id not in getattr(
+                    self, "_deferred_inbound_update_ids", set()
+                )
+            ):
+                await self._complete_durable_update_ids((update_id,), success=True)
+            return result
+
+        wrapped._hermes_telegram_durable_wrapper = True
+        return wrapped
+
+    def _wrap_platform_event_handler(
+        self, callback: Callable[..., Awaitable[Any]]
+    ) -> Callable[..., Awaitable[Any]]:
+        """Deduplicate the observer independently of core handler groups."""
+
+        @functools.wraps(callback)
+        async def wrapped(update, context):
+            if self._is_duplicate_platform_update(update):
+                logger.debug(
+                    "[Telegram] Ignoring duplicate Telegram platform update %s",
+                    getattr(update, "update_id", None),
+                )
+                return None
+            return await callback(update, context)
+
+        return wrapped
+
+    @staticmethod
+    def _update_payload(update: Any) -> Optional[dict[str, Any]]:
+        if isinstance(update, dict):
+            return update
+        converter = getattr(update, "to_dict", None)
+        if not callable(converter):
+            return None
+        try:
+            payload = converter()
+        except Exception:
+            logger.debug("[Telegram] Could not serialize update for durable ingress", exc_info=True)
+            return None
+        return payload if isinstance(payload, dict) else None
+
+    def _deserialize_update(self, payload: Any) -> Any:
+        """Rebuild a PTB Update from the durable JSON projection."""
+        if not isinstance(payload, dict) or not TELEGRAM_AVAILABLE:
+            return payload
+        try:
+            return Update.de_json(payload, self._bot)
+        except Exception:
+            logger.warning("[%s] Durable Telegram update could not be decoded", self.name, exc_info=True)
+            return None
+
+    def _classify_inbound_update(self, update: Any) -> CaptureDecision:
+        """Classify an update without downloading media or dispatching work."""
+        payload = self._update_payload(update)
+        message = self._effective_update_message(update)
+        update_kind = "message"
+        callback = getattr(update, "callback_query", None)
+        if callback is not None:
+            query_message = getattr(callback, "message", None)
+            query_user = getattr(callback, "from_user", None)
+            query_chat = getattr(query_message, "chat", None)
+            user_id = getattr(query_user, "id", None)
+            chat_id = getattr(query_chat, "id", None)
+            authorized = False
+            if user_id is not None:
+                try:
+                    authorized = bool(
+                        self._is_callback_user_authorized(
+                            str(user_id),
+                            chat_id=str(chat_id) if chat_id is not None else None,
+                            chat_type=getattr(query_chat, "type", None),
+                        )
+                    )
+                except Exception:
+                    logger.debug("[%s] Callback admission authorization failed", self.name, exc_info=True)
+            return CaptureDecision(
+                actionable=authorized and bool(getattr(callback, "data", None)),
+                update_kind="callback_query",
+                chat_id=str(chat_id) if chat_id is not None else None,
+                callback_query_id=(
+                    str(getattr(callback, "id", "")) or None
+                ),
+                payload=payload,
+                account_id=self._dedup_account_key(),
+                receipt_required=True,
+            )
+
+        if message is None:
+            return CaptureDecision(actionable=False, payload=payload)
+        try:
+            authorized = bool(self._is_user_authorized_from_message(message))
+        except Exception:
+            authorized = False
+        if not authorized or self._is_own_message(message):
+            return CaptureDecision(actionable=False, payload=payload)
+
+        text = getattr(message, "text", None) or getattr(message, "caption", None) or ""
+        is_command = bool(str(text).lstrip().startswith("/"))
+        has_location = getattr(message, "location", None) is not None or getattr(message, "venue", None) is not None
+        has_media = any(
+            getattr(message, attr, None) is not None
+            for attr in ("photo", "video", "audio", "voice", "document", "sticker")
+        )
+        if not (text or has_location or has_media):
+            return CaptureDecision(actionable=False, payload=payload)
+        try:
+            should_process = bool(
+                self._should_process_message(message, is_command=is_command)
+                if is_command
+                else self._should_process_message(message)
+            )
+            should_observe = (
+                False
+                if is_command or should_process
+                else bool(self._should_observe_unmentioned_group_message(message))
+            )
+        except Exception:
+            should_process = False
+            should_observe = False
+        kind = "command" if is_command else (
+            "location" if has_location and not text else "media" if has_media and not text else "message"
+        )
+        return CaptureDecision(
+            actionable=bool(should_process or should_observe),
+            update_kind=kind,
+            chat_id=(str(getattr(getattr(message, "chat", None), "id", "")) or None),
+            message_id=(str(getattr(message, "message_id", "")) or None),
+            payload=payload,
+            account_id=self._dedup_account_key(),
+            receipt_required=True,
+        )
+
+    def _ensure_inbound_queue(self) -> DurableTelegramUpdateQueue:
+        """Create the account-scoped durable PTB queue once per adapter."""
+        token = getattr(self.config, "token", None)
+        try:
+            account = bot_account_id_from_token(token)
+        except (TypeError, ValueError):
+            # A few lifecycle tests use a redacted token placeholder while
+            # replacing the whole PTB builder.  Keep those non-network test
+            # doubles usable without ever persisting the placeholder; real
+            # Telegram tokens always carry a numeric account prefix.
+            account = "0"
+        current = getattr(self, "_inbound_queue", None)
+        store = getattr(self, "_inbound_store", None)
+        if current is not None and self._bot_account_id == account:
+            if store is None or current.store.path == store.path:
+                # A queue retired by a completed handoff stays bound to its old
+                # adapter.  Late recovery on that stale adapter must remain a
+                # registry no-op; creating a third queue here would reverse the
+                # handoff and steal ownership from the active replacement.
+                if (
+                    getattr(current, "_lifecycle_retired", False)
+                    and getattr(current, "_handoff_target", None) is not None
+                ):
+                    return current
+                if not (
+                    getattr(current, "_ingress_closed", False)
+                    or getattr(current, "_store_executor_shutdown", False)
+                ):
+                    return current
+                self._retired_inbound_queue = current
+        store = store or TelegramInboundStore()
+        queue = DurableTelegramUpdateQueue(
+            store=store,
+            bot_account_id=account,
+            classifier=self._classify_inbound_update,
+            lease_owner=f"telegram:{account}:{os.getpid()}:{id(self)}",
+            active_limit=32,
+            item_factory=self._deserialize_update,
+        )
+        queue.attach_handoff_receiver(self)
+        self._inbound_store = store
+        self._inbound_queue = queue
+        self._bot_account_id = account
+        TelegramQueueLifecycleRegistry.observe(queue)
+        return queue
+
+    async def _recover_inbound_queue(self) -> None:
+        if not getattr(self, "_durable_queue_bound", False):
+            return
+        queue = self._ensure_inbound_queue()
+        # A reconnect may replay a leased row on this same adapter instance.
+        # The durable inbox, not these bounded process-local caches, decides
+        # whether the update is still eligible for delivery.
+        getattr(self, "_seen_update_ids", {}).clear()
+        getattr(self, "_seen_platform_update_ids", {}).clear()
+        # The registry serializes same-store/account lifecycle transitions and
+        # hands off any prior in-process queue before projecting recovery rows.
+        await TelegramQueueLifecycleRegistry.recover(queue)
+        # Clear only after a successful registry transition. On failure the
+        # strong reference preserves the predecessor for the next retry.
+        self._retired_inbound_queue = None
+
+    def _attach_inbound_queue(self, builder):
+        """Bind durable admission to PTB's polling/webhook queue boundary."""
+        setter = getattr(builder, "update_queue", None)
+        if not callable(setter):
+            self._durable_queue_bound = False
+            return builder
+        self._durable_queue_bound = True
+        configured_builder = setter(self._ensure_inbound_queue())
+        # PTB's fluent setter returns the builder itself.  Some legacy test
+        # doubles expose a callable ``update_queue`` but return a child mock;
+        # retain the canonical builder in that case so ``build()`` and the
+        # remaining chain still target the configured object.
+        return configured_builder if configured_builder is builder else builder
+
     def _register_handlers(self, app) -> None:
         """Register every PTB handler on ``app``.
 
@@ -4492,31 +5723,116 @@ class TelegramAdapter(BasePlatformAdapter):
         """
         app.add_handler(TelegramMessageHandler(
             filters.TEXT & ~filters.COMMAND,
-            self._handle_text_message
+            self._wrap_inbound_handler(self._handle_text_message)
         ))
         app.add_handler(TelegramMessageHandler(
             filters.COMMAND,
-            self._handle_command
+            self._wrap_inbound_handler(self._handle_command)
         ))
         app.add_handler(TelegramMessageHandler(
             filters.LOCATION | getattr(filters, "VENUE", filters.LOCATION),
-            self._handle_location_message
+            self._wrap_inbound_handler(self._handle_location_message)
         ))
         app.add_handler(TelegramMessageHandler(
             filters.PHOTO | filters.VIDEO | filters.AUDIO | filters.VOICE | filters.Document.ALL | filters.Sticker.ALL,
-            self._handle_media_message
+            self._wrap_inbound_handler(self._handle_media_message)
         ))
         # Handle inline keyboard button callbacks (update prompts)
-        app.add_handler(CallbackQueryHandler(self._handle_callback_query))
+        app.add_handler(CallbackQueryHandler(
+            self._wrap_inbound_handler(self._handle_callback_query)
+        ))
         # Inline command picker (@botname <query>) — searchable, uncapped
         # access to every command/skill. Inert until the bot owner enables
         # inline mode via BotFather /setinline (Telegram never delivers
         # inline_query updates otherwise), so registering unconditionally
-        # is safe.
-        app.add_handler(InlineQueryHandler(self._handle_inline_query))
+        # is safe. Inline queries are ordinary Telegram ingress and must use
+        # the same durable claim fence as other user-originated updates.
+        app.add_handler(InlineQueryHandler(
+            self._wrap_inbound_handler(self._handle_inline_query)
+        ))
         # gateway_platform_event observer (see _on_platform_update); group 99 so
         # it observes alongside, never displaces, the core handlers.
-        app.add_handler(TypeHandler(Update, self._on_platform_update), group=99)
+        app.add_handler(TypeHandler(
+            Update,
+            self._wrap_platform_event_handler(self._on_platform_update),
+        ), group=99)
+
+    def _telegram_plugin_application_proxy(self, app):
+        """Return the PTB registration surface used by plugin factories."""
+        return _TelegramPluginApplicationProxy(app, self)
+
+    def _wrap_plugin_handler(self, handler):
+        """Clone a plugin handler and wrap every callback before PTB sees it.
+
+        PTB invokes only the first matching handler in each group.  Plugin
+        handlers therefore need the same durable claim fence as the core
+        handlers, including nested ConversationHandler entries.  Never mutate
+        the plugin-owned handler object: factories may reuse it for another
+        application or retain it for teardown.
+        """
+        if not TELEGRAM_AVAILABLE:
+            raise TypeError("python-telegram-bot is not installed")
+
+        from telegram.ext._handlers.basehandler import BaseHandler
+        from telegram.ext._handlers.conversationhandler import ConversationHandler
+
+        if not isinstance(handler, BaseHandler):
+            raise TypeError(
+                "plugin Telegram handler must be a python-telegram-bot BaseHandler"
+            )
+
+        if isinstance(handler, ConversationHandler):
+            try:
+                wrapped = copy.copy(handler)
+                wrapped._entry_points = [
+                    self._wrap_plugin_handler(child)
+                    for child in handler.entry_points
+                ]
+                wrapped._states = {
+                    state: [
+                        self._wrap_plugin_handler(child)
+                        for child in state_handlers
+                    ]
+                    for state, state_handlers in handler.states.items()
+                }
+                wrapped._fallbacks = [
+                    self._wrap_plugin_handler(child)
+                    for child in handler.fallbacks
+                ]
+                wrapped._child_conversations = {
+                    child
+                    for child in (
+                        wrapped._entry_points
+                        + wrapped._fallbacks
+                        + [
+                            nested
+                            for state_handlers in wrapped._states.values()
+                            for nested in state_handlers
+                        ]
+                    )
+                    if isinstance(child, ConversationHandler)
+                }
+                return wrapped
+            except Exception as exc:
+                raise TypeError(
+                    f"cannot durably wrap plugin ConversationHandler: {type(handler).__name__}"
+                ) from exc
+
+        callback = getattr(handler, "callback", None)
+        if not callable(callback):
+            raise TypeError(
+                f"cannot durably wrap plugin Telegram handler: {type(handler).__name__}"
+            )
+        if getattr(callback, _DURABLE_WRAPPER_MARKER, False):
+            return handler
+        try:
+            wrapped = copy.copy(handler)
+            wrapped.callback = self._wrap_inbound_handler(callback)
+            return wrapped
+        except Exception as exc:
+            raise TypeError(
+                f"cannot durably wrap plugin Telegram handler: {type(handler).__name__}"
+            ) from exc
 
     async def connect(self, *, is_reconnect: bool = False) -> bool:
         """Connect to Telegram via polling or webhook.
@@ -4774,6 +6090,12 @@ class TelegramAdapter(BasePlatformAdapter):
 
             get_updates_request = self._instrument_polling_request(get_updates_request)
             builder = builder.request(request).get_updates_request(get_updates_request)
+            # PTB advances its polling offset immediately after
+            # ``update_queue.put`` returns (and the webhook handler responds
+            # after the same await).  Put the durable queue at that boundary so
+            # actionable updates cannot be acknowledged before SQLite has a
+            # replayable copy.
+            builder = self._attach_inbound_queue(builder)
             self._app = builder.build()
             self._bot = self._app.bot
 
@@ -4784,10 +6106,13 @@ class TelegramAdapter(BasePlatformAdapter):
             # matching handler per group, so pattern-scoped plugin handlers
             # take precedence for their own updates while everything else
             # falls through to the core handlers below.
-            self._wire_plugin_handlers(self._app)
+            self._wire_plugin_handlers(
+                self._telegram_plugin_application_proxy(self._app)
+            )
 
             # Register handlers via the single registration site (#64176).
             self._register_handlers(self._app)
+            await self._recover_inbound_queue()
             
             # Start polling — retry initialize() for transient TLS resets.
             # Each attempt is capped by _init_timeout so a single unreachable
@@ -4901,8 +6226,13 @@ class TelegramAdapter(BasePlatformAdapter):
                         old_app = self._app
                         self._app = builder.build()
                         self._bot = self._app.bot
-                        # Keep core and observer handlers in lockstep after a
-                        # transient-init rebuild (#64176).
+                        # Keep plugin, core, and observer handlers in lockstep
+                        # after a transient-init rebuild (#64176). Plugin handlers
+                        # must use the same proxy as the initial application so
+                        # they cannot bypass durable wrapping.
+                        self._wire_plugin_handlers(
+                            self._telegram_plugin_application_proxy(self._app)
+                        )
                         self._register_handlers(self._app)
                         # Best-effort discard the old app's resources
                         try:
@@ -5150,9 +6480,9 @@ class TelegramAdapter(BasePlatformAdapter):
     async def _cancel_pending_delivery_tasks(self) -> None:
         """Cancel every delayed-delivery task family before disconnect completes.
 
-        Covers media-group, photo-batch and text-batch flush tasks plus the
-        polling-error recovery task. Each sits behind an ``asyncio.sleep()``;
-        if teardown leaves them running they dispatch ``handle_message`` into a
+        Covers media-group, photo-batch and text-batch flush tasks, detached
+        post-window durable dispatches, and the polling-error recovery task.
+        Teardown must await them so none can dispatch ``handle_message`` into a
         torn-down session. Skips the current task so the coroutine driving
         teardown does not cancel itself.
         """
@@ -5178,6 +6508,9 @@ class TelegramAdapter(BasePlatformAdapter):
             collect(task)
         for task in list(self._pending_text_batch_tasks.values()):
             collect(task)
+        durable_dispatch_tasks = getattr(self, "_durable_batch_dispatch_tasks", None)
+        for task in list(durable_dispatch_tasks or ()):
+            collect(task)
         collect(getattr(self, "_polling_error_task", None))
         collect(getattr(self, "_polling_progress_verifier_task", None))
         # Hold-queue redispatch must be cancellable+awaitable on teardown so it
@@ -5189,6 +6522,10 @@ class TelegramAdapter(BasePlatformAdapter):
             task.cancel()
         if awaitable_tasks:
             await asyncio.gather(*awaitable_tasks, return_exceptions=True)
+        if durable_dispatch_tasks is not None:
+            durable_dispatch_tasks.difference_update(
+                task for task in tuple(durable_dispatch_tasks) if task.done()
+            )
 
         # Salvage buffered inbound events before clearing maps — unless permanent
         # fatal, where no reconnect can drain and hold would re-orphan them
@@ -5414,6 +6751,14 @@ class TelegramAdapter(BasePlatformAdapter):
                     "[%s] Error during Telegram disconnect: %s",
                     self.name, _redact_telegram_error_text(e),
                 )
+
+        inbound_queue = getattr(self, "_inbound_queue", None)
+        if inbound_queue is not None:
+            await self._await_disconnect_step(
+                inbound_queue.close(),
+                _DISCONNECT_STEP_TIMEOUT,
+                "durable queue close",
+            )
 
         self._app = None
         self._bot = None
@@ -9965,7 +11310,15 @@ class TelegramAdapter(BasePlatformAdapter):
         those updates, so handlers must use ``effective_message`` to avoid
         consuming channel posts without ever building a gateway event.
         """
-        return getattr(update, "effective_message", None) or getattr(update, "message", None)
+        # Prefer the explicit message field when present.  Apart from being
+        # the canonical PTB path, this avoids treating a dynamically-created
+        # placeholder attribute on sparse test/double objects as a real
+        # effective message.  Channel and edited-channel updates have no
+        # ``message`` field, so they still use PTB's effective projection.
+        message = getattr(update, "message", None)
+        if message is not None:
+            return message
+        return getattr(update, "effective_message", None)
 
     async def _handle_text_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle incoming text messages.
@@ -9992,7 +11345,7 @@ class TelegramAdapter(BasePlatformAdapter):
             if self._should_observe_unmentioned_group_message(msg):
                 self._observe_unmentioned_group_message(msg, MessageType.TEXT, update_id=update.update_id)
             return
-        await self._ensure_forum_commands(update.message)
+        await self._ensure_forum_commands(msg)
 
         event = self._build_message_event(msg, MessageType.TEXT, update_id=update.update_id)
         event.text = self._clean_bot_trigger_text(event.text)
@@ -10000,7 +11353,7 @@ class TelegramAdapter(BasePlatformAdapter):
         event = self._apply_telegram_group_observe_attribution(event)
         self._enqueue_text_event(event)
 
-    async def _handle_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    async def _handle_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> Any:
         """Handle incoming command messages."""
         msg = self._effective_update_message(update)
         if not msg or not msg.text:
@@ -10032,9 +11385,9 @@ class TelegramAdapter(BasePlatformAdapter):
         if len(event.text or "") >= self._SPLIT_THRESHOLD:
             self._enqueue_text_event(event)
             return
-        await self.handle_message(event)
+        return await self._dispatch_inbound_event(event)
 
-    async def _handle_location_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    async def _handle_location_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> Any:
         """Handle incoming location/venue pin messages."""
         msg = self._effective_update_message(update)
         if not msg:
@@ -10079,7 +11432,7 @@ class TelegramAdapter(BasePlatformAdapter):
         event = self._build_message_event(msg, MessageType.LOCATION, update_id=update.update_id)
         event.text = "\n".join(parts)
         event = self._apply_telegram_group_observe_attribution(event)
-        await self.handle_message(event)
+        return await self._dispatch_inbound_event(event)
 
     # ------------------------------------------------------------------
     # Text message aggregation (handles Telegram client-side splits)
@@ -10109,6 +11462,7 @@ class TelegramAdapter(BasePlatformAdapter):
         concatenates them and waits for a short quiet period before
         dispatching the combined message.
         """
+        self._defer_durable_event(event)
         if self._should_drop_delayed_delivery():
             self._hold_inbound_event(event, where="text-enqueue")
             return
@@ -10128,6 +11482,9 @@ class TelegramAdapter(BasePlatformAdapter):
             if event.media_urls:
                 existing.media_urls.extend(event.media_urls)
                 existing.media_types.extend(event.media_types)
+            self._merge_durable_event_metadata(existing, event)
+
+        self._mark_durable_event_buffered(event)
 
         # Cancel any pending flush and restart the timer
         prior_task = self._pending_text_batch_tasks.get(key)
@@ -10136,6 +11493,29 @@ class TelegramAdapter(BasePlatformAdapter):
         self._pending_text_batch_tasks[key] = asyncio.create_task(
             self._flush_text_batch(key)
         )
+
+    def _start_batched_durable_dispatch(
+        self, event: MessageEvent
+    ) -> asyncio.Task[Any]:
+        """Detach post-window dispatch from the cancellable batching timer."""
+        tasks = getattr(self, "_durable_batch_dispatch_tasks", None)
+        if tasks is None:
+            tasks = set()
+            self._durable_batch_dispatch_tasks = tasks
+        task = asyncio.create_task(self._dispatch_and_complete_durable_event(event))
+        tasks.add(task)
+
+        def observe(completed: asyncio.Task[Any]) -> None:
+            tasks.discard(completed)
+            try:
+                completed.exception()
+            except asyncio.CancelledError:
+                return
+            except Exception:
+                logger.exception("[Telegram] Detached durable batch dispatch failed")
+
+        task.add_done_callback(observe)
+        return task
 
     async def _flush_text_batch(self, key: str) -> None:
         """Wait for the quiet period then dispatch the aggregated text.
@@ -10181,8 +11561,14 @@ class TelegramAdapter(BasePlatformAdapter):
                 "[Telegram] Flushing text batch %s (%d chars)",
                 key, len(event.text or ""),
             )
-            await self.handle_message(event)
+            durable = bool(self._durable_update_ids(event))
+            dispatch_task = self._start_batched_durable_dispatch(event)
             event = None
+            if not durable:
+                # Preserve the legacy cancellation boundary for ordinary
+                # in-memory events. Durable events own their claim lifecycle
+                # in the detached task and must outlive a replaced batch timer.
+                await dispatch_task
         except asyncio.CancelledError:
             # Cancelled after pop but before durable dispatch — hold, don't lose.
             if event is not None:
@@ -10224,8 +11610,11 @@ class TelegramAdapter(BasePlatformAdapter):
                 event = None
                 return
             logger.info("[Telegram] Flushing photo batch %s with %d image(s)", batch_key, len(event.media_urls))
-            await self.handle_message(event)
+            durable = bool(self._durable_update_ids(event))
+            dispatch_task = self._start_batched_durable_dispatch(event)
             event = None
+            if not durable:
+                await dispatch_task
         except asyncio.CancelledError:
             if event is not None:
                 self._hold_inbound_event(event, where="photo-flush-cancelled")
@@ -10236,6 +11625,7 @@ class TelegramAdapter(BasePlatformAdapter):
 
     def _enqueue_photo_event(self, batch_key: str, event: MessageEvent) -> None:
         """Merge photo events into a pending batch and schedule flush."""
+        self._defer_durable_event(event)
         if self._should_drop_delayed_delivery():
             self._hold_inbound_event(event, where="photo-enqueue")
             return
@@ -10248,6 +11638,9 @@ class TelegramAdapter(BasePlatformAdapter):
             existing.media_types.extend(event.media_types)
             if event.text:
                 existing.text = self._merge_caption(existing.text, event.text)
+            self._merge_durable_event_metadata(existing, event)
+
+        self._mark_durable_event_buffered(event)
 
         prior_task = self._pending_photo_batch_tasks.get(batch_key)
         if prior_task and not prior_task.done():
@@ -10255,31 +11648,29 @@ class TelegramAdapter(BasePlatformAdapter):
 
         self._pending_photo_batch_tasks[batch_key] = asyncio.create_task(self._flush_photo_batch(batch_key))
 
-    async def _handle_media_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    async def _handle_media_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> Any:
         """Handle incoming media messages, downloading images to local cache."""
-        if not update.message:
+        msg = self._effective_update_message(update)
+        if not msg:
             return
-        if not self._is_user_authorized_from_message(update.message):
+        if not self._is_user_authorized_from_message(msg):
             logger.info(
                 "[Telegram] Blocked media from unauthorized user %s in chat %s",
-                getattr(getattr(update.message, "from_user", None), "id", None),
-                getattr(getattr(update.message, "chat", None), "id", None),
+                getattr(getattr(msg, "from_user", None), "id", None),
+                getattr(getattr(msg, "chat", None), "id", None),
             )
             return
-        if not self._should_process_message(update.message):
-            if self._should_observe_unmentioned_group_message(update.message):
-                _m = update.message
-                _observe_type = self._media_message_type(_m)
-                _event = self._build_message_event(_m, _observe_type, update_id=update.update_id)
-                if _m.caption:
-                    _event.text = self._clean_bot_trigger_text(_m.caption)
-                await self._cache_observed_media(_m, _event)
+        if not self._should_process_message(msg):
+            if self._should_observe_unmentioned_group_message(msg):
+                _observe_type = self._media_message_type(msg)
+                _event = self._build_message_event(msg, _observe_type, update_id=update.update_id)
+                if msg.caption:
+                    _event.text = self._clean_bot_trigger_text(msg.caption)
+                await self._cache_observed_media(msg, _event)
                 self._observe_unmentioned_group_message(
-                    _m, _event.message_type, update_id=update.update_id, event=_event
+                    msg, _event.message_type, update_id=update.update_id, event=_event
                 )
             return
-
-        msg = update.message
 
         msg_type = self._media_message_type(msg)
 
@@ -10293,7 +11684,7 @@ class TelegramAdapter(BasePlatformAdapter):
         if msg.sticker:
             await self._handle_sticker(msg, event)
             event = self._apply_telegram_group_observe_attribution(event)
-            await self.handle_message(event)
+            return await self._dispatch_inbound_event(event)
             return
 
         # Apply observe attribution after caption is set; sticker is handled above
@@ -10340,8 +11731,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 if not allowed:
                     event.text = self._append_observed_note(event.text, note or "")
                     logger.info("[Telegram] Skipped oversized user voice (size=%s)", getattr(msg.voice, "file_size", None))
-                    await self.handle_message(event)
-                    return
+                    return await self._dispatch_inbound_event(event)
                 file_obj = await msg.voice.get_file()
                 audio_bytes = await file_obj.download_as_bytearray()
                 cached_path = cache_audio_from_bytes(bytes(audio_bytes), ext=".ogg")
@@ -10357,8 +11747,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 if not allowed:
                     event.text = self._append_observed_note(event.text, note or "")
                     logger.info("[Telegram] Skipped oversized user audio (size=%s)", getattr(msg.audio, "file_size", None))
-                    await self.handle_message(event)
-                    return
+                    return await self._dispatch_inbound_event(event)
                 file_obj = await msg.audio.get_file()
                 audio_bytes = await file_obj.download_as_bytearray()
                 cached_path = cache_audio_from_bytes(bytes(audio_bytes), ext=".mp3")
@@ -10375,8 +11764,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 if not allowed:
                     event.text = self._append_observed_note(event.text, note or "")
                     logger.info("[Telegram] Skipped oversized user video (size=%s)", getattr(msg.video, "file_size", None))
-                    await self.handle_message(event)
-                    return
+                    return await self._dispatch_inbound_event(event)
                 file_obj = await msg.video.get_file()
                 video_bytes = await file_obj.download_as_bytearray()
                 ext = ".mp4"
@@ -10424,8 +11812,7 @@ class TelegramAdapter(BasePlatformAdapter):
                         f"Maximum: {limit_mb} MB."
                     )
                     logger.info("[Telegram] Document too large: %s bytes", doc.file_size)
-                    await self.handle_message(event)
-                    return
+                    return await self._dispatch_inbound_event(event)
 
                 # Telegram may deliver screenshots/photos as documents. If the
                 # payload is actually an image, route it through the image cache
@@ -10442,8 +11829,7 @@ class TelegramAdapter(BasePlatformAdapter):
                             f"Image document '{original_filename or doc_mime or ext or 'unknown'}' "
                             "could not be read as an image."
                         )
-                        await self.handle_message(event)
-                        return
+                        return await self._dispatch_inbound_event(event)
 
                     event.message_type = MessageType.PHOTO
                     event.media_urls = [cached_path]
@@ -10478,8 +11864,7 @@ class TelegramAdapter(BasePlatformAdapter):
                     event.media_types = [SUPPORTED_VIDEO_TYPES[ext]]
                     event.message_type = MessageType.VIDEO
                     logger.info("[Telegram] Cached user video document at %s", cached_path)
-                    await self.handle_message(event)
-                    return
+                    return await self._dispatch_inbound_event(event)
 
                 # NOTE: image-document handling is performed earlier in this
                 # function (ext in _TELEGRAM_IMAGE_EXTENSIONS or image/* mime),
@@ -10506,8 +11891,7 @@ class TelegramAdapter(BasePlatformAdapter):
                         f"Document '{original_filename or doc_mime or ext or 'unknown'}' "
                         "could not be cached."
                     )
-                    await self.handle_message(event)
-                    return
+                    return await self._dispatch_inbound_event(event)
                 event.media_urls = [cached.path]
                 event.media_types = [cached.media_type]
                 if cached.kind == "audio":
@@ -10553,7 +11937,7 @@ class TelegramAdapter(BasePlatformAdapter):
             await self._queue_media_group_event(str(media_group_id), event)
             return
 
-        await self.handle_message(event)
+        return await self._dispatch_inbound_event(event)
 
     async def _queue_media_group_event(self, media_group_id: str, event: MessageEvent) -> None:
         """Buffer Telegram media-group items so albums arrive as one logical event.
@@ -10567,6 +11951,7 @@ class TelegramAdapter(BasePlatformAdapter):
             self._hold_inbound_event(event, where="media-group-enqueue")
             return
 
+        self._defer_durable_event(event)
         existing = self._media_group_events.get(media_group_id)
         if existing is None:
             self._media_group_events[media_group_id] = event
@@ -10575,6 +11960,9 @@ class TelegramAdapter(BasePlatformAdapter):
             existing.media_types.extend(event.media_types)
             if event.text:
                 existing.text = self._merge_caption(existing.text, event.text)
+            self._merge_durable_event_metadata(existing, event)
+
+        self._mark_durable_event_buffered(event)
 
         prior_task = self._media_group_tasks.get(media_group_id)
         if prior_task:
@@ -10596,8 +11984,11 @@ class TelegramAdapter(BasePlatformAdapter):
                 self._hold_inbound_event(event, where="media-group-flush")
                 event = None
                 return
-            await self.handle_message(event)
+            durable = bool(self._durable_update_ids(event))
+            dispatch_task = self._start_batched_durable_dispatch(event)
             event = None
+            if not durable:
+                await dispatch_task
         except asyncio.CancelledError:
             # Cancelled after pop but before durable dispatch — hold, don't lose.
             if event is not None:
@@ -10994,7 +12385,7 @@ class TelegramAdapter(BasePlatformAdapter):
             _chat_id_str if thread_id_str else None,
         )
 
-        return MessageEvent(
+        event = MessageEvent(
             text=message.text or "",
             message_type=msg_type,
             source=source,
@@ -11007,6 +12398,7 @@ class TelegramAdapter(BasePlatformAdapter):
             channel_prompt=_channel_prompt,
             timestamp=message.date,
         )
+        return self._mark_durable_event(event, update_id)
 
     # ── Message reactions (processing lifecycle) ──────────────────────────
 
@@ -11016,10 +12408,11 @@ class TelegramAdapter(BasePlatformAdapter):
 
     async def _set_reaction(self, chat_id: str, message_id: str, emoji: str) -> bool:
         """Set a single emoji reaction on a Telegram message."""
-        if not self._bot:
+        bot = getattr(self, "_bot", None)
+        if not bot:
             return False
         try:
-            await self._bot.set_message_reaction(
+            await bot.set_message_reaction(
                 chat_id=normalize_telegram_chat_id(chat_id),
                 message_id=int(message_id),
                 reaction=emoji,
@@ -11037,10 +12430,11 @@ class TelegramAdapter(BasePlatformAdapter):
         reactions on a message — equivalent to Bot API 10.0's
         ``deleteMessageReaction`` but supported in PTB 22.6 already.
         """
-        if not self._bot:
+        bot = getattr(self, "_bot", None)
+        if not bot:
             return False
         try:
-            await self._bot.set_message_reaction(
+            await bot.set_message_reaction(
                 chat_id=normalize_telegram_chat_id(chat_id),
                 message_id=int(message_id),
                 reaction=None,
@@ -11052,6 +12446,7 @@ class TelegramAdapter(BasePlatformAdapter):
 
     async def on_processing_start(self, event: MessageEvent) -> None:
         """Add an in-progress reaction when message processing begins."""
+        setattr(event, "_telegram_processing_started", True)
         if not self._reactions_enabled():
             return
         chat_id = getattr(event.source, "chat_id", None)
@@ -11072,6 +12467,17 @@ class TelegramAdapter(BasePlatformAdapter):
         another agent run to swap it to 👍/👎 — which never happens if the
         cancellation was the last activity in the chat.
         """
+        # BasePlatformAdapter contains ordinary handler exceptions inside the
+        # owner task. Record its lifecycle result on both the exact event and
+        # its owner so a FIFO-drained event cannot mistake failure for success.
+        setattr(event, "_telegram_processing_outcome", outcome)
+        owner_task = asyncio.current_task()
+        if owner_task is not None:
+            setattr(owner_task, "_telegram_processing_outcome", outcome)
+        signal = getattr(event, "_telegram_processing_complete", None)
+        if isinstance(signal, asyncio.Event):
+            signal.set()
+        self._schedule_durable_processing_completion(event, outcome)
         if not self._reactions_enabled():
             return
         chat_id = getattr(event.source, "chat_id", None)
