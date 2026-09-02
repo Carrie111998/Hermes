@@ -206,3 +206,21 @@ class TestSendWithRetryAfter:
         second_sleep = mock_sleep.call_args_list[1][0][0]
         assert second_sleep >= 29.0  # 30 - 1 (max jitter)
 
+    @pytest.mark.asyncio
+    async def test_retry_after_budget_is_unlimited_by_default(self):
+        """Adapters that do not opt in preserve consecutive retry_after waits."""
+        adapter = _StubAdapter()
+        adapter._send_results = [
+            SendResult(success=False, error="rate limited once", retryable=True, retry_after=35.0),
+            SendResult(success=False, error="rate limited twice", retryable=True, retry_after=35.0),
+            SendResult(success=True, message_id="ok"),
+        ]
+
+        with (
+            patch("asyncio.sleep", new_callable=AsyncMock) as mock_sleep,
+            patch("gateway.platforms.base.random.uniform", return_value=0.0),
+        ):
+            result = await adapter._send_with_retry("chat1", "hello", max_retries=2)
+
+        assert result.success
+        assert [call.args[0] for call in mock_sleep.await_args_list] == [35.0, 35.0]

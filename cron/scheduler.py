@@ -2508,7 +2508,7 @@ def _resolve_single_delivery_target(job: dict, deliver_value: str) -> Optional[d
 
     if deliver_value == "origin":
         if origin:
-            return {
+            target = {
                 "platform": origin["platform"],
                 "chat_id": str(origin["chat_id"]),
                 "thread_id": _origin_delivery_thread(origin),
@@ -2516,6 +2516,9 @@ def _resolve_single_delivery_target(job: dict, deliver_value: str) -> Optional[d
                 # _target_mirror_eligible): this IS the origin conversation.
                 "_resolved_from": "origin",
             }
+            if origin.get("user_id") is not None:
+                target["user_id"] = str(origin["user_id"])
+            return target
         # Origin missing (e.g. job created via API/script) — try each
         # platform's home channel as a fallback instead of silently dropping.
         for platform_name in _iter_home_target_platforms():
@@ -6082,6 +6085,7 @@ def run_job(
         "HERMES_CRON_AUTO_DELIVER_PLATFORM",
         "HERMES_CRON_AUTO_DELIVER_CHAT_ID",
         "HERMES_CRON_AUTO_DELIVER_THREAD_ID",
+        "HERMES_CRON_AUTO_DELIVER_USER_ID",
     )
     for _var_name in _cron_delivery_vars:
         _VAR_MAP[_var_name].set("")
@@ -6160,6 +6164,11 @@ def run_job(
                 ""
                 if delivery_target.get("thread_id") is None
                 else str(delivery_target["thread_id"])
+            )
+            _VAR_MAP["HERMES_CRON_AUTO_DELIVER_USER_ID"].set(
+                ""
+                if delivery_target.get("user_id") is None
+                else str(delivery_target["user_id"])
             )
 
         # Model resolution precedence: per-job override > cron.model (the
