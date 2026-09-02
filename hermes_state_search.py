@@ -310,18 +310,29 @@ class SessionSearchMixin:
             # The chunk upper bound is an id, not a row count, so gaps from
             # deleted rows don't shrink chunks below the claimed range.
             upper = min(progress + chunk, high_water)
+            # Anti-join so a hole-fill of one projection (partial trigram
+            # against a complete base index) cannot duplicate already-indexed
+            # rows. The finish-boundary sweep already used this shape; the
+            # chunk worker did not, which forced a delete-all before replay.
             conn.execute(
                 "INSERT INTO messages_fts(rowid, content, tool_name, tool_calls) "
-                "SELECT id, content, tool_name, tool_calls FROM messages "
-                "WHERE id > ? AND id <= ?",
+                "SELECT m.id, m.content, m.tool_name, m.tool_calls "
+                "FROM messages m "
+                "WHERE m.id > ? AND m.id <= ? "
+                "AND NOT EXISTS ("
+                "SELECT 1 FROM messages_fts_docsize d WHERE d.id = m.id)",
                 (progress, upper),
             )
             if include_trigram:
                 conn.execute(
                     "INSERT INTO messages_fts_trigram"
                     "(rowid, content, tool_name, tool_calls) "
-                    "SELECT id, content, tool_name, tool_calls FROM messages "
-                    "WHERE id > ? AND id <= ? AND role <> 'tool'",
+                    "SELECT m.id, m.content, m.tool_name, m.tool_calls "
+                    "FROM messages m "
+                    "WHERE m.id > ? AND m.id <= ? AND m.role <> 'tool' "
+                    "AND NOT EXISTS ("
+                    "SELECT 1 FROM messages_fts_trigram_docsize d "
+                    "WHERE d.id = m.id)",
                     (progress, upper),
                 )
             # Publish progress in the same transaction as the rows it
@@ -482,6 +493,12 @@ class SessionSearchMixin:
         zero ``messages_fts_docsize`` rows against a non-empty messages table.
         Healthy installs (and mid-backfill installs that still hold markers)
         never match.
+
+        EXISTS, not COUNT: this runs on every writable open via the
+        ``_init_schema`` stamp condition. A partial-but-non-empty projection
+        (the field shape in #72716) is a different class — see
+        :meth:`_fts_projection_incomplete`, which is COUNT-based and must
+        stay off the every-open path.
         """
         try:
             has_msg = conn.execute(
@@ -492,9 +509,8 @@ class SessionSearchMixin:
             # docsize is the authoritative "is this rowid indexed" surface for
             # external-content FTS5; probing the virtual table itself is
             # not reliable across SQLite builds. EXISTS instead of COUNT(*):
-            # this runs on every writable open via the _init_schema stamp
-            # condition, and COUNT(*) is a full b-tree scan (~100ms on a
-            # 2M-row table) while EXISTS is O(1).
+            # COUNT(*) is a full b-tree scan (~100ms on a 2M-row table) while
+            # EXISTS is O(1).
             has_fts = conn.execute(
                 "SELECT EXISTS(SELECT 1 FROM messages_fts_docsize)"
             ).fetchone()[0]
@@ -502,6 +518,54 @@ class SessionSearchMixin:
         except sqlite3.OperationalError:
             # Table absent / FTS disabled mid-init — not this failure class.
             return False
+
+    def _fts_projection_incomplete(self, conn) -> bool:
+        """True when a v23 external-content projection is short of its source.
+
+        Complements :meth:`_fts_external_index_empty_with_messages`. Empty
+        detection is EXISTS on the base index only, so a non-empty but
+        historically truncated trigram index (or a base index missing most
+        of ``messages``) is stamped complete and ``optimize-storage``
+        reports nothing to do. Operator paths — optimize availability,
+        settle, bookkeeping repair, recover verification — use this COUNT
+        parity check instead. Do not call from ``_init_schema``.
+
+        Trigram is optional (tokenizer). A missing trigram table is not
+        incomplete; a present trigram table must match
+        ``messages_fts_trigram_src``.
+        """
+        try:
+            n_msg = conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
+        except sqlite3.OperationalError:
+            return False
+        if int(n_msg) == 0:
+            return False
+        try:
+            n_base = conn.execute(
+                "SELECT COUNT(*) FROM messages_fts_docsize"
+            ).fetchone()[0]
+        except sqlite3.OperationalError:
+            return False
+        if int(n_base) != int(n_msg):
+            return True
+        tri_present = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+            "AND name = 'messages_fts_trigram' LIMIT 1"
+        ).fetchone()
+        if tri_present is None:
+            return False
+        try:
+            n_tri = conn.execute(
+                "SELECT COUNT(*) FROM messages_fts_trigram_docsize"
+            ).fetchone()[0]
+            n_src = conn.execute(
+                "SELECT COUNT(*) FROM messages_fts_trigram_src"
+            ).fetchone()[0]
+        except sqlite3.OperationalError:
+            # Table exists but the docsize shadow or content view does not —
+            # the projection cannot be complete.
+            return True
+        return int(n_tri) != int(n_src)
 
     def _fts_index_known_empty(self, conn) -> bool:
         """True when the base external-content index holds no rows.
@@ -526,10 +590,13 @@ class SessionSearchMixin:
         regenerated from the content table; measured ~12µs/row, minutes on a
         large index, while holding the write lock) and corrupts the index if
         indexed rows have diverged from ``messages`` — precisely the broken-
-        bookkeeping shape this repair path handles. The backfill chunk worker
-        replays its whole selected id range with no anti-join, so a replay
-        from zero is only safe once the index is known empty — this is how a
-        partially indexed DB gets there.
+        bookkeeping shape this repair path handles.
+
+        Chunk INSERTs anti-join, but live UPDATE/DELETE triggers treat
+        ``(fts_rebuild_progress, fts_rebuild_high_water]`` as unindexed.
+        Seeding those markers over a populated index leaves stale tokens
+        (edits and redactions never refresh, deletes leave orphan docsize
+        rows). Replay from zero is only safe once the index is empty.
         """
         for tbl in ("messages_fts", "messages_fts_trigram"):
             try:
@@ -543,11 +610,11 @@ class SessionSearchMixin:
 
         When ``force`` is False and high_water is already set, only repairs a
         missing progress key (stuck no-op when high_water exists alone), and
-        only after the index is known empty: the chunk worker replays its
-        whole selected id range without an anti-join, so a partially indexed
-        DB is first reset to a known-empty surface rather than rebuilt from
-        zero on top of surviving rows. Caller must hold the write
-        transaction / lock as appropriate.
+        only after the index is known empty: a progress-less claim used to
+        replay from zero on top of surviving rows. The chunk worker now
+        anti-joins, but this path still resets so an older concurrent
+        inserter cannot duplicate. Caller must hold the write transaction /
+        lock as appropriate.
         """
         existing_hw = conn.execute(
             "SELECT value FROM state_meta WHERE key = 'fts_rebuild_high_water'"
@@ -587,7 +654,7 @@ class SessionSearchMixin:
     def _repair_optimize_bookkeeping(self) -> None:
         """Heal interrupted demote/backfill bookkeeping before optimize runs.
 
-        Covers two post-#65798 failure classes:
+        Covers three post-#65798 failure classes:
 
         1. Empty external-content index with messages present and no rebuild
            markers (demote crash window after empty v23 tables landed but
@@ -596,7 +663,13 @@ class SessionSearchMixin:
         2. ``fts_rebuild_high_water`` present without ``fts_rebuild_progress``
            (partial meta) — seed progress so the chunk loop is not a no-op,
            resetting a partially populated index to a known-empty surface
-           first so the anti-join-free chunk replay cannot duplicate rows.
+           first so a concurrent older inserter cannot duplicate rows.
+        3. Non-empty but incomplete projection (base or trigram docsize
+           short of its source cohort, no markers). Reset both indexes
+           to empty, then seed a full backfill. Hole-fill without reset
+           writes the rebuild marker pair over a populated base index,
+           so live UPDATE/DELETE triggers skip those ids and stale
+           tokens survive while optimize reports success.
 
         Must not invent markers on a still-legacy inline DB: that would make
         ``optimize_fts_storage`` skip demote (``legacy and not pending``) and
@@ -629,12 +702,20 @@ class SessionSearchMixin:
             if self._db_has_legacy_inline_fts(conn):
                 return
 
-            # Non-legacy empty external index (demote crash window / premature
-            # stamp): seed a full backfill claim.
-            if self._fts_external_index_empty_with_messages(conn):
+            # Non-legacy empty or partial external index (demote crash
+            # window, premature stamp, or truncated trigram): reset to a
+            # known-empty surface, then seed a full backfill. The rebuild
+            # markers mean rows in (progress, high_water] are unindexed;
+            # writing them over surviving docsize rows makes UPDATE/DELETE
+            # skip those ids while INSERT anti-join keeps the old tokens.
+            if (
+                self._fts_external_index_empty_with_messages(conn)
+                or self._fts_projection_incomplete(conn)
+            ):
                 conn.execute(
                     "DELETE FROM state_meta WHERE key = 'fts_storage_version'"
                 )
+                self._reset_fts_index_to_empty(conn)
                 self._seed_fts_rebuild_markers(conn, force=True)
         self._execute_write(_do)
 
@@ -645,8 +726,8 @@ class SessionSearchMixin:
         (legacy vtables already demoted, but backfill markers and/or trash
         tables remain) and re-running would resume it, or the CJK-bigram
         index needs a backfill/rebuild on this tokenizer-capable host, or
-        a prior demote left an empty external-content index without markers
-        (healable on re-run).
+        a prior demote left an empty or partial external-content index
+        without markers (healable on re-run).
         False for fresh and fully-optimized installs (and when FTS5 is
         unavailable)."""
         if not self._fts_enabled or self.read_only:
@@ -674,10 +755,14 @@ class SessionSearchMixin:
                 return True
             if self._has_fts_trash(self._conn):
                 return True
-            # Pre-fix crash window: empty external-content index with
-            # messages still present, no markers, no trash (teardown already
-            # finished or never needed). Re-run seeds markers and backfills.
-            return self._fts_external_index_empty_with_messages(self._conn)
+            # Pre-fix crash window / truncated projection: empty or partial
+            # external-content index with messages still present, no markers,
+            # no trash. Re-run seeds markers and backfills. COUNT parity is
+            # acceptable here: this is the operator command, not startup.
+            return (
+                self._fts_external_index_empty_with_messages(self._conn)
+                or self._fts_projection_incomplete(self._conn)
+            )
 
     def _demote_legacy_fts_to_trash(self) -> int:
         """Demote the legacy inline FTS vtables and stage their shadow tables
@@ -872,9 +957,10 @@ class SessionSearchMixin:
             _emit("teardown")
             _pause(time.monotonic() - _t0)
 
-        # Refuse to stamp "optimized" while work remains or the base index is
-        # still empty against a non-empty messages table. Pre-fix code could
-        # tear down trash and settle after a no-op backfill when markers were
+        # Refuse to stamp "optimized" while work remains, the base index is
+        # still empty against a non-empty messages table, or either
+        # projection is short of its source cohort. Pre-fix code could tear
+        # down trash and settle after a no-op backfill when markers were
         # missing — permanent search-index loss for historical rows.
         with self._lock:
             still_pending = self._conn.execute(
@@ -883,15 +969,17 @@ class SessionSearchMixin:
             ).fetchone() is not None
             still_trash = self._has_fts_trash(self._conn)
             empty_index = self._fts_external_index_empty_with_messages(self._conn)
-        if still_pending or still_trash or empty_index:
+            incomplete = self._fts_projection_incomplete(self._conn)
+        if still_pending or still_trash or empty_index or incomplete:
             reason = (
-                "backfill_incomplete" if still_pending or empty_index
+                "backfill_incomplete"
+                if still_pending or empty_index or incomplete
                 else "teardown_incomplete"
             )
             logger.warning(
                 "FTS storage optimization did not settle (%s): "
-                "pending=%s trash=%s empty_index=%s",
-                reason, still_pending, still_trash, empty_index,
+                "pending=%s trash=%s empty_index=%s incomplete=%s",
+                reason, still_pending, still_trash, empty_index, incomplete,
             )
             return {"ok": False, "reason": reason, "vacuumed": None}
 
@@ -946,7 +1034,10 @@ class SessionSearchMixin:
                 return "backfill_incomplete"
             if self._has_fts_trash(conn):
                 return "teardown_incomplete"
-            if self._fts_external_index_empty_with_messages(conn):
+            if (
+                self._fts_external_index_empty_with_messages(conn)
+                or self._fts_projection_incomplete(conn)
+            ):
                 return "backfill_incomplete"
             conn.execute(
                 "INSERT INTO state_meta (key, value) VALUES ('fts_storage_version', ?) "

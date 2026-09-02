@@ -17,6 +17,7 @@ from hermes_cli import session_recovery
 from hermes_cli.session_recovery import (
     SessionRecoverySafetyError,
     SessionRecoverySourceError,
+    _verify_recovered_database,
     inspect_session_database,
     recover_session_database,
 )
@@ -646,6 +647,57 @@ def test_partial_recovery_clears_only_unreadable_system_prompt_refs(
         )
     finally:
         conn.close()
+
+
+def test_recover_verification_rejects_partial_trigram_projection(
+    tmp_path: Path,
+) -> None:
+    """verified=true must not certify a truncated trigram index.
+
+    External-content FTS COUNT(*) / integrity-check / MATCH '' all pass
+    when the inverted index is a handful of post-switch rows against a
+    complete content view. The certificate has to use docsize parity.
+    """
+    path = tmp_path / "partial-trigram.db"
+    db = SessionDB(db_path=path)
+    try:
+        if not db._trigram_available:
+            pytest.skip("trigram tokenizer unavailable")
+        db.create_session("s1", "cli")
+        for i, role in enumerate(("user", "assistant", "tool") * 3):
+            db.append_message("s1", role, f"recover-trigram {role} {i}")
+        db._conn.execute(
+            "INSERT INTO messages_fts_trigram(messages_fts_trigram) "
+            "VALUES('delete-all')"
+        )
+        keep_id = db._conn.execute(
+            "SELECT id FROM messages WHERE role <> 'tool' ORDER BY id LIMIT 1"
+        ).fetchone()[0]
+        db._conn.execute(
+            "INSERT INTO messages_fts_trigram"
+            "(rowid, content, tool_name, tool_calls) "
+            "SELECT id, content, tool_name, tool_calls FROM messages "
+            "WHERE id = ?",
+            (keep_id,),
+        )
+        db._conn.commit()
+    finally:
+        db.close()
+
+    verification = _verify_recovered_database(
+        path,
+        expected_counts={"sessions": None, "messages": None},
+        copy_report={},
+    )
+    assert verification["healthy"] is False
+    assert any(
+        "messages_fts_trigram_docsize" in error
+        for error in verification["errors"]
+    ), verification["errors"]
+    assert verification["fts_checks"].get("messages_fts_trigram") == "ok"
+    projection = verification["fts_projection"]
+    assert projection["messages_fts_trigram_docsize"] == 1
+    assert projection["messages_fts_trigram_src"] > 1
 
 
 
