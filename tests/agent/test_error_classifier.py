@@ -204,6 +204,29 @@ class TestClassifyApiError:
         assert result.reason == FailoverReason.auth
         assert result.should_fallback is True
 
+    def test_403_weekly_usage_limit_rotates_credential(self):
+        e = MockAPIError(
+            "You've reached your weekly (7-day) usage limit.",
+            status_code=403,
+        )
+
+        result = classify_api_error(e, provider="kimi-coding")
+
+        assert result.reason == FailoverReason.billing
+        assert result.retryable is False
+        assert result.should_rotate_credential is True
+        assert result.should_fallback is True
+
+    def test_403_transient_usage_limit_is_not_billing(self):
+        e = MockAPIError(
+            "Usage limit reached; retry after 60 seconds.",
+            status_code=403,
+        )
+
+        result = classify_api_error(e, provider="kimi-coding")
+
+        assert result.reason != FailoverReason.billing
+
 
 
 

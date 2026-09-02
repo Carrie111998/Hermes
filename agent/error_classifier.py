@@ -1271,7 +1271,9 @@ def _classify_by_status(
 
     if status_code == 403:
         # OpenRouter 403 "key limit exceeded" is actually billing. Other
-        # providers also use 403 for account-plan or credit exhaustion.
+        # providers also use 403 for account-plan, credit, or hard usage-quota
+        # exhaustion. Reuse the same semantic quota-wall predicate as the 429
+        # path so a provider-specific status code cannot bypass pool rotation.
         if (
             (
                 provider == "xai-oauth"
@@ -1279,7 +1281,12 @@ def _classify_by_status(
             )
             or "key limit exceeded" in error_msg
             or "spending limit" in error_msg
-            or any(p in error_msg for p in _BILLING_PATTERNS)
+            or _is_hard_usage_or_billing_limit(
+                error_msg,
+                error_code,
+                body,
+                response_headers,
+            )
         ):
             return result_fn(
                 FailoverReason.billing,
@@ -1399,28 +1406,11 @@ def _classify_by_status(
         # not itself an explicit rate-limit phrase. Without that guard,
         # "Rate limit exceeded" ("limit exceeded" substring) would wrongly
         # promote to non-retryable billing. (broadening + guard credit #39441)
-        has_usage_limit = (
-            error_code.lower() == "usage_limit_reached"
-            or "usage_limit_reached" in error_msg
-            or any(p in error_msg for p in _USAGE_LIMIT_PATTERNS)
-        )
-        # Explicit billing phrases in a 429 body are a hard wall regardless of
-        # usage-limit wording — a provider that wraps "insufficient credits" in
-        # a 429 (rather than 402) was previously retried as a rate limit and
-        # burned the pool. (credit #39441)
-        has_billing = any(p in error_msg for p in _BILLING_PATTERNS)
-        has_explicit_rate_limit = any(
-            p in error_msg for p in _RATE_LIMIT_PATTERNS
-        )
-        has_transient_signal = _has_usage_limit_transient_signal(
+        if _is_hard_usage_or_billing_limit(
             error_msg,
+            error_code,
             body,
             response_headers,
-        )
-        if (
-            (has_billing or has_usage_limit)
-            and not has_explicit_rate_limit
-            and not has_transient_signal
         ):
             return result_fn(
                 FailoverReason.billing,
@@ -1568,6 +1558,34 @@ def _has_usage_limit_transient_signal(
             if value is not None and value != "":
                 return True
     return False
+
+
+def _is_hard_usage_or_billing_limit(
+    error_msg: str,
+    error_code: str,
+    body: dict,
+    response_headers,
+) -> bool:
+    """Return whether an account-scoped quota wall should rotate credentials."""
+    has_usage_limit = (
+        error_code.lower() == "usage_limit_reached"
+        or "usage_limit_reached" in error_msg
+        or any(pattern in error_msg for pattern in _USAGE_LIMIT_PATTERNS)
+    )
+    has_billing = any(pattern in error_msg for pattern in _BILLING_PATTERNS)
+    has_explicit_rate_limit = any(
+        pattern in error_msg for pattern in _RATE_LIMIT_PATTERNS
+    )
+    has_transient_signal = _has_usage_limit_transient_signal(
+        error_msg,
+        body,
+        response_headers,
+    )
+    return (
+        (has_billing or has_usage_limit)
+        and not has_explicit_rate_limit
+        and not has_transient_signal
+    )
 
 
 def _classify_402(error_msg: str, result_fn) -> ClassifiedError:
