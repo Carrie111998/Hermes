@@ -10,6 +10,7 @@ export interface WorldAssetManifestEntry {
 
 export interface WorldAssetManifest {
   assets: WorldAssetManifestEntry[]
+  profileManifest: string
   renderProfile: string
   scene: string
   schemaVersion: 1
@@ -42,6 +43,7 @@ export const LUNAR_CITY_ASSET_MANIFEST: WorldAssetManifest = {
     { collection: 'Characters', id: 'dispatcher-cube', kind: 'character', lod: ['high', 'low'], role: 'dispatcher' }
   ],
   renderProfile: 'desktop-preview',
+  profileManifest: 'lunar-city/profile-assets.json',
   scene: 'lunar-city-baseline',
   schemaVersion: 1,
   source: 'procedural-blender-baseline',

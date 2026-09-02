@@ -4,6 +4,7 @@
   "source": "procedural-blender-baseline",
   "units": "meters",
   "renderProfile": "desktop-preview",
+  "profileManifest": "lunar-city/profile-assets.json",
   "assets": [
     { "id": "terrain-colony-basin", "kind": "terrain", "collection": "Terrain", "lod": ["high", "low"] },
     { "id": "road-network-primary", "kind": "road", "collection": "Roads", "lod": ["high", "low"] },

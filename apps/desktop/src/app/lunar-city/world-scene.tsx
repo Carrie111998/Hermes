@@ -91,13 +91,22 @@ export function WorldScene({ onSelectSubject, projection }: WorldSceneProps) {
                 {LUNAR_CITY_ASSET_MANIFEST.assets.length} authored baseline assets ·{' '}
                 {LUNAR_CITY_ASSET_MANIFEST.renderProfile}
               </span>
-              <a
-                className="text-cyan-200 underline decoration-cyan-200/40 underline-offset-2 hover:text-white"
-                download="lunar-city-baseline.glb"
-                href={`${import.meta.env.BASE_URL}lunar-city/lunar-city-baseline.glb`}
-              >
-                Download 3D scene
-              </a>
+              <span className="flex flex-wrap gap-3">
+                <a
+                  className="text-cyan-200 underline decoration-cyan-200/40 underline-offset-2 hover:text-white"
+                  download="lunar-city-baseline.glb"
+                  href={`${import.meta.env.BASE_URL}lunar-city/lunar-city-baseline.glb`}
+                >
+                  Download 3D scene
+                </a>
+                <a
+                  className="text-violet-200 underline decoration-violet-200/40 underline-offset-2 hover:text-white"
+                  download="profile-class-roster.json"
+                  href={`${import.meta.env.BASE_URL}${LUNAR_CITY_ASSET_MANIFEST.profileManifest}`}
+                >
+                  Download class roster
+                </a>
+              </span>
             </div>
           </div>
 
