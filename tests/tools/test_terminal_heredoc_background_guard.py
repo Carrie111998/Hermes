@@ -87,6 +87,69 @@ class TestInertQuotedHeredocPayloadAllowed:
         )
         assert guidance(cmd) is None
 
+    def test_cd_link_does_not_defeat_python_heredoc(self):
+        """The extremely common `cd ~/x && python - <<'EOF'` has its heredoc
+        body masked: the cd link only changes the working directory."""
+        cmd = (
+            "cd ~/pivot-trader " + AMP + AMP + " .venv/bin/python - <<'EOF'" + NL
+            + "m = (a > 1) " + AMP + " (b < 4)" + NL
+            + "EOF"
+        )
+        assert guidance(cmd) is None
+
+    def test_cd_abs_path_does_not_defeat_python_heredoc(self):
+        cmd = (
+            "cd /home/albert/pivot-trader " + AMP + AMP + " python3 - <<'EOF'" + NL
+            + "x = a " + AMP + " b" + NL
+            + "EOF"
+        )
+        assert guidance(cmd) is None
+
+    def test_tilde_interpreter_path_allowed(self):
+        """`~/pivot-trader/.venv/bin/python - <<'EOF'` — tilde path prefix."""
+        cmd = (
+            "~/pivot-trader/.venv/bin/python - <<'EOF'" + NL
+            + "y = (a) " + AMP + " (b)" + NL
+            + "EOF"
+        )
+        assert guidance(cmd) is None
+
+    def test_timeout_wrapper_does_not_defeat_heredoc(self):
+        cmd = (
+            "cd ~/pivot-trader " + AMP + AMP + " timeout 150 .venv/bin/python - <<'PYEOF'" + NL
+            + "z = p " + AMP + " q" + NL
+            + "PYEOF"
+        )
+        assert guidance(cmd) is None
+
+    def test_multiple_cd_links_do_not_defeat_heredoc(self):
+        cmd = (
+            "cd /tmp " + AMP + AMP + " cd ~/pivot-trader " + AMP + AMP + " python3 - <<'EOF'" + NL
+            + "v = a " + AMP + " b" + NL
+            + "EOF"
+        )
+        assert guidance(cmd) is None
+
+    def test_source_activate_link_does_not_defeat_heredoc(self):
+        """`source .venv/bin/activate && PYTHONPATH=src python <<'EOF'` — the
+        source prologue sets up the venv; the body still belongs to python."""
+        cmd = (
+            "cd ~/pivot-trader " + AMP + AMP + " source .venv/bin/activate "
+            + AMP + AMP + " PYTHONPATH=src python - <<'EOF'" + NL
+            + "cnt = ((R.days_to_low >= a) " + AMP + " (R.days_to_low <= b)).sum()" + NL
+            + "EOF"
+        )
+        assert guidance(cmd) is None
+
+    def test_source_link_bash_consumer_still_scanned(self):
+        """source before bash — bash executes its body as shell, no masking."""
+        cmd = (
+            "source .venv/bin/activate " + AMP + AMP + " bash - <<'EOF'" + NL
+            + "nohup sleep 10 " + AMP + NL
+            + "EOF"
+        )
+        assert guidance(cmd) is not None
+
 
 class TestUnsafeHeredocPayloadRemainsVisible:
     """Bodies that can execute (or can't be proven inert) stay scanned.
@@ -119,6 +182,33 @@ class TestUnsafeHeredocPayloadRemainsVisible:
     def test_python_elsewhere_does_not_authorize_bash_heredoc(self):
         cmd = (
             "python3 -c 'pass'; bash <<'EOF'" + NL
+            + "nohup sleep 10 " + AMP + NL
+            + "EOF"
+        )
+        assert guidance(cmd) is not None
+
+    def test_cd_with_substitution_does_not_authorize_python_heredoc(self):
+        """`cd $(...) && python` runs a command in the path — not inert."""
+        cmd = (
+            "cd $(pwd) " + AMP + AMP + " python3 - <<'EOF'" + NL
+            + "x = a " + AMP + " b" + NL
+            + "EOF"
+        )
+        assert guidance(cmd) is not None
+
+    def test_cd_link_without_amp_does_not_authorize_heredoc(self):
+        """`python` after a cd not followed by `&&` is not a link: no masking."""
+        cmd = (
+            "cd /tmp python3 - <<'EOF'" + NL
+            + "x = a " + AMP + " b" + NL
+            + "EOF"
+        )
+        assert guidance(cmd) is not None
+
+    def test_cd_link_bash_consumer_still_scanned(self):
+        """cd link before bash — bash executes its body as shell, no masking."""
+        cmd = (
+            "cd /tmp " + AMP + AMP + " bash - <<'EOF'" + NL
             + "nohup sleep 10 " + AMP + NL
             + "EOF"
         )

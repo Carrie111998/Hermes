@@ -43,13 +43,35 @@ import re
 # Non-shell interpreters whose (quoted, inert) heredoc bodies are safe to
 # mask: the body is program text or plain data for THAT interpreter, not
 # shell syntax executed by this command line. Optional VAR=... assignments,
-# an ``env`` prefix, and a path prefix are allowed. Deliberately narrow:
-# anything not matched keeps its body visible (fail-closed).
+# an ``env`` prefix, a ``cd <path> &&`` / ``source <path> &&`` prologue link,
+# a ``timeout <N>`` wrapper, and a path prefix are allowed. Deliberately
+# narrow: anything not matched keeps its body visible (fail-closed).
+#
+# A prologue link (``cd``/``source``) is inert only when its path is a
+# plain, substitution-free token: quoting or ``$(...)``/backticks mean the
+# argument is evaluated by the shell, so such a link is NOT provably inert
+# and stays visible (fail-closed). The same regex drives the scanner's
+# skip-ahead so the link's ``&&`` is not counted as a list operator.
+# ``source`` runs a script before the interpreter — acceptable here because
+# the masking decision only ever covers the interpreter's own quoted
+# heredoc body, never the opener's prologue, and ``&&`` separators after the
+# prologue still count as list operators.
+_INERT_PROLOGUE_LINK_RE = re.compile(
+    r"(?:cd|source)\s+(?:[^$;|&'=\"`\n()]|\\\s)+(?:\s*&&\s*)",
+    re.IGNORECASE,
+)
+
 _INERT_HEREDOC_CONSUMER_RE = re.compile(
     r"^\s*"
+    # Env assignments may appear both before and between prologue links
+    # (e.g. `cd x && source activate && PYTHONPATH=src python`).
+    r"(?:(?:[A-Z_][A-Z0-9_]*=\S+\s+)?(?:" + _INERT_PROLOGUE_LINK_RE.pattern + r")?)*"
     r"(?:[A-Z_][A-Z0-9_]*=\S+\s+)*"
     r"(?:env\s+)?"
-    r"(?:[A-Za-z0-9_./-]+/)?"
+    # ``timeout <N> python...`` defers but does not reinterpret the body;
+    # the interpreter is still the consumer, so the body stays inert.
+    r"(?:timeout\s+\d+(?:s|m|h|d)?\s+)*"
+    r"(?:~?[A-Za-z0-9_./-]+/)?"
     r"(?:python(?:3(?:\.\d+)*)?|osascript|cat)(?=\s|$)",
     re.IGNORECASE,
 )
@@ -197,6 +219,20 @@ def _scan_heredoc_command_unit(command: str, start: int):
     specs = []
     unknown_operator = False
     has_list_operator = False
+
+    # A leading `cd <path> && ...` / `source <path> && ...` prologue only
+    # sets up the context; its `&&` is not an imperative list operator, so
+    # skip it (repeatedly) before scanning the real command. This keeps the
+    # extremely common agent spelling `cd ~/x && python - <<'EOF'` maskable
+    # by the consumer check below, while a bare `&` or `;` as a SEPARATOR
+    # still counts. Anything that is not a plain, substitution-free prologue
+    # link (quoted path, $(...)) fails closed: the link is not consumed and
+    # `&&` remains a list op.
+    while True:
+        link = _INERT_PROLOGUE_LINK_RE.match(command, cursor)
+        if link is None:
+            break
+        cursor = link.end()
 
     while cursor < len(command):
         char = command[cursor]

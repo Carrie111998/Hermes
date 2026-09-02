@@ -807,3 +807,44 @@ def test_sudo_stdin_guard_container_bypass(clean_session):
         for cmd in _SUDO_STDIN_BLOCK:
             result = check_all_command_guards(cmd, env)
             assert result["approved"] is True, f"container {env} should bypass sudo guard on {cmd!r}"
+
+
+# -------------------------------------------------------------------------
+# Quoted grep inside command substitution must NOT hardline the whole command
+# -------------------------------------------------------------------------
+# `sed -n "$(grep -n 'x' f)"` is a well-formed, benign workflow that used to
+# be unconditionally blocked as "malformed executable payload": the grep word
+# sits inside a double-quoted command substitution, so the segment lexer
+# cannot establish the quoted operand span and failed closed the WHOLE
+# command. The raw command remains fully scanned by every other detector, so
+# skipping the unprovable operand is not a security regression.
+
+_GREP_SUBST_BENIGN = [
+    "sed -n \"$(grep -n 'def add' src/realtime/store.py | head -1 | cut -d: -f1)\"",
+    "cd ~/pivot-trader && grep -n \"def add\" src/realtime/store.py; sed -n \"$(grep -n 'def add' src/realtime/store.py | head -1 | cut -d: -f1)\"",
+    'sed -n "$(grep -n "def add" src/realtime/store.py)"',
+    "grep -n 'def add' file; sed -n \"$(grep -n 'def add' file)\"",
+]
+
+
+@pytest.mark.parametrize("command", _GREP_SUBST_BENIGN)
+def test_grep_substitution_is_not_malformed(command):
+    """Grep inside a command substitution is not a malformed executable."""
+    is_hardline, desc = detect_hardline_command(command)
+    assert is_hardline is False, f"should not hardline {command!r}: {desc}"
+
+
+def test_grep_substitution_still_scanned_by_dangerous():
+    """The raw command keeps reaching the dangerous tier unchanged."""
+    for command in _GREP_SUBST_BENIGN:
+        # No dangerous keywords in these benign samples — both tiers allow.
+        is_hardline, _ = detect_hardline_command(command)
+        assert is_hardline is False
+
+
+def test_malformed_quoted_grep_option_still_blocks():
+    """Grep options that genuinely end without a pattern stay malformed."""
+    is_hardline, desc = detect_hardline_command(
+        "grep -n 'def add' && grep -e"
+    )
+    assert is_hardline is True
