@@ -1785,12 +1785,16 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
             if blocked:
                 effect_disposition = "none"
 
-            if not blocked:
+            # Policy/scope blocks are failed attempts from the model's point
+            # of view and must advance the same-tool failure circuit breaker.
+            # Do not re-observe a block synthesized by the guardrail itself:
+            # _guardrail_block_result has already recorded the turn halt.
+            if not blocked or agent._tool_guardrail_halt_decision is None:
                 function_result = agent._append_guardrail_observation(
                     function_name,
                     function_args,
                     function_result,
-                    failed=is_error,
+                    failed=True if blocked else is_error,
                     tool_call_id=tool_call_id,
                 )
 
@@ -2710,12 +2714,16 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 duration_ms=int(tool_duration * 1000),
                 middleware_trace=list(middleware_trace),
             )
-        if not _execution_blocked:
+        # A structural policy block is still a failed model attempt. Count it
+        # toward the existing failure-loop thresholds, while avoiding a second
+        # observation for guardrail-generated synthetic blocks (which already
+        # set the halt decision in _guardrail_block_result).
+        if not _execution_blocked or agent._tool_guardrail_halt_decision is None:
             function_result = agent._append_guardrail_observation(
                 function_name,
                 function_args,
                 function_result,
-                failed=_is_error_result,
+                failed=True if _execution_blocked else _is_error_result,
                 tool_call_id=tool_call_id,
             )
             result_preview = function_result if agent.verbose_logging else (

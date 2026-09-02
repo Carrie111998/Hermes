@@ -354,11 +354,69 @@ def test_relay_rewrite_is_guarded_before_dispatch_in_concurrent_path():
     assert "repeated_exact_failure_block" in messages[0]["content"]
 
 
-def test_plugin_pre_tool_block_wins_without_counting_as_toolguard_block():
-    agent = _make_agent("web_search")
+def test_repeated_plugin_pre_tool_blocks_halt_sequential_tool_loop():
+    config = _hard_stop_config()
+    config["tool_loop_guardrails"]["hard_stop_after"] = {
+        "exact_failure": 99,
+        "same_tool_failure": 3,
+        "idempotent_no_progress": 99,
+    }
+    agent = _make_agent("web_search", config=config)
     args = {"query": "same"}
-    tc = _mock_tool_call("web_search", json.dumps(args), "c-plugin")
-    msg = SimpleNamespace(content="", tool_calls=[tc])
+    responses = [
+        _mock_response(
+            content="",
+            finish_reason="tool_calls",
+            tool_calls=[
+                _mock_tool_call("web_search", json.dumps(args), f"c-plugin-{i}")
+            ],
+        )
+        for i in range(1, 5)
+    ]
+    agent.client.chat.completions.create.side_effect = responses
+
+    with (
+        patch(
+            "hermes_cli.plugins._dispatch_pre_tool_call_hooks",
+            return_value=("plugin policy", None),
+        ),
+        patch("run_agent.handle_function_call", return_value="SHOULD_NOT_RUN") as mock_hfc,
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+    ):
+        result = agent.run_conversation("search repeatedly")
+
+    mock_hfc.assert_not_called()
+    assert result["turn_exit_reason"] == "guardrail_halt"
+    assert "same_tool_failure_halt" in result["final_response"]
+    tool_contents = [
+        message["content"]
+        for message in result["messages"]
+        if message.get("role") == "tool"
+    ]
+    assert len(tool_contents) == 3
+    assert all("plugin policy" in content for content in tool_contents)
+    assert "same_tool_failure_halt" in tool_contents[-1]
+
+
+def test_repeated_plugin_pre_tool_blocks_halt_concurrent_tool_batch():
+    config = _hard_stop_config()
+    config["tool_loop_guardrails"]["hard_stop_after"] = {
+        "exact_failure": 99,
+        "same_tool_failure": 3,
+        "idempotent_no_progress": 99,
+    }
+    agent = _make_agent("web_search", config=config)
+    calls = [
+        _mock_tool_call(
+            "web_search",
+            json.dumps({"query": f"blocked-{i}"}),
+            f"c-plugin-{i}",
+        )
+        for i in range(1, 4)
+    ]
+    msg = SimpleNamespace(content="", tool_calls=calls)
     messages = []
 
     with (
@@ -368,11 +426,17 @@ def test_plugin_pre_tool_block_wins_without_counting_as_toolguard_block():
         ),
         patch("run_agent.handle_function_call", return_value="SHOULD_NOT_RUN") as mock_hfc,
     ):
-        agent._execute_tool_calls_sequential(msg, messages, "task-1")
+        agent._execute_tool_calls_concurrent(msg, messages, "task-1")
 
     mock_hfc.assert_not_called()
-    assert "plugin policy" in messages[0]["content"]
-    assert agent._tool_guardrails.before_call("web_search", args).action == "allow"
+    assert [message["tool_call_id"] for message in messages] == [
+        "c-plugin-1",
+        "c-plugin-2",
+        "c-plugin-3",
+    ]
+    assert agent._tool_guardrail_halt_decision is not None
+    assert agent._tool_guardrail_halt_decision.code == "same_tool_failure_halt"
+    assert "same_tool_failure_halt" in messages[-1]["content"]
 
 
 def test_default_run_conversation_warns_without_guardrail_halt():
