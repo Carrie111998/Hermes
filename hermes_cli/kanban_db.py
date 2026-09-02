@@ -77,6 +77,7 @@ import os
 import re
 import random
 import secrets
+import shlex
 import shutil
 import sqlite3
 import subprocess
@@ -10849,7 +10850,11 @@ def _default_spawn(
     # older hermes builds on PATH that predate the flag's precedence.
     env.pop("HERMES_TUI", None)
 
+    # Phase 1: optional resource-isolation wrapper (cgroup scope). Empty by
+    # default (no-op); set HERMES_KANBAN_WORKER_WRAPPER to a wrapper-script path
+    # to run each worker inside a memory/CPU-capped systemd scope.
     cmd = [
+        *shlex.split(os.environ.get("HERMES_KANBAN_WORKER_WRAPPER", "").strip()),
         *_resolve_hermes_argv(),
         "-p", profile_arg,
         "--cli",
