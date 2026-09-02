@@ -121,6 +121,7 @@ def test_reap_passes_child_pid_exclude_to_scan():
 
 import json
 from hermes_cli.dashboard_procs import (
+    _hermes_home_dir,
     _lock_owned_serve_pids,
     _valid_lockfile_payload,
 )
@@ -142,6 +143,42 @@ def _valid_lock_payload(pid: int, ownership_id: str, spawn_nonce: str) -> dict:
         "logPath": f"~/.hermes/desktop-ssh/{ownership_id}/{spawn_nonce}.log",
         "startedAt": "2026-08-04T20:00:00Z",
     }
+
+
+def test_lock_scan_uses_native_root_from_named_profile_home(tmp_path, monkeypatch):
+    """A standard named profile must discover Desktop's global ownership locks."""
+    native_home = tmp_path / "home"
+    root = native_home / ".hermes"
+    ownership_id = "c" * 32
+    spawn_nonce = "b" * 16
+    lock_dir = root / "desktop-ssh" / ownership_id
+    lock_dir.mkdir(parents=True)
+    (lock_dir / "backend.lock.json").write_text(
+        json.dumps(_valid_lock_payload(7171, ownership_id, spawn_nonce))
+    )
+    monkeypatch.setenv("HOME", str(native_home))
+    monkeypatch.setenv("HERMES_HOME", str(root / "profiles" / "dev"))
+
+    assert _hermes_home_dir() == root
+    assert _lock_owned_serve_pids() == {7171}
+
+
+def test_lock_scan_uses_native_root_from_custom_profile_home(tmp_path, monkeypatch):
+    """Custom HERMES_HOME must not hide locks written to Desktop's native root."""
+    native_home = tmp_path / "home"
+    native_root = native_home / ".hermes"
+    ownership_id = "d" * 32
+    spawn_nonce = "c" * 16
+    lock_dir = native_root / "desktop-ssh" / ownership_id
+    lock_dir.mkdir(parents=True)
+    (lock_dir / "backend.lock.json").write_text(
+        json.dumps(_valid_lock_payload(8181, ownership_id, spawn_nonce))
+    )
+    monkeypatch.setenv("HOME", str(native_home))
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "custom" / "profiles" / "dev"))
+
+    assert _hermes_home_dir() == native_root
+    assert _lock_owned_serve_pids() == {8181}
 
 
 def test_lock_owned_serve_pids_reads_valid_backend_lock(tmp_path):
