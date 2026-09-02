@@ -853,6 +853,7 @@ class TestWebhookApprovalExclusion:
         assert result["approved"] is False
         assert "api_server" in result["message"]
         smart_approve.assert_not_called()
+        assert "test-api-session" not in approval_mod._pending
 
     def test_api_server_unattended_approve_overrides_process_ask_mode(
         self, monkeypatch
