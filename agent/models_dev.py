@@ -214,6 +214,59 @@ PROVIDER_TO_MODELS_DEV: Dict[str, str] = {
     "ollama-cloud": "ollama-cloud",
 }
 
+# OpenRouter routing-variant suffixes that do not change the model identity.
+# These are stripped BEFORE the models.dev catalog lookup so that e.g.
+# ``z-ai/glm-5.3-flash:floor`` resolves to the same entry as the bare slug.
+# Source: https://openrouter.ai/docs/guides/routing/model-variants/* and
+# https://openrouter.ai/docs/faq — dynamic variants :online/:nitro/:floor/:exacto
+# plus static :free and the additional variants :extended/:thinking.
+_OPENROUTER_ROUTING_SUFFIXES: frozenset = frozenset({
+    "free", "extended", "thinking", "nitro", "floor", "exacto", "online",
+})
+
+
+def _strip_openrouter_routing_suffix(model: str) -> str:
+    """Strip a trailing OpenRouter routing suffix if present.
+
+    Only the last ``:suffix`` is considered and matching is case-insensitive.
+    Returns the stripped model ID or the original if no known suffix is found.
+    """
+    if not isinstance(model, str) or ":" not in model:
+        return model
+    prefix, suffix = model.rsplit(":", 1)
+    if not prefix or not suffix:
+        return model
+    if suffix.strip().lower() in _OPENROUTER_ROUTING_SUFFIXES:
+        return prefix
+    return model
+
+
+def _is_openrouter_provider(provider: Optional[str]) -> bool:
+    """True when *provider* is the OpenRouter provider (Hermes or models.dev id)."""
+    if not provider or not isinstance(provider, str):
+        return False
+    key = provider.strip().lower()
+    if not key:
+        return False
+    # PROVIDER_TO_MODELS_DEV maps Hermes id -> models.dev id.
+    mdev = PROVIDER_TO_MODELS_DEV.get(key, key)
+    return mdev == "openrouter" or key == "openrouter"
+
+
+def _should_strip_openrouter_suffix(model: str, provider: Optional[str]) -> bool:
+    """Whether *model*'s trailing ``:suffix`` should be stripped for *provider*."""
+    if ":" not in model:
+        return False
+    suffix = model.rsplit(":", 1)[1].strip().lower()
+    if suffix not in _OPENROUTER_ROUTING_SUFFIXES:
+        return False
+    if provider is None:
+        # Direct _find_model_entry calls without a provider are provider-agnostic
+        # in tests; be permissive and allow stripping so bare-model tests pass.
+        return True
+    return _is_openrouter_provider(provider)
+
+
 # Reverse mapping: models.dev id → Hermes ids (built lazily; many-to-one,
 # e.g. both "meta" and "meta-ai" may map to the same models.dev id).
 _MODELS_DEV_TO_PROVIDER: Optional[Dict[str, List[str]]] = None
@@ -774,20 +827,30 @@ def lookup_models_dev_context(
     if not isinstance(models, dict):
         return _default_override_context(provider)
 
-    # Exact match
-    entry = models.get(model)
-    if entry:
-        ctx = _extract_context(entry)
-        if ctx:
-            return ctx
+    # Build candidate IDs: bare model + OpenRouter routing-suffix-stripped
+    # variant (only for openrouter). Mirrors _find_model_entry.
+    candidates: List[str] = [model]
+    if _should_strip_openrouter_suffix(model, provider):
+        stripped = _strip_openrouter_routing_suffix(model)
+        if stripped != model and stripped not in candidates:
+            candidates.append(stripped)
 
-    # Case-insensitive match
-    model_lower = model.lower()
-    for mid, mdata in models.items():
-        if mid.lower() == model_lower:
-            ctx = _extract_context(mdata)
+    # Exact match for each candidate
+    for cand in candidates:
+        entry = models.get(cand)
+        if entry:
+            ctx = _extract_context(entry)
             if ctx:
                 return ctx
+
+    # Case-insensitive match for each candidate
+    for cand in candidates:
+        cand_lower = cand.lower()
+        for mid, mdata in models.items():
+            if mid.lower() == cand_lower:
+                ctx = _extract_context(mdata)
+                if ctx:
+                    return ctx
 
     # Suffix-aware fallback: some providers (e.g. ollama-cloud) store
     # model IDs with :cloud / -cloud suffixes in models.dev while the
@@ -796,20 +859,22 @@ def lookup_models_dev_context(
     # reporting 32768 — tripping the 64k minimum-context guard.
     # The suffix-stripping in fetch_ollama_cloud_models() handles the
     # model-picker UX; this handles the context-length lookup path.
-    for suffix in (":cloud", "-cloud"):
-        suffixed_key = model + suffix
-        entry = models.get(suffixed_key)
-        if entry:
-            ctx = _extract_context(entry)
-            if ctx:
-                return ctx
-        # Also try case-insensitive
-        suffixed_lower = model_lower + suffix
-        for mid, mdata in models.items():
-            if mid.lower() == suffixed_lower:
-                ctx = _extract_context(mdata)
+    for cand in candidates:
+        cand_lower = cand.lower()
+        for suffix in (":cloud", "-cloud"):
+            suffixed_key = cand + suffix
+            entry = models.get(suffixed_key)
+            if entry:
+                ctx = _extract_context(entry)
                 if ctx:
                     return ctx
+            # Also try case-insensitive
+            suffixed_lower = cand_lower + suffix
+            for mid, mdata in models.items():
+                if mid.lower() == suffixed_lower:
+                    ctx = _extract_context(mdata)
+                    if ctx:
+                        return ctx
 
     # Catalog miss — a _default override may fill the gap (#84482).
     return _default_override_context(provider)
@@ -1127,7 +1192,9 @@ def _get_provider_models(
     return models
 
 
-def _find_model_entry(models: Dict[str, Any], model: str) -> Optional[Dict[str, Any]]:
+def _find_model_entry(
+    models: Dict[str, Any], model: str, provider: Optional[str] = None
+) -> Optional[Dict[str, Any]]:
     """Find a model entry: exact, case-insensitive, then suffix fallback.
 
     The ``:cloud``/``-cloud`` suffix fallback mirrors
@@ -1136,28 +1203,50 @@ def _find_model_entry(models: Dict[str, Any], model: str) -> Optional[Dict[str, 
     fill-gap ``_default`` semantics, where a suffix-keyed catalog model
     (e.g. ``kimi-k2.6:cloud``) must count as KNOWN and keep its catalog
     metadata rather than being displaced by a ``_default``.
+
+    OpenRouter routing suffixes (``:floor``, ``:nitro``, ``:free``, …) are
+    stripped before the lookup when *provider* is ``openrouter`` (or when no
+    provider is given, for backwards compat with direct calls). The full
+    suffixed ID is kept for provider-facing config — only the catalog lookup
+    is normalized.
     """
-    # Exact match
-    entry = models.get(model)
-    if isinstance(entry, dict):
-        return entry
+    if not isinstance(models, dict):
+        return None
 
-    # Case-insensitive match
-    model_lower = model.lower()
-    for mid, mdata in models.items():
-        if mid.lower() == model_lower and isinstance(mdata, dict):
-            return mdata
+    # Build the candidate list: bare model first, then stripped routing suffix
+    # for OpenRouter.  This keeps the original ID authoritative while allowing
+    # a suffixed request to hit the bare catalog entry.
+    candidates: List[str] = [model]
+    if _should_strip_openrouter_suffix(model, provider):
+        stripped = _strip_openrouter_routing_suffix(model)
+        if stripped != model and stripped not in candidates:
+            candidates.append(stripped)
 
-    # Suffix-aware fallback (e.g. ollama-cloud stores kimi-k2.6:cloud
-    # while the live API returns the bare name).
-    for suffix in (":cloud", "-cloud"):
-        entry = models.get(model + suffix)
+    # 1. Exact match for each candidate (original first, then stripped)
+    for cand in candidates:
+        entry = models.get(cand)
         if isinstance(entry, dict):
             return entry
-        suffixed_lower = model_lower + suffix
+
+    # 2. Case-insensitive match for each candidate
+    for cand in candidates:
+        cand_lower = cand.lower()
         for mid, mdata in models.items():
-            if mid.lower() == suffixed_lower and isinstance(mdata, dict):
+            if mid.lower() == cand_lower and isinstance(mdata, dict):
                 return mdata
+
+    # 3. Suffix-aware fallback (e.g. ollama-cloud stores kimi-k2.6:cloud
+    # while the live API returns the bare name).
+    for cand in candidates:
+        cand_lower = cand.lower()
+        for suffix in (":cloud", "-cloud"):
+            entry = models.get(cand + suffix)
+            if isinstance(entry, dict):
+                return entry
+            suffixed_lower = cand_lower + suffix
+            for mid, mdata in models.items():
+                if mid.lower() == suffixed_lower and isinstance(mdata, dict):
+                    return mdata
 
     return None
 
@@ -1190,7 +1279,7 @@ def get_model_capabilities(
       - family     (str)   → model_family
     """
     models = _get_provider_models(provider, allow_network=allow_network)
-    entry = _find_model_entry(models, model) if models is not None else None
+    entry = _find_model_entry(models, model, provider) if models is not None else None
 
     # Select the override AFTER the catalog lookup: explicit overrides
     # always apply; _default entries only fill gaps for catalog misses.
@@ -1534,16 +1623,38 @@ def get_model_info(
             return _parse_model_info(mid, merged, mdev_id)
         return _parse_model_info(mid, raw, mdev_id)
 
-    # Exact match
-    raw = models.get(model_id)
-    if isinstance(raw, dict):
-        return _with_override(model_id, raw)
+    # Build candidate IDs including OpenRouter routing-suffix-stripped variant.
+    candidates: List[str] = [model_id]
+    if _should_strip_openrouter_suffix(model_id, provider_id):
+        stripped = _strip_openrouter_routing_suffix(model_id)
+        if stripped != model_id and stripped not in candidates:
+            candidates.append(stripped)
 
-    # Case-insensitive fallback
-    model_lower = model_id.lower()
-    for mid, mdata in models.items():
-        if mid.lower() == model_lower and isinstance(mdata, dict):
-            return _with_override(mid, mdata)
+    # Exact match for each candidate (original first, then stripped)
+    for cand in candidates:
+        raw = models.get(cand)
+        if isinstance(raw, dict):
+            return _with_override(cand, raw)
+
+    # Case-insensitive fallback for each candidate
+    for cand in candidates:
+        cand_lower = cand.lower()
+        for mid, mdata in models.items():
+            if mid.lower() == cand_lower and isinstance(mdata, dict):
+                return _with_override(mid, mdata)
+
+    # Also try :cloud/-cloud suffix fallback for each candidate (mirrors
+    # _find_model_entry/lookup_models_dev_context for consistency).
+    for cand in candidates:
+        cand_lower = cand.lower()
+        for suffix in (":cloud", "-cloud"):
+            entry = models.get(cand + suffix)
+            if isinstance(entry, dict):
+                return _with_override(cand + suffix, entry)
+            suffixed_lower = cand_lower + suffix
+            for mid, mdata in models.items():
+                if mid.lower() == suffixed_lower and isinstance(mdata, dict):
+                    return _with_override(mid, mdata)
 
     # Model not in catalog — an override (explicit or _default) may still
     # provide the metadata.

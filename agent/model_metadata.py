@@ -142,6 +142,36 @@ def _strip_provider_prefix(model: str) -> str:
         return suffix
     return model
 
+
+# OpenRouter routing-variant suffixes — same list as agent/models_dev.py.
+# Stripped before catalog lookups so a suffixed ID (``:floor`` etc) hits the
+# bare model entry; the full ID is kept for the provider/config layer.
+_OPENROUTER_ROUTING_SUFFIXES = frozenset({
+    "free", "extended", "thinking", "nitro", "floor", "exacto", "online",
+})
+
+
+def _strip_openrouter_routing_suffix(model: str) -> str:
+    """Strip a trailing OpenRouter routing suffix (``:floor`` etc) if present."""
+    if not isinstance(model, str) or ":" not in model:
+        return model
+    prefix, suffix = model.rsplit(":", 1)
+    if not prefix or not suffix:
+        return model
+    if suffix.strip().lower() in _OPENROUTER_ROUTING_SUFFIXES:
+        return prefix
+    return model
+
+
+def _is_openrouter_provider_name(provider: str) -> bool:
+    """True when *provider* (Hermes id or ``effective_provider``) is OpenRouter."""
+    if not provider or not isinstance(provider, str):
+        return False
+    key = provider.strip().lower()
+    if not key:
+        return False
+    return key == "openrouter"
+
 _model_metadata_cache: Dict[str, Dict[str, Any]] = {}
 _model_metadata_cache_time: float = 0
 _novita_metadata_cache: Dict[str, Dict[str, Any]] = {}
@@ -3502,6 +3532,20 @@ def get_model_context_length(
     if effective_provider == "openrouter":
         metadata = fetch_model_metadata()
         entry = metadata.get(model)
+        # Strip OpenRouter routing suffix (e.g. :floor/:nitro/:free) before
+        # the catalog lookup so a suffixed ID hits the bare entry. The full
+        # ID is kept for the wire/config layer.
+        if not entry:
+            stripped = _strip_openrouter_routing_suffix(model)
+            if stripped != model:
+                entry = metadata.get(stripped)
+                # Also try case-insensitive for the stripped variant
+                if not entry:
+                    stripped_lower = stripped.lower()
+                    for k, v in metadata.items():
+                        if k.lower() == stripped_lower:
+                            entry = v
+                            break
         if entry:
             or_ctx = entry.get("context_length")
             # Guard against the known OpenRouter Kimi-family 32k underreport
@@ -3510,6 +3554,20 @@ def get_model_context_length(
                 or_ctx == 32768 and _model_name_suggests_kimi(model)
             ):
                 return or_ctx
+        # Fallback: stripped model may have different case in metadata keys
+        # (e.g. Z-AI/GLM vs z-ai/glm). Try case-insensitive bare lookup once more.
+        if not entry:
+            model_lower = model.lower()
+            stripped_lower = _strip_openrouter_routing_suffix(model).lower()
+            if stripped_lower != model_lower:
+                for k, v in metadata.items():
+                    if k.lower() == stripped_lower:
+                        or_ctx = v.get("context_length")
+                        if isinstance(or_ctx, int) and or_ctx > 0 and not (
+                            or_ctx == 32768 and _model_name_suggests_kimi(model)
+                        ):
+                            return or_ctx
+                        break
 
     if effective_provider:
         from agent.models_dev import lookup_models_dev_context
