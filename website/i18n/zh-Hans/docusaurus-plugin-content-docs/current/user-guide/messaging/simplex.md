@@ -22,10 +22,13 @@ SimpleX Chat 项目未发布聊天客户端的预构建 Docker 镜像；如需�
 ## 启动守护进程
 
 ```bash
-simplex-chat -p 5225
+install -d -m 0700 /absolute/path/simplex/files /absolute/path/simplex/temp
+simplex-chat -p 5225 \
+  --files-folder /absolute/path/simplex/files \
+  --temp-folder /absolute/path/simplex/temp
 ```
 
-守护进程默认在 `ws://127.0.0.1:5225` 上监听 WebSocket 连接。
+守护进程默认在 `ws://127.0.0.1:5225` 上监听 WebSocket 连接。文件目录和临时目录必须位于同一文件系统，因为 SimpleX 使用文件系统重命名来完成 XFTP 下载。
 
 ## 配置 Hermes
 
@@ -43,15 +46,19 @@ hermes gateway setup
 
 ```
 SIMPLEX_WS_URL=ws://127.0.0.1:5225
+SIMPLEX_FILES_FOLDER=/absolute/path/simplex/files
 SIMPLEX_ALLOWED_USERS=<contact-id-1>,<contact-id-2>
 SIMPLEX_HOME_CHANNEL=<contact-id>
+SIMPLEX_AUTO_ACCEPT=false
 ```
 
 | 变量 | 是否必填 | 说明 |
 |---|---|---|
 | `SIMPLEX_WS_URL` | 是 | simplex-chat 守护进程的 WebSocket URL |
+| `SIMPLEX_FILES_FOLDER` | 接收入站文件时必填 | 传给 `simplex-chat --files-folder` 的同一绝对路径；应与守护进程的 `--temp-folder` 位于同一文件系统。 |
 | `SIMPLEX_ALLOWED_USERS` | 建议填写 | 允许使用 Agent 的联系人 ID，以逗号分隔 |
 | `SIMPLEX_ALLOW_ALL_USERS` | 可选 | 设为 `true` 以允许所有联系人（请谨慎使用） |
+| `SIMPLEX_AUTO_ACCEPT` | 可选 | 自动接受联系人请求（默认：`true`）；生产身份应保持为 `false`，除非明确需要无人值守注册。 |
 | `SIMPLEX_HOME_CHANNEL` | 可选 | cron 任务投递的默认联系人 ID |
 | `SIMPLEX_HOME_CHANNEL_NAME` | 可选 | 主频道的可读标签 |
 

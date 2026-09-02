@@ -24,6 +24,12 @@ from abc import ABC, abstractmethod
 from urllib.parse import urlsplit
 
 from utils import normalize_proxy_url
+from gateway.event_sidecars import (
+    merge_correlated_message_items,
+    merge_event_sidecars,
+    replace_correlated_event_text,
+    run_post_turn_cleanup_callbacks,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -2888,6 +2894,7 @@ def merge_pending_message_event(
             existing.media_text_inlined = existing_inline_flags
 
         if existing_is_photo and incoming_is_photo:
+            merge_event_sidecars(existing, event)
             existing.media_urls.extend(event.media_urls)
             existing.media_types.extend(event.media_types)
             existing.media_text_inlined.extend(incoming_inline_flags)
@@ -2897,6 +2904,7 @@ def merge_pending_message_event(
             return
 
         if existing_has_media or incoming_has_media:
+            merge_event_sidecars(existing, event)
             if incoming_has_media:
                 existing.media_urls.extend(event.media_urls)
                 existing.media_types.extend(event.media_types)
@@ -2921,6 +2929,7 @@ def merge_pending_message_event(
             and getattr(existing, "message_type", None) == MessageType.TEXT
             and event.message_type == MessageType.TEXT
         ):
+            merge_event_sidecars(existing, event)
             if event.text:
                 existing.text = f"{existing.text}\n{event.text}" if existing.text else event.text
             return
@@ -5785,6 +5794,14 @@ class BasePlatformAdapter(ABC):
         if result.success:
             return result
 
+        # A transport that has already delivered part of a split response, or
+        # lost the acknowledgement after submitting a command, cannot safely
+        # retry or fall back with the full content: either path duplicates
+        # messages the user may already have received. Preserve the adapter's
+        # explicit outcome and let the caller/operator decide whether to resend.
+        if result.error_kind in {"partial_delivery", "delivery_unknown"}:
+            return result
+
         error_str = result.error or ""
         is_network = result.retryable or self._is_retryable_error(error_str)
 
@@ -5871,6 +5888,18 @@ class BasePlatformAdapter(ABC):
             self._text_debounce = store
         return store
 
+    def replace_text_debounce_message(
+        self,
+        session_key: str,
+        message_id: str,
+        new_text: str,
+    ) -> bool:
+        """Replace one correlated component still in the busy-text buffer."""
+        state = self._text_debounce_store().get(session_key)
+        if state is None:
+            return False
+        return replace_correlated_event_text(state.event, message_id, new_text)
+
     def _is_queue_text_debounce_candidate(self, event: MessageEvent) -> bool:
         """Return True for normal text eligible for queue-mode debounce."""
         result = (
@@ -5956,6 +5985,7 @@ class BasePlatformAdapter(ABC):
                     if state.event.text
                     else event.text
                 )
+            merge_correlated_message_items(state.event, event)
             latest_message_id = getattr(event, "message_id", None)
             latest_anchor = latest_message_id or getattr(event, "reply_to_message_id", None)
             if latest_message_id is not None:
@@ -7199,6 +7229,16 @@ class BasePlatformAdapter(ABC):
                         )
                 except (asyncio.TimeoutError, Exception):
                     pass
+            # Transport adapters may attach callbacks for ephemeral inbound
+            # artifacts they created (for example a received-file target).
+            # Run them only after the turn has consumed the event, and keep
+            # failures isolated from session cleanup and the pending drain.
+            await run_post_turn_cleanup_callbacks(
+                event,
+                timeout=_POST_DELIVERY_CALLBACK_TIMEOUT_SECONDS,
+                logger=logger,
+                platform_name=self.name,
+            )
             # Some adapters keep platform-level typing tasks.  If callback
             # work or a late refresh recreated one, make one final bounded stop
             # before releasing the session guard.

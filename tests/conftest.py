@@ -375,6 +375,18 @@ _HERMES_BEHAVIORAL_VARS = frozenset({
     "EMAIL_ALLOW_ALL_USERS",
     "SMS_ALLOW_ALL_USERS",
     "PHOTON_ALLOW_ALL_USERS",
+    # SimpleX transport/runtime settings alter adapter initialization and file
+    # path ownership. Tests opt into them explicitly instead of inheriting a
+    # developer's active gateway profile.
+    "SIMPLEX_WS_URL",
+    "SIMPLEX_FILES_FOLDER",
+    "SIMPLEX_ALLOWED_USERS",
+    "SIMPLEX_ALLOW_ALL_USERS",
+    "SIMPLEX_AUTO_ACCEPT",
+    "SIMPLEX_GROUP_ALLOWED",
+    "SIMPLEX_HOME_CHANNEL",
+    "SIMPLEX_HOME_CHANNEL_NAME",
+    "HERMES_SIMPLEX_TEXT_BATCH_DELAY",
     # Gateway home channels are set by /sethome in real profiles. Tests that
     # exercise dashboard notification toggles must opt in explicitly or they
     # can accidentally subscribe against a developer's real home channel.

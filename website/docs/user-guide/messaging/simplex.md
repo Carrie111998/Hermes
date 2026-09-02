@@ -1,6 +1,6 @@
 # SimpleX Chat
 
-[SimpleX Chat](https://simplex.chat/) is a private, decentralised messaging platform where users own their contacts and groups. Unlike other platforms, SimpleX assigns no persistent user IDs — every contact is identified by an opaque internal ID generated at connection time, which makes it one of the most private messengers available.
+[SimpleX Chat](https://simplex.chat/) is a private, decentralised messaging platform where users own their contacts and groups. SimpleX has no global user identifiers; the local daemon assigns each connection an opaque numeric `contactId`. Hermes uses that identity-local, rename-stable ID for authorization.
 
 > Run `hermes gateway setup` and pick **SimpleX** for a guided walk-through.
 
@@ -24,10 +24,15 @@ The SimpleX Chat project does not publish a prebuilt Docker image for the chat c
 ## Start the daemon
 
 ```bash
-simplex-chat -p 5225
+install -d -m 0700 /absolute/path/simplex/files /absolute/path/simplex/temp
+simplex-chat -p 5225 \
+  --files-folder /absolute/path/simplex/files \
+  --temp-folder /absolute/path/simplex/temp
 ```
 
-The daemon listens on WebSocket at `ws://127.0.0.1:5225` by default.
+The daemon listens on WebSocket at `ws://127.0.0.1:5225` by default. Keep the
+files and temporary folders on the same filesystem: SimpleX completes an XFTP
+download with a filesystem rename.
 
 ## Configure Hermes
 
@@ -45,30 +50,42 @@ Add these to `~/.hermes/.env`:
 
 ```
 SIMPLEX_WS_URL=ws://127.0.0.1:5225
+SIMPLEX_FILES_FOLDER=/absolute/path/simplex/files
 SIMPLEX_ALLOWED_USERS=<contact-id-1>,<contact-id-2>
 SIMPLEX_HOME_CHANNEL=<contact-id>
+SIMPLEX_AUTO_ACCEPT=false
 ```
 
 | Variable | Required | Description |
 |---|---|---|
 | `SIMPLEX_WS_URL` | Yes | WebSocket URL of the simplex-chat daemon |
-| `SIMPLEX_ALLOWED_USERS` | Recommended | Comma-separated allowlist. Each entry can be a numeric `contactId` **or** a display name — both forms work. |
+| `SIMPLEX_FILES_FOLDER` | Required for inbound files | Exact absolute path passed to `simplex-chat --files-folder`. Keep it on the same filesystem as the daemon's `--temp-folder`; SimpleX completes XFTP downloads with a filesystem rename. |
+| `SIMPLEX_ALLOWED_USERS` | Recommended | Comma-separated numeric `contactId` allowlist. Display names are mutable labels and are not authorization identities. |
 | `SIMPLEX_ALLOW_ALL_USERS` | Optional | Set `true` to allow every contact (use carefully) |
-| `SIMPLEX_AUTO_ACCEPT` | Optional | Auto-accept incoming contact requests (default: `true`) |
+| `SIMPLEX_AUTO_ACCEPT` | Optional | Auto-accept incoming contact requests (default: `true`). Keep this `false` for production identities unless unattended enrollment is intentional. |
 | `SIMPLEX_GROUP_ALLOWED` | Optional | Comma-separated group IDs the bot participates in, or `*` for any group. Omit to ignore group messages entirely |
 | `SIMPLEX_HOME_CHANNEL` | Optional | Default contact/group ID for cron job delivery |
 | `SIMPLEX_HOME_CHANNEL_NAME` | Optional | Human label for the home channel |
 | `HERMES_SIMPLEX_TEXT_BATCH_DELAY` | Optional | Quiet-period seconds (default: `0.8`) used to concatenate rapid-fire inbound text messages into one event |
+| `platforms.simplex.extra.files_folder` | Alternative to `SIMPLEX_FILES_FOLDER` | Absolute daemon `--files-folder` path used to resolve relative received-file paths |
+| `platforms.simplex.extra.file_transfer_timeout` | Optional | Seconds before a stalled inbound transfer is discarded and its caption is delivered without the attachment (default: `300`) |
+| `platforms.simplex.extra.retain_received_files` | Optional | Keep adapter-created inbound transfer files after the turn. Defaults to `false`; unrelated daemon/user files are never removed. |
+| `platforms.simplex.extra.media_cleanup_timeout` | Optional | TTL backstop for adapter-created inbound files and converted outbound previews (default: `3600`, minimum: `60`) |
 
-## Find your contact ID or display name
+## Find your contact ID
 
-After starting the daemon, open a conversation with your agent contact. The numeric `contactId` appears in session logs. If you'd rather use the display name shown in the SimpleX UI, that works too — `SIMPLEX_ALLOWED_USERS` accepts either form.
+After starting the daemon, open a conversation with your agent contact and run `/contacts` in the SimpleX CLI. Copy the numeric `contactId`. A display name shown in the UI may be renamed or collide with another contact, so Hermes deliberately ignores display-name entries in `SIMPLEX_ALLOWED_USERS` and logs a migration warning.
+
+> **Upgrade note:** Older adapter builds accepted display-name entries in
+> `SIMPLEX_ALLOWED_USERS`. They no longer authorize direct messages. Replace
+> every such entry with the numeric `contactId` from `/contacts` before
+> restarting an existing deployment.
 
 ## Authorization
 
 By default **all contacts are denied**. You must either:
 
-1. Set `SIMPLEX_ALLOWED_USERS` to a comma-separated list of `contactId`s and/or display names (e.g. `SIMPLEX_ALLOWED_USERS=4,alice` matches either contactId 4 or the contact whose display name is "alice"), or
+1. Set `SIMPLEX_ALLOWED_USERS` to a comma-separated list of numeric `contactId`s (for example, `SIMPLEX_ALLOWED_USERS=4,7`), or
 2. Use **DM pairing** — send any message to the bot and it will reply with a pairing code. Enter that code via `hermes pairing approve simplex <CODE>`.
 
 ## Group chats
@@ -82,6 +99,12 @@ SIMPLEX_GROUP_ALLOWED=12,34          # specific group IDs
 SIMPLEX_GROUP_ALLOWED=*              # any group the bot is in
 ```
 
+An allowed group is the authorization boundary: every member of that group may
+invoke Hermes, even when the member is not listed in `SIMPLEX_ALLOWED_USERS`
+or paired as a direct-message contact. Prefer specific group IDs.
+`SIMPLEX_GROUP_ALLOWED=*` authorizes every member of every group the bot joins.
+Direct-message authorization remains separate and unchanged.
+
 Address groups by prefixing the chat ID with `group:`, e.g.
 `simplex:group:12` as a cron `deliver=` target or in a `hermes send` call.
 
@@ -91,7 +114,7 @@ SimpleX works as a standalone send target — the daemon must be running,
 but a live gateway is not required for plain text:
 
 ```bash
-hermes send --to simplex:alice "hello"          # DM by contact display name
+hermes send --to simplex:4 "hello"              # DM by numeric contactId
 hermes send --to simplex:group:12 "hello"       # group by numeric ID
 hermes send --to simplex "hello"                # SIMPLEX_HOME_CHANNEL
 ```
@@ -106,10 +129,16 @@ hint — direct targets like the ones above work regardless.
 
 The adapter supports native SimpleX attachments in both directions:
 
-- **Inbound** — incoming images, voice notes, and files are accepted via
+- **Inbound** — attachments from authorized senders are accepted via
   the daemon's XFTP flow (`rcvFileDescrReady` → `/freceive` → wait for
   `rcvFileComplete`) and surfaced as `MessageEvent.media_urls` with the
-  appropriate `MessageType` (`PHOTO`, `VOICE`, `TEXT` + document).
+  appropriate `MessageType` (`PHOTO`, `VOICE`, or `DOCUMENT`). Unknown senders
+  cannot trigger a download. Cancelled, failed, or timed-out transfers release
+  their state and preserve any text caption without presenting a missing file.
+  A caption-less failure becomes an explicit attachment-unavailable notice.
+  By default Hermes deletes only the unique receive path it created after the
+  consuming turn, with a TTL backstop for dropped/abandoned turns. Set
+  `retain_received_files: true` only when persistent local copies are wanted.
 - **Outbound** — `send_image_file`, `send_voice`, `send_document`, and
   `send_video` all use the structured `/_send` form with `filePath`, so
   the receiving SimpleX client renders images inline and plays voice
@@ -141,6 +170,7 @@ hermes send simplex:<contact-id> "Done!"
 - SimpleX never reveals phone numbers or email addresses — contacts use opaque IDs
 - The connection between Hermes and the daemon is local WebSocket (`ws://127.0.0.1:5225`) — no data leaves your machine
 - Messages are end-to-end encrypted by the SimpleX protocol before reaching the daemon
+- For a long-lived production identity, disable automatic contact acceptance and approve new contacts deliberately
 
 ## Troubleshooting
 

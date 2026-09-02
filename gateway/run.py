@@ -3031,6 +3031,8 @@ from gateway.session_state import (
     legacy_lease_token_property,
 )
 from gateway.authz_mixin import GatewayAuthorizationMixin
+from gateway.edit_supersede import GatewayEditSupersedeMixin
+from gateway.event_sidecars import correlated_event_message_ids
 from gateway.kanban_watchers import GatewayKanbanWatchersMixin
 from gateway.slash_commands import GatewaySlashCommandsMixin
 from gateway.turn_context import TurnContext
@@ -7320,7 +7322,12 @@ class TurnRunner:
 _SESSION_DB_UNPINNED = object()
 
 
-class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, GatewaySlashCommandsMixin):
+class GatewayRunner(
+    GatewayAuthorizationMixin,
+    GatewayEditSupersedeMixin,
+    GatewayKanbanWatchersMixin,
+    GatewaySlashCommandsMixin,
+):
     """
     Main gateway controller.
 
@@ -7339,6 +7346,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         DEFAULT_GATEWAY_SIGNAL_INTERRUPT_GRACE_TIMEOUT
     )
     _exit_code: Optional[int] = None
+    _agent_pending_sentinel = _AGENT_PENDING_SENTINEL
     _draining: bool = False
     _external_drain_active: bool = False
     _restart_requested: bool = False
@@ -11021,6 +11029,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 session_key,
             )
             return True  # handled (silently dropped); do not fall through
+
+        # Edits must supersede the matching queued or in-flight message before
+        # ordinary busy-mode redirect/queue logic sees them. Base adapters call
+        # this busy handler instead of the cold ``_handle_message`` path, so
+        # leaving correlation only there makes the feature unreachable during
+        # the exact active-turn window it is designed for.
+        edit_adapter = self._adapter_for_source(event.source)
+        if edit_adapter is not None and self._handle_edit_supersede(
+            event, session_key, edit_adapter
+        ):
+            return True
 
         effective_mode = self._effective_busy_input_mode(event.source)
 
@@ -18848,6 +18867,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             except Exception:
                 logger.debug("reaped-session staleness check failed", exc_info=True)
 
+        # ── Edit supersede (#35535) ────────────────────────────────────
+        # SYNCHRONOUS block: no await between queued-replace, in-flight
+        # check, and decision.  An inbound EDIT of a previously-sent message
+        # supersedes the queued original or the in-flight turn; an isolated
+        # out-of-context correction is silently dropped.
+        _edit_adapter = self._adapter_for_source(source)
+        if _edit_adapter is not None:
+            if self._handle_edit_supersede(event, _quick_key, _edit_adapter):
+                return None
+
         if self._is_session_running(_quick_key):
             # Resolve the command once; every command's mid-run behavior is
             # declared on its CommandDef (busy_policy / busy_handler in
@@ -19842,6 +19871,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _claim_state.turn.lease = _active_session_lease
         _claim_state.turn.agent = _AGENT_PENDING_SENTINEL
         _claim_state.turn.started_ts = time.time()
+        _claim_state.turn.active_message_id = event.message_id or None
+        _claim_state.turn.active_message_ids = correlated_event_message_ids(event)
         self._persist_active_agents()
         _run_generation = self._begin_session_run_generation(_quick_key)
 
