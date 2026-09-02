@@ -512,19 +512,19 @@ def _read_git_head_for_cache(repo_dir: Path) -> Optional[str]:
     git_entry = repo_dir / ".git"
     try:
         if git_entry.is_file():
-            text = git_entry.read_text().strip()
+            text = git_entry.read_text(encoding="utf-8").strip()  # windows-footgun: ok — git metadata is ASCII
             if not text.startswith("gitdir:"):
                 return None
             git_dir = (repo_dir / text.split(":", 1)[1].strip()).resolve()
         else:
             git_dir = git_entry
 
-        head_text = (git_dir / "HEAD").read_text().strip()
+        head_text = (git_dir / "HEAD").read_text(encoding="utf-8").strip()  # windows-footgun: ok — git refs are ASCII
         if head_text.startswith("ref:"):
             ref_path = git_dir / head_text[4:].strip()
             if not ref_path.exists():
                 return None
-            return ref_path.read_text().strip()
+            return ref_path.read_text(encoding="utf-8").strip()  # windows-footgun: ok — git ref content is ASCII/sha
         return head_text
     except OSError:
         return None
