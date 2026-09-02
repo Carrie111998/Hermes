@@ -798,6 +798,36 @@ class TestSend:
 
 
     @pytest.mark.asyncio
+    async def test_cron_delivery_does_not_consume_interactive_typing_card(self, adapter):
+        """Cron deliveries (metadata.job_id) must not steal the typing card
+        that belongs to the interactive turn processing in this DM.
+
+        Consuming it would patch cron content into the interactive turn's
+        thread and leave that turn with no card to patch, stranding its
+        reply at top-level. _resolve_thread_id already routes cron output
+        to a fresh top-level thread; this closes the remaining hole in
+        send(). Regression for Aug 21, 2026: the Morning Briefing patched
+        an active turn's card and its output landed inside the user's
+        conversation thread.
+        """
+        adapter._typing_messages["spaces/S"] = "spaces/S/messages/THINK"
+        adapter._patch_message = AsyncMock()
+        adapter._create_message = AsyncMock(
+            return_value=type("R", (), {"success": True, "message_id": "m/cron",
+                                        "error": None})()
+        )
+        result = await adapter.send(
+            "spaces/S", "cron output",
+            metadata={"job_id": "cron_daily_briefing"},
+        )
+        # The interactive typing card is untouched: no patch, slot intact.
+        adapter._patch_message.assert_not_awaited()
+        adapter._create_message.assert_awaited_once()
+        assert adapter._typing_messages["spaces/S"] == "spaces/S/messages/THINK"
+        assert result.success is True
+
+
+    @pytest.mark.asyncio
     async def test_send_clarify_posts_choice_card(self, adapter):
         adapter._create_message = AsyncMock(
             return_value=type(

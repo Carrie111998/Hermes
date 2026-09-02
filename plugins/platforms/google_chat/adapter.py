@@ -2164,7 +2164,17 @@ class GoogleChatAdapter(BasePlatformAdapter):
                 return SendResult(success=False, error="empty message")
 
             last_result: Optional[SendResult] = None
-            typing_msg_name = self._typing_messages.pop(chat_id, None)
+            # Cron deliveries (metadata.job_id) must NOT consume the chat's
+            # typing card: that card belongs to whatever interactive turn is
+            # processing in this DM. Consuming it would land cron content in
+            # the interactive turn's thread AND leave that turn with no card
+            # to patch, stranding its reply at top-level. Observed Aug 21,
+            # 2026: the Morning Briefing patched an active turn's card and
+            # its output landed inside the user's conversation thread.
+            if metadata and metadata.get("job_id"):
+                typing_msg_name = None
+            else:
+                typing_msg_name = self._typing_messages.pop(chat_id, None)
             # Treat any earlier sentinel as "no real card to patch" — defensive.
             if typing_msg_name == _TYPING_CONSUMED_SENTINEL:
                 typing_msg_name = None
