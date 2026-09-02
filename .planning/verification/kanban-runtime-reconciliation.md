@@ -89,3 +89,89 @@ Static gates on the same five-file staged tree:
     /home/houminxi/code/hermes/hermes-agent/venv/bin/python -m py_compile cli.py tools/kanban_tools.py tests/hermes_cli/test_kanban_worker_registration.py tests/cli/test_single_query_session_finalize.py
 
 Result: ruff `All checks passed!`; `py_compile` and `git diff --cached --check` silent; no non-ASCII added lines in the staged Python/test/docs hunks.
+
+## Task 3 - running worker identity diagnostics
+
+Source under test: `hermes_cli/kanban_diagnostics.py::_rule_running_worker_identity`. Thresholds stay as internal constants `RUNNING_PID_GRACE_SECONDS = 30` and `RUNNING_FIRST_HEARTBEAT_GRACE_SECONDS = 120`. The `cfg` argument remains unused on purpose; no new config keys.
+
+Contract: one root-cause diagnostic per state.
+
+- Critical `running_worker_run_mismatch` when the current run is missing/ended, claim locks differ, or task/run PIDs differ, including one-sided emptiness. Pid-missing and heartbeat stay silent on a broken identity.
+- Error `running_worker_pid_missing` only when both rows exist, both PID fields are empty, and age is past 30s. Detail/data name both unbound layers; they do not claim a populated layer is missing.
+- Warning `running_worker_heartbeat_missing` only when task/run/claim/PID identity already matches.
+
+The claim-time race finding is not a code defect: `claim_task()` writes the run row and `current_run_id` in one `write_txn`.
+
+### Initial RED
+
+Command:
+
+    HERMES_PYTHON=/home/houminxi/code/hermes/hermes-agent/venv/bin/python scripts/run_tests.sh tests/hermes_cli/test_kanban_diagnostics.py tests/hermes_cli/test_kanban_review_surfaces.py -q
+
+Result: exit 1, `2 files, 23 tests passed, 7 failed`. One-sided emptiness did not emit mismatch (`StopIteration` / `len == 0`); pid-missing data lacked `missing_layers`.
+
+### GREEN then architect correction
+
+First GREEN compared PIDs with `task_worker_pid != run_pid` but still stacked pid-missing/heartbeat on top of mismatch. Architect review of confirmed Forge finding `3271f746bbb7945c` required one diagnostic per state, not documented overlap.
+
+After rewriting tests to demand a single kind, RED against the stacked implementation was exit 1, `17 passed, 4 failed` (`test_running_one_sided_*_past_grace_is_mismatch_only` and the two heartbeat-suppression tests). Production now returns after mismatch, emits pid-missing only for both-empty after 30s, and emits heartbeat only on a consistent bound identity.
+
+Command:
+
+    HERMES_PYTHON=/home/houminxi/code/hermes/hermes-agent/venv/bin/python scripts/run_tests.sh tests/hermes_cli/test_kanban_diagnostics.py tests/hermes_cli/test_kanban_review_surfaces.py -q
+
+Result: exit 0, `2 files, 32 tests passed, 0 failed (100% complete) in 2.4s`.
+
+### One-sided PID mismatch defect injection
+
+Production mutation: restored the old both-nonempty compare:
+
+    or (task_worker_pid is not None and run_pid is not None and task_worker_pid != run_pid)
+
+Command:
+
+    HERMES_PYTHON=/home/houminxi/code/hermes/hermes-agent/venv/bin/python scripts/run_tests.sh tests/hermes_cli/test_kanban_diagnostics.py tests/hermes_cli/test_kanban_review_surfaces.py -k 'test_running_run_mismatch_task_pid_without_run_pid or test_running_run_mismatch_run_pid_without_task_pid or test_running_one_sided_task_pid_past_grace_is_mismatch_only or test_running_one_sided_run_pid_past_grace_is_mismatch_only or test_cli_and_dashboard_receive_one_sided_run_pid_mismatch' -q
+
+Injected result: exit 1, `0 tests passed, 5 failed`. One-sided cases emitted no identity diagnostic (`kinds == []` / `len(cli_diags) == 0`). Restored result: exit 0, `2 files, 32 tests passed, 0 failed`.
+
+### Static gates
+
+Command:
+
+    ruff check hermes_cli/kanban_diagnostics.py tests/hermes_cli/test_kanban_diagnostics.py tests/hermes_cli/test_kanban_review_surfaces.py
+    /home/houminxi/code/hermes/hermes-agent/venv/bin/python -m py_compile hermes_cli/kanban_diagnostics.py tests/hermes_cli/test_kanban_diagnostics.py tests/hermes_cli/test_kanban_review_surfaces.py
+    git diff --check
+
+Result: ruff `All checks passed!`; `py_compile` silent; `git diff --check` silent; no non-ASCII added lines. Python identifiers, diagnostic kinds, and JSON keys remain ASCII.
+
+### Code Forge cycle 1 (job `b9ee4ca5-1570-4eb6-97a6-06a717d06ccc`)
+
+CI mode, backend `mimo-direct`, 3 passes, wall 650s. Verdict FAIL: 1 confirmed, 2 uncertain, 1 dismissed.
+
+- Confirmed `3271f746bbb7945c`: one-sided PID emptiness past 30s stacked mismatch and pid-missing. Architect required suppressing the lower-severity signals; the production early-return implements that. Clean count resets.
+- Uncertain `8ad61e349be136db` / `97f8502669dbeaf0`: same cascade class; heartbeat is now suppressed unless identity already matches.
+- Dismissed E2E_CHECK and runtime/coverage/semgrep notes are tool-environment advisories, not code findings.
+
+Cycle 2 job `7c2e00d0-5deb-43f4-b196-74f54cda0a63` was stopped after the architect correction landed mid-review.
+
+### Fresh re-verification (continuation after crash)
+
+The prior coder run crashed (`pid 734261 not alive`) after staging the single-diagnostic identity rule. This continuation kept that staged tree, collapsed leftover blank lines in `tests/hermes_cli/test_kanban_diagnostics.py`, and re-ran the required gates on the live worktree.
+
+Command:
+
+    HERMES_PYTHON=/home/houminxi/code/hermes/hermes-agent/venv/bin/python scripts/run_tests.sh tests/hermes_cli/test_kanban_diagnostics.py tests/hermes_cli/test_kanban_review_surfaces.py -q
+
+Result: exit 0, `2 files, 32 tests passed, 0 failed (100% complete) in 1.9s`.
+
+One-sided PID mismatch defect injection (same production mutation as above: restore the both-nonempty compare) was re-run with `PYTHONDONTWRITEBYTECODE=1` after clearing `hermes_cli` bytecode for `kanban_diagnostics`. Injected result: exit 1, `0 tests passed, 5 failed`. One-sided cases emitted no identity diagnostic (`kinds == []` / `len(cli_diags) == 0`). Restored result: exit 0, `2 files, 32 tests passed, 0 failed`.
+
+Static gates on the four-file Task 3 tree:
+
+    ruff check hermes_cli/kanban_diagnostics.py tests/hermes_cli/test_kanban_diagnostics.py tests/hermes_cli/test_kanban_review_surfaces.py
+    /home/houminxi/code/hermes/hermes-agent/venv/bin/python -m py_compile hermes_cli/kanban_diagnostics.py tests/hermes_cli/test_kanban_diagnostics.py tests/hermes_cli/test_kanban_review_surfaces.py
+    git diff --check
+
+Result: ruff `All checks passed!`; `py_compile` silent; `git diff --check` silent; no non-ASCII added lines. Python identifiers, diagnostic kinds, and JSON keys remain ASCII.
+
+Operator direction for this coder run: do not restart long multi-round Forge loops. Cycle 1 confirmed code finding `3271f746bbb7945c` (stacked mismatch + pid-missing) is addressed by the early-return single-diagnostic rule; remaining clean rounds belong to the later independent Reviewer card, not this commit.
