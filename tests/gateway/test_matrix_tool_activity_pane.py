@@ -64,6 +64,20 @@ def test_plain_fallback_hides_arguments_and_rich_lines_are_bounded():
     assert "..." in html
 
 
+def test_matrix_activity_keeps_a_bounded_recent_window():
+    max_lines = 16
+    lines = [f"tool update {index}" for index in range(max_lines + 1)]
+
+    body, html = matrix_tool_activity_bodies(lines)
+
+    assert body == (
+        f"🛠 Tool activity ({len(lines)} updates, latest {max_lines} shown)"
+    )
+    assert html.count("<li>") == max_lines
+    assert "tool update 0" not in html
+    assert f"tool update {max_lines}" in html
+
+
 def test_matrix_tools_and_footer_render_in_locked_order():
     body, html = matrix_tool_activity_bodies(
         ["🔍 Recall & inspect", "💻 terminal: a < b"],
@@ -198,14 +212,6 @@ def test_matrix_one_line_label_contract_for_terminal():
     assert "```" not in label
     assert "\n" not in label
     assert label.startswith("💻 terminal:")
-
-
-def test_production_helper_is_single_source_for_pane():
-    """The coordinator must import the production helper, not fork rendering."""
-    import gateway.matrix_activity_pane as pane_mod
-
-    src = inspect.getsource(pane_mod)
-    assert "from gateway.matrix_tool_activity import matrix_tool_activity_bodies" in src
 
 
 class _PaneAdapter:

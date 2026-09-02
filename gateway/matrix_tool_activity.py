@@ -7,6 +7,9 @@ import re
 from typing import Iterable, List, Sequence, Tuple
 
 
+MAX_ACTIVITY_LINES = 16
+
+
 def matrix_tool_activity_bodies(
     lines: Sequence[str] | Iterable[str],
     footer: str | None = None,
@@ -33,9 +36,17 @@ def matrix_tool_activity_bodies(
             s = s[:157] + "..."
         cleaned.append(s)
     footer_text = str(footer or "").strip() or None
+    total = len(cleaned)
+    truncated = total > MAX_ACTIVITY_LINES
+    if truncated:
+        cleaned = cleaned[-MAX_ACTIVITY_LINES:]
     n = len(cleaned)
     title = (
-        f"🛠 Tool activity ({n} update{'s' if n != 1 else ''})"
+        (
+            f"🛠 Tool activity ({total} updates, latest {MAX_ACTIVITY_LINES} shown)"
+            if truncated
+            else f"🛠 Tool activity ({n} update{'s' if n != 1 else ''})"
+        )
         if cleaned
         else "🛠 Tool activity"
     )
