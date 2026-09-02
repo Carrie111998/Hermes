@@ -208,6 +208,9 @@ class LSPClient:
         self._stderr_task: Optional[asyncio.Task] = None
         self._reader_task: Optional[asyncio.Task] = None
         self._cleanup_lock = asyncio.Lock()
+        self._shutdown_task: Optional[asyncio.Task] = None
+        self._cleanup_error: Optional[str] = None
+        self._dispatch_tasks: Set[asyncio.Task] = set()
 
         # Request/response correlation
         self._next_id: int = 0
@@ -284,6 +287,15 @@ class LSPClient:
         """
         if self._state in {"running", "starting"}:
             return
+        shutdown_task = self._shutdown_task
+        if shutdown_task is not None and not shutdown_task.done():
+            await asyncio.shield(shutdown_task)
+        # A failed prior cleanup may still own a live process.  Never let a
+        # retry overwrite the only handle to that generation.
+        if self._proc is not None:
+            await self._cleanup_process()
+        self._shutdown_task = None
+        self._stopping = False
         self._state = "starting"
         try:
             await self._spawn()
@@ -347,7 +359,26 @@ class LSPClient:
         # fills and the server hangs.
         self._stderr_task = asyncio.create_task(self._drain_stderr())
         # Start the reader loop.
-        self._reader_task = asyncio.create_task(self._reader_loop())
+        self._start_reader_task()
+
+    def _start_reader_task(self) -> None:
+        task = asyncio.create_task(self._reader_loop())
+        self._reader_task = task
+        task.add_done_callback(self._consume_reader_task_result)
+
+    def _consume_reader_task_result(self, task: asyncio.Task) -> None:
+        """Retrieve detached reader failures while preserving client state."""
+        try:
+            exc = task.exception()
+        except asyncio.CancelledError:
+            return
+        if exc is not None:
+            logger.warning(
+                "[%s] reader task failed: %s: %s",
+                self.server_id,
+                type(exc).__name__,
+                exc,
+            )
 
     async def _drain_stderr(self) -> None:
         if self._proc is None or self._proc.stderr is None:
@@ -376,7 +407,9 @@ class LSPClient:
                 if kind == "response":
                     self._dispatch_response(key, msg)
                 elif kind == "request":
-                    asyncio.create_task(self._dispatch_request(key, msg))
+                    task = asyncio.create_task(self._dispatch_request(key, msg))
+                    self._dispatch_tasks.add(task)
+                    task.add_done_callback(self._dispatch_tasks.discard)
                 elif kind == "notification":
                     self._dispatch_notification(key, msg)
                 else:
@@ -475,10 +508,20 @@ class LSPClient:
         """Best-effort graceful shutdown.
 
         Sends ``shutdown`` + ``exit``, then SIGTERMs/SIGKILLs the
-        process if it doesn't exit cleanly.  Idempotent.
+        process if it doesn't exit cleanly.  Idempotent.  Cleanup is
+        retained in one task and shielded so cancellation of any caller
+        cannot strand the process or make a later caller return early.
         """
-        if self._stopping:
-            return
+        task = self._shutdown_task
+        if task is None or (
+            task.done()
+            and (task.cancelled() or task.exception() is not None)
+        ):
+            task = asyncio.create_task(self._shutdown_impl())
+            self._shutdown_task = task
+        await asyncio.shield(task)
+
+    async def _shutdown_impl(self) -> None:
         self._stopping = True
         try:
             if self.is_running:
@@ -498,7 +541,6 @@ class LSPClient:
         async with self._cleanup_lock:
             current_task = asyncio.current_task()
             reader_task = self._reader_task
-            self._reader_task = None
             if (
                 reader_task is not None
                 and reader_task is not current_task
@@ -509,31 +551,68 @@ class LSPClient:
                     await reader_task
                 except (asyncio.CancelledError, Exception):  # noqa: BLE001
                     pass
+            if self._reader_task is reader_task:
+                self._reader_task = None
+
+            dispatch_tasks = [
+                task
+                for task in self._dispatch_tasks
+                if task is not current_task and not task.done()
+            ]
+            for task in dispatch_tasks:
+                task.cancel()
+            if dispatch_tasks:
+                await asyncio.gather(*dispatch_tasks, return_exceptions=True)
+            completed_dispatch = {
+                task for task in self._dispatch_tasks if task.done()
+            }
+            self._dispatch_tasks.difference_update(completed_dispatch)
+
             stderr_task = self._stderr_task
-            self._stderr_task = None
             if stderr_task is not None and not stderr_task.done():
                 stderr_task.cancel()
                 try:
                     await stderr_task
                 except (asyncio.CancelledError, Exception):  # noqa: BLE001
                     pass
+            if self._stderr_task is stderr_task:
+                self._stderr_task = None
+
             proc = self._proc
-            self._proc = None
             if proc is None:
+                self._cleanup_error = None
                 return
-            if proc.returncode is None:
-                try:
-                    proc.terminate()
+
+            try:
+                if proc.returncode is None:
+                    try:
+                        proc.terminate()
+                    except ProcessLookupError:
+                        # The OS may have reaped it between returncode checks.
+                        # ``wait()`` below is still the confirmation boundary.
+                        pass
+
                     try:
                         await asyncio.wait_for(proc.wait(), timeout=SHUTDOWN_GRACE)
                     except asyncio.TimeoutError:
                         try:
                             proc.kill()
-                            await proc.wait()
                         except ProcessLookupError:
                             pass
-                except ProcessLookupError:
-                    pass
+                        await asyncio.wait_for(proc.wait(), timeout=SHUTDOWN_GRACE)
+
+                if proc.returncode is None:
+                    raise RuntimeError("language-server exit was not confirmed")
+            except Exception as e:
+                # Keep the process handle and the failure.  A later shutdown
+                # retries this same generation instead of reporting success or
+                # allowing a replacement to overlap it.
+                self._cleanup_error = f"{type(e).__name__}: {e}"
+                raise
+            else:
+                if self._proc is proc:
+                    self._proc = None
+                self._cleanup_error = None
 
     # ------------------------------------------------------------------
     # request / notification plumbing
@@ -927,21 +1006,32 @@ class LSPClient:
             if remaining <= 0:
                 return False
 
-            # Concurrent: document pull + push wait.
-            pull_task = asyncio.create_task(self._pull_document_diagnostics(abs_path))
-            push_task = asyncio.create_task(self._wait_for_fresh_push(abs_path, version, remaining))
-            done, pending = await asyncio.wait(
-                {pull_task, push_task},
-                timeout=remaining,
-                return_when=asyncio.FIRST_COMPLETED,
-            )
-            for t in pending:
-                t.cancel()
-            for t in pending:
-                try:
-                    await t
-                except (asyncio.CancelledError, Exception):  # noqa: BLE001
-                    pass
+            # Concurrent: document pull + push wait.  The parent owns both
+            # children across every exit path, including cancellation by the
+            # synchronous bridge when its outer timeout fires.
+            children: List[asyncio.Task] = []
+            try:
+                children.append(
+                    asyncio.create_task(
+                        self._pull_document_diagnostics(abs_path)
+                    )
+                )
+                children.append(
+                    asyncio.create_task(
+                        self._wait_for_fresh_push(abs_path, version, remaining)
+                    )
+                )
+                await asyncio.wait(
+                    children,
+                    timeout=remaining,
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+            finally:
+                for task in children:
+                    if not task.done():
+                        task.cancel()
+                if children:
+                    await asyncio.gather(*children, return_exceptions=True)
 
             # If we got a fresh push for our version, we're done.
             doc = self._docs.get(abs_path)
