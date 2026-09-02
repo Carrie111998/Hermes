@@ -53,6 +53,21 @@ class TestSubdirectoryHintTracker:
         assert result is not None
         assert "Frontend rules" in result
 
+    @pytest.mark.parametrize("filename", [".hermes.md", "HERMES.md"])
+    def test_discovers_hermes_md(self, tmp_path, filename):
+        """Hermes project context must follow tools into subdirectories."""
+        project = tmp_path / "service"
+        project.mkdir()
+        (project / filename).write_text("Hermes project rules")
+
+        tracker = SubdirectoryHintTracker(working_dir=str(tmp_path))
+        result = tracker.check_tool_call(
+            "read_file", {"path": str(project / "main.py")}
+        )
+
+        assert result is not None
+        assert "Hermes project rules" in result
+
     def test_no_duplicate_loading(self, project):
         """Same directory should not be loaded twice."""
         tracker = SubdirectoryHintTracker(working_dir=str(project))
