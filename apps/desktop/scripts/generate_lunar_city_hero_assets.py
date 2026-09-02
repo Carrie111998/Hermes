@@ -308,6 +308,101 @@ def sculpted_robe(name, x, y, height, mat, target, asset_id, role):
     return polish_surface(obj, subdivision=1, bevel=0.01)
 
 
+def sculpted_actor_body(name, x, y, height, radius, mat, target, asset_id, role, kind):
+    verts = []
+    faces = []
+    rings = 10
+    segments = 24
+    for ring in range(rings + 1):
+        v = ring / rings
+        z = height * (0.06 + 0.74 * v)
+        waist = 0.78 + 0.28 * sin(pi * v)
+        shoulder = 1.0 + 0.18 * sin(pi * min(1.0, v * 1.35))
+        taper = 0.58 + 0.42 * (1.0 - abs(v - 0.58))
+        if kind == "leader":
+            rx = radius * (waist + 0.12 * shoulder)
+            ry = radius * 0.68 * taper
+        else:
+            rx = radius * (0.82 + 0.2 * sin(pi * v))
+            ry = radius * 0.62 * (0.72 + 0.18 * sin(pi * v))
+        for segment in range(segments):
+            angle = 2 * pi * segment / segments
+            front_bias = 1.0 - 0.08 * max(0, -sin(angle))
+            px = x + cos(angle) * rx * front_bias
+            py = y + sin(angle) * ry
+            verts.append((px, py, z))
+    for ring in range(rings):
+        for segment in range(segments):
+            a = ring * segments + segment
+            b = ring * segments + (segment + 1) % segments
+            c = (ring + 1) * segments + (segment + 1) % segments
+            d = (ring + 1) * segments + segment
+            faces.append((a, b, c, d))
+    faces.append(tuple(reversed(range(segments))))
+    top_start = rings * segments
+    faces.append(tuple(range(top_start, top_start + segments)))
+    mesh = bpy.data.meshes.new(f"{name}_mesh")
+    mesh.from_pydata(verts, [], faces)
+    mesh.update()
+    mesh.materials.append(mat)
+    obj = bpy.data.objects.new(name, mesh)
+    target.objects.link(obj)
+    mark(obj, asset_id, "character", role, "single-piece-sculpted-body")
+    obj["mesh_construction"] = f"continuous_{kind}_body_skin"
+    obj["retopology_target"] = "quad_rings_with_lod_decimation"
+    return polish_surface(obj, subdivision=1, bevel=0.006)
+
+
+def sculpted_head(name, x, y, z, mat, target, asset_id, role, label_text, kind):
+    verts = []
+    faces = []
+    rings = 12
+    segments = 28
+    lower = label_text.lower()
+    for ring in range(rings + 1):
+        theta = pi * ring / rings
+        for segment in range(segments):
+            phi = 2 * pi * segment / segments
+            sx = sin(theta) * cos(phi)
+            sy = sin(theta) * sin(phi)
+            sz = cos(theta)
+            front = max(0.0, -sy)
+            side = abs(sx)
+            if kind == "leader":
+                rx = 0.34 + (0.04 if "fox" in lower else 0.0) - 0.025 * max(0, sz)
+                ry = 0.29 + 0.08 * front + (0.03 if "eagle" in lower or "hawk" in lower else 0.0)
+                rz = 0.33 + (0.03 if "owl" in lower else 0.0)
+                pz = z + sz * rz - 0.03 * front
+                px = x + sx * rx * (1.0 - 0.08 * max(0, -sz))
+                py = y + sy * ry - 0.08 * front * (1.0 - side)
+            else:
+                rx = 0.26 if kind == "worker" else 0.22
+                ry = 0.23 if kind == "worker" else 0.2
+                rz = 0.26 if kind == "worker" else 0.21
+                visor_flatten = 1.0 - 0.18 * front
+                px = x + sx * rx * visor_flatten
+                py = y + sy * ry
+                pz = z + sz * rz + 0.025 * max(0, sz)
+            verts.append((px, py, pz))
+    for ring in range(rings):
+        for segment in range(segments):
+            a = ring * segments + segment
+            b = ring * segments + (segment + 1) % segments
+            c = (ring + 1) * segments + (segment + 1) % segments
+            d = (ring + 1) * segments + segment
+            faces.append((a, b, c, d))
+    mesh = bpy.data.meshes.new(f"{name}_mesh")
+    mesh.from_pydata(verts, [], faces)
+    mesh.update()
+    mesh.materials.append(mat)
+    obj = bpy.data.objects.new(name, mesh)
+    target.objects.link(obj)
+    mark(obj, asset_id, "character", role, "single-piece-sculpted-head")
+    obj["mesh_construction"] = f"continuous_{kind}_head_skin"
+    obj["retopology_target"] = "quad_sphere_deformation"
+    return polish_surface(obj, subdivision=1, bevel=0.004)
+
+
 def add_species_detail(asset_id, role, label_text, x, y, height, accent_mat, target, mats):
     lower = label_text.lower()
     if "owl" in lower:
@@ -422,22 +517,10 @@ def make_character(asset_id, role, label_text, accent, x, y, target, mats, kind)
     height = 1.55 if leader else (0.82 if child else 1.05)
     body_w = 0.46 if leader else (0.28 if child else 0.34)
     body_mat = accent_mat if leader else mats["suit"]
-    ellipsoid(f"{asset_id}_skinned_torso_mesh", (x, y, height * 0.45), (body_w, 0.27, height * 0.38), body_mat, target, asset_id, "character", role, "skinned-torso")
+    sculpted_actor_body(f"{asset_id}_single_piece_body_skin", x, y, height, body_w, body_mat, target, asset_id, role, kind)
     chamfer(f"{asset_id}_belt_panel_mesh", (x, y - 0.24, height * 0.42), (body_w * 0.72, 0.025, 0.055), mats["gold"] if leader else accent_mat, target, asset_id, "character", role, "belt-panel")
     head_mat = mats["fur"] if leader else mats["helmet"]
-    ellipsoid(
-        f"{asset_id}_head_mesh",
-        (x, y - 0.01, height + 0.18),
-        (0.36, 0.31, 0.34) if leader else ((0.23, 0.21, 0.22) if child else (0.28, 0.25, 0.27)),
-        head_mat,
-        target,
-        asset_id,
-        "character",
-        role,
-        "skinned-head",
-        40,
-        20,
-    )
+    sculpted_head(f"{asset_id}_single_piece_head_skin", x, y - 0.01, height + 0.18, head_mat, target, asset_id, role, label_text, kind)
     visor = chamfer(f"{asset_id}_visor_mesh", (x, y - 0.27, height + 0.18), (0.16, 0.018, 0.07), mats["glass"], target, asset_id, "character", role, "visor")
     visor["animation_binding"] = f"{asset_id}:look"
     for side in (-1, 1):
@@ -446,10 +529,11 @@ def make_character(asset_id, role, label_text, accent, x, y, target, mats, kind)
         ellipsoid(f"{asset_id}_foot_{side}_mesh", (x + side * body_w * 0.48, y - 0.1, 0.05), (0.1, 0.16, 0.045), mats["black"], target, asset_id, "character", role, "foot", 20, 10)
     if leader:
         sculpted_robe(f"{asset_id}_robe_cloth_skin", x, y, height, accent_mat, target, asset_id, role)
+        ellipsoid(f"{asset_id}_front_muzzle_plate_mesh", (x, y - 0.335, height + 0.12), (0.16, 0.018, 0.11), mats["fur_light"], target, asset_id, "character", role, "front-muzzle-plate", 20, 10)
         for side in (-1, 1):
             cone(f"{asset_id}_ear_{side}_mesh", (x + side * 0.22, y, height + 0.58), 0.12, 0.02, 0.34, mats["fur"], target, asset_id, "character", role, "ear", 16, rotation=(0.18, side * 0.34, 0))
-            ellipsoid(f"{asset_id}_eye_{side}_mesh", (x + side * 0.11, y - 0.285, height + 0.25), (0.045, 0.018, 0.035), mats["white"], target, asset_id, "character", role, "eye", 16, 8)
-            ellipsoid(f"{asset_id}_pupil_{side}_mesh", (x + side * 0.115, y - 0.303, height + 0.25), (0.02, 0.008, 0.018), mats["black"], target, asset_id, "character", role, "pupil", 12, 6)
+            ellipsoid(f"{asset_id}_eye_{side}_mesh", (x + side * 0.12, y - 0.335, height + 0.255), (0.062, 0.012, 0.045), mats["white"], target, asset_id, "character", role, "eye", 16, 8)
+            ellipsoid(f"{asset_id}_pupil_{side}_mesh", (x + side * 0.124, y - 0.348, height + 0.255), (0.029, 0.006, 0.025), mats["black"], target, asset_id, "character", role, "pupil", 12, 6)
         cone(f"{asset_id}_muzzle_mesh", (x, y - 0.32, height + 0.12), 0.13, 0.06, 0.28, mats["fur_light"], target, asset_id, "character", role, "muzzle", 20, rotation=(1.45, 0, 0))
         if any(bird in label_text.lower() for bird in ("owl", "eagle", "hawk")):
             cone(f"{asset_id}_beak_mesh", (x, y - 0.39, height + 0.14), 0.075, 0.01, 0.24, mats["beak"], target, asset_id, "character", role, "beak", 18, rotation=(1.5, 0, 0))
@@ -561,6 +645,7 @@ def main():
     scene["asset_count"] = len(BUILDINGS) + len(LEADERS) + len(WORKERS) + len(CHILDREN)
     scene["hero_mesh_components"] = sum(1 for obj in bpy.data.objects if obj.get("hero_asset"))
     scene["sculpted_surface_components"] = sum(1 for obj in bpy.data.objects if obj.get("mesh_construction"))
+    scene["sculpted_character_core_components"] = sum(1 for obj in bpy.data.objects if str(obj.get("mesh_construction", "")).startswith("continuous_") and obj.get("asset_kind") == "character")
 
     manifest = {
         "schemaVersion": 1,
@@ -573,6 +658,7 @@ def main():
         "assetCount": scene["asset_count"],
         "heroMeshComponentCount": scene["hero_mesh_components"],
         "sculptedSurfaceComponentCount": scene["sculpted_surface_components"],
+        "sculptedCharacterCoreComponentCount": scene["sculpted_character_core_components"],
         "buildings": [
             {"id": asset_id, "role": role, "title": title, "collection": f"Hero Asset - {asset_id}", "lod": ["hero", "high", "medium", "low"]}
             for asset_id, role, title, _accent in BUILDINGS
@@ -613,6 +699,7 @@ def main():
             "noRawSoulContent": True,
             "freeLocalGenerationOnly": True,
             "usesContinuousSculptedSurfaces": scene["sculpted_surface_components"] >= len(BUILDINGS) * 4 + len(LEADERS),
+            "usesContinuousCharacterCoreMeshes": scene["sculpted_character_core_components"] >= (len(LEADERS) + len(WORKERS) + len(CHILDREN)) * 2,
         },
     }
     HERO_MANIFEST.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
@@ -625,11 +712,13 @@ def main():
     bpy.ops.render.render(write_still=True)
     camera = scene.camera
     if camera:
+        buildings.hide_render = True
         camera.location = (0, -28, 17)
-        camera.data.ortho_scale = 23
+        camera.data.ortho_scale = 20
         camera.rotation_euler = (Vector((0, -7.8, 0.9)) - camera.location).to_track_quat("-Z", "Y").to_euler()
         scene.render.filepath = str(HERO_CHARACTER_RENDER)
         bpy.ops.render.render(write_still=True)
+        buildings.hide_render = False
 
 
 if __name__ == "__main__":

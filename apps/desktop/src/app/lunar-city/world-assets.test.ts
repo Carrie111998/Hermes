@@ -70,6 +70,7 @@ describe('Lunar City asset manifest', () => {
       children: Array<{ collection: string; id: string }>
       heroMeshComponentCount: number
       leaders: Array<{ collection: string; id: string }>
+      sculptedCharacterCoreComponentCount: number
       sculptedSurfaceComponentCount: number
       validation: Record<string, boolean>
       workers: Array<{ collection: string; id: string }>
@@ -81,8 +82,10 @@ describe('Lunar City asset manifest', () => {
     expect(manifest.workers).toHaveLength(6)
     expect(manifest.children).toHaveLength(4)
     expect(manifest.heroMeshComponentCount).toBeGreaterThan(600)
-    expect(manifest.sculptedSurfaceComponentCount).toBeGreaterThanOrEqual(40)
+    expect(manifest.sculptedSurfaceComponentCount).toBeGreaterThanOrEqual(76)
+    expect(manifest.sculptedCharacterCoreComponentCount).toBeGreaterThanOrEqual(36)
     expect(manifest.validation.usesContinuousSculptedSurfaces).toBe(true)
+    expect(manifest.validation.usesContinuousCharacterCoreMeshes).toBe(true)
     expect(manifest.validation.freeLocalGenerationOnly).toBe(true)
     expect(manifest.validation.noRawSoulContent).toBe(true)
     for (const asset of [...manifest.buildings, ...manifest.leaders, ...manifest.workers, ...manifest.children]) {

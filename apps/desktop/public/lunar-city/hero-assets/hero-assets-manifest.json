@@ -159,7 +159,7 @@
     }
   ],
   "glb": "lunar-city/hero-assets/lunar-city-hero-assets.glb",
-  "heroMeshComponentCount": 629,
+  "heroMeshComponentCount": 637,
   "leaders": [
     {
       "animationClips": [
@@ -277,12 +277,14 @@
   "preview": "lunar-city/hero-assets/lunar-city-hero-assets.png",
   "referenceTarget": "approved_lunar_city_reference_images",
   "schemaVersion": 1,
-  "sculptedSurfaceComponentCount": 40,
+  "sculptedCharacterCoreComponentCount": 36,
+  "sculptedSurfaceComponentCount": 76,
   "source": "local_blender_hero_asset_generation",
   "validation": {
     "allAssetsVisibleInReviewScene": true,
     "freeLocalGenerationOnly": true,
     "noRawSoulContent": true,
+    "usesContinuousCharacterCoreMeshes": true,
     "usesContinuousSculptedSurfaces": true,
     "usesSeparateHeroAssetScene": true
   },
