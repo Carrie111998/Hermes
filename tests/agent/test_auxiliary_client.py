@@ -157,6 +157,24 @@ class TestResolveTaskProviderModel:
         assert model == "meta/llama-3.2-11b-vision-instruct"
         assert api_mode is None
 
+    def test_configured_bare_base_url_routes_to_keyless_custom_endpoint(self):
+        """A local task endpoint must not fall through to the main provider
+        merely because it does not require an API key."""
+        task_config = {
+            "model": "claude-sonnet-5",
+            "base_url": "http://127.0.0.1:9180/v1",
+        }
+        with patch("agent.auxiliary_client._get_auxiliary_task_config", return_value=task_config):
+            resolved_provider, model, base_url, api_key, api_mode = _resolve_task_provider_model(
+                task="compression",
+            )
+
+        assert resolved_provider == "custom"
+        assert model == "claude-sonnet-5"
+        assert base_url == "http://127.0.0.1:9180/v1"
+        assert api_key is None
+        assert api_mode is None
+
 
 
 
