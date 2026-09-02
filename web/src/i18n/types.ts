@@ -202,6 +202,12 @@ export interface Translations {
     selectedSessionsDeleted: string;
     failedToDeleteSelected: string;
     resumeInChat: string;
+    /** Optional — fall back to English until translated. */
+    liveView?: string;
+    liveViewReadOnlyHint?: string;
+    resumeWritableHint?: string;
+    resumeOwnershipTitle?: string;
+    resumeOwnershipDescription?: string;
     newChat: string;
     previousPage: string;
     nextPage: string;

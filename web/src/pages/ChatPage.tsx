@@ -32,6 +32,7 @@ import { useSearchParams } from "react-router";
 
 import { ChatSidebar } from "@/components/ChatSidebar";
 import { ChatSessionList } from "@/components/ChatSessionList";
+import { LiveSessionView } from "@/components/LiveSessionView";
 import { usePageHeader } from "@/contexts/usePageHeader";
 import { useI18n } from "@/i18n";
 import { api } from "@/lib/api";
@@ -175,6 +176,17 @@ function terminalLineHeightForWidth(layoutWidthPx: number): number {
 }
 
 export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
+  // Live view is a read-only subscription to persisted turns. It must not
+  // fall through into the embedded TUI / PTY path (that is Resume).
+  const [liveSearchParams] = useSearchParams();
+  const liveSessionId = (liveSearchParams.get("live") || "").trim();
+  if (liveSessionId) {
+    return <LiveSessionView sessionId={liveSessionId} isActive={isActive} />;
+  }
+  return <EmbeddedTuiChatPage isActive={isActive} />;
+}
+
+function EmbeddedTuiChatPage({ isActive = true }: { isActive?: boolean }) {
   const hostRef = useRef<HTMLDivElement | null>(null);
   const termWrapRef = useRef<HTMLDivElement | null>(null);
   const termRef = useRef<Terminal | null>(null);
@@ -284,6 +296,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
     const next = new URLSearchParams(searchParams);
 
     next.delete("resume");
+    next.delete("live");
     forceFreshPtyRef.current = true;
     reconnectAttemptRef.current = 0;
     clearReconnectTimer();

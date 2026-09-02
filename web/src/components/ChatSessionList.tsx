@@ -19,6 +19,14 @@
  */
 
 import { Button } from "@nous-research/ui/ui/components/button";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@nous-research/ui/ui/components/dialog";
 import { ListItem } from "@nous-research/ui/ui/components/list-item";
 import { Spinner } from "@nous-research/ui/ui/components/spinner";
 import { AlertCircle, MessageSquarePlus, RefreshCw } from "lucide-react";
@@ -27,6 +35,7 @@ import { useSearchParams } from "react-router";
 
 import { useI18n } from "@/i18n";
 import { api, type SessionInfo } from "@/lib/api";
+import { shouldConfirmResumeOwnership } from "@/lib/session-ownership";
 import { cn, timeAgo } from "@/lib/utils";
 
 const SESSION_LIMIT = 30;
@@ -69,6 +78,9 @@ export function ChatSessionList({
   const [error, setError] = useState<string | null>(null);
   // Bumped to force a refetch (after switching, on Refresh, on mount).
   const [reloadNonce, setReloadNonce] = useState(0);
+  const [handoffSession, setHandoffSession] = useState<SessionInfo | null>(
+    null,
+  );
 
   // `profile` is read inside the fetch; it's part of the scope key so a
   // profile switch refetches. The empty-string fallback keeps the dep
@@ -110,22 +122,50 @@ export function ChatSessionList({
 
   const reload = useCallback(() => setReloadNonce((n) => n + 1), []);
 
-  // Picking a row sets `/chat?resume=<id>`. Re-picking the row already in
-  // the terminal is a no-op (avoids a needless PTY teardown).
-  const pick = useCallback(
+  const navigateResume = useCallback(
     (id: string) => {
-      onPicked?.();
-      if (id === activeSessionId) return;
       setSearchParams(
         (prev) => {
           const next = new URLSearchParams(prev);
+          next.delete("live");
           next.set("resume", id);
           return next;
         },
         { replace: false },
       );
     },
-    [activeSessionId, onPicked, setSearchParams],
+    [setSearchParams],
+  );
+
+  const navigateLive = useCallback(
+    (id: string) => {
+      setSearchParams(
+        (prev) => {
+          const next = new URLSearchParams(prev);
+          next.delete("resume");
+          next.set("live", id);
+          return next;
+        },
+        { replace: false },
+      );
+    },
+    [setSearchParams],
+  );
+
+  // Picking a row resumes that conversation in the TUI — unless the session
+  // still looks gateway-owned, in which case we require an explicit handoff
+  // (same contract as SessionsPage Resume) and offer Live view instead.
+  const pick = useCallback(
+    (session: SessionInfo) => {
+      onPicked?.();
+      if (session.id === activeSessionId) return;
+      if (shouldConfirmResumeOwnership(session)) {
+        setHandoffSession(session);
+        return;
+      }
+      navigateResume(session.id);
+    },
+    [activeSessionId, navigateResume, onPicked],
   );
 
   // "New chat" prefers ChatPage's robust handler (clears resume + forces a
@@ -143,6 +183,7 @@ export function ChatSessionList({
       (prev) => {
         const next = new URLSearchParams(prev);
         next.delete("resume");
+        next.delete("live");
         return next;
       },
       { replace: false },
@@ -184,7 +225,7 @@ export function ChatSessionList({
           return (
             <ListItem
               key={s.id}
-              onClick={() => pick(s.id)}
+              onClick={() => pick(s)}
               aria-current={isActive ? "true" : undefined}
               className={cn(
                 "flex-col items-start gap-0.5 rounded px-2 py-1.5",
@@ -255,6 +296,50 @@ export function ChatSessionList({
       <div className="min-h-0 flex-1 overflow-y-auto overflow-x-hidden px-1 pb-1">
         {content}
       </div>
+
+      <Dialog
+        open={handoffSession !== null}
+        onOpenChange={(open) => {
+          if (!open) setHandoffSession(null);
+        }}
+      >
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>
+              {t.sessions.resumeOwnershipTitle ??
+                "Take ownership of this session?"}
+            </DialogTitle>
+            <DialogDescription>
+              {t.sessions.resumeOwnershipDescription ??
+                "This session still looks active on a messaging gateway. Resume starts a separate writable TUI and can create a second writer. Prefer Live view to watch without taking ownership."}
+            </DialogDescription>
+          </DialogHeader>
+          <DialogFooter className="gap-2">
+            <Button
+              outlined
+              onClick={() => {
+                const id = handoffSession?.id;
+                setHandoffSession(null);
+                if (id) navigateLive(id);
+              }}
+            >
+              {t.sessions.liveView ?? "Live view"}
+            </Button>
+            <Button outlined onClick={() => setHandoffSession(null)}>
+              {t.common.cancel}
+            </Button>
+            <Button
+              onClick={() => {
+                const id = handoffSession?.id;
+                setHandoffSession(null);
+                if (id) navigateResume(id);
+              }}
+            >
+              {t.sessions.resumeInChat}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </aside>
   );
 }
