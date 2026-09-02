@@ -5960,10 +5960,19 @@ def run_job(
                 f"Time: {_mon_now}"
             )
             return False, _mon_doc, _mon_alert, _mon.error
-        if not _mon.changed:
+        if not _mon.changed and not job.get("manual_run_at"):
             # Unchanged output — suppress the agent run entirely. Recorded
             # as a silent no_change tick (visible in the executions ledger
             # via this doc; SILENT_MARKER blocks delivery).
+            #
+            # An explicit manual fire is exempt (#100282): suppressing it
+            # made monitor jobs untestable — `hermes cron run <id>` returned
+            # [SILENT] without invoking the agent, and with
+            # cron.silent_fallback configured it delivered the fallback
+            # instead, which reads as "the research found nothing" rather
+            # than "the run never happened". Scheduled ticks keep normal
+            # suppression. trigger_job() stamps manual_run_at; the direct
+            # cronjob(action="run") path passes an ephemeral marker.
             logger.info(
                 "Job '%s': monitor output unchanged — suppressing agent run",
                 job_id,
@@ -5976,9 +5985,18 @@ def run_job(
                 f"**Status:** no_change (agent run suppressed)\n"
             )
             return True, _mon_doc, SILENT_MARKER, None
-        # Changed (or first run): inject the monitor context into the prompt
-        # through the existing per-run context seam and fall through to a
-        # normal agent run.
+        if not _mon.changed:
+            # Manual fire on unchanged output: run the prompt anyway, but say
+            # so in the log so an operator reading a monitor job's history can
+            # tell a forced run from a change-triggered one.
+            logger.info(
+                "Job '%s': monitor output unchanged, but this is a manual "
+                "run — executing the agent anyway (#100282)",
+                job_id,
+            )
+        # Changed (or first run, or manual force): inject the monitor context
+        # into the prompt through the existing per-run context seam and fall
+        # through to a normal agent run.
         _monitor_context = _mon.context_block
         if _monitor_context:
             extra_prompt = (

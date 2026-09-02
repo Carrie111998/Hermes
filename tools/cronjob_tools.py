@@ -1113,8 +1113,20 @@ def _run_claimed_job(
 
         try:
             try:
+                # Mark this fire as manual so the monitor gate in run_job()
+                # does not mistake it for a scheduled tick and suppress it on
+                # unchanged output (#100282). trigger_job() stamps
+                # manual_run_at persistently; this path is an explicit
+                # cronjob(action="run"), so the marker is EPHEMERAL — a
+                # shallow copy only, never written back to the jobs store and
+                # never touching monitor_state.
+                _manual_job = dict(job)
+                if not _manual_job.get("manual_run_at"):
+                    from cron.jobs import _hermes_now as _cron_now
+
+                    _manual_job["manual_run_at"] = _cron_now().isoformat()
                 processed = run_one_job(
-                    job, adapters=adapters, loop=gateway_loop,
+                    _manual_job, adapters=adapters, loop=gateway_loop,
                     extra_prompt=extra_prompt,
                 )
             finally:
