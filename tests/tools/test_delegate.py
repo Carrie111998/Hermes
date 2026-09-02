@@ -597,8 +597,13 @@ class TestDelegateTask(unittest.TestCase):
                 child_db = kwargs["session_db"]
                 self.assertIsInstance(child_db, SessionDB)
                 self.assertIsNot(child_db, parent_db)
+                # ``get_shared_session_db`` canonicalizes the path, while
+                # ``SessionDB`` preserves an explicitly supplied spelling
+                # (macOS commonly aliases ``/tmp`` to ``/private/tmp``).
+                # The invariant is the database file, not its spelling.
                 self.assertEqual(
-                    str(child_db.db_path), str(parent_db.db_path)
+                    Path(child_db.db_path).resolve(),
+                    Path(parent_db.db_path).resolve(),
                 )
             finally:
                 if child_db is not None:
