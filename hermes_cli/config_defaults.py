@@ -816,6 +816,11 @@ DEFAULT_CONFIG = {
         "max_bytes": 50_000,
         "max_lines": 2000,
         "max_line_length": 2000,
+        # Spillovers preserve the full result on disk and put only a preview
+        # in model context. MCP tools use the tighter prefix-wide threshold;
+        # exact tool names can be lowered independently for chatty providers.
+        "mcp_result_size_chars": 50_000,
+        "tool_overrides": {},
     },
 
     # Tool loop guardrails nudge models when they repeat failed or
