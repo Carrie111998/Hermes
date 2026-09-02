@@ -3624,14 +3624,25 @@ class CuaDriverBackend(ComputerUseBackend):
                 return ActionResult(ok=False, action="scroll",
                                     message="No active window_id for coordinate scroll.")
             # CUA Driver 0.7.1 Linux schema rejects x/y on scroll. Only
-            # include them when the driver explicitly advertises support
-            # for coordinate scrolling; otherwise omit and let the driver
-            # scroll the targeted window (window_id is still sent for
-            # routing).  This is the safe default when capabilities
-            # haven't been discovered yet (older drivers).
+            # include them when the driver advertises support for
+            # coordinate scrolling — via the capability vocabulary, or
+            # (defensive second path, #89527) via the live scroll
+            # inputSchema declaring `x`. cua-driver 0.23.x retired the
+            # `input.scroll.coordinates` capability token while keeping
+            # x/y in the schema; inputSchema is a core MCP tools/list
+            # field that no strict client model can drop, so the schema
+            # probe recovers coordinate scrolling there. Neither signal
+            # → omit x/y and let the driver scroll the targeted window
+            # (window_id is still sent for routing). This is the safe
+            # default when capabilities haven't been discovered yet
+            # (older drivers).
+            schema_has_coordinates = (
+                self._session.supports_input_property("scroll", "x")
+                and self._session.supports_input_property("scroll", "y")
+            )
             if self._session.supports_capability(
                 "input.scroll.coordinates", tool="scroll"
-            ):
+            ) or schema_has_coordinates:
                 args["x"] = x
                 args["y"] = y
             args["window_id"] = self._active_window_id
