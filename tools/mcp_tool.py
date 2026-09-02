@@ -676,8 +676,9 @@ _CREDENTIAL_PATTERN = re.compile(
 
 # Pre-compiled pattern for ${VAR_NAME} style env-var interpolation.
 # Supports any non-} characters in the variable name (hyphens, dots, etc.)
-# so providers like MY-VAR or my.var work correctly.
-_ENV_VAR_PATTERN = re.compile(r"\$\{([^}]+)\}")
+# so providers like MY-VAR or my.var work correctly. The optional first dollar
+# captures explicit $${VAR} escapes without changing their legacy behavior.
+_ENV_VAR_PATTERN = re.compile(r"(\$)?\$\{([^}]+)\}")
 
 
 def _env_ref_name(ref: str) -> str:
@@ -5842,7 +5843,7 @@ def _interrupted_call_result() -> str:
 # Config loading
 # ---------------------------------------------------------------------------
 
-def _interpolate_env_vars(value):
+def _interpolate_env_vars(value, *, unescape: bool = False):
     """Recursively resolve ``${VAR}`` placeholders.
 
     Both ``${VAR}`` and Cursor-style ``${env:VAR}`` are accepted — the
@@ -5855,23 +5856,46 @@ def _interpolate_env_vars(value):
     is on (so an MCP server config's ``${API_KEY}`` picks up the routed
     profile's value, not the process-global ``os.environ`` which may hold
     another profile's), falling back to ``os.environ`` otherwise. Unset vars
-    keep the literal placeholder, as before.
+    keep the literal placeholder, as before. When ``unescape`` is true,
+    ``$${VAR}`` becomes a literal ``${VAR}`` for a child process to expand;
+    normal references retain existing behavior.
     """
     from agent.secret_scope import get_secret as _get_secret
 
     if isinstance(value, str):
         def _replace(m):
-            ctx = _context_var_value(m.group(1).strip())
+            escaped = m.group(1) is not None
+            ref = m.group(2).strip()
+            if escaped and unescape:
+                return f"${{{ref}}}"
+            ctx = _context_var_value(ref)
             if ctx is not None:
-                return ctx
-            name = _env_ref_name(m.group(1))
-            return _get_secret(name, m.group(0)) or m.group(0)
+                return f"${ctx}" if escaped else ctx
+            name = _env_ref_name(ref)
+            resolved = _get_secret(name)
+            if not resolved:
+                return m.group(0)
+            return f"${resolved}" if escaped else resolved
         return _ENV_VAR_PATTERN.sub(_replace, value)
     if isinstance(value, dict):
-        return {k: _interpolate_env_vars(v) for k, v in value.items()}
+        return {
+            k: _interpolate_env_vars(v, unescape=unescape)
+            for k, v in value.items()
+        }
     if isinstance(value, list):
-        return [_interpolate_env_vars(v) for v in value]
+        return [
+            _interpolate_env_vars(v, unescape=unescape)
+            for v in value
+        ]
     return value
+
+
+def _interpolate_mcp_server_config(config: dict) -> dict:
+    """Interpolate one server config and unescape child-owned argv refs."""
+    return {
+        key: _interpolate_env_vars(value, unescape=key == "args")
+        for key, value in config.items()
+    }
 
 
 # (server_name, dotted key path) pairs already warned about — see
@@ -5981,7 +6005,7 @@ def _load_mcp_config() -> Dict[str, dict]:
             pass
         safe_servers: Dict[str, dict] = {}
         for name, cfg in _filter_suspicious_mcp_servers(servers).items():
-            interpolated = _interpolate_env_vars(cfg)
+            interpolated = _interpolate_mcp_server_config(cfg)
             if isinstance(interpolated, dict):
                 _warn_hidden_whitespace(name, interpolated)
                 safe_servers[name] = interpolated
