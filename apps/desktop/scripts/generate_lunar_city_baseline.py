@@ -48,6 +48,122 @@ def collection(name):
     return value
 
 
+def mesh_object(name, verts, faces, mat, target):
+    mesh = bpy.data.meshes.new(f"{name}_mesh")
+    mesh.from_pydata(verts, [], faces)
+    mesh.update()
+    mesh.materials.append(mat)
+    obj = bpy.data.objects.new(name, mesh)
+    target.objects.link(obj)
+    obj["lod"] = "high"
+    return obj
+
+
+def chamfered_box_asset(name, dimensions, mat, target, chamfer=0.08):
+    """Create a reusable skinned mesh asset, not an ad-hoc cube primitive."""
+    width, depth, height = dimensions
+    half_w = width / 2
+    half_d = depth / 2
+    half_h = height / 2
+    cut_w = min(chamfer, half_w * 0.45)
+    cut_d = min(chamfer, half_d * 0.45)
+    outline = [
+        (-half_w + cut_w, -half_d),
+        (half_w - cut_w, -half_d),
+        (half_w, -half_d + cut_d),
+        (half_w, half_d - cut_d),
+        (half_w - cut_w, half_d),
+        (-half_w + cut_w, half_d),
+        (-half_w, half_d - cut_d),
+        (-half_w, -half_d + cut_d),
+    ]
+    verts = [(x, y, -half_h) for x, y in outline] + [(x, y, half_h) for x, y in outline]
+    faces = [tuple(range(7, -1, -1)), tuple(range(8, 16))]
+    for index in range(8):
+        nxt = (index + 1) % 8
+        faces.append((index, nxt, nxt + 8, index + 8))
+    obj = mesh_object(name, verts, faces, mat, target)
+    obj["asset_source"] = True
+    obj["asset_geometry"] = "chamfered_skinned_mesh"
+    modifier = obj.modifiers.new("skin_edge_weight", "WEIGHTED_NORMAL")
+    if hasattr(modifier, "keep_sharp"):
+        modifier.keep_sharp = True
+    return obj
+
+
+def arched_wall_asset(name, width, height, thickness, mat, target, segments=10):
+    """Create an open-front arched wall mesh source for linked building shells."""
+    half_w = width / 2
+    shoulder = height * 0.62
+    radius = half_w
+    arch_center_z = shoulder
+    front = []
+    front.append((-half_w, 0, -height / 2))
+    front.append((half_w, 0, -height / 2))
+    front.append((half_w, 0, shoulder - height / 2))
+    for index in range(1, segments):
+        angle = pi * (index / segments)
+        x = cos(angle) * radius
+        z = arch_center_z + sin(angle) * radius * 0.34 - height / 2
+        front.append((x, 0, z))
+    front.append((-half_w, 0, shoulder - height / 2))
+    back = [(x, thickness, z) for x, _y, z in front]
+    verts = front + back
+    face_front = tuple(range(len(front)))
+    face_back = tuple(range(len(front), len(front) * 2))
+    faces = [face_front, tuple(reversed(face_back))]
+    count = len(front)
+    for index in range(count):
+        nxt = (index + 1) % count
+        faces.append((index, nxt, nxt + count, index + count))
+    obj = mesh_object(name, verts, faces, mat, target)
+    obj["asset_source"] = True
+    obj["asset_geometry"] = "arched_wall_skinned_mesh"
+    obj.modifiers.new("arched_wall_weighted_normals", "WEIGHTED_NORMAL")
+    return obj
+
+
+def instance_asset(source, name, target, location, scale=(1, 1, 1), rotation=None):
+    obj = bpy.data.objects.new(name, source.data)
+    obj.location = location
+    obj.scale = tuple(axis * 2 for axis in scale)
+    if rotation:
+        obj.rotation_euler = rotation
+    target.objects.link(obj)
+    for modifier in source.modifiers:
+        clone = obj.modifiers.new(modifier.name, modifier.type)
+        for attr in ("width", "segments", "keep_sharp"):
+            if hasattr(modifier, attr) and hasattr(clone, attr):
+                setattr(clone, attr, getattr(modifier, attr))
+    obj["lod"] = source.get("lod", "high")
+    obj["source_asset"] = source.name
+    obj["world_instance"] = True
+    return obj
+
+
+def build_asset_kit(target, mats):
+    target["source"] = "procedural reusable mesh asset kit"
+    target["render_policy"] = "hidden source meshes; visible linked world instances"
+    assets = {
+        "floor_plate": chamfered_box_asset("asset_floor_plate", (1, 1, 1), mats["floor"], target, 0.1),
+        "side_wall": chamfered_box_asset("asset_side_wall", (1, 1, 1), mats["shell"], target, 0.12),
+        "roof_beam": chamfered_box_asset("asset_roof_beam", (1, 1, 1), mats["shell"], target, 0.11),
+        "roof_cap": chamfered_box_asset("asset_roof_cap", (1, 1, 1), mats["shell"], target, 0.12),
+        "panel_strip": chamfered_box_asset("asset_panel_strip", (1, 1, 1), mats["panel"], target, 0.04),
+        "floor_seam": chamfered_box_asset("asset_floor_seam", (1, 1, 1), mats["panel"], target, 0.01),
+        "glass_inset": chamfered_box_asset("asset_glass_inset", (1, 1, 1), mats["glass"], target, 0.03),
+        "front_step": chamfered_box_asset("asset_front_step", (1, 1, 1), mats["floor"], target, 0.03),
+        "door_arch_wall": arched_wall_asset("asset_arch_wall_shell", 1, 1, 1, mats["shell"], target),
+    }
+    for mat_name in ("violet", "cyan", "amber", "green"):
+        assets[f"sign_{mat_name}"] = chamfered_box_asset(f"asset_sign_{mat_name}", (1, 1, 1), mats[mat_name], target, 0.05)
+        assets[f"accent_strip_{mat_name}"] = chamfered_box_asset(f"asset_accent_strip_{mat_name}", (1, 1, 1), mats[mat_name], target, 0.03)
+    for source in assets.values():
+        source.hide_viewport = True
+        source.hide_render = True
+    return assets
+
+
 def move_to(obj, target):
     for group in list(obj.users_collection):
         group.objects.unlink(obj)
@@ -278,20 +394,20 @@ def add_role_props(asset_id, role, x, y, base, accent, buildings, mats):
         cube(f"{asset_id}_review_desk", (x, y - 0.25, base + 0.42), (0.9, 0.34, 0.18), mats["wood"], buildings, 0.05)
 
 
-def building(asset_id, role, location, accent, buildings, mats):
+def building(asset_id, role, location, accent, buildings, mats, kit):
     x, y = location
     base = ground_height(x, y)
-    floor = cube(f"{asset_id}_floor", (x, y, base + 0.12), (2.95, 2.35, 0.12), mats["floor"], buildings, 0.18)
-    back_wall = cube(f"{asset_id}_back_wall", (x, y + 1.92, base + 1.32), (3.02, 0.18, 1.26), mats["shell"], buildings, 0.22)
-    left_wall = cube(f"{asset_id}_left_wall", (x - 2.9, y, base + 1.18), (0.18, 1.94, 1.12), mats["shell"], buildings, 0.22)
-    right_wall = cube(f"{asset_id}_right_wall", (x + 2.9, y, base + 1.18), (0.18, 1.94, 1.12), mats["shell"], buildings, 0.22)
-    roof_back = cube(f"{asset_id}_roof_back_beam", (x, y + 1.84, base + 2.6), (3.02, 0.22, 0.18), mats["shell"], buildings, 0.18)
-    roof_left = cube(f"{asset_id}_roof_left_beam", (x - 2.9, y - 0.2, base + 2.52), (0.18, 1.74, 0.16), mats["shell"], buildings, 0.18)
-    roof_right = cube(f"{asset_id}_roof_right_beam", (x + 2.9, y - 0.2, base + 2.52), (0.18, 1.74, 0.16), mats["shell"], buildings, 0.18)
+    floor = instance_asset(kit["floor_plate"], f"{asset_id}_floor", buildings, (x, y, base + 0.12), (2.95, 2.35, 0.12))
+    back_wall = instance_asset(kit["side_wall"], f"{asset_id}_back_wall", buildings, (x, y + 1.92, base + 1.32), (3.02, 0.18, 1.26))
+    left_wall = instance_asset(kit["side_wall"], f"{asset_id}_left_wall", buildings, (x - 2.9, y, base + 1.18), (0.18, 1.94, 1.12))
+    right_wall = instance_asset(kit["side_wall"], f"{asset_id}_right_wall", buildings, (x + 2.9, y, base + 1.18), (0.18, 1.94, 1.12))
+    roof_back = instance_asset(kit["roof_beam"], f"{asset_id}_roof_back_beam", buildings, (x, y + 1.84, base + 2.6), (3.02, 0.22, 0.18))
+    roof_left = instance_asset(kit["roof_beam"], f"{asset_id}_roof_left_beam", buildings, (x - 2.9, y - 0.2, base + 2.52), (0.18, 1.74, 0.16))
+    roof_right = instance_asset(kit["roof_beam"], f"{asset_id}_roof_right_beam", buildings, (x + 2.9, y - 0.2, base + 2.52), (0.18, 1.74, 0.16))
     roof_caps = []
     for cap_index, dx in enumerate((-2.1, -0.7, 0.7, 2.1)):
-        roof_caps.append(cube(f"{asset_id}_roof_segment_cap_{cap_index}", (x + dx, y + 0.95, base + 2.68), (0.42, 0.74, 0.1), mats["shell"], buildings, 0.12))
-    sign = cube(f"{asset_id}_sign", (x, y - 2.17, base + 1.75), (1.55, 0.06, 0.38), mats[accent], buildings, 0.06)
+        roof_caps.append(instance_asset(kit["roof_cap"], f"{asset_id}_roof_segment_cap_{cap_index}", buildings, (x + dx, y + 0.95, base + 2.68), (0.42, 0.74, 0.1)))
+    sign = instance_asset(kit[f"sign_{accent}"], f"{asset_id}_sign", buildings, (x, y - 2.17, base + 1.75), (1.55, 0.06, 0.38))
     text_label(f"{asset_id}_sign_text", ROLE_LABELS.get(role, role.upper()), (x, y - 2.245, base + 1.76), mats["sign_text"], buildings, 0.28 if role != "engineering" else 0.22)
     sign["asset_id"] = asset_id
     sign["role"] = role
@@ -303,15 +419,15 @@ def building(asset_id, role, location, accent, buildings, mats):
         shell["role"] = role
         shell["skinned_wireframe_shell"] = True
     for tile_x in (-1.95, -0.95, 0, 0.95, 1.95):
-        cube(f"{asset_id}_floor_tile_seam_x_{tile_x}", (x + tile_x, y, base + 0.255), (0.018, 2.0, 0.012), mats["panel"], buildings, 0.006)
+        instance_asset(kit["floor_seam"], f"{asset_id}_floor_tile_seam_x_{tile_x}", buildings, (x + tile_x, y, base + 0.255), (0.018, 2.0, 0.012))
     for tile_y in (-1.3, -0.6, 0.1, 0.8):
-        cube(f"{asset_id}_floor_tile_seam_y_{tile_y}", (x, y + tile_y, base + 0.258), (2.55, 0.018, 0.012), mats["panel"], buildings, 0.006)
+        instance_asset(kit["floor_seam"], f"{asset_id}_floor_tile_seam_y_{tile_y}", buildings, (x, y + tile_y, base + 0.258), (2.55, 0.018, 0.012))
     for dx in (-1.72, 0, 1.72):
-        cube(f"{asset_id}_back_window_{dx}", (x + dx, y + 1.73, base + 1.18), (0.42, 0.05, 0.28), mats["glass"], buildings, 0.04)
+        instance_asset(kit["glass_inset"], f"{asset_id}_back_window_{dx}", buildings, (x + dx, y + 1.73, base + 1.18), (0.42, 0.05, 0.28))
     for index, dx in enumerate((-2.95, -1.9, -0.75, 0.75, 1.9, 2.95)):
-        cube(f"{asset_id}_skin_panel_{index}", (x + dx, y - 2.05, base + 1.35), (0.08, 0.06, 0.92), mats["panel"], buildings, 0.035)
+        instance_asset(kit["panel_strip"], f"{asset_id}_skin_panel_{index}", buildings, (x + dx, y - 2.05, base + 1.35), (0.08, 0.06, 0.92))
     for index, dz in enumerate((0.34, 0.72, 2.16, 2.46)):
-        cube(f"{asset_id}_horizontal_skin_{index}", (x, y - 2.1, base + dz), (2.86, 0.04, 0.055), mats["panel"], buildings, 0.025)
+        instance_asset(kit[f"accent_strip_{accent}"], f"{asset_id}_horizontal_skin_{index}", buildings, (x, y - 2.1, base + dz), (2.86, 0.04, 0.055))
     for dx in (-2.55, 2.55):
         cylinder(f"{asset_id}_vent_{dx}", (x + dx, y + 0.4, base + 2.88), 0.2, 0.5, mats[accent], buildings, 18)
     curve(
@@ -344,9 +460,9 @@ def building(asset_id, role, location, accent, buildings, mats):
             buildings,
         )
     for step in range(5):
-        cube(f"{asset_id}_front_step_{step}", (x, y - 2.42 - step * 0.24, base + 0.08 + step * 0.01), (1.55 - step * 0.1, 0.09, 0.045), mats["floor"], buildings, 0.035)
+        instance_asset(kit["front_step"], f"{asset_id}_front_step_{step}", buildings, (x, y - 2.42 - step * 0.24, base + 0.08 + step * 0.01), (1.55 - step * 0.1, 0.09, 0.045))
     add_role_props(asset_id, role, x, y, base, accent, buildings, mats)
-    floor["architecture"] = "open_front_skinned_wireframe_shell"
+    floor["architecture"] = "asset_instanced_open_front_skinned_wireframe_shell"
     return {
         "asset_id": asset_id,
         "base_z": base,
@@ -360,23 +476,96 @@ def building(asset_id, role, location, accent, buildings, mats):
     }
 
 
-def character(name, location, leader, characters, mats, role=None, personality=None, kind=None, accent=None):
+def build_character_kit(target, mats):
+    target["source"] = "reusable rig-style Hermes character mesh assets"
+    target["render_policy"] = "hidden source meshes; visible linked animated character instances"
+    assets = {
+        "worker_body": chamfered_box_asset("asset_worker_body_suit", (1, 1, 1), mats["character"], target, 0.18),
+        "child_body": chamfered_box_asset("asset_child_body_suit", (1, 1, 1), mats["character"], target, 0.16),
+        "leader_body": chamfered_box_asset("asset_leader_tailored_suit", (1, 1, 1), mats["violet"], target, 0.2),
+        "worker_head": chamfered_box_asset("asset_worker_helmet_head", (1, 1, 1), mats["helmet"], target, 0.2),
+        "child_head": chamfered_box_asset("asset_child_helmet_head", (1, 1, 1), mats["helmet"], target, 0.2),
+        "leader_head": chamfered_box_asset("asset_leader_animal_head", (1, 1, 1), mats["fur"], target, 0.22),
+        "visor": chamfered_box_asset("asset_character_visor", (1, 1, 1), mats["glass"], target, 0.04),
+        "collar": chamfered_box_asset("asset_leader_collar_trim", (1, 1, 1), mats["gold"], target, 0.04),
+        "cloak": chamfered_box_asset("asset_leader_cloak_panel", (1, 1, 1), mats["violet"], target, 0.1),
+    }
+    for mat_name in ("violet", "cyan", "amber", "green"):
+        assets[f"leader_body_{mat_name}"] = chamfered_box_asset(f"asset_leader_body_{mat_name}", (1, 1, 1), mats[mat_name], target, 0.2)
+        assets[f"role_trim_{mat_name}"] = chamfered_box_asset(f"asset_role_trim_{mat_name}", (1, 1, 1), mats[mat_name], target, 0.035)
+    for source in assets.values():
+        source.hide_viewport = True
+        source.hide_render = True
+        source["asset_source"] = True
+        source["rig_source"] = "hermes_character_kit"
+    return assets
+
+
+def add_character_wire_rig(name, x, y, z, height, radius, characters, mats, accent):
+    spine = curve(
+        f"{name}_wire_spine",
+        [(x, y, z + 0.15), (x, y, z + height * 0.72), (x, y, z + height + 0.42)],
+        0.018,
+        mats[accent or "glass"],
+        characters,
+    )
+    arms = curve(
+        f"{name}_wire_arms",
+        [
+            (x - radius * 1.35, y, z + height * 0.72),
+            (x, y, z + height * 0.82),
+            (x + radius * 1.35, y, z + height * 0.72),
+        ],
+        0.014,
+        mats[accent or "glass"],
+        characters,
+    )
+    legs = curve(
+        f"{name}_wire_legs",
+        [
+            (x - radius * 0.75, y, z + 0.05),
+            (x, y, z + height * 0.35),
+            (x + radius * 0.75, y, z + 0.05),
+        ],
+        0.014,
+        mats[accent or "glass"],
+        characters,
+    )
+    for rig in (spine, arms, legs):
+        rig["character_rig_wire"] = True
+        rig["source_asset"] = "character_wire_rig"
+    return [spine, arms, legs]
+
+
+def character(name, location, leader, characters, mats, kit=None, role=None, personality=None, kind=None, accent=None):
     x, y, z = location
     child = kind == "child"
     radius = 0.25 if child else (0.34 if not leader else 0.48)
     height = 0.65 if child else (0.9 if not leader else 1.2)
-    suit = mats[accent or "character"] if leader else mats["character"]
-    body = cylinder(f"{name}_body", (x, y, z + height / 2), radius, height, suit, characters, 24 if leader else 16)
-    bpy.ops.mesh.primitive_ico_sphere_add(
-        subdivisions=2,
-        radius=0.32 if child else (0.43 if not leader else 0.58),
-        location=(x, y, z + height + (0.35 if child else 0.45)),
-    )
-    head = bpy.context.object
-    head.name = f"{name}_head"
-    head["lod"] = "high"
-    head.data.materials.append(mats["fur"] if leader else mats["helmet"])
-    move_to(head, characters)
+    if kit:
+        if leader:
+            body = instance_asset(kit.get(f"leader_body_{accent or 'violet'}", kit["leader_body"]), f"{name}_body", characters, (x, y, z + height / 2), (radius * 0.92, radius * 0.7, height / 2))
+            head = instance_asset(kit["leader_head"], f"{name}_head", characters, (x, y, z + height + 0.45), (0.42, 0.34, 0.46))
+        elif child:
+            body = instance_asset(kit["child_body"], f"{name}_body", characters, (x, y, z + height / 2), (radius * 0.82, radius * 0.68, height / 2))
+            head = instance_asset(kit["child_head"], f"{name}_head", characters, (x, y, z + height + 0.35), (0.26, 0.24, 0.27))
+        else:
+            body = instance_asset(kit["worker_body"], f"{name}_body", characters, (x, y, z + height / 2), (radius * 0.82, radius * 0.68, height / 2))
+            head = instance_asset(kit["worker_head"], f"{name}_head", characters, (x, y, z + height + 0.45), (0.34, 0.3, 0.34))
+    else:
+        suit = mats[accent or "character"] if leader else mats["character"]
+        body = cylinder(f"{name}_body", (x, y, z + height / 2), radius, height, suit, characters, 24 if leader else 16)
+        bpy.ops.mesh.primitive_ico_sphere_add(
+            subdivisions=2,
+            radius=0.32 if child else (0.43 if not leader else 0.58),
+            location=(x, y, z + height + (0.35 if child else 0.45)),
+        )
+        head = bpy.context.object
+        head.name = f"{name}_head"
+        head["lod"] = "high"
+        head.data.materials.append(mats["fur"] if leader else mats["helmet"])
+        move_to(head, characters)
+    head["character_component"] = "skinned_head_mesh"
     if leader:
         for side in (-1, 1):
             cone(
@@ -391,20 +580,45 @@ def character(name, location, leader, characters, mats, role=None, personality=N
                 rotation=(0.2, side * 0.4, 0),
             )
         cone(f"{name}_snout", (x, y - 0.48, z + height + 0.42), 0.17, 0.08, 0.36, mats["fur_light"], characters, 16, rotation=(1.45, 0, 0))
-        cube(f"{name}_cloak", (x, y + 0.22, z + height * 0.52), (0.5, 0.08, 0.62), mats[accent or "violet"], characters, 0.08)
-        cube(f"{name}_collar", (x, y - 0.15, z + height + 0.02), (0.46, 0.07, 0.08), mats["gold"], characters, 0.035)
-    visor = cube(
-        f"{name}_visor",
-        (x, y - (0.3 if child else 0.39), z + height + (0.35 if child else 0.45)),
-        (0.15 if child else 0.2, 0.04, 0.08 if child else 0.11),
-        mats[accent or "glass"],
-        characters,
-        0.05,
-    )
+        if kit:
+            instance_asset(kit["cloak"], f"{name}_cloak", characters, (x, y + 0.22, z + height * 0.52), (0.5, 0.08, 0.62))
+            instance_asset(kit["collar"], f"{name}_collar", characters, (x, y - 0.15, z + height + 0.02), (0.46, 0.07, 0.08))
+        else:
+            cube(f"{name}_cloak", (x, y + 0.22, z + height * 0.52), (0.5, 0.08, 0.62), mats[accent or "violet"], characters, 0.08)
+            cube(f"{name}_collar", (x, y - 0.15, z + height + 0.02), (0.46, 0.07, 0.08), mats["gold"], characters, 0.035)
+    if kit:
+        trim_key = f"role_trim_{accent or 'cyan'}"
+        if trim_key not in kit:
+            trim_key = "role_trim_cyan"
+        visor = instance_asset(
+            kit["visor"],
+            f"{name}_visor",
+            characters,
+            (x, y - (0.3 if child else 0.39), z + height + (0.35 if child else 0.45)),
+            (0.15 if child else 0.2, 0.04, 0.08 if child else 0.11),
+        )
+        instance_asset(
+            kit[trim_key],
+            f"{name}_role_trim",
+            characters,
+            (x, y - 0.12, z + height * 0.72),
+            (radius * 0.72, 0.035, 0.055),
+        )
+    else:
+        visor = cube(
+            f"{name}_visor",
+            (x, y - (0.3 if child else 0.39), z + height + (0.35 if child else 0.45)),
+            (0.15 if child else 0.2, 0.04, 0.08 if child else 0.11),
+            mats[accent or "glass"],
+            characters,
+            0.05,
+        )
+    add_character_wire_rig(name, x, y, z, height, radius, characters, mats, accent or "glass")
     body["role"] = role or ("leader" if leader else "worker")
     body["personality"] = personality or ("bold" if leader else "curious")
     body["kind"] = kind or ("leader" if leader else "worker")
     body["asset_family"] = "hermes-profile-variant"
+    body["rig_contract"] = "wireframe_controls_with_skinned_mesh_instances"
     add_animation_library(body, name, leader)
 
 
@@ -477,6 +691,8 @@ def add_animation_library(body, name, leader):
 
 def validate_scene(plan, road_points, building_records):
     checks = {
+        "asset_sources_present": True,
+        "asset_instances_present": True,
         "buildings_do_not_overlap": True,
         "buildings_touch_ground": True,
         "collections_present": True,
@@ -525,6 +741,15 @@ def validate_scene(plan, road_points, building_records):
         checks["lods_present"] = False
         failures.append(f"objects missing lod metadata: {', '.join(objects_missing_lod[:12])}")
 
+    asset_source_count = sum(1 for obj in bpy.data.objects if obj.get("asset_source"))
+    asset_instance_count = sum(1 for obj in bpy.data.objects if obj.get("world_instance"))
+    if asset_source_count < 20:
+        checks["asset_sources_present"] = False
+        failures.append(f"expected reusable source assets, found {asset_source_count}")
+    if asset_instance_count < 90:
+        checks["asset_instances_present"] = False
+        failures.append(f"expected linked world asset instances, found {asset_instance_count}")
+
     passed = all(checks.values())
     metadata = {
         "checks": checks,
@@ -532,9 +757,11 @@ def validate_scene(plan, road_points, building_records):
         "passed": passed,
         "sceneScaleMeters": { "radius": 42, "roadClearance": ROAD_CLEARANCE },
         "summary": {
+            "assetInstanceCount": asset_instance_count,
+            "assetSourceCount": asset_source_count,
             "buildingCount": len(building_records),
             "roadAnchorCount": len(road_points),
-            "renderedCollections": sorted(required_collections),
+            "renderedCollections": sorted(required_collections | {"World Asset Sources"}),
         },
     }
 
@@ -560,6 +787,7 @@ def main():
     characters = collection("Characters")
     props = collection("Props")
     lighting = collection("Lighting")
+    asset_sources = collection("World Asset Sources")
 
     mats = {
         "terrain": material("Lunar regolith", (0.18, 0.19, 0.21), roughness=0.94),
@@ -589,6 +817,8 @@ def main():
     }
 
     terrain(terrain_col, mats["terrain"])
+    building_kit = build_asset_kit(asset_sources, mats)
+    character_kit = build_character_kit(asset_sources, mats)
     scatter_terrain_detail(props, mats)
     roads_points = [
         (x, y, ground_height(x, y) + ROAD_CLEARANCE)
@@ -623,7 +853,7 @@ def main():
     ]
     building_records = []
     for asset_id, role, location, accent in plan:
-        building_records.append(building(asset_id, role, location, accent, buildings, mats))
+        building_records.append(building(asset_id, role, location, accent, buildings, mats, building_kit))
 
     garden_ground = ground_height(0, -1)
     sphere("break-garden_glasshouse", (0, -1, garden_ground + 0.78), 1.18, mats["glass"], props, 24, 12)
@@ -637,12 +867,12 @@ def main():
     add_habitat_domes(props, mats)
     add_transport_and_infrastructure(props, mats)
     for index, (x, y, accent) in enumerate(((-10, 6.2, "violet"), (8.7, 6.8, "cyan"), (12, -5.4, "violet"), (-9, -10.4, "cyan"))):
-        character(f"leader-scene-{index}", (x, y, ground_height(x, y)), True, characters, mats, accent=accent)
+        character(f"leader-scene-{index}", (x, y, ground_height(x, y)), True, characters, mats, kit=character_kit, accent=accent)
     for index, (x, y) in enumerate(((-4, -2), (-1, -1.9), (2, -1.6), (4, 0.6), (-7, -4.4), (8.8, -1.7), (10.8, -7.5), (-12, -0.6), (15, 5.2))):
-        character(f"worker-scene-{index}", (x, y, ground_height(x, y)), False, characters, mats)
+        character(f"worker-scene-{index}", (x, y, ground_height(x, y)), False, characters, mats, kit=character_kit, accent="cyan")
     cube("dispatcher-cube", (0, 4, ground_height(0, 4) + 0.62), (0.55, 0.55, 0.55), mats["glass"], characters, 0.18)
 
-    asset_library = collection("Character Asset Library")
+    asset_library = collection("Character Variant Library")
     asset_library["source"] = "sanitized Hermes role and personality classes"
     asset_library.hide_render = True
     asset_library["render_policy"] = "viewport_asset_library_only"
@@ -663,6 +893,7 @@ def main():
             True,
             asset_library,
             mats,
+            kit=character_kit,
             role=role,
             personality=personality,
             kind="leader",
@@ -684,6 +915,7 @@ def main():
             False,
             asset_library,
             mats,
+            kit=character_kit,
             role=role,
             personality=personality,
             kind="worker",
@@ -697,6 +929,7 @@ def main():
             False,
             asset_library,
             mats,
+            kit=character_kit,
             role="child",
             personality=personality,
             kind="child",

@@ -1,5 +1,7 @@
 {
   "checks": {
+    "asset_instances_present": true,
+    "asset_sources_present": true,
     "buildings_do_not_overlap": true,
     "buildings_touch_ground": true,
     "collections_present": true,
@@ -15,6 +17,8 @@
     "roadClearance": 0.08
   },
   "summary": {
+    "assetInstanceCount": 460,
+    "assetSourceCount": 34,
     "buildingCount": 8,
     "renderedCollections": [
       "Buildings",
@@ -22,7 +26,8 @@
       "Lighting",
       "Props",
       "Roads",
-      "Terrain"
+      "Terrain",
+      "World Asset Sources"
     ],
     "roadAnchorCount": 7
   }
