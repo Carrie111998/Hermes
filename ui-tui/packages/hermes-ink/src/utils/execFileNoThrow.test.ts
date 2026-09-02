@@ -64,6 +64,16 @@ afterEach(() => {
   rmSync(scriptDir, { recursive: true, force: true })
 })
 
+it('settles a timeout even when a native child keeps stdio open', async () => {
+  const result = await execFileNoThrow(
+    process.execPath,
+    ['-e', 'setTimeout(() => {}, 30_000)'],
+    { timeout: 200 },
+  )
+
+  expect(result.code).toBe(124)
+})
+
 describe.skipIf(onWindows)('execFileNoThrow with daemon-style children', () => {
   // Formerly a documented forever-hang: without resolveOnExit, the 'close'
   // event doesn't fire when the immediate child has exited but a forked
