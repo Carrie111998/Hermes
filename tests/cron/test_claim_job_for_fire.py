@@ -32,7 +32,10 @@ def test_claim_succeeds_once_then_blocks(temp_home):
 
     assert claim_job_for_fire(jid) is True
     assert claim_job_for_fire(jid) is False
-    assert get_job(jid)["next_run_at"] != before
+    claimed = get_job(jid)
+    assert claimed is not None
+    assert claimed["next_run_at"] != before
+    assert claimed["fire_claim"]["scheduled_at"] == before
 
 
 def test_claim_oneshot_cannot_be_double_claimed(temp_home):
@@ -84,8 +87,38 @@ def test_stale_claim_is_reclaimable(temp_home, monkeypatch):
     job = create_job(prompt="x", schedule="every 5m", name="s")
     jid = job["id"]
     assert claim_job_for_fire(jid) is True
+    from cron.jobs import get_job
+
+    first_claim = get_job(jid)
+    assert first_claim is not None
+    original_due = first_claim["fire_claim"]["scheduled_at"]
     # With a 0s TTL, the existing claim is always considered stale.
     assert claim_job_for_fire(jid, claim_ttl_seconds=0) is True
+    reclaimed = get_job(jid)
+    assert reclaimed is not None
+    assert reclaimed["fire_claim"]["scheduled_at"] == original_due
+    assert reclaimed["next_run_at"] != original_due
+
+
+def test_claim_preserves_scheduler_due_snapshot_after_pre_advance(temp_home):
+    from cron.jobs import advance_next_runs, claim_job_for_fire, create_job, get_job
+
+    job = create_job(prompt="x", schedule="every 5m", name="snapshot")
+    original_due = job["next_run_at"]
+    assert advance_next_runs([job["id"]]) == 1
+    persisted = get_job(job["id"])
+    assert persisted is not None
+    persisted_advanced_due = persisted["next_run_at"]
+
+    claimed = claim_job_for_fire(
+        job["id"],
+        return_job=True,
+        scheduled_at_utc=original_due,
+    )
+
+    assert isinstance(claimed, dict)
+    assert claimed["fire_claim"]["scheduled_at"] == original_due
+    assert claimed["next_run_at"] != persisted_advanced_due
 
 
 def test_mark_job_run_clears_claim(temp_home):

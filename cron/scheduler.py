@@ -4466,6 +4466,7 @@ def _run_job_script(
     script_path: str,
     workdir: Optional[str] = None,
     cancel_event: Optional[_CancelEventLike] = None,
+    execution_context: Optional[dict[str, str]] = None,
 ) -> tuple[bool, str]:
     """Execute a cron job's data-collection script and capture its output.
 
@@ -4596,6 +4597,16 @@ def _run_job_script(
             }
         env = build_subprocess_env()
         env.update(env_overlay)
+        for key in (
+            "HERMES_CRON_JOB_ID",
+            "HERMES_CRON_EXECUTION_ID",
+            "HERMES_CRON_SCHEDULED_AT_UTC",
+        ):
+            env.pop(key, None)
+            if execution_context:
+                value = execution_context.get(key)
+                if value is not None:
+                    env[key] = value
         # Use the job's workdir as the subprocess cwd when configured,
         # otherwise default to the scripts-dir parent (back-compat).
         # NEVER mutate the Python process cwd — that would leak into
@@ -4665,6 +4676,28 @@ def _run_job_script(
         return False, f"Script execution failed: {exc}"
 
 
+def _cron_script_execution_context(job: dict) -> dict[str, str]:
+    """Project one fire's non-secret durable identity into a fixed env allowlist."""
+    job_id = str(job.get("id") or "")
+    execution_id = str(job.get("execution_id") or "")
+    scheduled_at = str(job.get("scheduled_at_utc") or "")
+    if re.fullmatch(r"[0-9a-f]{12}", job_id) is None:
+        return {}
+    if re.fullmatch(r"[0-9a-f]{32}", execution_id) is None:
+        return {}
+    try:
+        planned = datetime.fromisoformat(scheduled_at.replace("Z", "+00:00"))
+    except ValueError:
+        return {}
+    if planned.tzinfo is None or planned.utcoffset() is None:
+        return {}
+    return {
+        "HERMES_CRON_JOB_ID": job_id,
+        "HERMES_CRON_EXECUTION_ID": execution_id,
+        "HERMES_CRON_SCHEDULED_AT_UTC": planned.astimezone(timezone.utc).isoformat(),
+    }
+
+
 def _run_job_script_with_claim_heartbeat(
     job: dict,
     script_path: str,
@@ -4683,6 +4716,7 @@ def _run_job_script_with_claim_heartbeat(
     storage.  ``heartbeat_run_claim`` compares that stable owner before every
     refresh, so a stale runner cannot extend a replacement owner's claim.
     """
+    execution_context = _cron_script_execution_context(job)
     schedule = job.get("schedule")
     claim = job.get("run_claim")
     owner = str(claim.get("by") or "") if isinstance(claim, dict) else ""
@@ -4691,7 +4725,12 @@ def _run_job_script_with_claim_heartbeat(
         and schedule.get("kind") == "once"
         and owner
     ):
-        return _run_job_script(script_path, workdir=workdir, cancel_event=cancel_event)
+        return _run_job_script(
+            script_path,
+            workdir=workdir,
+            cancel_event=cancel_event,
+            execution_context=execution_context,
+        )
 
     job_id = str(job.get("id") or "")
     stop = threading.Event()
@@ -4722,10 +4761,20 @@ def _run_job_script_with_claim_heartbeat(
             job_id,
             exc_info=True,
         )
-        return _run_job_script(script_path, workdir=workdir, cancel_event=cancel_event)
+        return _run_job_script(
+            script_path,
+            workdir=workdir,
+            cancel_event=cancel_event,
+            execution_context=execution_context,
+        )
 
     try:
-        return _run_job_script(script_path, workdir=workdir, cancel_event=cancel_event)
+        return _run_job_script(
+            script_path,
+            workdir=workdir,
+            cancel_event=cancel_event,
+            execution_context=execution_context,
+        )
     finally:
         stop.set()
         # Event.wait() wakes immediately.  Keep completion bounded if the
@@ -7454,7 +7503,14 @@ def _run_one_job_body(
 
     execution_id = job.get("execution_id")
     if not execution_id:
+        job["scheduled_at_utc"] = _hermes_now().astimezone(timezone.utc).isoformat()
         execution_id = create_execution(job["id"], source="direct")["id"]
+    elif not job.get("scheduled_at_utc"):
+        claim = job.get("fire_claim")
+        scheduled_at = claim.get("scheduled_at") if isinstance(claim, dict) else None
+        if isinstance(scheduled_at, str) and scheduled_at.strip():
+            job["scheduled_at_utc"] = scheduled_at
+    job["execution_id"] = str(execution_id)
     delivery_attempted = False
     delivery_error = None
     # Durable failure-incident bookkeeping for this run (see cron.incidents):
@@ -8329,6 +8385,8 @@ def tick(
         # cron-kind jobs both compute the same next occurrence; interval jobs
         # re-anchor from their own "now" at claim time (harmless for
         # at-most-once — mark_job_run re-anchors at completion regardless).
+        for job in due_jobs:
+            job["scheduled_at_utc"] = job.get("next_run_at")
         advance_next_runs([job["id"] for job in due_jobs])
 
         # Resolve max parallel workers: env var > config.yaml > unbounded.
@@ -8366,7 +8424,11 @@ def tick(
             # Acquire the durable claim only when this worker actually starts,
             # not while it may wait behind other work in an executor queue.
             # This prevents a queued lease from expiring before execution.
-            claimed = claim_job_for_fire(job["id"], return_job=True)
+            claimed = claim_job_for_fire(
+                job["id"],
+                return_job=True,
+                scheduled_at_utc=job.get("scheduled_at_utc"),
+            )
             if not claimed:
                 finish_execution(
                     job["execution_id"],

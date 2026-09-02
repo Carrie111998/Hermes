@@ -228,6 +228,10 @@ class CronScheduler(ABC):
                 error="Fire claim was not acquired",
             )
             return None
+        claim = claimed_job.get("fire_claim")
+        scheduled_at = claim.get("scheduled_at") if isinstance(claim, dict) else None
+        if isinstance(scheduled_at, str) and scheduled_at.strip():
+            claimed_job["scheduled_at_utc"] = scheduled_at
         claimed_job["execution_id"] = execution["id"]
         return claimed_job
 

@@ -374,18 +374,27 @@ def test_fire_due_default_claims_then_runs(monkeypatch):
         jobs,
         "claim_job_for_fire",
         lambda jid, **kw: claims.append((jid, kw))
-        or {"id": jid, "name": "t", "fire_claim": {"by": "exact-owner"}},
+        or {
+            "id": jid,
+            "name": "t",
+            "fire_claim": {
+                "by": "exact-owner",
+                "scheduled_at": "2026-08-25T12:00:00+00:00",
+            },
+        },
         raising=False,
     )
     monkeypatch.setattr(
         sched,
         "run_one_job",
-        lambda job, **kw: ran.append((job["id"], job["fire_claim"]["by"])) or True,
+        lambda job, **kw: ran.append(
+            (job["id"], job["fire_claim"]["by"], job["scheduled_at_utc"])
+        ) or True,
     )
 
     assert InProcessCronScheduler().fire_due("j1") is True
     assert claims == [("j1", {"return_job": True})]
-    assert ran == [("j1", "exact-owner")]
+    assert ran == [("j1", "exact-owner", "2026-08-25T12:00:00+00:00")]
 
 
 def test_claim_fire_persists_attempt_before_fire_claimed(monkeypatch):

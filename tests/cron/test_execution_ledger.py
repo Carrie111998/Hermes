@@ -7,6 +7,7 @@ import os
 import sqlite3
 import subprocess
 import sys
+from datetime import UTC, datetime
 from pathlib import Path
 
 
@@ -246,6 +247,34 @@ def test_run_one_job_records_running_then_terminal(monkeypatch):
     assert events[0] == ("running", "exec-3")
     assert events[-1][0:2] == ("finish", "exec-3")
     assert events[-1][2]["success"] is True
+
+
+def test_direct_run_stamps_invocation_time_before_execution(monkeypatch):
+    import cron.scheduler as scheduler
+
+    captured = []
+    fixed = datetime(2026, 8, 25, 14, 5, tzinfo=UTC)
+    monkeypatch.setattr(scheduler, "_hermes_now", lambda: fixed)
+    monkeypatch.setattr(
+        scheduler,
+        "create_execution",
+        lambda job_id, source: {"id": "0123456789abcdef0123456789abcdef"},
+    )
+    monkeypatch.setattr(scheduler, "mark_execution_running", lambda _execution_id: None)
+    monkeypatch.setattr(scheduler, "finish_execution", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(scheduler, "claim_dispatch", lambda _job_id: True)
+    monkeypatch.setattr(
+        scheduler,
+        "run_job",
+        lambda job, **_kwargs: captured.append(dict(job))
+        or (True, "output", "response", None),
+    )
+    monkeypatch.setattr(scheduler, "save_job_output", lambda *_args: None)
+    monkeypatch.setattr(scheduler, "_deliver_result", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(scheduler, "mark_job_run", lambda *_args, **_kwargs: None)
+
+    assert scheduler.run_one_job({"id": "direct-job"}) is True
+    assert captured[0]["scheduled_at_utc"] == "2026-08-25T14:05:00+00:00"
 
 
 def test_provider_start_recovers_interrupted_records_before_tick(monkeypatch):

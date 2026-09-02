@@ -131,7 +131,15 @@ class TestRunningJobGuard:
         result = callback()
         future.set_result(result)
 
-        assert claim_calls == [("queued-job", {"return_job": True})]
+        assert claim_calls == [
+            (
+                "queued-job",
+                {
+                    "return_job": True,
+                    "scheduled_at_utc": "2020-01-01T00:00:00",
+                },
+            )
+        ]
         assert "queued-job" not in sched._running_job_ids
 
 
@@ -382,7 +390,25 @@ class TestTickBatchAdvance:
         monkeypatch.setattr(
             sched, "advance_next_runs",
             lambda ids: advance_calls.append(list(ids)) or len(list(ids)))
-        monkeypatch.setattr(sched, "run_job", lambda j, **_kw: (True, "out", "resp", None))
+        monkeypatch.setattr(
+            sched,
+            "claim_job_for_fire",
+            lambda job_id, **kwargs: {
+                **next(job for job in jobs if job["id"] == job_id),
+                "fire_claim": {
+                    "by": f"owner-{job_id}",
+                    "scheduled_at": kwargs["scheduled_at_utc"],
+                },
+            },
+        )
+        monkeypatch.setattr(sched, "heartbeat_fire_claim", lambda *_a, **_kw: True)
+        fired = []
+        monkeypatch.setattr(
+            sched,
+            "run_job",
+            lambda j, **_kw: fired.append(j["scheduled_at_utc"])
+            or (True, "out", "resp", None),
+        )
         monkeypatch.setattr(sched, "save_job_output", lambda *_a, **_kw: "/tmp/out")
         monkeypatch.setattr(sched, "mark_job_run", lambda *_a, **_kw: None)
         monkeypatch.setattr(sched, "_deliver_result", lambda *_a, **_kw: None)
@@ -392,5 +418,6 @@ class TestTickBatchAdvance:
         assert n == 4
         assert advance_calls == [["job-0", "job-1", "job-2", "job-3"]], (
             f"tick must batch-advance the due set in ONE call; got {advance_calls}")
+        assert fired == ["2020-01-01T00:00:00"] * 4
 
         sched._shutdown_parallel_pool()

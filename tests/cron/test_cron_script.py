@@ -133,6 +133,62 @@ class TestRunJobScript:
         assert success is True
         assert output == "ABSENT"
 
+    def test_job_script_receives_bounded_execution_identity(self, cron_env):
+        from cron.scheduler import _run_job_script_with_claim_heartbeat
+
+        script = cron_env / "scripts" / "execution_context.py"
+        script.write_text(
+            "import json, os\n"
+            "print(json.dumps({key: os.environ.get(key) for key in ("
+            "'HERMES_CRON_JOB_ID', 'HERMES_CRON_EXECUTION_ID', "
+            "'HERMES_CRON_SCHEDULED_AT_UTC')}))\n",
+            encoding="utf-8",
+        )
+        job = {
+            "id": "a1b2c3d4e5f6",
+            "execution_id": "0123456789abcdef0123456789abcdef",
+            "scheduled_at_utc": "2026-08-25T14:00:00+02:00",
+            "next_run_at": "2026-08-25T14:30:00+02:00",
+            "schedule": {"kind": "once", "at": "2026-08-25T14:00:00+02:00"},
+            "run_claim": {"by": "test-owner"},
+        }
+
+        success, output = _run_job_script_with_claim_heartbeat(
+            job,
+            "execution_context.py",
+        )
+
+        assert success is True
+        assert json.loads(output) == {
+            "HERMES_CRON_JOB_ID": "a1b2c3d4e5f6",
+            "HERMES_CRON_EXECUTION_ID": "0123456789abcdef0123456789abcdef",
+            "HERMES_CRON_SCHEDULED_AT_UTC": "2026-08-25T12:00:00+00:00",
+        }
+
+    def test_plain_script_cannot_inherit_stale_execution_identity(
+        self,
+        cron_env,
+        monkeypatch,
+    ):
+        from cron.scheduler import _run_job_script
+
+        monkeypatch.setenv("HERMES_CRON_JOB_ID", "stale-job")
+        monkeypatch.setenv("HERMES_CRON_EXECUTION_ID", "stale-execution")
+        monkeypatch.setenv("HERMES_CRON_SCHEDULED_AT_UTC", "stale-time")
+        script = cron_env / "scripts" / "stale_context.py"
+        script.write_text(
+            "import os\n"
+            "print('PRESENT' if any(os.environ.get(key) for key in ("
+            "'HERMES_CRON_JOB_ID', 'HERMES_CRON_EXECUTION_ID', "
+            "'HERMES_CRON_SCHEDULED_AT_UTC')) else 'ABSENT')\n",
+            encoding="utf-8",
+        )
+
+        success, output = _run_job_script("stale_context.py")
+
+        assert success is True
+        assert output == "ABSENT"
+
     @pytest.mark.windows_only
     def test_windows_uv_venv_python_script_bypasses_launcher(self, cron_env, tmp_path, monkeypatch):
         # Windows-only: the fake ``sys.platform`` could not reproduce the
