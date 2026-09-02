@@ -14422,6 +14422,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         parts = command.split()
         days = 30
         source = None
+        since = None
+        until = None
         i = 1
         while i < len(parts):
             if parts[i] == "--days" and i + 1 < len(parts):
@@ -14434,6 +14436,12 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             elif parts[i] == "--source" and i + 1 < len(parts):
                 source = parts[i + 1]
                 i += 2
+            elif parts[i] == "--since" and i + 1 < len(parts):
+                since = parts[i + 1]
+                i += 2
+            elif parts[i] == "--until" and i + 1 < len(parts):
+                until = parts[i + 1]
+                i += 2
             elif parts[i].isdigit():
                 days = int(parts[i])
                 i += 1
@@ -14442,12 +14450,25 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
 
         try:
             from hermes_state import SessionDB
-            from agent.insights import InsightsEngine
+            from agent.insights import InsightsEngine, parse_calendar_day
+
+            try:
+                since_ts = parse_calendar_day(since) if since else None
+                until_ts = parse_calendar_day(until, end_of_day=True) if until else None
+            except ValueError as e:
+                print(f"  Invalid --since/--until date (expected YYYY-MM-DD): {e}")
+                return
+
+            kwargs = {"days": days, "source": source}
+            if since_ts is not None:
+                kwargs["since"] = since_ts
+            if until_ts is not None:
+                kwargs["until"] = until_ts
 
             db = SessionDB()
             try:
                 engine = InsightsEngine(db)
-                report = engine.generate(days=days, source=source)
+                report = engine.generate(**kwargs)
                 print(engine.format_terminal(report))
             finally:
                 db.close()

@@ -20,7 +20,7 @@ import json
 import sqlite3
 import time
 from collections import Counter, defaultdict
-from datetime import datetime
+from datetime import datetime, timedelta
 from decimal import Decimal
 from typing import Any, Dict, List, Optional
 
@@ -31,6 +31,23 @@ from agent.usage_pricing import (
     format_duration_compact,
     has_known_pricing,
 )
+
+
+def parse_calendar_day(value: str, *, end_of_day: bool = False) -> float:
+    """Parse a ``YYYY-MM-DD`` string into a local-midnight unix timestamp.
+
+    Shared by the CLI, interactive REPL, and gateway ``/insights`` entry
+    points so ``--since``/``--until`` mean the same calendar day everywhere.
+    ``end_of_day`` shifts to the start of the *next* day so callers can use
+    the result as an exclusive upper bound that still covers the whole day.
+
+    Raises:
+        ValueError: if ``value`` isn't ``YYYY-MM-DD``.
+    """
+    day = datetime.strptime(value, "%Y-%m-%d")
+    if end_of_day:
+        day += timedelta(days=1)
+    return day.timestamp()
 
 
 def _fmt_est_cost(est_cost: float) -> str:
@@ -137,18 +154,35 @@ class InsightsEngine:
             ):
                 setattr(self, _attr, getattr(self, _attr).replace(_strip, ""))
 
-    def generate(self, days: int = 30, source: str = None) -> Dict[str, Any]:
+    def generate(
+        self,
+        days: int = 30,
+        source: str = None,
+        since: Optional[float] = None,
+        until: Optional[float] = None,
+    ) -> Dict[str, Any]:
         """
         Generate a complete insights report.
 
         Args:
-            days: Number of days to look back (default: 30)
+            days: Number of days to look back (default: 30). Ignored when
+                ``since`` is given.
             source: Optional filter by source platform
+            since: Unix timestamp lower bound (inclusive), overrides ``days``.
+                Use for calendar-day reporting, e.g. midnight of a given day.
+            until: Unix timestamp upper bound (exclusive). Defaults to
+                unbounded (matches current behavior of reporting up to now).
 
         Returns:
             Dict with all computed insights
         """
-        cutoff = time.time() - (days * 86400)
+        cutoff = since if since is not None else time.time() - (days * 86400)
+        # Sentinel for "no upper bound": SQLite compares REAL columns against
+        # this numerically, so every query below can stay a single prepared
+        # statement instead of branching on whether `until` was given. The
+        # pinned-index tests bind this same sentinel deliberately.
+        until_bound = until if until is not None else float("inf")
+        period_label = self._format_period_label(days, since, until)
 
         # Token/cost totals may still sit on the SessionDB's async
         # accounting queue; drain so the report reflects exact counters.
@@ -158,15 +192,16 @@ class InsightsEngine:
             flush()
 
         # Gather raw data
-        sessions = self._get_sessions(cutoff, source)
-        tool_usage = self._get_tool_usage(cutoff, source)
-        skill_usage = self._get_skill_usage(cutoff, source)
-        message_stats = self._get_message_stats(cutoff, source)
+        sessions = self._get_sessions(cutoff, source, until_bound)
+        tool_usage = self._get_tool_usage(cutoff, source, until_bound)
+        skill_usage = self._get_skill_usage(cutoff, source, until_bound)
+        message_stats = self._get_message_stats(cutoff, source, until_bound)
 
         if not sessions:
             return {
                 "days": days,
                 "source_filter": source,
+                "period_label": period_label,
                 "empty": True,
                 "overview": {},
                 "models": [],
@@ -186,7 +221,7 @@ class InsightsEngine:
             }
 
         # Compute insights
-        models = self._compute_model_breakdown(sessions, cutoff, source)
+        models = self._compute_model_breakdown(sessions, cutoff, source, until_bound)
         overview = self._compute_overview(sessions, message_stats, models)
         platforms = self._compute_platform_breakdown(sessions)
         tools = self._compute_tool_breakdown(tool_usage)
@@ -197,6 +232,7 @@ class InsightsEngine:
         return {
             "days": days,
             "source_filter": source,
+            "period_label": period_label,
             "empty": False,
             "generated_at": time.time(),
             "overview": overview,
@@ -207,6 +243,22 @@ class InsightsEngine:
             "activity": activity,
             "top_sessions": top_sessions,
         }
+
+    @staticmethod
+    def _format_period_label(days: int, since: Optional[float], until: Optional[float]) -> str:
+        """Build the human-readable period header, e.g. "Last 30 days" or a
+        calendar-day range when ``--since``/``--until`` filtering is used."""
+        if since is None and until is None:
+            return f"Last {days} days"
+        since_str = datetime.fromtimestamp(since).strftime("%Y-%m-%d") if since is not None else None
+        # `until` is an exclusive next-day boundary, so step back a second
+        # before formatting to land on the intended last day.
+        until_str = datetime.fromtimestamp(until - 1).strftime("%Y-%m-%d") if until is not None else None
+        if since_str and until_str:
+            return since_str if since_str == until_str else f"{since_str} to {until_str}"
+        if since_str:
+            return f"Since {since_str}"
+        return f"Through {until_str}"
 
     def get_usage_breakdown(self, days: int = 30, source: str = None) -> Dict[str, Any]:
         """Return the analytics-usage payload without running a full generate().
@@ -238,12 +290,12 @@ class InsightsEngine:
     # not at runtime, so no user-controlled value can alter the query structure.
     _GET_SESSIONS_WITH_SOURCE = (
         f"SELECT {_SESSION_COLS} FROM sessions"
-        " WHERE started_at >= ? AND source = ?"
+        " WHERE started_at >= ? AND started_at < ? AND source = ?"
         " ORDER BY started_at DESC"
     )
     _GET_SESSIONS_ALL = (
         f"SELECT {_SESSION_COLS} FROM sessions"
-        " WHERE started_at >= ?"
+        " WHERE started_at >= ? AND started_at < ?"
         " ORDER BY started_at DESC"
     )
 
@@ -265,21 +317,21 @@ class InsightsEngine:
         "SELECT m.tool_calls"
         f" FROM messages m INDEXED BY {_MESSAGES_ASSISTANT_CALLS_INDEX}"
         " JOIN sessions s ON s.id = m.session_id"
-        " WHERE s.started_at >= ? AND s.source = ?"
+        " WHERE s.started_at >= ? AND s.started_at < ? AND s.source = ?"
         " AND m.role = 'assistant' AND m.tool_calls IS NOT NULL"
     )
     _GET_TOOL_CALLS_ALL = (
         "SELECT m.tool_calls"
         f" FROM messages m INDEXED BY {_MESSAGES_ASSISTANT_CALLS_INDEX}"
         " JOIN sessions s ON s.id = m.session_id"
-        " WHERE s.started_at >= ?"
+        " WHERE s.started_at >= ? AND s.started_at < ?"
         " AND m.role = 'assistant' AND m.tool_calls IS NOT NULL"
     )
     _GET_SKILL_CALLS_WITH_SOURCE = (
         "SELECT m.tool_calls, m.timestamp"
         f" FROM messages m INDEXED BY {_MESSAGES_ASSISTANT_CALLS_INDEX}"
         " JOIN sessions s ON s.id = m.session_id"
-        " WHERE s.started_at >= ? AND s.source = ?"
+        " WHERE s.started_at >= ? AND s.started_at < ? AND s.source = ?"
         " AND m.role = 'assistant' AND m.tool_calls IS NOT NULL"
         " AND (instr(m.tool_calls, 'skill_view') > 0"
         " OR instr(m.tool_calls, 'skill_manage') > 0)"
@@ -288,21 +340,27 @@ class InsightsEngine:
         "SELECT m.tool_calls, m.timestamp"
         f" FROM messages m INDEXED BY {_MESSAGES_ASSISTANT_CALLS_INDEX}"
         " JOIN sessions s ON s.id = m.session_id"
-        " WHERE s.started_at >= ?"
+        " WHERE s.started_at >= ? AND s.started_at < ?"
         " AND m.role = 'assistant' AND m.tool_calls IS NOT NULL"
         " AND (instr(m.tool_calls, 'skill_view') > 0"
         " OR instr(m.tool_calls, 'skill_manage') > 0)"
     )
 
-    def _get_sessions(self, cutoff: float, source: str = None) -> List[Dict]:
+    def _get_sessions(
+        self, cutoff: float, source: str = None, until: float = float("inf")
+    ) -> List[Dict]:
         """Fetch sessions within the time window."""
         if source:
-            cursor = self._conn.execute(self._GET_SESSIONS_WITH_SOURCE, (cutoff, source))
+            cursor = self._conn.execute(
+                self._GET_SESSIONS_WITH_SOURCE, (cutoff, until, source)
+            )
         else:
-            cursor = self._conn.execute(self._GET_SESSIONS_ALL, (cutoff,))
+            cursor = self._conn.execute(self._GET_SESSIONS_ALL, (cutoff, until))
         return [dict(row) for row in cursor.fetchall()]
 
-    def _get_tool_usage(self, cutoff: float, source: str = None) -> List[Dict]:
+    def _get_tool_usage(
+        self, cutoff: float, source: str = None, until: float = float("inf")
+    ) -> List[Dict]:
         """Get tool call counts from messages.
 
         Uses two sources:
@@ -318,22 +376,22 @@ class InsightsEngine:
                 """SELECT m.tool_name, COUNT(*) as count
                    FROM messages m
                    JOIN sessions s ON s.id = m.session_id
-                   WHERE s.started_at >= ? AND s.source = ?
+                   WHERE s.started_at >= ? AND s.started_at < ? AND s.source = ?
                      AND m.role = 'tool' AND m.tool_name IS NOT NULL
                    GROUP BY m.tool_name
                    ORDER BY count DESC""",
-                (cutoff, source),
+                (cutoff, until, source),
             )
         else:
             cursor = self._conn.execute(
                 """SELECT m.tool_name, COUNT(*) as count
                    FROM messages m
                    JOIN sessions s ON s.id = m.session_id
-                   WHERE s.started_at >= ?
+                   WHERE s.started_at >= ? AND s.started_at < ?
                      AND m.role = 'tool' AND m.tool_name IS NOT NULL
                    GROUP BY m.tool_name
                    ORDER BY count DESC""",
-                (cutoff,),
+                (cutoff, until),
             )
         for row in cursor.fetchall():
             tool_counts[row["tool_name"]] += row["count"]
@@ -342,10 +400,10 @@ class InsightsEngine:
         # (covers CLI sessions where tool_name is NULL on tool responses)
         if source:
             cursor2 = self._conn.execute(
-                self._GET_TOOL_CALLS_WITH_SOURCE, (cutoff, source)
+                self._GET_TOOL_CALLS_WITH_SOURCE, (cutoff, until, source)
             )
         else:
-            cursor2 = self._conn.execute(self._GET_TOOL_CALLS_ALL, (cutoff,))
+            cursor2 = self._conn.execute(self._GET_TOOL_CALLS_ALL, (cutoff, until))
 
         tool_calls_counts = Counter()
         for row in cursor2.fetchall():
@@ -382,16 +440,18 @@ class InsightsEngine:
             for name, count in tool_counts.most_common()
         ]
 
-    def _get_skill_usage(self, cutoff: float, source: str = None) -> List[Dict]:
+    def _get_skill_usage(
+        self, cutoff: float, source: str = None, until: float = float("inf")
+    ) -> List[Dict]:
         """Extract per-skill usage from assistant tool calls."""
         skill_counts: Dict[str, Dict[str, Any]] = {}
 
         if source:
             cursor = self._conn.execute(
-                self._GET_SKILL_CALLS_WITH_SOURCE, (cutoff, source)
+                self._GET_SKILL_CALLS_WITH_SOURCE, (cutoff, until, source)
             )
         else:
-            cursor = self._conn.execute(self._GET_SKILL_CALLS_ALL, (cutoff,))
+            cursor = self._conn.execute(self._GET_SKILL_CALLS_ALL, (cutoff, until))
 
         for row in cursor.fetchall():
             try:
@@ -446,7 +506,9 @@ class InsightsEngine:
 
         return list(skill_counts.values())
 
-    def _get_message_stats(self, cutoff: float, source: str = None) -> Dict:
+    def _get_message_stats(
+        self, cutoff: float, source: str = None, until: float = float("inf")
+    ) -> Dict:
         """Get aggregate message statistics."""
         if source:
             cursor = self._conn.execute(
@@ -457,8 +519,8 @@ class InsightsEngine:
                      SUM(CASE WHEN m.role = 'tool' THEN 1 ELSE 0 END) as tool_messages
                    FROM messages m
                    JOIN sessions s ON s.id = m.session_id
-                   WHERE s.started_at >= ? AND s.source = ?""",
-                (cutoff, source),
+                   WHERE s.started_at >= ? AND s.started_at < ? AND s.source = ?""",
+                (cutoff, until, source),
             )
         else:
             cursor = self._conn.execute(
@@ -469,8 +531,8 @@ class InsightsEngine:
                      SUM(CASE WHEN m.role = 'tool' THEN 1 ELSE 0 END) as tool_messages
                    FROM messages m
                    JOIN sessions s ON s.id = m.session_id
-                   WHERE s.started_at >= ?""",
-                (cutoff,),
+                   WHERE s.started_at >= ? AND s.started_at < ?""",
+                (cutoff, until),
             )
         row = cursor.fetchone()
         return dict(row) if row else {
@@ -584,7 +646,7 @@ class InsightsEngine:
         " u.cost_source, u.billing_mode"
         " FROM session_model_usage u"
         " JOIN sessions s ON s.id = u.session_id"
-        " WHERE s.started_at >= ? AND s.source = ?"
+        " WHERE s.started_at >= ? AND s.started_at < ? AND s.source = ?"
     )
     _GET_MODEL_USAGE_ALL = (
         "SELECT u.session_id, u.model, u.billing_provider, u.billing_base_url,"
@@ -594,10 +656,12 @@ class InsightsEngine:
         " u.cost_source, u.billing_mode"
         " FROM session_model_usage u"
         " JOIN sessions s ON s.id = u.session_id"
-        " WHERE s.started_at >= ?"
+        " WHERE s.started_at >= ? AND s.started_at < ?"
     )
 
-    def _get_model_usage(self, cutoff: float, source: str = None) -> List[Dict]:
+    def _get_model_usage(
+        self, cutoff: float, source: str = None, until: float = float("inf")
+    ) -> List[Dict]:
         """Fetch per-model usage rows within the window (issue #51607).
 
         Returns an empty list when the table is missing (e.g. a DB opened by
@@ -607,16 +671,20 @@ class InsightsEngine:
         try:
             if source:
                 cursor = self._conn.execute(
-                    self._GET_MODEL_USAGE_WITH_SOURCE, (cutoff, source)
+                    self._GET_MODEL_USAGE_WITH_SOURCE, (cutoff, until, source)
                 )
             else:
-                cursor = self._conn.execute(self._GET_MODEL_USAGE_ALL, (cutoff,))
+                cursor = self._conn.execute(self._GET_MODEL_USAGE_ALL, (cutoff, until))
             return [dict(row) for row in cursor.fetchall()]
         except sqlite3.OperationalError:
             return []
 
     def _compute_model_breakdown(
-        self, sessions: List[Dict], cutoff: float, source: str = None
+        self,
+        sessions: List[Dict],
+        cutoff: float,
+        source: str = None,
+        until: float = float("inf"),
     ) -> List[Dict]:
         """Break down token usage and cost by model.
 
@@ -669,7 +737,7 @@ class InsightsEngine:
                 d.setdefault("has_pricing", False)
             return display_model
 
-        usage_rows = self._get_model_usage(cutoff, source)
+        usage_rows = self._get_model_usage(cutoff, source, until)
         usage_totals = defaultdict(lambda: {
             "input_tokens": 0, "output_tokens": 0, "cache_read_tokens": 0,
             "cache_write_tokens": 0, "reasoning_tokens": 0,
@@ -970,20 +1038,19 @@ class InsightsEngine:
     def format_terminal(self, report: Dict) -> str:
         """Format the insights report for terminal display (CLI)."""
         if report.get("empty"):
-            days = report.get("days", 30)
+            period = report.get("period_label") or f"the last {report.get('days', 30)} days"
             src = f" (source: {report['source_filter']})" if report.get("source_filter") else ""
-            return f"  No sessions found in the last {days} days{src}."
+            return f"  No sessions found in {period}{src}."
 
         lines = []
         o = report["overview"]
-        days = report["days"]
         src_filter = report.get("source_filter")
 
         # Header
         lines.append("")
         lines.append("  ╔══════════════════════════════════════════════════════════╗")
         lines.append("  ║                    📊 Hermes Insights                    ║")
-        period_label = f"Last {days} days"
+        period_label = report.get("period_label") or f"Last {report['days']} days"
         if src_filter:
             period_label += f" ({src_filter})"
         padding = 58 - len(period_label) - 2
@@ -1133,14 +1200,14 @@ class InsightsEngine:
     def format_gateway(self, report: Dict) -> str:
         """Format the insights report for gateway/messaging (shorter)."""
         if report.get("empty"):
-            days = report.get("days", 30)
-            return f"No sessions found in the last {days} days."
+            period = report.get("period_label") or f"the last {report.get('days', 30)} days"
+            return f"No sessions found in {period}."
 
         lines = []
         o = report["overview"]
-        days = report["days"]
+        period_label = report.get("period_label") or f"Last {report['days']} days"
 
-        lines.append(f"📊 **Hermes Insights** — Last {days} days\n")
+        lines.append(f"📊 **Hermes Insights** — {period_label}\n")
 
         # Overview
         lines.append(f"**Sessions:** {o['total_sessions']} | **Messages:** {o['total_messages']:,} | **Tool calls:** {o['total_tool_calls']:,}")

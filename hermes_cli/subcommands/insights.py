@@ -22,4 +22,14 @@ def build_insights_parser(subparsers, *, cmd_insights: Callable) -> None:
     insights_parser.add_argument(
         "--source", help="Filter by platform (cli, telegram, discord, etc.)"
     )
+    insights_parser.add_argument(
+        "--since",
+        metavar="YYYY-MM-DD",
+        help="Calendar-day lower bound (local time), overrides --days",
+    )
+    insights_parser.add_argument(
+        "--until",
+        metavar="YYYY-MM-DD",
+        help="Calendar-day upper bound, inclusive (local time)",
+    )
     insights_parser.set_defaults(func=cmd_insights)

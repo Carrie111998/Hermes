@@ -24,10 +24,12 @@ def test_get_sessions_all_query_is_parameterized():
 
 
 def test_get_sessions_with_source_query_is_parameterized():
-    """_GET_SESSIONS_WITH_SOURCE must use ? placeholders for both parameters."""
+    """_GET_SESSIONS_WITH_SOURCE must use ? placeholders for all three parameters
+    (cutoff, until bound, source)."""
     query = InsightsEngine._GET_SESSIONS_WITH_SOURCE
-    assert query.count("?") == 2
+    assert query.count("?") == 3
     assert "started_at >= ?" in query
+    assert "started_at < ?" in query
     assert "source = ?" in query
     assert "{" not in query
 
