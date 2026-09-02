@@ -514,7 +514,7 @@ class GatewayKanbanWatchersMixin:
                             if _gc_due:
                                 # Hourly (plus once at startup) stale-sub GC:
                                 # drop subscriptions for tasks that have been
-                                # ``done`` untouched past the retention
+                                # ``done``/``blocked`` untouched past the retention
                                 # window. Best-effort — a failed sweep never
                                 # blocks delivery; the next hourly gate
                                 # retries it.
