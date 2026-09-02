@@ -47,6 +47,8 @@ describe('WorldScene', () => {
     render(<WorldScene projection={projection()} />)
 
     expect(screen.getByText('Fix authentication')).toBeTruthy()
+    expect(screen.getByRole('img', { name: /Blender baseline/i })).toBeTruthy()
+    expect(screen.getByRole('link', { name: 'Download 3D scene' })).toBeTruthy()
     expect(screen.getByText('pr.merged_stable')).toBeTruthy()
     expect(screen.getByTestId('world-scene-celebration.citywide')).toBeTruthy()
     expect(screen.getByTestId('world-npc-condition-task-7-panicking')).toBeTruthy()

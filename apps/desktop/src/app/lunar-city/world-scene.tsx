@@ -3,6 +3,7 @@ import { useMemo } from 'react'
 import type { WorldProjection } from '@/store/lunar-city'
 
 import type { DialogueSubject } from './dialogue-tray'
+import { LUNAR_CITY_ASSET_MANIFEST } from './world-assets'
 import type { WorldCondition, WorldEvent } from './world-events'
 import { resolveWorldPresentation } from './world-presentation'
 
@@ -74,6 +75,30 @@ export function WorldScene({ onSelectSubject, projection }: WorldSceneProps) {
             >
               {projection.stale ? 'Stale source' : 'Connected'}
             </span>
+          </div>
+
+          <div
+            aria-label="Baseline 3D scene"
+            className="mt-4 overflow-hidden rounded-xl border border-cyan-300/20 bg-black/30"
+          >
+            <img
+              alt="Lunar City Blender baseline with grounded roads and concave terrain"
+              className="block aspect-[16/9] w-full object-cover"
+              src={`${import.meta.env.BASE_URL}lunar-city/lunar-city-baseline.png`}
+            />
+            <div className="flex flex-wrap items-center justify-between gap-2 px-3 py-2 text-[0.65rem] text-slate-300">
+              <span>
+                {LUNAR_CITY_ASSET_MANIFEST.assets.length} authored baseline assets ·{' '}
+                {LUNAR_CITY_ASSET_MANIFEST.renderProfile}
+              </span>
+              <a
+                className="text-cyan-200 underline decoration-cyan-200/40 underline-offset-2 hover:text-white"
+                download="lunar-city-baseline.glb"
+                href={`${import.meta.env.BASE_URL}lunar-city/lunar-city-baseline.glb`}
+              >
+                Download 3D scene
+              </a>
+            </div>
           </div>
 
           <div className="mt-5 grid gap-3 sm:grid-cols-2">
