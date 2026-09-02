@@ -10731,6 +10731,9 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
         if "planner_user_message" in queued
         else _TUI_PLANNER_MESSAGE_UNSET
     )
+    planner_kwargs = {}
+    if queued_planner_user_message is not _TUI_PLANNER_MESSAGE_UNSET:
+        planner_kwargs["planner_user_message"] = queued_planner_user_message
     try:
         if use_compute_host:
             if queued.get("image_paths"):
@@ -10741,7 +10744,7 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
                     queued["text"],
                     image_paths=queued["image_paths"],
                     queued_prompt_generation=queue_generation,
-                    planner_user_message=queued_planner_user_message,
+                    **planner_kwargs,
                 )
             else:
                 resp = _submit_prompt_to_compute_host(
@@ -10750,7 +10753,7 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
                     session,
                     queued["text"],
                     queued_prompt_generation=queue_generation,
-                    planner_user_message=queued_planner_user_message,
+                    **planner_kwargs,
                 )
             if resp.get("error"):
                 message = str(((resp.get("error") or {}).get("message")) or "queued prompt failed")
@@ -10768,7 +10771,7 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
                     queued["text"],
                     image_paths=queued["image_paths"],
                     queued_prompt_generation=queue_generation,
-                    planner_user_message=queued_planner_user_message,
+                    **planner_kwargs,
                 )
             else:
                 _run_prompt_submit(
@@ -10777,7 +10780,7 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
                     session,
                     queued["text"],
                     queued_prompt_generation=queue_generation,
-                    planner_user_message=queued_planner_user_message,
+                    **planner_kwargs,
                 )
     except Exception as exc:
         print(

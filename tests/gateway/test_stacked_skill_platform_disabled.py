@@ -135,3 +135,49 @@ async def test_stacked_second_skill_disabled_for_platform_is_blocked(monkeypatch
     assert "disabled for telegram" in result
 
 
+@pytest.mark.asyncio
+async def test_orphan_rescue_keeps_skill_planner_input_with_incoming_event(
+    monkeypatch, skills_env
+):
+    import gateway.run as gateway_run
+
+    _make_skill(skills_env, "private")
+    monkeypatch.setattr(
+        gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "***"}
+    )
+
+    runner = _make_runner()
+    adapter = runner.adapters[Platform.TELEGRAM]
+    adapter._pending_messages = {}
+    incoming = _make_event("/private fix the scheduler")
+    orphan = _make_event("older queued turn")
+    turn = SimpleNamespace(lease=None, agent=None, started_ts=None)
+    runner._adapter_for_source = lambda _source: adapter
+    runner._claim_active_session_slot = MagicMock(return_value=(None, None))
+    runner._rescue_orphaned_overflow = MagicMock(return_value=orphan)
+    runner._enqueue_fifo = MagicMock()
+    runner._session_state = MagicMock(return_value=SimpleNamespace(turn=turn))
+    runner._persist_active_agents = MagicMock()
+    runner._begin_session_run_generation = MagicMock(return_value=1)
+    runner._handle_message_with_agent = AsyncMock(return_value="done")
+    runner._run_post_turn_hooks = AsyncMock()
+    runner._restore_moa_one_shot = MagicMock()
+    runner._restore_pending_one_turn_model_override = MagicMock()
+    runner._clear_durable_active_turn = AsyncMock()
+    runner._release_running_agent_state = MagicMock()
+    runner._release_turn_lease = MagicMock()
+
+    assert await runner._handle_message(incoming) == "done"
+
+    runner._enqueue_fifo.assert_called_once_with(
+        build_session_key(incoming.source), incoming, adapter
+    )
+    assert incoming.metadata["_planner_user_message"] == "fix the scheduler"
+    runner._handle_message_with_agent.assert_awaited_once_with(
+        orphan,
+        orphan.source,
+        build_session_key(incoming.source),
+        1,
+    )
+
+

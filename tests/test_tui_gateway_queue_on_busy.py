@@ -615,6 +615,44 @@ def test_busy_image_prompts_keep_b_and_c_attachments_in_submission_order(monkeyp
     ]
 
 
+def test_drain_preserves_all_planner_user_message_states(monkeypatch):
+    captured = []
+    monkeypatch.setattr(
+        server,
+        "_run_prompt_submit",
+        lambda _rid, _sid, _session, _text, **kwargs: captured.append(kwargs),
+    )
+
+    for queued in (
+        {"text": "ordinary", "transport": None},
+        {
+            "text": "bare skill scaffold",
+            "transport": None,
+            "planner_user_message": None,
+        },
+        {
+            "text": "skill scaffold",
+            "transport": None,
+            "planner_user_message": "fix the scheduler",
+        },
+    ):
+        assert (
+            server._drain_queued_prompt(
+                "r1", "sid", _session(queued_prompt=queued)
+            )
+            is True
+        )
+
+    assert captured == [
+        {"queued_prompt_generation": 0},
+        {"queued_prompt_generation": 0, "planner_user_message": None},
+        {
+            "queued_prompt_generation": 0,
+            "planner_user_message": "fix the scheduler",
+        },
+    ]
+
+
 # ── _drain_queued_prompt ───────────────────────────────────────────────────
 
 def test_drain_fires_queued_prompt_and_claims_running(monkeypatch):

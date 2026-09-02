@@ -56,8 +56,10 @@ class CaptureQueuedNativeImageAgent:
         self.tools = []
         self.tool_progress_callback = kwargs.get("tool_progress_callback")
 
-    def run_conversation(self, message, conversation_history=None, task_id=None):
-        type(self).calls.append(message)
+    def run_conversation(
+        self, message, conversation_history=None, task_id=None, **kwargs
+    ):
+        type(self).calls.append((message, kwargs))
         return {
             "final_response": f"done-{len(type(self).calls)}",
             "messages": [],
@@ -131,6 +133,7 @@ async def test_queued_followup_uses_pending_event_session_key_for_native_images(
         media_urls=[str(image_path)],
         media_types=["image/png"],
         message_id="queued-1",
+        metadata={"_planner_user_message": "describe this"},
     )
 
     result = await runner._run_agent(
@@ -144,7 +147,11 @@ async def test_queued_followup_uses_pending_event_session_key_for_native_images(
 
     assert result["final_response"] == "done-2"
     assert len(CaptureQueuedNativeImageAgent.calls) == 2
-    queued_message = CaptureQueuedNativeImageAgent.calls[1]
+    first_message, first_kwargs = CaptureQueuedNativeImageAgent.calls[0]
+    queued_message, queued_kwargs = CaptureQueuedNativeImageAgent.calls[1]
+    assert first_message == "hello"
+    assert "planner_user_message" not in first_kwargs
+    assert queued_kwargs["planner_user_message"] == "describe this"
     assert isinstance(queued_message, list)
     assert queued_message[0]["type"] == "text"
     assert queued_message[0]["text"].startswith("describe this")

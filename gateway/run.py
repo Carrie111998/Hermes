@@ -20169,6 +20169,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
             return _limit_message
 
+        # Skill expansion happens before FIFO orphan rescue. Keep the clean
+        # planner input on its event so swapping in an older queued event does
+        # not apply the new arrival's provenance to the wrong turn.
+        if planner_user_message is not PLANNER_USER_MESSAGE_UNSET:
+            event.metadata["_planner_user_message"] = planner_user_message
+
         # ── FIFO orphan rescue (#99882) ────────────────────────────────
         # If this session went idle with a populated overflow (queued
         # during a busy window whose post-turn drain never promoted —
@@ -20198,6 +20204,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     # behind the already-staged next orphan (FIFO).
                     self._enqueue_fifo(_quick_key, event, _orphan_adapter)
                     event = _rescued
+                    _rescued_metadata = getattr(event, "metadata", None)
+                    planner_user_message = (
+                        _rescued_metadata["_planner_user_message"]
+                        if isinstance(_rescued_metadata, dict)
+                        and "_planner_user_message" in _rescued_metadata
+                        else PLANNER_USER_MESSAGE_UNSET
+                    )
                     # Same session key by construction; carry the orphan's
                     # own source so reply anchors / thread metadata point
                     # at the message that is actually being answered.
@@ -20220,10 +20233,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self._persist_active_agents()
         _run_generation = self._begin_session_run_generation(_quick_key)
 
+        _planner_kwargs = {}
+        if planner_user_message is not PLANNER_USER_MESSAGE_UNSET:
+            _planner_kwargs["planner_user_message"] = planner_user_message
+
         try:
             try:
                 _agent_result = await self._handle_message_with_agent(
-                    event, source, _quick_key, _run_generation
+                    event,
+                    source,
+                    _quick_key,
+                    _run_generation,
+                    **_planner_kwargs,
                 )
             except TurnLeaseTimeoutError as exc:
                 # This is a rejected message, not a completed agent turn. Return
@@ -21042,7 +21063,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 pass
         return source
 
-    async def _handle_message_with_agent(self, event, source, _quick_key: str, run_generation: int):
+    async def _handle_message_with_agent(
+        self,
+        event,
+        source,
+        _quick_key: str,
+        run_generation: int,
+        planner_user_message: Any = PLANNER_USER_MESSAGE_UNSET,
+    ):
         """Inner handler that runs under the _running_agents sentinel guard."""
         _msg_start_time = time.time()
         _platform_name = source.platform.value if hasattr(source.platform, "value") else str(source.platform)
@@ -32568,6 +32596,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 next_message_id = None
                 next_channel_prompt = None
                 next_session_key = session_key
+                next_planner_user_message = PLANNER_USER_MESSAGE_UNSET
                 # #60671 — carry the pending event's message_type into the
                 # recursive call so queued voice turns can stream TTS and
                 # re-mark the generation for the final delivered turn.
@@ -32604,6 +32633,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     next_message_id = self._reply_anchor_for_event(pending_event)
                     next_channel_prompt = getattr(pending_event, "channel_prompt", None)
                     next_message_type = getattr(pending_event, "message_type", None)
+                    _pending_metadata = getattr(pending_event, "metadata", None)
+                    if (
+                        isinstance(_pending_metadata, dict)
+                        and "_planner_user_message" in _pending_metadata
+                    ):
+                        next_planner_user_message = _pending_metadata[
+                            "_planner_user_message"
+                        ]
 
                 # Clear the completed streaming marker from the prior logical
                 # turn so the recursive turn's streaming TTS is not suppressed
@@ -32647,6 +32684,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # what the follow-up's guard will consult.  Fail-safe in helper.
                 await self._refresh_agent_cache_message_count(session_key, session_id)
 
+                _followup_planner_kwargs = {}
+                if next_planner_user_message is not PLANNER_USER_MESSAGE_UNSET:
+                    _followup_planner_kwargs["planner_user_message"] = (
+                        next_planner_user_message
+                    )
+
                 followup_result = await self._run_agent(
                     message=next_message,
                     context_prompt=context_prompt,
@@ -32659,6 +32702,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     event_message_id=next_message_id,
                     channel_prompt=next_channel_prompt,
                     message_type=next_message_type,
+                    **_followup_planner_kwargs,
                 )
                 return _preserve_queued_followup_history_offset(result, followup_result)
         finally:
