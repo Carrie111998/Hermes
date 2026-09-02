@@ -1261,6 +1261,7 @@ def _probe_remote_backend(env_type: str) -> str | None:
                 "docker_persist_across_processes": config.get("docker_persist_across_processes", True),
                 "docker_shared_container_key": config.get("docker_shared_container_key", ""),
                 "docker_orphan_reaper": config.get("docker_orphan_reaper", True),
+                "docker_network": config.get("docker_network", True),
             }
 
         env = _create_environment(
