@@ -194,6 +194,20 @@ class TestRealProfileCdpLaunch:
         import tools.browser_tool as bt
         bt._real_profile_cdp_cache.clear()
 
+    def _make_cookie_db(self, root, count=3):
+        """Build a real sqlite cookie DB in a profile copy dir."""
+        import sqlite3
+
+        (root / "Default").mkdir(parents=True, exist_ok=True)
+        db = root / "Default" / "Cookies"
+        con = sqlite3.connect(str(db))
+        con.execute("CREATE TABLE cookies (host_key TEXT, name TEXT, value TEXT, encrypted_value BLOB)")
+        for i in range(count):
+            con.execute("INSERT INTO cookies VALUES (?, ?, ?, ?)", (f".host{i}.com", f"c{i}", "", b"v11"))
+        con.commit()
+        con.close()
+        return db
+
     def test_consent_off_is_noop(self):
         import tools.browser_tool as bt
         self._reset()
@@ -335,6 +349,82 @@ class TestRealProfileCdpLaunch:
         assert closed["n"] == 1  # stale wrong-dir session was closed
         assert cdp == "http://127.0.0.1:41000"
         self._reset()
+
+    def test_launch_verifies_cookies_survive(self, tmp_path):
+        import tools.browser_tool as bt
+        self._reset()
+        self._make_cookie_db(tmp_path, count=3)
+        proc = Mock(returncode=0, stdout="", stderr="")
+        with patch.object(bt, "_use_real_profile", return_value=True), \
+             patch("hermes_cli.browser_connect.detect_default_chromium", return_value="chrome"), \
+             patch("hermes_cli.browser_connect.snapshot_real_profile", return_value=(str(tmp_path), None)), \
+             patch.object(bt, "_agent_browser_get_cdp",
+                          side_effect=[None, "http://127.0.0.1:41000"]), \
+             patch.object(bt, "_find_agent_browser", return_value="/usr/bin/agent-browser"), \
+             patch.object(bt.subprocess, "run", return_value=proc), \
+             patch.object(bt, "_is_headed_mode", return_value=False), \
+             patch.object(bt, "_live_cookie_count", return_value=3):
+            cdp, err = bt._real_profile_cdp()
+        assert err is None
+        assert cdp == "http://127.0.0.1:41000"
+        self._reset()
+
+    def test_launch_fails_closed_when_cookies_wiped(self, tmp_path):
+        import tools.browser_tool as bt
+        self._reset()
+        self._make_cookie_db(tmp_path, count=3)
+        proc = Mock(returncode=0, stdout="", stderr="")
+        closed = {"n": 0}
+        with patch.object(bt, "_use_real_profile", return_value=True), \
+             patch("hermes_cli.browser_connect.detect_default_chromium", return_value="chrome"), \
+             patch("hermes_cli.browser_connect.snapshot_real_profile", return_value=(str(tmp_path), None)), \
+             patch.object(bt, "_agent_browser_get_cdp",
+                          side_effect=[None, "http://127.0.0.1:41000"]), \
+             patch.object(bt, "_find_agent_browser", return_value="/usr/bin/agent-browser"), \
+             patch.object(bt.subprocess, "run", return_value=proc), \
+             patch.object(bt, "_is_headed_mode", return_value=False), \
+             patch.object(bt, "_live_cookie_count", return_value=0), \
+             patch.object(bt, "_agent_browser_close_session",
+                          side_effect=lambda s: closed.__setitem__("n", closed["n"] + 1)):
+            cdp, err = bt._real_profile_cdp()
+        assert cdp is None
+        assert err and "signed out" in err
+        assert closed["n"] == 1
+        assert "cdp" not in bt._real_profile_cdp_cache
+        self._reset()
+
+    def test_launch_skips_verification_when_snapshot_has_no_cookies(self, tmp_path):
+        import tools.browser_tool as bt
+        self._reset()
+        proc = Mock(returncode=0, stdout="", stderr="")
+        live = Mock()
+        with patch.object(bt, "_use_real_profile", return_value=True), \
+             patch("hermes_cli.browser_connect.detect_default_chromium", return_value="chrome"), \
+             patch("hermes_cli.browser_connect.snapshot_real_profile", return_value=(str(tmp_path), None)), \
+             patch.object(bt, "_agent_browser_get_cdp",
+                          side_effect=[None, "http://127.0.0.1:41000"]), \
+             patch.object(bt, "_find_agent_browser", return_value="/usr/bin/agent-browser"), \
+             patch.object(bt.subprocess, "run", return_value=proc), \
+             patch.object(bt, "_is_headed_mode", return_value=False), \
+             patch.object(bt, "_live_cookie_count", live):
+            cdp, err = bt._real_profile_cdp()
+        assert err is None
+        assert cdp == "http://127.0.0.1:41000"
+        live.assert_not_called()
+        self._reset()
+
+    def test_live_cookie_count_parses_output(self):
+        import tools.browser_tool as bt
+        proc = Mock(returncode=0, stdout="SID=abc\nNID=def\n", stderr="")
+        with patch.object(bt, "_find_agent_browser", return_value="/usr/bin/agent-browser"), \
+             patch.object(bt, "_agent_browser_argv", side_effect=lambda c: [c]), \
+             patch.object(bt.subprocess, "run", return_value=proc):
+            assert bt._live_cookie_count("http://127.0.0.1:41000") == 2
+
+    def test_live_cookie_count_zero_on_error(self):
+        import tools.browser_tool as bt
+        with patch.object(bt, "_find_agent_browser", side_effect=FileNotFoundError):
+            assert bt._live_cookie_count("http://127.0.0.1:41000") == 0
 
     def test_cdp_on_data_dir_matches_devtoolsactiveport(self, tmp_path):
         import tools.browser_tool as bt

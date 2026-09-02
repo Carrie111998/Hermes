@@ -1640,6 +1640,68 @@ def _agent_browser_close_session(session_name: str) -> None:
         logger.debug("real-profile session close failed: %s", e)
 
 
+def _count_snapshot_cookies(copy_dir: str) -> int:
+    """Count rows in the copied profile's cookie DB (the auth state we intended
+    to load). Handles both modern (Default/Network/Cookies) and legacy
+    (Default/Cookies) locations. Returns 0 when the DB is missing or unreadable
+    — an empty jar to verify against means there is nothing to verify.
+    """
+    import sqlite3
+
+    for rel in ("Default/Network/Cookies", "Default/Cookies"):
+        db = os.path.join(copy_dir, rel)
+        if not os.path.isfile(db):
+            continue
+        try:
+            con = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=2)
+            try:
+                cur = con.execute("SELECT COUNT(*) FROM cookies")
+                return int(cur.fetchone()[0])
+            finally:
+                con.close()
+        except Exception as e:
+            logger.debug("could not count snapshot cookies in %s: %s", db, e)
+            return 0
+    return 0
+
+
+def _live_cookie_count(cdp_url: str) -> int:
+    """Query the launched browser's live cookie jar via
+    ``agent-browser --cdp <port> cookies get``. Returns the number of cookies
+    the browser actually holds in memory. Returns 0 on ANY failure (missing
+    port, CLI not found, subprocess error/nonzero exit, unparseable output) —
+    the caller treats 0-with-expected>0 as a wiped jar and fails closed.
+    """
+    m = re.search(r":(\d+)", cdp_url or "")
+    if not m:
+        return 0
+    try:
+        browser_cmd = _find_agent_browser()
+    except FileNotFoundError:
+        return 0
+    try:
+        proc = subprocess.run(
+            [*_agent_browser_argv(browser_cmd), "--cdp", m.group(1), "cookies", "get"],
+            capture_output=True, text=True, timeout=15, env=_build_browser_env(),
+        )
+    except (subprocess.SubprocessError, OSError) as e:
+        logger.debug("real-profile live cookie query failed: %s", e)
+        return 0
+    if proc.returncode != 0 or not (proc.stdout or "").strip():
+        stderr_tail = (proc.stderr or "").strip().splitlines()
+        logger.debug(
+            "real-profile live cookie query rc=%s stderr=%s",
+            proc.returncode, stderr_tail[-1] if stderr_tail else "",
+        )
+        return 0
+    count = 0
+    for line in (proc.stdout or "").splitlines():
+        line = line.strip()
+        if line and "=" in line and not line.startswith("["):
+            count += 1
+    return count
+
+
 def _real_profile_cdp() -> tuple:
     """Resolve ``(cdp_url, error)`` for consented real-profile browsing.
 
@@ -1915,6 +1977,32 @@ def _real_profile_cdp() -> tuple:
                 "browser.use_real_profile is on, but the real-profile browser "
                 "started without exposing a devtools endpoint. Retry, or turn "
                 "the toggle off."
+            )
+        # Fail closed if the launched browser's cookie jar came up empty while the
+        # snapshot carried cookies: the backend may have launched Chromium with a
+        # mock keychain / headless cookie store that cannot decrypt keyring-encrypted
+        # cookies, silently signing the session out. Never downgrade a consented
+        # user to a throwaway browser.
+        expected = _count_snapshot_cookies(copy_dir)
+        if expected > 0:
+            live = _live_cookie_count(cdp)
+            if live <= 0:
+                _agent_browser_close_session(_REAL_PROFILE_SESSION)
+                _real_profile_cdp_cache.pop("cdp", None)
+                return None, (
+                    "browser.use_real_profile is on, but the launched browser's "
+                    "cookie store came up empty: the copied profile has "
+                    f"{expected} cookies but the session reports {live}. This usually "
+                    "means the browser backend launched Chromium with a mock keychain "
+                    "or headless cookie store that cannot decrypt your keyring-encrypted "
+                    "cookies, so the session would run signed out — refusing to "
+                    "silently downgrade. Try a browser backend that launches real "
+                    "Chrome without a mock keychain, or connect a real Chrome via "
+                    "browser.cdp_url."
+                )
+            logger.info(
+                "real-profile cookie verification passed: %d cookies live (%d snapshotted)",
+                live, expected,
             )
         _real_profile_cdp_cache["cdp"] = cdp
         logger.info("real-profile browser ready for %s at %s (%s)", browser, cdp, copy_dir)
