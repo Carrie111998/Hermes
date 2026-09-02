@@ -67,6 +67,7 @@ from agent.message_sanitization import (
     _strip_images_from_messages,
     _strip_non_ascii,
     serialized_messages_bytes,
+    strip_reasoning_details_for_non_openrouter,
 )
 # Must mirror _STALE_TOOL_CALL_MARKER_RE in hermes_state.py — kept local
 # to avoid importing hermes_state at module load time (its module-level
@@ -2605,6 +2606,20 @@ def run_conversation(
             # The signature field helps maintain reasoning continuity
             api_messages.append(api_msg)
 
+        # NOTE: OpenRouter-only 'reasoning_details' is deliberately NOT
+        # reconciled here. OpenRouter emits it on reasoning turns and consumes
+        # it back for continuity (kept verbatim in the assistant branch
+        # above); it is NOT standard Chat Completions schema, so strict
+        # proxies reject it with 400 unrecognizedProperty (observed on the
+        # Palantir Foundry LLM proxy — session loops on the 400 until /new).
+        # Which side wins depends on the provider that actually serves each
+        # request, and mid-retry fallback can switch that provider AFTER this
+        # point — so the reconcile runs per attempt inside the retry loop,
+        # right next to _reapply_reasoning_echo_for_provider (same
+        # built-once-vs-current-provider staleness class as that pad and the
+        # #72626 prompt-cache redecoration). History keeps the field, so a
+        # later switch back to OpenRouter still finds it.
+
         # Build the final system message: cached prompt + ephemeral system prompt.
         # Ephemeral additions are API-call-time only (not persisted to session DB).
         # External recall context is injected into the user message, not the system
@@ -3360,6 +3375,16 @@ def run_conversation(
                 # unless the active provider needs it) so the fallback request
                 # isn't sent with stale, primary-shaped reasoning fields.
                 agent._reapply_reasoning_echo_for_provider(api_messages)
+                # Same staleness class: OpenRouter-only 'reasoning_details'
+                # must be reconciled against the provider serving THIS attempt
+                # (mid-retry fallback can have just switched it). Recompute the
+                # OpenRouter flag from the live agent state each iteration;
+                # idempotent, O(n), history keeps the field for a switch back.
+                strip_reasoning_details_for_non_openrouter(
+                    api_messages,
+                    (agent.provider or "").strip().lower() == "openrouter"
+                    or agent._is_openrouter_url(),
+                )
                 # Same story for prompt-cache decoration (#72626): try_activate_
                 # fallback refreshes the policy flags, but the decorated list
                 # still carries the primary's breakpoints (or none). Strip and
