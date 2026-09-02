@@ -16,6 +16,8 @@ computed for.
 from __future__ import annotations
 
 import subprocess
+import sqlite3
+import time
 from pathlib import Path
 
 import pytest
@@ -111,3 +113,114 @@ def test_genuine_crash_still_reclaims(conn):
     assert tid in crashed
     final = conn.execute("SELECT status FROM tasks WHERE id=?", (tid,)).fetchone()
     assert final["status"] in ("ready", "blocked", "todo")
+
+
+@pytest.mark.parametrize("stale_dimension", ["run", "claim"])
+def test_manual_reclaim_expectation_mismatch_has_no_signal_side_effect(
+    conn, stale_dimension,
+):
+    """A stale run handle fails before PID or containment termination."""
+    tid = kb.create_task(conn, title="exact manual reclaim", assignee="w")
+    assert kb.claim_task(conn, tid, claimer="worker:exact")
+    row = conn.execute(
+        "SELECT current_run_id, claim_lock FROM tasks WHERE id=?",
+        (tid,),
+    ).fetchone()
+    conn.execute("UPDATE tasks SET worker_pid=424242 WHERE id=?", (tid,))
+    conn.execute(
+        "UPDATE task_runs SET worker_pid=424242 WHERE id=?",
+        (row["current_run_id"],),
+    )
+    conn.commit()
+    signals = []
+
+    expected_run_id = int(row["current_run_id"])
+    expected_claim_lock = row["claim_lock"]
+    if stale_dimension == "run":
+        expected_run_id += 1
+    else:
+        expected_claim_lock = "worker:stale"
+
+    assert not kb.reclaim_task(
+        conn,
+        tid,
+        expected_run_id=expected_run_id,
+        expected_claim_lock=expected_claim_lock,
+        signal_fn=lambda pid, sig: signals.append((pid, sig)),
+    )
+    assert signals == []
+    final = conn.execute(
+        "SELECT status, current_run_id, claim_lock, worker_pid FROM tasks WHERE id=?",
+        (tid,),
+    ).fetchone()
+    assert final["status"] == "running"
+    assert int(final["current_run_id"]) == int(row["current_run_id"])
+    assert final["claim_lock"] == row["claim_lock"]
+    assert int(final["worker_pid"]) == 424242
+
+
+def test_exact_legacy_reclaim_serializes_validation_and_signal(conn):
+    """A successor cannot publish a recycled PID between check and signal."""
+    host = kb._claimer_id().split(":", 1)[0]
+    tid = kb.create_task(conn, title="legacy signal race", assignee="w")
+    assert kb.claim_task(conn, tid, claimer=f"{host}:old")
+    old = conn.execute(
+        "SELECT current_run_id, claim_lock FROM tasks WHERE id=?",
+        (tid,),
+    ).fetchone()
+    assert old["current_run_id"] is not None
+    assert old["claim_lock"] is not None
+    recycled_pid = 424242
+    conn.execute(
+        "UPDATE tasks SET worker_pid=? WHERE id=?",
+        (recycled_pid, tid),
+    )
+    conn.execute(
+        "UPDATE task_runs SET worker_pid=? WHERE id=?",
+        (recycled_pid, old["current_run_id"]),
+    )
+    conn.commit()
+    outcome = {"writer_committed": False, "writer_blocked": False}
+    signals = []
+
+    def race_successor_before_signal(pid, sig):
+        other = sqlite3.connect(kb.kanban_db_path(), timeout=0)
+        try:
+            other.execute("PRAGMA busy_timeout=0")
+            other.execute("BEGIN IMMEDIATE")
+            now = int(time.time())
+            successor_lock = f"{host}:successor"
+            other.execute(
+                "UPDATE task_runs SET ended_at=?, status='ended', outcome='done' "
+                "WHERE id=?",
+                (now, old["current_run_id"]),
+            )
+            cur = other.execute(
+                "INSERT INTO task_runs "
+                "(task_id, status, claim_lock, worker_pid, started_at) "
+                "VALUES (?, 'running', ?, ?, ?)",
+                (tid, successor_lock, recycled_pid, now),
+            )
+            other.execute(
+                "UPDATE tasks SET status='running', claim_lock=?, "
+                "worker_pid=?, current_run_id=?, started_at=? WHERE id=?",
+                (successor_lock, recycled_pid, int(cur.lastrowid), now, tid),
+            )
+            other.commit()
+            outcome["writer_committed"] = True
+        except sqlite3.OperationalError:
+            outcome["writer_blocked"] = True
+            other.rollback()
+        finally:
+            other.close()
+        signals.append((pid, sig))
+
+    assert kb.reclaim_task(
+        conn,
+        tid,
+        expected_run_id=int(old["current_run_id"]),
+        expected_claim_lock=old["claim_lock"],
+        signal_fn=race_successor_before_signal,
+    )
+    assert outcome == {"writer_committed": False, "writer_blocked": True}
+    assert len(signals) == 1

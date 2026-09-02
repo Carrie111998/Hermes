@@ -51,6 +51,7 @@ from pydantic import BaseModel, Field
 
 from hermes_cli import kanban_db
 from hermes_cli import kanban_diagnostics as kd
+from hermes_cli.kanban_containment import ContainmentError
 
 log = logging.getLogger(__name__)
 
@@ -732,47 +733,29 @@ async def upload_task_attachment(
             raise HTTPException(status_code=404, detail=f"task {task_id} not found")
 
         safe_name = _safe_attachment_name(file.filename or "")
+        data = bytearray()
+        while True:
+            chunk = await file.read(1024 * 1024)
+            if not chunk:
+                break
+            data.extend(chunk)
+            if len(data) > KANBAN_ATTACHMENT_MAX_BYTES:
+                raise HTTPException(
+                    status_code=413,
+                    detail=(
+                        f"attachment exceeds {KANBAN_ATTACHMENT_MAX_BYTES // (1024 * 1024)} MB limit"
+                    ),
+                )
 
-        # Stream to disk with a hard size cap so a huge upload can't fill
-        # the disk. Read in chunks; abort + clean up if the cap is hit.
-        dest_dir = kanban_db.task_attachments_dir(task_id, board=board)
-        dest_dir.mkdir(parents=True, exist_ok=True)
-
-        # Resolve name collisions: foo.pdf → foo (1).pdf, foo (2).pdf, …
-        dest_path = _collision_free_path(dest_dir, safe_name)
-        candidate = dest_path.name
-
-        total = 0
-        try:
-            with open(dest_path, "wb") as out:
-                while True:
-                    chunk = await file.read(1024 * 1024)
-                    if not chunk:
-                        break
-                    total += len(chunk)
-                    if total > KANBAN_ATTACHMENT_MAX_BYTES:
-                        out.close()
-                        dest_path.unlink(missing_ok=True)
-                        raise HTTPException(
-                            status_code=413,
-                            detail=(
-                                f"attachment exceeds {KANBAN_ATTACHMENT_MAX_BYTES // (1024 * 1024)} MB limit"
-                            ),
-                        )
-                    out.write(chunk)
-        except HTTPException:
-            raise
-        except OSError as exc:
-            raise HTTPException(status_code=500, detail=f"failed to store attachment: {exc}")
-
-        att_id = kanban_db.add_attachment(
+        att_id = kanban_db.store_attachment_bytes(
             conn,
             task_id,
-            filename=candidate,
-            stored_path=str(dest_path.resolve()),
+            safe_name,
+            bytes(data),
             content_type=file.content_type,
-            size=total,
             uploaded_by=(uploaded_by or "dashboard"),
+            board=board,
+            max_bytes=KANBAN_ATTACHMENT_MAX_BYTES,
         )
         att = kanban_db.get_attachment(conn, att_id)
         return {"attachment": _attachment_dict(att) if att else None}
@@ -896,6 +879,12 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
         # --- status -------------------------------------------------------
         if payload.status is not None:
             s = payload.status
+            if s != "running":
+                _ensure_contained_worker_retired(
+                    conn,
+                    task_id,
+                    reason=f"dashboard_status_{s}",
+                )
             ok = True
             if s == "done":
                 ok = kanban_db.complete_task(
@@ -1057,6 +1046,44 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
 
 
 # ---------------------------------------------------------------------------
+# Durable dashboard lifecycle custody
+# ---------------------------------------------------------------------------
+
+def _ensure_contained_worker_retired(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    reason: str,
+    require_cleanup: bool = False,
+) -> None:
+    """Retire an exact contained run before a dashboard lifecycle mutation.
+
+    Legacy tasks have no containment row and retain their existing dashboard
+    behavior.  Once a durable containment exists, however, PID/claim hints are
+    no longer authority: delegate the reserve -> kill -> certify -> semantic
+    reclaim protocol to :func:`kanban_db.reclaim_task`.  A failed certificate
+    leaves the task/run ownership untouched and fails the request closed.
+
+    Hard deletion additionally requires physical cleanup and durable
+    ``cleaned_at`` readback because the task row is the containment's audit
+    owner and must not disappear while cgroup retirement is incomplete.
+    """
+    if kanban_db.ensure_task_containment_retired(
+        conn,
+        task_id,
+        reason=reason,
+        require_cleanup=require_cleanup,
+    ):
+        return
+    detail = (
+        "worker containment cleanup is not durable"
+        if require_cleanup
+        else "worker containment retirement could not be certified"
+    )
+    raise HTTPException(status_code=409, detail=detail)
+
+
+# ---------------------------------------------------------------------------
 # DELETE /tasks/:id
 # ---------------------------------------------------------------------------
 
@@ -1065,6 +1092,12 @@ def delete_task(task_id: str, board: Optional[str] = Query(None)):
     board = _resolve_board(board)
     conn = _conn(board=board)
     try:
+        _ensure_contained_worker_retired(
+            conn,
+            task_id,
+            reason="dashboard_delete",
+            require_cleanup=True,
+        )
         ok = kanban_db.delete_task(conn, task_id)
         if not ok:
             raise HTTPException(status_code=404, detail=f"task {task_id} not found")
@@ -1131,6 +1164,26 @@ def _set_status_direct(
     orphaned. ``running -> ready`` via drag-drop is the common case
     (user yanking a stuck worker back to the queue).
     """
+    preflight = conn.execute(
+        "SELECT status FROM tasks WHERE id = ?", (task_id,),
+    ).fetchone()
+    if (
+        preflight is not None
+        and preflight["status"] in {"done", "archived"}
+        and new_status not in {"done", "archived"}
+    ):
+        try:
+            kanban_db.prepare_descendant_containment_retirement(conn, task_id)
+        except ContainmentError as exc:
+            raise HTTPException(
+                status_code=409,
+                detail="descendant containment retirement could not be certified",
+            ) from exc
+    _ensure_contained_worker_retired(
+        conn,
+        task_id,
+        reason=f"dashboard_status_{new_status}",
+    )
     terminations: list[tuple[Optional[int], Optional[str]]] = []
     effective_status = new_status
     with kanban_db.write_txn(conn):
@@ -1337,10 +1390,23 @@ def bulk_update(payload: BulkTaskBody, board: Optional[str] = Query(None)):
                     results.append(entry)
                     continue
                 if payload.archive:
+                    _ensure_contained_worker_retired(
+                        conn,
+                        tid,
+                        reason="dashboard_bulk_archive",
+                    )
                     if not kanban_db.archive_task(conn, tid):
                         entry.update(ok=False, error="archive refused")
                 if payload.status is not None and not payload.archive:
                     s = payload.status
+                    if s in {
+                        "done", "blocked", "review", "ready", "scheduled", "todo", "triage"
+                    }:
+                        _ensure_contained_worker_retired(
+                            conn,
+                            tid,
+                            reason=f"dashboard_bulk_status_{s}",
+                        )
                     if s == "done":
                         ok = kanban_db.complete_task(
                             conn, tid,
@@ -1738,7 +1804,13 @@ def terminate_run_endpoint(
                 status_code=409,
                 detail=f"run {run_id} already ended",
             )
-        ok = kanban_db.reclaim_task(conn, r.task_id, reason=payload.reason)
+        ok = kanban_db.reclaim_task(
+            conn,
+            r.task_id,
+            reason=payload.reason,
+            expected_run_id=r.id,
+            expected_claim_lock=r.claim_lock,
+        )
         if not ok:
             raise HTTPException(
                 status_code=409,

@@ -89,6 +89,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Optional
 
+from .kanban_containment import ContainmentRetirementPending
 from hermes_cli.sqlite_util import add_column_if_missing as _add_column_if_missing
 from toolsets import get_toolset_names
 
@@ -228,6 +229,14 @@ def _kanban_observer_consumed(event: str) -> bool:
         return False
 
 
+def _worker_pid_value(value: Any) -> Optional[int]:
+    """Return the scalar PID from a legacy int or contained spawn handle."""
+    if value is None:
+        return None
+    candidate = value if isinstance(value, int) else getattr(value, "pid", None)
+    return int(candidate) if candidate is not None else None
+
+
 def _fire_worker_spawned_hook(
     conn: sqlite3.Connection,
     task: "Task",
@@ -252,7 +261,7 @@ def _fire_worker_spawned_hook(
             board=board or get_current_board(),
             assignee=task.assignee,
             run_id=_current_run_id(conn, task.id),
-            worker_pid=int(pid) if pid else None,
+            worker_pid=_worker_pid_value(pid),
             workspace_path=str(workspace_path),
         )
     except Exception as exc:  # pragma: no cover - defensive
@@ -597,6 +606,59 @@ def boards_root() -> Path:
     return kanban_home() / "kanban" / "boards"
 
 
+_BOARD_NAMESPACE_LOCK_DEPTH: ContextVar[int] = ContextVar(
+    "kanban_board_namespace_lock_depth", default=0
+)
+
+
+@contextlib.contextmanager
+def board_namespace_lock():
+    """Serialize named-board connect/create/import/remove outside board dirs."""
+    depth = _BOARD_NAMESPACE_LOCK_DEPTH.get()
+    if depth:
+        token = _BOARD_NAMESPACE_LOCK_DEPTH.set(depth + 1)
+        try:
+            yield
+        finally:
+            _BOARD_NAMESPACE_LOCK_DEPTH.reset(token)
+        return
+
+    root = boards_root()
+    root.mkdir(parents=True, exist_ok=True)
+    handle = (root / ".namespace.lock").open("a+b")
+    if _IS_WINDOWS and handle.seek(0, os.SEEK_END) == 0:
+        handle.write(b"\0")
+        handle.flush()
+    token = _BOARD_NAMESPACE_LOCK_DEPTH.set(1)
+    try:
+        if _IS_WINDOWS:
+            import msvcrt
+
+            handle.seek(0)
+            locking = getattr(msvcrt, "locking")
+            locking(handle.fileno(), getattr(msvcrt, "LK_LOCK"), 1)
+        else:
+            import fcntl
+
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        yield
+    finally:
+        try:
+            if _IS_WINDOWS:
+                import msvcrt
+
+                handle.seek(0)
+                locking = getattr(msvcrt, "locking")
+                locking(handle.fileno(), getattr(msvcrt, "LK_UNLCK"), 1)
+            else:
+                import fcntl
+
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        finally:
+            handle.close()
+            _BOARD_NAMESPACE_LOCK_DEPTH.reset(token)
+
+
 def current_board_path() -> Path:
     """Return the path to ``<root>/kanban/current``.
 
@@ -868,7 +930,7 @@ def read_board_metadata(board: Optional[str] = None) -> dict:
     return meta
 
 
-def write_board_metadata(
+def _write_board_metadata_unlocked(
     board: Optional[str],
     *,
     name: Optional[str] = None,
@@ -879,7 +941,7 @@ def write_board_metadata(
     default_workdir: Optional[str] = None,
     project_id: Optional[str] = None,
 ) -> dict:
-    """Create / update ``board.json`` for ``board``.
+    """Create / update ``board.json`` while the namespace lock is held.
 
     Preserves any existing fields not mentioned in the call. Sets
     ``created_at`` on first write. Returns the resulting metadata dict.
@@ -920,7 +982,35 @@ def write_board_metadata(
     return meta
 
 
-def create_board(
+def write_board_metadata(
+    board: Optional[str],
+    *,
+    name: Optional[str] = None,
+    description: Optional[str] = None,
+    icon: Optional[str] = None,
+    color: Optional[str] = None,
+    archived: Optional[bool] = None,
+    default_workdir: Optional[str] = None,
+    project_id: Optional[str] = None,
+) -> dict:
+    """Update existing metadata without recreating a removed board namespace."""
+    slug = _normalize_board_slug(board) or DEFAULT_BOARD
+    with board_namespace_lock():
+        if slug != DEFAULT_BOARD:
+            _assert_named_board_available_unlocked(slug)
+        return _write_board_metadata_unlocked(
+            slug,
+            name=name,
+            description=description,
+            icon=icon,
+            color=color,
+            archived=archived,
+            default_workdir=default_workdir,
+            project_id=project_id,
+        )
+
+
+def _create_board_unlocked(
     slug: str,
     *,
     name: Optional[str] = None,
@@ -939,7 +1029,10 @@ def create_board(
     normed = _normalize_board_slug(slug)
     if not normed:
         raise ValueError("board slug is required")
-    meta = write_board_metadata(
+    directory = board_dir(normed)
+    if directory.is_symlink() or (directory / "kanban.db").is_symlink():
+        raise ValueError(f"board {normed!r} uses unsupported symlinked storage")
+    meta = _write_board_metadata_unlocked(
         normed,
         name=name,
         description=description,
@@ -951,6 +1044,29 @@ def create_board(
     # Touch the DB so list_boards() sees it immediately.
     init_db(board=normed)
     return meta
+
+
+def create_board(
+    slug: str,
+    *,
+    name: Optional[str] = None,
+    description: Optional[str] = None,
+    icon: Optional[str] = None,
+    color: Optional[str] = None,
+    default_workdir: Optional[str] = None,
+    project_id: Optional[str] = None,
+) -> dict:
+    """Create one board while excluding namespace publication/removal."""
+    with board_namespace_lock():
+        return _create_board_unlocked(
+            slug,
+            name=name,
+            description=description,
+            icon=icon,
+            color=color,
+            default_workdir=default_workdir,
+            project_id=project_id,
+        )
 
 
 def list_boards(*, include_archived: bool = True) -> list[dict]:
@@ -997,7 +1113,7 @@ def list_boards(*, include_archived: bool = True) -> list[dict]:
     return entries
 
 
-def remove_board(slug: str, *, archive: bool = True) -> dict:
+def _remove_board_unlocked(slug: str, *, archive: bool = True) -> dict:
     """Remove or archive a board.
 
     ``archive=True`` (default) moves the board's directory to
@@ -1018,31 +1134,83 @@ def remove_board(slug: str, *, archive: bool = True) -> dict:
     if not d.exists():
         raise ValueError(f"board {normed!r} does not exist")
 
-    # If the user removed the currently-active board, revert to default.
-    if get_current_board() == normed:
-        clear_current_board()
+    db_path = d / "kanban.db"
+    lock = (
+        _dispatch_tick_lock(db_path)
+        if db_path.is_file()
+        else contextlib.nullcontext(True)
+    )
+    with lock as lock_acquired:
+        if not lock_acquired:
+            raise ValueError(f"board {normed!r} is busy")
 
-    # A concurrent connect(board=normed) after the rename/delete recreates
-    # an empty sqlite file via mkdir(exist_ok=True); the cache entry must be
-    # dropped first so the schema init pass re-runs on that fresh file.
-    _INITIALIZED_PATHS.discard(str((d / "kanban.db").resolve()))
+        if db_path.is_file():
+            with connect(board=normed) as conn:
+                retirement_failed = False
+                with write_txn(conn):
+                    conn.execute(
+                        "UPDATE board_lifecycle SET state='retiring' "
+                        "WHERE singleton=1"
+                    )
+                    task_ids = [
+                        row["task_id"]
+                        for row in conn.execute(
+                            "SELECT DISTINCT task_id FROM worker_containments "
+                            "WHERE cleaned_at IS NULL ORDER BY task_id"
+                        ).fetchall()
+                    ]
+                    for task_id in task_ids:
+                        if not ensure_task_containment_retired(
+                            conn,
+                            task_id,
+                            reason="board_removal",
+                            require_cleanup=True,
+                        ):
+                            retirement_failed = True
+                            break
+                    if retirement_failed:
+                        # Preserve all exact retirement evidence already written,
+                        # but keep a board whose removal failed usable for recovery.
+                        conn.execute(
+                            "UPDATE board_lifecycle SET state='active' "
+                            "WHERE singleton=1"
+                        )
+                if retirement_failed:
+                    raise ValueError(
+                        f"board {normed!r} worker containment could not be retired"
+                    )
 
-    if archive:
-        archive_root = boards_root() / "_archived"
-        archive_root.mkdir(parents=True, exist_ok=True)
-        ts = int(time.time())
-        target = archive_root / f"{normed}-{ts}"
-        # Avoid collision on rapid double-archives.
-        suffix = 1
-        while target.exists():
-            target = archive_root / f"{normed}-{ts}-{suffix}"
-            suffix += 1
-        d.rename(target)
-        return {"slug": normed, "action": "archived", "new_path": str(target)}
-    else:
+        # If the user removed the currently-active board, revert to default.
+        if get_current_board() == normed:
+            clear_current_board()
+
+        # A concurrent connect(board=normed) after the rename/delete recreates
+        # an empty sqlite file via mkdir(exist_ok=True); the cache entry must be
+        # dropped first so the schema init pass re-runs on that fresh file.
+        _INITIALIZED_PATHS.discard(str(db_path.resolve()))
+
+        if archive:
+            archive_root = boards_root() / "_archived"
+            archive_root.mkdir(parents=True, exist_ok=True)
+            ts = int(time.time())
+            target = archive_root / f"{normed}-{ts}"
+            # Avoid collision on rapid double-archives.
+            suffix = 1
+            while target.exists():
+                target = archive_root / f"{normed}-{ts}-{suffix}"
+                suffix += 1
+            d.rename(target)
+            return {"slug": normed, "action": "archived", "new_path": str(target)}
+
         import shutil
         shutil.rmtree(d)
         return {"slug": normed, "action": "deleted", "new_path": ""}
+
+
+def remove_board(slug: str, *, archive: bool = True) -> dict:
+    """Remove one board while excluding namespace publication/recreation."""
+    with board_namespace_lock():
+        return _remove_board_unlocked(slug, archive=archive)
 
 
 # ---------------------------------------------------------------------------
@@ -1477,6 +1645,61 @@ CREATE TABLE IF NOT EXISTS task_runs (
     error               TEXT
 );
 
+-- Immutable kernel containment identity for an active worker run. PIDs and
+-- process-group IDs are recyclable; the cgroup directory inode is not.
+CREATE TABLE IF NOT EXISTS worker_containments (
+    run_id          INTEGER PRIMARY KEY,
+    task_id         TEXT NOT NULL,
+    claim_lock      TEXT NOT NULL,
+    backend         TEXT NOT NULL,
+    worker_pid      INTEGER NOT NULL,
+    cgroup_path     TEXT NOT NULL,
+    cgroup_inode    INTEGER NOT NULL,
+    created_at      INTEGER NOT NULL,
+    retirement_started_at INTEGER,
+    retirement_reason TEXT,
+    termination_certified_at INTEGER,
+    unlink_intent_at INTEGER,
+    cleaned_at INTEGER
+);
+
+-- Durable board-wide reservation used while a board is being removed. Stale
+-- connections may retain the old database inode after a namespace rename, so
+-- SQL triggers (not pathname checks) reject publication of new authority.
+CREATE TABLE IF NOT EXISTS board_lifecycle (
+    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+    state TEXT NOT NULL CHECK (state IN ('active', 'retiring'))
+);
+INSERT OR IGNORE INTO board_lifecycle(singleton, state) VALUES (1, 'active');
+
+CREATE TRIGGER IF NOT EXISTS guard_retiring_board_task_authority
+BEFORE UPDATE OF status, current_run_id, claim_lock, worker_pid ON tasks
+WHEN (SELECT state FROM board_lifecycle WHERE singleton = 1) = 'retiring'
+ AND (
+      (OLD.status != 'running' AND NEW.status = 'running')
+      OR (OLD.current_run_id IS NOT NEW.current_run_id
+          AND NEW.current_run_id IS NOT NULL)
+      OR (OLD.claim_lock IS NOT NEW.claim_lock AND NEW.claim_lock IS NOT NULL)
+      OR (OLD.worker_pid IS NOT NEW.worker_pid AND NEW.worker_pid IS NOT NULL)
+ )
+BEGIN
+    SELECT RAISE(ABORT, 'board retirement rejects task authority');
+END;
+
+CREATE TRIGGER IF NOT EXISTS guard_retiring_board_run_authority
+BEFORE INSERT ON task_runs
+WHEN (SELECT state FROM board_lifecycle WHERE singleton = 1) = 'retiring'
+BEGIN
+    SELECT RAISE(ABORT, 'board retirement rejects run authority');
+END;
+
+CREATE TRIGGER IF NOT EXISTS guard_retiring_board_containment_authority
+BEFORE INSERT ON worker_containments
+WHEN (SELECT state FROM board_lifecycle WHERE singleton = 1) = 'retiring'
+BEGIN
+    SELECT RAISE(ABORT, 'board retirement rejects containment authority');
+END;
+
 -- Files attached to a task (PDFs, images, source documents). The blob
 -- lives on disk under ``attachments_root(board)/<task_id>/<stored_name>``;
 -- this row carries metadata + the absolute ``stored_path`` so the
@@ -1522,6 +1745,7 @@ CREATE INDEX IF NOT EXISTS idx_comments_task         ON task_comments(task_id, c
 CREATE INDEX IF NOT EXISTS idx_events_task           ON task_events(task_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_runs_task             ON task_runs(task_id, started_at);
 CREATE INDEX IF NOT EXISTS idx_runs_status           ON task_runs(status);
+CREATE INDEX IF NOT EXISTS idx_worker_containment_task ON worker_containments(task_id, run_id);
 CREATE INDEX IF NOT EXISTS idx_attachments_task      ON task_attachments(task_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_notify_task           ON kanban_notify_subs(task_id);
 """
@@ -2335,7 +2559,73 @@ def _schema_is_present(conn: sqlite3.Connection) -> bool:
     return row is not None
 
 
-def connect(
+def _named_board_slug_for_db_path(path: Path) -> Optional[str]:
+    """Classify named-board ownership lexically, before following symlinks."""
+    try:
+        lexical = Path(os.path.abspath(os.path.expanduser(os.fspath(path))))
+        root = Path(os.path.abspath(os.fspath(boards_root())))
+        if lexical.name != "kanban.db" or os.path.normcase(
+            os.fspath(lexical.parent.parent)
+        ) != os.path.normcase(os.fspath(root)):
+            return None
+        slug = _normalize_board_slug(lexical.parent.name)
+    except (OSError, ValueError):
+        return None
+    if not slug or slug == DEFAULT_BOARD:
+        return None
+    return slug
+
+
+def _named_board_slug_for_connection(
+    conn: sqlite3.Connection,
+) -> Optional[str]:
+    """Recover the named-board slug from a live or stale SQLite connection."""
+    try:
+        rows = conn.execute("PRAGMA database_list").fetchall()
+    except sqlite3.DatabaseError:
+        return None
+    for row in rows:
+        name = row["name"] if isinstance(row, sqlite3.Row) else row[1]
+        path = row["file"] if isinstance(row, sqlite3.Row) else row[2]
+        if name == "main" and path:
+            return _named_board_slug_for_db_path(Path(path))
+    return None
+
+
+def _assert_named_board_available_unlocked(slug: str) -> None:
+    """Reject missing or symlinked named-board storage while holding the lock."""
+    directory = board_dir(slug)
+    if directory.is_symlink() or (directory / "kanban.db").is_symlink():
+        raise ValueError(f"board {slug!r} uses unsupported symlinked storage")
+    if not board_exists(slug):
+        raise FileNotFoundError(f"board {slug!r} does not exist")
+
+
+@contextlib.contextmanager
+def board_filesystem_write(
+    *,
+    board: Optional[str] = None,
+    conn: Optional[sqlite3.Connection] = None,
+):
+    """Guard every named-board filesystem mutation against namespace removal."""
+    requested = _normalize_board_slug(board)
+    connection_slug = _named_board_slug_for_connection(conn) if conn is not None else None
+    if requested and connection_slug and requested != connection_slug:
+        raise ValueError(
+            f"board {requested!r} does not match connection board {connection_slug!r}"
+        )
+    slug = requested or connection_slug
+    if slug is None:
+        slug = get_current_board()
+    if slug == DEFAULT_BOARD:
+        yield slug
+        return
+    with board_namespace_lock():
+        _assert_named_board_available_unlocked(slug)
+        yield slug
+
+
+def _connect_unlocked(
     db_path: Optional[Path] = None,
     *,
     board: Optional[str] = None,
@@ -2474,6 +2764,21 @@ def connect(
     return conn
 
 
+def connect(
+    db_path: Optional[Path] = None,
+    *,
+    board: Optional[str] = None,
+) -> sqlite3.Connection:
+    """Open a board DB, serializing named-board namespace resolution."""
+    path = db_path if db_path is not None else kanban_db_path(board=board)
+    slug = _named_board_slug_for_db_path(path)
+    if slug is None:
+        return _connect_unlocked(db_path, board=board)
+    with board_namespace_lock():
+        _assert_named_board_available_unlocked(slug)
+        return _connect_unlocked(db_path, board=board)
+
+
 @contextlib.contextmanager
 def connect_closing(
     db_path: Optional[Path] = None,
@@ -2509,6 +2814,19 @@ def connect_closing(
             pass
 
 
+def _init_db_unlocked(path: Path) -> Path:
+    """Initialize ``path`` after any required namespace lock/revalidation."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    resolved = str(path.resolve())
+    # Clear the cache entry so the underlying connect() re-runs the
+    # schema + migration pass unconditionally.
+    with _INIT_LOCK:
+        _INITIALIZED_PATHS.discard(resolved)
+    with contextlib.closing(connect(path)):
+        pass
+    return path
+
+
 def init_db(
     db_path: Optional[Path] = None,
     *,
@@ -2528,15 +2846,12 @@ def init_db(
         path = db_path
     else:
         path = kanban_db_path(board=board)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    resolved = str(path.resolve())
-    # Clear the cache entry so the underlying connect() re-runs the
-    # schema + migration pass unconditionally.
-    with _INIT_LOCK:
-        _INITIALIZED_PATHS.discard(resolved)
-    with contextlib.closing(connect(path)):
-        pass
-    return path
+    slug = _named_board_slug_for_db_path(path)
+    if slug is None:
+        return _init_db_unlocked(path)
+    with board_namespace_lock():
+        _assert_named_board_available_unlocked(slug)
+        return _init_db_unlocked(path)
 
 
 def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
@@ -2704,6 +3019,101 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_tasks_session_id ON tasks(session_id)"
     )
+
+    # Containment lifecycle columns are additive. Install guards only after
+    # every referenced column exists, so an intermediate P2/A3R board remains
+    # openable. Never DROP the active guard before its replacement exists:
+    # other already-open processes are not protected by the initialization
+    # lock and could otherwise write through an autocommit DDL gap.
+    wc_exists = conn.execute(
+        "SELECT 1 FROM sqlite_master "
+        "WHERE type='table' AND name='worker_containments'"
+    ).fetchone() is not None
+    if wc_exists:
+        wc_cols = {
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(worker_containments)")
+        }
+        containment_columns = (
+            ("retirement_started_at", "retirement_started_at INTEGER"),
+            ("retirement_reason", "retirement_reason TEXT"),
+            ("termination_certified_at", "termination_certified_at INTEGER"),
+            ("unlink_intent_at", "unlink_intent_at INTEGER"),
+            ("cleaned_at", "cleaned_at INTEGER"),
+        )
+        for column, definition in containment_columns:
+            if column not in wc_cols:
+                _add_column_if_missing(
+                    conn, "worker_containments", column, definition
+                )
+        conn.execute(
+            "UPDATE worker_containments "
+            "SET termination_certified_at = cleaned_at "
+            "WHERE cleaned_at IS NOT NULL "
+            "AND termination_certified_at IS NULL"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_worker_containments_pending "
+            "ON worker_containments(task_id, termination_certified_at) "
+            "WHERE cleaned_at IS NULL AND termination_certified_at IS NULL"
+        )
+        conn.execute(
+            """
+            CREATE TRIGGER IF NOT EXISTS guard_reserved_worker_identity_v2
+            BEFORE UPDATE OF status, claim_lock, claim_expires, current_run_id,
+                             worker_pid, last_heartbeat_at, max_runtime_seconds
+            ON tasks
+            WHEN EXISTS (
+                SELECT 1 FROM worker_containments wc
+                WHERE wc.task_id = OLD.id
+                  AND wc.run_id = OLD.current_run_id
+                  AND wc.retirement_started_at IS NOT NULL
+                  AND wc.termination_certified_at IS NULL
+            )
+            BEGIN
+                SELECT RAISE(ABORT, 'worker retirement is reserved');
+            END
+            """
+        )
+        conn.execute(
+            """
+            CREATE TRIGGER IF NOT EXISTS guard_uncertified_contained_retry_v3
+            BEFORE UPDATE OF status, current_run_id, claim_lock, worker_pid ON tasks
+            WHEN NEW.status IN ('todo', 'ready', 'running')
+             AND (
+                  NEW.status IS NOT OLD.status
+                  OR NEW.current_run_id IS NOT OLD.current_run_id
+                  OR NEW.claim_lock IS NOT OLD.claim_lock
+                  OR NEW.worker_pid IS NOT OLD.worker_pid
+             )
+             AND EXISTS (
+                 SELECT 1 FROM worker_containments wc
+                 WHERE wc.task_id = OLD.id
+                   AND wc.cleaned_at IS NULL
+                   AND wc.termination_certified_at IS NULL
+                   AND wc.retirement_started_at IS NULL
+             )
+            BEGIN
+                SELECT RAISE(ABORT, 'uncertified worker containment');
+            END
+            """
+        )
+        conn.execute(
+            """
+            CREATE TRIGGER IF NOT EXISTS guard_uncleaned_worker_containment_delete_v2
+            BEFORE DELETE ON tasks
+            WHEN EXISTS (
+                SELECT 1 FROM worker_containments wc
+                WHERE wc.task_id = OLD.id AND wc.cleaned_at IS NULL
+            )
+            BEGIN
+                SELECT RAISE(ABORT, 'uncleaned worker containment');
+            END
+            """
+        )
+        # The versioned guard is live before the legacy name is retired, so
+        # there is no interval without protection even under autocommit DDL.
+        conn.execute("DROP TRIGGER IF EXISTS guard_reserved_worker_identity")
 
     # task_events gained a run_id column; back-fill it as NULL for
     # historical events (they predate runs and can't be attributed).
@@ -4114,7 +4524,7 @@ def _collision_free_path(dest_dir: Path, safe_name: str) -> Path:
     return dest_dir / candidate
 
 
-def store_attachment_bytes(
+def _store_attachment_bytes_unlocked(
     conn: sqlite3.Connection,
     task_id: str,
     filename: str,
@@ -4171,6 +4581,31 @@ def store_attachment_bytes(
         except OSError:
             pass
         raise
+
+
+def store_attachment_bytes(
+    conn: sqlite3.Connection,
+    task_id: str,
+    filename: str,
+    data: bytes,
+    *,
+    content_type: Optional[str] = None,
+    uploaded_by: Optional[str] = None,
+    board: Optional[str] = None,
+    max_bytes: Optional[int] = None,
+) -> int:
+    """Store one attachment under the board namespace publication guard."""
+    with board_filesystem_write(board=board, conn=conn):
+        return _store_attachment_bytes_unlocked(
+            conn,
+            task_id,
+            filename,
+            data,
+            content_type=content_type,
+            uploaded_by=uploaded_by,
+            board=board,
+            max_bytes=max_bytes,
+        )
 
 
 def add_attachment(
@@ -4341,8 +4776,9 @@ def _end_run(
     error: Optional[str] = None,
     metadata: Optional[dict] = None,
     status: Optional[str] = None,
+    expected_run_id: Optional[int] = None,
 ) -> Optional[int]:
-    """Close the currently-active run for ``task_id`` and clear the pointer.
+    """Close one exact active run and clear only its task pointer atomically.
 
     ``outcome`` is the semantic result (completed / blocked / crashed /
     timed_out / spawn_failed / gave_up / reclaimed). ``status`` is the
@@ -4351,42 +4787,51 @@ def _end_run(
     existed (e.g. a CLI user calling ``hermes kanban complete`` on a
     task that was never claimed).
     """
-    now = int(time.time())
-    row = conn.execute(
-        "SELECT current_run_id FROM tasks WHERE id = ?", (task_id,),
-    ).fetchone()
-    if not row or not row["current_run_id"]:
-        return None
-    run_id = int(row["current_run_id"])
-    conn.execute(
-        """
-        UPDATE task_runs
-           SET status        = ?,
-               outcome       = ?,
-               summary       = ?,
-               error         = ?,
-               metadata      = ?,
-               ended_at      = ?,
-               claim_lock    = NULL,
-               claim_expires = NULL,
-               worker_pid    = NULL
-         WHERE id = ?
-           AND ended_at IS NULL
-        """,
-        (
-            status or outcome,
-            outcome,
-            summary,
-            error,
-            json.dumps(metadata, ensure_ascii=False) if metadata else None,
-            now,
-            run_id,
-        ),
-    )
-    conn.execute(
-        "UPDATE tasks SET current_run_id = NULL WHERE id = ?", (task_id,),
-    )
-    return run_id
+    with write_txn(conn, allow_nested=True):
+        now = int(time.time())
+        row = conn.execute(
+            "SELECT current_run_id FROM tasks WHERE id = ?", (task_id,),
+        ).fetchone()
+        if not row or not row["current_run_id"]:
+            return None
+        run_id = int(row["current_run_id"])
+        if expected_run_id is not None and run_id != int(expected_run_id):
+            return None
+        run_cur = conn.execute(
+            """
+            UPDATE task_runs
+               SET status        = ?,
+                   outcome       = ?,
+                   summary       = ?,
+                   error         = ?,
+                   metadata      = ?,
+                   ended_at      = ?,
+                   claim_lock    = NULL,
+                   claim_expires = NULL,
+                   worker_pid    = NULL
+             WHERE id = ?
+               AND task_id = ?
+               AND ended_at IS NULL
+            """,
+            (
+                status or outcome,
+                outcome,
+                summary,
+                error,
+                json.dumps(metadata, ensure_ascii=False) if metadata else None,
+                now,
+                run_id,
+                task_id,
+            ),
+        )
+        task_cur = conn.execute(
+            "UPDATE tasks SET current_run_id = NULL "
+            "WHERE id = ? AND current_run_id = ?",
+            (task_id, run_id),
+        )
+        if run_cur.rowcount != 1 or task_cur.rowcount != 1:
+            raise RuntimeError("run identity changed while ending exact run")
+        return run_id
 
 
 def _current_run_id(conn: sqlite3.Connection, task_id: str) -> Optional[int]:
@@ -4990,7 +5435,7 @@ def release_stale_claims(
     host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
     stale = conn.execute(
         "SELECT id, claim_lock, worker_pid, claim_expires, last_heartbeat_at, "
-        "       assignee "
+        "       assignee, current_run_id, started_at "
         "FROM tasks "
         "WHERE status = 'running' AND claim_expires IS NOT NULL "
         "  AND claim_expires < ?",
@@ -5050,9 +5495,39 @@ def release_stale_claims(
                 )
             continue
 
-        termination = _terminate_reclaimed_worker(
-            row["worker_pid"], row["claim_lock"], signal_fn=signal_fn,
+        run_id = row["current_run_id"]
+        containment_row = _worker_containment_for_termination(
+            conn, row["id"], run_id
         )
+        if containment_row is not None and containment_row["cleaned_at"] is None:
+            from . import kanban_containment as containment
+
+            if row["started_at"] is None or not _reserve_worker_retirement(
+                conn,
+                task_id=row["id"],
+                run_id=run_id,
+                claim_lock=row["claim_lock"],
+                reason="ttl_expired",
+                now=now,
+                active_started_at=int(row["started_at"]),
+                expected_claim_expires=int(row["claim_expires"]),
+                claim_expires_lt=now,
+            ):
+                continue
+            termination = containment.kill_cgroup(
+                containment_row["cgroup_path"],
+                int(containment_row["cgroup_inode"]),
+            )
+            if not (
+                isinstance(termination, dict)
+                and termination.get("containment_certified")
+                and _persist_containment_certification(conn, containment_row)
+            ):
+                continue
+        else:
+            termination = _terminate_reclaimed_worker(
+                row["worker_pid"], row["claim_lock"], signal_fn=signal_fn,
+            )
         # Never release a claim while our own worker is still alive: that would
         # spawn a duplicate beside it. Hold the claim and retry next tick.
         if _worker_survived_termination(termination):
@@ -5067,8 +5542,9 @@ def release_stale_claims(
                 "UPDATE tasks SET status = ?, claim_lock = NULL, "
                 "claim_expires = NULL, worker_pid = NULL "
                 "WHERE id = ? AND status = 'running' AND claim_lock IS ? "
+                "AND current_run_id IS ? "
                 "AND claim_expires IS NOT NULL AND claim_expires < ?",
-                (retry_status, row["id"], row["claim_lock"], now),
+                (retry_status, row["id"], row["claim_lock"], run_id, now),
             )
             if cur.rowcount != 1:
                 continue
@@ -5077,6 +5553,7 @@ def release_stale_claims(
                 outcome="reclaimed", status="reclaimed",
                 error=f"stale_lock={row['claim_lock']}",
                 metadata=termination,
+                expected_run_id=run_id,
             )
             payload = {
                 "stale_lock": row["claim_lock"],
@@ -5122,12 +5599,17 @@ def release_stale_claims(
     return reclaimed
 
 
+_RECLAIM_EXPECTATION_UNSET = object()
+
+
 def reclaim_task(
     conn: sqlite3.Connection,
     task_id: str,
     *,
     reason: Optional[str] = None,
     signal_fn=None,
+    expected_run_id=_RECLAIM_EXPECTATION_UNSET,
+    expected_claim_lock=_RECLAIM_EXPECTATION_UNSET,
 ) -> bool:
     """Operator-driven reclaim: release the claim and restore its source phase.
 
@@ -5140,8 +5622,85 @@ def reclaim_task(
     Returns True if a reclaim happened, False if the task isn't in a
     reclaimable state (not running, or doesn't exist).
     """
+    exact_expectation = (
+        expected_run_id is not _RECLAIM_EXPECTATION_UNSET
+        or expected_claim_lock is not _RECLAIM_EXPECTATION_UNSET
+    )
+    if exact_expectation:
+        exact_legacy_done = False
+        with write_txn(conn, allow_nested=True):
+            exact_row = conn.execute(
+                "SELECT status, claim_lock, worker_pid, current_run_id, started_at "
+                "FROM tasks WHERE id = ?",
+                (task_id,),
+            ).fetchone()
+            if not exact_row:
+                return False
+            if exact_row["status"] != "running" and exact_row["claim_lock"] is None:
+                return False
+            if (
+                expected_run_id is not _RECLAIM_EXPECTATION_UNSET
+                and exact_row["current_run_id"] != expected_run_id
+            ):
+                return False
+            if (
+                expected_claim_lock is not _RECLAIM_EXPECTATION_UNSET
+                and exact_row["claim_lock"] != expected_claim_lock
+            ):
+                return False
+            exact_containment = _worker_containment_for_termination(
+                conn, task_id, exact_row["current_run_id"],
+            )
+            if exact_containment is None:
+                prev_lock = exact_row["claim_lock"]
+                run_id = exact_row["current_run_id"]
+                termination = _terminate_reclaimed_worker(
+                    exact_row["worker_pid"], prev_lock, signal_fn=signal_fn,
+                )
+                retry_status = _retry_status_for_run(conn, task_id)
+                cur = conn.execute(
+                    "UPDATE tasks SET status = ?, claim_lock = NULL, "
+                    "claim_expires = NULL, worker_pid = NULL "
+                    "WHERE id = ? AND status IN ('running', 'ready', 'blocked') "
+                    "AND claim_lock IS ? AND current_run_id IS ?",
+                    (retry_status, task_id, prev_lock, run_id),
+                )
+                if cur.rowcount != 1:
+                    return False
+                ended_run_id = _end_run(
+                    conn,
+                    task_id,
+                    outcome="reclaimed",
+                    status="reclaimed",
+                    error=(
+                        f"manual_reclaim: {reason}" if reason
+                        else f"manual_reclaim lock={prev_lock}"
+                    ),
+                    metadata=termination,
+                    expected_run_id=run_id,
+                )
+                payload = {
+                    "manual": True,
+                    "reason": reason,
+                    "prev_lock": prev_lock,
+                    "retry_status": retry_status,
+                }
+                payload.update(termination)
+                _append_event(
+                    conn,
+                    task_id,
+                    "reclaimed",
+                    payload,
+                    run_id=ended_run_id,
+                )
+                exact_legacy_done = True
+        if exact_legacy_done:
+            _clear_failure_counter(conn, task_id)
+            return True
+
     row = conn.execute(
-        "SELECT status, claim_lock, worker_pid FROM tasks WHERE id = ?",
+        "SELECT status, claim_lock, worker_pid, current_run_id, started_at "
+        "FROM tasks WHERE id = ?",
         (task_id,),
     ).fetchone()
     if not row:
@@ -5149,18 +5708,56 @@ def reclaim_task(
     if row["status"] != "running" and row["claim_lock"] is None:
         # Nothing to reclaim — already ready / blocked / done.
         return False
+    if (
+        expected_run_id is not _RECLAIM_EXPECTATION_UNSET
+        and row["current_run_id"] != expected_run_id
+    ):
+        return False
+    if (
+        expected_claim_lock is not _RECLAIM_EXPECTATION_UNSET
+        and row["claim_lock"] != expected_claim_lock
+    ):
+        return False
     prev_lock = row["claim_lock"]
-    termination = _terminate_reclaimed_worker(
-        row["worker_pid"], prev_lock, signal_fn=signal_fn,
-    )
-    with write_txn(conn):
+    run_id = row["current_run_id"]
+    containment_row = _worker_containment_for_termination(conn, task_id, run_id)
+    if containment_row is not None and containment_row["cleaned_at"] is None:
+        from . import kanban_containment as containment
+
+        if row["status"] != "running" or row["started_at"] is None:
+            return False
+        if not _reserve_worker_retirement(
+            conn,
+            task_id=task_id,
+            run_id=run_id,
+            claim_lock=prev_lock,
+            reason="manual_reclaim",
+            now=int(time.time()),
+            active_started_at=int(row["started_at"]),
+        ):
+            return False
+        termination = containment.kill_cgroup(
+            containment_row["cgroup_path"],
+            int(containment_row["cgroup_inode"]),
+        )
+        if not (
+            isinstance(termination, dict)
+            and termination.get("containment_certified")
+            and _persist_containment_certification(conn, containment_row)
+        ):
+            return False
+    else:
+        termination = _terminate_reclaimed_worker(
+            row["worker_pid"], prev_lock, signal_fn=signal_fn,
+        )
+    with write_txn(conn, allow_nested=True):
         retry_status = _retry_status_for_run(conn, task_id)
         cur = conn.execute(
             "UPDATE tasks SET status = ?, claim_lock = NULL, "
             "claim_expires = NULL, worker_pid = NULL "
             "WHERE id = ? AND status IN ('running', 'ready', 'blocked') "
-            "AND claim_lock IS ?",
-            (retry_status, task_id, prev_lock),
+            "AND claim_lock IS ? AND current_run_id IS ?",
+            (retry_status, task_id, prev_lock, run_id),
         )
         if cur.rowcount != 1:
             return False
@@ -5172,6 +5769,7 @@ def reclaim_task(
                 else f"manual_reclaim lock={prev_lock}"
             ),
             metadata=termination,
+            expected_run_id=run_id,
         )
         payload = {
             "manual": True,
@@ -5360,7 +5958,7 @@ class ArtifactPreservationError(RuntimeError):
     """Raised when a declared scratch deliverable cannot be preserved."""
 
 
-def complete_task(
+def _complete_task_with_namespace_locked(
     conn: sqlite3.Connection,
     task_id: str,
     *,
@@ -5504,6 +6102,7 @@ def complete_task(
             outcome="completed", status="done",
             summary=summary if summary is not None else result,
             metadata=metadata,
+            expected_run_id=expected_run_id,
         )
         # If complete_task was called on a never-claimed task (ready or
         # blocked → done with no run in flight), synthesize a
@@ -5601,6 +6200,31 @@ def complete_task(
             summary=(summary if summary is not None else result),
         )
     return True
+
+
+def complete_task(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    result: Optional[str] = None,
+    summary: Optional[str] = None,
+    metadata: Optional[dict] = None,
+    created_cards: Optional[Iterable[str]] = None,
+    expected_run_id: Optional[int] = None,
+    fire_lifecycle_hook: bool = True,
+) -> bool:
+    """Complete a task while excluding named-board filesystem retirement."""
+    with board_filesystem_write(conn=conn):
+        return _complete_task_with_namespace_locked(
+            conn,
+            task_id,
+            result=result,
+            summary=summary,
+            metadata=metadata,
+            created_cards=created_cards,
+            expected_run_id=expected_run_id,
+            fire_lifecycle_hook=fire_lifecycle_hook,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -6339,6 +6963,7 @@ def block_task(
                 conn, task_id,
                 outcome="blocked", status="blocked",
                 summary=reason,
+                expected_run_id=expected_run_id,
             )
             if run_id is None and reason:
                 run_id = _synthesize_ended_run(
@@ -6397,6 +7022,7 @@ def block_task(
                 conn, task_id,
                 outcome="blocked", status="blocked",
                 summary=reason,
+                expected_run_id=expected_run_id,
             )
             if run_id is None and reason:
                 run_id = _synthesize_ended_run(
@@ -6451,6 +7077,7 @@ def block_task(
                 conn, task_id,
                 outcome="blocked", status="blocked",
                 summary=reason,
+                expected_run_id=expected_run_id,
             )
             # Synthesize a run when blocking a never-claimed task so the
             # reason is preserved in attempt history.
@@ -6635,6 +7262,7 @@ def request_review(
             status="review",
             summary=summary,
             metadata=metadata,
+            expected_run_id=expected_run_id,
         )
         if run_id is None and (summary or metadata):
             run_id = _synthesize_ended_run(
@@ -6763,6 +7391,7 @@ def request_changes(
             outcome="changes_requested",
             status=new_status,
             summary=reason,
+            expected_run_id=int(current_run_id),
         )
         _append_event(
             conn,
@@ -7027,6 +7656,72 @@ def reopen_review_task(conn: sqlite3.Connection, task_id: str) -> bool:
         return True
 
 
+def prepare_descendant_containment_retirement(
+    conn: sqlite3.Connection,
+    task_id: str,
+) -> list[str]:
+    """Reserve and certify every running contained descendant as one set."""
+    from . import kanban_containment as containment
+
+    if conn.in_transaction:
+        raise RuntimeError(
+            "descendant containment retirement must start outside a transaction"
+        )
+    rows = conn.execute(
+        """
+        WITH RECURSIVE descendants(id) AS (
+            SELECT child_id FROM task_links WHERE parent_id = ?
+            UNION
+            SELECT l.child_id
+              FROM task_links l JOIN descendants d ON d.id = l.parent_id
+        )
+        SELECT t.id, t.current_run_id, t.claim_lock,
+               COALESCE(r.started_at, t.started_at) AS active_started_at,
+               wc.*
+          FROM descendants d
+          JOIN tasks t ON t.id = d.id
+          JOIN worker_containments wc
+            ON wc.task_id = t.id AND wc.run_id = t.current_run_id
+          LEFT JOIN task_runs r ON r.id = t.current_run_id
+         WHERE t.status = 'running' AND wc.cleaned_at IS NULL
+         ORDER BY t.id
+        """,
+        (task_id,),
+    ).fetchall()
+    if not rows:
+        return []
+    now = int(time.time())
+    with write_txn(conn):
+        for row in rows:
+            if row["active_started_at"] is None or not _reserve_worker_retirement(
+                conn,
+                task_id=row["id"],
+                run_id=row["current_run_id"],
+                claim_lock=row["claim_lock"],
+                reason="ancestor_reopened",
+                now=now,
+                active_started_at=int(row["active_started_at"]),
+            ):
+                raise containment.ContainmentError(
+                    "descendant containment set could not be reserved"
+                )
+    for row in rows:
+        if row["termination_certified_at"] is not None:
+            continue
+        termination = containment.kill_cgroup(
+            row["cgroup_path"], int(row["cgroup_inode"])
+        )
+        if not (
+            isinstance(termination, dict)
+            and termination.get("containment_certified")
+            and _persist_containment_certification(conn, row)
+        ):
+            raise containment.ContainmentError(
+                "descendant containment set could not be certified"
+            )
+    return [row["id"] for row in rows]
+
+
 def invalidate_descendants_for_parent_reopen(
     conn: sqlite3.Connection,
     task_id: str,
@@ -7089,6 +7784,8 @@ def invalidate_descendants_for_parent_reopen(
     and each termination is a ``(worker_pid, claim_lock)`` tuple.
     """
     caller_owns_txn = bool(getattr(conn, "in_transaction", False))
+    if not caller_owns_txn:
+        prepare_descendant_containment_retirement(conn, task_id)
     now = int(time.time())
     invalidated: list[dict[str, Any]] = []
     terminations: list[tuple[Optional[int], Optional[str]]] = []
@@ -7121,21 +7818,37 @@ def invalidate_descendants_for_parent_reopen(
                 resume_status = _retry_status_for_run(
                     conn, row["id"], row["current_run_id"]
                 )
-                terminations.append((row["worker_pid"], row["claim_lock"]))
+                containment_row = _worker_containment_for_termination(
+                    conn, row["id"], row["current_run_id"]
+                )
+                if containment_row is not None:
+                    if containment_row["termination_certified_at"] is None:
+                        from . import kanban_containment as containment
+
+                        raise containment.ContainmentError(
+                            "descendant containment retirement is not certified"
+                        )
+                else:
+                    terminations.append((row["worker_pid"], row["claim_lock"]))
                 run_id = _end_run(
                     conn,
                     row["id"],
                     outcome="reclaimed",
                     status="todo",
                     summary=f"ancestor {task_id} reopened",
+                    expected_run_id=row["current_run_id"],
                 )
             # consecutive_failures = 0: deliberate operator reset — see
             # docstring for why this diverges from reopen_review_task.
+            expected_current_run = (
+                None if previous_status == "running" else row["current_run_id"]
+            )
             conn.execute(
                 "UPDATE tasks SET status = 'todo', completed_at = NULL, "
                 "claim_lock = NULL, claim_expires = NULL, worker_pid = NULL, "
-                "current_run_id = NULL, consecutive_failures = 0 WHERE id = ?",
-                (row["id"],),
+                "current_run_id = NULL, consecutive_failures = 0 "
+                "WHERE id = ? AND current_run_id IS ?",
+                (row["id"], expected_current_run),
             )
             _append_event(
                 conn,
@@ -7521,8 +8234,79 @@ def decompose_triage_task(
     return child_ids
 
 
+def ensure_task_containment_retired(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    reason: str,
+    require_cleanup: bool = False,
+) -> bool:
+    """Certify one task's contained workers before a lifecycle mutation."""
+    task = conn.execute(
+        "SELECT status, current_run_id FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    if task is None:
+        return True
+
+    rows = conn.execute(
+        "SELECT * FROM worker_containments "
+        "WHERE task_id = ? AND cleaned_at IS NULL ORDER BY run_id",
+        (task_id,),
+    ).fetchall()
+    if not rows:
+        return True
+
+    current_run_id = (
+        int(task["current_run_id"])
+        if task["current_run_id"] is not None
+        else None
+    )
+    active = next(
+        (row for row in rows if int(row["run_id"]) == current_run_id),
+        None,
+    )
+    if active is not None and active["termination_certified_at"] is None:
+        if task["status"] != "running" or not reclaim_task(
+            conn, task_id, reason=reason,
+        ):
+            return False
+
+    rows = conn.execute(
+        "SELECT * FROM worker_containments "
+        "WHERE task_id = ? AND cleaned_at IS NULL ORDER BY run_id",
+        (task_id,),
+    ).fetchall()
+    if any(row["termination_certified_at"] is None for row in rows):
+        cleanup_inactive_worker_containments(conn)
+        rows = conn.execute(
+            "SELECT * FROM worker_containments "
+            "WHERE task_id = ? AND cleaned_at IS NULL ORDER BY run_id",
+            (task_id,),
+        ).fetchall()
+        if any(row["termination_certified_at"] is None for row in rows):
+            return False
+
+    if require_cleanup and rows:
+        cleanup_inactive_worker_containments(conn)
+        pending = conn.execute(
+            "SELECT 1 FROM worker_containments "
+            "WHERE task_id = ? AND cleaned_at IS NULL LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        if pending is not None:
+            return False
+    return True
+
+
 def archive_task(conn: sqlite3.Connection, task_id: str) -> bool:
     with write_txn(conn):
+        # Retirement and archive are one writer transaction: no successor can
+        # publish authority between certification and the status transition.
+        if not ensure_task_containment_retired(
+            conn, task_id, reason="task_archive",
+        ):
+            return False
         cur = conn.execute(
             "UPDATE tasks SET status = 'archived', "
             "    claim_lock = NULL, claim_expires = NULL, worker_pid = NULL "
@@ -7564,6 +8348,19 @@ def delete_archived_task(conn: sqlite3.Connection, task_id: str) -> bool:
         ).fetchone()
         if not row or row["status"] != "archived":
             return False
+        if not ensure_task_containment_retired(
+            conn,
+            task_id,
+            reason="archived_task_delete",
+            require_cleanup=True,
+        ):
+            return False
+        row = conn.execute(
+            "SELECT status FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if not row or row["status"] != "archived":
+            return False
         conn.execute(
             "DELETE FROM task_links WHERE parent_id = ? OR child_id = ?",
             (task_id, task_id),
@@ -7584,9 +8381,16 @@ def delete_task(conn: sqlite3.Connection, task_id: str) -> bool:
     This keeps the operation atomic (single ``write_txn``).
 
     Returns ``True`` if the task existed and was deleted, ``False``
-    if the task was not found.
+    if the task was not found or containment cleanup could not be certified.
     """
     with write_txn(conn):
+        if not ensure_task_containment_retired(
+            conn,
+            task_id,
+            reason="task_delete",
+            require_cleanup=True,
+        ):
+            return False
         cur = conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
         if cur.rowcount != 1:
             return False
@@ -7868,20 +8672,21 @@ def resolve_workspace(task: Task, *, board: Optional[str] = None) -> Path:
     """
     kind = task.workspace_kind or "scratch"
     if kind == "scratch":
-        if task.workspace_path:
-            # Legacy scratch tasks that were set to an explicit path get the
-            # same absolute-path guard as dir: — consistent with the
-            # threat model.
-            p = Path(task.workspace_path).expanduser()
-            if not p.is_absolute():
-                raise ValueError(
-                    f"task {task.id} has non-absolute workspace_path "
-                    f"{task.workspace_path!r}; workspace paths must be absolute"
-                )
-        else:
-            p = workspaces_root(board=board) / task.id
-        p.mkdir(parents=True, exist_ok=True)
-        return p
+        with board_filesystem_write(board=board):
+            if task.workspace_path:
+                # Legacy scratch tasks that were set to an explicit path get the
+                # same absolute-path guard as dir: — consistent with the
+                # threat model.
+                p = Path(task.workspace_path).expanduser()
+                if not p.is_absolute():
+                    raise ValueError(
+                        f"task {task.id} has non-absolute workspace_path "
+                        f"{task.workspace_path!r}; workspace paths must be absolute"
+                    )
+            else:
+                p = workspaces_root(board=board) / task.id
+            p.mkdir(parents=True, exist_ok=True)
+            return p
     if kind == "dir":
         if not task.workspace_path:
             raise ValueError(
@@ -8456,7 +9261,7 @@ def enforce_max_runtime(
     rows = conn.execute(
         "SELECT t.id, t.worker_pid, "
         "       COALESCE(r.started_at, t.started_at) AS active_started_at, "
-        "       t.max_runtime_seconds, t.claim_lock "
+        "       t.max_runtime_seconds, t.claim_lock, t.current_run_id "
         "FROM tasks t "
         "LEFT JOIN task_runs r ON r.id = t.current_run_id "
         "WHERE t.status = 'running' AND t.max_runtime_seconds IS NOT NULL "
@@ -8476,31 +9281,56 @@ def enforce_max_runtime(
 
         pid = int(row["worker_pid"])
         tid = row["id"]
-        # SIGTERM then SIGKILL. Keep it simple: 5 s grace. Workers that
-        # want a cleaner shutdown can install their own SIGTERM handler
-        # before the grace expires.
+        run_id = row["current_run_id"]
         killed = False
-        kill = signal_fn if signal_fn is not None else (
-            os.kill if hasattr(os, "kill") else None
+        containment_row = _worker_containment_for_termination(
+            conn, tid, run_id
         )
-        if kill is not None:
-            try:
-                kill(pid, signal.SIGTERM)
-            except (ProcessLookupError, OSError):
-                pass
-            # Short polling wait — no time.sleep on the write txn.
-            for _ in range(10):
-                if not _pid_alive(pid):
-                    break
-                time.sleep(0.5)
-            if _pid_alive(pid):
+        if containment_row is not None and containment_row["cleaned_at"] is None:
+            from . import kanban_containment as containment
+
+            if not _reserve_worker_retirement(
+                conn,
+                task_id=tid,
+                run_id=run_id,
+                claim_lock=row["claim_lock"],
+                reason="max_runtime",
+                now=now,
+                active_started_at=int(row["active_started_at"]),
+                max_runtime_seconds=int(row["max_runtime_seconds"]),
+            ):
+                continue
+            termination = containment.kill_cgroup(
+                containment_row["cgroup_path"],
+                int(containment_row["cgroup_inode"]),
+            )
+            if not (
+                isinstance(termination, dict)
+                and termination.get("containment_certified")
+                and _persist_containment_certification(conn, containment_row)
+            ):
+                continue
+        else:
+            # Legacy workers retain the historical PID protocol.
+            kill = signal_fn if signal_fn is not None else (
+                os.kill if hasattr(os, "kill") else None
+            )
+            if kill is not None:
                 try:
-                    # signal.SIGKILL doesn't exist on Windows.
-                    _sigkill = getattr(signal, "SIGKILL", signal.SIGTERM)
-                    kill(pid, _sigkill)
-                    killed = True
+                    kill(pid, signal.SIGTERM)
                 except (ProcessLookupError, OSError):
                     pass
+                for _ in range(10):
+                    if not _pid_alive(pid):
+                        break
+                    time.sleep(0.5)
+                if _pid_alive(pid):
+                    try:
+                        _sigkill = getattr(signal, "SIGKILL", signal.SIGTERM)
+                        kill(pid, _sigkill)
+                        killed = True
+                    except (ProcessLookupError, OSError):
+                        pass
 
         with write_txn(conn):
             retry_status = _retry_status_for_run(conn, tid)
@@ -8509,8 +9339,9 @@ def enforce_max_runtime(
                 "claim_expires = NULL, worker_pid = NULL, "
                 "last_heartbeat_at = NULL "
                 "WHERE id = ? AND status = 'running' "
-                "  AND worker_pid = ? AND claim_lock IS ?",
-                (retry_status, tid, pid, row["claim_lock"]),
+                "  AND worker_pid = ? AND claim_lock IS ? "
+                "  AND current_run_id IS ?",
+                (retry_status, tid, pid, row["claim_lock"], run_id),
             )
             if cur.rowcount == 1:
                 payload = {
@@ -8525,6 +9356,7 @@ def enforce_max_runtime(
                     outcome="timed_out", status="timed_out",
                     error=f"elapsed {int(elapsed)}s > limit {int(row['max_runtime_seconds'])}s",
                     metadata=payload,
+                    expected_run_id=run_id,
                 )
                 _append_event(
                     conn, tid, "timed_out", payload, run_id=run_id,
@@ -8595,6 +9427,7 @@ def detect_stale_running(
 
     rows = conn.execute(
         "SELECT t.id, t.worker_pid, t.last_heartbeat_at, t.claim_lock, "
+        "       t.current_run_id, "
         "       COALESCE(r.started_at, t.started_at) AS active_started_at "
         "FROM tasks t "
         "LEFT JOIN task_runs r ON r.id = t.current_run_id "
@@ -8618,11 +9451,40 @@ def detect_stale_running(
         pid = row["worker_pid"]
         tid = row["id"]
         lock = row["claim_lock"] or ""
+        run_id = row["current_run_id"]
 
-        # Terminate the worker if it's still host-local.
-        termination = _terminate_reclaimed_worker(
-            pid, lock, signal_fn=signal_fn,
+        containment_row = _worker_containment_for_termination(
+            conn, tid, run_id
         )
+        if containment_row is not None and containment_row["cleaned_at"] is None:
+            from . import kanban_containment as containment
+
+            if not _reserve_worker_retirement(
+                conn,
+                task_id=tid,
+                run_id=run_id,
+                claim_lock=row["claim_lock"],
+                reason="stale_heartbeat",
+                now=now,
+                active_started_at=int(row["active_started_at"]),
+                stale_timeout_seconds=stale_timeout_seconds,
+                last_heartbeat_at=(int(last_hb) if last_hb is not None else None),
+            ):
+                continue
+            termination = containment.kill_cgroup(
+                containment_row["cgroup_path"],
+                int(containment_row["cgroup_inode"]),
+            )
+            if not (
+                isinstance(termination, dict)
+                and termination.get("containment_certified")
+                and _persist_containment_certification(conn, containment_row)
+            ):
+                continue
+        else:
+            termination = _terminate_reclaimed_worker(
+                pid, lock, signal_fn=signal_fn,
+            )
 
         # Never release a claim while our own worker is still alive: that would
         # spawn a duplicate beside it. Hold the claim and retry next tick.
@@ -8640,8 +9502,8 @@ def detect_stale_running(
                 "claim_expires = NULL, worker_pid = NULL, "
                 "last_heartbeat_at = NULL "
                 "WHERE id = ? AND status = 'running' "
-                "  AND claim_lock IS ?",
-                (retry_status, tid, row["claim_lock"]),
+                "  AND claim_lock IS ? AND current_run_id IS ?",
+                (retry_status, tid, row["claim_lock"], run_id),
             )
             if cur.rowcount != 1:
                 continue
@@ -8669,6 +9531,7 @@ def detect_stale_running(
                     else "no heartbeat ever"
                 ) + f" after {int(elapsed)}s running",
                 metadata=payload,
+                expected_run_id=run_id,
             )
             _append_event(
                 conn, tid, "stale", payload, run_id=run_id,
@@ -8715,14 +9578,43 @@ def reconcile_orphaned_running(
     now = int(time.time())
     reconciled: list[str] = []
     rows = conn.execute(
-        "SELECT id, claim_lock, claim_expires, worker_pid FROM tasks "
-        "WHERE status = 'running' "
-        "  AND (claim_lock IS NULL OR claim_expires IS NULL)"
+        "SELECT t.id, t.claim_lock, t.claim_expires, t.worker_pid, "
+        "       t.current_run_id, "
+        "       COALESCE(r.started_at, t.started_at) AS active_started_at "
+        "FROM tasks t LEFT JOIN task_runs r ON r.id = t.current_run_id "
+        "WHERE t.status = 'running' "
+        "  AND (t.claim_lock IS NULL OR t.claim_expires IS NULL)"
     ).fetchall()
     for row in rows:
         tid = row["id"]
         pid = row["worker_pid"]
-        if pid and _pid_alive(pid):
+        run_id = row["current_run_id"]
+        containment_row = _worker_containment_for_termination(conn, tid, run_id)
+        termination = {}
+        if containment_row is not None and containment_row["cleaned_at"] is None:
+            from . import kanban_containment as containment
+
+            if row["active_started_at"] is None or not _reserve_worker_retirement(
+                conn,
+                task_id=tid,
+                run_id=run_id,
+                claim_lock=row["claim_lock"],
+                reason="orphan_reconcile",
+                now=now,
+                active_started_at=int(row["active_started_at"]),
+            ):
+                continue
+            termination = containment.kill_cgroup(
+                containment_row["cgroup_path"],
+                int(containment_row["cgroup_inode"]),
+            )
+            if not (
+                isinstance(termination, dict)
+                and termination.get("containment_certified")
+                and _persist_containment_certification(conn, containment_row)
+            ):
+                continue
+        elif pid and _pid_alive(pid):
             # The recorded worker may still be doing real work — never
             # requeue beside a live process. Retry next tick.
             _log.debug(
@@ -8736,8 +9628,9 @@ def reconcile_orphaned_running(
                 "claim_expires = NULL, worker_pid = NULL, "
                 "last_heartbeat_at = NULL "
                 "WHERE id = ? AND status = 'running' "
-                "  AND claim_lock IS ? AND claim_expires IS ?",
-                (tid, row["claim_lock"], row["claim_expires"]),
+                "  AND claim_lock IS ? AND claim_expires IS ? "
+                "  AND current_run_id IS ?",
+                (tid, row["claim_lock"], row["claim_expires"], run_id),
             )
             if cur.rowcount != 1:
                 continue
@@ -8751,11 +9644,13 @@ def reconcile_orphaned_running(
                 "worker_pid": int(pid) if pid else None,
                 "now": now,
             }
+            payload.update(termination)
             run_id = _end_run(
                 conn, tid,
                 outcome="reclaimed", status="reclaimed",
                 error="orphaned running card (broken claim bookkeeping)",
                 metadata=payload,
+                expected_run_id=run_id,
             )
             # Inline comment INSERT — add_comment opens its own write_txn
             # and would raise on nesting (see write_txn pitfalls).
@@ -8901,13 +9796,73 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     # Worker-exit observer payloads (RFC #58548), collected inside the main
     # txn and fired only after every reclaim/accounting txn has committed.
     exited_hook_payloads: list[dict] = []
+    contained_certificates: dict[str, tuple[int, dict]] = {}
+    contained_rows = conn.execute(
+        "SELECT t.id, t.claim_lock, t.started_at, t.current_run_id "
+        "FROM tasks t JOIN worker_containments wc "
+        "  ON wc.task_id = t.id AND wc.run_id = t.current_run_id "
+        "WHERE t.status = 'running' AND t.worker_pid IS NOT NULL "
+        "  AND wc.cleaned_at IS NULL"
+    ).fetchall()
+    host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
+    for candidate in contained_rows:
+        lock = candidate["claim_lock"] or ""
+        if not lock.startswith(host_prefix):
+            continue
+        started_at = candidate["started_at"]
+        if started_at is None:
+            continue
+        grace = _resolve_crash_grace_seconds()
+        if time.time() - started_at < grace:
+            continue
+        run_id = candidate["current_run_id"]
+        containment_row = _worker_containment_for_termination(
+            conn, candidate["id"], run_id
+        )
+        if containment_row is None:
+            continue
+        from . import kanban_containment as containment
+
+        try:
+            if containment.cgroup_populated(
+                containment_row["cgroup_path"],
+                int(containment_row["cgroup_inode"]),
+            ):
+                continue
+        except containment.ContainmentError:
+            continue
+        if not _reserve_worker_retirement(
+            conn,
+            task_id=candidate["id"],
+            run_id=run_id,
+            claim_lock=candidate["claim_lock"],
+            reason="crash_detected",
+            now=int(time.time()),
+            active_started_at=int(started_at),
+        ):
+            continue
+        try:
+            termination = containment.kill_cgroup(
+                containment_row["cgroup_path"],
+                int(containment_row["cgroup_inode"]),
+            )
+        except containment.ContainmentError:
+            continue
+        if not (
+            isinstance(termination, dict)
+            and termination.get("containment_certified")
+            and _persist_containment_certification(conn, containment_row)
+        ):
+            continue
+        contained_certificates[candidate["id"]] = (int(run_id), termination)
+
     with write_txn(conn):
         rows = conn.execute(
-            "SELECT id, worker_pid, claim_lock, started_at, assignee "
+            "SELECT id, worker_pid, claim_lock, started_at, assignee, "
+            "       current_run_id "
             "FROM tasks "
             "WHERE status = 'running' AND worker_pid IS NOT NULL"
         ).fetchall()
-        host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
         for row in rows:
             # Only check liveness for claims owned by this host.
             lock = row["claim_lock"] or ""
@@ -8921,8 +9876,20 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                 grace = _resolve_crash_grace_seconds()
                 if time.time() - started_at < grace:
                     continue
-            if _pid_alive(row["worker_pid"]):
-                continue
+            contained_certificate = contained_certificates.get(row["id"])
+            if contained_certificate is not None:
+                certified_run_id, termination = contained_certificate
+                if certified_run_id != row["current_run_id"]:
+                    continue
+            else:
+                containment_row = _worker_containment_for_termination(
+                    conn, row["id"], row["current_run_id"]
+                )
+                if containment_row is not None:
+                    continue
+                if _pid_alive(row["worker_pid"]):
+                    continue
+                termination = {}
 
             pid = int(row["worker_pid"])
             kind, code = _classify_worker_exit(pid)
@@ -8987,6 +9954,7 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                 if code is not None and kind != "unknown":
                     event_payload["exit_kind"] = kind
                     event_payload["exit_code"] = code
+            event_payload.update(termination)
 
             retry_status = _retry_status_for_run(conn, row["id"])
             event_payload["retry_status"] = retry_status
@@ -8994,8 +9962,15 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                 "UPDATE tasks SET status = ?, claim_lock = NULL, "
                 "claim_expires = NULL, worker_pid = NULL "
                 "WHERE id = ? AND status = 'running' "
-                "  AND worker_pid = ? AND claim_lock IS ?",
-                (retry_status, row["id"], pid, row["claim_lock"]),
+                "  AND worker_pid = ? AND claim_lock IS ? "
+                "  AND current_run_id IS ?",
+                (
+                    retry_status,
+                    row["id"],
+                    pid,
+                    row["claim_lock"],
+                    row["current_run_id"],
+                ),
             )
             if cur.rowcount == 1:
                 # Rate-limited requeues are a clean release, not a crash —
@@ -9007,6 +9982,7 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                     outcome=_run_outcome, status=_run_outcome,
                     error=error_text,
                     metadata=dict(event_payload),
+                    expected_run_id=row["current_run_id"],
                 )
                 _append_event(
                     conn, row["id"], event_kind,
@@ -9354,13 +10330,481 @@ def _record_spawn_failure(
     )
 
 
-def _set_worker_pid(conn: sqlite3.Connection, task_id: str, pid: int) -> None:
+def _register_worker_containment(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    run_id: int,
+    claim_lock: str,
+    worker_pid: int,
+    cgroup_path: str,
+    cgroup_inode: int,
+) -> None:
+    """Atomically bind one contained worker to its exact durable owner."""
+    run_id = int(run_id)
+    worker_pid = int(worker_pid)
+    cgroup_inode = int(cgroup_inode)
+    with write_txn(conn):
+        task_cur = conn.execute(
+            "UPDATE tasks SET worker_pid = ? "
+            "WHERE id = ? AND status = 'running' "
+            "AND current_run_id = ? AND claim_lock = ? "
+            "AND worker_pid IS NULL",
+            (worker_pid, task_id, run_id, claim_lock),
+        )
+        run_cur = conn.execute(
+            "UPDATE task_runs SET worker_pid = ? "
+            "WHERE id = ? AND task_id = ? AND status = 'running' "
+            "AND outcome IS NULL AND ended_at IS NULL "
+            "AND claim_lock = ? AND worker_pid IS NULL",
+            (worker_pid, run_id, task_id, claim_lock),
+        )
+        if task_cur.rowcount != 1 or run_cur.rowcount != 1:
+            raise RuntimeError(
+                "contained worker ownership changed before registration"
+            )
+        conn.execute(
+            """
+            INSERT INTO worker_containments (
+                run_id, task_id, claim_lock, backend, worker_pid,
+                cgroup_path, cgroup_inode, created_at, cleaned_at
+            ) VALUES (?, ?, ?, 'cgroup_v2', ?, ?, ?, ?, NULL)
+            """,
+            (
+                run_id,
+                task_id,
+                claim_lock,
+                worker_pid,
+                cgroup_path,
+                cgroup_inode,
+                int(time.time()),
+            ),
+        )
+        _append_event(
+            conn,
+            task_id,
+            "spawned",
+            {"pid": worker_pid},
+            run_id=run_id,
+        )
+
+
+def _worker_containment_for_termination(
+    conn: sqlite3.Connection,
+    task_id: Optional[str],
+    run_id: Optional[int],
+) -> Optional[sqlite3.Row]:
+    """Resolve containment only by exact immutable task and run identity."""
+    if task_id is None or run_id is None:
+        return None
+    return conn.execute(
+        "SELECT * FROM worker_containments WHERE task_id = ? AND run_id = ?",
+        (task_id, int(run_id)),
+    ).fetchone()
+
+
+def _persist_containment_certification(
+    conn: sqlite3.Connection,
+    row: sqlite3.Row,
+) -> bool:
+    """Persist and read back one exact run/path/inode termination certificate."""
+    now = int(time.time())
+
+    def _apply() -> bool:
+        conn.execute(
+            "UPDATE worker_containments "
+            "SET termination_certified_at = COALESCE(termination_certified_at, ?) "
+            "WHERE run_id = ? AND task_id = ? AND backend = 'cgroup_v2' "
+            "AND cgroup_path = ? AND cgroup_inode = ?",
+            (
+                now,
+                int(row["run_id"]),
+                row["task_id"],
+                row["cgroup_path"],
+                int(row["cgroup_inode"]),
+            ),
+        )
+        persisted = conn.execute(
+            "SELECT termination_certified_at FROM worker_containments "
+            "WHERE run_id = ? AND task_id = ? AND backend = 'cgroup_v2' "
+            "AND cgroup_path = ? AND cgroup_inode = ?",
+            (
+                int(row["run_id"]),
+                row["task_id"],
+                row["cgroup_path"],
+                int(row["cgroup_inode"]),
+            ),
+        ).fetchone()
+        return bool(
+            persisted is not None
+            and persisted["termination_certified_at"] is not None
+        )
+
+    if conn.in_transaction:
+        return _apply()
+    with write_txn(conn):
+        return _apply()
+
+
+def _persist_unlink_intent(conn: sqlite3.Connection, row: sqlite3.Row) -> bool:
+    """Durably announce physical removal of one exact certified cgroup."""
+    with write_txn(conn, allow_nested=True):
+        conn.execute(
+            "UPDATE worker_containments "
+            "SET unlink_intent_at = COALESCE(unlink_intent_at, ?) "
+            "WHERE run_id = ? AND task_id = ? AND backend = 'cgroup_v2' "
+            "AND cgroup_path = ? AND cgroup_inode = ? "
+            "AND termination_certified_at IS NOT NULL AND cleaned_at IS NULL",
+            (
+                int(time.time()),
+                int(row["run_id"]),
+                row["task_id"],
+                row["cgroup_path"],
+                int(row["cgroup_inode"]),
+            ),
+        )
+        persisted = conn.execute(
+            "SELECT unlink_intent_at FROM worker_containments "
+            "WHERE run_id = ? AND task_id = ? AND backend = 'cgroup_v2' "
+            "AND cgroup_path = ? AND cgroup_inode = ?",
+            (
+                int(row["run_id"]),
+                row["task_id"],
+                row["cgroup_path"],
+                int(row["cgroup_inode"]),
+            ),
+        ).fetchone()
+        return bool(persisted is not None and persisted["unlink_intent_at"] is not None)
+
+
+def _complete_containment_cleanup(conn: sqlite3.Connection, row: sqlite3.Row) -> bool:
+    """CAS cleaned_at after exact certification, intent, and physical cleanup."""
+    with write_txn(conn, allow_nested=True):
+        cur = conn.execute(
+            "UPDATE worker_containments SET cleaned_at = ? "
+            "WHERE run_id = ? AND task_id = ? AND backend = 'cgroup_v2' "
+            "AND cgroup_path = ? AND cgroup_inode = ? "
+            "AND termination_certified_at IS NOT NULL "
+            "AND unlink_intent_at IS NOT NULL AND cleaned_at IS NULL",
+            (
+                int(time.time()),
+                int(row["run_id"]),
+                row["task_id"],
+                row["cgroup_path"],
+                int(row["cgroup_inode"]),
+            ),
+        )
+        return cur.rowcount == 1
+
+
+def cleanup_inactive_worker_containments(conn: sqlite3.Connection) -> int:
+    """Retire inactive runs by exact cgroup identity, never by leader PID."""
+    from . import kanban_containment as containment
+
+    rows = conn.execute(
+        """
+        SELECT wc.*
+          FROM worker_containments wc
+          LEFT JOIN task_runs r ON r.id = wc.run_id
+          LEFT JOIN tasks t ON t.id = wc.task_id
+         WHERE wc.cleaned_at IS NULL
+           AND (
+                r.ended_at IS NOT NULL
+                OR t.id IS NULL
+                OR t.status != 'running'
+                OR t.current_run_id IS NULL
+                OR t.current_run_id != wc.run_id
+                OR wc.retirement_started_at IS NOT NULL
+           )
+        """
+    ).fetchall()
+    cleaned = 0
+    for row in rows:
+        if row["termination_certified_at"] is None:
+            termination = containment.kill_cgroup(
+                row["cgroup_path"], int(row["cgroup_inode"])
+            )
+            if not (
+                isinstance(termination, dict)
+                and termination.get("containment_certified")
+                and _persist_containment_certification(conn, row)
+            ):
+                continue
+
+        if row["retirement_reason"] == "spawn_gate_failed":
+            active = conn.execute(
+                "SELECT status, current_run_id FROM tasks WHERE id = ?",
+                (row["task_id"],),
+            ).fetchone()
+            if (
+                active is not None
+                and active["status"] == "running"
+                and active["current_run_id"] == int(row["run_id"])
+            ):
+                _record_spawn_failure(
+                    conn,
+                    row["task_id"],
+                    "contained worker gate release failed",
+                )
+                active = conn.execute(
+                    "SELECT status, current_run_id FROM tasks WHERE id = ?",
+                    (row["task_id"],),
+                ).fetchone()
+                if (
+                    active is not None
+                    and active["status"] == "running"
+                    and active["current_run_id"] == int(row["run_id"])
+                ):
+                    continue
+
+        active = conn.execute(
+            "SELECT status, current_run_id, claim_lock FROM tasks WHERE id = ?",
+            (row["task_id"],),
+        ).fetchone()
+        if (
+            active is not None
+            and active["status"] == "running"
+            and active["current_run_id"] == int(row["run_id"])
+        ):
+            with write_txn(conn, allow_nested=True):
+                retry_status = _retry_status_for_run(conn, row["task_id"])
+                cur = conn.execute(
+                    "UPDATE tasks SET status = ?, claim_lock = NULL, "
+                    "claim_expires = NULL, worker_pid = NULL, "
+                    "last_heartbeat_at = NULL "
+                    "WHERE id = ? AND status = 'running' "
+                    "  AND current_run_id = ? "
+                    "  AND (claim_lock IS ? OR claim_lock IS NULL)",
+                    (
+                        retry_status,
+                        row["task_id"],
+                        int(row["run_id"]),
+                        row["claim_lock"],
+                    ),
+                )
+                if cur.rowcount != 1:
+                    continue
+                payload = {
+                    "reason": row["retirement_reason"] or "containment_retirement",
+                    "retry_status": retry_status,
+                    "containment_replay": True,
+                }
+                ended_run_id = _end_run(
+                    conn,
+                    row["task_id"],
+                    outcome="reclaimed",
+                    status="reclaimed",
+                    error="contained worker retirement replayed by sweeper",
+                    metadata=payload,
+                    expected_run_id=int(row["run_id"]),
+                )
+                _append_event(
+                    conn,
+                    row["task_id"],
+                    "reclaimed",
+                    payload,
+                    run_id=ended_run_id,
+                )
+
+        had_intent = row["unlink_intent_at"] is not None
+        if not had_intent:
+            if containment.cgroup_absent(row["cgroup_path"]):
+                # Absence without prior intent is ambiguous: another actor may
+                # have replaced or removed the path. Preserve the evidence.
+                continue
+            if not _persist_unlink_intent(conn, row):
+                continue
+            had_intent = True
+
+        removed = containment.cleanup_cgroup(
+            row["cgroup_path"], int(row["cgroup_inode"])
+        )
+        if removed or (
+            had_intent and containment.cgroup_absent(row["cgroup_path"])
+        ):
+            cleaned += int(_complete_containment_cleanup(conn, row))
+    return cleaned
+
+
+def _reserve_worker_retirement(
+    conn: sqlite3.Connection,
+    *,
+    task_id: str,
+    run_id: Optional[int],
+    claim_lock: Optional[str],
+    reason: str,
+    now: int,
+    active_started_at: int,
+    max_runtime_seconds: Optional[int] = None,
+    stale_timeout_seconds: Optional[int] = None,
+    last_heartbeat_at: Optional[int] = None,
+    expected_claim_expires: Optional[int] = None,
+    claim_expires_lt: Optional[int] = None,
+) -> bool:
+    """Durably reserve one exact eligible run before kernel termination."""
+    from . import kanban_containment as containment
+
+    if run_id is None:
+        return False
+    containment_row = _worker_containment_for_termination(conn, task_id, run_id)
+    if containment_row is not None and containment_row["cleaned_at"] is None:
+        claim_lock = containment_row["claim_lock"]
+    elif not claim_lock:
+        return False
+    legacy_policy = containment_row is None and not containment.enabled()
+    containment_owns_claim = bool(
+        containment_row is not None
+        and containment_row["cleaned_at"] is None
+        and containment_row["claim_lock"] == claim_lock
+    )
+    with write_txn(conn, allow_nested=True):
+        row = conn.execute(
+            "SELECT t.status, t.current_run_id, t.claim_lock, "
+            "       t.max_runtime_seconds, t.last_heartbeat_at, t.claim_expires, "
+            "       COALESCE(r.started_at, t.started_at) AS active_started_at "
+            "FROM tasks t LEFT JOIN task_runs r ON r.id=t.current_run_id "
+            "WHERE t.id=?",
+            (task_id,),
+        ).fetchone()
+        if (
+            row is None
+            or row["status"] != "running"
+            or row["current_run_id"] != int(run_id)
+            or (row["claim_lock"] != claim_lock and not containment_owns_claim)
+            or row["active_started_at"] != int(active_started_at)
+        ):
+            return False
+        if expected_claim_expires is not None:
+            observed_expiry = row["claim_expires"]
+            if (
+                observed_expiry is None
+                or int(observed_expiry) != int(expected_claim_expires)
+                or (
+                    claim_expires_lt is not None
+                    and int(observed_expiry) >= int(claim_expires_lt)
+                )
+            ):
+                return False
+        elapsed = int(now) - int(active_started_at)
+        if max_runtime_seconds is not None and (
+            row["max_runtime_seconds"] != int(max_runtime_seconds)
+            or elapsed < int(max_runtime_seconds)
+        ):
+            return False
+        if stale_timeout_seconds is not None:
+            observed_hb = row["last_heartbeat_at"]
+            if observed_hb != last_heartbeat_at or elapsed < int(stale_timeout_seconds):
+                return False
+            hb_age = (
+                int(now) - int(observed_hb)
+                if observed_hb is not None
+                else None
+            )
+            if hb_age is not None and hb_age < _STALE_HEARTBEAT_GAP_SECONDS:
+                return False
+        if legacy_policy:
+            return True
+        cur = conn.execute(
+            "UPDATE worker_containments "
+            "SET retirement_started_at=COALESCE(retirement_started_at, ?), "
+            "    retirement_reason=COALESCE(retirement_reason, ?) "
+            "WHERE run_id=? AND task_id=? AND claim_lock=? "
+            "  AND cleaned_at IS NULL AND ("
+            "       (termination_certified_at IS NULL "
+            "        AND (retirement_reason IS NULL OR retirement_reason=?)) "
+            "       OR (termination_certified_at IS NOT NULL "
+            "           AND (retirement_reason IS NULL OR retirement_reason=?)))",
+            (
+                int(now),
+                reason,
+                int(run_id),
+                task_id,
+                claim_lock,
+                reason,
+                reason,
+            ),
+        )
+        return cur.rowcount == 1
+
+
+def _set_worker_pid(conn: sqlite3.Connection, task_id: str, pid: Any) -> None:
     """Record the spawned child's pid + emit a ``spawned`` event.
 
     The event's payload carries the pid so a human reading ``hermes kanban
     tail`` can correlate log lines with OS-level traces without opening
     the drawer.
     """
+    if not isinstance(pid, int):
+        handle = pid
+        committed = False
+        try:
+            if handle.task_id != task_id:
+                raise RuntimeError("contained worker task identity changed")
+            _register_worker_containment(
+                conn,
+                task_id,
+                run_id=int(handle.run_id),
+                claim_lock=str(handle.claim_lock),
+                worker_pid=int(handle.pid),
+                cgroup_path=str(handle.cgroup_path),
+                cgroup_inode=int(handle.cgroup_inode),
+            )
+            committed = True
+            handle.release()
+        except Exception as gate_error:
+            if committed:
+                active = conn.execute(
+                    "SELECT COALESCE(r.started_at, t.started_at) AS active_started_at "
+                    "FROM tasks t LEFT JOIN task_runs r ON r.id=t.current_run_id "
+                    "WHERE t.id=? AND t.status='running' AND t.current_run_id=?",
+                    (task_id, int(handle.run_id)),
+                ).fetchone()
+                reserved = bool(
+                    active is not None
+                    and _reserve_worker_retirement(
+                        conn,
+                        task_id=task_id,
+                        run_id=int(handle.run_id),
+                        claim_lock=handle.claim_lock,
+                        reason="spawn_gate_failed",
+                        now=int(time.time()),
+                        active_started_at=int(active["active_started_at"] or 0),
+                    )
+                )
+                if not reserved:
+                    raise RuntimeError(
+                        "post-registration gate failure could not reserve retirement"
+                    ) from gate_error
+            try:
+                termination = handle.abort(unlink=not committed)
+            except Exception as abort_error:
+                if committed:
+                    raise ContainmentRetirementPending(
+                        f"{gate_error}; abort outcome unknown: {abort_error}",
+                        certified=False,
+                    ) from gate_error
+                raise
+            if committed:
+                certified = bool(
+                    isinstance(termination, dict)
+                    and termination.get("containment_certified")
+                )
+                containment_row = _worker_containment_for_termination(
+                    conn, task_id, int(handle.run_id)
+                )
+                if certified and (
+                    containment_row is None
+                    or not _persist_containment_certification(conn, containment_row)
+                ):
+                    raise RuntimeError(
+                        "post-registration gate failure certificate was not persisted"
+                    ) from gate_error
+                raise ContainmentRetirementPending(
+                    str(gate_error), certified=certified
+                ) from gate_error
+            raise
+        return
+
     with write_txn(conn):
         conn.execute(
             "UPDATE tasks SET worker_pid = ? WHERE id = ?",
@@ -9385,7 +10829,7 @@ def _clear_failure_counter(conn: sqlite3.Connection, task_id: str) -> None:
     about whether the run will succeed, so we need to let timeouts and
     crashes accumulate across spawn boundaries.
     """
-    with write_txn(conn):
+    with write_txn(conn, allow_nested=True):
         conn.execute(
             "UPDATE tasks SET consecutive_failures = 0, "
             "last_failure_error = NULL WHERE id = ?",
@@ -9953,6 +11397,8 @@ def _dispatch_once_locked(
     reap_worker_zombies()
 
     result = DispatchResult()
+    if not dry_run:
+        cleanup_inactive_worker_containments(conn)
     result.reclaimed = release_stale_claims(conn)
     if reconcile_orphans:
         # Orphaned-card reconciliation: requeue 'running' cards whose claim
@@ -10275,13 +11721,17 @@ def _dispatch_once_locked(
             except (TypeError, ValueError):
                 pid = _spawn(claimed, str(workspace))
             if pid:
-                _set_worker_pid(conn, claimed.id, int(pid))
+                _set_worker_pid(conn, claimed.id, pid)
             # Worker-lifecycle observer (RFC #58548): fires AFTER spawn_fn
             # returned and the PID (when reported) is durably persisted,
             # per the RFC timing contract. Best-effort — can never break
             # the dispatch loop.
             _fire_worker_spawned_hook(
-                conn, claimed, str(workspace), pid, board=board,
+                conn,
+                claimed,
+                str(workspace),
+                _worker_pid_value(pid),
+                board=board,
             )
             # NOTE: we intentionally do NOT reset consecutive_failures
             # here. A successful spawn proves the worker can start but
@@ -10299,6 +11749,13 @@ def _dispatch_once_locked(
                 _per_profile_running[claimed.assignee] = (
                     _per_profile_running.get(claimed.assignee, 0) + 1
                 )
+        except ContainmentRetirementPending as exc:
+            _log.warning(
+                "kanban dispatch: task %s containment retirement pending "
+                "after gate failure (certified=%s)",
+                claimed.id,
+                exc.certified,
+            )
         except Exception as exc:
             auto = _record_spawn_failure(
                 conn, claimed.id, str(exc),
@@ -10407,11 +11864,15 @@ def _dispatch_once_locked(
             except (TypeError, ValueError):
                 pid = _spawn(claimed, str(workspace))
             if pid:
-                _set_worker_pid(conn, claimed.id, int(pid))
+                _set_worker_pid(conn, claimed.id, pid)
             # Worker-lifecycle observer (RFC #58548): same contract as the
             # ready-lane fire above — after spawn + PID persistence.
             _fire_worker_spawned_hook(
-                conn, claimed, str(workspace), pid, board=board,
+                conn,
+                claimed,
+                str(workspace),
+                _worker_pid_value(pid),
+                board=board,
             )
             result.spawned.append((claimed.id, claimed.assignee or "", str(workspace)))
             spawned += 1
@@ -10419,6 +11880,13 @@ def _dispatch_once_locked(
                 _per_profile_running[claimed.assignee] = (
                     _per_profile_running.get(claimed.assignee, 0) + 1
                 )
+        except ContainmentRetirementPending as exc:
+            _log.warning(
+                "kanban review dispatch: task %s containment retirement pending "
+                "after gate failure (certified=%s)",
+                claimed.id,
+                exc.certified,
+            )
         except Exception as exc:
             auto = _record_spawn_failure(
                 conn, claimed.id, str(exc),
@@ -10717,16 +12185,28 @@ def _retag_legacy_worker_sessions(workspaces_root_path: str) -> None:
         _log.debug("kanban worker: legacy session retag skipped (%s)", exc)
 
 
+def _open_worker_log(task: Task, *, board: Optional[str] = None):
+    """Open the task log without racing named-board namespace retirement."""
+    with board_filesystem_write(board=board):
+        log_dir = worker_logs_dir(board=board)
+        log_dir.mkdir(parents=True, exist_ok=True)
+        log_path = log_dir / f"{task.id}.log"
+        rotate_bytes, backup_count = worker_log_rotation_config()
+        _rotate_worker_log(log_path, rotate_bytes, backup_count)
+        return open(log_path, "ab")
+
+
 def _default_spawn(
     task: Task,
     workspace: str,
     *,
     board: Optional[str] = None,
-) -> Optional[int]:
+) -> Optional[object]:
     """Fire-and-forget ``hermes -p <profile> chat -q ...`` subprocess.
 
-    Returns the spawned child's PID so the dispatcher can detect crashes
-    before the claim TTL expires. The child's completion is still observed
+    Returns either the legacy child PID or a gated containment handle. The
+    dispatcher durably registers and releases a gated handle before workers
+    execute. The child's completion is still observed
     via the ``complete`` / ``block`` transitions the worker writes itself;
     the PID check is a safety net for crashes, OOM kills, and Ctrl+C.
 
@@ -10899,24 +12379,40 @@ def _default_spawn(
     # Anchored at the board root (not the shared kanban root), so
     # `hermes kanban log` on a specific board reads its own file and
     # logs don't collide across boards that happen to share task ids.
-    log_dir = worker_logs_dir(board=board)
-    log_dir.mkdir(parents=True, exist_ok=True)
-    log_path = log_dir / f"{task.id}.log"
-    rotate_bytes, backup_count = worker_log_rotation_config()
-    _rotate_worker_log(log_path, rotate_bytes, backup_count)
-
     # Use 'a' so a re-run on unblock appends rather than overwrites.
-    log_f = open(log_path, "ab")
+    log_f = _open_worker_log(task, board=board)
     try:
+        popen_kwargs = {
+            "cwd": workspace if os.path.isdir(workspace) else None,
+            "stdin": subprocess.DEVNULL,
+            "stdout": log_f,
+            "stderr": subprocess.STDOUT,
+            "env": env,
+            "start_new_session": True,
+            "creationflags": (
+                getattr(subprocess, "CREATE_NO_WINDOW", 0) if _IS_WINDOWS else 0
+            ),
+        }
+        from . import kanban_containment as containment
+
+        if containment.enabled():
+            if task.current_run_id is None:
+                raise containment.ContainmentError(
+                    "contained worker spawn requires a durable run id"
+                )
+            if not task.claim_lock:
+                raise containment.ContainmentError(
+                    "contained worker spawn requires a durable claim lock"
+                )
+            return containment.spawn_gated(
+                cmd,
+                task_id=task.id,
+                run_id=int(task.current_run_id),
+                claim_lock=task.claim_lock,
+                popen_kwargs=popen_kwargs,
+            )
         proc = subprocess.Popen(  # noqa: S603 -- argv is a fixed list built above
-            cmd,
-            cwd=workspace if os.path.isdir(workspace) else None,
-            stdin=subprocess.DEVNULL,
-            stdout=log_f,
-            stderr=subprocess.STDOUT,
-            env=env,
-            start_new_session=True,
-            creationflags=subprocess.CREATE_NO_WINDOW if _IS_WINDOWS else 0,
+            cmd, **popen_kwargs,
         )
     except FileNotFoundError:
         log_f.close()
@@ -10924,6 +12420,9 @@ def _default_spawn(
             "`hermes` executable not found on PATH. "
             "Install Hermes Agent or activate its venv before running the kanban dispatcher."
         )
+    except Exception:
+        log_f.close()
+        raise
     # NOTE: we intentionally do NOT close log_f here — we want Popen's
     # child process to keep writing after this function returns.  The
     # handle is kept alive by the child's inheritance.  The parent's

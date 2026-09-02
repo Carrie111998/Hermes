@@ -17,6 +17,7 @@ with it":
 from __future__ import annotations
 
 import json
+import sqlite3
 import sys
 import tarfile
 import time
@@ -88,6 +89,26 @@ def _claim(task_id: str, slug: str = "alpha") -> None:
                 "session_id='sess-xyz', consecutive_failures=2 WHERE id=?",
                 (int(time.time()) + 600, int(time.time()), task_id),
             )
+
+
+def _contained_claim(task_id: str, slug: str = "alpha") -> None:
+    """Attach machine-local cgroup custody to a claimed task."""
+    with kb.connect_closing(board=slug) as conn:
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (task_id,))
+        task = kb.claim_task(conn, task_id, claimer="worker:source")
+        assert task is not None
+        assert task.current_run_id is not None
+        assert task.claim_lock == "worker:source"
+        kb._register_worker_containment(
+            conn,
+            task_id,
+            run_id=task.current_run_id,
+            claim_lock=task.claim_lock,
+            worker_pid=4242,
+            cgroup_path="/sys/fs/cgroup/hermes-exporter/run-1",
+            cgroup_inode=987654,
+        )
 
 
 def _subscribe(task_id: str, slug: str = "alpha") -> None:
@@ -200,6 +221,38 @@ def test_claimed_task_arrives_unclaimed_and_queued(kanban_root, tmp_path):
     assert task["current_run_id"] is None
     assert task["session_id"] is None
     assert task["consecutive_failures"] == 0
+
+
+def test_export_drops_machine_local_worker_containment(kanban_root, tmp_path):
+    ids = _seed_board()
+    _contained_claim(ids["scratch"])
+    archive = kt.export_board("alpha", str(tmp_path / "alpha"))["archive"]
+
+    extracted = tmp_path / "exported"
+    safe_extract_targz(archive, extracted)
+    conn = sqlite3.connect(str(extracted / "alpha" / "kanban.db"))
+    try:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM worker_containments"
+        ).fetchone()[0] == 0
+    finally:
+        conn.close()
+
+
+def test_import_relocation_drops_untrusted_worker_containment(
+    kanban_root, tmp_path,
+):
+    ids = _seed_board()
+    _contained_claim(ids["scratch"])
+
+    with kb.connect_closing(board="alpha") as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM worker_containments"
+        ).fetchone()[0] == 1
+        kt._relocate_imported_rows(conn, "alpha")
+        assert conn.execute(
+            "SELECT COUNT(*) FROM worker_containments"
+        ).fetchone()[0] == 0
 
 
 def test_gateway_subscriptions_never_travel(kanban_root, tmp_path):
@@ -362,3 +415,23 @@ def test_import_rejects_a_future_format_version(kanban_root, tmp_path):
     kanban_root("target")
     with pytest.raises(ValueError, match="newer than this Hermes"):
         kt.import_board(str(bumped))
+
+
+def test_import_scrubs_before_board_becomes_discoverable(
+    kanban_root, tmp_path, monkeypatch,
+):
+    _seed_board()
+    archive = kt.export_board("alpha", str(tmp_path / "alpha"))["archive"]
+    kanban_root("target")
+    observed = []
+    original = kt._relocate_imported_rows
+
+    def assert_private(conn, slug, **kwargs):
+        observed.append(kb.board_exists(slug))
+        return original(conn, slug, **kwargs)
+
+    monkeypatch.setattr(kt, "_relocate_imported_rows", assert_private)
+    result = kt.import_board(archive)
+
+    assert observed == [False]
+    assert kb.board_exists(result["board"])

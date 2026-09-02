@@ -102,6 +102,13 @@ def _scrub_local_state(conn: sqlite3.Connection) -> None:
     input.
     """
     conn.execute("DELETE FROM kanban_notify_subs")
+    # Containment path/inode/PID identity is meaningful only on the machine
+    # that created it.  This function runs exclusively against an export
+    # snapshot or a newly imported board, never the live source board, so no
+    # local worker can legitimately be governed by these rows.  Remove them
+    # before clearing task/run ownership: the live-board triggers correctly
+    # reject claim release while an uncertified containment still exists.
+    conn.execute("DELETE FROM worker_containments")
     conn.execute(
         """
         UPDATE tasks
@@ -293,7 +300,10 @@ def _read_board_metadata(path: Path) -> dict[str, Any]:
 
 
 def _relocate_imported_rows(
-    conn: sqlite3.Connection, slug: str
+    conn: sqlite3.Connection,
+    slug: str,
+    *,
+    board_root: Path | None = None,
 ) -> tuple[dict[str, int], list[str]]:
     """Re-anchor an imported board's rows to this machine.
 
@@ -314,7 +324,12 @@ def _relocate_imported_rows(
     """
     warnings: list[str] = []
     now = int(time.time())
-    attachments_dir = kb.attachments_root(slug)
+    attachment_source_dir = (
+        board_root / "attachments"
+        if board_root is not None
+        else kb.attachments_root(slug)
+    )
+    attachment_destination_dir = kb.attachments_root(slug)
 
     with kb.write_txn(conn):
         _scrub_local_state(conn)
@@ -324,11 +339,13 @@ def _relocate_imported_rows(
         for row in conn.execute(
             "SELECT id, task_id, stored_path FROM task_attachments"
         ).fetchall():
-            landed = attachments_dir / row["task_id"] / Path(row["stored_path"]).name
-            if landed.is_file():
+            filename = Path(row["stored_path"]).name
+            staged_blob = attachment_source_dir / row["task_id"] / filename
+            final_blob = attachment_destination_dir / row["task_id"] / filename
+            if staged_blob.is_file():
                 conn.execute(
                     "UPDATE task_attachments SET stored_path = ? WHERE id = ?",
-                    (str(landed), row["id"]),
+                    (str(final_blob), row["id"]),
                 )
                 rehomed += 1
             else:
@@ -406,7 +423,10 @@ def import_board(
         )
     archive_root = roots.pop()
 
-    with tempfile.TemporaryDirectory() as tmpdir:
+    kb.boards_root().mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(
+        dir=kb.boards_root(), prefix=".import-staging-"
+    ) as tmpdir:
         staging = Path(tmpdir)
         safe_extract_targz(archive, staging)
         extracted = staging / archive_root
@@ -424,36 +444,43 @@ def import_board(
                 "cannot determine a board name from the archive — pass one "
                 "explicitly with --as <slug>"
             )
-        target = _available_slug(requested)
-
         staged_meta = _read_board_metadata(extracted / "board.json")
 
-        board_root = kb.board_dir(target)
-        board_root.mkdir(parents=True, exist_ok=True)
-        shutil.move(str(staged_db), str(board_root / "kanban.db"))
-        for tree in ("attachments", "logs"):
-            src = extracted / tree
-            if src.is_dir():
-                shutil.move(str(src), str(board_root / tree))
+        # Migrate and scrub while private. The staging directory lives under
+        # boards_root, so publication below is one atomic same-filesystem rename.
+        kb.init_db(db_path=staged_db)
+        with kb.board_namespace_lock():
+            target = _available_slug(requested)
+            destination = kb.board_dir(target)
+            if destination.exists():
+                raise ValueError(f"board {target!r} already exists")
 
-    # Rewritten rather than moved across: the archive's copy names a slug
-    # and a workdir that belong to the exporting machine.
-    name = str(staged_meta.get("name") or manifest.get("board_name") or target)
-    kb.write_board_metadata(
-        target,
-        name=name,
-        description=str(staged_meta.get("description") or ""),
-        icon=str(staged_meta.get("icon") or ""),
-        color=str(staged_meta.get("color") or ""),
-        archived=False,
-    )
-    # Bring the imported schema up to this install's version before the
-    # relocation pass writes to it.
-    kb.init_db(board=target)
+            with kb.connect_closing(db_path=staged_db) as conn:
+                stats, warnings = _relocate_imported_rows(
+                    conn, target, board_root=extracted
+                )
+                counts = _count_rows(conn)
 
-    with kb.connect_closing(board=target) as conn:
-        stats, warnings = _relocate_imported_rows(conn, target)
-        counts = _count_rows(conn)
+            name = str(
+                staged_meta.get("name") or manifest.get("board_name") or target
+            )
+            staged_meta.pop("db_path", None)
+            staged_meta.update(
+                {
+                    "slug": target,
+                    "name": name,
+                    "description": str(staged_meta.get("description") or ""),
+                    "icon": str(staged_meta.get("icon") or ""),
+                    "color": str(staged_meta.get("color") or ""),
+                    "created_at": staged_meta.get("created_at") or int(time.time()),
+                    "archived": False,
+                }
+            )
+            (extracted / "board.json").write_text(
+                json.dumps(staged_meta, indent=2, ensure_ascii=False) + "\n",
+                encoding="utf-8",
+            )
+            extracted.rename(destination)
 
     if activate:
         kb.set_current_board(target)

@@ -138,8 +138,13 @@ def _setup_running_task_with_run(conn, *, title, assignee, worker_pid):
         "VALUES (?, 'running', ?, ?, ?, ?)",
         (task_id, lock, future, worker_pid, int(time.time())),
     )
+    run_id = int(cur.lastrowid)
+    conn.execute(
+        "UPDATE tasks SET current_run_id=? WHERE id=?",
+        (run_id, task_id),
+    )
     conn.commit()
-    return task_id, cur.lastrowid
+    return task_id, run_id
 
 
 def test_terminate_run_404_unknown_id(client):
@@ -150,5 +155,72 @@ def test_terminate_run_404_unknown_id(client):
     )
     assert r.status_code == 404
     assert "777777" in r.json()["detail"]
+
+
+def test_terminate_stale_run_handle_does_not_reclaim_successor(
+    client, monkeypatch,
+):
+    """A run endpoint handle remains bound to its snapshotted run and claim."""
+    with kb.connect_closing() as conn:
+        task_id, old_run_id = _setup_running_task_with_run(
+            conn,
+            title="stale termination handle",
+            assignee="default",
+            worker_pid=None,
+        )
+
+    original_reclaim = kb.reclaim_task
+    raced = False
+    successor_state = {}
+
+    def replace_with_successor(conn, requested_task_id, **kwargs):
+        nonlocal raced
+        assert requested_task_id == task_id
+        assert not raced
+        raced = True
+        now = int(time.time())
+        successor_lock = secrets.token_hex(8)
+        future = now + 3600
+        conn.execute(
+            "UPDATE task_runs SET ended_at=?, status='ended', outcome='done' "
+            "WHERE id=?",
+            (now, old_run_id),
+        )
+        cur = conn.execute(
+            "INSERT INTO task_runs "
+            "(task_id, status, claim_lock, claim_expires, worker_pid, started_at) "
+            "VALUES (?, 'running', ?, ?, NULL, ?)",
+            (task_id, successor_lock, future, now),
+        )
+        successor_run_id = int(cur.lastrowid)
+        conn.execute(
+            "UPDATE tasks SET status='running', claim_lock=?, claim_expires=?, "
+            "worker_pid=NULL, current_run_id=?, started_at=? WHERE id=?",
+            (successor_lock, future, successor_run_id, now, task_id),
+        )
+        conn.commit()
+        successor_state["run_id"] = successor_run_id
+        successor_state["claim_lock"] = successor_lock
+        return original_reclaim(conn, requested_task_id, **kwargs)
+
+    monkeypatch.setattr(kb, "reclaim_task", replace_with_successor)
+    response = client.post(
+        f"/api/plugins/kanban/runs/{old_run_id}/terminate",
+        json={"reason": "stale dashboard request"},
+    )
+
+    assert raced
+    assert response.status_code == 409
+    with kb.connect_closing() as conn:
+        task = conn.execute(
+            "SELECT status, claim_lock, current_run_id FROM tasks WHERE id=?",
+            (task_id,),
+        ).fetchone()
+        successor = kb.get_run(conn, successor_state["run_id"])
+    assert task["status"] == "running"
+    assert task["claim_lock"] == successor_state["claim_lock"]
+    assert int(task["current_run_id"]) == successor_state["run_id"]
+    assert successor is not None
+    assert successor.ended_at is None
 
 
