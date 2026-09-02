@@ -3159,16 +3159,27 @@ class OpenVikingMemoryProvider(MemoryProvider):
         snapshot = self._conn_snapshot
         if snapshot is not None:
             endpoint, api_key, account, user, agent = snapshot
-            return _VikingClient(
+            client = _VikingClient(
                 endpoint, api_key, account=account, user=user, agent=agent,
             )
-        return _VikingClient(
-            self._endpoint,
-            self._api_key,
-            account=self._account,
-            user=self._user,
-            agent=self._agent,
-        )
+        else:
+            client = _VikingClient(
+                self._endpoint,
+                self._api_key,
+                account=self._account,
+                user=self._user,
+                agent=self._agent,
+            )
+        # Stamp the client with the snapshot it was actually built from, so
+        # _user_space() can key/publish its identity cache against the
+        # connection this specific client speaks for — not whatever
+        # self._conn_snapshot happens to be when the resolution runs. Callers
+        # like on_memory_write() build a client on one thread and resolve/use
+        # it later on a background thread; a reload in between must not let
+        # this stale client's resolved identity get cached under the new
+        # connection's key (see _user_space()).
+        client._conn_snapshot = snapshot
+        return client
 
     @staticmethod
     def _text_part(content: str) -> Dict[str, str]:
@@ -3912,7 +3923,19 @@ class OpenVikingMemoryProvider(MemoryProvider):
         # snapshot, so object-identity keying would miss the cache on every
         # write. The snapshot tuple is published atomically under
         # _client_refresh_lock and changes on every config reload.
-        snapshot = getattr(self, "_conn_snapshot", None)
+        #
+        # When an explicit client was passed in, use THAT client's own
+        # frozen snapshot (stamped by _new_client()) rather than the live
+        # self._conn_snapshot. Background writers (on_memory_write,
+        # sync_turn) build a client on one thread and resolve/use it later;
+        # if a reload swaps self._conn_snapshot in between, reading the live
+        # value here would resolve the old client's identity but publish it
+        # under the NEW connection's cache key, poisoning every subsequent
+        # lookup for the new connection with the old one's user.
+        if client is not None and hasattr(client, "_conn_snapshot"):
+            snapshot = client._conn_snapshot
+        else:
+            snapshot = getattr(self, "_conn_snapshot", None)
         cached = getattr(self, "_user_space_cache", None)
         if active is not None and cached is not None and cached[0] == snapshot:
             return cached[1]
@@ -3921,7 +3944,12 @@ class OpenVikingMemoryProvider(MemoryProvider):
             resolved = _resolve_user_space(active, timeout=timeout)
             if resolved:
                 # Only publish when the snapshot hasn't changed under us.
-                current_snapshot = getattr(self, "_conn_snapshot", None)
+                # (An explicit client's stamped snapshot is immutable once
+                # set, so this recheck only matters for the self._client path.)
+                if client is not None and hasattr(client, "_conn_snapshot"):
+                    current_snapshot = client._conn_snapshot
+                else:
+                    current_snapshot = getattr(self, "_conn_snapshot", None)
                 if snapshot is not None and snapshot is current_snapshot:
                     self._user_space_cache = (snapshot, resolved)
                 return resolved

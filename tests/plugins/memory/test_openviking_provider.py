@@ -1415,6 +1415,53 @@ def test_memory_write_uses_one_connection_for_identity_uri_and_post(monkeypatch)
     assert provider._memory_write_threads == set()
 
 
+def test_user_space_cache_not_poisoned_by_stale_client_across_reload():
+    """A client frozen via _new_client() before a reload must have its
+    resolved identity cached under ITS OWN snapshot, not whatever
+    self._conn_snapshot has moved on to by the time resolution runs.
+
+    Background writers (on_memory_write, sync_turn) capture a client early
+    and resolve/use it later, possibly after a profile reload has already
+    swapped the live connection. If the old client's resolved identity gets
+    published under the new connection's cache key, every subsequent lookup
+    for the new connection returns the old connection's user.
+    """
+    provider = OpenVikingMemoryProvider()
+
+    class StubClient:
+        def __init__(self, user):
+            self._user = user
+
+        def get(self, path, **kwargs):
+            assert path == "/api/v1/system/status"
+            return {"status": "ok", "result": {"user": self._user}}
+
+    def make_frozen_client(user):
+        # Mirrors _new_client(): stamp the client with whatever
+        # self._conn_snapshot is at the moment it's built.
+        client = StubClient(user)
+        client._conn_snapshot = provider._conn_snapshot
+        return client
+
+    # Connection A is live; a background writer freezes a client from it.
+    provider._conn_snapshot = ("http://a", "", "acct", "alice", "agent")
+    frozen_alice_client = make_frozen_client("alice")
+
+    # A reload swaps the live connection to B before the writer's deferred
+    # identity resolution runs.
+    provider._conn_snapshot = ("http://b", "", "acct", "bob", "agent")
+
+    # The writer resolves identity using its now-stale, frozen client.
+    resolved = provider._user_space(frozen_alice_client)
+    assert resolved == "alice"
+
+    # The live connection (B) must resolve and cache its OWN identity, not
+    # reuse the frozen client's "alice" from the write that just happened.
+    provider._client = make_frozen_client("bob")
+    resolved_live = provider._user_space()
+    assert resolved_live == "bob"
+
+
 def _make_prefetch_provider() -> OpenVikingMemoryProvider:
     provider = OpenVikingMemoryProvider()
     provider._client = MagicMock()
