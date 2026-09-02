@@ -549,7 +549,10 @@ def test_feed_cursor_is_durable_deduplicated_and_telegram_uses_home_target(
     assert calls[0]["items"] == [
         {
             "heading": "✅ Updated on this device",
-            "detail": "managed-skill · v2",
+            "detail": (
+                "managed-skill · v2\n"
+                "Security: Unavailable · Professionalism: Unavailable"
+            ),
         }
     ]
 
@@ -601,7 +604,10 @@ def test_telegram_update_available_offers_verified_update_action(
     assert calls[0]["items"] == [
         {
             "heading": "⬆️ Update available",
-            "detail": "managed-skill · v2",
+            "detail": (
+                "managed-skill · v2\n"
+                "Security: Unavailable · Professionalism: Unavailable"
+            ),
         }
     ]
 
@@ -671,6 +677,8 @@ def test_notifications_resolve_org_skill_names_filter_noise_and_deep_link(
             "moderation_note": None,
             "portal_url": "http://127.0.0.1:3111/orgs/org-1/wisdom/skills/remote-skill?version=3",
             "occurred_at": "2026-08-24T00:00:00Z",
+            "security_check": None,
+            "professionalism_check": None,
         }
     ]
     assert [
@@ -698,7 +706,10 @@ def test_notifications_resolve_org_skill_names_filter_noise_and_deep_link(
     assert calls[0]["items"] == [
         {
             "heading": "🆕 New skill from your team",
-            "detail": "team-runbook · v3",
+            "detail": (
+                "team-runbook · v3\n"
+                "Security: Unavailable · Professionalism: Unavailable"
+            ),
         }
     ]
 

@@ -2,6 +2,24 @@ import type { ActionResponse } from '@/types/hermes'
 
 import { capabilityScoped, type ProfileScope } from './client'
 
+export type WisdomReviewStatus = 'advisory' | 'blocked' | 'pass' | 'pending' | 'retry' | 'running' | 'unavailable'
+
+export interface WisdomReviewCheckRow {
+  key: string
+  label?: string
+  status: WisdomReviewStatus
+  finding_count: number
+  details: string[]
+}
+
+export interface WisdomReviewCheck {
+  schema_version?: number
+  status: WisdomReviewStatus
+  summary?: string
+  checks?: WisdomReviewCheckRow[]
+  provenance?: { kind: 'agent_assessed'; model: null | string; provider: null | string }
+}
+
 export interface WisdomStatus {
   configured: boolean
   setup_required_reason?: 'not_configured' | 'organization_changed' | null
@@ -22,6 +40,7 @@ export interface WisdomCandidate {
   reason: null | string
   qualification: string
   contribution_state: 'new' | 'prepared'
+  professionalism_check?: null | WisdomReviewCheck
 }
 
 export interface WisdomCandidateEvent {
@@ -48,6 +67,8 @@ export interface WisdomSkillSummary {
   install_count: number
   scan_verdict?: null | string
   system_spec?: null | Record<string, unknown>
+  security_check?: null | WisdomReviewCheck
+  professionalism_check?: null | WisdomReviewCheck
 }
 
 export interface WisdomDiscovery {
@@ -65,6 +86,8 @@ export interface WisdomDraft {
   scanVerdict: null | string
   systemSpec?: null | Record<string, unknown>
   updatedAt: string
+  security_check?: null | WisdomReviewCheck
+  professionalism_check?: null | WisdomReviewCheck
 }
 
 export interface WisdomPreparedDraft {
@@ -76,6 +99,7 @@ export interface WisdomPreparedDraft {
   local_scan: WisdomLocalScan
   system_specification: Record<string, unknown>
   next_step: string
+  professionalism_check: WisdomReviewCheck
 }
 
 export interface WisdomLocalScan {
@@ -87,6 +111,7 @@ export interface WisdomSubmittedDraft {
   draft: WisdomDraft
   local_scan: WisdomLocalScan
   notice: string
+  professionalism_check: WisdomReviewCheck
 }
 
 export interface WisdomDraftReview {
@@ -106,13 +131,24 @@ export interface WisdomRevisedDraft {
   draft: WisdomDraft & Record<string, unknown>
   local_scan: WisdomLocalScan
   notice: string
+  professionalism_check: WisdomReviewCheck
 }
 
 export interface WisdomSkillDetail {
   latest_version_detail?: Record<string, unknown>
   local_compatibility?: Record<string, unknown>
+  local_installation?: null | Record<string, unknown>
+  portal_url?: string | null
   skill: Record<string, unknown>
   versions: Array<Record<string, unknown>>
+}
+
+export interface WisdomVersionDetail {
+  local_compatibility?: Record<string, unknown>
+  local_installation?: null | Record<string, unknown>
+  portal_url?: string | null
+  skill: Record<string, unknown>
+  version: Record<string, unknown>
 }
 
 export interface WisdomVersionContent {
@@ -217,6 +253,13 @@ export const getWisdomDrafts = (profile?: ProfileScope): Promise<{ drafts: Wisdo
 
 export const getWisdomSkill = (skillId: string, profile?: ProfileScope): Promise<WisdomSkillDetail> =>
   request(`/api/wisdom/skills/${encodeURIComponent(skillId)}`, profile)
+
+export const getWisdomVersion = (
+  skillId: string,
+  version: number,
+  profile?: ProfileScope
+): Promise<WisdomVersionDetail> =>
+  request(`/api/wisdom/skills/${encodeURIComponent(skillId)}/versions/${version}`, profile)
 
 export const getWisdomVersionContent = (
   skillId: string,

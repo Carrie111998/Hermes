@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 # Launch the local Collective Wisdom demo as one coordinated, foreground stack.
 #
-# The supervisor keeps Portal, Gateway, Dashboard, and Desktop on the default
-# Hermes profile while isolating local demo credentials and logs. Press Ctrl-C
-# to stop application processes; database and object-store containers are
-# intentionally left running so demo state survives.
+# The supervisor keeps Portal, Gateway, the Hermes messaging gateway, Dashboard,
+# and Desktop on the default Hermes profile while isolating local demo
+# credentials and logs. Press Ctrl-C to stop application processes; database
+# and object-store containers are intentionally left running so demo state
+# survives.
 
 set -Eeuo pipefail
 
@@ -45,8 +46,28 @@ port_pid() {
   lsof -nP -iTCP:"$1" -sTCP:LISTEN -t 2>/dev/null | head -1
 }
 
+messaging_gateway_pid() {
+  (
+    export HERMES_HOME="${AGENT_HOME}"
+    export HERMES_SHARED_AUTH_DIR="${DEMO_HOME}/shared"
+    export HERMES_WISDOM_QUIET=1
+    # shellcheck disable=SC1091
+    source "${ROOT}/scripts/wisdom-demo-env.sh"
+    "${HERMES_WISDOM_PYTHON}" - "${AGENT_HOME}" <<'PY'
+from pathlib import Path
+import sys
+
+from gateway.control_socket import identify_gateway
+
+identity = identify_gateway(Path(sys.argv[1]), timeout=0.25)
+if identity and identity.get("pid"):
+    print(identity["pid"])
+PY
+  )
+}
+
 status() {
-  local port label pid
+  local port label pid messaging_pid
   while read -r port label; do
     pid="$(port_pid "${port}" || true)"
     if [[ -n "${pid}" ]]; then
@@ -63,6 +84,13 @@ status() {
 5173 Dashboard UI
 5174 Desktop renderer
 EOF
+
+  messaging_pid="$(messaging_gateway_pid 2>/dev/null || true)"
+  if [[ -n "${messaging_pid}" ]]; then
+    printf '%-18s up (pid %s)\n' "Messaging gateway" "${messaging_pid}"
+  else
+    printf '%-18s down\n' "Messaging gateway"
+  fi
 }
 
 require_directory() {
@@ -106,6 +134,21 @@ wait_for_http() {
     sleep 1
   done
   echo "error: ${label} did not return HTTP ${expected}" >&2
+  return 1
+}
+
+wait_for_messaging_gateway() {
+  local pid
+  for _ in $(seq 1 120); do
+    pid="$(messaging_gateway_pid 2>/dev/null || true)"
+    if [[ -n "${pid}" ]]; then
+      echo "ready: Hermes messaging gateway (pid ${pid})"
+      return 0
+    fi
+    sleep 0.5
+  done
+  echo "error: Hermes messaging gateway control socket did not become ready" >&2
+  tail -n 40 "${STATE_DIR}/messaging-gateway.log" >&2 || true
   return 1
 }
 
@@ -173,13 +216,61 @@ start_agent_process() {
   CHILD_PIDS+=("$!")
 }
 
+start_messaging_gateway_process() {
+  local name="messaging-gateway"
+  echo "starting: Hermes messaging gateway (log: ${STATE_DIR}/${name}.log)"
+  (
+    cd "${ROOT}"
+    export HERMES_HOME="${AGENT_HOME}"
+    export HERMES_SHARED_AUTH_DIR="${DEMO_HOME}/shared"
+    export GATEWAY_URL
+    export HERMES_WISDOM_QUIET=1
+    # shellcheck disable=SC1091
+    source "${ROOT}/scripts/wisdom-demo-env.sh"
+
+    while true; do
+      set +e
+      hermes gateway run --replace --external-supervisor -v
+      gateway_exit=$?
+      set -e
+
+      case "${gateway_exit}" in
+        0)
+          echo "Hermes messaging gateway stopped cleanly"
+          exit 0
+          ;;
+        75)
+          echo "Hermes messaging gateway requested restart; relaunching"
+          ;;
+        78)
+          echo "Hermes messaging gateway has a fatal configuration error; not restarting" >&2
+          exit 78
+          ;;
+        *)
+          echo "Hermes messaging gateway exited with status ${gateway_exit}; retrying in 1 second" >&2
+          sleep 1
+          ;;
+      esac
+    done
+  ) >"${STATE_DIR}/${name}.log" 2>&1 &
+  CHILD_PIDS+=("$!")
+}
+
 authenticate_demo() {
   local auth_record="${STATE_DIR}/portal-login.json"
   local -a relogin_args=(
     --privy-did "${PRIVY_DID}"
     --org-id "${TEAM_ORG_ID}"
-    --hermes-home "${DEMO_HOME}"
   )
+
+  # The Portal helper needs --hermes-home only for the first device-code
+  # bootstrap. On repeat launches an existing shared credential is imported
+  # without a device code, which the helper correctly refuses to treat as a
+  # fresh authorization. The Wisdom setup below refreshes and revalidates the
+  # existing team-scoped credential instead.
+  if [[ ! -s "${DEMO_HOME}/shared/nous_auth.json" ]]; then
+    relogin_args+=(--hermes-home "${DEMO_HOME}")
+  fi
 
   export HERMES_HOME="${AGENT_HOME}"
   export HERMES_SHARED_AUTH_DIR="${DEMO_HOME}/shared"
@@ -348,6 +439,9 @@ up() {
 
   authenticate_demo
 
+  start_messaging_gateway_process
+  wait_for_messaging_gateway
+
   start_agent_process \
     "dashboard-api" "${ROOT}" \
     hermes dashboard --host 127.0.0.1 --port 9119 --no-open --isolated --skip-build
@@ -367,16 +461,23 @@ up() {
   echo "  Portal:    ${PORTAL_URL}/orgs/${TEAM_ORG_SLUG}/wisdom"
   echo "  Management:${PORTAL_URL}/orgs/${TEAM_ORG_SLUG}/wisdom/admin"
   echo "  Dashboard: http://127.0.0.1:5173/skills"
+  echo "  Messaging: supervised (log: ${STATE_DIR}/messaging-gateway.log)"
   echo "  CLI:       HERMES_HOME=${AGENT_HOME} HERMES_SHARED_AUTH_DIR=${DEMO_HOME}/shared ${ROOT}/scripts/wisdom-demo-env.sh -- hermes wisdom status"
   echo
   echo "Keep this terminal open. Press Ctrl-C to stop application processes."
   wait
 }
 
-case "${1:-up}" in
-  up) up ;;
-  login) login ;;
-  status) status ;;
-  -h|--help|help) usage ;;
-  *) usage >&2; exit 2 ;;
-esac
+main() {
+  case "${1:-up}" in
+    up) up ;;
+    login) login ;;
+    status) status ;;
+    -h|--help|help) usage ;;
+    *) usage >&2; exit 2 ;;
+  esac
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  main "$@"
+fi

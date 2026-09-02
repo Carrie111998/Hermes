@@ -344,6 +344,36 @@ def test_prepare_requires_local_owner_edit_before_any_network(
         "hermes_wisdom.service.draft_description",
         lambda _body: pytest.fail("existing author copy should avoid a model call"),
     )
+    monkeypatch.setattr(
+        "hermes_wisdom.professionalism.run_review",
+        lambda job: {
+            "schema_version": 1,
+            "content_hash": job["content_hash"],
+            "author_description_hash": job["author_description_hash"],
+            "status": "pass",
+            "summary": "No professionalism concerns detected.",
+            "checks": [
+                {
+                    "key": key,
+                    "status": "pass",
+                    "finding_count": 0,
+                    "details": [],
+                }
+                for key in (
+                    "profanity_or_abuse",
+                    "hate_or_harassment",
+                    "sexual_or_graphic_language",
+                    "manipulative_or_spam",
+                )
+            ],
+            "provenance": {
+                "kind": "agent_assessed",
+                "provider": "codex",
+                "model": "gpt-5.6-sol",
+            },
+            "assessed_at": "2026-09-02T00:00:00+00:00",
+        },
+    )
 
     prepared = service.suggest("my-skill")
     assert prepared["network_submission"] is False
@@ -396,7 +426,9 @@ def test_prepare_requires_local_owner_edit_before_any_network(
         "commit",
         "content_hash",
         "description",
+        "professionalism_review",
     }
+    assert fake.submissions[0]["professionalism_review"]["status"] == "pass"
     serialized = json.dumps(fake.submissions[0])
     for forbidden in ("usage", "refinement", "candidate", "ranking", "stability"):
         assert forbidden not in serialized
@@ -1151,6 +1183,48 @@ def test_portal_install_url_preserves_explicit_version_selector():
         service._resolve_install_ref(
             "https://portal.example/orgs/team/wisdom/skills/skill-1?version=latest"
         )
+
+
+def test_version_detail_resolves_metadata_and_profile_portal_url(
+    monkeypatch, tmp_path: Path
+):
+    class VersionClient:
+        def skill(self, skill_id):
+            value = {
+                "skill": {"id": skill_id, "slug": "managed-skill"},
+                "versions": [{"version": 2}, {"version": 1}],
+            }
+            return SimpleNamespace(
+                **value, model_dump=lambda mode: copy.deepcopy(value)
+            )
+
+        def version(self, skill_id, version):
+            value = {
+                "skill": {"id": skill_id, "slug": "managed-skill"},
+                "version": {
+                    "version": version,
+                    "author_description": f"Release {version}",
+                    "content_hash": f"sha256:content-{version}",
+                    "system_spec": {},
+                },
+            }
+            return SimpleNamespace(
+                **value, model_dump=lambda mode: copy.deepcopy(value)
+            )
+
+    store = WisdomStore(tmp_path / "state")
+    store.activate_installation_identity("hwi_test", "nas_organisation:wisdom-local")
+    service = WisdomService(store=store, client=VersionClient())
+    monkeypatch.setattr(
+        "hermes_wisdom.service.portal_base_url", lambda: "http://127.0.0.1:3111"
+    )
+
+    detail = service.version_detail("skill-1", 1, include_compatibility=False)
+
+    assert detail["version"]["author_description"] == "Release 1"
+    assert detail["portal_url"] == (
+        "http://127.0.0.1:3111/orgs/wisdom-local/wisdom/skills/skill-1?version=1"
+    )
 
 
 def test_command_home_does_not_read_remote_collections_when_status_is_degraded(

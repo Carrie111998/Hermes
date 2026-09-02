@@ -123,6 +123,34 @@ def test_wisdom_rich_card_stays_below_telegram_limit_for_large_page():
     assert len(TelegramAdapter._wisdom_command_html(view)) < 4096
 
 
+def test_wisdom_back_control_is_separate_and_first():
+    view = WisdomView(
+        "Skill details",
+        "A shared skill",
+        actions=[WisdomAction("Install", callback_data="wi:cmd:install")],
+        navigation_actions=[WisdomAction("← Back", callback_data="wi:cmd:back")],
+    )
+
+    rendered = TelegramAdapter._wisdom_command_html(view)
+    with (
+        patch(
+            "plugins.platforms.telegram.adapter.InlineKeyboardButton",
+            side_effect=lambda text, **kwargs: SimpleNamespace(text=text, **kwargs),
+        ),
+        patch(
+            "plugins.platforms.telegram.adapter.InlineKeyboardMarkup",
+            side_effect=lambda rows: SimpleNamespace(inline_keyboard=rows),
+        ),
+    ):
+        keyboard = TelegramAdapter._wisdom_command_keyboard(view)
+
+    assert rendered.index("← Back") < rendered.index("A shared skill")
+    assert rendered.index("← Back") < rendered.index("Install")
+    assert keyboard is not None
+    assert [button.text for button in keyboard.inline_keyboard[0]] == ["← Back"]
+    assert [button.text for button in keyboard.inline_keyboard[1]] == ["Install"]
+
+
 @pytest.mark.asyncio
 async def test_group_continuation_is_always_rendered_as_dm_deep_link():
     adapter = _adapter()

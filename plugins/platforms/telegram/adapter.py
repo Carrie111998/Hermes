@@ -8114,6 +8114,11 @@ class TelegramAdapter(BasePlatformAdapter):
             if sum(map(len, item_html)) + len(candidate) > 2600:
                 break
             item_html.append(candidate)
+        navigation_controls = [
+            value
+            for action in getattr(view, "navigation_actions", [])
+            if (value := button(action))
+        ]
         controls = [value for action in view.actions if (value := button(action))]
         summary = (
             f"<p>{_html.escape(compact(view.summary, 600)).replace(chr(10), '<br/>')}</p>"
@@ -8125,10 +8130,13 @@ class TelegramAdapter(BasePlatformAdapter):
             if view.notice
             else ""
         )
+        navigation_html = (
+            f"<p>{' '.join(navigation_controls)}</p>" if navigation_controls else ""
+        )
         action_html = f"<p>{' '.join(controls)}</p>" if controls else ""
         return (
             f"<h3>{_html.escape(compact(view.title, 120))}</h3>"
-            f"{summary}{''.join(item_html)}{notice}{action_html}"
+            f"{navigation_html}{summary}{''.join(item_html)}{notice}{action_html}"
         )
 
     @staticmethod
@@ -8147,7 +8155,16 @@ class TelegramAdapter(BasePlatformAdapter):
     @staticmethod
     def _wisdom_command_keyboard(view) -> Optional["InlineKeyboardMarkup"]:
         rows = []
-        for actions in [*(item.actions for item in view.items), view.actions]:
+        action_groups = [
+            *(
+                [getattr(view, "navigation_actions", [])]
+                if getattr(view, "navigation_actions", [])
+                else []
+            ),
+            *(item.actions for item in view.items),
+            view.actions,
+        ]
+        for actions in action_groups:
             row = []
             for action in actions:
                 if action.url:
@@ -8389,6 +8406,7 @@ class TelegramAdapter(BasePlatformAdapter):
         qualification_reason: str,
         status: str,
         actions: List[Dict[str, Any]],
+        professionalism_review: Optional[Dict[str, Any]] = None,
     ) -> str:
         controls: list[str] = []
         for action in actions:
@@ -8407,12 +8425,22 @@ class TelegramAdapter(BasePlatformAdapter):
                 f'{_html.escape(callback_data, quote=True)}">{label}</tg-button>'
             )
         control_html = f"<br/>{' '.join(controls)}" if controls else ""
+        from hermes_wisdom.professionalism import review_text
+
+        review_html = (
+            "<br/><br/>"
+            + _html.escape(
+                review_text(professionalism_review, include_checks=True)
+            ).replace("\n", "<br/>")
+            if professionalism_review is not None
+            else ""
+        )
         return (
             "<h3>Hermes Collective Wisdom</h3>"
             "<p><b>Reusable skill ready to review</b><br/>"
             f"<code>{_html.escape(skill_name)}</code><br/>"
             f"<b>Why suggested:</b> {_html.escape(qualification_reason)}<br/>"
-            f"{_html.escape(status)}{control_html}</p>"
+            f"{_html.escape(status)}{review_html}{control_html}</p>"
         )
 
     @staticmethod
@@ -8507,6 +8535,8 @@ class TelegramAdapter(BasePlatformAdapter):
         metadata: Optional[Dict[str, Any]] = None,
     ) -> int:
         """Surface newly qualified local skills in their exact Telegram session."""
+        from hermes_wisdom.professionalism import review_text
+        from hermes_wisdom.service import WisdomService
         from hermes_wisdom.store import WisdomStore
 
         events = await self._run_wisdom_profile_operation(
@@ -8520,6 +8550,14 @@ class TelegramAdapter(BasePlatformAdapter):
             payload = event.get("payload")
             payload = payload if isinstance(payload, dict) else {}
             skill_name = str(payload.get("skill_name") or "Local skill")
+            professionalism_review = await self._run_wisdom_profile_operation(
+                lambda event=event: (
+                    WisdomService().finish_candidate_professionalism_review(
+                        skill_id=str(event["skill_id"]),
+                        content_hash=str(event["content_hash"]),
+                    )
+                )
+            )
             qualification_reason = self._wisdom_candidate_qualification_reason(
                 str(event.get("qualification") or payload.get("qualification") or "")
             )
@@ -8546,6 +8584,7 @@ class TelegramAdapter(BasePlatformAdapter):
                     "until you choose an action."
                 ),
                 actions=actions,
+                professionalism_review=professionalism_review,
             )
             delivered = False
             raw_request = getattr(getattr(self, "_bot", None), "do_api_request", None)
@@ -8586,7 +8625,8 @@ class TelegramAdapter(BasePlatformAdapter):
                         f"<code>{_html.escape(skill_name)}</code>\n"
                         "<b>Why suggested:</b> "
                         f"{_html.escape(qualification_reason)}\n"
-                        "Nothing is shared until you choose an action."
+                        "Nothing is shared until you choose an action.\n\n"
+                        f"{_html.escape(review_text(professionalism_review, include_checks=True))}"
                     ),
                     "parse_mode": ParseMode.HTML,
                     "reply_markup": self._wisdom_candidate_keyboard(actions),

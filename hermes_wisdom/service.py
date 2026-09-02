@@ -50,6 +50,11 @@ from .package import (
     prepare_package,
     verify_content_files,
 )
+from .professionalism import (
+    enqueue_review,
+    exact_utf8_package,
+    process_pending_reviews,
+)
 from .store import WisdomStore, utc_now
 
 
@@ -296,6 +301,123 @@ class WisdomService:
             scan=_scan_summary,
             config=_config(),
         )
+
+    def _enqueue_professionalism_review(
+        self,
+        *,
+        subject_id: str,
+        content_hash: str,
+        package_root: Path,
+        author_description: str,
+    ) -> dict[str, Any]:
+        return enqueue_review(
+            self.store,
+            skill_id=subject_id,
+            content_hash=content_hash,
+            package=exact_utf8_package(package_root),
+            author_description=author_description,
+        )
+
+    def process_professionalism_reviews(
+        self, *, max_jobs: int = 1, review_id: str | None = None
+    ) -> list[dict[str, Any]]:
+        return process_pending_reviews(
+            self.store, max_jobs=max_jobs, review_id=review_id
+        )
+
+    def candidate_professionalism_review(
+        self, *, skill_id: str, content_hash: str
+    ) -> dict[str, Any] | None:
+        row = self.store.professionalism_review(
+            skill_id=skill_id,
+            content_hash=content_hash,
+            author_description_hash=author_description_hash(""),
+        )
+        if row is None:
+            local = self.store.local_skill(skill_id)
+            source = Path(str(local["canonical_path"])) if local else None
+            if (
+                source is None
+                or not source.is_dir()
+                or _source_fingerprint(source) != content_hash
+            ):
+                return None
+            row = self._enqueue_professionalism_review(
+                subject_id=skill_id,
+                content_hash=content_hash,
+                package_root=source,
+                author_description="",
+            )
+        return row.get("result") or {"status": row["state"]}
+
+    def finish_candidate_professionalism_review(
+        self, *, skill_id: str, content_hash: str
+    ) -> dict[str, Any] | None:
+        row = self.store.professionalism_review(
+            skill_id=skill_id,
+            content_hash=content_hash,
+            author_description_hash=author_description_hash(""),
+        )
+        if row is None:
+            self.candidate_professionalism_review(
+                skill_id=skill_id, content_hash=content_hash
+            )
+            row = self.store.professionalism_review(
+                skill_id=skill_id,
+                content_hash=content_hash,
+                author_description_hash=author_description_hash(""),
+            )
+        if row is None:
+            return None
+        if row.get("state") != "complete":
+            self.store.expedite_professionalism_review(str(row["id"]))
+            process_pending_reviews(
+                self.store,
+                max_jobs=2,
+                review_id=str(row["id"]),
+                retry_delay_seconds=0,
+            )
+        return self.candidate_professionalism_review(
+            skill_id=skill_id, content_hash=content_hash
+        )
+
+    def _require_professionalism_review(
+        self,
+        *,
+        subject_id: str,
+        content_hash: str,
+        package_root: Path,
+        author_description: str,
+    ) -> dict[str, Any]:
+        job = self._enqueue_professionalism_review(
+            subject_id=subject_id,
+            content_hash=content_hash,
+            package_root=package_root,
+            author_description=author_description,
+        )
+        if job.get("state") != "complete":
+            self.store.expedite_professionalism_review(str(job["id"]))
+            process_pending_reviews(
+                self.store,
+                max_jobs=1,
+                review_id=str(job["id"]),
+                terminal_on_failure=True,
+            )
+            job = (
+                self.store.professionalism_review(
+                    skill_id=subject_id,
+                    content_hash=content_hash,
+                    author_description_hash=author_description_hash(author_description),
+                )
+                or job
+            )
+        result = job.get("result")
+        if not isinstance(result, dict):
+            raise WisdomConflict(
+                "Professionalism check is still running; try submission again shortly",
+                code="professionalism_review_pending",
+            )
+        return result
 
     def require_setup(self) -> None:
         wisdom = _config()
@@ -602,6 +724,13 @@ class WisdomService:
                 eligibility = "instruction_only_fork_required"
                 reason = str(exc)
             event = qualified.get((skill_id, source_hash))
+            candidate_review = (
+                self.candidate_professionalism_review(
+                    skill_id=skill_id, content_hash=source_hash
+                )
+                if event
+                else None
+            )
             candidates.append({
                 "local_skill_id": skill_id,
                 "name": path.name,
@@ -619,6 +748,7 @@ class WisdomService:
                     str(event["qualification"]) if event else "manual_selection"
                 ),
                 "contribution_state": "prepared" if contribution else "new",
+                "professionalism_check": candidate_review,
             })
         return candidates
 
@@ -640,6 +770,11 @@ class WisdomService:
         manifest = _parse_package_manifest(
             (overlay / "skill.manifest.json").read_bytes()
         )
+        review = self.store.professionalism_review(
+            skill_id=str(draft["skill_id"]),
+            content_hash=str(draft["content_hash"]),
+            author_description_hash=str(draft["description_hash"]),
+        )
         return {
             "network_submission": False,
             "local_draft_id": str(draft["id"]),
@@ -648,6 +783,11 @@ class WisdomService:
             "system_specification": manifest.requirements.model_dump(mode="json"),
             "files": _editable_package_files(overlay),
             "local_scan": _scan_summary(overlay),
+            "professionalism_check": (
+                review.get("result")
+                if review and isinstance(review.get("result"), dict)
+                else {"status": str(review.get("state") if review else "pending")}
+            ),
             "next_step": (
                 "Review and save the complete local package, then send its exact bytes "
                 "for owner-only server review."
@@ -711,6 +851,12 @@ class WisdomService:
                 "description_hash": local_package.description_hash,
                 "manifest_hash": local_package.manifest_hash,
             })
+            self._enqueue_professionalism_review(
+                subject_id=skill_id,
+                content_hash=local_package.content_hash,
+                package_root=local_package.overlay,
+                author_description=local_package.description,
+            )
             local = self.store.draft(local_id)
             if local is None:  # pragma: no cover - SQLite write/read invariant
                 raise WisdomValidationError("prepared local draft was not persisted")
@@ -758,12 +904,19 @@ class WisdomService:
             raise PackagePolicyError(
                 "source changed while the review overlay was being prepared"
             )
+        professionalism_review = self._require_professionalism_review(
+            subject_id=skill_id,
+            content_hash=package.content_hash,
+            package_root=package.overlay,
+            author_description=package.description,
+        )
         self.client.upload_private_objects(package.objects)
         server = self.client.submit_draft(
             slug=_slug(skill_name),
             commit=package.commit,
             content_hash=package.content_hash,
             description=package.description,
+            professionalism_review=professionalism_review,
         )
         self.store.set_draft_state(str(prepared["id"]), "submitted")
         self.store.record_draft({
@@ -783,6 +936,7 @@ class WisdomService:
         return {
             "draft": server.model_dump(mode="json"),
             "local_scan": local_scan,
+            "professionalism_check": professionalism_review,
             "notice": "Draft bytes are owner-private; nothing is published until hash-bound approval.",
         }
 
@@ -855,6 +1009,12 @@ class WisdomService:
             "description_hash": package.description_hash,
             "manifest_hash": package.manifest_hash,
         })
+        self._enqueue_professionalism_review(
+            subject_id=str(local["skill_id"]),
+            content_hash=package.content_hash,
+            package_root=package.overlay,
+            author_description=package.description,
+        )
         saved = self.store.draft(draft_id)
         if saved is None:  # pragma: no cover - SQLite write/read invariant
             raise WisdomValidationError("saved local draft was not persisted")
@@ -884,6 +1044,20 @@ class WisdomService:
             f"{portal_base_url()}/orgs/{quote(org_slug, safe='')}/wisdom/review/"
             f"{quote(draft_id, safe='')}"
         )
+
+    def portal_skill_url(
+        self, skill_id: str, *, version: int | None = None
+    ) -> str | None:
+        """Return the Portal detail URL when this profile has a verified team."""
+        org_id = self.store.active_org_id()
+        if not org_id:
+            return None
+        org_slug = org_id.split(":", 1)[-1]
+        url = (
+            f"{portal_base_url()}/orgs/{quote(org_slug, safe='')}/wisdom/skills/"
+            f"{quote(skill_id, safe='')}"
+        )
+        return f"{url}?version={version}" if version is not None else url
 
     def _candidate_event_context(
         self, event_id: str
@@ -1289,6 +1463,15 @@ class WisdomService:
                 "high-confidence local secret finding paused upload; explicitly confirm owner-only server review to continue"
             )
 
+        local = self.store.draft(draft_id)
+        review_subject = str(local["skill_id"]) if local else f"draft:{draft_id}"
+        professionalism_review = self._require_professionalism_review(
+            subject_id=review_subject,
+            content_hash=package.content_hash,
+            package_root=package.overlay,
+            author_description=package.description,
+        )
+
         self.client.upload_private_objects(package.objects)
         revised = self.client.revise_draft(
             draft_id,
@@ -1298,8 +1481,8 @@ class WisdomService:
             expected_content_hash=expected_content_hash,
             expected_description_hash=expected_description_hash,
             expected_manifest_hash=expected_manifest_hash,
+            professionalism_review=professionalism_review,
         )
-        local = self.store.draft(draft_id)
         if local:
             self.store.set_draft_state(draft_id, "invalidated")
             self.store.record_draft({
@@ -1320,6 +1503,7 @@ class WisdomService:
         return {
             "draft": revised.model_dump(mode="json"),
             "local_scan": local_scan,
+            "professionalism_check": professionalism_review,
             "notice": "Changes were saved as a new owner-private revision and rescanned.",
         }
 
@@ -1711,10 +1895,52 @@ class WisdomService:
                 )
         if include_compatibility:
             result["local_installation"] = self.store.installation(skill_id)
+        portal_url = self.portal_skill_url(skill_id)
+        if portal_url:
+            result["portal_url"] = portal_url
         return result
 
     def versions(self, skill_id: str) -> list[dict[str, Any]]:
         return self.client.skill(skill_id).versions
+
+    def version_detail(
+        self,
+        reference: str,
+        version: int,
+        *,
+        include_compatibility: bool = True,
+    ) -> dict[str, Any]:
+        """Resolve a skill reference and return one immutable version's metadata."""
+        if version < 1:
+            raise WisdomValidationError("Wisdom version must be a positive integer")
+        raw, _selected_version = self._resolve_install_ref(reference)
+        try:
+            detail = self.client.version(raw, version)
+        except WisdomNotFound:
+            matches = [
+                item for item in self.search_skills(raw) if item.get("slug") == raw
+            ]
+            if len(matches) != 1:
+                raise WisdomNotFound("Wisdom skill not found")
+            detail = self.client.version(str(matches[0]["id"]), version)
+        result = detail.model_dump(mode="json")
+        skill = result.get("skill") or {}
+        skill_id = str(skill.get("id") or raw)
+        specification = (result.get("version") or {}).get("system_spec")
+        if include_compatibility and isinstance(specification, dict):
+            parsed_specification = SystemSpecification.model_validate(specification)
+            result["local_compatibility"] = asdict(
+                evaluate(
+                    parsed_specification,
+                    detect_local_capabilities(parsed_specification),
+                )
+            )
+        if include_compatibility:
+            result["local_installation"] = self.store.installation(skill_id)
+        portal_url = self.portal_skill_url(skill_id, version=version)
+        if portal_url:
+            result["portal_url"] = portal_url
+        return result
 
     def _content_authority(self) -> str:
         installation_id = self.store.existing_installation_identity()

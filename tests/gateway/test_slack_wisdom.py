@@ -70,6 +70,27 @@ def test_wisdom_blocks_escape_untrusted_skill_text_and_limit_items():
     assert "&lt;here&gt;" in str(blocks)
 
 
+def test_wisdom_back_control_is_in_a_separate_first_action_row():
+    view = WisdomView(
+        "Skill details",
+        "A shared skill",
+        actions=[WisdomAction("Install", callback_data="wi:cmd:install")],
+        navigation_actions=[WisdomAction("← Back", callback_data="wi:cmd:back")],
+    )
+
+    blocks = render_wisdom_blocks(view)
+
+    assert [block["type"] for block in blocks] == [
+        "header",
+        "actions",
+        "section",
+        "actions",
+    ]
+    assert [button["text"]["text"] for button in blocks[1]["elements"]] == ["← Back"]
+    assert blocks[1]["elements"][0].get("style") is None
+    assert blocks[3]["elements"][0]["text"]["text"] == "Install"
+
+
 @pytest.mark.asyncio
 async def test_group_private_action_becomes_user_bound_dm_continuation():
     adapter = _adapter()

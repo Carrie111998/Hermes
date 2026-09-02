@@ -92,6 +92,13 @@ def test_high_usage_threshold_uses_consecutive_business_days_and_deduplicates(
         "business_day_timezone": "Australia/Brisbane",
         "business_week": "monday_friday",
     }
+    with store.transaction() as db:
+        reviews = db.execute(
+            "SELECT skill_id,content_hash,state FROM professionalism_review"
+        ).fetchall()
+    assert [tuple(row) for row in reviews] == [
+        (events[0]["skill_id"], events[0]["content_hash"], "pending")
+    ]
 
 
 def test_weekend_usage_neither_advances_nor_breaks_business_day_streak(

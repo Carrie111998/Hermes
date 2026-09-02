@@ -22,11 +22,16 @@ from hermes_wisdom.client import (
     WisdomValidationError,
 )
 from hermes_wisdom.package import PackagePolicyError
+from hermes_wisdom.review_presentation import (
+    aggregate_review_text,
+    full_review_text,
+)
 from hermes_wisdom.service import WisdomService, portal_base_url
 
 
 PAGE_SIZE = 5
 TOKEN_TTL_SECONDS = 600
+MAX_NAVIGATION_DEPTH = 8
 _ALIASES = {"list": "browse", "suggest": "submit"}
 _PRIVATE_COMMANDS = {
     "setup",
@@ -65,6 +70,12 @@ class WisdomAction:
     local_command: str | None = None
 
 
+@dataclass(frozen=True)
+class _NavigationTarget:
+    operation: str
+    arguments: dict[str, Any] = field(default_factory=dict)
+
+
 @dataclass
 class WisdomItem:
     title: str
@@ -79,6 +90,11 @@ class WisdomView:
     items: list[WisdomItem] = field(default_factory=list)
     actions: list[WisdomAction] = field(default_factory=list)
     notice: str | None = None
+    navigation_actions: list[WisdomAction] = field(default_factory=list)
+    _navigation_target: _NavigationTarget | None = field(default=None, repr=False)
+    _navigation_history: tuple[_NavigationTarget, ...] = field(
+        default_factory=tuple, repr=False
+    )
 
     def to_text(self) -> str:
         lines = [self.title]
@@ -170,6 +186,7 @@ class _Token:
     organization_id: str | None
     expires_at: float
     allow_dm_continuation: bool = False
+    navigation_history: tuple[_NavigationTarget, ...] = ()
 
 
 class _CallbackTokens:
@@ -183,6 +200,7 @@ class _CallbackTokens:
         context: WisdomCommandContext,
         *,
         allow_dm_continuation: bool = False,
+        navigation_history: tuple[_NavigationTarget, ...] = (),
     ) -> str:
         if not action.operation:
             raise ValueError("callback action has no operation")
@@ -197,6 +215,7 @@ class _CallbackTokens:
             organization_id=context.organization_id,
             expires_at=now + TOKEN_TTL_SECONDS,
             allow_dm_continuation=allow_dm_continuation,
+            navigation_history=navigation_history,
         )
         with self._lock:
             self._values = {
@@ -243,9 +262,29 @@ CALLBACK_TOKENS = _CallbackTokens()
 
 def bind_view_callbacks(view: WisdomView, context: WisdomCommandContext) -> WisdomView:
     """Bind every non-URL action to a short, scoped Telegram callback."""
+    current_history = view._navigation_history
+    forward_history = current_history
+    if view._navigation_target is not None:
+        if not forward_history or forward_history[-1] != view._navigation_target:
+            forward_history = (*forward_history, view._navigation_target)
+        forward_history = forward_history[-MAX_NAVIGATION_DEPTH:]
+
+    for action in view.navigation_actions:
+        if action.operation and not action.url:
+            token = CALLBACK_TOKENS.issue(
+                action,
+                context,
+                navigation_history=current_history,
+            )
+            action.callback_data = f"wi:cmd:{token}"
+
     for action in [*view.actions, *(a for item in view.items for a in item.actions)]:
         if action.operation and not action.url:
-            token = CALLBACK_TOKENS.issue(action, context)
+            token = CALLBACK_TOKENS.issue(
+                action,
+                context,
+                navigation_history=forward_history,
+            )
             action.callback_data = f"wi:cmd:{token}"
     return view
 
@@ -300,39 +339,52 @@ class WisdomCommandController:
         raw_args: str,
         service: WisdomService,
         context: WisdomCommandContext,
+        *,
+        _navigation_history: tuple[_NavigationTarget, ...] = (),
     ) -> WisdomView:
         keyword, args = self.parse(raw_args)
+        target = _NavigationTarget("command", {"raw_args": raw_args.strip()})
         if keyword == "action":
             if len(args) != 1:
                 raise ValueError("Usage: /wisdom action <control>")
             return self.execute_token(args[0], service, context)
         if context.is_group and keyword == "home":
-            return WisdomView(
-                "Collective Wisdom",
-                "Browse skills published by your team. Private skills and device changes continue in a direct message.",
-                actions=[
-                    WisdomAction(
-                        "Browse",
-                        "browse",
-                        primary=True,
-                        local_command=_wisdom_command("browse"),
-                    ),
-                    WisdomAction("Continue in DM", "continue_dm", {"raw_args": ""}),
-                    WisdomAction("Help", "help", local_command=_wisdom_command("help")),
-                ],
+            return self._attach_navigation(
+                WisdomView(
+                    "Collective Wisdom",
+                    "Browse skills published by your team. Private skills and device changes continue in a direct message.",
+                    actions=[
+                        WisdomAction(
+                            "Browse",
+                            "browse",
+                            primary=True,
+                            local_command=_wisdom_command("browse"),
+                        ),
+                        WisdomAction("Continue in DM", "continue_dm", {"raw_args": ""}),
+                        WisdomAction(
+                            "Help", "help", local_command=_wisdom_command("help")
+                        ),
+                    ],
+                ),
+                target,
+                _navigation_history,
             )
         if context.is_group and keyword in _PRIVATE_COMMANDS:
-            return WisdomView(
-                "Collective Wisdom",
-                "Private skills, device state, and mutations are available in a direct message.",
-                actions=[
-                    WisdomAction(
-                        "Continue in DM",
-                        "continue_dm",
-                        {"raw_args": raw_args},
-                        primary=True,
-                    )
-                ],
+            return self._attach_navigation(
+                WisdomView(
+                    "Collective Wisdom",
+                    "Private skills, device state, and mutations are available in a direct message.",
+                    actions=[
+                        WisdomAction(
+                            "Continue in DM",
+                            "continue_dm",
+                            {"raw_args": raw_args},
+                            primary=True,
+                        )
+                    ],
+                ),
+                target,
+                _navigation_history,
             )
         handlers = {
             "home": self._home,
@@ -357,7 +409,7 @@ class WisdomCommandController:
         if handler is None:
             view = self._help(service, [])
             view.notice = f"Unknown /wisdom keyword: {keyword}"
-            return view
+            return self._attach_navigation(view, target, _navigation_history)
         if keyword == "show":
             view = self._show(
                 service,
@@ -370,7 +422,60 @@ class WisdomCommandController:
             view = handler(service, args)
         if context.is_group:
             self._make_group_safe(view, raw_args=raw_args)
+        return self._attach_navigation(view, target, _navigation_history)
+
+    @staticmethod
+    def _attach_navigation(
+        view: WisdomView,
+        target: _NavigationTarget,
+        history: tuple[_NavigationTarget, ...],
+    ) -> WisdomView:
+        bounded_history = tuple(history[-MAX_NAVIGATION_DEPTH:])
+        view._navigation_target = target
+        view._navigation_history = bounded_history
+        view.navigation_actions = (
+            [WisdomAction("← Back", "back")] if bounded_history else []
+        )
         return view
+
+    def _execute_navigation_target(
+        self,
+        target: _NavigationTarget,
+        history: tuple[_NavigationTarget, ...],
+        service: WisdomService,
+        context: WisdomCommandContext,
+    ) -> WisdomView:
+        if target.operation == "command":
+            return self.execute(
+                str(target.arguments.get("raw_args") or ""),
+                service,
+                context,
+                _navigation_history=history,
+            )
+        if target.operation == "browse_page":
+            view = self._browse(
+                service,
+                [str(target.arguments.get("query") or "")],
+                page=max(0, int(target.arguments.get("page") or 0)),
+            )
+            raw_args = "browse " + str(target.arguments.get("query") or "")
+        elif target.operation == "versions_page":
+            skill = str(target.arguments.get("skill") or "")
+            view = self._versions(
+                service,
+                [skill],
+                page=max(0, int(target.arguments.get("page") or 0)),
+            )
+            raw_args = f"versions {skill}".strip()
+        elif target.operation == "install_modes":
+            reference = str(target.arguments.get("reference") or "")
+            view = self._install_modes(reference)
+            raw_args = f"install {reference}".strip()
+        else:
+            raise ValueError("Invalid Collective Wisdom navigation target.")
+        if context.is_group:
+            self._make_group_safe(view, raw_args=raw_args.strip())
+        return self._attach_navigation(view, target, history)
 
     def execute_token(
         self,
@@ -380,6 +485,15 @@ class WisdomCommandController:
     ) -> WisdomView:
         value = CALLBACK_TOKENS.resolve(token, context, consume=False)
         operation, args = value.operation, value.arguments
+        if operation == "back":
+            if not value.navigation_history:
+                raise ValueError("This Collective Wisdom view has no previous page.")
+            return self._execute_navigation_target(
+                value.navigation_history[-1],
+                value.navigation_history[:-1],
+                service,
+                context,
+            )
         navigation = {
             "home": "",
             "browse": "browse " + str(args.get("query") or ""),
@@ -394,28 +508,26 @@ class WisdomCommandController:
             "help": "help",
         }
         if operation == "browse_page":
-            view = self._browse(
+            return self._execute_navigation_target(
+                _NavigationTarget("browse_page", dict(args)),
+                value.navigation_history,
                 service,
-                [str(args.get("query") or "")],
-                page=max(0, int(args.get("page") or 0)),
+                context,
             )
-            if context.is_group:
-                self._make_group_safe(view, raw_args="browse")
-            return view
         if operation == "versions_page":
-            view = self._versions(
+            return self._execute_navigation_target(
+                _NavigationTarget("versions_page", dict(args)),
+                value.navigation_history,
                 service,
-                [str(args.get("skill") or "")],
-                page=max(0, int(args.get("page") or 0)),
+                context,
             )
-            if context.is_group:
-                self._make_group_safe(
-                    view,
-                    raw_args=f"versions {args.get('skill') or ''}".strip(),
-                )
-            return view
         if operation in navigation:
-            return self.execute(navigation[operation], service, context)
+            return self.execute(
+                navigation[operation],
+                service,
+                context,
+                _navigation_history=value.navigation_history,
+            )
 
         # Navigation remains reusable for ten minutes. Mutation controls are
         # consumed only after the authoritative operation succeeds, so a
@@ -458,12 +570,22 @@ class WisdomCommandController:
                 WisdomView("Draft declined", "These exact bytes will not be published.")
             )
         if operation == "install_modes":
-            return self._install_modes(str(args["reference"]))
+            return self._attach_navigation(
+                self._install_modes(str(args["reference"])),
+                _NavigationTarget("install_modes", dict(args)),
+                value.navigation_history,
+            )
         if operation == "install_plan":
             plan = service.install_plan(
                 str(args["reference"]), update_mode=args.get("update_mode")
             )
-            return complete(self._plan_view(plan, kind="install"))
+            return complete(
+                self._attach_navigation(
+                    self._plan_view(plan, kind="install"),
+                    _NavigationTarget("install_plan", dict(args)),
+                    value.navigation_history,
+                )
+            )
         if operation == "install_apply":
             result = service.install_apply(str(args["receipt"]), accept_partial=False)
             return complete(
@@ -483,9 +605,19 @@ class WisdomCommandController:
             plan = service.update_plan(str(args["skill_id"]))
             if not plan.get("receipt"):
                 return complete(
-                    WisdomView("Skill is current", "No update is available.")
+                    self._attach_navigation(
+                        WisdomView("Skill is current", "No update is available."),
+                        _NavigationTarget("update_plan", dict(args)),
+                        value.navigation_history,
+                    )
                 )
-            return complete(self._plan_view(plan, kind="update"))
+            return complete(
+                self._attach_navigation(
+                    self._plan_view(plan, kind="update"),
+                    _NavigationTarget("update_plan", dict(args)),
+                    value.navigation_history,
+                )
+            )
         if operation == "update_apply":
             result = service.update_apply(str(args["receipt"]))
             return complete(
@@ -506,22 +638,26 @@ class WisdomCommandController:
             return complete(self._check_view(result))
         if operation == "uninstall_confirm":
             skill_id = str(args["skill_id"])
-            return WisdomView(
-                "Remove managed skill?",
-                "The validated managed copy will move to recoverable Wisdom trash.",
-                actions=[
-                    WisdomAction(
-                        "Cancel",
-                        "installed",
-                        local_command=_wisdom_command("installed"),
-                    ),
-                    WisdomAction(
-                        "Uninstall",
-                        "uninstall_apply",
-                        {"skill_id": skill_id},
-                        destructive=True,
-                    ),
-                ],
+            return self._attach_navigation(
+                WisdomView(
+                    "Remove managed skill?",
+                    "The validated managed copy will move to recoverable Wisdom trash.",
+                    actions=[
+                        WisdomAction(
+                            "Cancel",
+                            "installed",
+                            local_command=_wisdom_command("installed"),
+                        ),
+                        WisdomAction(
+                            "Uninstall",
+                            "uninstall_apply",
+                            {"skill_id": skill_id},
+                            destructive=True,
+                        ),
+                    ],
+                ),
+                _NavigationTarget("uninstall_confirm", dict(args)),
+                value.navigation_history,
             )
         if operation == "uninstall_apply":
             result = service.uninstall(str(args["skill_id"]))
@@ -776,7 +912,12 @@ class WisdomCommandController:
         version = item.get("latest_version")
         return WisdomItem(
             skill_name,
-            f"v{version or '?'} · {item.get('author_description') or 'No description'}",
+            "\n".join([
+                f"v{version or '?'} · {item.get('author_description') or 'No description'}",
+                aggregate_review_text(
+                    item.get("security_check"), item.get("professionalism_check")
+                ),
+            ]),
             actions=[
                 WisdomAction(
                     "View",
@@ -833,6 +974,17 @@ class WisdomCommandController:
             else "Installed: no"
         )
         skill_name = str(skill.get("slug") or skill_id)
+        review_text = (
+            full_review_text(
+                latest_version.get("security_check"),
+                latest_version.get("professionalism_check"),
+            )
+            if include_compatibility
+            else aggregate_review_text(
+                latest_version.get("security_check"),
+                latest_version.get("professionalism_check"),
+            )
+        )
         return WisdomView(
             skill_name,
             "\n".join([
@@ -841,6 +993,8 @@ class WisdomCommandController:
                 f"Compatibility: {compatibility.get('outcome') or 'review on install'}",
                 f"Requirements: {requirements}",
                 installation_text,
+                "",
+                review_text,
             ]),
             actions=[
                 WisdomAction(
@@ -903,11 +1057,17 @@ class WisdomCommandController:
             items=[
                 WisdomItem(
                     f"Version {item.get('version')}",
-                    str(
-                        item.get("created_at")
-                        or item.get("published_at")
-                        or "Immutable published version"
-                    ),
+                    "\n".join([
+                        str(
+                            item.get("created_at")
+                            or item.get("published_at")
+                            or "Immutable published version"
+                        ),
+                        aggregate_review_text(
+                            item.get("security_check"),
+                            item.get("professionalism_check"),
+                        ),
+                    ]),
                     actions=[
                         WisdomAction(
                             "Install",
@@ -1063,6 +1223,12 @@ class WisdomCommandController:
             detail.append(f"Server scan: {verdict}")
         if findings:
             detail.append(f"Findings: {len(findings)} — inspect in full review")
+        detail.extend([
+            "",
+            full_review_text(
+                draft.get("security_check"), draft.get("professionalism_check")
+            ),
+        ])
         if effective_policy:
             mode = (
                 effective_policy.get("publication_mode")

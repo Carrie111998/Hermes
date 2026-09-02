@@ -154,7 +154,9 @@ def test_identity_rotation_is_atomic_with_org_activation(tmp_path: Path):
     assert store.active_org_id() == "org-2"
 
 
-def test_schema_v7_tracks_profile_local_usage_and_surface_delivery(tmp_path: Path):
+def test_schema_v8_tracks_profile_local_usage_surface_delivery_and_reviews(
+    tmp_path: Path,
+):
     store = WisdomStore(tmp_path / "wisdom")
     with store.transaction() as db:
         snapshot_columns = {
@@ -169,6 +171,12 @@ def test_schema_v7_tracks_profile_local_usage_and_surface_delivery(tmp_path: Pat
         event_columns = {
             row[1] for row in db.execute("PRAGMA table_info(local_event)").fetchall()
         }
+        review_columns = {
+            row[1]
+            for row in db.execute(
+                "PRAGMA table_info(professionalism_review)"
+            ).fetchall()
+        }
         version = db.execute(
             "SELECT value FROM schema_meta WHERE key='schema_version'"
         ).fetchone()[0]
@@ -177,7 +185,53 @@ def test_schema_v7_tracks_profile_local_usage_and_surface_delivery(tmp_path: Pat
     assert {"day_local", "timezone_name"} <= usage_columns
     assert "day_utc" not in usage_columns
     assert "telegram_delivered_at" in event_columns
-    assert version == "7"
+    assert {
+        "content_hash",
+        "author_description_hash",
+        "package_json",
+        "state",
+        "attempts",
+        "lease_expires_at",
+        "result_json",
+    } <= review_columns
+    assert version == "8"
+
+
+def test_professionalism_review_queue_is_hash_bound_idempotent_and_leased(
+    tmp_path: Path,
+):
+    store = WisdomStore(tmp_path / "wisdom")
+    first = store.enqueue_professionalism_review(
+        skill_id="skill-1",
+        content_hash="sha256:" + "a" * 64,
+        author_description_hash="sha256:" + "b" * 64,
+        package=[{"path": "SKILL.md", "content_utf8": "hello"}],
+        author_description="A useful skill.",
+    )
+    duplicate = store.enqueue_professionalism_review(
+        skill_id="skill-1",
+        content_hash="sha256:" + "a" * 64,
+        author_description_hash="sha256:" + "b" * 64,
+        package=[{"path": "SKILL.md", "content_utf8": "ignored duplicate"}],
+        author_description="A useful skill.",
+    )
+
+    assert duplicate["id"] == first["id"]
+    claimed = store.claim_professionalism_review(worker_id="worker-1")
+    assert claimed and claimed["id"] == first["id"]
+    assert claimed["attempts"] == 1
+    assert store.claim_professionalism_review(worker_id="worker-2") is None
+
+    result = {"status": "pass"}
+    assert store.complete_professionalism_review(
+        first["id"], worker_id="worker-1", result=result
+    )
+    saved = store.professionalism_review(
+        skill_id="skill-1",
+        content_hash="sha256:" + "a" * 64,
+        author_description_hash="sha256:" + "b" * 64,
+    )
+    assert saved and saved["state"] == "complete" and saved["result"] == result
 
 
 def test_candidate_delivery_is_independent_per_surface(tmp_path: Path):

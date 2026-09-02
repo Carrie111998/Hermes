@@ -396,6 +396,7 @@ async def _wisdom_checker_loop(interval: int = 300) -> None:
 
                     service = WisdomService()
                     service.require_setup()
+                    service.process_professionalism_reviews(max_jobs=4)
                     return service.check(apply_automatic=False)
 
                 await asyncio.to_thread(reconcile_wisdom)
@@ -15275,6 +15276,21 @@ async def _run_wisdom(profile: Optional[str], fn, *, require_setup: bool = True)
         raise _wisdom_http_error(exc) from exc
 
 
+def _schedule_wisdom_professionalism_reviews(profile: Optional[str]) -> None:
+    """Wake the local review worker after Dashboard/Desktop creates new work."""
+
+    async def run() -> None:
+        try:
+            await _run_wisdom(
+                profile,
+                lambda service: service.process_professionalism_reviews(max_jobs=4),
+            )
+        except Exception:
+            _log.debug("Collective Wisdom professionalism worker failed", exc_info=True)
+
+    asyncio.create_task(run())
+
+
 @app.get("/api/wisdom/status")
 async def get_wisdom_status(profile: Optional[str] = None):
     return await _run_wisdom(
@@ -15375,7 +15391,19 @@ async def get_wisdom_discovery(profile: Optional[str] = None):
 
 @app.get("/api/wisdom/skills/{skill_id}")
 async def get_wisdom_skill(skill_id: str, profile: Optional[str] = None):
-    return await _run_wisdom(profile, lambda service: service.show(skill_id))
+    # Command views intentionally show human-readable slugs. Accept the same
+    # opaque-ID-or-exact-slug references as `/wisdom show` so Desktop preview
+    # actions can consume command output without leaking registry IDs into it.
+    return await _run_wisdom(profile, lambda service: service.resolve_skill(skill_id))
+
+
+@app.get("/api/wisdom/skills/{skill_id}/versions/{version}")
+async def get_wisdom_version(
+    skill_id: str, version: int, profile: Optional[str] = None
+):
+    return await _run_wisdom(
+        profile, lambda service: service.version_detail(skill_id, version)
+    )
 
 
 @app.get("/api/wisdom/skills/{skill_id}/versions/{version}/content")
@@ -15389,7 +15417,7 @@ async def get_wisdom_version_content(
 
 @app.post("/api/wisdom/suggest")
 async def post_wisdom_suggest(body: WisdomSuggestRequest):
-    return await _run_wisdom(
+    result = await _run_wisdom(
         body.profile,
         lambda service: service.suggest(
             body.skill,
@@ -15399,6 +15427,9 @@ async def post_wisdom_suggest(body: WisdomSuggestRequest):
             local_skill_id=body.local_skill_id,
         ),
     )
+    if result.get("network_submission") is False and result.get("local_draft_id"):
+        _schedule_wisdom_professionalism_reviews(body.profile)
+    return result
 
 
 @app.post("/api/wisdom/review")
@@ -15413,7 +15444,7 @@ async def post_wisdom_review(body: WisdomReviewRequest):
 
 @app.post("/api/wisdom/prepared/save")
 async def post_wisdom_prepared_save(body: WisdomPreparedSaveRequest):
-    return await _run_wisdom(
+    result = await _run_wisdom(
         body.profile,
         lambda service: service.save_prepared(
             body.draft_id,
@@ -15421,6 +15452,8 @@ async def post_wisdom_prepared_save(body: WisdomPreparedSaveRequest):
             files=[item.model_dump() for item in body.files],
         ),
     )
+    _schedule_wisdom_professionalism_reviews(body.profile)
+    return result
 
 
 @app.post("/api/wisdom/candidates/dismiss")

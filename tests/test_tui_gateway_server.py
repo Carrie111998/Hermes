@@ -18036,6 +18036,39 @@ def test_slash_exec_concurrent_first_use_spawns_single_worker(monkeypatch):
         server._sessions.pop("race-spawn", None)
 
 
+def test_slash_exec_wisdom_uses_native_profile_scoped_controller(monkeypatch, tmp_path):
+    class _ExplodingWorker:
+        def __init__(self, *args, **kwargs):
+            raise AssertionError("native /wisdom must not spawn the CLI worker")
+
+    profile_home = tmp_path / "profile"
+    profile_home.mkdir()
+    session = _session(
+        profile_home=str(profile_home),
+        session_key="wisdom-session",
+        slash_worker=None,
+    )
+    server._sessions["wisdom-native"] = session
+    monkeypatch.setattr(server, "_SlashWorker", _ExplodingWorker)
+
+    try:
+        resp = server.handle_request({
+            "id": "wisdom",
+            "method": "slash.exec",
+            "params": {
+                "command": "wisdom help",
+                "session_id": "wisdom-native",
+            },
+        })
+    finally:
+        server._sessions.pop("wisdom-native", None)
+
+    assert "result" in resp
+    assert "Collective Wisdom commands" in resp["result"]["output"]
+    assert "/wisdom browse" in resp["result"]["output"]
+    assert session["slash_worker"] is None
+
+
 def test_session_close_rpc_claims_then_tears_down(monkeypatch):
     seen = []
     claimed = {"session_key": "k"}

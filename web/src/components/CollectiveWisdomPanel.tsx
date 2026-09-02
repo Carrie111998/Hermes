@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
-import { AlertTriangle, CheckCircle2, Loader2, Search, Sparkles } from 'lucide-react'
+import { AlertTriangle, Loader2, Search, Sparkles } from 'lucide-react'
 
 import { api } from '@/lib/api'
 import type {
@@ -9,6 +9,7 @@ import type {
   WisdomDraft,
   WisdomDraftReview,
   WisdomPreparedDraft,
+  WisdomReviewCheck,
   WisdomActionPlan,
   WisdomInstallations,
   WisdomSkillDetail,
@@ -21,6 +22,7 @@ import { Input } from '@nous-research/ui/ui/components/input'
 import { useI18n } from '@/i18n'
 import { WisdomFileEditor } from './WisdomFileEditor'
 import { WisdomSystemSpecificationEditor } from './WisdomManifestEditor'
+import { WisdomCheckBadge, WisdomReviewTables } from './WisdomChecks'
 import {
   parseWisdomSystemSpecification,
   wisdomManifestValidationError,
@@ -780,6 +782,11 @@ export function CollectiveWisdomPanel({ profile }: Props) {
                   <div className="min-w-0">
                     <p className="truncate font-mono text-sm">{candidate.name}</p>
                     <p className="text-xs text-text-tertiary">{candidateSummary(candidate)}</p>
+                    {candidate.professionalism_check && (
+                      <div className="mt-1">
+                        <WisdomCheckBadge label="Professionalism" value={candidate.professionalism_check} />
+                      </div>
+                    )}
                   </div>
                   <Button
                     size="sm"
@@ -817,6 +824,14 @@ export function CollectiveWisdomPanel({ profile }: Props) {
                             <div className="min-w-0">
                               <p className="truncate font-mono text-sm">{candidate.name}</p>
                               <p className="text-xs text-text-tertiary">{candidateSummary(candidate)}</p>
+                              {candidate.professionalism_check && (
+                                <div className="mt-1">
+                                  <WisdomCheckBadge
+                                    label="Professionalism"
+                                    value={candidate.professionalism_check}
+                                  />
+                                </div>
+                              )}
                             </div>
                             <Button
                               size="sm"
@@ -874,9 +889,8 @@ export function CollectiveWisdomPanel({ profile }: Props) {
             <div className="mb-3 flex items-start justify-between gap-3">
               <span className="font-mono font-semibold">{skill.slug}</span>
               <span className="flex shrink-0 flex-col items-end gap-1">
-                <span className="flex items-center gap-1 text-xs text-emerald-400">
-                  <CheckCircle2 className="h-3 w-3" /> {copy.serverScanPassed}
-                </span>
+                <WisdomCheckBadge label="Security" value={skill.security_check} />
+                <WisdomCheckBadge label="Professionalism" value={skill.professionalism_check} />
                 {pendingUpdates.has(skill.id) && (
                   <span className="text-xs text-amber-500">
                     {copy.updateAvailable(pendingUpdates.get(skill.id)?.plan?.version)}
@@ -905,6 +919,18 @@ export function CollectiveWisdomPanel({ profile }: Props) {
               {copy.close}
             </Button>
           </div>
+          <WisdomReviewTables
+            security={
+              asRecord(asRecord(selected.latest_version_detail).version).security_check as
+                | WisdomReviewCheck
+                | undefined
+            }
+            professionalism={
+              asRecord(asRecord(selected.latest_version_detail).version).professionalism_check as
+                | WisdomReviewCheck
+                | undefined
+            }
+          />
           <pre className="mt-4 max-h-80 overflow-auto whitespace-pre-wrap text-xs text-text-secondary">
             {JSON.stringify(
               {
@@ -1041,6 +1067,7 @@ export function CollectiveWisdomPanel({ profile }: Props) {
         <div className="border border-cyan-500/40 p-4" aria-label="Prepare owner-private Wisdom draft">
           <h3 className="font-mono text-base">{copy.prepareTitle}</h3>
           <p className="mt-1 text-xs text-text-secondary">{copy.prepareNotice}</p>
+          <WisdomReviewTables professionalism={prepared.professionalism_check} />
           <label className="mt-4 block text-xs font-medium" htmlFor="wisdom-author-description">
             {copy.ownerDescription}
           </label>
@@ -1134,6 +1161,10 @@ export function CollectiveWisdomPanel({ profile }: Props) {
             </div>
             <div>
               <strong>Server-enforced scan and server-derived facts</strong>
+              <WisdomReviewTables
+                security={review.draft.security_check}
+                professionalism={review.draft.professionalism_check}
+              />
               <pre className="mt-1 max-h-48 overflow-auto whitespace-pre-wrap text-text-secondary">
                 {JSON.stringify(
                   {

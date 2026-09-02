@@ -154,6 +154,20 @@ def test_approve_exact_three_hash_body():
 
 def test_revise_binds_predecessor_hashes_and_new_private_commit():
     value = client(Response(201, {"draft": _draft(id="d2")}))
+    professionalism_review = {
+        "schema_version": 1,
+        "content_hash": "sha256:" + "f" * 64,
+        "author_description_hash": "sha256:" + "9" * 64,
+        "status": "pass",
+        "summary": "No language or conduct concerns detected.",
+        "checks": [],
+        "provenance": {
+            "kind": "agent_assessed",
+            "provider": "codex",
+            "model": "gpt-5.6-sol",
+        },
+        "assessed_at": "2026-09-02T00:00:00Z",
+    }
 
     revised = value.revise_draft(
         "d1",
@@ -163,6 +177,7 @@ def test_revise_binds_predecessor_hashes_and_new_private_commit():
         expected_content_hash="sha256:" + "b" * 64,
         expected_description_hash="sha256:" + "c" * 64,
         expected_manifest_hash="sha256:" + "d" * 64,
+        professionalism_review=professionalism_review,
     )
 
     assert revised.id == "d2"
@@ -178,6 +193,7 @@ def test_revise_binds_predecessor_hashes_and_new_private_commit():
         "expected_content_hash": "sha256:" + "b" * 64,
         "expected_author_description_hash": "sha256:" + "c" * 64,
         "expected_package_manifest_hash": "sha256:" + "d" * 64,
+        "professionalism_review": professionalism_review,
     }
 
 

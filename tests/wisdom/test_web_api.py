@@ -62,6 +62,59 @@ def test_setup_bff_forwards_explicit_disclosure_with_profile_scope(monkeypatch):
     assert rejected.value.status_code == 422
 
 
+def test_skill_detail_bff_resolves_command_slug_with_profile_scope(monkeypatch):
+    calls = []
+
+    class Service:
+        def resolve_skill(self, reference):
+            calls.append(("resolve", reference))
+            return {"skill": {"id": "skill-1", "slug": reference}}
+
+    async def run(profile, fn):
+        calls.append(("profile", profile))
+        return fn(Service())
+
+    monkeypatch.setattr(web_server, "_run_wisdom", run)
+
+    result = asyncio.run(
+        web_server.get_wisdom_skill("collective-wisdom-canary", profile="research")
+    )
+
+    assert result == {"skill": {"id": "skill-1", "slug": "collective-wisdom-canary"}}
+    assert calls == [
+        ("profile", "research"),
+        ("resolve", "collective-wisdom-canary"),
+    ]
+
+
+def test_version_detail_bff_preserves_skill_version_and_profile_scope(monkeypatch):
+    calls = []
+
+    class Service:
+        def version_detail(self, reference, version):
+            calls.append(("version", reference, version))
+            return {
+                "skill": {"id": "skill-1", "slug": reference},
+                "version": {"version": version, "explanation": "Reviewed release"},
+            }
+
+    async def run(profile, fn):
+        calls.append(("profile", profile))
+        return fn(Service())
+
+    monkeypatch.setattr(web_server, "_run_wisdom", run)
+
+    result = asyncio.run(
+        web_server.get_wisdom_version("collective-wisdom-canary", 2, profile="research")
+    )
+
+    assert result["version"] == {"version": 2, "explanation": "Reviewed release"}
+    assert calls == [
+        ("profile", "research"),
+        ("version", "collective-wisdom-canary", 2),
+    ]
+
+
 def test_suggest_bff_preserves_profile_and_owner_approved_fields(monkeypatch) -> None:
     calls: list[tuple[str | None, tuple[object, ...], dict[str, object]]] = []
 
@@ -175,6 +228,11 @@ def test_prepared_save_and_candidate_dismiss_remain_profile_scoped(monkeypatch) 
         return fn(Service())
 
     monkeypatch.setattr(web_server, "_run_wisdom", run)
+    monkeypatch.setattr(
+        web_server,
+        "_schedule_wisdom_professionalism_reviews",
+        lambda profile: calls.append(("schedule", profile)),
+    )
     files = [
         WisdomEditedFile(path="SKILL.md", content_utf8="# Edited\n"),
         WisdomEditedFile(
@@ -213,6 +271,7 @@ def test_prepared_save_and_candidate_dismiss_remain_profile_scoped(monkeypatch) 
                 "files": [item.model_dump() for item in files],
             },
         ),
+        ("schedule", "research"),
         ("profile", "research"),
         ("dismiss", "skill-1", "sha256:content"),
     ]

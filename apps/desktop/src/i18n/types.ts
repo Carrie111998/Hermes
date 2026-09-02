@@ -43,6 +43,14 @@ export interface WisdomTranslations {
   draftState: (state: string) => string
   authoritative: string
   versionHistory: string
+  versions: string
+  versionDetails: (version: number) => string
+  immutableVersion: string
+  published: (date: string) => string
+  releaseExplanation: string
+  viewInPortal: string
+  backToSkill: string
+  backToVersions: string
   prepareTitle: string
   prepareNotice: string
   ownerDescription: string

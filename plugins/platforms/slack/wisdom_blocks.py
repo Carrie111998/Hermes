@@ -69,6 +69,9 @@ def render_wisdom_blocks(view: Any) -> list[dict[str, Any]]:
             },
         }
     ]
+    blocks.extend(
+        _action_blocks(getattr(view, "navigation_actions", []) or [], row="navigation")
+    )
     summary = str(getattr(view, "summary", "") or "").strip()
     if summary:
         blocks.append({

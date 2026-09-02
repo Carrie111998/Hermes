@@ -15,7 +15,7 @@ from typing import Any, Iterator
 from hermes_constants import get_hermes_home
 
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 
 
 def utc_now() -> str:
@@ -220,6 +220,26 @@ class WisdomStore:
                   owner TEXT NOT NULL,
                   expires_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS professionalism_review (
+                  id TEXT PRIMARY KEY,
+                  skill_id TEXT NOT NULL,
+                  content_hash TEXT NOT NULL,
+                  author_description_hash TEXT NOT NULL,
+                  package_json TEXT NOT NULL,
+                  author_description TEXT NOT NULL,
+                  state TEXT NOT NULL,
+                  attempts INTEGER NOT NULL DEFAULT 0,
+                  available_at TEXT NOT NULL,
+                  lease_owner TEXT,
+                  lease_expires_at TEXT,
+                  result_json TEXT,
+                  last_error TEXT,
+                  created_at TEXT NOT NULL,
+                  updated_at TEXT NOT NULL,
+                  UNIQUE(skill_id, content_hash, author_description_hash)
+                );
+                CREATE INDEX IF NOT EXISTS professionalism_review_queue
+                  ON professionalism_review(state, available_at);
                 """
             )
             columns = {
@@ -666,6 +686,192 @@ class WisdomStore:
             return None
         value = dict(row)
         value["payload"] = json.loads(value.pop("payload_json"))
+        return value
+
+    def enqueue_professionalism_review(
+        self,
+        *,
+        skill_id: str,
+        content_hash: str,
+        author_description_hash: str,
+        package: list[dict[str, str]],
+        author_description: str,
+    ) -> dict[str, Any]:
+        """Persist one exact hash-bound review job without resetting completed work."""
+
+        now = utc_now()
+        review_id = str(uuid.uuid4())
+        package_json = json.dumps(package, sort_keys=True, separators=(",", ":"))
+        with self.transaction() as db:
+            db.execute(
+                "INSERT OR IGNORE INTO professionalism_review("
+                "id,skill_id,content_hash,author_description_hash,package_json,"
+                "author_description,state,attempts,available_at,lease_owner,"
+                "lease_expires_at,result_json,last_error,created_at,updated_at"
+                ") VALUES(?,?,?,?,?,?,'pending',0,?,NULL,NULL,NULL,NULL,?,?)",
+                (
+                    review_id,
+                    skill_id,
+                    content_hash,
+                    author_description_hash,
+                    package_json,
+                    author_description,
+                    now,
+                    now,
+                    now,
+                ),
+            )
+            row = db.execute(
+                "SELECT * FROM professionalism_review WHERE skill_id=? "
+                "AND content_hash=? AND author_description_hash=?",
+                (skill_id, content_hash, author_description_hash),
+            ).fetchone()
+        if row is None:  # pragma: no cover - insert/select invariant
+            raise RuntimeError("professionalism review was not persisted")
+        return self._decode_professionalism_review(dict(row))
+
+    def professionalism_review(
+        self,
+        *,
+        skill_id: str,
+        content_hash: str,
+        author_description_hash: str,
+    ) -> dict[str, Any] | None:
+        with self.transaction() as db:
+            row = db.execute(
+                "SELECT * FROM professionalism_review WHERE skill_id=? "
+                "AND content_hash=? AND author_description_hash=?",
+                (skill_id, content_hash, author_description_hash),
+            ).fetchone()
+        return self._decode_professionalism_review(dict(row)) if row else None
+
+    def claim_professionalism_review(
+        self,
+        *,
+        worker_id: str,
+        lease_seconds: int = 300,
+        review_id: str | None = None,
+    ) -> dict[str, Any] | None:
+        """Claim pending work or recover an expired lease atomically."""
+
+        now = datetime.now(timezone.utc)
+        now_text = now.isoformat()
+        lease_expires_at = (now + timedelta(seconds=lease_seconds)).isoformat()
+        with self.transaction() as db:
+            query = (
+                "SELECT * FROM professionalism_review WHERE "
+                "((state IN ('pending','retry') AND available_at<=?) OR "
+                "(state='running' AND lease_expires_at<=?))"
+            )
+            params: list[str] = [now_text, now_text]
+            if review_id:
+                query += " AND id=?"
+                params.append(review_id)
+            query += " ORDER BY available_at,created_at LIMIT 1"
+            row = db.execute(query, params).fetchone()
+            if row is None:
+                return None
+            cursor = db.execute(
+                "UPDATE professionalism_review SET state='running',attempts=attempts+1,"
+                "lease_owner=?,lease_expires_at=?,updated_at=? WHERE id=? AND "
+                "((state IN ('pending','retry') AND available_at<=?) OR "
+                "(state='running' AND lease_expires_at<=?))",
+                (
+                    worker_id,
+                    lease_expires_at,
+                    now_text,
+                    row["id"],
+                    now_text,
+                    now_text,
+                ),
+            )
+            if cursor.rowcount != 1:
+                return None
+            claimed = db.execute(
+                "SELECT * FROM professionalism_review WHERE id=?", (row["id"],)
+            ).fetchone()
+        return self._decode_professionalism_review(dict(claimed)) if claimed else None
+
+    def expedite_professionalism_review(self, review_id: str) -> None:
+        """Make a queued retry immediately claimable before an explicit submission."""
+
+        with self.transaction() as db:
+            db.execute(
+                "UPDATE professionalism_review SET available_at=?,updated_at=? "
+                "WHERE id=? AND state IN ('pending','retry')",
+                (utc_now(), utc_now(), review_id),
+            )
+
+    def complete_professionalism_review(
+        self, review_id: str, *, worker_id: str, result: dict[str, Any]
+    ) -> bool:
+        now = utc_now()
+        with self.transaction() as db:
+            cursor = db.execute(
+                "UPDATE professionalism_review SET state='complete',result_json=?,"
+                "lease_owner=NULL,lease_expires_at=NULL,last_error=NULL,updated_at=? "
+                "WHERE id=? AND state='running' AND lease_owner=?",
+                (
+                    json.dumps(result, sort_keys=True, separators=(",", ":")),
+                    now,
+                    review_id,
+                    worker_id,
+                ),
+            )
+            return cursor.rowcount == 1
+
+    def retry_professionalism_review(
+        self,
+        review_id: str,
+        *,
+        worker_id: str,
+        error: str,
+        unavailable_result: dict[str, Any],
+        max_attempts: int = 2,
+        retry_delay_seconds: int = 5,
+    ) -> str | None:
+        """Release a failed claim or make its bounded unavailable result terminal."""
+
+        now = datetime.now(timezone.utc)
+        with self.transaction() as db:
+            row = db.execute(
+                "SELECT attempts FROM professionalism_review WHERE id=? "
+                "AND state='running' AND lease_owner=?",
+                (review_id, worker_id),
+            ).fetchone()
+            if row is None:
+                return None
+            terminal = int(row["attempts"]) >= max_attempts
+            state = "complete" if terminal else "retry"
+            result_json = (
+                json.dumps(unavailable_result, sort_keys=True, separators=(",", ":"))
+                if terminal
+                else None
+            )
+            available_at = (
+                now if terminal else now + timedelta(seconds=retry_delay_seconds)
+            ).isoformat()
+            db.execute(
+                "UPDATE professionalism_review SET state=?,available_at=?,"
+                "lease_owner=NULL,lease_expires_at=NULL,result_json=?,last_error=?,"
+                "updated_at=? WHERE id=? AND state='running' AND lease_owner=?",
+                (
+                    state,
+                    available_at,
+                    result_json,
+                    error[:512],
+                    now.isoformat(),
+                    review_id,
+                    worker_id,
+                ),
+            )
+        return state
+
+    @staticmethod
+    def _decode_professionalism_review(value: dict[str, Any]) -> dict[str, Any]:
+        value["package"] = json.loads(value.pop("package_json"))
+        raw_result = value.pop("result_json")
+        value["result"] = json.loads(raw_result) if raw_result else None
         return value
 
     def pending_telegram_events(

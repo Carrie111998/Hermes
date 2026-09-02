@@ -186,7 +186,7 @@ def _emit_candidate(
     session_id: str | None,
     task_id: str | None,
 ) -> str | None:
-    return store.emit_local_event(
+    event_id = store.emit_local_event(
         kind="wisdom.candidate",
         skill_id=skill_id,
         content_hash=content_hash,
@@ -201,6 +201,29 @@ def _emit_candidate(
             "networked": False,
         },
     )
+    if event_id:
+        try:
+            from .professionalism import enqueue_review, exact_utf8_package
+
+            local = store.local_skill(skill_id)
+            source = Path(str(local["canonical_path"])) if local else None
+            if source is not None:
+                enqueue_review(
+                    store,
+                    skill_id=skill_id,
+                    content_hash=content_hash,
+                    package=exact_utf8_package(source),
+                    author_description="",
+                )
+        except Exception as exc:
+            # Qualification is a foreground signal. Review processing is
+            # advisory and may never delay or fail the user's active turn.
+            logger.warning(
+                "Could not enqueue Wisdom professionalism review for %s: %s",
+                skill_name,
+                type(exc).__name__,
+            )
+    return event_id
 
 
 def process_due_stability_jobs(

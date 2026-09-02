@@ -91,6 +91,8 @@ class Draft(WireModel):
     systemSpec: SystemSpecification | None
     scan: dict[str, Any] | None
     scanVerdict: str | None
+    security_check: dict[str, Any] | None = None
+    professionalism_check: dict[str, Any] | None = None
     explanation: str | None
     updatedAt: str
 
@@ -132,6 +134,8 @@ class SkillSummary(WireModel):
     install_count: int
     takedown_generation: int
     system_spec: SystemSpecification | None
+    security_check: dict[str, Any] | None = None
+    professionalism_check: dict[str, Any] | None = None
 
 
 class SkillList(WireModel):
@@ -412,18 +416,27 @@ class WisdomClient:
         self.sync.put_objects(objects.objects)
 
     def submit_draft(
-        self, *, slug: str, commit: str, content_hash: str, description: str
+        self,
+        *,
+        slug: str,
+        commit: str,
+        content_hash: str,
+        description: str,
+        professionalism_review: dict[str, Any] | None = None,
     ) -> Draft:
+        payload: dict[str, Any] = {
+            "slug": slug,
+            "draft_commit": commit,
+            "content_hash": content_hash,
+            "author_description": description,
+        }
+        if professionalism_review is not None:
+            payload["professionalism_review"] = professionalism_review
         body = self._request(
             "POST",
             "drafts",
             model=DraftResponse,
-            json_body={
-                "slug": slug,
-                "draft_commit": commit,
-                "content_hash": content_hash,
-                "author_description": description,
-            },
+            json_body=payload,
         )
         return body.draft
 
@@ -457,19 +470,23 @@ class WisdomClient:
         expected_content_hash: str,
         expected_description_hash: str,
         expected_manifest_hash: str,
+        professionalism_review: dict[str, Any] | None = None,
     ) -> Draft:
         """Create a newly vetted successor for an immutable owner draft."""
+        payload: dict[str, Any] = {
+            "draft_commit": commit,
+            "content_hash": content_hash,
+            "author_description": description,
+            "expected_content_hash": expected_content_hash,
+            "expected_author_description_hash": expected_description_hash,
+            "expected_package_manifest_hash": expected_manifest_hash,
+        }
+        if professionalism_review is not None:
+            payload["professionalism_review"] = professionalism_review
         body = self._request(
             "POST",
             f"drafts/{quote(draft_id, safe='')}/revise",
-            json_body={
-                "draft_commit": commit,
-                "content_hash": content_hash,
-                "author_description": description,
-                "expected_content_hash": expected_content_hash,
-                "expected_author_description_hash": expected_description_hash,
-                "expected_package_manifest_hash": expected_manifest_hash,
-            },
+            json_body=payload,
         )
         return Draft.model_validate(body.get("draft", body))
 

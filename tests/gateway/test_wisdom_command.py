@@ -410,6 +410,48 @@ def test_private_show_includes_requirements_and_installation_state():
     assert "Installed: v1 · MANUAL" in view.summary
 
 
+def test_browse_navigation_can_step_back_through_show_and_versions():
+    service = _Service()
+    controller = WisdomCommandController()
+    context = _context()
+
+    browse = controller.execute("browse", service, context)
+    assert browse.navigation_actions == []
+    bind_view_callbacks(browse, context)
+    show_action = browse.items[0].actions[0]
+    show = controller.execute_token(
+        show_action.callback_data.removeprefix("wi:cmd:"), service, context
+    )
+
+    assert [action.label for action in show.navigation_actions] == ["← Back"]
+    bind_view_callbacks(show, context)
+    versions_action = next(
+        action for action in show.actions if action.operation == "versions"
+    )
+    versions = controller.execute_token(
+        versions_action.callback_data.removeprefix("wi:cmd:"), service, context
+    )
+
+    assert versions.title == "incident-handoff versions"
+    bind_view_callbacks(versions, context)
+    back_to_show = controller.execute_token(
+        versions.navigation_actions[0].callback_data.removeprefix("wi:cmd:"),
+        service,
+        context,
+    )
+
+    assert back_to_show.title == "incident-handoff"
+    bind_view_callbacks(back_to_show, context)
+    back_to_browse = controller.execute_token(
+        back_to_show.navigation_actions[0].callback_data.removeprefix("wi:cmd:"),
+        service,
+        context,
+    )
+
+    assert back_to_browse.title == "Shared skills"
+    assert back_to_browse.navigation_actions == []
+
+
 def test_review_shows_exact_hashes_scan_and_effective_policy():
     service = _Service()
     view = WisdomCommandController().execute("review draft-1", service, _context())
@@ -460,6 +502,46 @@ def test_install_requires_mode_plan_and_second_confirmation():
     apply_token = plan.actions[0].callback_data.removeprefix("wi:cmd:")
     controller.execute_token(apply_token, service, context)
     assert service.calls[-1] == ("install_apply", "receipt-1", False)
+
+
+def test_install_preview_can_step_back_to_modes_and_skill():
+    service = _Service()
+    controller = WisdomCommandController()
+    context = _context()
+    show = controller.execute("show skill-1", service, context)
+    bind_view_callbacks(show, context)
+
+    install = next(
+        action for action in show.actions if action.operation == "install_modes"
+    )
+    modes = controller.execute_token(
+        install.callback_data.removeprefix("wi:cmd:"), service, context
+    )
+    bind_view_callbacks(modes, context)
+    manual = next(
+        action
+        for action in modes.actions
+        if action.arguments.get("update_mode") == "MANUAL"
+    )
+    plan = controller.execute_token(
+        manual.callback_data.removeprefix("wi:cmd:"), service, context
+    )
+    bind_view_callbacks(plan, context)
+
+    back_to_modes = controller.execute_token(
+        plan.navigation_actions[0].callback_data.removeprefix("wi:cmd:"),
+        service,
+        context,
+    )
+    assert back_to_modes.title == "Choose how future updates are handled"
+    bind_view_callbacks(back_to_modes, context)
+
+    back_to_skill = controller.execute_token(
+        back_to_modes.navigation_actions[0].callback_data.removeprefix("wi:cmd:"),
+        service,
+        context,
+    )
+    assert back_to_skill.title == "incident-handoff"
 
 
 def test_blocked_install_plan_never_offers_quick_application():

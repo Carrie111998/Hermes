@@ -7562,6 +7562,7 @@ class SlackAdapter(BasePlatformAdapter):
         callbacks = [
             str(action.callback_data)
             for action in [
+                *getattr(view, "navigation_actions", []),
                 *view.actions,
                 *(action for item in view.items for action in item.actions),
             ]
@@ -7768,6 +7769,8 @@ class SlackAdapter(BasePlatformAdapter):
     ) -> int:
         """DM newly qualified local skills after their originating Slack turn."""
         from gateway.wisdom_command import WisdomAction
+        from hermes_wisdom.professionalism import review_text
+        from hermes_wisdom.service import WisdomService
         from hermes_wisdom.store import WisdomStore
 
         if self._app is None:
@@ -7804,10 +7807,22 @@ class SlackAdapter(BasePlatformAdapter):
             qualification = str(
                 event.get("qualification") or payload.get("qualification") or ""
             )
+            professionalism_review = await self._run_wisdom_profile_operation(
+                lambda event=event: (
+                    WisdomService().finish_candidate_professionalism_review(
+                        skill_id=str(event["skill_id"]),
+                        content_hash=str(event["content_hash"]),
+                    )
+                ),
+                profile=profile,
+            )
             view = self._wisdom_candidate_view(
                 skill_name=skill_name,
                 qualification=qualification,
-                status="Nothing is shared until you choose an action.",
+                status=(
+                    "Nothing is shared until you choose an action.\n"
+                    + review_text(professionalism_review, include_checks=True)
+                ),
                 actions=[
                     WisdomAction(
                         "Draft in Collective",

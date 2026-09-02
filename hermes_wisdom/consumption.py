@@ -34,6 +34,7 @@ from .contract import (
 from .package import PackagePolicyError, verify_content_files
 from .qualification import process_due_stability_jobs
 from .store import WisdomStore
+from .review_presentation import aggregate_review_text, full_review_text
 
 
 UPDATE_MODES = {"MANUAL", "AUTO_WITH_NOTICE", "REQUIRED"}
@@ -305,6 +306,12 @@ class WisdomConsumption:
                 "moderation_note": payload.get("moderation_note"),
                 "portal_url": portal_url,
                 "occurred_at": event.get("created_at") or payload.get("occurred_at"),
+                "security_check": (
+                    catalog_item.get("security_check") if catalog_item else None
+                ),
+                "professionalism_check": (
+                    catalog_item.get("professionalism_check") if catalog_item else None
+                ),
             }
 
         return list(grouped.values()), ignored
@@ -1152,6 +1159,13 @@ class WisdomConsumption:
         if not selected:
             self.store.mark_feed_telegram_delivered(ignored)
             return {"attempted": False, "delivered": 0}
+        try:
+            from gateway.config import Platform, load_gateway_config
+
+            home = load_gateway_config().get_home_channel(Platform.TELEGRAM)
+            private_home = bool(home and not str(home.chat_id).startswith("-"))
+        except Exception:
+            private_home = False
         lines = [
             "<b>Collective Wisdom</b>",
             f"{len(selected)} new {'update' if len(selected) == 1 else 'updates'}",
@@ -1160,6 +1174,16 @@ class WisdomConsumption:
         rich_items: list[dict[str, object]] = []
         for event in selected:
             heading, detail = self._telegram_notification_text(event)
+            checks = (
+                full_review_text(
+                    event.get("security_check"), event.get("professionalism_check")
+                )
+                if private_home
+                else aggregate_review_text(
+                    event.get("security_check"), event.get("professionalism_check")
+                )
+            )
+            detail = f"{detail}\n{checks}"
             lines.extend(["", f"<b>{escape(heading)}</b>", escape(detail)])
             rich_items.append({"heading": heading, "detail": detail})
             row: list[dict[str, str]] = []
@@ -1264,6 +1288,16 @@ class WisdomConsumption:
         items: list[dict[str, object]] = []
         for event in selected:
             heading, detail = self._telegram_notification_text(event)
+            checks = (
+                full_review_text(
+                    event.get("security_check"), event.get("professionalism_check")
+                )
+                if private_home
+                else aggregate_review_text(
+                    event.get("security_check"), event.get("professionalism_check")
+                )
+            )
+            detail = f"{detail}\n{checks}"
             lines.extend(["", heading, detail])
             items.append({"heading": heading, "detail": detail})
             row: list[dict[str, str]] = []

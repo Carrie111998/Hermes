@@ -2253,6 +2253,24 @@ export interface WisdomStatus {
   error?: string | null
 }
 
+export type WisdomReviewStatus = 'advisory' | 'blocked' | 'pass' | 'pending' | 'retry' | 'running' | 'unavailable'
+
+export interface WisdomReviewCheckRow {
+  key: string
+  label?: string
+  status: WisdomReviewStatus
+  finding_count: number
+  details: string[]
+}
+
+export interface WisdomReviewCheck {
+  schema_version?: number
+  status: WisdomReviewStatus
+  summary?: string
+  checks?: WisdomReviewCheckRow[]
+  provenance?: { kind: 'agent_assessed'; model: null | string; provider: null | string }
+}
+
 export interface WisdomCandidate {
   local_skill_id: string
   name: string
@@ -2262,6 +2280,7 @@ export interface WisdomCandidate {
   reason: string | null
   qualification: string
   contribution_state: 'new' | 'prepared'
+  professionalism_check?: WisdomReviewCheck | null
 }
 
 export interface WisdomCandidateEvent {
@@ -2286,6 +2305,7 @@ export interface WisdomPreparedDraft {
   drafted_description: string
   system_specification: Record<string, unknown>
   next_step: string
+  professionalism_check: WisdomReviewCheck
 }
 
 export interface WisdomLocalScan {
@@ -2297,6 +2317,7 @@ export interface WisdomSubmittedDraft {
   draft: WisdomDraft
   local_scan: WisdomLocalScan
   notice: string
+  professionalism_check: WisdomReviewCheck
 }
 
 export interface WisdomSkillSummary {
@@ -2308,6 +2329,8 @@ export interface WisdomSkillSummary {
   install_count: number
   scan_verdict?: string | null
   system_spec?: Record<string, unknown> | null
+  security_check?: WisdomReviewCheck | null
+  professionalism_check?: WisdomReviewCheck | null
 }
 
 export interface WisdomDiscovery {
@@ -2325,6 +2348,8 @@ export interface WisdomDraft {
   scanVerdict: string | null
   systemSpec?: Record<string, unknown> | null
   updatedAt: string
+  security_check?: WisdomReviewCheck | null
+  professionalism_check?: WisdomReviewCheck | null
 }
 
 export interface WisdomSkillDetail {
@@ -2359,6 +2384,7 @@ export interface WisdomRevisedDraft {
   draft: WisdomDraft & Record<string, unknown>
   local_scan: Record<string, unknown>
   notice: string
+  professionalism_check: WisdomReviewCheck
 }
 
 export interface WisdomVersionContent {

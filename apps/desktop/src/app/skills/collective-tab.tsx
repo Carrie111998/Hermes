@@ -7,6 +7,7 @@ import { Input } from '@/components/ui/input'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
 import { Textarea } from '@/components/ui/textarea'
 import { WisdomNotificationsCard } from '@/components/wisdom-notifications-card'
+import { WisdomCheckBadge, WisdomReviewTables } from '@/components/wisdom-checks'
 import {
   acknowledgeWisdomNotifications,
   applyWisdomInstall,
@@ -36,6 +37,7 @@ import {
   type WisdomCheckResult,
   type WisdomDraftReview,
   type WisdomPreparedDraft,
+  type WisdomReviewCheck,
   type WisdomUpdateMode
 } from '@/hermes'
 import { useI18n } from '@/i18n'
@@ -55,6 +57,10 @@ import { WisdomSystemSpecificationEditor } from './wisdom-manifest-editor'
 
 const TERMINAL_DRAFT_STATES = new Set(['published', 'declined', 'invalidated', 'rejected'])
 const UPDATE_CHECK_INTERVAL_MS = 5 * 60 * 1000
+
+function asRecord(value: unknown): Record<string, unknown> {
+  return value && typeof value === 'object' && !Array.isArray(value) ? (value as Record<string, unknown>) : {}
+}
 
 async function waitForWisdomAction(name: string, profile: ProfileScope): Promise<void> {
   for (let attempt = 0; attempt < 1200; attempt += 1) {
@@ -833,7 +839,8 @@ export function CollectiveTab({ profile, query }: { profile: ProfileScope; query
                 </span>
               </span>
               <span className="ml-2 flex shrink-0 flex-col items-end gap-0.5 text-[0.6rem]">
-                <span className="text-emerald-600">{copy.serverScanPassed}</span>
+                <WisdomCheckBadge label="Security" value={skill.security_check} />
+                <WisdomCheckBadge label="Professionalism" value={skill.professionalism_check} />
                 {pendingUpdates.has(skill.id) && (
                   <span className="text-amber-500">
                     {copy.updateAvailable(pendingUpdates.get(skill.id)?.plan?.version)}
@@ -864,6 +871,11 @@ export function CollectiveTab({ profile, query }: { profile: ProfileScope; query
                           <div className="text-[0.65rem] leading-4 text-muted-foreground">
                             {candidateSummary(candidate)}
                           </div>
+                          {candidate.professionalism_check && (
+                            <div className="mt-1">
+                              <WisdomCheckBadge label="Professionalism" value={candidate.professionalism_check} />
+                            </div>
+                          )}
                         </div>
                         <Button
                           disabled={busy === candidate.local_skill_id || candidate.eligibility !== 'eligible'}
@@ -904,6 +916,14 @@ export function CollectiveTab({ profile, query }: { profile: ProfileScope; query
                                     <div className="text-[0.65rem] leading-4 text-muted-foreground">
                                       {candidateSummary(candidate)}
                                     </div>
+                                    {candidate.professionalism_check && (
+                                      <div className="mt-1">
+                                        <WisdomCheckBadge
+                                          label="Professionalism"
+                                          value={candidate.professionalism_check}
+                                        />
+                                      </div>
+                                    )}
                                   </div>
                                   <Button
                                     disabled={busy === candidate.local_skill_id || candidate.eligibility !== 'eligible'}
@@ -956,6 +976,16 @@ export function CollectiveTab({ profile, query }: { profile: ProfileScope; query
                 <p className="mt-2 text-sm text-muted-foreground">
                   {String(detail.data.skill.authorDescription || detail.data.skill.author_description || '')}
                 </p>
+                <WisdomReviewTables
+                  security={
+                    asRecord(asRecord(detail.data.latest_version_detail).version).security_check as
+                      WisdomReviewCheck | undefined
+                  }
+                  professionalism={
+                    asRecord(asRecord(detail.data.latest_version_detail).version).professionalism_check as
+                      WisdomReviewCheck | undefined
+                  }
+                />
                 <h3 className="mt-5 text-xs font-medium">{copy.versionHistory}</h3>
                 <pre className="mt-2 max-h-72 overflow-auto whitespace-pre-wrap text-[0.67rem] text-muted-foreground">
                   {JSON.stringify(
@@ -1022,6 +1052,7 @@ export function CollectiveTab({ profile, query }: { profile: ProfileScope; query
         >
           <h2 className="font-mono text-sm">{copy.prepareTitle}</h2>
           <p className="mt-1 text-xs text-muted-foreground">{copy.prepareNotice}</p>
+          <WisdomReviewTables professionalism={prepared.professionalism_check} />
           <label className="mt-4 block text-xs" htmlFor="desktop-wisdom-description">
             {copy.ownerDescription}
           </label>
@@ -1107,6 +1138,10 @@ export function CollectiveTab({ profile, query }: { profile: ProfileScope; query
             </div>
             <div>
               <strong>{copy.serverFactsLabel}</strong>
+              <WisdomReviewTables
+                professionalism={review.draft.professionalism_check}
+                security={review.draft.security_check}
+              />
               <pre className="mt-1 max-h-48 overflow-auto whitespace-pre-wrap text-muted-foreground">
                 {JSON.stringify(
                   {
