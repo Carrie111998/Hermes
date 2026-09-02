@@ -12,6 +12,7 @@ Two invariants:
    opencode-go) reject unknown message keys with "Extra inputs are not
    permitted", poisoning the session.
 """
+from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -19,6 +20,8 @@ import pytest
 from agent.context_compressor import (
     COMPRESSED_SUMMARY_HAS_USER_TURN_KEY,
     COMPRESSED_SUMMARY_METADATA_KEY,
+    RECALL_PLANNER_EXCLUDE_METADATA_KEY,
+    RECALL_PLANNER_SUMMARY_SAFE_METADATA_KEY,
     ContextCompressor,
 )
 
@@ -32,8 +35,8 @@ def _make_compressor():
         )
 
 
-def _make_messages(n_turns=30):
-    msgs = [{"role": "system", "content": "sys"}]
+def _make_messages(n_turns=30) -> list[dict[str, Any]]:
+    msgs: list[dict[str, Any]] = [{"role": "system", "content": "sys"}]
     for i in range(n_turns):
         msgs.append({"role": "user", "content": f"question {i} " + "x" * 400})
         msgs.append({"role": "assistant", "content": f"answer {i} " + "y" * 400})
@@ -58,6 +61,29 @@ class TestMetadataFlagSet:
         assert len(flagged) == 1
         # The flagged message is the one carrying the compaction handoff.
         assert "[CONTEXT COMPACTION" in flagged[0]["content"]
+        assert flagged[0]["display_metadata"][
+            RECALL_PLANNER_SUMMARY_SAFE_METADATA_KEY
+        ] is True
+
+    def test_skill_excluded_source_marks_summary_unsafe(self):
+        cc = _make_compressor()
+        messages = _make_messages()
+        messages[9]["display_metadata"] = {
+            RECALL_PLANNER_EXCLUDE_METADATA_KEY: True
+        }
+
+        out = _compress(cc, messages)
+
+        flagged = [
+            message
+            for message in out
+            if isinstance(message, dict)
+            and message.get(COMPRESSED_SUMMARY_METADATA_KEY)
+        ]
+        assert len(flagged) == 1
+        assert flagged[0]["display_metadata"][
+            RECALL_PLANNER_SUMMARY_SAFE_METADATA_KEY
+        ] is False
 
     def test_helper_detects_flag(self):
         assert ContextCompressor._has_compressed_summary_metadata(
@@ -89,6 +115,7 @@ class TestMetadataFlagNeverReachesWire:
             and (
                 COMPRESSED_SUMMARY_METADATA_KEY in m
                 or COMPRESSED_SUMMARY_HAS_USER_TURN_KEY in m
+                or "display_metadata" in m
             )
             for m in wire
         )

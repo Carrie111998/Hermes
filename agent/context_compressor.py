@@ -300,6 +300,11 @@ LEGACY_SUMMARY_PREFIX = "[CONTEXT SUMMARY]:"
 # "is_compressed_summary" would reach the wire and trip exactly that.
 COMPRESSED_SUMMARY_METADATA_KEY = "_compressed_summary"
 COMPRESSED_SUMMARY_HAS_USER_TURN_KEY = "_compressed_summary_has_user_turn"
+# Durable display-sidecar provenance for auxiliary recall-planner egress. The
+# sidecar survives SessionDB round trips but is removed from provider wire
+# messages alongside other display metadata.
+RECALL_PLANNER_EXCLUDE_METADATA_KEY = "recall_planner_exclude"
+RECALL_PLANNER_SUMMARY_SAFE_METADATA_KEY = "recall_planner_summary_safe"
 # Distinguishes rolling micro-compaction markers from batch-compaction
 # markers (both carry COMPRESSED_SUMMARY_METADATA_KEY so resume/handoff
 # treat them alike). Supersede/defrag/rehydration must only ever touch
@@ -355,6 +360,45 @@ def _fresh_compaction_message_copy(msg: Dict[str, Any]) -> Dict[str, Any]:
     fresh = msg.copy()
     fresh.pop(_DB_PERSISTED_MARKER, None)
     return fresh
+
+
+def _recall_planner_summary_message_is_safe(message: Dict[str, Any]) -> bool:
+    metadata = message.get("display_metadata")
+    return (
+        isinstance(metadata, dict)
+        and metadata.get(RECALL_PLANNER_SUMMARY_SAFE_METADATA_KEY) is True
+    )
+
+
+def _recall_planner_summary_sources_are_safe(messages: List[Dict[str, Any]]) -> bool:
+    """Return whether a generated summary may enter the recall-planner capsule.
+
+    A summary can paraphrase model-facing slash-skill bodies even when it no
+    longer contains the canonical scaffold marker.  Therefore safety derives
+    from durable source provenance, never from the generated summary text.
+    Legacy summary carriers without an explicit safe bit are ambiguous and
+    fail closed.
+    """
+
+    from agent.skill_commands import is_skill_scaffold_message
+
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        metadata = message.get("display_metadata")
+        metadata = metadata if isinstance(metadata, dict) else {}
+        if metadata.get(RECALL_PLANNER_EXCLUDE_METADATA_KEY) is True:
+            return False
+        if (
+            message.get(COMPRESSED_SUMMARY_METADATA_KEY)
+            and metadata.get(RECALL_PLANNER_SUMMARY_SAFE_METADATA_KEY) is not True
+        ):
+            return False
+        if is_skill_scaffold_message(message.get("content")):
+            return False
+        if is_skill_scaffold_message(message.get("api_content")):
+            return False
+    return True
 
 
 def _template_visible_role(message: Any) -> Optional[str]:
@@ -7637,6 +7681,11 @@ This compaction should PRIORITISE preserving all information related to the focu
             # so they remain in the transcript and _transcript_has_real_user_turn
             # keeps reporting them directly.
             COMPRESSED_SUMMARY_HAS_USER_TURN_KEY: False,
+            # Rolling micro summaries cover assistant/tool text without enough
+            # source-turn provenance to prove they excluded skill-derived data.
+            "display_metadata": {
+                RECALL_PLANNER_SUMMARY_SAFE_METADATA_KEY: False
+            },
         }
 
         result = messages[:splice_start] + [summary_msg] + messages[splice_end:]
@@ -8037,6 +8086,14 @@ This compaction should PRIORITISE preserving all information related to the focu
             )
             return messages
 
+        recall_planner_summary_safe = _recall_planner_summary_sources_are_safe(
+            list(turns_to_summarize)
+        ) and all(
+            _recall_planner_summary_message_is_safe(messages[index])
+            for index in sorted(summary_indices)
+            if 0 <= index < len(messages)
+        )
+
         if not self.quiet_mode:
             logger.info(
                 "Context compression triggered (%d tokens >= %d threshold)",
@@ -8434,6 +8491,9 @@ This compaction should PRIORITISE preserving all information related to the focu
                 COMPRESSED_SUMMARY_HAS_USER_TURN_KEY: bool(
                     self._summary_has_user_turn
                 ),
+                "display_metadata": {
+                    RECALL_PLANNER_SUMMARY_SAFE_METADATA_KEY: recall_planner_summary_safe
+                },
             })
 
         # Default merge target: literal tail index 0. For an ordinary
@@ -8497,6 +8557,14 @@ This compaction should PRIORITISE preserving all information related to the focu
                 # Mark the merged message so frontends can identify it as
                 # containing a compression summary prefix.
                 msg[COMPRESSED_SUMMARY_METADATA_KEY] = True
+                display_metadata = msg.get("display_metadata")
+                display_metadata = (
+                    dict(display_metadata) if isinstance(display_metadata, dict) else {}
+                )
+                display_metadata[
+                    RECALL_PLANNER_SUMMARY_SAFE_METADATA_KEY
+                ] = recall_planner_summary_safe
+                msg["display_metadata"] = display_metadata
                 msg[COMPRESSED_SUMMARY_HAS_USER_TURN_KEY] = bool(
                     self._summary_has_user_turn
                 )
@@ -8734,6 +8802,18 @@ def split_user_originated_turn(
             "content": _handoff_only_content(message.get("content")),
             COMPRESSED_SUMMARY_METADATA_KEY: True,
             "display_kind": "hidden",
+        }
+        source_display_metadata = message.get("display_metadata")
+        source_display_metadata = (
+            source_display_metadata
+            if isinstance(source_display_metadata, dict)
+            else {}
+        )
+        handoff["display_metadata"] = {
+            RECALL_PLANNER_SUMMARY_SAFE_METADATA_KEY: source_display_metadata.get(
+                RECALL_PLANNER_SUMMARY_SAFE_METADATA_KEY
+            )
+            is True
         }
         if COMPRESSED_SUMMARY_HAS_USER_TURN_KEY in message:
             handoff[COMPRESSED_SUMMARY_HAS_USER_TURN_KEY] = bool(

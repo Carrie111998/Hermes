@@ -192,7 +192,7 @@ from tools.browser_tool import cleanup_browser
 
 
 # Agent internals extracted to agent/ package for modularity
-from agent.memory_manager import sanitize_context
+from agent.memory_manager import RECALL_PLANNER_MESSAGE_UNSET, sanitize_context
 from agent.memory_provider import is_trivial_prompt
 from agent.error_classifier import FailoverReason
 from agent.redact import redact_sensitive_text
@@ -9220,6 +9220,7 @@ class AIAgent:
         persist_user_display_metadata: Optional[Dict[str, Any]] = None,
         persist_user_platform_id: Optional[str] = None,
         moa_config: Optional[dict[str, Any]] = None,
+        planner_user_message: Any = RECALL_PLANNER_MESSAGE_UNSET,
     ) -> Dict[str, Any]:
         """Forwarder — see ``agent.conversation_loop.run_conversation``."""
         # A review deliberately shares this agent's session_id for prompt-cache
@@ -9771,6 +9772,7 @@ class AIAgent:
                         persist_user_display_metadata=persist_user_display_metadata,
                         persist_user_platform_id=persist_user_platform_id,
                         moa_config=moa_config,
+                        planner_user_message=planner_user_message,
                     )
                 finally:
                     # The lease remains held through relay/task finalization, but

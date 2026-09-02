@@ -5164,6 +5164,24 @@ class _SeededQueryMessage:
         return self.text
 
 
+class _SkillInvocationInput:
+    """Typed pending-input handoff for a model-facing skill expansion.
+
+    ``text`` may be wrapped by later API-only transforms. The separately
+    captured ``planner_user_message`` is therefore the only value allowed to
+    reach the auxiliary recall planner; ``None`` denotes a bare invocation.
+    """
+
+    __slots__ = ("text", "planner_user_message")
+
+    def __init__(self, text: str, planner_user_message: Optional[str]):
+        self.text = text
+        self.planner_user_message = planner_user_message
+
+
+_CLI_PLANNER_MESSAGE_UNSET = object()
+
+
 def _should_seed_interactive(query, image, quiet: bool, oneshot: bool) -> bool:
     """Whether a ``-q/--image`` invocation should seed an interactive session.
 
@@ -13206,7 +13224,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                             f"[yellow]Skipped missing skills: {', '.join(missing)}[/]"
                         )
                     if hasattr(self, '_pending_input'):
-                        self._pending_input.put(msg)
+                        self._pending_input.put(
+                            _SkillInvocationInput(msg, user_instruction or None)
+                        )
                 else:
                     ChatConsole().print(
                         f"[bold red]Failed to load bundle for {base_cmd}[/]"
@@ -13239,7 +13259,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                                 f"[yellow]Skipped missing skills: {', '.join(missing)}[/]"
                             )
                         if hasattr(self, '_pending_input'):
-                            self._pending_input.put(msg)
+                            self._pending_input.put(
+                                _SkillInvocationInput(msg, user_instruction or None)
+                            )
                     else:
                         ChatConsole().print(
                             f"[bold red]Failed to load stacked skills for {base_cmd}[/]"
@@ -13253,7 +13275,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     skill_name = skill_commands[base_cmd]["name"]
                     print(f"\n⚡ Loading skill: {skill_name}")
                     if hasattr(self, '_pending_input'):
-                        self._pending_input.put(msg)
+                        self._pending_input.put(
+                            _SkillInvocationInput(msg, user_instruction or None)
+                        )
                 else:
                     ChatConsole().print(f"[bold red]Failed to load skill for {base_cmd}[/]")
             else:
@@ -16942,7 +16966,13 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             except Exception:
                 pass
 
-    def chat(self, message, images: list = None, voice_input: bool = False) -> Optional[str]:
+    def chat(
+        self,
+        message,
+        images: list = None,
+        voice_input: bool = False,
+        planner_user_message: Any = _CLI_PLANNER_MESSAGE_UNSET,
+    ) -> Optional[str]:
         """
         Send a message to the agent and get a response.
         
@@ -17297,14 +17327,17 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 )
                 self._pending_one_turn_model_restore = None
                 try:
-                    result = self.agent.run_conversation(
-                        user_message=agent_message,
-                        conversation_history=self.conversation_history[:-1],  # Exclude the message we just added
-                        stream_callback=stream_callback,
-                        task_id=self.session_id,
-                        persist_user_message=_persist_clean_user_message,
-                        moa_config=_moa_cfg,
-                    )
+                    _conversation_kwargs = {
+                        "user_message": agent_message,
+                        "conversation_history": self.conversation_history[:-1],
+                        "stream_callback": stream_callback,
+                        "task_id": self.session_id,
+                        "persist_user_message": _persist_clean_user_message,
+                        "moa_config": _moa_cfg,
+                    }
+                    if planner_user_message is not _CLI_PLANNER_MESSAGE_UNSET:
+                        _conversation_kwargs["planner_user_message"] = planner_user_message
+                    result = self.agent.run_conversation(**_conversation_kwargs)
                     if getattr(self, "_pending_moa_disable_after_turn", False):
                         _restore = getattr(self, "_pending_moa_restore_model", None) or {}
                         for _key, _value in _restore.items():
@@ -21062,6 +21095,11 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                                 pass
                         continue
 
+                    planner_user_message = _CLI_PLANNER_MESSAGE_UNSET
+                    if isinstance(user_input, _SkillInvocationInput):
+                        planner_user_message = user_input.planner_user_message
+                        user_input = user_input.text
+
                     # Voice-transcribed messages arrive wrapped in a sentinel
                     # so only genuine STT output gets the voice prefix (#65827).
                     is_voice_input = isinstance(user_input, _VoiceInputMessage)
@@ -21206,7 +21244,12 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     app.invalidate()  # Refresh status line
 
                     try:
-                        self.chat(user_input, images=submit_images or None, voice_input=is_voice_input)
+                        self.chat(
+                            user_input,
+                            images=submit_images or None,
+                            voice_input=is_voice_input,
+                            planner_user_message=planner_user_message,
+                        )
                     finally:
                         self._agent_running = False
                         self._spinner_text = ""

@@ -29,6 +29,9 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, List, Optional
 
 
+PLANNER_USER_MESSAGE_UNSET = object()
+
+
 @dataclass
 class TurnContext:
     """Closed-over locals of ``_run_agent_inner`` needed by ``TurnRunner``."""
@@ -95,6 +98,10 @@ class TurnContext:
     inbound_message_id: Optional[str] = None
     moa_config: Optional[dict] = None
     persist_user_message: Optional[Any] = None
+    # Explicit clean user intent for the auxiliary recall planner. The gateway
+    # sentinel means no transformation-owned override; ``None`` means a bare
+    # skill invocation that must fail closed.
+    planner_user_message: Any = PLANNER_USER_MESSAGE_UNSET
     persist_user_timestamp: Optional[float] = None
     # display_kind stamped on the persisted user row at turn start when this
     # turn was self-injected (MessageEvent.internal), e.g.

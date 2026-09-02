@@ -102,7 +102,7 @@ export function useSubmission(opts: UseSubmissionOptions) {
       showUserMessage = true,
       displayText?: string,
       expandOverride?: (value: string) => string,
-      submitOpts: { skipDetectDrop?: boolean } = {}
+      submitOpts: { plannerUserMessage?: string | null; skipDetectDrop?: boolean } = {}
     ) => {
       // Read tokens off the ref, not render state: a paste immediately followed
       // by Enter submits before React has re-rendered with the new token.

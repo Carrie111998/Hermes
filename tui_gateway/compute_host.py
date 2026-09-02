@@ -536,6 +536,11 @@ class ComputeHost:
                 session,
                 text,
                 display_kind=frame.get("display_kind") or None,
+                planner_user_message=(
+                    frame.get("planner_user_message")
+                    if "planner_user_message" in frame
+                    else server._TUI_PLANNER_MESSAGE_UNSET
+                ),
             )
             run_thread = session.get("_run_thread")
             if run_thread is not None and hasattr(run_thread, "join"):

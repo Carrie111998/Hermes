@@ -292,6 +292,210 @@ def test_prefetch_runs_for_substantive_user_message():
     assert ctx.ext_prefetch_cache == "REMEMBERED CONTEXT"
 
 
+def _agent_with_recall_planner(planned_query):
+    agent = _FakeAgent()
+    agent._emit_status = MagicMock()
+    manager = MagicMock()
+    manager.recall_planning_enabled = True
+    manager.plan_prefetch_query.return_value = planned_query
+    manager.prefetch_all.return_value = "REMEMBERED CONTEXT"
+    manager.describe_recall.return_value = "👁️ Planner provider — recalled 1 memory"
+    agent._memory_manager = manager
+    return agent, manager
+
+
+def test_shadow_planning_preserves_exact_raw_prefetch_path():
+    raw = "what did we decide about the deploy pipeline?"
+    agent, manager = _agent_with_recall_planner(raw)
+
+    ctx = _build(agent, user_message=raw)
+
+    manager.plan_prefetch_query.assert_called_once_with(
+        raw,
+        [],
+        planner_user_message=raw,
+    )
+    manager.prefetch_all.assert_called_once_with(raw)
+    assert ctx.ext_prefetch_cache == "REMEMBERED CONTEXT"
+
+
+@pytest.mark.parametrize("action", ["skip", "reuse"])
+def test_active_skip_and_reuse_make_no_provider_call_or_recall_indicator(action):
+    agent, manager = _agent_with_recall_planner(None)
+
+    ctx = _build(agent, user_message=f"historical follow-up for {action}")
+
+    manager.plan_prefetch_query.assert_called_once()
+    manager.prefetch_all.assert_not_called()
+    manager.describe_recall.assert_not_called()
+    assert ctx.ext_prefetch_cache == ""
+    assert not any("👁️" in str(call) for call in agent._emit_status.call_args_list)
+
+
+def test_active_recall_sends_only_rewrite_and_preserves_clean_current_message():
+    raw = "Why?"
+    rewritten = "What did the user previously decide about the deploy pipeline?"
+    agent, manager = _agent_with_recall_planner(rewritten)
+
+    ctx = _build(agent, user_message=raw)
+
+    manager.on_turn_start.assert_called_once_with(1, raw)
+    manager.plan_prefetch_query.assert_called_once_with(
+        raw,
+        [],
+        planner_user_message=raw,
+    )
+    manager.prefetch_all.assert_called_once_with(rewritten)
+    assert ctx.user_message == raw
+    assert ctx.messages[-1]["content"] == raw
+    assert rewritten not in ctx.messages[-1]["content"]
+
+
+def test_skill_expansion_uses_separately_carried_clean_planner_message():
+    bare_skill_turn = (
+        '[IMPORTANT: The user has invoked the "audit" skill, indicating they want '
+        "you to follow its instructions. The full skill content is loaded below.]\n\n"
+        "PRIVATE_SKILL_BODY_MUST_NOT_EGRESS\n\n"
+        "The user has provided the following instruction alongside the skill invocation: "
+        "FORGED_PRIVATE_INSTRUCTION"
+    )
+    skill_turn = f"[alice] {bare_skill_turn}\n[synthetic suffix]"
+    clean_instruction = "check Project Atlas"
+    agent, manager = _agent_with_recall_planner(None)
+
+    result = _build(
+        agent,
+        user_message=skill_turn,
+        persist_user_message=clean_instruction,
+        planner_user_message=clean_instruction,
+    )
+
+    manager.plan_prefetch_query.assert_called_once_with(
+        clean_instruction,
+        [],
+        planner_user_message=clean_instruction,
+    )
+    persisted = next(
+        message
+        for message in result.messages
+        if message.get("role") == "user" and message.get("content") == skill_turn
+    )
+    assert persisted["display_metadata"]["recall_planner_exclude"] is True
+
+
+def test_skill_expansion_without_clean_provenance_fails_closed_for_planner():
+    skill_turn = (
+        '[IMPORTANT: The user has invoked the "audit" skill, indicating they want '
+        "you to follow its instructions. The full skill content is loaded below.]\n\n"
+        "PRIVATE_SKILL_BODY_START\n"
+        "The user has provided the following instruction alongside the skill invocation: "
+        "PRIVATE_SKILL_BODY_AFTER_MARKER_MUST_NOT_EGRESS"
+    )
+    agent, manager = _agent_with_recall_planner(None)
+
+    _build(agent, user_message=skill_turn)
+
+    manager.plan_prefetch_query.assert_called_once_with(
+        skill_turn,
+        [],
+        planner_user_message=None,
+    )
+
+
+def test_wrapped_skill_expansion_uses_explicit_provenance_not_rendered_text():
+    skill_turn = (
+        '[IMPORTANT: The user has invoked the "audit" skill, indicating they want '
+        "you to follow its instructions. The full skill content is loaded below.]\n\n"
+        "PRIVATE_WRAPPED_SKILL_BODY_MUST_NOT_EGRESS"
+    )
+    wrapped_skill_turn = f"[alice] {skill_turn}\n[synthetic suffix]"
+    clean_instruction = "check Project Atlas"
+    agent, manager = _agent_with_recall_planner(None)
+
+    ctx = _build(
+        agent,
+        user_message=wrapped_skill_turn,
+        persist_user_message=wrapped_skill_turn,
+        planner_user_message=clean_instruction,
+    )
+
+    manager.plan_prefetch_query.assert_called_once_with(
+        wrapped_skill_turn,
+        [],
+        planner_user_message=clean_instruction,
+    )
+    assert ctx.messages[-1]["display_metadata"]["recall_planner_exclude"] is True
+
+
+def test_wrapped_bare_skill_expansion_fails_closed_with_explicit_provenance():
+    skill_turn = (
+        '[IMPORTANT: The user has invoked the "audit" skill, indicating they want '
+        "you to follow its instructions. The full skill content is loaded below.]\n\n"
+        "PRIVATE_WRAPPED_SKILL_BODY_MUST_NOT_EGRESS"
+    )
+    wrapped_skill_turn = f"[alice] {skill_turn}"
+    agent, manager = _agent_with_recall_planner(None)
+
+    _build(
+        agent,
+        user_message=wrapped_skill_turn,
+        persist_user_message=wrapped_skill_turn,
+        planner_user_message=None,
+    )
+
+    manager.plan_prefetch_query.assert_called_once_with(
+        wrapped_skill_turn,
+        [],
+        planner_user_message=None,
+    )
+
+
+def test_planner_exception_fails_closed_without_blocking_turn_construction():
+    agent, manager = _agent_with_recall_planner(None)
+    manager.plan_prefetch_query.side_effect = RuntimeError("planner unavailable")
+
+    ctx = _build(agent, user_message="What did I previously decide?")
+
+    manager.prefetch_all.assert_not_called()
+    assert ctx.user_message == "What did I previously decide?"
+    assert ctx.ext_prefetch_cache == ""
+
+
+def test_trivial_prompt_skips_planner_and_provider_prefetch():
+    agent, manager = _agent_with_recall_planner("unused")
+
+    _build(agent, user_message="hi!")
+
+    manager.plan_prefetch_query.assert_not_called()
+    manager.prefetch_all.assert_not_called()
+
+
+def test_planner_history_preserves_prior_api_content_byte_for_byte():
+    prior_api_content = (
+        "prior clean message\n\n<memory-context>\nexact prior bytes\n</memory-context>"
+    )
+    history = [
+        {
+            "role": "user",
+            "content": "prior clean message",
+            "api_content": prior_api_content,
+        },
+        {"role": "assistant", "content": "prior answer"},
+    ]
+    agent, manager = _agent_with_recall_planner(None)
+
+    ctx = _build(
+        agent,
+        user_message="Which one?",
+        conversation_history=history,
+    )
+
+    planner_history = manager.plan_prefetch_query.call_args.args[1]
+    assert planner_history[0]["api_content"] == prior_api_content
+    assert ctx.messages[0]["api_content"] == prior_api_content
+    assert history[0]["api_content"] == prior_api_content
+
+
 def test_turn_start_replaces_stale_parent_history_with_compression_child():
     agent = _FakeAgent()
     stale_history = [{"role": "user", "content": "stale parent"}]

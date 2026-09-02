@@ -43,6 +43,7 @@ from agent.display import KawaiiSpinner
 from agent.error_classifier import FailoverReason, classify_api_error
 from agent.fast_mode import begin_turn as begin_fast_mode_turn
 from agent.message_metadata import append_message
+from agent.memory_manager import RECALL_PLANNER_MESSAGE_UNSET
 from agent.turn_context import (
     PreflightCompressionTimedOut,
     _compression_warrants_another_preflight_pass,
@@ -2006,6 +2007,7 @@ def run_conversation(
     persist_user_display_metadata: Optional[Dict[str, Any]] = None,
     persist_user_platform_id: Optional[str] = None,
     moa_config: Optional[dict[str, Any]] = None,
+    planner_user_message: Any = RECALL_PLANNER_MESSAGE_UNSET,
 ) -> Dict[str, Any]:
     """
     Run a complete conversation with tool calling until completion.
@@ -2034,7 +2036,9 @@ def run_conversation(
             Discord/Telegram message id) to store as metadata on that
             persisted user message, so restart drain-window recovery can
             dedup an interrupted turn against the transcript.
-                or queuing follow-up prefetch work.
+        planner_user_message: Separately carried clean user-authored text for
+            the auxiliary recall planner. Explicit ``None`` marks a transformed
+            turn with no clean instruction and fails closed.
 
     Returns:
         Dict: Complete conversation result with final response and message history
@@ -2089,6 +2093,7 @@ def run_conversation(
             persist_user_display_kind=persist_user_display_kind,
             persist_user_display_metadata=persist_user_display_metadata,
             persist_user_platform_id=persist_user_platform_id,
+            planner_user_message=planner_user_message,
             restore_or_build_system_prompt=_restore_or_build_system_prompt,
             install_safe_stdio=_install_safe_stdio,
             sanitize_surrogates=_sanitize_surrogates,

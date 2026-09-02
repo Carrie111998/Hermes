@@ -291,6 +291,13 @@ def _(rid, params: dict) -> dict:
     sid = params.get("session_id", "")
     raw_text = params.get("text", "")
     text = sanitize_user_prompt_text(raw_text) if isinstance(raw_text, str) else raw_text
+    planner_user_message = (
+        params.get("planner_user_message")
+        if "planner_user_message" in params
+        else _TUI_PLANNER_MESSAGE_UNSET
+    )
+    if isinstance(planner_user_message, str):
+        planner_user_message = sanitize_user_prompt_text(planner_user_message)
     # Off-screen sends (widget intents): type the persisted user row so no
     # client renders it as a bubble. Whitelisted to "hidden" — display_kind
     # is a DB-only sidecar and this RPC must not mint arbitrary kinds.
@@ -457,9 +464,18 @@ def _(rid, params: dict) -> dict:
         # skill turn shows its invocation, so re-expand it here — otherwise
         # re-running `/work fix it` sends the agent nine literal characters
         # instead of the skill it originally loaded.
+        replay_text = text
         text = _expand_skill_invocation_for_replay(
-            text, str(session.get("session_key") or "")
+            replay_text, str(session.get("session_key") or "")
         )
+        if (
+            planner_user_message is _TUI_PLANNER_MESSAGE_UNSET
+            and text != replay_text
+        ):
+            replay_parts = replay_text.strip().split(maxsplit=1)
+            planner_user_message = (
+                replay_parts[1].strip() if len(replay_parts) == 2 else None
+            )
     isolation_cfg = _load_dashboard_process_isolation_config()
     turn_isolation = _session_uses_compute_host(session, isolation_cfg)
     if internal_hosted_submit and turn_isolation:
@@ -489,6 +505,7 @@ def _(rid, params: dict) -> dict:
         busy_response = _handle_busy_submit(
             rid, sid, session, text, busy_transport,
             queued=bool(params.get("queued")),
+            planner_user_message=planner_user_message,
         )
         if busy_response is not None:
             return busy_response
@@ -931,7 +948,12 @@ def _(rid, params: dict) -> dict:
 
     if turn_isolation:
         isolated_response = _submit_prompt_to_compute_host(
-            rid, sid, session, text, display_kind=display_kind
+            rid,
+            sid,
+            session,
+            text,
+            display_kind=display_kind,
+            planner_user_message=planner_user_message,
         )
         if not isolated_response.get("error"):
             if survivor_user_row_ids is not None and requested_rebind_ids is None:
@@ -1050,6 +1072,7 @@ def _(rid, params: dict) -> dict:
             session,
             text,
             display_kind=display_kind,
+            planner_user_message=planner_user_message,
             terminal_callback=hosted_terminal_callback,
         )
 

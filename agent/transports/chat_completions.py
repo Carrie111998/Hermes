@@ -382,6 +382,8 @@ class ChatCompletionsTransport(ProviderTransport):
           ``anthropic_content_blocks`` and ``bedrock_content_blocks`` are
           durable-history data for their native transports, not part of the
           Chat Completions schema. They must not cross a provider boundary.
+        - ``display_metadata`` is a persistence/UI sidecar and likewise never
+          belongs on a provider message.
         """
         strip_extra_content = not _model_consumes_thought_signature(
             kwargs.get("model")
@@ -398,6 +400,7 @@ class ChatCompletionsTransport(ProviderTransport):
                 or "timestamp" in msg  # #47868 — strict providers reject this
                 or "platform_message_id" in msg  # gateway dedup id (persistence-only)
                 or "api_content" in msg  # persist-what-you-send sidecar
+                or "display_metadata" in msg  # persistence/UI sidecar
                 or "anthropic_content_blocks" in msg
                 or "bedrock_content_blocks" in msg
             ):
@@ -472,6 +475,7 @@ class ChatCompletionsTransport(ProviderTransport):
                 or "timestamp" in msg  # #47868 — leak into strict providers
                 or "platform_message_id" in msg  # gateway dedup id (persistence-only)
                 or "api_content" in msg  # persist-what-you-send sidecar
+                or "display_metadata" in msg  # persistence/UI sidecar
                 or "anthropic_content_blocks" in msg
                 or "bedrock_content_blocks" in msg
             ):
@@ -483,6 +487,7 @@ class ChatCompletionsTransport(ProviderTransport):
                 out_msg.pop("timestamp", None)  # #47868 — leak into strict providers
                 out_msg.pop("platform_message_id", None)  # gateway dedup id
                 out_msg.pop("api_content", None)  # persist-what-you-send sidecar
+                out_msg.pop("display_metadata", None)  # persistence/UI sidecar
                 out_msg.pop("anthropic_content_blocks", None)
                 out_msg.pop("bedrock_content_blocks", None)
 

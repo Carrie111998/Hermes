@@ -25,16 +25,23 @@ Usage in run_agent.py:
 
 from __future__ import annotations
 
+import contextvars
+import inspect
 import json
 import logging
+import math
 import re
-import inspect
 import threading
+import time
 from concurrent.futures import Future, ThreadPoolExecutor, wait
-from typing import Any, Callable, Dict, List, Optional
+from dataclasses import dataclass
+from typing import Any, Callable, Dict, List, Literal, Mapping, Optional, Sequence, cast
 
 from agent.memory_provider import MemoryProvider, PRE_COMPRESS_CHECKPOINT_API_VERSION
-from agent.skill_commands import extract_user_instruction_from_skill_message
+from agent.skill_commands import (
+    extract_user_instruction_from_skill_message,
+    is_skill_scaffold_message,
+)
 from tools.registry import tool_error
 
 # Providers that predate the checkpoint-API attribute are implicitly on the
@@ -79,6 +86,97 @@ logger = logging.getLogger(__name__)
 # running past this window dies with the interpreter.
 _SYNC_DRAIN_TIMEOUT_S = 5.0
 _EXTERNAL_PREFETCH_TIMEOUT_S = 8.0
+
+RecallPlannerMode = Literal["off", "shadow", "active"]
+
+
+@dataclass(frozen=True)
+class RecallPlannerConfig:
+    """Startup-scoped host configuration for automatic recall planning."""
+
+    mode: RecallPlannerMode = "off"
+    provider: str = ""
+    timeout_seconds: float = 5.0
+
+
+_RECALL_PLANNER_OFF = RecallPlannerConfig()
+_RECALL_PLANNER_PROCESS_GATE = threading.Lock()
+_RECALL_PLANNER_WARNING_LOCK = threading.Lock()
+_RECALL_PLANNER_WARNING_KEYS: set[tuple[str, ...]] = set()
+RECALL_PLANNER_MESSAGE_UNSET = object()
+
+
+def _warn_recall_planner_once(
+    key: tuple[str, ...], message: str, *args: Any
+) -> None:
+    with _RECALL_PLANNER_WARNING_LOCK:
+        if key in _RECALL_PLANNER_WARNING_KEYS:
+            return
+        _RECALL_PLANNER_WARNING_KEYS.add(key)
+    logger.warning(message, *args)
+
+
+def normalize_recall_planner_config(raw: Any) -> RecallPlannerConfig:
+    """Return one immutable valid planner config, or canonical ``off``."""
+
+    if raw is None:
+        return _RECALL_PLANNER_OFF
+    if not isinstance(raw, Mapping):
+        _warn_recall_planner_once(
+            ("invalid-config",),
+            "Invalid memory.recall_planner configuration; planner disabled",
+        )
+        return _RECALL_PLANNER_OFF
+
+    if any(
+        not isinstance(key, str)
+        or key not in {"mode", "provider", "timeout_seconds"}
+        for key in raw
+    ):
+        _warn_recall_planner_once(
+            ("invalid-keys",),
+            "memory.recall_planner contains unknown settings; planner disabled",
+        )
+        return _RECALL_PLANNER_OFF
+
+    mode = raw.get("mode", "off")
+    if mode == "off":
+        return _RECALL_PLANNER_OFF
+    if not isinstance(mode, str) or mode not in {"shadow", "active"}:
+        _warn_recall_planner_once(
+            ("invalid-mode",),
+            "Invalid memory.recall_planner.mode; planner disabled",
+        )
+        return _RECALL_PLANNER_OFF
+
+    provider = raw.get("provider", "")
+    if not isinstance(provider, str) or not provider or provider != provider.strip():
+        _warn_recall_planner_once(
+            ("invalid-provider",),
+            "memory.recall_planner.provider must be non-empty when enabled; "
+            "planner disabled",
+        )
+        return _RECALL_PLANNER_OFF
+
+    timeout = raw.get("timeout_seconds", 5.0)
+    if (
+        isinstance(timeout, bool)
+        or not isinstance(timeout, (int, float))
+        or not math.isfinite(float(timeout))
+        or float(timeout) <= 0
+    ):
+        _warn_recall_planner_once(
+            ("invalid-timeout",),
+            "memory.recall_planner.timeout_seconds must be finite and positive; "
+            "planner disabled",
+        )
+        return _RECALL_PLANNER_OFF
+
+    return RecallPlannerConfig(
+        mode=cast(RecallPlannerMode, mode),
+        provider=provider,
+        timeout_seconds=float(timeout),
+    )
 
 
 def normalize_tool_schema(schema: Any) -> Optional[Dict[str, Any]]:
@@ -437,7 +535,12 @@ class MemoryManager:
     provider is allowed.  Failures in one provider never block the other.
     """
 
-    def __init__(self, *, external_prefetch_timeout: Optional[float] = None) -> None:
+    def __init__(
+        self,
+        *,
+        external_prefetch_timeout: Optional[float] = None,
+        recall_planner_config: Optional[RecallPlannerConfig] = None,
+    ) -> None:
         self._providers: List[MemoryProvider] = []
         self._tool_to_provider: Dict[str, MemoryProvider] = {}
         self._has_external: bool = False  # True once a non-builtin provider is added
@@ -450,6 +553,17 @@ class MemoryManager:
             raise ValueError("external_prefetch_timeout must be positive")
         self._external_prefetch_threads: Dict[str, threading.Thread] = {}
         self._external_prefetch_lock = threading.Lock()
+        self._recall_planner_config = (
+            recall_planner_config
+            if isinstance(recall_planner_config, RecallPlannerConfig)
+            else _RECALL_PLANNER_OFF
+        )
+        self._recall_planner_effective_mode: RecallPlannerMode = "off"
+        self._recall_planner_provider: Optional[MemoryProvider] = None
+        self._initialized_provider_ids: set[int] = set()
+        self._recall_planner_thread: Optional[threading.Thread] = None
+        self._recall_planner_state_lock = threading.Lock()
+        self._recall_planner_shutdown = False
         # Background executor for end-of-turn sync/prefetch. Lazily created on
         # first use so the common builtin-only path spawns no extra threads.
         # A single worker serializes a provider's writes (turn N must land
@@ -571,6 +685,281 @@ class MemoryManager:
                 )
         return "\n\n".join(blocks)
 
+    # -- Recall planning -----------------------------------------------------
+
+    @property
+    def recall_planner_config(self) -> RecallPlannerConfig:
+        """Immutable planner config captured when this manager was created."""
+        return self._recall_planner_config
+
+    @property
+    def active_external_provider_name(self) -> str:
+        """Name of the selected external provider, or an empty string."""
+        provider = next((p for p in self._providers if p.name != "builtin"), None)
+        return provider.name if provider is not None else ""
+
+    @property
+    def recall_planning_enabled(self) -> bool:
+        return self._recall_planner_effective_mode in {"shadow", "active"}
+
+    def _configure_recall_planner(self) -> None:
+        self._recall_planner_effective_mode = "off"
+        self._recall_planner_provider = None
+        config = self._recall_planner_config
+        if config.mode == "off":
+            return
+
+        provider = next((p for p in self._providers if p.name != "builtin"), None)
+        if provider is None:
+            _warn_recall_planner_once(
+                ("no-provider",),
+                "memory.recall_planner is enabled but no external memory provider "
+                "is active; planner disabled",
+            )
+            return
+        if provider.name != config.provider:
+            _warn_recall_planner_once(
+                ("provider-mismatch",),
+                "memory.recall_planner.provider does not match active memory "
+                "provider; planner disabled",
+            )
+            return
+        if id(provider) not in self._initialized_provider_ids:
+            _warn_recall_planner_once(
+                ("provider-init-failed",),
+                "Active memory provider did not initialize successfully; recall "
+                "planner disabled",
+            )
+            return
+
+        try:
+            provider_rewrites_value = provider.rewrites_recall_queries()
+            provider_rewrites = (
+                provider_rewrites_value
+                if type(provider_rewrites_value) is bool
+                else True
+            )
+        except Exception:
+            provider_rewrites = True
+        if provider_rewrites:
+            _warn_recall_planner_once(
+                ("provider-rewrites",),
+                "Active memory provider already rewrites recall queries; host recall "
+                "planner disabled to avoid double planning",
+            )
+            return
+
+        try:
+            supports_current_query = (
+                provider.supports_current_query_recall_planning() is True
+            )
+        except Exception:
+            supports_current_query = False
+        if not supports_current_query:
+            _warn_recall_planner_once(
+                ("unsupported-provider",),
+                "Active memory provider does not support current-query recall planning; "
+                "planner disabled",
+            )
+            return
+
+        self._recall_planner_provider = provider
+        self._recall_planner_effective_mode = config.mode
+
+    def _run_recall_planner(
+        self,
+        current_user_message: str,
+        history: Sequence[Mapping[str, Any]],
+    ) -> tuple[Any, str, float]:
+        """Run one bounded planner worker and classify its completion."""
+
+        started_at = time.monotonic()
+        try:
+            from agent.context_compressor import (
+                RECALL_PLANNER_EXCLUDE_METADATA_KEY,
+                RECALL_PLANNER_SUMMARY_SAFE_METADATA_KEY,
+                ContextCompressor,
+            )
+            from plugins.memory.query_rewrite import plan_memory_recall
+
+            # Give a late worker a stable, privacy-minimized view. In
+            # particular, retain no attachment/list payloads or tool bodies.
+            # Provenance becomes booleans rather than forwarding the display
+            # metadata sidecar itself.
+            def _snapshot_message(message: Mapping[str, Any]) -> dict[str, Any]:
+                display_metadata = message.get("display_metadata")
+                display_metadata = (
+                    display_metadata if isinstance(display_metadata, Mapping) else {}
+                )
+                content = (
+                    message.get("content")
+                    if isinstance(message.get("content"), str)
+                    else ""
+                )
+                is_summary = bool(
+                    message.get("_compressed_summary")
+                    or RECALL_PLANNER_SUMMARY_SAFE_METADATA_KEY in display_metadata
+                    or ContextCompressor._is_context_summary_content(content)
+                )
+                return {
+                    "role": message.get("role"),
+                    "content": content,
+                    "api_content": (
+                        message.get("api_content")
+                        if isinstance(message.get("api_content"), str)
+                        else ""
+                    ),
+                    "_compressed_summary": bool(
+                        message.get("_compressed_summary")
+                    ),
+                    "_recall_planner_is_summary": is_summary,
+                    "_recall_planner_exclude": (
+                        display_metadata.get(RECALL_PLANNER_EXCLUDE_METADATA_KEY)
+                        is True
+                    ),
+                    "_recall_planner_summary_safe": (
+                        display_metadata.get(
+                            RECALL_PLANNER_SUMMARY_SAFE_METADATA_KEY
+                        )
+                        is True
+                    ),
+                    "tool_calls": bool(message.get("tool_calls")),
+                }
+
+            history_snapshot = tuple(
+                _snapshot_message(message)
+                for message in history
+                if isinstance(message, Mapping)
+            )
+            caller_context = contextvars.copy_context()
+        except Exception:
+            return None, "setup_failed", time.monotonic() - started_at
+
+        remaining = self._recall_planner_config.timeout_seconds - (
+            time.monotonic() - started_at
+        )
+        if remaining <= 0:
+            return None, "timeout", time.monotonic() - started_at
+
+        with self._recall_planner_state_lock:
+            if self._recall_planner_shutdown:
+                return None, "shutdown", time.monotonic() - started_at
+            existing = self._recall_planner_thread
+            if existing is not None and existing.is_alive():
+                return None, "busy", time.monotonic() - started_at
+            if not _RECALL_PLANNER_PROCESS_GATE.acquire(blocking=False):
+                return None, "busy", time.monotonic() - started_at
+
+            result_box: dict[str, Any] = {}
+            done = threading.Event()
+
+            def _worker() -> None:
+                try:
+                    result_box["value"] = caller_context.run(
+                        plan_memory_recall,
+                        current_user_message,
+                        history_snapshot,
+                    )
+                except Exception:
+                    result_box["value"] = None
+                finally:
+                    _RECALL_PLANNER_PROCESS_GATE.release()
+                    done.set()
+
+            thread = threading.Thread(
+                target=_worker,
+                daemon=True,
+                name="memory-recall-planner",
+            )
+            self._recall_planner_thread = thread
+            try:
+                thread.start()
+            except Exception:
+                self._recall_planner_thread = None
+                _RECALL_PLANNER_PROCESS_GATE.release()
+                return None, "start_failed", time.monotonic() - started_at
+
+        remaining = self._recall_planner_config.timeout_seconds - (
+            time.monotonic() - started_at
+        )
+        completed = done.wait(max(0.0, remaining))
+        elapsed = time.monotonic() - started_at
+        if not completed:
+            return None, "timeout", elapsed
+        with self._recall_planner_state_lock:
+            if self._recall_planner_shutdown:
+                return None, "shutdown", elapsed
+        plan = result_box.get("value")
+        return plan, "valid" if plan is not None else "invalid", elapsed
+
+    def plan_prefetch_query(
+        self,
+        current_user_message: str,
+        history: Sequence[Mapping[str, Any]],
+        *,
+        planner_user_message: Any = RECALL_PLANNER_MESSAGE_UNSET,
+    ) -> Optional[str]:
+        """Return raw/rewritten provider query, or ``None`` to skip prefetch.
+
+        ``planner_user_message`` is the separately carried clean user field.
+        Callers that only have a model-facing slash-skill expansion must pass
+        ``None``; rendered scaffold text is never parsed for an instruction.
+        The unset compatibility path accepts ordinary current messages but
+        still rejects canonical skill scaffolding before starting a worker.
+        """
+
+        mode = self._recall_planner_effective_mode
+        if mode == "off":
+            return current_user_message
+
+        planner_message = (
+            current_user_message
+            if planner_user_message is RECALL_PLANNER_MESSAGE_UNSET
+            else planner_user_message
+        )
+        if (
+            not isinstance(planner_message, str)
+            or not planner_message.strip()
+            or is_skill_scaffold_message(planner_message)
+        ):
+            result = current_user_message if mode == "shadow" else None
+            logger.info(
+                "Memory recall planner mode=%s action=none outcome=input_rejected "
+                "latency_ms=0 provider_call=%s",
+                mode,
+                "raw" if mode == "shadow" else "none",
+            )
+            return result
+
+        from plugins.memory.query_rewrite import RecallPlan
+
+        plan, outcome, elapsed = self._run_recall_planner(
+            planner_message,
+            history,
+        )
+        if not isinstance(plan, RecallPlan):
+            plan = None
+            if outcome == "valid":
+                outcome = "invalid"
+
+        action = plan.action if plan is not None else "none"
+        provider_call = "raw" if mode == "shadow" else "none"
+        result: Optional[str] = current_user_message if mode == "shadow" else None
+        if mode == "active" and plan is not None and plan.action == "recall":
+            result = plan.query
+            provider_call = "rewritten"
+
+        logger.info(
+            "Memory recall planner mode=%s action=%s outcome=%s latency_ms=%d "
+            "provider_call=%s",
+            mode,
+            action,
+            outcome,
+            round(elapsed * 1000),
+            provider_call,
+        )
+        return result
+
     # -- Prefetch / recall ---------------------------------------------------
 
     @staticmethod
@@ -630,7 +1019,6 @@ class MemoryManager:
 
         # Propagate the caller's contextvars (profile HERMES_HOME override)
         # to the prefetch thread — see _submit_background.
-        import contextvars
         from functools import partial
 
         thread = threading.Thread(
@@ -707,7 +1095,14 @@ class MemoryManager:
         wedged provider can never block the caller. See ``sync_all`` for
         the full rationale (agent stuck "running" minutes after a turn).
         """
-        providers = list(self._providers)
+        planner_provider = (
+            self._recall_planner_provider
+            if self._recall_planner_effective_mode == "active"
+            else None
+        )
+        # Active planning makes the selected provider's current-query prefetch
+        # authoritative. Never queue the raw post-turn message behind it.
+        providers = [p for p in self._providers if p is not planner_provider]
         if not providers:
             return
 
@@ -1345,6 +1740,8 @@ class MemoryManager:
         daemon, so anything still wedged past the drain window dies with
         the interpreter rather than blocking exit.
         """
+        with self._recall_planner_state_lock:
+            self._recall_planner_shutdown = True
         self._drain_sync_executor()
         for provider in reversed(self._providers):
             try:
@@ -1426,11 +1823,15 @@ class MemoryManager:
         if "hermes_home" not in kwargs:
             from hermes_constants import get_hermes_home
             kwargs["hermes_home"] = str(get_hermes_home())
+        self._initialized_provider_ids.clear()
         for provider in self._providers:
             try:
                 provider.initialize(session_id=session_id, **kwargs)
+                self._initialized_provider_ids.add(id(provider))
+                logger.info("Memory provider '%s' initialized", provider.name)
             except Exception as e:
                 logger.warning(
                     "Memory provider '%s' initialize failed: %s",
                     provider.name, e,
                 )
+        self._configure_recall_planner()

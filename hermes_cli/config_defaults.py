@@ -2130,6 +2130,13 @@ DEFAULT_CONFIG = {
         # "hindsight", "holographic", "retaindb", "byterover".
         # Only ONE external provider is allowed at a time.
         "provider": "",
+        # Optional host-level automatic recall routing. The provider binding and
+        # capability gate prevent behavior changes for unsupported/legacy plugins.
+        "recall_planner": {
+            "mode": "off",  # off | shadow (observe only) | active
+            "provider": "",  # must exactly match memory.provider when enabled
+            "timeout_seconds": 5.0,
+        },
     },
 
     # Subagent delegation — override the provider:model used by delegate_task

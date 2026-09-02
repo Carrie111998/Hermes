@@ -316,6 +316,8 @@ export function useSlashCommand(deps: SlashCommandDeps) {
 
           const message = ('message' in dispatch ? dispatch.message : '')?.trim() ?? ''
 
+          const plannerUserMessage = 'plannerUserMessage' in dispatch ? dispatch.plannerUserMessage : undefined
+
           // /undo returns a prefill directive: drop the backed-up message into
           // the composer for editing instead of submitting it immediately.
           if (dispatch.type === 'prefill') {
@@ -359,7 +361,14 @@ export function useSlashCommand(deps: SlashCommandDeps) {
             // whichever chat is now in front.
             const queueKey = resolveComposerSessionKey(storedSessionId, $sessions.get()) || storedSessionId || sessionId
 
-            if (enqueueQueuedPrompt(queueKey, { attachments: [], text: message, displayText })) {
+            if (
+              enqueueQueuedPrompt(queueKey, {
+                attachments: [],
+                text: message,
+                displayText,
+                plannerUserMessage: plannerUserMessage
+              })
+            ) {
               renderSlashOutput('session busy — message queued to send when the current turn finishes')
             } else {
               renderSlashOutput('session busy — /interrupt the current turn before sending this command')
@@ -376,7 +385,12 @@ export function useSlashCommand(deps: SlashCommandDeps) {
           // its kickoff as a user message into whatever conversation was on
           // screen. Every other target the dispatcher serves (tile, background
           // queue drain, a session created by this very call) had the same leak.
-          await submitPromptText(message, { sessionId, storedSessionId, displayText })
+          await submitPromptText(message, {
+            sessionId,
+            storedSessionId,
+            displayText,
+            plannerUserMessage: plannerUserMessage
+          })
         }
 
         try {

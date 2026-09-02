@@ -54,6 +54,8 @@ from tui_gateway.transport import (
 
 logger = logging.getLogger(__name__)
 
+_TUI_PLANNER_MESSAGE_UNSET = object()
+
 _hermes_home = get_hermes_home()
 load_hermes_dotenv(
     hermes_home=_hermes_home, project_env=Path(__file__).parent.parent / ".env"
@@ -2719,6 +2721,7 @@ def _compute_host_turn_frame(
     image_paths: list[str] | None = None,
     queued_prompt_generation: int | None = None,
     display_kind: str | None = None,
+    planner_user_message: Any = _TUI_PLANNER_MESSAGE_UNSET,
 ) -> dict:
     with session["history_lock"]:
         history = list(session.get("history", []))
@@ -2735,6 +2738,11 @@ def _compute_host_turn_frame(
         "session_key": session.get("session_key") or sid,
         "text": text,
         **({"display_kind": display_kind} if display_kind else {}),
+        **(
+            {"planner_user_message": planner_user_message}
+            if planner_user_message is not _TUI_PLANNER_MESSAGE_UNSET
+            else {}
+        ),
         "history": history,
         "history_version": history_version,
         "cols": int(session.get("cols", 80) or 80),
@@ -2907,6 +2915,7 @@ def _submit_prompt_to_compute_host(
     image_paths: list[str] | None = None,
     queued_prompt_generation: int | None = None,
     display_kind: str | None = None,
+    planner_user_message: Any = _TUI_PLANNER_MESSAGE_UNSET,
 ) -> dict:
     cfg = _load_dashboard_process_isolation_config()
     frame = _compute_host_turn_frame(
@@ -2917,6 +2926,7 @@ def _submit_prompt_to_compute_host(
         image_paths=image_paths,
         queued_prompt_generation=queued_prompt_generation,
         display_kind=display_kind,
+        planner_user_message=planner_user_message,
     )
 
     def _complete(done: dict) -> None:
@@ -10397,6 +10407,7 @@ def _enqueue_prompt(
     text: Any,
     transport: Any,
     image_paths: list[str] | None = None,
+    planner_user_message: Any = _TUI_PLANNER_MESSAGE_UNSET,
 ) -> None:
     """Stash a message to run as the very next turn once the live one ends.
 
@@ -10425,6 +10436,8 @@ def _enqueue_prompt(
     queued = {"text": text, "transport": transport}
     if image_paths:
         queued["image_paths"] = image_paths
+    if planner_user_message is not _TUI_PLANNER_MESSAGE_UNSET:
+        queued["planner_user_message"] = planner_user_message
     existing = session.get("queued_prompt")
     if (
         existing
@@ -10436,6 +10449,13 @@ def _enqueue_prompt(
     ):
         prev = existing["text"]
         existing["text"] = f"{prev}\n\n{text}" if prev and text else (prev or text)
+        if (
+            "planner_user_message" in existing
+            or planner_user_message is not _TUI_PLANNER_MESSAGE_UNSET
+        ):
+            # Two independently-authored turns no longer have one trustworthy
+            # planner projection after their model-facing strings are merged.
+            existing["planner_user_message"] = None
         return
     if existing:
         session.setdefault("queued_prompts", []).append(queued)
@@ -10555,7 +10575,13 @@ def _interrupt_busy_session(sid: str, session: dict, agent: Any) -> None:
 
 
 def _handle_busy_submit(
-    rid, sid: str, session: dict, text: Any, transport: Any, queued: bool = False
+    rid,
+    sid: str,
+    session: dict,
+    text: Any,
+    transport: Any,
+    queued: bool = False,
+    planner_user_message: Any = _TUI_PLANNER_MESSAGE_UNSET,
 ) -> dict | None:
     """Apply the ``display.busy_input_mode`` policy to a prompt that lands while
     a turn is in flight, instead of rejecting it with ``session busy``.
@@ -10633,7 +10659,13 @@ def _handle_busy_submit(
             if image_paths:
                 session["attached_images"] = image_paths + list(session.get("attached_images", []))
             return None
-        _enqueue_prompt(session, text, transport, image_paths=image_paths)
+        _enqueue_prompt(
+            session,
+            text,
+            transport,
+            image_paths=image_paths,
+            planner_user_message=planner_user_message,
+        )
         session["last_active"] = time.time()
 
     # Attachments need a separate model invocation. Queue them without
@@ -10694,6 +10726,14 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
             session["running"] = False
             return True
     dispatch_failed = False
+    queued_planner_user_message = (
+        queued.get("planner_user_message")
+        if "planner_user_message" in queued
+        else _TUI_PLANNER_MESSAGE_UNSET
+    )
+    planner_kwargs = {}
+    if queued_planner_user_message is not _TUI_PLANNER_MESSAGE_UNSET:
+        planner_kwargs["planner_user_message"] = queued_planner_user_message
     try:
         if use_compute_host:
             if queued.get("image_paths"):
@@ -10704,10 +10744,16 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
                     queued["text"],
                     image_paths=queued["image_paths"],
                     queued_prompt_generation=queue_generation,
+                    **planner_kwargs,
                 )
             else:
                 resp = _submit_prompt_to_compute_host(
-                    rid, sid, session, queued["text"], queued_prompt_generation=queue_generation
+                    rid,
+                    sid,
+                    session,
+                    queued["text"],
+                    queued_prompt_generation=queue_generation,
+                    **planner_kwargs,
                 )
             if resp.get("error"):
                 message = str(((resp.get("error") or {}).get("message")) or "queued prompt failed")
@@ -10725,6 +10771,7 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
                     queued["text"],
                     image_paths=queued["image_paths"],
                     queued_prompt_generation=queue_generation,
+                    **planner_kwargs,
                 )
             else:
                 _run_prompt_submit(
@@ -10733,6 +10780,7 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
                     session,
                     queued["text"],
                     queued_prompt_generation=queue_generation,
+                    **planner_kwargs,
                 )
     except Exception as exc:
         print(
@@ -13174,6 +13222,7 @@ def _run_prompt_submit(
     image_paths: list[str] | None = None,
     queued_prompt_generation: int | None = None,
     terminal_callback: Callable[[dict[str, Any]], None] | None = None,
+    planner_user_message: Any = _TUI_PLANNER_MESSAGE_UNSET,
 ) -> bool:
     # Ownership admission at the ONE chokepoint every fresh turn source must
     # cross. prompt.submit already claims the slot in its RPC handler (so this
@@ -13561,6 +13610,17 @@ def _run_prompt_submit(
                 _run_params = {}
             if "task_id" in _run_params:
                 run_kwargs["task_id"] = session["session_key"]
+            if (
+                planner_user_message is not _TUI_PLANNER_MESSAGE_UNSET
+                and (
+                    "planner_user_message" in _run_params
+                    or any(
+                        parameter.kind is inspect.Parameter.VAR_KEYWORD
+                        for parameter in _run_params.values()
+                    )
+                )
+            ):
+                run_kwargs["planner_user_message"] = planner_user_message
             if display_kind and "persist_user_display_kind" in _run_params:
                 run_kwargs["persist_user_display_kind"] = display_kind
                 run_kwargs["persist_user_display_metadata"] = display_metadata

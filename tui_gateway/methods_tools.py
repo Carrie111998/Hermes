@@ -572,6 +572,7 @@ def _(rid, params: dict) -> dict:
             {
                 "type": "send",
                 "message": msg,
+                "planner_user_message": arg or None,
                 "notice": notice,
                 # UIs render this, never `message` — the expanded bundle body
                 # is model-facing scaffolding (see _skill_scaffold_projection).
@@ -597,6 +598,7 @@ def _(rid, params: dict) -> dict:
                     {
                         "type": "skill",
                         "message": msg,
+                        "planner_user_message": arg or None,
                         "name": cmds[key].get("name", name),
                         # UIs render this, never `message` — the expanded skill
                         # body is model-facing scaffolding.

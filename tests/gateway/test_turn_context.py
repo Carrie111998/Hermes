@@ -17,7 +17,7 @@ import pytest
 
 from gateway.config import Platform
 from gateway.session import SessionSource
-from gateway.turn_context import TurnContext
+from gateway.turn_context import PLANNER_USER_MESSAGE_UNSET, TurnContext
 
 
 def _make_runner(ctx):
@@ -47,6 +47,10 @@ class TestTurnContext:
         ctx = TurnContext(last_progress_msg=last_progress_msg)
         ctx.last_progress_msg[0] = "🔍 web_search"
         assert last_progress_msg[0] == "🔍 web_search"
+
+    def test_planner_provenance_default_is_distinct_from_bare_skill(self):
+        assert TurnContext().planner_user_message is PLANNER_USER_MESSAGE_UNSET
+        assert TurnContext(planner_user_message=None).planner_user_message is None
 
 
 class TestTurnRunner:

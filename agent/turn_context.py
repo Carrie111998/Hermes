@@ -40,7 +40,10 @@ from agent.conversation_compression import (
 )
 from agent.context_engine import automatic_compaction_status_message
 from agent.iteration_budget import IterationBudget
-from agent.memory_manager import build_memory_context_block
+from agent.memory_manager import (
+    RECALL_PLANNER_MESSAGE_UNSET,
+    build_memory_context_block,
+)
 from agent.memory_provider import is_trivial_prompt
 from agent.message_metadata import append_message, stamp_message_timestamp
 from agent.model_metadata import (
@@ -48,6 +51,7 @@ from agent.model_metadata import (
     estimate_messages_tokens_rough,
     estimate_request_tokens_rough,
 )
+from agent.skill_commands import is_skill_scaffold_message
 
 logger = logging.getLogger(__name__)
 
@@ -561,6 +565,7 @@ def build_turn_context(
     *,
     persist_user_display_kind: Optional[str] = None,
     persist_user_display_metadata: Optional[Dict[str, Any]] = None,
+    planner_user_message: Any = RECALL_PLANNER_MESSAGE_UNSET,
     restore_or_build_system_prompt,
     install_safe_stdio,
     sanitize_surrogates,
@@ -672,6 +677,8 @@ def build_turn_context(
         user_message = sanitize_surrogates(user_message)
     if isinstance(persist_user_message, str):
         persist_user_message = sanitize_surrogates(persist_user_message)
+    if isinstance(planner_user_message, str):
+        planner_user_message = sanitize_surrogates(planner_user_message)
 
     # Store stream callback for _interruptible_api_call to pick up.
     agent._stream_callback = stream_callback
@@ -815,6 +822,14 @@ def build_turn_context(
         user_msg["display_kind"] = persist_user_display_kind
         if persist_user_display_metadata:
             user_msg["display_metadata"] = persist_user_display_metadata
+    if planner_user_message is not RECALL_PLANNER_MESSAGE_UNSET:
+        # Explicit planner provenance means this turn's model-facing text was
+        # transformed at ingress (currently slash-skill expansion).  The clean
+        # field may guide this turn's planner, but neither the transformed user
+        # row nor its assistant response is eligible for a future capsule.
+        display_metadata = dict(user_msg.get("display_metadata") or {})
+        display_metadata["recall_planner_exclude"] = True
+        user_msg["display_metadata"] = display_metadata
 
     # Stamp the platform-side message id (e.g. the Discord/Telegram message id)
     # as metadata on the user turn so it survives the early crash-resilience
@@ -1547,7 +1562,46 @@ def build_turn_context(
         try:
             _query = original_user_message if isinstance(original_user_message, str) else ""
             if not is_trivial_prompt(_query):
-                ext_prefetch_cache = agent._memory_manager.prefetch_all(_query) or ""
+                _prefetch_query: Optional[str] = _query
+                if (
+                    getattr(
+                        agent._memory_manager,
+                        "recall_planning_enabled",
+                        False,
+                    )
+                    is True
+                ):
+                    _planner_history = (
+                        messages[:current_turn_user_idx]
+                        + messages[current_turn_user_idx + 1 :]
+                        if 0 <= current_turn_user_idx < len(messages)
+                        else messages[:-1]
+                    )
+                    _planner_user_message: Any = planner_user_message
+                    if planner_user_message is RECALL_PLANNER_MESSAGE_UNSET:
+                        _planner_user_message = _query
+                    if (
+                        planner_user_message is RECALL_PLANNER_MESSAGE_UNSET
+                        and (
+                            is_skill_scaffold_message(user_message)
+                            or is_skill_scaffold_message(_query)
+                        )
+                    ):
+                        # The model-facing expansion is contaminated by the
+                        # private skill body.  Only a separately carried clean
+                        # provenance field may cross the auxiliary boundary;
+                        # otherwise active planning fails closed (shadow mode
+                        # retains its documented raw-provider path).
+                        _planner_user_message = None
+                    _prefetch_query = agent._memory_manager.plan_prefetch_query(
+                        _query,
+                        _planner_history,
+                        planner_user_message=_planner_user_message,
+                    )
+                if _prefetch_query:
+                    ext_prefetch_cache = (
+                        agent._memory_manager.prefetch_all(_prefetch_query) or ""
+                    )
         except Exception:
             pass
         # Deterministic, model-independent recall indicator: when memory was

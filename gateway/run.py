@@ -3150,7 +3150,7 @@ from gateway.session_state import (
 from gateway.authz_mixin import GatewayAuthorizationMixin
 from gateway.kanban_watchers import GatewayKanbanWatchersMixin
 from gateway.slash_commands import GatewaySlashCommandsMixin
-from gateway.turn_context import TurnContext
+from gateway.turn_context import PLANNER_USER_MESSAGE_UNSET, TurnContext
 from gateway.platforms.base import (
     BasePlatformAdapter,
     EphemeralReply,
@@ -7101,6 +7101,8 @@ class TurnRunner:
                 _conversation_kwargs["persist_user_message"] = _persist_user_message_override
             elif observed_group_context:
                 _conversation_kwargs["persist_user_message"] = ctx.message
+            if ctx.planner_user_message is not PLANNER_USER_MESSAGE_UNSET:
+                _conversation_kwargs["planner_user_message"] = ctx.planner_user_message
             if ctx.persist_user_display_kind:
                 # Internal self-injected turn (#82888): type the persisted user
                 # row at turn start so UIs render it as a timeline notice, not
@@ -18793,6 +18795,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         7. Return response
         """
         source = event.source
+        planner_user_message: Any = PLANNER_USER_MESSAGE_UNSET
 
         # 🔴 Cross-session leak guard. This handler runs inside a per-message
         # asyncio task created via create_task(), which snapshots the spawning
@@ -20172,6 +20175,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     if bundle_result:
                         msg, _loaded, missing = bundle_result
                         event.text = msg
+                        planner_user_message = user_instruction or None
                         _bundle_handled = True
                         if missing:
                             logger.info(
@@ -20250,6 +20254,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         if stacked_result:
                             msg, _loaded, _missing = stacked_result
                             event.text = msg
+                            planner_user_message = stacked_instruction or None
                             # Fall through to normal message processing
                         else:
                             return f"Failed to load stacked skills for /{command}."
@@ -20259,6 +20264,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         )
                         if msg:
                             event.text = msg
+                            planner_user_message = user_instruction or None
                             # Fall through to normal message processing with skill content
                 else:
                     # Not an active skill — check if it's a known-but-disabled or
@@ -20342,6 +20348,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
             return _limit_message
 
+        # Skill expansion happens before FIFO orphan rescue. Keep the clean
+        # planner input on its event so swapping in an older queued event does
+        # not apply the new arrival's provenance to the wrong turn.
+        if planner_user_message is not PLANNER_USER_MESSAGE_UNSET:
+            event.metadata["_planner_user_message"] = planner_user_message
+
         # ── FIFO orphan rescue (#99882) ────────────────────────────────
         # If this session went idle with a populated overflow (queued
         # during a busy window whose post-turn drain never promoted —
@@ -20371,6 +20383,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     # behind the already-staged next orphan (FIFO).
                     self._enqueue_fifo(_quick_key, event, _orphan_adapter)
                     event = _rescued
+                    _rescued_metadata = getattr(event, "metadata", None)
+                    planner_user_message = (
+                        _rescued_metadata["_planner_user_message"]
+                        if isinstance(_rescued_metadata, dict)
+                        and "_planner_user_message" in _rescued_metadata
+                        else PLANNER_USER_MESSAGE_UNSET
+                    )
                     # Same session key by construction; carry the orphan's
                     # own source so reply anchors / thread metadata point
                     # at the message that is actually being answered.
@@ -20393,10 +20412,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self._persist_active_agents()
         _run_generation = self._begin_session_run_generation(_quick_key)
 
+        _planner_kwargs = {}
+        if planner_user_message is not PLANNER_USER_MESSAGE_UNSET:
+            _planner_kwargs["planner_user_message"] = planner_user_message
+
         try:
             try:
                 _agent_result = await self._handle_message_with_agent(
-                    event, source, _quick_key, _run_generation
+                    event,
+                    source,
+                    _quick_key,
+                    _run_generation,
+                    **_planner_kwargs,
                 )
             except TurnLeaseTimeoutError as exc:
                 # This is a rejected message, not a completed agent turn. Return
@@ -21215,7 +21242,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 pass
         return source
 
-    async def _handle_message_with_agent(self, event, source, _quick_key: str, run_generation: int):
+    async def _handle_message_with_agent(
+        self,
+        event,
+        source,
+        _quick_key: str,
+        run_generation: int,
+        planner_user_message: Any = PLANNER_USER_MESSAGE_UNSET,
+    ):
         """Inner handler that runs under the _running_agents sentinel guard."""
         _msg_start_time = time.time()
         _platform_name = source.platform.value if hasattr(source.platform, "value") else str(source.platform)
@@ -23184,6 +23218,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 channel_prompt=event.channel_prompt,
                 moa_config=getattr(event, "_moa_config", None),
                 persist_user_message=persist_user_message,
+                planner_user_message=planner_user_message,
                 persist_user_timestamp=persist_user_timestamp,
                 persist_user_display_kind=persist_user_display_kind,
                 message_type=event.message_type,
@@ -31106,6 +31141,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         channel_prompt: Optional[str] = None,
         moa_config: Optional[dict] = None,
         persist_user_message: Optional[Any] = None,
+        planner_user_message: Any = PLANNER_USER_MESSAGE_UNSET,
         persist_user_timestamp: Optional[float] = None,
         persist_user_display_kind: Optional[str] = None,
         message_type: Optional[str] = None,
@@ -31127,6 +31163,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 inbound_message_id=inbound_message_id,
                 channel_prompt=channel_prompt, moa_config=moa_config,
                 persist_user_message=persist_user_message,
+                planner_user_message=planner_user_message,
                 persist_user_timestamp=persist_user_timestamp,
                 persist_user_display_kind=persist_user_display_kind,
                 message_type=message_type,
@@ -31141,6 +31178,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 inbound_message_id=inbound_message_id,
                 channel_prompt=channel_prompt, moa_config=moa_config,
                 persist_user_message=persist_user_message,
+                planner_user_message=planner_user_message,
                 persist_user_timestamp=persist_user_timestamp,
                 persist_user_display_kind=persist_user_display_kind,
                 message_type=message_type,
@@ -31285,6 +31323,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         channel_prompt: Optional[str] = None,
         moa_config: Optional[dict] = None,
         persist_user_message: Optional[Any] = None,
+        planner_user_message: Any = PLANNER_USER_MESSAGE_UNSET,
         persist_user_timestamp: Optional[float] = None,
         persist_user_display_kind: Optional[str] = None,
         message_type: Optional[str] = None,
@@ -31596,6 +31635,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             inbound_message_id=inbound_message_id,
             moa_config=moa_config,
             persist_user_message=persist_user_message,
+            planner_user_message=planner_user_message,
             persist_user_timestamp=persist_user_timestamp,
             persist_user_display_kind=persist_user_display_kind,
         )
@@ -32759,6 +32799,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 next_message_id = None
                 next_channel_prompt = None
                 next_session_key = session_key
+                next_planner_user_message = PLANNER_USER_MESSAGE_UNSET
                 # #60671 — carry the pending event's message_type into the
                 # recursive call so queued voice turns can stream TTS and
                 # re-mark the generation for the final delivered turn.
@@ -32795,6 +32836,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     next_message_id = self._reply_anchor_for_event(pending_event)
                     next_channel_prompt = getattr(pending_event, "channel_prompt", None)
                     next_message_type = getattr(pending_event, "message_type", None)
+                    _pending_metadata = getattr(pending_event, "metadata", None)
+                    if (
+                        isinstance(_pending_metadata, dict)
+                        and "_planner_user_message" in _pending_metadata
+                    ):
+                        next_planner_user_message = _pending_metadata[
+                            "_planner_user_message"
+                        ]
 
                 # Clear the completed streaming marker from the prior logical
                 # turn so the recursive turn's streaming TTS is not suppressed
@@ -32838,6 +32887,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # what the follow-up's guard will consult.  Fail-safe in helper.
                 await self._refresh_agent_cache_message_count(session_key, session_id)
 
+                _followup_planner_kwargs = {}
+                if next_planner_user_message is not PLANNER_USER_MESSAGE_UNSET:
+                    _followup_planner_kwargs["planner_user_message"] = (
+                        next_planner_user_message
+                    )
+
                 followup_result = await self._run_agent(
                     message=next_message,
                     context_prompt=context_prompt,
@@ -32850,6 +32905,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     event_message_id=next_message_id,
                     channel_prompt=next_channel_prompt,
                     message_type=next_message_type,
+                    **_followup_planner_kwargs,
                 )
                 return _preserve_queued_followup_history_offset(result, followup_result)
         finally:

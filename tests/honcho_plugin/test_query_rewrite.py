@@ -168,3 +168,16 @@ def test_config_defaults_keep_rewrite_opt_in_and_bound_first_turn_waits():
     assert cfg.query_rewrite is False
     assert cfg.first_turn_base_wait == 3.0
     assert cfg.first_turn_dialectic_wait == 2.0
+    assert DEFAULT_CONFIG["memory"]["recall_planner"] == {
+        "mode": "off",
+        "provider": "",
+        "timeout_seconds": 5.0,
+    }
+
+
+def test_honcho_reports_initialized_provider_local_query_rewrite_setting():
+    provider = HonchoMemoryProvider()
+
+    assert provider.rewrites_recall_queries() is False
+    provider._query_rewrite_enabled = True
+    assert provider.rewrites_recall_queries() is True

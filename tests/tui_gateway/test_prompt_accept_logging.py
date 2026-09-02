@@ -119,6 +119,38 @@ def test_accepted_and_finished_records_on_success(turn_env, caplog):
     assert "hunter2" not in fin
 
 
+def test_explicit_planner_user_message_reaches_agent_without_scaffold(turn_env):
+    calls = []
+
+    def _run(*args, **kwargs):
+        calls.append((args, kwargs))
+        return {"final_response": "done"}
+
+    agent = types.SimpleNamespace(
+        session_id="agent-sid-1",
+        run_conversation=_run,
+        clear_interrupt=lambda: None,
+    )
+    session = _session(agent=agent, running=True)
+    scaffold = (
+        "[channel context]\n"
+        "[IMPORTANT: The user has invoked the \"private\" skill.]\nPRIVATE_BODY"
+    )
+
+    server._run_prompt_submit(
+        "rid",
+        "ui-sid",
+        session,
+        scaffold,
+        planner_user_message="fix the scheduler",
+    )
+
+    assert len(calls) == 1
+    args, kwargs = calls[0]
+    assert args == (scaffold,)
+    assert kwargs["planner_user_message"] == "fix the scheduler"
+
+
 def test_finished_record_reflects_mid_turn_rotation(turn_env, caplog):
     """Compression rotating agent.session_id mid-turn must be visible as an
     accepted/finished pair with different agent ids — that pair IS the
