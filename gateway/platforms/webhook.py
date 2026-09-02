@@ -28,6 +28,27 @@ Security:
     legacy body-only V1 (X-Webhook-Signature) is deprecated but still
     accepted with a warning, since it has no replay protection
   - Set secret to "INSECURE_NO_AUTH" to skip validation (testing only)
+
+Orca bridge routes:
+  A route with ``orca_bridge: true`` does not run the agent at all. Its body
+  is handed to ``tools.orca_bridge`` as DATA — never a prompt, never a
+  command — so a local Orca run can wake Hermes the moment it finishes
+  instead of waiting for the next poll. Because such a route can trigger real
+  work on the owner's behalf it is held to stricter rules than an ordinary
+  one:
+    * HMAC is mandatory — INSECURE_NO_AUTH is refused outright
+    * the request must actually AUTHENTICATE under a replay-protected
+      scheme — generic V2 (HMAC over "<timestamp>.<raw body>", ±300 s) or
+      Svix. The GitHub body-only HMAC, the GitLab plain-token compare and
+      the legacy V1 body-only branches are not evaluated at all here; they
+      stay available to every OTHER route for backward compatibility, but
+      none of them binds a timestamp, so a captured bridge POST under one
+      would replay forever
+    * the listener is pinned to loopback
+    * peers that are not on this machine — including anything arriving with a
+      forwarding header — are rejected
+    * the route kind can only come from config.yaml, never from the
+      agent-writable dynamic subscriptions file
 """
 
 import asyncio
@@ -129,6 +150,10 @@ _BUILTIN_DELIVER_PLATFORMS = {
 #     ``platforms.webhook.extra.host``.
 DEFAULT_HOST = None
 DEFAULT_PORT = 8644
+# Bind used when an Orca bridge route is configured and the operator did not
+# pin a host. The adapter's usual "all interfaces" default is wrong for a
+# local control channel: the bridge exists for a process on THIS machine.
+ORCA_BRIDGE_DEFAULT_HOST = "127.0.0.1"
 _INSECURE_NO_AUTH = "INSECURE_NO_AUTH"
 _DYNAMIC_ROUTES_FILENAME = "webhook_subscriptions.json"
 _RATE_WINDOW_SECONDS = 60.0
@@ -167,7 +192,71 @@ def _hmac_str_equal(provided: str, expected: str) -> bool:
     Comparing as UTF-8 bytes keeps the constant-time guarantee while making a
     hostile header fail closed with a clean rejection.
     """
-    return hmac.compare_digest(provided.encode(), expected.encode())
+    # aiohttp decodes header bytes that are NOT valid UTF-8 using
+    # ``surrogateescape``, so ``provided`` can hold lone surrogates (e.g.
+    # ``\udce9`` from a latin-1 byte). A strict ``.encode()`` refuses those
+    # with ``UnicodeEncodeError``, which escapes the request handler as a 500
+    # — the exact failure this helper exists to prevent, just one codec
+    # further out than the original non-ASCII fix reached. Re-encoding with
+    # the same error handler round-trips them back to the original wire
+    # bytes, so a hostile header is compared as bytes and fails closed with a
+    # clean rejection instead of a 500.
+    return hmac.compare_digest(
+        provided.encode("utf-8", "surrogateescape"), expected.encode()
+    )
+
+
+# Headers that mean "somebody relayed this request for the real client".
+# Their mere PRESENCE disqualifies a request from the bridge — see
+# _is_same_machine_request.
+_FORWARDING_HEADERS = (
+    "X-Forwarded-For",
+    "X-Real-IP",
+    "Forwarded",
+    "X-Forwarded-Host",
+    "X-Forwarded-Proto",
+)
+
+
+def _request_peer_host(request: "web.Request") -> str:
+    """Remote address of the TCP peer, ignoring forwarding headers.
+
+    Deliberately NOT ``request.remote`` semantics extended with
+    X-Forwarded-For: those headers are attacker-controlled, and the whole
+    point of this check is that the caller shares the machine.
+    """
+    transport = getattr(request, "transport", None)
+    peername = transport.get_extra_info("peername") if transport else None
+    if isinstance(peername, tuple) and peername:
+        return str(peername[0])
+    return str(getattr(request, "remote", "") or "")
+
+
+def _is_same_machine_request(request: "web.Request") -> bool:
+    """True only for a request that originated on this machine.
+
+    A loopback peer address is necessary but NOT sufficient. An SSH tunnel, a
+    ``kubectl port-forward``, or a reverse proxy bound to 127.0.0.1 all
+    deliver off-machine traffic to a loopback listener with a loopback
+    peername — the proxy is the peer, not the client. Such relays announce
+    themselves in a forwarding header, so the presence of ANY of them is
+    treated as proof that the real client is elsewhere and the request is
+    refused.
+
+    That means the bridge cannot be proxied. It is meant to fail closed: a
+    local control channel that can wake the owner's session about real work
+    should stop working when someone puts it behind a proxy, not silently
+    start trusting whoever is on the other side.
+    """
+    xff = ""
+    for header in _FORWARDING_HEADERS:
+        value = request.headers.get(header, "")
+        if value:
+            xff = value
+            break
+    if xff:
+        return False
+    return _is_loopback_host(_request_peer_host(request))
 
 
 def check_webhook_requirements() -> bool:
@@ -246,13 +335,45 @@ class WebhookAdapter(BasePlatformAdapter):
     # Lifecycle
     # ------------------------------------------------------------------
 
+    def orca_bridge_routes(self) -> list:
+        """Names of the configured Orca bridge routes (config.yaml only)."""
+        return [
+            name for name, route in self._routes.items()
+            if route.get("orca_bridge")
+        ]
+
     async def connect(self, *, is_reconnect: bool = False) -> bool:
         # Load agent-created subscriptions before validating
         self._reload_dynamic_routes()
 
+        # An Orca bridge route pins the listener to loopback. Resolve that
+        # BEFORE the per-route validation loop so the INSECURE_NO_AUTH rail
+        # below sees the host the socket will actually use.
+        orca_routes = self.orca_bridge_routes()
+        if orca_routes:
+            if self._host is None:
+                self._host = ORCA_BRIDGE_DEFAULT_HOST
+            elif not _is_loopback_host(self._host):
+                raise ValueError(
+                    f"[webhook] Orca bridge route(s) {', '.join(orca_routes)} "
+                    f"require a loopback bind, but host is '{self._host}'. "
+                    f"The bridge is a local control channel: set "
+                    f"platforms.webhook.extra.host to 127.0.0.1, or move the "
+                    f"bridge onto its own loopback webhook profile."
+                )
+
         # Validate routes at startup — secret is required per route
         for name, route in self._routes.items():
             secret = route.get("secret", self._global_secret)
+            # HMAC is mandatory on an Orca bridge route even on loopback: any
+            # local process (a browser page, a compromised dev tool) can reach
+            # 127.0.0.1, and this route can wake the agent about real work.
+            if route.get("orca_bridge") and secret == _INSECURE_NO_AUTH:
+                raise ValueError(
+                    f"[webhook] Orca bridge route '{name}' cannot use "
+                    f"{_INSECURE_NO_AUTH}. Set a real HMAC secret — every "
+                    f"other local process can reach a loopback port."
+                )
             if not secret:
                 raise ValueError(
                     f"[webhook] Route '{name}' has no HMAC secret. "
@@ -551,6 +672,19 @@ class WebhookAdapter(BasePlatformAdapter):
                         self._host,
                     )
                     continue
+                if v.get("orca_bridge"):
+                    # This file is agent-writable. A route that can wake the
+                    # owner's session about "completed" work is an operator
+                    # decision, so the kind is honoured from config.yaml only;
+                    # strip the flag rather than dropping the route, so a
+                    # mislabelled subscription still behaves as a normal one.
+                    logger.warning(
+                        "[webhook] Dynamic route '%s' requested orca_bridge; "
+                        "ignoring — Orca bridge routes must be declared in "
+                        "config.yaml.",
+                        k,
+                    )
+                    v = {kk: vv for kk, vv in v.items() if kk != "orca_bridge"}
                 new_dynamic[k] = v
             self._dynamic_routes = new_dynamic
             self._routes = {**self._dynamic_routes, **self._static_routes}
@@ -691,6 +825,27 @@ class WebhookAdapter(BasePlatformAdapter):
                 {"error": f"Route disabled: {route_name}"}, status=403
             )
 
+        # ── Orca bridge: same-machine only ───────────────────────
+        # Checked before the body is read, and independently of the bind: a
+        # port-forward, an SSH tunnel or a reverse proxy in front can deliver
+        # off-machine traffic to a loopback listener.
+        is_orca_bridge = bool(route_config.get("orca_bridge"))
+        if is_orca_bridge and not _is_same_machine_request(request):
+            relayed = any(
+                request.headers.get(h) for h in _FORWARDING_HEADERS
+            )
+            logger.warning(
+                "[webhook] Orca bridge route %s refused %s (peer %s)",
+                route_name,
+                "a relayed request (forwarding header present)" if relayed
+                else "a non-local peer",
+                _request_peer_host(request) or "<unknown>",
+            )
+            return web.json_response(
+                {"error": "Orca bridge accepts local requests only"},
+                status=403,
+            )
+
         # ── Auth-before-body ─────────────────────────────────────
         # Check Content-Length before reading the full payload.
         content_length = request.content_length or 0
@@ -733,7 +888,10 @@ class WebhookAdapter(BasePlatformAdapter):
                 status=403,
             )
         if secret != _INSECURE_NO_AUTH:
-            if not self._validate_signature(request, raw_body, secret):
+            if not self._validate_signature(
+                request, raw_body, secret,
+                require_replay_protection=is_orca_bridge,
+            ):
                 logger.warning(
                     "[webhook] Invalid signature for route %s", route_name
                 )
@@ -763,6 +921,15 @@ class WebhookAdapter(BasePlatformAdapter):
                 return web.json_response(
                     {"error": "Cannot parse body"}, status=400
                 )
+
+        # ── Orca bridge dispatch ─────────────────────────────────
+        # Authenticated, replay-protected, rate-limited, size-capped,
+        # same-machine. Everything below this point (event filters, scripts,
+        # prompt templates, skills, agent dispatch) is deliberately skipped:
+        # the bridge treats the body as data and decides on its own taxonomy,
+        # and no field in it may become a prompt or a command.
+        if is_orca_bridge:
+            return await self._handle_orca_bridge_event(route_name, payload)
 
         # Check event type filter
         event_type = (
@@ -1009,6 +1176,59 @@ class WebhookAdapter(BasePlatformAdapter):
             status=202,
         )
 
+    # ------------------------------------------------------------------
+    # Orca bridge
+    # ------------------------------------------------------------------
+
+    _ORCA_BRIDGE_HTTP_STATUS = {
+        "invalid_run_id": 400,
+        "invalid_terminal": 400,
+        "unknown_run": 404,
+        # Orca unreachable is a retryable server-side condition, not a bad
+        # request: telling the sender 5xx keeps its own retry honest.
+        "reconcile_unavailable": 503,
+    }
+
+    async def _handle_orca_bridge_event(
+        self, route_name: str, payload: Any
+    ) -> "web.Response":
+        """Hand an authenticated local Orca notification to the bridge."""
+        if not isinstance(payload, dict):
+            return web.json_response(
+                {"status": "invalid_run_id",
+                 "error": "Body must be a JSON object"},
+                status=400,
+            )
+        from tools import orca_bridge
+
+        try:
+            # process_event may shell out to `orca` to reconcile, so keep it
+            # off the event loop.
+            result = await asyncio.to_thread(orca_bridge.process_event, payload)
+        except orca_bridge.BridgeNotRunning:
+            # The listener outlived the bridge (shutdown in flight). 503 so
+            # the sender retries rather than treating the event as consumed.
+            return web.json_response(
+                {"status": "bridge_stopped"}, status=503
+            )
+        except Exception:
+            logger.exception(
+                "[webhook] Orca bridge failed route=%s", route_name
+            )
+            return web.json_response(
+                {"status": "error", "error": "Bridge failure"}, status=500
+            )
+
+        status = str(result.get("status", "error"))
+        logger.info(
+            "[webhook] orca-bridge route=%s run=%s status=%s published=%s",
+            route_name, result.get("run_id", "?"), status,
+            result.get("published"),
+        )
+        return web.json_response(
+            result, status=self._ORCA_BRIDGE_HTTP_STATUS.get(status, 200)
+        )
+
     async def on_processing_complete(
         self, event: "MessageEvent", outcome: Any
     ) -> None:
@@ -1102,9 +1322,22 @@ class WebhookAdapter(BasePlatformAdapter):
     # ------------------------------------------------------------------
 
     def _validate_signature(
-        self, request: "web.Request", body: bytes, secret: str
+        self, request: "web.Request", body: bytes, secret: str,
+        *, require_replay_protection: bool = False,
     ) -> bool:
-        """Validate webhook signature (GitHub, GitLab, Svix, Linear, generic HMAC-SHA256)."""
+        """Validate webhook signature (GitHub, GitLab, Svix, Linear, generic HMAC-SHA256).
+
+        ``require_replay_protection`` narrows the accepted set to the schemes
+        that bind a timestamp into the signed bytes: Svix, or generic V2
+        (HMAC-SHA256 over ``"<timestamp>.<raw body>"`` inside a ±300 s
+        window). It selects the SCHEME — the request has to authenticate
+        under one of those two, and sending an ``X-Webhook-Signature-V2``
+        header that does not verify buys nothing. The GitHub, GitLab-token,
+        Linear and legacy V1 branches remain available to every other route
+        — none of them is weakened here — but a captured request under any
+        of the four replays forever, which is not a property the Orca bridge
+        can carry.
+        """
         def _header(name: str) -> str:
             return (
                 request.headers.get(name, "")
@@ -1130,30 +1363,45 @@ class WebhookAdapter(BasePlatformAdapter):
                 signature_header=svix_signature,
             )
 
-        # Linear: linear-signature = <hex HMAC-SHA256 of the raw body, keyed
-        # by the webhook signing key>. Linear's documented scheme signs the
-        # body only (no timestamp binding), so this mirrors it exactly;
-        # without this branch every Linear delivery to a secret-configured
-        # route was rejected as unrecognized (#87348).
-        linear_sig = _header("linear-signature")
-        if linear_sig:
-            expected_linear = hmac.new(
-                secret.encode(), body, hashlib.sha256
-            ).hexdigest()
-            return _hmac_str_equal(linear_sig, expected_linear)
+        # GitHub / GitLab / Linear / legacy V1 all sign (at most) the body,
+        # so a captured request replays indefinitely. Fine for their own
+        # senders, never for a route that can wake the owner about real work.
+        #
+        # This is a gate on the SCHEME, not on a header being present. Asking
+        # "was an X-Webhook-Signature-V2 header sent?" and then falling
+        # through re-opened the very downgrade V2 exists to close: any junk
+        # string in that header satisfied the check, after which a captured
+        # X-Hub-Signature-256 or the GitLab plain token authenticated the
+        # request under a scheme with no timestamp bound into it. So on a
+        # replay-protected route the body-only branches are not evaluated at
+        # all — only Svix (returned above) or a signature that actually
+        # verifies against V2 (below) can return True.
+        if not require_replay_protection:
+            # Linear: linear-signature = <hex HMAC-SHA256 of the raw body,
+            # keyed by the webhook signing key>. Linear's documented scheme
+            # signs the body only (no timestamp binding), so this mirrors it
+            # exactly; without this branch every Linear delivery to a
+            # secret-configured route was rejected as unrecognized (#87348).
+            # Body-only, therefore replayable, therefore gated with the rest.
+            linear_sig = _header("linear-signature")
+            if linear_sig:
+                expected_linear = hmac.new(
+                    secret.encode(), body, hashlib.sha256
+                ).hexdigest()
+                return _hmac_str_equal(linear_sig, expected_linear)
 
-        # GitHub: X-Hub-Signature-256 = sha256=<hex>
-        gh_sig = request.headers.get("X-Hub-Signature-256", "")
-        if gh_sig:
-            expected = "sha256=" + hmac.new(
-                secret.encode(), body, hashlib.sha256
-            ).hexdigest()
-            return _hmac_str_equal(gh_sig, expected)
+            # GitHub: X-Hub-Signature-256 = sha256=<hex>
+            gh_sig = request.headers.get("X-Hub-Signature-256", "")
+            if gh_sig:
+                expected = "sha256=" + hmac.new(
+                    secret.encode(), body, hashlib.sha256
+                ).hexdigest()
+                return _hmac_str_equal(gh_sig, expected)
 
-        # GitLab: X-Gitlab-Token = <plain secret>
-        gl_token = request.headers.get("X-Gitlab-Token", "")
-        if gl_token:
-            return _hmac_str_equal(gl_token, secret)
+            # GitLab: X-Gitlab-Token = <plain secret>
+            gl_token = request.headers.get("X-Gitlab-Token", "")
+            if gl_token:
+                return _hmac_str_equal(gl_token, secret)
 
         # Generic V2: X-Webhook-Signature-V2 = <hex HMAC-SHA256 of "<timestamp>.<body>">
         #             X-Webhook-Timestamp = <unix seconds> (required for V2)
@@ -1197,6 +1445,17 @@ class WebhookAdapter(BasePlatformAdapter):
                 secret.encode(), signed_content, hashlib.sha256
             ).hexdigest()
             return _hmac_str_equal(v2_sig, expected_v2)
+
+        # Replay-protected route with no V2 signature at all: nothing below
+        # this line binds a timestamp, so refuse instead of falling through.
+        if require_replay_protection:
+            logger.warning(
+                "[webhook] Route '%s' requires a replay-protected signature "
+                "(X-Webhook-Signature-V2 + X-Webhook-Timestamp, or Svix); "
+                "refusing body-only auth.",
+                request.match_info.get("route_name", ""),
+            )
+            return False
 
         # Generic V1 (legacy): X-Webhook-Signature = <hex HMAC-SHA256 of body>
         # (deprecated — no replay protection, since the signature only

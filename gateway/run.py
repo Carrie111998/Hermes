@@ -26,6 +26,7 @@ except ModuleNotFoundError:
 
 import asyncio
 import concurrent.futures
+import contextlib
 import dataclasses
 import faulthandler
 import functools
@@ -7435,6 +7436,105 @@ class TurnRunner:
 # DB-backed commands and is how many suites construct a bare runner).  A plain
 # ``None`` cannot express both.  Mirrors ``gateway.session._DB_UNPINNED``.
 _SESSION_DB_UNPINNED = object()
+class OrcaBridgeSupervisor:
+    """Lifecycle for the Orca completion bridge and the listener it rides on.
+
+    The bridge has no socket of its own — it is reached through the webhook
+    adapter's loopback route — and that coupling is the whole reason these two
+    are supervised as a pair rather than as independent subsystems. A live
+    listener whose bridge failed to start would accept authenticated,
+    replay-protected completion events and then drop them on the floor, which
+    is strictly worse than not listening: the sender gets a 5xx it can retry
+    from, or a 200 for work nobody recorded.
+
+    ``webhook`` is the already-connected adapter and ``bridge`` is the
+    ``tools.orca_bridge`` module (injected so the ordering can be tested
+    without a socket or a database).
+    """
+
+    def __init__(self, adapters, platform, webhook=None, bridge=None):
+        # The gateway's live platform map. Rollback removes the webhook entry
+        # from it so nothing downstream routes to a listener we just closed.
+        self.adapters = adapters
+        self.platform = platform
+        self.webhook = webhook
+        self.bridge = bridge
+        self._sweep_task = None
+
+    async def start(self) -> bool:
+        """Bring the bridge up behind an already-started listener.
+
+        Returns False after rolling the listener back, rather than raising:
+        an Orca bridge that cannot open its durable state is a reason to run
+        the gateway without the bridge, not a reason to take every other
+        platform down with it.
+        """
+        try:
+            self.bridge.start()
+        except Exception as exc:  # noqa: BLE001
+            logger.error(
+                "Orca bridge failed to start (%s); shutting the webhook "
+                "listener back down so it cannot accept events the bridge "
+                "would drop", exc, exc_info=True,
+            )
+            await self.shutdown()
+            self.adapters.pop(self.platform, None)
+            return False
+
+        # A run that finished while the gateway was down never gets its POST
+        # redelivered, so recovery cannot depend on the sender — ask Orca.
+        self._sweep_task = asyncio.create_task(self._startup_sweep())
+        return True
+
+    async def _startup_sweep(self) -> None:
+        """Reconcile runs that ended while this gateway was not running.
+
+        Runs once, off the event loop, and never propagates: a missing `orca`
+        binary or an unreachable runtime is a reason to keep serving webhooks,
+        not a reason to fail startup.
+
+        ponytail: the sweep runs on a worker thread, so cancelling this task
+        unblocks shutdown but does not interrupt an in-flight `orca` call —
+        the subprocess timeout (20s per query) is the real ceiling. Good
+        enough while the sweep is a bounded one-shot over registered runs; if
+        it ever becomes periodic, give it a cancellable subprocess instead.
+        """
+        try:
+            published = await asyncio.to_thread(self.bridge.sweep)
+            if published:
+                logger.info(
+                    "Orca startup sweep recovered %d completed run(s)",
+                    published,
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Orca startup sweep failed: %s", exc)
+
+    async def shutdown(self) -> None:
+        """Close the listener first, then the bridge behind it.
+
+        Order is load-bearing. Stopping the bridge while the socket is still
+        accepting would leave a window where an authenticated event is taken
+        in and then refused by a bridge that has already closed its state —
+        the sender sees a failure for a request that was genuinely delivered.
+        Closing the listener first means no new event can arrive after the
+        bridge stops recording.
+        """
+        task, self._sweep_task = self._sweep_task, None
+        if task is not None:
+            task.cancel()
+            # Cancellation is the expected outcome and anything else the sweep
+            # raised is already logged inside it. Neither may abort the rest of
+            # shutdown, so await it for the join and swallow both.
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await task
+        if self.webhook:
+            await self.webhook.disconnect()
+            self.webhook = None
+        if self.bridge:
+            self.bridge.stop()
+            self.bridge = None
 
 
 class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, GatewaySlashCommandsMixin):
@@ -7578,6 +7678,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # user knows persistence is broken instead of discovering it later
         # via a missing /resume or empty history (#88235).
         self._session_db_init_error: Optional[str] = None
+        # Set by _start_orca_bridge() only when a webhook Orca bridge route
+        # is configured; stays None on every other deployment.
+        self._orca_supervisor: Optional["OrcaBridgeSupervisor"] = None
         # Multi-profile multiplexing: adapters for NON-default profiles live
         # here, keyed by profile name then Platform. self.adapters stays the
         # default/active profile's map so the ~93 existing self.adapters[...]
@@ -13735,6 +13838,50 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 self._loop_heartbeat_task.add_done_callback(_bg.discard)
         except Exception:
             logger.debug("Failed to start gateway loop heartbeat", exc_info=True)
+    async def _start_orca_bridge(self) -> bool:
+        """Start the Orca completion bridge if the webhook serves one.
+
+        No-op — and no import of ``tools.orca_bridge`` at all — unless the
+        connected webhook adapter actually declares an ``orca_bridge`` route.
+        """
+        adapter = self.adapters.get(Platform.WEBHOOK)
+        routes = getattr(adapter, "orca_bridge_routes", None)
+        if adapter is None or not callable(routes) or not routes():
+            return False
+
+        from tools import orca_bridge
+
+        self._orca_supervisor = OrcaBridgeSupervisor(
+            self.adapters, Platform.WEBHOOK, webhook=adapter, bridge=orca_bridge
+        )
+        started = await self._orca_supervisor.start()
+        if not started:
+            self._orca_supervisor = None
+            self._update_platform_runtime_status(
+                Platform.WEBHOOK.value,
+                platform_state="fatal",
+                error_code="orca_bridge_start_failed",
+                error_message="Orca completion bridge could not start",
+            )
+            return False
+        logger.info("✓ Orca completion bridge started")
+        return True
+
+    async def _stop_orca_bridge(self) -> None:
+        """Close the listener and then the bridge. Never raises.
+
+        getattr-guard for the same reason ``stop()`` uses one: shutdown-path
+        tests build bare runners via ``object.__new__``, which never ran
+        ``__init__`` and so have no ``_orca_supervisor`` attribute at all.
+        """
+        supervisor = getattr(self, "_orca_supervisor", None)
+        self._orca_supervisor = None
+        if supervisor is None:
+            return
+        try:
+            await supervisor.shutdown()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Orca bridge shutdown error: %s", exc)
 
     async def start(self) -> bool:
         """
@@ -14536,6 +14683,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Update delivery router with adapters
         if await self._abort_startup_if_shutdown_requested():
             return True
+        # Orca completion bridge — started only when the webhook platform is
+        # actually serving a bridge route. Must run BEFORE the router is
+        # published, so a rollback removes the listener before anything can
+        # route to it.
+        await self._start_orca_bridge()
+
         self.delivery_router.adapters = self.adapters
         self._wire_teams_pipeline_runtime()
 
@@ -16716,6 +16869,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
             if cancel_completion_batches is not None:
                 await cancel_completion_batches()
+            # Orca bridge first: it closes the webhook listener and only then
+            # stops the bridge, so no authenticated completion event can be
+            # accepted into a bridge that has already stopped recording. The
+            # generic teardown below still runs for the webhook adapter —
+            # adapter.disconnect() is idempotent by contract.
+            #
+            # getattr/callable-guarded like the liveness guards and agent
+            # cache above: shutdown-path tests drive this body with partial
+            # runner doubles that implement only what they assert on.
+            _stop_bridge = getattr(self, "_stop_orca_bridge", None)
+            if callable(_stop_bridge):
+                await _stop_bridge()
 
             for platform, adapter in list(self.adapters.items()):
                 await self._bounded_adapter_teardown(adapter, platform)

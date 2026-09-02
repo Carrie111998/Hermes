@@ -142,7 +142,10 @@ def webhook_command(args):
     sub = getattr(args, "webhook_action", None)
 
     if not sub:
-        print("Usage: hermes webhook {subscribe|list|remove|test}")
+        print(
+            "Usage: hermes webhook {subscribe|list|remove|test"
+            "|orca-register|orca-runs|orca-sweep|orca-notify}"
+        )
         print("Run 'hermes webhook --help' for details.")
         return
 
@@ -157,6 +160,178 @@ def webhook_command(args):
         _cmd_remove(args)
     elif sub == "test":
         _cmd_test(args)
+    elif sub == "orca-register":
+        _cmd_orca_register(args)
+    elif sub == "orca-runs":
+        _cmd_orca_runs(args)
+    elif sub == "orca-sweep":
+        _cmd_orca_sweep(args)
+    elif sub == "orca-notify":
+        _cmd_orca_notify(args)
+
+
+# ---------------------------------------------------------------------------
+# Orca completion bridge
+# ---------------------------------------------------------------------------
+
+_ORCA_DYNAMIC_SEGMENT = "orca"
+
+
+def _build_destination_path(path: str, event_type: str) -> str:
+    """Normalise an Orca notification path back to the bridge's base route.
+
+    Orca's notifier builds a DYNAMIC route by appending ``/orca/<event>`` to
+    whatever target URL it was handed, so one configured endpoint fans out
+    into a path per event type. Hermes' bridge is deliberately a SINGLE route:
+    the event kind is read out of the signed JSON body, because the request
+    path is not covered by the HMAC and therefore must never select
+    behaviour.
+
+    So both dynamic segments are stripped and the POST goes to the base route.
+    Dropping only the event name leaves ``/orca`` — a route the adapter does
+    not serve, which 404s at runtime while still passing any check that merely
+    asserts "the event name is gone".
+    """
+    parts = [p for p in path.split("/") if p]
+    if (
+        event_type
+        and len(parts) >= 2
+        and parts[-1] == event_type
+        and parts[-2] == _ORCA_DYNAMIC_SEGMENT
+    ):
+        parts = parts[:-2]
+    return "/" + "/".join(parts)
+
+
+def _cmd_orca_register(args):
+    """Record an Orca run so its completion can be routed back here.
+
+    Registration is the ONLY point at which the originating conversation is
+    still known, so it is also the only point at which the follow-up can be
+    made routable. Pass ``--session-key`` when calling from outside a session;
+    inside one, the live ``HERMES_SESSION_KEY`` is used and the completion
+    lands in the same thread that asked for the work.
+    """
+    from tools import orca_bridge
+
+    run_id = (getattr(args, "run_id", "") or "").strip()
+    if not orca_bridge.is_valid_run_id(run_id):
+        print(f"Error: Invalid Orca run id '{run_id}'.")
+        return
+
+    terminal = (getattr(args, "terminal", "") or "").strip()
+    if terminal and not orca_bridge.is_valid_terminal_id(terminal):
+        print(f"Error: Invalid Orca terminal handle '{terminal}'.")
+        return
+
+    run = orca_bridge.register_run(
+        run_id,
+        goal=(getattr(args, "goal", "") or "").strip(),
+        session_key=(getattr(args, "session_key", "") or "").strip() or None,
+        worktree=(getattr(args, "worktree", "") or "").strip(),
+        terminal=terminal,
+    )
+    target = run.get("session_key") or "(none — completion will not be routed)"
+    print(f"Registered Orca run {run_id}")
+    print(f"  goal:       {run.get('goal') or '(none)'}")
+    print(f"  reports to: {target}")
+
+
+def _cmd_orca_runs(args):
+    from tools import orca_bridge
+
+    state = (getattr(args, "state", "") or "").strip() or None
+    runs = orca_bridge.list_runs(state)
+    if not runs:
+        print("No Orca runs registered.")
+        return
+    for run in runs:
+        print(
+            f"{run['run_id']}  [{run['state']}]  "
+            f"{run.get('goal') or '(no goal)'}"
+        )
+        print(f"    reports to: {run.get('session_key') or '(unrouted)'}")
+
+
+def _cmd_orca_sweep(args):
+    """Force a reconcile of every open run against Orca's own ledger."""
+    from tools import orca_bridge
+
+    orca_bridge.start()
+    try:
+        published = orca_bridge.sweep()
+    except Exception as exc:  # noqa: BLE001 — surface the reason, don't trace
+        print(f"Error: could not reach Orca ({type(exc).__name__}).")
+        return
+    print(f"Reconciled Orca runs; {published} newly delivered.")
+
+
+def _cmd_orca_notify(args):
+    """Send a signed completion notification to the local bridge route.
+
+    This is what an Orca hook calls. The signature is the replay-protected
+    generic V2 scheme (HMAC-SHA256 over ``"<timestamp>.<body>"``) because the
+    bridge refuses the body-only schemes.
+    """
+    import hashlib
+    import hmac
+    import urllib.parse
+    import urllib.request
+
+    route = (getattr(args, "route", "") or "orca").strip().lower()
+    run_id = (getattr(args, "run_id", "") or "").strip()
+    event = (getattr(args, "event", "") or "worker_done").strip()
+    secret = (getattr(args, "secret", "") or "").strip()
+
+    if not secret:
+        wh_extra = _get_webhook_config().get("extra", {})
+        route_cfg = (wh_extra.get("routes", {}) or {}).get(route, {}) or {}
+        secret = route_cfg.get("secret", "") or wh_extra.get("secret", "") or ""
+    if not secret:
+        print(
+            f"Error: no HMAC secret for route '{route}'. Pass --secret or set "
+            f"platforms.webhook.extra.routes.{route}.secret."
+        )
+        return
+
+    base_url = _get_webhook_base_url()
+    parsed = urllib.parse.urlsplit(f"{base_url}/webhooks/{route}")
+    path = _build_destination_path(parsed.path, event)
+    url = urllib.parse.urlunsplit(
+        (parsed.scheme, parsed.netloc, path, "", "")
+    )
+
+    body = json.dumps(
+        {
+            "run_id": run_id,
+            "kind": event,
+            "event_id": (getattr(args, "event_id", "") or "").strip() or None,
+            "sequence": getattr(args, "sequence", -1),
+        },
+        separators=(",", ":"),
+    ).encode()
+    timestamp = str(int(time.time()))
+    sig = hmac.new(
+        secret.encode(), timestamp.encode() + b"." + body, hashlib.sha256
+    ).hexdigest()
+
+    print(f"  POST {url}  (event={event})")
+    try:
+        req = urllib.request.Request(
+            url,
+            data=body,
+            headers={
+                "Content-Type": "application/json",
+                "X-Webhook-Signature-V2": sig,
+                "X-Webhook-Timestamp": timestamp,
+            },
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            print(f"  Response ({resp.status}): {resp.read().decode()}")
+    except Exception as e:
+        print(f"  Error: {e}")
+        print("  Is the gateway running? (hermes gateway run)")
 
 
 def _cmd_subscribe(args):

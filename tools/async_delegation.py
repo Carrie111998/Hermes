@@ -578,6 +578,87 @@ def release_event_delivery(evt: Dict[str, Any], claim_id: str) -> None:
         release_completion_delivery(str(evt.get("delegation_id") or ""), claim_id)
 
 
+def publish_external_completion(evt: Dict[str, Any]) -> str:
+    """Publish a completion produced OUTSIDE the daemon executor.
+
+    Some work Hermes delegates does not run on this executor at all — an Orca
+    run finishes in another process, on its own schedule, and reports back
+    over the local bridge.  Such a result still needs everything this module
+    already gives an in-process delegation: a durable row that survives a
+    crash between "finished" and "delivered", the claim/ack protocol that
+    stops two consumers injecting the same result twice, the attempt cap that
+    retires an undeliverable row, and bounded retention.
+
+    So rather than standing up a second ledger and a second drain loop beside
+    this one, an external producer writes a TERMINAL row here and pushes the
+    same event onto the same queue.  It never appears as ``running``, so the
+    owner-pid recovery sweep (which speaks for this process's threads only)
+    correctly ignores it.
+
+    Idempotent by ``delegation_id``: a second call for an id already recorded
+    is a no-op and returns ``""``, so a retried publish cannot double-inject.
+    """
+    delegation_id = str(evt.get("delegation_id") or "") or _new_delegation_id()
+    evt["delegation_id"] = delegation_id
+    evt.setdefault("type", "async_delegation")
+    now = time.time()
+    status = str(evt.get("status") or "completed")
+    if status in ("running", "finalizing"):
+        raise ValueError(
+            f"external completion must be terminal, got status={status!r}"
+        )
+    evt.setdefault("completed_at", now)
+    result = {
+        "status": status,
+        "summary": evt.get("summary"),
+        "error": evt.get("error"),
+        "api_calls": evt.get("api_calls", 0),
+        "duration_seconds": evt.get("duration_seconds"),
+    }
+    task_payload = {
+        key: evt.get(key)
+        for key in ("goal", "context", "toolsets", "role", "model",
+                    "scope_id", "user_id", "user_name")
+        if evt.get(key) is not None
+    }
+    with _DB_LOCK, _transaction() as conn:
+        cur = conn.execute(
+            """INSERT OR IGNORE INTO async_delegations
+               (delegation_id, origin_session, origin_ui_session_id,
+                parent_session_id, state, dispatched_at, completed_at,
+                updated_at, event_json, result_json, delivery_state,
+                delivery_attempts, task_json, origin_session_id)
+               VALUES (?,?,?,?,?,?,?,?,?,?, 'pending', 0, ?, ?)""",
+            (delegation_id, evt.get("session_key", "") or "",
+             evt.get("origin_ui_session_id", "") or "",
+             evt.get("parent_session_id"), status,
+             evt.get("dispatched_at") or now, evt.get("completed_at") or now,
+             now, json.dumps(evt), json.dumps(result),
+             json.dumps(task_payload),
+             evt.get("origin_session_id", "") or ""),
+        )
+        inserted = cur.rowcount == 1
+    if not inserted:
+        logger.debug(
+            "External completion %s already published; skipping re-enqueue",
+            delegation_id,
+        )
+        return ""
+    _prune_durable_records()
+    try:
+        from tools.process_registry import process_registry
+
+        process_registry.completion_queue.put(evt)
+    except Exception as exc:  # pragma: no cover — import/queue failure is rare
+        # The durable row is already committed, so the result is NOT lost: the
+        # next restart replays it through restore_undelivered_completions.
+        logger.error(
+            "External completion %s persisted but could not be enqueued; "
+            "it will be replayed on restart: %s", delegation_id, exc,
+        )
+    return delegation_id
+
+
 def get_durable_delegation(delegation_id: str) -> Optional[Dict[str, Any]]:
     with _DB_LOCK, _transaction() as conn:
         row = conn.execute(

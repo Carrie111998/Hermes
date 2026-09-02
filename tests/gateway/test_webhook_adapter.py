@@ -1081,3 +1081,117 @@ def test_route_profile_validation_fails_closed():
         assert WebhookAdapter._route_allows_profile(
             {"profile": malformed}, "worker"
         ) is False
+
+
+# ---------------------------------------------------------------------------
+# Malformed signature-header bytes
+# ---------------------------------------------------------------------------
+
+def _raw_post(host: str, port: int, path: bytes, body: bytes,
+              header_lines: list) -> int:
+    """POST over a raw socket so the exact header BYTES reach the parser.
+
+    An HTTP client library encodes header values for us, which is precisely
+    what has to be bypassed here: the bytes under test are not valid UTF-8 and
+    no well-behaved client would emit them.
+    """
+    sock = socket.create_connection((host, port), timeout=15)
+    try:
+        req = (
+            b"POST " + path + b" HTTP/1.1\r\n"
+            b"Host: " + host.encode() + b"\r\n"
+            b"Content-Type: application/json\r\n"
+            b"Content-Length: " + str(len(body)).encode() + b"\r\n"
+        )
+        for line in header_lines:
+            req += line + b"\r\n"
+        req += b"Connection: close\r\n\r\n" + body
+        sock.sendall(req)
+        buf = b""
+        while True:
+            chunk = sock.recv(65536)
+            if not chunk:
+                break
+            buf += chunk
+    finally:
+        sock.close()
+    # "HTTP/1.1 401 Unauthorized" -> 401
+    return int(buf.split(b"\r\n", 1)[0].split(b" ")[1])
+
+
+class TestMalformedSignatureHeaderBytes:
+    """A signature header whose wire bytes are not valid UTF-8 must 401, not 500.
+
+    aiohttp decodes such bytes with ``surrogateescape``, so the value reaching
+    the adapter holds lone surrogates. Encoding those back with the strict
+    codec raises ``UnicodeEncodeError`` straight out of the request handler,
+    turning an unauthenticated rejection into a 500 on a network-reachable
+    route. Every scheme routes through the same comparison helper, so every
+    scheme is checked rather than only the one that happened to be reported.
+    """
+
+    SECRET = "malformed-header-secret"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("header_name", [
+        b"X-Hub-Signature-256",   # GitHub
+        b"linear-signature",      # Linear (#87348)
+        b"X-Gitlab-Token",        # GitLab
+        b"X-Webhook-Signature",   # legacy generic V1
+        b"X-Webhook-Signature-V2",  # replay-protected generic V2
+    ])
+    @pytest.mark.parametrize("bad_bytes", [
+        "café".encode("latin-1"),   # lone 0xE9 — invalid UTF-8
+        b"\xff" * 16,               # 0xFF never appears in valid UTF-8
+    ])
+    async def test_invalid_utf8_signature_bytes_are_rejected_not_crashed(
+        self, header_name, bad_bytes
+    ):
+        adapter = _make_adapter(
+            routes={"plain": {"secret": self.SECRET, "events": ["never"]}},
+            host="127.0.0.1",
+        )
+        assert await adapter.connect()
+        try:
+            addrs = [a for a in adapter._runner.addresses
+                     if ":" not in str(a[0])] or list(adapter._runner.addresses)
+            host, port = addrs[0][0], addrs[0][1]
+            body = json.dumps({"hello": "world"}).encode()
+            headers = [header_name + b": " + bad_bytes]
+            if header_name == b"X-Webhook-Signature-V2":
+                # V2 refuses before comparing unless a fresh timestamp is
+                # present, which would hide the crash this test is about.
+                headers.append(
+                    b"X-Webhook-Timestamp: " + str(int(time.time())).encode()
+                )
+            status = await asyncio.to_thread(
+                _raw_post, host, port, b"/webhooks/plain", body, headers
+            )
+        finally:
+            await adapter.disconnect()
+        assert status == 401, (
+            f"{header_name.decode()} with invalid-UTF-8 bytes returned "
+            f"{status}; a hostile header must fail closed as 401, never 500"
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_correct_signature_still_authenticates(self):
+        """Control: the fix must not break the ordinary accepting path."""
+        adapter = _make_adapter(
+            routes={"plain": {"secret": self.SECRET, "events": ["never"]}},
+            host="127.0.0.1",
+        )
+        assert await adapter.connect()
+        try:
+            addrs = [a for a in adapter._runner.addresses
+                     if ":" not in str(a[0])] or list(adapter._runner.addresses)
+            host, port = addrs[0][0], addrs[0][1]
+            body = json.dumps({"hello": "world"}).encode()
+            sig = _github_signature(body, self.SECRET).encode()
+            status = await asyncio.to_thread(
+                _raw_post, host, port, b"/webhooks/plain", body,
+                [b"X-Hub-Signature-256: " + sig],
+            )
+        finally:
+            await adapter.disconnect()
+        assert status == 200

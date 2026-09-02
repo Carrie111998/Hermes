@@ -488,6 +488,102 @@ Behavior and safety properties:
 
 ---
 
+## Orca Completion Bridge {#orca-bridge}
+
+A route marked `orca_bridge: true` lets a **local** Orca instance wake Hermes the moment a run finishes, instead of Hermes finding out on its next poll. It is not an ordinary route: the agent never runs, and the body is never a prompt.
+
+### What the bridge guarantees
+
+**A payload never declares itself complete.** Every inbound event is a *candidate*. Hermes reads only identifiers out of the body (`run_id`, `kind`, `event_id`, `sequence`) and then re-queries Orca itself — `orchestration run-show`, `task-list`, `worker-list` — before deciding anything. A forged body, a truncated hook, or a worker that lies about its outcome cannot fabricate a completion.
+
+**Quiet is not done.** A Claude `Stop` hook or an idle TUI means the model stopped emitting — mid-task, waiting on approval, or genuinely finished; the signal cannot tell you which. Those are recorded and otherwise ignored. Only `hermes-ready`, `worker_done` and terminal `exit` are worth a re-query.
+
+**A failed worker is not a completion.** Task status and worker accounting are two independent ledgers in Orca — a worker can report `worker_done`, drive every Task to `completed`, and then fall over on the way out. So the bridge reads `workerState` (that is `worker_dispatches.state`, whose domain Orca fixes at `starting`, `ready`, `start_unknown`, `failed`, `succeeded`, `stopping`, `stop_unknown`, `stopped`, `abandoned`) and is fail-closed on it: only `succeeded` completes. Every settled-but-unsuccessful state (`failed`, `stopped`, `abandoned`) and both ambiguous ones (`start_unknown`, `stop_unknown`) deliver **nothing**, because telling the owner their work landed when the worker fell over is worse than silence. A state the bridge does not recognise is treated the same way.
+
+`StopFailure` is *not* one of those states — it is a hook **eventName**, the turn boundary that sits next to `Stop` and lights the same "done" lamp. It is handled exactly like `Stop`: recorded, never a completion candidate, and it never costs a re-query.
+
+**A live worker is not a completion either.** `starting`, `ready` and `stopping` mean the worker has not settled, so the run stays open and the recovery sweep re-asks once it does.
+
+**No worker ledger is not a verdict.** A run can have no dispatches (`worker-list` returns an empty list), and a context-only dispatch — one injected into an existing terminal, with no supervised process to account for — reports `unsupervised`, because `worker-list` selects `COALESCE(worker_dispatches.state, 'unsupervised')` (the single-worker path spells the same absence `unknown`). None of those is an outcome, so the Task ledger decides on its own. That is deliberately *not* the same as `start_unknown` / `stop_unknown`, which are real settled states meaning Orca could not confirm a start or a stop — those withhold delivery.
+
+**Exactly one completion per run.** Two events racing (a `worker_done` and a terminal `exit`, or a webhook and the recovery sweep) elect a single winner through one conditional `UPDATE`; losers report `duplicate` and publish nothing. The delegation id is derived from the run, so even a lost race cannot mint a second delivery.
+
+**The originating conversation is preserved.** The gateway session key is captured at registration, not at completion, and replayed verbatim — so a Mattermost thread gets its follow-up in that thread. Delivery rides the existing durable async-delegation ledger, which survives a gateway restart and retries without double-posting.
+
+### Constraints (enforced at startup and per request)
+
+| Rule | Behaviour |
+|------|-----------|
+| HMAC required | `INSECURE_NO_AUTH` is refused outright for this route kind |
+| Replay-protected auth only | The request must **authenticate** under `X-Webhook-Signature-V2` (HMAC-SHA256 over `"<timestamp>.<raw body>"`, ±300 s) or Svix. The GitHub, GitLab-token and legacy V1 branches are not evaluated at all **on this route** — sending an `X-Webhook-Signature-V2` header that does not verify buys nothing. Every other route keeps all of them |
+| Loopback bind | Omit `host` and the listener pins itself to `127.0.0.1`; a non-loopback `host` with a bridge route fails to start |
+| Same-machine peer | Off-machine peers are refused, and so is any request carrying `X-Forwarded-For`, `X-Real-IP`, `Forwarded`, `X-Forwarded-Host` or `X-Forwarded-Proto` — the bridge cannot be proxied, by design |
+| Config-only | `hermes webhook subscribe` cannot mint one; the flag is stripped from the agent-writable subscriptions file |
+| Registered runs only | An event for a run that was never registered is a 404 — an unregistered run has no conversation to report to |
+
+### Configuration
+
+```yaml
+platforms:
+  webhook:
+    enabled: true
+    extra:
+      # host omitted → pinned to 127.0.0.1 by the bridge route below
+      port: 8644
+      routes:
+        orca:
+          orca_bridge: true
+          secret: "${ORCA_BRIDGE_SECRET}"
+```
+
+### Registering a run
+
+Registration is the only moment at which the originating conversation is still known, so it is the only moment the follow-up can be made routable. Run it from the conversation that launched the work:
+
+```bash
+hermes webhook orca-register --run-id run_6e33f11c3f86 \
+  --goal "Port the completion bridge" \
+  --worktree /path/to/worktree
+```
+
+Inside a session the live `HERMES_SESSION_KEY` is used automatically. From outside one, pass `--session-key`; with no key the run is registered as unrouted and the completion has no chat to land in — which is the honest outcome, rather than guessing a surface.
+
+```bash
+hermes webhook orca-runs                # list registered runs and their targets
+hermes webhook orca-sweep               # re-query Orca for every open run
+```
+
+### Notifying
+
+An Orca hook posts a signed notification:
+
+```bash
+hermes webhook orca-notify --run-id run_6e33f11c3f86 --event worker_done
+```
+
+The POST goes to the route's **base** URL. Orca's notifier builds dynamic routes by appending `/orca/<event>`; the bridge strips that tail, because the request path is not covered by the HMAC and therefore must never select behaviour — the event kind travels inside the signed body.
+
+### Response codes
+
+| Status | Meaning |
+|--------|---------|
+| `200 completed` | Orca confirmed the run finished; the owner has been woken |
+| `200 duplicate` / `already_completed` | Seen before, or another event already won — nothing published |
+| `200 observed` / `ignored` | A non-completion signal (`Stop`, idle, unknown kind) |
+| `200 not_terminal` | Orca says tasks are still open, or a worker is still in flight (`starting`/`ready`/`stopping`) |
+| `200 terminal_failure` | Authoritative `workerState` settled without success (`failed`, `stopped`, `abandoned`, `start_unknown`, `stop_unknown`, or anything unrecognised) — no delivery. The no-ledger values `unsupervised` / `unknown` are excluded: they are not outcomes |
+| `400` | Malformed body, or an invalid run id / terminal handle |
+| `403` | Off-machine peer, or a forwarding header was present |
+| `401` | Missing, wrong, stale, or non-replay-protected signature (including a valid GitHub/GitLab/V1 signature, with or without a junk V2 header) |
+| `404` | The run was never registered |
+| `503` | Orca could not be reached, or the bridge is shutting down |
+
+### Recovery after downtime
+
+If Hermes is down when Orca finishes, that POST is gone for good — nothing redelivers it. The gateway therefore runs a one-shot reconciliation sweep at startup that re-queries every still-open run and delivers the ones Orca says are done. `hermes webhook orca-sweep` forces the same pass on demand.
+
+---
+
 ## Security {#security}
 
 The webhook adapter includes multiple layers of security:
@@ -502,6 +598,8 @@ The adapter validates incoming webhook signatures using the appropriate method f
 - **Generic (V1, legacy)**: `X-Webhook-Signature` header — raw HMAC-SHA256 hex digest of the body only. Still accepted for backward compatibility, but it has no replay protection (a captured request replays indefinitely); the gateway logs a deprecation warning once per route. Switch senders to V2.
 
 If a secret is configured but no recognized signature header is present, the request is rejected.
+
+**Which schemes carry replay protection.** Only the two that bind a timestamp into the signed bytes do: **Generic V2** (`<timestamp>.<body>`, ±300s skew) and **Svix** (`<id>.<timestamp>.<body>`). GitHub's `X-Hub-Signature-256`, the GitLab plain-token match, and legacy V1 all sign at most the body, so a captured request can be replayed indefinitely against them. Every one of those branches stays available for backward compatibility on ordinary routes — nothing here is being narrowed for existing senders — but an [Orca bridge route](#orca-bridge) accepts only V2 or Svix, because a captured POST there can wake the agent about work.
 
 ### Secret is required
 

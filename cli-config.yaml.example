@@ -1359,6 +1359,40 @@ platform_toolsets:
 #       # Route scripts default to a 30 second timeout. Scripts must live under
 #       # the active profile's scripts directory and receive webhook JSON on stdin.
 #       script_timeout_seconds: 30
+#       routes:
+#         # Orca completion bridge: a LOCAL Orca instance wakes Hermes the
+#         # moment a run reports in, instead of Hermes finding out on its next
+#         # poll. The body is data, never a prompt or a command, and no payload
+#         # can declare itself complete — Hermes re-queries Orca by run_id and
+#         # only Orca's own ledger completes a run. `Stop` and `StopFailure`
+#         # are hook events: recorded and ignored, never completions. And the
+#         # worker ledger has a veto — only workerState `succeeded` completes,
+#         # while `failed`/`stopped`/`abandoned`/`start_unknown`/`stop_unknown`
+#         # deliver nothing at all. A run with no worker ledger (no dispatches,
+#         # or context-only ones reported as `unsupervised`) is decided by the
+#         # Task ledger alone.
+#         #
+#         # Constraints (enforced at startup and per request):
+#         #   * HMAC secret required; INSECURE_NO_AUTH is refused for this kind
+#         #   * the request must AUTHENTICATE under a replay-protected scheme
+#         #     (X-Webhook-Signature-V2 + X-Webhook-Timestamp, or Svix); the
+#         #     GitHub/GitLab-token/V1 branches stay available to every OTHER
+#         #     route but are not evaluated here at all, so a junk V2 header
+#         #     alongside a valid GitHub signature does not get in
+#         #   * loopback bind — omit `host` and it pins itself to 127.0.0.1;
+#         #     a non-loopback `host` with an orca_bridge route fails to start
+#         #   * off-machine peers are rejected, and so is any request carrying
+#         #     a forwarding header (the bridge must not be proxied)
+#         #   * config.yaml only — `hermes webhook subscribe` cannot mint one
+#         #
+#         # Register a run from the conversation that launched it so the report
+#         # comes back to that thread:
+#         #   hermes webhook orca-register --run-id run_xxx --goal "..."
+#         # Then have the Orca hook notify:
+#         #   hermes webhook orca-notify --run-id run_xxx --event worker_done
+#         orca:
+#           orca_bridge: true
+#           secret: "${ORCA_BRIDGE_SECRET}"
 #
 # Discord-specific settings (config.yaml top-level, not under platforms:):
 #
