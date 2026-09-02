@@ -348,7 +348,8 @@ VALID_HOOKS: Set[str] = {
     #   result: hermes_cli.kanban_db.DispatchResult (spawned, reclaimed,
     #     promoted, reconciled_orphans, crashed, stale, timed_out,
     #     auto_blocked, rate_limited, auto_assigned_default,
-    #     respawn_guarded, skipped_per_profile_capped, skipped_unassigned,
+    #     respawn_guarded, skipped_per_profile_capped,
+    #     skipped_review_disabled_skills, skipped_unassigned,
     #     skipped_nonspawnable, skipped_locked).
     #   Privacy: result carries task ids, assignees, and workspace paths.
     "on_kanban_dispatch_tick",

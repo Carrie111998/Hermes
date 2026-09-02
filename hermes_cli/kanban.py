@@ -2786,6 +2786,10 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
                 {"task_id": tid, "assignee": who, "current": current}
                 for (tid, who, current) in res.skipped_per_profile_capped
             ],
+            "skipped_review_disabled_skills": [
+                {"task_id": tid, "assignee": who, "skill": skill}
+                for (tid, who, skill) in res.skipped_review_disabled_skills
+            ],
             "auto_assigned_default": res.auto_assigned_default,
         }, indent=2))
         return 0
@@ -2818,6 +2822,11 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
         for tid, who, current in res.skipped_per_profile_capped:
             print(
                 f"Deferred ({who} at per-profile cap, {current} running): {tid}"
+            )
+    if res.skipped_review_disabled_skills:
+        for tid, who, skill in res.skipped_review_disabled_skills:
+            print(
+                f"Review left for a human ({who} disabled required skill {skill}): {tid}"
             )
     if res.skipped_nonspawnable:
         print(

@@ -527,6 +527,56 @@ def test_review_dispatch_preserves_task_skills_and_adds_reviewer_skill(
     assert captured == [["domain-specific-review", "sdlc-review"]]
 
 
+def test_review_dispatch_respects_assignee_disabled_review_skill(
+    kanban_home: Path,
+) -> None:
+    """A disabled review skill leaves the card for a human instead of crashing."""
+    from hermes_cli.profiles import create_profile
+
+    reviewer_home = create_profile("reviewer", no_alias=True)
+    (reviewer_home / "config.yaml").write_text(
+        "skills:\n  disabled:\n    - sdlc-review\n",
+        encoding="utf-8",
+    )
+    spawned: list[str] = []
+
+    def spawn(task, workspace):
+        spawned.append(task.id)
+        return None
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="human review", assignee="reviewer")
+        implementation = kb.claim_task(conn, task_id)
+        assert implementation is not None
+        assert kb.request_review(
+            conn,
+            task_id,
+            summary="ready",
+            expected_run_id=implementation.current_run_id,
+        )
+
+        result = kb.dispatch_once(conn, spawn_fn=spawn)
+
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        assert task.status == "review"
+        assert result.skipped_review_disabled_skills == [
+            (task_id, "reviewer", "sdlc-review"),
+        ]
+        assert _events(conn, task_id, kind="review_dispatch_skipped") == [
+            (
+                "review_dispatch_skipped",
+                {
+                    "assignee": "reviewer",
+                    "reason": "required_skill_disabled",
+                    "skill": "sdlc-review",
+                },
+            ),
+        ]
+
+    assert spawned == []
+
+
 def test_review_dispatch_honors_global_and_per_profile_caps(
     kanban_home: Path,
     monkeypatch: pytest.MonkeyPatch,
