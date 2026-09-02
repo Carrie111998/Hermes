@@ -1,11 +1,11 @@
-"""Configured models extend built-in picker rows."""
+"""Configured models extend or explicitly pin built-in picker rows."""
 
 from unittest.mock import patch
 
 from hermes_cli.model_switch import list_authenticated_providers
 
 
-def _provider_row(configured_models, *, max_models=None):
+def _provider_row(configured_models, *, discover_models=True, max_models=None):
     with (
         patch(
             "agent.models_dev.fetch_models_dev",
@@ -24,7 +24,12 @@ def _provider_row(configured_models, *, max_models=None):
     ):
         rows = list_authenticated_providers(
             current_provider="deepseek",
-            user_providers={"deepseek": {"models": configured_models}},
+            user_providers={
+                "deepseek": {
+                    "discover_models": discover_models,
+                    "models": configured_models,
+                }
+            },
             max_models=max_models,
         )
     return next(row for row in rows if row["slug"] == "deepseek")
@@ -37,3 +42,12 @@ def test_configured_models_precede_and_deduplicate_discovered_models():
     assert row["total_models"] == 3
 
 
+def test_discover_models_false_pins_builtin_picker_to_configured_models():
+    row = _provider_row(
+        ["glm-5.3-flash", "glm-5.3"],
+        discover_models=False,
+    )
+
+    assert row["models"] == ["glm-5.3-flash", "glm-5.3"]
+    assert row["total_models"] == 2
+    assert "live-a" not in row["models"]
