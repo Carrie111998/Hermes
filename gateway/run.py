@@ -41,6 +41,7 @@ import signal
 import threading
 import time
 import traceback
+import uuid
 from collections import OrderedDict
 from contextvars import Context, copy_context
 from pathlib import Path
@@ -2292,9 +2293,48 @@ def _home_thread_env_var(platform_name: str) -> str:
     return f"{_home_target_env_var(platform_name)}_THREAD_ID"
 
 
+def _restart_notification_paths() -> list[Path]:
+    """Return a stable, oldest-first snapshot of durable restart receipts."""
+    canonical = _hermes_home / ".restart_notify.json"
+    paths = [
+        *_hermes_home.glob(".restart_notify.claimed.*.json"),
+        *_hermes_home.glob(".restart_notify.retry.*.json"),
+    ]
+    if os.path.lexists(canonical):
+        paths.append(canonical)
+
+    def _sort_key(path: Path) -> tuple[int, str]:
+        try:
+            return path.stat().st_mtime_ns, path.name
+        except OSError:
+            return 0, path.name
+
+    return sorted(paths, key=_sort_key)
+
+
+def _fsync_restart_notification_directory() -> None:
+    """Best-effort durability barrier for restart queue entry transitions."""
+    if os.name != "posix":
+        return
+    try:
+        fd = os.open(
+            _hermes_home,
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+        )
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+    except OSError:
+        logger.warning(
+            "Could not fsync restart notification directory",
+            exc_info=True,
+        )
+
+
 def _restart_notification_pending() -> bool:
-    """Return True when a /restart completion marker is waiting to be delivered."""
-    return (_hermes_home / ".restart_notify.json").exists()
+    """Return True when any durable restart receipt is pending."""
+    return bool(_restart_notification_paths())
 
 
 def _planned_restart_notification_path() -> Path:
@@ -4677,6 +4717,13 @@ _RECONNECT_BACKOFF_CAP = 300
 _RECONNECT_ATTENTION_AFTER_SECONDS = _float_env(
     "HERMES_RECONNECT_ATTENTION_AFTER_SECONDS", 7200
 )
+_RECONNECT_ATTENTION_SEND_TIMEOUT_SECONDS = 15.0
+
+# A restart receipt is durable, but a connected adapter can still reject one
+# send transiently. Retry for a bounded period without waiting for reconnect.
+_RESTART_NOTIFICATION_RETRY_DELAYS = (5.0, 15.0, 30.0, 60.0)
+_RESTART_NOTIFICATION_SEND_TIMEOUT_SECONDS = 15.0
+_RESTART_NOTIFICATION_MAX_AGE_SECONDS = 86_400
 
 
 def _reconnect_backoff(attempt: int) -> int:
@@ -8227,6 +8274,27 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         task.cancel()
         task.add_done_callback(consume_detached_task_result)
         return False
+
+    async def _await_with_detach_on_timeout(
+        self, awaitable: Awaitable[Any], timeout: float
+    ) -> tuple[bool, Any]:
+        """Return at a hard deadline even if the cancelled child will not exit."""
+        if timeout <= 0:
+            return True, await awaitable
+
+        task = asyncio.ensure_future(awaitable)
+        try:
+            done, _pending = await asyncio.wait({task}, timeout=timeout)
+        except asyncio.CancelledError:
+            task.cancel()
+            task.add_done_callback(consume_detached_task_result)
+            raise
+        if task in done:
+            return True, await task
+
+        task.cancel()
+        task.add_done_callback(consume_detached_task_result)
+        return False, None
 
     async def _safe_adapter_disconnect(self, adapter, platform) -> None:
         """Call adapter.disconnect() defensively, swallowing any error.
@@ -15750,6 +15818,251 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         )
         self._spawn_reconnect_watcher()
 
+    @staticmethod
+    def _platform_attention_message(platform: Platform, info: dict) -> str:
+        """Build the localized owner alert for one reconnect outage episode."""
+        queued_at = float(info.get("queued_at") or time.monotonic())
+        minutes = max(1, int((time.monotonic() - queued_at) // 60))
+        attempts = int(info.get("attempts") or 0)
+        label = platform.value.replace("_", " ").title()
+        return (
+            "⚠️ "
+            + t(
+                "gateway.status.platform_state",
+                platform=label,
+                state=t("gateway.status.platform_disconnected"),
+            )
+            + " "
+            + t(
+                "gateway.status.attention_summary",
+                minutes=minutes,
+                attempts=attempts,
+            )
+            + "\n"
+            + t("gateway.status.advice_reconnect", platform=label)
+        )
+
+    def _complete_platform_attention_send(
+        self,
+        failed_platform: Platform,
+        info: dict,
+        target: tuple[str, str, Optional[str]],
+        state: dict,
+        task: asyncio.Task,
+    ) -> None:
+        """Latch one send result or arm that target's next retry deadline."""
+        background_tasks = getattr(self, "_background_tasks", None)
+        if isinstance(background_tasks, set):
+            background_tasks.discard(task)
+        timeout_handle = state.get("timeout_handle")
+        if timeout_handle is not None:
+            timeout_handle.cancel()
+            state["timeout_handle"] = None
+
+        retries = info.get("attention_target_retries", {})
+        owns_attempt = (
+            self._failed_platforms.get(failed_platform) is info
+            and retries.get(target) is state
+            and state.get("task") is task
+        )
+        try:
+            result = task.result()
+        except asyncio.CancelledError:
+            if owns_attempt:
+                if state.get("timed_out"):
+                    logger.warning(
+                        "Platform attention notification timed out for %s via %s",
+                        failed_platform.value,
+                        target[0],
+                    )
+                state["task"] = None
+                state["next_retry"] = time.monotonic() + _reconnect_backoff(
+                    state["attempts"]
+                )
+            return
+        except Exception:
+            if owns_attempt:
+                logger.warning(
+                    "Platform attention notification failed for %s via %s",
+                    failed_platform.value,
+                    target[0],
+                    exc_info=True,
+                )
+                state["task"] = None
+                state["next_retry"] = time.monotonic() + _reconnect_backoff(
+                    state["attempts"]
+                )
+            return
+
+        if not owns_attempt:
+            return
+        if result is None or getattr(result, "success", True):
+            info.setdefault("attention_delivered_targets", set()).add(target)
+            retries.pop(target, None)
+            return
+        state["task"] = None
+        state["next_retry"] = time.monotonic() + _reconnect_backoff(
+            state["attempts"]
+        )
+
+    def _detach_platform_attention_send(
+        self, state: dict, task: asyncio.Task
+    ) -> None:
+        """Remove all outage bookkeeping before cancelling one attention send."""
+        timeout_handle = state.get("timeout_handle")
+        if timeout_handle is not None:
+            timeout_handle.cancel()
+        state["timeout_handle"] = None
+        completion_callback = state.get("completion_callback")
+        if completion_callback is not None:
+            task.remove_done_callback(completion_callback)
+        state["completion_callback"] = None
+        state["task"] = None
+        background_tasks = getattr(self, "_background_tasks", None)
+        if isinstance(background_tasks, set):
+            background_tasks.discard(task)
+        task.cancel()
+        task.add_done_callback(consume_detached_task_result)
+
+    def _timeout_platform_attention_send(
+        self,
+        failed_platform: Platform,
+        info: dict,
+        target: tuple[str, str, Optional[str]],
+        state: dict,
+    ) -> None:
+        """Cancel an overdue send without awaiting cancellation completion."""
+        retries = info.get("attention_target_retries", {})
+        task = state.get("task")
+        if (
+            self._failed_platforms.get(failed_platform) is not info
+            or retries.get(target) is not state
+            or task is None
+            or task.done()
+        ):
+            return
+        state["timed_out"] = True
+        state["next_retry"] = time.monotonic() + _reconnect_backoff(
+            state["attempts"]
+        )
+        self._detach_platform_attention_send(state, task)
+
+    def _schedule_platform_attention_notifications(
+        self, platform: Platform, info: dict, now: float
+    ) -> None:
+        """Start independent, bounded owner-alert sends without awaiting them."""
+        homes = [
+            (target_platform, platform_cfg.home_channel)
+            for target_platform, platform_cfg in self.config.platforms.items()
+            if platform_cfg.home_channel and platform_cfg.home_channel.chat_id
+        ]
+        if not homes:
+            return
+        delivered = info.setdefault("attention_delivered_targets", set())
+        retries = info.setdefault("attention_target_retries", {})
+        message = self._platform_attention_message(platform, info)
+        for target_platform, home in homes:
+            thread_id = None if home.thread_id is None else str(home.thread_id)
+            target = (target_platform.value, str(home.chat_id), thread_id)
+            if target in delivered:
+                continue
+            state = retries.get(target)
+            if state is not None:
+                task = state.get("task")
+                if task is not None and not task.done():
+                    continue
+                if now < float(state.get("next_retry") or 0):
+                    continue
+            attempts = int(state.get("attempts") or 0) + 1 if state else 1
+            transport = resolve_delivery_transport(
+                target_platform, self.config, self.adapters
+            )
+            if transport is None:
+                retries[target] = {
+                    "attempts": attempts,
+                    "next_retry": now + _reconnect_backoff(attempts),
+                    "task": None,
+                    "timeout_handle": None,
+                    "timed_out": False,
+                }
+                continue
+            metadata = self._thread_metadata_for_target(
+                target_platform,
+                home.chat_id,
+                home.thread_id,
+                adapter=transport.adapter,
+            )
+            if transport.is_relay:
+                metadata = dict(metadata or {})
+                if home.user_id:
+                    metadata["user_id"] = home.user_id
+                if home.scope_id:
+                    metadata["scope_id"] = home.scope_id
+            task = asyncio.create_task(
+                transport.send(
+                    target_platform,
+                    str(home.chat_id),
+                    message,
+                    metadata=_non_conversational_metadata(
+                        metadata, platform=target_platform
+                    ),
+                ),
+                name=(
+                    "gateway-platform-attention-"
+                    f"{platform.value}-via-{target_platform.value}"
+                ),
+            )
+            state = {
+                "attempts": attempts,
+                "next_retry": now,
+                "task": task,
+                "timeout_handle": None,
+                "timed_out": False,
+                "completion_callback": None,
+            }
+            retries[target] = state
+            state["timeout_handle"] = asyncio.get_running_loop().call_later(
+                _RECONNECT_ATTENTION_SEND_TIMEOUT_SECONDS,
+                self._timeout_platform_attention_send,
+                platform,
+                info,
+                target,
+                state,
+            )
+            background_tasks = getattr(self, "_background_tasks", None)
+            if isinstance(background_tasks, set):
+                background_tasks.add(task)
+            def _complete_attention_send(
+                done,
+                failed=platform,
+                episode=info,
+                key=target,
+                attempt_state=state,
+            ):
+                self._complete_platform_attention_send(
+                    failed, episode, key, attempt_state, done
+                )
+
+            state["completion_callback"] = _complete_attention_send
+            task.add_done_callback(
+                _complete_attention_send
+            )
+
+    def _cancel_platform_attention_notifications(self, info: dict) -> None:
+        """Fully detach one resolved outage episode's send tasks and timers."""
+        retries = info.get("attention_target_retries", {})
+        for state in list(retries.values()):
+            task = state.get("task")
+            if task is not None:
+                self._detach_platform_attention_send(state, task)
+                continue
+            handle = state.get("timeout_handle")
+            if handle is not None:
+                handle.cancel()
+            state["timeout_handle"] = None
+            state["completion_callback"] = None
+        retries.clear()
+
     async def _platform_reconnect_watcher(self) -> None:
         """Background task that periodically retries connecting failed platforms.
 
@@ -15822,6 +16135,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         retrying_since=retrying_since_iso,
                     )
                 if now < info["next_retry"]:
+                    if info.get("attention_flagged"):
+                        self._schedule_platform_attention_notifications(
+                            platform, info, now
+                        )
                     continue  # not time yet
 
                 platform_config = info["config"]
@@ -15835,6 +16152,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         "removing from retry queue",
                         platform.value,
                     )
+                    self._cancel_platform_attention_notifications(info)
                     del self._failed_platforms[platform]
                     continue
                 logger.info(
@@ -15850,6 +16168,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             "Reconnect %s: adapter creation returned None, removing from retry queue",
                             platform.value,
                         )
+                        self._cancel_platform_attention_notifications(info)
                         del self._failed_platforms[platform]
                         continue
 
@@ -15878,6 +16197,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         if hasattr(adapter, "_voice_input_callback"):
                             adapter._voice_input_callback = self._handle_voice_channel_input
                         self.delivery_router.adapters = self.adapters
+                        self._cancel_platform_attention_notifications(info)
                         del self._failed_platforms[platform]
                         self._update_platform_runtime_status(
                             platform.value,
@@ -15888,6 +16208,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             retrying_since=None,
                         )
                         logger.info("✓ %s reconnected successfully", platform.value)
+
+                        # A restart receipt whose requester transport was
+                        # unavailable at boot remains durable. Retry it after
+                        # every successful platform reconnect; successful
+                        # delivery removes the marker.
+                        try:
+                            await self._send_restart_notification()
+                        except Exception:
+                            logger.debug(
+                                "restart receipt retry after %s reconnect failed",
+                                platform.value,
+                                exc_info=True,
+                            )
 
                         # Final responses rejected while this adapter was down
                         # are still owned by this live process, so startup
@@ -15946,6 +16279,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         # gateway hits the 2560-fd limit after ~12h of
                         # failed reconnects at the 300s backoff cap (#37011).
                         await _dispose_unused_adapter(adapter)
+                        self._cancel_platform_attention_notifications(info)
                         del self._failed_platforms[platform]
                     else:
                         self._update_platform_runtime_status(
@@ -17973,6 +18307,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             "verbose": self._handle_verbose_command,
             "footer": self._handle_footer_command,
             "help": self._handle_help_command,
+            "menu": self._handle_menu_command,
             "commands": self._handle_commands_command,
             "profile": self._handle_profile_command,
             "update": self._handle_update_command,
@@ -18093,23 +18428,100 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         return EphemeralReply(t("gateway.stop.stopped"))
 
     async def _busy_new_command(self, event: MessageEvent, quick_key: str, source):
-        # /reset and /new must bypass the running-agent guard so they
-        # actually dispatch as commands instead of being queued as user
-        # text (which would be fed back to the agent with the same
-        # broken history — #2170).  Interrupt the agent first, then
-        # clear the adapter's pending queue so the stale "/reset" text
-        # doesn't get re-processed as a user message after the
-        # interrupt completes.
-        # Clear any pending messages so the old text doesn't replay
-        await self._interrupt_and_clear_session(
-            quick_key,
-            source,
-            interrupt_reason=_INTERRUPT_REASON_RESET,
-            invalidation_reason="new_command",
+        return await self._handle_new_command(
+            event,
+            busy_quick_key=quick_key,
+            busy_source=source,
         )
-        # Clean up the running agent entry so the reset handler
-        # doesn't think an agent is still active.
-        return await self._handle_reset_command(event)
+
+    async def _handle_new_command(
+        self,
+        event: MessageEvent,
+        *,
+        busy_quick_key: Optional[str] = None,
+        busy_source: Optional[SessionSource] = None,
+    ):
+        """Run idle and busy ``/new`` through one confirmation authority."""
+        source = event.source
+        if await asyncio.to_thread(self._is_telegram_topic_root_lobby, source):
+            return self._telegram_topic_root_new_message()
+
+        async def _do_reset():
+            approval_source = busy_source or source
+            adapter = self._adapter_for_source(approval_source)
+            if adapter is not None:
+                adapter_config = getattr(adapter, "config", None)
+                adapter_extra = getattr(adapter_config, "extra", None) or {}
+                profile_for_key = getattr(adapter, "_session_key_profile", None)
+                approval_session_key = build_session_key(
+                    approval_source,
+                    group_sessions_per_user=adapter_extra.get(
+                        "group_sessions_per_user", True
+                    ),
+                    thread_sessions_per_user=adapter_extra.get(
+                        "thread_sessions_per_user", False
+                    ),
+                    profile=(
+                        profile_for_key(approval_source)
+                        if callable(profile_for_key)
+                        else getattr(approval_source, "profile", None)
+                    ),
+                )
+            else:
+                approval_session_key = self._session_key_for_source(approval_source)
+            session_tasks = getattr(adapter, "_session_tasks", None)
+            if isinstance(session_tasks, dict):
+                active_task = session_tasks.get(approval_session_key)
+                approval_task = asyncio.current_task()
+                approval_is_busy = (
+                    active_task is not None
+                    and active_task is not approval_task
+                    and not active_task.done()
+                )
+            else:
+                # Compatibility for non-Base adapter test doubles and plugins:
+                # only request-time busy dispatch supplies this fallback.
+                approval_is_busy = (
+                    busy_quick_key is not None and busy_source is not None
+                )
+                if approval_is_busy:
+                    approval_session_key = busy_quick_key
+
+            async def _execute_reset():
+                if approval_is_busy:
+                    # Only mutate the active turn after destructive confirmation.
+                    # Clearing here also prevents stale queued /reset text from
+                    # replaying against the fresh session (#2170).
+                    await self._interrupt_and_clear_session(
+                        approval_session_key,
+                        approval_source,
+                        interrupt_reason=_INTERRUPT_REASON_RESET,
+                        invalidation_reason="new_command",
+                    )
+                return await self._handle_reset_command(event)
+
+            # Every approved /new owns the adapter lifecycle while reset runs,
+            # including an idle approval snapshot. Only interruption of an old
+            # turn remains conditional inside ``_execute_reset``.
+            approved_dispatch = getattr(
+                type(adapter), "_run_approved_active_session_command", None
+            )
+            if adapter is not None and callable(approved_dispatch):
+                return await approved_dispatch(
+                    adapter, approval_session_key, _execute_reset
+                )
+            return await _execute_reset()
+
+        return await self._maybe_confirm_destructive_slash(
+            event=event,
+            command="new",
+            title="/new",
+            detail=(
+                "This starts a fresh session and discards the current "
+                "conversation history."
+            ),
+            execute=_do_reset,
+        )
 
     async def _busy_queue_command(self, event: MessageEvent, quick_key: str, source):
         # /queue <prompt> — queue without interrupting.
@@ -19189,21 +19601,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if plain_handler is not None:
             return await plain_handler(event)
 
+        if canonical == "menu":
+            return await self._handle_menu_command(event)
+
         if canonical == "new":
-            if await asyncio.to_thread(self._is_telegram_topic_root_lobby, source):
-                return self._telegram_topic_root_new_message()
-            async def _do_reset():
-                return await self._handle_reset_command(event)
-            return await self._maybe_confirm_destructive_slash(
-                event=event,
-                command="new",
-                title="/new",
-                detail=(
-                    "This starts a fresh session and discards the current "
-                    "conversation history."
-                ),
-                execute=_do_reset,
-            )
+            return await self._handle_new_command(event)
 
         if canonical == "topic":
             return await self._handle_topic_command(event)
@@ -26647,30 +27049,213 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         return True
 
-    async def _send_restart_notification(self) -> Optional[tuple[str, str, Optional[str]]]:
-        """Notify the chat that initiated /restart that the gateway is back."""
-        notify_path = _hermes_home / ".restart_notify.json"
-        if not notify_path.exists():
-            return None
+    @staticmethod
+    def _restart_notification_unique_path(kind: str) -> Path:
+        return _hermes_home / f".restart_notify.{kind}.{uuid.uuid4().hex}.json"
 
+    @staticmethod
+    def _restart_notification_pending() -> bool:
+        return _restart_notification_pending()
+
+    def _claim_restart_notification_marker(self, candidate: Path) -> Optional[Path]:
+        """Atomically claim one exact candidate from a stable queue snapshot."""
+        claimed = self._restart_notification_unique_path("claimed")
         try:
-            data = json.loads(notify_path.read_text(encoding="utf-8"))
+            os.replace(candidate, claimed)
+        except FileNotFoundError:
+            return None
+        except OSError as exc:
+            logger.warning(
+                "Could not claim restart notification marker %s: %s",
+                candidate,
+                exc,
+            )
+            return None
+        _fsync_restart_notification_directory()
+        return claimed
+
+    def _retain_restart_notification_claim(self, claimed_path: Path) -> None:
+        """Retain a failed claim without touching a newer canonical marker."""
+        retry_path = self._restart_notification_unique_path("retry")
+        try:
+            # The unique retry path preserves this exact claim. Never moving it
+            # back onto canonical avoids racing with a newly published marker.
+            os.replace(claimed_path, retry_path)
+            _fsync_restart_notification_directory()
+        except OSError as exc:
+            logger.warning(
+                "Could not queue retained restart notification claim %s: %s",
+                claimed_path,
+                exc,
+            )
+
+    def _schedule_restart_notification_retry(self) -> None:
+        """Start at most one bounded retry loop for the durable receipt."""
+        if not self._restart_notification_pending():
+            return
+        existing = getattr(self, "_restart_notification_retry_task", None)
+        if existing is not None and not existing.done():
+            return
+        task = asyncio.create_task(
+            self._restart_notification_retry_loop(),
+            name="gateway-restart-notification-retry",
+        )
+        self._restart_notification_retry_task = task
+        background_tasks = getattr(self, "_background_tasks", None)
+        if isinstance(background_tasks, set):
+            background_tasks.add(task)
+            task.add_done_callback(background_tasks.discard)
+
+    async def _restart_notification_retry_loop(self) -> None:
+        for delay in _RESTART_NOTIFICATION_RETRY_DELAYS:
+            await asyncio.sleep(delay)
+            await self._send_restart_notification(schedule_retry=False)
+            if not self._restart_notification_pending():
+                return
+
+    async def _send_restart_notification(
+        self, *, schedule_retry: bool = True
+    ) -> Optional[tuple[str, str, Optional[str]]]:
+        """Serialize delivery of the durable restart receipt."""
+        lock = getattr(self, "_restart_notification_lock", None)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._restart_notification_lock = lock
+        async with lock:
+            return await self._send_restart_notification_locked(
+                schedule_retry=schedule_retry
+            )
+
+    async def _send_restart_notification_locked(
+        self, *, schedule_retry: bool = True
+    ) -> Optional[tuple[str, str, Optional[str]]]:
+        """Attempt every receipt in one bounded, stable queue snapshot."""
+        candidates = _restart_notification_paths()
+        first_delivered = None
+        for candidate in candidates:
+            claimed_path = self._claim_restart_notification_marker(candidate)
+            if claimed_path is None:
+                continue
+            delivered = await self._deliver_claimed_restart_notification(claimed_path)
+            if delivered is not None and first_delivered is None:
+                first_delivered = delivered
+        if schedule_retry and self._restart_notification_pending():
+            self._schedule_restart_notification_retry()
+        return first_delivered
+
+    async def _deliver_claimed_restart_notification(
+        self, claimed_path: Path
+    ) -> Optional[tuple[str, str, Optional[str]]]:
+        """Validate and deliver one uniquely claimed restart receipt.
+
+        Delivery is intentionally at-least-once: a process crash after the
+        transport accepts the send but before the durable unlink can cause a
+        duplicate. Acknowledging first would instead permit silent loss.
+        """
+        cleanup = False
+        retry_claim = False
+        try:
+            try:
+                marker_stat = claimed_path.stat()
+                marker_age = time.time() - marker_stat.st_mtime
+            except FileNotFoundError:
+                return None
+            except OSError as exc:
+                logger.warning(
+                    "Discarding restart notification marker with unknown freshness: %s",
+                    exc,
+                )
+                cleanup = True
+                return None
+            if marker_age < 0:
+                logger.warning(
+                    "Discarding future-dated restart notification marker (age %.0fs)",
+                    marker_age,
+                )
+                cleanup = True
+                return None
+            if marker_age > _RESTART_NOTIFICATION_MAX_AGE_SECONDS:
+                logger.warning(
+                    "Discarding stale restart notification marker (age %.0fs)",
+                    marker_age,
+                )
+                cleanup = True
+                return None
+            try:
+                data = json.loads(claimed_path.read_text(encoding="utf-8"))
+            except (json.JSONDecodeError, UnicodeError) as exc:
+                logger.warning("Discarding invalid restart notification marker: %s", exc)
+                cleanup = True
+                return None
+            if not isinstance(data, dict):
+                logger.warning("Discarding non-object restart notification marker")
+                cleanup = True
+                return None
             platform_str = data.get("platform")
             chat_id = data.get("chat_id")
             chat_type = data.get("chat_type")
             thread_id = data.get("thread_id")
             message_id = data.get("message_id")
 
-            if not platform_str or not chat_id:
+            if (
+                not isinstance(platform_str, str)
+                or not platform_str
+                or not isinstance(chat_id, str)
+                or not chat_id
+            ):
+                logger.warning(
+                    "Discarding restart notification marker with invalid route"
+                )
+                cleanup = True
+                return None
+            invalid_string_field = next(
+                (
+                    field
+                    for field in (
+                        "chat_type",
+                        "thread_id",
+                        "message_id",
+                        "user_id",
+                        "scope_id",
+                    )
+                    if data.get(field) is not None
+                    and not isinstance(data.get(field), str)
+                ),
+                None,
+            )
+            if invalid_string_field is not None:
+                logger.warning(
+                    "Discarding restart notification marker with invalid %s",
+                    invalid_string_field,
+                )
+                cleanup = True
+                return None
+            if (
+                "delivered_via_upstream_relay" in data
+                and type(data["delivered_via_upstream_relay"]) is not bool
+            ):
+                logger.warning(
+                    "Discarding restart notification marker with invalid relay flag"
+                )
+                cleanup = True
                 return None
 
-            platform = Platform(platform_str)
+            try:
+                platform = Platform(platform_str)
+            except (TypeError, ValueError):
+                logger.warning(
+                    "Discarding restart notification marker with unknown platform: %r",
+                    platform_str,
+                )
+                cleanup = True
+                return None
             transport = resolve_delivery_transport(platform, self.config, self.adapters)
             if transport is None:
                 logger.debug(
                     "Restart notification skipped: no live transport for %s",
                     platform_str,
                 )
+                retry_claim = True
                 return None
 
             platform_cfg = self.config.platforms.get(platform)
@@ -26679,6 +27264,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     "Restart notification suppressed: %s has gateway_restart_notification=false",
                     platform_str,
                 )
+                cleanup = True
                 return None
 
             metadata = self._thread_metadata_for_target(
@@ -26695,12 +27281,97 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     metadata["user_id"] = str(data["user_id"])
                 if data.get("scope_id"):
                     metadata["scope_id"] = str(data["scope_id"])
-            result = await transport.send(
-                platform,
-                str(chat_id),
-                "♻ Gateway restarted successfully. Your session continues.",
-                metadata=_non_conversational_metadata(metadata, platform=platform),
+            from gateway.status import read_runtime_status
+
+            try:
+                runtime_record = read_runtime_status() or {}
+            except Exception:
+                runtime_record = {}
+            runtime_platforms = runtime_record.get("platforms", {})
+            if not isinstance(runtime_platforms, dict):
+                runtime_platforms = {}
+            configured_platforms = set(self.config.get_connected_platforms())
+            configured_platforms.update(self.adapters.keys())
+            for runtime_platform_id in runtime_platforms:
+                try:
+                    configured_platforms.add(Platform(runtime_platform_id))
+                except (TypeError, ValueError):
+                    logger.debug(
+                        "Ignoring unknown runtime platform in restart receipt: %r",
+                        runtime_platform_id,
+                    )
+            platform_health: list[tuple[str, bool]] = []
+            for adapter_platform in sorted(
+                configured_platforms, key=lambda item: item.value
+            ):
+                adapter_obj = self.adapters.get(adapter_platform)
+                runtime_entry = runtime_platforms.get(adapter_platform.value, {})
+                runtime_state = (
+                    str(runtime_entry.get("state") or "unknown").lower()
+                    if isinstance(runtime_entry, dict)
+                    else "unknown"
+                )
+                if adapter_obj is not None:
+                    try:
+                        connected = bool(
+                            getattr(adapter_obj, "is_connected", False)
+                        )
+                    except Exception:
+                        connected = False
+                else:
+                    connected = runtime_state == "connected"
+                label = adapter_platform.value.replace("_", " ").title()
+                platform_health.append((label, connected))
+            connected_names = [name for name, connected in platform_health if connected]
+            disconnected_names = [name for name, connected in platform_health if not connected]
+            restart_lines = [t("gateway.status.restart_success")]
+            if connected_names and not disconnected_names:
+                restart_lines.extend(
+                    [
+                        t("gateway.status.restart_overall_healthy"),
+                        t(
+                            "gateway.status.restart_connected_platforms",
+                            platforms=", ".join(connected_names),
+                        ),
+                    ]
+                )
+            elif platform_health:
+                restart_lines.append(t("gateway.status.restart_overall_degraded"))
+                if connected_names:
+                    restart_lines.append(
+                        t(
+                            "gateway.status.restart_connected_platforms",
+                            platforms=", ".join(connected_names),
+                        )
+                    )
+                if disconnected_names:
+                    restart_lines.append(
+                        t(
+                            "gateway.status.restart_disconnected_platforms",
+                            platforms=", ".join(disconnected_names),
+                        )
+                    )
+
+            completed, result = await self._await_with_detach_on_timeout(
+                transport.send(
+                    platform,
+                    str(chat_id),
+                    "\n".join(restart_lines),
+                    metadata=_non_conversational_metadata(
+                        metadata, platform=platform
+                    ),
+                ),
+                _RESTART_NOTIFICATION_SEND_TIMEOUT_SECONDS,
             )
+            if not completed:
+                logger.warning(
+                    "Restart notification to %s:%s timed out after %.1fs; retaining receipt",
+                    platform_str,
+                    chat_id,
+                    _RESTART_NOTIFICATION_SEND_TIMEOUT_SECONDS,
+                )
+                retry_claim = True
+                return None
             # adapter.send() catches provider errors (e.g. "Chat not found")
             # and returns SendResult(success=False) rather than raising, so
             # we must inspect the result before claiming success — otherwise
@@ -26712,6 +27383,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     chat_id,
                     getattr(result, "error", "send returned success=False"),
                 )
+                retry_claim = True
                 return None
 
             logger.info(
@@ -26719,12 +27391,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 platform_str,
                 chat_id,
             )
+            cleanup = True
             return str(platform_str), str(chat_id), str(thread_id) if thread_id else None
         except Exception as e:
             logger.warning("Restart notification failed: %s", e)
+            retry_claim = True
             return None
         finally:
-            notify_path.unlink(missing_ok=True)
+            if cleanup:
+                claimed_path.unlink(missing_ok=True)
+                _fsync_restart_notification_directory()
+            elif retry_claim:
+                self._retain_restart_notification_claim(claimed_path)
 
     async def _send_home_channel_startup_notifications(
         self,
@@ -29419,10 +30097,37 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if _eph_pin is not None and _eph_pin[0] == _eph_key:
             return _eph_pin[1]
         text = build_session_context_prompt(context, redact_pii=redact_pii)
+        response_design_prompt = (
+            _eph_pin[2]
+            if _eph_pin is not None and len(_eph_pin) > 2
+            else None
+        )
+        try:
+            from gateway.display_config import resolve_display_setting
+            from gateway.response_design import build_response_design_prompt
+
+            if response_design_prompt is None:
+                platform_key = _platform_config_key(context.source.platform)
+                response_design_mode = resolve_display_setting(
+                    _load_gateway_config(),
+                    platform_key,
+                    "response_design",
+                    "off",
+                )
+                response_design_prompt = build_response_design_prompt(
+                    platform_key,
+                    str(response_design_mode or "off"),
+                )
+            if response_design_prompt:
+                text = f"{text}\n\n{response_design_prompt}".strip()
+        except Exception:
+            logger.debug("response design prompt resolution failed", exc_info=True)
+            response_design_prompt = response_design_prompt or ""
         if session_key:
             self._session_state(session_key).conversation.ephemeral_pin = (
                 _eph_key,
                 text,
+                response_design_prompt,
             )
         return text
 

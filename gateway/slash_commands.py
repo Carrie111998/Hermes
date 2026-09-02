@@ -580,7 +580,64 @@ class GatewaySlashCommandsMixin:
         source = event.source
         session_entry = await self.async_session_store.get_or_create_session(source)
 
-        connected_platforms = [p.value for p in self.adapters.keys()]
+        from gateway.status import read_runtime_status
+
+        try:
+            runtime_record = read_runtime_status() or {}
+        except Exception:
+            runtime_record = {}
+        runtime_platforms = runtime_record.get("platforms", {})
+        if not isinstance(runtime_platforms, dict):
+            runtime_platforms = {}
+
+        configured_platforms = set(self.config.get_connected_platforms())
+        configured_platforms.update(self.adapters.keys())
+        for runtime_platform_id in runtime_platforms:
+            try:
+                configured_platforms.add(Platform(runtime_platform_id))
+            except (TypeError, ValueError):
+                logger.debug(
+                    "Ignoring unknown runtime platform in /status: %r",
+                    runtime_platform_id,
+                )
+        platform_health: list[dict[str, Any]] = []
+        for platform in sorted(configured_platforms, key=lambda item: item.value):
+            platform_adapter = self.adapters.get(platform)
+            runtime_entry = runtime_platforms.get(platform.value, {})
+            if not isinstance(runtime_entry, dict):
+                runtime_entry = {}
+            runtime_state = str(runtime_entry.get("state") or "unknown").lower()
+            if platform_adapter is not None:
+                try:
+                    connected = bool(getattr(platform_adapter, "is_connected", False))
+                except Exception:
+                    connected = False
+            else:
+                connected = runtime_state == "connected"
+            platform_health.append(
+                {
+                    "name": platform.value,
+                    "connected": connected,
+                    "state": runtime_state,
+                    "error_code": str(runtime_entry.get("error_code") or "").strip(),
+                    "error_message": str(runtime_entry.get("error_message") or "").strip(),
+                    "retrying_since": str(runtime_entry.get("retrying_since") or "").strip(),
+                    "needs_attention": bool(runtime_entry.get("needs_attention", False)),
+                }
+            )
+        from gateway.disk_status import collect_disk_status
+        from gateway.memory_status import collect_memory_status
+
+        memory_status = collect_memory_status()
+        disk_status = collect_disk_status()
+        resource_pressure = {
+            str(memory_status.get("pressure") or "unknown").lower(),
+            str(disk_status.get("pressure") or "unknown").lower(),
+        }
+        resources_healthy = resource_pressure == {"ok"}
+        all_platforms_healthy = bool(platform_health) and all(
+            item["connected"] for item in platform_health
+        ) and resources_healthy
 
         # Check if there's an active agent. Keep the sentinel distinct: a
         # starting/pending run should not be treated as a fully usable agent for
@@ -601,6 +658,43 @@ class GatewaySlashCommandsMixin:
                 return int(value)
             except (TypeError, ValueError):
                 return 0
+
+        def _duration(value: float) -> str:
+            seconds = max(0, int(value))
+            days, remainder = divmod(seconds, 86_400)
+            hours, remainder = divmod(remainder, 3_600)
+            minutes, seconds = divmod(remainder, 60)
+            if days:
+                parts = [t("gateway.status.duration_days", value=days)]
+                if hours:
+                    parts.append(t("gateway.status.duration_hours", value=hours))
+                return " ".join(parts)
+            if hours:
+                parts = [t("gateway.status.duration_hours", value=hours)]
+                if minutes:
+                    parts.append(t("gateway.status.duration_minutes", value=minutes))
+                return " ".join(parts)
+            if minutes:
+                return t("gateway.status.duration_minutes", value=minutes)
+            return t("gateway.status.duration_seconds", value=seconds)
+
+        def _pressure_label(value: Any) -> str:
+            pressure = str(value or "unknown").lower()
+            if pressure not in {"ok", "elevated", "critical", "unknown"}:
+                pressure = "unknown"
+            return t(f"gateway.status.pressure_{pressure}")
+
+        def _format_session_timestamp(value: datetime) -> str:
+            """Render the timestamp in the configured zone at its own instant."""
+            from hermes_time import get_timezone
+
+            # Legacy routing entries may contain naive server-local datetimes;
+            # astimezone() attaches the correct local offset for that instant.
+            aware = value.astimezone() if value.tzinfo is None else value
+            configured_tz = get_timezone()
+            if configured_tz is not None:
+                aware = aware.astimezone(configured_tz)
+            return aware.strftime("%Y-%m-%d %H:%M %Z")
 
         title = None
         session_row: dict[str, Any] = {}
@@ -728,14 +822,52 @@ class GatewaySlashCommandsMixin:
 
         lines = [
             t("gateway.status.header"),
+            t(
+                "gateway.status.overall_healthy"
+                if all_platforms_healthy
+                else "gateway.status.overall_degraded"
+            ),
             "",
-            t("gateway.status.session_id", session_id=session_entry.session_id),
+            t("gateway.status.gateway_running"),
+            t(
+                "gateway.status.agent_state",
+                state=t(
+                    "gateway.status.agent_processing"
+                    if is_running
+                    else "gateway.status.agent_waiting"
+                ),
+            ),
         ]
+        now_ts = time.time()
+        gateway_started_at = float(getattr(self, "_gateway_started_at", 0.0) or 0.0)
+        if gateway_started_at > 0:
+            lines.append(
+                t(
+                    "gateway.status.gateway_uptime",
+                    duration=_duration(now_ts - gateway_started_at),
+                )
+            )
+        running_started = getattr(self, "_running_agents_ts", {}) or {}
+        task_started_at = float(running_started.get(session_key, 0.0) or 0.0)
+        if is_running and task_started_at > 0:
+            lines.append(
+                t(
+                    "gateway.status.task_duration",
+                    duration=_duration(now_ts - task_started_at),
+                )
+            )
+        lines.append(t("gateway.status.session_id", session_id=session_entry.session_id))
         if title:
             lines.append(t("gateway.status.title", title=title))
         lines.extend([
-            t("gateway.status.created", timestamp=session_entry.created_at.strftime('%Y-%m-%d %H:%M')),
-            t("gateway.status.last_activity", timestamp=session_entry.updated_at.strftime('%Y-%m-%d %H:%M')),
+            t(
+                "gateway.status.created",
+                timestamp=_format_session_timestamp(session_entry.created_at),
+            ),
+            t(
+                "gateway.status.last_activity",
+                timestamp=_format_session_timestamp(session_entry.updated_at),
+            ),
         ])
         if model_line:
             lines.append(model_line)
@@ -743,7 +875,6 @@ class GatewaySlashCommandsMixin:
             lines.append(context_line)
         lines.extend([
             t("gateway.status.tokens", tokens=f"{db_total_tokens:,}"),
-            t("gateway.status.agent_running", state=t("gateway.status.state_yes") if is_running else t("gateway.status.state_no")),
         ])
         if queue_depth:
             lines.append(t("gateway.status.queued", count=queue_depth))
@@ -763,10 +894,115 @@ class GatewaySlashCommandsMixin:
                     session_key=self._redact_matrix_session_key(session_key),
                 ),
             ])
-        lines.extend([
-            "",
-            t("gateway.status.platforms", platforms=', '.join(connected_platforms)),
-        ])
+        lines.append("")
+        memory_parts = [_pressure_label(memory_status.get("pressure"))]
+        if memory_status.get("gateway_rss_mb") is not None:
+            memory_parts.append(
+                t(
+                    "gateway.status.memory_rss",
+                    value=memory_status["gateway_rss_mb"],
+                )
+            )
+        if memory_status.get("system_available_mb") is not None:
+            memory_parts.append(
+                t(
+                    "gateway.status.memory_available",
+                    value=memory_status["system_available_mb"],
+                )
+            )
+        lines.append(
+            t(
+                "gateway.status.platform_state",
+                platform=t("gateway.status.resource_memory"),
+                state=" · ".join(memory_parts),
+            )
+        )
+        disk_parts = [_pressure_label(disk_status.get("pressure"))]
+        if disk_status.get("free_mb") is not None:
+            disk_parts.append(
+                t("gateway.status.disk_free", value=disk_status["free_mb"])
+            )
+        if disk_status.get("used_percent") is not None:
+            disk_parts.append(
+                t("gateway.status.disk_used", value=disk_status["used_percent"])
+            )
+        lines.append(
+            t(
+                "gateway.status.platform_state",
+                platform=t("gateway.status.resource_disk"),
+                state=" · ".join(disk_parts),
+            )
+        )
+        lines.append("")
+        def _safe_runtime_detail(value: str, limit: int) -> str:
+            """Force-redact and defang untrusted adapter diagnostics for chat."""
+            from agent.redact import redact_sensitive_text
+
+            text = redact_sensitive_text(
+                " ".join(str(value or "").split()),
+                force=True,
+                redact_url_credentials=True,
+            )[:limit]
+            # Runtime adapter errors are untrusted provider text. Replace chat
+            # markup/mention metacharacters with inert Unicode equivalents so
+            # one platform's diagnostic cannot ping users or inject formatting
+            # when /status is rendered on another platform.
+            return text.translate(
+                str.maketrans(
+                    {
+                        "@": "＠",
+                        "<": "‹",
+                        ">": "›",
+                        "*": "＊",
+                        "_": "＿",
+                        "[": "［",
+                        "]": "］",
+                        "(": "（",
+                        ")": "）",
+                        "`": "｀",
+                        "~": "～",
+                    }
+                )
+            )
+
+        for item in platform_health:
+            platform_name = item["name"]
+            connected = item["connected"]
+            lines.append(
+                t(
+                    "gateway.status.platform_state",
+                    platform=platform_name.title(),
+                    state=t(
+                        "gateway.status.platform_connected"
+                        if connected
+                        else "gateway.status.platform_disconnected"
+                    ),
+                )
+            )
+            error_code = _safe_runtime_detail(item["error_code"], 80)
+            error_message = _safe_runtime_detail(item["error_message"], 240)
+            if error_code or error_message:
+                detail = ": ".join(part for part in (error_code, error_message) if part)
+                lines.append(f"  {detail}")
+            retrying_since = _safe_runtime_detail(item["retrying_since"], 64)
+            if retrying_since:
+                lines.append(
+                    "  "
+                    + t(
+                        "gateway.status.retrying_since",
+                        timestamp=retrying_since,
+                    )
+                )
+        disconnected_platforms = [
+            item["name"].title() for item in platform_health if not item["connected"]
+        ]
+        if disconnected_platforms:
+            lines.append(
+                t(
+                    "gateway.status.advice_reconnect",
+                    platform=", ".join(disconnected_platforms),
+                )
+            )
 
         return "\n".join(lines)
 
@@ -1601,7 +1837,10 @@ class GatewaySlashCommandsMixin:
 
     async def _handle_restart_command(self, event: MessageEvent) -> Union[str, EphemeralReply]:
         """Handle /restart command - drain active work, then restart the gateway."""
-        from gateway.run import _hermes_home
+        from gateway.run import (
+            _fsync_restart_notification_directory,
+            _hermes_home,
+        )
         # Defensive idempotency check: if the previous gateway process
         # recorded this same /restart (same platform + update_id) and the new
         # process is seeing it *again*, this is a re-delivery caused by PTB's
@@ -1662,6 +1901,7 @@ class GatewaySlashCommandsMixin:
                 notify_data,
                 indent=None,
             )
+            await asyncio.to_thread(_fsync_restart_notification_directory)
         except Exception as e:
             logger.debug("Failed to write restart notify file: %s", e)
 
@@ -1716,6 +1956,33 @@ class GatewaySlashCommandsMixin:
         from hermes_cli.slash_exec import CommandContext, execute_command
 
         return execute_command("version", CommandContext(surface="gateway")).text
+
+    async def _handle_menu_command(self, event: MessageEvent) -> Optional[str]:
+        """Render a native action menu when supported, else return text."""
+        source = event.source
+        adapter = self._adapter_for_source(source)
+        send_menu = getattr(adapter, "send_main_menu", None)
+        if callable(send_menu):
+            metadata = self._thread_metadata_for_source(
+                source,
+                self._reply_anchor_for_event(event),
+            )
+            try:
+                result = await send_menu(str(source.chat_id), metadata=metadata)
+                if result is not None and getattr(result, "success", False):
+                    return None
+            except Exception:
+                logger.debug("Native /menu send failed", exc_info=True)
+
+        from hermes_cli.slash_exec import CommandContext, execute_command
+
+        return execute_command(
+            "menu",
+            CommandContext(
+                surface="gateway",
+                args=event.get_command_args(),
+            ),
+        ).text
 
     async def _handle_help_command(self, event: MessageEvent) -> str:
         """Handle /help command - list available commands."""

@@ -107,11 +107,11 @@ class CommandDef:
     #                               can't run mid-turn" catch-all is returned;
     #                               with ``busy_handler`` a command-specific
     #                               reject message is used.
-    #   "interrupt_then_dispatch" — interrupt/kill the running agent first,
-    #                               then dispatch (the /stop, /new, /reset
-    #                               class).  Guard 1 (platforms/base.py)
-    #                               routes these through the cancel-handoff
-    #                               path via is_interrupt_then_dispatch().
+    #   "interrupt_then_dispatch" — interrupt/kill the running agent before
+    #                               execution (the /stop, /new, /reset class).
+    #                               Destructive-confirm-gated commands prompt
+    #                               without mutation and enter the cancel-handoff
+    #                               only after approval.
     busy_policy: str = "reject"
     # Optional key of a special mid-run handler in the Guard-2 handler table
     # (gateway/run.py) for commands whose busy behavior differs from their
@@ -378,6 +378,8 @@ COMMAND_REGISTRY: list[CommandDef] = [
                "Tools & Skills", cli_only=True, desktop="terminal"),
 
     # Info
+    CommandDef("menu", "Open compact Telegram action buttons", "Info",
+               gateway_only=True, busy_policy="dispatch", execute="gateway_menu"),
     CommandDef("commands", "Browse all commands and skills (paginated)", "Info",
                gateway_only=True, args_hint="[page]", busy_policy="dispatch",
                execute="gateway_commands"),
@@ -578,12 +580,12 @@ ACTIVE_SESSION_BYPASS_COMMANDS: frozenset[str] = frozenset(
 
 
 def is_interrupt_then_dispatch(command_name: str | None) -> bool:
-    """Return True when *command_name* must interrupt a running agent first.
+    """Return True when execution requires interrupting a running agent.
 
     Derived from the registry: commands whose ``busy_policy`` is
-    "interrupt_then_dispatch" (the /stop, /new, /reset class).  Guard 1
-    (gateway/platforms/base.py) routes these through the cancel-handoff
-    path that serializes cancellation + runner response + pending drain.
+    "interrupt_then_dispatch" (the /stop, /new, /reset class). Guard 1 routes
+    immediate commands through the cancel-handoff; gated destructive commands
+    enter the same handoff from their approved callback.
     Accepts aliases (e.g. "reset" resolves to "new").
     """
     if not command_name:
@@ -764,6 +766,7 @@ _TELEGRAM_PRIORITY_MODES = {"prepend", "append", "replace"}
 _TELEGRAM_MENU_PRIORITY = (
     # Most-typed everyday commands first.
     "help",
+    "menu",
     "new",
     "stop",
     "status",
@@ -1478,7 +1481,7 @@ _SLACK_PRIORITY_ALIASES: tuple[str, ...] = ()
 #     (session export is an interactive surface; platform is a rare
 #     informational lookup) — without this entry /save tips the registry
 #     past the 50-cap and silently clamps /platform, breaking parity.
-_SLACK_VIA_HERMES_ONLY = frozenset({"topup", "moa", "debug", "egress", "init", "version", "diff", "update", "heartbeat", "refine", "review", "pause", "whoami", "platform", "insights"})
+_SLACK_VIA_HERMES_ONLY = frozenset({"topup", "moa", "debug", "egress", "init", "version", "diff", "update", "heartbeat", "refine", "review", "pause", "whoami", "platform", "insights", "menu"})
 
 
 def _sanitize_slack_name(raw: str) -> str:

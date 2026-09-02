@@ -621,6 +621,11 @@ async def test_send_image_upload_fallback_blocks_connect_time_rebind(monkeypatch
 @pytest.mark.asyncio
 async def test_slash_confirm_forum_callback_followup_keeps_existing_thread_behavior(monkeypatch):
     adapter = _make_adapter()
+    # This routing regression does not exercise scope policy. Keep it isolated
+    # from scoped-gate environment values left by earlier config-loading tests.
+    adapter.config.extra.update(
+        {"allowed_chats": [], "allowed_topics": [], "ignored_threads": []}
+    )
     adapter._slash_confirm_state = {"confirm-1": "session-1"}
     adapter._is_callback_user_authorized = lambda *args, **kwargs: True
     call_log = []

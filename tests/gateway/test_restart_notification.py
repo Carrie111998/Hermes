@@ -1,6 +1,8 @@
 """Tests for /restart notification — the gateway notifies the requester on comeback."""
 
+import asyncio
 import json
+import os
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
@@ -30,6 +32,24 @@ def test_planned_restart_notification_pending_roundtrip(tmp_path, monkeypatch):
     gateway_run._clear_planned_restart_notification()
 
     assert gateway_run._planned_restart_notification_pending() is False
+
+
+@pytest.mark.parametrize(
+    "marker_name",
+    [
+        ".restart_notify.json",
+        ".restart_notify.retry.old.json",
+        ".restart_notify.claimed.interrupted.json",
+    ],
+)
+def test_restart_notification_pending_includes_every_durable_state(
+    tmp_path, monkeypatch, marker_name
+):
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    (tmp_path / marker_name).write_text("{}")
+
+    assert gateway_run._restart_notification_pending() is True
+    assert gateway_run.GatewayRunner._restart_notification_pending() is True
 
 
 # ── _handle_restart_command writes .restart_notify.json ──────────────────
@@ -287,6 +307,534 @@ async def test_relay_restart_notification_uses_logical_platform_and_owner(tmp_pa
 
 
 @pytest.mark.asyncio
+async def test_restart_notification_single_call_drains_existing_snapshot(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    now = gateway_run.time.time()
+    markers = [
+        (".restart_notify.claimed.interrupted.json", "41", now - 3),
+        (".restart_notify.retry.old.json", "42", now - 2),
+        (".restart_notify.json", "43", now - 1),
+    ]
+    for name, chat_id, mtime in markers:
+        path = tmp_path / name
+        path.write_text(json.dumps({"platform": "telegram", "chat_id": chat_id}))
+        os.utime(path, (mtime, mtime))
+
+    runner, adapter = make_restart_runner()
+    adapter.send = AsyncMock(
+        return_value=SendResult(success=True, message_id="delivered")
+    )
+
+    delivered = await runner._send_restart_notification(schedule_retry=False)
+
+    assert delivered == ("telegram", "41", None)
+    assert [call.args[0] for call in adapter.send.await_args_list] == ["41", "42", "43"]
+    assert not list(tmp_path.glob(".restart_notify*.json"))
+
+
+@pytest.mark.asyncio
+async def test_failed_old_retry_does_not_block_new_canonical(tmp_path, monkeypatch):
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    retry = tmp_path / ".restart_notify.retry.old.json"
+    canonical = tmp_path / ".restart_notify.json"
+    retry.write_text(json.dumps({"platform": "telegram", "chat_id": "old"}))
+    canonical.write_text(json.dumps({"platform": "telegram", "chat_id": "new"}))
+    now = gateway_run.time.time()
+    os.utime(retry, (now - 2, now - 2))
+    os.utime(canonical, (now - 1, now - 1))
+    runner, adapter = make_restart_runner()
+
+    async def _send(chat_id, *_args, **_kwargs):
+        if chat_id == "old":
+            return SendResult(success=False, error="still unavailable")
+        return SendResult(success=True, message_id="new-delivered")
+
+    adapter.send = AsyncMock(side_effect=_send)
+
+    delivered = await runner._send_restart_notification(schedule_retry=False)
+
+    assert delivered == ("telegram", "new", None)
+    assert [call.args[0] for call in adapter.send.await_args_list] == ["old", "new"]
+    remaining = list(tmp_path.glob(".restart_notify*.json"))
+    assert len(remaining) == 1
+    assert json.loads(remaining[0].read_text())["chat_id"] == "old"
+
+
+@pytest.mark.asyncio
+async def test_hung_old_restart_receipt_is_detached_and_newer_receipt_delivers(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setattr(
+        gateway_run, "_RESTART_NOTIFICATION_SEND_TIMEOUT_SECONDS", 0.01
+    )
+    retry = tmp_path / ".restart_notify.retry.old.json"
+    canonical = tmp_path / ".restart_notify.json"
+    retry.write_text(json.dumps({"platform": "telegram", "chat_id": "old"}))
+    canonical.write_text(json.dumps({"platform": "telegram", "chat_id": "new"}))
+    now = gateway_run.time.time()
+    os.utime(retry, (now - 2, now - 2))
+    os.utime(canonical, (now - 1, now - 1))
+    runner, adapter = make_restart_runner()
+    release_old = asyncio.Event()
+    attempts = []
+
+    async def _send(chat_id, *_args, **_kwargs):
+        attempts.append(chat_id)
+        if chat_id == "old":
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                await release_old.wait()
+            return SendResult(success=True, message_id="ambiguous-old")
+        return SendResult(success=True, message_id="new-delivered")
+
+    adapter.send = AsyncMock(side_effect=_send)
+    delivery = asyncio.create_task(
+        runner._send_restart_notification(schedule_retry=False)
+    )
+    try:
+        await asyncio.sleep(0.2)
+        completed_before_release = delivery.done()
+        delivered = delivery.result() if completed_before_release else None
+        remaining = list(tmp_path.glob(".restart_notify*.json"))
+    finally:
+        release_old.set()
+        await delivery
+        await asyncio.sleep(0)
+
+    assert completed_before_release is True
+    assert delivered == ("telegram", "new", None)
+    assert attempts == ["old", "new"]
+    assert len(remaining) == 1
+    assert json.loads(remaining[0].read_text())["chat_id"] == "old"
+
+
+@pytest.mark.asyncio
+async def test_cancel_after_transport_acceptance_is_at_least_once(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    (tmp_path / ".restart_notify.json").write_text(
+        json.dumps({"platform": "telegram", "chat_id": "42"})
+    )
+    runner, adapter = make_restart_runner()
+    accepted = asyncio.Event()
+    release = asyncio.Event()
+    attempts = []
+
+    async def _send(chat_id, *_args, **_kwargs):
+        attempts.append(chat_id)
+        accepted.set()
+        await release.wait()
+        return SendResult(success=True, message_id="accepted")
+
+    adapter.send = AsyncMock(side_effect=_send)
+    first = asyncio.create_task(
+        runner._send_restart_notification(schedule_retry=False)
+    )
+    await accepted.wait()
+    first.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await first
+
+    claims = list(tmp_path.glob(".restart_notify.claimed.*.json"))
+    assert len(claims) == 1
+
+    release.set()
+    await runner._send_restart_notification(schedule_retry=False)
+
+    # A crash/cancellation after remote acceptance but before durable cleanup
+    # cannot be distinguished from a failed send; at-least-once may duplicate.
+    assert attempts == ["42", "42"]
+    assert not list(tmp_path.glob(".restart_notify*.json"))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "marker_text",
+    ["{not-json", "[]", json.dumps({"platform": "unknown", "chat_id": "42"})],
+)
+async def test_restart_notification_discards_invalid_durable_marker(
+    tmp_path, monkeypatch, marker_text
+):
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    notify_path = tmp_path / ".restart_notify.json"
+    notify_path.write_text(marker_text)
+    runner, adapter = make_restart_runner()
+
+    assert await runner._send_restart_notification() is None
+
+    assert not notify_path.exists()
+    assert not hasattr(runner, "_restart_notification_retry_task")
+    assert adapter.sent == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("field", "invalid_value"),
+    [
+        ("chat_id", []),
+        ("thread_id", {}),
+        ("chat_type", []),
+        ("message_id", {}),
+        ("user_id", []),
+        ("scope_id", {}),
+        ("delivered_via_upstream_relay", "true"),
+    ],
+)
+async def test_restart_notification_discards_marker_with_invalid_field_type(
+    tmp_path, monkeypatch, field, invalid_value
+):
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    notify_path = tmp_path / ".restart_notify.json"
+    marker = {"platform": "telegram", "chat_id": "42"}
+    marker[field] = invalid_value
+    notify_path.write_text(json.dumps(marker))
+    runner, adapter = make_restart_runner()
+
+    assert await runner._send_restart_notification() is None
+
+    assert not notify_path.exists()
+    assert not hasattr(runner, "_restart_notification_retry_task")
+    assert adapter.sent == []
+
+
+@pytest.mark.asyncio
+async def test_restart_notification_discards_marker_when_freshness_stat_fails(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    notify_path = tmp_path / ".restart_notify.json"
+    notify_path.write_text(json.dumps({"platform": "telegram", "chat_id": "42"}))
+    runner, adapter = make_restart_runner()
+    real_stat = Path.stat
+
+    def _fail_explicit_marker_stat(path, *args, **kwargs):
+        if path.name == ".restart_notify.json" or path.name.startswith(
+            ".restart_notify.claimed."
+        ):
+            raise OSError("freshness unavailable")
+        return real_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", _fail_explicit_marker_stat)
+
+    assert await runner._send_restart_notification() is None
+
+    monkeypatch.setattr(Path, "stat", real_stat)
+    assert not notify_path.exists()
+    assert not hasattr(runner, "_restart_notification_retry_task")
+    assert adapter.sent == []
+
+
+@pytest.mark.asyncio
+async def test_restart_notification_discards_future_dated_marker(tmp_path, monkeypatch):
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    notify_path = tmp_path / ".restart_notify.json"
+    notify_path.write_text(
+        json.dumps({"platform": "telegram", "chat_id": "42"})
+    )
+    future = gateway_run.time.time() + 60
+    os.utime(notify_path, (future, future))
+    runner, adapter = make_restart_runner()
+
+    assert await runner._send_restart_notification() is None
+
+    assert not notify_path.exists()
+    assert adapter.sent == []
+
+
+@pytest.mark.asyncio
+async def test_restart_notification_discards_expired_marker(tmp_path, monkeypatch):
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setattr(
+        gateway_run, "_RESTART_NOTIFICATION_MAX_AGE_SECONDS", -1
+    )
+    notify_path = tmp_path / ".restart_notify.json"
+    notify_path.write_text(
+        json.dumps({"platform": "telegram", "chat_id": "42"})
+    )
+    runner, adapter = make_restart_runner()
+
+    assert await runner._send_restart_notification() is None
+
+    assert not notify_path.exists()
+    assert adapter.sent == []
+
+
+@pytest.mark.asyncio
+async def test_concurrent_restart_notification_senders_deliver_once(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    notify_path = tmp_path / ".restart_notify.json"
+    notify_path.write_text(
+        json.dumps({"platform": "telegram", "chat_id": "42"})
+    )
+    runner, adapter = make_restart_runner()
+    adapter.send = AsyncMock(
+        return_value=SendResult(success=True, message_id="delivered-once")
+    )
+
+    first, second = await asyncio.gather(
+        runner._send_restart_notification(),
+        runner._send_restart_notification(),
+    )
+
+    assert adapter.send.await_count == 1
+    assert not notify_path.exists()
+    assert sorted(value is None for value in (first, second)) == [False, True]
+
+
+@pytest.mark.asyncio
+async def test_restart_notification_preserves_replacement_written_during_send(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    notify_path = tmp_path / ".restart_notify.json"
+    old_marker = {"platform": "telegram", "chat_id": "42"}
+    new_marker = {"platform": "telegram", "chat_id": "99"}
+    notify_path.write_text(json.dumps(old_marker))
+    runner, adapter = make_restart_runner()
+    send_started = asyncio.Event()
+    release_send = asyncio.Event()
+
+    async def _send(*args, **kwargs):
+        send_started.set()
+        await release_send.wait()
+        return SendResult(success=True, message_id="old-delivered")
+
+    adapter.send = AsyncMock(side_effect=_send)
+    delivery = asyncio.create_task(runner._send_restart_notification())
+    await send_started.wait()
+    replacement = tmp_path / ".restart_notify.replacement.json"
+    replacement.write_text(json.dumps(new_marker))
+    os.replace(replacement, notify_path)
+    release_send.set()
+
+    assert await delivery == ("telegram", "42", None)
+    assert json.loads(notify_path.read_text()) == new_marker
+    assert adapter.send.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_restart_notification_claim_isolated_from_pre_read_replacement(
+    tmp_path, monkeypatch
+):
+    """A marker published after claim is neither read nor cleaned as the old one."""
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    notify_path = tmp_path / ".restart_notify.json"
+    old_marker = {"platform": "telegram", "chat_id": "42"}
+    new_marker = {"platform": "telegram", "chat_id": "99"}
+    notify_path.write_text(json.dumps(old_marker))
+    runner, adapter = make_restart_runner()
+    adapter.send = AsyncMock(
+        return_value=SendResult(success=True, message_id="delivered")
+    )
+    real_replace = os.replace
+    replacement_published = False
+
+    def _replace_and_publish_new(source, destination):
+        nonlocal replacement_published
+        real_replace(source, destination)
+        destination_name = Path(destination).name
+        if (
+            not replacement_published
+            and Path(source) == notify_path
+            and destination_name.startswith(".restart_notify.claimed.")
+        ):
+            replacement_published = True
+            notify_path.write_text(json.dumps(new_marker))
+
+    monkeypatch.setattr(gateway_run.os, "replace", _replace_and_publish_new)
+
+    assert await runner._send_restart_notification() == ("telegram", "42", None)
+
+    assert replacement_published is True
+    assert json.loads(notify_path.read_text()) == new_marker
+    assert await runner._send_restart_notification() == ("telegram", "99", None)
+    assert [call.args[0] for call in adapter.send.await_args_list] == ["42", "99"]
+    assert not list(tmp_path.glob(".restart_notify*.json"))
+
+
+@pytest.mark.asyncio
+async def test_restart_notification_transient_claim_retries_without_overwriting_replacement(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    notify_path = tmp_path / ".restart_notify.json"
+    old_marker = {"platform": "telegram", "chat_id": "42"}
+    new_marker = {"platform": "telegram", "chat_id": "99"}
+    notify_path.write_text(json.dumps(old_marker))
+    runner, adapter = make_restart_runner()
+    attempted_chat_ids = []
+
+    async def _send(chat_id, *_args, **_kwargs):
+        attempted_chat_ids.append(chat_id)
+        if len(attempted_chat_ids) == 1:
+            notify_path.write_text(json.dumps(new_marker))
+            return SendResult(success=False, error="temporary timeout")
+        return SendResult(success=True, message_id=f"delivered-{chat_id}")
+
+    adapter.send = AsyncMock(side_effect=_send)
+
+    assert await runner._send_restart_notification(schedule_retry=False) is None
+
+    retained_payloads = [
+        json.loads(path.read_text())
+        for path in tmp_path.glob(".restart_notify*.json")
+    ]
+    assert old_marker in retained_payloads
+    assert new_marker in retained_payloads
+
+    assert await runner._send_restart_notification(schedule_retry=False) == (
+        "telegram",
+        "42",
+        None,
+    )
+    assert attempted_chat_ids == ["42", "42", "99"]
+    assert not list(tmp_path.glob(".restart_notify*.json"))
+
+
+@pytest.mark.asyncio
+async def test_restart_notification_fsyncs_claim_and_success_cleanup(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    (tmp_path / ".restart_notify.json").write_text(
+        json.dumps({"platform": "telegram", "chat_id": "42"})
+    )
+    fsyncs = MagicMock()
+    monkeypatch.setattr(
+        gateway_run, "_fsync_restart_notification_directory", fsyncs, raising=False
+    )
+    runner, adapter = make_restart_runner()
+    adapter.send = AsyncMock(
+        return_value=SendResult(success=True, message_id="delivered")
+    )
+
+    await runner._send_restart_notification(schedule_retry=False)
+
+    assert fsyncs.call_count == 2
+
+
+@pytest.mark.asyncio
+async def test_restart_notification_confirms_live_platform_health(tmp_path, monkeypatch):
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    (tmp_path / ".restart_notify.json").write_text(
+        json.dumps({"platform": "telegram", "chat_id": "42"})
+    )
+    runner, adapter = make_restart_runner()
+    adapter._running = True
+    whatsapp = MagicMock()
+    whatsapp.is_connected = True
+    runner.adapters[Platform.WHATSAPP] = whatsapp
+
+    await runner._send_restart_notification()
+
+    message = adapter.sent[0]
+    assert "Gateway restarted successfully" in message
+    assert "System is operating normally" in message
+    assert "Telegram, Whatsapp" in message
+
+
+@pytest.mark.asyncio
+async def test_restart_notification_reports_configured_failed_platform(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    (tmp_path / ".restart_notify.json").write_text(
+        json.dumps({"platform": "telegram", "chat_id": "42"})
+    )
+    runner, adapter = make_restart_runner()
+    adapter._running = True
+    runner.config.platforms[Platform.SLACK] = PlatformConfig(enabled=True, token="***")
+    monkeypatch.setattr(
+        "gateway.status.read_runtime_status",
+        lambda: {
+            "gateway_state": "running",
+            "platforms": {
+                "telegram": {"state": "connected"},
+                "slack": {"state": "retrying"},
+            },
+        },
+    )
+
+    await runner._send_restart_notification()
+
+    message = adapter.sent[0]
+    assert "System is operating with limitations" in message
+    assert "Disconnected platforms: Slack" in message
+
+
+@pytest.mark.asyncio
+async def test_restart_notification_reports_runtime_only_retrying_platform(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    (tmp_path / ".restart_notify.json").write_text(
+        json.dumps({"platform": "telegram", "chat_id": "42"})
+    )
+    runner, adapter = make_restart_runner()
+    adapter._running = True
+    monkeypatch.setattr(
+        "gateway.status.read_runtime_status",
+        lambda: {
+            "platforms": {
+                "telegram": {"state": "connected"},
+                "slack": {"state": "retrying"},
+                "future_plugin_platform": {"state": "retrying"},
+            }
+        },
+    )
+
+    await runner._send_restart_notification()
+
+    message = adapter.sent[0]
+    assert "System is operating with limitations" in message
+    assert "Disconnected platforms: Slack" in message
+    assert "future_plugin_platform" not in message
+
+
+@pytest.mark.asyncio
+async def test_restart_notification_health_summary_is_localized(tmp_path, monkeypatch):
+    from agent import i18n
+
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    (tmp_path / ".restart_notify.json").write_text(
+        json.dumps({"platform": "telegram", "chat_id": "42"})
+    )
+    runner, adapter = make_restart_runner()
+    adapter._running = True
+    runner.config.platforms[Platform.SLACK] = PlatformConfig(enabled=True, token="***")
+    monkeypatch.setattr(
+        "gateway.status.read_runtime_status",
+        lambda: {
+            "platforms": {
+                "telegram": {"state": "connected"},
+                "slack": {"state": "retrying"},
+            }
+        },
+    )
+    monkeypatch.setenv("HERMES_LANGUAGE", "ru")
+    i18n.reset_language_cache()
+    try:
+        await runner._send_restart_notification()
+    finally:
+        i18n.reset_language_cache()
+
+    message = adapter.sent[0]
+    assert "Gateway успешно перезапущен" in message
+    assert "Система работает с ограничениями" in message
+    assert "Подключённые платформы: Telegram" in message
+    assert "Отключённые платформы: Slack" in message
+    assert "Gateway restarted successfully" not in message
+    assert "Disconnected platforms" not in message
+
+
+@pytest.mark.asyncio
 async def test_send_restart_notification_logs_warning_on_sendresult_failure(
     tmp_path, monkeypatch, caplog
 ):
@@ -335,8 +883,42 @@ async def test_send_restart_notification_logs_warning_on_sendresult_failure(
         "Expected a WARNING line mentioning the failure; "
         f"got records: {[(r.levelname, r.getMessage()) for r in caplog.records]}"
     )
-    # Still cleans up.
+    # Keep the durable receipt so a later reconnect can retry delivery.
+    retained_paths = list(tmp_path.glob(".restart_notify*.json"))
+    assert len(retained_paths) == 1
+    assert json.loads(retained_paths[0].read_text()) == {
+        "platform": "telegram",
+        "chat_id": "42",
+    }
+
+
+@pytest.mark.asyncio
+async def test_restart_notification_retries_transient_failure_while_connected(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setattr(
+        gateway_run, "_RESTART_NOTIFICATION_RETRY_DELAYS", (0.0,), raising=False
+    )
+    notify_path = tmp_path / ".restart_notify.json"
+    notify_path.write_text(
+        json.dumps({"platform": "telegram", "chat_id": "42"})
+    )
+    runner, adapter = make_restart_runner()
+    adapter.send = AsyncMock(
+        side_effect=[
+            SendResult(success=False, error="temporary timeout"),
+            SendResult(success=True, message_id="retry-ok"),
+        ]
+    )
+
+    assert await runner._send_restart_notification() is None
+    retry_task = runner._restart_notification_retry_task
+    await retry_task
+
+    assert adapter.send.await_count == 2
     assert not notify_path.exists()
+    assert retry_task.done()
 
 
 @pytest.mark.asyncio

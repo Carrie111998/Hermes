@@ -6165,6 +6165,67 @@ class BasePlatformAdapter(ABC):
             return
         self._start_session_processing(pending_event, session_key)
 
+    async def _run_approved_active_session_command(
+        self,
+        session_key: str,
+        execute: Callable[[], Awaitable[Any]],
+    ) -> Any:
+        """Cancel active adapter work only after a gated command is approved."""
+        current_guard = self._active_sessions.get(session_key)
+        current_owner = self._session_tasks.get(session_key)
+        approval_task = asyncio.current_task()
+        if current_owner is approval_task:
+            # Confirmation-disabled /new and /reset execute inside their own
+            # normal message-processing task. That task already owns the
+            # lifecycle guard, so cancelling it here would cancel the command
+            # before reset can run. Let its ordinary completion path send the
+            # response and drain any racing follow-up in order.
+            return await execute()
+        command_guard = asyncio.Event()
+        self._active_sessions[session_key] = command_guard
+        completed = False
+        try:
+            await self.cancel_session_processing(
+                session_key,
+                release_guard=False,
+                discard_pending=False,
+            )
+            # ``cancel_session_processing`` also observes the expected
+            # CancelledError raised by the old owner task.  If cancellation was
+            # instead requested on this approval task while it was awaiting that
+            # drain, its compatibility catch cannot distinguish the two.  Keep
+            # the outer lifecycle cancellation-transparent.
+            if approval_task is not None and approval_task.cancelling():
+                raise asyncio.CancelledError
+            response = await execute()
+            await self._drain_pending_after_session_command(
+                session_key, command_guard
+            )
+            completed = True
+            return response
+        finally:
+            if not completed and self._active_sessions.get(session_key) is command_guard:
+                owner_is_live = current_owner is not None and not current_owner.done()
+                replacement_owner = self._session_tasks.get(session_key)
+                if (
+                    current_guard is not None
+                    and owner_is_live
+                    and (
+                        replacement_owner is None
+                        or replacement_owner is current_owner
+                    )
+                ):
+                    self._session_tasks[session_key] = current_owner
+                    self._active_sessions[session_key] = current_guard
+                else:
+                    # The old owner is gone, so failure cleanup still owns the
+                    # lifecycle boundary. Flush queued/debounced input before
+                    # releasing the command guard; otherwise it is stranded
+                    # until a later inbound message arrives.
+                    await self._drain_pending_after_session_command(
+                        session_key, command_guard
+                    )
+
     async def _dispatch_active_session_command(
         self,
         event: MessageEvent,
@@ -6307,16 +6368,21 @@ class BasePlatformAdapter(ABC):
             cmd = event.get_command()
             from hermes_cli.commands import (
                 is_interrupt_then_dispatch,
+                resolve_command,
                 should_bypass_active_session,
             )
 
             if should_bypass_active_session(cmd):
-                # /stop, /new, /reset must cancel the in-flight adapter task
-                # and preserve ordering of queued follow-ups.  Route those
-                # through the dedicated handoff path that serializes
-                # cancellation + runner response + pending drain.
-                # (Registry-derived: busy_policy == "interrupt_then_dispatch".)
-                if cmd and is_interrupt_then_dispatch(cmd):
+                # /stop remains an immediate cancel-handoff. /new and its
+                # /reset alias are destructive-confirm gated, so their initial
+                # request must use the non-mutating direct path below; the
+                # approved callback performs the handoff exactly once.
+                cmd_def = resolve_command(cmd) if cmd else None
+                if (
+                    cmd
+                    and is_interrupt_then_dispatch(cmd)
+                    and (cmd_def is None or cmd_def.name != "new")
+                ):
                     self._discard_text_debounce(session_key)
                     try:
                         await self._dispatch_active_session_command(event, session_key, cmd)
@@ -7195,18 +7261,15 @@ class BasePlatformAdapter(ABC):
             if late_pending is not None:
                 current_task = asyncio.current_task()
                 existing_task = self._session_tasks.get(session_key)
+                active_guard = self._active_sessions.get(session_key)
                 if (
-                    existing_task is not None
-                    and existing_task is not current_task
-                ):
-                    # The in-band drain (or an earlier late-arrival drain)
-                    # already spawned a follow-up task that owns this
-                    # session.  Re-queue the late-arrival event so that
-                    # task picks it up — avoids spawning two concurrent
-                    # _process_message_background tasks for the same key
-                    # (#17758 follow-up: prevents the create_task path
-                    # from racing with itself across the in-band/finally
-                    # boundary).
+                    active_guard is not None and active_guard is not interrupt_event
+                ) or (existing_task is not None and existing_task is not current_task):
+                    # A command handoff may have replaced our interrupt guard
+                    # before cancelling us, or an earlier drain may already
+                    # own the session. Re-queue the late arrival for that
+                    # replacement owner instead of starting work across the
+                    # command boundary.
                     self._pending_messages[session_key] = late_pending
                 else:
                     logger.debug(

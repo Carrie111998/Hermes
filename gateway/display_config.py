@@ -31,6 +31,7 @@ from typing import Any
 # and don't participate in per-platform resolution.
 
 _GLOBAL_DEFAULTS: dict[str, Any] = {
+    "response_design": "off",
     "tool_progress": "all",
     "tool_progress_grouping": "accumulate",  # "accumulate" = edit one bubble; "separate" = one msg per tool
     "show_reasoning": False,
@@ -129,6 +130,7 @@ _PLATFORM_DEFAULTS: dict[str, dict[str, Any]] = {
     # via display.platforms.telegram.busy_ack_detail / tool_progress.
     "telegram":    {
         **_TIER_HIGH,
+        "response_design": "structured",
         "tool_progress": "off",
         "busy_ack_detail": False,
     },
@@ -158,7 +160,10 @@ _PLATFORM_DEFAULTS: dict[str, dict[str, Any]] = {
 
     # Tier 3 — no edit support, progress messages are permanent
     "signal":          _TIER_LOW,
-    "whatsapp":        _TIER_MEDIUM,  # Baileys bridge supports /edit
+    "whatsapp":        {
+        **_TIER_MEDIUM,
+        "response_design": "structured",
+    },  # Baileys bridge supports /edit
     # WhatsApp Cloud API: Meta added message editing in 2023 but the
     # Hermes Cloud adapter doesn't implement edit_message yet, so we
     # stay on TIER_LOW (tool_progress off) to avoid spamming each
@@ -266,6 +271,9 @@ def resolve_display_setting(
 
 def _normalise(setting: str, value: Any) -> Any:
     """Normalise YAML quirks (bare ``off`` → False in YAML 1.1)."""
+    if setting == "response_design":
+        val = str(value).strip().lower()
+        return val if val in {"structured", "off"} else "off"
     if setting == "tool_progress":
         if value is False:
             return "off"

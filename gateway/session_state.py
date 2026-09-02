@@ -105,7 +105,9 @@ class ConversationState:
     queued_events: List[Any] = field(default_factory=list)
     # Per-turn must-deliver sidecar notes (one-shot).
     sidecar_notes: List[str] = field(default_factory=list)
-    # Pinned session-context bytes: (change_key, text).
+    # Pinned session-context bytes: (change_key, text, response_design_prompt).
+    # The third item keeps response-design policy byte-stable across legitimate
+    # context re-renders in the same session. Legacy two-item tuples are read.
     ephemeral_pin: Optional[Tuple[Any, ...]] = None
     # Last voice-channel context delivered (None = never delivered).
     vc_last: Optional[str] = None

@@ -1213,17 +1213,52 @@ class TelegramAdapter(BasePlatformAdapter):
         if not normalized_user_id:
             return False
 
+        normalized_chat_type = str(chat_type or "dm").strip().lower() or "dm"
+        if normalized_chat_type == "private":
+            normalized_chat_type = "dm"
+        elif normalized_chat_type == "supergroup":
+            normalized_chat_type = "forum" if thread_id is not None else "group"
+
+        # Match normal message intake precedence: an adapter-local user
+        # allowlist is the sole authority when configured. Broader/profile
+        # grants (including pairing) must not override this live restriction.
+        extra = getattr(getattr(self, "config", None), "extra", None) or {}
+        if normalized_chat_type in ("group", "forum", "channel"):
+            adapter_allow_from = extra.get("group_allow_from")
+        else:
+            adapter_allow_from = extra.get("allow_from")
+        if adapter_allow_from is not None:
+            allowed = _coerce_allow_set(adapter_allow_from)
+            return normalized_user_id in allowed or "*" in allowed
+
+        # Prefer the profile-bound authorization callback installed by the
+        # gateway. Unlike recovering ``_message_handler.__self__``, this path
+        # survives multiplex-profile handler closures and includes pairing,
+        # config allowlists, and the correct profile scope.
+        authorization_check = getattr(self, "_authorization_check", None)
+        if authorization_check is not None:
+            try:
+                return bool(
+                    authorization_check(
+                        normalized_user_id,
+                        normalized_chat_type,
+                        str(chat_id or normalized_user_id),
+                    )
+                )
+            except Exception:
+                logger.warning(
+                    "[Telegram] Profile-bound callback authorization failed "
+                    "for user %s; denying menu action",
+                    normalized_user_id,
+                    exc_info=True,
+                )
+                return False
+
         runner = getattr(getattr(self, "_message_handler", None), "__self__", None)
         auth_fn = getattr(runner, "_is_user_authorized", None)
         if callable(auth_fn):
             try:
                 from gateway.session import SessionSource
-
-                normalized_chat_type = str(chat_type or "dm").strip().lower() or "dm"
-                if normalized_chat_type == "private":
-                    normalized_chat_type = "dm"
-                elif normalized_chat_type == "supergroup":
-                    normalized_chat_type = "forum" if thread_id is not None else "group"
 
                 source = SessionSource(
                     platform=Platform.TELEGRAM,
@@ -6432,6 +6467,142 @@ class TelegramAdapter(BasePlatformAdapter):
             logger.warning("[%s] send_update_prompt failed: %s", self.name, _redact_telegram_error_text(e))
             return SendResult(success=False, error=_redact_telegram_error_text(e))
 
+    def _main_menu_markup(self):
+        """Return the compact, mobile-first Telegram action menu."""
+        return InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("➕ New", callback_data="hm:new"),
+                InlineKeyboardButton("⏹ Stop", callback_data="hm:stop"),
+            ],
+            [
+                InlineKeyboardButton("📊 Status", callback_data="hm:status"),
+                InlineKeyboardButton("🗂 Sessions", callback_data="hm:sessions"),
+            ],
+            [
+                InlineKeyboardButton("⚡ Fast", callback_data="hm:fast"),
+                InlineKeyboardButton("🔎 Deep", callback_data="hm:deep"),
+            ],
+        ])
+
+    async def send_main_menu(
+        self,
+        chat_id: str,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """Send the compact Telegram action menu."""
+        if not self._bot:
+            return SendResult(success=False, error="Not connected")
+        try:
+            thread_id = self._metadata_thread_id(metadata)
+            message = await self._send_message_with_thread_fallback(
+                chat_id=normalize_telegram_chat_id(chat_id),
+                text="⚡ Quick actions",
+                parse_mode=None,
+                reply_markup=self._main_menu_markup(),
+                **self._thread_kwargs_for_send(
+                    chat_id,
+                    thread_id,
+                    metadata,
+                    reply_to_mode=self._reply_to_mode,
+                ),
+                **self._link_preview_kwargs(),
+            )
+            return SendResult(success=True, message_id=str(message.message_id))
+        except Exception as exc:
+            logger.warning(
+                "[%s] send_main_menu failed: %s",
+                self.name,
+                _redact_telegram_error_text(exc),
+            )
+            return SendResult(
+                success=False,
+                error=_redact_telegram_error_text(exc),
+            )
+
+    def _main_menu_event(self, query, command: str) -> MessageEvent:
+        """Build an authorized command event from a Telegram menu callback."""
+        message = query.message
+        chat = message.chat
+        user = query.from_user
+        telegram_chat_type = str(getattr(chat, "type", "")).split(".")[-1].lower()
+        chat_type = "dm"
+        if telegram_chat_type in {"group", "supergroup"}:
+            chat_type = "group"
+        elif telegram_chat_type == "channel":
+            chat_type = "channel"
+        thread_id = self._effective_message_thread_id(message)
+        source = self.build_source(
+            chat_id=str(chat.id),
+            chat_name=(
+                getattr(chat, "title", None)
+                or getattr(chat, "full_name", None)
+            ),
+            chat_type=chat_type,
+            user_id=str(user.id),
+            user_name=(
+                getattr(user, "full_name", None)
+                or getattr(user, "first_name", None)
+            ),
+            thread_id=str(thread_id) if thread_id is not None else None,
+            message_id=str(getattr(message, "message_id", "")),
+            is_bot=bool(getattr(user, "is_bot", False)),
+        )
+        return MessageEvent(
+            text=command,
+            message_type=MessageType.COMMAND,
+            source=source,
+            raw_message=message,
+            message_id=str(getattr(message, "message_id", "")),
+            timestamp=getattr(message, "date", None),
+        )
+
+    async def _handle_main_menu_callback(self, query, data: str) -> None:
+        """Authorize and route one compact-menu callback."""
+        message = getattr(query, "message", None)
+        chat = getattr(message, "chat", None)
+        user = getattr(query, "from_user", None)
+        chat_id = getattr(message, "chat_id", None)
+        if chat_id is None and chat is not None:
+            chat_id = getattr(chat, "id", None)
+        chat_type = getattr(chat, "type", None)
+        thread_id = (
+            self._effective_message_thread_id(message)
+            if message is not None
+            else None
+        )
+        user_id = str(getattr(user, "id", ""))
+        user_name = getattr(user, "first_name", None)
+        if not self._is_callback_user_authorized(
+            user_id,
+            chat_id=chat_id,
+            chat_type=str(chat_type) if chat_type is not None else None,
+            thread_id=str(thread_id) if thread_id is not None else None,
+            user_name=user_name,
+        ):
+            await query.answer(text="⛔ You are not authorized to use this menu.")
+            return
+        if self._telegram_hard_scope_denial(message) is not None:
+            await query.answer(
+                text="⛔ This menu is no longer available in this chat or topic."
+            )
+            return
+
+        action = data.split(":", 1)[1] if ":" in data else ""
+        commands = {
+            "new": "/new",
+            "stop": "/stop",
+            "status": "/status",
+            "sessions": "/sessions",
+            "fast": "/fast fast",
+            "deep": "/reasoning high",
+        }
+        command = commands.get(action)
+        if command is None:
+            await query.answer(text="Unknown menu action.")
+            return
+        await query.answer(text=f"Running {command.split()[0]}")
+        await self.handle_message(self._main_menu_event(query, command))
+
     # Template attrs for the shared _format_exec_approval core (HTML mode).
     _EA_HEADER = "⚠️ <b>Command Approval Required</b>\n\n"
     _EA_CODE_OPEN = "<pre>"
@@ -7412,6 +7583,11 @@ class TelegramAdapter(BasePlatformAdapter):
         query_thread_id = getattr(query_message, "message_thread_id", None)
         query_user_name = getattr(query.from_user, "first_name", None)
 
+        # --- Compact main-menu callbacks ---
+        if data.startswith("hm:"):
+            await self._handle_main_menu_callback(query, data)
+            return
+
         # --- Model picker callbacks ---
         if data.startswith(("mp:", "mpg:", "mpv:", "mm:", "mc:", "mb", "mx", "mg:")):
             chat_id = str(query.message.chat_id) if query.message else None
@@ -7539,6 +7715,14 @@ class TelegramAdapter(BasePlatformAdapter):
                     user_name=query_user_name,
                 ):
                     await query.answer(text="⛔ You are not authorized to answer this prompt.")
+                    return
+                if self._telegram_hard_scope_denial(query_message) is not None:
+                    await query.answer(
+                        text=(
+                            "⛔ This prompt is no longer available in this chat "
+                            "or topic."
+                        )
+                    )
                     return
 
                 session_key = self._slash_confirm_state.pop(confirm_id, None)
@@ -9784,6 +9968,39 @@ class TelegramAdapter(BasePlatformAdapter):
         user_id = getattr(from_user, "id", None)
         return bot_id is not None and user_id is not None and bot_id == user_id
 
+    def _telegram_hard_scope_denial(self, message: Message) -> Optional[str]:
+        """Return the current hard group-scope gate that rejects ``message``."""
+        if not self._is_group_chat(message):
+            return None
+
+        thread_id = self._effective_message_thread_id(message)
+        allowed_topics = self._telegram_allowed_topics()
+        if allowed_topics:
+            topic_id = (
+                str(thread_id)
+                if thread_id is not None
+                else self._GENERAL_TOPIC_THREAD_ID
+            )
+            if topic_id not in allowed_topics:
+                return "allowed_topics"
+
+        if thread_id is not None:
+            try:
+                if int(thread_id) in self._telegram_ignored_threads():
+                    return "ignored_threads"
+            except (TypeError, ValueError):
+                logger.warning(
+                    "[%s] Ignoring non-numeric Telegram message_thread_id: %r",
+                    self.name,
+                    thread_id,
+                )
+
+        allowed_chats = self._telegram_allowed_chats()
+        chat_id = str(getattr(getattr(message, "chat", None), "id", ""))
+        if allowed_chats and chat_id not in allowed_chats:
+            return "allowed_chats"
+        return None
+
     def _should_process_message(self, message: Message, *, is_command: bool = False) -> bool:
         """Apply Telegram group trigger rules.
 
@@ -9823,28 +10040,9 @@ class TelegramAdapter(BasePlatformAdapter):
         if not self._is_group_chat(message):
             return True
 
-        thread_id = self._effective_message_thread_id(message)
-        allowed_topics = self._telegram_allowed_topics()
-        if allowed_topics:
-            topic_id = str(thread_id) if thread_id is not None else self._GENERAL_TOPIC_THREAD_ID
-            if topic_id not in allowed_topics:
-                return False
-
-        # Check ignored_threads first — applies to both groups and DM topics
-        if thread_id is not None:
-            try:
-                if int(thread_id) in self._telegram_ignored_threads():
-                    return False
-            except (TypeError, ValueError):
-                logger.warning("[%s] Ignoring non-numeric Telegram message_thread_id: %r", self.name, thread_id)
-
-        if not self._is_group_chat(message):
-            # Root DM (non-topic): ignore if ignore_root_dm is configured
-            if thread_id is None and self.config.extra.get("ignore_root_dm", False):
-                chat_id = str(getattr(getattr(message, "chat", None), "id", ""))
-                if not is_command and chat_id in self._dm_topic_chat_ids:
-                    return False
-            return True
+        scope_denial = self._telegram_hard_scope_denial(message)
+        if scope_denial not in {None, "allowed_chats"}:
+            return False
 
         chat_id_str = str(getattr(getattr(message, "chat", None), "id", ""))
 
@@ -9858,8 +10056,7 @@ class TelegramAdapter(BasePlatformAdapter):
         # allowed_chats check (whitelist). When set, group messages from chats
         # outside the whitelist are ignored unless guest_mode permits this
         # exact message as an explicit direct mention. DMs are excluded above.
-        allowed = self._telegram_allowed_chats()
-        if allowed and chat_id_str not in allowed:
+        if scope_denial == "allowed_chats":
             return guest_mention
 
         if guest_mention:

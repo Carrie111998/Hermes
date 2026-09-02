@@ -84,6 +84,26 @@ class _AsyncCM:
 class TestFormatMessage:
     """WhatsApp markdown conversion."""
 
+    def test_structured_mobile_blocks_remain_visually_separated(self):
+        adapter = _make_adapter()
+        text = (
+            "## Result\n\n"
+            "A concise conclusion.\n\n"
+            "**Problem:** Messages merge visually.\n\n"
+            "**Risk:** The action is missed.\n\n"
+            "**My advice:** Follow these steps.\n\n"
+            "1. Run `hermes status`\n"
+            "2. Check `/home/hermes/config.yaml`"
+        )
+
+        result = adapter.format_message(text)
+
+        assert "*Result*\n\nA concise conclusion" in result
+        assert "\n\n*Problem:*" in result
+        assert "\n\n*Risk:*" in result
+        assert "\n\n*My advice:*" in result
+        assert "`hermes status`" in result
+        assert "`/home/hermes/config.yaml`" in result
 
     def test_strikethrough(self):
         adapter = _make_adapter()

@@ -19,11 +19,12 @@ Two-part fix, both covered here:
 
 import asyncio
 import time
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from gateway.config import GatewayConfig, Platform, PlatformConfig
+from gateway.config import GatewayConfig, HomeChannel, Platform, PlatformConfig
+from gateway.platforms.base import SendResult
 from gateway.run import (
     GatewayRunner,
     _reconnect_needs_attention,
@@ -331,6 +332,276 @@ def _make_runner():
 
 
 class TestWatcherAttentionEscalation:
+    def test_attention_with_no_home_targets_creates_no_delivery_latch(self):
+        runner = _make_runner()
+        info = {
+            "attempts": 40,
+            "queued_at": time.monotonic() - 999999,
+            "attention_flagged": True,
+        }
+        runner._failed_platforms[Platform.SLACK] = info
+
+        runner._schedule_platform_attention_notifications(
+            Platform.SLACK, info, time.monotonic()
+        )
+
+        assert "attention_delivered_targets" not in info
+        assert "attention_target_retries" not in info
+
+    @pytest.mark.asyncio
+    async def test_attention_timeout_detaches_never_finishing_send_and_retries(
+        self, monkeypatch
+    ):
+        import gateway.run as run_module
+
+        runner = _make_runner()
+        runner._background_tasks = set()
+        runner.config.platforms[Platform.TELEGRAM].home_channel = HomeChannel(
+            platform=Platform.TELEGRAM,
+            chat_id="owner-chat",
+            name="Owner",
+        )
+        swallowed_cancel = asyncio.Event()
+        release_abandoned = asyncio.Event()
+        transport = MagicMock()
+        send_attempts = 0
+
+        async def _send(*_args, **_kwargs):
+            nonlocal send_attempts
+            send_attempts += 1
+            if send_attempts == 1:
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    swallowed_cancel.set()
+                    await release_abandoned.wait()
+                return SendResult(success=True, message_id="ambiguous-late-success")
+            return SendResult(success=True, message_id="retry-success")
+
+        transport.send = AsyncMock(side_effect=_send)
+        runner.adapters[Platform.TELEGRAM] = transport
+        info = {
+            "attempts": 40,
+            "queued_at": time.monotonic() - 999999,
+            "attention_flagged": True,
+        }
+        runner._failed_platforms[Platform.SLACK] = info
+        monkeypatch.setattr(
+            run_module, "_RECONNECT_ATTENTION_SEND_TIMEOUT_SECONDS", 0.01
+        )
+
+        target = ("telegram", "owner-chat", None)
+        now = time.monotonic()
+        runner._schedule_platform_attention_notifications(Platform.SLACK, info, now)
+        first_state = info["attention_target_retries"][target]
+        first_task = first_state["task"]
+        try:
+            await asyncio.wait_for(swallowed_cancel.wait(), timeout=0.2)
+            detached = (
+                first_state["task"] is None
+                and first_task not in runner._background_tasks
+            )
+            retry_at = first_state["next_retry"]
+            if detached:
+                runner._schedule_platform_attention_notifications(
+                    Platform.SLACK, info, retry_at
+                )
+                await asyncio.gather(*list(runner._background_tasks))
+                await asyncio.sleep(0)
+            attempts_before_release = transport.send.await_count
+            delivered_before_release = set(
+                info.get("attention_delivered_targets", set())
+            )
+        finally:
+            release_abandoned.set()
+            await first_task
+            await asyncio.sleep(0)
+
+        assert detached is True
+        assert attempts_before_release == 2
+        assert delivered_before_release == {target}
+        assert info["attention_target_retries"] == {}
+
+    @pytest.mark.asyncio
+    async def test_recovery_fully_detaches_cancellation_resistant_attention_send(self):
+        runner = _make_runner()
+        runner._background_tasks = set()
+        runner.config.platforms[Platform.TELEGRAM].home_channel = HomeChannel(
+            platform=Platform.TELEGRAM,
+            chat_id="owner-chat",
+            name="Owner",
+        )
+        send_started = asyncio.Event()
+        swallowed_cancel = asyncio.Event()
+        release_abandoned = asyncio.Event()
+        transport = MagicMock()
+
+        async def _send(*_args, **_kwargs):
+            send_started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                swallowed_cancel.set()
+                await release_abandoned.wait()
+            return SendResult(success=True, message_id="stale-late-success")
+
+        transport.send = AsyncMock(side_effect=_send)
+        runner.adapters[Platform.TELEGRAM] = transport
+        info = {
+            "attempts": 40,
+            "queued_at": time.monotonic() - 999999,
+            "attention_flagged": True,
+        }
+        runner._failed_platforms[Platform.SLACK] = info
+
+        target = ("telegram", "owner-chat", None)
+        runner._schedule_platform_attention_notifications(
+            Platform.SLACK, info, time.monotonic()
+        )
+        state = info["attention_target_retries"][target]
+        task = state["task"]
+        await send_started.wait()
+
+        # A successful reconnect resolves the outage before the send timeout.
+        runner._cancel_platform_attention_notifications(info)
+        runner._failed_platforms.pop(Platform.SLACK)
+        await asyncio.wait_for(swallowed_cancel.wait(), timeout=0.2)
+
+        assert task not in runner._background_tasks
+        assert state["task"] is None
+        assert state["timeout_handle"] is None
+        assert state["completion_callback"] is None
+        assert info["attention_target_retries"] == {}
+
+        release_abandoned.set()
+        await task
+        await asyncio.sleep(0)
+
+        # A cancellation-resistant late result is consumed as detached work;
+        # it cannot relatch a stale alert after the outage has recovered.
+        assert info.get("attention_delivered_targets", set()) == set()
+
+    @pytest.mark.asyncio
+    async def test_attention_retries_only_failed_target_without_duplicate_success(self):
+        runner = _make_runner()
+        runner._background_tasks = set()
+        runner.config.platforms = {
+            Platform.TELEGRAM: PlatformConfig(
+                enabled=True,
+                token="telegram",
+                home_channel=HomeChannel(
+                    platform=Platform.TELEGRAM,
+                    chat_id="telegram-owner",
+                    name="Telegram owner",
+                ),
+            ),
+            Platform.DISCORD: PlatformConfig(
+                enabled=True,
+                token="discord",
+                home_channel=HomeChannel(
+                    platform=Platform.DISCORD,
+                    chat_id="discord-owner",
+                    name="Discord owner",
+                ),
+            ),
+        }
+        telegram = MagicMock()
+        telegram.send = AsyncMock(
+            return_value=SendResult(success=True, message_id="telegram-ok")
+        )
+        discord = MagicMock()
+        discord.send = AsyncMock(
+            side_effect=[
+                SendResult(success=False, error="temporary"),
+                SendResult(success=True, message_id="discord-ok"),
+            ]
+        )
+        runner.adapters = {
+            Platform.TELEGRAM: telegram,
+            Platform.DISCORD: discord,
+        }
+        info = {
+            "attempts": 40,
+            "queued_at": time.monotonic() - 999999,
+            "attention_flagged": True,
+        }
+        runner._failed_platforms[Platform.SLACK] = info
+
+        now = time.monotonic()
+        runner._schedule_platform_attention_notifications(Platform.SLACK, info, now)
+        await asyncio.gather(*list(runner._background_tasks))
+        await asyncio.sleep(0)
+
+        telegram_target = ("telegram", "telegram-owner", None)
+        discord_target = ("discord", "discord-owner", None)
+        assert info["attention_delivered_targets"] == {telegram_target}
+        retry_at = info["attention_target_retries"][discord_target]["next_retry"]
+
+        runner._schedule_platform_attention_notifications(
+            Platform.SLACK, info, retry_at
+        )
+        await asyncio.gather(*list(runner._background_tasks))
+        await asyncio.sleep(0)
+
+        assert info["attention_delivered_targets"] == {
+            telegram_target,
+            discord_target,
+        }
+        assert info["attention_target_retries"] == {}
+        assert telegram.send.await_count == 1
+        assert discord.send.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_hung_attention_send_never_blocks_reconnect_watcher(
+        self, monkeypatch
+    ):
+        runner = _make_runner()
+        runner._background_tasks = set()
+        runner.config.platforms[Platform.TELEGRAM].home_channel = HomeChannel(
+            platform=Platform.TELEGRAM,
+            chat_id="owner-chat",
+            name="Owner",
+        )
+        release_send = asyncio.Event()
+        transport = MagicMock()
+
+        async def _hung_send(*_args, **_kwargs):
+            await release_send.wait()
+            return SendResult(success=True, message_id="attention")
+
+        transport.send = AsyncMock(side_effect=_hung_send)
+        runner.adapters[Platform.TELEGRAM] = transport
+        runner._failed_platforms[Platform.SLACK] = {
+            "config": PlatformConfig(enabled=True, token="test"),
+            "attempts": 40,
+            "next_retry": time.monotonic() + 300,
+            "queued_at": time.monotonic() - 999999,
+            "attention_flagged": True,
+        }
+
+        progressed = asyncio.Event()
+        sleep_calls = 0
+        real_sleep = asyncio.sleep
+
+        async def _fake_sleep(_delay):
+            nonlocal sleep_calls
+            sleep_calls += 1
+            if sleep_calls > 1:
+                progressed.set()
+                runner._running = False
+            await real_sleep(0)
+
+        watcher = asyncio.create_task(runner._platform_reconnect_watcher())
+        try:
+            with patch("gateway.run.asyncio.sleep", side_effect=_fake_sleep):
+                await asyncio.wait_for(progressed.wait(), timeout=0.1)
+        finally:
+            release_send.set()
+            runner._running = False
+            await watcher
+
+        assert transport.send.await_count == 1
+
     @pytest.mark.asyncio
     async def test_watcher_flags_long_queued_platform_and_keeps_retrying(self, monkeypatch):
         import gateway.run as run_module
@@ -341,6 +612,12 @@ class TestWatcherAttentionEscalation:
             runner,
             "_update_platform_runtime_status",
             lambda platform, **kw: status_writes.append((platform, kw)),
+        )
+        notifier = MagicMock()
+        monkeypatch.setattr(
+            runner,
+            "_schedule_platform_attention_notifications",
+            notifier,
         )
 
         threshold = run_module._RECONNECT_ATTENTION_AFTER_SECONDS
@@ -374,6 +651,7 @@ class TestWatcherAttentionEscalation:
         # circuit breaker.
         assert Platform.TELEGRAM in runner._failed_platforms
         assert runner._failed_platforms[Platform.TELEGRAM].get("attention_flagged") is True
+        notifier.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_watcher_flags_only_once(self, monkeypatch):

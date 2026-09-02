@@ -229,6 +229,7 @@ class TestPlatformReconnectWatcher:
         runner._sync_voice_mode_state_to_adapter = MagicMock()
         runner._redeliver_failed_obligations_for_platform = AsyncMock(return_value=1)
         runner._schedule_resume_pending_sessions = MagicMock(return_value=1)
+        runner._send_restart_notification = AsyncMock(return_value=None)
 
         platform_config = PlatformConfig(enabled=True, token="test")
         runner._failed_platforms[Platform.TELEGRAM] = {
@@ -265,6 +266,7 @@ class TestPlatformReconnectWatcher:
         runner._schedule_resume_pending_sessions.assert_called_once_with(
             platform=Platform.TELEGRAM
         )
+        runner._send_restart_notification.assert_awaited_once()
 
 
     @pytest.mark.asyncio

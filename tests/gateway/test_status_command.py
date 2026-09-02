@@ -1,14 +1,15 @@
 from hermes_state import AsyncSessionDB, SessionDB
 """Tests for gateway /status behavior and token persistence."""
 
-from datetime import datetime
+from datetime import datetime, timezone
 import time
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
+from zoneinfo import ZoneInfo
 
 import pytest
 
-from gateway.config import GatewayConfig, Platform, PlatformConfig
+from gateway.config import GatewayConfig, HomeChannel, Platform, PlatformConfig
 from gateway.platforms.base import MessageEvent
 from gateway.session import SessionEntry, SessionSource, build_session_key
 
@@ -101,6 +102,505 @@ async def test_status_command_reads_token_totals_from_session_db():
 
     # 1000 + 250 + 500 + 100 + 50 = 1,900
     assert "**Lifetime tokens billed:** 1,900" in result
+
+
+@pytest.mark.asyncio
+async def test_status_command_reports_healthy_gateway_and_idle_agent(monkeypatch):
+    session_entry = SessionEntry(
+        session_key=build_session_key(_make_source()),
+        session_id="sess-idle",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+    )
+    runner = _make_runner(session_entry)
+    runner.adapters[Platform.TELEGRAM].is_connected = True
+    monkeypatch.setattr(
+        "gateway.memory_status.collect_memory_status", lambda: {"pressure": "ok"}
+    )
+    monkeypatch.setattr(
+        "gateway.disk_status.collect_disk_status", lambda: {"pressure": "ok"}
+    )
+
+    result = await runner._handle_message(_make_event("/status"))
+
+    assert "🟢 **Hermes is operating normally**" in result
+    assert "**Gateway:** Running" in result
+    assert "**Agent:** Waiting for messages" in result
+    assert "Agent Running" not in result
+
+
+@pytest.mark.asyncio
+async def test_status_command_russian_idle_wording_is_not_false_negative(monkeypatch):
+    from agent import i18n
+
+    session_entry = SessionEntry(
+        session_key=build_session_key(_make_source()),
+        session_id="sess-ru",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+    )
+    runner = _make_runner(session_entry)
+    runner.adapters[Platform.TELEGRAM].is_connected = True
+    monkeypatch.setattr(
+        "gateway.memory_status.collect_memory_status", lambda: {"pressure": "ok"}
+    )
+    monkeypatch.setattr(
+        "gateway.disk_status.collect_disk_status", lambda: {"pressure": "ok"}
+    )
+    monkeypatch.setenv("HERMES_LANGUAGE", "ru")
+    i18n.reset_language_cache()
+    try:
+        result = await runner._handle_message(_make_event("/status"))
+    finally:
+        i18n.reset_language_cache()
+
+    assert "🟢 **Hermes работает штатно**" in result
+    assert "**Агент:** ожидает сообщения" in result
+    assert "Агент активен" not in result
+
+
+@pytest.mark.asyncio
+async def test_status_command_localizes_resource_and_retry_labels(monkeypatch):
+    from agent import i18n
+
+    session_entry = SessionEntry(
+        session_key=build_session_key(_make_source()),
+        session_id="sess-ru-details",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+    )
+    runner = _make_runner(session_entry)
+    runner.adapters[Platform.TELEGRAM].is_connected = True
+    runner.config.platforms[Platform.SLACK] = PlatformConfig(enabled=True, token="***")
+    monkeypatch.setattr(
+        "gateway.memory_status.collect_memory_status",
+        lambda: {"pressure": "ok", "gateway_rss_mb": 512, "system_available_mb": 96},
+    )
+    monkeypatch.setattr(
+        "gateway.disk_status.collect_disk_status",
+        lambda: {"pressure": "ok", "free_mb": 200, "used_percent": 98.0},
+    )
+    monkeypatch.setattr(
+        "gateway.status.read_runtime_status",
+        lambda: {
+            "platforms": {
+                "telegram": {"state": "connected"},
+                "slack": {
+                    "state": "retrying",
+                    "retrying_since": "2026-08-29T10:00:00+00:00",
+                },
+            }
+        },
+    )
+    monkeypatch.setenv("HERMES_LANGUAGE", "ru")
+    i18n.reset_language_cache()
+    try:
+        result = await runner._handle_message(_make_event("/status"))
+    finally:
+        i18n.reset_language_cache()
+
+    assert "**Память:** норма · RSS 512 МБ · 96 МБ доступно" in result
+    assert "**Диск:** норма · 200 МБ свободно · использовано 98.0%" in result
+    assert "повторные попытки с: 2026-08-29T10:00:00+00:00" in result
+    assert "**Memory:**" not in result
+    assert "MB available" not in result
+    assert "retrying since" not in result
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("language", "pressure", "expected"),
+    [
+        ("ru", "ok", "**Память:** норма"),
+        ("ru", "elevated", "**Память:** повышено"),
+        ("ru", "critical", "**Память:** критично"),
+        ("ru", "unknown", "**Память:** неизвестно"),
+        ("de", "ok", "**Arbeitsspeicher:** normal"),
+        ("de", "elevated", "**Arbeitsspeicher:** erhöht"),
+        ("de", "critical", "**Arbeitsspeicher:** kritisch"),
+        ("de", "unknown", "**Arbeitsspeicher:** unbekannt"),
+        ("ja", "ok", "**メモリ:** 正常"),
+        ("ja", "elevated", "**メモリ:** 上昇"),
+        ("ja", "critical", "**メモリ:** 危険"),
+        ("ja", "unknown", "**メモリ:** 不明"),
+    ],
+)
+async def test_status_command_localizes_pressure_states(
+    monkeypatch, language, pressure, expected
+):
+    from agent import i18n
+
+    session_entry = SessionEntry(
+        session_key=build_session_key(_make_source()),
+        session_id=f"sess-pressure-{language}-{pressure}",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+    )
+    runner = _make_runner(session_entry)
+    runner.adapters[Platform.TELEGRAM].is_connected = True
+    monkeypatch.setattr(
+        "gateway.memory_status.collect_memory_status", lambda: {"pressure": pressure}
+    )
+    monkeypatch.setattr(
+        "gateway.disk_status.collect_disk_status", lambda: {"pressure": "ok"}
+    )
+    monkeypatch.setenv("HERMES_LANGUAGE", language)
+    i18n.reset_language_cache()
+    try:
+        result = await runner._handle_message(_make_event("/status"))
+    finally:
+        i18n.reset_language_cache()
+
+    assert expected in result
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("language", "elapsed", "expected"),
+    [
+        ("ru", 90_000, "1 д 1 ч"),
+        ("ru", 3_660, "1 ч 1 мин"),
+        ("ru", 60, "1 мин"),
+        ("ru", 1, "1 с"),
+        ("de", 90_000, "1 T 1 Std."),
+        ("de", 3_660, "1 Std. 1 Min."),
+        ("de", 60, "1 Min."),
+        ("de", 1, "1 Sek."),
+        ("ja", 90_000, "1日 1時間"),
+        ("ja", 3_660, "1時間 1分"),
+        ("ja", 60, "1分"),
+        ("ja", 1, "1秒"),
+    ],
+)
+async def test_status_command_localizes_duration_units(
+    monkeypatch, language, elapsed, expected
+):
+    from agent import i18n
+
+    session_entry = SessionEntry(
+        session_key=build_session_key(_make_source()),
+        session_id=f"sess-duration-{language}-{elapsed}",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+    )
+    runner = _make_runner(session_entry)
+    runner.adapters[Platform.TELEGRAM].is_connected = True
+    runner._gateway_started_at = 1_000.0
+    monkeypatch.setattr(time, "time", lambda: 1_000.0 + elapsed)
+    monkeypatch.setattr(
+        "gateway.memory_status.collect_memory_status", lambda: {"pressure": "ok"}
+    )
+    monkeypatch.setattr(
+        "gateway.disk_status.collect_disk_status", lambda: {"pressure": "ok"}
+    )
+    monkeypatch.setenv("HERMES_LANGUAGE", language)
+    i18n.reset_language_cache()
+    try:
+        result = await runner._handle_message(_make_event("/status"))
+    finally:
+        i18n.reset_language_cache()
+
+    assert expected in result
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("language", "expected"),
+    [("ru", "(2 мин, 3)"), ("de", "(2 Min., 3)"), ("ja", "(2分, 3)")],
+)
+async def test_platform_attention_notification_localizes_minute_unit(
+    monkeypatch, language, expected
+):
+    from agent import i18n
+    import gateway.run as gateway_run
+
+    session_entry = SessionEntry(
+        session_key=build_session_key(_make_source()),
+        session_id=f"sess-attention-{language}",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+    )
+    runner = _make_runner(session_entry)
+    runner.config.platforms[Platform.TELEGRAM].home_channel = HomeChannel(
+        platform=Platform.TELEGRAM,
+        chat_id="home-1",
+        name="Home",
+    )
+    monkeypatch.setattr(gateway_run.time, "monotonic", lambda: 1_000.0)
+    monkeypatch.setenv("HERMES_LANGUAGE", language)
+    i18n.reset_language_cache()
+    try:
+        message = runner._platform_attention_message(
+            Platform.SLACK, {"queued_at": 880.0, "attempts": 3}
+        )
+    finally:
+        i18n.reset_language_cache()
+
+    assert expected in message
+
+
+@pytest.mark.asyncio
+async def test_status_command_reports_disconnected_platform_as_degraded():
+    session_entry = SessionEntry(
+        session_key=build_session_key(_make_source()),
+        session_id="sess-degraded",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+    )
+    runner = _make_runner(session_entry)
+    telegram = runner.adapters[Platform.TELEGRAM]
+    telegram.is_connected = True
+    slack = MagicMock()
+    slack.is_connected = False
+    runner.adapters[Platform.SLACK] = slack
+
+    result = await runner._handle_message(_make_event("/status"))
+
+    assert "🟡 **Hermes is operating with limitations**" in result
+    assert "**Telegram:** Connected ✓" in result
+    assert "**Slack:** Disconnected" in result
+    assert "**Advice:** Reconnect Slack" in result
+
+
+@pytest.mark.asyncio
+async def test_status_command_includes_configured_platform_missing_from_adapters(monkeypatch):
+    session_entry = SessionEntry(
+        session_key=build_session_key(_make_source()),
+        session_id="sess-runtime",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+    )
+    runner = _make_runner(session_entry)
+    runner.adapters[Platform.TELEGRAM].is_connected = True
+    runner.config.platforms[Platform.SLACK] = PlatformConfig(enabled=True, token="***")
+    monkeypatch.setattr(
+        "gateway.status.read_runtime_status",
+        lambda: {
+            "gateway_state": "running",
+            "platforms": {
+                "telegram": {"state": "connected"},
+                "slack": {
+                    "state": "retrying",
+                    "error_code": "auth_failed",
+                    "error_message": "token revoked",
+                    "retrying_since": "2026-08-29T10:00:00+00:00",
+                    "needs_attention": True,
+                },
+            },
+        },
+    )
+
+    result = await runner._handle_message(_make_event("/status"))
+
+    assert "🟡 **Hermes is operating with limitations**" in result
+    assert "**Slack:** Disconnected" in result
+    assert "auth＿failed: token revoked" in result
+    assert "2026-08-29T10:00:00+00:00" in result
+
+
+@pytest.mark.asyncio
+async def test_status_command_includes_runtime_only_retrying_platform(monkeypatch):
+    session_entry = SessionEntry(
+        session_key=build_session_key(_make_source()),
+        session_id="sess-runtime-only",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+    )
+    runner = _make_runner(session_entry)
+    runner.adapters[Platform.TELEGRAM].is_connected = True
+    monkeypatch.setattr(
+        "gateway.status.read_runtime_status",
+        lambda: {
+            "platforms": {
+                "telegram": {"state": "connected"},
+                "slack": {"state": "retrying"},
+                "future_plugin_platform": {"state": "retrying"},
+            }
+        },
+    )
+
+    result = await runner._handle_message(_make_event("/status"))
+
+    assert "🟡 **Hermes is operating with limitations**" in result
+    assert "**Slack:** Disconnected" in result
+    assert "future_plugin_platform" not in result
+
+
+@pytest.mark.asyncio
+async def test_status_command_safely_renders_untrusted_runtime_errors(monkeypatch):
+    session_entry = SessionEntry(
+        session_key=build_session_key(_make_source()),
+        session_id="sess-safe-error",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+    )
+    runner = _make_runner(session_entry)
+    runner.adapters[Platform.TELEGRAM].is_connected = True
+    leaked_token = "sk-supersecret0123456789"
+    credential_url = "https://alice:hunter2@example.com/oauth?access_token=opaque-secret"
+    monkeypatch.setattr(
+        "gateway.status.read_runtime_status",
+        lambda: {
+            "platforms": {
+                "telegram": {
+                    "state": "retrying",
+                    "error_code": f"auth_failed **bold** {leaked_token}",
+                    "error_message": (
+                        f"{credential_url} @everyone <@U123> [click](https://evil.invalid)"
+                    ),
+                    "retrying_since": f"{credential_url} @everyone",
+                }
+            }
+        },
+    )
+
+    result = await runner._handle_message(_make_event("/status"))
+
+    assert leaked_token not in result
+    assert "alice:hunter2" not in result
+    assert "opaque-secret" not in result
+    assert "@everyone" not in result
+    assert "<@U123>" not in result
+    assert "**bold**" not in result
+    assert "[click](https://evil.invalid)" not in result
+
+
+@pytest.mark.asyncio
+async def test_status_command_surfaces_memory_and_disk_pressure(monkeypatch):
+    session_entry = SessionEntry(
+        session_key=build_session_key(_make_source()),
+        session_id="sess-pressure",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+    )
+    runner = _make_runner(session_entry)
+    runner.adapters[Platform.TELEGRAM].is_connected = True
+    monkeypatch.setattr(
+        "gateway.memory_status.collect_memory_status",
+        lambda: {"pressure": "elevated", "gateway_rss_mb": 512, "system_available_mb": 96},
+    )
+    monkeypatch.setattr(
+        "gateway.disk_status.collect_disk_status",
+        lambda: {"pressure": "critical", "free_mb": 200, "used_percent": 98.0},
+    )
+
+    result = await runner._handle_message(_make_event("/status"))
+
+    assert "🟡 **Hermes is operating with limitations**" in result
+    assert "**Memory:** elevated" in result
+    assert "RSS 512 MB" in result
+    assert "**Disk:** critical" in result
+    assert "200 MB free" in result
+
+
+@pytest.mark.asyncio
+async def test_status_command_does_not_claim_healthy_when_telemetry_unknown(
+    monkeypatch,
+):
+    session_entry = SessionEntry(
+        session_key=build_session_key(_make_source()),
+        session_id="sess-unknown-telemetry",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+    )
+    runner = _make_runner(session_entry)
+    runner.adapters[Platform.TELEGRAM].is_connected = True
+    monkeypatch.setattr(
+        "gateway.memory_status.collect_memory_status",
+        lambda: {"pressure": "unknown"},
+    )
+    monkeypatch.setattr(
+        "gateway.disk_status.collect_disk_status",
+        lambda: {"pressure": "unknown"},
+    )
+
+    result = await runner._handle_message(_make_event("/status"))
+
+    assert "🟢 **Hermes is operating normally**" not in result
+    assert "🟡 **Hermes is operating with limitations**" in result
+    assert "**Memory:** unknown" in result
+    assert "**Disk:** unknown" in result
+
+
+@pytest.mark.asyncio
+async def test_status_command_shows_timezone_uptime_and_active_task_duration(monkeypatch):
+    now = datetime(2026, 8, 29, 10, 30)
+    session_key = build_session_key(_make_source())
+    session_entry = SessionEntry(
+        session_key=session_key,
+        session_id="sess-time",
+        created_at=now,
+        updated_at=now,
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+    )
+    runner = _make_runner(session_entry)
+    runner.adapters[Platform.TELEGRAM].is_connected = True
+    runner._gateway_started_at = 1_000.0
+    runner._running_agents_ts = {session_key: 4_540.0}
+    runner._running_agents[session_key] = SimpleNamespace(
+        model="openai/gpt-test",
+        provider="openai",
+        context_compressor=SimpleNamespace(last_prompt_tokens=0, context_length=100_000),
+        interrupt=MagicMock(),
+        get_activity_summary=lambda: {"seconds_since_activity": 0},
+    )
+    monkeypatch.setattr(time, "time", lambda: 4_600.0)
+
+    result = await runner._handle_message(_make_event("/status"))
+
+    assert "2026-08-29 10:30 UTC" in result
+    assert "**Gateway uptime:** 1h" in result
+    assert "**Current task duration:** 1m" in result
+    assert "**Agent:** Processing a request ⚡" in result
+
+
+@pytest.mark.asyncio
+async def test_status_command_converts_each_timestamp_across_dst_transition(
+    monkeypatch,
+):
+    session_entry = SessionEntry(
+        session_key=build_session_key(_make_source()),
+        session_id="sess-dst",
+        created_at=datetime(2026, 11, 1, 5, 30, tzinfo=timezone.utc),
+        updated_at=datetime(2026, 11, 1, 6, 30, tzinfo=timezone.utc),
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+    )
+    runner = _make_runner(session_entry)
+    runner.adapters[Platform.TELEGRAM].is_connected = True
+    monkeypatch.setattr(
+        "hermes_time.get_timezone", lambda: ZoneInfo("America/New_York")
+    )
+
+    result = await runner._handle_message(_make_event("/status"))
+
+    assert "**Created:** 2026-11-01 01:30 EDT" in result
+    assert "**Last Activity:** 2026-11-01 01:30 EST" in result
 
 
 @pytest.mark.asyncio
