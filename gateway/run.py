@@ -144,7 +144,11 @@ _TELEGRAM_NOISY_STATUS_RE = re.compile(
     r"|context\s+reduced\s+to\s+[\d,]+\s+tokens\s+\(was\s+[\d,]+\),\s+retrying"
     r"|session\s+compressed\s+\d+\s+times"
     r"|rate\s+limited\.\s+waiting\s+\d"
-    r"|retrying\s+in\s+\d"
+    # #101138: the empty-response retry emitter gained a counter, so the
+    # current format is "retrying (1/3) in 8s" — cover both generations.
+    r"|retrying\s+(?:\(\d+/\d+\)\s+)?in\s+\d"
+    r"|empty\s+response\s+from\s+model"
+    r"|no\s+reply:\s+the\s+model\s+returned\s+empty\s+content"
     r"|max\s+retries\s+\(\d+\).*(?:trying\s+fallback|exhausted|invalid\s+responses)"
     r"|stream\s+(?:drop|drop\s+mid\s+tool-call).+retry\s+\d"
     r"|stale\s+connections\s+from\s+a\s+previous\s+provider\s+issue"
@@ -990,6 +994,22 @@ def _looks_like_gateway_provider_error(text: str) -> bool:
     return bool(_GATEWAY_PROVIDER_ERROR_SHAPE_RE.search(body))
 
 
+def _final_response_is_noise(text: str) -> bool:
+    """True when a short final response is retry-chatter exhaustion text.
+
+    The turn-exit notice for exhausted retries ("⚠️ No reply: the model
+    returned empty content after retries... Try `continue`, switch
+    model/provider...") is infrastructure noise with CLI-only instructions,
+    not assistant prose (#101138). Same short-envelope guard as
+    ``_looks_like_gateway_provider_error`` so long assistant answers that
+    merely quote a noisy phrase pass through untouched.
+    """
+    body = str(text).strip()
+    if not body or len(body) > 400 or body.count("\n") > 4:
+        return False
+    return bool(_TELEGRAM_NOISY_STATUS_RE.search(body))
+
+
 def _sanitize_gateway_final_response(platform: Any, text: str) -> str:
     """Sanitize final gateway replies before sending them to chat surfaces.
 
@@ -1025,6 +1045,12 @@ def _sanitize_gateway_final_response(platform: Any, text: str) -> str:
 
     redacted = _redact_gateway_user_facing_secrets(str(text))
     if _looks_like_gateway_provider_error(redacted):
+        return _gateway_provider_error_reply(redacted)
+    # #101138: the retry-exhaustion notice never matched the provider-error
+    # shape, so it reached chats verbatim as the turn's final word. Replace
+    # it with the plain-language provider-failure reply instead of dropping
+    # it — silence after a user's message is its own failure mode.
+    if _final_response_is_noise(redacted):
         return _gateway_provider_error_reply(redacted)
     return redacted
 

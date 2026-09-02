@@ -343,3 +343,77 @@ def test_chat_gateways_redact_all_issue_23810_credential_shapes(platform, shape_
     # Prose around the secret is preserved — redaction is surgical.
     assert "here is the token you asked me to echo" in sanitized
     assert sanitized.endswith("done.")
+
+
+# #101138: the empty-response retry emitter reworded its status to
+# "Empty response from model — retrying (1/3) in 8s" (counter added), but
+# the noise filter only knew "retrying in Ns", so the chatter reached chat.
+@pytest.mark.parametrize("platform", CHAT_PLATFORMS)
+def test_chat_gateways_suppress_counter_format_retry_chatter(platform):
+    """Both retry-status generations must stay out of chat surfaces."""
+    assert (
+        _prepare_gateway_status_message(
+            platform, "lifecycle", "⚠️ Empty response from model — retrying (1/3) in 8s"
+        )
+        is None
+    )
+    assert (
+        _prepare_gateway_status_message(
+            platform,
+            "lifecycle",
+            "⚠️ Empty response from model — retrying (3/5) in 12s"
+            " — high-cost request, reduced retry budget",
+        )
+        is None
+    )
+    # Pre-counter generation keeps being suppressed too.
+    assert _prepare_gateway_status_message(platform, "lifecycle", "⏳ Retrying in 4.2s...") is None
+
+
+# #101138 defect 2: the retry-exhaustion turn-exit notice leaves as the turn's
+# FINAL response, which never consulted the noise filter, so users got raw
+# CLI-only instructions ("Try `continue`, switch model/provider...") as the
+# last word. It must be replaced with a plain-language reply, not dropped.
+@pytest.mark.parametrize("platform", CHAT_PLATFORMS)
+def test_chat_gateways_replace_retry_exhaustion_final_response(platform):
+    exhaustion_notice = (
+        "⚠️ No reply: the model returned empty content after retries and any "
+        "fallback providers. Try `continue`, switch model/provider, or "
+        "inspect the tool output above."
+    )
+
+    sanitized = _sanitize_gateway_final_response(platform, exhaustion_notice)
+
+    assert sanitized
+    assert "No reply:" not in sanitized
+    assert "switch model/provider" not in sanitized
+    assert "provider failed after retries" in sanitized.lower()
+
+
+def test_local_final_response_keeps_retry_exhaustion_notice():
+    """Local/CLI diagnostics keep the raw turn-exit notice verbatim."""
+    raw = (
+        "⚠️ No reply: the model returned empty content after retries and any "
+        "fallback providers. Try `continue`, switch model/provider, or "
+        "inspect the tool output above."
+    )
+
+    assert _sanitize_gateway_final_response("local", raw) == raw
+
+
+def test_final_response_noise_guard_skips_long_prose():
+    """Long assistant prose quoting a noisy phrase must pass through.
+
+    The noise rewrite is scoped to short envelopes; a full answer that
+    happens to mention "retrying (1/3) in 8s" must not be rewritten.
+    """
+    prose = (
+        "The provider logged 'Empty response from model — retrying (1/3) in "
+        "8s' during the outage, and here is the long post-mortem analysis of "
+        "what happened, why the retry ladder behaved the way it did, and what "
+        "we changed afterwards to make the empty-response budget easier to "
+        "tune. " + "Detail paragraph. " * 30
+    )
+    assert len(prose) > 400
+
+    assert _sanitize_gateway_final_response(Platform.TELEGRAM, prose) == prose
