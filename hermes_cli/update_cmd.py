@@ -3749,13 +3749,27 @@ def _run_pending_fleet_restart() -> bool:
         return False
 
 
-def _apply_pending_fleet_restart_catchup() -> None:
+def _apply_pending_fleet_restart_catchup(*, respect_no_gateway_restart: bool = False, no_gateway_restart: bool = False) -> None:
     """On an already-up-to-date ``hermes update``, finish a skipped restart.
 
     No-op when nothing is pending. Exits 1 when the catch-up restart is
     incomplete so automation does not treat the fleet as healthy.
+
+    When called from a cron's ``--no-gateway-restart`` flow, the caller
+    passes ``respect_no_gateway_restart=True``. In that case the pending
+    fleet restart is deferred — the update stays healthy and the marker is
+    kept so a later out-of-cron update (or ``hermes gateway restart``)
+    finishes it. This prevents a cron that runs ``hermes update --yes
+    --no-gateway-restart`` twice in the same window from killing its own
+    gateway mid-flight (#95294 vs #cron-self-kill 2026-08-29).
     """
     if not _pending_fleet_restart_needed():
+        return
+    if respect_no_gateway_restart and no_gateway_restart:
+        print()
+        _warn_pending_fleet_restart()
+        print("  (fleet restart deferred — --no-gateway-restart; marker kept)")
+        print("  Restart separately: `hermes gateway restart` or next non-cron update.")
         return
     print()
     _warn_pending_fleet_restart()
@@ -9011,24 +9025,16 @@ def _cmd_update_impl(args, gateway_mode: bool):
             # Git is current, but a prior pull may still owe the fleet a
             # restart (#95294). Catch up even on the "Already up to date"
             # path — that early return is what left the gateway on stale
-            # code for two days. Runs BEFORE the runtime-verification exit
-            # gate below: a vulnerable SQLite runtime demotes the outcome to
-            # partial, but must not strand the fleet on stale code (#91277
-            # fleet contract — the pending-restart check always executes).
-            _apply_pending_fleet_restart_catchup()
-            if not current_checkout_complete:
-                if gateway_mode:
-                    _write_gateway_update_exit_code(False)
-                try:
-                    from hermes_cli.update_receipt import finalize_update_receipt
-
-                    finalize_update_receipt("partial")
-                except Exception as _receipt_exc:
-                    logger.debug(
-                        "Update receipt finalize (current checkout) failed: %s",
-                        _receipt_exc,
-                    )
-                sys.exit(1)
+            # code for two days. When invoked with --no-gateway-restart
+            # (cron inside gateway), defer instead of self-killing (2026-08-29).
+            # Runs BEFORE the runtime-verification exit gate below: a vulnerable
+            # SQLite runtime demotes the outcome to partial, but must not strand
+            # the fleet on stale code (#91277 fleet contract — the pending-restart
+            # check always executes).
+            _apply_pending_fleet_restart_catchup(
+                respect_no_gateway_restart=True,
+                no_gateway_restart=bool(getattr(args, "no_gateway_restart", False)),
+            )
             return
 
         if commit_count > 0:
@@ -9832,6 +9838,14 @@ def _cmd_update_impl(args, gateway_mode: bool):
 
         gateway_fleet_restart_incomplete = False
         gateway_restart_phase_errors: list[str] = []
+        no_gateway_restart = bool(getattr(args, "no_gateway_restart", False))
+        class _SkipGatewayRestart(Exception):
+            pass
+        if no_gateway_restart:
+            print()
+            print("→ Gateway restart skipped (--no-gateway-restart).")
+            print("  Code and dependencies are updated; gateways still serve pre-update code.")
+            print("  Restart them separately: `hermes gateway restart` or a daily-restart cron.")
         # Snapshot of gateways running before we touch anything. Stays empty
         # until we successfully import the probe and are about to stop/drain —
         # so an exception raised before we touch any gateway keeps this empty
@@ -9875,8 +9889,11 @@ def _cmd_update_impl(args, gateway_mode: bool):
         # that the new source expects a new symbol from would otherwise
         # ImportError and abort this whole phase (2026-08-20 field failure:
         # new gateway.py ← stale cli_output missing line_input).
-        _m()._purge_stale_hermes_modules()
+        if not no_gateway_restart:
+            _m()._purge_stale_hermes_modules()
         try:
+            if no_gateway_restart:
+                raise _SkipGatewayRestart
             from hermes_cli.gateway import (
                 is_macos,
                 supports_systemd_services,
@@ -10583,6 +10600,8 @@ def _cmd_update_impl(args, gateway_mode: bool):
             except Exception as _sweep_exc:
                 logger.debug("Post-restart survivor sweep failed: %s", _sweep_exc)
 
+        except _SkipGatewayRestart:
+            pass
         except Exception as e:
             logger.debug("Gateway restart during update failed: %s", e)
             gateway_restart_phase_errors.append(str(e))
@@ -10810,9 +10829,12 @@ def _cmd_update_impl(args, gateway_mode: bool):
         # Forward the systemd units restarted above (includes hermes-serve*,
         # #83438) so a Serve-only install's freshly restarted process isn't
         # found and restarted again below (review on #83595).
-        _finish_dashboard_update_cleanup(
-            node_failures, already_restarted_units=set(restarted_services)
-        )
+        if not no_gateway_restart:
+            _finish_dashboard_update_cleanup(
+                node_failures, already_restarted_units=set(restarted_services)
+            )
+        else:
+            print("  (dashboard restart skipped — --no-gateway-restart)")
 
         # Check if any pre-update serve/dashboard runtimes survived on
         # pre-update code generations (#100479). This is the SUCCESS-path
@@ -10902,7 +10924,10 @@ def _cmd_update_impl(args, gateway_mode: bool):
                     pre_restart_pids=_pre_restart_gateway_pids
                 )
             if print_fleet_version_matrix(_fleet_snapshot):
-                gateway_fleet_restart_incomplete = True
+                if not no_gateway_restart:
+                    gateway_fleet_restart_incomplete = True
+                else:
+                    print("  (fleet still on pre-update code — restart was skipped)")
             elif not _fleet_snapshot and _fleet_rows_expected:
                 # Fleet probe returned zero rows even though at least one
                 # gateway runtime was (or may have been) live pre-update —
@@ -10918,7 +10943,10 @@ def _cmd_update_impl(args, gateway_mode: bool):
                     "\n⚠ Fleet version check returned no rows even though"
                     " gateway runtimes were expected — verification incomplete."
                 )
-                gateway_fleet_restart_incomplete = True
+                if not no_gateway_restart:
+                    gateway_fleet_restart_incomplete = True
+                else:
+                    print("  (fleet still on pre-update code — restart was skipped)")
         except Exception as _fleet_exc:
             logger.debug("Fleet version verification failed: %s", _fleet_exc)
 
