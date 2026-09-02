@@ -475,6 +475,103 @@ def test_active_pr_guard_skipped_for_review_lane_but_defers_ready_lane(
         ) == "rate_limit_cooldown"
 
 
+def test_active_pr_guard_bypassed_after_changes_requested(
+    kanban_home: Path,
+) -> None:
+    """Reviewer-requested rework with an active PR must resume, not defer.
+
+    Lifecycle: worker opens a PR, requests review, the reviewer returns the
+    card via ``request_changes`` (or ``reopen_review_task``). The PR-URL
+    comment is now the artifact to UPDATE, not a duplicate-implementation
+    signal — the guard must fall through so the dispatcher re-spawns the
+    coder, who resumes the existing worktree and pushes to the same PR.
+    A fresh PR comment with NO re-queue signal after it is still guarded.
+    """
+    pr_comment = "Opened https://github.com/example/repo/pull/456 for review."
+
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="rework me", assignee="worker")
+
+        # Pass 1: implement -> comment PR URL -> request review.
+        claimed = kb.claim_task(conn, tid)
+        assert claimed is not None
+        kb.add_comment(conn, tid, author="worker", body=pr_comment)
+        assert kb.request_review(
+            conn, tid, summary="PR ready",
+            expected_run_id=claimed.current_run_id,
+        )
+        assert kb.get_task(conn, tid).status == "review"
+
+        # Reviewer requests changes -> task lands back in ready for rework.
+        reviewer_claim = kb.claim_review_task(conn, tid)
+        assert reviewer_claim is not None
+        ok, why = kb.request_changes(
+            conn, tid, reason="please address nits",
+            expected_run_id=kb.get_task(conn, tid).current_run_id,
+        )
+        assert ok is True, why
+        assert kb.get_task(conn, tid).status == "ready"
+
+        # The active_pr guard must NOT strand the rework...
+        assert kb.check_respawn_guard(conn, tid) is None
+
+        # ...and the dispatcher must actually spawn the implementer again.
+        with patch_profile_spawnable():
+            res = kb.dispatch_once(conn, dry_run=True)
+        assert tid in [s[0] for s in res.spawned]
+        assert tid not in dict(res.respawn_guarded)
+
+    # Control: the same PR comment with no changes-requested after it
+    # (fresh task, ready lane) remains a duplicate-work signal.
+    with kb.connect() as conn:
+        dup_id = kb.create_task(conn, title="dup check", assignee="worker")
+        kb.add_comment(conn, dup_id, author="worker", body=pr_comment)
+        assert kb.check_respawn_guard(conn, dup_id) == "active_pr"
+
+
+class patch_profile_spawnable:
+    """Context manager: make every assignee a spawnable profile + enable
+    review dispatch, mirroring the monkeypatch pattern used by sibling
+    tests (works inside a ``with`` block without pytest.MonkeyPatch)."""
+
+    def __enter__(self):
+        import hermes_cli.config as cfgmod
+        import hermes_cli.profiles as profmod
+        self._orig = (profmod.profile_exists, cfgmod.load_config)
+        profmod.profile_exists = lambda name: True
+        cfgmod.load_config = (
+            lambda *a, **k: {"kanban": {"review_dispatch": True}}
+        )
+        return self
+
+    def __exit__(self, *exc):
+        import hermes_cli.config as cfgmod
+        import hermes_cli.profiles as profmod
+        profmod.profile_exists, cfgmod.load_config = self._orig
+        return False
+
+
+def test_active_pr_guard_also_bypassed_after_review_reopen(
+    kanban_home: Path,
+) -> None:
+    """``reopen_review_task`` (manual changes-requested) gets the same
+    bypass: the PR stays live and the coder resumes it."""
+    pr_comment = "PR: https://github.com/example/repo/pull/789"
+
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="reopen rework", assignee="worker")
+        claimed = kb.claim_task(conn, tid)
+        assert claimed is not None
+        kb.add_comment(conn, tid, author="worker", body=pr_comment)
+        assert kb.request_review(
+            conn, tid, summary="v1",
+            expected_run_id=claimed.current_run_id,
+        )
+        assert kb.reopen_review_task(conn, tid) is True
+        assert kb.get_task(conn, tid).status == "ready"
+        assert kb.check_respawn_guard(conn, tid) is None
+
+
 def test_review_dispatch_preserves_task_skills_and_adds_reviewer_skill(
     kanban_home: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
