@@ -86,6 +86,25 @@ class TestClarifyChoiceViewConstruction:
     """The view should build numeric buttons plus an Other button."""
 
 
+    def test_unlimited_clarify_keeps_discord_buttons_live(self, monkeypatch):
+        """Discord's button view must share the canonical clarify lifetime.
+
+        A separate five-minute view timeout made the card look expired while
+        the gateway was still waiting for the user's answer.
+        """
+        monkeypatch.setattr(
+            "tools.clarify_gateway.get_clarify_timeout", lambda: 0
+        )
+
+        view = ClarifyChoiceView(
+            choices=["approve", "reject"],
+            clarify_id="cid-unlimited",
+            allowed_user_ids=set(),
+        )
+
+        assert view.timeout is None
+
+
     def test_truncates_long_choice_label(self):
         long_choice = "x" * 200
         view = ClarifyChoiceView(

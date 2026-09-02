@@ -1072,6 +1072,24 @@ def _read_discord_prompt_timeout() -> int:
     return seconds
 
 
+def _read_discord_clarify_timeout() -> Optional[float]:
+    """Return the canonical clarify lifetime for Discord choice buttons.
+
+    Clarify prompts are not execution approvals: their button view must remain
+    usable for exactly as long as the gateway is waiting for the user's answer.
+    A non-positive canonical timeout means unlimited and maps to discord.py's
+    ``View(timeout=None)``. Security-sensitive approval views continue using
+    the separately bounded ``approvals.discord_prompt_timeout`` setting.
+    """
+    try:
+        from tools.clarify_gateway import get_clarify_timeout
+
+        seconds = float(get_clarify_timeout())
+    except Exception:
+        seconds = 3600.0
+    return None if seconds <= 0 else seconds
+
+
 class DiscordAdapter(BasePlatformAdapter):
     """
     Discord bot adapter.
@@ -9742,7 +9760,7 @@ def _define_discord_view_classes() -> None:
             allowed_user_ids: set,
             allowed_role_ids: Optional[set] = None,
         ):
-            super().__init__(timeout=_read_discord_prompt_timeout())
+            super().__init__(timeout=_read_discord_clarify_timeout())
             self.choices = list(choices)[:24]
             self.clarify_id = clarify_id
             self.allowed_user_ids = allowed_user_ids
