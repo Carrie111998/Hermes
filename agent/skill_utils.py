@@ -1300,6 +1300,71 @@ def is_skill_description_truncated_for_prompt(frontmatter: Dict[str, Any]) -> bo
     return len(desc) > SKILL_PROMPT_DESC_LIMIT
 
 
+def extract_skill_editorial_metadata(
+    frontmatter: Dict[str, Any],
+    *,
+    fallback_name: str,
+    fallback_description: str,
+) -> Dict[str, str]:
+    """Resolve optional human-facing skill copy without changing agent metadata.
+
+    ``name`` and ``description`` remain the canonical agent-facing routing
+    fields. Hermes UIs may use the optional values under ``metadata.hermes``;
+    older and third-party skills fall back to the canonical pair.
+    """
+    metadata = frontmatter.get("metadata")
+    hermes = metadata.get("hermes") if isinstance(metadata, dict) else None
+    if not isinstance(hermes, dict):
+        hermes = {}
+
+    editorial_name = hermes.get("editorial_name")
+    editorial_description = hermes.get("editorial_description")
+    return {
+        "editorial_name": (
+            editorial_name.strip()
+            if isinstance(editorial_name, str) and editorial_name.strip()
+            else fallback_name
+        ),
+        "editorial_description": (
+            editorial_description.strip()
+            if isinstance(editorial_description, str)
+            and editorial_description.strip()
+            else fallback_description
+        ),
+    }
+
+
+def load_skill_editorial_metadata(
+    skill_path: Path,
+    *,
+    fallback_name: str | None = None,
+    fallback_description: str = "",
+) -> Dict[str, str]:
+    """Load human-facing copy from a skill directory with safe fallbacks."""
+    canonical_name = fallback_name or skill_path.name
+    canonical_description = fallback_description
+    try:
+        frontmatter, _body = parse_frontmatter(
+            (skill_path / "SKILL.md").read_text(encoding="utf-8")
+        )
+        name = frontmatter.get("name")
+        description = frontmatter.get("description")
+        if isinstance(name, str) and name.strip():
+            canonical_name = name.strip()
+        if isinstance(description, str) and description.strip():
+            canonical_description = description.strip()
+        return extract_skill_editorial_metadata(
+            frontmatter,
+            fallback_name=canonical_name,
+            fallback_description=canonical_description,
+        )
+    except (OSError, UnicodeError, ValueError):
+        return {
+            "editorial_name": canonical_name,
+            "editorial_description": canonical_description,
+        }
+
+
 # ── File iteration ────────────────────────────────────────────────────────
 
 

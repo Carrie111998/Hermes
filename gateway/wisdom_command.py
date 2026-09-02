@@ -1097,17 +1097,24 @@ class WisdomCommandController:
             "Nothing leaves this device until you create a private draft.",
             items=[
                 WisdomItem(
-                    str(item["name"]),
+                    str(item.get("editorial_name") or item["name"]),
                     (
-                        f"{qualification_notice(item)}\n"
-                        "Why suggested: "
-                        + str(item.get("qualification") or "manual selection").replace(
-                            "_", " "
+                        (
+                            str(item.get("editorial_description")) + "\n"
+                            if item.get("editorial_description")
+                            else ""
                         )
-                        if item.get("notice_variant")
-                        else str(
-                            item.get("qualification") or "manual selection"
-                        ).replace("_", " ")
+                        + (
+                            f"{qualification_notice(item)}\n"
+                            "Why suggested: "
+                            + str(
+                                item.get("qualification") or "manual selection"
+                            ).replace("_", " ")
+                            if item.get("notice_variant")
+                            else str(
+                                item.get("qualification") or "manual selection"
+                            ).replace("_", " ")
+                        )
                     ),
                     actions=[
                         WisdomAction(

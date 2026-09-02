@@ -119,6 +119,18 @@ const usageOf = (skill: SkillInfo): number => (typeof skill.usage === 'number' ?
 
 const categoryFor = (skill: SkillInfo): string => asText(skill.category) || 'general'
 
+type SkillPresentation = {
+  description: string
+  editorial_description?: string
+  editorial_name?: string
+  name: string
+}
+
+const skillDisplayName = (skill: SkillPresentation): string => asText(skill.editorial_name) || skill.name
+
+const skillDisplayDescription = (skill: SkillPresentation): string =>
+  asText(skill.editorial_description) || skill.description
+
 // Row subtitle: category, with non-default origins badged.
 function skillSubtitle(skill: SkillInfo): React.ReactNode {
   const category = prettyName(categoryFor(skill))
@@ -148,9 +160,14 @@ function filteredSkills(skills: SkillInfo[], query: string, desc: boolean): Skil
   return skills
     .filter(
       skill =>
-        !q || includesQuery(skill.name, q) || includesQuery(skill.description, q) || includesQuery(skill.category, q)
+        !q ||
+        includesQuery(skill.name, q) ||
+        includesQuery(skill.description, q) ||
+        includesQuery(skillDisplayName(skill), q) ||
+        includesQuery(skillDisplayDescription(skill), q) ||
+        includesQuery(skill.category, q)
     )
-    .sort((a, b) => sign * (usageOf(b) - usageOf(a)) || asText(a.name).localeCompare(asText(b.name)))
+    .sort((a, b) => sign * (usageOf(b) - usageOf(a)) || skillDisplayName(a).localeCompare(skillDisplayName(b)))
 }
 
 // Catalog rows have no usage yet — plain A–Z, same query fields as installed
@@ -164,10 +181,12 @@ function filteredOfficial(skills: OfficialSkillInfo[], query: string): OfficialS
         !q ||
         includesQuery(skill.name, q) ||
         includesQuery(skill.description, q) ||
+        includesQuery(skillDisplayName(skill), q) ||
+        includesQuery(skillDisplayDescription(skill), q) ||
         includesQuery(skill.category, q) ||
         skill.tags.some(tag => includesQuery(tag, q))
     )
-    .sort((a, b) => asText(a.name).localeCompare(asText(b.name)))
+    .sort((a, b) => skillDisplayName(a).localeCompare(skillDisplayName(b)))
 }
 
 const toolsetCalls = (toolset: ToolsetInfo, toolCalls: Record<string, number>): number =>
@@ -939,8 +958,8 @@ export function SkillsView({
                         }}
                         onToggle={enabled => void handleToggleSkill(skill, enabled)}
                         subtitle={skillSubtitle(skill)}
-                        title={skill.name}
-                        toggleLabel={skill.name}
+                        title={skillDisplayName(skill)}
+                        toggleLabel={skillDisplayName(skill)}
                       />
                     ))}
                     {/* The built-in optional-skills catalog, below the
@@ -973,7 +992,7 @@ export function SkillsView({
                           key={skill.identifier}
                           onSelect={() => setSelectedOfficial(skill.identifier)}
                           subtitle={prettyName(skill.category)}
-                          title={skill.name}
+                          title={skillDisplayName(skill)}
                         />
                       )
                     })}
@@ -1195,7 +1214,7 @@ function SkillDetail({
   return (
     <>
       <DetailHeader
-        description={asText(skill.description) || t.skills.noDescription}
+        description={skillDisplayDescription(skill) || t.skills.noDescription}
         pills={
           <>
             <PanelPill>{prettyName(categoryFor(skill))}</PanelPill>
@@ -1206,7 +1225,7 @@ function SkillDetail({
             )}
           </>
         }
-        title={skill.name}
+        title={skillDisplayName(skill)}
       />
       {editable && (
         <div className="flex items-center gap-2">
@@ -1273,14 +1292,14 @@ function OfficialSkillDetail({
   return (
     <>
       <DetailHeader
-        description={asText(skill.description) || t.skills.noDescription}
+        description={skillDisplayDescription(skill) || t.skills.noDescription}
         pills={
           <>
             <PanelPill>{prettyName(skill.category)}</PanelPill>
             <PanelPill tone="muted">{t.skills.officialPill}</PanelPill>
           </>
         }
-        title={skill.name}
+        title={skillDisplayName(skill)}
       />
       <div className="flex items-center gap-2">
         <Button disabled={installing} onClick={onInstall} size="xs" variant="textStrong">

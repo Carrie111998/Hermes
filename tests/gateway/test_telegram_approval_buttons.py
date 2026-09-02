@@ -399,6 +399,8 @@ class TestTelegramApprovalCallback:
             content_hash="sha256:source",
             payload={
                 "skill_name": "telegram-skill",
+                "editorial_name": "Telegram Workflow",
+                "editorial_description": "Reuse a reliable Telegram workflow.",
                 "local_reasons": {
                     "consecutive_business_days": 7,
                     "business_day_timezone": "Australia/Brisbane",
@@ -428,7 +430,8 @@ class TestTelegramApprovalCallback:
         raw_call = adapter._bot.do_api_request.await_args
         assert raw_call.args == ("sendRichMessage",)
         html = raw_call.kwargs["api_kwargs"]["rich_message"]["html"]
-        assert "telegram-skill" in html
+        assert "Telegram Workflow" in html
+        assert "Reuse a reliable Telegram workflow." in html
         assert "Your organisation (Nous Research) has enabled Collective Wisdom" in html
         assert "Congratulations! Hermes detected a skill" in html
         assert "Why suggested:" in html

@@ -341,6 +341,8 @@ describe('CollectiveTab', () => {
         {
           local_skill_id: 'qualified-1',
           name: 'qualified-skill',
+          editorial_name: 'Qualified Skill',
+          editorial_description: 'A useful skill ready for team review.',
           eligibility: 'eligible',
           reason: null,
           qualification: 'high_usage',
@@ -375,7 +377,8 @@ describe('CollectiveTab', () => {
       screen.getByText('Drafts awaiting your review and submissions waiting for collective approval.')
     ).toBeTruthy()
     expect(screen.getByText('1 qualified suggestion')).toBeTruthy()
-    expect(screen.getByText('qualified-skill')).toBeTruthy()
+    expect(screen.getByText('Qualified Skill')).toBeTruthy()
+    expect(screen.getByText('A useful skill ready for team review.')).toBeTruthy()
     expect(screen.getAllByRole('button', { name: 'Start contribution' })).toHaveLength(1)
     expect(screen.getByText('View all local skills (1)')).toBeTruthy()
     expect(screen.queryByText('already-shared')).toBeNull()

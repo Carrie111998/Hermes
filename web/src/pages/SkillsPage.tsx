@@ -122,6 +122,19 @@ function toolsetIcon(
   return Wrench;
 }
 
+type SkillPresentation = {
+  name: string;
+  description: string;
+  editorial_name?: string;
+  editorial_description?: string;
+};
+
+const skillDisplayName = (skill: SkillPresentation) =>
+  skill.editorial_name?.trim() || skill.name;
+
+const skillDisplayDescription = (skill: SkillPresentation) =>
+  skill.editorial_description?.trim() || skill.description;
+
 /* ------------------------------------------------------------------ */
 /*  Component                                                          */
 /* ------------------------------------------------------------------ */
@@ -272,6 +285,8 @@ export default function SkillsPage() {
       (s) =>
         s.name.toLowerCase().includes(lowerSearch) ||
         s.description.toLowerCase().includes(lowerSearch) ||
+        skillDisplayName(s).toLowerCase().includes(lowerSearch) ||
+        skillDisplayDescription(s).toLowerCase().includes(lowerSearch) ||
         (s.category ?? "").toLowerCase().includes(lowerSearch),
     );
   }, [skills, isSearching, lowerSearch]);
@@ -279,14 +294,18 @@ export default function SkillsPage() {
   const activeSkills = useMemo(() => {
     if (isSearching) return [];
     if (!activeCategory)
-      return [...skills].sort((a, b) => a.name.localeCompare(b.name));
+      return [...skills].sort((a, b) =>
+        skillDisplayName(a).localeCompare(skillDisplayName(b)),
+      );
     return skills
       .filter((s) =>
         activeCategory === "__none__"
           ? !s.category
           : s.category === activeCategory,
       )
-      .sort((a, b) => a.name.localeCompare(b.name));
+      .sort((a, b) =>
+        skillDisplayName(a).localeCompare(skillDisplayName(b)),
+      );
   }, [skills, activeCategory, isSearching]);
 
   const allCategories = useMemo(() => {
@@ -768,11 +787,11 @@ function SkillRow({
               skill.enabled ? "text-foreground" : "text-muted-foreground"
             }`}
           >
-            {skill.name}
+            {skillDisplayName(skill)}
           </span>
         </div>
         <p className="text-xs text-muted-foreground leading-relaxed line-clamp-2">
-          {skill.description || noDescriptionLabel}
+          {skillDisplayDescription(skill) || noDescriptionLabel}
         </p>
       </div>
       <Button
@@ -1283,11 +1302,11 @@ function HubResultCard({
           type="button"
           className="flex-1 min-w-0 text-left"
           onClick={onOpen}
-          aria-label={`Open ${result.name}`}
+          aria-label={`Open ${skillDisplayName(result)}`}
         >
           <div className="flex flex-wrap items-center gap-2 mb-0.5">
             <span className="font-mono-ui text-sm hover:underline">
-              {result.name}
+              {skillDisplayName(result)}
             </span>
             <Badge tone={trust.tone} className="text-xs">
               {trust.label}
@@ -1302,7 +1321,7 @@ function HubResultCard({
             )}
           </div>
           <p className="text-xs text-text-secondary line-clamp-2">
-            {result.description}
+            {skillDisplayDescription(result)}
           </p>
           <div className="flex flex-wrap items-center gap-1 mt-1">
             {result.tags.slice(0, 5).map((tag) => (
@@ -1401,7 +1420,7 @@ function SkillDetailDialog({
         <DialogHeader>
           <DialogTitle className="flex flex-wrap items-center gap-2 text-sm">
             <Package className="h-4 w-4" />
-            {result.name}
+            {skillDisplayName(result)}
             <Badge tone={trust.tone} className="text-xs">
               {trust.label}
             </Badge>
@@ -1415,13 +1434,15 @@ function SkillDetailDialog({
             )}
           </DialogTitle>
           <DialogDescription className="sr-only">
-            Preview the SKILL.md source and run a security scan for {result.name}{" "}
-            before installing.
+            Preview the SKILL.md source and run a security scan for{" "}
+            {skillDisplayName(result)} before installing.
           </DialogDescription>
         </DialogHeader>
 
         <div className="mt-1 flex flex-col gap-1">
-          <p className="text-xs text-text-secondary">{result.description}</p>
+          <p className="text-xs text-text-secondary">
+            {skillDisplayDescription(result)}
+          </p>
           <p className="text-xs font-mono text-text-tertiary truncate">
             {result.identifier}
           </p>

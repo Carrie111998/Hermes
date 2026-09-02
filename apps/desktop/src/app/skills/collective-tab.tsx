@@ -62,6 +62,12 @@ function asRecord(value: unknown): Record<string, unknown> {
   return value && typeof value === 'object' && !Array.isArray(value) ? (value as Record<string, unknown>) : {}
 }
 
+const candidateDisplayName = (candidate: WisdomCandidate): string =>
+  candidate.editorial_name?.trim() || candidate.name
+
+const candidateDisplayDescription = (candidate: WisdomCandidate): string =>
+  candidate.editorial_description?.trim() || ''
+
 async function waitForWisdomAction(name: string, profile: ProfileScope): Promise<void> {
   for (let attempt = 0; attempt < 1200; attempt += 1) {
     const status = await getActionStatus(name, 80, profile)
@@ -242,8 +248,14 @@ export function CollectiveTab({ profile, query }: { profile: ProfileScope; query
       const needle = query.trim().toLocaleLowerCase()
 
       return items
-        .filter(candidate => (!needle ? true : candidate.name.toLocaleLowerCase().includes(needle)))
-        .toSorted((left, right) => left.name.localeCompare(right.name))
+        .filter(candidate =>
+          !needle
+            ? true
+            : [candidate.name, candidateDisplayName(candidate), candidateDisplayDescription(candidate)].some(value =>
+                value.toLocaleLowerCase().includes(needle)
+              )
+        )
+        .toSorted((left, right) => candidateDisplayName(left).localeCompare(candidateDisplayName(right)))
     },
     [query]
   )
@@ -870,7 +882,12 @@ export function CollectiveTab({ profile, query }: { profile: ProfileScope; query
                         key={candidate.local_skill_id}
                       >
                         <div className="min-w-0 flex-1">
-                          <div className="truncate font-mono text-xs">{candidate.name}</div>
+                          <div className="truncate text-xs font-medium">{candidateDisplayName(candidate)}</div>
+                          {candidateDisplayDescription(candidate) && (
+                            <div className="line-clamp-2 text-[0.65rem] leading-4 text-muted-foreground">
+                              {candidateDisplayDescription(candidate)}
+                            </div>
+                          )}
                           <div className="text-[0.65rem] leading-4 text-muted-foreground">
                             {candidateSummary(candidate)}
                           </div>
@@ -915,7 +932,12 @@ export function CollectiveTab({ profile, query }: { profile: ProfileScope; query
                                   key={candidate.local_skill_id}
                                 >
                                   <div className="min-w-0 flex-1">
-                                    <div className="truncate font-mono text-xs">{candidate.name}</div>
+                                    <div className="truncate text-xs font-medium">{candidateDisplayName(candidate)}</div>
+                                    {candidateDisplayDescription(candidate) && (
+                                      <div className="line-clamp-2 text-[0.65rem] leading-4 text-muted-foreground">
+                                        {candidateDisplayDescription(candidate)}
+                                      </div>
+                                    )}
                                     <div className="text-[0.65rem] leading-4 text-muted-foreground">
                                       {candidateSummary(candidate)}
                                     </div>

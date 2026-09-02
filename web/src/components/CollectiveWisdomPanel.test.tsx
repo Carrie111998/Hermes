@@ -177,6 +177,8 @@ describe('CollectiveWisdomPanel', () => {
         {
           local_skill_id: 'local-first',
           name: 'first-skill',
+          editorial_name: 'First Skill',
+          editorial_description: 'A friendly description for people.',
           path: '/skills/first-skill',
           content_hash: 'sha256:first',
           eligibility: 'eligible',
@@ -206,6 +208,8 @@ describe('CollectiveWisdomPanel', () => {
     render(<CollectiveWisdomPanel profile="research" />)
 
     expect(await screen.findByText(/Your organisation \(Nous Research\) has enabled Collective Wisdom/)).toBeTruthy()
+    expect(screen.getByText('First Skill')).toBeTruthy()
+    expect(screen.getByText('A friendly description for people.')).toBeTruthy()
     expect(screen.getByText(/Hermes detected another skill that could be useful to your team/)).toBeTruthy()
   })
 

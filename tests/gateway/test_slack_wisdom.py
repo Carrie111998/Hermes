@@ -64,7 +64,8 @@ def test_wisdom_blocks_render_details_and_inline_actions():
 def test_candidate_card_uses_returning_copy_and_requested_action_order():
     adapter = _adapter()
     view = adapter._wisdom_candidate_view(
-        skill_name="incident-handoff",
+        skill_name="Incident Handoff",
+        skill_description="Transfer incident context between responders.",
         qualification="high_usage",
         status=(
             "Hermes detected another skill that could be useful to your team.\n\n"
@@ -90,6 +91,7 @@ def test_candidate_card_uses_returning_copy_and_requested_action_order():
         "Yes",
     ]
     assert "Hermes detected *another* skill" in wisdom_fallback_text(view)
+    assert "Transfer incident context between responders." in wisdom_fallback_text(view)
     assert "Would you like to share?" in wisdom_fallback_text(view)
 
 

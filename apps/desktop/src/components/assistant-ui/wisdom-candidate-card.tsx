@@ -238,6 +238,8 @@ export function WisdomCandidateCard({ profile, sessionId }: { profile?: ProfileS
   }
 
   const skill = event.payload.skill_name
+  const displayName = event.payload.editorial_name?.trim() || skill
+  const displayDescription = event.payload.editorial_description?.trim()
 
   const qualificationNotice =
     event.notice_variant === 'first' ? copy.qualificationFirst(event.organization_name) : copy.qualificationReturning
@@ -415,7 +417,7 @@ export function WisdomCandidateCard({ profile, sessionId }: { profile?: ProfileS
       <header className="flex items-center justify-between border-b border-(--ui-stroke-tertiary) px-4 py-3">
         <div>
           <div className="text-xs font-medium">{copy.proposalTitle}</div>
-          <div className="font-mono text-[0.68rem] text-muted-foreground">{skill}</div>
+          <div className="text-[0.68rem] font-medium text-muted-foreground">{displayName}</div>
         </div>
         <span className="text-[0.62rem] text-muted-foreground">
           {review ? copy.serverEnforced : copy.localSuggestion}
@@ -424,6 +426,7 @@ export function WisdomCandidateCard({ profile, sessionId }: { profile?: ProfileS
 
       <div className="border-b border-(--ui-stroke-tertiary) px-4 py-3">
         <p className="text-xs leading-5">{qualificationNotice}</p>
+        {displayDescription && <p className="mt-1 text-xs text-muted-foreground">{displayDescription}</p>}
         <p className="mt-1 text-xs text-muted-foreground">{copy.proposalNotice}</p>
         <p className="mt-2 text-xs font-medium">{copy.sharePrompt}</p>
       </div>

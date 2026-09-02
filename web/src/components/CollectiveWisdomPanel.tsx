@@ -55,6 +55,10 @@ function userFacingError(reason: unknown): string {
   return message.replace(/^Error:\s*/, '')
 }
 
+const candidateDisplayName = (candidate: WisdomCandidate) => candidate.editorial_name?.trim() || candidate.name
+
+const candidateDisplayDescription = (candidate: WisdomCandidate) => candidate.editorial_description?.trim() || ''
+
 function wisdomActionFailure(status: { exit_code: number | null; lines: string[] }): string {
   const lastRunMarker = status.lines.findLastIndex(line => line.startsWith('==='))
   const latestRun = status.lines
@@ -257,8 +261,14 @@ export function CollectiveWisdomPanel({ profile }: Props) {
       const needle = query.trim().toLocaleLowerCase()
 
       return items
-        .filter(candidate => (!needle ? true : candidate.name.toLocaleLowerCase().includes(needle)))
-        .toSorted((left, right) => left.name.localeCompare(right.name))
+        .filter(candidate =>
+          !needle
+            ? true
+            : [candidate.name, candidateDisplayName(candidate), candidateDisplayDescription(candidate)].some(value =>
+                value.toLocaleLowerCase().includes(needle)
+              )
+        )
+        .toSorted((left, right) => candidateDisplayName(left).localeCompare(candidateDisplayName(right)))
     },
     [query]
   )
@@ -785,7 +795,12 @@ export function CollectiveWisdomPanel({ profile }: Props) {
                   className="flex items-start justify-between gap-3 border-t border-border py-2 first:border-0"
                 >
                   <div className="min-w-0">
-                    <p className="truncate font-mono text-sm">{candidate.name}</p>
+                    <p className="truncate text-sm font-medium">{candidateDisplayName(candidate)}</p>
+                    {candidateDisplayDescription(candidate) && (
+                      <p className="line-clamp-2 text-xs text-text-secondary">
+                        {candidateDisplayDescription(candidate)}
+                      </p>
+                    )}
                     <p className="text-xs text-text-tertiary">{candidateSummary(candidate)}</p>
                     {candidate.professionalism_check && (
                       <div className="mt-1">
@@ -827,7 +842,12 @@ export function CollectiveWisdomPanel({ profile }: Props) {
                             className="flex items-start justify-between gap-3 border-t border-border py-2 first:border-0"
                           >
                             <div className="min-w-0">
-                              <p className="truncate font-mono text-sm">{candidate.name}</p>
+                              <p className="truncate text-sm font-medium">{candidateDisplayName(candidate)}</p>
+                              {candidateDisplayDescription(candidate) && (
+                                <p className="line-clamp-2 text-xs text-text-secondary">
+                                  {candidateDisplayDescription(candidate)}
+                                </p>
+                              )}
                               <p className="text-xs text-text-tertiary">{candidateSummary(candidate)}</p>
                               {candidate.professionalism_check && (
                                 <div className="mt-1">

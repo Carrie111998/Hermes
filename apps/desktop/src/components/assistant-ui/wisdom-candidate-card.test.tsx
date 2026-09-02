@@ -40,6 +40,8 @@ const candidate = {
   organization_name: 'Nous Research',
   payload: {
     skill_name: 'safe-skill',
+    editorial_name: 'Safe Skill',
+    editorial_description: 'Share a dependable workflow with your team.',
     qualification: 'meaningful_refinements',
     local_reasons: { meaningful_refinements: 3 },
     consent_required: true,
@@ -154,6 +156,8 @@ describe('WisdomCandidateCard', () => {
     expect(await screen.findByRole('button', { name: 'Review & edit' })).toBeTruthy()
     expect(screen.getByText(/Your organisation \(Nous Research\) has enabled Collective Wisdom/)).toBeTruthy()
     expect(screen.getByText(/Congratulations! Hermes detected a skill/)).toBeTruthy()
+    expect(screen.getByText('Safe Skill')).toBeTruthy()
+    expect(screen.getByText('Share a dependable workflow with your team.')).toBeTruthy()
     expect(screen.queryByDisplayValue('Owner copy')).toBeNull()
     expect(screen.queryByLabelText('Edit SKILL.md')).toBeNull()
     expect(screen.queryByText('Minimum Hermes version')).toBeNull()

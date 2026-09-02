@@ -8520,6 +8520,7 @@ class TelegramAdapter(BasePlatformAdapter):
     def _wisdom_candidate_html(
         *,
         skill_name: str,
+        skill_description: str = "",
         qualification_reason: str,
         status: str,
         actions: List[Dict[str, Any]],
@@ -8557,11 +8558,15 @@ class TelegramAdapter(BasePlatformAdapter):
             .replace("Hermes detected another", "Hermes detected <b>another</b>")
             .replace("\n", "<br/>")
         )
+        description_html = (
+            f"{_html.escape(skill_description)}<br/>" if skill_description else ""
+        )
         return (
             "<h3>Hermes Collective Wisdom</h3>"
             f"<p>{status_html}<br/><br/>"
             "<b>Reusable skill ready to review</b><br/>"
-            f"<code>{_html.escape(skill_name)}</code><br/>"
+            f"<b>{_html.escape(skill_name)}</b><br/>"
+            f"{description_html}"
             f"<b>Why suggested:</b> {_html.escape(qualification_reason)}<br/>"
             f"{review_html}{control_html}</p>"
         )
@@ -8671,7 +8676,12 @@ class TelegramAdapter(BasePlatformAdapter):
             event_id = str(event["id"])
             payload = event.get("payload")
             payload = payload if isinstance(payload, dict) else {}
-            skill_name = str(payload.get("skill_name") or "Local skill")
+            skill_name = str(
+                payload.get("editorial_name")
+                or payload.get("skill_name")
+                or "Local skill"
+            )
+            skill_description = str(payload.get("editorial_description") or "")
             professionalism_review = await self._run_wisdom_profile_operation(
                 lambda event=event: (
                     WisdomService().finish_candidate_professionalism_review(
@@ -8701,6 +8711,7 @@ class TelegramAdapter(BasePlatformAdapter):
             ]
             html = self._wisdom_candidate_html(
                 skill_name=skill_name,
+                skill_description=skill_description,
                 qualification_reason=qualification_reason,
                 status=(
                     f"{notice}\n\nNothing is shared without your approval.\n\n"
@@ -8747,7 +8758,12 @@ class TelegramAdapter(BasePlatformAdapter):
                         "<b>Reusable skill ready to review</b>\n"
                         f"{_html.escape(notice).replace('another', '<b>another</b>')}\n\n"
                         f"<code>{_html.escape(skill_name)}</code>\n"
-                        "<b>Why suggested:</b> "
+                        + (
+                            f"{_html.escape(skill_description)}\n"
+                            if skill_description
+                            else ""
+                        )
+                        + "<b>Why suggested:</b> "
                         f"{_html.escape(qualification_reason)}\n"
                         "Nothing is shared without your approval.\n"
                         "Would you like to share?\n\n"

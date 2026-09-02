@@ -18,6 +18,7 @@ from typing import Any
 from urllib.parse import parse_qs, quote, urlparse
 
 from hermes_constants import get_hermes_home, get_skills_dir
+from agent.skill_utils import load_skill_editorial_metadata
 from tools.skill_usage import is_bundled, is_hub_installed
 from tools.skills_guard import scan_skill, should_allow_install
 from tools.skillevaluator_scan import run_tier1_scan, tier1_advisory_enabled
@@ -269,16 +270,22 @@ def _existing_author_description(skill_md: str) -> str | None:
     without usable copy still use the configured model path below.
     """
     try:
-        from agent.skill_utils import parse_frontmatter
+        from agent.skill_utils import (
+            extract_skill_editorial_metadata,
+            parse_frontmatter,
+        )
 
         frontmatter, _body = parse_frontmatter(skill_md)
     except Exception:
         return None
     value = frontmatter.get("description")
-    if not isinstance(value, str):
-        return None
-    description = value.strip()
-    return description or None
+    description = value.strip() if isinstance(value, str) else ""
+    editorial = extract_skill_editorial_metadata(
+        frontmatter,
+        fallback_name="",
+        fallback_description=description,
+    )
+    return editorial["editorial_description"] or None
 
 
 class WisdomService:
@@ -786,6 +793,7 @@ class WisdomService:
         self.store.mark_missing_skills({str(path.resolve()) for path in eligible_paths})
         for path in eligible_paths:
             source_hash = _source_fingerprint(path)
+            editorial = load_skill_editorial_metadata(path)
             skill_id = self.store.register_skill(
                 path, content_hash=source_hash, source_kind="local"
             )
@@ -820,6 +828,7 @@ class WisdomService:
             candidates.append({
                 "local_skill_id": skill_id,
                 "name": path.name,
+                **editorial,
                 "path": str(path),
                 "content_hash": source_hash,
                 "eligibility": eligibility,

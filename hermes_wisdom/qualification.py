@@ -13,6 +13,7 @@ from typing import Any
 
 from hermes_constants import get_skills_dir
 from hermes_time import get_timezone
+from agent.skill_utils import load_skill_editorial_metadata
 from tools.skill_usage import _find_skill_dir, is_bundled, is_hub_installed
 
 from .contract import sha256_address
@@ -186,6 +187,16 @@ def _emit_candidate(
     session_id: str | None,
     task_id: str | None,
 ) -> str | None:
+    local = store.local_skill(skill_id)
+    source = Path(str(local["canonical_path"])) if local else None
+    editorial = (
+        load_skill_editorial_metadata(source, fallback_name=skill_name)
+        if source is not None
+        else {
+            "editorial_name": skill_name,
+            "editorial_description": "",
+        }
+    )
     event_id = store.emit_local_event(
         kind="wisdom.candidate",
         skill_id=skill_id,
@@ -195,6 +206,7 @@ def _emit_candidate(
         qualification=qualification,
         payload={
             "skill_name": skill_name,
+            **editorial,
             "qualification": qualification,
             "local_reasons": local_reasons,
             "consent_required": True,
@@ -205,8 +217,6 @@ def _emit_candidate(
         try:
             from .professionalism import enqueue_review, exact_utf8_package
 
-            local = store.local_skill(skill_id)
-            source = Path(str(local["canonical_path"])) if local else None
             if source is not None:
                 enqueue_review(
                     store,

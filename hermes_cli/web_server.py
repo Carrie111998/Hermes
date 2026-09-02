@@ -15025,6 +15025,10 @@ def _skill_meta_to_payload(m) -> dict:
     return {
         "name": m.name,
         "description": m.description,
+        "editorial_name": getattr(m, "editorial_name", None) or m.name,
+        "editorial_description": (
+            getattr(m, "editorial_description", None) or m.description
+        ),
         "source": m.source,
         "identifier": m.identifier,
         "trust_level": m.trust_level,

@@ -41,6 +41,8 @@ SKILL.md Format (YAML Frontmatter, agentskills.io compatible):
     compatibility: Requires X     # Optional (agentskills.io)
     metadata:                     # Optional, arbitrary key-value (agentskills.io)
       hermes:
+        editorial_name: Axolotl Fine-Tuning
+        editorial_description: Fine-tune language models with practical recipes.
         tags: [fine-tuning, llm]
         related_skills: [peft, lora]
     ---
@@ -83,6 +85,7 @@ from hermes_cli.config import cfg_get
 from utils import env_var_enabled
 from agent.skill_utils import (
     EXCLUDED_SKILL_DIRS as _EXCLUDED_SKILL_DIRS,
+    extract_skill_editorial_metadata,
     is_skill_support_path as _is_skill_support_path,
 )
 
@@ -684,16 +687,38 @@ def _is_skill_disabled(name: str, platform: str = None) -> bool:
         return False
 
 
-def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any]]:
+def _skill_metadata_projection(
+    skills: List[Dict[str, Any]], *, include_editorial: bool
+) -> List[Dict[str, Any]]:
+    """Copy cached metadata, omitting UI-only copy for agent-facing callers."""
+    if include_editorial:
+        return [dict(skill) for skill in skills]
+    return [
+        {
+            key: value
+            for key, value in skill.items()
+            if key not in {"editorial_name", "editorial_description"}
+        }
+        for skill in skills
+    ]
+
+
+def _find_all_skills(
+    *, skip_disabled: bool = False, include_editorial: bool = False
+) -> List[Dict[str, Any]]:
     """Recursively find all skills in ~/.hermes/skills/ and external dirs.
 
     Args:
         skip_disabled: If True, return ALL skills regardless of disabled
             state (used by ``hermes skills`` config UI). Default False
             filters out disabled skills.
+        include_editorial: Include resolved human-facing presentation copy.
+            Defaults to False so agent-facing discovery remains unchanged.
 
     Returns:
-        List of skill metadata dicts (name, description, category).
+        List of skill metadata dicts. ``name`` and ``description`` remain the
+        agent-facing fields; ``editorial_*`` is resolved presentation copy for
+        UI callers and falls back to that canonical pair.
 
     Results are cached per-session; the cache is invalidated when the scan
     signature changes (dir/category mtimes or the disabled-set) and expires
@@ -736,7 +761,9 @@ def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any]]:
         # Per-call shallow copies: callers mutate the returned dicts
         # (e.g. web_server annotates s["enabled"]/s["usage"]) — handing
         # out the cached objects would poison the cache for everyone else.
-        return [dict(s) for s in cached[2]]
+        return _skill_metadata_projection(
+            cached[2], include_editorial=include_editorial
+        )
 
     skills = []
     seen_names: set = set()
@@ -785,11 +812,17 @@ def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any]]:
                     description = description[:MAX_DESCRIPTION_LENGTH - 3] + "..."
 
                 category = _get_category_from_path(skill_md)
+                editorial = extract_skill_editorial_metadata(
+                    frontmatter,
+                    fallback_name=name,
+                    fallback_description=description,
+                )
 
                 seen_names.add(name)
                 skills.append({
                     "name": name,
                     "description": description,
+                    **editorial,
                     "category": category,
                 })
 
@@ -807,7 +840,7 @@ def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any]]:
     # re-scans rather than serving the torn result past the TTL). Same
     # shallow-copy contract as the hit path — the caller may mutate.
     _SKILLS_CACHE[cache_key] = (signature, now, skills)
-    return [dict(s) for s in skills]
+    return _skill_metadata_projection(skills, include_editorial=include_editorial)
 
 
 def _sort_skills(skills: List[Dict[str, Any]]) -> List[Dict[str, Any]]:

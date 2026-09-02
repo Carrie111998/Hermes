@@ -28,7 +28,15 @@ def _skill(tmp_path: Path) -> Path:
     path = tmp_path / "skills" / "learned-skill"
     path.mkdir(parents=True)
     (path / "SKILL.md").write_text(
-        "---\nname: learned-skill\n---\n# One\n", encoding="utf-8"
+        "---\n"
+        "name: learned-skill\n"
+        "description: Use when retaining a learned workflow.\n"
+        "metadata:\n"
+        "  hermes:\n"
+        "    editorial_name: Learned Workflow\n"
+        "    editorial_description: Reuse a workflow refined through practice.\n"
+        "---\n# One\n",
+        encoding="utf-8",
     )
     return path
 
@@ -87,6 +95,11 @@ def test_high_usage_threshold_uses_consecutive_business_days_and_deduplicates(
     assert events[0]["session_id"] == "session-1"
     assert events[0]["payload"]["networked"] is False
     assert events[0]["payload"]["consent_required"] is True
+    assert events[0]["payload"]["editorial_name"] == "Learned Workflow"
+    assert (
+        events[0]["payload"]["editorial_description"]
+        == "Reuse a workflow refined through practice."
+    )
     assert events[0]["payload"]["local_reasons"] == {
         "consecutive_business_days": HIGH_USAGE_CONSECUTIVE_BUSINESS_DAYS,
         "business_day_timezone": "Australia/Brisbane",

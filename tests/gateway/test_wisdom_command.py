@@ -111,6 +111,8 @@ class _Service:
         return [
             {
                 "name": "incident-handoff",
+                "editorial_name": "Incident Handoff",
+                "editorial_description": "Transfer incident context between responders.",
                 "local_skill_id": "local-1",
                 "eligibility": "eligible",
                 "qualification": "high_usage",
@@ -253,6 +255,8 @@ def test_candidates_uses_the_stable_first_notice_projection():
     )
     assert "Congratulations! Hermes detected a skill" in view.items[0].detail
     assert "Why suggested: high usage" in view.items[0].detail
+    assert view.items[0].title == "Incident Handoff"
+    assert "Transfer incident context between responders." in view.items[0].detail
 
 
 def test_skill_preview_keeps_install_as_the_trailing_action():

@@ -1324,6 +1324,8 @@ export interface SessionImportResponse {
 export interface SkillHubResult {
   name: string
   description: string
+  editorial_name?: string
+  editorial_description?: string
   source: string
   identifier: string
   trust_level: string
@@ -1368,6 +1370,8 @@ export interface SkillHubSourcesResponse {
 export interface SkillHubPreview {
   name: string
   description: string
+  editorial_name?: string
+  editorial_description?: string
   source: string
   identifier: string
   trust_level: string
@@ -2238,6 +2242,9 @@ export interface AutomationBlueprint {
 export interface SkillInfo {
   name: string
   description: string
+  /** Human-facing presentation copy; absent on older backends. */
+  editorial_name?: string
+  editorial_description?: string
   category: string
   enabled: boolean
 }
@@ -2274,6 +2281,8 @@ export interface WisdomReviewCheck {
 export interface WisdomCandidate {
   local_skill_id: string
   name: string
+  editorial_name?: string
+  editorial_description?: string
   path: string
   content_hash: string
   eligibility: 'eligible' | 'instruction_only_fork_required'
@@ -2297,6 +2306,8 @@ export interface WisdomCandidateEvent {
   organization_name: string | null
   payload: {
     skill_name: string
+    editorial_name?: string
+    editorial_description?: string
     qualification: string
     local_reasons: Record<string, unknown>
     consent_required: boolean

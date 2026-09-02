@@ -34,6 +34,8 @@ export interface WisdomStatus {
 export interface WisdomCandidate {
   local_skill_id: string
   name: string
+  editorial_name?: string
+  editorial_description?: string
   path: string
   content_hash: string
   eligibility: 'eligible' | 'instruction_only_fork_required'
@@ -57,6 +59,8 @@ export interface WisdomCandidateEvent {
   organization_name: string | null
   payload: {
     skill_name: string
+    editorial_name?: string
+    editorial_description?: string
     qualification: string
     local_reasons: Record<string, unknown>
     consent_required: true

@@ -7802,7 +7802,12 @@ class SlackAdapter(BasePlatformAdapter):
             event_id = str(event["id"])
             payload = event.get("payload")
             payload = payload if isinstance(payload, dict) else {}
-            skill_name = str(payload.get("skill_name") or "Local skill")
+            skill_name = str(
+                payload.get("editorial_name")
+                or payload.get("skill_name")
+                or "Local skill"
+            )
+            skill_description = str(payload.get("editorial_description") or "")
             qualification = str(
                 event.get("qualification") or payload.get("qualification") or ""
             )
@@ -7818,6 +7823,7 @@ class SlackAdapter(BasePlatformAdapter):
             notice = qualification_notice(event)
             view = self._wisdom_candidate_view(
                 skill_name=skill_name,
+                skill_description=skill_description,
                 qualification=qualification,
                 status=(
                     f"{notice}\n\nNothing is shared without your approval.\n\n"
@@ -7928,6 +7934,7 @@ class SlackAdapter(BasePlatformAdapter):
         cls,
         *,
         skill_name: str,
+        skill_description: str = "",
         qualification: str,
         status: str,
         actions,
@@ -7942,7 +7949,10 @@ class SlackAdapter(BasePlatformAdapter):
             items=[
                 WisdomItem(
                     skill_name,
-                    f"Why suggested: {cls._wisdom_candidate_reason(qualification)}",
+                    (
+                        f"{skill_description}\n" if skill_description else ""
+                    )
+                    + f"Why suggested: {cls._wisdom_candidate_reason(qualification)}",
                     actions=list(actions),
                 )
             ],

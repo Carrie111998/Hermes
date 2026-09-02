@@ -1033,6 +1033,9 @@ export interface ProfilesResponse {
 export interface SkillInfo {
   category: string
   description: string
+  /** Human-facing presentation copy; absent on older backends. */
+  editorial_description?: string
+  editorial_name?: string
   enabled: boolean
   name: string
   /** Total observed activity (use + view + patch). Absent on older backends. */
@@ -1046,6 +1049,8 @@ export interface SkillInfo {
 export interface OfficialSkillInfo {
   category: string
   description: string
+  editorial_description?: string
+  editorial_name?: string
   identifier: string
   installed: boolean
   name: string
@@ -1502,6 +1507,8 @@ export interface SkillHubSource {
 export interface SkillHubResult {
   name: string
   description: string
+  editorial_name?: string
+  editorial_description?: string
   source: string
   identifier: string
   trust_level: string
@@ -1533,6 +1540,8 @@ export interface SkillHubSearchResponse {
 export interface SkillHubPreview {
   name: string
   description: string
+  editorial_name?: string
+  editorial_description?: string
   source: string
   identifier: string
   trust_level: string

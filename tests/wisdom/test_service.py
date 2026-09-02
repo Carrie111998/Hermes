@@ -336,7 +336,15 @@ def test_prepare_requires_local_owner_edit_before_any_network(
     skill = tmp_path / "skills" / "my-skill"
     skill.mkdir(parents=True)
     (skill / "SKILL.md").write_text(
-        "---\nname: my-skill\ndescription: Test.\n---\n# Test\n", encoding="utf-8"
+        "---\n"
+        "name: my-skill\n"
+        "description: Test.\n"
+        "metadata:\n"
+        "  hermes:\n"
+        "    editorial_name: My Skill\n"
+        "    editorial_description: A useful skill for people.\n"
+        "---\n# Test\n",
+        encoding="utf-8",
     )
     fake = FakeClient()
     service = WisdomService(store=WisdomStore(tmp_path / "state"), client=fake)
@@ -378,7 +386,7 @@ def test_prepare_requires_local_owner_edit_before_any_network(
 
     prepared = service.suggest("my-skill")
     assert prepared["network_submission"] is False
-    assert prepared["drafted_description"] == "Test."
+    assert prepared["drafted_description"] == "A useful skill for people."
     assert fake.uploaded == 0
     assert {item["path"] for item in prepared["files"]} == {
         "SKILL.md",
@@ -470,11 +478,26 @@ def test_candidate_scan_hides_an_exact_contributed_version_until_content_changes
     skills = tmp_path / "skills"
     skill = skills / "incident-handoff"
     skill.mkdir(parents=True)
-    (skill / "SKILL.md").write_text("# Incident handoff\n", encoding="utf-8")
+    (skill / "SKILL.md").write_text(
+        "---\n"
+        "name: incident-handoff\n"
+        "description: Use when handing off an incident.\n"
+        "metadata:\n"
+        "  hermes:\n"
+        "    editorial_name: Incident Handoff\n"
+        "    editorial_description: Transfer incident context between responders.\n"
+        "---\n# Incident handoff\n",
+        encoding="utf-8",
+    )
     monkeypatch.setattr("hermes_wisdom.service.get_skills_dir", lambda: skills)
     service = WisdomService(store=WisdomStore(tmp_path / "state"), client=FakeClient())
 
     candidate = service.scan_candidates()[0]
+    assert candidate["editorial_name"] == "Incident Handoff"
+    assert (
+        candidate["editorial_description"]
+        == "Transfer incident context between responders."
+    )
     service.store.record_draft({
         "id": "draft-1",
         "skill_id": candidate["local_skill_id"],
@@ -490,7 +513,9 @@ def test_candidate_scan_hides_an_exact_contributed_version_until_content_changes
     assert service.scan_candidates() == []
 
     (skill / "SKILL.md").write_text(
-        "# Incident handoff\n\nNew material guidance.\n", encoding="utf-8"
+        (skill / "SKILL.md").read_text(encoding="utf-8")
+        + "\nNew material guidance.\n",
+        encoding="utf-8",
     )
     changed = service.scan_candidates()
     assert [item["name"] for item in changed] == ["incident-handoff"]
