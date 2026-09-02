@@ -78,6 +78,12 @@ export interface WisdomTranslations {
   preparingLocal: string
   whySuggested: string
   proposalNotice: string
+  sharePrompt: string
+  reviewFirst: string
+  notNow: string
+  yes: string
+  muteNotificationsSoon: string
+  unmuteNotificationsSoon: string
   openCollective: string
   prepareExact: string
   skillName: string

@@ -6,17 +6,19 @@ import type * as HermesApi from '@/hermes'
 
 const getWisdomEvents = vi.fn()
 const getWisdomCandidates = vi.fn()
+const approveWisdomCandidate = vi.fn()
+const deferWisdomCandidate = vi.fn()
 const suggestWisdomSkill = vi.fn()
 const saveWisdomPreparedDraft = vi.fn()
 const reviewWisdomDraft = vi.fn()
 const reviseWisdomDraft = vi.fn()
 const decideWisdomDraft = vi.fn()
-const dismissWisdomCandidate = vi.fn()
 
 vi.mock('@/hermes', async importOriginal => ({
   ...(await importOriginal<typeof HermesApi>()),
+  approveWisdomCandidate,
   decideWisdomDraft,
-  dismissWisdomCandidate,
+  deferWisdomCandidate,
   getWisdomCandidates,
   getWisdomEvents,
   reviewWisdomDraft,
@@ -155,7 +157,10 @@ describe('WisdomCandidateCard', () => {
     expect(screen.queryByDisplayValue('Owner copy')).toBeNull()
     expect(screen.queryByLabelText('Edit SKILL.md')).toBeNull()
     expect(screen.queryByText('Minimum Hermes version')).toBeNull()
-    expect(screen.queryByRole('button', { name: 'Approve & publish' })).toBeNull()
+    expect(screen.getByText('Would you like to share?')).toBeTruthy()
+    expect(screen.getByRole('button', { name: 'Review first' })).toBeTruthy()
+    expect(screen.getByRole('button', { name: 'Not Now' })).toBeTruthy()
+    expect(screen.getByRole('button', { name: 'Yes' })).toBeTruthy()
     fireEvent.click(screen.getByRole('button', { name: 'Review & edit' }))
     expect(screen.getByDisplayValue('Owner copy')).toBeTruthy()
     expect(screen.getByLabelText('Edit SKILL.md')).toBeTruthy()
@@ -196,7 +201,7 @@ describe('WisdomCandidateCard', () => {
     const localEditor = await screen.findByLabelText('Edit SKILL.md')
     fireEvent.change(screen.getByDisplayValue('safe-skill'), { target: { value: 'safer-skill' } })
     fireEvent.change(localEditor, { target: { value: '# Locally edited\n' } })
-    expect((screen.getByRole('button', { name: 'Submit draft' }) as HTMLButtonElement).disabled).toBe(true)
+    expect((screen.getByRole('button', { name: 'Review first' }) as HTMLButtonElement).disabled).toBe(true)
     fireEvent.click(screen.getByRole('button', { name: 'Save' }))
     await waitFor(() =>
       expect(saveWisdomPreparedDraft).toHaveBeenCalledWith(
@@ -211,14 +216,14 @@ describe('WisdomCandidateCard', () => {
     )
 
     await waitFor(() =>
-      expect((screen.getByRole('button', { name: 'Submit draft' }) as HTMLButtonElement).disabled).toBe(false)
+      expect((screen.getByRole('button', { name: 'Review first' }) as HTMLButtonElement).disabled).toBe(false)
     )
-    fireEvent.click(screen.getByRole('button', { name: 'Submit draft' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Review first' }))
     expect(await screen.findByText(/sha256:draft-1-content/)).toBeTruthy()
     expect(suggestWisdomSkill.mock.calls[1][3]).toBe('local-skill-1')
 
     fireEvent.change(screen.getByLabelText('Edit SKILL.md'), { target: { value: '# Rescanned edit\n' } })
-    expect((screen.getByRole('button', { name: 'Approve & publish' }) as HTMLButtonElement).disabled).toBe(true)
+    expect((screen.getByRole('button', { name: 'Yes' }) as HTMLButtonElement).disabled).toBe(true)
     fireEvent.click(screen.getByRole('button', { name: 'Save changes & rescan' }))
     await waitFor(() =>
       expect(reviseWisdomDraft).toHaveBeenCalledWith(
@@ -230,7 +235,7 @@ describe('WisdomCandidateCard', () => {
       )
     )
 
-    fireEvent.click(await screen.findByRole('button', { name: 'Approve & publish' }))
+    fireEvent.click(await screen.findByRole('button', { name: 'Yes' }))
     await waitFor(() => expect(decideWisdomDraft).toHaveBeenCalledWith('draft-2', 'approve', 'research'))
     expect(reviewWisdomDraft.mock.calls[2].slice(0, 2)).toEqual(['draft-2', true])
     expect(screen.queryByText('safe-skill')).toBeNull()
@@ -243,13 +248,34 @@ describe('WisdomCandidateCard', () => {
     expect(screen.queryByText('safe-skill')).toBeNull()
   })
 
-  it('declines the exact local candidate without uploading it', async () => {
-    dismissWisdomCandidate.mockResolvedValue({ dismissed: true })
+  it('defers this notification without declining the qualified candidate', async () => {
+    deferWisdomCandidate.mockResolvedValue({ event_id: 'event-1', state: 'deferred' })
     await renderCard()
-    fireEvent.click(await screen.findByRole('button', { name: 'Decline' }))
-    await waitFor(() =>
-      expect(dismissWisdomCandidate).toHaveBeenCalledWith('local-skill-1', 'sha256:local', 'research')
-    )
+    fireEvent.click(await screen.findByRole('button', { name: 'Not Now' }))
+    await waitFor(() => expect(deferWisdomCandidate).toHaveBeenCalledWith('event-1', 'research'))
     expect(screen.queryByText('safe-skill')).toBeNull()
+  })
+
+  it('publishes directly from Yes through the candidate approval boundary', async () => {
+    approveWisdomCandidate.mockResolvedValue({ publication_state: 'pending_moderation' })
+    await renderCard()
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Yes' }))
+
+    await waitFor(() => expect(approveWisdomCandidate).toHaveBeenCalledWith('event-1', 'research'))
+    expect(decideWisdomDraft).not.toHaveBeenCalled()
+    expect(screen.queryByText('safe-skill')).toBeNull()
+  })
+
+  it('shows the notification mute placeholder as a local visual toggle', async () => {
+    await renderCard()
+
+    const mute = await screen.findByRole('button', { name: 'Mute notifications (coming soon)' })
+    expect(mute.getAttribute('aria-pressed')).toBe('false')
+    fireEvent.click(mute)
+    const unmute = screen.getByRole('button', { name: 'Unmute notifications (coming soon)' })
+    expect(unmute.getAttribute('aria-pressed')).toBe('true')
+    expect(deferWisdomCandidate).not.toHaveBeenCalled()
+    expect(approveWisdomCandidate).not.toHaveBeenCalled()
   })
 })

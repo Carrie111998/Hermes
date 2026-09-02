@@ -7820,21 +7820,21 @@ class SlackAdapter(BasePlatformAdapter):
                 skill_name=skill_name,
                 qualification=qualification,
                 status=(
-                    f"{notice}\n\nNothing is shared until you choose an action.\n"
+                    f"{notice}\n\nNothing is shared without your approval.\n\n"
+                    "Would you like to share?\n"
                     + review_text(professionalism_review, include_checks=True)
                 ),
                 actions=[
                     WisdomAction(
-                        "Decline",
-                        callback_data=f"wi:decline:{event_id}",
-                        destructive=True,
+                        "Not Now",
+                        callback_data=f"wi:defer:{event_id}",
                     ),
                     WisdomAction(
-                        "Submit draft",
+                        "Review first",
                         callback_data=f"wi:draft:{event_id}",
                     ),
                     WisdomAction(
-                        "Approve & publish",
+                        "Yes",
                         callback_data=f"wi:publish:{event_id}",
                         primary=True,
                     ),
@@ -8193,6 +8193,7 @@ class SlackAdapter(BasePlatformAdapter):
             if len(parts) != 3 or parts[:2] not in (
                 ["wi", "draft"],
                 ["wi", "publish"],
+                ["wi", "defer"],
                 ["wi", "decline"],
             ):
                 raise ValueError("Invalid Collective Wisdom action.")
@@ -8206,6 +8207,10 @@ class SlackAdapter(BasePlatformAdapter):
                     return service.draft_candidate(event_id)
                 if candidate_action == "publish":
                     return service.approve_candidate(event_id)
+                if candidate_action == "defer":
+                    return service.defer_candidate_prompt(
+                        event_id, surface="slack"
+                    )
                 return service.decline_candidate(event_id)
 
             result = await self._run_wisdom_profile_operation(
@@ -8228,15 +8233,21 @@ class SlackAdapter(BasePlatformAdapter):
                 status = "Private draft created. Nothing is shared until you approve it."
                 actions = [
                     WisdomAction(
-                        "Decline", callback_data=f"wi:decline:{event_id}"
+                        "Not Now", callback_data=f"wi:defer:{event_id}"
                     ),
                     *view_action,
                     WisdomAction(
-                        "Approve & publish",
+                        "Yes",
                         callback_data=f"wi:publish:{event_id}",
                         primary=True,
                     ),
                 ]
+            elif candidate_action == "defer":
+                status, actions = (
+                    "Not sharing right now. You can revisit this skill in "
+                    "Collective Wisdom.",
+                    [],
+                )
             elif state == "pending_moderation":
                 status, actions = (
                     "Sent to your collective administrator for approval.",

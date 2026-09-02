@@ -371,6 +371,21 @@ export const dismissWisdomCandidate = (
     body: { content_hash: contentHash, local_skill_id: localSkillId }
   })
 
+export const deferWisdomCandidate = (
+  eventId: string,
+  profile?: ProfileScope
+): Promise<{ event_id: string; state: 'deferred' }> =>
+  request('/api/wisdom/candidates/defer', profile, {
+    method: 'POST',
+    body: { event_id: eventId }
+  })
+
+export const approveWisdomCandidate = (eventId: string, profile?: ProfileScope): Promise<Record<string, unknown>> =>
+  request('/api/wisdom/candidates/approve', profile, {
+    method: 'POST',
+    body: { event_id: eventId }
+  })
+
 export const reviseWisdomDraft = (
   draftId: string,
   authorDescription: string,

@@ -339,6 +339,11 @@ class WisdomCandidateDismissRequest(BaseModel):
     profile: Optional[str] = None
 
 
+class WisdomCandidateEventRequest(BaseModel):
+    event_id: str
+    profile: Optional[str] = None
+
+
 class WisdomReviseRequest(BaseModel):
     draft_id: str
     author_description: str = Field(min_length=1, max_length=4096)

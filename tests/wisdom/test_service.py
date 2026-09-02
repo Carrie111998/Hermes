@@ -600,6 +600,48 @@ def test_candidate_notice_projection_is_stable_across_surfaces_and_uses_verified
     )
 
 
+def test_defer_candidate_prompt_hides_only_the_selected_surface(tmp_path: Path):
+    store = WisdomStore(tmp_path / "state")
+    store.installation_identity()
+    store.verify_installation_identity("org-1")
+    skill = tmp_path / "skill"
+    skill.mkdir()
+    (skill / "SKILL.md").write_text("# Useful\n", encoding="utf-8")
+    skill_id = store.register_skill(
+        skill, content_hash="sha256:useful", source_kind="local"
+    )
+    event_id = store.emit_local_event(
+        kind="wisdom.candidate",
+        skill_id=skill_id,
+        content_hash="sha256:useful",
+        payload={"skill_name": "skill", "local_reasons": {}},
+        session_id="session-1",
+        task_id="task-1",
+        qualification="high_usage",
+    )
+    assert event_id is not None
+    service = WisdomService(store=store, client=FakeClient())
+
+    result = service.defer_candidate_prompt(event_id, surface="desktop")
+
+    assert result == {
+        "event_id": event_id,
+        "skill_name": "skill",
+        "qualification": "high_usage",
+        "state": "deferred",
+    }
+    assert service.pending_candidate_events(
+        session_id="session-1", surface="desktop"
+    ) == []
+    assert [
+        event["id"]
+        for event in service.pending_candidate_events(
+            session_id="session-1", surface="telegram"
+        )
+    ] == [event_id]
+    assert store.local_event(event_id)["state"] == "unread"
+
+
 def test_organization_name_mismatch_and_failure_are_negative_cached(
     monkeypatch, tmp_path: Path
 ):

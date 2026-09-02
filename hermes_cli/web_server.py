@@ -1864,6 +1864,7 @@ from hermes_cli.web_models import (  # noqa: F401
     WisdomReviewRequest,
     WisdomPreparedSaveRequest,
     WisdomCandidateDismissRequest,
+    WisdomCandidateEventRequest,
     WisdomReviseRequest,
     WisdomDecisionRequest,
     WisdomSetupRequest,
@@ -15570,7 +15571,9 @@ async def get_wisdom_events(
 ):
     def read(service):
         return {
-            "events": service.local_candidate_events(session_id=session_id)
+            "events": service.pending_candidate_events(
+                session_id=session_id or "", surface="desktop"
+            )
         }
 
     return await _run_wisdom(profile, read)
@@ -15667,6 +15670,23 @@ async def post_wisdom_candidate_dismiss(body: WisdomCandidateDismissRequest):
         lambda service: service.dismiss_local_candidate(
             body.local_skill_id, body.content_hash
         ),
+    )
+
+
+@app.post("/api/wisdom/candidates/defer")
+async def post_wisdom_candidate_defer(body: WisdomCandidateEventRequest):
+    return await _run_wisdom(
+        body.profile,
+        lambda service: service.defer_candidate_prompt(
+            body.event_id, surface="desktop"
+        ),
+    )
+
+
+@app.post("/api/wisdom/candidates/approve")
+async def post_wisdom_candidate_approve(body: WisdomCandidateEventRequest):
+    return await _run_wisdom(
+        body.profile, lambda service: service.approve_candidate(body.event_id)
     )
 
 

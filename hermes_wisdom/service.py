@@ -1273,7 +1273,7 @@ class WisdomService:
         }
 
     def approve_candidate(self, event_id: str) -> dict[str, Any]:
-        """Use an explicit Telegram action as exact-package owner consent."""
+        """Use an explicit qualification action as exact-package owner consent."""
         drafted = self.draft_candidate(event_id)
         state = str(drafted["state"])
         if state in {"pending_moderation", "published"}:
@@ -1335,6 +1335,25 @@ class WisdomService:
             "state": publication_state,
             "publication_state": publication_state,
             "approval": result,
+        }
+
+    def defer_candidate_prompt(
+        self, event_id: str, *, surface: str
+    ) -> dict[str, Any]:
+        """Hide one surface prompt without declining the qualified skill."""
+        if surface not in {"desktop", "slack", "telegram"}:
+            raise WisdomValidationError("unsupported candidate notification surface")
+        event = self._candidate_event(event_id)
+        if event.get("organization_id") != self.store.active_org_id():
+            raise WisdomNotFound("local candidate not found")
+        self.store.mark_surface_delivered([event_id], surface=surface)
+        payload = event.get("payload")
+        payload = payload if isinstance(payload, dict) else {}
+        return {
+            "event_id": event_id,
+            "skill_name": str(payload.get("skill_name") or "Local skill"),
+            "qualification": str(event.get("qualification") or ""),
+            "state": "deferred",
         }
 
     def _resume_candidate_publication(

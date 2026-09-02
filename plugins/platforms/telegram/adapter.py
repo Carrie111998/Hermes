@@ -7886,12 +7886,18 @@ class TelegramAdapter(BasePlatformAdapter):
             except Exception:
                 pass
             return
-        if len(parts) == 3 and parts[1] in {"draft", "publish", "decline"}:
+        if len(parts) == 3 and parts[1] in {
+            "defer",
+            "draft",
+            "publish",
+            "decline",
+        }:
             action, event_id = parts[1], parts[2]
             await query.answer(
                 text={
                     "draft": "Creating private draft…",
                     "publish": "Reviewing and publishing…",
+                    "defer": "Saving for later…",
                     "decline": "Declining…",
                 }[action]
             )
@@ -7904,6 +7910,10 @@ class TelegramAdapter(BasePlatformAdapter):
                     return service.draft_candidate(event_id)
                 if action == "publish":
                     return service.approve_candidate(event_id)
+                if action == "defer":
+                    return service.defer_candidate_prompt(
+                        event_id, surface="telegram"
+                    )
                 return service.decline_candidate(event_id)
 
             try:
@@ -7935,12 +7945,12 @@ class TelegramAdapter(BasePlatformAdapter):
                 if state == "ready":
                     actions = [
                         {
-                            "label": "Decline",
-                            "callback_data": f"wi:decline:{event_id}",
+                            "label": "Not Now",
+                            "callback_data": f"wi:defer:{event_id}",
                         },
                         *view_action,
                         {
-                            "label": "Approve & publish",
+                            "label": "Yes",
                             "callback_data": f"wi:publish:{event_id}",
                             "primary": True,
                         },
@@ -7958,6 +7968,12 @@ class TelegramAdapter(BasePlatformAdapter):
                 status, actions = self._wisdom_candidate_resolved_state(
                     state, already_advanced=already_advanced, view_action=view_action
                 )
+            elif action == "defer":
+                status = (
+                    "Not sharing right now. You can revisit this skill in "
+                    "Collective Wisdom."
+                )
+                actions = []
             else:
                 if state == "published":
                     status = "This skill is already published to your collective."
@@ -8670,15 +8686,15 @@ class TelegramAdapter(BasePlatformAdapter):
             notice = qualification_notice(event)
             actions: List[Dict[str, Any]] = [
                 {
-                    "label": "Decline",
-                    "callback_data": f"wi:decline:{event_id}",
+                    "label": "Not Now",
+                    "callback_data": f"wi:defer:{event_id}",
                 },
                 {
-                    "label": "Submit draft",
+                    "label": "Review first",
                     "callback_data": f"wi:draft:{event_id}",
                 },
                 {
-                    "label": "Approve & publish",
+                    "label": "Yes",
                     "callback_data": f"wi:publish:{event_id}",
                     "primary": True,
                 },
@@ -8686,7 +8702,10 @@ class TelegramAdapter(BasePlatformAdapter):
             html = self._wisdom_candidate_html(
                 skill_name=skill_name,
                 qualification_reason=qualification_reason,
-                status=f"{notice}\n\nNothing is shared until you choose an action.",
+                status=(
+                    f"{notice}\n\nNothing is shared without your approval.\n\n"
+                    "Would you like to share?"
+                ),
                 actions=actions,
                 professionalism_review=professionalism_review,
             )
@@ -8730,7 +8749,8 @@ class TelegramAdapter(BasePlatformAdapter):
                         f"<code>{_html.escape(skill_name)}</code>\n"
                         "<b>Why suggested:</b> "
                         f"{_html.escape(qualification_reason)}\n"
-                        "Nothing is shared until you choose an action.\n\n"
+                        "Nothing is shared without your approval.\n"
+                        "Would you like to share?\n\n"
                         f"{_html.escape(review_text(professionalism_review, include_checks=True))}"
                     ),
                     "parse_mode": ParseMode.HTML,

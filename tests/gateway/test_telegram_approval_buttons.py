@@ -435,11 +435,11 @@ class TestTelegramApprovalCallback:
         assert "consistently across consecutive business days" in html
         assert "consecutive_business_days" not in html
         assert "Australia/Brisbane" not in html
-        assert "Submit draft" in html
-        assert "Approve &amp; publish" in html
-        assert html.index("Decline") < html.index("Submit draft") < html.index(
-            "Approve &amp; publish"
-        )
+        assert "Would you like to share?" in html
+        assert "Review first" in html
+        assert "Yes" in html
+        assert html.index("Not Now") < html.index("Review first") < html.index("Yes")
+        assert f"wi:defer:{event_id}" in html
         assert f"wi:draft:{event_id}" in html
         assert f"wi:publish:{event_id}" in html
         assert store.pending_telegram_events(
@@ -468,10 +468,10 @@ class TestTelegramApprovalCallback:
         )
         notice = qualification_notice({"notice_variant": "returning"})
         actions = [
-            {"label": "Decline", "callback_data": "wi:decline:event-2"},
-            {"label": "Submit draft", "callback_data": "wi:draft:event-2"},
+            {"label": "Not Now", "callback_data": "wi:defer:event-2"},
+            {"label": "Review first", "callback_data": "wi:draft:event-2"},
             {
-                "label": "Approve & publish",
+                "label": "Yes",
                 "callback_data": "wi:publish:event-2",
                 "primary": True,
             },
@@ -479,14 +479,17 @@ class TestTelegramApprovalCallback:
         html = TelegramAdapter._wisdom_candidate_html(
             skill_name="another-skill",
             qualification_reason="It met the local rules.",
-            status=f"{notice}\n\nNothing is shared until you choose an action.",
+            status=(
+                f"{notice}\n\nNothing is shared without your approval.\n\n"
+                "Would you like to share?"
+            ),
             actions=actions,
         )
         keyboard = TelegramAdapter._wisdom_candidate_keyboard(actions)
 
         assert "Hermes detected <b>another</b> skill" in html
         assert keyboard is not None
-        assert captured_rows == [["Decline", "Submit draft", "Approve & publish"]]
+        assert captured_rows == [["Not Now", "Review first", "Yes"]]
 
     def test_wisdom_candidate_reason_explains_refinement_without_raw_evidence(self):
         reason = TelegramAdapter._wisdom_candidate_qualification_reason("refinement")
@@ -528,12 +531,42 @@ class TestTelegramApprovalCallback:
             "rich_message"
         ]["html"]
         assert "Private draft created" in html
-        assert "Approve &amp; publish" in html
+        assert "Yes" in html
         assert "https://portal.test/review/draft-1" in html
-        assert "wi:decline:event-1" in html
-        assert html.index("Decline") < html.index("View") < html.index(
-            "Approve &amp; publish"
+        assert "wi:defer:event-1" in html
+        assert html.index("Not Now") < html.index("View") < html.index("Yes")
+
+    @pytest.mark.asyncio
+    async def test_wisdom_candidate_not_now_defers_without_declining(self):
+        adapter = _make_adapter()
+        query = AsyncMock()
+        query.data = "wi:defer:event-1"
+        query.message = MagicMock(chat_id=12345, message_id=79)
+        query.from_user = MagicMock(id="12345", first_name="Shannon")
+        query.answer = AsyncMock()
+        query.edit_message_text = AsyncMock()
+        service = MagicMock()
+        service.defer_candidate_prompt.return_value = {
+            "skill_name": "telegram-skill",
+            "qualification": "high_usage",
+            "state": "deferred",
+        }
+
+        with patch.dict(os.environ, {"TELEGRAM_ALLOWED_USERS": "*"}, clear=False):
+            with patch("hermes_wisdom.service.WisdomService", return_value=service):
+                await adapter._handle_callback_query(
+                    MagicMock(callback_query=query), MagicMock()
+                )
+
+        service.defer_candidate_prompt.assert_called_once_with(
+            "event-1", surface="telegram"
         )
+        service.decline_candidate.assert_not_called()
+        html = adapter._bot.do_api_request.await_args.kwargs["api_kwargs"][
+            "rich_message"
+        ]["html"]
+        assert "Not sharing right now" in html
+        assert "Collective Wisdom" in html
 
     @pytest.mark.asyncio
     async def test_wisdom_candidate_publish_callback_reports_moderation_state(self):

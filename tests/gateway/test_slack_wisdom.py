@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -68,13 +68,14 @@ def test_candidate_card_uses_returning_copy_and_requested_action_order():
         qualification="high_usage",
         status=(
             "Hermes detected another skill that could be useful to your team.\n\n"
-            "Nothing is shared until you choose an action."
+            "Nothing is shared without your approval.\n\n"
+            "Would you like to share?"
         ),
         actions=[
-            WisdomAction("Decline", callback_data="wi:decline:event-2", destructive=True),
-            WisdomAction("Submit draft", callback_data="wi:draft:event-2"),
+            WisdomAction("Not Now", callback_data="wi:defer:event-2"),
+            WisdomAction("Review first", callback_data="wi:draft:event-2"),
             WisdomAction(
-                "Approve & publish",
+                "Yes",
                 callback_data="wi:publish:event-2",
                 primary=True,
             ),
@@ -84,11 +85,44 @@ def test_candidate_card_uses_returning_copy_and_requested_action_order():
     blocks = render_wisdom_blocks(view)
     action_block = next(block for block in blocks if block["type"] == "actions")
     assert [button["text"]["text"] for button in action_block["elements"]] == [
-        "Decline",
-        "Submit draft",
-        "Approve & publish",
+        "Not Now",
+        "Review first",
+        "Yes",
     ]
     assert "Hermes detected *another* skill" in wisdom_fallback_text(view)
+    assert "Would you like to share?" in wisdom_fallback_text(view)
+
+
+@pytest.mark.asyncio
+async def test_candidate_not_now_defers_the_slack_prompt_without_declining():
+    adapter = _adapter()
+    adapter._is_interactive_user_authorized = MagicMock(return_value=True)
+    adapter._wisdom_callback_profile = MagicMock(return_value="demo")
+    adapter._update_wisdom_interaction = AsyncMock()
+    service = MagicMock()
+    service.defer_candidate_prompt.return_value = {
+        "skill_name": "incident-handoff",
+        "qualification": "high_usage",
+        "state": "deferred",
+    }
+    body = {
+        "team": {"id": "T1"},
+        "channel": {"id": "D1"},
+        "user": {"id": "U1", "name": "Shannon"},
+        "message": {"ts": "1.2"},
+    }
+
+    with patch("hermes_wisdom.service.WisdomService", return_value=service):
+        await adapter._handle_wisdom_action(
+            AsyncMock(), body, {"value": "wi:defer:event-1"}
+        )
+
+    service.defer_candidate_prompt.assert_called_once_with(
+        "event-1", surface="slack"
+    )
+    service.decline_candidate.assert_not_called()
+    view = adapter._update_wisdom_interaction.await_args.args[1]
+    assert "Not sharing right now" in wisdom_fallback_text(view)
 
 
 def test_wisdom_blocks_escape_untrusted_skill_text_and_limit_items():

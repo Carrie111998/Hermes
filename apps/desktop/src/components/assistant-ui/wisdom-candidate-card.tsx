@@ -2,12 +2,14 @@ import { useEffect, useLayoutEffect, useRef, useState } from 'react'
 
 import { WisdomFileEditor } from '@/app/skills/wisdom-file-editor'
 import { parseWisdomManifest, wisdomManifestValidationError } from '@/app/skills/wisdom-manifest'
+import { TooltipIconButton } from '@/components/assistant-ui/tooltip-icon-button'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Textarea } from '@/components/ui/textarea'
 import {
+  approveWisdomCandidate,
   decideWisdomDraft,
-  dismissWisdomCandidate,
+  deferWisdomCandidate,
   getWisdomCandidates,
   getWisdomEvents,
   type ProfileScope,
@@ -22,6 +24,7 @@ import {
   type WisdomPreparedDraft
 } from '@/hermes'
 import { useI18n } from '@/i18n'
+import { Volume2, VolumeX } from '@/lib/icons'
 import { notifyError } from '@/store/notifications'
 
 const MAX_INLINE_REVIEW_BYTES = 256 * 1024
@@ -78,8 +81,9 @@ export function WisdomCandidateCard({ profile, sessionId }: { profile?: ProfileS
   const [localScan, setLocalScan] = useState<null | WisdomLocalScan>(null)
   const [editorOpen, setEditorOpen] = useState(false)
   const [detailedEditorOpen, setDetailedEditorOpen] = useState(false)
+  const [notificationsMuted, setNotificationsMuted] = useState(false)
 
-  const [busy, setBusy] = useState<null | 'approve' | 'decline' | 'prepare' | 'save-local' | 'save-server' | 'submit'>(
+  const [busy, setBusy] = useState<null | 'approve' | 'defer' | 'prepare' | 'save-local' | 'save-server' | 'submit'>(
     null
   )
 
@@ -155,6 +159,7 @@ export function WisdomCandidateCard({ profile, sessionId }: { profile?: ProfileS
   useEffect(() => {
     setEditorOpen(false)
     setDetailedEditorOpen(false)
+    setNotificationsMuted(false)
   }, [eventId])
 
   useEffect(() => {
@@ -354,42 +359,42 @@ export function WisdomCandidateCard({ profile, sessionId }: { profile?: ProfileS
     }
   }
 
-  const decline = async () => {
-    setBusy('decline')
+  const notNow = async () => {
+    setBusy('defer')
 
     try {
-      if (review) {
-        await decideWisdomDraft(review.draft.id, 'decline', profile)
-      } else if (prepared) {
-        await dismissWisdomCandidate(prepared.localSkillId, event.content_hash, profile)
-      }
-
+      await deferWisdomCandidate(event.id, profile)
       resolvedEventIdsRef.current.add(event.id)
       setPrepared(null)
       setReview(null)
       setEvent(null)
     } catch (error) {
-      notifyError(error, 'Collective Wisdom decline failed')
+      notifyError(error, 'Collective Wisdom notification could not be deferred')
     } finally {
       setBusy(null)
     }
   }
 
   const approve = async () => {
-    if (!review || reviewDirty) {
+    if ((!review && (!prepared || preparedDirty || preparedManifestError)) || (review && reviewDirty)) {
       return
     }
 
     setBusy('approve')
 
     try {
-      const acknowledged = await reviewWisdomDraft(review.draft.id, true, profile)
+      if (review) {
+        const acknowledged = await reviewWisdomDraft(review.draft.id, true, profile)
 
-      if (!acknowledged.receipt) {
-        throw new Error('Complete-package review receipt was not created')
+        if (!acknowledged.receipt) {
+          throw new Error('Complete-package review receipt was not created')
+        }
+
+        await decideWisdomDraft(review.draft.id, 'approve', profile)
+      } else {
+        await approveWisdomCandidate(event.id, profile)
       }
 
-      await decideWisdomDraft(review.draft.id, 'approve', profile)
       resolvedEventIdsRef.current.add(event.id)
       setPrepared(null)
       setReview(null)
@@ -420,6 +425,7 @@ export function WisdomCandidateCard({ profile, sessionId }: { profile?: ProfileS
       <div className="border-b border-(--ui-stroke-tertiary) px-4 py-3">
         <p className="text-xs leading-5">{qualificationNotice}</p>
         <p className="mt-1 text-xs text-muted-foreground">{copy.proposalNotice}</p>
+        <p className="mt-2 text-xs font-medium">{copy.sharePrompt}</p>
       </div>
 
       {!prepared && !review && (
@@ -591,9 +597,17 @@ export function WisdomCandidateCard({ profile, sessionId }: { profile?: ProfileS
             )}
           </div>
           <footer className="mt-3 grid grid-cols-3 items-center gap-2">
-            <div className="justify-self-start">
-              <Button disabled={busy !== null} onClick={() => void decline()} size="sm" variant="outline">
-                {copy.decline}
+            <div className="flex items-center gap-1 justify-self-start">
+              <TooltipIconButton
+                aria-pressed={notificationsMuted}
+                disabled={busy !== null}
+                onClick={() => setNotificationsMuted(value => !value)}
+                tooltip={notificationsMuted ? copy.unmuteNotificationsSoon : copy.muteNotificationsSoon}
+              >
+                {notificationsMuted ? <VolumeX className="size-4" /> : <Volume2 className="size-4" />}
+              </TooltipIconButton>
+              <Button disabled={busy !== null} onClick={() => void notNow()} size="sm" variant="outline">
+                {copy.notNow}
               </Button>
             </div>
             <div className="justify-self-center">
@@ -602,10 +616,18 @@ export function WisdomCandidateCard({ profile, sessionId }: { profile?: ProfileS
                 onClick={() => void submit()}
                 size="sm"
               >
-                {busy === 'submit' ? copy.submitting : copy.sendPrivateReview}
+                {busy === 'submit' ? copy.submitting : copy.reviewFirst}
               </Button>
             </div>
-            <span aria-hidden="true" />
+            <div className="justify-self-end">
+              <Button
+                disabled={busy !== null || preparedDirty || Boolean(preparedManifestError)}
+                onClick={() => void approve()}
+                size="sm"
+              >
+                {busy === 'approve' ? copy.publishing : copy.yes}
+              </Button>
+            </div>
           </footer>
         </div>
       )}
@@ -737,9 +759,17 @@ export function WisdomCandidateCard({ profile, sessionId }: { profile?: ProfileS
 
           <div className="mt-3 border-t border-(--ui-stroke-tertiary) pt-3">{fullReviewLink}</div>
           <footer className="mt-3 grid grid-cols-3 items-center gap-2">
-            <div className="justify-self-start">
-              <Button disabled={busy !== null} onClick={() => void decline()} size="sm" variant="outline">
-                {copy.decline}
+            <div className="flex items-center gap-1 justify-self-start">
+              <TooltipIconButton
+                aria-pressed={notificationsMuted}
+                disabled={busy !== null}
+                onClick={() => setNotificationsMuted(value => !value)}
+                tooltip={notificationsMuted ? copy.unmuteNotificationsSoon : copy.muteNotificationsSoon}
+              >
+                {notificationsMuted ? <VolumeX className="size-4" /> : <Volume2 className="size-4" />}
+              </TooltipIconButton>
+              <Button disabled={busy !== null} onClick={() => void notNow()} size="sm" variant="outline">
+                {copy.notNow}
               </Button>
             </div>
             <div className="flex flex-wrap justify-center gap-2">
@@ -775,7 +805,7 @@ export function WisdomCandidateCard({ profile, sessionId }: { profile?: ProfileS
             </div>
             <div className="justify-self-end">
               <Button disabled={busy !== null || reviewDirty} onClick={() => void approve()} size="sm">
-                {busy === 'approve' ? copy.publishing : copy.approvePublish}
+                {busy === 'approve' ? copy.publishing : copy.yes}
               </Button>
             </div>
           </footer>

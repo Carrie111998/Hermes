@@ -9,6 +9,7 @@ from fastapi import HTTPException
 
 from hermes_cli import web_server
 from hermes_cli.web_models import (
+    WisdomCandidateEventRequest,
     WisdomEditedFile,
     WisdomCandidateDismissRequest,
     WisdomInstallApplyRequest,
@@ -211,7 +212,7 @@ def test_revise_bff_forwards_complete_content_and_hash_preconditions(
     ]
 
 
-def test_prepared_save_and_candidate_dismiss_remain_profile_scoped(monkeypatch) -> None:
+def test_prepared_save_and_candidate_actions_remain_profile_scoped(monkeypatch) -> None:
     calls = []
 
     class Service:
@@ -222,6 +223,14 @@ def test_prepared_save_and_candidate_dismiss_remain_profile_scoped(monkeypatch) 
         def dismiss_local_candidate(self, local_skill_id, content_hash):
             calls.append(("dismiss", local_skill_id, content_hash))
             return {"dismissed": True}
+
+        def defer_candidate_prompt(self, event_id, *, surface):
+            calls.append(("defer", event_id, surface))
+            return {"event_id": event_id, "state": "deferred"}
+
+        def approve_candidate(self, event_id):
+            calls.append(("approve", event_id))
+            return {"event_id": event_id, "state": "pending_moderation"}
 
     async def run(profile, fn):
         calls.append(("profile", profile))
@@ -258,9 +267,21 @@ def test_prepared_save_and_candidate_dismiss_remain_profile_scoped(monkeypatch) 
             )
         )
     )
+    deferred = asyncio.run(
+        web_server.post_wisdom_candidate_defer(
+            WisdomCandidateEventRequest(event_id="event-1", profile="research")
+        )
+    )
+    approved = asyncio.run(
+        web_server.post_wisdom_candidate_approve(
+            WisdomCandidateEventRequest(event_id="event-1", profile="research")
+        )
+    )
 
     assert saved == {"local_draft_id": "local:1"}
     assert dismissed == {"dismissed": True}
+    assert deferred == {"event_id": "event-1", "state": "deferred"}
+    assert approved == {"event_id": "event-1", "state": "pending_moderation"}
     assert calls == [
         ("profile", "research"),
         (
@@ -274,7 +295,35 @@ def test_prepared_save_and_candidate_dismiss_remain_profile_scoped(monkeypatch) 
         ("schedule", "research"),
         ("profile", "research"),
         ("dismiss", "skill-1", "sha256:content"),
+        ("profile", "research"),
+        ("defer", "event-1", "desktop"),
+        ("profile", "research"),
+        ("approve", "event-1"),
     ]
+
+
+def test_candidate_event_feed_is_scoped_to_undelivered_desktop_events(
+    monkeypatch,
+) -> None:
+    calls = []
+
+    class Service:
+        def pending_candidate_events(self, *, session_id, surface):
+            calls.append((session_id, surface))
+            return [{"id": "event-1"}]
+
+    async def run(profile, fn):
+        calls.append(profile)
+        return fn(Service())
+
+    monkeypatch.setattr(web_server, "_run_wisdom", run)
+
+    result = asyncio.run(
+        web_server.get_wisdom_events(profile="research", session_id="session-1")
+    )
+
+    assert result == {"events": [{"id": "event-1"}]}
+    assert calls == ["research", ("session-1", "desktop")]
 
 
 def test_install_apply_bff_requires_a_plan_receipt(monkeypatch) -> None:

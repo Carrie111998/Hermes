@@ -1485,7 +1485,13 @@ export const ru = defineLocale({
       qualificationFirst: organizationName =>
         `${organizationName ? `Ваша организация (${organizationName})` : 'Ваша организация'} включила Collective Wisdom — функцию, которая автоматически находит полезные навыки у всех участников команды. Поздравляем! Hermes обнаружил навык, который может быть полезен вашей команде.`,
       qualificationReturning: 'Hermes обнаружил ещё один навык, который может быть полезен вашей команде.',
-      sendPrivateReview: 'Отправить черновик'
+      sendPrivateReview: 'Отправить черновик',
+      sharePrompt: 'Хотите поделиться?',
+      reviewFirst: 'Сначала проверить',
+      notNow: 'Не сейчас',
+      yes: 'Да',
+      muteNotificationsSoon: 'Отключить уведомления (скоро)',
+      unmuteNotificationsSoon: 'Включить уведомления (скоро)'
     },
     tabSkills: 'Навыки',
     tabToolsets: 'Инструменты',
