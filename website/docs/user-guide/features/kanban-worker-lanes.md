@@ -53,9 +53,9 @@ Every claim must end in exactly one of:
 - `kanban_complete(summary=..., metadata=...)` — task succeeds, status flips to `done`.
 - `kanban_request_review(summary=..., metadata=..., reviewer=...)` — same-card implementation is complete and enters first-class review; status flips to `review`. The dispatcher loads the bundled `sdlc-review` skill unless `kanban.review_dispatch` is disabled. A reviewer approves with `kanban_complete`, returns actionable rework with `kanban_request_changes`, or escalates a genuine external blocker with `kanban_block`.
 - `kanban_block(reason=...)` — task waits for human input, status flips to `blocked`. The dispatcher respawns when `kanban_unblock` runs.
-- The worker process exits without a tool call. The kernel reaps it and emits `crashed` (PID died) or `gave_up` (consecutive-failure breaker tripped) or `timed_out` (max_runtime exceeded). This is the failure path; healthy workers don't end here.
+- The worker process exits without a tool call. A clean exit closes the run as `handoff_missing` and parks the task in `blocked` with the exact worker session id. Non-zero exits, signals, and missing PIDs remain `crashed`; runtime overruns remain `timed_out`.
 
-The kanban kernel enforces that exactly one of these terminates each run. A worker that calls neither and exits normally is treated as crashed.
+The kanban kernel enforces that exactly one of these terminates each run. A clean process exit does not claim that the work succeeded, and it does not trigger a blind retry. Inspect the attached worker session, then explicitly continue, review, or close the task.
 
 ## Outputs and the review handoff
 
@@ -73,7 +73,7 @@ The injected `KANBAN_GUIDANCE` covers both graph shapes, `kanban_complete`, the 
 
 The dispatcher writes per-task worker stdout/stderr to `<board-root>/logs/<task_id>.log`. Logs are auditable from kanban metadata:
 
-- `task_runs` rows carry the `log_path`, exit code (where available), summary, and metadata.
+- `task_runs` rows carry the exit code (where available), summary, and metadata. A `handoff_missing` run also carries `worker_session_id`; the per-task log remains at `<board-root>/logs/<task_id>.log`.
 - `task_events` rows carry every state transition (`promoted`, `claimed`, `heartbeat`, `completed`, `blocked`, `review_requested`, `changes_requested`, `review_reopened`, `gave_up`, `crashed`, `timed_out`, `reclaimed`, `claim_extended`).
 - `kanban_show` returns both, so a reviewer (or a follow-up worker) reading the task gets the full history without needing dashboard access.
 

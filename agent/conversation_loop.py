@@ -8979,7 +8979,7 @@ def run_conversation(
                 # Workers must end with kanban_complete / kanban_block.
                 # Models sometimes narrate the next step ("Let me write the
                 # report") and stop with finish_reason=stop — a clean exit
-                # that the dispatcher records as protocol_violation. Nudge
+                # that the dispatcher records as handoff_missing. Nudge
                 # once or twice before allowing that exit.
                 try:
                     from agent.kanban_stop import build_kanban_stop_nudge
