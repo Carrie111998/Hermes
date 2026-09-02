@@ -134,6 +134,74 @@ class TestLookupModelsDevContext:
         mock_fetch.return_value = SAMPLE_REGISTRY
         assert lookup_models_dev_context("anthropic", "claude-opus-4-6") == 1000000
 
+    @pytest.mark.parametrize(
+        "suffix",
+        (":free", ":extended", ":thinking", ":nitro", ":floor", ":exacto", ":online"),
+    )
+    @patch("agent.models_dev.fetch_models_dev")
+    def test_openrouter_routing_suffix_uses_bare_catalog_entry(self, mock_fetch, suffix):
+        mock_fetch.return_value = {
+            "openrouter": {
+                "models": {
+                    "z-ai/glm-5.3-flash": {
+                        "limit": {"context": 1_310_720, "output": 131_072},
+                    },
+                },
+            },
+        }
+
+        assert (
+            lookup_models_dev_context("openrouter", f"z-ai/glm-5.3-flash{suffix}")
+            == 1_310_720
+        )
+
+    @patch("agent.models_dev.fetch_models_dev")
+    def test_openrouter_routing_suffix_normalization_is_provider_scoped(self, mock_fetch):
+        mock_fetch.return_value = SAMPLE_REGISTRY
+
+        assert lookup_models_dev_context("anthropic", "claude-opus-4-6:free") is None
+
+    @patch("agent.models_dev.fetch_models_dev")
+    def test_unknown_openrouter_suffix_does_not_alias_catalog_model(self, mock_fetch):
+        mock_fetch.return_value = {
+            "openrouter": {
+                "models": {
+                    "z-ai/glm-5.3-flash": {"limit": {"context": 1_310_720}},
+                },
+            },
+        }
+
+        assert lookup_models_dev_context("openrouter", "z-ai/glm-5.3-flash:beta") is None
+
+    @patch("agent.models_dev.fetch_models_dev")
+    def test_openrouter_routing_suffix_preserves_full_id_for_model_info(self, mock_fetch):
+        mock_fetch.return_value = {
+            "openrouter": {
+                "models": {
+                    "z-ai/glm-5.3-flash": {
+                        "tool_call": True,
+                        "reasoning": True,
+                        "modalities": {"input": ["text", "image"]},
+                        "limit": {"context": 1_310_720, "output": 131_072},
+                    },
+                },
+            },
+        }
+        routed_id = "z-ai/glm-5.3-flash:floor"
+
+        caps = get_model_capabilities("openrouter", routed_id)
+        info = get_model_info("openrouter", routed_id)
+
+        assert caps is not None
+        assert caps.context_window == 1_310_720
+        assert caps.max_output_tokens == 131_072
+        assert caps.supports_tools is True
+        assert caps.supports_reasoning is True
+        assert caps.supports_vision is True
+        assert info is not None
+        assert info.id == routed_id
+        assert info.context_window == 1_310_720
+
 
 
 
