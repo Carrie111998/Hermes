@@ -4309,6 +4309,7 @@ def _resolve_gateway_model(config: dict | None = None) -> str:
 def _channel_override_lookup_keys(
     chat_id: str,
     *,
+    platform: Platform,
     thread_id: Optional[str] = None,
     parent_id: Optional[str] = None,
 ) -> list[str]:
@@ -4327,6 +4328,19 @@ def _channel_override_lookup_keys(
             continue
         seen.add(sk)
         keys.append(sk)
+    # Webhook sessions use per-delivery chat ids ("webhook:<route>:<delivery>");
+    # also try the route-level "webhook:<route>" key so a static
+    # channel_overrides entry can target every delivery on a route.
+    if platform == Platform.WEBHOOK:
+        for key in list(keys):
+            if not key.startswith("webhook:"):
+                continue
+            parts = key.split(":")
+            if len(parts) >= 3:
+                route_key = ":".join(parts[:2])
+                if route_key not in seen:
+                    seen.add(route_key)
+                    keys.append(route_key)
     return keys
 
 
@@ -4351,7 +4365,7 @@ def _get_channel_override(
         return None
     overrides = platform_config.channel_overrides
     for key in _channel_override_lookup_keys(
-        chat_id, thread_id=thread_id, parent_id=parent_id
+        chat_id, platform=platform, thread_id=thread_id, parent_id=parent_id
     ):
         ov = overrides.get(key)
         if ov is not None:
