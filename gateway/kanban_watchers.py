@@ -705,6 +705,10 @@ class GatewayKanbanWatchersMixin:
 
                         if sub.get("thread_id") and not metadata.get("thread_id"):
                             metadata["thread_id"] = sub["thread_id"]
+                        if str(sub.get("platform") or "").lower() == "slack":
+                            from gateway.platforms.base import strict_machine_thread_metadata
+
+                            metadata = strict_machine_thread_metadata(metadata)
                         # Adapters with no push channel (the API server —
                         # ``supports_async_delivery = False``) can NEVER
                         # satisfy a text-send: ``send()`` always reports
@@ -998,6 +1002,9 @@ class GatewayKanbanWatchersMixin:
                                 user_id_alt=sub.get("user_id_alt"),
                                 profile=sub_profile or None,
                                 scope_id=_wake_scope_id(adapter, sub),
+                                strict_machine_thread_affinity=(
+                                    getattr(plat, "value", plat) == "slack"
+                                ),
                             )
                             # deliver_wake preserves the synthetic
                             # MessageEvent/handle_message path for

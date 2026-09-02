@@ -23,6 +23,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from gateway.config import PlatformConfig
+from gateway.platforms.base import strict_machine_thread_metadata
 from plugins.platforms.slack.adapter import SlackAdapter
 
 
@@ -43,6 +44,119 @@ def _make_adapter(extra=None):
 
 
 META = {"thread_id": "111.000", "user_id": "U123"}
+
+
+class TestStrictMachineThreadAffinity:
+    @pytest.mark.asyncio
+    async def test_exact_thread_is_used_for_machine_post(self):
+        adapter, client = _make_adapter()
+
+        result = await adapter.send(
+            "C0BTQQX0SLC",
+            "Machine update",
+            metadata=strict_machine_thread_metadata(
+                {"thread_id": "1788217797.757469"}
+            ),
+        )
+
+        assert result.success
+        assert client.chat_postMessage.await_args.kwargs["thread_ts"] == (
+            "1788217797.757469"
+        )
+
+    @pytest.mark.asyncio
+    async def test_unanchored_machine_post_is_suppressed(self):
+        adapter, client = _make_adapter()
+
+        result = await adapter.send(
+            "C0BTQQX0SLC",
+            "Machine update",
+            metadata=strict_machine_thread_metadata(),
+        )
+
+        assert not result.success
+        assert "thread anchor" in (result.error or "")
+        client.chat_postMessage.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_unanchored_machine_stream_is_suppressed(self):
+        adapter, client = _make_adapter()
+
+        result = await adapter.send_draft(
+            "C0BTQQX0SLC",
+            7,
+            "Machine update",
+            metadata=strict_machine_thread_metadata(),
+        )
+
+        assert not result.success
+        assert "thread anchor" in (result.error or "")
+        client.chat_startStream.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_unanchored_machine_file_upload_is_suppressed(self, tmp_path):
+        adapter, client = _make_adapter()
+        file_path = tmp_path / "status.txt"
+        file_path.write_text("machine status")
+
+        result = await adapter._upload_file(
+            "C0BTQQX0SLC",
+            str(file_path),
+            metadata=strict_machine_thread_metadata(),
+        )
+
+        assert not result.success
+        assert "thread anchor" in (result.error or "")
+        client.files_upload_v2.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_direct_human_root_send_remains_allowed(self):
+        adapter, client = _make_adapter()
+
+        result = await adapter.send("C0BTQQX0SLC", "Human-authored root send")
+
+        assert result.success
+        assert "thread_ts" not in client.chat_postMessage.await_args.kwargs
+
+    @pytest.mark.asyncio
+    async def test_machine_reply_anchor_ignores_flat_reply_preference(self):
+        adapter, client = _make_adapter({"reply_in_thread": False})
+
+        result = await adapter.send(
+            "D1",
+            "Machine update",
+            reply_to="1788217797.757469",
+            metadata=strict_machine_thread_metadata(),
+        )
+
+        assert result.success
+        assert (
+            client.chat_postMessage.await_args.kwargs["thread_ts"]
+            == "1788217797.757469"
+        )
+
+    @pytest.mark.asyncio
+    async def test_machine_final_does_not_seal_stream_in_a_different_thread(self):
+        adapter, client = _make_adapter()
+        origin_thread = "1788217797.757469"
+        final_thread = "1788217999.000001"
+
+        await adapter.send_draft(
+            "C0BTQQX0SLC",
+            7,
+            "Machine update",
+            metadata=strict_machine_thread_metadata({"thread_id": origin_thread}),
+        )
+
+        result = await adapter.send(
+            "C0BTQQX0SLC",
+            "Machine update final",
+            metadata=strict_machine_thread_metadata({"thread_id": final_thread}),
+        )
+
+        assert result.success
+        client.chat_stopStream.assert_not_awaited()
+        assert client.chat_postMessage.await_args.kwargs["thread_ts"] == final_thread
 
 
 class TestSupportsDraftStreaming:

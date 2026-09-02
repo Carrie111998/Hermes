@@ -45,8 +45,12 @@ def slack_job():
     return {
         "id": "job-media-1",
         "name": "media-parity",
-        "deliver": "slack:D0123456789",
-        "origin": {"platform": "slack", "chat_id": "D0123456789"},
+        "deliver": "origin",
+        "origin": {
+            "platform": "slack",
+            "chat_id": "D0123456789",
+            "thread_id": "1788217797.757469",
+        },
     }
 
 
@@ -319,8 +323,12 @@ class TestMediaPolicyEnvBridge:
         job = {
             "id": "job-media-3",
             "name": "bridge",
-            "deliver": "slack:D0123456789",
-            "origin": {"platform": "slack", "chat_id": "D0123456789"},
+            "deliver": "origin",
+            "origin": {
+                "platform": "slack",
+                "chat_id": "D0123456789",
+                "thread_id": "1788217797.757469",
+            },
         }
         _deliver_result(job, f"Report.\n\nMEDIA:{media_file}", adapters=None, loop=None)
         sent_media = [m for c in calls for m in c["media_files"]]

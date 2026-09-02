@@ -121,6 +121,39 @@ def _platform_name(platform) -> str:
     return str(value or "").lower()
 
 
+_STRICT_MACHINE_THREAD_AFFINITY_KEY = "_strict_machine_thread_affinity"
+_STRICT_MACHINE_THREAD_AFFINITY_ERROR = (
+    "strict machine Slack delivery requires an exact thread anchor"
+)
+
+
+def strict_machine_thread_metadata(metadata: dict | None = None) -> dict:
+    """Mark a machine-generated send as fail-closed for Slack threads."""
+    strict_metadata = dict(metadata) if metadata else {}
+    strict_metadata[_STRICT_MACHINE_THREAD_AFFINITY_KEY] = True
+    return strict_metadata
+
+
+def is_strict_machine_thread_delivery(metadata: dict | None) -> bool:
+    """Return whether *metadata* carries the strict machine-delivery policy."""
+    return bool((metadata or {}).get(_STRICT_MACHINE_THREAD_AFFINITY_KEY))
+
+
+def strict_machine_thread_affinity_error(
+    platform,
+    metadata: dict | None,
+    thread_anchor: object | None,
+) -> str | None:
+    """Return an explicit suppression error for an unanchored strict send."""
+    if not is_strict_machine_thread_delivery(metadata):
+        return None
+    if _platform_name(platform) != "slack":
+        return None
+    if str(thread_anchor or "").strip():
+        return None
+    return _STRICT_MACHINE_THREAD_AFFINITY_ERROR
+
+
 def _float_env(name: str, default: float) -> float:
     raw = os.environ.get(name, "").strip()
     if not raw:
@@ -143,6 +176,8 @@ def _thread_metadata_for_source(source, reply_to_message_id: str | None = None) 
     """
     thread_id = getattr(source, "thread_id", None)
     metadata = {"thread_id": thread_id} if thread_id is not None else {}
+    if getattr(source, "strict_machine_thread_affinity", False):
+        metadata = strict_machine_thread_metadata(metadata)
     # Slack workspace identity is durable routing state, not ephemeral event
     # metadata. Carry it on every outbound path (including unthreaded sends)
     # so a multi-workspace Socket Mode gateway never falls back to its primary

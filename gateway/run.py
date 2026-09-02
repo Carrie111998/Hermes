@@ -711,12 +711,14 @@ def _non_conversational_metadata(
     *,
     platform: Any = None,
 ) -> Optional[Dict[str, Any]]:
-    """Mark Discord lifecycle/status sends without changing other platforms."""
-    if _gateway_platform_value(platform) != "discord":
-        return metadata
+    """Mark machine lifecycle/status sends and enforce Slack thread affinity."""
+    platform_value = _gateway_platform_value(platform)
     merged = dict(metadata or {})
-    merged["non_conversational"] = True
-    return merged
+    if platform_value == "slack":
+        merged = strict_machine_thread_metadata(merged)
+    if platform_value == "discord":
+        merged["non_conversational"] = True
+    return merged or None
 
 
 def _interim_metadata(
@@ -3022,6 +3024,7 @@ from gateway.platforms.base import (
     _reply_anchor_for_event,
     build_auto_tts_output_path,
     merge_pending_message_event,
+    strict_machine_thread_metadata,
     utf16_len,
 )
 from gateway.shutdown_watchdog import (
@@ -25772,6 +25775,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             chat_type=getattr(source, "chat_type", None),
             reply_to_message_id=reply_to_message_id or getattr(source, "message_id", None),
         )
+        if getattr(source, "strict_machine_thread_affinity", False):
+            metadata = strict_machine_thread_metadata(metadata)
         if getattr(source, "platform", None) == Platform.SLACK:
             # Per-turn egress identity (R3-5, connector PR gateway-gateway#210).
             # Slack's chat.startStream requires recipient_user_id (+
@@ -27034,9 +27039,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         Falling back to the currently active foreground event is what causes
         cross-topic bleed, so don't do that.
         """
+        from dataclasses import replace
+
         from gateway.session import SessionSource
 
         session_key = str(evt.get("session_key") or "").strip()
+        origin_source = None
         derived_platform = ""
         derived_chat_type = ""
         derived_chat_id = ""
@@ -27046,7 +27054,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 self.session_store._ensure_loaded()
                 entry = self.session_store._entries.get(session_key)
                 if entry and getattr(entry, "origin", None):
-                    return entry.origin
+                    origin_source = entry.origin
             except Exception as exc:
                 logger.debug(
                     "Synthetic process-event session-store lookup failed for %s: %s",
@@ -27054,15 +27062,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     exc,
                 )
 
-            cached_source = self._get_cached_session_source(session_key)
-            if cached_source is not None:
-                return cached_source
+            if origin_source is None:
+                origin_source = self._get_cached_session_source(session_key)
 
-            _parsed = _parse_session_key(session_key)
-            if _parsed:
-                derived_platform = _parsed["platform"]
-                derived_chat_type = _parsed["chat_type"]
-                derived_chat_id = _parsed["chat_id"]
+            if origin_source is not None:
+                derived_platform = str(
+                    getattr(origin_source.platform, "value", origin_source.platform)
+                    or ""
+                ).lower()
+                derived_chat_type = str(origin_source.chat_type or "")
+                derived_chat_id = str(origin_source.chat_id or "")
+            else:
+                _parsed = _parse_session_key(session_key)
+                if _parsed:
+                    derived_platform = _parsed["platform"]
+                    derived_chat_type = _parsed["chat_type"]
+                    derived_chat_id = _parsed["chat_id"]
 
         platform_name = str(evt.get("platform") or derived_platform or "").strip().lower()
         chat_type = str(evt.get("chat_type") or derived_chat_type or "").strip().lower()
@@ -27096,7 +27111,30 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
             return None
 
-        scope_id = str(evt.get("scope_id") or "").strip() or None
+        thread_id = (
+            str(
+                evt.get("thread_id")
+                or getattr(origin_source, "thread_id", None)
+                or ""
+            ).strip()
+            or None
+        )
+        message_id = (
+            str(
+                evt.get("message_id")
+                or getattr(origin_source, "message_id", None)
+                or ""
+            ).strip()
+            or None
+        )
+        scope_id = (
+            str(
+                evt.get("scope_id")
+                or getattr(origin_source, "scope_id", None)
+                or ""
+            ).strip()
+            or None
+        )
         if scope_id is None and chat_type not in ("dm", "thread"):
             # Reconstructed (non-persisted) source for a scoped chat with no
             # scope discriminator: on a relay-fronted deployment the
@@ -27111,15 +27149,32 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "the connector's tenant guard (user_id fallback only).",
                 platform_name, chat_id, chat_type,
             )
-        return SessionSource(
-            platform=platform,
-            chat_id=chat_id,
-            chat_type=chat_type,
-            thread_id=str(evt.get("thread_id") or "").strip() or None,
-            user_id=str(evt.get("user_id") or "").strip() or None,
-            user_name=str(evt.get("user_name") or "").strip() or None,
-            scope_id=scope_id,
-        )
+        source_updates = {
+            "platform": platform,
+            "chat_id": chat_id,
+            "chat_type": chat_type,
+            "thread_id": thread_id,
+            "message_id": message_id,
+            "user_id": (
+                str(evt.get("user_id") or getattr(origin_source, "user_id", None) or "").strip()
+                or None
+            ),
+            "user_name": (
+                str(
+                    evt.get("user_name")
+                    or getattr(origin_source, "user_name", None)
+                    or ""
+                ).strip()
+                or None
+            ),
+            "scope_id": scope_id,
+            "strict_machine_thread_affinity": platform == Platform.SLACK,
+        }
+        if origin_source is not None:
+            # Clone rather than mutate the canonical session origin: strict
+            # affinity belongs only to this synthetic machine turn.
+            return replace(origin_source, **source_updates)
+        return SessionSource(**source_updates)
 
     async def _drain_watch_notifications(self, completion_queue) -> None:
         """Consume queued watch events and inject them when notifications are enabled.

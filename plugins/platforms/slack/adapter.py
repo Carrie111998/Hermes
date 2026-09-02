@@ -57,6 +57,8 @@ from gateway.platforms.base import (
     _ssrf_redirect_guard,
     cache_document_from_bytes,
     cache_video_from_bytes,
+    is_strict_machine_thread_delivery,
+    strict_machine_thread_affinity_error,
 )
 
 try:  # sibling module; support both package and flat plugin-dir import
@@ -1274,8 +1276,11 @@ class SlackAdapter(BasePlatformAdapter):
         # Each value: {"response_url": str, "ts": float}
         self._slash_command_contexts: Dict[Tuple[str, ...], Dict[str, Any]] = {}
         # Native streaming (chat.startStream/appendStream/stopStream) state.
-        # One active stream per chat, keyed by chat_id. Each value:
-        # {"ts": str, "draft_id": int, "sent": str, "started": float}
+        # One active stream per chat, keyed by chat_id. Each value includes
+        # the parent ``thread_ts`` so strict machine finals cannot seal a
+        # stream from another Slack thread.
+        # {"ts": str, "thread_ts": str, "draft_id": int, "sent": str,
+        #  "started": float}
         # ``sent`` is the raw (pre-mrkdwn) text streamed so far — deltas are
         # computed against it because the streaming API is append-only.
         self._active_streams: Dict[str, Dict[str, Any]] = {}
@@ -2932,6 +2937,16 @@ class SlackAdapter(BasePlatformAdapter):
         if not self._app:
             return SendResult(success=False, error="Not connected")
 
+        affinity_thread_ts = self._resolve_thread_ts(reply_to, metadata)
+        affinity_error = strict_machine_thread_affinity_error(
+            Platform.SLACK,
+            metadata,
+            affinity_thread_ts,
+        )
+        if affinity_error:
+            logger.warning("[Slack] Suppressed outbound machine send: %s", affinity_error)
+            return SendResult(success=False, error=affinity_error)
+
         chat_id = await self._ensure_dm_conversation(
             chat_id, team_id=self._metadata_team_id(metadata)
         )
@@ -2991,7 +3006,12 @@ class SlackAdapter(BasePlatformAdapter):
             # chat.startStream stream and this send carries its final
             # content, seal the stream instead of posting a duplicate
             # message (the streamed message IS the final message).
-            stream_result = await self._try_finalize_stream(chat_id, content)
+            stream_result = await self._try_finalize_stream(
+                chat_id,
+                content,
+                expected_thread_ts=affinity_thread_ts,
+                strict_machine=is_strict_machine_thread_delivery(metadata),
+            )
             if stream_result is not None:
                 return stream_result
 
@@ -3397,9 +3417,34 @@ class SlackAdapter(BasePlatformAdapter):
         if self._native_stream_unsupported:
             return SendResult(success=False, error="native streaming unsupported")
 
+        thread_ts = self._resolve_thread_ts(None, metadata)
+        affinity_error = strict_machine_thread_affinity_error(
+            Platform.SLACK,
+            metadata,
+            thread_ts,
+        )
+        if affinity_error:
+            logger.warning("[Slack] Suppressed outbound machine stream: %s", affinity_error)
+            return SendResult(success=False, error=affinity_error)
+
         text = self._strip_stream_cursor(content)
         client = self._get_client(chat_id)
         stream = self._active_streams.get(chat_id)
+
+        if (
+            is_strict_machine_thread_delivery(metadata)
+            and stream is not None
+            and str(stream.get("thread_ts") or "") != str(thread_ts or "")
+        ):
+            logger.warning(
+                "[Slack] Suppressed machine stream frame for %s: active stream "
+                "belongs to a different thread",
+                chat_id,
+            )
+            return SendResult(
+                success=False,
+                error="strict machine Slack stream belongs to a different thread",
+            )
 
         try:
             if stream is not None and stream.get("draft_id") != draft_id:
@@ -3409,7 +3454,6 @@ class SlackAdapter(BasePlatformAdapter):
                 stream = None
 
             if stream is None:
-                thread_ts = self._resolve_thread_ts(None, metadata)
                 if not thread_ts:
                     # Streamed messages must anchor to a thread_ts. The
                     # gateway sets metadata.thread_id even for top-level
@@ -3438,6 +3482,7 @@ class SlackAdapter(BasePlatformAdapter):
                     raise RuntimeError("chat.startStream returned no ts")
                 self._active_streams[chat_id] = {
                     "ts": str(ts),
+                    "thread_ts": str(thread_ts),
                     "draft_id": draft_id,
                     "sent": text,
                     "started": time.time(),
@@ -3533,6 +3578,9 @@ class SlackAdapter(BasePlatformAdapter):
         self,
         chat_id: str,
         content: str,
+        *,
+        expected_thread_ts: Optional[str] = None,
+        strict_machine: bool = False,
     ) -> Optional[SendResult]:
         """Finalize an active native stream with the turn-final content.
 
@@ -3544,6 +3592,12 @@ class SlackAdapter(BasePlatformAdapter):
         """
         stream = self._active_streams.get(chat_id)
         if stream is None:
+            return None
+        if strict_machine and str(stream.get("thread_ts") or "") != str(
+            expected_thread_ts or ""
+        ):
+            # A synthetic machine final may share a channel with an active
+            # stream from another thread. Let send() use its exact anchor.
             return None
         sent = stream.get("sent", "")
         text = self._strip_stream_cursor(content)
@@ -3870,6 +3924,10 @@ class SlackAdapter(BasePlatformAdapter):
         thread replies.  Messages that originate inside an existing thread are
         always replied to in-thread to preserve conversation context.
         """
+        if is_strict_machine_thread_delivery(metadata):
+            md = metadata or {}
+            return md.get("thread_id") or md.get("thread_ts") or reply_to
+
         # When reply_in_thread is disabled (default: True for backward compat),
         # only thread messages that are already part of an existing thread.
         # For top-level channel messages, the inbound handler sets
@@ -3914,10 +3972,17 @@ class SlackAdapter(BasePlatformAdapter):
         if not os.path.exists(file_path):
             raise FileNotFoundError(f"File not found: {file_path}")
 
+        thread_ts = self._resolve_thread_ts(reply_to, metadata)
+        affinity_error = strict_machine_thread_affinity_error(
+            Platform.SLACK, metadata, thread_ts
+        )
+        if affinity_error:
+            logger.warning("[Slack] Suppressed machine file upload: %s", affinity_error)
+            return SendResult(success=False, error=affinity_error)
+
         chat_id = await self._ensure_dm_conversation(
             chat_id, team_id=self._metadata_team_id(metadata)
         )
-        thread_ts = self._resolve_thread_ts(reply_to, metadata)
         last_exc = None
         for attempt in range(3):
             try:
@@ -3973,6 +4038,14 @@ class SlackAdapter(BasePlatformAdapter):
         if not images:
             return
 
+        thread_ts = self._resolve_thread_ts(None, metadata)
+        affinity_error = strict_machine_thread_affinity_error(
+            Platform.SLACK, metadata, thread_ts
+        )
+        if affinity_error:
+            logger.warning("[Slack] Suppressed machine image batch: %s", affinity_error)
+            return
+
         chat_id = await self._ensure_dm_conversation(
             chat_id, team_id=self._metadata_team_id(metadata)
         )
@@ -3986,8 +4059,6 @@ class SlackAdapter(BasePlatformAdapter):
         except Exception:
             await super().send_multiple_images(chat_id, images, metadata, human_delay)
             return
-
-        thread_ts = self._resolve_thread_ts(None, metadata)
 
         CHUNK = 10
         chunks = [images[i : i + CHUNK] for i in range(0, len(images), CHUNK)]
@@ -4793,6 +4864,14 @@ class SlackAdapter(BasePlatformAdapter):
         if not self._app:
             return SendResult(success=False, error="Not connected")
 
+        thread_ts = self._resolve_thread_ts(reply_to, metadata)
+        affinity_error = strict_machine_thread_affinity_error(
+            Platform.SLACK, metadata, thread_ts
+        )
+        if affinity_error:
+            logger.warning("[Slack] Suppressed machine image upload: %s", affinity_error)
+            return SendResult(success=False, error=affinity_error)
+
         from tools.url_safety import create_ssrf_safe_async_client, is_safe_url
 
         if not is_safe_url(image_url):
@@ -4818,7 +4897,6 @@ class SlackAdapter(BasePlatformAdapter):
                 response = await client.get(image_url)
                 response.raise_for_status()
 
-            thread_ts = self._resolve_thread_ts(reply_to, metadata)
             chat_id = await self._ensure_dm_conversation(
                 chat_id, team_id=self._metadata_team_id(metadata)
             )
@@ -4895,11 +4973,18 @@ class SlackAdapter(BasePlatformAdapter):
                 success=False, error=f"Video file not found: {video_path}"
             )
 
+        thread_ts = self._resolve_thread_ts(reply_to, metadata)
+        affinity_error = strict_machine_thread_affinity_error(
+            Platform.SLACK, metadata, thread_ts
+        )
+        if affinity_error:
+            logger.warning("[Slack] Suppressed machine video upload: %s", affinity_error)
+            return SendResult(success=False, error=affinity_error)
+
         chat_id = await self._ensure_dm_conversation(
             chat_id, team_id=self._metadata_team_id(metadata)
         )
         try:
-            thread_ts = self._resolve_thread_ts(reply_to, metadata)
             last_exc = None
             for attempt in range(3):
                 try:
@@ -4960,6 +5045,12 @@ class SlackAdapter(BasePlatformAdapter):
 
         display_name = file_name or os.path.basename(file_path)
         thread_ts = self._resolve_thread_ts(reply_to, metadata)
+        affinity_error = strict_machine_thread_affinity_error(
+            Platform.SLACK, metadata, thread_ts
+        )
+        if affinity_error:
+            logger.warning("[Slack] Suppressed machine document upload: %s", affinity_error)
+            return SendResult(success=False, error=affinity_error)
         chat_id = await self._ensure_dm_conversation(
             chat_id, team_id=self._metadata_team_id(metadata)
         )
