@@ -4664,7 +4664,16 @@ def _is_transient_transport_error(exc: Exception) -> bool:
     same target once" gate, distinct from ``_is_payment_error`` /
     ``_is_auth_error`` / ``_is_rate_limit_error`` which the except-chain
     handles by switching provider, refreshing creds, or rotating the pool.
+
+    A body-confirmed model-not-found is excluded even when it arrives with a
+    5xx status: aggregator gateways answer ``503 model_not_found`` when no
+    channel can serve the model, which is a permanent property of that route,
+    not a blip. Retrying the same target burns the full backoff budget (and,
+    on the compression critical path, the user's wall clock) before the
+    fallback chain is reached, so send it straight to the except-chain.
     """
+    if _is_model_not_found_error(exc):
+        return False
     if _is_connection_error(exc):
         return True
     status = getattr(exc, "status_code", None) or getattr(
@@ -4849,6 +4858,11 @@ def _is_model_not_found_error(exc: Exception) -> bool:
     otherwise abort the whole auxiliary task instead of failing over.
     """
     status = getattr(exc, "status_code", None)
+    if status is None:
+        # httpx / OpenAI-SDK wrapping shapes carry the code on ``.response``
+        # only; read it too so classification is driven by a real status
+        # rather than silently falling into the status-is-None allowance.
+        status = getattr(getattr(exc, "response", None), "status_code", None)
     err_lower = str(exc).lower()
     # Billing/quota 404s belong to _is_payment_error — don't claim them here.
     if any(kw in err_lower for kw in (
@@ -9833,6 +9847,7 @@ def _create_with_progress_once(
         if (
             force_stream
             or _is_transient_transport_error(exc)
+            or _is_model_not_found_error(exc)
             or _is_auth_error(exc)
             or _is_payment_error(exc)
             or _is_rate_limit_error(exc)
