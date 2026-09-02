@@ -2132,9 +2132,30 @@ class GoalManager:
             ),
         }
 
+    def _continuation_judge_feedback(self) -> str:
+        """Return bounded feedback from the previous failed completion check.
+
+        The judge reason is durable goal state, but historically the next agent
+        turn only received the static goal/contract again. That made repeated
+        ``continue`` verdicts easy to loop on: the judge knew what was missing
+        while the agent did not. Feed back only a failed ``continue`` reason;
+        wait/done state must not leak into an unrelated continuation.
+        """
+        if not self._state or self._state.last_verdict != "continue":
+            return ""
+        reason = (self._state.last_reason or "").strip()
+        if not reason:
+            return ""
+        return (
+            "\n\nPrevious completion-check feedback:\n"
+            f"{_truncate(reason, 1200)}\n\n"
+            "Address this specific feedback before claiming the goal is done again."
+        )
+
     def next_continuation_prompt(self) -> Optional[str]:
         if not self._state or self._state.status != "active":
             return None
+        feedback = self._continuation_judge_feedback()
         # Contract takes priority: it carries the verification surface and
         # constraints the agent must target. Subgoals fold in as extra
         # criteria appended to the contract block.
@@ -2146,16 +2167,19 @@ class GoalManager:
                     for i, text in enumerate(self._state.subgoals, start=1)
                 )
                 contract_block = f"{contract_block}\n{extra}"
-            return CONTINUATION_PROMPT_WITH_CONTRACT_TEMPLATE.format(
+            prompt = CONTINUATION_PROMPT_WITH_CONTRACT_TEMPLATE.format(
                 goal=self._state.goal,
                 contract_block=contract_block,
             )
+            return f"{prompt}{feedback}"
         if self._state.subgoals:
-            return CONTINUATION_PROMPT_WITH_SUBGOALS_TEMPLATE.format(
+            prompt = CONTINUATION_PROMPT_WITH_SUBGOALS_TEMPLATE.format(
                 goal=self._state.goal,
                 subgoals_block=self._state.render_subgoals_block(),
             )
-        return CONTINUATION_PROMPT_TEMPLATE.format(goal=self._state.goal)
+            return f"{prompt}{feedback}"
+        prompt = CONTINUATION_PROMPT_TEMPLATE.format(goal=self._state.goal)
+        return f"{prompt}{feedback}"
 
     def render_contract(self) -> str:
         """Public helper for the /goal show + /goal draft slash commands."""
