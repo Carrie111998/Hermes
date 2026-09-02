@@ -87,6 +87,13 @@ def _with_mentions_disabled(payload: Dict[str, Any]) -> Dict[str, Any]:
     return payload
 
 
+def _posts_api_path(metadata: Optional[Dict[str, Any]]) -> str:
+    """Return the post endpoint for normal or silent delivery."""
+    if not isinstance(metadata, dict) or metadata.get("notify") is True:
+        return "posts"
+    return "posts?silent=true" if metadata.get("silent") is True else "posts"
+
+
 def check_mattermost_requirements() -> bool:
     """Return True if the Mattermost adapter runtime dependency is available."""
     try:
@@ -236,7 +243,8 @@ class MattermostAdapter(BasePlatformAdapter):
         metadata: Optional[Dict[str, Any]],
     ) -> Dict[str, Any]:
         """Post once, optionally falling back flat for final notify content."""
-        data = await self._api_post("posts", payload)
+        posts_path = _posts_api_path(metadata)
+        data = await self._api_post(posts_path, payload)
         if data or "root_id" not in payload:
             return data
         if not (isinstance(metadata, dict) and metadata.get("notify")):
@@ -255,7 +263,7 @@ class MattermostAdapter(BasePlatformAdapter):
             "Mattermost: falling back to flat channel delivery for notify-worthy post in %s",
             chat_id,
         )
-        return await self._api_post("posts", flat_payload)
+        return await self._api_post(posts_path, flat_payload)
 
     async def _api_put(
         self, path: str, payload: Dict[str, Any]

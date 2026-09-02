@@ -741,6 +741,19 @@ def _interim_metadata(
     return merged
 
 
+def _tool_progress_metadata(
+    metadata: Optional[Dict[str, Any]] = None,
+    *,
+    platform: Any = None,
+) -> Optional[Dict[str, Any]]:
+    """Mark Mattermost tool-progress posts for silent delivery."""
+    if _gateway_platform_value(platform) != "mattermost":
+        return metadata
+    merged = dict(metadata or {})
+    merged["silent"] = True
+    return merged
+
+
 def _seed_hygiene_system_prompt(
     agent: Any,
     session_row: Optional[Dict[str, Any]],
@@ -31584,7 +31597,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # No real thread yet, but the connector will auto-thread on the
             # reply anchor; carry it so progress joins that thread.
             _progress_metadata = {"reply_to_message_id": event_message_id}
-        _progress_metadata = _non_conversational_metadata(_progress_metadata, platform=source.platform)
+        _progress_metadata = _non_conversational_metadata(
+            _progress_metadata, platform=source.platform
+        )
+        _progress_metadata = _tool_progress_metadata(
+            _progress_metadata, platform=source.platform
+        )
         if _native_slack_task_cards:
             # chat.startStream in channels requires the recipient team/user
             # pair; harmless extras elsewhere, so stamp them whenever known.
