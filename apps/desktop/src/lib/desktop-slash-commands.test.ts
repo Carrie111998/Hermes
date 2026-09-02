@@ -331,6 +331,22 @@ describe('desktop slash command curation', () => {
     expect(desktopSubcommandUnavailableMessage('/skills', 'pending')).toBeNull()
   })
 
+  it('lets a live catalog revoke the static /skills allowlist with an empty list', () => {
+    rememberDesktopCommandsCatalog({
+      commands: {
+        '/skills': {
+          argument_mode: 'options',
+          desktop: null,
+          desktop_subcommands: []
+        }
+      },
+      canon: { '/skills': '/skills' }
+    })
+
+    expect(desktopSubcommandAllowlist('/skills')).toEqual([])
+    expect(desktopSubcommandUnavailableMessage('/skills', 'pending')).toContain('/skills pending')
+  })
+
   it('falls back to the static /skills allowlist when the catalog has none', () => {
     expect(desktopSubcommandAllowlist('/skills')).toEqual(['pending', 'approve', 'reject', 'diff', 'approval'])
     expect(desktopSubcommandUnavailableMessage('/skills', 'diff a1b2')).toBeNull()

@@ -205,9 +205,12 @@ export function useSlashCompletions(options: {
         // the full `/personality alice` token instead of stranding `/alice`.
         const replaceFromRaw = result.replace_from
         const hasReplaceFrom = typeof replaceFromRaw === 'number'
-        const replaceFrom = hasReplaceFrom ? replaceFromRaw : 1
-        const isArgCompletion = replaceFrom > 1
-        const prefix = isArgCompletion ? text.slice(0, replaceFrom) : ''
+        const inferredArgCompletion = /\s/.test(text.trimStart())
+        const inferredReplaceFrom = text.match(/\S+$/)?.index ?? text.length
+        const replaceFrom = hasReplaceFrom ? replaceFromRaw : inferredReplaceFrom
+        const isArgCompletion = hasReplaceFrom ? replaceFrom > 1 : inferredArgCompletion
+        const rawPrefix = isArgCompletion ? text.slice(0, replaceFrom) : ''
+        const prefix = rawPrefix && !/\s$/.test(rawPrefix) ? `${rawPrefix} ` : rawPrefix
 
         // Commands narrowed by `desktop_subcommands` (e.g. /skills exposes
         // only its review slice here) must not suggest the subcommands the

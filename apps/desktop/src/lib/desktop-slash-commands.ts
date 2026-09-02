@@ -451,13 +451,11 @@ function specFromCatalog(command: string): DesktopCommandSpec | null {
 }
 
 function asSubcommandList(value: unknown): readonly string[] | undefined {
-  if (!Array.isArray(value) || value.length === 0) {
+  if (!Array.isArray(value)) {
     return undefined
   }
 
-  const subs = value.filter((sub): sub is string => typeof sub === 'string' && sub.trim() !== '')
-
-  return subs.length > 0 ? subs : undefined
+  return value.filter((sub): sub is string => typeof sub === 'string' && sub.trim() !== '')
 }
 
 function isAliasCommand(command: string): boolean {
@@ -511,7 +509,7 @@ export function resolveDesktopCommand(command: string): DesktopCommandSpec | nul
   if (staticSpec) {
     const catalogSubs = catalogSpec?.desktopSubcommands
 
-    if (catalogSubs && catalogSubs.length > 0) {
+    if (catalogSubs !== undefined) {
       return { ...staticSpec, desktopSubcommands: catalogSubs }
     }
 
