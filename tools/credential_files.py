@@ -434,6 +434,89 @@ _CACHE_DIRS: list[tuple[str, str]] = [
 ]
 
 
+# ---------------------------------------------------------------------------
+# HERMES_HOME context files (SOUL.md, persona, scripts) for Docker passthrough
+# ---------------------------------------------------------------------------
+
+# Persona / identity files that the agent loads from HERMES_HOME at prompt-
+# build time. When the terminal backend is Docker, the agent runs inside a
+# container whose filesystem is isolated from the host — without an explicit
+# bind mount these files are invisible and the agent falls back to a hard-
+# coded default or an empty persona (issue #100900). Mount each file that
+# exists on the host so the container sees the user's custom persona.
+_HERMES_CONTEXT_FILES: tuple[str, ...] = (
+    "SOUL.md",
+    "USER.md",
+    "MEMORY.md",
+    "IDENTITY.md",
+    "HEARTBEAT.md",
+    "BOOTSTRAP.md",
+    "AGENTS.md",
+)
+
+# Directories under HERMES_HOME that contain user-authored code referenced by
+# the agent at runtime (e.g. ~/.hermes/scripts/* invoked via run_script).
+_HERMES_CONTEXT_DIRS: tuple[str, ...] = (
+    "scripts",
+)
+
+
+def get_hermes_context_mounts(
+    container_base: str = "/root/.hermes",
+) -> List[Dict[str, str]]:
+    """Return bind-mount entries for HERMES_HOME context files/dirs.
+
+    Each entry has ``host_path`` and ``container_path`` keys. Only paths
+    that actually exist on the host are returned, so an empty default install
+    produces no extra mounts. Mounted read-only by the Docker backend.
+
+    When the active HERMES_HOME is a profile directory
+    (``~/.hermes/profiles/<name>``), the file is mounted to *both* the
+    default container location (``/root/.hermes/<name>``) and the
+    profile-specific location (``/root/.hermes/profiles/<name>/<name>``)
+    so the container sees it regardless of whether it resolves HERMES_HOME
+    to the default or profile path (the in-container HERMES_HOME can vary
+    depending on whether the session carries a profile-scoped override).
+    """
+    mounts: List[Dict[str, str]] = []
+    hermes_home = _resolve_hermes_home()
+    # Detect profile suffix for dual-mount
+    profile_suffix = None
+    try:
+        # hermes_home like /root/.hermes/profiles/<name>
+        parts = hermes_home.parts
+        if "profiles" in parts:
+            idx = parts.index("profiles")
+            profile_suffix = "/".join(parts[idx:])  # profiles/<name>
+    except Exception:
+        profile_suffix = None
+    for name in _HERMES_CONTEXT_FILES:
+        host_path = hermes_home / name
+        if host_path.is_file():
+            mounts.append({
+                "host_path": str(host_path),
+                "container_path": f"{container_base.rstrip('/')}/{name}",
+            })
+            if profile_suffix:
+                mounts.append({
+                    "host_path": str(host_path),
+                    "container_path": f"{container_base.rstrip('/')}/{profile_suffix}/{name}",
+                })
+    for name in _HERMES_CONTEXT_DIRS:
+        host_path = hermes_home / name
+        if host_path.is_dir():
+            mounts.append({
+                "host_path": str(host_path),
+                "container_path": f"{container_base.rstrip('/')}/{name}",
+            })
+            if profile_suffix:
+                mounts.append({
+                    "host_path": str(host_path),
+                    "container_path": f"{container_base.rstrip('/')}/{profile_suffix}/{name}",
+                })
+    return mounts
+
+
 def get_cache_directory_mounts(
     container_base: str = "/root/.hermes",
 ) -> List[Dict[str, str]]:
