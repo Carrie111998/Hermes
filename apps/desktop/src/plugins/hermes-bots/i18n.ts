@@ -184,6 +184,7 @@ type BotsMessages = {
     waitingForAnswer: string
     memberThinking: (name: string) => string
     roomWorking: string
+    recoveryUnknown: string
     messageRoom: (group: string) => string
     newThreadPlaceholder: (group: string) => string
     everyoneMeta: string
@@ -384,6 +385,7 @@ const en: BotsMessages = {
     waitingForAnswer: 'Waiting for your answer…',
     memberThinking: name => `${name} is thinking…`,
     roomWorking: 'The room is working…',
+    recoveryUnknown: '⚠️ Reply status is unknown after the app restarted. Send the message again to retry.',
     messageRoom: group => `Message ${group}`,
     newThreadPlaceholder: group => `New thread in ${group}… (@name to direct, @everyone for all)`,
     everyoneMeta: 'Every bot in the room',
@@ -578,6 +580,7 @@ const ja: BotsMessages = {
     waitingForAnswer: 'あなたの回答を待っています…',
     memberThinking: name => `${name}が考えています…`,
     roomWorking: 'ルームが作業中です…',
+    recoveryUnknown: '⚠️ アプリの再起動後、この返信の状態を確認できません。もう一度送信して再試行してください。',
     messageRoom: group => `${group}にメッセージ`,
     newThreadPlaceholder: group => `${group}で新しいスレッド…（@名前で個別、@everyoneで全員）`,
     everyoneMeta: 'ルーム内のすべてのボット',
@@ -771,6 +774,7 @@ const zh: BotsMessages = {
     waitingForAnswer: '等待你的回答…',
     memberThinking: name => `${name} 正在思考…`,
     roomWorking: '房间正在处理…',
+    recoveryUnknown: '⚠️ 应用重启后无法确认此回复的状态。请重新发送消息以重试。',
     messageRoom: group => `发消息给 ${group}`,
     newThreadPlaceholder: group => `在 ${group} 中开启新讨论串…（@名称指定，@everyone 全体）`,
     everyoneMeta: '房间里的所有机器人',
@@ -964,6 +968,7 @@ const zhHant: BotsMessages = {
     waitingForAnswer: '等待你的回答…',
     memberThinking: name => `${name} 正在思考…`,
     roomWorking: '房間正在處理…',
+    recoveryUnknown: '⚠️ 應用程式重新啟動後，無法確認此回覆的狀態。請重新傳送訊息以重試。',
     messageRoom: group => `傳訊息給 ${group}`,
     newThreadPlaceholder: group => `在 ${group} 中開啟新討論串…（@名稱指定，@everyone 全體）`,
     everyoneMeta: '房間裡的所有機器人',

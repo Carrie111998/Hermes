@@ -55,6 +55,7 @@ import {
   updateGroupChat
 } from './group-chat'
 import { groupWorkspaceOwnerKey } from './group-membership'
+import { recoverInterruptedGroupTurns, stopInterruptedGroupTurnRecovery } from './group-turns'
 import { annotateOrphanedGroupChatMembers } from './hygiene'
 import { BOTS_LOCALES } from './i18n'
 import { displayName } from './labels'
@@ -94,6 +95,8 @@ export default {
   description:
     'Bot Mode — a one-chat-per-agent roster with avatars, routines, group chats, and bot-to-bot messaging. Ships with the app; disable here if unwanted.',
   register(ctx: PluginContext) {
+    let disposed = false
+
     setPluginCtx(ctx)
     const disposeLocales = ctx.i18n.register(BOTS_LOCALES)
     setGroupChatSyncDisposed(false)
@@ -105,6 +108,9 @@ export default {
     // Disabling the plugin (or a hot reload) must actually stop the clock —
     // before this, the rAF loop + 1Hz document scan ran until app restart.
     if (typeof ctx.onDispose === 'function') {
+      ctx.onDispose(() => {
+        disposed = true
+      })
       ctx.onDispose(disposeLocales)
       ctx.onDispose(stopFaceClock)
       ctx.onDispose(stopBotRelay)
@@ -264,6 +270,10 @@ export default {
                   ? await Promise.resolve(window.hermesDesktop?.connections?.list?.()).catch(() => null)
                   : null
 
+              if (disposed) {
+                return
+              }
+
               const liveIds = Array.isArray(registry?.connections)
                 ? new Set(registry.connections.map(connection => String(connection?.id || '').trim()).filter(Boolean))
                 : null
@@ -287,10 +297,20 @@ export default {
             }
           }
 
+          if (disposed) {
+            return
+          }
+
           // Receive before publish. A fresh Desktop with no local room cache
           // must hydrate the gateway projection instead of merely avoiding an
           // empty overwrite and then rendering an empty conversation.
           await pullGroupChatServerState().catch(() => false)
+
+          if (disposed) {
+            return
+          }
+
+          void recoverInterruptedGroupTurns().catch(() => undefined)
           scheduleGroupChatServerSync($groupChats.get())
         })
         .catch(() => undefined)
@@ -334,6 +354,7 @@ export default {
 
     if (typeof ctx.onDispose === 'function') {
       ctx.onDispose(() => {
+        stopInterruptedGroupTurnRecovery()
         stopGroupChatServerSync()
 
         if (typeof unbindProfileListener === 'function') {

@@ -22,9 +22,14 @@ import {
 } from './group-chat'
 import type { GroupChatRoom, GroupHoldStamp } from './group-chat'
 import { durableGroupChatMembers, groupMemberKey } from './group-membership'
-import { harvestStrandedGroupReply, isGroupPassText, runGroupChatMemberTurn } from './group-turns'
+import {
+  harvestStrandedGroupReply,
+  isGroupPassText,
+  runGroupChatMemberTurn,
+  settleGroupTurnRecovery
+} from './group-turns'
 import { requestForBot } from './routing'
-import type { Attachment, GroupMember, GroupMessage } from './types'
+import type { Attachment, GroupMember, GroupMessage, GroupTurnRecovery } from './types'
 
 // ── group chats: bounded round-robin coordination over a shared room log ─────
 //
@@ -638,9 +643,13 @@ export async function runGroupChatRounds(group: string, members: GroupMember[], 
           return r
         })
         let reply: null | string = null
+        const recoveryState: { current: GroupTurnRecovery | null } = { current: null }
+        let turnFailed = false
 
         try {
-          reply = await runGroupChatMemberTurn(group, member, prompt, thread, deltaImages)
+          reply = await runGroupChatMemberTurn(group, member, prompt, thread, deltaImages, marker => {
+            recoveryState.current = marker
+          })
 
           // Needs-attention hook (#93091 item 3): a turn that produced a real
           // reply (or an explicit pass) is a good turn — clear the badge.
@@ -650,6 +659,7 @@ export async function runGroupChatRounds(group: string, members: GroupMember[], 
             clearBotAttention(groupMemberKey(member))
           }
         } catch (error: any) {
+          turnFailed = true
           const reason = String(error?.data?.reason || '').trim()
           recordGroupActivity(group, {
             kind: 'failed',
@@ -698,6 +708,10 @@ export async function runGroupChatRounds(group: string, members: GroupMember[], 
             thread
           })
 
+          if (!turnFailed && recoveryState.current && recoveryState.current.phase !== 'timed-out') {
+            settleGroupTurnRecovery(group, member, recoveryState.current.recoveryId)
+          }
+
           return
         }
 
@@ -721,7 +735,9 @@ export async function runGroupChatRounds(group: string, members: GroupMember[], 
                 : {})
             },
             reply,
-            thread
+            thread,
+            undefined,
+            recoveryState.current?.recoveryId
           )
           // Its own message counts as seen too.
           updateGroupChat(group, (r: GroupChatRoom) => {
@@ -731,6 +747,10 @@ export async function runGroupChatRounds(group: string, members: GroupMember[], 
           })
           posted += 1
           spokeThisRound += 1
+        }
+
+        if (!turnFailed && recoveryState.current && recoveryState.current.phase !== 'timed-out') {
+          settleGroupTurnRecovery(group, member, recoveryState.current.recoveryId)
         }
       }
 
@@ -805,14 +825,19 @@ export async function runGroupChatRounds(group: string, members: GroupMember[], 
                 return r
               })
               let continuationReply: null | string = null
+              const continuationRecoveryState: { current: GroupTurnRecovery | null } = { current: null }
+              let continuationFailed = false
 
               try {
-                continuationReply = await runGroupChatMemberTurn(group, member, prompt, thread)
+                continuationReply = await runGroupChatMemberTurn(group, member, prompt, thread, undefined, marker => {
+                  continuationRecoveryState.current = marker
+                })
 
                 if (continuationReply !== null) {
                   clearBotAttention(memberKey)
                 }
               } catch (error: any) {
+                continuationFailed = true
                 recordGroupActivity(group, {
                   kind: 'failed',
                   member: member.name,
@@ -823,6 +848,14 @@ export async function runGroupChatRounds(group: string, members: GroupMember[], 
               }
 
               if (!isCurrent()) {
+                if (
+                  !continuationFailed &&
+                  continuationRecoveryState.current &&
+                  continuationRecoveryState.current.phase !== 'timed-out'
+                ) {
+                  settleGroupTurnRecovery(group, member, continuationRecoveryState.current.recoveryId)
+                }
+
                 return
               }
 
@@ -845,7 +878,9 @@ export async function runGroupChatRounds(group: string, members: GroupMember[], 
                       : {})
                   },
                   continuationReply,
-                  thread
+                  thread,
+                  undefined,
+                  continuationRecoveryState.current?.recoveryId
                 )
                 updateGroupChat(group, (r: GroupChatRoom) => {
                   r.watermarks[markKey] = r.log.length
@@ -860,6 +895,14 @@ export async function runGroupChatRounds(group: string, members: GroupMember[], 
                 // continues rather than settling; the outer for-loop's next
                 // iteration re-evaluates everything.
                 spokeThisRound += 1
+              }
+
+              if (
+                !continuationFailed &&
+                continuationRecoveryState.current &&
+                continuationRecoveryState.current.phase !== 'timed-out'
+              ) {
+                settleGroupTurnRecovery(group, member, continuationRecoveryState.current.recoveryId)
               }
             }
           }

@@ -27,8 +27,10 @@ import type * as RoutingModule from './routing'
 const mocks = vi.hoisted(() => ({
   botChatOwnsWorkspace: vi.fn(() => false),
   paneVisibility: vi.fn(),
+  recoverInterruptedGroupTurns: vi.fn(async () => undefined),
   sessionOwnsWorkspace: vi.fn(() => false),
-  setWorkspaceScope: vi.fn()
+  setWorkspaceScope: vi.fn(),
+  stopInterruptedGroupTurnRecovery: vi.fn()
 }))
 
 vi.mock('@hermes/plugin-sdk', async importOriginal => {
@@ -77,6 +79,10 @@ vi.mock('./group-chat', async () => {
     updateGroupChat: vi.fn()
   }
 })
+vi.mock('./group-turns', () => ({
+  recoverInterruptedGroupTurns: mocks.recoverInterruptedGroupTurns,
+  stopInterruptedGroupTurnRecovery: mocks.stopInterruptedGroupTurnRecovery
+}))
 vi.mock('./data', async importOriginal => {
   const original = await importOriginal<typeof DataModule>()
 
@@ -97,7 +103,7 @@ interface Registration {
 }
 
 /** A recording `PluginContext`: registrations, their disposers, teardown. */
-function recordingContext() {
+function recordingContext(groupChats?: unknown) {
   const disposers: (() => void)[] = []
   const registrations: Registration[] = []
   const unregisters = new Map<string, () => void>()
@@ -116,7 +122,7 @@ function recordingContext() {
 
       return unregister
     },
-    storage: { get: async () => undefined, set: async () => undefined }
+    storage: { get: async (key: string) => (key === 'group-chats' ? groupChats : undefined), set: async () => undefined }
   }
 
   return {
@@ -126,6 +132,68 @@ function recordingContext() {
     unregisters
   }
 }
+
+describe('cold group-turn recovery', () => {
+  it('starts reconciliation after persisted rooms hydrate', async () => {
+    paneStores()
+
+    const harness = recordingContext({
+      Cold: {
+        log: [],
+        members: [{ name: 'research' }],
+        sessions: { research: 'sid-research' },
+        stranded: {
+          research: {
+            before: 0,
+            phase: 'submitted',
+            recoveryId: 'recovery-cold',
+            thread: 't-cold'
+          }
+        },
+        watermarks: {}
+      }
+    })
+
+    plugin.register(harness.ctx)
+    await settle()
+
+    expect(mocks.recoverInterruptedGroupTurns).toHaveBeenCalledTimes(1)
+    harness.dispose()
+    expect(mocks.stopInterruptedGroupTurnRecovery).toHaveBeenCalledTimes(1)
+  })
+
+  it('does not start recovery after disposal wins the hydration race', async () => {
+    paneStores()
+
+    let finishHydration: (value: unknown) => void = () => undefined
+
+    const hydration = new Promise(resolve => {
+      finishHydration = resolve
+    })
+
+    const harness = recordingContext(hydration)
+
+    plugin.register(harness.ctx)
+    harness.dispose()
+    finishHydration({
+      Cold: {
+        log: [],
+        members: [{ name: 'research' }],
+        stranded: {
+          research: {
+            before: 0,
+            phase: 'submitted',
+            recoveryId: 'recovery-cold'
+          }
+        },
+        watermarks: {}
+      }
+    })
+    await settle()
+
+    expect(mocks.recoverInterruptedGroupTurns).toHaveBeenCalledTimes(0)
+  })
+})
 
 /** Nanostore stand-ins for the SDK's per-pane visibility stores. */
 function paneStores() {

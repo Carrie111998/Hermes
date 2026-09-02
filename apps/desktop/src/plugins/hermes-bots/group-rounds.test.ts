@@ -162,6 +162,7 @@ describe('round lifecycle', () => {
     expect(log(room, 'Quiet')[0].from.kind).toBe('user')
     // Every member took exactly one turn (round 1), then the settle exit fired.
     expect(room.gateway.calls).toHaveLength(3)
+    expect(room.chat.$groupChats.get().Quiet.stranded).toEqual({})
   })
 
   it('stops chatty members at GROUP_CHAT_MAX_MESSAGES', async () => {
@@ -189,8 +190,11 @@ describe('round lifecycle', () => {
     room.rounds.sendToGroupChat('Flaky', MEMBERS, 'anyone around?')
     await settle(room, 'Flaky')
 
-    // Just the user message; no error entries.
-    expect(log(room, 'Flaky')).toHaveLength(1)
+    // The raw exception stays out of the room, but the ambiguous submitted
+    // turn resolves visibly instead of disappearing as a silent pass.
+    expect(log(room, 'Flaky')).toHaveLength(2)
+    expect(log(room, 'Flaky')[1].text).toMatch(/status is unknown/i)
+    expect(room.chat.$groupChats.get().Flaky.stranded?.builder).toBeUndefined()
   })
 
   it('badges needs-you when a member addresses @user, and clears it on the next user send', async () => {

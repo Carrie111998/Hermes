@@ -740,7 +740,9 @@ export function durableGroupChatRooms(all: Record<string, GroupChat> = $groupCha
       log: room.log,
       watermarks: room.watermarks || {},
       sessions: room.sessions || {},
+      sessionOwners: room.sessionOwners || {},
       stranded: room.stranded || {},
+      holds: room.holds || {},
       members: Array.isArray(room.members) ? room.members : [],
       // Immutable room identity: without this, a room merged in via the
       // remote-sync path (the only caller of this function) loses its
@@ -1333,9 +1335,9 @@ export function updateGroupChat(
         watermarks: room.watermarks,
         sessions: room.sessions || {},
         sessionOwners: room.sessionOwners || {},
-        // Timed-out turns awaiting a late reply — keyed by member, valued
-        // with the pre-turn message baseline. Survives reloads so finished
-        // work is still harvested after a window restart.
+        // In-flight turns awaiting reconciliation — keyed by member and
+        // carrying the pre-turn message baseline. Survives reloads so
+        // finished work is still harvested after a window restart.
         stranded: room.stranded || {},
         // #93129: sticky per-member stop holds. Watermarks persist, so holds
         // must too — otherwise a window restart silently releases a bot the
@@ -1421,10 +1423,11 @@ export function appendGroupChatEntry(
   from: GroupMessageAuthor,
   text: string,
   thread?: null | string,
-  images?: Attachment[]
+  images?: Attachment[],
+  entryId?: string
 ): GroupMessage {
   const entry: GroupMessage = {
-    id: groupChatEntryId(),
+    id: entryId || groupChatEntryId(),
     at: Date.now(),
     from,
     text: normalizeGroupChatText(text),
@@ -1442,6 +1445,12 @@ export function appendGroupChatEntry(
   // byte-identical. Drop the echo instead of flooding the room. User
   // entries and non-adjacent repeats are never touched.
   const priorLog = ($groupChats.get()[group] || {}).log || []
+  const committed = entryId ? priorLog.find(prior => prior?.id === entryId) : undefined
+
+  if (committed) {
+    return committed
+  }
+
   const lastEntry = priorLog[priorLog.length - 1]
 
   if (isDuplicateGroupAppend(lastEntry, from, entry.text, entry.thread)) {
