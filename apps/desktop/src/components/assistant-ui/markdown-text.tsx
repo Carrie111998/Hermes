@@ -42,7 +42,12 @@ import { ArtifactCard } from './artifact-card'
 import { SessionRefLink } from './directive-text'
 import { detectEmbed, extractAlert, MarkdownAlert, RichCodeBlock, UrlEmbed } from './embeds'
 import { ResizableMarkdownTable, ResizableMarkdownTh } from './markdown-table'
-import { paragraphPlainText, TranscriptDirectiveLeaf, useIsClaimedDirective } from './transcript-directive'
+import {
+  paragraphPlainText,
+  TranscriptDirectiveLeaf,
+  useDirectiveDropWarning,
+  useIsClaimedDirective
+} from './transcript-directive'
 
 // Math rendering plugin (KaTeX). Configured once at module scope — the
 // plugin is stateless beyond its internal cache so re-creating per-render
@@ -525,6 +530,11 @@ function MarkdownParagraph({
 }: ComponentProps<'p'> & { streaming?: boolean }) {
   const plain = paragraphPlainText(children)
   const claimed = useIsClaimedDirective(plain)
+
+  // A paragraph that addresses a directive but will not become a widget —
+  // malformed, or claimed by nobody. It renders as its own raw source, which
+  // reads like model junk rather than a dropped panel; say so in the log.
+  useDirectiveDropWarning(plain, claimed, streaming ?? false)
 
   if (claimed && plain !== null) {
     return <TranscriptDirectiveLeaf streaming={streaming} text={plain} />
