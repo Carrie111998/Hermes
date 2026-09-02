@@ -2840,10 +2840,12 @@ _gateway_notify_cbs: dict[str, object] = {}  # session_key → callable(approval
 def register_gateway_notify(session_key: str, cb) -> None:
     """Register a per-session callback for sending approval requests to the user.
 
-    The callback signature is ``cb(approval_data: dict) -> None`` where
+    The callback signature is ``cb(approval_data: dict) -> object`` where
     *approval_data* contains ``command``, ``description``, and
     ``pattern_keys``.  The callback bridges sync→async (runs in the agent
-    thread, must schedule the actual send on the event loop).
+    thread, must schedule the actual send on the event loop). Returning exactly
+    ``False`` reports that the transport rejected the write; legacy callbacks
+    that return ``None`` remain fire-and-forget.
     """
     with _lock:
         _gateway_notify_cbs[session_key] = cb
@@ -4558,8 +4560,11 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
 
     Returns ``{"resolved": bool, "choice": str|None}`` on completion, or
     ``{"resolved": False, "choice": None, "notify_failed": True}`` if the
-    notify callback raised.  Persistence of an approved choice and building
-    the final tool-facing result dict remain the caller's responsibility.
+    notify callback raised or explicitly rejected the event write.  A truthy
+    write result confirms transport acceptance, not client receipt; a client
+    that accepts but never answers still follows the normal approval timeout.
+    Persistence of an approved choice and building the final tool-facing
+    result dict remain the caller's responsibility.
     """
     command = approval_data.get("command", "")
     description = approval_data.get("description", "")
@@ -4625,11 +4630,8 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
         surface=surface,
     )
 
-    # Notify the user (bridges sync agent thread → async gateway)
-    try:
-        notify_cb(dict(entry.data))
-    except Exception as exc:
-        logger.warning("Gateway approval notify failed: %s", exc)
+    def _notify_failed(reason) -> dict:
+        logger.warning("Gateway approval notify failed: %s", reason)
         _drop_entry()
         _fire_approval_hook(
             "post_approval_response",
@@ -4642,6 +4644,16 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
             choice="notify_failed",
         )
         return {"resolved": False, "choice": None, "notify_failed": True}
+
+    # Notify the user (bridges sync agent thread → async gateway)
+    try:
+        delivered = notify_cb(dict(entry.data))
+    except Exception as exc:
+        return _notify_failed(exc)
+    if delivered is False:
+        return _notify_failed(
+            "approval transport rejected the event write"
+        )
 
     # Block until the user responds or the canonical approval timeout elapses
     # (default 300s). Poll in short slices so we can fire activity heartbeats

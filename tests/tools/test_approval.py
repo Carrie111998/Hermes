@@ -1517,6 +1517,40 @@ class TestApprovalTimeoutIsNotConsent:
         ]
         assert hook_calls[-1][1]["choice"] == "notify_failed"
 
+    def test_rejected_transport_write_fails_fast_and_cleans_up(self, monkeypatch):
+        """A closed transport reports False instead of raising."""
+        from tools import approval as mod
+
+        hook_calls = []
+        monkeypatch.setattr(
+            mod,
+            "_fire_approval_hook",
+            lambda event_name, **kwargs: hook_calls.append((event_name, kwargs)),
+        )
+
+        decision = mod._await_gateway_decision(
+            self.SESSION_KEY,
+            lambda _data: False,
+            {
+                "command": "redacted-command",
+                "description": "redacted-description",
+                "pattern_key": "dangerous",
+                "pattern_keys": ["dangerous"],
+            },
+        )
+
+        assert decision == {
+            "resolved": False,
+            "choice": None,
+            "notify_failed": True,
+        }
+        assert self.SESSION_KEY not in mod._gateway_queues
+        assert [name for name, _ in hook_calls] == [
+            "pre_approval_request",
+            "post_approval_response",
+        ]
+        assert hook_calls[-1][1]["choice"] == "notify_failed"
+
     def test_pending_approval_is_replayable_and_acknowledged(self, monkeypatch):
         from tools import approval as mod
 

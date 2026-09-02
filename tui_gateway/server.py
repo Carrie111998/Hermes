@@ -2615,8 +2615,8 @@ def _event_frame(event: str, sid: str, payload: dict | None = None) -> dict:
     return {"jsonrpc": "2.0", "method": "event", "params": params}
 
 
-def _emit(event: str, sid: str, payload: dict | None = None):
-    write_json(_event_frame(event, sid, payload))
+def _emit(event: str, sid: str, payload: dict | None = None) -> bool:
+    return write_json(_event_frame(event, sid, payload))
 
 
 # Live client transports, one per connected WS peer (maintained by tui_gateway.ws).
@@ -3086,7 +3086,7 @@ def _pending_approval_request_payload(session_key: str) -> dict | None:
     return _approval_request_payload(approval) if approval else None
 
 
-def _emit_approval_request(sid: str, data: dict | None) -> None:
+def _emit_approval_request(sid: str, data: dict | None) -> bool:
     """Emit an ``approval.request`` event to the TUI client with the command
     redacted. The approval payload is built from the RAW command string, so a
     credential-shaped value Tirith flagged would otherwise be echoed verbatim
@@ -3094,7 +3094,16 @@ def _emit_approval_request(sid: str, data: dict | None) -> None:
     platforms and the SSE/API stream fixed in #50767). Reuse the shared gateway
     seam so all approval transports redact consistently."""
     payload = _approval_request_payload(data)
-    _emit("approval.request", sid, payload)
+    request_id = str(payload.get("request_id") or "")
+    delivered = _emit("approval.request", sid, payload)
+    if delivered is False:
+        logger.warning(
+            "Approval request transport rejected delivery for session %s "
+            "(request_id=%s)",
+            sid,
+            request_id or "unknown",
+        )
+    return delivered
 
 
 def _status_update(sid: str, kind: str, text: str | None = None):
