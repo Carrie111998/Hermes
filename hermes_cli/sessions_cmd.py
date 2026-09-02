@@ -330,7 +330,10 @@ def cmd_sessions(args, sessions_parser=None):
         from hermes_state import workspace_key as _ws_key
 
         sessions = db.list_sessions_rich(
-            source=args.source, exclude_sources=_exclude, limit=args.limit
+            source=args.source,
+            exclude_sources=_exclude,
+            limit=args.limit,
+            order_by_last_active=True,
         )
 
         # Workspace filter: match a session by its workspace key (git repo
@@ -1210,7 +1213,10 @@ def cmd_sessions(args, sessions_parser=None):
         source = getattr(args, "source", None)
         _browse_exclude = None if source else ["tool"]
         sessions = db.list_sessions_rich(
-            source=source, exclude_sources=_browse_exclude, limit=limit
+            source=source,
+            exclude_sources=_browse_exclude,
+            limit=limit,
+            order_by_last_active=True,
         )
         if not sessions:
             db.close()
