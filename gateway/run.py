@@ -7169,6 +7169,18 @@ class TurnRunner:
                     result.get("messages", []),
                     history_offset=len(agent_history),
                 )
+            try:
+                from gateway.session_context import current_run_binding
+
+                _binding = current_run_binding()
+                if _binding is not None:
+                    result["run_binding"] = {
+                        "repo": _binding.repo_root,
+                        "branch": _binding.branch or _binding.ref,
+                        "sha": _binding.short_head,
+                    }
+            except Exception:
+                logger.debug("Could not attach run binding to gateway result", exc_info=True)
 
         ctx.result_holder[0] = result
 
@@ -7366,6 +7378,7 @@ class TurnRunner:
                 "output_tokens": _output_toks,
                 "model": _resolved_model,
                 "context_length": _context_length,
+                "run_binding": result.get("run_binding"),
             }
 
         # Scan tool results for MEDIA:<path> tags that need to be delivered
@@ -7455,6 +7468,7 @@ class TurnRunner:
             # self-persisted (it didn't — see codex_runtime.py).  Default
             # True preserves the skip-db behaviour for the standard runtime.
             "agent_persisted": (ctx.result_holder[0].get("agent_persisted", True) if ctx.result_holder[0] else True),
+            "run_binding": ctx.result_holder[0].get("run_binding") if ctx.result_holder[0] else None,
         }
 
 
@@ -23775,6 +23789,44 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
                 response = ""
 
+            # Keep the server-owned delegation identity on the existing final
+            # reply. This is independent of optional tool progress, so a
+            # normal messaging channel still receives the checkout and child
+            # outcome when progress display is disabled.
+            _binding_meta = agent_result.get("run_binding")
+            _binding_line = None
+            if isinstance(_binding_meta, dict) and not _intentional_silence:
+                _binding_line = (
+                    "🔀 delegation "
+                    f"{'failed' if agent_result.get('failed') else 'completed'} · "
+                    f"repo={_binding_meta.get('repo') or ''} "
+                    f"branch={_binding_meta.get('branch') or 'HEAD'} "
+                    f"sha={_binding_meta.get('sha') or ''}"
+                )
+                if response and not agent_result.get("already_sent"):
+                    response = f"{response}\n\n{_binding_line}"
+                elif not response and not agent_result.get("already_sent"):
+                    response = _binding_line
+
+            # ``run_binding`` is returned by the server-owned gateway turn,
+            # not by the model. Attach it to the existing final reply so
+            # messaging surfaces still show the selected checkout when their
+            # optional tool-progress queue is disabled.
+            _binding_meta = agent_result.get("run_binding")
+            _binding_line = None
+            if isinstance(_binding_meta, dict) and not _intentional_silence:
+                _binding_line = (
+                    "🔀 delegation "
+                    f"{'failed' if agent_result.get('failed') else 'completed'} · "
+                    f"repo={_binding_meta.get('repo') or ''} "
+                    f"branch={_binding_meta.get('branch') or 'HEAD'} "
+                    f"sha={_binding_meta.get('sha') or ''}"
+                )
+                if response and not agent_result.get("already_sent"):
+                    response = f"{response}\n\n{_binding_line}"
+                elif not response and not agent_result.get("already_sent"):
+                    response = _binding_line
+
             # Auto voice reply: send TTS audio before the text response
             _already_sent = bool(agent_result.get("already_sent"))
             # Skip when streaming TTS already delivered audio for this turn (#60671).
@@ -23822,6 +23874,32 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             )
                     except Exception as _e:
                         logger.debug("trailing footer send failed: %s", _e)
+                if _binding_line:
+                    try:
+                        _binding_adapter = self._adapter_for_source(source)
+                        if _binding_adapter:
+                            await _binding_adapter.send(
+                                source.chat_id,
+                                _binding_line,
+                                metadata=self._thread_metadata_for_source(
+                                    source, self._reply_anchor_for_event(event)
+                                ),
+                            )
+                    except Exception as _e:
+                        logger.debug("trailing binding send failed: %s", _e)
+                if _binding_line:
+                    try:
+                        _binding_adapter = self._adapter_for_source(source)
+                        if _binding_adapter:
+                            await _binding_adapter.send(
+                                source.chat_id,
+                                _binding_line,
+                                metadata=self._thread_metadata_for_source(
+                                    source, self._reply_anchor_for_event(event)
+                                ),
+                            )
+                    except Exception as _e:
+                        logger.debug("trailing binding send failed: %s", _e)
                 # This branch returns None so the adapter does not send the
                 # body twice. /loop and /goal hooks in _handle_message read
                 # the return value, so stash the delivered text on the event

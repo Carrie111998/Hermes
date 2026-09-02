@@ -1,8 +1,9 @@
 """Focused ordinary-gateway turn to delegate binding coverage."""
 
 import queue
+import asyncio
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from gateway.config import Platform
 from gateway.run import GatewayRunner, TurnRunner
@@ -102,3 +103,29 @@ def test_gateway_progress_keeps_bound_checkout_visible():
     assert progress.get_nowait() == (
         "🔀 delegation started · repo=/workspace branch=main sha=abc123456789"
     )
+
+
+def test_final_adapter_delivery_keeps_binding_when_progress_is_off():
+    runner = object.__new__(GatewayRunner)
+    adapter = MagicMock()
+    adapter.extract_media.side_effect = lambda text: ([], text)
+    adapter.send = AsyncMock()
+    source = SessionSource(platform=Platform.TELEGRAM, chat_id="chat")
+    response = (
+        "The child completed the requested work.\n\n"
+        "🔀 delegation completed · repo=/workspace branch=main sha=abc123456789"
+    )
+
+    # This is the existing final adapter path. No progress queue is involved;
+    # progress display is off, but the final same-channel reply remains intact.
+    asyncio.run(
+        runner._deliver_queued_first_response(
+            response,
+            source,
+            adapter,
+            deliver_media=False,
+        )
+    )
+
+    adapter.send.assert_awaited_once()
+    assert response in adapter.send.await_args.args

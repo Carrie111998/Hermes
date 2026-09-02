@@ -4360,6 +4360,15 @@ def delegate_task(
                     "Start a new conversation turn after selecting the intended worktree."
                 )
         _bound_run_binding = _reprobed
+        try:
+            from gateway.session_context import set_run_binding
+
+            # Preserve the server-derived result for the enclosing gateway
+            # run. The event-loop final-reply path consumes only the compact
+            # projection; it never trusts model/RPC text for identity.
+            set_run_binding(_bound_run_binding)
+        except Exception:
+            logger.debug("Could not publish gateway run binding", exc_info=True)
         if run_git(_binding_cwd, "status", "--porcelain", "--untracked-files=all"):
             return tool_error(
                 "Delegation refused: the selected worktree has uncommitted changes. "
