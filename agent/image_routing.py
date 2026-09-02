@@ -66,8 +66,19 @@ _IMAGE_EXT_PATTERN = "|".join(e.lstrip(".") for e in _IMAGE_EXTS)
 # Absolute / home-relative local image path. Matches the same shape gateway's
 # extract_local_files() uses: anchors to ``~/`` or ``/``, ignores matches inside
 # URLs (the ``(?<![/:\w.])`` lookbehind), and case-insensitive on the extension.
+#
+# The second alternative is the Windows drive-letter form (``C:\dir\x.png``
+# or ``C:/dir/x.png``). Without it a worker on Windows silently attaches
+# nothing: every native absolute path a task body can carry starts with a
+# drive letter, not ``/``. Its lookbehind refuses a drive letter preceded by
+# a word char, dot, colon or slash, so URL shapes like
+# ``https://host/s:/a.png`` still do not match.
 _LOCAL_IMAGE_PATH_RE = re.compile(
-    r"(?<![/:\w.])(?:~/|/)(?:[\w.\-]+/)*[\w.\-]+\.(?:" + _IMAGE_EXT_PATTERN + r")\b",
+    r"(?<![/:\w.])(?:~/|/)(?:[\w.\-]+/)*[\w.\-]+\.(?:" + _IMAGE_EXT_PATTERN + r")\b"
+    r"|"
+    r"(?<![\w:.\\/])[A-Za-z]:[\\/](?:[\w.\-]+[\\/])*[\w.\-]+\.(?:"
+    + _IMAGE_EXT_PATTERN
+    + r")\b",
     re.IGNORECASE,
 )
 
@@ -120,7 +131,12 @@ def extract_image_refs(text: str) -> Tuple[List[str], List[str]]:
         if _in_code(match.start()):
             continue
         raw = match.group(0)
-        expanded = os.path.expanduser(raw)
+        # normpath settles the separator: expanduser concatenates the home
+        # dir onto the rest of the match, so ``~/x.png`` on Windows comes
+        # back as ``C:\Users\me/x.png``. isfile() tolerates that, but the
+        # path is also echoed to the model in the text part and keyed for
+        # dedup, so it should read as one platform's path, not a mix.
+        expanded = os.path.normpath(os.path.expanduser(raw))
         try:
             if not os.path.isfile(expanded):
                 continue
