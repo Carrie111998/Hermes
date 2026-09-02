@@ -58,6 +58,25 @@ class TestEmailReadOnly(unittest.TestCase):
         self.assertTrue(result.success)
         adapter._send_email.assert_not_called()
 
+    def test_read_only_connects_with_imap_only_and_never_tests_smtp(self):
+        """Inbound-only mode must not need a working SMTP endpoint to receive."""
+        adapter = _make_adapter(extra={"read_only": True})
+        adapter._address = "hermes@example.com"
+        adapter._password = "mailbox-password"
+        adapter._imap_host = "imap.example.com"
+        adapter._smtp_host = ""
+        adapter._connect_smtp = MagicMock(name="smtp_connection")
+        imap = MagicMock()
+        imap.uid.return_value = ("OK", [b""])
+
+        async def connect_then_disconnect():
+            with patch("imaplib.IMAP4_SSL", return_value=imap):
+                self.assertTrue(await adapter.connect())
+                await adapter.disconnect()
+
+        asyncio.run(connect_then_disconnect())
+        adapter._connect_smtp.assert_not_called()
+
     def test_default_is_not_read_only_and_sends(self):
         adapter = _make_adapter()  # no extra, no env -> read_only stays False
         self.assertFalse(adapter._read_only)
@@ -73,6 +92,28 @@ class TestEmailReadOnly(unittest.TestCase):
         # Explicit config.yaml value wins over the env mirror.
         adapter = _make_adapter(extra={"read_only": False}, env={"EMAIL_READ_ONLY": "true"})
         self.assertFalse(adapter._read_only)
+
+    def test_proactive_standalone_send_remains_an_explicit_opt_in_route(self):
+        """Cron/report delivery is intentionally not an Email-session reply."""
+        from gateway.config import PlatformConfig
+        from plugins.platforms.email.adapter import _standalone_send
+
+        pconfig = PlatformConfig(
+            enabled=True,
+            extra={
+                "read_only": True,
+                "address": "hermes@example.com",
+                "smtp_host": "smtp.example.com",
+            },
+        )
+        with patch.dict(os.environ, {"EMAIL_PASSWORD": "mailbox-password"}, clear=False), \
+             patch("smtplib.SMTP") as smtp:
+            result = asyncio.run(
+                _standalone_send(pconfig, "report-recipient@example.com", "scheduled report")
+            )
+
+        self.assertTrue(result["success"])
+        smtp.return_value.send_message.assert_called_once()
 
     def test_read_only_suppresses_document_and_image_batch(self):
         adapter = _make_adapter(extra={"read_only": True})
