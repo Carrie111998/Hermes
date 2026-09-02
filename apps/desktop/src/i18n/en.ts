@@ -2571,6 +2571,8 @@ export const en: Translations = {
     queueEdit: 'Edit',
     queueSendNext: 'Next',
     queueSteer: 'Steer — redirect the live turn now',
+    steerImagesUnsupportedTitle: 'Images cannot steer this runtime',
+    steerImagesUnsupported: 'Images cannot steer this runtime; queued for the next turn',
     queueSend: 'Send',
     queueDelete: 'Delete',
     queueResume: 'Resume',
