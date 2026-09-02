@@ -2095,7 +2095,10 @@ def query_ollama_num_ctx(model: str, base_url: str, api_key: str = "") -> Option
 
     try:
         with httpx.Client(timeout=3.0, headers=headers) as client:
-            resp = client.post(f"{server_url}/api/show", json={"name": bare_model})
+            resp = client.post(
+                f"{server_url}/api/show",
+                json={"model": bare_model, "name": bare_model},
+            )
             if resp.status_code != 200:
                 return None
             data = resp.json()
@@ -2153,7 +2156,10 @@ def query_ollama_supports_vision(model: str, base_url: str, api_key: str = "") -
 
     try:
         with httpx.Client(timeout=3.0, headers=headers) as client:
-            resp = client.post(f"{server_url}/api/show", json={"name": bare_model})
+            resp = client.post(
+                f"{server_url}/api/show",
+                json={"model": bare_model, "name": bare_model},
+            )
             if resp.status_code != 200:
                 return None
             data = resp.json()
@@ -2233,7 +2239,10 @@ def _query_ollama_api_show_uncached(model: str, base_url: str, api_key: str = ""
 
     try:
         with httpx.Client(timeout=5.0, headers=headers) as client:
-            resp = client.post(f"{server_url}/api/show", json={"name": model})
+            resp = client.post(
+                f"{server_url}/api/show",
+                json={"model": model, "name": model},
+            )
             if resp.status_code != 200:
                 return None
             data = resp.json()
@@ -2420,7 +2429,10 @@ def _query_local_context_length_uncached(model: str, base_url: str, api_key: str
         with httpx.Client(timeout=3.0, headers=headers) as client:
             # Ollama: /api/show returns model details with context info
             if server_type == "ollama":
-                resp = client.post(f"{server_url}/api/show", json={"name": model})
+                resp = client.post(
+                    f"{server_url}/api/show",
+                    json={"model": model, "name": model},
+                )
                 if resp.status_code == 200:
                     data = resp.json()
                     # Prefer explicit num_ctx from Modelfile parameters: this is
