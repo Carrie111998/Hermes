@@ -34,6 +34,7 @@ Directory layout for user skills:
 
 import json
 import logging
+import os
 import re
 import shutil
 import threading
@@ -741,7 +742,10 @@ def _find_skill(name: str) -> Optional[Dict[str, Any]]:
     for skills_dir in get_all_skills_dirs():
         if not skills_dir.exists():
             continue
-        for skill_md in skills_dir.rglob("SKILL.md"):
+        for root, _dirs, files in os.walk(str(skills_dir), followlinks=True):
+            if "SKILL.md" not in files:
+                continue
+            skill_md = Path(root) / "SKILL.md"
             if is_excluded_skill_path(skill_md):
                 continue
             # Fast path first: the bare directory name. Avoids the resolve()
@@ -752,7 +756,7 @@ def _find_skill(name: str) -> Optional[Dict[str, Any]]:
             # dir's POSIX relative path so the lookup works on Windows too.
             if "/" in name or "\\" in name:
                 try:
-                    rel = skill_md.parent.resolve().relative_to(_local_root())
+                    rel = skill_md.parent.relative_to(_local_root())
                 except ValueError:
                     continue
                 if rel.as_posix() == name:
