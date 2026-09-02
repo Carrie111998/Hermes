@@ -113,6 +113,13 @@ class TestShouldAllowInstall:
         assert allowed is True
         assert "builtin source" in reason
 
+    @pytest.mark.parametrize("verdict", ["safe", "caution", "dangerous"])
+    def test_operator_policy_never_blocks(self, verdict):
+        f = [Finding("x", "critical", "c", "f", 1, "m", "d")]
+        allowed, reason = should_allow_install(self._result("operator", verdict, f))
+        assert allowed is True
+        assert f"operator source, {verdict} verdict" in reason
+
 
     @pytest.mark.parametrize("trust", ["community", "trusted"])
     def test_force_does_not_override_dangerous(self, trust):

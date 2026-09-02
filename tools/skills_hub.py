@@ -134,7 +134,7 @@ class SkillMeta:
     description: str
     source: str           # "official", "github", "clawhub", "lobehub"
     identifier: str       # source-specific ID (e.g. "openai/skills/skill-creator")
-    trust_level: str      # "builtin" | "trusted" | "community"
+    trust_level: str      # "builtin" | "operator" | "trusted" | "community"
     repo: Optional[str] = None
     path: Optional[str] = None
     tags: List[str] = field(default_factory=list)
@@ -691,8 +691,17 @@ class GitHubSource(SkillSource):
     def __init__(self, auth: GitHubAuth, extra_taps: Optional[List[Dict]] = None):
         self.auth = auth
         self.taps = list(self.DEFAULT_TAPS)
-        if extra_taps:
-            self.taps.extend(extra_taps)
+        self._operator_tap_repos: set[str] = set()
+        for tap in extra_taps or []:
+            if not isinstance(tap, dict):
+                logger.warning("Ignoring malformed custom tap record: %r", tap)
+                continue
+            normalized = self._normalize_repo(tap.get("repo", ""))
+            if normalized is None:
+                logger.warning("Ignoring custom tap with invalid repo: %r", tap)
+                continue
+            self._operator_tap_repos.add(normalized)
+            self.taps.append(tap)
         # Per-instance cache: repo -> (default_branch, tree_entries)
         # Survives within a single search/install flow, avoiding redundant API calls.
         self._tree_cache: Dict[str, Tuple[str, List[dict]]] = {}
@@ -712,11 +721,21 @@ class GitHubSource(SkillSource):
         """Whether GitHub API rate limit was hit during operations."""
         return self._rate_limited
 
+    @staticmethod
+    def _normalize_repo(repo: str) -> Optional[str]:
+        parts = str(repo).strip().strip("/").split("/")
+        if len(parts) != 2 or not all(parts):
+            return None
+        return "/".join(parts).casefold()
+
     def trust_level_for(self, identifier: str) -> str:
         # identifier format: "owner/repo/path/to/skill"
         parts = identifier.split("/", 2)
         if len(parts) >= 2:
             repo = f"{parts[0]}/{parts[1]}"
+            normalized_repo = self._normalize_repo(repo)
+            if normalized_repo in self._operator_tap_repos:
+                return "operator"
             if repo in TRUSTED_REPOS:
                 return "trusted"
         return "community"
@@ -740,7 +759,9 @@ class GitHubSource(SkillSource):
         # Deduplicate by identifier, preferring higher trust levels.
         # identifier is unique per skill; name is not (two configured taps can
         # publish skills with the same name but different identifiers).
-        _trust_rank = {"builtin": 2, "trusted": 1, "community": 0}
+        _trust_rank = {
+            "builtin": 3, "operator": 2, "trusted": 1, "community": 0,
+        }
         seen = {}
         for r in results:
             if r.identifier not in seen:
@@ -780,7 +801,13 @@ class GitHubSource(SkillSource):
             return None
         referenced = _referenced_support_paths(skill_md)
         if referenced is None:
-            return None
+            # A complete pinned tree confines every downloaded byte beneath
+            # skill_path, so parent-relative prose links cannot escape the
+            # bundle. Keep fail-closed behavior only for the Contents API
+            # fallback, where references determine what gets fetched.
+            if tree is None:
+                return None
+            referenced = set()
 
         files: Dict[str, Union[str, bytes]] = {"SKILL.md": skill_md}
         if tree is not None:
@@ -806,7 +833,7 @@ class GitHubSource(SkillSource):
                 if rel_path == "SKILL.md":
                     continue
                 base = rel_path.rsplit("/", 1)[-1]
-                if base.startswith(".") or base.endswith(".pyc") or "__pycache__" in rel_path.split("/"):
+                if base.endswith(".pyc") or "__pycache__" in rel_path.split("/"):
                     continue
                 try:
                     rel_path = _validate_bundle_rel_path(rel_path)
@@ -815,9 +842,10 @@ class GitHubSource(SkillSource):
                     return None
                 content = self._fetch_file_bytes(repo, item_path, ref=pinned_ref)
                 if content is None:
-                    logger.warning("Failed to fetch referenced skill support "
-                                   "file; continuing without it: %s", item_path)
-                    continue
+                    logger.warning(
+                        "Failed to fetch tree-listed skill file: %s", item_path
+                    )
+                    return None
                 files[rel_path] = content
             # A SKILL.md-linked support path that isn't in the tree is a
             # dangling link — a repo-only dev tool, prose over-match, or a
@@ -842,14 +870,11 @@ class GitHubSource(SkillSource):
                     )
             revision = self._tree_revisions.get(repo) or branch
         else:
-            for rel_path in referenced:
-                content = self._fetch_file_bytes(repo, f"{skill_path.rstrip('/')}/{rel_path}")
-                if content is None:
-                    logger.warning("Failed to fetch referenced skill support "
-                                   "file; continuing without it: %s", rel_path)
-                    continue
-                files[rel_path] = content
-            revision = ""
+            logger.warning(
+                "Cannot fetch a complete pinned skill bundle without the "
+                "repository tree: %s/%s", repo, skill_path,
+            )
+            return None
 
         skill_name = skill_path.rstrip("/").split("/")[-1]
         trust = self.trust_level_for(identifier)
@@ -1826,9 +1851,11 @@ class SkillsShSource(SkillSource):
     )
     _WEEKLY_INSTALLS_RE = re.compile(r'Weekly Installs.*?children\\":\\"(?P<count>[0-9.,Kk]+)\\"', re.DOTALL)
 
-    def __init__(self, auth: GitHubAuth):
+    def __init__(
+        self, auth: GitHubAuth, github: Optional[GitHubSource] = None
+    ):
         self.auth = auth
-        self.github = GitHubSource(auth=auth)
+        self.github = github or GitHubSource(auth=auth)
 
     def source_id(self) -> str:
         return "skills-sh"
@@ -4609,13 +4636,15 @@ class HermesIndexSource(SkillSource):
     downstream sources take over transparently.
     """
 
-    def __init__(self, auth: GitHubAuth):
+    def __init__(
+        self, auth: GitHubAuth, github: Optional[GitHubSource] = None
+    ):
         self._index: Optional[dict] = None
         self._loaded = False
         self.auth = auth
         # Lazily create GitHubSource for fetch — only used when actually
         # downloading files, which requires real GitHub API calls.
-        self._github: Optional[GitHubSource] = None
+        self._github: Optional[GitHubSource] = github
 
     def _ensure_loaded(self) -> dict:
         if not self._loaded:
@@ -4771,14 +4800,22 @@ class HermesIndexSource(SkillSource):
 
         return None
 
-    @staticmethod
-    def _to_meta(entry: dict) -> SkillMeta:
+    def _to_meta(self, entry: dict) -> SkillMeta:
+        trust_level = entry.get("trust_level", "community")
+        github_id = entry.get("resolved_github_id")
+        if not github_id:
+            repo = entry.get("repo", "")
+            path = entry.get("path", "")
+            if repo and path:
+                github_id = f"{repo}/{path}"
+        if github_id:
+            trust_level = self._get_github().trust_level_for(github_id)
         return SkillMeta(
             name=entry.get("name", ""),
             description=entry.get("description", ""),
             source=entry.get("source", "hermes-index"),
             identifier=entry.get("identifier", ""),
-            trust_level=entry.get("trust_level", "community"),
+            trust_level=trust_level,
             repo=entry.get("repo"),
             path=entry.get("path"),
             tags=entry.get("tags", []),
@@ -4796,14 +4833,15 @@ def create_source_router(auth: Optional[GitHubAuth] = None) -> List[SkillSource]
 
     taps_mgr = TapsManager()
     extra_taps = taps_mgr.list_taps()
+    github = GitHubSource(auth=auth, extra_taps=extra_taps)
 
     sources: List[SkillSource] = [
         OptionalSkillSource(auth=auth),  # Official optional skills (highest priority)
-        HermesIndexSource(auth=auth), # Centralized index (search + resolved install paths)
-        SkillsShSource(auth=auth),
+        HermesIndexSource(auth=auth, github=github), # Centralized index (search + resolved install paths)
+        SkillsShSource(auth=auth, github=github),
         WellKnownSkillSource(),
         UrlSource(),                  # Direct HTTP(S) URL to a SKILL.md file
-        GitHubSource(auth=auth, extra_taps=extra_taps),
+        github,
         ClawHubSource(),
         LobeHubSource(),
         BrowseShSource(),   # browse.sh: 169+ site-specific browser automation skills
@@ -4946,7 +4984,9 @@ def unified_search(query: str, sources: List[SkillSource],
     # identifier is always unique per skill (e.g. "browse-sh/airbnb.com/search-listings-ddgioa").
     # Using name would incorrectly collapse browse-sh skills from different sites that share
     # the same task name (e.g. "search-listings" from Airbnb and Booking.com).
-    _TRUST_RANK = {"builtin": 2, "trusted": 1, "community": 0}
+    _TRUST_RANK = {
+        "builtin": 3, "operator": 2, "trusted": 1, "community": 0,
+    }
     seen: Dict[str, SkillMeta] = {}
     for r in all_results:
         if r.identifier not in seen:

@@ -28,6 +28,15 @@ from hermes_constants import display_hermes_home
 _console = Console()
 
 
+def _apply_current_bundle_trust(
+    result, scan_provenance: dict, trust_level: str
+) -> None:
+    """Bind policy to the active source router, never stale scan-cache trust."""
+    result.trust_level = trust_level
+    result.scan_provenance["trust_level"] = trust_level
+    scan_provenance["trust_level"] = trust_level
+
+
 def _display_source(r) -> str:
     """Human-facing source label for a result row.
 
@@ -389,7 +398,9 @@ def do_browse(page: int = 1, page_size: int = 20, source: str = "all",
 
     # Collect results from all (or filtered) sources in parallel.
     # Per-source limits are generous — parallelism + 30s timeout cap prevents hangs.
-    _TRUST_RANK = {"builtin": 3, "trusted": 2, "community": 1}
+    _TRUST_RANK = {
+        "builtin": 4, "operator": 3, "trusted": 2, "community": 1,
+    }
     # NOTE: when the centralized index is available, parallel_search_sources
     # skips the external API sources and serves everything from "hermes-index".
     # That source MUST therefore carry a limit large enough to cover the whole
@@ -717,6 +728,10 @@ def do_install(identifier: str, category: str = "", force: bool = False,
         source_url=source_url_for_bundle(bundle),
         cache_dir=HUB_DIR / "scan-cache",
     )
+    # Source identifiers drive scanner provenance, while the active source
+    # router owns trust classification. Reapply current bundle trust on every
+    # install/update so cached scans cannot retain stale tap membership.
+    _apply_current_bundle_trust(result, scan_provenance, bundle.trust_level)
     c.print(format_scan_report(result))
     freshness = "fresh" if scan_provenance["fresh"] else "cached"
     c.print(
@@ -912,7 +927,9 @@ def browse_skills(page: int = 1, page_size: int = 20, source: str = "all") -> di
     )
 
     page_size = max(1, min(page_size, 100))
-    _TRUST_RANK = {"builtin": 3, "trusted": 2, "community": 1}
+    _TRUST_RANK = {
+        "builtin": 4, "operator": 3, "trusted": 2, "community": 1,
+    }
     # "hermes-index" must carry a high limit: when the index is available the
     # router skips external API sources and serves everything from it, so a
     # low cap here silently truncates the whole hub (see do_browse note).

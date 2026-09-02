@@ -11,6 +11,7 @@ import pytest
 from tools.skills_hub import (
     GitHubAuth,
     GitHubSource,
+    HermesIndexSource,
     LobeHubSource,
     SkillsShSource,
     UrlSource,
@@ -123,6 +124,58 @@ class TestTrustLevelFor:
         auth = MagicMock(spec=GitHubAuth)
         return GitHubSource(auth=auth)
 
+    def test_extra_tap_repo_is_operator_trusted(self):
+        auth = MagicMock(spec=GitHubAuth)
+        src = GitHubSource(
+            auth=auth,
+            extra_taps=[{"repo": "GoBeromsu/bstack", "path": "skills/"}],
+        )
+
+        assert src.trust_level_for("goberomsu/BSTACK/skills/hermes") == "operator"
+
+    def test_operator_trust_requires_exact_extra_tap_repo(self):
+        auth = MagicMock(spec=GitHubAuth)
+        src = GitHubSource(
+            auth=auth,
+            extra_taps=[{"repo": "GoBeromsu/bstack", "path": "skills/"}],
+        )
+
+        assert src.trust_level_for("GoBeromsu/bstack-evil/skills/hermes") == "community"
+        assert src.trust_level_for("GoBeromsu/other/skills/hermes") == "community"
+        assert src.trust_level_for("malformed") == "community"
+
+    def test_operator_trust_is_profile_local_and_revoked_with_tap(self):
+        auth = MagicMock(spec=GitHubAuth)
+        default = GitHubSource(
+            auth=auth,
+            extra_taps=[{"repo": "GoBeromsu/bstack", "path": "skills/"}],
+        )
+        other_profile = GitHubSource(auth=auth, extra_taps=[])
+        after_removal = GitHubSource(auth=auth, extra_taps=[])
+        identifier = "GoBeromsu/bstack/skills/hermes"
+
+        assert default.trust_level_for(identifier) == "operator"
+        assert other_profile.trust_level_for(identifier) == "community"
+        assert after_removal.trust_level_for(identifier) == "community"
+
+    def test_default_tap_is_not_operator_trusted(self):
+        src = self._source()
+
+        assert src.trust_level_for("garrytan/gstack/skills/example") == "community"
+
+    @pytest.mark.parametrize("bad_tap", [None, "owner/repo", [], {}, {"repo": "bad"}])
+    def test_malformed_extra_tap_never_crashes_or_confers_trust(
+        self, bad_tap, caplog
+    ):
+        src = GitHubSource(
+            auth=MagicMock(spec=GitHubAuth),
+            extra_taps=[bad_tap],
+        )
+
+        assert src.trust_level_for("owner/repo/skills/example") == "community"
+        assert bad_tap not in src.taps
+        assert "Ignoring" in caplog.text
+
     def test_trusted_repo(self):
         src = self._source()
         # TRUSTED_REPOS is imported from skills_guard, test with known trusted repo
@@ -159,6 +212,82 @@ class TestGitHubSourceFileFetch:
             "https://api.github.com/repos/owner/repo/contents/"
             "skill/references/foo%23bar.md"
         )
+
+    def test_full_directory_fetch_includes_dotfiles(self):
+        src = GitHubSource(auth=MagicMock(spec=GitHubAuth))
+        src._tree_revisions["owner/repo"] = "abc123"
+        src._get_repo_tree = MagicMock(return_value=(
+            "main",
+            [
+                {"path": "skills/demo/SKILL.md", "type": "blob", "mode": "100644"},
+                {"path": "skills/demo/.env.example", "type": "blob", "mode": "100644"},
+            ],
+        ))
+        src._fetch_file_content = MagicMock(return_value=(
+            "---\nname: demo\ndescription: demo\n---\n"
+        ))
+        src._fetch_file_bytes = MagicMock(return_value=b"KEY=example\n")
+
+        bundle = src.fetch("owner/repo/skills/demo")
+
+        assert bundle is not None
+        assert bundle.files[".env.example"] == b"KEY=example\n"
+        src._fetch_file_bytes.assert_called_once_with(
+            "owner/repo", "skills/demo/.env.example", ref="abc123"
+        )
+
+    def test_full_directory_fetch_fails_on_missing_tree_listed_blob(self):
+        src = GitHubSource(auth=MagicMock(spec=GitHubAuth))
+        src._tree_revisions["owner/repo"] = "abc123"
+        src._get_repo_tree = MagicMock(return_value=(
+            "main",
+            [
+                {"path": "skills/demo/SKILL.md", "type": "blob", "mode": "100644"},
+                {"path": "skills/demo/config.json", "type": "blob", "mode": "100644"},
+            ],
+        ))
+        src._fetch_file_content = MagicMock(return_value=(
+            "---\nname: demo\ndescription: demo\n---\n"
+        ))
+        src._fetch_file_bytes = MagicMock(return_value=None)
+
+        assert src.fetch("owner/repo/skills/demo") is None
+
+    def test_full_tree_ignores_parent_relative_prose_link(self):
+        src = GitHubSource(auth=MagicMock(spec=GitHubAuth))
+        src._tree_revisions["owner/repo"] = "abc123"
+        src._get_repo_tree = MagicMock(return_value=(
+            "main",
+            [
+                {"path": "skills/demo/SKILL.md", "type": "blob", "mode": "100644"},
+                {"path": "skills/demo/CHANGELOG.md", "type": "blob", "mode": "100644"},
+            ],
+        ))
+        src._fetch_file_content = MagicMock(return_value=(
+            "---\nname: demo\ndescription: demo\n---\n"
+            "See [the shared contract](../other/contract.md).\n"
+        ))
+        src._fetch_file_bytes = MagicMock(return_value=b"changed\n")
+
+        bundle = src.fetch("owner/repo/skills/demo")
+
+        assert bundle is not None
+        assert bundle.files["CHANGELOG.md"] == b"changed\n"
+        src._fetch_file_bytes.assert_called_once_with(
+            "owner/repo", "skills/demo/CHANGELOG.md", ref="abc123"
+        )
+
+    def test_fetch_fails_closed_when_repository_tree_is_unavailable(self):
+        src = GitHubSource(auth=MagicMock(spec=GitHubAuth))
+        src._get_repo_tree = MagicMock(return_value=None)
+        src._fetch_file_content = MagicMock(return_value=(
+            "---\nname: demo\ndescription: demo\n---\n"
+            "See `references/guide.md`.\n"
+        ))
+        src._fetch_file_bytes = MagicMock(return_value=b"partial")
+
+        assert src.fetch("owner/repo/skills/demo") is None
+        src._fetch_file_bytes.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -566,6 +695,81 @@ class TestCreateSourceRouter:
         url_idx = next(i for i, src in enumerate(sources) if isinstance(src, UrlSource))
         gh_idx = next(i for i, src in enumerate(sources) if isinstance(src, GitHubSource))
         assert url_idx < gh_idx
+
+    def test_operator_aware_github_is_shared_by_index_and_skills_sh(
+        self, monkeypatch
+    ):
+        monkeypatch.setattr(
+            TapsManager,
+            "list_taps",
+            lambda self: [{"repo": "GoBeromsu/bstack", "path": "skills/"}],
+        )
+
+        sources = create_source_router(auth=MagicMock(spec=GitHubAuth))
+        github = next(src for src in sources if type(src) is GitHubSource)
+        index = next(src for src in sources if type(src) is HermesIndexSource)
+        skills_sh = next(src for src in sources if type(src) is SkillsShSource)
+        identifier = "GoBeromsu/bstack/skills/hermes"
+
+        assert github.trust_level_for(identifier) == "operator"
+        assert index._get_github() is github
+        assert skills_sh.github is github
+
+    def test_index_fetch_preserves_operator_trust_from_shared_github(
+        self, monkeypatch
+    ):
+        github = GitHubSource(
+            auth=MagicMock(spec=GitHubAuth),
+            extra_taps=[{"repo": "GoBeromsu/bstack", "path": "skills/"}],
+        )
+        index = HermesIndexSource(
+            auth=MagicMock(spec=GitHubAuth),
+            github=github,
+        )
+        identifier = "GoBeromsu/bstack/skills/hermes"
+        index._loaded = True
+        index._index = {
+            "skills": [{
+                "identifier": identifier,
+                "resolved_github_id": identifier,
+                "source": "github",
+            }],
+        }
+        monkeypatch.setattr(
+            github,
+            "fetch",
+            lambda resolved: SkillBundle(
+                name="hermes",
+                files={"SKILL.md": "dangerous example"},
+                source="github",
+                identifier=resolved,
+                trust_level=github.trust_level_for(resolved),
+            ),
+        )
+
+        bundle = index.fetch(identifier)
+
+        assert bundle is not None
+        assert bundle.trust_level == "operator"
+
+    def test_index_metadata_uses_current_operator_tap_trust(self):
+        github = GitHubSource(
+            auth=MagicMock(spec=GitHubAuth),
+            extra_taps=[{"repo": "GoBeromsu/bstack", "path": "skills/"}],
+        )
+        index = HermesIndexSource(
+            auth=MagicMock(spec=GitHubAuth),
+            github=github,
+        )
+
+        meta = index._to_meta({
+            "name": "hermes",
+            "identifier": "GoBeromsu/bstack/skills/hermes",
+            "resolved_github_id": "GoBeromsu/bstack/skills/hermes",
+            "trust_level": "community",
+        })
+
+        assert meta.trust_level == "operator"
 
 
 # ---------------------------------------------------------------------------

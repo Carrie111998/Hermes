@@ -69,6 +69,9 @@ TRUSTED_REPOS = {
 INSTALL_POLICY = {
     #                  safe      caution    dangerous
     "builtin":       ("allow",  "allow",   "allow"),
+    # Adding a custom tap is the operator's one-time trust decision. Scanning
+    # and findings remain intact, but they are advisory for that source.
+    "operator":      ("allow",  "allow",   "allow"),
     "trusted":       ("allow",  "allow",   "block"),
     "community":     ("allow",  "block",   "block"),
     # Agent-created: "ask" on dangerous surfaces as an error to the agent,
@@ -100,7 +103,7 @@ class Finding:
 class ScanResult:
     skill_name: str
     source: str
-    trust_level: str    # "builtin" | "trusted" | "community"
+    trust_level: str    # "builtin" | "operator" | "trusted" | "community"
     verdict: str        # "safe" | "caution" | "dangerous"
     findings: List[Finding] = field(default_factory=list)
     scanned_at: str = ""
