@@ -8224,6 +8224,13 @@ def _cmd_update_impl(args, gateway_mode: bool):
     # every planned runtime against the phase's bookkeeping (restart via
     # declared mechanism — the plan is the worklist, not just a printout).
     _pre_update_plan = None
+    # Linux user-systemd installs get a stricter, exact worker-generation
+    # boundary in addition to the generic cross-platform runtime inventory.
+    # Keep the pre-mutation module object alive across the source swap: its
+    # injected runner and parsed snapshot are deliberately self-contained.
+    _systemd_worker_boundary = None
+    _systemd_boundary_snapshot = None
+    _systemd_boundary_units: set[str] = set()
     try:
         from hermes_cli.update_inventory import (
             collect_runtime_inventory,
@@ -8559,6 +8566,27 @@ def _cmd_update_impl(args, gateway_mode: bool):
 
     # Fetch and pull
     try:
+
+        # Capture exact user units before checkout/merge can mutate source.
+        # Once the existing capability probe says user systemd is relevant,
+        # inventory errors are fatal: an empty result cannot be distinguished
+        # from a failed user bus and must not permit an in-place code swap.
+        try:
+            from hermes_cli.gateway import supports_systemd_services
+            from hermes_cli.update_systemd_boundary import (
+                capture_systemd_worker_boundary,
+            )
+
+            _captured_boundary = capture_systemd_worker_boundary(
+                relevant=supports_systemd_services()
+            )
+            if _captured_boundary is not None:
+                _systemd_worker_boundary, _systemd_boundary_snapshot = (
+                    _captured_boundary
+                )
+        except Exception as exc:
+            print(f"✗ Cannot establish the systemd worker boundary: {exc}")
+            sys.exit(1)
 
         # Resolve the target branch up front so the fetch can be scoped to it.
         # A bare `git fetch origin` pulls every ref, and this repo carries
@@ -9865,6 +9893,35 @@ def _cmd_update_impl(args, gateway_mode: bool):
         # path forwards it to the update receipt.
         killed_pids: set = set()
 
+        # The source and dependencies now form the installed generation.  Move
+        # every exact user-systemd target captured before mutation through the
+        # canary/fleet boundary before the older generic restart logic runs.
+        # On failure monitors intentionally stay paused and the exception's
+        # recovery text names every affected unit.
+        if (
+            _systemd_worker_boundary is not None
+            and _systemd_boundary_snapshot is not None
+            and _systemd_boundary_snapshot.targets
+        ):
+            try:
+                _systemd_boundary_units = set(
+                    _systemd_worker_boundary.transition(_systemd_boundary_snapshot)
+                )
+                restarted_services.extend(sorted(_systemd_boundary_units))
+            except Exception as exc:
+                print(f"✗ Systemd worker generation transition failed: {exc}")
+                gateway_fleet_restart_incomplete = True
+                failed_or_stale_units.extend(
+                    sorted(_systemd_boundary_snapshot.targets)
+                )
+                try:
+                    from hermes_cli.update_receipt import finalize_update_receipt
+
+                    finalize_update_receipt("partial")
+                except Exception:
+                    pass
+                sys.exit(1)
+
         # Auto-restart ALL gateways after update.
         # The code update (git pull) is shared across all profiles, so every
         # running gateway needs restarting to pick up the new code.
@@ -10101,6 +10158,12 @@ def _cmd_update_impl(args, gateway_mode: bool):
                         continue
 
                     def _restart_one_systemd_gateway_unit(svc_name: str) -> None:
+                        # Already transitioned and exactly reconciled by the
+                        # user-systemd generation boundary above. Restarting it
+                        # again would destroy the canary proof and start-time
+                        # evidence we just established.
+                        if svc_name in _systemd_boundary_units:
+                            return
                         # Check if active
                         check = subprocess.run(
                             scope_cmd + ["is-active", svc_name],
@@ -10921,6 +10984,12 @@ def _cmd_update_impl(args, gateway_mode: bool):
                 gateway_fleet_restart_incomplete = True
         except Exception as _fleet_exc:
             logger.debug("Fleet version verification failed: %s", _fleet_exc)
+            if _systemd_boundary_units:
+                print(
+                    "\n⚠ Fleet version verification raised after the systemd "
+                    f"transition: {_fleet_exc}"
+                )
+                gateway_fleet_restart_incomplete = True
 
         # Plan-vs-execution reconciliation (#91277 Phase 2, restart via
         # declared mechanism): every runtime the PLAN saw must be accounted
@@ -10962,6 +11031,33 @@ def _cmd_update_impl(args, gateway_mode: bool):
                     pass
         except Exception as _outcome_exc:
             logger.debug("Runtime-outcome reconciliation failed: %s", _outcome_exc)
+            if _systemd_boundary_units:
+                print(
+                    "\n⚠ Runtime-outcome reconciliation raised after the "
+                    f"systemd transition: {_outcome_exc}"
+                )
+                gateway_fleet_restart_incomplete = True
+
+        # The systemd boundary intentionally left optional Buzz health/e2e
+        # monitors paused while the authoritative code-SHA fleet matrix and
+        # plan-vs-execution reconciliation ran. Re-arm only after both proofs
+        # pass; a failed timer/e2e start makes the update partial/non-zero.
+        if (
+            _systemd_worker_boundary is not None
+            and _systemd_boundary_snapshot is not None
+            and _systemd_boundary_units
+            and not gateway_fleet_restart_incomplete
+        ):
+            try:
+                _systemd_worker_boundary.rearm_monitors(
+                    _systemd_boundary_snapshot
+                )
+            except Exception as _monitor_exc:
+                print(f"✗ Systemd monitor re-arm failed: {_monitor_exc}")
+                gateway_fleet_restart_incomplete = True
+                failed_or_stale_units.extend(
+                    sorted(_systemd_boundary_snapshot.targets)
+                )
 
         try:
             from hermes_cli.update_receipt import finalize_update_receipt
