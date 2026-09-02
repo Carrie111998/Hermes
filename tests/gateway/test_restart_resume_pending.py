@@ -300,6 +300,29 @@ class TestResumePendingSystemNote:
             last_resume_marked_at=now,
         )
 
+    def test_interactive_resume_allows_one_required_read_only_completion_check(self):
+        """A restart must block replay, not the receipt that proves completion."""
+        note = build_resume_recovery_note(
+            "shutdown_timeout", "", interactive=True
+        )
+
+        assert "do NOT re-execute it" in note
+        assert "exactly one targeted read-only status or receipt check" in note
+        assert "report the terminal state" in note
+        assert "do NOT re-execute or verify it" not in note
+        assert "do not continue unfinished mutating work" in note
+
+    def test_new_user_message_may_request_read_only_completion_check(self):
+        """A user's completion question must not be blocked by the replay guard."""
+        note = build_resume_recovery_note(
+            "restart_timeout", "Did the release finish?", interactive=True
+        )
+
+        assert "Address the user's NEW message" in note
+        assert "targeted read-only status or receipt check is allowed" in note
+        assert "Did the release finish?" in note
+        assert "unless the new message requests it" in note
+
 
     def test_empty_message_noninteractive_note_continues_task(self):
         """Non-interactive platforms (webhook, API server): nobody can answer

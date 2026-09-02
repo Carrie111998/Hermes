@@ -1570,17 +1570,22 @@ def build_resume_recovery_note(
             "on what the user is asking now."
         )
         tail_guidance = (
-            "Do NOT re-execute old tool calls — skip any "
-            "unfinished work from the conversation history."
+            "Do NOT re-execute old tool calls. A targeted read-only status "
+            "or receipt check is allowed when needed to answer the new "
+            "message; do not continue other unfinished mutating work unless "
+            "the new message requests it."
         )
     elif interactive:
         resume_guidance = (
-            "Report to the user that the session was restored "
-            "successfully and ask what they would like to do next."
+            "If the interrupted task declares a required post-restart "
+            "completion check, perform exactly one targeted read-only status "
+            "or receipt check and report the terminal state. Otherwise, "
+            "report to the user that the session was restored successfully "
+            "and ask what they would like to do next."
         )
         tail_guidance = (
-            "Do NOT re-execute old tool calls — skip any "
-            "unfinished work from the conversation history."
+            "Do NOT re-execute old tool calls and do not continue unfinished "
+            "mutating work."
         )
     else:
         resume_guidance = (
@@ -1598,7 +1603,7 @@ def build_resume_recovery_note(
         f"[System note: The previous turn was interrupted by "
         f"{reason_phrase}; the gateway is now back online. "
         f"Any restart/shutdown command in the history has already "
-        f"run — do NOT re-execute or verify it. {resume_guidance} "
+        f"run — do NOT re-execute it. {resume_guidance} "
         f"{tail_guidance}]"
         + (f"\n\n{message}" if message else "")
     )
