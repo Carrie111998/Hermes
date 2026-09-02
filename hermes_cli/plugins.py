@@ -6110,6 +6110,7 @@ class PluginManager:
         return [
             {
                 "name": qualified,
+                "plugin_key": str(entry.get("plugin_key", entry.get("plugin", ""))),
                 "description": str(entry.get("description", "")),
                 "category": "plugin",
                 "frontmatter": dict(entry.get("frontmatter", {})),
