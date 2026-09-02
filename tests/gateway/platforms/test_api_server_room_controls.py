@@ -247,3 +247,22 @@ async def test_retry_is_queued_for_the_process_that_owns_the_room_lease(
     assert [(item.command_id, item.task_ids) for item in pending] == [
         ("remote-retry-worker", ("task-1",))
     ]
+
+
+@pytest.mark.asyncio
+async def test_empty_remote_retry_returns_the_shared_actionable_error(control_api):
+    _adapter, app, service, headers = control_api
+    service.retried.append("already-settled")
+
+    async with TestClient(TestServer(app)) as client:
+        response = await client.post(
+            "/v1/room-controls/room-1",
+            json={"action": "retry", "command_id": "remote-retry-empty"},
+            headers=headers,
+        )
+        payload = await response.json()
+
+    assert response.status == 400
+    assert payload["error"]["message"] == (
+        "This Group Chat has no failed work to retry."
+    )

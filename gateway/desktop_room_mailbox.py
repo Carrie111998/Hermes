@@ -22,6 +22,7 @@ from typing import Any, Iterator
 MAX_ROOM_IDS = 128
 MAX_QUERY_ROOM_IDS = 4096
 MAX_COMMANDS_PER_CLAIM = 8
+MAX_AUTOMATIC_SEND_CLAIMS = 2
 MAX_PAYLOAD_BYTES = 64 * 1024
 # Desktop refreshes classic-room presence on a 60s retained-socket backstop;
 # push events handle command latency. Keep enough overlap for scheduler jitter
@@ -346,6 +347,21 @@ def _expire_stale_state(
            WHERE state = 'claimed' AND created_at <= ?
              AND COALESCE(lease_expires_at, 0) <= ?""",
         (expired_result, now, cutoff, now),
+    )
+    exhausted_result = _payload_json({
+        "code": "automatic_attempts_exhausted",
+        "message": "This Group Chat command needs an explicit Retry.",
+    })
+    conn.execute(
+        """UPDATE desktop_room_commands
+           SET state='failed', result_json=?, lease_owner=NULL,
+               lease_token=NULL, lease_expires_at=NULL, updated_at=?
+           WHERE action='send' AND attempts>=?
+             AND (
+                 state='pending'
+                 OR (state='claimed' AND COALESCE(lease_expires_at, 0)<=?)
+             )""",
+        (exhausted_result, now, MAX_AUTOMATIC_SEND_CLAIMS, now),
     )
     conn.execute(
         """DELETE FROM desktop_room_commands
@@ -866,7 +882,8 @@ def retry_failed_command(
             raise DesktopRoomMailboxError("that Group Chat command is not retryable")
         conn.execute(
             """UPDATE desktop_room_commands
-                  SET state='pending', lease_token=NULL, lease_owner=NULL,
+                  SET state='pending', attempts=0,
+                      lease_token=NULL, lease_owner=NULL,
                       lease_expires_at=NULL, result_json=NULL,
                       created_at=?, updated_at=?
                 WHERE command_id=? AND state='failed'""",
@@ -941,7 +958,8 @@ def retry_failed_commands(
                 continue
             conn.execute(
                 """UPDATE desktop_room_commands
-                      SET state='pending', lease_token=NULL, lease_owner=NULL,
+                      SET state='pending', attempts=0,
+                          lease_token=NULL, lease_owner=NULL,
                           lease_expires_at=NULL, result_json=NULL,
                           created_at=?, updated_at=?
                     WHERE command_id=? AND state='failed'""",

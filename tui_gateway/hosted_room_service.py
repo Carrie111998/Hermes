@@ -1126,13 +1126,14 @@ class HostedRoomService:
         require_acknowledged: bool = False,
     ) -> int:
         room = self._owned_room(room_id)
-        hosted_rooms.request_room_stop(
+        stop_event = hosted_rooms.request_room_stop(
             self.db_path,
             room_id=room_id,
             cancel_id=cancel_id,
             expected_gateway_id=str(room["authority_gateway_id"]),
             expected_epoch=int(room["authority_epoch"]),
         )
+        stop_seq = int(stop_event["seq"])
         cancelled = 0
         pending = 0
         with self._policy_lock:
@@ -1149,6 +1150,8 @@ class HostedRoomService:
                     room_id=room_id,
                     status=status,
                 ):
+                    if int(task["payload"]["source_event_seq"]) >= stop_seq:
+                        continue
                     identity = task["identity"]
                     tasks[(identity.room_id, identity.task_id)] = task
             for task in tasks.values():
