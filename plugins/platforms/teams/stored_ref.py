@@ -172,6 +172,22 @@ def load_stored_refs(directory: Path) -> Dict[str, Dict[str, Any]]:
     return loaded
 
 
+def _ref_filename_stem(
+    *,
+    conversation_id: str,
+    kind: str,
+    filename_stem: Optional[str],
+    person: Optional[str],
+    aad_object_id: Optional[str],
+    user_id: Optional[str],
+) -> str:
+    """Conversation-qualified stem. Never key on person alone."""
+    label = filename_stem or person or aad_object_id or user_id or "ref"
+    raw = f"{label}-{kind}-{conversation_id}"
+    stem = _STEM_RE.sub("-", raw).strip("-._") or "ref"
+    return stem[:180]
+
+
 def persist_inbound_ref(
     directory: Path,
     *,
@@ -233,8 +249,14 @@ def persist_inbound_ref(
             continue
         if "reply_only" in str(prev.get("outbound_policy") or ""):
             raise StoredRefError("will not unlock reply_only ref")
-    stem = filename_stem or person or aad_object_id or conversation_id[:12]
-    stem = _STEM_RE.sub("-", stem).strip("-._") or "personal"
+    stem = _ref_filename_stem(
+        conversation_id=conversation_id,
+        kind=kind,
+        filename_stem=filename_stem,
+        person=person,
+        aad_object_id=aad_object_id,
+        user_id=user_id,
+    )
     dest = directory / f"{stem}.json"
     dest.write_text(json.dumps(ref, indent=2) + "\n", encoding="utf-8")
     dest.chmod(0o600)

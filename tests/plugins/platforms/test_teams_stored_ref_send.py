@@ -614,8 +614,14 @@ def test_two_senders_keep_own_refs_latest_unmentioned_not_older_mention(
         inbound_activity_id="latest-unmentioned",
         addressed_via="unmentioned",
     )
-    zulu = json.loads((tmp_path / "Zulu.json").read_text(encoding="utf-8"))
-    alpha = json.loads((tmp_path / "Alpha.json").read_text(encoding="utf-8"))
+    by_person = {
+        json.loads(path.read_text(encoding="utf-8"))["person"]: json.loads(
+            path.read_text(encoding="utf-8")
+        )
+        for path in tmp_path.glob("*.json")
+    }
+    zulu = by_person["Zulu"]
+    alpha = by_person["Alpha"]
     assert zulu["addressed_via"] == "mention"
     assert zulu["last_inbound_activity_id"] == "old-mentioned"
     assert zulu["addressed_by"] == "29:zulu-roster"
@@ -626,3 +632,49 @@ def test_two_senders_keep_own_refs_latest_unmentioned_not_older_mention(
     assert loaded["addressed_via"] == "unmentioned"
     assert loaded["last_inbound_activity_id"] == "latest-unmentioned"
     assert loaded["addressed_by"] == "29:alpha-roster"
+
+
+def _persist_same_person(tmp_path: Path, *, personal_first: bool) -> None:
+    person = "Pat"
+    user_id = "29:same-roster"
+    common = dict(
+        service_url="https://smba.trafficmanager.net/teams/",
+        tenant_id="00000000-0000-0000-0000-000000000002",
+        bot_app_id=BOT,
+        user_id=user_id,
+        person=person,
+    )
+    personal = dict(
+        conversation_id="19:personal-throwaway",
+        conversation_type="personal",
+        **common,
+    )
+    group = dict(
+        conversation_id="19:group-throwaway",
+        conversation_type="groupChat",
+        inbound_activity_id="group-line",
+        addressed_via="unmentioned",
+        **common,
+    )
+    first, second = (personal, group) if personal_first else (group, personal)
+    persist_inbound_ref(tmp_path, **first)
+    persist_inbound_ref(tmp_path, **second)
+
+
+@pytest.mark.parametrize("personal_first", [True, False])
+def test_same_person_personal_and_group_keep_separate_refs(
+    tmp_path: Path, personal_first: bool
+):
+    _persist_same_person(tmp_path, personal_first=personal_first)
+    loaded = load_stored_refs(tmp_path)
+    personal = loaded["19:personal-throwaway"]
+    group = loaded["19:group-throwaway"]
+    assert personal["kind"] == "personal"
+    assert personal["person"] == "Pat"
+    assert personal["user_id"] == "29:same-roster"
+    assert group["kind"] == "groupChat"
+    assert group["person"] == "Pat"
+    assert group["conversation_id"] == "19:group-throwaway"
+    assert personal["conversation_id"] == "19:personal-throwaway"
+    names = {path.name for path in tmp_path.glob("*.json")}
+    assert len(names) == 2
