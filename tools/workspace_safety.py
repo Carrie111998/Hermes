@@ -81,6 +81,9 @@ _MUTATING_BRANCH_FLAGS = frozenset({
     "--delete",
     "--move",
     "--copy",
+    "--track",
+    "--force",
+    "-f",
     "--set-upstream-to",
     "--unset-upstream",
     "--edit-description",
@@ -287,7 +290,8 @@ def _iter_git_invocations(command: str, cwd: Path) -> Iterable[GitInvocation]:
             continue
         if tokens[0] == "cd":
             if len(tokens) != 2 or _path_has_shell_expansion(tokens[1]):
-                yield GitInvocation(_UNSAFE_GIT_CWD_SUBCOMMAND, [], current_cwd)
+                if _command_has_git_executable_token(command):
+                    yield GitInvocation(_UNSAFE_GIT_CWD_SUBCOMMAND, [], current_cwd)
                 continue
             current_cwd = _safe_resolve(current_cwd / tokens[1])
             continue
@@ -440,6 +444,45 @@ _SHELL_WRAPPERS = frozenset({
     "ionice",
     "time",
 })
+_WRAPPER_VALUE_OPTS = frozenset({
+    "-n",
+    "-u",
+    "-k",
+    "-s",
+    "-o",
+    "-E",
+    "--nice",
+    "--adjustment",
+    "--signal",
+    "--kill-after",
+})
+
+
+def _skip_wrapper(tokens: list[str], index: int, name: str) -> int:
+    index += 1
+    while index < len(tokens):
+        token = tokens[index]
+        if token == "--":
+            return index + 1
+        if token.startswith("-"):
+            index += 1
+            takes_value = token in _WRAPPER_VALUE_OPTS or (
+                token.startswith("--") and "=" not in token
+            )
+            if takes_value and index < len(tokens) and not tokens[index].startswith("-"):
+                index += 1
+            continue
+        break
+    if name == "timeout" and index < len(tokens):
+        next_name = Path(tokens[index]).name
+        if (
+            next_name not in _SHELL_NAMES
+            and next_name not in _SHELL_WRAPPERS
+            and next_name != "eval"
+            and not _is_git_executable_token(tokens[index])
+        ):
+            index += 1
+    return index
 
 
 def _shell_command_executes_git(command: str) -> bool:
@@ -468,14 +511,14 @@ def _shell_command_executes_git(command: str) -> bool:
 
         name = Path(token).name
         if name in _SHELL_WRAPPERS:
+            index = _skip_wrapper(tokens, index, name)
+            continue
+        if name == "eval":
+            rest = " ".join(tokens[index + 1 :])
+            if rest and _payload_has_git_command(rest):
+                return True
+            command_position = False
             index += 1
-            if (
-                name == "timeout"
-                and index < len(tokens)
-                and not tokens[index].startswith("-")
-                and Path(tokens[index]).name not in _SHELL_NAMES
-            ):
-                index += 1
             continue
         if name in _SHELL_NAMES:
             payload = _shell_c_payload(tokens, index)
@@ -537,7 +580,17 @@ def _payload_has_git_command(payload: str) -> bool:
             continue
 
         name = Path(part).name
-        if name == "git":
+        if name in _SHELL_WRAPPERS:
+            index = _skip_wrapper(parts, index, name)
+            continue
+        if name == "eval":
+            rest = " ".join(parts[index + 1 :])
+            if rest and _payload_has_git_command(rest):
+                return True
+            command_position = False
+            index += 1
+            continue
+        if _is_git_executable_token(part):
             return True
         if name in _SHELL_NAMES:
             nested_payload = _shell_c_payload(parts, index)

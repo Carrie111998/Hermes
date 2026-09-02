@@ -426,6 +426,15 @@ def test_real_git_in_substitution_or_group_still_fails_closed(command, tmp_path)
         "timeout 5 bash -c 'git -C /tmp/other commit -m update'",
         "bash -xc 'git -C /tmp/other commit -m update'",
         "nohup bash -c 'git -C /tmp/other commit -m update'",
+        "env -i bash -c 'git -C /tmp/other commit -m update'",
+        "command -- bash -c 'git -C /tmp/other commit -m update'",
+        "nice -n 5 bash -c 'git -C /tmp/other commit -m update'",
+        "timeout -k 1 5 bash -c 'git -C /tmp/other commit -m update'",
+        "bash -c 'command git -C /tmp/other commit -m update'",
+        "bash -c 'env git -C /tmp/other commit -m update'",
+        "bash -c 'eval \"git -C /tmp/other commit -m update\"'",
+        "eval 'git -C /tmp/other commit -m update'",
+        "$(command git -C /tmp/other commit -m update)",
     ],
 )
 def test_wrapped_substitution_and_shell_git_still_fails_closed(command, tmp_path):
