@@ -5,6 +5,7 @@ background session) across gateway messenger platforms.
 """
 
 import asyncio
+from dataclasses import replace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -76,6 +77,28 @@ class TestHandleBackgroundCommand:
         event = _make_event(text="/bg   ")
         result = await runner._handle_background_command(event)
         assert "Usage:" in result
+
+    @pytest.mark.asyncio
+    async def test_background_normalizes_source_before_scheduling(self):
+        """Background sessions use the recovered Telegram topic key."""
+        runner = _make_runner()
+        event = _make_event(text="/background check this")
+        normalized = replace(event.source, thread_id="topic-42")
+
+        run_background_task = AsyncMock()
+        with patch.object(
+            runner,
+            "_normalize_source_for_session_key",
+            return_value=normalized,
+        ) as normalize, patch.object(
+            runner, "_run_background_task", new=run_background_task
+        ):
+            await runner._handle_background_command(event)
+            await asyncio.sleep(0)
+
+        normalize.assert_called_once_with(event.source)
+        scheduled_source = run_background_task.await_args.args[1]
+        assert scheduled_source.thread_id == "topic-42"
 
 
 # ---------------------------------------------------------------------------
