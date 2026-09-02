@@ -1,3 +1,77 @@
+import type { ChildProcess } from 'node:child_process'
+
+let activeProcess: ChildProcess | null = null
+let stopPromise: Promise<void> | null = null
+
+export const registerRealtimeVoiceProcess = (child: ChildProcess): void => {
+  if (activeProcess && activeProcess !== child) {
+    throw new Error('A native realtime voice process is already registered.')
+  }
+
+  activeProcess = child
+}
+
+export const unregisterRealtimeVoiceProcess = (child: ChildProcess): void => {
+  if (activeProcess === child) {
+    activeProcess = null
+  }
+}
+
+export const stopRegisteredRealtimeVoiceProcess = (graceMs = 1_500): Promise<void> => {
+  if (stopPromise) {
+    return stopPromise
+  }
+
+  const child = activeProcess
+
+  if (!child || child.exitCode !== null || child.signalCode !== null) {
+    activeProcess = null
+    return Promise.resolve()
+  }
+  let resolveStop: () => void = () => {}
+  const promise = new Promise<void>(resolve => {
+    resolveStop = resolve
+  })
+  let settled = false
+  const finish = () => {
+    if (settled) {
+      return
+    }
+
+    settled = true
+    clearTimeout(timer)
+    child.off('exit', finish)
+    resolveStop()
+  }
+  const timer = setTimeout(() => {
+    try {
+      child.kill('SIGKILL')
+    } finally {
+      finish()
+    }
+  }, graceMs)
+
+  child.once('exit', finish)
+
+  try {
+    if (!child.kill('SIGINT')) {
+      finish()
+    }
+  } catch {
+    finish()
+  }
+
+  const stopping = promise.finally(() => {
+    if (activeProcess === child) {
+      activeProcess = null
+    }
+    stopPromise = null
+  })
+  stopPromise = stopping
+
+  return stopping
+}
+
 export type RealtimeVoicePhase = 'composing' | 'listening' | 'solving'
 
 export interface RealtimeVoiceTranscript {
