@@ -127,14 +127,6 @@ class TestVolcEngineXmlPollution:
         assert repair('"terminal"') == "terminal"
 
 
-    def test_leading_quote_falls_through_to_fuzzy_match(self, repair):
-        # Sanitizer only trims when the XML char is at idx > 0 - a
-        # name that *starts* with a quote is left untouched so the
-        # rest of the pipeline (fuzzy match at 0.7 cutoff) can still
-        # recover the obvious target.
-        assert repair('"terminal"') == "terminal"
-
-
 # -- MCP name bridging (#100807) --------------------------------------------
 #
 # Prompts teach the BARE MCP catalog name; the runtime registers
