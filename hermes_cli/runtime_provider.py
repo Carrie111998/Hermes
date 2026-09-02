@@ -1368,8 +1368,12 @@ def _resolve_named_custom_runtime(
     _cp_is_openrouter   = base_url_host_matches(base_url, "openrouter.ai")
     api_key_candidates = [
         (explicit_api_key or "").strip(),
-        str(custom_provider.get("api_key", "") or "").strip(),
+        # key_env before inline api_key — same precedence as the providers:
+        # dict path (_get_named_custom_provider), so rotating a credential by
+        # pointing key_env at a fresh env var also works for legacy entries.
+        # An unset/empty env var falls through to the inline literal.
         _getenv(str(custom_provider.get("key_env", "") or "").strip(), "").strip(),
+        str(custom_provider.get("api_key", "") or "").strip(),
         # Gate provider env keys on their authoritative hosts — sending
         # OPENAI_API_KEY to a local-llm endpoint leaks credentials (#28660).
         (_getenv("OPENAI_API_KEY", "").strip()     if _cp_is_openai_url  else ""),

@@ -160,6 +160,15 @@ def test_qwen_oauth_auto_fallthrough_on_auth_failure(monkeypatch):
     from hermes_cli.auth import AuthError
 
     monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "qwen-oauth")
+    # Without this, resolution reads the REAL on-disk credential pool before
+    # ever calling the mocked resolve_qwen_runtime_credentials below — on any
+    # machine where the developer actually has qwen-oauth credentials
+    # configured, that pool hit wins and the intended auth-failure fallthrough
+    # never triggers (hermeticity regression, matches the neighboring
+    # load_pool stubs elsewhere in this file).
+    monkeypatch.setattr(
+        rp, "load_pool", lambda provider: SimpleNamespace(has_credentials=lambda: False)
+    )
     monkeypatch.setattr(
         rp,
         "resolve_qwen_runtime_credentials",
@@ -815,6 +824,79 @@ def test_named_custom_provider_falls_back_to_openai_api_key(monkeypatch):
     # localhost is not openai.com — OPENAI_API_KEY must not leak to local endpoints (#28660)
     assert resolved["api_key"] == "no-key-required"
     assert resolved["requested_provider"] == "custom:local-llm"
+
+
+def test_legacy_custom_provider_key_env_beats_stale_inline_api_key(monkeypatch):
+    """key_env must win over an inline api_key in the legacy custom_providers
+    list format, matching the providers-dict precedence (see the resolver's
+    own key_env-then-api_key fallback chain). Before this fix the inline
+    (possibly stale) literal silently won, so rotating a credential by
+    pointing key_env at a fresh env var had no effect for legacy entries."""
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    monkeypatch.setenv("ROTATED_KEY", "fresh-env-secret")
+    monkeypatch.setattr(
+        rp,
+        "load_config",
+        lambda: {
+            "custom_providers": [
+                {
+                    "name": "Rotating",
+                    "base_url": "http://1.2.3.4:1234/v1",
+                    "api_key": "stale-inline-key",
+                    "key_env": "ROTATED_KEY",
+                }
+            ]
+        },
+    )
+    monkeypatch.setattr(
+        rp,
+        "resolve_provider",
+        lambda *a, **k: (_ for _ in ()).throw(
+            AssertionError(
+                "resolve_provider should not be called for named custom providers"
+            )
+        ),
+    )
+
+    resolved = rp.resolve_runtime_provider(requested="custom:rotating")
+
+    assert resolved["api_key"] == "fresh-env-secret"
+
+
+def test_legacy_custom_provider_inline_api_key_still_used_when_env_unset(monkeypatch):
+    """With key_env set but the env var absent, the inline api_key remains the
+    fallback — key_env precedence must not break offline/inline setups."""
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    monkeypatch.delenv("UNSET_ROTATION_KEY", raising=False)
+    monkeypatch.setattr(
+        rp,
+        "load_config",
+        lambda: {
+            "custom_providers": [
+                {
+                    "name": "Offline",
+                    "base_url": "http://1.2.3.4:1234/v1",
+                    "api_key": "inline-fallback-key",
+                    "key_env": "UNSET_ROTATION_KEY",
+                }
+            ]
+        },
+    )
+    monkeypatch.setattr(
+        rp,
+        "resolve_provider",
+        lambda *a, **k: (_ for _ in ()).throw(
+            AssertionError(
+                "resolve_provider should not be called for named custom providers"
+            )
+        ),
+    )
+
+    resolved = rp.resolve_runtime_provider(requested="custom:offline")
+
+    assert resolved["api_key"] == "inline-fallback-key"
 
 
 
