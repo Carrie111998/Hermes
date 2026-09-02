@@ -306,6 +306,19 @@ def _server():
     return SimpleNamespace(_methods={}, _sessions={}, _sessions_lock=threading.Lock())
 
 
+def test_local_profiles_ignore_non_profile_directories(tmp_path: Path):
+    (tmp_path / "profiles" / "pm-chair").mkdir(parents=True)
+    (tmp_path / "profiles" / ".deleted").mkdir()
+    (tmp_path / "profiles" / "bad profile").mkdir()
+
+    service = HostedRoomService(
+        _server(),  # type: ignore[arg-type]
+        db_path=tmp_path / "state.db",
+    )
+
+    assert service.local_profiles() == ("default", "pm-chair")
+
+
 def _wait_for(predicate, timeout=2.0):
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
