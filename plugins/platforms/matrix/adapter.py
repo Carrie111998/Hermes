@@ -1340,7 +1340,18 @@ class MatrixAdapter(BasePlatformAdapter):
         self._reaction_redaction_tasks: Set[asyncio.Task] = set()
 
         # Proxy support — resolve once at init, reuse for all HTTP traffic.
-        self._proxy_url: str | None = resolve_proxy_url(platform_env_var="MATRIX_PROXY")
+        # Pass the homeserver host so NO_PROXY is honored: a local/tailnet
+        # homeserver (e.g. http://127.0.0.1:6167 with 127.0.0.1 in NO_PROXY)
+        # must not be force-proxied through HTTPS_PROXY — that sends every
+        # Matrix request to a proxy with no route to the homeserver and
+        # connect fails with the proxy's error page (observed 2026-08-20:
+        # whoami -> 500 XML from the upstream proxy).
+        from urllib.parse import urlparse as _urlparse
+        _hs_host = _urlparse(self._homeserver).hostname if self._homeserver else None
+        self._proxy_url: str | None = resolve_proxy_url(
+            platform_env_var="MATRIX_PROXY",
+            target_hosts=_hs_host,
+        )
         if self._proxy_url:
             logger.info("Matrix: proxy configured — %s", self._proxy_url)
         try:
