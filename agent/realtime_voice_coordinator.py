@@ -17,7 +17,7 @@ from agent.realtime_voice import (
     RealtimeVoiceProvider,
 )
 
-ToolDispatcher = Callable[[str, dict[str, Any]], str | Awaitable[str]]
+ToolDispatcher = Callable[[str, dict[str, Any]], Awaitable[str]]
 logger = logging.getLogger(__name__)
 
 
@@ -36,6 +36,11 @@ class RealtimeVoiceCoordinator:
             raise ValueError("max_in_flight_tool_calls must be positive")
         if max_completed_tool_calls < 1:
             raise ValueError("max_completed_tool_calls must be positive")
+        if not (
+            inspect.iscoroutinefunction(dispatch_tool)
+            or inspect.iscoroutinefunction(getattr(dispatch_tool, "__call__", None))
+        ):
+            raise TypeError("dispatch_tool must be an async callable")
         self._provider = provider
         self._dispatch_tool = dispatch_tool
         self._session: RealtimeSession | None = None
@@ -50,6 +55,7 @@ class RealtimeVoiceCoordinator:
             str, tuple[str, dict[str, Any]]
         ] = OrderedDict()
         self._tool_tasks: dict[str, asyncio.Task[None]] = {}
+        self._errors: asyncio.Queue[RealtimeEvent] = asyncio.Queue(maxsize=1)
 
     async def open(
         self,
@@ -67,6 +73,7 @@ class RealtimeVoiceCoordinator:
         self._session = session
         self._tool_calls.clear()
         self._completed_tool_calls.clear()
+        self._errors = asyncio.Queue(maxsize=1)
         self._reset_output_state()
 
     def _require_session(self) -> RealtimeSession:
@@ -104,27 +111,49 @@ class RealtimeVoiceCoordinator:
     async def cancel_response(self) -> None:
         session = self._require_session()
         boundary, self._heard_boundary = self._heard_boundary, None
+        await session.cancel_response()
         if boundary is not None:
             await session.truncate_response(boundary)
-        await session.cancel_response()
 
     async def events(self) -> AsyncIterator[RealtimeEvent]:
         session = self._require_session()
         generation = self._generation
-        async for event in session.events():
-            if not self._is_current_session(session, generation):
-                return
-            if event.type is RealtimeEventType.AUDIO and event.item_id:
-                if event.item_id != self._current_item_id:
-                    self._current_item_id = event.item_id
+        provider_events = session.events().__aiter__()
+        provider_next = asyncio.create_task(anext(provider_events))
+        error_next = asyncio.create_task(self._errors.get())
+        try:
+            while True:
+                done, _ = await asyncio.wait(
+                    (provider_next, error_next),
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if error_next in done:
+                    provider_next.cancel()
+                    await asyncio.gather(provider_next, return_exceptions=True)
+                    yield error_next.result()
+                    return
+                try:
+                    event = provider_next.result()
+                except StopAsyncIteration:
+                    return
+                if not self._is_current_session(session, generation):
+                    return
+                if event.type is RealtimeEventType.AUDIO and event.item_id:
+                    if event.item_id != self._current_item_id:
+                        self._current_item_id = event.item_id
+                        self._heard_boundary = None
                     self._current_audio_events.clear()
-                    self._heard_boundary = None
-                self._current_audio_events[event.emission_id] = event
-            if event.type is RealtimeEventType.TOOL_CALL:
-                self._start_tool_dispatch(event, session, generation)
-            if not self._is_current_session(session, generation):
-                return
-            yield event
+                    self._current_audio_events[event.emission_id] = event
+                if event.type is RealtimeEventType.TOOL_CALL:
+                    self._start_tool_dispatch(event, session, generation)
+                if not self._is_current_session(session, generation):
+                    return
+                yield event
+                provider_next = asyncio.create_task(anext(provider_events))
+        finally:
+            provider_next.cancel()
+            error_next.cancel()
+            await asyncio.gather(provider_next, error_next, return_exceptions=True)
 
     def _start_tool_dispatch(
         self, event: RealtimeEvent, session: RealtimeSession, generation: int
@@ -148,24 +177,31 @@ class RealtimeVoiceCoordinator:
             self._completed_tool_calls.move_to_end(event.call_id)
             return
 
-        self._tool_calls[event.call_id] = call
         if len(self._tool_tasks) >= self._max_in_flight_tool_calls:
-            output = "Error: too many realtime voice tool calls are already in flight"
-            self._complete_call(event.call_id, call)
-            task = asyncio.create_task(
-                self._submit_result(event.call_id, output, session, generation)
+            self._publish_error(
+                "too many realtime voice tool calls are already in flight",
+                session,
+                generation,
             )
-        else:
-            task = asyncio.create_task(self._dispatch(event, session, generation))
+            return
+        self._tool_calls[event.call_id] = call
+        task = asyncio.create_task(self._dispatch(event, session, generation))
         self._tool_tasks[event.call_id] = task
         task.add_done_callback(
             lambda completed_task, call_id=event.call_id: self._tool_task_done(
-                call_id, completed_task
+                call_id,
+                completed_task,
+                session,
+                generation,
             )
         )
 
     def _tool_task_done(
-        self, call_id: str, task: asyncio.Task[None]
+        self,
+        call_id: str,
+        task: asyncio.Task[None],
+        session: RealtimeSession,
+        generation: int,
     ) -> None:
         if self._tool_tasks.get(call_id) is task:
             self._tool_tasks.pop(call_id, None)
@@ -178,6 +214,11 @@ class RealtimeVoiceCoordinator:
                 extra={"call_id": call_id},
                 exc_info=(type(exception), exception, exception.__traceback__),
             )
+            self._publish_error(
+                f"realtime tool result submission failed: {exception}",
+                session,
+                generation,
+            )
 
     async def _dispatch(
         self, event: RealtimeEvent, session: RealtimeSession, generation: int
@@ -185,19 +226,10 @@ class RealtimeVoiceCoordinator:
         if not event.call_id or not event.tool_name:
             raise ValueError("Realtime tool_call events require call_id and tool_name")
         try:
-            arguments = dict(event.arguments)
-            if inspect.iscoroutinefunction(
-                self._dispatch_tool
-            ) or inspect.iscoroutinefunction(
-                getattr(self._dispatch_tool, "__call__", None)
-            ):
-                result = await self._dispatch_tool(event.tool_name, arguments)
-            else:
-                result = await asyncio.to_thread(
-                    self._dispatch_tool, event.tool_name, arguments
-                )
-                if inspect.isawaitable(result):
-                    result = await result
+            result = await self._dispatch_tool(
+                event.tool_name,
+                dict(event.arguments),
+            )
             output = str(result)
         except asyncio.CancelledError:
             raise
@@ -211,14 +243,27 @@ class RealtimeVoiceCoordinator:
         if not self._is_current_session(session, generation):
             return
         call = (event.tool_name, dict(event.arguments))
-        self._complete_call(event.call_id, call)
         await self._submit_result(event.call_id, output, session, generation)
+        if self._is_current_session(session, generation):
+            self._complete_call(event.call_id, call)
 
     async def _submit_result(
         self, call_id: str, output: str, session: RealtimeSession, generation: int
     ) -> None:
         if self._is_current_session(session, generation):
             await session.submit_tool_result(call_id, output)
+
+    def _publish_error(
+        self,
+        message: str,
+        session: RealtimeSession,
+        generation: int,
+    ) -> None:
+        if not self._is_current_session(session, generation) or self._errors.full():
+            return
+        self._errors.put_nowait(
+            RealtimeEvent(type=RealtimeEventType.ERROR, text=message)
+        )
 
     def _complete_call(
         self, call_id: str, call: tuple[str, dict[str, Any]]
