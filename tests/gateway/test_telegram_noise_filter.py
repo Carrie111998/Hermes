@@ -343,3 +343,69 @@ def test_chat_gateways_redact_all_issue_23810_credential_shapes(platform, shape_
     # Prose around the secret is preserved — redaction is surgical.
     assert "here is the token you asked me to echo" in sanitized
     assert sanitized.endswith("done.")
+
+
+# ── #101138: current empty-response retry format + final-reply boundary ─────
+
+# The current empty-response retry path (agent/conversation_loop.py) emits
+# "Empty response from model — retrying (1/3) in 6s" — the retry counter sits
+# between "retrying" and "in", so the older "retrying in <delay>" matcher
+# missed it. These strings are built from the live emission formats.
+_CURRENT_EMPTY_RETRY_STATUSES = [
+    "⚠️ Empty response from model — retrying (1/3) in 6s",
+    "⚠️ Empty response from model — retrying (2/3) in 11s — high-cost request, reduced retry budget",
+    (
+        "⚠️ Model is deterministically returning empty (zero output tokens) — "
+        "skipping further retries to avoid repeat charges"
+    ),
+]
+
+_EMPTY_RETRY_FINAL_EXPECTED = (
+    "⚠️ The model returned an empty response and automatic retries were "
+    "exhausted. Please try again, or start a fresh session with /new."
+)
+
+
+@pytest.mark.parametrize("message", _CURRENT_EMPTY_RETRY_STATUSES)
+def test_telegram_status_suppresses_current_empty_response_retry_format(message):
+    """#101138: the current '(1/3)' retry format must be suppressed like the
+    older 'retrying in <delay>' wording — not leaked to chat users."""
+    assert (
+        _prepare_gateway_status_message(Platform.TELEGRAM, "warn", message) is None
+    )
+
+
+@pytest.mark.parametrize("platform", CHAT_PLATFORMS)
+@pytest.mark.parametrize("message", _CURRENT_EMPTY_RETRY_STATUSES)
+def test_all_chat_gateways_suppress_current_empty_response_retry_status(platform, message):
+    """Same suppression on every chat surface, not just Telegram."""
+    assert _prepare_gateway_status_message(platform, "warn", message) is None
+
+
+@pytest.mark.parametrize("message", _CURRENT_EMPTY_RETRY_STATUSES)
+def test_chat_final_response_replaces_empty_response_retry_diagnostic(message):
+    """#101138: when a buffered retry diagnostic is replayed as the turn's
+    FINAL reply, chat users get one concise recovery prompt — not the raw
+    implementation-level status line."""
+    sanitized = _sanitize_gateway_final_response(Platform.TELEGRAM, message)
+    assert sanitized == _EMPTY_RETRY_FINAL_EXPECTED
+
+
+def test_final_response_keeps_answers_that_quote_the_diagnostic():
+    """Normal assistant answers that merely quote an empty-response diagnostic
+    (longer prose, diagnostic not the whole message) stay untouched."""
+    quoted = (
+        'You asked about "Empty response from model — retrying (1/3) in 6s". '
+        "That message means the model produced no output tokens; the gateway "
+        "backs off and retries up to three times before giving up. In your "
+        "case the retry succeeded and the answer is below: …"
+    )
+    sanitized = _sanitize_gateway_final_response(Platform.TELEGRAM, quoted)
+    assert sanitized == quoted
+
+
+@pytest.mark.parametrize("platform", ("local", "api_server", "webhook"))
+def test_programmatic_surfaces_keep_empty_response_diagnostics(platform):
+    """Programmatic surfaces keep the raw diagnostic — no rewrite."""
+    message = "⚠️ Empty response from model — retrying (1/3) in 6s"
+    assert _sanitize_gateway_final_response(platform, message) == message

@@ -145,12 +145,43 @@ _TELEGRAM_NOISY_STATUS_RE = re.compile(
     r"|session\s+compressed\s+\d+\s+times"
     r"|rate\s+limited\.\s+waiting\s+\d"
     r"|retrying\s+in\s+\d"
+    # #101138: the empty-response retry path (agent/conversation_loop.py)
+    # emits "Empty response from model — retrying (1/3) in 6s". The retry
+    # counter sits between "retrying" and "in", so the plain
+    # "retrying in \d" branch above misses it and the diagnostic leaks to
+    # chat surfaces. Deterministic-empty skips are covered too.
+    r"|retrying\s+\(\d+/\d+\)\s+in\s+\d"
+    r"|empty\s+response\s+from\s+model"
+    r"|deterministically\s+returning\s+empty"
     r"|max\s+retries\s+\(\d+\).*(?:trying\s+fallback|exhausted|invalid\s+responses)"
     r"|stream\s+(?:drop|drop\s+mid\s+tool-call).+retry\s+\d"
     r"|stale\s+connections\s+from\s+a\s+previous\s+provider\s+issue"
     rf"|{re.escape(COMPACTION_DONE_STATUS)}"
     r")",
     re.IGNORECASE | re.DOTALL,
+)
+
+
+# #101138: when a turn exhausts its empty-response retries, the buffered
+# status line ("⚠️ Empty response from model — retrying (1/3) in 6s") can be
+# replayed as the turn's FINAL reply and reach chat users verbatim.  This
+# matcher recognises the empty-response diagnostic SHAPE (empty-response
+# wording + retry/skip/exhausted outcome) and is applied only near the start
+# of a short final message, so ordinary assistant answers that merely quote
+# a diagnostic stay untouched.
+_EMPTY_RESPONSE_RETRY_FINAL_RE = re.compile(
+    r"(?:empty\s+response\s+from\s+model|deterministically\s+returning\s+empty)"
+    r".{0,160}?"
+    r"(?:retrying\s+\(\d+/\d+\)\s+in\s+\d|skipping\s+further\s+retries"
+    r"|retries\s+were\s+exhausted)",
+    re.IGNORECASE | re.DOTALL,
+)
+
+# Concise recovery prompt substituted for an empty-response retry diagnostic
+# on the FINAL-reply boundary (see _sanitize_gateway_final_response).
+_EMPTY_RESPONSE_RETRY_EXHAUSTED_REPLY = (
+    "⚠️ The model returned an empty response and automatic retries were "
+    "exhausted. Please try again, or start a fresh session with /new."
 )
 
 
@@ -1024,6 +1055,17 @@ def _sanitize_gateway_final_response(platform: Any, text: str) -> str:
         return ""
 
     redacted = _redact_gateway_user_facing_secrets(str(text))
+    # #101138: the status path suppresses empty-response retry chatter, but
+    # the FINAL-reply boundary never consulted the noise classification — a
+    # buffered retry diagnostic replayed as the turn's final reply reached
+    # chat users verbatim (or, after the status fix, got dropped entirely,
+    # leaving the user with nothing).  Replace a diagnostic that STARTS a
+    # short message with one concise retry prompt instead of dropping the
+    # reply; the near-start + length guards keep ordinary assistant answers
+    # that quote a diagnostic unchanged.
+    m = _EMPTY_RESPONSE_RETRY_FINAL_RE.search(redacted)
+    if m and m.start() <= 32 and len(redacted) <= 160:
+        return _EMPTY_RESPONSE_RETRY_EXHAUSTED_REPLY
     if _looks_like_gateway_provider_error(redacted):
         return _gateway_provider_error_reply(redacted)
     return redacted
