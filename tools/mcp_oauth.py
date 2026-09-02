@@ -59,7 +59,7 @@ from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, parse_qsl, urlencode, urlparse, urlsplit, urlunsplit
 from hermes_constants import secure_parent_dir
 
 logger = logging.getLogger(__name__)
@@ -1161,6 +1161,74 @@ def _paste_callback_reader(result: dict) -> None:
 # ---------------------------------------------------------------------------
 
 
+def _join_authorization_endpoint_query(
+    authorization_endpoint: str,
+    authorization_url: str,
+) -> str:
+    """Join SDK-generated OAuth parameters onto a discovered endpoint.
+
+    MCP SDK 2.0 appends ``?`` unconditionally. Preserve the endpoint's raw
+    query and fragment while moving generated parameters into the query. An
+    identical RFC 8707 ``resource`` already supplied by the endpoint wins;
+    distinct resource values remain repeated as the RFC permits.
+    """
+    generated_prefix = f"{authorization_endpoint}?"
+    if not authorization_url.startswith(generated_prefix):
+        return authorization_url
+
+    generated_query = authorization_url[len(generated_prefix):]
+    endpoint = urlsplit(authorization_endpoint)
+    existing_resources = {
+        value
+        for key, value in parse_qsl(endpoint.query, keep_blank_values=True)
+        if key == "resource"
+    }
+    generated_params = [
+        (key, value)
+        for key, value in parse_qsl(generated_query, keep_blank_values=True)
+        if key != "resource" or value not in existing_resources
+    ]
+    encoded_generated = urlencode(generated_params)
+    merged_query = endpoint.query
+    if merged_query and encoded_generated:
+        merged_query += "&"
+    merged_query += encoded_generated
+    return urlunsplit(
+        (endpoint.scheme, endpoint.netloc, endpoint.path, merged_query, endpoint.fragment)
+    )
+
+
+async def _perform_authorization_code_grant_with_compatible_query(
+    provider: Any,
+    parent_method: Any,
+):
+    """Run the SDK grant while repairing its authorization URL."""
+    original_redirect_handler = provider.context.redirect_handler
+    metadata = provider.context.oauth_metadata
+    authorization_endpoint = (
+        str(metadata.authorization_endpoint)
+        if metadata is not None and metadata.authorization_endpoint
+        else None
+    )
+    if original_redirect_handler is None or authorization_endpoint is None:
+        return await parent_method()
+
+    async def redirect_handler(authorization_url: str) -> None:
+        await original_redirect_handler(
+            _join_authorization_endpoint_query(
+                authorization_endpoint,
+                authorization_url,
+            )
+        )
+
+    provider.context.redirect_handler = redirect_handler
+    try:
+        return await parent_method()
+    finally:
+        if provider.context.redirect_handler is redirect_handler:
+            provider.context.redirect_handler = original_redirect_handler
+
+
 HermesOAuthClientProvider: Any = None
 
 
@@ -1189,6 +1257,12 @@ def _get_hermes_oauth_provider_class() -> type | None:
         def __init__(self, *args: Any, token_user_agent: "str | None" = None, **kwargs: Any):
             super().__init__(*args, **kwargs)
             self._hermes_token_user_agent = token_user_agent
+
+        async def _perform_authorization_code_grant(self):
+            return await _perform_authorization_code_grant_with_compatible_query(
+                self,
+                super()._perform_authorization_code_grant,
+            )
 
         def _stamp_token_user_agent(self, request):
             ua = getattr(self, "_hermes_token_user_agent", None)

@@ -113,6 +113,9 @@ def _make_hermes_provider_class() -> Optional[type]:
         from mcp.client.auth.oauth2 import OAuthClientProvider
     except ImportError:  # pragma: no cover — SDK required in CI
         return None
+    from tools.mcp_oauth import (
+        _perform_authorization_code_grant_with_compatible_query,
+    )
 
     class HermesMCPOAuthProvider(OAuthClientProvider):
         """OAuthClientProvider with pre-flow disk-mtime reload.
@@ -158,6 +161,12 @@ def _make_hermes_provider_class() -> Optional[type]:
             # oauth.user_agent — stamped onto token-endpoint requests only;
             # some authorization servers/WAFs reject httpx's default (#75576).
             self._hermes_token_user_agent = token_user_agent
+
+        async def _perform_authorization_code_grant(self):
+            return await _perform_authorization_code_grant_with_compatible_query(
+                self,
+                super()._perform_authorization_code_grant,
+            )
 
         def _stamp_token_user_agent(self, request):
             ua = getattr(self, "_hermes_token_user_agent", None)
