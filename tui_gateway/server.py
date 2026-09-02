@@ -15523,6 +15523,9 @@ def _project_tree_row(r: dict) -> dict:
         "cwd": r.get("cwd"),
         "git_branch": r.get("git_branch"),
         "git_repo_root": r.get("git_repo_root"),
+        # Grouping consults this so a pinned chat stays in its stored workspace
+        # project instead of drifting when cwd later matches a different folder.
+        "pinned": bool(r.get("pinned")),
     }
 
 
