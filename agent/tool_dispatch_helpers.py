@@ -499,33 +499,92 @@ def _extract_file_mutation_targets(tool_name: str, args: Dict[str, Any]) -> List
     return []
 
 
-def _extract_landed_file_mutation_paths(
-    tool_name: str,
-    args: Dict[str, Any],
-    result: Any,
-) -> List[str]:
-    """Return the concrete file paths a successful mutation reports."""
-    targets = _extract_file_mutation_targets(tool_name, args)
-    if tool_name not in _FILE_MUTATING_TOOLS or not isinstance(result, str):
-        return targets
+def _extract_reported_landed_paths(result: Any) -> List[str]:
+    """Return ONLY the explicit landed subset a tool result reports.
+
+    Pulls ``files_modified``, ``files_created``, and ``files_deleted`` from a
+    parsed JSON tool result (including both endpoints of an ``old -> new``
+    move), or ``resolved_path``. Returns ``[]`` when the result carries no
+    explicit landed list — so a complete no-write failure is never treated as
+    landed (the caller distinguishes "no reported landed paths" from the
+    requested-targets fallback).
+    """
+    if not isinstance(result, str):
+        return []
     try:
         data = json.loads(result.strip())
     except Exception:
-        return targets
+        return []
     if not isinstance(data, dict):
-        return targets
+        return []
 
-    files = data.get("files_modified")
-    if isinstance(files, list):
-        landed = [str(p) for p in files if p]
-        if landed:
-            return landed
+    landed: List[str] = []
+    for field in ("files_modified", "files_created", "files_deleted"):
+        files = data.get(field)
+        if not isinstance(files, list):
+            continue
+        for item in files:
+            if not item:
+                continue
+            value = str(item)
+            if field == "files_modified" and " -> " in value:
+                # A move is reported as ``old -> new``; both endpoints changed.
+                landed.extend(part for part in value.split(" -> ") if part)
+            else:
+                landed.append(value)
+    if landed:
+        return list(dict.fromkeys(landed))
 
     resolved = data.get("resolved_path")
     if resolved:
         return [str(resolved)]
 
+    return []
+
+
+def _extract_landed_file_mutation_paths(
+    tool_name: str,
+    args: Dict[str, Any],
+    result: Any,
+) -> List[str]:
+    """Return the concrete file paths a mutation reports as landed.
+
+    Aggregates the explicit landed subset from a tool result — ``files_modified``,
+    ``files_created``, and ``files_deleted`` (including both endpoints of a
+    ``old -> new`` move) — so a partial multi-file patch that reports some
+    files as landed can reconcile exactly which targets changed. Falls back to
+    the requested targets when the result carries no explicit landed list.
+    """
+    targets = _extract_file_mutation_targets(tool_name, args)
+    if tool_name not in _FILE_MUTATING_TOOLS or not isinstance(result, str):
+        return targets
+    reported = _extract_reported_landed_paths(result)
+    if reported:
+        return reported
     return targets
+
+
+def _paths_equal_reconciled(requested: str, landed: str) -> bool:
+    """Return True when a requested path and a reported landed path are the same file.
+
+    Handles the absolute/relative mismatch between the requested target (often
+    relative to the execution cwd, e.g. ``src/app.py``) and the tool-reported
+    landed path (often absolute, e.g. ``/tmp/project/src/app.py``). Also handles
+    duplicate requested paths. Reconciles by comparing each spelling against the
+    other as a suffix, so the most-specific match wins; an ambiguous shorter
+    suffix (e.g. a bare ``app.py`` that is a suffix of several landed paths) is
+    not cleared.
+    """
+    if not requested or not landed:
+        return False
+    a = os.path.normcase(os.path.normpath(str(requested)))
+    b = os.path.normcase(os.path.normpath(str(landed)))
+    if a == b:
+        return True
+    # One is a suffix of the other at a path-component boundary.
+    if a.endswith(os.sep + b) or b.endswith(os.sep + a):
+        return True
+    return False
 
 
 def _extract_error_preview(result: Any, max_len: int = 180) -> str:

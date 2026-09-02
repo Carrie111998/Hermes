@@ -263,6 +263,8 @@ from agent.tool_dispatch_helpers import (
     _append_subdir_hint_to_multimodal,  # noqa: F401  # re-exported for tests that `from run_agent import _append_subdir_hint_to_multimodal`
     _extract_file_mutation_targets,
     _extract_landed_file_mutation_paths,
+    _extract_reported_landed_paths,
+    _paths_equal_reconciled,
     _extract_error_preview,
     _trajectory_normalize_msg,  # noqa: F401  # re-exported for tests that `from run_agent import _trajectory_normalize_msg`
 )
@@ -4083,6 +4085,15 @@ class AIAgent:
         model recovered within the turn).  Silently no-ops if the per-turn
         state dict hasn't been initialised yet (e.g. a tool dispatched
         outside ``run_conversation``).
+
+        A partial multi-file patch that reports ``success: false`` plus a
+        top-level error AND a non-empty ``files_modified``/``files_created``/
+        ``files_deleted`` landed subset stays error-shaped for CLI display and
+        tool-call guardrails, but FMV reconciles the explicitly-reported landed
+        subset: those targets are treated as landed (moved to the changed set
+        and cleared from the failure state), so only the unresolved requested
+        targets remain failed. Relative and absolute spellings of the same path
+        reconcile to one another.
         """
         if tool_name not in _FILE_MUTATING_TOOLS:
             return
@@ -4093,8 +4104,20 @@ class AIAgent:
         if not targets:
             return
         landed = file_mutation_result_landed(tool_name, result)
-        if landed:
-            landed_paths = _extract_landed_file_mutation_paths(tool_name, args, result)
+        # Explicitly-reported landed subset (files_modified/created/deleted +
+        # resolved_path), empty for a complete no-write failure. Distinct from
+        # ``landed_paths`` below so an error-shaped partial patch can still
+        # reconcile the files it actually changed.
+        reported_landed = _extract_reported_landed_paths(result)
+        if landed or reported_landed:
+            # Track landed/changed paths and feed the checkpoint ledger whether
+            # the call is a clean success OR a partial patch failure that
+            # explicitly reported some files as landed.
+            landed_paths = (
+                _extract_landed_file_mutation_paths(tool_name, args, result)
+                if landed
+                else reported_landed
+            )
             changed = getattr(self, "_turn_file_mutation_paths", None)
             if changed is not None:
                 changed.update(landed_paths)
@@ -4109,7 +4132,20 @@ class AIAgent:
                         pass
         if is_error and not landed:
             preview = _extract_error_preview(result)
+            # A later partial retry may report a target as landed under a
+            # different spelling (relative vs absolute) than the key recorded by
+            # an earlier attempt — clear any equivalent prior failure key.
+            if reported_landed:
+                for existing in list(state.keys()):
+                    if any(_paths_equal_reconciled(existing, lp) for lp in reported_landed):
+                        state.pop(existing, None)
             for path in targets:
+                # A landed (reported or reconciled) target is not a failure —
+                # it changed on disk. Only unresolved requested targets stay
+                # in the failure state.
+                if any(_paths_equal_reconciled(path, lp) for lp in reported_landed):
+                    state.pop(path, None)
+                    continue
                 # Keep the FIRST error we saw for a given path unless we
                 # later see success.  A repeated failure with a different
                 # message shouldn't silently overwrite the original.

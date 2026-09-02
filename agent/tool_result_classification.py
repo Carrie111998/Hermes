@@ -34,7 +34,16 @@ def file_mutation_result_landed(tool_name: str, result: Any) -> bool:
     if not isinstance(data, dict) or data.get("error"):
         return False
     if tool_name == "write_file":
-        return "bytes_written" in data
+        bytes_written = data.get("bytes_written")
+        # A failed write_file that reports ``bytes_written: 0`` is not landed —
+        # zero bytes written means nothing changed on disk.
+        return isinstance(bytes_written, (int, float)) and bytes_written > 0
     if tool_name == "patch":
+        # A patch is only a complete success when ``success`` is True AND there
+        # is no top-level error (the error guard above already handles the
+        # latter). A partial patch failure that reports non-empty
+        # files_modified/created/deleted stays error-shaped for CLI display and
+        # tool-call guardrails; FMV reconciles the explicit landed subset
+        # separately via ``_extract_landed_file_mutation_paths``.
         return data.get("success") is True
     return False
