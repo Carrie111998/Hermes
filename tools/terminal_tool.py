@@ -4023,10 +4023,27 @@ def check_terminal_requirements() -> bool:
 
         elif env_type == "singularity":
             executable = shutil.which("apptainer") or shutil.which("singularity")
-            if executable:
-                result = subprocess.run([executable, "--version"], capture_output=True, timeout=5, stdin=subprocess.DEVNULL)
-                return result.returncode == 0
-            return False
+            if not executable:
+                logger.error(
+                    "Singularity backend selected but neither 'apptainer' nor "
+                    "'singularity' was found in PATH. Install Apptainer "
+                    "(https://apptainer.org/docs/admin/main/installation.html) "
+                    "or set TERMINAL_ENV to 'local' or 'docker'."
+                )
+                return False
+            result = subprocess.run([executable, "--version"], capture_output=True, timeout=5, stdin=subprocess.DEVNULL)
+            if result.returncode != 0:
+                stderr_tail = (result.stderr or b"").decode(errors="replace").strip()
+                if len(stderr_tail) > 200:
+                    stderr_tail = stderr_tail[-200:]
+                logger.error(
+                    "Singularity backend selected but '%s --version' exited with %d%s",
+                    executable,
+                    result.returncode,
+                    f": {stderr_tail}" if stderr_tail else "",
+                )
+                return False
+            return True
 
         elif env_type == "ssh":
             if not config.get("ssh_host") or not config.get("ssh_user"):

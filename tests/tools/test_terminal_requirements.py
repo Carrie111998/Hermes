@@ -85,6 +85,42 @@ def test_modal_backend_managed_mode_without_feature_flag_logs_clear_error(monkey
     )
 
 
+def test_singularity_backend_without_binary_logs_specific_error(monkeypatch, caplog):
+    _clear_terminal_env(monkeypatch)
+    monkeypatch.setenv("TERMINAL_ENV", "singularity")
+    monkeypatch.setattr(terminal_tool_module.shutil, "which", lambda _name: None)
+
+    with caplog.at_level(logging.ERROR):
+        ok = terminal_tool_module.check_terminal_requirements()
+
+    assert ok is False
+    assert any(
+        "neither 'apptainer' nor 'singularity' was found in PATH" in record.getMessage()
+        for record in caplog.records
+    )
+
+
+def test_singularity_backend_version_failure_logs_specific_error(monkeypatch, caplog):
+    _clear_terminal_env(monkeypatch)
+    monkeypatch.setenv("TERMINAL_ENV", "singularity")
+    monkeypatch.setattr(terminal_tool_module.shutil, "which", lambda name: f"C:\\fake\\{name}")
+    monkeypatch.setattr(
+        terminal_tool_module.subprocess,
+        "run",
+        lambda *a, **kw: type("R", (), {"returncode": 1, "stderr": b"version check failed"})(),
+    )
+
+    with caplog.at_level(logging.ERROR):
+        ok = terminal_tool_module.check_terminal_requirements()
+
+    assert ok is False
+    assert any(
+        "--version' exited with 1" in record.getMessage()
+        and "version check failed" in record.getMessage()
+        for record in caplog.records
+    )
+
+
 def test_vercel_backend_without_sdk_logs_specific_error(monkeypatch, caplog):
     _clear_terminal_env(monkeypatch)
     monkeypatch.setenv("TERMINAL_ENV", "vercel_sandbox")
