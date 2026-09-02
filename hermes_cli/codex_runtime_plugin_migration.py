@@ -599,6 +599,19 @@ def _build_hermes_tools_mcp_entry() -> dict:
     }
     if env:
         out["env"] = env
+    # Forward dynamic Kanban env vars so Codex-spawned workers expose
+    # kanban lifecycle tools (kanban_show, kanban_complete, etc.).
+    # Without this, the hermes-tools MCP server starts without
+    # HERMES_KANBAN_* vars and hides those tools (#92282).
+    out["env_vars"] = [
+        "HERMES_KANBAN_TASK",
+        "HERMES_KANBAN_BOARD",
+        "HERMES_KANBAN_DB",
+        "HERMES_KANBAN_ROOT",
+        "HERMES_KANBAN_WORKSPACE",
+        "HERMES_KANBAN_WORKSPACES_ROOT",
+        "HERMES_KANBAN_BRANCH",
+    ]
     # Generous timeouts — browser_navigate or delegate_task can take a
     # while; we don't want codex's MCP client to give up too early.
     out["startup_timeout_sec"] = 30.0
