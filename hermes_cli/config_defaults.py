@@ -151,7 +151,10 @@ DEFAULT_CONFIG = {
             # leaves the budget untouched.
             "cost_threshold_usd": 0.25,
         },
+        # Fast mode: "" / "normal" (off), "fast" (always), "auto" (first
+        # fast_auto_seconds of every turn), "cold" (first turn of a session only).
         "service_tier": "",
+        "fast_auto_seconds": 60,
         # Tool-use enforcement: injects system prompt guidance that tells the
         # model to actually call tools instead of describing intended actions.
         # Values: "auto" (default — applies to gpt/codex models), true/false
@@ -1466,12 +1469,18 @@ DEFAULT_CONFIG = {
         # Mirrors `hermes -c` muscle memory.  Default off so existing
         # users aren't surprised.  HERMES_TUI_RESUME=<id> always wins.
         "tui_auto_resume_recent": False,
+        # When true (default), the Desktop app reopens the last chat (or
+        # last page) on cold start. Set false to always land on a fresh
+        # new chat. Also a switch in Desktop Settings → Appearance.
+        "resume_last_session": True,
         # When true (default), `hermes --tui` drops a one-time hint
         # ("subagents working · /agents to watch live") the first time a turn
         # starts delegating, nudging the user toward the live spawn-tree
         # dashboard. Set false to suppress the hint.
         "tui_agents_nudge": True,
         "bell_on_complete": False,
+        # Bell when a blocking prompt opens (clarify/approval/sudo/secret).
+        "bell_on_prompt": False,
         # Stream the model's reasoning/thinking live before the response.
         # Default ON: on thinking models the reasoning phase can run tens of
         # seconds, and with this off the user stares at a spinner the whole
@@ -3107,10 +3116,12 @@ DEFAULT_CONFIG = {
     "model_catalog": {
         "enabled": True,
         "url": "https://hermes-agent.nousresearch.com/docs/api/model-catalog.json",
-        # Disk cache TTL in hours.  Beyond this, the CLI refetches on the
-        # next /model or `hermes model` invocation; network failures
-        # silently fall back to the stale cache.
-        "ttl_hours": 1,
+        # Disk cache TTL in minutes.  The gateway refreshes the catalogs on
+        # this cadence in the background; the CLI refetches on the next
+        # /model or `hermes model` invocation once the cache is older than
+        # this.  Network failures silently fall back to the stale cache.
+        # (Legacy `ttl_hours` is still honoured when set explicitly.)
+        "ttl_minutes": 20,
         # Optional per-provider override URLs for third parties that want
         # to self-host their own curation list using the same schema.
         # Example:
@@ -3363,6 +3374,17 @@ DEFAULT_CONFIG = {
         # (gateway/platforms/base.py), so the cap holds across every platform
         # adapter. ``0`` disables the cap. Default 128 MiB.
         "max_inbound_media_bytes": 134217728,
+
+        # Whether gateway platform adapters let aiohttp read proxy settings
+        # (HTTP_PROXY / HTTPS_PROXY / NO_PROXY, plus SSL_CERT_FILE) from the
+        # process environment, and whether generic proxy env / the macOS
+        # system proxy are auto-detected for adapter clients. Set to false
+        # when the gateway inherits a proxy it must not use — e.g. a Windows
+        # Scheduled Task picking up a Clash/V2Ray HTTP_PROXY the interactive
+        # shell never sees, producing "Cannot connect to host 127.0.0.1:7890"
+        # poll loops (#48820). Explicit per-platform vars (DISCORD_PROXY,
+        # TELEGRAM_PROXY, ...) are still honored. One knob for every adapter.
+        "trust_env": True,
 
         # When false (default), any file path the agent emits is delivered
         # as a native attachment as long as it isn't under the credential /
@@ -4070,7 +4092,7 @@ DEFAULT_CONFIG = {
     },
 
     # Config schema version - bump this when adding new required fields
-    "_config_version": 39,
+    "_config_version": 40,
 }
 
 # Optional environment variables that enhance functionality
