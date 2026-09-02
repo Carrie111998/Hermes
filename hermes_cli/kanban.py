@@ -436,7 +436,8 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                           default="running",
                           help="Initial card status. Use 'blocked' for cards "
                                "that require immediate human ops (R3 gate) "
-                               "to skip the brief running-to-blocked transition.")
+                               "to skip the brief running-to-blocked transition; "
+                               "use 'to_be_worked' for the non-dispatchable shelf.")
     p_create.add_argument("--json", action="store_true", help="Emit JSON output")
 
     # --- swarm ---
@@ -692,6 +693,21 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         help="Optional reason/note — recorded as a comment before unblocking. Quote multi-word reasons.",
     )
     p_unblock.add_argument("task_ids", nargs="+")
+
+    p_shelf = sub.add_parser(
+        "shelf",
+        help="Move a blocked/ready task to the non-dispatchable to-be-worked shelf",
+    )
+    p_shelf.add_argument("task_id")
+    p_shelf.add_argument("--reason", default=None)
+
+    p_unshelf = sub.add_parser(
+        "unshelf",
+        help="Move a to-be-worked task to triage or the parent-gated ready path",
+    )
+    p_unshelf.add_argument("task_id")
+    p_unshelf.add_argument("--dest", required=True, choices=("triage", "ready"))
+    p_unshelf.add_argument("--reason", default=None)
 
     p_request_review = sub.add_parser(
         "request-review",
@@ -1168,6 +1184,8 @@ def kanban_command(args: argparse.Namespace) -> int:
             "block":    _cmd_block,
             "schedule": _cmd_schedule,
             "unblock":  _cmd_unblock,
+            "shelf":    _cmd_shelf,
+            "unshelf":  _cmd_unshelf,
             "request-review": _cmd_request_review,
             "request-changes": _cmd_request_changes,
             "reopen-review":  _cmd_reopen_review,
@@ -1236,6 +1254,8 @@ _DELEGATED_CHILD_DENIED_ACTIONS: frozenset[str] = frozenset({
     "block",
     "schedule",
     "unblock",
+    "shelf",
+    "unshelf",
     "promote",
     "archive",
     "dispatch",
@@ -2530,6 +2550,45 @@ def _cmd_unblock(args: argparse.Namespace) -> int:
     return 0 if not failed else 1
 
 
+def _cmd_shelf(args: argparse.Namespace) -> int:
+    reason = getattr(args, "reason", None)
+    reason = (reason.strip() or None) if reason is not None else None
+    actor = _profile_author()
+    with kb.connect_closing() as conn:
+        ok, error = kb.shelf_task(
+            conn, args.task_id, actor=actor, reason=reason,
+        )
+    if not ok:
+        print(f"cannot shelf {args.task_id}: {error}", file=sys.stderr)
+        return 1
+    print(f"Shelved {args.task_id}" + (f": {reason}" if reason else ""))
+    return 0
+
+
+def _cmd_unshelf(args: argparse.Namespace) -> int:
+    reason = getattr(args, "reason", None)
+    reason = (reason.strip() or None) if reason is not None else None
+    actor = _profile_author()
+    with kb.connect_closing() as conn:
+        ok, error = kb.unshelf_task(
+            conn,
+            args.task_id,
+            actor=actor,
+            dest=args.dest,
+            reason=reason,
+        )
+        landed = kb.get_task(conn, args.task_id) if ok else None
+    if not ok:
+        print(f"cannot unshelf {args.task_id}: {error}", file=sys.stderr)
+        return 1
+    landed_status = landed.status if landed is not None else args.dest
+    print(
+        f"Unshelved {args.task_id} -> {landed_status}"
+        + (f": {reason}" if reason else "")
+    )
+    return 0
+
+
 def _cmd_request_review(args: argparse.Namespace) -> int:
     tid = args.task_id
     summary = getattr(args, "summary", None)
@@ -3047,7 +3106,10 @@ def _cmd_stats(args: argparse.Namespace) -> int:
         print(json.dumps(stats, indent=2, ensure_ascii=False))
         return 0
     print("By status:")
-    for k in ("triage", "todo", "scheduled", "ready", "running", "blocked", "done"):
+    for k in (
+        "triage", "todo", "scheduled", "ready", "running", "blocked",
+        "to_be_worked", "review", "done",
+    ):
         print(f"  {k:8s}  {stats['by_status'].get(k, 0)}")
     if stats["by_assignee"]:
         print("\nBy assignee:")

@@ -99,8 +99,11 @@ _log = logging.getLogger(__name__)
 # Constants
 # ---------------------------------------------------------------------------
 
-VALID_STATUSES = {"triage", "todo", "scheduled", "ready", "running", "blocked", "review", "done", "archived"}
-VALID_INITIAL_STATUSES = {"running", "blocked"}
+VALID_STATUSES = {
+    "triage", "todo", "scheduled", "ready", "running", "blocked",
+    "to_be_worked", "review", "done", "archived",
+}
+VALID_INITIAL_STATUSES = {"running", "blocked", "to_be_worked"}
 
 # Typed block reasons. Distinguishes the two fundamentally different things a
 # worker (or human) means by "blocked", so each can be routed differently
@@ -3203,6 +3206,10 @@ def create_task(
     parents — a specifier/triager is expected to promote the task to
     ``todo`` once the spec is fleshed out.
 
+    ``initial_status="to_be_worked"`` lands directly on the operator-owned
+    shelf in the INSERT. It is never created as ``ready`` first, and parent
+    state does not move it to ``todo``.
+
     If ``idempotency_key`` is provided and a non-archived task with the
     same key already exists, returns the existing task's id instead of
     creating a duplicate. Useful for retried webhooks / automation that
@@ -3245,6 +3252,10 @@ def create_task(
     if initial_status not in VALID_INITIAL_STATUSES:
         raise ValueError(
             f"initial_status must be one of {sorted(VALID_INITIAL_STATUSES)}"
+        )
+    if initial_status == "to_be_worked" and triage:
+        raise ValueError(
+            "triage and initial_status='to_be_worked' are conflicting landings"
         )
     if workspace_kind not in VALID_WORKSPACE_KINDS:
         raise ValueError(
@@ -3452,7 +3463,13 @@ def create_task(
                 # Determine task status from parent status, unless the caller
                 # parks it directly in blocked for human-ops review or in
                 # triage for a specifier.
-                if initial_status == "blocked":
+                if initial_status == "to_be_worked":
+                    task_status = "to_be_worked"
+                    if parents:
+                        missing = _find_missing_parents(conn, parents)
+                        if missing:
+                            raise ValueError(f"unknown parent task(s): {', '.join(missing)}")
+                elif initial_status == "blocked":
                     task_status = "blocked"
                     if parents:
                         missing = _find_missing_parents(conn, parents)
@@ -6849,6 +6866,104 @@ def promote_task(
     return True, None
 
 
+def shelf_task(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    actor: str,
+    reason: Optional[str] = None,
+) -> tuple[bool, Optional[str]]:
+    """Move a ``blocked`` or ``ready`` task onto the operator-owned shelf.
+
+    This is deliberately distinct from :func:`block_task` and
+    :func:`unblock_task`: the card is neither stuck nor dispatchable. Failure
+    counters are preserved because shelving is a planning decision, not a
+    successful retry.
+    """
+    actor = str(actor or "").strip()
+    if not actor:
+        raise ValueError("actor is required to shelf a task")
+    reason = str(reason).strip() if reason is not None else None
+    reason = reason or None
+
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT status FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        if row is None:
+            return False, f"task {task_id} not found"
+        from_status = row["status"]
+        if from_status not in {"blocked", "ready"}:
+            return False, (
+                f"task {task_id} is {from_status!r}; shelf only applies to "
+                "'blocked' or 'ready'"
+            )
+        cur = conn.execute(
+            "UPDATE tasks SET status = 'to_be_worked' "
+            "WHERE id = ? AND status = ?",
+            (task_id, from_status),
+        )
+        if cur.rowcount != 1:
+            return False, f"task {task_id} status changed while shelving"
+        _append_event(
+            conn,
+            task_id,
+            "shelved",
+            {"actor": actor, "from_status": from_status, "reason": reason},
+        )
+    return True, None
+
+
+def unshelf_task(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    actor: str,
+    dest: str,
+    reason: Optional[str] = None,
+) -> tuple[bool, Optional[str]]:
+    """Move a shelf task to ``triage`` or the parent-gated ready path."""
+    actor = str(actor or "").strip()
+    if not actor:
+        raise ValueError("actor is required to unshelf a task")
+    dest = str(dest or "").strip()
+    if dest not in {"triage", "ready"}:
+        return False, "unshelf destination must be 'triage' or 'ready'"
+    reason = str(reason).strip() if reason is not None else None
+    reason = reason or None
+
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT status FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        if row is None:
+            return False, f"task {task_id} not found"
+        if row["status"] != "to_be_worked":
+            return False, (
+                f"task {task_id} is {row['status']!r}; unshelf only applies "
+                "to 'to_be_worked'"
+            )
+        landing = (
+            _landing_status_after_parents(conn, task_id)
+            if dest == "ready"
+            else "triage"
+        )
+        cur = conn.execute(
+            "UPDATE tasks SET status = ? "
+            "WHERE id = ? AND status = 'to_be_worked'",
+            (landing, task_id),
+        )
+        if cur.rowcount != 1:
+            return False, f"task {task_id} status changed while unshelving"
+        _append_event(
+            conn,
+            task_id,
+            "unshelved",
+            {"actor": actor, "dest": landing, "reason": reason},
+        )
+    return True, None
+
+
 def _reclaim_dangling_run(
     conn: sqlite3.Connection, task_id: str, *, statuses, now: int, note: str,
 ) -> None:
@@ -7526,7 +7641,7 @@ def archive_task(conn: sqlite3.Connection, task_id: str) -> bool:
         cur = conn.execute(
             "UPDATE tasks SET status = 'archived', "
             "    claim_lock = NULL, claim_expires = NULL, worker_pid = NULL "
-            "WHERE id = ? AND status != 'archived'",
+            "WHERE id = ? AND status NOT IN ('archived', 'to_be_worked')",
             (task_id,),
         )
         if cur.rowcount != 1:

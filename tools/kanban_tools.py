@@ -1758,8 +1758,8 @@ KANBAN_LIST_SCHEMA = {
             "status": {
                 "type": "string",
                 "enum": [
-                    "triage", "todo", "ready", "running",
-                    "blocked", "done", "archived",
+                    "triage", "todo", "scheduled", "ready", "running",
+                    "blocked", "to_be_worked", "review", "done", "archived",
                 ],
                 "description": "Optional task status filter.",
             },
@@ -2259,12 +2259,14 @@ KANBAN_CREATE_SCHEMA = {
             },
             "initial_status": {
                 "type": "string",
-                "enum": ["running", "blocked"],
+                "enum": ["running", "blocked", "to_be_worked"],
                 "description": (
                     "Initial card status. Use 'blocked' for tasks that "
                     "require immediate human ops (R3 gate) to skip the "
                     "brief running-to-blocked transition. Defaults to "
-                    "'running', which preserves the usual dispatch path."
+                    "'running', which preserves the usual dispatch path. "
+                    "Use 'to_be_worked' to land directly on Marcin's shelf; "
+                    "the dispatcher will not claim it."
                 ),
             },
             "skills": {
