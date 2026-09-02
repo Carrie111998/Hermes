@@ -6751,6 +6751,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         session_id: str,
         source: str,
         model: str = None,
+        requested_model: str = None,
+        requested_provider: str = None,
         model_config: Dict[str, Any] = None,
         system_prompt: str = None,
         user_id: str = None,
@@ -6776,6 +6778,131 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         only filling columns that are still NULL, never overwriting values an
         earlier writer already set (so a later bare call with source="unknown"
         can't clobber a real source/model).
+
+        ``requested_model``/``requested_provider`` record the route the CALLER
+        asked for, which is NOT the same thing as ``model``/``billing_provider``:
+        those hold the route that actually served the turn and are rewritten by
+        ``update_token_counts``' first-accounted-route reconciliation. Keeping
+        the request beside the delivery is what makes a silent fallback
+        (requested model X, served model Y, no warning) visible after the fact.
+
+        THE AUDIT-RECORD INVARIANT (canonical statement; the three writers of
+        these columns — this upsert, ``record_session_fallback`` and
+        ``update_session_model`` — all obey it):
+
+            ``requested_model`` and ``requested_provider`` are not two columns,
+            they are one route. Every write must leave them describing a route
+            that some caller actually asked for: never the model of one request
+            beside the provider of another. A writer may adopt a snapshot's
+            pair as a whole (when the row records no request, or records only a
+            half this snapshot supersedes), or complete one half from a
+            snapshot that names the same route as far as the row records it —
+            nothing else.
+
+            ``fallback_activated`` is not a fourth independent column either:
+            it is the VERDICT on that pair — "the request these two name was
+            abandoned". So the record is a triple, and a write may not splice a
+            verdict reached about request A onto request B's pair. That fails
+            in both directions at once: it cries wolf about a request that was
+            honored (``requested glm-5.4 (minimax) → served glm-5.4
+            (minimax)``, a warning whose two routes are identical), and it
+            erases the provider of the request that actually was abandoned.
+            Concretely, only a writer whose call site asserts something about
+            the request itself may write the pair and the flag together:
+            ``record_session_fallback``, whose caller is abandoning the route
+            it names as we write (so it raises the flag over that route), and
+            ``update_session_model``, whose caller is making a new explicit
+            request (so it clears the flag, because a verdict on the old
+            request is moot once the request is replaced). This upsert asserts
+            neither: its snapshot is a process START, a request that has not
+            been answered yet. So it may write the pair only while the flag is
+            DOWN, and it never writes the flag — a snapshot it adopts is a
+            request with no verdict yet, which is exactly ``0``.
+
+            And a verdict, once reached, keeps its subject: NO writer may hand
+            a standing raised flag a different request. ``record_session_fallback``
+            is not exempt from that — the round-5 lie was written by exactly
+            such an exemption, in reverse — it is simply the one writer that
+            may claim the pair *while no verdict stands*, because the route it
+            names is the one being abandoned in that very statement. Once the
+            flag is up, both snapshot-carrying writers freeze the pair and may
+            only complete a NULL half from a route that agrees with the row on
+            the half the row does record (same route, one more half known —
+            which moves nothing). ``update_session_model`` is the only escape:
+            it discards the old request and the old verdict together.
+
+        Both halves are normalized to NULL at bind time in all three writers
+        (``x or None``), so "not requested" has exactly one representation and
+        the SQL gates below never have to compare ``''`` against a real name.
+
+        ``COALESCE``-ing the two halves independently breaks the invariant in
+        both directions. This upsert runs on the FIRST TURN OF EVERY PROCESS for
+        an existing session id (that is what the ``ON CONFLICT`` is for) with
+        that process's immutable start-of-run snapshot, which is unrelated to
+        what the row may already record:
+
+        * *model recorded, provider NULL* — a mid-session ``/model`` switch
+          whose provider-less form deliberately stores NULL, i.e. "no provider
+          requested", an answer and not a gap to patch. An ungated provider
+          ``COALESCE`` printed ``requested <switched model> (<snapshot
+          provider>) → served ...`` in ``hermes sessions list``.
+        * *provider recorded, model NULL* — the mirror image, and ordinary
+          production state: ``hermes --provider vllm`` with no ``model.default``
+          leaves ``self.model == ""``, so ``agent_init`` snapshots an empty
+          requested model while ``requested_provider`` has an ``"auto"`` floor
+          and is effectively never empty (and ``vllm``/``ollama``/``custom``
+          have no catalog default to heal it with). The row is written before
+          the first API call, so it outlives even a request that 400s. An
+          ungated model ``COALESCE`` then stitched the NEXT process's model onto
+          that stored provider: ``requested glm-5.4 (vllm) → served grok-4
+          (xai)`` when process 1 asked for vllm with no model and process 2 for
+          glm-5.4 via minimax.
+
+        The two halves are deliberately NOT symmetric about who wins, because
+        their provenance differs. A recorded *model* can be newer than any
+        snapshot (``update_session_model`` writes it mid-run on every ``/model``
+        switch), so it is authoritative and is never overwritten. A recorded
+        *provider with no model* can only come from a process-start snapshot —
+        no switch can produce it, since a switch always names a model — so it
+        has no claim to be newer, and it describes a request that never named a
+        model at all. When a later snapshot names a model, that model has to
+        come with its own provider; keeping the old one would be the very lie
+        above, and refusing the model would leave the loud warning naming a bare
+        provider from an abandoned start while suppressing the provider of the
+        request that actually got abandoned. So a provider-only row yields to a
+        model-naming snapshot as a whole pair. A snapshot that names no model
+        adds nothing, and leaves the provider-only row as it stands.
+
+        That provenance argument inverts once the row's flag is up, which is why
+        the freeze above comes first. "The stored provider describes a request
+        that never named a model, and refusing this snapshot's model would
+        suppress the provider of the request that actually got abandoned" holds
+        only while nothing has told us WHICH request was abandoned. A raised
+        flag does tell us: the provider-only row IS that request, so yielding to
+        the snapshot would commit the very harm the argument was written to
+        avoid — dropping ``vllm``, the provider of the abandoned request, and
+        pinning its verdict on a snapshot that may well be honored end to end.
+        What freezing does cost is stated plainly, because it used to be papered
+        over here ("freezing costs nothing, ``record_session_fallback``
+        supersedes the pair itself"): it does not. That writer freezes an
+        already-flagged pair too — a standing verdict keeps its subject no matter
+        who is writing — so in the one history where the frozen pair could have
+        carried more (P1's request abandoned AND P2's request abandoned) the row
+        goes on naming P1's, and P2's route is not recorded anywhere. The flag
+        still reports the fallback and everything the row says is true; the
+        second abandonment is simply under-reported. That is a boundary of the
+        schema, not a choice between truths: three columns hold ONE request and
+        ONE verdict, and a session id can span any number of processes. Naming
+        every abandoned request would need a per-process audit row.
+
+        RESIDUAL, same boundary, on the printed line rather than the row: the
+        served half (``model``/``billing_provider``) is the FIRST accounted route
+        of the whole session id, so when P1's request is abandoned and a later
+        process is honored serving that same route, `hermes sessions list` prints
+        a line whose two routes are character-identical
+        (``requested X (Y) → served X (Y)``) even though every column in it is
+        true — request X (Y) really was abandoned, route X (Y) really did serve.
+        Only a per-process record could tell those two apart.
 
         ``chat_id``/``thread_id`` record the messaging origin (the chat/room and
         thread the session was started in) so that gateway ``/resume`` can prove
@@ -6821,13 +6948,72 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             conn.execute(
                 """INSERT INTO sessions (
                    id, source, user_id, session_key, chat_id, chat_type, thread_id,
-                   model, model_config, system_prompt, system_prompt_hash,
+                   model, requested_model, requested_provider,
+                   model_config, system_prompt, system_prompt_hash,
                    parent_session_id, cwd, profile_name, git_repo_root,
                    origin_json, display_name, started_at
                 )
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?)
                    ON CONFLICT(id) DO UPDATE SET
                        model = COALESCE(sessions.model, excluded.model),
+                       -- Audit-record invariant (see docstring): the pair and
+                       -- `fallback_activated` are ONE record, so neither the
+                       -- halves nor the verdict may come from different
+                       -- requests. A raised flag is a verdict ON the stored
+                       -- pair, and this writer's snapshot is a process START —
+                       -- a request not yet answered, let alone abandoned — so
+                       -- while the flag is up the recorded request is frozen
+                       -- and the flag (never in this UPDATE) stays up. With
+                       -- the flag down there is no verdict to contradict and
+                       -- the ordinary pair gate applies: a recorded model is
+                       -- authoritative (a /model switch can have written it
+                       -- after this snapshot was taken) and is kept.
+                       requested_model = CASE
+                           WHEN sessions.fallback_activated <> 0
+                           THEN sessions.requested_model
+                           ELSE COALESCE(
+                               sessions.requested_model,
+                               excluded.requested_model
+                           )
+                       END,
+                       requested_provider = CASE
+                           -- Same freeze, both halves together: superseding a
+                           -- flagged pair would hand a verdict nobody reached
+                           -- to a request nobody has abandoned (and drop the
+                           -- provider of the one that was). If this snapshot's
+                           -- request is abandoned too, record_session_fallback
+                           -- freezes as well — a standing verdict keeps its
+                           -- subject — so the row names the FIRST abandoned
+                           -- request and the later one is under-reported. That
+                           -- is the schema's boundary (see the residual note
+                           -- in the docstring), not a lie.
+                           WHEN sessions.fallback_activated <> 0
+                           THEN sessions.requested_provider
+                           -- Row records no model but this snapshot names
+                           -- one: the model half above is taking it, so the
+                           -- provider must come from the SAME snapshot. Any
+                           -- provider the row held belongs to a request that
+                           -- never named a model (only a process start can
+                           -- record that, so it is not newer than this one) —
+                           -- it cannot stay beside a foreign model.
+                           WHEN sessions.requested_model IS NULL
+                                AND excluded.requested_model IS NOT NULL
+                           THEN excluded.requested_provider
+                           -- Otherwise only ever FILL a NULL: for a row with
+                           -- no request at all, or one recording the very
+                           -- model this snapshot names (same route, provider
+                           -- half now known). A row whose model came from
+                           -- somewhere else keeps its own provider, NULL
+                           -- ("no provider requested") included.
+                           WHEN sessions.requested_model IS NULL
+                                OR sessions.requested_model
+                                   = excluded.requested_model
+                           THEN COALESCE(
+                               sessions.requested_provider,
+                               excluded.requested_provider
+                           )
+                           ELSE sessions.requested_provider
+                       END,
                        model_config = CASE
                            WHEN excluded.model_config IS NOT NULL
                                 AND json_type(
@@ -6876,6 +7062,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     chat_type,
                     thread_id,
                     model,
+                    requested_model or None,
+                    requested_provider or None,
                     json.dumps(model_config) if model_config else None,
                     system_prompt_hash,
                     parent_session_id,
@@ -9223,6 +9411,144 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             self._delete_unreferenced_system_prompts(conn)
         self._execute_write(_do)
 
+    def record_session_fallback(
+        self,
+        session_id: str,
+        *,
+        requested_model: Optional[str] = None,
+        requested_provider: Optional[str] = None,
+    ) -> None:
+        """Flag a session whose requested route was abandoned for a fallback.
+
+        Called when ``try_activate_fallback`` swaps the live model/provider. The
+        served route keeps flowing into ``model``/``billing_provider`` through
+        the usual accounting path; this only raises the sticky
+        ``fallback_activated`` flag so readers can tell "this session ran a
+        model nobody asked for" apart from "this session ran the model it was
+        given". Deriving the flag by comparing requested vs served strings is
+        not equivalent: an alias/normalization rewrite makes them differ without
+        any fallback, and a fallback chain whose first entry happens to match
+        the primary makes them equal despite one.
+
+        ``requested_model``/``requested_provider`` are NOT a "backfill from
+        whatever the process happens to remember". They name **the route this
+        call is abandoning** — the live model/provider as they stand the instant
+        before the swap (``_record_fallback_on_session`` passes
+        ``try_activate_fallback``'s ``old_model``/``old_provider``). That is the
+        one thing this call site can assert, and it is what makes the ``= 1``
+        below a verdict about the pair written beside it. A caller that passes
+        something else — a process-start snapshot the ``/model`` switches have
+        since superseded, say — makes the row lie, and no SQL here can detect
+        it. A caller with no route knowledge passes neither half; an all-NULL
+        argument asserts nothing about the pair, so the pair is left exactly as
+        it stands and only the flag is raised.
+
+        The write obeys the audit-record invariant stated in
+        ``_insert_session_row`` — the pair and the flag are ONE record, a
+        request plus the verdict "this request was abandoned" — and the rule is
+        the same one the upsert follows, not an exemption from it:
+
+        * **No verdict stands yet** (``fallback_activated = 0``): the route this
+          call names is the abandoned one, so it becomes the record's subject,
+          **whole**. Whatever pair the row held describes a request nobody has
+          judged: a process start (``create_session``'s upsert), or a ``/model``
+          switch, or an earlier process's request that was honored end to end.
+          Superseding it as a unit cannot mispair anything, because both halves
+          come from this one route. Coalescing instead — "a recorded model
+          wins" — is what produced the round-5 lie: with ``P1 = hermes -m
+          glm-5.4 --provider minimax`` honored and billed, and ``P2 = hermes -c
+          -m grok-4 --provider xai`` on the same session id abandoned, the row
+          kept P1's complete honored pair and stamped P2's verdict on it, so
+          `hermes sessions list` printed ``requested glm-5.4 (minimax) → served
+          glm-5.4 (minimax)`` — two identical routes — while ``grok-4``/``xai``,
+          the route actually abandoned, was recorded nowhere.
+        * **A verdict already stands** (``fallback_activated <> 0``): the stored
+          pair is what that verdict is ABOUT, and this call has no authority to
+          re-subject it — the same reason the upsert freezes. This is what keeps
+          a multi-hop chain naming the request it started from: hop 1 abandons
+          the primary route and adopts it whole (flag was down), hop 2 abandons
+          the first fallback and finds the flag up, so the row goes on naming
+          what the operator asked for instead of drifting to an intermediate
+          route they never requested. The pair may still be named more
+          PRECISELY: a NULL half is filled only from a route that agrees with
+          the row on the half the row does record (same model, or the row
+          records no model and the providers match). That completion does not
+          move the verdict — it describes the same route with one more half
+          known — and it is what keeps the provider in the warning for a
+          flagged ``model only`` row whose model is genuinely re-requested
+          through a known provider.
+
+        The one thing this rule cannot do is name TWO abandoned requests: a row
+        holds one pair, so when P1's request was abandoned and P2's is too, the
+        row keeps P1's and P2's route is not recorded. Both are true statements
+        and the flag still reports the fallback, but the second abandonment is
+        under-reported; naming it instead would require a per-process audit row,
+        i.e. a schema change. See the residual note in ``_insert_session_row``.
+
+        Deliberately NOT symmetric with the upsert, and the asymmetry is the
+        invariant's verdict clause: only a writer whose call site asserts the
+        abandonment may make the pair its own, and only while no verdict stands.
+        ``create_session``'s snapshot is a process START — a request that has
+        not been answered yet, let alone abandoned — so it may never take a pair
+        away from a standing verdict, and it never writes the flag at all.
+
+        Best-effort and idempotent: a fallback swap is a recovery path and must
+        not be aborted by a bookkeeping write.
+        """
+        if not session_id:
+            return
+
+        def _do(conn):
+            # SQLite evaluates every SET expression against the pre-UPDATE row,
+            # so every CASE arm reads the pair and the flag the row had on
+            # entry — including `fallback_activated`, which this statement is
+            # also setting to 1.
+            conn.execute(
+                """UPDATE sessions
+                      SET fallback_activated = 1,
+                          requested_model = CASE
+                              -- Caller names no route: it asserts nothing
+                              -- about the pair (flag-only raise).
+                              WHEN :model IS NULL AND :provider IS NULL
+                                  THEN requested_model
+                              -- No verdict standing: the route being
+                              -- abandoned becomes the subject, whole.
+                              WHEN fallback_activated = 0
+                                  THEN :model
+                              -- Verdict standing: name it more precisely
+                              -- only, and only from a route the row does not
+                              -- already contradict.
+                              WHEN requested_model IS NULL
+                                   AND (requested_provider IS NULL
+                                        OR requested_provider = :provider)
+                                  THEN COALESCE(:model, requested_model)
+                              ELSE requested_model
+                          END,
+                          requested_provider = CASE
+                              WHEN :model IS NULL AND :provider IS NULL
+                                  THEN requested_provider
+                              WHEN fallback_activated = 0
+                                  THEN :provider
+                              -- Mirror completion: fill a NULL provider only
+                              -- when the row's model is the very model this
+                              -- route names (or it records none), so the pair
+                              -- still describes ONE route.
+                              WHEN requested_provider IS NULL
+                                   AND (requested_model IS NULL
+                                        OR requested_model = :model)
+                                  THEN COALESCE(:provider, requested_provider)
+                              ELSE requested_provider
+                          END
+                    WHERE id = :session_id""",
+                {
+                    "model": requested_model or None,
+                    "provider": requested_provider or None,
+                    "session_id": session_id,
+                },
+            )
+
+        self._execute_write(_do)
+
     def update_session_model(
         self, session_id: str, model: str, provider: Optional[str] = None
     ) -> None:
@@ -9236,12 +9562,37 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         switch explicitly replaces any confirmed Browser runtime lock while
         preserving unrelated lineage markers in ``model_config``.
 
-        When *provider* is given, it is merged into ``model_config``
-        alongside the model (``$.model`` / ``$.provider``) so a later
-        resume recombines the persisted model with the provider that
-        actually serves it instead of the config.yaml primary provider
-        (#79536). Callers without provider knowledge leave any stored
-        provider untouched.
+        *provider* drives two deliberately different writes:
+
+        * ``model_config`` (``$.model`` / ``$.provider``) is a RESUME route:
+          it exists so a later resume recombines the persisted model with the
+          provider that actually serves it instead of the config.yaml primary
+          provider (#79536). Only touched when *provider* is given — callers
+          without provider knowledge leave any stored provider untouched.
+        * the request audit columns are a statement about THIS call, so they
+          are rewritten wholesale: ``requested_model`` becomes *model*,
+          ``requested_provider`` becomes *provider* — either half NULL when the
+          caller names none — and ``fallback_activated`` clears. All three go
+          together, which is what makes the record coherent from any of the
+          eight prior row states (neither half / model only / provider only /
+          both, each with the flag up or down). A mid-session /model switch is a
+          NEW explicit request: the old requested route is no longer what the
+          operator is asking for, and any fallback flag raised against it would
+          now be misleading. Note this is the opposite half of the choice the
+          upsert makes for a flagged row: a switch legitimately discards the old
+          verdict because it discards the old request WITH it, whereas the
+          upsert has no such authority — it carries an unanswered snapshot, so
+          it freezes the flagged pair rather than clearing a flag that still
+          describes a real, unreported fallback.
+
+        The audit provider is NOT coalesced with the stored one: keeping the
+        previous request's provider beside the newly requested model would
+        make the pair describe a route nobody ever asked for (requested model
+        Y via the provider of abandoned request X), which is exactly what the
+        columns exist to rule out — see the audit-record invariant stated in
+        ``_insert_session_row``, which every writer of these three columns
+        obeys. Callers that know the provider they are switching to must
+        therefore pass it — every /model path does.
         """
         # This write bypasses the token queue, so deltas enqueued before the
         # switch must land first: a still-queued first delta carries the
@@ -9264,12 +9615,26 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             merged = self._merge_model_config_json(conn, session_id, patch)
             if merged is _MODEL_CONFIG_ROW_MISSING:
                 return
+            # A mid-session /model switch is a NEW explicit request, so it
+            # resets the whole request audit — both halves from THIS call, so
+            # the pair always names one route. A provider-less switch records
+            # "no provider requested" (NULL) rather than inheriting the
+            # abandoned request's provider; the stored model_config provider
+            # above is the resume route and keeps its own COALESCE-like
+            # semantics (untouched when the caller names no provider).
+            # Both audit halves go through `or None` like the other two
+            # writers': "not requested" must have ONE representation, or the
+            # NULL gates in those writers would silently treat a stored ''
+            # as a recorded name (and `'' = :model` would never match).
             conn.execute(
                 "UPDATE sessions SET "
                 "model = ?, model_config = ?, "
+                "requested_model = ?, "
+                "requested_provider = ?, "
+                "fallback_activated = 0, "
                 "system_prompt = NULL, system_prompt_hash = NULL "
                 "WHERE id = ?",
-                (model, merged, session_id),
+                (model, merged, model or None, provider or None, session_id),
             )
             self._delete_unreferenced_system_prompts(conn)
         self._execute_write(_do)
@@ -9948,6 +10313,13 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             # call. If it fails and fallback succeeds, the first accounted usage
             # event is the first authoritative route. After that, preserve the
             # legacy row: one row cannot represent mixed-provider usage.
+            #
+            # This overwrite is exactly why the audit columns exist: it is the
+            # write that made silent fallback undetectable after the fact (the
+            # row ended up claiming it ran the model that actually never
+            # answered). requested_model/requested_provider/fallback_activated
+            # are deliberately absent from the UPDATE below and must stay that
+            # way — they carry the request, not the delivery.
             first_accounted_route = (
                 existing_api_calls == 0
                 and has_accounted_usage
