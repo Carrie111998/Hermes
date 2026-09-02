@@ -6804,10 +6804,15 @@ def fetch_ollama_cloud_models(
     """Fetch Ollama Cloud models by merging live API + models.dev, with disk cache.
 
     Resolution order:
-      1. Disk cache (if fresh, < 1 hour, and not force_refresh)
-      2. Live ``/v1/models`` endpoint (primary — freshest source)
-      3. models.dev registry (secondary — fills gaps for unlisted models)
-      4. Merge: live models first, then models.dev additions (deduped)
+      1. Disk cache (if fresh, ``_OLLAMA_CLOUD_CACHE_TTL``, and not force_refresh)
+      2. Live ``/v1/models`` endpoint (primary — freshest source, and
+         authoritative for existence when it returns a non-empty list)
+      3. models.dev registry (secondary — full fallback when the live probe
+         yields no models: no key, probe failure, or empty listing)
+      4. Merge: live models (deduped, order-preserving). models.dev never
+         adds IDs the live listing doesn't already carry — models.dev lags
+         retirements, so unioning its only-here IDs would resurrect retired
+         models in the picker (#94041).
 
     Returns a list of model IDs (never None — empty list on total failure).
     """
@@ -6837,7 +6842,8 @@ def fetch_ollama_cloud_models(
     except Exception:
         pass
 
-    # 4. Merge: live first, then models.dev additions (deduped, order-preserving)
+    # 4. Merge: live first; models.dev only fills a fully-failed live probe
+    #    (deduped, order-preserving) — see docstring note on #94041.
     if live_models or mdev_models:
         seen: set[str] = set()
         merged: list[str] = []
@@ -6848,6 +6854,11 @@ def fetch_ollama_cloud_models(
         for m in mdev_models:
             normalized = _strip_ollama_cloud_suffix(m)
             if normalized and normalized not in seen:
+                if live_models:
+                    # Existence is the live API's call: a models.dev-only ID
+                    # means Ollama retired (or never had) the model, and
+                    # selecting it fails at runtime (#94041).
+                    continue
                 seen.add(normalized)
                 merged.append(normalized)
         if merged:
