@@ -56,11 +56,21 @@ class TestNormalizeWorkdir:
         with pytest.raises(ValueError, match="absolute path"):
             _normalize_workdir("some/relative/path")
 
-    def test_missing_dir_rejected(self, tmp_path):
+    def test_host_missing_dir_is_retained_for_nonlocal_backend_validation(self, tmp_path, monkeypatch):
         from cron.jobs import _normalize_workdir
         missing = tmp_path / "does-not-exist"
-        with pytest.raises(ValueError, match="does not exist"):
-            _normalize_workdir(str(missing))
+        monkeypatch.setattr(
+            "tools.terminal_tool.get_effective_terminal_backend", lambda: "docker"
+        )
+        assert _normalize_workdir(str(missing)) == str(missing)
+
+    def test_local_backend_rejects_missing_dir(self, tmp_path, monkeypatch):
+        from cron.jobs import _normalize_workdir
+        monkeypatch.setattr(
+            "tools.terminal_tool.get_effective_terminal_backend", lambda: "local"
+        )
+        with pytest.raises(ValueError, match="not a directory"):
+            _normalize_workdir(str(tmp_path / "does-not-exist"), target="backend")
 
     def test_file_not_dir_rejected(self, tmp_path):
         from cron.jobs import _normalize_workdir
@@ -95,6 +105,29 @@ class TestCreateJobWorkdir:
                 workdir="not/absolute",
             )
 
+    def test_scheduler_target_rejects_missing_workdir(self, tmp_cron_dir):
+        from cron.jobs import create_job
+        with pytest.raises(ValueError, match="not a directory"):
+            create_job(
+                prompt="hello",
+                schedule="every 1h",
+                target="scheduler",
+                workdir=str(tmp_cron_dir / "missing"),
+            )
+
+    def test_local_backend_target_rejects_missing_workdir(self, tmp_cron_dir, monkeypatch):
+        from cron.jobs import create_job
+        monkeypatch.setattr(
+            "tools.terminal_tool.get_effective_terminal_backend", lambda: "local"
+        )
+        with pytest.raises(ValueError, match="not a directory"):
+            create_job(
+                prompt="hello",
+                schedule="every 1h",
+                target="backend",
+                workdir=str(tmp_cron_dir / "missing"),
+            )
+
 
 class TestUpdateJobWorkdir:
     def test_set_workdir_via_update(self, tmp_cron_dir):
@@ -117,6 +150,21 @@ class TestUpdateJobWorkdir:
         job = create_job(prompt="x", schedule="every 1h")
         with pytest.raises(ValueError):
             update_job(job["id"], {"workdir": "nope/relative"})
+
+    def test_scheduler_target_update_rejects_missing_workdir(self, tmp_cron_dir):
+        from cron.jobs import create_job, update_job
+        job = create_job(prompt="x", schedule="every 1h", target="scheduler")
+        with pytest.raises(ValueError, match="not a directory"):
+            update_job(job["id"], {"workdir": str(tmp_cron_dir / "missing")})
+
+    def test_local_backend_target_update_rejects_missing_workdir(self, tmp_cron_dir, monkeypatch):
+        from cron.jobs import create_job, update_job
+        monkeypatch.setattr(
+            "tools.terminal_tool.get_effective_terminal_backend", lambda: "local"
+        )
+        job = create_job(prompt="x", schedule="every 1h", target="backend")
+        with pytest.raises(ValueError, match="not a directory"):
+            update_job(job["id"], {"workdir": str(tmp_cron_dir / "missing")})
 
 
 # ---------------------------------------------------------------------------
@@ -316,3 +364,30 @@ class TestRunJobTerminalCwd:
         assert observed["terminal_cwd_during_run"] == baseline
         assert os.environ["TERMINAL_CWD"] == baseline
         assert get_session_cwd(observed["task_id"]) is None
+
+    def test_agent_prerun_script_receives_job_workdir(self, monkeypatch, tmp_path):
+        """Agent-backed script context uses the declared backend-visible cwd."""
+        import cron.scheduler as sched
+
+        observed: dict = {}
+        self._install_stubs(monkeypatch, observed)
+        calls = []
+        monkeypatch.setattr(
+            sched,
+            "_run_job_script_with_claim_heartbeat",
+            lambda job, script, workdir=None, cancel_event=None: calls.append((script, workdir))
+            or (True, "data"),
+        )
+        job = {
+            "id": "script-cwd",
+            "name": "script-cwd",
+            "prompt": "summarize",
+            "script": "/workspace/collect.py",
+            "workdir": "/workspace",
+            "schedule_display": "manual",
+        }
+
+        success, *_ = sched.run_job(job)
+
+        assert success is True
+        assert calls == [("/workspace/collect.py", "/workspace")]

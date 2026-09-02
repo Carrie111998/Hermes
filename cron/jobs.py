@@ -2024,19 +2024,15 @@ def save_jobs(
         _save_jobs_unlocked(jobs, removed_ids=removed_ids, replace=replace)
 
 
-def _normalize_workdir(workdir: Optional[str]) -> Optional[str]:
-    """Normalize and validate a cron job workdir.
+def _normalize_workdir(
+    workdir: Optional[str], *, target: str = "backend",
+) -> Optional[str]:
+    """Normalize a cron job workdir for its declared execution target.
 
-    Rules:
-      - Empty / None → None (feature off, preserves old behaviour).
-      - ``~`` is expanded.  Relative paths are rejected — cron jobs run detached
-        from any shell cwd, so relative paths have no stable meaning.
-      - The path must exist and be a directory at create/update time.  We do
-        NOT re-check at run time (a user might briefly unmount the dir; the
-        scheduler will just fall back to old behaviour with a logged warning).
-
-    Returns the absolute path string, or None when disabled.
-    Raises ValueError on invalid input.
+    Backend workdirs may be visible only to a container or remote backend, so
+    missing host paths remain valid only for a non-local effective backend.
+    Scheduler-target jobs and backend-target jobs executed through the local
+    terminal must name an existing directory before persistence.
     """
     if workdir is None:
         return None
@@ -2049,12 +2045,26 @@ def _normalize_workdir(workdir: Optional[str]) -> Optional[str]:
             f"Cron workdir must be an absolute path (got {raw!r}). "
             f"Cron jobs run detached from any shell cwd, so relative paths are ambiguous."
         )
-    resolved = expanded.resolve()
-    if not resolved.exists():
-        raise ValueError(f"Cron workdir does not exist: {resolved}")
-    if not resolved.is_dir():
-        raise ValueError(f"Cron workdir is not a directory: {resolved}")
-    return str(resolved)
+    # Preserve useful local validation when the path is visible to the scheduler,
+    # but accept paths absent on the host because they may exist only in a
+    # container or remote terminal backend.
+    if expanded.exists():
+        resolved = expanded.resolve()
+        if not resolved.is_dir():
+            raise ValueError(f"Cron workdir is not a directory: {resolved}")
+        return str(resolved)
+    requires_local_directory = target == "scheduler"
+    if target == "backend":
+        # Backend targets still execute on the scheduler host when the active
+        # terminal backend is local. Match script validation's effective-
+        # backend boundary so an unusable local cwd is rejected at persistence,
+        # not deferred until detached fire time.
+        from tools.terminal_tool import get_effective_terminal_backend
+
+        requires_local_directory = get_effective_terminal_backend() == "local"
+    if requires_local_directory:
+        raise ValueError(f"Cron workdir is not a directory: {expanded}")
+    return str(expanded)
 
 
 def _resolve_default_model_snapshot() -> Optional[str]:
@@ -2244,6 +2254,7 @@ def create_job(
     enabled_toolsets: Optional[List[str]] = None,
     workdir: Optional[str] = None,
     no_agent: bool = False,
+    target: Optional[str] = None,
     attach_to_session: Optional[bool] = None,
     monitor_script: Optional[str] = None,
     monitor_url: Optional[str] = None,
@@ -2303,8 +2314,12 @@ def create_job(
                 should emit stable output (no timestamps). Mutually exclusive
                 with ``monitor_url``; incompatible with ``no_agent=True``.
         monitor_url: Optional http(s) URL used as the monitor source instead
-                of a script — fetched with a bounded GET each tick. Same
-                hash-suppression semantics as ``monitor_script``.
+                of a script — fetched with a bounded GET (30s timeout, 256KB cap)
+                each tick. Same hash-suppression semantics as monitor_script.
+        target: Execution target for scripts. New script jobs default to the
+                profile terminal backend; use ``scheduler`` explicitly for
+                scheduler-host automation. Existing persisted jobs without this
+                field retain scheduler-host behavior at execution time.
         reasoning_effort: Optional per-job reasoning effort pin. One of the
                 canonical Hermes levels (none|minimal|low|medium|high|xhigh|
                 max|ultra, case-insensitive). When set, it wins over BOTH the
@@ -2346,8 +2361,11 @@ def create_job(
     normalized_script = normalized_script or None
     normalized_toolsets = [str(t).strip() for t in enabled_toolsets if str(t).strip()] if enabled_toolsets else None
     normalized_toolsets = normalized_toolsets or None
-    normalized_workdir = _normalize_workdir(workdir)
     normalized_no_agent = bool(no_agent)
+    normalized_target = str(target or ("backend" if normalized_script else "scheduler")).strip().lower()
+    if normalized_target not in {"scheduler", "backend"}:
+        raise ValueError("Cron target must be either 'scheduler' or 'backend'.")
+    normalized_workdir = _normalize_workdir(workdir, target=normalized_target)
     normalized_attach = attach_to_session if isinstance(attach_to_session, bool) else None
     normalized_reasoning_effort = _normalize_reasoning_effort(reasoning_effort)
     normalized_monitor_script = str(monitor_script).strip() if isinstance(monitor_script, str) else None
@@ -2389,6 +2407,16 @@ def create_job(
     from cron.lifecycle_guard import check_gateway_lifecycle
     check_gateway_lifecycle(prompt_text, normalized_script)
 
+    # Enforce target-aware path validation at the persistence boundary too.
+    # Tool/CLI checks give better early UX, but direct callers must not be able
+    # to write a job that bypasses the same execution-boundary contract.
+    from tools.cronjob_tools import _validate_cron_script_path
+    script_error = _validate_cron_script_path(
+        normalized_script, normalized_target, workdir=normalized_workdir,
+    )
+    if script_error:
+        raise ValueError(script_error)
+
     label_source = (prompt_text or (normalized_skills[0] if normalized_skills else None) or (normalized_script if normalized_no_agent else None)) or "cron job"
 
     provider_snapshot, model_snapshot = _compute_provider_model_snapshots(
@@ -2420,6 +2448,7 @@ def create_job(
         "skill": normalized_skills[0] if normalized_skills else None,
         "model": normalized_model,
         "provider": normalized_provider,
+        "target": normalized_target,
         # Provider/model resolution captured at creation for unpinned jobs
         # (#44585). None for pinned axes, no_agent jobs, resolution failures, and
         # any pre-existing job written before these fields existed (back-compat).
@@ -2555,14 +2584,10 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
             if job["id"] != job_id:
                 continue
 
-            # Validate / normalize workdir if present in updates.  Empty string
-            # or None both mean "clear the field" (restore old behaviour).
-            if "workdir" in updates:
-                _wd = updates["workdir"]
-                if _wd in {None, "", False}:
-                    updates["workdir"] = None
-                else:
-                    updates["workdir"] = _normalize_workdir(_wd)
+            # Normalize workdir empties early; target-aware filesystem validation
+            # happens after the merged target is resolved below.
+            if "workdir" in updates and updates["workdir"] in {None, "", False}:
+                updates["workdir"] = None
 
             # Normalize monitor fields the same way create_job does (empty
             # string clears the field).
@@ -2633,10 +2658,23 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
                     bool(updated.get("no_agent")),
                     _upd_script or None,
                 )
-
             if any(k in updates for k in _PAYLOAD_FIELDS):
                 if job_payload_is_empty(updated):
                     raise ValueError(EMPTY_PAYLOAD_ERROR)
+            updated_target = str(updated.get("target") or "scheduler").strip().lower()
+            if updated_target not in {"scheduler", "backend"}:
+                raise ValueError("Cron target must be either 'scheduler' or 'backend'.")
+            updated["target"] = updated_target
+            if updated.get("workdir") is not None:
+                updated["workdir"] = _normalize_workdir(
+                    updated["workdir"], target=updated_target,
+                )
+            from tools.cronjob_tools import _validate_cron_script_path
+            script_error = _validate_cron_script_path(
+                updated.get("script"), updated_target, workdir=updated.get("workdir"),
+            )
+            if script_error:
+                raise ValueError(script_error)
             schedule_changed = "schedule" in updates
             inference_fields_changed = bool(
                 {"provider", "model", "base_url", "no_agent"}.intersection(updates)

@@ -200,6 +200,7 @@ def test_update_job_allows_swapping_the_script_of_a_no_agent_job(hermes_env):
     from cron.jobs import create_job, get_job, update_job
 
     (hermes_env / "scripts" / "w.sh").write_text("echo hi\n")
+    (hermes_env / "scripts" / "other.sh").write_text("echo other\n")
     job = create_job(
         prompt=None, schedule="every 5m", script="w.sh", no_agent=True, deliver="local"
     )

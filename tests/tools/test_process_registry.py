@@ -2,6 +2,7 @@
 
 import json
 import os
+import shlex
 import signal
 import subprocess
 import sys
@@ -773,6 +774,86 @@ class TestSpawnEnvSanitization:
         # A failed launch must not be exposed as a running/tracked session.
         assert session.id not in registry._running
 
+    def test_spawn_via_env_prefers_setsid_with_a_portable_fallback(self, registry):
+        class FakeEnv:
+            def __init__(self):
+                self.commands = []
+
+            def execute(self, command, **kwargs):
+                self.commands.append((command, kwargs))
+                return {"output": "4242\n", "returncode": 0}
+
+        env = FakeEnv()
+        fake_thread = MagicMock()
+        with patch("tools.process_registry.threading.Thread", return_value=fake_thread), \
+            patch.object(registry, "_write_checkpoint"):
+            session = registry.spawn_via_env(env, "python worker.py")
+
+        assert session.pid == 4242
+        launch = env.commands[0][0]
+        assert "if command -v setsid >/dev/null 2>&1; then" in launch
+        assert "setsid bash -lc" in launch
+        assert "set -m;" in launch
+        assert "child=$!" in launch
+        assert 'wait "$child"' in launch
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX shell process groups")
+    def test_spawn_via_env_without_setsid_kills_the_child_process_group(self, registry, tmp_path):
+        class LocalShellEnv:
+            def get_temp_dir(self):
+                return str(tmp_path)
+
+            def execute(self, command, **kwargs):
+                # Exercise the exact no-setsid branch without depending on the
+                # host PATH: it must record Bash's job-control group leader.
+                command = command.replace(
+                    "command -v setsid >/dev/null 2>&1", "false"
+                )
+                result = subprocess.run(
+                    ["bash", "-lc", command],
+                    text=True,
+                    capture_output=True,
+                    timeout=10,
+                )
+                return {
+                    "output": result.stdout,
+                    "returncode": result.returncode,
+                    "error": result.stderr,
+                }
+
+        child_pid_file = tmp_path / "child.pid"
+        child_command = (
+            f"sleep 30 & child=$!; echo \"$child\" > {shlex.quote(str(child_pid_file))}; "
+            'wait "$child"'
+        )
+        env = LocalShellEnv()
+        fake_thread = MagicMock()
+        with patch("tools.process_registry.threading.Thread", return_value=fake_thread), \
+            patch.object(registry, "_write_checkpoint"):
+            session = registry.spawn_via_env(env, child_command)
+            assert session.pid is not None
+            deadline = time.monotonic() + 5
+            while not child_pid_file.exists() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            assert child_pid_file.exists(), "background child did not publish its PID"
+            child_pid = int(child_pid_file.read_text(encoding="utf-8").strip())
+            assert subprocess.run(
+                ["kill", "-0", str(session.pid)], capture_output=True
+            ).returncode == 0
+            assert subprocess.run(
+                ["kill", "-0", str(child_pid)], capture_output=True
+            ).returncode == 0
+
+            result = registry.kill_process(session.id)
+
+        assert result["status"] == "killed"
+        assert subprocess.run(
+            ["kill", "-0", str(session.pid)], capture_output=True
+        ).returncode != 0
+        assert subprocess.run(
+            ["kill", "-0", str(child_pid)], capture_output=True
+        ).returncode != 0
+
     def test_env_poller_quotes_temp_paths_with_spaces(self, registry):
         session = _make_session(sid="proc_space")
         session.exited = False
@@ -1059,6 +1140,47 @@ class TestKillProcess:
         registry._finished[s.id] = s
         result = registry.kill_process(s.id)
         assert result["status"] == "already_exited"
+
+    def test_kill_non_local_process_targets_its_process_group(self, registry):
+        commands = []
+
+        class FakeEnv:
+            def execute(self, command, **kwargs):
+                commands.append((command, kwargs))
+                return {"output": "", "returncode": 0}
+
+        session = _make_session(sid="proc_remote")
+        session.pid = 4242
+        session.pid_scope = "sandbox"
+        session.env_ref = FakeEnv()
+        registry._running[session.id] = session
+
+        with patch.object(registry, "_write_checkpoint"):
+            result = registry.kill_process(session.id)
+
+        assert result["status"] == "killed"
+        assert "kill -TERM -- -4242" in commands[0][0]
+        assert "kill -KILL -- -4242" in commands[0][0]
+        assert "then exit 1" in commands[0][0]
+        assert "|| true" not in commands[0][0]
+
+    def test_kill_non_local_process_keeps_session_when_termination_fails(self, registry):
+        class FakeEnv:
+            def execute(self, _command, **_kwargs):
+                return {"output": "permission denied", "returncode": 1}
+
+        session = _make_session(sid="proc_remote_failed")
+        session.pid = 4242
+        session.pid_scope = "sandbox"
+        session.env_ref = FakeEnv()
+        registry._running[session.id] = session
+
+        result = registry.kill_process(session.id)
+
+        assert result["status"] == "error"
+        assert "termination failed" in result["error"]
+        assert registry.get(session.id) is session
+        assert session.exited is False
 
 
     def test_kill_detached_session_uses_host_pid(self, registry):
