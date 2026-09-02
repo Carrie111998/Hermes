@@ -617,6 +617,122 @@ class TestOSSBackend:
         assert state.clients == []
         assert raw == before
 
+    def test_api_key_env_is_resolved_for_all_provider_sections_before_mem0_init(self, monkeypatch):
+        import sys
+        import types
+
+        captured = {}
+
+        class Memory:
+            @staticmethod
+            def from_config(config):
+                captured.update(config)
+                return FakeOSSMemory()
+
+        # mem0 is a lazy optional dep absent from CI's env; stub it like the
+        # api_base normalization test above does.
+        stub_mem0 = types.ModuleType("mem0")
+        stub_mem0.Memory = Memory  # type: ignore[attr-defined]
+        monkeypatch.setitem(sys.modules, "mem0", stub_mem0)
+
+        monkeypatch.setenv("TEST_MEM0_LLM_API_KEY", "llm-key-from-env")
+        monkeypatch.setenv("TEST_MEM0_EMBEDDER_API_KEY", "embedder-key-from-env")
+        monkeypatch.setenv("TEST_MEM0_VECTOR_STORE_API_KEY", "qdrant-key-from-env")
+
+        raw = {
+            "llm": {
+                "provider": "openai",
+                "config": {
+                    "model": "gpt-5-mini",
+                    "api_key_env": "TEST_MEM0_LLM_API_KEY",
+                },
+            },
+            "embedder": {
+                "provider": "openai",
+                "config": {
+                    "model": "text-embedding-3-small",
+                    "api_key_env": "TEST_MEM0_EMBEDDER_API_KEY",
+                },
+            },
+            "vector_store": {
+                "provider": "qdrant",
+                "config": {"url": "http://qdrant:6333", "api_key_env": "TEST_MEM0_VECTOR_STORE_API_KEY"},
+            },
+        }
+        before = copy.deepcopy(raw)
+
+        OSSBackend(raw)
+
+        assert captured["llm"]["config"]["api_key"] == "llm-key-from-env"
+        assert captured["embedder"]["config"]["api_key"] == "embedder-key-from-env"
+        assert captured["vector_store"]["config"]["api_key"] == "qdrant-key-from-env"
+        for section in ("llm", "embedder", "vector_store"):
+            assert "api_key_env" not in captured[section]["config"]
+        # The caller's config dict must not be mutated.
+        assert raw == before
+
+    def test_api_key_env_missing_variable_raises_actionable_error(self, monkeypatch):
+        import sys
+        import types
+
+        class Memory:
+            @staticmethod
+            def from_config(config):  # pragma: no cover - must never be reached
+                raise AssertionError("Memory.from_config should not run")
+
+        stub_mem0 = types.ModuleType("mem0")
+        stub_mem0.Memory = Memory  # type: ignore[attr-defined]
+        monkeypatch.setitem(sys.modules, "mem0", stub_mem0)
+        monkeypatch.delenv("TEST_MEM0_MISSING_API_KEY", raising=False)
+
+        raw = {
+            "llm": {
+                "provider": "openai",
+                "config": {"model": "gpt-5-mini"},
+            },
+            "embedder": {
+                "provider": "openai",
+                "config": {"model": "text-embedding-3-small", "api_key_env": "TEST_MEM0_MISSING_API_KEY"},
+            },
+            "vector_store": {"provider": "qdrant", "config": {}},
+        }
+
+        with pytest.raises(ValueError, match="TEST_MEM0_MISSING_API_KEY"):
+            OSSBackend(raw)
+
+    def test_sections_without_api_key_env_pass_through_unchanged(self, monkeypatch):
+        import sys
+        import types
+
+        captured = {}
+
+        class Memory:
+            @staticmethod
+            def from_config(config):
+                captured.update(config)
+                return FakeOSSMemory()
+
+        stub_mem0 = types.ModuleType("mem0")
+        stub_mem0.Memory = Memory  # type: ignore[attr-defined]
+        monkeypatch.setitem(sys.modules, "mem0", stub_mem0)
+
+        raw = {
+            "llm": {
+                "provider": "openai",
+                "config": {"model": "gpt-5-mini", "api_key": "direct-key"},
+            },
+            "embedder": {
+                "provider": "ollama",
+                "config": {"model": "nomic-embed-text"},
+            },
+            "vector_store": {"provider": "qdrant", "config": {}},
+        }
+
+        OSSBackend(raw)
+
+        assert captured["llm"]["config"]["api_key"] == "direct-key"
+        assert "api_key" not in captured["embedder"]["config"]
+
 
 httpx = pytest.importorskip("httpx")
 

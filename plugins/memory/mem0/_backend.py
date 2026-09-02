@@ -203,13 +203,29 @@ class OSSBackend(Mem0Backend):
             block["config"] = provider_config
             return block
 
-        vector_store = dict(oss_config["vector_store"])
+        def _resolve_api_key_env(section: dict) -> dict:
+            """Resolve a named API-key env var without persisting secrets in mem0.json."""
+            resolved = dict(section)
+            provider_config = dict(resolved.get("config", {}))
+            env_name = provider_config.pop("api_key_env", None)
+            if env_name:
+                api_key = os.environ.get(env_name)
+                if not api_key:
+                    raise ValueError(
+                        f"Configured API key environment variable is not set: {env_name}"
+                    )
+                provider_config["api_key"] = api_key
+            resolved["config"] = provider_config
+            return resolved
+
+        vector_store = _resolve_api_key_env(dict(oss_config["vector_store"]))
         vs_config = dict(vector_store.get("config", {}))
 
         if "path" in vs_config:
             vs_config["path"] = os.path.expanduser(vs_config["path"])
 
-        embedder_config = oss_config.get("embedder", {}).get("config", {})
+        embedder = _resolve_api_key_env(_provider_block("embedder"))
+        embedder_config = embedder.get("config", {})
         dims = embedder_config.get("embedding_dims")
         if not dims:
             from ._oss_providers import KNOWN_DIMS
@@ -225,8 +241,8 @@ class OSSBackend(Mem0Backend):
 
         config = {
             "vector_store": vector_store,
-            "llm": _provider_block("llm"),
-            "embedder": _provider_block("embedder"),
+            "llm": _resolve_api_key_env(_provider_block("llm")),
+            "embedder": embedder,
             "version": "v1.1",
         }
         if str(config["llm"].get("provider") or "").strip().lower() == "openai":
