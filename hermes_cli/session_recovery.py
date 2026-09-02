@@ -92,6 +92,13 @@ _MAX_SALVAGE_RANGE_QUERIES = 10_000
 _MIN_SQLITE_ROWID = -(2**63)
 _MAX_SQLITE_ROWID = 2**63 - 1
 
+# ``sessions.model_config`` is queried with SQLite's JSON functions by session
+# list/count/lineage paths. A malformed value can survive a physically sound
+# recovery and make those whole surfaces raise ``malformed JSON``. Keep this
+# declaration narrow and explicit; raw values are deliberately not reported
+# because model configuration can contain credentials.
+_RECOVERY_JSON_COLUMNS = (("sessions", "model_config", "{}"),)
+
 
 class SessionRecoveryError(RuntimeError):
     """Base error for offline session recovery."""
@@ -516,6 +523,50 @@ def _append_skipped_range(
         ranges[-1]["high"] = high
         return
     ranges.append({"low": low, "high": high, "error": error})
+
+
+def _quarantine_malformed_json(
+    destination: sqlite3.Connection,
+) -> dict[str, Any]:
+    """Replace malformed runtime JSON with safe empty values and count it.
+
+    SQLite's physical integrity checks do not validate JSON stored in TEXT
+    columns. Recovery therefore enforces this semantic invariant before
+    declaring an output usable. The original source/snapshot stays untouched;
+    the report records only table/column counts, never raw values.
+    """
+
+    result: dict[str, Any] = {
+        "malformed_json_values_quarantined": 0,
+        "columns": {},
+    }
+    destination.execute("BEGIN IMMEDIATE")
+    try:
+        for table, column, replacement in _RECOVERY_JSON_COLUMNS:
+            if column not in _table_columns(destination, table):
+                continue
+            invalid = int(
+                destination.execute(
+                    f'SELECT COUNT(*) FROM "{table}" '
+                    f'WHERE "{column}" IS NOT NULL '
+                    f'AND NOT json_valid("{column}")'
+                ).fetchone()[0]
+            )
+            if not invalid:
+                continue
+            destination.execute(
+                f'UPDATE "{table}" SET "{column}" = ? '
+                f'WHERE "{column}" IS NOT NULL '
+                f'AND NOT json_valid("{column}")',
+                (replacement,),
+            )
+            result["columns"][f"{table}.{column}"] = invalid
+            result["malformed_json_values_quarantined"] += invalid
+        destination.execute("COMMIT")
+    except BaseException:
+        destination.execute("ROLLBACK")
+        raise
+    return result
 
 
 def _salvage_rowid_bounds(
@@ -1215,6 +1266,7 @@ def _verify_recovered_database(
     copy_report: dict[str, dict[str, Any]],
     allow_partial: bool = False,
     orphan_cleanup: Optional[dict[str, Any]] = None,
+    semantic_cleanup: Optional[dict[str, Any]] = None,
 ) -> dict[str, Any]:
     verification: dict[str, Any] = {
         "errors": [],
@@ -1366,6 +1418,16 @@ def _verify_recovered_database(
                     "timestamps, cost) is lost"
                 )
                 verification["loss_detected"] = True
+
+        quarantined_json = int(
+            (semantic_cleanup or {}).get("malformed_json_values_quarantined") or 0
+        )
+        if quarantined_json:
+            verification["warnings"].append(
+                f"quarantined {quarantined_json} malformed JSON value(s) "
+                "from runtime metadata; original values remain in the source database"
+            )
+            verification["loss_detected"] = True
 
         fts_checks: dict[str, str] = {}
         for table in ("messages_fts", "messages_fts_trigram", "messages_fts_cjk"):
@@ -1533,6 +1595,7 @@ def _recover_via_lost_and_found(
         destination_conn.execute("PRAGMA foreign_keys=OFF")
         mapping = map_lost_and_found_rows(lf_conn, destination_conn)
         stubbing = stub_missing_parent_sessions(destination_conn)
+        semantic_cleanup = _quarantine_malformed_json(destination_conn)
         fts = rebuild_fts_indexes(destination_conn)
         derived_metadata = _finalize_derived_metadata(destination_conn)
     finally:
@@ -1564,6 +1627,7 @@ def _recover_via_lost_and_found(
             "messages_removed": 0,
             "total_removed_or_relinked": 0,
         },
+        semantic_cleanup=semantic_cleanup,
     )
     verification["loss_detected"] = True
     verification["warnings"].append(
@@ -1626,6 +1690,7 @@ def _recover_via_lost_and_found(
             "messages_removed": 0,
             "total_removed_or_relinked": 0,
         },
+        "semantic_cleanup": semantic_cleanup,
         "derived_metadata": derived_metadata,
         "verification": verification,
         "complete": False,
@@ -1788,6 +1853,7 @@ def recover_session_database(
                     progress_cb=progress_cb,
                     source_rows=table_inspection.get("rows"),
                 )
+            semantic_cleanup = _quarantine_malformed_json(destination_conn)
             orphan_cleanup = (
                 _cleanup_partial_orphans(destination_conn)
                 if allow_partial
@@ -1817,6 +1883,7 @@ def recover_session_database(
             copy_report=copy_report,
             allow_partial=allow_partial,
             orphan_cleanup=orphan_cleanup,
+            semantic_cleanup=semantic_cleanup,
         )
         source_unchanged = (
             _source_fingerprint(source) == inspection["source_fingerprint"]
@@ -1844,6 +1911,7 @@ def recover_session_database(
             },
             "copy": copy_report,
             "orphan_cleanup": orphan_cleanup,
+            "semantic_cleanup": semantic_cleanup,
             "derived_metadata": derived_metadata,
             "verification": verification,
             "complete": bool(verification.get("complete") and source_unchanged),
