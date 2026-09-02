@@ -16,6 +16,7 @@ import {
 } from '@/store/native-notifications'
 import { openPluginInstallRequest } from '@/store/plugin-install-request'
 import { openFolderAsProject } from '@/store/projects'
+import { storedSessionIdForRuntimeId } from '@/store/session-states'
 import {
   getRememberedRoute,
   getRememberedSessionId,
@@ -209,7 +210,17 @@ export function useDesktopIntegrations({
   useEffect(() => {
     const unsubscribe = window.hermesDesktop?.onFocusSession?.(sessionId => {
       if (sessionId) {
-        openSession(storedSessionIdForNotification(sessionId, runtimeIdByStoredSessionId.current), navigate, 'stack')
+        // The notification carries the gateway's RUNTIME id. Translate it to
+        // the durable stored id via the window's live binding first, then the
+        // per-runtime state mirror ($sessionStates) — a main-pane runtime id
+        // whose ensureSessionState binding predates this window's map (window
+        // reload, pop-out window, gateway respawn) still lands on the real
+        // chat route instead of resuming a nonexistent stored session
+        // ("session not found", the #93080 identity split on the nav leg).
+        const viaLocalMap = storedSessionIdForNotification(sessionId, runtimeIdByStoredSessionId.current)
+        const storedId = viaLocalMap !== sessionId ? viaLocalMap : (storedSessionIdForRuntimeId(sessionId) ?? sessionId)
+
+        openSession(storedId, navigate, 'stack')
       }
     })
 
