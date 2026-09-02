@@ -906,8 +906,16 @@ def _safe_restore_db(src: Path, dst: Path) -> bool:
 # Backup
 # ---------------------------------------------------------------------------
 
-def run_backup(args) -> None:
-    """Create a zip backup of the Hermes home directory."""
+def run_backup(args) -> bool:
+    """Create a zip backup of the Hermes home directory.
+
+    Returns True when every selected file landed in the archive (or there
+    was nothing to back up), False when the archive was written but is
+    incomplete — the summary lists what is missing and the zip is kept so
+    the operator can still restore the rest. Hard failures (no Hermes home,
+    unusable output path, another backup already running) keep raising
+    ``SystemExit(1)`` / ``SystemExit(2)``.
+    """
     hermes_root = get_default_hermes_root()
 
     if not hermes_root.is_dir():
@@ -916,13 +924,13 @@ def run_backup(args) -> None:
 
     try:
         with _backup_operation_lock(hermes_root):
-            _run_backup_locked(args, hermes_root)
+            return _run_backup_locked(args, hermes_root)
     except BackupInProgressError as exc:
         print(f"Error: {exc}")
         raise SystemExit(2) from exc
 
 
-def _run_backup_locked(args, hermes_root: Path) -> None:
+def _run_backup_locked(args, hermes_root: Path) -> bool:
     """Write a full backup while the cross-process backup slot is held."""
 
     # Determine output path
@@ -990,7 +998,7 @@ def _run_backup_locked(args, hermes_root: Path) -> None:
             (time.monotonic() - scan_started) * 1000,
         )
         print("No files to back up.")
-        return
+        return True
 
     # Create the zip
     file_count = len(files_to_add) + len(external_to_add)
@@ -1097,7 +1105,10 @@ def _run_backup_locked(args, hermes_root: Path) -> None:
             print(f"    {d}/")
 
     if errors:
-        print(f"\n  Warnings ({len(errors)} files skipped):")
+        print(
+            f"\n  Archive kept, but {len(errors)} file(s) could not be added "
+            "(exit status 1):"
+        )
         for e in errors[:10]:
             print(e)
         if len(errors) > 10:
@@ -1105,6 +1116,8 @@ def _run_backup_locked(args, hermes_root: Path) -> None:
 
     if not errors:
         print(f"\nRestore with: hermes import {out_path.name}")
+
+    return not errors
 
 
 # ---------------------------------------------------------------------------

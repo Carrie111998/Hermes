@@ -6012,7 +6012,11 @@ def cmd_backup(args):
     else:
         from hermes_cli.backup import run_backup
 
-        run_backup(args)
+        # A written-but-incomplete archive must not report shell success:
+        # cron/systemd timers would otherwise publish zips missing state.db
+        # for months. The archive is kept; only the exit status changes.
+        if run_backup(args) is False:
+            raise SystemExit(1)
 
 
 def cmd_import(args):
