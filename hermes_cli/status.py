@@ -541,13 +541,31 @@ def show_status(args):
 
     # Plugin-registered platforms
     try:
+        from gateway.config import PlatformConfig
         from gateway.platform_registry import platform_registry
         for entry in platform_registry.plugin_entries():
             # Per-entry guard: one raising probe must not abort the listing
             # of every remaining plugin platform (matches the other three
             # check_fn call sites).
             try:
-                configured = bool(entry.check_fn())
+                # "configured" must follow the same semantic chain the
+                # gateway uses for "is this platform usable" (is_connected ->
+                # validate_config), NOT check_fn: for several plugins
+                # (teams, photon, a2a) check_fn is the PASSIVE dependency
+                # probe (SDK importability / stdlib-only), so reporting it as
+                # "configured" showed platforms with only commented-out .env
+                # template lines as configured the moment the optional SDKs
+                # were installed (#96190). Every current plugin registers
+                # validate_config/is_connected; an entry with neither is
+                # reported not configured rather than trusting a probe whose
+                # credential semantics are unknowable at this call site.
+                probe_cfg = PlatformConfig()
+                if entry.is_connected is not None:
+                    configured = bool(entry.is_connected(probe_cfg))
+                elif entry.validate_config is not None:
+                    configured = bool(entry.validate_config(probe_cfg))
+                else:
+                    configured = False
             except Exception:
                 configured = False
             status_str = "configured" if configured else "not configured"
