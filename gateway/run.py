@@ -19540,11 +19540,33 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     exec_cmd = qcmd.get("command", "")
                     if exec_cmd:
                         try:
-                            # Sanitize env to prevent credential leakage —
-                            # quick commands run in the gateway process which
-                            # has all API keys in os.environ.
+                            # Start from the sanitized child environment, then add
+                            # only non-secret command/origin metadata required by
+                            # detached workers and result notifiers.
                             from tools.environments.local import build_subprocess_env
                             sanitized_env = build_subprocess_env()
+                            sanitized_env["HERMES_COMMAND_NAME"] = command
+                            sanitized_env["HERMES_COMMAND_ARGS"] = (
+                                event.get_command_args().strip()
+                            )
+                            source_platform = getattr(source, "platform", "")
+                            origin_platform = getattr(
+                                source_platform, "value", source_platform
+                            )
+                            origin_values = {
+                                "HERMES_ORIGIN_PLATFORM": origin_platform,
+                                "HERMES_ORIGIN_CHAT_ID": getattr(
+                                    source, "chat_id", None
+                                ),
+                                "HERMES_ORIGIN_THREAD_ID": getattr(
+                                    source, "thread_id", None
+                                ),
+                            }
+                            for env_name, value in origin_values.items():
+                                if value is None or value == "":
+                                    sanitized_env.pop(env_name, None)
+                                else:
+                                    sanitized_env[env_name] = str(value)
                             proc = await asyncio.create_subprocess_shell(
                                 exec_cmd,
                                 stdout=asyncio.subprocess.PIPE,
