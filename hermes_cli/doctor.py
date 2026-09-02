@@ -2747,7 +2747,12 @@ def run_doctor(args):
                             "errors with an arborist crash it's a known npm bug — clears "
                             "via a lockfile bump"
                         )
-                    issues.append(
+                    # `--fix` never runs npm here (workspace-scoped `npm audit
+                    # fix` crashes with a known arborist bug, see above; the
+                    # root-scoped fix_cmd is only ever printed, not executed),
+                    # so this can't land in `issues` — that list drives the
+                    # "run hermes doctor --fix" tip, which would be false.
+                    manual_issues.append(
                         f"{label} has {total} npm "
                         f"{'vulnerability' if total == 1 else 'vulnerabilities'}"
                     )
@@ -3441,7 +3446,7 @@ def run_doctor(args):
         for i, issue in enumerate(remaining_issues, 1):
             print(f"  {i}. {issue}")
         print()
-        if not should_fix:
+        if not should_fix and issues:
             print(color("  Tip: run 'hermes doctor --fix' to auto-fix what's possible.", Colors.DIM))
     else:
         print(color("─" * 60, Colors.GREEN))
