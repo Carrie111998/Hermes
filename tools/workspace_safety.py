@@ -279,8 +279,21 @@ def _git_common_dir(repo_root: Path) -> Optional[Path]:
     gitdir = _gitdir_pointer(repo_root)
     if gitdir is None or not gitdir.is_dir():
         return None
-    if gitdir.parent.name == "worktrees" and gitdir.parent.parent.name == ".git":
-        return gitdir.parent.parent
+    commondir = gitdir / "commondir"
+    try:
+        if commondir.is_file():
+            raw = Path(commondir.read_text(encoding="utf-8").strip())
+            if not raw.is_absolute():
+                raw = gitdir / raw
+            resolved = raw.resolve()
+            if resolved.is_dir():
+                return resolved
+    except OSError:
+        pass
+    if gitdir.parent.name == "worktrees":
+        candidate = gitdir.parent.parent
+        if candidate.is_dir():
+            return candidate
     return gitdir
 
 
@@ -297,6 +310,27 @@ def _linked_worktree_backref_ok(repo_root: Path, gitdir: Path) -> bool:
         return False
 
 
+def _is_authorized_checkout(repo_root: Path, gitdir: Path) -> bool:
+    """True when repo_root is the primary checkout or a validated linked worktree."""
+    marker = repo_root / ".git"
+    try:
+        if marker.is_symlink():
+            return False
+        if marker.is_dir():
+            return _same_path(gitdir, marker)
+        if not marker.is_file():
+            return False
+        if gitdir.parent.name == "worktrees":
+            return _linked_worktree_backref_ok(repo_root, gitdir)
+        # Separate-git-dir / bare common. Do not treat a pointer at another
+        # checkout's `.git` directory as this root's primary gitdir.
+        if gitdir.name == ".git" and gitdir.is_dir() and not _same_path(gitdir.parent, repo_root):
+            return False
+        return True
+    except OSError:
+        return False
+
+
 def _same_repo(left: Path, right: Path) -> bool:
     """True when both paths are the same checkout or linked worktrees."""
     if _same_path(left, right):
@@ -309,11 +343,7 @@ def _same_repo(left: Path, right: Path) -> bool:
         return False
     if not _same_path(left_common, right_common):
         return False
-    if left_git.parent.name == "worktrees" and not _linked_worktree_backref_ok(left, left_git):
-        return False
-    if right_git.parent.name == "worktrees" and not _linked_worktree_backref_ok(right, right_git):
-        return False
-    return True
+    return _is_authorized_checkout(left, left_git) and _is_authorized_checkout(right, right_git)
 
 
 def _safe_resolve(path: str | Path) -> Path:

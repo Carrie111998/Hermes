@@ -41,6 +41,7 @@ def _linked_worktree(main: Path, linked: Path) -> Path:
     linked.mkdir(parents=True)
     (linked / ".git").write_text(f"gitdir: {gitdir}\n", encoding="utf-8")
     (gitdir / "gitdir").write_text(f"{linked / '.git'}\n", encoding="utf-8")
+    (gitdir / "commondir").write_text("../..\n", encoding="utf-8")
     return linked
 
 
@@ -516,7 +517,69 @@ def test_worktree_pointer_without_backref_is_blocked(tmp_path):
     tokens = _gateway_session(bound_repo)
     try:
         write_result = json.loads(write_file_tool(str(spoof / "file.txt"), "data"))
+        error = check_terminal_side_effect_allowed("git commit -m update", spoof)
     finally:
         clear_session_vars(tokens)
 
     assert "outside authoritative workspace binding" in write_result["error"]
+    assert error is not None
+    assert "outside authoritative" in error
+
+
+def test_gitdir_file_pointing_at_bound_git_is_blocked(tmp_path):
+    bound_repo = _git_repo(tmp_path / "bound")
+    spoof = tmp_path / "spoof"
+    spoof.mkdir()
+    (spoof / ".git").write_text(f"gitdir: {bound_repo / '.git'}\n", encoding="utf-8")
+    tokens = _gateway_session(bound_repo)
+    try:
+        write_result = json.loads(write_file_tool(str(spoof / "file.txt"), "data"))
+        error = check_terminal_side_effect_allowed("git commit -m update", spoof)
+    finally:
+        clear_session_vars(tokens)
+
+    assert "outside authoritative workspace binding" in write_result["error"]
+    assert error is not None
+    assert "outside authoritative" in error
+
+
+def test_git_symlink_to_bound_git_is_blocked(tmp_path):
+    bound_repo = _git_repo(tmp_path / "bound")
+    spoof = tmp_path / "spoof"
+    spoof.mkdir()
+    (spoof / ".git").symlink_to(bound_repo / ".git")
+    tokens = _gateway_session(bound_repo)
+    try:
+        write_result = json.loads(write_file_tool(str(spoof / "file.txt"), "data"))
+        error = check_terminal_side_effect_allowed("git commit -m update", spoof)
+    finally:
+        clear_session_vars(tokens)
+
+    assert "outside authoritative workspace binding" in write_result["error"]
+    assert error is not None
+    assert "outside authoritative" in error
+
+
+def test_commondir_outside_dotgit_name_allows_linked_worktree(tmp_path):
+    common = tmp_path / "shared.git"
+    common.mkdir()
+    main = tmp_path / "main"
+    main.mkdir()
+    (main / ".git").write_text(f"gitdir: {common}\n", encoding="utf-8")
+    linked = tmp_path / "linked"
+    gitdir = common / "worktrees" / "linked"
+    gitdir.mkdir(parents=True)
+    linked.mkdir()
+    (linked / ".git").write_text(f"gitdir: {gitdir}\n", encoding="utf-8")
+    (gitdir / "gitdir").write_text(f"{linked / '.git'}\n", encoding="utf-8")
+    (gitdir / "commondir").write_text(f"{common}\n", encoding="utf-8")
+    tokens = _gateway_session(main)
+    try:
+        write_result = json.loads(write_file_tool(str(linked / "file.txt"), "data"))
+        error = check_terminal_side_effect_allowed("git commit -m update", linked)
+    finally:
+        clear_session_vars(tokens)
+
+    assert write_result.get("error") in (None, "")
+    assert (linked / "file.txt").read_text(encoding="utf-8") == "data"
+    assert error is None
