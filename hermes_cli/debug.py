@@ -15,6 +15,8 @@ Currently supports:
                           (viewable only by Nous staff / allowlisted mods via
                           a Google-login-gated viewer) and auto-deletes after
                           14 days, rather than going to a public paste.
+    hermes debug bundle   Write a bounded, redacted diagnostic bundle locally;
+                          this path never uploads or accepts ``--no-redact``.
 """
 
 import datetime
@@ -22,8 +24,11 @@ import gzip
 import io
 import json
 import logging
+import os
+import platform
 import re
 import sys
+import tempfile
 import time
 import urllib.request
 from dataclasses import dataclass
@@ -48,6 +53,19 @@ _EMAIL_ADDRESS_RE = re.compile(
     r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}"
     r"(?![A-Za-z0-9._%+-])"
 )
+
+# ``redact_sensitive_text`` deliberately preserves its non-reusable vendor
+# label (for example ``«redacted:sk-…»``).  A local diagnostic bundle should
+# not preserve even that fixture-like token: it is both unnecessary detail and
+# can make a second-pass scan non-idempotent.  Collapse markers to one stable
+# sentinel before serialization.
+_DIAGNOSTIC_REDACTION_MARKER_RE = re.compile(r"«redacted(?::[^»]*)?»")
+_DIAGNOSTIC_RESERVED_BASENAMES = {
+    "CON", "PRN", "AUX", "NUL",
+    *(f"COM{index}" for index in range(1, 10)),
+    *(f"LPT{index}" for index in range(1, 10)),
+    "COM¹", "COM²", "COM³", "LPT¹", "LPT²", "LPT³",
+}
 
 
 # ---------------------------------------------------------------------------
@@ -504,14 +522,14 @@ def _capture_log_snapshot(
         full_raw = raw
         if truncated and len(full_raw) > max_bytes:
             cut = len(full_raw) - max_bytes
-            # Check whether the cut lands exactly on a line boundary.  If the
-            # byte just before the cut position is a newline the first retained
-            # byte starts a complete line and we should keep it.  Only drop a
-            # partial first line when we're genuinely mid-line.
-            on_boundary = cut > 0 and full_raw[cut - 1 : cut] == b"\n"
-            full_raw = full_raw[cut:]
-            if not on_boundary and b"\n" in full_raw:
-                full_raw = full_raw.split(b"\n", 1)[1]
+            # Keep complete lines. If the byte budget cuts through a line
+            # (including the middle of a CRLF pair), move the start backward
+            # to that line's beginning rather than discarding the remainder
+            # of the first retained line. The result can exceed max_bytes by
+            # at most the leading line length, which is preferable to
+            # silently losing a complete record and works for LF and CRLF.
+            line_start = full_raw.rfind(b"\n", 0, cut) + 1
+            full_raw = full_raw[line_start:]
 
         all_text = raw.decode("utf-8", errors="replace")
         tail_text = "".join(all_text.splitlines(keepends=True)[-tail_lines:]).rstrip("\n")
@@ -749,6 +767,503 @@ def build_nous_bundle(bundle: dict[str, str], redact: bool = True) -> bytes:
         "files": bundle,
     }
     return gzip.compress(json.dumps(envelope).encode("utf-8"))
+
+
+# ---------------------------------------------------------------------------
+# Local diagnostic bundle
+# ---------------------------------------------------------------------------
+
+# This path is deliberately separate from ``collect_share_bundle``.  The
+# share collector is a legacy upload surface and supports ``--no-redact``;
+# the local bundle is a closed, bounded diagnostic format and must never
+# inherit that escape hatch or any of the upload code paths.
+_DIAGNOSTIC_SCHEMA_VERSION = "hermes-debug-bundle/1"
+_DIAGNOSTIC_DEFAULT_FILENAME = "debug-bundle.json"
+_DIAGNOSTIC_OUTPUT_DIRNAME = "diagnostics"
+_DIAGNOSTIC_MAX_INPUT_BYTES = 96 * 1024
+_DIAGNOSTIC_MAX_SECTION_BYTES = 24 * 1024
+_DIAGNOSTIC_MAX_TOTAL_BYTES = 160 * 1024
+_DIAGNOSTIC_MAX_LOG_LINES = 200
+
+_DIAGNOSTIC_LOG_ALLOWLIST = {
+    "agent": "agent.log",
+    "errors": "errors.log",
+    "gateway": "gateway.log",
+    "gui": "gui.log",
+    "desktop": "desktop.log",
+}
+
+_DIAGNOSTIC_SYSTEM_FIELDS = (
+    "hermes_version",
+    "python_version",
+    "os",
+    "machine",
+    "profile",
+)
+_DIAGNOSTIC_TOP_LEVEL_KEYS = {
+    "schema_version", "audience", "exportable", "manifest", "sections"
+}
+
+
+class DiagnosticBundleError(RuntimeError):
+    """A local diagnostic bundle could not be safely collected or committed."""
+
+
+def _diagnostic_redact_text(value: str) -> str:
+    """Redact a string before it is placed in the diagnostic document."""
+    if not value:
+        return value
+    redacted = _redact_log_text(value)
+    return _DIAGNOSTIC_REDACTION_MARKER_RE.sub("[REDACTED]", redacted)
+
+
+def _diagnostic_truncate_text(value: str, max_bytes: int) -> tuple[str, bool]:
+    """Return a UTF-8-safe prefix no larger than *max_bytes*."""
+    encoded = value.encode("utf-8")
+    if len(encoded) <= max_bytes:
+        return value, False
+    # Loss-tolerant UTF-8 prefix: drop at most one partial trailing codepoint.
+    # errors="ignore" is deliberate so a U+FFFD replacement cannot enlarge the
+    # already-truncated value against the global diagnostic byte budget.
+    return encoded[:max_bytes].decode("utf-8", errors="ignore"), True
+
+
+def _diagnostic_safe_root() -> Path:
+    """Resolve the active profile home, failing closed if it is unavailable."""
+    try:
+        return Path(get_hermes_home()).resolve(strict=True)
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise DiagnosticBundleError("profile home unavailable") from exc
+
+
+def _diagnostic_path_is_safe(path: Path, root: Path) -> bool:
+    """Check containment and reject symlink/reparse-like path components."""
+    try:
+        path.relative_to(root)
+    except ValueError:
+        return False
+
+    current = path
+    while True:
+        if current.is_symlink():
+            return False
+        if current == root:
+            break
+        if current.parent == current:
+            return False
+        current = current.parent
+    try:
+        # This catches a directory junction/reparse target on platforms where
+        # ``Path.is_symlink`` does not report it as a symlink.
+        return path.resolve(strict=False) == path.absolute()
+    except (OSError, RuntimeError):
+        return False
+
+
+def _diagnostic_logs_dir(root: Path) -> Path | None:
+    logs_dir = root / "logs"
+    if not _diagnostic_path_is_safe(logs_dir, root):
+        return None
+    if not logs_dir.exists() or not logs_dir.is_dir():
+        return None
+    return logs_dir
+
+
+def _diagnostic_system_values() -> dict[str, str]:
+    """Read only the explicitly allowlisted, non-content system fields."""
+    try:
+        from hermes_cli import __version__
+    except ImportError:
+        __version__ = "(unknown)"
+    try:
+        from hermes_cli.profiles import get_active_profile_name
+        profile = get_active_profile_name() or "(default)"
+    except Exception:
+        profile = "(default)"
+
+    values = {
+        "hermes_version": str(__version__),
+        "python_version": platform.python_version(),
+        "os": f"{platform.system()} {platform.release()}",
+        "machine": platform.machine(),
+        "profile": str(profile),
+    }
+    return {key: _diagnostic_redact_text(values[key]) for key in _DIAGNOSTIC_SYSTEM_FIELDS}
+
+
+def _diagnostic_read_log(path: Path) -> dict:
+    """Read one allowlisted log with input, line, and output bounds."""
+    try:
+        with path.open("rb") as stream:
+            raw = stream.read(_DIAGNOSTIC_MAX_INPUT_BYTES + 1)
+        input_truncated = len(raw) > _DIAGNOSTIC_MAX_INPUT_BYTES
+        raw = raw[:_DIAGNOSTIC_MAX_INPUT_BYTES]
+        decoded = raw.decode("utf-8", errors="replace")
+        redacted = _diagnostic_redact_text(decoded)
+        lines = redacted.splitlines(keepends=True)
+        line_truncated = len(lines) > _DIAGNOSTIC_MAX_LOG_LINES
+        text = "".join(lines[-_DIAGNOSTIC_MAX_LOG_LINES:]) if line_truncated else redacted
+        text, byte_truncated = _diagnostic_truncate_text(text, _DIAGNOSTIC_MAX_SECTION_BYTES)
+        truncated = input_truncated or line_truncated or byte_truncated
+        status = "truncated" if truncated else ("redacted" if text != decoded else "complete")
+        return {
+            "name": path.name,
+            "status": status,
+            "text": text,
+            "counts": {
+                "input_bytes": len(raw),
+                "output_bytes": len(text.encode("utf-8")),
+                "lines": len(text.splitlines()),
+            },
+        }
+    except Exception:
+        # Error details and paths are intentionally not serialized.
+        return {
+            "name": path.name,
+            "status": "failed",
+            "text": "",
+            "counts": {"input_bytes": 0, "output_bytes": 0, "lines": 0},
+        }
+
+
+def _diagnostic_json_bytes(document: dict) -> bytes:
+    """Canonical JSON encoding used for both bounds and final scanning."""
+    return json.dumps(
+        document,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+
+
+def _diagnostic_validate_document(document: dict) -> None:
+    """Validate the closed bundle schema before any bytes are committed."""
+    if not isinstance(document, dict) or set(document) != _DIAGNOSTIC_TOP_LEVEL_KEYS:
+        raise DiagnosticBundleError("invalid diagnostic document")
+    if document["schema_version"] != _DIAGNOSTIC_SCHEMA_VERSION:
+        raise DiagnosticBundleError("unsupported diagnostic schema")
+    if document["audience"] != "local-only" or document["exportable"] is not False:
+        raise DiagnosticBundleError("invalid diagnostic audience")
+
+    manifest = document["manifest"]
+    if not isinstance(manifest, dict) or set(manifest) != {
+        "schema_version", "audience", "exportable", "section_order",
+        "section_status", "counts", "limits", "truncated", "complete",
+    }:
+        raise DiagnosticBundleError("invalid diagnostic manifest")
+    if (
+        manifest["schema_version"] != _DIAGNOSTIC_SCHEMA_VERSION
+        or manifest["audience"] != "local-only"
+        or manifest["exportable"] is not False
+        or manifest["section_order"] != ["system", "logs"]
+        or type(manifest["truncated"]) is not bool
+        or type(manifest["complete"]) is not bool
+    ):
+        raise DiagnosticBundleError("invalid diagnostic manifest")
+    section_status = manifest["section_status"]
+    if (
+        not isinstance(section_status, dict)
+        or set(section_status) != {"system", "logs"}
+        or section_status["system"] != "complete"
+        or section_status["logs"] not in {"complete", "redacted", "truncated", "unavailable", "failed"}
+    ):
+        raise DiagnosticBundleError("invalid diagnostic section status")
+    counts = manifest["counts"]
+    if not isinstance(counts, dict) or set(counts) != {"system_fields", "log_files", "log_bytes"}:
+        raise DiagnosticBundleError("invalid diagnostic manifest counts")
+    if any(type(value) is not int or value < 0 for value in counts.values()):
+        raise DiagnosticBundleError("invalid diagnostic manifest counts")
+    limits = manifest["limits"]
+    if not isinstance(limits, dict) or set(limits) != {
+        "input_bytes_per_log", "section_bytes", "total_bytes", "log_lines"
+    }:
+        raise DiagnosticBundleError("invalid diagnostic limits")
+    if any(type(value) is not int or value < 0 for value in limits.values()):
+        raise DiagnosticBundleError("invalid diagnostic limits")
+
+    sections = document["sections"]
+    if not isinstance(sections, dict) or set(sections) != {"system", "logs"}:
+        raise DiagnosticBundleError("invalid diagnostic sections")
+    system = sections["system"]
+    if not isinstance(system, dict) or set(system) != {"status", "data"}:
+        raise DiagnosticBundleError("invalid diagnostic system section")
+    if system["status"] != "complete" or not isinstance(system["data"], dict):
+        raise DiagnosticBundleError("invalid diagnostic system section")
+    if set(system["data"]) != set(_DIAGNOSTIC_SYSTEM_FIELDS):
+        raise DiagnosticBundleError("unknown diagnostic system field")
+    if any(not isinstance(value, str) for value in system["data"].values()):
+        raise DiagnosticBundleError("invalid diagnostic system value")
+
+    logs = sections["logs"]
+    if not isinstance(logs, dict) or set(logs) != {"status", "items"}:
+        raise DiagnosticBundleError("invalid diagnostic logs section")
+    if logs["status"] not in {"complete", "redacted", "truncated", "unavailable", "failed"}:
+        raise DiagnosticBundleError("invalid diagnostic logs status")
+    if not isinstance(logs["items"], list) or len(logs["items"]) != len(_DIAGNOSTIC_LOG_ALLOWLIST):
+        raise DiagnosticBundleError("invalid diagnostic log items")
+    allowed_names = set(_DIAGNOSTIC_LOG_ALLOWLIST.values())
+    item_keys = {"name", "status", "text", "counts"}
+    count_keys = {"input_bytes", "output_bytes", "lines"}
+    item_names = []
+    for item in logs["items"]:
+        if not isinstance(item, dict) or set(item) != item_keys:
+            raise DiagnosticBundleError("invalid diagnostic log item")
+        if item["name"] not in allowed_names or item["status"] not in {
+            "complete", "redacted", "truncated", "unavailable", "failed"
+        } or not isinstance(item["text"], str):
+            raise DiagnosticBundleError("invalid diagnostic log item")
+        item_names.append(item["name"])
+        counts = item["counts"]
+        if not isinstance(counts, dict) or set(counts) != count_keys:
+            raise DiagnosticBundleError("invalid diagnostic log counts")
+        if any(type(value) is not int or value < 0 for value in counts.values()):
+            raise DiagnosticBundleError("invalid diagnostic log counts")
+    if set(item_names) != allowed_names:
+        raise DiagnosticBundleError("duplicate or missing diagnostic log")
+
+
+def _diagnostic_final_scan(payload: bytes) -> None:
+    """Scan the complete staged artifact and its content values fail-closed."""
+    try:
+        text = payload.decode("utf-8")
+        document = json.loads(text)
+        _diagnostic_validate_document(document)
+        if _diagnostic_json_bytes(document) != payload:
+            raise DiagnosticBundleError("diagnostic artifact is not canonical JSON")
+
+        # The complete artifact scan uses content-oriented redaction modes so
+        # schema keys (for example ``api_key`` in a log string's surrounding
+        # JSON) cannot create false positives. Prefix, JWT, private-key, and
+        # URL-credential patterns still run in these modes.
+        from agent.redact import redact_sensitive_text
+        scanned = redact_sensitive_text(
+            text,
+            force=True,
+            code_file=True,
+            file_read=True,
+            redact_url_credentials=True,
+        )
+        if scanned != text or _EMAIL_ADDRESS_RE.search(text):
+            raise DiagnosticBundleError("diagnostic redaction scan rejected the bundle")
+
+        # Assignment and structured-field patterns are checked on the actual
+        # collected values, not on the enclosing JSON syntax.
+        log_items = document["sections"]["logs"]["items"]
+        system_values = document["sections"]["system"]["data"].values()
+        values = [item["text"] for item in log_items] + list(system_values)
+        for value in values:
+            if not isinstance(value, str) or _diagnostic_redact_text(value) != value:
+                raise DiagnosticBundleError("diagnostic redaction scan rejected the bundle")
+    except DiagnosticBundleError:
+        raise
+    except Exception as exc:
+        raise DiagnosticBundleError("diagnostic redaction scan failed") from exc
+
+
+def collect_local_diagnostic_bundle() -> dict:
+    """Collect a bounded, allowlisted, redacted diagnostic document locally.
+
+    Only in-process reads from the active profile home are used.  In
+    particular, this does not invoke ``hermes dump``, subprocesses, upload
+    helpers, or network code.
+    """
+    root = _diagnostic_safe_root()
+    system = _diagnostic_system_values()
+    logs_dir = _diagnostic_logs_dir(root)
+    items: list[dict] = []
+    if logs_dir is None:
+        logs_status = "unavailable"
+    else:
+        for key in _DIAGNOSTIC_LOG_ALLOWLIST:
+            path = logs_dir / _DIAGNOSTIC_LOG_ALLOWLIST[key]
+            if not _diagnostic_path_is_safe(path, root) or not path.exists() or not path.is_file():
+                item = {
+                    "name": path.name,
+                    "status": "unavailable",
+                    "text": "",
+                    "counts": {"input_bytes": 0, "output_bytes": 0, "lines": 0},
+                }
+            else:
+                item = _diagnostic_read_log(path)
+            items.append(item)
+        statuses = {item["status"] for item in items}
+        if "failed" in statuses:
+            logs_status = "failed"
+        elif "truncated" in statuses:
+            logs_status = "truncated"
+        elif "redacted" in statuses:
+            logs_status = "redacted"
+        else:
+            logs_status = "complete" if any(item["status"] == "complete" for item in items) else "unavailable"
+
+    document = {
+        "schema_version": _DIAGNOSTIC_SCHEMA_VERSION,
+        "audience": "local-only",
+        "exportable": False,
+        "manifest": {
+            "schema_version": _DIAGNOSTIC_SCHEMA_VERSION,
+            "audience": "local-only",
+            "exportable": False,
+            "section_order": ["system", "logs"],
+            "section_status": {"system": "complete", "logs": logs_status},
+            "counts": {
+                "system_fields": len(system),
+                "log_files": len(items),
+                "log_bytes": sum(item["counts"]["output_bytes"] for item in items),
+            },
+            "limits": {
+                "input_bytes_per_log": _DIAGNOSTIC_MAX_INPUT_BYTES,
+                "section_bytes": _DIAGNOSTIC_MAX_SECTION_BYTES,
+                "total_bytes": _DIAGNOSTIC_MAX_TOTAL_BYTES,
+                "log_lines": _DIAGNOSTIC_MAX_LOG_LINES,
+            },
+            "truncated": logs_status == "truncated",
+            "complete": logs_status not in {"failed", "truncated"},
+        },
+        "sections": {
+            "system": {"status": "complete", "data": system},
+            "logs": {"status": logs_status, "items": items},
+        },
+    }
+
+    _diagnostic_validate_document(document)
+    payload = _diagnostic_json_bytes(document)
+    if len(payload) > _DIAGNOSTIC_MAX_TOTAL_BYTES:
+        items = document["sections"]["logs"]["items"]
+        fixed = _diagnostic_json_bytes({
+            **document,
+            "sections": {
+                "system": document["sections"]["system"],
+                "logs": {
+                    "status": logs_status,
+                    "items": [{**item, "text": ""} for item in items],
+                },
+            },
+        })
+        available = _DIAGNOSTIC_MAX_TOTAL_BYTES - len(fixed)
+        if available < 0:
+            raise DiagnosticBundleError("diagnostic manifest exceeds size limit")
+        for item in items:
+            text, was_truncated = _diagnostic_truncate_text(item["text"], available)
+            item["text"] = text
+            item["counts"]["output_bytes"] = len(text.encode("utf-8"))
+            available -= item["counts"]["output_bytes"]
+            if was_truncated:
+                item["status"] = "truncated"
+        document["manifest"]["section_status"]["logs"] = "truncated"
+        document["manifest"]["truncated"] = True
+        document["manifest"]["complete"] = False
+        document["sections"]["logs"]["status"] = "truncated"
+        payload = _diagnostic_json_bytes(document)
+    if len(payload) > _DIAGNOSTIC_MAX_TOTAL_BYTES:
+        raise DiagnosticBundleError("diagnostic bundle exceeds size limit")
+    _diagnostic_final_scan(payload)
+    return document
+
+
+def _diagnostic_valid_output_name(name: str) -> bool:
+    """Reject names that are invalid or device aliases on Windows."""
+    if not name or "\x00" in name or name.endswith((".", " ")):
+        return False
+    basename = name.split(".", 1)[0].upper()
+    return basename not in _DIAGNOSTIC_RESERVED_BASENAMES
+
+
+def _diagnostic_output_path(output_path: str | Path | None) -> Path:
+    """Resolve an output strictly below the active profile diagnostics root."""
+    root = _diagnostic_safe_root()
+    directory = root / _DIAGNOSTIC_OUTPUT_DIRNAME
+    if directory.exists() and not _diagnostic_path_is_safe(directory, root):
+        raise DiagnosticBundleError("diagnostic output directory is unsafe")
+    directory.mkdir(parents=True, exist_ok=True)
+    if not _diagnostic_path_is_safe(directory, root):
+        raise DiagnosticBundleError("diagnostic output directory is unsafe")
+
+    candidate = Path(output_path) if output_path is not None else Path(_DIAGNOSTIC_DEFAULT_FILENAME)
+    if not candidate.is_absolute():
+        candidate = directory / candidate
+    candidate = candidate.absolute()
+    try:
+        candidate.relative_to(root)
+    except ValueError as exc:
+        raise DiagnosticBundleError("diagnostic output must remain profile-scoped") from exc
+    if not _diagnostic_path_is_safe(candidate, root):
+        raise DiagnosticBundleError("diagnostic output path is unsafe")
+    if not _diagnostic_valid_output_name(candidate.name):
+        raise DiagnosticBundleError("invalid diagnostic output name")
+    if candidate.exists() and candidate.is_dir():
+        raise DiagnosticBundleError("diagnostic output must be a file")
+    destination = candidate.resolve(strict=False)
+    directory_resolved = directory.resolve(strict=True)
+    try:
+        destination.relative_to(directory_resolved)
+    except ValueError as exc:
+        raise DiagnosticBundleError("diagnostic output must remain profile-scoped") from exc
+    if not _diagnostic_valid_output_name(destination.name):
+        raise DiagnosticBundleError("invalid diagnostic output name")
+    if destination.exists() and destination.is_symlink():
+        raise DiagnosticBundleError("diagnostic output symlink rejected")
+    if not _diagnostic_path_is_safe(destination.parent, root):
+        raise DiagnosticBundleError("diagnostic output path is unsafe")
+    return destination
+
+
+def write_local_diagnostic_bundle(document: dict, output_path: str | Path | None = None) -> Path:
+    """Atomically commit one collected diagnostic document."""
+    _diagnostic_validate_document(document)
+    payload = _diagnostic_json_bytes(document)
+    if len(payload) > _DIAGNOSTIC_MAX_TOTAL_BYTES:
+        raise DiagnosticBundleError("diagnostic bundle exceeds size limit")
+    _diagnostic_final_scan(payload)
+    destination = _diagnostic_output_path(output_path)
+    fd = -1
+    temporary: Path | None = None
+    try:
+        fd, temp_name = tempfile.mkstemp(
+            prefix=f".{destination.name}.", suffix=".tmp", dir=str(destination.parent)
+        )
+        temporary = Path(temp_name)
+        with os.fdopen(fd, "wb") as stream:
+            fd = -1
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, destination)
+        temporary = None
+        try:
+            directory_fd = os.open(destination.parent, os.O_RDONLY)
+        except OSError:
+            directory_fd = -1
+        if directory_fd >= 0:
+            try:
+                os.fsync(directory_fd)
+            except OSError:
+                pass
+            finally:
+                os.close(directory_fd)
+        return destination
+    except (OSError, ValueError) as exc:
+        raise DiagnosticBundleError("diagnostic bundle commit failed") from exc
+    finally:
+        if fd >= 0:
+            os.close(fd)
+        if temporary is not None:
+            try:
+                temporary.unlink()
+            except OSError:
+                pass
+
+
+def run_debug_bundle(args) -> None:
+    """Collect and atomically write the strictly local diagnostic bundle."""
+    # This command has no no-redact option and always uses forced redaction.
+    output = getattr(args, "output", None)
+    try:
+        destination = write_local_diagnostic_bundle(collect_local_diagnostic_bundle(), output)
+    except DiagnosticBundleError as exc:
+        print(f"Diagnostic bundle unavailable: {exc}", file=sys.stderr)
+        sys.exit(1)
+    print(f"Diagnostic bundle written locally: {destination}")
 
 
 # ---------------------------------------------------------------------------
@@ -1037,9 +1552,16 @@ def run_debug_delete(args):
 
 def run_debug(args):
     """Route debug subcommands."""
-    # Opportunistic sweep of expired pastes on every ``hermes debug`` call.
+    subcmd = getattr(args, "debug_command", None)
+    # The diagnostic bundle is a strict local-only path. Dispatch before the
+    # legacy paste cleanup sweep because that sweep performs network I/O.
+    if subcmd == "bundle":
+        run_debug_bundle(args)
+        return
+
+    # Opportunistic sweep of expired pastes on every legacy ``hermes debug`` call.
     # Replaces the old per-paste sleeping subprocess that used to leak as
-    # one orphaned Python interpreter per scheduled deletion.  Silent and
+    # one orphaned Python interpreter per scheduled deletion. Silent and
     # best-effort — any failure is swallowed so ``hermes debug`` stays
     # reliable even when offline.
     try:
@@ -1047,7 +1569,6 @@ def run_debug(args):
     except Exception:
         pass
 
-    subcmd = getattr(args, "debug_command", None)
     if subcmd == "share":
         run_debug_share(args)
     elif subcmd == "delete":
