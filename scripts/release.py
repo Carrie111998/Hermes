@@ -2089,6 +2089,12 @@ def _load_contributor_dir(directory: "Path | None" = None) -> dict:
     Filename = commit-author email, first non-comment line = GitHub login.
     Additions never merge-conflict (each mapping is a distinct file), which
     is why new entries go here instead of the frozen LEGACY_AUTHOR_MAP.
+
+    Keys are LOWERCASED: email hosts case-flap in the wild
+    (agents-Mac-mini.local vs Agents-Mac-mini.local, #99966), and a
+    case-insensitive filesystem maps both filenames to one file while git
+    tracks two — the release lookup must see one canonical key regardless
+    of which spelling a commit carries.
     """
     directory = directory or CONTRIBUTORS_EMAILS_DIR
     mapping = {}
@@ -2101,7 +2107,7 @@ def _load_contributor_dir(directory: "Path | None" = None) -> dict:
             for line in path.read_text(encoding="utf-8").splitlines():
                 line = line.strip()
                 if line and not line.startswith("#"):
-                    mapping[path.name] = line.lstrip("@")
+                    mapping[path.name.lower()] = line.lstrip("@")
                     break
         except OSError:
             continue
