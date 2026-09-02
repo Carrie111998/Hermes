@@ -141,6 +141,26 @@ class TestReapOrphanedBrowserSessions:
         _reap_orphaned_browser_sessions()
         assert not d.exists()
 
+    def test_browser_harness_dead_owner_reaps_bu_pid(self, fake_tmpdir):
+        from tools.browser_tool import _reap_orphaned_browser_sessions
+
+        session = "hermes_bh_111_alpha"
+        d = _make_socket_dir(fake_tmpdir, session, owner_pid=111)
+        (d / "bu.pid").write_text("222")
+        terminated = []
+
+        with patch("gateway.status._pid_exists", side_effect=[False, True]), \
+             patch("gateway.status.get_process_start_time", return_value=333), \
+             patch("tools.browser_tool._verify_reapable_browser_daemon", return_value=True), \
+             patch(
+                 "tools.process_registry.ProcessRegistry._terminate_host_pid",
+                 side_effect=lambda pid, expected_start=None: terminated.append(pid),
+             ):
+            _reap_orphaned_browser_sessions()
+
+        assert terminated == [222]
+        assert not d.exists()
+
 
 class TestOwnerPidCrossProcess:
     """Tests for owner_pid-based cross-process safe reaping.
@@ -296,7 +316,8 @@ class TestReaperIdentityGuard:
             return self._environ
 
     def _run(self, fake_proc, socket_dir, session_name="h_sess123456",
-             daemon_pid=12345, no_such=False, access_denied=False):
+             daemon_pid=12345, no_such=False, access_denied=False,
+             expected_start=None):
         import psutil
         from tools.browser_tool import _verify_reapable_browser_daemon
 
@@ -309,7 +330,9 @@ class TestReaperIdentityGuard:
 
         with patch("psutil.Process", side_effect=_factory):
             return _verify_reapable_browser_daemon(
-                daemon_pid, socket_dir, session_name)
+                daemon_pid, socket_dir, session_name,
+                expected_start=expected_start,
+            )
 
     def test_real_daemon_bound_via_cmdline_is_reapable(self):
         socket_dir = "/tmp/agent-browser-h_sess123456"
@@ -329,6 +352,50 @@ class TestReaperIdentityGuard:
         )
         assert self._run(proc, socket_dir) is True
 
+
+    def test_harness_daemon_bound_via_runtime_env_is_reapable(self):
+        socket_dir = "/tmp/agent-browser-hermes_bh_111_alpha"
+        proc = self._FakeProc(
+            name="python",
+            cmdline=["python", "-m", "browser_harness.daemon"],
+            environ={"BH_RUNTIME_DIR": socket_dir},
+        )
+        assert self._run(
+            proc, socket_dir, session_name="hermes_bh_111_alpha"
+        ) is True
+
+    def test_harness_recycled_pid_with_other_runtime_is_refused(self):
+        socket_dir = "/tmp/agent-browser-hermes_bh_111_alpha"
+        proc = self._FakeProc(
+            name="python",
+            cmdline=["python", "-m", "browser_harness.daemon"],
+            environ={"BH_RUNTIME_DIR": "/tmp/agent-browser-hermes_bh_111_other"},
+        )
+        assert self._run(
+            proc, socket_dir, session_name="hermes_bh_111_alpha"
+        ) is False
+
+    def test_fingerprint_uses_same_cross_platform_source(self):
+        socket_dir = "/tmp/agent-browser-h_sess123456"
+        proc = self._FakeProc(
+            name="agent-browser",
+            cmdline=["agent-browser", "--socket-dir", socket_dir],
+        )
+        with patch("gateway.status.get_process_start_time", return_value=123456):
+            assert self._run(
+                proc, socket_dir, expected_start=123456
+            ) is True
+
+    def test_fingerprint_mismatch_refuses_recycled_pid(self):
+        socket_dir = "/tmp/agent-browser-h_sess123456"
+        proc = self._FakeProc(
+            name="agent-browser",
+            cmdline=["agent-browser", "--socket-dir", socket_dir],
+        )
+        with patch("gateway.status.get_process_start_time", return_value=999999):
+            assert self._run(
+                proc, socket_dir, expected_start=123456
+            ) is False
 
     def test_recycled_pid_browser_not_bound_to_our_dir_is_refused(self):
         """An agent-browser process for a DIFFERENT session must not be reaped.
