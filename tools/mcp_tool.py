@@ -3430,6 +3430,12 @@ class MCPServerTask:
         finally:
             for t in (shutdown_task, reconnect_task):
                 if not t.done():
+                    try:
+                        loop = asyncio.get_event_loop()
+                        if loop.is_closed():
+                            continue
+                    except RuntimeError:
+                        continue
                     t.cancel()
                     try:
                         await t
@@ -3478,6 +3484,12 @@ class MCPServerTask:
         finally:
             for t in (shutdown_task, reconnect_task):
                 if not t.done():
+                    try:
+                        loop = asyncio.get_event_loop()
+                        if loop.is_closed():
+                            continue
+                    except RuntimeError:
+                        continue
                     t.cancel()
                     try:
                         await t
