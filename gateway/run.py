@@ -51,6 +51,7 @@ from agent.async_utils import consume_detached_task_result, safe_schedule_thread
 from agent.conversation_compression import (
     COMPACTION_DONE_STATUS,
     COMPACTION_STATUS,
+    CONTEXT_OVERFLOW_BLOCKED_WARNING_TEMPLATE,
     COMPRESSION_RETRY_CONTEXT_REDUCED_STATUS_TEMPLATE,
     COMPRESSION_RETRY_MESSAGES_STATUS_TEMPLATE,
     COMPRESSION_RETRY_TOKENS_STATUS_TEMPLATE,
@@ -1029,7 +1030,34 @@ def _sanitize_gateway_final_response(platform: Any, text: str) -> str:
     return redacted
 
 
-def _prepare_gateway_status_message(platform: Any, event_type: str, message: str) -> Optional[str]:
+def _blocked_overflow_status_regex(template: str) -> re.Pattern[str]:
+    """Match only complete instances of the blocked-overflow template."""
+    marker_tokens = "__HERMES_TOKENS__"
+    marker_threshold = "__HERMES_THRESHOLD__"
+    marker_reason = "__HERMES_REASON__"
+    source = template.replace("{tokens:,}", marker_tokens)
+    source = source.replace("{threshold:,}", marker_threshold)
+    source = source.replace("{reason}", marker_reason)
+    source = re.escape(source)
+    source = source.replace(re.escape(marker_tokens), r"[\d,]+")
+    source = source.replace(re.escape(marker_threshold), r"[\d,]+")
+    source = source.replace(re.escape(marker_reason), r"[^\r\n()]{1,256}")
+    return re.compile(rf"^{source}$")
+
+
+_CONTEXT_OVERFLOW_BLOCKED_STATUS_RE = _blocked_overflow_status_regex(
+    CONTEXT_OVERFLOW_BLOCKED_WARNING_TEMPLATE
+)
+_MULTI_USER_CHAT_TYPES = {"group", "forum", "channel", "supergroup", "thread"}
+
+
+def _prepare_gateway_status_message(
+    platform: Any,
+    event_type: str,
+    message: str,
+    *,
+    chat_type: Any = None,
+) -> Optional[str]:
     """Filter/sanitize agent status callbacks before platform delivery.
 
     Local/CLI sessions keep the raw diagnostic stream. Messaging gateway
@@ -1042,6 +1070,12 @@ def _prepare_gateway_status_message(platform: Any, event_type: str, message: str
         return text
 
     text = _redact_gateway_user_facing_secrets(text)
+    normalized_chat_type = str(getattr(chat_type, "value", chat_type) or "").strip().lower()
+    if (
+        normalized_chat_type in _MULTI_USER_CHAT_TYPES
+        and _CONTEXT_OVERFLOW_BLOCKED_STATUS_RE.fullmatch(text)
+    ):
+        return None
     if _TELEGRAM_NOISY_STATUS_RE.search(text):
         # Opt-in #52995: `compression.progress_notices: true` lets ROUTINE
         # compression progress statuses through to chat platforms. The
@@ -5754,6 +5788,7 @@ class TurnRunner:
             ctx.source.platform,
             event_type,
             message,
+            chat_type=ctx.source.chat_type,
         )
         if prepared_message is None:
             logger.debug(

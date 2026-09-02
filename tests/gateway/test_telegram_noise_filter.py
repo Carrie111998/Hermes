@@ -177,6 +177,53 @@ def test_manual_compress_feedback_and_failure_notices_stay_visible(platform, mes
     assert _prepare_gateway_status_message(platform, "warn", message) == message
 
 
+@pytest.mark.parametrize(
+    "chat_type", ["group", "forum", "channel", "supergroup", "thread"]
+)
+def test_blocked_overflow_warning_is_suppressed_in_multi_user_chats(chat_type):
+    warning = CONTEXT_OVERFLOW_BLOCKED_WARNING_TEMPLATE.format(
+        tokens=85_000, threshold=72_000, reason="cooldown:30"
+    )
+    assert (
+        _prepare_gateway_status_message(
+            Platform.TELEGRAM, "warn", warning, chat_type=chat_type
+        )
+        is None
+    )
+
+
+def test_blocked_overflow_warning_stays_visible_in_dm_and_raw_surfaces():
+    warning = CONTEXT_OVERFLOW_BLOCKED_WARNING_TEMPLATE.format(
+        tokens=85_000, threshold=72_000, reason="ineffective"
+    )
+    assert (
+        _prepare_gateway_status_message(
+            Platform.TELEGRAM, "warn", warning, chat_type="dm"
+        )
+        == warning
+    )
+    for platform in ("local", "api_server", "webhook", "msgraph_webhook"):
+        assert (
+            _prepare_gateway_status_message(
+                platform, "warn", warning, chat_type="group"
+            )
+            == warning
+        )
+
+
+@pytest.mark.parametrize("suffix", [" extra", "\nextra"])
+def test_similar_blocked_overflow_text_is_not_suppressed(suffix):
+    warning = CONTEXT_OVERFLOW_BLOCKED_WARNING_TEMPLATE.format(
+        tokens=85_000, threshold=72_000, reason="cooldown:30"
+    )
+    assert (
+        _prepare_gateway_status_message(
+            Platform.TELEGRAM, "warn", warning + suffix, chat_type="group"
+        )
+        == warning + suffix
+    )
+
+
 @pytest.mark.parametrize("platform", ["slack", "matrix"])
 def test_chat_gateways_redact_secret_in_provider_error(platform):
     """Provider-error bodies carrying secrets must never reach chat users.
