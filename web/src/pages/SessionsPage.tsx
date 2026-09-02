@@ -25,6 +25,7 @@ import {
   Hash,
   X,
   Play,
+  Eye,
   Eraser,
   Download,
   Upload,
@@ -34,7 +35,12 @@ import {
 } from "lucide-react";
 import { api } from "@/lib/api";
 import { formatSessionPruneResult } from "@/lib/session-prune";
-import { shouldRefreshSessions } from "@/lib/session-refresh";
+import {
+  shouldRefreshExpandedTranscript,
+  shouldRefreshSessions,
+  type SessionListRevision,
+} from "@/lib/session-refresh";
+import { shouldConfirmResumeOwnership } from "@/lib/session-ownership";
 import {
   importSummary,
   parseImportSessions,
@@ -480,24 +486,104 @@ function SessionRow({
   const [renaming, setRenaming] = useState(false);
   const [renameValue, setRenameValue] = useState(session.title ?? "");
   const [renameSaving, setRenameSaving] = useState(false);
+  const [transcriptTargetId, setTranscriptTargetId] = useState(session.id);
+  const [resumeHandoffOpen, setResumeHandoffOpen] = useState(false);
+  const loadedRevisionRef = useRef<{
+    messageCount: number;
+    lastActive: number;
+  } | null>(null);
   const { t } = useI18n();
   const navigate = useNavigate();
+  const liveViewLabel = t.sessions.liveView ?? "Live view";
+  const resumeWritableHint =
+    t.sessions.resumeWritableHint ??
+    "Starts a writable TUI runtime — not a live gateway viewer";
+  const resumeHandoffTitle =
+    t.sessions.resumeOwnershipTitle ?? "Take ownership of this session?";
+  const resumeHandoffDescription =
+    t.sessions.resumeOwnershipDescription ??
+    "This session still looks active on a messaging gateway. Resume starts a separate writable TUI and can create a second writer. Prefer Live view to watch without taking ownership.";
+
+  const goResume = () => {
+    navigate(
+      `/chat?resume=${encodeURIComponent(transcriptTargetId || session.id)}`,
+    );
+  };
+
+  const requestResume = (e: React.MouseEvent) => {
+    e.stopPropagation();
+    if (shouldConfirmResumeOwnership(session)) {
+      setResumeHandoffOpen(true);
+      return;
+    }
+    goResume();
+  };
 
   useEffect(() => {
-    if (!isExpanded || messages !== null) return;
+    setTranscriptTargetId(session.id);
+    setMessages(null);
+    loadedRevisionRef.current = null;
+  }, [session.id]);
+
+  useEffect(() => {
+    if (!isExpanded) return;
+    const prev = loadedRevisionRef.current;
+    const needsFetch =
+      messages === null ||
+      (prev != null &&
+        shouldRefreshExpandedTranscript(
+          prev.messageCount,
+          prev.lastActive,
+          session.message_count,
+          session.last_active,
+        ));
+    if (!needsFetch) return;
+
     let cancelled = false;
+    const loadId = session.id;
     api
-      .getSessionMessages(session.id)
+      .getSessionLatestDescendant(loadId)
+      .then((descendant) => {
+        if (cancelled) return null;
+        const target =
+          descendant.session_id && descendant.changed
+            ? descendant.session_id
+            : loadId;
+        if (target !== loadId) {
+          setTranscriptTargetId(target);
+        }
+        return api.getSessionMessages(target);
+      })
       .then((resp) => {
-        if (!cancelled) setMessages(resp.messages);
+        if (cancelled || !resp) return;
+        setMessages(resp.messages);
+        loadedRevisionRef.current = {
+          messageCount: session.message_count,
+          lastActive: session.last_active,
+        };
+        setError(null);
       })
       .catch((err) => {
-        if (!cancelled) setError(String(err));
+        if (!cancelled) {
+          setError(String(err));
+          // Avoid a null→retry storm when the messages endpoint fails.
+          setMessages([]);
+          loadedRevisionRef.current = {
+            messageCount: session.message_count,
+            lastActive: session.last_active,
+          };
+        }
       });
     return () => {
       cancelled = true;
     };
-  }, [isExpanded, session.id, messages]);
+  }, [
+    isExpanded,
+    session.id,
+    session.message_count,
+    session.last_active,
+    messages,
+  ]);
 
   const sourceKey = session.source?.split(":")[0];
   const sourceInfo = (session.source
@@ -529,19 +615,36 @@ function SessionRow({
       </Badge>
 
       {resumeInChatEnabled && (
-        <Button
-          ghost
-          size="icon"
-          className="text-muted-foreground hover:text-success"
-          aria-label={t.sessions.resumeInChat}
-          title={t.sessions.resumeInChat}
-          onClick={(e) => {
-            e.stopPropagation();
-            navigate(`/chat?resume=${encodeURIComponent(session.id)}`);
-          }}
-        >
-          <Play />
-        </Button>
+        <>
+          <Button
+            ghost
+            size="icon"
+            className="text-muted-foreground hover:text-foreground"
+            aria-label={liveViewLabel}
+            title={
+              t.sessions.liveViewReadOnlyHint ??
+              "Read-only live view of persisted turns (no TUI)"
+            }
+            onClick={(e) => {
+              e.stopPropagation();
+              navigate(
+                `/chat?live=${encodeURIComponent(transcriptTargetId || session.id)}`,
+              );
+            }}
+          >
+            <Eye />
+          </Button>
+          <Button
+            ghost
+            size="icon"
+            className="text-muted-foreground hover:text-success"
+            aria-label={t.sessions.resumeInChat}
+            title={`${t.sessions.resumeInChat} — ${resumeWritableHint}`}
+            onClick={requestResume}
+          >
+            <Play />
+          </Button>
+        </>
       )}
 
       <Button
@@ -756,6 +859,52 @@ function SessionRow({
           )}
         </div>
       )}
+
+      <Dialog
+        open={resumeHandoffOpen}
+        onOpenChange={(open) => {
+          if (!open) setResumeHandoffOpen(false);
+        }}
+      >
+        <DialogContent onClick={(e) => e.stopPropagation()}>
+          <DialogHeader>
+            <DialogTitle>{resumeHandoffTitle}</DialogTitle>
+            <DialogDescription>{resumeHandoffDescription}</DialogDescription>
+          </DialogHeader>
+          <DialogFooter className="gap-2">
+            <Button
+              outlined
+              onClick={(e) => {
+                e.stopPropagation();
+                setResumeHandoffOpen(false);
+                navigate(
+                  `/chat?live=${encodeURIComponent(transcriptTargetId || session.id)}`,
+                );
+              }}
+            >
+              {liveViewLabel}
+            </Button>
+            <Button
+              outlined
+              onClick={(e) => {
+                e.stopPropagation();
+                setResumeHandoffOpen(false);
+              }}
+            >
+              {t.common.cancel}
+            </Button>
+            <Button
+              onClick={(e) => {
+                e.stopPropagation();
+                setResumeHandoffOpen(false);
+                goResume();
+              }}
+            >
+              {t.sessions.resumeInChat}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </div>
   );
 }
@@ -1049,7 +1198,7 @@ export default function SessionsPage() {
     if (!silent) sessionsRequestRef.current = requestId;
     if (!silent) setLoading(true);
     api
-      .getSessions(PAGE_SIZE, p * PAGE_SIZE, sessionQueryOptions)
+      .getSessions(PAGE_SIZE, p * PAGE_SIZE, sessionQueryOptions, "recent")
       .then((resp) => {
         if (requestId !== sessionsRequestRef.current) return;
         setSessions(resp.sessions);
@@ -1104,12 +1253,12 @@ export default function SessionsPage() {
     loadStats();
   }, [loadStats]);
 
-  // Refs for the overview poll's new-session detection. The poll effect
-  // below is mounted once with stable deps, so it reads the current page
-  // and the last-seen newest session id through refs instead of capturing
-  // stale values. ``newestSeenRef`` starts null so the first poll sets a
-  // baseline without triggering a redundant reload (mount already loads).
-  const newestSeenRef = useRef<string | null>(null);
+  // Refs for the overview poll's change detection. The poll effect below is
+  // mounted once with stable deps, so it reads the current page and the
+  // last-seen head revision through refs instead of capturing stale values.
+  // ``newestSeenRef`` starts null so the first poll sets a baseline without
+  // triggering a redundant reload (mount already loads).
+  const newestSeenRef = useRef<SessionListRevision | null>(null);
   const pageRef = useRef(page);
 
   useEffect(() => {
@@ -1138,22 +1287,27 @@ export default function SessionsPage() {
         })
         .catch(() => {});
       api
-        .getSessions(50, 0, sessionQueryOptions)
+        .getSessions(50, 0, sessionQueryOptions, "recent")
         .then((r) => {
           if (cancelled) return;
           setOverviewSessions(r.sessions);
-          // The dashboard server and a terminal CLI are separate
+          // The dashboard server and messaging gateways are separate
           // processes sharing one session DB — there is no push channel,
-          // so we detect sessions created in another process here. The
-          // overview poll already fetches the 50 newest sessions, so we
-          // reuse its head id as a cheap change signal: when it changes,
-          // silently refresh the paginated list so the new session shows
-          // up in real time without a visible loading flicker.
-          const newest = r.sessions[0]?.id ?? null;
-          if (shouldRefreshSessions(newestSeenRef.current, newest)) {
+          // so we detect externally written turns here. Refresh when the
+          // head session id changes OR when the same head session's
+          // message_count / last_active advances.
+          const head = r.sessions[0];
+          const current: SessionListRevision | null = head
+            ? {
+                newestId: head.id,
+                messageCount: head.message_count,
+                lastActive: head.last_active,
+              }
+            : null;
+          if (shouldRefreshSessions(newestSeenRef.current, current)) {
             loadSessions(pageRef.current, true);
           }
-          newestSeenRef.current = newest;
+          newestSeenRef.current = current;
         })
         .catch(() => {});
     };

@@ -189,6 +189,14 @@ export const en: Translations = {
     selectedSessionsDeleted: "{count} sessions deleted",
     failedToDeleteSelected: "Failed to delete selected sessions",
     resumeInChat: "Resume in Chat",
+    liveView: "Live view",
+    liveViewReadOnlyHint:
+      "Read-only view of persisted turns — does not start a TUI",
+    resumeWritableHint:
+      "Starts a writable TUI runtime — not a live gateway viewer",
+    resumeOwnershipTitle: "Take ownership of this session?",
+    resumeOwnershipDescription:
+      "This session still looks active on a messaging gateway. Resume starts a separate writable TUI and can create a second writer. Prefer Live view to watch without taking ownership.",
     newChat: "New chat",
     previousPage: "Previous page",
     nextPage: "Next page",
