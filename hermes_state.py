@@ -14593,6 +14593,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         preserve_compaction_handoff: bool = False,
         expected_active_ids: Optional[List[int]] = None,
         expected_target_content: Any = None,
+        include_rewound_messages: bool = False,
     ) -> Dict[str, Any]:
         """Soft-delete all messages with id >= ``target_message_id`` in *session_id*.
 
@@ -14619,7 +14620,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
         ``expected_active_ids`` optionally pins the ordered active row set.
         ``expected_target_content`` additionally pins the selected canonical
-        live-user payload.  Both checks run inside the write transaction before
+        live-user payload. ``include_rewound_messages`` opts callers such as
+        Telegram ``/undo`` into the archived row metadata needed for visible
+        message cleanup without changing the default result contract.
+        Both checks run inside the write transaction before
         any row or counter mutation.  Presentation-only metadata changes (for
         example Desktop reactions) deliberately do not invalidate a rewind.
         A live cross-process turn lease always refuses the rewind; expired or
@@ -14705,11 +14709,12 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 replacement = handoff if preserve_compaction_handoff else None
 
             cursor = conn.execute(
-                "SELECT id FROM messages "
-                "WHERE session_id = ? AND id >= ? AND active = 1",
+                "SELECT id, role, platform_message_id FROM messages "
+                "WHERE session_id = ? AND id >= ? AND active = 1 ORDER BY id",
                 (session_id, target_message_id),
             )
-            ids = [r[0] for r in cursor.fetchall()]
+            rewound_rows = [dict(row) for row in cursor.fetchall()]
+            ids = [row["id"] for row in rewound_rows]
             if ids:
                 placeholders = ",".join("?" for _ in ids)
                 conn.execute(
@@ -14740,7 +14745,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             new_head_id = (
                 head_row[0] if head_row and head_row[0] is not None else None
             )
-            return target_row, ids, new_head_id, replacement_message_id
+            return target_row, rewound_rows, new_head_id, replacement_message_id
 
         target_row, rewound, new_head_id, replacement_message_id = (
             self._execute_write(_do)
@@ -14757,6 +14762,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         }
         if preserve_compaction_handoff:
             result["replacement_message_id"] = replacement_message_id
+        if include_rewound_messages:
+            result["rewound_messages"] = rewound
         return result
 
     def restore_rewound(self, session_id: str, since_message_id: int) -> int:
@@ -14987,9 +14994,50 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             )
             return cursor.fetchone() is not None
 
-    # =========================================================================
-    # Export and cleanup
-    # =========================================================================
+    def set_latest_assistant_platform_message_ids(
+        self,
+        session_id: str,
+        message_ids: Any,
+    ) -> bool:
+        """Attach one or more visible platform delivery IDs to latest reply."""
+        if not session_id:
+            return False
+        ids: List[str] = []
+
+        def _collect(value: Any) -> None:
+            if value is None:
+                return
+            if isinstance(value, (list, tuple, set)):
+                for item in value:
+                    _collect(item)
+                return
+            text = str(value).strip()
+            if text and text != "__no_edit__" and text not in ids:
+                ids.append(text)
+
+        _collect(message_ids)
+        if not ids:
+            return False
+        stored_value = ids[0] if len(ids) == 1 else json.dumps(ids)
+
+        def _do(conn):
+            row = conn.execute(
+                "SELECT id FROM messages "
+                "WHERE session_id = ? AND role = 'assistant' AND active = 1 "
+                "ORDER BY id DESC LIMIT 1",
+                (session_id,),
+            ).fetchone()
+            if row is None:
+                return False
+            row_id = row["id"] if hasattr(row, "keys") else row[0]
+            conn.execute(
+                "UPDATE messages SET platform_message_id = ? WHERE id = ?",
+                (stored_value, row_id),
+            )
+            return True
+
+        return bool(self._execute_write(_do))
+
 
     def _is_explicit_fork_child_row(self, session: Dict[str, Any]) -> bool:
         """True when ``session`` is a branch, delegate, or tool child of its parent.

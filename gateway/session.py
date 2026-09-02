@@ -4495,8 +4495,6 @@ class SessionStore:
                 logger.debug("rewind_session: failed to resolve canonical target: %s", e)
                 return None
             if require_retryable_composite:
-                # Keep replay-policy failures distinct from persistence errors
-                # so /retry can explain why the selected carrier is unsafe.
                 target_text = retryable_user_text(target_view.get("content"))
             try:
                 result = self._db_for_session_id(session_id).rewind_to_message(
@@ -4505,6 +4503,7 @@ class SessionStore:
                     preserve_compaction_handoff=handoff is not None,
                     expected_active_ids=expected_active_ids,
                     expected_target_content=target_view.get("content"),
+                    include_rewound_messages=True,
                 )
             except ValueError as e:
                 logger.debug("rewind_session: %s", e)
@@ -4513,26 +4512,22 @@ class SessionStore:
                 logger.debug("rewind_session: rewind_to_message failed: %s", e)
                 return None
             self._clear_dirty_transcript(session_id)
-            # ``target_view`` is the canonical live projection of the physical DB
-            # row. For a composite carrier, the raw target contains the historical
-            # summary wrapper and must never be echoed back as the editable prompt.
-            if not require_retryable_composite:
-                content = target_view.get("content") or ""
-                if isinstance(content, list):
-                    parts = [
-                        p.get("text", "")
-                        for p in content
-                        if isinstance(p, dict) and p.get("type") == "text"
-                    ]
-                    target_text = "\n".join(t for t in parts if t)
-                elif isinstance(content, str):
-                    target_text = content
-                else:
-                    target_text = ""
+            content = target_view.get("content") or ""
+            if isinstance(content, list):
+                target_text = "\n".join(
+                    p.get("text", "")
+                    for p in content
+                    if isinstance(p, dict) and p.get("type") == "text" and p.get("text")
+                )
+            elif isinstance(content, str):
+                target_text = content
+            else:
+                target_text = ""
             return {
                 "rewound_count": result.get("rewound_count", 0),
                 "turns_undone": turns_undone,
                 "target_text": target_text,
+                "rewound_messages": result.get("rewound_messages", []),
             }
 
 
