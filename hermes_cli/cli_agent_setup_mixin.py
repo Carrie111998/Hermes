@@ -72,6 +72,14 @@ class CLIAgentSetupMixin:
                 requested=self.requested_provider,
                 explicit_api_key=self._explicit_api_key,
                 explicit_base_url=self._explicit_base_url,
+                # Pass the session's actual model so model-dependent routing
+                # (Bedrock's Claude→AnthropicBedrock vs non-Claude→Converse
+                # dual path) resolves for THIS session's model, not the
+                # config default. Without this, `hermes chat --model
+                # qwen.qwen3-vl-235b-a22b` on a Claude-default config gets
+                # api_mode=anthropic_messages and sends Anthropic-format
+                # tools (no `type` field) to a Converse-only model → 400.
+                target_model=self.model or None,
             )
         except Exception as exc:
             _primary_exc = exc
