@@ -1512,14 +1512,20 @@ class ProcessRegistry:
             except Exception:
                 pass
             # Always reap the child to prevent zombie processes.
+            _wait_failed = False
             try:
                 session.process.wait(timeout=5)
             except Exception as e:
+                _wait_failed = True
                 logger.debug("Process wait timed out or failed: %s", e)
             session.exited = True
             if session.completion_reason != "killed":
-                session.exit_code = session.process.returncode
-                session.completion_reason = "exited"
+                if _wait_failed:
+                    session.exit_code = session.process.returncode if session.process.returncode is not None else -1
+                    session.completion_reason = "lost"
+                else:
+                    session.exit_code = session.process.returncode
+                    session.completion_reason = "exited"
             self._move_to_finished(session)
 
     def _env_poller_loop(
