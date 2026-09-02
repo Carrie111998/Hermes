@@ -102,16 +102,23 @@ class TestWinPtyBridgeSpawn:
 class TestWinPtyBridgeIO:
 
     def test_write_sends_to_child_stdin(self):
-        # python -c reads stdin, echoes a marker, exits.  More reliable than
-        # ``cat`` (not on Windows) and doesn't depend on a particular shell.
+        # The child emits a READY marker so the test can synchronise on
+        # stdin-attach before writing.  Without this barrier the write races
+        # the child's PTY attach on lower-core/lower-clock CI runners: the
+        # PTY echoes the bytes but sys.stdin.readline() never receives them,
+        # and _read_until times out with only terminal init sequences in the
+        # buffer (#98556).
         script = (
             "import sys; "
+            "sys.stdout.write('READY\\n'); "
+            "sys.stdout.flush(); "
             "line = sys.stdin.readline().strip(); "
             "sys.stdout.write('GOT:' + line + '\\n'); "
             "sys.stdout.flush()"
         )
         bridge = WinPtyBridge.spawn([sys.executable, "-c", script])
         try:
+            _read_until(bridge, b"READY")
             bridge.write(b"hello-pty\r\n")
             output = _read_until(bridge, b"GOT:hello-pty")
             assert b"GOT:hello-pty" in output
