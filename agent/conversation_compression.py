@@ -1520,7 +1520,6 @@ def run_compress_context_with_progress_timeout(
     ceiling = max(float(total_ceiling_seconds), float(idle_timeout_seconds))
     idle = float(idle_timeout_seconds)
     fence = fence if fence is not None else CompressionCommitFence()
-    fence.set_total_ceiling_seconds(ceiling)
     # Sync mirror of gateway session-hygiene's run_in_executor(None, ...) +
     # wait_for loop (gateway/run.py): offload compress_context onto the shared
     # daemon pool, poll with an inactivity budget + total ceiling, then
@@ -1572,16 +1571,24 @@ def run_compress_context_with_progress_timeout(
         return worker(worker_fence)
 
     # Bare pool workers start with an empty ContextVar map; propagate the
-    # parent conversation/approval context into the worker.
+    # parent conversation/approval context into the worker.  Build the wrapper
+    # before arming the timeout: callback capture performs lazy imports on its
+    # first use, and that host-side setup must not consume the worker budget.
+    contextual_worker = propagate_context_to_thread(_fence_gated_worker)
+
+    # Start the timeout budget only after one-time lazy imports and executor
+    # initialization.  Charging that host-side setup can expire tiny budgets
+    # before the submitted worker is even allowed to start (notably on the
+    # first Windows invocation).  Submission/queue time remains inside the
+    # budget so a saturated executor is still bounded.
+    wait_started = time.monotonic()
+    fence.set_total_ceiling_seconds(ceiling)
     try:
-        future = executor.submit(
-            propagate_context_to_thread(_fence_gated_worker), fence
-        )
+        future = executor.submit(contextual_worker, fence)
     except BaseException:
         _release_compression_admission()
         raise
     future.add_done_callback(_release_compression_admission)
-    wait_started = time.monotonic()
     # F2: EVERY host unwind (KeyboardInterrupt, task cancellation, unexpected
     # exception while waiting) must revoke future commit admission before the
     # host resumes, or a detached worker could later commit and mutate durable
