@@ -447,6 +447,7 @@ Payload fields below are the exact event-specific fields supplied by each call s
 | `post_llm_call` | Observer | Successful, non-interrupted turn finalization; return ignored. | `session_id`, `task_id`, `turn_id`, `user_message`, `assistant_response`, `conversation_history`, `model`, `platform` | Full prompt, response, and history. |
 | `transform_llm_output` | Transform | Before `post_llm_call` and final delivery; first non-empty string replaces the response. | `response_text`, `session_id`, `model`, `platform` | Full final assistant text. |
 | `pre_verify` | Directive/control | At the bounded edited-code verify gate; first valid continue/block-stop directive keeps the turn going. | `session_id`, `platform`, `model`, `coding`, `attempt`, `final_response`, `changed_paths` | Draft response and changed paths. |
+| [`pre_goal_turn`](#pre_goal_turn) | Directive/control | Before each continuation turn of the kanban goal loop (never the one-shot finalize nudge); the first valid `{"prompt": ...}` rewrites the turn, `handed_off` sends it on a fresh session. | `prompt`, `task_id`, `goal_text`, `progress`, `next_step`, `turns_used`, `max_turns`, `handoffs_done`, `runtime` | Goal text, worker progress, and the continuation prompt. |
 | `pre_api_request` | Observer | Per provider attempt, immediately before the request; return ignored. | `task_id`, `turn_id`, `api_request_id`, `session_id`, `user_message`, `conversation_history`, `platform`, `model`, `provider`, `base_url`, `api_mode`, `api_call_count`, `retry_count`, `request_messages`, `message_count`, `tool_count`, `approx_input_tokens`, `request_char_count`, `max_tokens`, `started_at`, `middleware_trace`, `request` | High sensitivity: legacy `user_message`, `conversation_history`, and `request_messages` are intentionally raw; prefer sanitized `request`. |
 | `post_api_request` | Observer | After normalized provider success; return ignored. | `task_id`, `turn_id`, `api_request_id`, `session_id`, `platform`, `model`, `provider`, `base_url`, `api_mode`, `api_call_count`, `api_duration`, `started_at`, `ended_at`, `finish_reason`, `message_count`, `response_model`, `response`, `usage`, `assistant_message`, `assistant_content_chars`, `assistant_tool_call_count` | Sanitized `response` is available, but raw normalized `assistant_message` may contain model/user content; `usage` is accounting data. |
 | `api_request_error` | Observer | On each failed provider attempt; return ignored. | `task_id`, `turn_id`, `api_request_id`, `session_id`, `platform`, `model`, `provider`, `base_url`, `api_mode`, `api_call_count`, `api_duration`, `started_at`, `ended_at`, `status_code`, `retry_count`, `max_retries`, `retryable`, `reason`, `error`, `request` | Error text may contain provider/user data; `request` is intended to be sanitized. |
@@ -880,6 +881,67 @@ return {"reason": "model_not_found",   # required: a FailoverReason name
 Dispatch is run-all-then-pick-first: every callback runs, failures are isolated, and the first valid result in registration order wins (valid-but-losing results log a runtime warning). Invalid dicts and unknown reasons are skipped, so a broken plugin can never break classification.
 
 **Privacy:** `error_message` and `error_body` may carry unredacted provider data. **Python plugins only** — shell registrations are refused at config parse with a warning.
+
+### `pre_goal_turn`
+
+Fires **before each continuation turn** of the kanban goal loop: the Ralph-style loop a dispatcher-spawned `goal_mode` kanban worker runs in, re-prompting itself until an auxiliary judge agrees the card is done, the worker finalizes the task, or the turn budget runs out. The one-shot finalize nudge — the turn sent after the judge has already returned `done` — is never intercepted.
+
+**Callback signature:**
+
+```python
+def my_callback(prompt: str, task_id: str, goal_text: str, progress: str,
+                next_step: str, turns_used: int, max_turns: int,
+                handoffs_done: int, runtime: dict, **kwargs):
+```
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `prompt` | `str` | The continuation prompt the loop is about to send |
+| `task_id` | `str` | Kanban task id the loop is driving |
+| `goal_text` | `str` | The goal being pursued |
+| `progress` | `str` | The worker's response from the previous turn |
+| `next_step` | `str` | The judge's stated reason for continuing |
+| `turns_used` | `int` | Turns spent so far |
+| `max_turns` | `int` | The loop's hard turn budget |
+| `handoffs_done` | `int` | Handoffs a hook has already reported this loop — self-throttle on this |
+| `runtime` | `dict` | Caller-supplied best-effort callables (see below) |
+
+**Fires:** In `hermes_cli/goals.py` (`run_kanban_goal_loop`), after the turn-budget check and before the next turn is run.
+
+**The `runtime` dict** is supplied by whoever drives the loop; from the CLI it carries `context_occupancy_fn()` (live prompt tokens ÷ context window, or `None` when unknown), `compaction_active_fn()`, `session_id_fn()`, and `reset_session_fn()` (start a fresh session). Every entry is best-effort — treat a missing or raising callable as "unknown" and skip whatever depended on it.
+
+**Return value — rewrite the next turn:**
+
+```python
+return {"prompt": "Checkpoint your state to the task, then continue.", "handed_off": True}
+```
+
+The first returned dict with a non-empty `prompt` wins; later callbacks are not consulted. `handed_off` is bookkeeping — set it when the directive represents a handoff (state checkpointed, loop moved on) and it comes back as `handoffs_done` on later firings so a hook can bound how often it intervenes. Any other return leaves the turn untouched.
+
+**Bounded:** the loop's `max_turns` budget is checked *before* the hook and is unaffected by it, so a hook that rewrites every prompt can never extend the loop past its budget. A callback that raises is logged and the turn runs unchanged.
+
+**Use cases:** soft context-budget handoff (checkpoint the worker and restart on a clean window before the live one rides down into repeated compaction), injecting fresh external state into every continuation, escalating instructions as the turn budget runs low.
+
+**Example — hand off to a fresh session when the context window fills up:**
+
+```python
+def context_budget_handoff(prompt, runtime, handoffs_done, **kwargs):
+    if handoffs_done >= 2:
+        return None  # don't loop on handoffs
+    occupancy = (runtime.get("context_occupancy_fn") or (lambda: None))()
+    if occupancy is None or occupancy < 0.8:
+        return None
+    (runtime.get("reset_session_fn") or (lambda: None))()
+    return {
+        "prompt": "Fresh session — re-read the task, then continue:\n" + prompt,
+        "handed_off": True,
+    }
+
+def register(ctx):
+    ctx.register_hook("pre_goal_turn", context_budget_handoff)
+```
+
+**Shell hooks:** a shell hook returns the same `{"prompt": ..., "handed_off": ...}` JSON on stdout. It receives the resolved probe *values* — `extra.runtime.context_occupancy` and `extra.runtime.compaction_active`, with the loop's session id in the top-level `session_id` field — because a subprocess cannot call a Python callable. The control callables have no shell equivalent, so a shell hook cannot switch the loop to a fresh session; it influences the loop by rewriting the prompt.
 
 ---
 
@@ -1584,6 +1646,7 @@ Use shell hooks when you want a drop-in, single-file script (Bash, Python, anyth
 - **Block or modify a tool call** — reject dangerous `terminal` commands, enforce per-directory policies, require approval for destructive `write_file` / `patch` operations, or rewrite arguments (sanitize paths, inject defaults) before the tool runs.
 - **Run after a tool call** — auto-format Python or TypeScript files that the agent just wrote, log API calls, trigger a CI workflow.
 - **Inject context into the next LLM turn** — prepend `git status` output, the current weekday, or retrieved documents to the user message (see [`pre_llm_call`](#pre_llm_call)).
+- **Steer a long-running goal loop** — rewrite the next continuation prompt when the context window fills up or the turn budget runs low (see [`pre_goal_turn`](#pre_goal_turn)).
 - **Observe lifecycle events** — write a log line when a subagent completes (`subagent_stop`) or a session starts (`on_session_start`).
 
 Shell hooks are registered by calling `agent.shell_hooks.register_from_config(cfg)` at both CLI startup (`hermes_cli/main.py`) and gateway startup (`gateway/run.py`). They compose naturally with Python plugin hooks — both flow through the same dispatcher.
@@ -1599,6 +1662,7 @@ Shell hooks are registered by calling `agent.shell_hooks.register_from_config(cf
 | Events | `VALID_HOOKS` (incl. `subagent_stop`) | `VALID_HOOKS` | Gateway lifecycle (`gateway:startup`, `agent:*`, `command:*`) |
 | Can block a tool call | Yes (`pre_tool_call`) | Yes (`pre_tool_call`) | No |
 | Can inject LLM context | Yes (`pre_llm_call`) | Yes (`pre_llm_call`) | No |
+| Can steer the goal loop | Prompt only (`pre_goal_turn`) | Yes (`pre_goal_turn`) | No |
 | Consent | First-use prompt per `(event, command)` pair | Implicit (Python plugin trust) | Implicit (dir trust) |
 | Inter-process isolation | Yes (subprocess) | No (in-process) | No (in-process) |
 
@@ -1635,7 +1699,7 @@ Each time the event fires, Hermes spawns a subprocess for every matching hook (m
 }
 ```
 
-`tool_name` and `tool_input` are `null` for non-tool events (`pre_llm_call`, `subagent_stop`, session lifecycle). The `extra` dict carries all event-specific kwargs (`user_message`, `conversation_history`, `child_role`, `duration_ms`, …). Unserialisable values are stringified rather than omitted.
+`tool_name` and `tool_input` are `null` for non-tool events (`pre_llm_call`, `subagent_stop`, session lifecycle). The `extra` dict carries all event-specific kwargs (`user_message`, `conversation_history`, `child_role`, `duration_ms`, …). Unserialisable values are stringified rather than omitted — the one exception is [`pre_goal_turn`](#pre_goal_turn), whose `runtime` callables are evaluated into plain values so a script can read them.
 
 **stdout — optional response:**
 
@@ -1654,6 +1718,9 @@ Each time the event fires, Hermes spawns a subprocess for every matching hook (m
 // Keep the agent going at the verify gate (pre_verify); both shapes accepted:
 {"action": "continue", "message": "Run the formatter, then finish."}
 {"decision": "block",  "reason":  "Run the formatter, then finish."}
+
+// Rewrite the goal loop's next continuation turn (pre_goal_turn):
+{"prompt": "Checkpoint your state to the task, then continue.", "handed_off": true}
 
 // Silent no-op — any empty / non-matching output is fine:
 ```
