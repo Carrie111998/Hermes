@@ -33,6 +33,7 @@ const { clearBotAttentionMock, hostMock, noteBotAttentionMock, UnboundedCache } 
     onEvent: vi.fn(),
     profileRoutes: vi.fn(),
     requestProfile: vi.fn(),
+    retainProfile: vi.fn(),
     retainProfileSocket: vi.fn(),
     warmAgent: vi.fn()
   } as Record<string, unknown>,
@@ -135,6 +136,7 @@ beforeEach(() => {
   hostMock.connections = vi.fn(async () => [])
   hostMock.profileRoutes = vi.fn(async () => [route('a'), route('b')])
   hostMock.requestProfile = vi.fn(async () => ({}))
+  hostMock.retainProfile = vi.fn(async () => vi.fn())
   hostMock.retainProfileSocket = vi.fn(() => vi.fn())
   hostMock.warmAgent = vi.fn()
 })

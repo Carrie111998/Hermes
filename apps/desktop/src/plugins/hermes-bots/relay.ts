@@ -114,6 +114,7 @@ const relayRouteRetentions = new Map<string, () => void>()
  *  label fields are read defensively in relayAgentsOn and never arrive. */
 interface RelayConnection {
   id: string
+  recoveryRelease?: () => void
   route: ProfileRoute & { connectionLabel?: string; label?: string }
 }
 
@@ -251,13 +252,31 @@ async function waitForRelayConnection(
             ? source.remoteProfile.trim()
             : profile
 
-        return {
+        const recovered: RelayConnection = {
           id: connectionId,
           route: {
             connectionId,
             mode: kind === 'local' ? 'local' : 'remote',
             profile,
             targetProfile
+          }
+        }
+
+        // `warmAgent` can lose a race with a gateway restart. The SDK's
+        // retained-profile door both dials and waits for readiness without
+        // foregrounding the connection. Keep its temporary lease until the
+        // standing relay retention below takes ownership of the socket.
+        if (typeof host.retainProfile !== 'function') {
+          return recovered
+        }
+
+        while (!relay.disposed && Date.now() < deadline) {
+          try {
+            recovered.recoveryRelease = await host.retainProfile(recovered.route)
+
+            return recovered
+          } catch {
+            await new Promise<void>(resolve => setTimeout(resolve, RELAY_ROUTE_RECONNECT_POLL_MS))
           }
         }
       }
@@ -525,6 +544,8 @@ async function drainRelayOutboxes() {
         if (!byId.has(target.id)) {
           byId.set(target.id, target)
           syncRelayRetention([...connections, target])
+          target.recoveryRelease?.()
+          delete target.recoveryRelease
         }
 
         // Needs-attention hook (#93091 item 3): a delivered background DM is
