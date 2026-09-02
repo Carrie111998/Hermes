@@ -435,6 +435,36 @@ class TestThreadContextPersistence(unittest.TestCase):
             adapter2 = self._make_adapter(tmp)
             self.assertEqual(adapter2._thread_context, {})
 
+    def test_lru_eviction_bounds_memory_and_disk(self):
+        """Thread context is strictly bounded to _thread_context_max_entries (500),
+        with genuine LRU eviction: updating/touching an older key moves it to
+        the end so it survives over untouched older entries."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            adapter = self._make_adapter(tmp)
+            for i in range(500):
+                adapter._set_thread_context(f"key_{i}", {"subject": f"Sub {i}", "message_id": f"<m{i}>"})
+            self.assertEqual(len(adapter._thread_context), 500)
+            self.assertIn("key_0", adapter._thread_context)
+
+            # Touch key_0 so it becomes most recently used
+            ctx0 = adapter._get_thread_context("key_0")
+            self.assertIsNotNone(ctx0)
+
+            # Insert key_500: since key_0 was touched, key_1 should be evicted instead
+            adapter._set_thread_context("key_500", {"subject": "Sub 500", "message_id": "<m500>"})
+            self.assertEqual(len(adapter._thread_context), 500)
+            self.assertIn("key_0", adapter._thread_context)
+            self.assertNotIn("key_1", adapter._thread_context)
+            self.assertIn("key_500", adapter._thread_context)
+
+            # Persisted copy is also capped at 500 and preserves LRU order on reload
+            adapter._save_thread_context()
+            adapter2 = self._make_adapter(tmp)
+            self.assertEqual(len(adapter2._thread_context), 500)
+            self.assertIn("key_0", adapter2._thread_context)
+            self.assertNotIn("key_1", adapter2._thread_context)
+
 
 class TestSessionLifecycle(unittest.TestCase):
     """/new in email body + auto-rotation cap bound session growth."""
@@ -442,6 +472,9 @@ class TestSessionLifecycle(unittest.TestCase):
     def setUp(self):
         self._prev_allow_all = os.environ.get("EMAIL_ALLOW_ALL_USERS")
         os.environ["EMAIL_ALLOW_ALL_USERS"] = "true"
+        self._smtp_patcher = patch("smtplib.SMTP")
+        self._mock_smtp = self._smtp_patcher.start()
+        self.addCleanup(self._smtp_patcher.stop)
         import tempfile
         self._tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self._tmp.cleanup)
@@ -496,6 +529,13 @@ class TestSessionLifecycle(unittest.TestCase):
         captured = self._dispatch(adapter, "Re: My Thread", "/new", "m2")
         # Bare /new must not dispatch to the agent (confirmation only)
         self.assertEqual(captured, [])
+        # Confirmation is threaded into the conversation (Re: subject + In-Reply-To)
+        send_calls = self._mock_smtp.return_value.send_message.call_args_list
+        self.assertTrue(len(send_calls) >= 1)
+        confirm_msg = send_calls[-1][0][0]
+        self.assertEqual(confirm_msg["Subject"], "Re: My Thread")
+        self.assertEqual(confirm_msg["In-Reply-To"], "<m2@test.com>")
+        self.assertEqual(confirm_msg["References"], "<m2@test.com>")
         # Next real message lands in epoch 1 → new session key
         captured2 = self._dispatch(adapter, "Re: My Thread", "fresh start", "m3")
         self.assertEqual(len(captured2), 1)
@@ -617,11 +657,12 @@ class TestReplySubjectIsolation(unittest.TestCase):
             mock_server = MagicMock()
             mock_smtp.return_value = mock_server
             # The gateway sends chat_id=plain sender + metadata thread_id
-            asyncio.run(adapter.send(
+            result = asyncio.run(adapter.send(
                 chat_id="user@test.com",
                 content="Reply to A",
                 metadata={"thread_id": "test-session-isolation-a"},
             ))
+            self.assertTrue(result.success)
         self.assertEqual(
             self._sent_subject(mock_smtp), "Re: test session isolation A"
         )
@@ -636,11 +677,12 @@ class TestReplySubjectIsolation(unittest.TestCase):
         with patch("smtplib.SMTP") as mock_smtp:
             mock_server = MagicMock()
             mock_smtp.return_value = mock_server
-            asyncio.run(adapter.send(
+            result = asyncio.run(adapter.send(
                 chat_id="user@test.com",
                 content="Reply to B",
                 metadata={"thread_id": "test-session-isolation-b"},
             ))
+            self.assertTrue(result.success)
         self.assertEqual(
             self._sent_subject(mock_smtp), "Re: test session isolation B"
         )
@@ -656,10 +698,11 @@ class TestReplySubjectIsolation(unittest.TestCase):
         with patch("smtplib.SMTP") as mock_smtp:
             mock_server = MagicMock()
             mock_smtp.return_value = mock_server
-            asyncio.run(adapter.send(
+            result = asyncio.run(adapter.send(
                 chat_id="user@test.com",
                 content="Cron report",
             ))
+            self.assertTrue(result.success)
         msg = mock_smtp.return_value.send_message.call_args_list[0][0][0]
         self.assertEqual(msg["Subject"], "Hermes Agent")
         # Fresh conversation: no threading headers into the sender's thread
@@ -676,11 +719,12 @@ class TestReplySubjectIsolation(unittest.TestCase):
         with patch("smtplib.SMTP") as mock_smtp:
             mock_server = MagicMock()
             mock_smtp.return_value = mock_server
-            asyncio.run(adapter.send(
+            result = asyncio.run(adapter.send(
                 chat_id="user@test.com",
                 content="Plain reply",
                 reply_to="<m1@test.com>",
             ))
+            self.assertTrue(result.success)
         self.assertEqual(
             self._sent_subject(mock_smtp), "Re: test session isolation A"
         )
@@ -697,11 +741,12 @@ class TestReplySubjectIsolation(unittest.TestCase):
         with patch("smtplib.SMTP") as mock_smtp:
             mock_server = MagicMock()
             mock_smtp.return_value = mock_server
-            asyncio.run(adapter.send(
+            result = asyncio.run(adapter.send(
                 chat_id="user@test.com",
                 content="Backup report",
                 metadata={"subject": "Cronjob Response: hermes-nightly-backup"},
             ))
+            self.assertTrue(result.success)
         msg = mock_smtp.return_value.send_message.call_args_list[0][0][0]
         self.assertEqual(msg["Subject"], "Cronjob Response: hermes-nightly-backup")
         self.assertNotIn("In-Reply-To", msg)
@@ -721,12 +766,13 @@ class TestReplySubjectIsolation(unittest.TestCase):
         with patch("smtplib.SMTP") as mock_smtp:
             mock_server = MagicMock()
             mock_smtp.return_value = mock_server
-            asyncio.run(adapter.send_document(
+            result = asyncio.run(adapter.send_document(
                 chat_id="user@test.com",
                 file_path=attach_path,
                 caption="Report with file",
                 metadata={"subject": "Cronjob Response: weekly-report"},
             ))
+            self.assertTrue(result.success)
         msg = mock_smtp.return_value.send_message.call_args_list[0][0][0]
         self.assertEqual(msg["Subject"], "Cronjob Response: weekly-report")
         self.assertNotIn("In-Reply-To", msg)
