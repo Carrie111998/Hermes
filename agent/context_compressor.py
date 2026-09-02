@@ -1596,12 +1596,15 @@ def _estimate_msg_budget_tokens(msg: dict, charge_stale_thinking: bool = True) -
     # The wire ships at most ONE of the generic thinking keys: every request
     # build pops ``reasoning`` after (optionally) promoting it into
     # ``reasoning_content`` (``apply_reasoning_content_policy``), and a
-    # non-empty stored ``reasoning_content`` always displaces it. Charging
-    # both keys double-counted the same thinking text on echo-back providers
-    # that persist it under both (#84371 comment: +53% vs real
-    # prompt_tokens). Mirror the wire: reasoning_content wins when present.
+    # string-valued stored ``reasoning_content`` always displaces it — even
+    # legacy ``""`` and space placeholders enter policy case 1 and return
+    # before promotion. Charging both keys double-counted the same thinking
+    # text on echo-back providers that persist it under both (#84371 comment:
+    # +53% vs real prompt_tokens), and still charged the wire-dead trajectory
+    # copy behind placeholders (#99398). Mirror the wire: any string
+    # reasoning_content wins when present.
     _rc = msg.get("reasoning_content")
-    _skip_reasoning_dup = isinstance(_rc, str) and bool(_rc.strip())
+    _skip_reasoning_dup = isinstance(_rc, str)
     for key in _NEWEST_TURN_ONLY_BUDGET_KEYS:
         if key == "reasoning" and _skip_reasoning_dup:
             continue
