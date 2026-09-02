@@ -2326,6 +2326,16 @@ def write_credential_pool(
     removed = {rid for rid in (removed_ids or ()) if rid}
     with _auth_store_lock():
         auth_store = _load_auth_store()
+        tombstones = auth_store.get("credential_pool_removed_ids")
+        if not isinstance(tombstones, dict):
+            tombstones = {}
+            auth_store["credential_pool_removed_ids"] = tombstones
+        provider_tombstones = {
+            str(item) for item in tombstones.get(provider_id, []) if item
+        }
+        provider_tombstones.update(str(item) for item in removed)
+        if provider_tombstones:
+            tombstones[provider_id] = sorted(provider_tombstones)
         pool = auth_store.get("credential_pool")
         if not isinstance(pool, dict):
             pool = {}
@@ -2334,6 +2344,8 @@ def write_credential_pool(
             sanitize_borrowed_credential_payload(entry, provider_id)
             if isinstance(entry, dict) else entry
             for entry in entries
+            if not isinstance(entry, dict)
+            or entry.get("id") not in provider_tombstones
         ]
         existing = pool.get(provider_id)
         existing_list = existing if isinstance(existing, list) else []
@@ -2359,7 +2371,11 @@ def write_credential_pool(
             if not isinstance(disk_entry, dict):
                 continue
             disk_id = disk_entry.get("id")
-            if not disk_id or disk_id in new_ids or disk_id in removed:
+            if (
+                not disk_id
+                or disk_id in new_ids
+                or disk_id in provider_tombstones
+            ):
                 continue
             merged.append(sanitize_borrowed_credential_payload(disk_entry, provider_id))
         pool[provider_id] = merged

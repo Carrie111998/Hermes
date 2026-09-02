@@ -110,6 +110,13 @@ CREDENTIAL_PERSIST_FAILED_REASON = "credential_persist_failed"
 # write-side sync (``_save_codex_tokens`` etc.) clears the status.
 DEAD_MANUAL_PRUNE_TTL_SECONDS = 24 * 60 * 60  # 24 hours
 
+_FILE_BACKED_SINGLETON_SOURCES = frozenset({
+    ("minimax-oauth", "oauth"),
+    ("nous", "device_code"),
+    ("openai-codex", "device_code"),
+    ("xai-oauth", "device_code"),
+})
+
 AUTH_TYPE_OAUTH = "oauth"
 AUTH_TYPE_API_KEY = "api_key"
 
@@ -3675,6 +3682,7 @@ def _prune_stale_seeded_entries(
         return (
             is_borrowed_credential_source(entry.source, entry.provider)
             or entry.source == "hermes_pkce"
+            or (entry.provider, entry.source) in _FILE_BACKED_SINGLETON_SOURCES
         )
 
     retained = [
