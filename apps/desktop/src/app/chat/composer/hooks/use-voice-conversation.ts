@@ -50,8 +50,18 @@ const INTERRUPT_SETTLE_TIMEOUT_MS = 5_000
  *  (always-rearm mode). */
 const LEGACY_IDLE_SILENCE_MS = 12_000
 
-/** Hard cap on a single listen cycle when follow-up idle is disabled. */
-const LEGACY_TURN_TIMEOUT_MS = 60_000
+/**
+ * Hard cap on a single listen cycle, independent of `voice.follow_up_idle_seconds`.
+ *
+ * This bounds how long one in-progress listen (mic capture of the user's live
+ * utterance) may run before we force-stop and transcribe whatever was
+ * captured — it protects against a stuck/never-silent mic, not against the
+ * user taking a while to start talking. `follow_up_idle_seconds` governs a
+ * *different* thing (how long to wait for speech to begin before ending the
+ * conversation) and must never shrink this cap: doing so would let a short
+ * follow-up idle setting truncate an utterance that's still being spoken.
+ */
+const TURN_TIMEOUT_MS = 60_000
 
 export function useVoiceConversation({
   busy,
@@ -261,10 +271,12 @@ export function useVoiceConversation({
       // Follow-up window from voice.follow_up_idle_seconds. When > 0, wait that
       // long for the user to start speaking; no speech ends the conversation
       // in handleTurn. When 0, keep the legacy short idle cycle + always-rearm.
+      // The per-listen turn timeout (TURN_TIMEOUT_MS) is intentionally NOT
+      // derived from follow-up idle: it bounds an in-progress utterance, and a
+      // short follow_up_idle_seconds must not truncate active speech.
       const followUpIdleSeconds = $voiceFollowUpIdleSeconds.get()
       const followUpIdleMs = followUpIdleSeconds > 0 ? Math.round(followUpIdleSeconds * 1000) : 0
       const idleSilenceMs = followUpIdleMs > 0 ? followUpIdleMs : LEGACY_IDLE_SILENCE_MS
-      const turnTimeoutMs = followUpIdleMs > 0 ? followUpIdleMs : LEGACY_TURN_TIMEOUT_MS
 
       await handle.start({
         silenceLevel: 0.075,
@@ -281,7 +293,7 @@ export function useVoiceConversation({
       // Clear any prior turn-timeout before arming a fresh one so a stale timer
       // can't fire mid-listen after a re-arm.
       clearTurnTimeout()
-      turnTimeoutRef.current = window.setTimeout(() => void handleTurn(), turnTimeoutMs)
+      turnTimeoutRef.current = window.setTimeout(() => void handleTurn(), TURN_TIMEOUT_MS)
     } catch (error) {
       notifyError(error, voiceCopy.couldNotStartSession)
       pendingStartRef.current = false

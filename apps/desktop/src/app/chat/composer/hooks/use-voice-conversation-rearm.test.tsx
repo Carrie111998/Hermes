@@ -185,6 +185,55 @@ describe('useVoiceConversation playback rearm', () => {
     )
   })
 
+  it('does not let a short follow-up idle window truncate an in-progress listen', async () => {
+    // Reviewer finding on #79574: voice.follow_up_idle_seconds must only govern
+    // the no-speech follow-up window (idleSilenceMs, handled by useMicRecorder),
+    // never the hard cap on an already-in-progress listen/utterance. A short
+    // idle setting (5s here) must not cut off active speech before the
+    // independent per-listen turn timeout (60s) elapses.
+    vi.useFakeTimers()
+
+    try {
+      $voiceFollowUpIdleSeconds.set(5)
+
+      const hook = renderHook(
+        ({ enabled }) =>
+          useVoiceConversation({
+            busy: false,
+            consumePendingResponse: vi.fn(),
+            enabled,
+            onSubmit: async () => undefined,
+            onTranscribeAudio: async () => 'still talking',
+            pendingResponse: () => null
+          }),
+        { initialProps: { enabled: false } }
+      )
+
+      hook.rerender({ enabled: true })
+      await vi.advanceTimersByTimeAsync(0)
+      expect(mocks.handle.start).toHaveBeenCalledTimes(1)
+      // The follow-up idle setting still reaches the mic recorder's own
+      // no-speech detector...
+      expect(mocks.handle.start).toHaveBeenCalledWith(
+        expect.objectContaining({
+          idleSilenceMs: 5_000
+        })
+      )
+
+      // ...but it must NOT shrink the per-listen turn timeout. At the 5s mark
+      // (the configured follow-up idle) the listen must still be alive — no
+      // forced stop/transcribe of the in-progress utterance.
+      await vi.advanceTimersByTimeAsync(5_000)
+      expect(mocks.handle.stop).not.toHaveBeenCalled()
+
+      // The independent hard cap (60s) still protects against a stuck listen.
+      await vi.advanceTimersByTimeAsync(55_000)
+      expect(mocks.handle.stop).toHaveBeenCalledTimes(1)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
   it('ends the voice conversation when follow-up idle elapses with no speech', async () => {
     const onStopWord = vi.fn()
     mocks.handle.stop.mockResolvedValueOnce({
@@ -226,6 +275,7 @@ describe('useVoiceConversation playback rearm', () => {
     })
 
     const onStopWord = vi.fn()
+
     const hook = renderHook(
       ({ enabled }) =>
         useVoiceConversation({
