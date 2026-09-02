@@ -5082,7 +5082,7 @@ class GatewaySlashCommandsMixin:
 
             await asyncio.to_thread(_render_and_write)
 
-            adapter = self.get_adapter(source.platform)
+            adapter = getattr(self, "adapters", {}).get(source.platform)
             if adapter:
                 await adapter.send_document(
                     chat_id=source.chat_id,
