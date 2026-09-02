@@ -4485,6 +4485,28 @@ def provider_model_ids(provider: Optional[str], *, force_refresh: bool = False) 
             live = fetch_api_models(api_key, base_url, api_mode=api_mode)
             if live:
                 return live
+    if normalized.startswith("custom:"):
+        # Named custom providers (config.yaml providers.<name>): resolve the
+        # provider's own base_url/api_key from config. provider_model_ids()
+        # previously only handled the bare "custom" slug, so every named
+        # custom provider fell through to the empty static table and the
+        # model picker showed 0 models (whole-class bug; upstream fixed
+        # probe_api_models paths at :6770 but the model_ids resolver still
+        # misses named slugs).
+        try:
+            from hermes_cli.config import load_config
+
+            _cfg = load_config()
+            _entry = (_cfg.get("providers") or {}).get(normalized.split(":", 1)[1]) or {}
+            _base_url = str(_entry.get("base_url") or "").strip()
+            _api_key = str(_entry.get("api_key") or "").strip()
+            if _base_url and _api_key and not _api_key.startswith("${"):
+                _api_mode = "anthropic_messages" if _base_url_looks_like_anthropic_messages(_base_url) else None
+                _live = fetch_api_models(_api_key, _base_url, api_mode=_api_mode)
+                if _live:
+                    return _live
+        except Exception:
+            logger.debug("named custom provider resolution failed for %s", normalized, exc_info=True)
     # Bedrock uses live discovery keyed by the resolved AWS region so that
     # EU/AP users see eu.*/ap.* model IDs instead of the static us.* list.
     # Note: early return intentionally skips _MODELS_DEV_PREFERRED merge
