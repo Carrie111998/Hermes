@@ -438,7 +438,11 @@ def _try_relay_delivery(
             return json.dumps({"error": str(exc), "reason": exc.reason})
         label = f"@{match['handle']} on {match['connection_label'] or match['connection_id']}"
         return _spawn_delivery(
-            waiter_command(root, envelope), label, task_id=task_id, agent=agent
+            waiter_command(root, envelope),
+            label,
+            task_id=task_id,
+            agent=agent,
+            delivery_committed=True,
         )
     except Exception:
         logger.debug("relay delivery attempt failed", exc_info=True)
@@ -682,6 +686,7 @@ def _spawn_delivery(
     dm_file: Optional[str] = None,
     task_id: Optional[str],
     agent: Any,
+    delivery_committed: bool = False,
 ) -> str:
     """Launch the cleanup-owning runner and transfer file ownership on ack.
 
@@ -706,10 +711,26 @@ def _spawn_delivery(
         except (ValueError, TypeError):
             parsed = {}
         proc_id = parsed.get("session_id") or ""
-        if parsed.get("error"):
-            return _err(f"Delivery to {label} failed to start: {parsed['error']}")
-        if not proc_id:
-            return _err(f"Delivery to {label} failed to start: no process id returned")
+        observer_error = str(parsed.get("error") or "").strip()
+        if parsed.get("approval_pending") or parsed.get("status") == "pending_approval":
+            observer_error = "reply watcher needs approval"
+        elif not observer_error and not proc_id:
+            observer_error = "reply watcher returned no process id"
+        if observer_error:
+            if delivery_committed:
+                return json.dumps(
+                    {
+                        "status": "sent_unwatched",
+                        "to": label,
+                        "detail": (
+                            f"Message was queued to {label}, but automatic reply monitoring "
+                            f"is unavailable ({observer_error}). Do not resend blindly; the "
+                            "recipient may already have received it."
+                        ),
+                        "sent_at": int(time.time()),
+                    }
+                )
+            return _err(f"Delivery to {label} failed to start: {observer_error}")
         # From this point the background runner owns the file and removes it
         # only after the local query-file or peer stdin consumer has finished.
         transferred = True
@@ -729,6 +750,19 @@ def _spawn_delivery(
         )
     except Exception as exc:
         logger.error("message_agent delivery spawn failed: %s", exc, exc_info=True)
+        if delivery_committed:
+            return json.dumps(
+                {
+                    "status": "sent_unwatched",
+                    "to": label,
+                    "detail": (
+                        f"Message was queued to {label}, but automatic reply monitoring "
+                        f"could not start ({exc}). Do not resend blindly; the recipient "
+                        "may already have received it."
+                    ),
+                    "sent_at": int(time.time()),
+                }
+            )
         return _err(f"Delivery to {label} could not be started: {exc}")
     finally:
         if dm_file and not transferred:

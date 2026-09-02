@@ -14,6 +14,7 @@ relay adds to message_agent:
 
 import json
 import re
+import shlex
 from pathlib import Path
 
 import pytest
@@ -147,8 +148,18 @@ def test_write_reply_reason_passthrough_and_classification(root):
 def test_waiter_command_quotes_and_targets_reply_file(root):
     env = {"id": "b" * 32, "target_handle": "researcher", "target_connection": "ssh-vps"}
     cmd = bot_relay.waiter_command(root, env)
-    assert ("b" * 32) in cmd and "-c" in cmd
-    assert "rm -rf" not in cmd  # sanity: single quoted -c payload
+    parts = shlex.split(cmd)
+    assert ("b" * 32) in cmd
+    assert parts[1:4] == ["-m", "tools.bot_relay", "wait"]
+    assert "-c" not in parts
+    assert "rm -rf" not in cmd
+
+
+def test_waiter_command_passes_unattended_dangerous_command_gate(root):
+    from tools.approval import detect_dangerous_command
+
+    env = {"id": "b" * 32, "target_handle": "researcher", "target_connection": "ssh-vps"}
+    assert detect_dangerous_command(bot_relay.waiter_command(root, env))[0] is False
 
 
 def test_waiter_picks_up_reply_within_a_sub_second_cadence(root):
@@ -192,10 +203,7 @@ def test_roster_rejects_connection_id_outside_handle_charset(root):
     assert bot_relay.write_remote_roster(root, [good]) == 1
 
 
-def test_waiter_command_repr_encodes_hostile_connection_id(root):
-    import ast
-    import shlex
-
+def test_waiter_command_treats_hostile_connection_id_as_argv_data(root):
     inj = "x'); open(r'/tmp/pwned','w').write('pwned'); print('x"
     env = {
         "id": "c" * 32,
@@ -204,26 +212,8 @@ def test_waiter_command_repr_encodes_hostile_connection_id(root):
     }
     cmd = bot_relay.waiter_command(root, env)
     parts = shlex.split(cmd)
-    code = parts[parts.index("-c") + 1]
-    compile(code, "<waiter>", "exec")
-    tree = ast.parse(code)
-    opens = [
-        n
-        for n in ast.walk(tree)
-        if isinstance(n, ast.Call)
-        and isinstance(n.func, ast.Name)
-        and n.func.id == "open"
-    ]
-    # Only json.load(open(p, ...)) is a real open(); the payload must stay data.
-    assert len(opens) == 1
-
-    # A quote in the id used to SyntaxError the waiter. It must compile.
-    quoted = bot_relay.waiter_command(
-        root,
-        {"id": "a" * 32, "target_handle": "h", "target_connection": "foo'bar"},
-    )
-    qcode = shlex.split(quoted)[shlex.split(quoted).index("-c") + 1]
-    compile(qcode, "<waiter-quote>", "exec")
+    assert parts[1:4] == ["-m", "tools.bot_relay", "wait"]
+    assert parts[5] == "@researcher on " + inj
 
 
 # ── message_agent integration: relay route + legacy-SOUL gate fix ───────────
@@ -310,9 +300,10 @@ def test_relay_route_queues_envelope_and_spawns_waiter(tmp_path, monkeypatch):
 
     spawned = {}
 
-    def _fake_spawn(command, label, *, task_id, agent):
+    def _fake_spawn(command, label, *, task_id, agent, delivery_committed=False):
         spawned["command"] = command
         spawned["label"] = label
+        spawned["delivery_committed"] = delivery_committed
         return json.dumps({"status": "sent", "to": label})
 
     monkeypatch.setattr("tools.bot_mode_dm._spawn_delivery", _fake_spawn)
@@ -320,6 +311,7 @@ def test_relay_route_queues_envelope_and_spawns_waiter(tmp_path, monkeypatch):
     out = json.loads(message_agent_tool(target="hermes", message="ping", agent=agent))
     assert out.get("status") == "sent"
     assert "Hermes Cloud" in spawned["label"]
+    assert spawned["delivery_committed"] is True
     # envelope landed in the outbox with attribution prefixed
     pending = bot_relay.claim_pending_envelopes(home)
     assert len(pending) == 1
