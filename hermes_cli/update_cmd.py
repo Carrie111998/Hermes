@@ -11109,7 +11109,14 @@ def _fleet_probe_expected_runtimes(
         return True
     try:
         if pre_update_plan is not None and pre_update_plan.runtimes:
-            return True
+            # Only gateway runtimes require fleet verification;
+            # dashboard/serve-only plans don't need gateway rows.
+            has_gateway = any(
+                getattr(r, 'kind', '') == 'gateway'
+                for r in pre_update_plan.runtimes
+            )
+            if has_gateway:
+                return True
     except Exception:
         pass
     return False
