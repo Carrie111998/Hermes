@@ -775,6 +775,27 @@ class TestSpawnEnvSanitization:
         # A failed launch must not be exposed as a running/tracked session.
         assert session.id not in registry._running
 
+    def test_spawn_via_env_executes_wrapper_in_requested_cwd(self, registry):
+        class FakeEnv:
+            def __init__(self):
+                self.commands = []
+
+            def execute(self, command, **kwargs):
+                self.commands.append((command, kwargs))
+                return {"output": "launch failed", "returncode": 2}
+
+        env = FakeEnv()
+
+        with patch.object(registry, "_write_checkpoint"):
+            session = registry.spawn_via_env(
+                env,
+                "./gradlew test",
+                cwd="/workspace/project",
+            )
+
+        assert env.commands[0][1]["cwd"] == "/workspace/project"
+        assert session.cwd == "/workspace/project"
+
     def test_env_poller_quotes_temp_paths_with_spaces(self, registry):
         session = _make_session(sid="proc_space")
         session.exited = False

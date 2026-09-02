@@ -1339,6 +1339,7 @@ class ProcessRegistry:
         try:
             result = env.execute(
                 bg_command,
+                cwd=cwd,
                 timeout=timeout,
                 rewrite_compound_background=False,
             )
