@@ -12427,6 +12427,106 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         except Exception:
             pass
 
+    def _commit_memory_for_evicted_session(
+        self, session_key: str, old_entry: Any, source: Any
+    ) -> None:
+        """Fire end-of-session memory for a /new'd session with no cached agent.
+
+        The idle-TTL sweep soft-evicts agents of ``mode="none"`` sessions
+        without firing ``on_session_end`` — correct at eviction time, because
+        eviction is a cache detail and the session itself continues. But
+        ``/new`` is a real session boundary: when the cached agent is gone,
+        the whole memory chain (``_cleanup_agent_resources`` →
+        ``shutdown_memory_provider`` → ``on_session_end``) is skipped, so
+        providers that extract at session end (Cognee ``improve()``,
+        MEMORY.md synthesis, …) silently lose the transcript (#99402).
+
+        Compensation: reload the transcript from the session DB and fire
+        ``on_session_end`` on a throwaway ``MemoryManager`` initialized with
+        the OLD session id and the source-derived scoping kwargs the
+        per-agent manager would have received, then shut it down. Runs on a
+        worker thread with a bounded wait (see _handle_reset_command).
+        Best-effort: any failure is swallowed so /new never breaks on memory.
+        """
+        old_sid = getattr(old_entry, "session_id", None)
+        if not old_sid:
+            return
+        db = getattr(self, "_session_db", None)
+        if db is None:
+            return
+        try:
+            from tools.memory_tool import get_builtin_memory_config
+            provider_name = (get_builtin_memory_config().get("provider") or "").strip()
+        except Exception:
+            provider_name = ""
+        if not provider_name:
+            return  # no external memory provider configured — nothing to fire
+        try:
+            messages = db.get_messages_as_conversation(str(old_sid))
+        except Exception:
+            logger.debug(
+                "Could not reload transcript for /new memory commit (session %s)",
+                old_sid, exc_info=True,
+            )
+            return
+        if not messages:
+            return
+        try:
+            from agent.memory_manager import MemoryManager
+            from plugins.memory import load_memory_provider
+
+            provider = load_memory_provider(provider_name)
+            if provider is None or not provider.is_available():
+                return
+            manager = MemoryManager()
+            manager.add_provider(provider)
+            # Same scoping contract the per-agent manager gets in
+            # agent_init.py; user/chat identity comes from the message source
+            # the session key itself was derived from, so provider-side
+            # keying (per-user memory, chat isolation) matches the turns
+            # that were actually lived.
+            init_kwargs = {
+                "session_id": str(old_sid),
+                "platform": source.platform.value if getattr(source, "platform", None) else "",
+                "agent_context": "primary",
+            }
+            for src_attr, kwarg in (
+                ("user_id", "user_id"),
+                ("chat_id", "chat_id"),
+                ("chat_type", "chat_type"),
+                ("thread_id", "thread_id"),
+            ):
+                _v = getattr(source, src_attr, None)
+                if _v:
+                    init_kwargs[kwarg] = _v
+            if session_key:
+                init_kwargs["gateway_session_key"] = session_key
+            try:
+                _title = db.get_session_title(str(old_sid))
+            except Exception:
+                _title = None
+            if _title:
+                init_kwargs["session_title"] = _title
+            try:
+                from hermes_cli.profiles import get_active_profile_name
+                init_kwargs["agent_identity"] = get_active_profile_name()
+                init_kwargs["agent_workspace"] = "hermes"
+            except Exception:
+                pass
+            manager.initialize_all(**init_kwargs)
+            manager.on_session_end(messages)
+            manager.shutdown_all()
+            logger.debug(
+                "Committed /new end-of-session memory for evicted session=%s "
+                "(old sid=%s, %d messages)",
+                session_key, old_sid, len(messages),
+            )
+        except Exception as e:
+            logger.warning(
+                "/new memory commit for evicted session %s failed: %s (#99402)",
+                session_key, e,
+            )
+
     _STUCK_LOOP_THRESHOLD = 3  # restarts while active before auto-suspend
     _STUCK_LOOP_FILE = ".restart_failure_counts"
 
