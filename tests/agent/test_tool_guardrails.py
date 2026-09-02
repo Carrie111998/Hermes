@@ -741,3 +741,52 @@ def test_supervised_task_platforms_keep_warning_only_default():
     for platform in ("telegram", "discord", "cron", "kanban"):
         cfg = ToolCallGuardrailConfig.from_mapping({}, platform=platform)
         assert cfg.hard_stop_enabled is True, platform
+
+
+# ── The carry must be reachable from production, not just from tests ────────
+
+
+def _SKILL_VIEW_DEDUP(name: str = "hermes-development") -> str:
+    """The exact envelope tools/skills_tool.py emits for a repeat view."""
+    return json.dumps(
+        {
+            "success": True,
+            "status": "unchanged",
+            "name": name,
+            "file": "SKILL.md",
+            "dedup": True,
+            "content_returned": False,
+            "message": "already served this turn",
+        }
+    )
+
+
+def test_internal_continuation_carries_the_streak_into_the_next_turn():
+    """An agent-authored continuation must not launder a no-progress streak.
+
+    build_turn_context() calls reset_for_turn(new_user_input=not
+    internal_continuation). Before that argument was threaded through, every
+    turn passed the default and the streak restarted at 1 forever -- the
+    mechanism existed but no production path could reach it.
+    """
+    c = _HARD()
+    args = {"name": "hermes-development"}
+    blocked_at = None
+    for turn in range(1, 8):
+        c.reset_for_turn(new_user_input=False)  # what an internal retry does
+        if not c.before_call("skill_view", args).allows_execution:
+            blocked_at = turn
+            break
+        c.after_call("skill_view", args, _SKILL_VIEW_DEDUP())
+    assert blocked_at is not None, "carried streak never reached the block"
+
+
+def test_a_genuine_new_user_request_still_clears_the_streak():
+    """The other half of the same argument: real user turns must never block."""
+    c = _HARD()
+    args = {"name": "hermes-development"}
+    for _ in range(8):
+        c.reset_for_turn(new_user_input=True)
+        assert c.before_call("skill_view", args).allows_execution
+        c.after_call("skill_view", args, _SKILL_VIEW_DEDUP())
+    assert c.halt_decision is None
