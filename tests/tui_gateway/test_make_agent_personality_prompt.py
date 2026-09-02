@@ -61,6 +61,13 @@ def test_make_agent_uses_display_personality_when_set():
     assert kwargs["ephemeral_system_prompt"] == "You are helpful."
 
 
+def test_make_agent_honors_checkpoints_enabled_from_config(monkeypatch):
+    monkeypatch.delenv("HERMES_TUI_CHECKPOINTS", raising=False)
+    kwargs = _call_make_agent({"checkpoints": {"enabled": True, "max_snapshots": 12}})
+    assert kwargs["checkpoints_enabled"] is True
+    assert kwargs["checkpoint_max_snapshots"] == 12
+
+
 def test_make_agent_preserves_manual_prompt_without_personality():
     cfg = {
         "display": {"personality": "none"},

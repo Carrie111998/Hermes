@@ -3419,6 +3419,25 @@ export const en: Translations = {
       sendEdited: 'Send edited message',
       attachingFile: 'Attaching…'
     },
+    fileCheckpoints: {
+      menu: 'File checkpoints',
+      title: 'File checkpoints',
+      empty: 'No file snapshots yet. They appear after Hermes edits files.',
+      disabled: 'File checkpoints are off. Enable them to snapshot the workspace before edits.',
+      enable: 'Enable file checkpoints',
+      revert: 'Revert workspace',
+      revertTitle: 'Revert workspace to this snapshot?',
+      revertBody: 'Project files return to this snapshot. The conversation stays as it is.',
+      revertConfirm: 'Revert files',
+      firstUseTitle: 'Save a snapshot before each file edit?',
+      firstUseBody:
+        'Hermes can checkpoint your project outside git so you can undo any turn’s file changes in one click. The conversation is not rewound.',
+      firstUseConfirm: 'Enable snapshots',
+      firstUseSkip: 'Not now',
+      restoreFailed: 'Could not revert those files',
+      loadFailed: 'Could not load file checkpoints',
+      enabledToast: 'File checkpoints are on for new edits'
+    },
     approval: {
       gatewayDisconnected: 'Hermes gateway is not connected',
       sendFailed: 'Could not send approval response',

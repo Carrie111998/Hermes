@@ -1417,7 +1417,9 @@ def _(rid, params: dict) -> dict:
         def go(mgr, cwd):
             resolved = _resolve_checkpoint_hash(mgr, cwd, target)
             result = mgr.restore(cwd, resolved, file_path=file_path or None)
-            if result.get("success") and not file_path:
+            rewind_raw = params.get("rewind_history", True)
+            rewind_history = rewind_raw not in (False, "false", "0", 0)
+            if result.get("success") and not file_path and rewind_history:
                 removed = 0
                 with session["history_lock"]:
                     history = _history_without_ephemeral_scaffolding(
@@ -1443,6 +1445,8 @@ def _(rid, params: dict) -> dict:
                                 f"failed: {exc}"
                             ) from exc
                 result["history_removed"] = removed
+            elif result.get("success") and not file_path:
+                result["history_removed"] = 0
             return result
 
         return _ok(rid, _with_checkpoints(session, go))

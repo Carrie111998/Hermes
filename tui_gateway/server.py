@@ -9165,6 +9165,55 @@ def _resolve_runtime_with_fallback(
         raise
 
 
+def resolve_tui_checkpoint_kwargs(cfg, environ=None) -> dict:
+    """Resolve CheckpointManager kwargs for TUI / desktop / serve sessions.
+
+    ``HERMES_TUI_CHECKPOINTS`` remains an explicit on-switch (``hermes --tui
+    --checkpoints``). Otherwise honor ``checkpoints.enabled`` from config.yaml
+    so Studio Settings and the CLI share one master switch. Size caps stay
+    those already documented for the shadow store.
+    """
+    env = os.environ if environ is None else environ
+    raw = cfg.get("checkpoints") if isinstance(cfg, dict) else None
+    if isinstance(raw, bool):
+        cfg_enabled = raw
+        cp = {}
+    elif isinstance(raw, dict):
+        cfg_enabled = bool(raw.get("enabled", False))
+        cp = raw
+    else:
+        cfg_enabled = False
+        cp = {}
+
+    def _int(key: str, default: int) -> int:
+        try:
+            return int(cp.get(key, default) or default)
+        except (TypeError, ValueError):
+            return default
+
+    return {
+        "checkpoints_enabled": bool(
+            is_truthy_value(env.get("HERMES_TUI_CHECKPOINTS")) or cfg_enabled
+        ),
+        "checkpoint_max_snapshots": max(1, _int("max_snapshots", 20)),
+        "checkpoint_max_total_size_mb": max(0, _int("max_total_size_mb", 500)),
+        "checkpoint_max_file_size_mb": max(0, _int("max_file_size_mb", 10)),
+    }
+
+
+def apply_checkpoint_kwargs(mgr, kwargs: dict) -> None:
+    """Keep a live session's manager aligned with current config / env."""
+    if mgr is None:
+        return
+    mgr.enabled = bool(kwargs.get("checkpoints_enabled", False))
+    if "checkpoint_max_snapshots" in kwargs:
+        mgr.max_snapshots = max(1, int(kwargs["checkpoint_max_snapshots"]))
+    if "checkpoint_max_total_size_mb" in kwargs:
+        mgr.max_total_size_mb = max(0, int(kwargs["checkpoint_max_total_size_mb"]))
+    if "checkpoint_max_file_size_mb" in kwargs:
+        mgr.max_file_size_mb = max(0, int(kwargs["checkpoint_max_file_size_mb"]))
+
+
 def _make_agent(
     sid: str,
     key: str,
@@ -9345,7 +9394,7 @@ def _make_agent(
         session_id=session_id or key,
         session_db=session_db if session_db is not None else _get_db(),
         ephemeral_system_prompt=system_prompt or None,
-        checkpoints_enabled=is_truthy_value(os.environ.get("HERMES_TUI_CHECKPOINTS")),
+        **resolve_tui_checkpoint_kwargs(cfg),
         pass_session_id=is_truthy_value(os.environ.get("HERMES_TUI_PASS_SESSION_ID")),
         skip_context_files=is_truthy_value(os.environ.get("HERMES_IGNORE_RULES")),
         skip_memory=is_truthy_value(os.environ.get("HERMES_IGNORE_RULES")),
@@ -9501,7 +9550,9 @@ def _new_session_key() -> str:
 
 
 def _with_checkpoints(session, fn):
-    return fn(session["agent"]._checkpoint_mgr, _session_cwd(session))
+    mgr = session["agent"]._checkpoint_mgr
+    apply_checkpoint_kwargs(mgr, resolve_tui_checkpoint_kwargs(_load_cfg()))
+    return fn(mgr, _session_cwd(session))
 
 
 def _resolve_checkpoint_hash(mgr, cwd: str, ref: str) -> str:

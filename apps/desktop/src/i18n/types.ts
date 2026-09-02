@@ -2959,6 +2959,24 @@ export interface Translations {
       sendEdited: string
       attachingFile: string
     }
+    fileCheckpoints: {
+      menu: string
+      title: string
+      empty: string
+      disabled: string
+      enable: string
+      revert: string
+      revertTitle: string
+      revertBody: string
+      revertConfirm: string
+      firstUseTitle: string
+      firstUseBody: string
+      firstUseConfirm: string
+      firstUseSkip: string
+      restoreFailed: string
+      loadFailed: string
+      enabledToast: string
+    }
     approval: {
       gatewayDisconnected: string
       sendFailed: string

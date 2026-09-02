@@ -11690,6 +11690,55 @@ def test_rollback_restore_truncates_from_real_user_turn_not_marker(monkeypatch):
         server._sessions.pop("sid", None)
 
 
+def test_rollback_restore_can_keep_session_history(monkeypatch):
+    """Studio file revert restores the workspace and leaves the transcript."""
+
+    class _Mgr:
+        enabled = True
+
+        def list_checkpoints(self, cwd):
+            return [{"hash": "abc123"}]
+
+        def restore(self, cwd, target, file_path=None):
+            return {"success": True, "message": "restored"}
+
+    history = [
+        {"role": "user", "content": "first question"},
+        {"role": "assistant", "content": "first answer"},
+        {"role": "user", "content": "second question"},
+        {"role": "assistant", "content": "second answer"},
+    ]
+    server._sessions["sid"] = _session(
+        agent=types.SimpleNamespace(_checkpoint_mgr=_Mgr()),
+        history=list(history),
+        session_key="",
+    )
+    try:
+        resp = server.handle_request(
+            {
+                "id": "1",
+                "method": "rollback.restore",
+                "params": {
+                    "session_id": "sid",
+                    "hash": "abc123",
+                    "rewind_history": False,
+                },
+            }
+        )
+
+        assert resp["result"]["success"] is True
+        assert resp["result"]["history_removed"] == 0
+        remaining = server._sessions["sid"]["history"]
+        assert [m["content"] for m in remaining] == [
+            "first question",
+            "first answer",
+            "second question",
+            "second answer",
+        ]
+    finally:
+        server._sessions.pop("sid", None)
+
+
 def test_rollback_restore_skips_legacy_compaction_handoff(monkeypatch):
     """rollback.restore must not truncate from a legacy standalone compaction
     handoff — a durable role=user row persisted pre-#80622 with NO

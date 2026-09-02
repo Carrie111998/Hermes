@@ -3014,6 +3014,25 @@ export const ja = defineLocale({
       sendEdited: '編集済みメッセージを送信',
       attachingFile: '添付中…'
     },
+    fileCheckpoints: {
+      menu: 'ファイルチェックポイント',
+      title: 'ファイルチェックポイント',
+      empty: 'ファイルのスナップショットはまだありません。Hermes がファイルを編集するとここに出ます。',
+      disabled: 'ファイルチェックポイントはオフです。オンにすると編集前にワークスペースを保存します。',
+      enable: 'ファイルチェックポイントを有効化',
+      revert: 'ワークスペースを戻す',
+      revertTitle: 'このスナップショットにワークスペースを戻しますか？',
+      revertBody: 'プロジェクトのファイルだけが戻ります。会話はそのままです。',
+      revertConfirm: 'ファイルを戻す',
+      firstUseTitle: 'ファイル編集の前にスナップショットを保存しますか？',
+      firstUseBody:
+        'git を汚さずにプロジェクトをチェックポイントできます。任意のターンのファイル変更をワンクリックで取り消せます。会話は巻き戻りません。',
+      firstUseConfirm: 'スナップショットを有効化',
+      firstUseSkip: 'あとで',
+      restoreFailed: 'ファイルを戻せませんでした',
+      loadFailed: 'ファイルチェックポイントを読み込めませんでした',
+      enabledToast: '以降の編集でファイルチェックポイントが有効です'
+    },
     approval: {
       gatewayDisconnected: 'Hermes ゲートウェイが接続されていません',
       sendFailed: '承認応答を送信できませんでした',

@@ -2908,6 +2908,24 @@ export const zhHant = defineLocale({
       sendEdited: '傳送編輯後的訊息',
       attachingFile: '正在附加…'
     },
+    fileCheckpoints: {
+      menu: '檔案檢查點',
+      title: '檔案檢查點',
+      empty: '尚無檔案快照。Hermes 修改檔案後會顯示在這裡。',
+      disabled: '檔案檢查點已關閉。開啟後會在編輯前為工作區做快照。',
+      enable: '啟用檔案檢查點',
+      revert: '還原工作區',
+      revertTitle: '將工作區還原到此快照？',
+      revertBody: '專案檔案會回到此快照。對話內容維持不變。',
+      revertConfirm: '還原檔案',
+      firstUseTitle: '在每次檔案編輯前儲存快照？',
+      firstUseBody: 'Hermes 可以在 git 之外為專案做檢查點，一鍵撤銷任意一輪的檔案變更。對話不會被回退。',
+      firstUseConfirm: '啟用快照',
+      firstUseSkip: '暫不',
+      restoreFailed: '無法還原這些檔案',
+      loadFailed: '無法載入檔案檢查點',
+      enabledToast: '後續編輯將啟用檔案檢查點'
+    },
     approval: {
       gatewayDisconnected: 'Hermes 閘道未連線',
       sendFailed: '無法傳送核准回應',

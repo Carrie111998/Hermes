@@ -63,6 +63,7 @@ import { requestComposerInsert } from './composer/focus'
 import { droppedFileInlineRefs } from './composer/inline-refs'
 import { ComposerSurfaceProvider, useComposerScope, useComposerSurfaceId } from './composer/scope'
 import type { ChatBarState } from './composer/types'
+import { FileCheckpointsButton } from './file-checkpoints-panel'
 import { type DroppedFile, partitionDroppedFiles } from './hooks/use-composer-actions'
 import { type DragKind, useFileDropZone } from './hooks/use-file-drop-zone'
 import { shouldShowIntro } from './intro-visibility'
@@ -79,6 +80,7 @@ import {
   transcriptBackfillAvailable
 } from './transcript-backfill'
 import { advanceTranscriptWindow, type TranscriptWindowState } from './transcript-window'
+import { useFileCheckpointFirstUse } from './use-file-checkpoint-first-use'
 
 interface ChatViewProps extends Omit<React.ComponentProps<'div'>, 'onSubmit'> {
   gateway: HermesGateway | null
@@ -179,6 +181,7 @@ function ChatHeader({
           <TitleMenuTrigger>{title}</TitleMenuTrigger>
         </SessionActionsMenu>
       </div>
+      <FileCheckpointsButton sessionId={activeSessionId || selectedSessionId || ''} />
     </header>
   )
 }
@@ -428,6 +431,7 @@ const ChatViewContent = memo(function ChatViewContent({
   const gatewaySwapTarget = useStore($gatewaySwapTarget)
   const hydrationSyncProfile = useStore($hydrationSyncProfile)
   const gatewayOpen = gatewayState === 'open'
+  useFileCheckpointFirstUse(isPrimary && gatewayOpen)
   const introPersonality = useStore($introPersonality)
   const introSeed = useStore($introSeed)
   const introSplash = useStore($introSplash)

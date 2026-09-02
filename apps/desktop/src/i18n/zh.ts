@@ -3563,6 +3563,24 @@ export const zh: Translations = {
       sendEdited: '发送编辑后的消息',
       attachingFile: '正在附加…'
     },
+    fileCheckpoints: {
+      menu: '文件检查点',
+      title: '文件检查点',
+      empty: '还没有文件快照。Hermes 修改文件后会显示在这里。',
+      disabled: '文件检查点已关闭。开启后会在编辑前为工作区做快照。',
+      enable: '启用文件检查点',
+      revert: '还原工作区',
+      revertTitle: '将工作区还原到此快照？',
+      revertBody: '项目文件会回到此快照。对话内容保持不变。',
+      revertConfirm: '还原文件',
+      firstUseTitle: '在每次文件编辑前保存快照？',
+      firstUseBody: 'Hermes 可以在 git 之外为项目做检查点，一键撤销任意一轮的文件改动。对话不会被回退。',
+      firstUseConfirm: '启用快照',
+      firstUseSkip: '暂不',
+      restoreFailed: '无法还原这些文件',
+      loadFailed: '无法加载文件检查点',
+      enabledToast: '后续编辑将启用文件检查点'
+    },
     approval: {
       gatewayDisconnected: 'Hermes 网关未连接',
       sendFailed: '无法发送审批响应',
