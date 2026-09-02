@@ -1759,12 +1759,25 @@ async def _generate_edge_tts(text: str, output_path: str, tts_config: Dict[str, 
     _edge_tts = _import_edge_tts()
     edge_config = tts_config.get("edge") or {}
     voice = edge_config.get("voice", DEFAULT_EDGE_VOICE)
-    speed = float(edge_config.get("speed", tts_config.get("speed", 1.0)))
+    raw_rate = edge_config.get(
+        "rate", edge_config.get("speed", tts_config.get("speed", 1.0))
+    )
 
     kwargs = {"voice": voice}
-    if speed != 1.0:
-        pct = round((speed - 1.0) * 100)
-        kwargs["rate"] = f"{pct:+d}%"
+    try:
+        speed = float(raw_rate)
+    except (TypeError, ValueError):
+        if isinstance(raw_rate, str) and re.fullmatch(r"[+-]\d+(\.\d+)?%", raw_rate.strip()):
+            kwargs["rate"] = raw_rate.strip()
+        else:
+            raise ValueError(
+                f'invalid tts.edge.rate {raw_rate!r} — expected a numeric factor '
+                'such as 1.6, or a percent string such as "+60%"'
+            ) from None
+    else:
+        if speed != 1.0:
+            pct = round((speed - 1.0) * 100)
+            kwargs["rate"] = f"{pct:+d}%"
 
     communicate = _edge_tts.Communicate(text, **kwargs)
     await communicate.save(output_path)

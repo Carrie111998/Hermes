@@ -47,6 +47,33 @@ class TestEdgeTtsSpeed:
         assert "rate" not in kwargs
 
 
+    def test_edge_rate_key_is_honored(self, tmp_path):
+        """tts.edge.rate (the intuitive key) drives playback speed."""
+        comm_cls = self._run({"edge": {"rate": 1.6}}, tmp_path)
+        kwargs = comm_cls.call_args[1]
+        assert kwargs["rate"] == "+60%"
+
+
+    def test_edge_rate_takes_precedence_over_speed(self, tmp_path):
+        """When both are set, tts.edge.rate wins over tts.edge.speed."""
+        comm_cls = self._run({"edge": {"rate": 1.6, "speed": 1.25}}, tmp_path)
+        kwargs = comm_cls.call_args[1]
+        assert kwargs["rate"] == "+60%"
+
+
+    def test_edge_rate_accepts_percent_string(self, tmp_path):
+        """tts.edge.rate also accepts edge-tts's native "+N%" string form."""
+        comm_cls = self._run({"edge": {"rate": "+60%"}}, tmp_path)
+        kwargs = comm_cls.call_args[1]
+        assert kwargs["rate"] == "+60%"
+
+
+    def test_edge_rate_invalid_string_raises_clear_error(self, tmp_path):
+        """An unparseable tts.edge.rate raises a config error, not a raw ValueError from float()."""
+        with pytest.raises(ValueError, match="invalid tts.edge.rate"):
+            self._run({"edge": {"rate": "fast"}}, tmp_path)
+
+
 # ---------------------------------------------------------------------------
 # OpenAI TTS speed
 # ---------------------------------------------------------------------------

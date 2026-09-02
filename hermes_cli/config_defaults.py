@@ -1876,6 +1876,8 @@ DEFAULT_CONFIG = {
         "edge": {
             "voice": "en-US-AriaNeural",
             # Popular: AriaNeural, JennyNeural, AndrewNeural, BrianNeural, SoniaNeural
+            # Optional: rate: 1.6 (speed multiplier, or a raw "+60%" string) — takes
+            # precedence over speed below, which falls back to the global tts.speed.
         },
         "elevenlabs": {
             "voice_id": "pNInz6obpgDQGcFmaJgB",  # Adam

@@ -1858,7 +1858,8 @@ tts:
   speed: 1.0                    # Global speed multiplier (fallback for all providers)
   edge:
     voice: "en-US-AriaNeural"   # 322 voices, 74 languages
-    speed: 1.0                  # Speed multiplier (converted to rate percentage, e.g. 1.5 → +50%)
+    rate: 1.0                   # Speed multiplier (converted to rate percentage, e.g. 1.5 → +50%); also accepts a raw "+N%" string. Takes precedence over `speed` below.
+    speed: 1.0                  # Older alias for `rate`, kept for backward compatibility with existing configs
   elevenlabs:
     voice_id: "pNInz6obpgDQGcFmaJgB"
     model_id: "eleven_multilingual_v2"
@@ -1893,7 +1894,7 @@ tts:
 
 This controls both the `text_to_speech` tool and spoken replies in voice mode (`/voice tts` in the CLI or messaging gateway).
 
-**Speed fallback hierarchy:** provider-specific speed (e.g. `tts.edge.speed`) → global `tts.speed` → `1.0` default. Set the global `tts.speed` to apply a uniform speed across all providers, or override per-provider for fine-grained control.
+**Speed fallback hierarchy:** provider-specific speed (e.g. `tts.edge.speed`) → global `tts.speed` → `1.0` default. Set the global `tts.speed` to apply a uniform speed across all providers, or override per-provider for fine-grained control. For Edge TTS specifically, `tts.edge.rate` takes precedence over `tts.edge.speed` before falling back to the global `tts.speed`.
 
 ## Display Settings
 
