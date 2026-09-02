@@ -36,6 +36,7 @@ from hermes_cli.models import _HERMES_USER_AGENT
 from hermes_cli.vercel_auth import describe_vercel_auth
 from hermes_constants import OPENROUTER_MODELS_URL
 from utils import base_url_host_matches
+from utils import normalize_proxy_env_vars
 
 
 _PROVIDER_ENV_HINTS = (
@@ -2766,6 +2767,11 @@ def run_doctor(args):
             check_info(note)
 
     _section("API Connectivity")
+    # Normalise Clash/Verge-style SOCKS proxy env vars (socks:// -> socks5://)
+    # so bare httpx probes don't fail with "Unknown scheme for proxy URL".
+    # Mirrors what the real LLM client paths (anthropic_adapter,
+    # auxiliary_client) already do via normalize_proxy_env_vars().
+    normalize_proxy_env_vars()
     # Refactor: every connectivity probe below is HTTP-bound and fully
     # independent. Running them in series spent ~5s wall on a typical
     # workstation (2s of that was boto3's IMDS lookup for AWS credentials,
