@@ -30,6 +30,29 @@ _SESSION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
 # subprocess launches — never exported to the CLI.
 _PRIVATE_BROWSER_SENTINEL = "_HERMES_BU_PRIVATE_BROWSER"
 
+# Internal marker set when Hermes, rather than Browser Use CLI itself, owns
+# the provider CDP endpoint. Browser Harness 0.1.10's
+# BH_REQUIRE_EXISTING_DAEMON contract lets each model-authored call prove it
+# is still talking to the exact daemon Hermes provisioned. Popped before the
+# subprocess launches.
+_PROVIDER_BROWSER_SENTINEL = "_HERMES_BU_PROVIDER_BROWSER"
+
+_PROVIDER_DAEMON_PREFLIGHT_CODE = """\
+# HERMES_PROVIDER_DAEMON_PREFLIGHT: strict health check happens before this
+pass
+"""
+
+_PROVIDER_DAEMON_BOOTSTRAP_CODE = """\
+# HERMES_PROVIDER_DAEMON_BOOTSTRAPPED: ensure_daemon self-heals before this
+pass
+"""
+
+_REQUIRED_DAEMON_FAILURE_PHRASES = (
+    "is not running",
+    "is unhealthy",
+    "failed its CDP health check",
+)
+
 # Preamble prepended to the model's code for named sessions on SHARED
 # browsers (local Chrome / CDP override). The harness daemon attaches to the
 # first existing page at startup, so two fresh named daemons can land on the
@@ -102,6 +125,16 @@ def _blocked_url_in_code(code: str) -> Optional[str]:
         if err:
             return err.get("error", "Blocked: unsafe URL")
     return None
+
+
+def _is_required_daemon_failure(proc: subprocess.CompletedProcess) -> bool:
+    """Whether a trusted preflight was refused by Browser Harness."""
+    stderr = str(proc.stderr or "")
+    return (
+        proc.returncode != 0
+        and "browser-harness: required daemon " in stderr
+        and any(phrase in stderr for phrase in _REQUIRED_DAEMON_FAILURE_PHRASES)
+    )
 
 
 def _base_subprocess_env() -> dict:
@@ -641,6 +674,7 @@ def _resolve_backend_cdp(
             "the built-in browser tools for this provider."
         )
     env["BU_CDP_URL" if cdp.startswith(("http://", "https://")) else "BU_CDP_WS"] = cdp
+    env[_PROVIDER_BROWSER_SENTINEL] = "1"
     # A provider browser keyed bu-named-<name> is exclusive to this session —
     # the own-tab preamble is unnecessary there (it would just leak a blank
     # tab into a browser nobody else touches).
@@ -794,6 +828,7 @@ def browser_exec(
     # the model's code. Private per-name browsers (provider-keyed or BU
     # cloud) skip this: no one to collide with, and the extra tab would leak.
     private_browser = env.pop(_PRIVATE_BROWSER_SENTINEL, None)
+    provider_browser = env.pop(_PROVIDER_BROWSER_SENTINEL, None)
     if session and not private_browser:
         code = _OWN_TAB_PREAMBLE + code
 
@@ -811,6 +846,12 @@ def browser_exec(
     except (TypeError, ValueError):
         timeout = _DEFAULT_TIMEOUT_S
 
+    # Browser Harness 0.1.10+ fails closed when an orchestrator-owned daemon
+    # is missing or unhealthy. Older releases ignore this variable, preserving
+    # compatibility until the hardened harness is published.
+    if provider_browser:
+        env["BH_REQUIRE_EXISTING_DAEMON"] = "1"
+
     # Windows: hide the console the .cmd shim would flash (as browser_tool does)
     popen_extra: dict = {}
     if os.name == "nt":
@@ -825,16 +866,69 @@ def browser_exec(
             logger.debug("Windows hide-flags unavailable: %s", e)
 
     started = time.time()
+    deadline = time.monotonic() + timeout
     try:
-        proc = subprocess.run(
-            cmd,
-            input=code,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            env=env,
-            **popen_extra,
-        )
+        proc = None
+        if provider_browser:
+            # Health-check the exact orchestrator-owned daemon before any
+            # model-authored code can run. This trusted preflight is the only
+            # result eligible to trigger recovery, so user code is never
+            # retried after a partial or completed side effect.
+            preflight = subprocess.run(
+                cmd,
+                input=_PROVIDER_DAEMON_PREFLIGHT_CODE,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                env=env,
+                **popen_extra,
+            )
+            if _is_required_daemon_failure(preflight):
+                # Without strict mode, Browser Harness ensure_daemon() already
+                # performs one CDP health probe and self-heals a missing or
+                # stale daemon under the current provider endpoint. The
+                # bootstrap body is deliberately a no-op: an explicit
+                # restart_daemon()/ensure_daemon() here would rebind twice.
+                bootstrap_env = dict(env)
+                bootstrap_env.pop("BH_REQUIRE_EXISTING_DAEMON", None)
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise subprocess.TimeoutExpired(cmd, timeout)
+                bootstrap = subprocess.run(
+                    cmd,
+                    input=_PROVIDER_DAEMON_BOOTSTRAP_CODE,
+                    capture_output=True,
+                    text=True,
+                    timeout=remaining,
+                    env=bootstrap_env,
+                    **popen_extra,
+                )
+                if bootstrap.returncode != 0:
+                    proc = subprocess.CompletedProcess(
+                        bootstrap.args,
+                        bootstrap.returncode,
+                        bootstrap.stdout,
+                        "browser daemon bootstrap failed after required-daemon check:\n"
+                        + str(bootstrap.stderr or ""),
+                    )
+            elif preflight.returncode != 0:
+                proc = preflight
+
+        if proc is None:
+            command_timeout = timeout
+            if provider_browser:
+                command_timeout = deadline - time.monotonic()
+                if command_timeout <= 0:
+                    raise subprocess.TimeoutExpired(cmd, timeout)
+            proc = subprocess.run(
+                cmd,
+                input=code,
+                capture_output=True,
+                text=True,
+                timeout=command_timeout,
+                env=env,
+                **popen_extra,
+            )
     except subprocess.TimeoutExpired:
         return tool_error(
             f"browser-use exec timed out after {timeout}s. The daemon may "
