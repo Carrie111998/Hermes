@@ -6965,11 +6965,12 @@ def _run_with_fire_claim_heartbeat(job: dict, run) -> bool:
     claim = job.get("fire_claim")
     owner = str(claim.get("by") or "") if isinstance(claim, dict) else ""
     if not owner:
-        return run(None)
+        return run(None, None)
 
     job_id = str(job.get("id") or "")
     stop = threading.Event()
     lost_ownership = threading.Event()
+    heartbeat_uncertain = threading.Event()
     heartbeat_context = contextvars.copy_context()
 
     def _finish_unstarted(error: str) -> None:
@@ -7047,6 +7048,7 @@ def _run_with_fire_claim_heartbeat(job: dict, run) -> bool:
                     time.monotonic() - last_confirmed
                     >= _FIRE_CLAIM_HEARTBEAT_GRACE_SECONDS
                 ):
+                    heartbeat_uncertain.set()
                     lost_ownership.set()
                     logger.warning(
                         "Job '%s': fire_claim could not be renewed within %.1fs; "
@@ -7076,7 +7078,7 @@ def _run_with_fire_claim_heartbeat(job: dict, run) -> bool:
         return True
 
     try:
-        return run(lost_ownership)
+        return run(lost_ownership, heartbeat_uncertain)
     finally:
         stop.set()
         heartbeat_thread.join(timeout=1.0)
@@ -7131,7 +7133,7 @@ def run_one_job(
     try:
         return _run_with_fire_claim_heartbeat(
             job,
-            lambda lost_ownership: _run_one_job_body(
+            lambda lost_ownership, heartbeat_uncertain: _run_one_job_body(
                 job,
                 adapters=adapters,
                 loop=loop,
@@ -7142,6 +7144,8 @@ def run_one_job(
                     if cancel_event is not None
                     else lost_ownership
                 ),
+                fire_claim_uncertain=heartbeat_uncertain,
+                external_cancel_event=cancel_event,
                 execution_token=execution_token,
             ),
         )
@@ -7162,6 +7166,8 @@ def _run_one_job_body(
     verbose: bool = False,
     extra_prompt: Optional[str] = None,
     fire_claim_lost: Optional[_CancelEventLike] = None,
+    fire_claim_uncertain: Optional[_CancelEventLike] = None,
+    external_cancel_event: Optional[_CancelEventLike] = None,
     execution_token: Optional[object] = None,
 ) -> bool:
     claim = job.get("fire_claim")
@@ -7511,17 +7517,38 @@ def _run_one_job_body(
                 except FireFenceUnavailableError:
                     ownership_verdict = None
             if ownership_verdict is True:
-                mark_job_run(
-                    job["id"],
-                    False,
-                    "Interrupted by shutdown before terminal completion.",
-                    expected_fire_owner=fire_owner,
+                self_contention_recovered = (
+                    success
+                    and delivery_attempted
+                    and not side_effect_ownership_lost
+                    and fire_claim_uncertain is not None
+                    and fire_claim_uncertain.is_set()
+                    and not (
+                        external_cancel_event is not None
+                        and external_cancel_event.is_set()
+                    )
                 )
-                finish_execution(
-                    execution_id,
-                    success=False,
-                    error="Interrupted by shutdown before terminal completion.",
-                )
+                if self_contention_recovered:
+                    # The heartbeat exceeded grace only because THIS run held
+                    # the side-effect fence across its successful delivery.
+                    # Re-validating the same owner after delivery proves there
+                    # was no takeover; preserve the real outcome. A transport
+                    # cancellation, confirmed takeover, or fence refusal still
+                    # takes one of the fail-closed branches below.
+                    ownership_verdict = None
+                else:
+                    mark_job_run(
+                        job["id"],
+                        False,
+                        "Interrupted by shutdown before terminal completion.",
+                        expected_fire_owner=fire_owner,
+                    )
+                    finish_execution(
+                        execution_id,
+                        success=False,
+                        error="Interrupted by shutdown before terminal completion.",
+                    )
+                    return True
             elif ownership_verdict is False:
                 finish_execution(
                     execution_id,
