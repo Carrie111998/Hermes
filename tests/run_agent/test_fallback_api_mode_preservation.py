@@ -160,6 +160,59 @@ class TestOriginalUrlDetection:
         assert mock_rpc.call_args.kwargs["api_mode"] == "anthropic_messages"
 
 
+class TestHostMandatedRedetection:
+    def test_kimi_coding_provider_lands_on_anthropic_messages(self):
+        """A kimi-coding fallback entry resolves api.kimi.com/coding from
+        provider config, not the entry, so the pre-resolve hint check never
+        sees it. The /coding endpoint only speaks Anthropic Messages
+        (POST /coding/chat/completions returns HTTP 404), so post-resolve
+        re-detection must consult host_mandated_api_mode the same way agent
+        init does."""
+        fbs = [{"provider": "kimi-coding", "model": "kimi-k2.6", "api_key": "k"}]
+        agent = _make_agent(fallback_model=fbs)
+        _activate(agent, "https://api.kimi.com/coding", "kimi-k2.6")
+        assert agent.api_mode == "anthropic_messages"
+
+    def test_kimi_coding_base_url_entry_detected(self):
+        """Same endpoint spelled directly on the fallback entry."""
+        fbs = [{
+            "provider": "custom",
+            "model": "kimi-k2.6",
+            "base_url": "https://api.kimi.com/coding",
+            "api_key": "k",
+        }]
+        agent = _make_agent(fallback_model=fbs)
+        _activate(agent, "https://api.kimi.com/coding", "kimi-k2.6")
+        assert agent.api_mode == "anthropic_messages"
+
+    def test_explicit_api_mode_still_wins_over_host_mandate(self):
+        """The fallback path keeps the existing contract: an explicit
+        fb.api_mode is never clobbered, host mandate included."""
+        fbs = [{
+            "provider": "custom",
+            "model": "kimi-k2.6",
+            "base_url": "https://api.kimi.com/coding",
+            "api_key": "k",
+            "api_mode": "chat_completions",
+        }]
+        agent = _make_agent(fallback_model=fbs)
+        _activate(agent, "https://api.kimi.com/coding", "kimi-k2.6")
+        assert agent.api_mode == "chat_completions"
+
+    def test_plain_kimi_chat_host_not_mandated(self):
+        """api.kimi.com WITHOUT /coding is an ordinary OpenAI-compatible
+        surface — no mandate, stays chat_completions."""
+        fbs = [{
+            "provider": "custom",
+            "model": "kimi-k2.6",
+            "base_url": "https://api.kimi.com/v1",
+            "api_key": "k",
+        }]
+        agent = _make_agent(fallback_model=fbs)
+        _activate(agent, "https://api.kimi.com/v1", "kimi-k2.6")
+        assert agent.api_mode == "chat_completions"
+
+
 class TestPlainFallbackUnchanged:
     def test_plain_openrouter_fallback_stays_chat_completions(self):
         fbs = [{

@@ -2844,7 +2844,18 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
         _fb_is_azure = agent._is_azure_openai_url(fb_base_url)
 
         if not fb_api_mode_explicit and fb_api_mode == "chat_completions":
-            if fb_provider == "openai-codex":
+            from hermes_cli.providers import host_mandated_api_mode
+
+            _fb_mandated = host_mandated_api_mode(fb_base_url)
+            if _fb_mandated:
+                # Hosts that only speak one wire protocol (Kimi /coding →
+                # anthropic_messages, official OpenAI → codex_responses,
+                # Bedrock → bedrock_converse…) must be mapped here the same
+                # way agent init does, or a kimi-coding fallback entry 404s
+                # on every call (POST /coding/chat/completions) while the
+                # same provider works as a primary. (Fix 2026-08-15, carried.)
+                fb_api_mode = _fb_mandated
+            elif fb_provider == "openai-codex":
                 fb_api_mode = "codex_responses"
             elif fb_provider in {"nous", "nous-portal", "nousresearch"}:
                 # Portal is dual-wire: anthropic/* must land on /v1/messages.
