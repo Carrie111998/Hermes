@@ -558,7 +558,7 @@ class TestCheckForSkillUpdates:
         assert results[0]["name"] == "demo-skill"
         assert results[0]["status"] == "update_available"
 
-    def test_skips_bundle_fetch_when_immutable_revision_is_unchanged(self):
+    def test_skips_bundle_fetch_when_skill_tree_is_unchanged(self):
         lock = MagicMock()
         lock.list_installed.return_value = [{
             "name": "demo-skill",
@@ -571,8 +571,8 @@ class TestCheckForSkillUpdates:
 
         source = MagicMock(spec=SkillSource)
         source.source_id.return_value = "github"
-        source.current_revision.return_value = "abc123"
-        source.fetch.side_effect = AssertionError("unchanged revision must not fetch bundle")
+        source.is_revision_content_current.return_value = True
+        source.fetch.side_effect = AssertionError("unchanged skill tree must not fetch bundle")
 
         results = check_for_skill_updates(lock=lock, sources=[source])
 
@@ -586,7 +586,7 @@ class TestCheckForSkillUpdates:
         }]
         source.fetch.assert_not_called()
 
-    def test_fetches_bundle_when_immutable_revision_changed(self):
+    def test_fetches_bundle_when_skill_tree_changed(self):
         lock = MagicMock()
         lock.list_installed.return_value = [{
             "name": "demo-skill",
@@ -599,7 +599,7 @@ class TestCheckForSkillUpdates:
 
         source = MagicMock(spec=SkillSource)
         source.source_id.return_value = "github"
-        source.current_revision.return_value = "def456"
+        source.is_revision_content_current.return_value = False
         source.fetch.return_value = SkillBundle(
             name="demo-skill",
             files={"SKILL.md": "new content"},
@@ -612,6 +612,36 @@ class TestCheckForSkillUpdates:
 
         assert results[0]["status"] == "update_available"
         source.fetch.assert_called_once_with("owner/repo/demo-skill")
+
+    def test_github_revision_comparison_ignores_unrelated_tree_changes(self):
+        source = GitHubSource(auth=MagicMock(spec=GitHubAuth))
+        source._tree_cache["owner/repo"] = ("main", [
+            {"path": "skills/demo/SKILL.md", "type": "blob", "mode": "100644", "sha": "same"},
+            {"path": "skills/other/SKILL.md", "type": "blob", "mode": "100644", "sha": "new"},
+        ])
+        source._tree_revisions["owner/repo"] = "new-revision"
+        source._revision_tree_cache[("owner/repo", "old-revision")] = [
+            {"path": "skills/demo/SKILL.md", "type": "blob", "mode": "100644", "sha": "same"},
+            {"path": "skills/other/SKILL.md", "type": "blob", "mode": "100644", "sha": "old"},
+        ]
+
+        assert source.is_revision_content_current(
+            "owner/repo/skills/demo", "old-revision"
+        ) is True
+
+    def test_github_revision_comparison_detects_skill_tree_change(self):
+        source = GitHubSource(auth=MagicMock(spec=GitHubAuth))
+        source._tree_cache["owner/repo"] = ("main", [
+            {"path": "skills/demo/SKILL.md", "type": "blob", "mode": "100644", "sha": "new"},
+        ])
+        source._tree_revisions["owner/repo"] = "new-revision"
+        source._revision_tree_cache[("owner/repo", "old-revision")] = [
+            {"path": "skills/demo/SKILL.md", "type": "blob", "mode": "100644", "sha": "old"},
+        ]
+
+        assert source.is_revision_content_current(
+            "owner/repo/skills/demo", "old-revision"
+        ) is False
 
 
 class TestCreateSourceRouter:
