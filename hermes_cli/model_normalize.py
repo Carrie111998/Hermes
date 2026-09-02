@@ -73,6 +73,27 @@ _AGGREGATOR_PROVIDERS: frozenset[str] = frozenset({
     "kilocode",
 })
 
+# Vendor slugs the aggregator namespacing can stamp onto a model id (the
+# values of _VENDOR_PREFIXES, e.g. the `z-ai` of `z-ai/glm-5.2`). On a
+# native provider such a prefix is never a legal model name — only the bare
+# id is served — so _MATCHING_PREFIX_STRIP_PROVIDERS strips it (#93980).
+# Normalized to lowercase at construction so the ``.lower()`` membership
+# checks below stay correct even if a mixed-case slug is ever added here.
+_KNOWN_VENDOR_SLUGS: frozenset[str] = frozenset(
+    v.lower() for v in _VENDOR_PREFIXES.values()
+)
+
+# Providers where a `vendor/` prefix is (or may be) part of the *served*
+# model id, so the foreign-slug strip must never run: `nebius-token-factory`
+# natively serves `Qwen/Qwen3.5-…`-style catalog ids (stripping the slug
+# 404s), and a `custom` endpoint may front a proxy whose route requires the
+# slug. Both still repair their *own* provider alias via
+# _strip_matching_provider_prefix — only the foreign-slug strip is exempt.
+_VENDOR_SLUG_STRIP_EXEMPT_PROVIDERS: frozenset[str] = frozenset({
+    "custom",
+    "nebius-token-factory",
+})
+
 # Providers that want bare names with dots replaced by hyphens.
 _DOT_TO_HYPHEN_PROVIDERS: frozenset[str] = frozenset({
     "anthropic",
@@ -560,6 +581,31 @@ def normalize_model_for_provider(model_input: str, target_provider: str) -> str:
     # --- Direct providers: repair matching provider prefixes only ---
     if provider in _MATCHING_PREFIX_STRIP_PROVIDERS:
         result = _strip_matching_provider_prefix(name, provider)
+        # A foreign vendor slug can also arrive here: `glm-5.2` gains the
+        # `z-ai/` prefix when normalized for an aggregator (OpenRouter
+        # namespacing), and switching the provider later hands the
+        # prefixed form to a native API that only serves the bare id —
+        # ollama.com answers `z-ai/glm-5.2` with HTTP 404 (#93980).
+        # Strip the prefix only when it is a known vendor slug; other
+        # slash-bearing names keep passing through untouched, so a
+        # proxy-required routing prefix (e.g. LiteLLM's `ollama/glm-5.2`
+        # on a custom endpoint — see _strip_matching_provider_prefix)
+        # is never mangled.
+        #
+        # Scope decisions, deliberate: (a) exactly one slug level is
+        # stripped — a stacked id like `litellm/z-ai/glm-5.2` keeps its
+        # prefixes because a leftover prefix chain means the id came
+        # through a proxy route whose segments we cannot safely guess
+        # beyond the top-level vendor slug; (b) providers in
+        # _VENDOR_SLUG_STRIP_EXEMPT_PROVIDERS are skipped — a `custom`
+        # endpoint may *require* its own routing prefixes, and
+        # `nebius-token-factory` serves `vendor/model` catalog ids
+        # natively, so both stay strict passthroughs here (#93980 pins
+        # the custom case).
+        if "/" in result and provider not in _VENDOR_SLUG_STRIP_EXEMPT_PROVIDERS:
+            _prefix, _bare = result.split("/", 1)
+            if _bare.strip() and _prefix.strip().lower() in _KNOWN_VENDOR_SLUGS:
+                result = _bare.strip()
         # Some providers require lowercase model IDs (e.g. Xiaomi's API
         # rejects "MiMo-V2.5-Pro" but accepts "mimo-v2.5-pro").
         if provider in _LOWERCASE_MODEL_PROVIDERS:
