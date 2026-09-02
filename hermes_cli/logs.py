@@ -12,6 +12,8 @@ Usage examples::
     hermes logs gateway -n 100    # last 100 lines of gateway.log
     hermes logs gui -f            # follow gui.log (dashboard/pty/ws)
     hermes logs desktop -f        # follow desktop.log (Electron app boot/backend)
+    hermes logs update            # last 50 lines of update.log (hermes update mirror)
+    hermes logs handoff           # last 50 lines of desktop-update-handoff.log
     hermes logs --level WARNING    # only WARNING+ lines
     hermes logs --session abc123   # filter by session ID substring
     hermes logs --component tools  # only tool-related lines
@@ -35,6 +37,17 @@ LOG_FILES = {
     "gateway": "gateway.log",
     "gui": "gui.log",
     "desktop": "desktop.log",
+    # Full stdout/stderr mirror of the last `hermes update` runs (written by
+    # hermes_cli.main's _UpdateOutputStream; append-only across runs). When a
+    # Desktop-driven update fails at the Electron rebuild the ONLY artifacts
+    # holding the root cause are this file and the hand-off log below, so
+    # `hermes logs list` (a directory scan) showing them without readable
+    # keys was an inconsistency of its own.
+    "update": "update.log",
+    # Desktop-driven update hand-off (scripts/desktop-update/windows.ps1 +
+    # posix.sh): stage log including the `desktop --force-build --build-only`
+    # retry stderr.
+    "handoff": "desktop-update-handoff.log",
     # Every stdio MCP subprocess's stderr (tools/mcp_tool.py redirects it
     # here, with per-server session markers) — the "MCP output channel".
     "mcp": "mcp-stderr.log",
@@ -157,7 +170,8 @@ def tail_log(
     Parameters
     ----------
     log_name
-        Which log to read: ``"agent"``, ``"errors"``, ``"gateway"``, ``"gui"``.
+        Which log to read: ``"agent"``, ``"errors"``, ``"gateway"``, ``"gui"``,
+        ``"desktop"``, ``"update"``, ``"handoff"``.
     num_lines
         Number of recent lines to show (before follow starts).
     follow
