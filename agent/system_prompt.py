@@ -159,6 +159,32 @@ def _tui_embedded_pane_clarifier(hint: str) -> str:
     return hint + _TUI_EMBEDDED_PANE_CLARIFIER
 
 
+_GUIDANCE_TRUE_VALUES = {"true", "always", "yes", "on"}
+_GUIDANCE_FALSE_VALUES = {"false", "never", "no", "off"}
+
+
+def _guidance_config_enabled(value: Any, model: str, auto_patterns: tuple[str, ...]) -> bool:
+    """Resolve a guidance config value for one fixed session model.
+
+    ``auto`` is intentionally universal: guidance blocks are generic agentic
+    execution instructions, and newly added model families should not silently
+    miss them just because their name was not added to a hand-maintained tuple.
+    Explicit ``false`` and custom substring lists keep their historical
+    opt-out/targeting semantics. Unrecognised values retain the old curated
+    fallback for backwards compatibility.
+    """
+    if value is True or (isinstance(value, str) and value.lower() in _GUIDANCE_TRUE_VALUES):
+        return True
+    if value is False or (isinstance(value, str) and value.lower() in _GUIDANCE_FALSE_VALUES):
+        return False
+    model_lower = (model or "").lower()
+    if isinstance(value, list):
+        return any(p.lower() in model_lower for p in value if isinstance(p, str))
+    if isinstance(value, str) and value.lower() == "auto":
+        return True
+    return any(p in model_lower for p in auto_patterns)
+
+
 def _plugin_session_info(agent: Any) -> Dict[str, str]:
     """Return immutable-at-render-time metadata exposed to prompt sections."""
     try:
@@ -557,26 +583,18 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
         stable_parts.append(STEER_CHANNEL_NOTE)
 
     # Tool-use enforcement: tells the model to actually call tools instead
-    # of describing intended actions.  Controlled by config.yaml
+    # of describing intended actions. Controlled by config.yaml
     # agent.tool_use_enforcement:
-    #   "auto" (default) — matches TOOL_USE_ENFORCEMENT_MODELS
+    #   "auto" (default) — inject for every model with tools
     #   true  — always inject (all models)
     #   false — never inject
     #   list  — custom model-name substrings to match
     if agent.valid_tool_names:
-        _enforce = agent._tool_use_enforcement
-        _inject = False
-        if _enforce is True or (isinstance(_enforce, str) and _enforce.lower() in {"true", "always", "yes", "on"}):
-            _inject = True
-        elif _enforce is False or (isinstance(_enforce, str) and _enforce.lower() in {"false", "never", "no", "off"}):
-            _inject = False
-        elif isinstance(_enforce, list):
-            model_lower = (agent.model or "").lower()
-            _inject = any(p.lower() in model_lower for p in _enforce if isinstance(p, str))
-        else:
-            # "auto" or any unrecognised value — use hardcoded defaults
-            model_lower = (agent.model or "").lower()
-            _inject = any(p in model_lower for p in TOOL_USE_ENFORCEMENT_MODELS)
+        _inject = _guidance_config_enabled(
+            agent._tool_use_enforcement,
+            agent.model,
+            TOOL_USE_ENFORCEMENT_MODELS,
+        )
         if _inject:
             stable_parts.append(TOOL_USE_ENFORCEMENT_GUIDANCE)
             _model_lower = (agent.model or "").lower()
@@ -587,31 +605,20 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
 
     # Execution-discipline guidance (tool persistence, mandatory tool use
     # for arithmetic, external-write read-back, count reconciliation,
-    # literal preservation, verification-gated completion).  Historically
-    # nested inside the tool-use-enforcement branch and fenced to
-    # gpt/codex/grok; now an independent gate so DeepSeek/Kimi/Qwen-class
-    # models receive it even when tool_use_enforcement is off.  Controlled
-    # by config.yaml agent.execution_guidance:
-    #   "auto" (default) — matches EXECUTION_GUIDANCE_MODELS
+    # literal preservation, verification-gated completion). Controlled
+    # independently by config.yaml agent.execution_guidance:
+    #   "auto" (default) — inject for every model with tools
     #   true  — always inject (all models)
     #   false — never inject
     #   list  — custom model-name substrings to match
     # Resolved once at session start keyed on the (fixed) model name, so
     # the system prompt stays byte-stable for the life of the conversation.
     if agent.valid_tool_names:
-        _exec_guidance = getattr(agent, "_execution_guidance", "auto")
-        _exec_inject = False
-        if _exec_guidance is True or (isinstance(_exec_guidance, str) and _exec_guidance.lower() in {"true", "always", "yes", "on"}):
-            _exec_inject = True
-        elif _exec_guidance is False or (isinstance(_exec_guidance, str) and _exec_guidance.lower() in {"false", "never", "no", "off"}):
-            _exec_inject = False
-        elif isinstance(_exec_guidance, list):
-            model_lower = (agent.model or "").lower()
-            _exec_inject = any(p.lower() in model_lower for p in _exec_guidance if isinstance(p, str))
-        else:
-            # "auto" or any unrecognised value — use hardcoded defaults
-            model_lower = (agent.model or "").lower()
-            _exec_inject = any(p in model_lower for p in EXECUTION_GUIDANCE_MODELS)
+        _exec_inject = _guidance_config_enabled(
+            getattr(agent, "_execution_guidance", "auto"),
+            agent.model,
+            EXECUTION_GUIDANCE_MODELS,
+        )
         if _exec_inject:
             from agent.prompt_builder import execution_guidance_text
             stable_parts.append(execution_guidance_text(agent.valid_tool_names))
