@@ -548,6 +548,34 @@ class GatewayAuthorizationMixin:
         ):
             return True
 
+        # Telegram Business customers are intentionally not part of the bot's
+        # operator allowlist. Admit only the in-process proof stamped by the
+        # plugin after its fail-closed business policy checks, and re-bind that
+        # proof to the live adapter config plus isolated connection scope. The
+        # marker is wire/persistence-invisible on SessionSource.
+        if (
+            allow_adapter_delegation
+            and source.platform == Platform.TELEGRAM
+            and getattr(source, "authorized_via_telegram_business", False) is True
+            and str(getattr(source, "scope_id", "") or "").startswith(
+                "telegram-business:"
+            )
+            and source.chat_type == "dm"
+            and source.chat_id
+        ):
+            try:
+                adapter = self._adapter_for_source(source)
+                cfg = adapter._business_config() if adapter is not None else {}
+                allowed_chats = set(cfg.get("allowed_chats") or ())
+                if (
+                    cfg.get("enabled") is True
+                    and bool(cfg.get("trigger_words"))
+                    and (not allowed_chats or str(source.chat_id) in allowed_chats)
+                ):
+                    return True
+            except Exception:
+                pass
+
         user_id = source.user_id
 
         # Telegram (and similar) authorize entire group/forum/channel chats

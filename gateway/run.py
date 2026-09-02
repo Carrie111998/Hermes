@@ -18231,6 +18231,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return await self._handle_loop_command(event)
         return "Agent is running — use /loop status / pause / stop mid-run, or /stop before setting a new loop."
 
+    @staticmethod
+    def _gateway_command_for_event(event: MessageEvent) -> Optional[str]:
+        """Return a slash command only when the event owns control authority."""
+        if getattr(event, "allow_gateway_control", True) is not True:
+            return None
+        return event.get_command()
+
     async def _handle_message(self, event: MessageEvent) -> Optional[str]:
         """
         Handle an incoming message from any platform.
@@ -19054,8 +19061,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # which is read by _run_agent. Removed to prevent unbounded growth.
             return None
 
-        # Check for commands
-        command = event.get_command()
+        # Events admitted by a restricted delegated transport may converse but
+        # must never acquire gateway lifecycle/control authority through slash
+        # text. Keep the literal text for the agent instead of dispatching it.
+        command = self._gateway_command_for_event(event)
 
         from hermes_cli.commands import (
             GATEWAY_KNOWN_COMMANDS,
@@ -22625,6 +22634,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 inbound_message_id=(
                     str(event.message_id) if event.message_id else None
                 ),
+                event_metadata=event.metadata,
                 channel_prompt=event.channel_prompt,
                 moa_config=getattr(event, "_moa_config", None),
                 persist_user_message=persist_user_message,
@@ -22647,7 +22657,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     await _typing_adapter._stop_typing_with_metadata(
                         source.chat_id,
                         self._thread_metadata_for_source(
-                            source, self._reply_anchor_for_event(event)
+                            source,
+                            self._reply_anchor_for_event(event),
+                            event.metadata,
                         ),
                     )
                 elif _typing_adapter and callable(_stop_typing):
@@ -23226,7 +23238,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _media_adapter = self._adapter_for_source(source)
                     if _media_adapter:
                         await self._deliver_media_from_response(
-                            response, event, _media_adapter,
+                            response,
+                            event,
+                            _media_adapter,
                         )
                 # Streaming already delivered the body text, but the footer was
                 # intentionally held back (see the `not already_sent` gate above).
@@ -23239,7 +23253,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             await _foot_adapter.send(
                                 source.chat_id,
                                 _footer_line,
-                                metadata=self._thread_metadata_for_source(source, self._reply_anchor_for_event(event)),
+                                metadata=self._thread_metadata_for_source(
+                                    source,
+                                    self._reply_anchor_for_event(event),
+                                    event.metadata,
+                                ),
                             )
                     except Exception as _e:
                         logger.debug("trailing footer send failed: %s", _e)
@@ -23268,7 +23286,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     await _err_adapter._stop_typing_with_metadata(
                         source.chat_id,
                         self._thread_metadata_for_source(
-                            source, self._reply_anchor_for_event(event)
+                            source,
+                            self._reply_anchor_for_event(event),
+                            event.metadata,
                         ),
                     )
                 elif _err_adapter and callable(_stop_typing):
@@ -24599,7 +24619,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 and is_in_voice_channel(guild_id)
             )
             reply_anchor = self._reply_anchor_for_event(event)
-            thread_meta = self._thread_metadata_for_source(event.source, reply_anchor)
+            thread_meta = self._thread_metadata_for_source(
+                event.source, reply_anchor, event.metadata
+            )
             if not in_voice_channel and callable(send_voice):
                 # Mark the auto voice reply as notify-worthy.  Mirrors the
                 # final-text path in gateway/platforms/base.py which sets
@@ -24693,6 +24715,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 else self._thread_metadata_for_source(
                     event.source,
                     self._reply_anchor_for_event(event),
+                    event.metadata,
                 )
             )
 
@@ -26132,6 +26155,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self,
         source,
         reply_to_message_id: Optional[str] = None,
+        event_metadata: Optional[Dict[str, Any]] = None,
     ) -> Optional[Dict[str, Any]]:
         """Build the metadata dict platforms need for thread-aware replies."""
         metadata = self._thread_metadata_for_target(
@@ -26163,6 +26187,26 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     metadata.setdefault("scope_id", str(team_id))
                 if user_id:
                     metadata.setdefault("user_id", str(user_id))
+        if getattr(source, "platform", None) == Platform.TELEGRAM:
+            # Send-as-account authority is per trusted inbound event, not
+            # durable session state. Propagate it only while the event's
+            # connection id still matches the isolated Business scope.
+            business_connection_id = str(
+                (event_metadata or {}).get("business_connection_id") or ""
+            ).strip()
+            if (
+                (event_metadata or {}).get("allow_business_send_as_account") is True
+                and business_connection_id
+                and str(getattr(source, "scope_id", "") or "")
+                == f"telegram-business:{business_connection_id}"
+            ):
+                metadata = dict(metadata or {})
+                metadata.update(
+                    {
+                        "allow_business_send_as_account": True,
+                        "business_connection_id": business_connection_id,
+                    }
+                )
         return metadata
 
     def _thread_metadata_for_target(
@@ -30168,6 +30212,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         session_key: str = None,
         run_generation: Optional[int] = None,
         event_message_id: Optional[str] = None,
+        event_metadata: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Forward the message to a remote Hermes API server instead of
         running a local AIAgent.
@@ -30274,7 +30319,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             else bool(_plat_streaming)
         )
 
-        _thread_metadata: Optional[Dict[str, Any]] = self._thread_metadata_for_source(source, event_message_id)
+        _thread_metadata: Optional[Dict[str, Any]] = self._thread_metadata_for_source(
+            source, event_message_id, event_metadata
+        )
 
         if _streaming_enabled:
             try:
@@ -30455,6 +30502,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         _interrupt_depth: int = 0,
         event_message_id: Optional[str] = None,
         inbound_message_id: Optional[str] = None,
+        event_metadata: Optional[Dict[str, Any]] = None,
         channel_prompt: Optional[str] = None,
         moa_config: Optional[dict] = None,
         persist_user_message: Optional[Any] = None,
@@ -30477,6 +30525,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 session_key=session_key, run_generation=run_generation,
                 _interrupt_depth=_interrupt_depth, event_message_id=event_message_id,
                 inbound_message_id=inbound_message_id,
+                event_metadata=event_metadata,
                 channel_prompt=channel_prompt, moa_config=moa_config,
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
@@ -30491,6 +30540,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 session_key=session_key, run_generation=run_generation,
                 _interrupt_depth=_interrupt_depth, event_message_id=event_message_id,
                 inbound_message_id=inbound_message_id,
+                event_metadata=event_metadata,
                 channel_prompt=channel_prompt, moa_config=moa_config,
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
@@ -30634,6 +30684,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         _interrupt_depth: int = 0,
         event_message_id: Optional[str] = None,
         inbound_message_id: Optional[str] = None,
+        event_metadata: Optional[Dict[str, Any]] = None,
         channel_prompt: Optional[str] = None,
         moa_config: Optional[dict] = None,
         persist_user_message: Optional[Any] = None,
@@ -30664,6 +30715,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 session_key=session_key,
                 run_generation=run_generation,
                 event_message_id=event_message_id,
+                event_metadata=event_metadata,
             )
 
         from run_agent import AIAgent
@@ -31035,7 +31087,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             else None
         )
         _progress_metadata = (
-            self._thread_metadata_for_source(source, event_message_id)
+            self._thread_metadata_for_source(
+                source, event_message_id, event_metadata
+            )
             if _progress_thread_id == source.thread_id
             else self._thread_metadata_for_target(
                 source.platform,
@@ -31185,7 +31239,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             }
         else:
             _status_thread_metadata = (
-                self._thread_metadata_for_source(source, event_message_id)
+                self._thread_metadata_for_source(
+                    source, event_message_id, event_metadata
+                )
                 if _progress_thread_id == source.thread_id
                 else self._thread_metadata_for_target(
                     source.platform,
@@ -32200,6 +32256,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     run_generation=run_generation,
                     _interrupt_depth=_interrupt_depth + 1,
                     event_message_id=next_message_id,
+                    event_metadata=getattr(pending_event, "metadata", None),
                     channel_prompt=next_channel_prompt,
                     message_type=next_message_type,
                 )
