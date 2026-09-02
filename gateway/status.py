@@ -1016,8 +1016,13 @@ def _pid_exists(pid: int) -> bool:
                 )
                 if r.returncode == 0 and r.stdout.strip().startswith("Z"):
                     return False
-            except Exception:
-                pass
+            except Exception as exc:
+                # If we cannot determine zombie state, treat as dead rather
+                # than silently falling through to os.kill(), which cannot
+                # detect zombies on POSIX. A false "alive" here causes
+                # --replace to wait forever on a reaped PID.
+                logger.debug("zombie check failed for pid %s: %s", pid, exc)
+                return False
         except (IndexError, PermissionError, OSError):
             pass
         try:
