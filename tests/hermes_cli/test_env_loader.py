@@ -463,16 +463,16 @@ def test_export_prefixed_known_key_in_user_env_is_kept(tmp_path, monkeypatch):
     assert os.getenv("HERMES_ACP_AUTH_METHOD") == "claude_code_cli"
 
 
-def test_shell_exported_credentials_survive_cleanup(tmp_path, monkeypatch):
+def test_shell_exported_credentials_survive_cleanup(tmp_path, monkeypatch, caplog):
     """User-shell-exported provider credentials must NOT be scrubbed.
 
     ``export OPENAI_API_KEY=…`` in the shell with a ``.env`` that doesn't
     contain the key is a documented, legitimate flow (see
     test_dump_env_visibility.py). The startup cleanup is scoped to
-    _PROFILE_MANAGED_ENV_KEYS (ACP routing keys) precisely so it can never
-    delete shell-supplied credentials — a process cannot distinguish a
-    shell export from parent-process leakage, so credential isolation is
-    owned by read-time secret scoping instead.
+    _PROFILE_MANAGED_ENV_KEYS (ACP routing keys and profile exposure keys)
+    precisely so it can never delete shell-supplied credentials — a process
+    cannot distinguish a shell export from parent-process leakage, so
+    credential isolation is owned by read-time secret scoping instead.
     """
     home = tmp_path / "hermes"
     home.mkdir()
@@ -481,15 +481,21 @@ def test_shell_exported_credentials_survive_cleanup(tmp_path, monkeypatch):
     monkeypatch.setenv("OPENAI_API_KEY", "sk-from-shell")
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-from-shell")
     monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "12345:token-from-shell")
-    # A profile-managed routing key inherited alongside them IS cleared.
+    # Profile-managed keys inherited alongside them ARE cleared and logged.
     monkeypatch.setenv("HERMES_ACP_AUTH_METHOD", "cursor_login")
+    monkeypatch.setenv("HERMES_DASHBOARD_PUBLIC_URL", "http://mini.tailcf05f.ts.net:9119")
 
-    load_hermes_dotenv(hermes_home=home)
+    import logging
+    with caplog.at_level(logging.INFO):
+        load_hermes_dotenv(hermes_home=home)
 
     assert os.getenv("OPENAI_API_KEY") == "sk-from-shell"
     assert os.getenv("ANTHROPIC_API_KEY") == "sk-ant-from-shell"
     assert os.getenv("TELEGRAM_BOT_TOKEN") == "12345:token-from-shell"
     assert "HERMES_ACP_AUTH_METHOD" not in os.environ
+    assert "HERMES_DASHBOARD_PUBLIC_URL" not in os.environ
+    assert "Cleared inherited HERMES_DASHBOARD_PUBLIC_URL='http://mini.tailcf05f.ts.net:9119'" in caplog.text
+    assert "Cleared inherited HERMES_ACP_AUTH_METHOD='cursor_login'" in caplog.text
 
 
 def test_cleanup_scope_is_the_profile_managed_set():

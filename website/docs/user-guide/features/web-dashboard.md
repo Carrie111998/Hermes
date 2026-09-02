@@ -989,8 +989,10 @@ Same precedence as the other dashboard settings — env wins over `config.yaml`:
 
 | Surface | Override path | When to use |
 |---------|---------------|-------------|
-| `dashboard.public_url` in `config.yaml` | `HERMES_DASHBOARD_PUBLIC_URL` | Local dev / on-prem (canonical) |
-| `HERMES_DASHBOARD_PUBLIC_URL` env var | — | Hosting-platform secrets / CI |
+| `dashboard.public_url` in `config.yaml` | `HERMES_DASHBOARD_PUBLIC_URL` (in `.env`) | Local dev / on-prem (canonical) |
+| `HERMES_DASHBOARD_PUBLIC_URL` in `.env` | — | Per-profile env / hosting-platform secrets / CI |
+
+> **Profile isolation note:** `HERMES_DASHBOARD_PUBLIC_URL` is profile-managed. To prevent unintended cross-profile leakage (such as forcing authentication on loopback desktop instances), inherited parent shell exports are cleared on startup unless explicitly declared in that profile's `.env` or in `config.yaml`. Ensure it is placed in your profile's `~/.hermes/.env` or `config.yaml`.
 | (unset) | — | Default — reconstruct from `X-Forwarded-*` headers |
 
 Validation rejects values without `http://` / `https://` scheme, without a host, or containing quote / angle / whitespace / control characters. A malformed value silently falls through to header reconstruction so the login flow keeps working rather than dispatching the user to a hostile URL.
