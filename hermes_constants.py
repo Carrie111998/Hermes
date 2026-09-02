@@ -9,6 +9,7 @@ import shutil
 import stat
 import sys
 import sysconfig
+import tempfile
 from contextvars import ContextVar, Token
 from pathlib import Path
 
@@ -742,7 +743,7 @@ def get_real_home(env: dict[str, str] | None = None) -> str:
         seen.add(key)
         if not _is_profile_home(candidate, profile_home):
             return candidate
-    return "/tmp"
+    return get_effective_temp_dir()
 
 
 def get_subprocess_home(env: dict[str, str] | None = None) -> str | None:
@@ -974,6 +975,44 @@ def apply_ipv4_preference(force: bool = False) -> None:
 
     _ipv4_getaddrinfo._hermes_ipv4_patched = True  # type: ignore[attr-defined]
     socket.getaddrinfo = _ipv4_getaddrinfo  # type: ignore[assignment]
+
+
+def get_effective_temp_dir() -> str:
+    """Return a writable temp directory, handling platform quirks.
+
+    Termux/Android has no ``/tmp`` — ``TMPDIR`` is the portable location.
+    Windows needs a space-free path that resolves in both Git Bash and native
+    Python.  On regular POSIX systems, ``/tmp`` is fine.
+
+    Used by tools that need a temp path on the **host** (e.g. default args,
+    fallback paths). NOT for sandbox-internal paths — sandboxes should use /tmp
+    unless they have their own platform detection.
+    """
+    if sys.platform == "win32":
+        try:
+            cache_dir = get_hermes_home() / "cache" / "terminal"
+        except Exception:
+            cache_dir = Path(tempfile.gettempdir()) / "hermes_terminal"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        return str(cache_dir).replace("\\", "/")
+
+    # Prefer POSIX-style env vars (TMPDIR is set on Termux to a writable path)
+    for env_var in ("TMPDIR", "TMP", "TEMP"):
+        candidate = os.environ.get(env_var)
+        if candidate and candidate.startswith("/"):
+            return candidate.rstrip("/") or "/"
+
+    # Fall back to /tmp if it exists and is writable
+    if os.path.isdir("/tmp") and os.access("/tmp", os.W_OK | os.X_OK):
+        return "/tmp"
+
+    # Last resort: use tempfile.gettempdir() without recursing into this function
+    candidate = tempfile.gettempdir()
+    if candidate.startswith("/"):
+        return candidate.rstrip("/") or "/"
+
+    # Absolute last resort (should never hit on POSIX/Windows)
+    return "/tmp"
 
 
 # ─── Streaming Response Constants ────────────────────────────────────────────
