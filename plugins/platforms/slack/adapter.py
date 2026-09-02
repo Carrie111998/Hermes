@@ -157,8 +157,14 @@ def _slack_response_payload(response: Any) -> Dict[str, Any]:
     return data if isinstance(data, dict) else {}
 
 
+#: Slack ``<!…>`` tokens that notify a group of people rather than one user.
+#: ``everyone``/``channel``/``here`` broadcast the room; ``subteam^S…`` pings a
+#: named usergroup, which is just as real a notification and is attacker-chosen
+#: when it arrives via a display name the model echoes back (see
+#: ``neutralize_untrusted_envelope_field``). Escaped on the way out so model
+#: output can never fire one by default.
 _SLACK_SPECIAL_MENTION_RE = re.compile(
-    r"<!(?:everyone|channel|here)(?:\|[^>\n]*)?>", re.IGNORECASE
+    r"<!(?:everyone|channel|here|subteam\^[A-Z0-9]+)(?:\|[^>\n]*)?>", re.IGNORECASE
 )
 
 # Cap on how many thread-root images are downloaded and delivered when the

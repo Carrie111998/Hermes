@@ -2688,6 +2688,28 @@ class TestFormatMessage:
         """<!everyone> broadcast mention is displayed literally."""
         assert adapter.format_message("Hey <!everyone>") == "Hey &lt;!everyone&gt;"
 
+    def test_subteam_mention_escaped(self, adapter):
+        """<!subteam^S…> pings a whole usergroup — escape it like <!here>.
+
+        The shared-session sender envelope hands the model a display name the
+        gateway vouches for, and #17916 exists so the model can mention that
+        sender back. A participant whose display name carries usergroup syntax
+        therefore turns an echoed name into a real attacker-chosen group ping
+        unless the outbound formatter escapes it too.
+        """
+        result = adapter.format_message("Ping <!subteam^S0BOSS>")
+        assert result == "Ping &lt;!subteam^S0BOSS&gt;"
+        assert "<!subteam" not in result
+
+    def test_subteam_mention_with_label_escaped(self, adapter):
+        result = adapter.format_message("Ping <!subteam^S0BOSS|@oncall>")
+        assert result == "Ping &lt;!subteam^S0BOSS|@oncall&gt;"
+        assert "<!subteam" not in result
+
+    def test_user_mention_preserved(self, adapter):
+        """A real, gateway-supplied user mention must still resolve."""
+        assert adapter.format_message("Hi <@U123>") == "Hi <@U123>"
+
 
     # --- Additional edge cases ---
 

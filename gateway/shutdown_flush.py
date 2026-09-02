@@ -28,13 +28,18 @@ from __future__ import annotations
 import itertools
 import json
 import logging
+import math
 import os
+import threading
 import time
 import uuid
 from pathlib import Path
 from typing import Any, Dict, Optional
 
 logger = logging.getLogger(__name__)
+
+_write_order_lock = threading.Lock()
+_last_write_order = 0
 
 
 def _get_flush_dir():
@@ -59,15 +64,24 @@ def _fsync_directory(path: Path) -> None:
         os.close(directory_fd)
 
 
+def _next_write_order() -> int:
+    """Return a process-monotonic file order, even if the clock stalls."""
+    global _last_write_order
+    with _write_order_lock:
+        _last_write_order = max(time.time_ns(), _last_write_order + 1)
+        return _last_write_order
+
+
 def _write_payload(flush_dir: Path, payload: Dict[str, Any]) -> Path:
-    """Atomically write one private, uniquely named recovery payload.
+    """Atomically write one private, uniquely named ordered recovery payload.
 
     Returns the path of the published payload file.
     """
     from utils import atomic_json_write
 
+    order = _next_write_order()
     file_id = uuid.uuid4().hex
-    final_path = flush_dir / f"pending-{file_id}.json"
+    final_path = flush_dir / f"pending-{order:020d}-{file_id}.json"
     atomic_json_write(
         final_path,
         payload,
@@ -88,6 +102,7 @@ def flush_pending_to_file(
     pending: Dict[str, Any],
     *,
     reason: str = "shutdown",
+    session_ids: Optional[Dict[str, str]] = None,
 ) -> int:
     """Serialise non-empty ``_pending_messages`` slots to disk.
 
@@ -118,6 +133,9 @@ def flush_pending_to_file(
             serialised = _serialise_value(value)
             if serialised is None:
                 continue
+            session_id = (session_ids or {}).get(session_key)
+            if session_id:
+                serialised.setdefault("session_id", session_id)
             _write_payload(
                 flush_dir,
                 {
@@ -138,6 +156,61 @@ def flush_pending_to_file(
         logger.info(
             "Flushed %d pending message(s) to %s (reason=%s)",
             flushed, flush_dir, reason,
+        )
+    return flushed
+
+
+def flush_queued_events_to_file(
+    queued: Dict[str, Any],
+    *,
+    reason: str = "shutdown_queued",
+    session_ids: Optional[Dict[str, str]] = None,
+) -> int:
+    """Serialise every runner FIFO event without collapsing a session's tail.
+
+    ``SessionState.conversation.queued_events`` stores a list per session, while
+    :func:`flush_pending_to_file` stores one value per mapping key.  Write each
+    queued turn as its own payload so shutdown preserves both FIFO order and
+    the original session key for operator recovery.
+    """
+    if not queued:
+        return 0
+
+    flush_dir = _get_flush_dir()
+    ts = int(time.time())
+    flushed = 0
+    for session_key, events in list(queued.items()):
+        for value in list(events or []):
+            try:
+                serialised = _serialise_value(value)
+                if serialised is None:
+                    continue
+                session_id = (session_ids or {}).get(session_key)
+                if session_id:
+                    serialised.setdefault("session_id", session_id)
+                _write_payload(
+                    flush_dir,
+                    {
+                        "session_key": session_key,
+                        "reason": reason,
+                        "ts": ts,
+                        "data": serialised,
+                    },
+                )
+                flushed += 1
+            except Exception as exc:
+                logger.debug(
+                    "Failed to flush queued event for %s: %s",
+                    session_key,
+                    exc,
+                )
+
+    if flushed:
+        logger.info(
+            "Flushed %d queued event(s) to %s (reason=%s)",
+            flushed,
+            flush_dir,
+            reason,
         )
     return flushed
 
@@ -259,9 +332,29 @@ def _serialise_value(value: Any) -> Optional[dict]:
     # MessageEvent objects have a .text attribute and other fields
     if hasattr(value, "text"):
         result: Dict[str, Any] = {"text": getattr(value, "text", "")}
+        source = getattr(value, "source", None)
+        if source is not None:
+            try:
+                source_value = source.to_dict()
+                json.dumps(source_value)
+                result["source"] = source_value
+            except (AttributeError, TypeError, ValueError):
+                logger.debug("Could not serialise pending message source", exc_info=True)
         # Preserve additional fields if present
-        for attr in ("session_id", "platform", "sender_id", "sender_name",
-                      "reply_to", "media", "raw_event"):
+        for attr in (
+            "session_id",
+            "platform",
+            "sender_id",
+            "sender_name",
+            "message_id",
+            "message_type",
+            "reply_to",
+            "reply_to_message_id",
+            "media",
+            "media_urls",
+            "media_types",
+            "raw_event",
+        ):
             val = getattr(value, attr, None)
             if val is not None:
                 try:
@@ -281,6 +374,43 @@ def _serialise_value(value: Any) -> Optional[dict]:
         except (TypeError, ValueError):
             return {"text": str(value)}
     return {"text": str(value)}
+
+
+def _recovery_file_sort_key(path: Path) -> tuple[float, int, str]:
+    """Order legacy and ordered files using persisted chronology when available.
+
+    Legacy ``pending-<uuid>.json`` names carry no sequence.  Payload timestamps
+    establish cross-version order; ordered filenames provide their durable
+    same-timestamp sequence while legacy files fall back to mtime.  The name is
+    only the conservative final fallback when order is otherwise unknowable.
+    """
+    try:
+        mtime_ns = path.stat().st_mtime_ns
+    except OSError:
+        mtime_ns = 0
+    timestamp = mtime_ns / 1_000_000_000
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        raw_timestamp = payload.get("ts") if isinstance(payload, dict) else None
+        if isinstance(raw_timestamp, (int, float)):
+            try:
+                candidate = float(raw_timestamp)
+            except OverflowError:
+                candidate = math.nan
+            if math.isfinite(candidate):
+                timestamp = candidate
+    except (OSError, ValueError, TypeError):
+        pass
+
+    ordered_sequence = None
+    name_parts = path.stem.split("-")
+    if len(name_parts) == 3 and name_parts[0] == "pending":
+        try:
+            ordered_sequence = int(name_parts[1])
+        except ValueError:
+            pass
+    tie_breaker = ordered_sequence if ordered_sequence is not None else mtime_ns
+    return timestamp, tie_breaker, path.name
 
 
 def recover_pending_to_db(
@@ -305,7 +435,7 @@ def recover_pending_to_db(
         Number of messages recovered.
     """
     flush_dir = _get_flush_dir()
-    flush_files = sorted(flush_dir.glob("*.json"))
+    flush_files = sorted(flush_dir.glob("*.json"), key=_recovery_file_sort_key)
     if not flush_files:
         return 0
 
@@ -326,7 +456,9 @@ def recover_pending_to_db(
             pass
 
     recovered = 0
+    blocked_session_keys: set[str] = set()
     for path in flush_files:
+        session_key = ""
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
             # Agent-history snapshots use a different schema (reason +
@@ -358,6 +490,8 @@ def recover_pending_to_db(
                 path.unlink(missing_ok=True)
                 continue
             session_key = payload.get("session_key", "")
+            if session_key in blocked_session_keys:
+                continue
             data = payload.get("data", {})
             text = data.get("text", "")
             if not text or not session_key:
@@ -366,6 +500,8 @@ def recover_pending_to_db(
                     "the flush file has been preserved",
                     path,
                 )
+                if session_key:
+                    blocked_session_keys.add(session_key)
                 continue
 
             # The session_key is a gateway routing key (e.g.
@@ -388,6 +524,7 @@ def recover_pending_to_db(
                     "preserved in %s",
                     session_key, path,
                 )
+                blocked_session_keys.add(session_key)
                 continue
 
             session_db.append_message(
@@ -398,16 +535,18 @@ def recover_pending_to_db(
             )
             recovered += 1
             path.unlink(missing_ok=True)
-        except BaseException:
-            # Shutdown cancellation/interrupt must not strand an owned DB.
-            _close_owned_db()
-            raise
         except Exception as exc:
             logger.warning(
                 "Failed to recover pending message from %s: %s",
                 path, exc,
             )
             # Leave the file for next startup retry.
+            if session_key:
+                blocked_session_keys.add(session_key)
+        except BaseException:
+            # Shutdown cancellation/interrupt must not strand an owned DB.
+            _close_owned_db()
+            raise
 
     _close_owned_db()
 

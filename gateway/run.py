@@ -1808,6 +1808,291 @@ def _message_timestamps_enabled(user_config: Optional[dict]) -> bool:
     return bool(mt)
 
 
+#: Every code point Python's ``str.splitlines`` treats as a line break, minus
+#: ``\n`` itself. ``re.MULTILINE`` recognizes ONLY ``\n``, so a line-anchored
+#: pattern silently misses a forgery introduced by any of these — a one-byte
+#: separator swap that is invisible in most chat clients.
+_ENVELOPE_LINE_BREAKS = "\r\v\f\x1c\x1d\x1e\x85\u2028\u2029"
+
+#: Reference matcher retained for sanitizer diagnostics. The production strip
+#: uses the bounded scanner below; this still describes one complete envelope
+#: anywhere in a turn, with ``[^\]\n]*`` preventing it from swallowing later
+#: text.
+_VERIFIED_SENDER_ENVELOPE_RE = re.compile(
+    r"(?:[^\S\n]*\[Verified sender:[^\]\n]*\][^\S\n]*)+"
+)
+
+#: A bare envelope OPENER with no closing bracket of its own. Harmless in
+#: isolation, but this module's own formatting supplies the missing bracket:
+#: the reply-quote wrapper closes with ``"]``, so an untrusted fragment that
+#: ends mid-envelope is completed into a valid one by us. Half a forgery plus
+#: our own punctuation is still a forgery, so the opener is defanged.
+_VERIFIED_SENDER_OPENER_RE = re.compile(r"\[(?=Verified sender:)")
+
+#: Fullwidth look-alikes of the envelope's structural characters, folded to
+#: their ASCII form for MATCHING ONLY. ``neutralize_untrusted_envelope_field``
+#: already treats ``［］｜`` as equivalent to ``[]|`` on the grounds that the
+#: envelope is judged by a *reader*, not a parser; an ASCII-only body pattern
+#: contradicts the other half of that same threat model. Every entry is a
+#: single code point mapped to a single code point, so folding preserves string
+#: length and match offsets index the ORIGINAL text — which is what lets the
+#: strip delete exactly the forged span and leave benign text byte-identical.
+_ENVELOPE_LOOKALIKE_FOLD = str.maketrans(
+    {"［": "[", "］": "]", "｜": "|", "：": ":"}
+)
+
+#: The folded token every guarded shape must contain. Reader-equivalent marker
+#: whitespace is omitted here so the streaming matcher accepts the canonical
+#: space, duplicates, substitutions, and deletion in both the early-out and
+#: reduction paths. Match offsets still point into the original text.
+_VERIFIED_SENDER_MARKER = "[Verifiedsender:"
+
+
+def _envelope_marker_failures() -> tuple:
+    """Build the prefix fallback table for the fixed envelope marker."""
+    failures = [0] * len(_VERIFIED_SENDER_MARKER)
+    matched = 0
+    for index in range(1, len(_VERIFIED_SENDER_MARKER)):
+        while (
+            matched
+            and _VERIFIED_SENDER_MARKER[index] != _VERIFIED_SENDER_MARKER[matched]
+        ):
+            matched = failures[matched - 1]
+        if _VERIFIED_SENDER_MARKER[index] == _VERIFIED_SENDER_MARKER[matched]:
+            matched += 1
+        failures[index] = matched
+    return tuple(failures)
+
+
+_VERIFIED_SENDER_MARKER_FAILURES = _envelope_marker_failures()
+
+
+def _fold_envelope_match_character(character: str) -> Optional[str]:
+    """Fold one reader-equivalent marker character for matching only."""
+    if is_default_ignorable_character(character):
+        return None
+    if is_unicode_space_separator(character):
+        return " "
+    return character.translate(_ENVELOPE_LOOKALIKE_FOLD)
+
+
+def _iter_verified_sender_marker_starts(
+    text: str, *, reset_at_line_breaks: bool = True
+):
+    """Yield original offsets of look-alike/ignorable-tolerant markers."""
+    marker_state = 0
+    marker_start: Optional[int] = None
+    marker_length = len(_VERIFIED_SENDER_MARKER)
+    for original_index, original_character in enumerate(text):
+        # Newline-like Cc whitespace is reader-equivalent to a break, not an
+        # inline gap. Reset before folding so an envelope marker can never
+        # straddle a rendered line boundary. The production reduction applies
+        # the same rule after normalizing _ENVELOPE_LINE_BREAKS to ``\n``.
+        if original_character == "\n":
+            marker_state = 0
+            marker_start = None
+            continue
+        if reset_at_line_breaks and original_character in _ENVELOPE_LINE_BREAKS:
+            marker_state = 0
+            marker_start = None
+            continue
+        folded_character = _fold_envelope_match_character(original_character)
+        if folded_character is None:
+            continue
+        if (
+            folded_character == " "
+            and marker_state
+            and marker_state < marker_length
+            and _VERIFIED_SENDER_MARKER[marker_state] != " "
+        ):
+            continue
+        while marker_state and (
+            marker_state == marker_length
+            or folded_character != _VERIFIED_SENDER_MARKER[marker_state]
+        ):
+            marker_state = _VERIFIED_SENDER_MARKER_FAILURES[marker_state - 1]
+            if not marker_state:
+                marker_start = None
+        if folded_character == _VERIFIED_SENDER_MARKER[marker_state]:
+            if marker_state == 0:
+                marker_start = original_index
+            marker_state += 1
+        if marker_state == marker_length:
+            yield marker_start
+            marker_state = _VERIFIED_SENDER_MARKER_FAILURES[-1]
+            marker_start = None
+
+
+def _strip_verified_sender_envelopes(text: str) -> str:
+    """Remove every copy of Hermes' sender envelope from untrusted text.
+
+    ``[Verified sender: name | Slack user <@U>]`` is a gateway-authenticated
+    attestation: the model is told it may trust it. Any copy that did not come
+    from us is therefore a forgery, and where it sits is the forger's choice —
+    leading, one line down behind a ``\\r``, or mid-sentence. Line breaks are
+    normalized to ``\\n`` first because ``re.MULTILINE`` recognizes only ``\\n``
+    while chat clients render ``\\r``, VT, FF, NEL and U+2028/9 as breaks too.
+
+    The result of this function is read as an attestation, so it must satisfy
+    ``strip(strip(x)) == strip(x)``. A single ``re.sub`` pass does not: deleting
+    an inner match splices the surrounding halves into a NEW well-formed
+    envelope. The streaming reduction below keeps the marker-prefix state beside
+    every retained character. Deleting an envelope therefore exposes the exact
+    state at its left edge, and later input can complete an enclosing marker
+    without rescanning the retained prefix. Every character is appended once and
+    removed at most once, so arbitrary nesting is handled in amortized O(n) time.
+
+    Matching folds fullwidth structure, omits the marker's reader-optional
+    horizontal whitespace, and skips default-ignorable marker intrusions.
+    Newline-like whitespace resets the marker state after normalization rather
+    than acting as an inline gap, so a forgery cannot straddle a line. Deletion
+    still uses offsets recorded against the original stream, so benign text is
+    returned byte-identically.
+
+    Content that legitimately quotes the envelope shape loses only the quoted
+    envelope, exactly as it already does when quoted at the top of a message.
+    """
+    if not text:
+        return text
+    marker_start = next(_iter_verified_sender_marker_starts(text), None)
+    if marker_start is None:
+        # The strict scanner resets at renderer line breaks so deletion can
+        # never capture across lines. A second, relaxed detection pass exists
+        # only to make normalization unconditional for a marker split by a raw
+        # VT/FF/CR/record-separator/NEL control. Without it, the early-out would
+        # leak that control verbatim unless an unrelated valid envelope later
+        # in the turn happened to activate normalization. The relaxed pass does
+        # not authorize deletion: after normalization the strict scanner below
+        # still resets at the resulting ``\n``. Benign text with no marker-like
+        # candidate therefore remains byte-identical.
+        has_line_split_marker = (
+            any(ch in text for ch in _ENVELOPE_LINE_BREAKS)
+            and next(
+                _iter_verified_sender_marker_starts(text, reset_at_line_breaks=False),
+                None,
+            )
+            is not None
+        )
+        if not has_line_split_marker:
+            return text
+    normalized = text.replace("\r\n", "\n")
+    if any(ch in normalized for ch in _ENVELOPE_LINE_BREAKS):
+        normalized = normalized.translate(
+            {ord(ch): "\n" for ch in _ENVELOPE_LINE_BREAKS}
+        )
+    output: List[str] = []
+    marker_states: List[int] = []
+    marker_starts: List[Optional[int]] = []
+    marker_length = len(_VERIFIED_SENDER_MARKER)
+    envelope_start: Optional[int] = None
+    drop_trailing_space = False
+
+    for original_char in normalized:
+        if drop_trailing_space:
+            if original_char != "\n" and original_char.isspace():
+                continue
+            drop_trailing_space = False
+
+        folded_char = _fold_envelope_match_character(original_char)
+        marker_state = marker_states[-1] if marker_states else 0
+        marker_start = marker_starts[-1] if marker_starts else None
+        skip_marker_gap = folded_char is None or (
+            folded_char == " "
+            and marker_state
+            and marker_state < marker_length
+            and _VERIFIED_SENDER_MARKER[marker_state] != " "
+        )
+        if not skip_marker_gap:
+            while marker_state and (
+                marker_state == marker_length
+                or folded_char != _VERIFIED_SENDER_MARKER[marker_state]
+            ):
+                marker_state = _VERIFIED_SENDER_MARKER_FAILURES[marker_state - 1]
+                if not marker_state:
+                    marker_start = None
+            if folded_char == _VERIFIED_SENDER_MARKER[marker_state]:
+                if marker_state == 0:
+                    marker_start = len(output)
+                marker_state += 1
+
+        output.append(original_char)
+        marker_states.append(marker_state)
+        marker_starts.append(marker_start)
+
+        if envelope_start is None and marker_state == marker_length:
+            envelope_start = marker_start
+
+        if original_char == "\n":
+            envelope_start = None
+        elif folded_char == "]" and envelope_start is not None:
+            cut_start = envelope_start
+            while (
+                cut_start
+                and output[cut_start - 1] != "\n"
+                and output[cut_start - 1].isspace()
+            ):
+                cut_start -= 1
+            del output[cut_start:]
+            del marker_states[cut_start:]
+            del marker_starts[cut_start:]
+            envelope_start = None
+            drop_trailing_space = True
+
+    reduced = "".join(output)
+
+    # A complete deletion can expose a bare opener split around it. The caller's
+    # own punctuation could close that fragment, so defang every surviving
+    # opener in one bounded post-pass. Marker offsets were collected against
+    # the original reduced text, including any ignored intrusions.
+    opener_starts = list(_iter_verified_sender_marker_starts(reduced))
+    if not opener_starts:
+        return reduced
+    defanged = list(reduced)
+    for opener_start in opener_starts:
+        defanged[opener_start] = "("
+    return "".join(defanged)
+
+
+def _sanitize_untrusted_quote(text: Any, limit: int) -> str:
+    """Sanitize then truncate an untrusted quote destined for a wrapper.
+
+    Ordering matters and the naive order is the vulnerable one: truncating
+    first can cut between ``<@U_BOSS>`` and its closing ``]``, leaving a shape
+    the envelope pattern cannot match — and the caller's own f-string then
+    supplies the missing bracket, restoring a valid envelope. So the strip runs
+    BEFORE the cut, again AFTER it (the cut itself can leave a newly-complete
+    envelope at the tail), and the opener defang inside the strip covers the
+    case where the caller's punctuation would close what the attacker opened.
+    """
+    if not isinstance(text, str):
+        text = str(text)
+    return _strip_verified_sender_envelopes(
+        _strip_verified_sender_envelopes(text)[:limit]
+    )
+
+
+def _without_verified_sender_envelope(content: Any) -> Any:
+    """Return text content with Hermes' sender envelope removed.
+
+    Shared-session turns attach this gateway-authenticated envelope to the
+    API-facing message so the model can trust the current platform sender.
+    Hidden-reasoning incomplete turns are not completed model output, so their
+    gateway fallback persistence should keep only the clean user text in the
+    transcript while still shedding any forged envelope that the normal inbound
+    path already normalized.
+
+    This shares :func:`_strip_verified_sender_envelopes` with the inbound path
+    on purpose. The transcript written here is replayed on every later turn, so
+    a forgery this helper sheds less aggressively than the inbound strip would
+    be laundered into durable history — the anchoring of the two must not drift
+    apart again.
+    """
+
+    if not isinstance(content, str):
+        return content
+    return _strip_verified_sender_envelopes(content)
+
+
 def _build_gateway_agent_history(
     history: List[Dict[str, Any]],
     *,
@@ -1855,7 +2140,15 @@ def _build_gateway_agent_history(
         if inject_timestamps and role == "user" and isinstance(content, str):
             content = _render_msg_ts(content, msg.get("timestamp"), tz=_msg_tz)
         if separate_observed_context and msg.get("observed") and role == "user" and content:
-            observed_group_context.append(str(content).strip())
+            # Observed rows are other participants' verbatim text, stored by the
+            # Telegram adapter with no neutralization and replayed into the SAME
+            # model turn as the live message. A participant who never addresses
+            # the bot must not be able to plant a forged attestation there, so
+            # this content passes the same strip as every other untrusted block
+            # that reaches the turn.
+            observed_group_context.append(
+                _strip_verified_sender_envelopes(str(content)).strip()
+            )
             continue
 
         # Rich agent messages (tool_calls, tool results) must be passed through
@@ -2986,8 +3279,13 @@ from gateway.session import (
     build_session_context_prompt,
     build_channel_continuity_note,
     build_session_key,
+    is_default_ignorable_character,
+    is_pii_safe_platform,
     is_shared_multi_user_session,
+    is_unicode_space_separator,
+    neutralize_untrusted_envelope_field,
     neutralize_untrusted_inline_text,
+    _hash_sender_id,
 )
 from gateway.delivery import (
     DeliveryRouter,
@@ -9666,8 +9964,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     # tail.  Enqueue puts new items in the slot when free, otherwise in
     # the overflow.  Promotion (called after each run's drain) moves the
     # next overflow item into the slot so the following recursion picks
-    # it up.  Clearing happens on /new and /reset via
-    # _handle_reset_command.
+    # it up.  Clearing happens on /new, /reset, and /stop via
+    # _interrupt_and_clear_session.
 
     def _enqueue_fifo(self, session_key: str, queued_event: "MessageEvent", adapter: Any) -> None:
         """Append a /queue event to the FIFO chain for a session."""
@@ -9682,6 +9980,25 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
         else:
             pending_slot[session_key] = queued_event
+
+    def _requeue_fifo_head(
+        self,
+        session_key: str,
+        queued_event: "MessageEvent",
+        adapter: Any,
+    ) -> None:
+        """Put an earlier drained event back ahead of any promoted overflow."""
+        if adapter is None:
+            return
+        pending_slot = getattr(adapter, "_pending_messages", None)
+        if pending_slot is None:
+            return
+        displaced = pending_slot.get(session_key)
+        pending_slot[session_key] = queued_event
+        if displaced is not None:
+            self._session_state(session_key).conversation.queued_events.insert(
+                0, displaced
+            )
 
     def _promote_queued_event(
         self,
@@ -10803,8 +11120,42 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     # still small enough to never threaten memory.
     _BUSY_QUEUE_MAX_PENDING = 32
 
-    def _queue_or_replace_pending_event(self, session_key: str, event: MessageEvent) -> None:
-        adapter = self._adapter_for_source(event.source)
+    # Hard ceiling for the paths that are allowed to bypass the ordinary busy
+    # cap.  A cross-sender refusal must not cost the incoming sender a message,
+    # so it may append past ``_BUSY_QUEUE_MAX_PENDING`` — but that allowance
+    # cannot be unconditional: two participants alternating media in a shared
+    # session hit the refusal exit on *every* message, and an unbounded bypass
+    # lets any authorised group participant drive unbounded ``MessageEvent`` and
+    # media retention.  A bounded margin over the busy cap keeps the refusal
+    # lossless in every realistic backlog while still terminating a flood.
+    _BUSY_QUEUE_HARD_MAX_PENDING = 2 * _BUSY_QUEUE_MAX_PENDING
+
+    def _enqueue_fifo_bounded(
+        self, session_key: str, event: MessageEvent, adapter: Any
+    ) -> None:
+        """Append via the refusal allowance, stopping at the hard ceiling."""
+        if (
+            self._queue_depth(session_key, adapter=adapter)
+            >= self._BUSY_QUEUE_HARD_MAX_PENDING
+        ):
+            logger.warning(
+                "Dropping cross-sender follow-up for session %s — pending queue "
+                "at hard cap (%d).",
+                session_key,
+                self._BUSY_QUEUE_HARD_MAX_PENDING,
+            )
+            return
+        self._enqueue_fifo(session_key, event, adapter)
+
+    def _queue_or_replace_pending_event(
+        self,
+        session_key: str,
+        event: MessageEvent,
+        adapter: Any = None,
+        *,
+        merge_text: bool = False,
+    ) -> None:
+        adapter = adapter or self._adapter_for_source(event.source)
         if not adapter:
             return
         # #28503 — Previously this called ``merge_pending_message_event``
@@ -10812,9 +11163,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # the single pending slot when consecutive text messages arrived
         # in ``busy_input_mode: queue``. Route through the FIFO
         # infrastructure shared with ``/queue`` so each follow-up gets
-        # its own turn in arrival order. Photo bursts still merge into
-        # the head slot via ``merge_pending_message_event`` (album
-        # semantics); everything else appends to the overflow tail.
+        # its own turn in arrival order. Contiguous photo/media bursts still
+        # merge at the canonical queue tail (album semantics); everything else
+        # appends without overtaking an existing overflow item.
         pending_slot = getattr(adapter, "_pending_messages", None)
         existing = pending_slot.get(session_key) if isinstance(pending_slot, dict) else None
         security_metadata_keys = (
@@ -10824,29 +11175,98 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             "gateway_session_id",
             "gateway_session_strict",
         )
-        same_security_context = existing is not None and (
-            getattr(existing, "internal", False) == getattr(event, "internal", False)
-            and getattr(existing, "allow_gateway_control", True)
-            == getattr(event, "allow_gateway_control", True)
-            and all(
-                (getattr(existing, "metadata", None) or {}).get(key)
-                == (getattr(event, "metadata", None) or {}).get(key)
-                for key in security_metadata_keys
+
+        def _same_security_context(queued_event: MessageEvent) -> bool:
+            return (
+                getattr(queued_event, "internal", False)
+                == getattr(event, "internal", False)
+                and getattr(queued_event, "allow_gateway_control", True)
+                == getattr(event, "allow_gateway_control", True)
+                and all(
+                    (getattr(queued_event, "metadata", None) or {}).get(key)
+                    == (getattr(event, "metadata", None) or {}).get(key)
+                    for key in security_metadata_keys
+                )
             )
-        )
-        if same_security_context and (
+
+        _q_state = self._peek_session_state(session_key)
+        overflow = _q_state.conversation.queued_events if _q_state else []
+        if overflow:
+            tail = overflow[-1]
+            if _same_security_context(tail) and (
+                getattr(tail, "message_type", None) == MessageType.PHOTO
+                or event.message_type == MessageType.PHOTO
+                or bool(getattr(tail, "media_urls", None))
+                or bool(getattr(event, "media_urls", None))
+                or (
+                    merge_text
+                    and getattr(tail, "message_type", None) == MessageType.TEXT
+                    and event.message_type == MessageType.TEXT
+                )
+            ):
+                tail_slot = {session_key: tail}
+                if merge_pending_message_event(
+                    tail_slot,
+                    session_key,
+                    event,
+                    merge_text=merge_text,
+                ):
+                    if tail_slot.get(session_key) is tail:
+                        return
+                    # The helper may report success by replacing its slot
+                    # rather than mutating the existing event. ``tail_slot``
+                    # is only a probe around the real FIFO tail, so retain the
+                    # replacement as its own turn instead of discarding it.
+                    self._enqueue_fifo_bounded(session_key, event, adapter)
+                    return
+                # A cross-sender media refusal remains lossless even at the
+                # ordinary busy cap, but must append after the current tail —
+                # and only up to the hard ceiling, so alternating senders
+                # cannot turn this exit into an unbounded queue.
+                self._enqueue_fifo_bounded(session_key, event, adapter)
+                return
+            if self._queue_depth(session_key, adapter=adapter) >= self._BUSY_QUEUE_MAX_PENDING:
+                logger.warning(
+                    "Dropping busy-mode follow-up for session %s — pending queue at cap (%d).",
+                    session_key,
+                    self._BUSY_QUEUE_MAX_PENDING,
+                )
+                return
+            self._enqueue_fifo(session_key, event, adapter)
+            return
+        if existing is not None and _same_security_context(existing) and (
             getattr(existing, "message_type", None) == MessageType.PHOTO
             or event.message_type == MessageType.PHOTO
             or bool(getattr(existing, "media_urls", None))
             or bool(getattr(event, "media_urls", None))
+            or (
+                merge_text
+                and getattr(existing, "message_type", None) == MessageType.TEXT
+                and event.message_type == MessageType.TEXT
+            )
         ):
             # Preserve photo-burst / media-merge semantics for the head slot.
-            merge_pending_message_event(
+            # A False return means the head slot belongs to a different sender:
+            # the event is still ours, so fall through to the FIFO and give it
+            # its own turn instead of splicing it into someone else's album.
+            if merge_pending_message_event(
                 adapter._pending_messages,
                 session_key,
                 event,
-                merge_text=event.message_type == MessageType.TEXT,
-            )
+                merge_text=merge_text,
+            ):
+                if adapter._pending_messages.get(session_key) is existing:
+                    return
+                # Slot replacement would overtake and silently discard the
+                # occupied head. Restore the head and queue the incoming event
+                # as the next turn instead.
+                adapter._pending_messages[session_key] = existing
+                self._enqueue_fifo_bounded(session_key, event, adapter)
+                return
+            # Refusal transfers ownership back to this caller. It may bypass
+            # the ordinary busy-queue cap — the refusal itself must never cost
+            # the incoming sender a message — but only up to the hard ceiling.
+            self._enqueue_fifo_bounded(session_key, event, adapter)
             return
 
         if self._queue_depth(session_key, adapter=adapter) >= self._BUSY_QUEUE_MAX_PENDING:
@@ -13921,6 +14341,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             adapter.set_fatal_error_handler(self._handle_adapter_fatal_error)
             adapter.set_session_store(self.session_store)
             adapter.set_busy_session_handler(self._handle_active_session_busy_message)
+            _set_pending_queue = getattr(
+                adapter, "set_pending_event_queue_handler", None
+            )
+            if callable(_set_pending_queue):
+                _set_pending_queue(
+                    lambda session_key, event, _adapter=adapter: self._queue_or_replace_pending_event(
+                        session_key, event, _adapter
+                    )
+                )
             _set_reaction = getattr(adapter, "set_reaction_handler", None)
             if callable(_set_reaction):
                 _set_reaction(self._handle_reaction_event)
@@ -15738,6 +16167,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     adapter.set_fatal_error_handler(self._handle_adapter_fatal_error)
                     adapter.set_session_store(self.session_store)
                     adapter.set_busy_session_handler(self._handle_active_session_busy_message)
+                    _set_pending_queue = getattr(
+                        adapter, "set_pending_event_queue_handler", None
+                    )
+                    if callable(_set_pending_queue):
+                        _set_pending_queue(
+                            lambda session_key, event, _adapter=adapter: self._queue_or_replace_pending_event(
+                                session_key, event, _adapter
+                            )
+                        )
                     _set_reaction = getattr(adapter, "set_reaction_handler", None)
                     if callable(_set_reaction):
                         _set_reaction(self._handle_reaction_event)
@@ -16400,8 +16838,34 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # in-memory pending text is the only surviving copy.  Clearing
             # without flushing causes permanent data loss.
             try:
-                from gateway.shutdown_flush import flush_pending_to_file
-                flush_pending_to_file(dict(self._pending_messages), reason="shutdown")
+                from gateway.shutdown_flush import (
+                    flush_pending_to_file,
+                    flush_queued_events_to_file,
+                )
+
+                pending_messages = dict(self._pending_messages)
+                queued_events = dict(self._queued_events)
+                session_ids = {}
+                for session_key in pending_messages.keys() | queued_events.keys():
+                    try:
+                        session_id = await self.async_session_store.peek_session_id(
+                            session_key
+                        )
+                    except Exception:
+                        session_id = None
+                    if session_id:
+                        session_ids[session_key] = session_id
+
+                flush_pending_to_file(
+                    pending_messages,
+                    reason="shutdown",
+                    session_ids=session_ids,
+                )
+                flush_queued_events_to_file(
+                    queued_events,
+                    reason="shutdown_queued",
+                    session_ids=session_ids,
+                )
             except Exception:
                 pass
             # On the real runner these are live SessionState views whose
@@ -16879,6 +17343,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         adapter.set_busy_session_handler(
             self._make_profile_busy_session_handler(profile_name)
         )
+        _set_pending_queue = getattr(adapter, "set_pending_event_queue_handler", None)
+        if callable(_set_pending_queue):
+            _set_pending_queue(
+                lambda session_key, event, _adapter=adapter: self._queue_or_replace_pending_event(
+                    session_key, event, _adapter
+                )
+            )
         _set_reaction = getattr(adapter, "set_reaction_handler", None)
         if callable(_set_reaction):
             _set_reaction(self._handle_reaction_event)
@@ -18735,7 +19206,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 logger.debug("PRIORITY photo follow-up for session %s — queueing without interrupt", _quick_key)
                 adapter = self._adapter_for_source(source)
                 if adapter:
-                    merge_pending_message_event(adapter._pending_messages, _quick_key, event)
+                    self._queue_or_replace_pending_event(_quick_key, event, adapter)
                 return None
 
             effective_busy_input_mode = self._effective_busy_input_mode(source)
@@ -18761,11 +19232,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     if effective_busy_input_mode == "queue":
                         self._enqueue_fifo(_quick_key, event, adapter)
                     else:
-                        merge_pending_message_event(
-                            adapter._pending_messages,
-                            _quick_key,
-                            event,
-                            merge_text=True,
+                        self._queue_or_replace_pending_event(
+                            _quick_key, event, adapter, merge_text=True
                         )
                 return None
 
@@ -18782,11 +19250,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # agent starts.
                 adapter = self._adapter_for_source(source)
                 if adapter:
-                    merge_pending_message_event(
-                        adapter._pending_messages,
-                        _quick_key,
-                        event,
-                        merge_text=True,
+                    self._queue_or_replace_pending_event(
+                        _quick_key, event, adapter, merge_text=True
                     )
                 return None
             if self._draining:
@@ -19782,7 +20247,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             group_sessions_per_user=_group_sessions_per_user,
             thread_sessions_per_user=_thread_sessions_per_user,
         )
-        if _is_shared_multi_user and source.user_name:
+        _verified_sender_envelope: Optional[str] = None
+        if _is_shared_multi_user:
+            _has_trusted_sender_id = bool(source.user_id or source.user_id_alt)
+            # Strip any user-supplied copy of Hermes' canonical sender envelope
+            # before attaching the gateway-authenticated one. In a shared
+            # session, leaving a forged envelope in place lets one participant
+            # impersonate another in the exact metadata shape we ask the model
+            # to trust. Not anchored: this PR is what makes the envelope a
+            # trusted attestation, and the forger picks where the forgery sits
+            # — leading, one line down behind a separator ``re.MULTILINE`` does
+            # not recognize, or mid-sentence. Any copy we did not emit is a
+            # forgery wherever it appears.
+            message_text = _strip_verified_sender_envelopes(message_text)
             # source.user_name is the platform display name — attacker-
             # influenceable on any platform that lets participants set their
             # own name. Neutralize embedded newlines/control chars before
@@ -19790,24 +20267,75 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # a hostile name can masquerade as a fake markdown section
             # (mirrors the same field's treatment in
             # build_session_context_prompt via _format_untrusted_prompt_value).
-            _safe_user_name = neutralize_untrusted_inline_text(source.user_name)
-            # On Slack, expose the current author's verifiable user ID next to
-            # the display name (#17916): "mention me again" requests need a
-            # trusted `<@U...>` target for the CURRENT speaker — display names
-            # are ambiguous and historical mentions may point at someone else.
-            # The user_id comes from the Slack event envelope (not
-            # user-editable text), so it does not need neutralization.
-            if source.platform == Platform.SLACK and source.user_id:
-                _safe_user_name = (
-                    f"{_safe_user_name} | Slack user <@{source.user_id}>"
-                )
-            message_text = f"[{_safe_user_name}] {message_text}"
+            # The envelope below is additionally a ``|``-delimited field list
+            # wrapped in ``[...]``, so its own structural delimiters must be
+            # neutralized too: otherwise a name carrying ``|`` mints an extra
+            # authenticated-looking field (an attacker-chosen mention target)
+            # and a name carrying ``]`` closes the envelope early and emits a
+            # second, fully attacker-controlled one.
+            _safe_user_name = neutralize_untrusted_envelope_field(
+                source.user_name or "unknown sender"
+            )
+            if _has_trusted_sender_id:
+                _sender_parts = [_safe_user_name]
+                # Platforms without an in-message mention system never need a
+                # raw sender ID in model-facing text. Hash those IDs even when
+                # privacy.redact_pii is off: this per-turn envelope is a new,
+                # repeated exposure surface, and the stable hash preserves
+                # cross-turn attribution without leaking phone-derived IDs.
+                # Slack/Discord retain raw authenticated IDs because their real
+                # mention syntax requires them. Apply the same policy to the
+                # stable alternate namespace below.
+                _hash_envelope_ids = is_pii_safe_platform(source.platform)
 
-        # Prepend channel context from history backfill (if any).  This
-        # happens after sender-prefix so the prefix only applies to the
-        # trigger message, not the backfill block.
-        if getattr(event, "channel_context", None):
-            message_text = f"{event.channel_context}\n\n[New message]\n{message_text}"
+                def _envelope_sender_id(value: str) -> str:
+                    return _hash_sender_id(value) if _hash_envelope_ids else value
+
+                if source.platform == Platform.SLACK and source.user_id:
+                    _sender_parts.append(f"Slack user <@{source.user_id}>")
+                elif source.user_id:
+                    _sender_parts.append(
+                        f"{source.platform.value.title()} user_id "
+                        f"{_envelope_sender_id(source.user_id)}"
+                    )
+                if source.user_id_alt and source.user_id_alt != source.user_id:
+                    _sender_parts.append(
+                        f"user_id_alt {_envelope_sender_id(source.user_id_alt)}"
+                    )
+                _verified_sender_envelope = (
+                    f"[Verified sender: {' | '.join(_sender_parts)}]"
+                )
+            else:
+                # A display name without either stable sender namespace is not
+                # an authenticated identity. Shared sessions still require one
+                # leading gateway envelope so the wire contract is invariant,
+                # but it must state the absence rather than vouch for the name.
+                _verified_sender_envelope = (
+                    "[Verified sender: unavailable | no authenticated sender ID]"
+                )
+
+        # Prepend channel context from history backfill (if any). The verified
+        # sender envelope is deliberately deferred until every enrichment is
+        # complete, so this untrusted block can never displace it from the true
+        # leading position.
+        #
+        # The backfill is other participants' verbatim text, so it must go
+        # through the same envelope strip as the trigger body: it is
+        # concatenated into the SAME model turn, and a forged
+        # ``[Verified sender: ...]`` inside a quoted thread line is exactly as
+        # trusted-looking there as it is at the top. Platform adapters
+        # neutralize newlines in these blocks but not the envelope delimiters,
+        # so the gateway owns this guard for every platform at once.
+        # Applied unconditionally rather than only under
+        # ``_is_shared_multi_user``: the block is other people's text on every
+        # path that produces it, and a strictly stronger guard costs nothing —
+        # text that does not contain the envelope shape is returned unchanged.
+        _channel_context = getattr(event, "channel_context", None)
+        if _channel_context:
+            _safe_channel_context = _strip_verified_sender_envelopes(
+                str(_channel_context)
+            )
+            message_text = f"{_safe_channel_context}\n\n[New message]\n{message_text}"
 
         # Declare at outer scope so the audio-file-paths handling block below
         # remains safe when ``event.media_urls`` is empty (no inner block runs).
@@ -20041,7 +20569,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # is referencing. History can contain the same or similar text
             # multiple times, and without an explicit pointer the agent has to
             # guess (or answer for both subjects). Token overhead is minimal.
-            reply_snippet = event.reply_to_text[:500]
+            # The quote is another participant's verbatim text arriving in the
+            # same model turn, so it gets the same envelope strip as the body
+            # and the backfill block — a forged ``[Verified sender: ...]``
+            # inside a quoted message is no less trusted-looking for being
+            # quoted. The strip runs BEFORE the 500-char cut: truncating first
+            # can land the cut between ``<@U_BOSS>`` and its closing bracket,
+            # leaving a shape the pattern cannot match that the f-string below
+            # then re-closes with ``"]`` — manufacturing the very envelope the
+            # strip exists to remove.
+            reply_snippet = _sanitize_untrusted_quote(event.reply_to_text, 500)
             if getattr(event, "reply_to_is_own_message", False):
                 message_text = (
                     f'[Replying to your previous message: "{reply_snippet}"]\n\n'
@@ -20149,10 +20686,29 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         )
                     return None
                 if _ctx_result.expanded:
-                    message_text = _ctx_result.message
+                    # Expansion appends fetched file/folder/URL content to the
+                    # turn before the gateway attaches its envelope. Only the
+                    # appended tail is filtered when the expander preserves the
+                    # already-sanitized prefix; otherwise filter the whole
+                    # expanded message fail-closed.
+                    _expanded_message = _ctx_result.message
+                    _sanitized_prefix = message_text.strip()
+                    if _expanded_message.startswith(_sanitized_prefix):
+                        message_text = _sanitized_prefix + (
+                            _strip_verified_sender_envelopes(
+                                _expanded_message[len(_sanitized_prefix):]
+                            )
+                        )
+                    else:
+                        message_text = _strip_verified_sender_envelopes(
+                            _expanded_message
+                        )
             except Exception as exc:
                 logger.warning("@ context reference expansion failed: %s", exc)
                 logger.debug("@ context reference expansion failure detail", exc_info=True)
+
+        if _verified_sender_envelope is not None:
+            message_text = f"{_verified_sender_envelope} {message_text}"
 
         return message_text
 
@@ -22652,13 +23208,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # reasoning-only incomplete turns follow the same persistence
                 # rule so peer-agent channels don't ingest them as completed
                 # assistant turns. (#7100, #51628)
+                _fallback_user_content = (
+                    persist_user_message
+                    if persist_user_message is not None
+                    else message_text
+                )
+                if hidden_reasoning_incomplete:
+                    _fallback_user_content = _without_verified_sender_envelope(
+                        _fallback_user_content
+                    )
                 _user_entry = {
                     "role": "user",
-                    "content": (
-                        persist_user_message
-                        if persist_user_message is not None
-                        else message_text
-                    ),
+                    "content": _fallback_user_content,
                     "timestamp": (
                         persist_user_timestamp
                         if persist_user_timestamp is not None
@@ -26698,6 +27259,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 if result.get("success"):
                     description = result.get("analysis", "")
                     description = sanitize_context(description)
+                    # The description is a model's rendering of an image the
+                    # attacker chose, spliced into the same turn AFTER the
+                    # gateway minted its envelope — and it PREPENDS, so a
+                    # forgery here would sit ahead of the genuine attestation.
+                    # ``sanitize_context`` only sheds ``<memory-context>``
+                    # fences, so the envelope guard is applied explicitly.
+                    description = _strip_verified_sender_envelopes(description)
                     enriched_parts.append(
                         f"[The user sent an image~ Here's what I can see:\n{description}]\n"
                         f"[If you need a closer look, use vision_analyze with "
@@ -26820,6 +27388,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         )
                         continue
                     successful_transcripts.append(transcript)
+                    # The transcript is attacker-supplied audio rendered into
+                    # text and spliced into the same turn AFTER the gateway
+                    # minted its envelope — and it PREPENDS, so an unguarded
+                    # forgery would sit ahead of the genuine attestation. The
+                    # echo above keeps the raw transcript so users still verify
+                    # STT quality verbatim; only the model-facing copy is
+                    # guarded.
+                    transcript = _strip_verified_sender_envelopes(transcript)
                     # Pass the transcript through as a plain quoted line. The
                     # earlier wording ("The user sent a voice message~ Here's
                     # what they said: ...") read as a meta-instruction and made
@@ -28862,6 +29438,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if adapter and hasattr(adapter, "get_pending_message"):
             adapter.get_pending_message(session_key)  # consume and discard
         if _iac_state is not None:
+            # Refused cross-sender turns and /queue overflow live outside the
+            # adapter's single pending slot and must share /stop discard semantics.
+            _iac_state.conversation.queued_events.clear()
             _iac_state.persistent.pending_command_text = None
         if release_running_state:
             self._release_running_agent_state(session_key)
@@ -31598,7 +32177,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     )
                     adapter = self._adapter_for_source(source)
                     if adapter and pending_event:
-                        merge_pending_message_event(adapter._pending_messages, session_key, pending_event)
+                        self._requeue_fifo_head(session_key, pending_event, adapter)
                     elif adapter and hasattr(adapter, 'queue_message'):
                         adapter.queue_message(session_key, pending)
                     return result_holder[0] or {"final_response": response, "messages": history}
