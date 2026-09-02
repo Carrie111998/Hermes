@@ -8351,12 +8351,11 @@ def tick(
             except Exception:
                 pass
 
-        if verbose:
-            logger.info(
-                "Running %d job(s) in parallel (max_workers=%s)",
-                len(due_jobs),
-                _max_workers if _max_workers else "unbounded",
-            )
+        logger.info(
+            "Running %d job(s) in parallel (max_workers=%s)",
+            len(due_jobs),
+            _max_workers if _max_workers else "unbounded",
+        )
 
         def _process_job(job: dict) -> bool:
             """Run one due job end-to-end. Thin wrapper around the shared
