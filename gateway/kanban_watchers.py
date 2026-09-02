@@ -516,7 +516,11 @@ class GatewayKanbanWatchersMixin:
                             for route in (
                                 getattr(_config, "profile_routes", None) or []
                             )
-                            if getattr(route, "enabled", False)
+                            # Compatible route representations may omit an
+                            # explicit enabled field. Treat omission as active;
+                            # ``enabled: false`` still denies the route before
+                            # the exact authorization pass.
+                            if getattr(route, "enabled", True)
                             and str(getattr(route, "platform", "")).lower()
                             in active_platforms
                             and str(getattr(route, "profile", "")).strip()

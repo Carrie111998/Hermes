@@ -830,6 +830,7 @@ def _make_routed_discord_runner(
     adapter,
     *,
     route_profile="yuki",
+    route_enabled=True,
     served_profiles=("default", "yuki"),
 ):
     from gateway.config import GatewayConfig
@@ -853,6 +854,7 @@ def _make_routed_discord_runner(
                     "guild_id": "engineering-guild",
                     "chat_id": "engineering-chat",
                     "profile": route_profile,
+                    "enabled": route_enabled,
                 }
             ]
         ),
@@ -947,6 +949,22 @@ def test_routed_profile_uses_primary_discord_adapter_on_secondary_board_once(
     asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
     assert len(adapter.sent) == 1
     assert len(adapter.handled) == 1
+
+
+def test_disabled_profile_route_is_not_a_primary_transport_target(
+    tmp_path, monkeypatch,
+):
+    """An explicitly disabled parsed route remains fail-closed."""
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "kanban.db"))
+    task_id = _create_routed_discord_completion(board=None)
+
+    adapter = RecordingAdapter()
+    runner = _make_routed_discord_runner(adapter, route_enabled=False)
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert adapter.sent == []
+    assert adapter.handled == []
+    assert _unseen_routed_event_count(task_id) == 1
 
 
 def test_routed_profile_primary_adapter_denies_wrong_or_unmatched_route(
