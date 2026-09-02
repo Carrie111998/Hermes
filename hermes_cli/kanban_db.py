@@ -9354,25 +9354,116 @@ def _record_spawn_failure(
     )
 
 
-def _set_worker_pid(conn: sqlite3.Connection, task_id: str, pid: int) -> None:
-    """Record the spawned child's pid + emit a ``spawned`` event.
+def register_worker_pid(
+    conn: sqlite3.Connection,
+    task_id: str,
+    pid: int,
+    *,
+    expected_run_id: int,
+    expected_claim_lock: str,
+    source: str,
+) -> str:
+    """Bind ``pid`` to one exact running task/run identity.
 
-    The event's payload carries the pid so a human reading ``hermes kanban
-    tail`` can correlate log lines with OS-level traces without opening
-    the drawer.
+    The task row and its current run form one identity boundary.  A caller
+    must pin both the run id and claim lock; stale or conflicting writers are
+    rejected without changing either row.  Repeating the same registration is
+    idempotent and does not duplicate the ``spawned`` audit event.
     """
+    try:
+        registered_pid = int(pid)
+        pinned_run_id = int(expected_run_id)
+    except (TypeError, ValueError):
+        return "rejected"
+    if registered_pid <= 0 or pinned_run_id <= 0 or not expected_claim_lock:
+        return "rejected"
+
     with write_txn(conn):
-        conn.execute(
-            "UPDATE tasks SET worker_pid = ? WHERE id = ?",
-            (int(pid), task_id),
+        row = conn.execute(
+            "SELECT t.status, t.current_run_id, "
+            "t.claim_lock AS task_claim_lock, "
+            "t.worker_pid AS task_worker_pid, "
+            "r.status AS run_status, r.ended_at, "
+            "r.claim_lock AS run_claim_lock, "
+            "r.worker_pid AS run_worker_pid "
+            "FROM tasks t "
+            "LEFT JOIN task_runs r ON r.id = t.current_run_id "
+            "WHERE t.id = ?",
+            (task_id,),
+        ).fetchone()
+        if (
+            row is None
+            or row["status"] != "running"
+            or row["current_run_id"] != pinned_run_id
+            or row["run_status"] != "running"
+            or row["ended_at"] is not None
+            or row["task_claim_lock"] != expected_claim_lock
+            or row["run_claim_lock"] != expected_claim_lock
+        ):
+            return "rejected"
+
+        task_pid = row["task_worker_pid"]
+        run_pid = row["run_worker_pid"]
+        if task_pid == registered_pid and run_pid == registered_pid:
+            return "already_registered"
+        if task_pid is not None or run_pid is not None:
+            return "rejected"
+
+        task_update = conn.execute(
+            "UPDATE tasks SET worker_pid = ? "
+            "WHERE id = ? AND status = 'running' "
+            "AND current_run_id = ? AND claim_lock = ? "
+            "AND worker_pid IS NULL",
+            (
+                registered_pid,
+                task_id,
+                pinned_run_id,
+                expected_claim_lock,
+            ),
         )
-        run_id = _current_run_id(conn, task_id)
-        if run_id is not None:
-            conn.execute(
-                "UPDATE task_runs SET worker_pid = ? WHERE id = ?",
-                (int(pid), run_id),
-            )
-        _append_event(conn, task_id, "spawned", {"pid": int(pid)}, run_id=run_id)
+        run_update = conn.execute(
+            "UPDATE task_runs SET worker_pid = ? "
+            "WHERE id = ? AND task_id = ? AND status = 'running' "
+            "AND ended_at IS NULL AND claim_lock = ? "
+            "AND worker_pid IS NULL",
+            (
+                registered_pid,
+                pinned_run_id,
+                task_id,
+                expected_claim_lock,
+            ),
+        )
+        if task_update.rowcount != 1 or run_update.rowcount != 1:
+            raise RuntimeError("worker PID registration lost its identity pin")
+        _append_event(
+            conn,
+            task_id,
+            "spawned",
+            {"pid": registered_pid, "source": source},
+            run_id=pinned_run_id,
+        )
+    return "registered"
+
+
+def _set_worker_pid(
+    conn: sqlite3.Connection,
+    task: Task | str,
+    pid: int,
+    *,
+    source: str = "dispatcher",
+) -> str:
+    """Compatibility wrapper for dispatcher PID registration."""
+    claimed = get_task(conn, task) if isinstance(task, str) else task
+    if claimed is None or claimed.current_run_id is None or not claimed.claim_lock:
+        return "rejected"
+    return register_worker_pid(
+        conn,
+        claimed.id,
+        pid,
+        expected_run_id=claimed.current_run_id,
+        expected_claim_lock=claimed.claim_lock,
+        source=source,
+    )
 
 
 def _clear_failure_counter(conn: sqlite3.Connection, task_id: str) -> None:
@@ -10275,7 +10366,11 @@ def _dispatch_once_locked(
             except (TypeError, ValueError):
                 pid = _spawn(claimed, str(workspace))
             if pid:
-                _set_worker_pid(conn, claimed.id, int(pid))
+                registration = _set_worker_pid(conn, claimed, int(pid))
+                if registration == "rejected":
+                    raise RuntimeError(
+                        "spawned worker PID could not be bound to the claimed run"
+                    )
             # Worker-lifecycle observer (RFC #58548): fires AFTER spawn_fn
             # returned and the PID (when reported) is durably persisted,
             # per the RFC timing contract. Best-effort — can never break
@@ -10407,7 +10502,11 @@ def _dispatch_once_locked(
             except (TypeError, ValueError):
                 pid = _spawn(claimed, str(workspace))
             if pid:
-                _set_worker_pid(conn, claimed.id, int(pid))
+                registration = _set_worker_pid(conn, claimed, int(pid))
+                if registration == "rejected":
+                    raise RuntimeError(
+                        "spawned worker PID could not be bound to the claimed run"
+                    )
             # Worker-lifecycle observer (RFC #58548): same contract as the
             # ready-lane fire above — after spawn + PID persistence.
             _fire_worker_spawned_hook(
