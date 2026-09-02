@@ -12,6 +12,17 @@ except ImportError:
     web = None  # type: ignore[assignment]
 
 
+def _reserved_room_run_fields(body: Any) -> set[str]:
+    if not isinstance(body, dict):
+        return set()
+    return {
+        key
+        for key in body
+        if isinstance(key, str)
+        and (key == "hosted_room_dispatch" or key.startswith("_room_"))
+    }
+
+
 async def _ensure_hosted_member_session(self, dispatch: Any) -> str:
     """Create or verify the target's canonical hidden group session.
 
@@ -38,7 +49,9 @@ async def _ensure_hosted_member_session(self, dispatch: Any) -> str:
             ).fetchone()
             if row is not None:
                 if row["title"] != title or row["source"] != "bot_room":
-                    raise RuntimeError("room session identity conflicts with existing data")
+                    raise RuntimeError(
+                        "room session identity conflicts with existing data"
+                    )
                 return session_id
             clean_title = db.sanitize_title(title)
             conflict = conn.execute(
@@ -92,6 +105,14 @@ async def _normalize_room_dispatch(
 
     room_token = self._room_grant_token(request)
     if not room_token:
+        if _reserved_room_run_fields(body):
+            return body, web.json_response(
+                _openai_error(
+                    "Room dispatch fields require HermesRoom authorization.",
+                    code="invalid_room_dispatch",
+                ),
+                status=400,
+            )
         return body, None
 
     allowed_room_fields = {"input", "hosted_room_dispatch"}
@@ -117,9 +138,7 @@ async def _normalize_room_dispatch(
             execution_policy_mapping,
         )
 
-        dispatch = HostedMemberDispatch.from_mapping(
-            body.get("hosted_room_dispatch")
-        )
+        dispatch = HostedMemberDispatch.from_mapping(body.get("hosted_room_dispatch"))
         grant_claims = verify_room_grant(
             self._room_grant_secret(),
             room_token,
@@ -137,12 +156,11 @@ async def _normalize_room_dispatch(
         ):
             raise ValueError("room dispatch target does not match this profile")
         with self._profile_scope(active_profile):
-            execution_policy = execution_policy_mapping(
-                target_profile=active_profile
-            )
+            execution_policy = execution_policy_mapping(target_profile=active_profile)
         from gateway.platforms.api_server_room_attachments import (
             roomlink_attachments_available,
         )
+
         catalog = GatewayRoomCatalog.from_mapping(
             catalog_mapping(
                 installation_id=local_install,
@@ -155,9 +173,7 @@ async def _normalize_room_dispatch(
                 execution_policy=execution_policy,
             )
         )
-        policy = RoomExecutionPolicy.from_mapping(
-            catalog.execution_policy.as_mapping()
-        )
+        policy = RoomExecutionPolicy.from_mapping(catalog.execution_policy.as_mapping())
         if not hmac.compare_digest(
             policy.policy_digest,
             dispatch.execution_policy_digest,
