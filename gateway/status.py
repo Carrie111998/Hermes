@@ -450,6 +450,43 @@ def _get_process_start_time(pid: int) -> Optional[int]:
         return None
 
 
+# Tolerance for the ``start_time`` fingerprint comparison, in the units
+# ``_get_process_start_time`` returns (centiseconds on macOS/Windows).
+#
+# On Linux the fingerprint is /proc field 22 — clock ticks since BOOT — which no
+# wall-clock adjustment can move, so the comparison is exact there.  Everywhere
+# else psutil reports ``create_time()`` as an absolute UNIX epoch, and macOS
+# derives that from a wall clock that NTP steps: a single sub-second correction
+# re-dates every live process at once, so a gateway that never restarted starts
+# failing an exact match and every liveness surface reports it dead while its
+# cron ticker keeps firing.  Observed live on macOS: a 2.00s step desynced the
+# top-level ``start_time`` from the ``writer_start_time`` written by the same
+# call in the same file.
+#
+# 5s is far below the gap that separates a PID-reuse candidate (a new process
+# occupying a recycled PID started at a wholly different time, and one that must
+# ALSO pass the argv + HERMES_HOME identity check) yet comfortably above any
+# realistic NTP step on a running host.
+_START_TIME_MATCH_TOLERANCE = 500  # centiseconds (5s)
+
+
+def _start_times_match(recorded: Any, current: Any) -> bool:
+    """Return True when two start-time fingerprints identify the same process.
+
+    Returns True when either side is unknown: an absent fingerprint is not
+    evidence of a mismatch, and callers treat this as "no objection" rather
+    than proof of identity (they corroborate with argv/HERMES_HOME).
+    """
+    if recorded is None or current is None:
+        return True
+    try:
+        return abs(int(recorded) - int(current)) <= _START_TIME_MATCH_TOLERANCE
+    except (TypeError, ValueError):
+        # Unparseable fingerprint: same rule as absent — don't manufacture a
+        # mismatch from a corrupt field.
+        return True
+
+
 def get_process_start_time(pid: int) -> Optional[int]:
     """Public wrapper for retrieving a process start time when available."""
     return _get_process_start_time(pid)
@@ -1358,11 +1395,7 @@ def runtime_status_pid_is_live(record: Optional[dict[str, Any]]) -> bool:
         return False
     recorded_start = (record or {}).get("start_time")
     current_start = _get_process_start_time(pid)
-    if (
-        recorded_start is not None
-        and current_start is not None
-        and current_start != recorded_start
-    ):
+    if not _start_times_match(recorded_start, current_start):
         return False
     return True
 
@@ -1598,11 +1631,7 @@ def get_runtime_status_running_pid(
 
     recorded_start = payload.get("start_time")
     current_start = _get_process_start_time(pid)
-    if (
-        recorded_start is not None
-        and current_start is not None
-        and current_start != recorded_start
-    ):
+    if not _start_times_match(recorded_start, current_start):
         return None
 
     # When no explicit expected_home is given (active profile context),
@@ -1704,7 +1733,9 @@ def acquire_scoped_lock(scope: str, identity: str, metadata: Optional[dict[str, 
                 if (
                     existing.get("start_time") is not None
                     and current_start is not None
-                    and current_start != existing.get("start_time")
+                    and not _start_times_match(
+                        existing.get("start_time"), current_start
+                    )
                 ):
                     stale = True
                 # When start_time comparison is unavailable on either side
