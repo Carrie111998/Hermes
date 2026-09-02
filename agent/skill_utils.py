@@ -905,9 +905,11 @@ def get_scan_ordered_skills_dirs() -> List[Path]:
 # write artifacts into the user's checkout).
 
 _PROJECT_SCAN_SOURCE = "project-local"
-# (skill_dir_resolved) -> quarantined bool, keyed per-process; scan_skill_cached
-# already re-scans on content change via the bundle hash, this only avoids
-# re-reading the attestation JSON on every index/list/view call in one run.
+# (skill_dir_resolved, bundle_hash) -> quarantined bool, keyed per-process;
+# scan_skill_cached already re-scans on content change via the bundle hash,
+# this only avoids re-reading the attestation JSON on every index/list/view
+# call in one run. The hash belongs in the key so that repairing a quarantined
+# skill takes effect immediately instead of at the next process start.
 _PROJECT_QUARANTINE_CACHE: Dict[str, bool] = {}
 
 
@@ -926,12 +928,25 @@ def is_quarantined_project_skill(skill_md) -> bool:
     """
     skill_dir = Path(skill_md).parent
     try:
-        key = str(skill_dir.resolve())
+        path_key = str(skill_dir.resolve())
     except OSError:
-        key = str(skill_dir)
-    cached = _PROJECT_QUARANTINE_CACHE.get(key)
-    if cached is not None:
-        return cached
+        path_key = str(skill_dir)
+    # Key on content, not just path: an author who FIXES a quarantined skill
+    # mid-session must be able to load it again. scan_skill_cached already
+    # re-scans on content change (bundle hash), but a path-only key pinned the
+    # stale "dangerous" verdict for the life of the process, so the repaired
+    # skill stayed invisible until restart.
+    try:
+        from tools.skills_guard import full_content_hash
+
+        key = f"{path_key}\0{full_content_hash(skill_dir)}"
+    except Exception:
+        # Hashing failed — do not reuse any cached verdict for this dir.
+        key = None
+    if key is not None:
+        cached = _PROJECT_QUARANTINE_CACHE.get(key)
+        if cached is not None:
+            return cached
     try:
         from tools.skills_guard import scan_skill_cached
 
@@ -954,7 +969,8 @@ def is_quarantined_project_skill(skill_md) -> bool:
             exc_info=True,
         )
         quarantined = True
-    _PROJECT_QUARANTINE_CACHE[key] = quarantined
+    if key is not None:
+        _PROJECT_QUARANTINE_CACHE[key] = quarantined
     return quarantined
 
 
