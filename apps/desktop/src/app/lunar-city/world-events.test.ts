@@ -87,6 +87,7 @@ describe('world event normalization', () => {
 
   it('derives blocked and stale-worker conditions from current task state', () => {
     const blocked = classifyTaskCondition({ id: 'blocked', status: 'blocked', title: 'Fix auth' }, now)
+
     const stale = classifyTaskCondition(
       {
         assignee: 'worker-a',
@@ -105,7 +106,11 @@ describe('world event normalization', () => {
   it('deduplicates by source and id while keeping separate sources distinct', () => {
     const first = normalizeKanbanEvent('main', kanban('blocked', 41), now)
     const replacement = normalizeKanbanEvent('main', kanban('completed', 41), now + 1)
-    const external = normalizeExternalEvent({ id: '41', kind: 'pr.approved', source: 'pull_request', title: 'Approved' }, now + 2)
+
+    const external = normalizeExternalEvent(
+      { id: '41', kind: 'pr.approved', source: 'pull_request', title: 'Approved' },
+      now + 2
+    )
 
     expect(dedupeWorldEvents([first], [replacement, external])).toHaveLength(2)
     expect(dedupeWorldEvents([first], [replacement])).toEqual([replacement])

@@ -1,7 +1,7 @@
-import { Codecs, persistentAtom } from '@/lib/persisted'
 import { atom, type WritableAtom } from 'nanostores'
 
 import type { WorldCondition, WorldEvent } from '@/app/lunar-city/world-events'
+import { Codecs, persistentAtom } from '@/lib/persisted'
 
 // Device-scoped desktop preferences. These control whether this renderer
 // surface exists and intentionally do not follow a gateway profile.
@@ -40,18 +40,28 @@ function sanitizeCursors(value: unknown): WorldCursorState {
   }
 
   const raw = value as Record<string, unknown>
+
   const bySource =
     raw.bySource && typeof raw.bySource === 'object' && !Array.isArray(raw.bySource)
       ? Object.fromEntries(
           Object.entries(raw.bySource).filter(
-            (entry): entry is [string, string] => typeof entry[0] === 'string' && typeof entry[1] === 'string' && entry[0].length <= 200 && entry[1].length <= 200
+            (entry): entry is [string, string] =>
+              typeof entry[0] === 'string' &&
+              typeof entry[1] === 'string' &&
+              entry[0].length <= 200 &&
+              entry[1].length <= 200
           )
         )
       : {}
+
   const dismissedRecapIds = Array.isArray(raw.dismissedRecapIds)
-    ? raw.dismissedRecapIds.filter((id): id is string => typeof id === 'string' && id.length > 0 && id.length <= 200).slice(-100)
+    ? raw.dismissedRecapIds
+        .filter((id): id is string => typeof id === 'string' && id.length > 0 && id.length <= 200)
+        .slice(-100)
     : []
-  const lastOpenedAt = typeof raw.lastOpenedAt === 'number' && Number.isFinite(raw.lastOpenedAt) ? raw.lastOpenedAt : null
+
+  const lastOpenedAt =
+    typeof raw.lastOpenedAt === 'number' && Number.isFinite(raw.lastOpenedAt) ? raw.lastOpenedAt : null
 
   return { bySource, dismissedRecapIds, lastOpenedAt }
 }

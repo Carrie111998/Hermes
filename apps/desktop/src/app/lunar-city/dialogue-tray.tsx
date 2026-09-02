@@ -45,10 +45,12 @@ function actionFor(subject: DialogueSubject, kind: WorldActionIntent['kind']): W
 export function DialogueTray({ onAction, onClose, subject }: DialogueTrayProps) {
   const event = subject.event
   const condition = subject.condition
+
   const actions = new Set<WorldActionIntent['kind']>([
     ...(event?.actionKinds ?? []),
     ...(condition?.kind === 'task.blocked' || condition?.kind === 'worker.stale' ? ['inspect_blocker' as const] : [])
   ])
+
   const [actionMessage, setActionMessage] = useState<string | null>(null)
 
   const runAction = async (kind: WorldActionIntent['kind']) => {
@@ -56,6 +58,7 @@ export function DialogueTray({ onAction, onClose, subject }: DialogueTrayProps) 
 
     if (!intent || !onAction) {
       setActionMessage('This action is not available from the current Hermes state.')
+
       return
     }
 
@@ -64,7 +67,10 @@ export function DialogueTray({ onAction, onClose, subject }: DialogueTrayProps) 
   }
 
   return (
-    <aside aria-label={`Dialogue: ${subject.title}`} className="rounded-2xl border border-violet-300/30 bg-slate-950/95 p-4 shadow-xl">
+    <aside
+      aria-label={`Dialogue: ${subject.title}`}
+      className="rounded-2xl border border-violet-300/30 bg-slate-950/95 p-4 shadow-xl"
+    >
       <div className="flex items-start justify-between gap-3">
         <div>
           <p className="text-[0.65rem] font-semibold uppercase tracking-[0.18em] text-violet-300">In-world dialogue</p>
@@ -100,7 +106,9 @@ export function DialogueTray({ onAction, onClose, subject }: DialogueTrayProps) 
 
       {(typeof event?.facts.role === 'string' || typeof condition?.facts.assignee === 'string') && (
         <p className="mt-2 text-xs text-slate-400">
-          {event?.facts.role ? `Role: ${String(event.facts.role)}` : `Assigned to: ${String(condition?.facts.assignee)}`}
+          {event?.facts.role
+            ? `Role: ${String(event.facts.role)}`
+            : `Assigned to: ${String(condition?.facts.assignee)}`}
         </p>
       )}
 

@@ -1,4 +1,5 @@
 import type { AgentNoticePayload } from '@/store/agent-notices'
+import { type AgentNoticeListener, subscribeAgentNotices } from '@/store/agent-notices'
 import {
   $worldCursors,
   recordWorldCursor as persistWorldCursor,
@@ -9,24 +10,21 @@ import {
 } from '@/store/lunar-city'
 
 import {
-  subscribeAgentNotices,
-  type AgentNoticeListener
-} from '@/store/agent-notices'
-import {
-  subscribeKanbanEvents,
   type CompletionEvent,
-  type KanbanEventsListener
+  type KanbanEventsListener,
+  subscribeKanbanEvents
 } from '../../plugins/kanban/completion-notify'
 import type { KanbanTask } from '../../plugins/kanban/types'
+
 import {
   classifyTaskCondition,
   dedupeWorldEvents,
+  type ExternalWorldEventInput,
   normalizeAgentNotice,
   normalizeExternalEvent,
   normalizeKanbanEvent,
-  type ExternalWorldEventInput,
-  type WorldEvent,
   type WorldCondition,
+  type WorldEvent,
   type WorldSource
 } from './world-events'
 
@@ -96,8 +94,6 @@ function updateCursors(events: readonly WorldEvent[], cursors: WorldCursorState)
 
     if (!prior || (priorNumber !== null && eventNumber !== null && eventNumber > priorNumber)) {
       next.bySource[scope] = event.id
-    } else if (!prior) {
-      next.bySource[scope] = event.id
     }
   }
 
@@ -117,10 +113,12 @@ export function reconcileWorldSnapshot(
   const conditions = snapshot.tasks
     .map(task => classifyTaskCondition(task, now))
     .filter((condition): condition is WorldCondition => condition !== null)
+
   const snapshotEvents = (snapshot.externalEvents ?? []).map(input => normalizeExternalEvent(input, now))
   const allEvents = dedupeWorldEvents([], [...incoming, ...snapshotEvents])
   const transitions = allEvents.filter(event => !wasSeen(event, cursors)).slice(-MAX_TRANSITIONS_PER_REOPEN)
   const nextCursors = updateCursors(allEvents, cursors)
+
   const projection: WorldProjection = {
     conditions,
     recentEvents: allEvents.slice(-MAX_RECENT_EVENTS),
@@ -134,6 +132,7 @@ export function reconcileWorldSnapshot(
 
 export function bindWorldSources(doors: WorldSourceDoors, sink: WorldSyncSink): () => void {
   const unsubs: Array<() => void> = []
+
   const publishEvents = (events: WorldEvent[]) => {
     if (events.length === 0) {
       return
@@ -141,18 +140,22 @@ export function bindWorldSources(doors: WorldSourceDoors, sink: WorldSyncSink): 
 
     const current = sink.getCursors()
     const transitions = events.filter(event => !wasSeen(event, current))
+
     const projection = {
       ...emptyProjection(),
       recentEvents: events.slice(-MAX_RECENT_EVENTS),
       transitions: transitions.slice(-MAX_TRANSITIONS_PER_REOPEN)
     }
+
     const cursors = updateCursors(events, current)
 
     sink.publish(projection, { ...cursors, lastOpenedAt: Date.now() })
   }
+
   const onKanban: KanbanEventsListener = (board, events: CompletionEvent[]) => {
     publishEvents(events.map(event => normalizeKanbanEvent(board, event)))
   }
+
   const onNotice: AgentNoticeListener = (payload: AgentNoticePayload) => {
     const event = normalizeAgentNotice(payload)
 

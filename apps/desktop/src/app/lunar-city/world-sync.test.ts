@@ -2,13 +2,8 @@ import { describe, expect, it, vi } from 'vitest'
 
 import type { WorldCursorState } from '@/store/lunar-city'
 
-import {
-  bindWorldSources,
-  reconcileWorldSnapshot,
-  worldSourceScopeKey,
-  type WorldSourceDoors
-} from './world-sync'
 import type { WorldEvent } from './world-events'
+import { bindWorldSources, reconcileWorldSnapshot, type WorldSourceDoors, worldSourceScopeKey } from './world-sync'
 
 const cursors: WorldCursorState = { bySource: {}, dismissedRecapIds: [], lastOpenedAt: null }
 
@@ -71,16 +66,20 @@ describe('world synchronization', () => {
   it('disposes every registered source when the world closes', () => {
     const closeKanban = vi.fn()
     const closeNotices = vi.fn()
+
     const doors: WorldSourceDoors = {
       kanban: listener => {
         expect(listener).toBeTypeOf('function')
+
         return closeKanban
       },
       notices: listener => {
         expect(listener).toBeTypeOf('function')
+
         return closeNotices
       }
     }
+
     const publish = vi.fn()
     const dispose = bindWorldSources(doors, { getCursors: () => cursors, publish })
 

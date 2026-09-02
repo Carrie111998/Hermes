@@ -8,7 +8,7 @@ export interface WorldActionContext {
     reclaimTask: (id: string) => Promise<unknown>
     reassignTask: (id: string, profile: string) => Promise<unknown>
   }
-  createSession?: (params: Record<string, unknown>) => Promise<unknown>
+  createSession?: (params: Record<string, unknown>) => Promise<unknown> | unknown
   requestApproval?: (params: Record<string, unknown>) => Promise<unknown>
 }
 
@@ -71,21 +71,32 @@ export function createWorldActionRunner(context: WorldActionContext): WorldActio
       try {
         switch (intent.kind) {
           case 'inspect':
+
           case 'inspect_blocker':
+
           case 'show_source':
             return completed(intent.target)
+
           case 'comment':
             return completed(await context.kanban.addComment(intent.taskId, intent.body))
+
           case 'recover_task':
             return completed(await context.kanban.patchTask(intent.taskId, intent.patch))
+
           case 'reassign_task':
             return completed(await context.kanban.reassignTask(intent.taskId, intent.profile))
+
           case 'reclaim_task':
             return completed(await context.kanban.reclaimTask(intent.taskId))
+
           case 'create_task':
             return completed(await context.kanban.createTask(intent.body))
+
           case 'create_session':
-            return context.createSession ? completed(await context.createSession(intent.params)) : failed(new Error('New sessions are unavailable'))
+            return context.createSession
+              ? completed(await context.createSession(intent.params))
+              : failed(new Error('New sessions are unavailable'))
+
           case 'request_approval':
             return context.requestApproval
               ? completed(await context.requestApproval(intent.params))

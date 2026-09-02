@@ -1,10 +1,10 @@
-import { useState, type FormEvent } from 'react'
+import { type FormEvent, useState } from 'react'
 
 import { Button } from '@/components/ui/button'
 
+import type { DialogueSubject } from './dialogue-tray'
 import type { WorldActionResult, WorldActionRunner } from './world-actions'
 import type { WorldCondition, WorldEvent } from './world-events'
-import { DialogueTray, type DialogueSubject } from './dialogue-tray'
 
 export interface DispatcherCubeContext {
   actionRunner: WorldActionRunner
@@ -40,6 +40,7 @@ export function DispatcherCube({ context, onSubjectSelected }: DispatcherCubePro
 
     if (!title.trim()) {
       setFeedback('A task title is required.')
+
       return
     }
 
@@ -56,14 +57,20 @@ export function DispatcherCube({ context, onSubjectSelected }: DispatcherCubePro
   }
 
   return (
-    <section aria-label="Dispatcher companion" className="rounded-2xl border border-cyan-400/30 bg-slate-950/90 p-4 shadow-xl">
+    <section
+      aria-label="Dispatcher companion"
+      className="rounded-2xl border border-cyan-400/30 bg-slate-950/90 p-4 shadow-xl"
+    >
       <div className="flex items-start justify-between gap-3">
         <div>
           <p className="text-[0.65rem] font-semibold uppercase tracking-[0.18em] text-cyan-300">Dispatcher cube</p>
           <h2 className="mt-1 text-lg font-semibold text-white">Command center</h2>
           <p className="mt-1 text-xs text-slate-300">Talk to Hermes through the city.</p>
         </div>
-        <div aria-hidden className="grid size-10 place-items-center rounded-lg border border-cyan-300/50 bg-cyan-300/10 text-xl text-cyan-200">
+        <div
+          aria-hidden
+          className="grid size-10 place-items-center rounded-lg border border-cyan-300/50 bg-cyan-300/10 text-xl text-cyan-200"
+        >
           ◈
         </div>
       </div>
@@ -94,7 +101,11 @@ export function DispatcherCube({ context, onSubjectSelected }: DispatcherCubePro
       </div>
 
       {mode === 'task' && (
-        <form aria-label="Create Kanban task" className="mt-4 space-y-2 rounded-xl border border-white/10 bg-white/5 p-3" onSubmit={submitTask}>
+        <form
+          aria-label="Create Kanban task"
+          className="mt-4 space-y-2 rounded-xl border border-white/10 bg-white/5 p-3"
+          onSubmit={submitTask}
+        >
           <label className="block text-xs text-slate-300" htmlFor="dispatcher-task-title">
             Title
           </label>
@@ -154,7 +165,10 @@ export function DispatcherCube({ context, onSubjectSelected }: DispatcherCubePro
       )}
 
       {feedback && (
-        <p className="mt-3 rounded-md border border-white/10 bg-white/5 px-2 py-1.5 text-xs text-slate-200" role="status">
+        <p
+          className="mt-3 rounded-md border border-white/10 bg-white/5 px-2 py-1.5 text-xs text-slate-200"
+          role="status"
+        >
           {feedback}
         </p>
       )}

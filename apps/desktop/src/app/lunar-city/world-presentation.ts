@@ -279,6 +279,7 @@ function uniqueRefs(refs: readonly WorldSourceRef[]): WorldSourceRef[] {
     }
 
     seen.add(key)
+
     return true
   })
 }
@@ -352,9 +353,11 @@ export function resolveWorldPresentation(
 ): WorldPresentation {
   const spec = sceneFor(event)
   const tags = animationTagsFor(spec.animationTags, assetTags)
+
   const related = conditions
     .filter(condition => condition.sourceRef?.taskId && condition.sourceRef.taskId === event.sourceRef?.taskId)
     .map(condition => condition.sourceRef!)
+
   const participants = uniqueRefs([...(event.sourceRef ? [event.sourceRef] : []), ...related])
   const primaryActor = participants[0] ?? { agentId: `world:${stableEventSeed(event)}` }
   const role = typeof event.facts.role === 'string' ? event.facts.role : undefined
@@ -362,13 +365,19 @@ export function resolveWorldPresentation(
 
   if (event.kind === 'pr.merged_stable') {
     npcActivities.push(
-      resolveNpcActivity(event, { agentId: `celebration:${stableEventSeed(event)}` }, 'celebrating', ['celebration.citywide', 'dance'])
+      resolveNpcActivity(event, { agentId: `celebration:${stableEventSeed(event)}` }, 'celebrating', [
+        'celebration.citywide',
+        'dance'
+      ])
     )
   }
 
   if (event.kind === 'task.blocked' || event.kind === 'task.block_loop') {
     npcActivities.push(
-      resolveNpcActivity(event, { agentId: `responders:${stableEventSeed(event)}` }, 'repairing', ['repair', 'extinguish'])
+      resolveNpcActivity(event, { agentId: `responders:${stableEventSeed(event)}` }, 'repairing', [
+        'repair',
+        'extinguish'
+      ])
     )
   }
 

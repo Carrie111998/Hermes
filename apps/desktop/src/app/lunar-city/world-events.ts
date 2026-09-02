@@ -84,11 +84,13 @@ function record(value: unknown): Record<string, unknown> {
 
 function safeDetail(value: unknown): string | undefined {
   const detail = text(value)
+
   return detail ? detail.slice(0, 2_000) : undefined
 }
 
 function sourceEventId(source: WorldSource, id: unknown, fallback: string): string {
   const normalized = typeof id === 'number' && Number.isFinite(id) ? String(id) : text(id)
+
   return normalized ? `${source}:${normalized}` : `${source}:${fallback}`
 }
 
@@ -100,36 +102,97 @@ function eventSpec(kind: string): {
 } {
   switch (kind) {
     case 'blocked':
-      return { actionKinds: ['inspect_blocker', 'comment', 'reassign_task', 'reclaim_task'], scope: 'task', severity: 'warning', worldKind: 'task.blocked' }
+      return {
+        actionKinds: ['inspect_blocker', 'comment', 'reassign_task', 'reclaim_task'],
+        scope: 'task',
+        severity: 'warning',
+        worldKind: 'task.blocked'
+      }
+
     case 'block_loop_detected':
-      return { actionKinds: ['inspect_blocker', 'comment', 'reassign_task'], scope: 'district', severity: 'critical', worldKind: 'task.block_loop' }
+      return {
+        actionKinds: ['inspect_blocker', 'comment', 'reassign_task'],
+        scope: 'district',
+        severity: 'critical',
+        worldKind: 'task.block_loop'
+      }
+
     case 'crashed':
-      return { actionKinds: ['inspect', 'reclaim_task', 'reassign_task'], scope: 'worker', severity: 'error', worldKind: 'worker.crashed' }
+      return {
+        actionKinds: ['inspect', 'reclaim_task', 'reassign_task'],
+        scope: 'worker',
+        severity: 'error',
+        worldKind: 'worker.crashed'
+      }
+
     case 'gave_up':
-      return { actionKinds: ['inspect', 'reclaim_task', 'reassign_task'], scope: 'task', severity: 'error', worldKind: 'worker.gave_up' }
+      return {
+        actionKinds: ['inspect', 'reclaim_task', 'reassign_task'],
+        scope: 'task',
+        severity: 'error',
+        worldKind: 'worker.gave_up'
+      }
+
     case 'timed_out':
-      return { actionKinds: ['inspect', 'reclaim_task', 'reassign_task'], scope: 'task', severity: 'warning', worldKind: 'worker.timed_out' }
+      return {
+        actionKinds: ['inspect', 'reclaim_task', 'reassign_task'],
+        scope: 'task',
+        severity: 'warning',
+        worldKind: 'worker.timed_out'
+      }
+
     case 'completed':
-      return { actionKinds: ['inspect', 'show_source'], scope: 'task', severity: 'success', worldKind: 'task.completed' }
+      return {
+        actionKinds: ['inspect', 'show_source'],
+        scope: 'task',
+        severity: 'success',
+        worldKind: 'task.completed'
+      }
+
     case 'done':
-      return { actionKinds: ['inspect', 'show_source'], scope: 'task', severity: 'success', worldKind: 'task.completed' }
+      return {
+        actionKinds: ['inspect', 'show_source'],
+        scope: 'task',
+        severity: 'success',
+        worldKind: 'task.completed'
+      }
+
     case 'unblocked':
-      return { actionKinds: ['inspect', 'show_source'], scope: 'task', severity: 'success', worldKind: 'task.recovered' }
+      return {
+        actionKinds: ['inspect', 'show_source'],
+        scope: 'task',
+        severity: 'success',
+        worldKind: 'task.recovered'
+      }
+
     case 'archived':
+
     case 'deleted':
       return { actionKinds: ['inspect'], scope: 'task', severity: 'info', worldKind: 'task.removed' }
+
     case 'review':
       return { actionKinds: ['inspect', 'comment'], scope: 'task', severity: 'warning', worldKind: 'task.in_review' }
+
     case 'running':
       return { actionKinds: ['inspect'], scope: 'task', severity: 'info', worldKind: 'task.running' }
+
     case 'ready':
       return { actionKinds: ['inspect'], scope: 'task', severity: 'info', worldKind: 'task.ready' }
+
     case 'scheduled':
+
     case 'todo':
+
     case 'triage':
       return { actionKinds: ['inspect'], scope: 'task', severity: 'info', worldKind: 'task.waiting' }
+
     default:
-      return { actionKinds: ['inspect', 'show_source'], scope: 'city', severity: 'warning', worldKind: 'system.unclassified_alert' }
+      return {
+        actionKinds: ['inspect', 'show_source'],
+        scope: 'city',
+        severity: 'warning',
+        worldKind: 'system.unclassified_alert'
+      }
   }
 }
 
@@ -173,8 +236,20 @@ export function normalizeAgentNotice(payload: AgentNoticePayload, now = Date.now
 
   const level = text(payload.level)
   const key = text(payload.key) || text(payload.id) || detail
-  const kind = key === 'credits.depleted' ? 'credits.depleted' : level === 'success' ? 'agent.success' : level === 'error' ? 'agent.error' : level === 'warn' ? 'agent.warning' : 'agent.info'
-  const severity: WorldSeverity = level === 'success' ? 'success' : level === 'error' ? 'error' : level === 'warn' ? 'warning' : 'info'
+
+  const kind =
+    key === 'credits.depleted'
+      ? 'credits.depleted'
+      : level === 'success'
+        ? 'agent.success'
+        : level === 'error'
+          ? 'agent.error'
+          : level === 'warn'
+            ? 'agent.warning'
+            : 'agent.info'
+
+  const severity: WorldSeverity =
+    level === 'success' ? 'success' : level === 'error' ? 'error' : level === 'warn' ? 'warning' : 'info'
 
   return {
     id: sourceEventId('agent_notice', key, detail),
@@ -225,7 +300,10 @@ export function classifyTaskCondition(task: KanbanTask, now = Date.now()): World
   }
 
   const spec = eventSpec(status)
-  const stale = status === 'running' && !!task.last_heartbeat_at && now / 1_000 - task.last_heartbeat_at > WORKER_STALE_SECONDS
+
+  const stale =
+    status === 'running' && !!task.last_heartbeat_at && now / 1_000 - task.last_heartbeat_at > WORKER_STALE_SECONDS
+
   const kind = stale ? 'worker.stale' : spec.worldKind
   const severity: WorldSeverity = stale ? 'warning' : spec.severity
   const scope: WorldScope = stale ? 'worker' : spec.scope

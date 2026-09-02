@@ -1,7 +1,6 @@
 import { describe, expect, it } from 'vitest'
 
 import type { WorldEvent } from './world-events'
-
 import { resolveNpcPersonality, resolveWorldPresentation, stableEventSeed } from './world-presentation'
 
 function event(kind: string, overrides: Partial<WorldEvent> = {}): WorldEvent {
@@ -38,7 +37,10 @@ describe('world presentation', () => {
   })
 
   it('escalates a critical blocker to a district fire scene', () => {
-    const presentation = resolveWorldPresentation(event('task.blocked', { scope: 'district', severity: 'critical' }), [])
+    const presentation = resolveWorldPresentation(
+      event('task.blocked', { scope: 'district', severity: 'critical' }),
+      []
+    )
 
     expect(presentation.sceneTag).toBe('crisis.fire.district')
     expect(presentation.cosmetic.intensity).toBe(3)
@@ -46,7 +48,12 @@ describe('world presentation', () => {
 
   it('renders stable merges as a city celebration with a cosmetic flourish', () => {
     const presentation = resolveWorldPresentation(
-      event('pr.merged_stable', { scope: 'city', severity: 'success', source: 'pull_request', sourceRef: { prId: 'pr-9' } }),
+      event('pr.merged_stable', {
+        scope: 'city',
+        severity: 'success',
+        source: 'pull_request',
+        sourceRef: { prId: 'pr-9' }
+      }),
       []
     )
 

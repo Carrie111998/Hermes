@@ -41,11 +41,15 @@ describe('world action runner', () => {
     const disconnectedDoors = context()
     disconnectedDoors.kanban.patchTask.mockRejectedValue(new Error('gateway disconnected'))
 
-    await expect(createWorldActionRunner(approvalDoors).run({ kind: 'recover_task', patch: {}, taskId: 'task-7' })).resolves.toMatchObject({
+    await expect(
+      createWorldActionRunner(approvalDoors).run({ kind: 'recover_task', patch: {}, taskId: 'task-7' })
+    ).resolves.toMatchObject({
       kind: 'approval_required',
       ok: false
     })
-    await expect(createWorldActionRunner(disconnectedDoors).run({ kind: 'recover_task', patch: {}, taskId: 'task-7' })).resolves.toMatchObject({
+    await expect(
+      createWorldActionRunner(disconnectedDoors).run({ kind: 'recover_task', patch: {}, taskId: 'task-7' })
+    ).resolves.toMatchObject({
       kind: 'disconnected',
       ok: false
     })
