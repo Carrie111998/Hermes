@@ -1769,6 +1769,13 @@ def parse_context_limit_from_error(error_msg: str) -> Optional[int]:
       - "Maximum context size 32768 exceeded"
       - "model's max context length is 65536"
       - "input token count is 32825 but model only supports up to 32768"
+      - "This model's maximum context length is 1048576 tokens" (Bedrock Llama 4)
+
+    Some do not, and there is nothing to extract: Bedrock's Nova models say
+    "Input Tokens Exceeded: Number of input tokens exceeds maximum length."
+    and DeepSeek R1 says "Input is too long for requested model.", neither of
+    which names a number.  ``None`` is the correct answer there — callers fall
+    back to their static table rather than inventing a window.
     """
     error_lower = error_msg.lower()
     # Pattern: look for numbers near context-related keywords
