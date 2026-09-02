@@ -240,6 +240,38 @@ def finalize_turn(
                 _kanban_task, api_call_count, agent.max_iterations, logger,
             )
 
+    # Normalize relative MEDIA paths against the session cwd before the
+    # response is persisted/delivered. Models routinely violate the
+    # "MEDIA:/absolute/path" instruction while working inside a project
+    # directory; downstream consumers all assume absolute (gateways skip
+    # delivery, the desktop renders an unplayable card). Rewrites happen only
+    # when the joined path exists on disk — see agent/media_path_normalizer.py.
+    # The matching assistant message in the histories is updated too so the
+    # stored transcript and the returned response stay consistent.
+    if isinstance(final_response, str) and "MEDIA:" in final_response:
+        try:
+            from agent.media_path_normalizer import normalize_relative_media_paths
+
+            _normalized_media = normalize_relative_media_paths(
+                final_response, session_key=effective_task_id
+            )
+            if _normalized_media != final_response:
+                for _hist in (messages, conversation_history):
+                    try:
+                        for _m in reversed(_hist or []):
+                            if (
+                                isinstance(_m, dict)
+                                and _m.get("role") == "assistant"
+                                and _m.get("content") == final_response
+                            ):
+                                _m["content"] = _normalized_media
+                                break
+                    except Exception:
+                        pass
+                final_response = _normalized_media
+        except Exception:
+            logger.debug("media path normalization skipped", exc_info=True)
+
     # Determine if conversation completed successfully
     normal_text_response = str(_turn_exit_reason).startswith("text_response(")
     completed = (
