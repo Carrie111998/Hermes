@@ -171,6 +171,10 @@ class TestImageRejectionPhraseIsolation:
     def _matches(self, body: str) -> bool:
         return _looks_like_image_content_rejection(body)
 
+    def test_zai_image_rejection_matches(self):
+        body = "Error code: 400 - {'error': {'code': '1210', 'message': \"messages.content.type is invalid, allowed values: ['text']\"}}"
+        assert self._matches(body) is True
+
     def test_kimi_truncated_image_trips_recovery(self):
         # Kimi/Moonshot reject truncated image bytes with this 400; the
         # bad bytes are in immutable history so stripping must fire.

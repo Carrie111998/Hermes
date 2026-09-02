@@ -5145,7 +5145,7 @@ def run_conversation(
                     pass
                 _err_status = getattr(api_error, "status_code", None)
                 _looks_like_image_rejection = _looks_like_image_content_rejection(_err_body)
-                # 4xx-only gate: never interpret 5xx/timeout as "server
+                # 4xx-only gate: never interpret 5xx/timeout as "server"
                 # said no to images" — those are transient and must
                 # route to the normal retry path.
                 _status_ok = _err_status is None or (400 <= int(_err_status) < 500)

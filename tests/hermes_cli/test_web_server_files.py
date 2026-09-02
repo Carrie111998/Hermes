@@ -288,6 +288,26 @@ def test_sensitive_env_files_hidden_from_listing(forced_files_client):
     assert ".env.prod" not in names
 
 
+def test_dangling_symlink_does_not_crash_file_listing(forced_files_client):
+    """Regression test: broken/dangling symlinks must not cause HTTP 500 when listing files."""
+    import os
+    client, root = forced_files_client
+    root.mkdir(parents=True, exist_ok=True)
+
+    regular = root / "valid_file.txt"
+    regular.write_text("hello")
+
+    broken_link = root / "dangling_link"
+    os.symlink("/nonexistent/target/path", broken_link)
+
+    listing = client.get("/api/files", params={"path": str(root)})
+    assert listing.status_code == 200
+    entries = listing.json()["entries"]
+    names = [e["name"] for e in entries]
+    assert "valid_file.txt" in names
+    assert "dangling_link" in names
+
+
 
 
 

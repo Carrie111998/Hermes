@@ -542,6 +542,12 @@ _IMAGE_REJECTION_PHRASES = (
     # "unknown variant `image_url`, expected `text`".
     "unknown variant `image_url`, expected `text`",
     "unknown variant image_url, expected text",
+    # Z.ai / Zhipu GLM API reports text-only endpoints rejecting image content as:
+    # "messages.content.type is invalid, allowed values: ['text']".
+    "messages.content.type is invalid",
+    "content.type is invalid",
+    "allowed values: ['text']",
+    "allowed values: [\"text\"]",
     # OpenRouter routes a request to upstream endpoints and,
     # when none of the candidate endpoints for the model accept
     # image input, returns HTTP 404 "No endpoints found that

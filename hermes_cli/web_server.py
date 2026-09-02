@@ -2745,20 +2745,26 @@ def _managed_file_entry(policy: ManagedFilesPolicy, target: Path) -> Dict[str, A
     try:
         resolved = target.resolve()
     except (OSError, RuntimeError):
-        raise HTTPException(status_code=400, detail="Invalid path")
-    if policy.locked_root is not None and not _path_is_under(policy.locked_root, resolved):
+        resolved = target.absolute()
+
+    check_path = resolved if target.exists() else target.absolute()
+    if policy.locked_root is not None and not _path_is_under(policy.locked_root, check_path):
         raise HTTPException(status_code=403, detail="Path outside managed files root")
 
     try:
         st = resolved.stat()
-    except OSError as exc:
-        raise HTTPException(status_code=500, detail=f"Could not stat path: {exc}")
+        is_dir = resolved.is_dir()
+    except OSError:
+        try:
+            st = target.lstat()
+            is_dir = False
+        except OSError as exc:
+            raise HTTPException(status_code=500, detail=f"Could not stat path: {exc}")
 
-    is_dir = resolved.is_dir()
-    mime_type = None if is_dir else (mimetypes.guess_type(resolved.name)[0] or "application/octet-stream")
+    mime_type = None if is_dir else (mimetypes.guess_type(target.name)[0] or "application/octet-stream")
     return {
         "name": target.name or resolved.name or str(resolved),
-        "path": str(resolved),
+        "path": str(resolved if target.exists() else target.absolute()),
         "is_directory": is_dir,
         "size": None if is_dir else st.st_size,
         "mtime": st.st_mtime,
@@ -2884,11 +2890,15 @@ async def list_managed_files(request: Request, path: Optional[str] = None):
 
     try:
         with os.scandir(target) as scan:
-            entries = [
-                _managed_file_entry(policy, Path(entry.path))
-                for entry in scan
-                if not _is_sensitive_path(Path(entry.path))
-            ]
+            entries = []
+            for entry in scan:
+                p = Path(entry.path)
+                if _is_sensitive_path(p):
+                    continue
+                try:
+                    entries.append(_managed_file_entry(policy, p))
+                except HTTPException:
+                    continue
     except PermissionError:
         raise HTTPException(status_code=403, detail="Directory is not readable")
     except OSError as exc:
