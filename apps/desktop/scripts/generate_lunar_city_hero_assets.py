@@ -94,8 +94,22 @@ def subcollection(parent, name):
     return child
 
 
+def tune_material(mat, *, noise_scale, noise_detail, bump_strength, bump_distance, pipeline):
+    mat["surface_pipeline"] = pipeline
+    mat["texture_resolution_target"] = "2k_procedural_default"
+    node_tree = mat.node_tree
+    for node in node_tree.nodes:
+        if node.bl_idname == "ShaderNodeTexNoise":
+            node.inputs["Scale"].default_value = noise_scale
+            node.inputs["Detail"].default_value = noise_detail
+        elif node.bl_idname == "ShaderNodeBump":
+            node.inputs["Strength"].default_value = bump_strength
+            node.inputs["Distance"].default_value = bump_distance
+    return mat
+
+
 def create_materials():
-    return {
+    mats = {
         "floor": lunar.material("Hero floor graphite PBR", (0.15, 0.17, 0.2), metallic=0.38, roughness=0.34),
         "shell": lunar.material("Hero white hull PBR", (0.68, 0.72, 0.78), metallic=0.44, roughness=0.24),
         "dark": lunar.material("Hero dark interior alloy", (0.045, 0.055, 0.075), metallic=0.38, roughness=0.42),
@@ -118,6 +132,21 @@ def create_materials():
         "text": lunar.material("Hero sign text emission", (0.9, 0.98, 1.0), roughness=0.16, emission=(0.9, 0.98, 1.0)),
         "review_floor": lunar.material("Hero review floor", (0.1, 0.11, 0.13), roughness=0.86),
     }
+    tune_material(mats["floor"], noise_scale=36, noise_detail=10, bump_strength=0.22, bump_distance=0.055, pipeline="2k_pbr_lunar_floor_micro_panel_noise")
+    tune_material(mats["shell"], noise_scale=28, noise_detail=9, bump_strength=0.14, bump_distance=0.035, pipeline="2k_pbr_ceramic_hull_panel_noise")
+    tune_material(mats["dark"], noise_scale=42, noise_detail=8, bump_strength=0.12, bump_distance=0.03, pipeline="2k_pbr_dark_alloy_brushed_noise")
+    tune_material(mats["panel"], noise_scale=64, noise_detail=11, bump_strength=0.1, bump_distance=0.022, pipeline="2k_pbr_panel_seam_noise")
+    tune_material(mats["fur"], noise_scale=52, noise_detail=12, bump_strength=0.18, bump_distance=0.03, pipeline="4k_pbr_leader_fur_directional_noise")
+    tune_material(mats["fur_light"], noise_scale=48, noise_detail=10, bump_strength=0.13, bump_distance=0.024, pipeline="4k_pbr_leader_muzzle_soft_noise")
+    tune_material(mats["helmet"], noise_scale=34, noise_detail=9, bump_strength=0.08, bump_distance=0.018, pipeline="2k_pbr_worker_helmet_ceramic_noise")
+    tune_material(mats["suit"], noise_scale=44, noise_detail=11, bump_strength=0.16, bump_distance=0.028, pipeline="2k_pbr_worker_suit_fabric_alloy_noise")
+    tune_material(mats["wood"], noise_scale=22, noise_detail=12, bump_strength=0.2, bump_distance=0.04, pipeline="2k_pbr_warm_wood_grain_noise")
+    for key in ("glass", "violet", "cyan", "amber", "green", "red", "gold", "white", "black", "beak", "text", "review_floor"):
+        tune_material(mats[key], noise_scale=18, noise_detail=5, bump_strength=0.04, bump_distance=0.012, pipeline="2k_pbr_emissive_or_trim_micro_noise")
+    mats["fur"]["texture_resolution_target"] = "4k_hero_leader"
+    mats["fur_light"]["texture_resolution_target"] = "4k_hero_leader"
+    mats["shell"]["texture_resolution_target"] = "4k_hero_building_facade_allowed"
+    return mats
 
 
 def arc_points(cx, cy, cz, width, height, count=9):
@@ -646,6 +675,7 @@ def main():
     scene["hero_mesh_components"] = sum(1 for obj in bpy.data.objects if obj.get("hero_asset"))
     scene["sculpted_surface_components"] = sum(1 for obj in bpy.data.objects if obj.get("mesh_construction"))
     scene["sculpted_character_core_components"] = sum(1 for obj in bpy.data.objects if str(obj.get("mesh_construction", "")).startswith("continuous_") and obj.get("asset_kind") == "character")
+    pbr_materials = sorted({mat.name for mat in bpy.data.materials if mat.get("surface_pipeline")})
 
     manifest = {
         "schemaVersion": 1,
@@ -659,6 +689,8 @@ def main():
         "heroMeshComponentCount": scene["hero_mesh_components"],
         "sculptedSurfaceComponentCount": scene["sculpted_surface_components"],
         "sculptedCharacterCoreComponentCount": scene["sculpted_character_core_components"],
+        "proceduralPbrMaterialCount": len(pbr_materials),
+        "proceduralPbrMaterials": pbr_materials,
         "buildings": [
             {"id": asset_id, "role": role, "title": title, "collection": f"Hero Asset - {asset_id}", "lod": ["hero", "high", "medium", "low"]}
             for asset_id, role, title, _accent in BUILDINGS
@@ -700,6 +732,7 @@ def main():
             "freeLocalGenerationOnly": True,
             "usesContinuousSculptedSurfaces": scene["sculpted_surface_components"] >= len(BUILDINGS) * 4 + len(LEADERS),
             "usesContinuousCharacterCoreMeshes": scene["sculpted_character_core_components"] >= (len(LEADERS) + len(WORKERS) + len(CHILDREN)) * 2,
+            "usesProceduralPbrMaterials": len(pbr_materials) >= 12,
         },
     }
     HERO_MANIFEST.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")

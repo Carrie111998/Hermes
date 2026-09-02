@@ -275,6 +275,30 @@
     }
   ],
   "preview": "lunar-city/hero-assets/lunar-city-hero-assets.png",
+  "proceduralPbrMaterialCount": 21,
+  "proceduralPbrMaterials": [
+    "Hero amber identity emission",
+    "Hero beak gold keratin",
+    "Hero cyan glass emission",
+    "Hero cyan identity emission",
+    "Hero dark interior alloy",
+    "Hero floor graphite PBR",
+    "Hero gold trim",
+    "Hero green identity emission",
+    "Hero ink black detail",
+    "Hero inset panel alloy",
+    "Hero leader fur",
+    "Hero leader light muzzle",
+    "Hero red alert enamel",
+    "Hero review floor",
+    "Hero sign text emission",
+    "Hero violet identity emission",
+    "Hero warm desk wood",
+    "Hero warm eye highlight",
+    "Hero white hull PBR",
+    "Hero worker helmet ceramic",
+    "Hero worker suit fabric alloy"
+  ],
   "referenceTarget": "approved_lunar_city_reference_images",
   "schemaVersion": 1,
   "sculptedCharacterCoreComponentCount": 36,
@@ -286,6 +310,7 @@
     "noRawSoulContent": true,
     "usesContinuousCharacterCoreMeshes": true,
     "usesContinuousSculptedSurfaces": true,
+    "usesProceduralPbrMaterials": true,
     "usesSeparateHeroAssetScene": true
   },
   "workers": [
