@@ -65,13 +65,16 @@ def _run_staleness_harness(script: str) -> Dict[str, Any]:
 
 def test_probe_rejection_classification_is_strict() -> None:
     """Only round-trip-proving rejections count as alive: not-found-shaped
-    errors, and server-answered rejections (gRPC INVALID_ARGUMENT /
-    FAILED_PRECONDITION or a "[spectrum-*]" source stamp — the synthetic
-    probe id is not a valid Apple message GUID, so the proxy answers with a
-    validation error on every probe, #101618). Transport-shaped errors stay
-    inconclusive — a rejected probe is NEVER treated as alive on the say-so
-    of the network layer alone (#45580's original /probe treated any
-    rejection as alive, which was too loose)."""
+    errors, and server-answered rejections (gRPC INVALID_ARGUMENT or a
+    "[spectrum-*]" source stamp — the synthetic probe id is not a valid
+    Apple message GUID, so the proxy answers with a validation error on
+    every probe, #101618). Transport-shaped errors stay inconclusive — a
+    rejected probe is NEVER treated as alive on the say-so of the network
+    layer alone (#45580's original /probe treated any rejection as alive,
+    which was too loose). FAILED_PRECONDITION stays inconclusive too: the
+    proxy can answer it from a half-ready state that never completed the
+    probe, and #101618 only ever observed INVALID_ARGUMENT-shaped
+    rejections."""
     out = _run_staleness_harness(
         """
         const results = {
@@ -99,14 +102,21 @@ def test_probe_rejection_classification_is_strict() -> None:
         "sdkNotFound",
         "invalidArgCode",
         "invalidArgSdk",
-        "failedPrecondition",
         "spectrumStamped",
         "spectrumErrorObject",
     ):
         assert out[name]["alive"] is True, name
         assert out[name]["inconclusive"] is False, name
-    # Everything else: not alive AND explicitly inconclusive.
-    for name in ("unavailable", "deadline", "generic", "weird"):
+    # Everything else: not alive AND explicitly inconclusive. That includes
+    # FAILED_PRECONDITION — deliberately excluded from the server-answered
+    # set (a half-ready proxy answer, not a completed probe).
+    for name in (
+        "unavailable",
+        "deadline",
+        "generic",
+        "weird",
+        "failedPrecondition",
+    ):
         assert out[name]["alive"] is False, name
         assert out[name]["inconclusive"] is True, name
 
