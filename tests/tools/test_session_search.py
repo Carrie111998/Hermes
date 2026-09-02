@@ -389,6 +389,64 @@ class TestScrollPattern:
         assert last_id in [m["id"] for m in v1["messages"]]
         assert last_id in [m["id"] for m in v2["messages"]]
 
+    def test_scroll_zero_anchor_falls_through_to_read(self, db):
+        """#94792: around_message_id=0 is the schema zero-value, not an
+        anchor — message ids come from an AUTOINCREMENT primary key and
+        start at 1. Models that fill the complete argument object send 0
+        for every read; treating it as set hijacked the scroll branch and
+        failed 100% of the time, so 0 must count as unset."""
+        db.create_session("s_zero", source="cli")
+        for i in range(3):
+            db.append_message("s_zero", role="user", content=f"zero msg {i}")
+
+        result = json.loads(session_search(
+            session_id="s_zero", around_message_id=0, window=2, db=db
+        ))
+        assert result["success"] is True
+        assert result["mode"] == "read"
+        # The full zero-filled schema shape still reads, matching how
+        # query="" / profile="" are already tolerated as empty.
+        full = dict(
+            around_message_id=0, detail="adaptive", limit=3, profile="",
+            query="", role_filter="user,assistant", session_id="s_zero",
+            sort="newest", window=5,
+        )
+        full_result = json.loads(session_search(db=db, **full))
+        assert full_result["success"] is True
+        assert full_result["mode"] == "read"
+
+    def test_scroll_positive_anchor_still_scrolls(self, db):
+        """The zero-tolerance must not eat real anchors: a positive id
+        keeps selecting the scroll shape."""
+        db.create_session("s_pos", source="cli")
+        ids = []
+        for i in range(5):
+            ids.append(db.append_message("s_pos", role="user", content=f"pos {i}"))
+
+        result = json.loads(session_search(
+            session_id="s_pos", around_message_id=ids[2], window=2, db=db
+        ))
+        assert result["success"] is True
+        assert result["mode"] == "scroll"
+        assert ids[2] in [m["id"] for m in result["messages"]]
+
+    def test_scroll_string_anchor_still_scrolls(self, db):
+        """Review on #94801: _scroll coerces string anchors (\"4408\"
+        scrolls on main), so the zero-anchor gate must coerce before
+        comparing — a naive `> 0` on the raw value raised TypeError and
+        broke every string-anchor scroll."""
+        db.create_session("s_str", source="cli")
+        ids = []
+        for i in range(3):
+            ids.append(db.append_message("s_str", role="user", content=f"str {i}"))
+
+        result = json.loads(session_search(
+            session_id="s_str", around_message_id=str(ids[1]), window=2, db=db
+        ))
+        assert result["success"] is True
+        assert result["mode"] == "scroll"
+        assert ids[1] in [m["id"] for m in result["messages"]]
+
 
 # =========================================================================
 # Shape precedence

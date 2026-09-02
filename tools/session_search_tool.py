@@ -1007,7 +1007,24 @@ def _session_search_impl(
             current_session_id = None
 
     # Scroll shape takes precedence — explicit anchor beats any query.
-    if (isinstance(session_id, str) and session_id.strip()) and around_message_id is not None:
+    # The anchor gate checks for a POSITIVE id: message ids come from an
+    # AUTOINCREMENT primary key and start at 1, so 0 can never be a valid
+    # anchor — yet models that fill the complete schema with zero values
+    # send around_message_id=0 for every read, hijacking the scroll branch
+    # and failing 100% of the time ("0 not in session_id") until
+    # same_tool_failure_halt fires. Treat 0 like every other empty field
+    # (query="", profile="") is already treated: as unset (#94792).
+    # Coerce before comparing (same semantics as _scroll itself): string
+    # anchors like "4408" scroll successfully today and must keep doing so.
+    try:
+        _anchor_ok = int(around_message_id) > 0
+    except (TypeError, ValueError):
+        _anchor_ok = False
+    if (
+        (isinstance(session_id, str) and session_id.strip())
+        and around_message_id is not None
+        and _anchor_ok
+    ):
         return _scroll(
             db=db,
             session_id=session_id,
