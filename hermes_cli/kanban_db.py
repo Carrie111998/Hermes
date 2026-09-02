@@ -3203,10 +3203,11 @@ def create_task(
     parents — a specifier/triager is expected to promote the task to
     ``todo`` once the spec is fleshed out.
 
-    If ``idempotency_key`` is provided and a non-archived task with the
-    same key already exists, returns the existing task's id instead of
-    creating a duplicate. Useful for retried webhooks / automation that
-    should not double-write.
+    If ``idempotency_key`` is provided and a task with the same key
+    already exists (regardless of status — archived rows match too:
+    admitted-once means admitted-forever), returns the existing task's
+    id instead of creating a duplicate. Useful for retried webhooks /
+    automation that should not double-write.
 
     ``max_runtime_seconds`` caps how long a worker may run before the
     dispatcher SIGTERMs (then SIGKILLs after a grace window) and
@@ -3409,10 +3410,13 @@ def create_task(
     # and to avoid holding a write lock during the lookup. Race is
     # acceptable: two concurrent creators with the same key might both
     # insert, at which point both rows exist but the next lookup stabilises.
+    # The lookup is STATUS-BLIND: archived rows match too. Admitted-once
+    # means admitted-forever — a retried webhook replaying a key whose
+    # task has since been archived must get that task's id back, never a
+    # fresh duplicate row (the #64 double-admission mechanism).
     if idempotency_key:
         row = conn.execute(
             "SELECT id FROM tasks WHERE idempotency_key = ? "
-            "AND status != 'archived' "
             "ORDER BY created_at DESC LIMIT 1",
             (idempotency_key,),
         ).fetchone()
