@@ -2315,17 +2315,38 @@ def _run_post_setup(post_setup_key: str):
             _print_info("    Run manually: hermes auth spotify")
 
     elif post_setup_key == "langfuse":
-        # Install the langfuse SDK.
+        # Install the langfuse SDK. The bundled observability/langfuse plugin
+        # targets the SDK v3 API (update_trace); v4 removed those methods and
+        # the plugin fails open silently, so the install is pinned to 3.x
+        # and an existing v4 is downgraded rather than accepted (#94710).
+        _LANGFUSE_PIN = "langfuse>=3,<4"
         try:
-            __import__("langfuse")
-            _print_success("    langfuse SDK already installed")
+            import importlib.metadata as _md
+
+            _lf_ver = _md.version("langfuse")
+            if _lf_ver.startswith("3"):
+                _print_success("    langfuse SDK already installed")
+            else:
+                _print_warning(
+                    f"    langfuse SDK {_lf_ver} is incompatible with the "
+                    "bundled plugin (targets v3 update_trace API); "
+                    f"installing {_LANGFUSE_PIN}..."
+                )
+                result = _pip_install([_LANGFUSE_PIN, "--quiet"], timeout=120)
+                if result.returncode == 0:
+                    _print_success(f"    langfuse SDK pinned to {_LANGFUSE_PIN}")
+                else:
+                    _print_warning(
+                        "    langfuse SDK downgrade failed - run manually: "
+                        f"uv pip install '{_LANGFUSE_PIN}'"
+                    )
         except ImportError:
             _print_info("    Installing langfuse SDK...")
-            result = _pip_install(["langfuse", "--quiet"], timeout=120)
+            result = _pip_install([_LANGFUSE_PIN, "--quiet"], timeout=120)
             if result.returncode == 0:
                 _print_success("    langfuse SDK installed")
             else:
-                _print_warning("    langfuse SDK install failed — run manually: uv pip install langfuse")
+                _print_warning("    langfuse SDK install failed — run manually: uv pip install 'langfuse>=3,<4'")
         # Opt the bundled observability/langfuse plugin into plugins.enabled.
         # The plugin ships in the repo but doesn't load until the user enables
         # it (standalone plugins are opt-in).
