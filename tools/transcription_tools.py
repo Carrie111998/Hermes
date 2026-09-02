@@ -38,6 +38,7 @@ from typing import Optional, Dict, Any
 from urllib.parse import urljoin
 
 from utils import is_truthy_value
+from hermes_cli._subprocess_compat import windows_hide_flags
 from tools.managed_tool_gateway import resolve_managed_tool_gateway
 from tools.tool_backend_helpers import (
     managed_nous_tools_enabled,
@@ -552,7 +553,7 @@ def _run_command_stt(command: str, timeout: float) -> subprocess.CompletedProces
         "text": True,
     }
     if os.name == "nt":
-        popen_kwargs["creationflags"] = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+        popen_kwargs["creationflags"] = windows_hide_flags()
     else:
         popen_kwargs["start_new_session"] = True
 
