@@ -583,3 +583,46 @@ def test_adapter_send_unmentioned_default_and_error_are_silent():
     assert posted == []
     assert default.success is True and default.message_id is None
     assert error.success is True and error.message_id is None
+
+
+def test_two_senders_keep_own_refs_latest_unmentioned_not_older_mention(
+    tmp_path: Path,
+):
+    conv = "19:group-throwaway"
+    common = dict(
+        conversation_id=conv,
+        conversation_type="groupChat",
+        service_url="https://smba.trafficmanager.net/teams/",
+        tenant_id="00000000-0000-0000-0000-000000000002",
+        bot_app_id=BOT,
+    )
+    persist_inbound_ref(
+        tmp_path,
+        **common,
+        user_id="29:zulu-roster",
+        person="Zulu",
+        filename_stem="Zulu",
+        inbound_activity_id="old-mentioned",
+        addressed_via="mention",
+    )
+    persist_inbound_ref(
+        tmp_path,
+        **common,
+        user_id="29:alpha-roster",
+        person="Alpha",
+        filename_stem="Alpha",
+        inbound_activity_id="latest-unmentioned",
+        addressed_via="unmentioned",
+    )
+    zulu = json.loads((tmp_path / "Zulu.json").read_text(encoding="utf-8"))
+    alpha = json.loads((tmp_path / "Alpha.json").read_text(encoding="utf-8"))
+    assert zulu["addressed_via"] == "mention"
+    assert zulu["last_inbound_activity_id"] == "old-mentioned"
+    assert zulu["addressed_by"] == "29:zulu-roster"
+    assert alpha["addressed_via"] == "unmentioned"
+    assert alpha["last_inbound_activity_id"] == "latest-unmentioned"
+    assert alpha["addressed_by"] == "29:alpha-roster"
+    loaded = load_stored_refs(tmp_path)[conv]
+    assert loaded["addressed_via"] == "unmentioned"
+    assert loaded["last_inbound_activity_id"] == "latest-unmentioned"
+    assert loaded["addressed_by"] == "29:alpha-roster"

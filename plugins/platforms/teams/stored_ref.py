@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+import time
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, Mapping, Optional
 from urllib.parse import quote, urlparse
@@ -134,11 +135,24 @@ def activity_post_url(ref: Mapping[str, Any]) -> str:
     return f"{base}v3/conversations/{conv}/activities"
 
 
+def _ref_recency(path: Path, data: Mapping[str, Any]) -> int:
+    stamp = data.get("persisted_at")
+    if isinstance(stamp, bool):
+        stamp = None
+    if isinstance(stamp, (int, float)):
+        return int(stamp)
+    try:
+        return path.stat().st_mtime_ns
+    except OSError:
+        return 0
+
+
 def load_stored_refs(directory: Path) -> Dict[str, Dict[str, Any]]:
     loaded: Dict[str, Dict[str, Any]] = {}
+    recency: Dict[str, int] = {}
     if not directory.is_dir():
         return loaded
-    for path in sorted(directory.glob("*.json")):
+    for path in directory.glob("*.json"):
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
@@ -149,7 +163,12 @@ def load_stored_refs(directory: Path) -> Dict[str, Dict[str, Any]]:
             classify_stored_ref(data)
         except StoredRefError:
             continue
-        loaded[str(data["conversation_id"])] = data
+        conv = str(data["conversation_id"])
+        rank = _ref_recency(path, data)
+        if conv in recency and recency[conv] >= rank:
+            continue
+        recency[conv] = rank
+        loaded[conv] = data
     return loaded
 
 
@@ -200,6 +219,7 @@ def persist_inbound_ref(
         ref["addressed_by"] = str(addresser)
         if inbound_activity_id:
             ref["last_inbound_activity_id"] = str(inbound_activity_id)
+    ref["persisted_at"] = time.time_ns()
     classify_stored_ref(ref, expected_bot_app_id=bot_app_id)
     directory.mkdir(parents=True, exist_ok=True)
     for existing in directory.glob("*.json"):
