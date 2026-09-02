@@ -491,6 +491,187 @@ def test_preflight_codex_api_kwargs_leaves_tool_definition_names_alone():
     assert kwargs["tools"][0]["name"] == "my_tool"
 
 
+def test_actual_plaintext_reasoning_replays_adjacent_to_function_call():
+    """Actual must receive Kimi's thought on the same assistant action turn."""
+    messages = [
+        {"role": "user", "content": "Inspect the repository"},
+        {
+            "role": "assistant",
+            "content": "",
+            "reasoning": "I should inspect the repository before answering.",
+            "reasoning_content": "I should inspect the repository before answering.",
+            "tool_calls": [
+                {
+                    "id": "call_status",
+                    "type": "function",
+                    "function": {
+                        "name": "terminal",
+                        "arguments": '{"command":"git status"}',
+                    },
+                }
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call_status", "content": "clean"},
+    ]
+
+    items = _chat_messages_to_responses_input(
+        messages,
+        replay_plaintext_reasoning=True,
+        current_issuer_kind="other:https://api.actual.inc/v1",
+    )
+
+    reasoning_index = next(
+        i for i, item in enumerate(items) if item.get("type") == "reasoning"
+    )
+    call_index = next(
+        i for i, item in enumerate(items) if item.get("type") == "function_call"
+    )
+    output_index = next(
+        i for i, item in enumerate(items)
+        if item.get("type") == "function_call_output"
+    )
+    assert call_index == reasoning_index + 1
+    assert output_index == call_index + 1
+    assert items[reasoning_index] == {
+        "type": "reasoning",
+        "content": [{
+            "type": "reasoning_text",
+            "text": "I should inspect the repository before answering.",
+        }],
+        "summary": [],
+    }
+
+
+def test_actual_plaintext_reasoning_heads_mixed_content_action_turn():
+    """A turn with visible text AND a tool call stays one contiguous run.
+
+    Wire order is OpenAI's canonical output order — reasoning, then the
+    assistant message, then the function_call(s) — with nothing interleaved
+    and nothing dropped. The relay attaches reasoning to the contiguous
+    assistant run that follows it (the whole model turn), so the contract is
+    turn-level adjacency, not reasoning-touches-function_call.
+    """
+    messages = [
+        {"role": "user", "content": "Inspect the repository"},
+        {
+            "role": "assistant",
+            "content": "Checking the working tree and the branch.",
+            "reasoning_content": (
+                "Two probes: status for drift, branch for identity."
+            ),
+            "tool_calls": [
+                {
+                    "id": "call_status",
+                    "type": "function",
+                    "function": {
+                        "name": "terminal",
+                        "arguments": '{"command":"git status"}',
+                    },
+                },
+                {
+                    "id": "call_branch",
+                    "type": "function",
+                    "function": {
+                        "name": "terminal",
+                        "arguments": '{"command":"git branch --show-current"}',
+                    },
+                },
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call_status", "content": "clean"},
+        {"role": "tool", "tool_call_id": "call_branch", "content": "main"},
+    ]
+
+    items = _chat_messages_to_responses_input(
+        messages,
+        replay_plaintext_reasoning=True,
+        current_issuer_kind="other:https://api.actual.inc/v1",
+    )
+
+    reasoning_index = next(
+        i for i, item in enumerate(items) if item.get("type") == "reasoning"
+    )
+    message_index = next(
+        i
+        for i, item in enumerate(items)
+        if i > reasoning_index and item.get("role") == "assistant"
+    )
+    call_indexes = [
+        i for i, item in enumerate(items) if item.get("type") == "function_call"
+    ]
+    assert message_index == reasoning_index + 1
+    assert call_indexes == [message_index + 1, message_index + 2]
+    assert items[reasoning_index]["content"][0]["text"] == (
+        "Two probes: status for drift, branch for identity."
+    )
+    # The missing_following_item guard must not inject an empty assistant
+    # message into a turn that already has visible content.
+    assert items[message_index]["content"] == (
+        "Checking the working tree and the branch."
+    )
+
+
+def test_plaintext_reasoning_replay_is_opt_in():
+    messages = [{
+        "role": "assistant",
+        "content": "done",
+        "reasoning_content": "private provider thought",
+    }]
+
+    items = _chat_messages_to_responses_input(messages)
+
+    assert not any(item.get("type") == "reasoning" for item in items)
+
+
+def test_preflight_plaintext_reasoning_is_capability_gated():
+    raw = [{
+        "type": "reasoning",
+        "content": [{"type": "reasoning_text", "text": "replay me"}],
+        "summary": [],
+    }]
+
+    assert _preflight_codex_input_items(raw) == []
+    assert _preflight_codex_input_items(
+        raw, allow_plaintext_reasoning=True
+    ) == raw
+
+
+def test_normalize_actual_reasoning_content_extracts_plaintext():
+    response = SimpleNamespace(
+        status="completed",
+        output=[
+            SimpleNamespace(
+                type="reasoning",
+                id="rs_actual_1",
+                status="completed",
+                encrypted_content=None,
+                content=[SimpleNamespace(
+                    type="reasoning_text",
+                    text="I need a repository inspection first.",
+                )],
+                summary=[],
+            ),
+            SimpleNamespace(
+                type="function_call",
+                id="fc_actual_1",
+                call_id="call_actual_1",
+                status="completed",
+                name="terminal",
+                arguments='{"command":"git status"}',
+            ),
+        ],
+    )
+
+    assistant, finish_reason = _normalize_codex_response(
+        response,
+        issuer_kind="other:https://api.actual.inc/v1",
+    )
+
+    assert finish_reason == "tool_calls"
+    assert assistant.reasoning == "I need a repository inspection first."
+    assert assistant.codex_reasoning_items is None
+
+
 def test_preflight_codex_input_items_drops_short_id_for_github_responses():
     items = _preflight_codex_input_items(
         [
