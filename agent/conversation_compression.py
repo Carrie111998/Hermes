@@ -1459,6 +1459,7 @@ def run_compress_context_with_progress_timeout(
     telemetry_agent: Any = None,
     stall_fallback: bool = True,
     new_fence: Optional[Callable[[], CompressionCommitFence]] = None,
+    on_primary_stall: Optional[Callable[[], None]] = None,
 ) -> Tuple[list, str]:
     """Run ``worker(fence)`` under a sync progress-aware timeout.
 
@@ -1500,6 +1501,16 @@ def run_compress_context_with_progress_timeout(
     handling (exception-path only) never sees it (#78981). ``on_timeout``
     therefore fires only after that attempt has also failed, which keeps its
     cooldown bookkeeping from suppressing the retry it precedes.
+
+    ``on_primary_stall`` is the route-specific escalation hook for the
+    fallback-RECOVERED case (#95879): when the retry succeeds, this callback
+    fires (once) BEFORE the recovered result is returned, so the host can
+    record the stall in the dedicated primary-stall ledger
+    (``ContextCompressor.record_primary_route_stall_recovered``) — which the
+    shared cooldown ladder (``on_timeout``) deliberately must not learn about.
+    ``on_timeout`` is NOT called in that case; the ladder stays untouched and
+    the healthy fallback keeps running while the half-dead primary accrues
+    escalation state.
 
     ``new_fence`` mints that retry's fence. Hosts that publish the active
     fence for hard-interrupt admission pass a factory that publishes the new
@@ -1781,6 +1792,27 @@ def run_compress_context_with_progress_timeout(
                 new_fence=new_fence,
             )
             if recovered is not None:
+                # #95879: the fallback saved the compaction, but the PRIMARY
+                # stalled to get here. Escalate that in the route-specific
+                # ledger BEFORE returning (on_timeout — the shared cooldown
+                # ladder — must not learn about a recovery: the fallback just
+                # worked and suppressing it would re-break #95433 ordering).
+                if on_primary_stall is not None:
+                    try:
+                        on_primary_stall()
+                    except Exception:
+                        logger.debug(
+                            "compress_context primary-stall callback failed",
+                            exc_info=True,
+                        )
+                if telemetry_agent is not None:
+                    _emit_compression_attempt_telemetry(
+                        telemetry_agent,
+                        started_at=wait_started,
+                        commit_status="fallback_recovered",
+                        split_status="fallback_recovered",
+                        failure_class="primary_route_stall_recovered",
+                    )
                 return recovered
         if on_timeout is not None:
             try:
@@ -1909,6 +1941,14 @@ def _emit_compression_attempt_telemetry(
             payload["commit_ms"] = commit_ms
         if failure_class:
             payload["failure_class"] = failure_class
+        if failure_class == "primary_route_stall_recovered":
+            # #95879: surface the route-specific ledger count on the stall
+            # telemetry line so a half-dead primary is visible in the same
+            # stream as other compression failures without changing the shape
+            # of every other attempt's payload.
+            payload["primary_stall_streak"] = getattr(
+                agent.context_compressor, "_primary_stall_streak", 0
+            )
         payload.setdefault("chunking", False)
         payload.setdefault("chunk_count", 0)
         payload["fallback_used"] = bool(

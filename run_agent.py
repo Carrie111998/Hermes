@@ -8819,7 +8819,47 @@ class AIAgent:
                         self._active_compression_commit_fence = retry_fence
                     return retry_fence
 
-                result = run_compress_context_with_progress_timeout(
+                # #95879: route-specific escalation for a stalled primary
+                # summary route. When the primary-stall ledger tripped the
+                # skip-primary gate, make the FIRST fallback_chain entry the
+                # FIRST attempt (pre-pinned via the existing single-use pin
+                # mechanism) instead of burning the full idle window on a
+                # half-dead primary before the fallback saves the compaction.
+                # The gate is route-specific — it never touches the shared
+                # cooldown ladder, so a healthy fallback keeps running.
+                compressor = getattr(self, "context_compressor", None)
+                pre_pin_route = None
+                if compressor is not None:
+                    should_skip = getattr(
+                        compressor, "should_skip_primary_route", None
+                    )
+                    if callable(should_skip):
+                        try:
+                            if should_skip():
+                                pre_pin_route = resolve_compression_fallback_route()
+                        except Exception:
+                            logger.debug(
+                                "primary-route skip gate check failed",
+                                exc_info=True,
+                            )
+
+                def _on_primary_stall():
+                    # Fallback-recovered stall: record it in the dedicated
+                    # route-specific ledger (never the shared cooldown ladder).
+                    record = getattr(
+                        compressor, "record_primary_route_stall_recovered", None
+                    )
+                    if not callable(record):
+                        return
+                    try:
+                        record()
+                    except Exception:
+                        logger.debug(
+                            "failed to record primary-route stall",
+                            exc_info=True,
+                        )
+
+                _run_kwargs = dict(
                     worker=_snapshot_worker,
                     messages=messages,
                     system_prompt_fallback=_fallback_prompt,
@@ -8831,7 +8871,23 @@ class AIAgent:
                     fence=active_fence,
                     telemetry_agent=self,
                     new_fence=_publish_new_fence,
+                    on_primary_stall=_on_primary_stall,
                 )
+                if pre_pin_route is not None:
+                    # The pre-pinned attempt IS the fallback; do not burn a
+                    # second retry on the same chain entry if it stalls too
+                    # (the shared ladder then degrades, exactly as FM3).
+                    _run_kwargs["stall_fallback"] = False
+                    from agent.context_compressor import pin_summary_route
+
+                    with pin_summary_route(pre_pin_route):
+                        result = run_compress_context_with_progress_timeout(
+                            **_run_kwargs
+                        )
+                else:
+                    result = run_compress_context_with_progress_timeout(
+                        **_run_kwargs
+                    )
             # _DB_PERSISTED_MARKER lives at module level in
             # agent.context_compressor; conversation_compression only
             # imports it locally (cannot be imported from there). Imported

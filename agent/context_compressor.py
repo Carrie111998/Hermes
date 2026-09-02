@@ -95,6 +95,38 @@ _PINNED_ROUTE_FIELDS: tuple[str, ...] = (
     "timeout",
 )
 
+# #95879: persisted keys for the route-specific primary-stall ledger. The
+# ledger is deliberately SEPARATE from the shared summary-failure cooldown
+# ladder (record_timeout_failure / _summary_failure_cooldown_until): that
+# ladder is route-agnostic, so recording a fallback-recovered stall there
+# would suppress ALL compression — including the fallback that just worked —
+# and re-break the #95433 ordering (fallback runs before on_timeout precisely
+# so the cooldown can't suppress the retry). Values ride the session's
+# model_config JSON (same merge discipline as proactive-prune rearm), so no
+# schema migration is needed and a restart cannot disarm mid-escalation.
+_PRIMARY_STALL_STREAK_KEY = "primary_stall_streak"
+_PRIMARY_STALL_SKIP_UNTIL_KEY = "primary_stall_skip_until"
+_PRIMARY_STALL_DEFAULT_SKIP_THRESHOLD = 2
+_PRIMARY_STALL_DEFAULT_SKIP_SECONDS = 600.0
+
+
+def _compression_config_value(key: str, default: Any):
+    """Read one ``compression.*`` config value, falling back to ``default``.
+
+    Mirrors ``resolve_context_compression_timeouts``'s read of the same
+    section: fresh read per call (the events are rare), never raises.
+    """
+    try:
+        from hermes_cli.config import load_config
+
+        raw = load_config()
+        cfg = raw.get("compression", {}) if isinstance(raw, dict) else {}
+        if isinstance(cfg, dict) and key in cfg and cfg[key] is not None:
+            return cfg[key]
+    except Exception:
+        pass
+    return default
+
 
 @contextlib.contextmanager
 def pin_summary_route(route: Optional[Dict[str, Any]]):
@@ -2317,6 +2349,8 @@ class ContextCompressor(ContextEngine):
         self._structural_no_op_backoff_until = 0.0
         self._prellm_skip_count = 0
         self._fallback_compression_streak = 0
+        self._primary_stall_streak = 0
+        self._primary_stall_skip_until = 0.0
         self._verify_compaction_cleared_threshold = False
         self._last_compression_made_progress = False
         self._summary_failure_cooldown_until = 0.0  # transient errors must not block a fresh session
@@ -2621,6 +2655,8 @@ class ContextCompressor(ContextEngine):
         self._structural_no_op_backoff_until = 0.0
         self._prellm_skip_count = 0
         self._fallback_compression_streak = 0
+        self._primary_stall_streak = 0
+        self._primary_stall_skip_until = 0.0
         self._verify_compaction_cleared_threshold = False
         self._last_compression_made_progress = False
         self._summary_failure_cooldown_until = 0.0
@@ -2653,11 +2689,14 @@ class ContextCompressor(ContextEngine):
         self._anti_thrash_recovery_deadline = 0.0
         self._structural_no_op_backoff_until = 0.0
         self._proactive_prune_rearm_tokens = 0
+        self._primary_stall_streak = 0
+        self._primary_stall_skip_until = 0.0
         self.get_active_compression_failure_cooldown()
         self._load_fallback_compression_streak()
         self._load_ineffective_compression_count()
         self._load_anti_thrash_recovery_deadline()
         self._load_proactive_prune_rearm_tokens()
+        self._load_primary_stall_state()
 
     def on_session_start(self, session_id: str, **kwargs) -> None:
         """Bind session-scoped compression state for a new or resumed session."""
@@ -2667,6 +2706,8 @@ class ContextCompressor(ContextEngine):
         session_db = kwargs.get("session_db", getattr(self, "_session_db", None))
         previous_fallback_streak = self._fallback_compression_streak
         previous_ineffective_count = self._ineffective_compression_count
+        previous_primary_stall_streak = None
+        previous_primary_stall_skip_until = None
         if boundary_reason == "compression" and old_session_id:
             getter = getattr(session_db, "get_compression_fallback_streak", None)
             if callable(getter):
@@ -2698,6 +2739,33 @@ class ContextCompressor(ContextEngine):
                         "compression parent ineffective count lookup failed (non-sqlite): %s",
                         exc,
                     )
+            # #95879: the primary-stall ledger is a logical-conversation
+            # property too — a half-dead primary must not be silently healed
+            # by a session-id rotation. Read the parent row's ledger via the
+            # same model_config channel bind_session_state will use on the
+            # child.
+            parent_config_getter = getattr(
+                session_db, "get_session_model_config_value", None,
+            )
+            if callable(parent_config_getter):
+                try:
+                    previous_primary_stall_streak = parent_config_getter(
+                        old_session_id, _PRIMARY_STALL_STREAK_KEY, None,
+                    )
+                    previous_primary_stall_skip_until = parent_config_getter(
+                        old_session_id, _PRIMARY_STALL_SKIP_UNTIL_KEY, None,
+                    )
+                except (TypeError, ValueError, sqlite3.Error) as exc:
+                    logger.debug(
+                        "compression parent primary-stall ledger lookup failed: %s",
+                        exc,
+                    )
+                except Exception as exc:
+                    logger.debug(
+                        "compression parent primary-stall ledger lookup failed "
+                        "(non-sqlite): %s",
+                        exc,
+                    )
         self.bind_session_state(session_db, session_id)
         if boundary_reason == "compression":
             # Rotation creates a fresh child row before this callback. Preserve
@@ -2712,6 +2780,48 @@ class ContextCompressor(ContextEngine):
             if self._ineffective_compression_count != previous_ineffective_count:
                 self._ineffective_compression_count = previous_ineffective_count
                 self._persist_ineffective_compression_count()
+            # Same carry discipline for the primary-stall ledger (#95879):
+            # bind_session_state() loaded the FRESH child row (zeros), so
+            # restore + persist the parent's streak and skip-window now. A
+            # restart between rotation and the next stall/success would
+            # otherwise disarm the escalation mid-window.
+            if previous_primary_stall_streak is not None:
+                try:
+                    carried_streak = max(
+                        0,
+                        int(previous_primary_stall_streak)
+                        if isinstance(
+                            previous_primary_stall_streak, (int, float, str)
+                        )
+                        else 0,
+                    )
+                except (TypeError, ValueError):
+                    carried_streak = 0
+            else:
+                carried_streak = self._primary_stall_streak
+            if previous_primary_stall_skip_until is not None:
+                try:
+                    carried_epoch = float(previous_primary_stall_skip_until or 0.0)
+                except (TypeError, ValueError):
+                    carried_epoch = 0.0
+                if carried_epoch > 0.0:
+                    carried_remaining = carried_epoch - time.time()
+                    carried_skip_until = (
+                        time.monotonic() + carried_remaining
+                        if carried_remaining > 0.0
+                        else 0.0
+                    )
+                else:
+                    carried_skip_until = 0.0
+            else:
+                carried_skip_until = self._primary_stall_skip_until
+            if (
+                self._primary_stall_streak != carried_streak
+                or self._primary_stall_skip_until != carried_skip_until
+            ):
+                self._primary_stall_streak = carried_streak
+                self._primary_stall_skip_until = carried_skip_until
+                self._persist_primary_stall_state()
 
     def _load_fallback_compression_streak(self) -> None:
         session_db = getattr(self, "_session_db", None)
@@ -2779,6 +2889,208 @@ class ContextCompressor(ContextEngine):
             logger.debug("compression fallback streak persist failed: %s", exc)
         except Exception as exc:
             logger.debug("compression fallback streak persist failed (non-sqlite): %s", exc)
+
+    # ------------------------------------------------------------------
+    # Primary-stall ledger (#95879) — route-specific escalation
+    # ------------------------------------------------------------------
+    #
+    # The shared cooldown ladder (record_timeout_failure /
+    # _summary_failure_cooldown_until) is route-agnostic: recording a
+    # fallback-recovered stall there would suppress ALL compression —
+    # including the fallback that just worked — and re-break the #95433
+    # ordering (fallback runs before on_timeout so the cooldown can't
+    # suppress the retry). This separate, persisted ledger counts
+    # consecutive fallback-recovered primary stalls and, past a threshold,
+    # arms a bounded skip-primary window during which the host pre-pins the
+    # first fallback_chain entry as the FIRST attempt.
+
+    def _load_primary_stall_state(self) -> None:
+        """Restore the primary-stall ledger for a bound/resumed session.
+
+        Reads both keys from the session's model_config JSON (the same
+        merge-discipline channel as proactive-prune rearm), so a fresh
+        compressor on a resumed session inherits an armed skip window
+        instead of letting a restart silently heal a half-dead primary
+        (#95879).
+        """
+        session_db = getattr(self, "_session_db", None)
+        session_id = getattr(self, "_session_id", "")
+        getter = getattr(session_db, "get_session_model_config_value", None)
+        if not session_id or not callable(getter):
+            return
+        try:
+            stored_streak = getter(session_id, _PRIMARY_STALL_STREAK_KEY, 0)
+            self._primary_stall_streak = max(
+                0,
+                int(stored_streak)
+                if isinstance(stored_streak, (int, float, str))
+                else 0,
+            )
+            stored_epoch = getter(session_id, _PRIMARY_STALL_SKIP_UNTIL_KEY, 0.0)
+            if isinstance(stored_epoch, (int, float, str)):
+                try:
+                    epoch = float(stored_epoch or 0.0)
+                except (TypeError, ValueError):
+                    epoch = 0.0
+            else:
+                epoch = 0.0
+            if epoch > 0.0:
+                remaining = epoch - time.time()
+                # Persisted window stores wall-clock epoch; the in-memory
+                # mirror is monotonic, matching _summary_failure_cooldown_until.
+                self._primary_stall_skip_until = (
+                    time.monotonic() + remaining if remaining > 0.0 else 0.0
+                )
+            else:
+                self._primary_stall_skip_until = 0.0
+        except (TypeError, ValueError, sqlite3.Error) as exc:
+            logger.debug("compression primary-stall ledger lookup failed: %s", exc)
+        except Exception as exc:
+            logger.debug(
+                "compression primary-stall ledger lookup failed (non-sqlite): %s",
+                exc,
+            )
+
+    def _persist_primary_stall_state(self) -> None:
+        session_db = getattr(self, "_session_db", None)
+        session_id = getattr(self, "_session_id", "")
+        patcher = getattr(session_db, "patch_session_model_config", None)
+        if not session_id or not callable(patcher):
+            return
+        try:
+            skip_epoch = 0.0
+            if self._primary_stall_skip_until > 0.0:
+                skip_epoch = time.time() + max(
+                    0.0, self._primary_stall_skip_until - time.monotonic()
+                )
+            patcher(
+                session_id,
+                {
+                    _PRIMARY_STALL_STREAK_KEY: max(
+                        0, int(self._primary_stall_streak)
+                    ),
+                    _PRIMARY_STALL_SKIP_UNTIL_KEY: skip_epoch,
+                },
+            )
+        except sqlite3.Error as exc:
+            logger.debug("compression primary-stall ledger persist failed: %s", exc)
+        except Exception as exc:
+            logger.debug(
+                "compression primary-stall ledger persist failed (non-sqlite): %s",
+                exc,
+            )
+
+    def record_primary_route_stall_recovered(self) -> None:
+        """Record one fallback-recovered primary-route stall (#95879).
+
+        Called by the host (via ``run_compress_context_with_progress_timeout``
+        's ``on_primary_stall`` hook) when the stall path recovered on the
+        fallback chain. Route-specific counterpart to
+        :meth:`record_timeout_failure`: the SHARED ladder must NOT learn about
+        this — the fallback just worked, and suppressing it with the shared
+        cooldown would re-break #95433 ordering.
+
+        When the streak reaches ``compression.primary_stall_skip_threshold``
+        (default 2), a bounded skip-primary window
+        (``compression.primary_stall_skip_seconds``, default 600s) is armed so
+        the host pre-pins the first fallback_chain entry as the next attempt.
+        Once the window lapses the next compression re-probes the real primary;
+        a stall re-arms the window, a token-producing primary clears the ledger.
+        """
+        self._primary_stall_streak += 1
+        threshold = self._primary_stall_skip_threshold()
+        if self._primary_stall_streak >= threshold:
+            # Re-arm only when the previous window has lapsed (or never
+            # armed). While the window is ACTIVE the primary is skipped, so a
+            # stall cannot be recorded to extend it; after it lapses the
+            # re-probe stall re-arms a fresh full window — bounded cadence,
+            # not a permanent bypass.
+            if self._primary_stall_skip_until <= time.monotonic():
+                self._primary_stall_skip_until = (
+                    time.monotonic() + self._primary_stall_skip_window_seconds()
+                )
+        self._persist_primary_stall_state()
+        if not self.quiet_mode:
+            logger.warning(
+                "Primary summary route stalled and was recovered by the "
+                "fallback chain; primary_stall_streak=%d%s",
+                self._primary_stall_streak,
+                " — skipping the primary on the next compression attempts"
+                if self._primary_stall_streak >= threshold
+                else "",
+            )
+
+    def record_primary_route_success(self) -> None:
+        """Clear the primary-stall ledger after a real primary summary.
+
+        Called from ``_generate_summary`` only when the successful summary
+        call was NOT driven by a pinned fallback route (and no earlier call in
+        the same attempt consumed a pin — a main-model retry after a pinned
+        fallback error inherits the consumed echo and must not clear the
+        streak). An unpinned success is proof the primary (task) route
+        produced tokens again, so both the streak and any armed skip window
+        are reset — durably.
+        """
+        if (
+            self._primary_stall_streak == 0
+            and self._primary_stall_skip_until <= 0.0
+        ):
+            return
+        self._primary_stall_streak = 0
+        self._primary_stall_skip_until = 0.0
+        self._persist_primary_stall_state()
+        if not self.quiet_mode:
+            logger.info("Primary summary route healthy; primary-stall ledger cleared")
+
+    def _primary_stall_skip_threshold(self) -> int:
+        value = _compression_config_value(
+            "primary_stall_skip_threshold", _PRIMARY_STALL_DEFAULT_SKIP_THRESHOLD
+        )
+        try:
+            return max(1, int(value))
+        except (TypeError, ValueError):
+            return _PRIMARY_STALL_DEFAULT_SKIP_THRESHOLD
+
+    def _primary_stall_skip_window_seconds(self) -> float:
+        value = _compression_config_value(
+            "primary_stall_skip_seconds", _PRIMARY_STALL_DEFAULT_SKIP_SECONDS
+        )
+        try:
+            return max(1.0, float(value))
+        except (TypeError, ValueError):
+            return _PRIMARY_STALL_DEFAULT_SKIP_SECONDS
+
+    def _primary_stall_gate_tripped(self) -> bool:
+        """Evaluate the skip-primary gate on in-memory state only."""
+        if self._primary_stall_streak < self._primary_stall_skip_threshold():
+            return False
+        skip_until = self._primary_stall_skip_until
+        if skip_until > 0.0 and time.monotonic() < skip_until:
+            return True
+        return False
+
+    def should_skip_primary_route(self) -> bool:
+        """Whether the next compression should skip the primary summary route.
+
+        True only when the primary-stall streak reached
+        ``compression.primary_stall_skip_threshold`` AND the skip window armed
+        by the last fallback-recovered stall has not lapsed. Route-specific:
+        never consults the shared ``_summary_failure_cooldown_until`` ladder.
+
+        When True, the host pre-pins the first ``fallback_chain`` entry so it
+        becomes the FIRST attempt (``pin_summary_route``), instead of burning
+        the full idle window on a half-dead primary before the fallback saves
+        the compaction.
+        """
+        if not self._primary_stall_gate_tripped():
+            return False
+        # Durable ledger may have been cleared by another agent since
+        # bind_session_state() — a primary attempt that produced tokens on a
+        # sibling process zeroes the streak and window. Refresh and re-evaluate
+        # before letting a stale local skip outlive the durable state that
+        # justified it (same shape as _automatic_compression_blocked).
+        self._load_primary_stall_state()
+        return self._primary_stall_gate_tripped()
 
     def _load_ineffective_compression_count(self) -> None:
         """Load the durable anti-thrash strike count for the bound session.
@@ -3599,6 +3911,17 @@ class ContextCompressor(ContextEngine):
         # real-usage effectiveness counter, ordinary fitting responses must not
         # reset this breaker; only a healthy completed summary does.
         self._fallback_compression_streak: int = 0
+        # #95879: route-specific escalation state for a stalled primary
+        # summary route. ``_primary_stall_streak`` counts consecutive
+        # fallback-recovered stalls; when it reaches the skip threshold,
+        # ``_primary_stall_skip_until`` (monotonic) arms a bounded window
+        # during which the host pre-pins the first fallback_chain entry as the
+        # FIRST attempt instead of burning the full idle budget on the
+        # half-dead primary. A real (unpinned) primary summary resets both.
+        # Deliberately separate from the shared timeout ladder — see
+        # record_primary_route_stall_recovered.
+        self._primary_stall_streak: int = 0
+        self._primary_stall_skip_until: float = 0.0
         # Set after a completed compression boundary; consumed by the next
         # provider-reported prompt count in update_from_response().
         self._verify_compaction_cleared_threshold: bool = False
@@ -5488,6 +5811,16 @@ This compaction should PRIORITISE preserving all information related to the focu
             # Store for iterative updates on next compaction
             self._previous_summary = summary
             self._clear_compression_failure_cooldown()
+            # #95879: reset the route-specific primary-stall ledger when the
+            # successful summary was NOT driven by a stall-fallback pin — and
+            # no earlier call in this attempt consumed one. The consumed echo
+            # (``_SUMMARY_ROUTE_CONSUMED``) is set only inside a pinned
+            # attempt, so a main-model retry after a pinned fallback error
+            # keeps the streak: the primary stalled and we are still on a
+            # fallback journey. An unpinned success is proof the primary
+            # (task) route produced tokens again.
+            if not _pinned_route and not _SUMMARY_ROUTE_CONSUMED.get():
+                self.record_primary_route_success()
             self._summary_model_fallen_back = False
             self._last_summary_error = None
             self._last_summary_auth_failure = False

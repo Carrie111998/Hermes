@@ -989,6 +989,19 @@ DEFAULT_CONFIG = {
                                       # warning channel while the host keeps
                                       # waiting in bounded increments for the
                                       # commit to finish.
+        "primary_stall_skip_threshold": 2,  # #95879: N consecutive fallback-recovered
+                                      # primary-route stalls before the next
+                                      # compression SKIPS the primary and uses the
+                                      # first fallback_chain entry as the FIRST
+                                      # attempt (route-specific escalation; the
+                                      # shared cooldown ladder is deliberately not
+                                      # touched so the healthy fallback keeps
+                                      # running).
+        "primary_stall_skip_seconds": 600,  # how long the skip-primary gate stays
+                                      # armed after it trips. After this window the
+                                      # next compression re-probes the real
+                                      # primary: a stall re-arms the window, a
+                                      # token-producing primary clears the ledger.
         "protect_first_n": 3,         # non-system head messages always preserved
                                       # verbatim, in ADDITION to the system prompt
                                       # (which is always implicitly protected). Set to
