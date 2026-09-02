@@ -416,6 +416,7 @@ class TestBuildContextFilesPrompt:
         # git-root AGENTS.md + intermediate + cwd are all merged, root first
         # and cwd last so deeper guidance takes precedence.
         (tmp_path / ".git").mkdir()
+        (tmp_path / ".git" / "HEAD").write_text("ref: refs/heads/main\n")
         (tmp_path / "AGENTS.md").write_text("Root: use Ruff.")
         pkg = tmp_path / "packages"
         pkg.mkdir()
@@ -438,6 +439,7 @@ class TestBuildContextFilesPrompt:
     def test_agents_md_chain_skips_gaps(self, tmp_path):
         # Intermediate dirs without AGENTS.md contribute nothing.
         (tmp_path / ".git").mkdir()
+        (tmp_path / ".git" / "HEAD").write_text("ref: refs/heads/main\n")
         (tmp_path / "AGENTS.md").write_text("Root rules.")
         deep = tmp_path / "a" / "b" / "c"
         deep.mkdir(parents=True)
@@ -447,6 +449,7 @@ class TestBuildContextFilesPrompt:
 
     def test_agents_md_chain_dedupes_identical_content(self, tmp_path):
         (tmp_path / ".git").mkdir()
+        (tmp_path / ".git" / "HEAD").write_text("ref: refs/heads/main\n")
         (tmp_path / "AGENTS.md").write_text("Same rules everywhere.")
         sub = tmp_path / "sub"
         sub.mkdir()
@@ -460,6 +463,7 @@ class TestBuildContextFilesPrompt:
         from agent.prompt_builder import _load_agents_md
 
         (tmp_path / ".git").mkdir()
+        (tmp_path / ".git" / "HEAD").write_text("ref: refs/heads/main\n")
         sub = tmp_path / "sub"
         sub.mkdir()
         (sub / "AGENTS.md").write_text("Only file.")
@@ -581,6 +585,7 @@ class TestFindHermesMd:
 
     def test_walks_to_git_root(self, tmp_path):
         (tmp_path / ".git").mkdir()
+        (tmp_path / ".git" / "HEAD").write_text("ref: refs/heads/main\n")
         (tmp_path / ".hermes.md").write_text("root rules")
         sub = tmp_path / "a" / "b"
         sub.mkdir(parents=True)
@@ -612,10 +617,12 @@ class TestFindHermesMd:
 class TestFindGitRoot:
     def test_finds_git_dir(self, tmp_path):
         (tmp_path / ".git").mkdir()
+        (tmp_path / ".git" / "HEAD").write_text("ref: refs/heads/main\n")
         assert _find_git_root(tmp_path) == tmp_path
 
     def test_finds_from_subdirectory(self, tmp_path):
         (tmp_path / ".git").mkdir()
+        (tmp_path / ".git" / "HEAD").write_text("ref: refs/heads/main\n")
         sub = tmp_path / "src" / "lib"
         sub.mkdir(parents=True)
         assert _find_git_root(sub) == tmp_path
