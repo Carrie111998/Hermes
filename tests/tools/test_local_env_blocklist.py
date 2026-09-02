@@ -1000,18 +1000,19 @@ class TestPythonpathSelectiveStrip:
         assert "PYTHONPATH" in captured["env"], \
             "execute_code never reached Popen"
         parts = captured["env"]["PYTHONPATH"].split(os.pathsep)
-        # Windows path comparison is case-insensitive: the inherited entries
-        # and the re-added repo root can carry a different case than the
-        # resolve()/abspath()-derived spellings used in this test (e.g. a
-        # launcher-written lowercase PYTHONPATH).  Normalize with
-        # os.path.normcase so a case-only difference never fails the
-        # composition contract (identity on POSIX).
-        norm_parts = [os.path.normcase(p) for p in parts]
-        norm_staging = os.path.normcase(captured["staging"])
-        norm_root = os.path.normcase(hermes_root)
-        norm_venv = os.path.normcase(venv_sp)
-        norm_user_a = os.path.normcase(user_a)
-        norm_user_b = os.path.normcase(user_b)
+        # Windows path comparison is case-insensitive, and macOS can report
+        # the same temp worktree through both /tmp and /private/tmp.  Normalize
+        # both spellings so platform path aliases do not fail the composition
+        # contract.
+        def _norm_path(path: str) -> str:
+            return os.path.normcase(os.path.realpath(path))
+
+        norm_parts = [_norm_path(p) for p in parts]
+        norm_staging = _norm_path(captured["staging"])
+        norm_root = _norm_path(hermes_root)
+        norm_venv = _norm_path(venv_sp)
+        norm_user_a = _norm_path(user_a)
+        norm_user_b = _norm_path(user_b)
         assert norm_parts[0] == norm_staging, \
             "staging tmpdir must be the first PYTHONPATH entry"
         assert norm_venv not in norm_parts, \
@@ -1507,6 +1508,7 @@ class TestBlocklistCoverage:
             "DISCORD_HOME_CHANNEL_NAME",
             "DISCORD_REQUIRE_MENTION",
             "DISCORD_FREE_RESPONSE_CHANNELS",
+            "DISCORD_AUTO_THREAD_CHANNELS",
             "DISCORD_AUTO_THREAD",
             "SLACK_HOME_CHANNEL",
             "SLACK_HOME_CHANNEL_NAME",
