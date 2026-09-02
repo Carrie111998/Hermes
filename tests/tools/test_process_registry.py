@@ -72,6 +72,33 @@ def _spawn_python_sleep(seconds: float) -> subprocess.Popen:
     )
 
 
+def test_poll_acknowledge_consumes_completion(registry):
+    """#94455: poll(acknowledge=True) on an exited process must consume the
+    queued notify_on_complete completion so the watcher never injects a stale
+    synthetic turn for a result the agent handled inline. Default poll stays
+    read-only (issue #10156 semantics)."""
+    s = _make_session(sid="proc_ack1", exited=True, exit_code=0, output="done")
+    registry._finished[s.id] = s
+
+    # Read-only default: NOT consumed.
+    registry.poll(s.id)
+    assert not registry.is_completion_consumed(s.id)
+
+    # Explicit acknowledgment: consumed.
+    result = registry.poll(s.id, acknowledge=True)
+    assert result["status"] == "exited"
+    assert registry.is_completion_consumed(s.id)
+
+
+def test_poll_acknowledge_running_is_noop(registry):
+    """Acknowledging a still-running poll must not pre-consume anything — the
+    completion only exists once the process has exited."""
+    s = _make_session(sid="proc_ack2", exited=False)
+    registry._running[s.id] = s
+    registry.poll(s.id, acknowledge=True)
+    assert not registry.is_completion_consumed(s.id)
+
+
 def test_kill_started_since_preserves_preexisting_and_foreign_processes(registry):
     old = _make_session(sid="proc_old", task_id="session-a")
     finished = _make_session(

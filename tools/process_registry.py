@@ -2188,8 +2188,15 @@ class ProcessRegistry:
         )
         self._move_to_finished(session)
 
-    def poll(self, session_id: str) -> dict:
-        """Check status and get new output for a background process."""
+    def poll(self, session_id: str, acknowledge: bool = False) -> dict:
+        """Check status and get new output for a background process.
+
+        ``acknowledge=True`` opts into consuming the completion: when the
+        process has exited, the queued ``notify_on_complete`` notification is
+        marked consumed so the watcher never injects a stale synthetic turn
+        for a result the agent just handled inline (#94455). The default
+        remains fully read-only.
+        """
         from tools.ansi_strip import strip_ansi
 
         session = self.get(session_id)
@@ -2226,6 +2233,11 @@ class ProcessRegistry:
             # without affecting the gateway/tui watchers, which only consult
             # _completion_consumed.
             self._poll_observed.add(session_id)
+            if acknowledge:
+                # Explicit opt-in: the caller states it fully handled the
+                # exited result inline, so the queued completion must not
+                # produce another turn (#94455).
+                self._completion_consumed.add(session_id)
         if session.detached:
             result["detached"] = True
             result["note"] = "Process recovered after restart -- output history unavailable"
@@ -3468,6 +3480,10 @@ PROCESS_SCHEMA = {
                 "type": "integer",
                 "description": "Log line offset (default: last 200)."
             },
+            "acknowledge": {
+                "type": "boolean",
+                "description": "For 'poll' on an exited process: mark the queued notify_on_complete completion as handled so no synthetic completion turn is injected afterwards. Set this when the poll result was fully processed inline."
+            },
             "limit": {
                 "type": "integer",
                 "description": "Max log lines.",
@@ -3532,7 +3548,8 @@ def _handle_process(args, **kw):
         if not session_id:
             return tool_error(f"session_id is required for {action}")
         if action == "poll":
-            return json.dumps(_redact_process_result(process_registry.poll(session_id)), ensure_ascii=False)
+            return json.dumps(_redact_process_result(process_registry.poll(
+                session_id, acknowledge=bool(args.get("acknowledge")))), ensure_ascii=False)
         elif action == "log":
             return json.dumps(_redact_process_result(process_registry.read_log(
                 session_id, offset=args.get("offset"), limit=args.get("limit", 200))), ensure_ascii=False)
