@@ -232,13 +232,14 @@ function NotificationItem({ notification }: { notification: AppNotification }) {
           {notification.action && (
             <Button
               className="mt-1.5"
-              onClick={() => {
+              onClick={(e) => {
+                e.stopPropagation()
                 notification.action?.onClick()
                 dismissNotification(notification.id)
               }}
-              size="xs"
+              size="sm"
               type="button"
-              variant="textStrong"
+              variant="default"
             >
               {notification.action.label}
             </Button>
