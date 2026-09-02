@@ -18,26 +18,22 @@ import logging
 import os
 import re
 import shutil
-import stat
 import subprocess
 import sys
 import tempfile
-import time
 import urllib.parse
-import threading
 import unicodedata
-from contextlib import contextmanager, nullcontext
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Any, Optional
 
 from hermes_constants import get_hermes_home
 from hermes_cli._subprocess_compat import noninteractive_git_env
 from hermes_cli.config import cfg_get
+from hermes_cli import plugin_install_state as _install_state
 from hermes_cli.secret_prompt import masked_secret_prompt
 from utils import (
     secure_atomic_write_text,
-    secure_open_file,
-    secure_parent_directory,
     secure_replace,
     secure_rmtree,
     secure_unlink,
@@ -79,8 +75,7 @@ def _resolve_git_executable() -> Optional[str]:
     return None
 
 
-class PluginOperationError(Exception):
-    """Recoverable plugin install/update failure (CLI exits; HTTP maps to 4xx)."""
+PluginOperationError = _install_state.PluginOperationError
 
 
 class PluginScanBlocked(PluginOperationError):
@@ -633,316 +628,52 @@ def _require_installed_plugin(name: str, plugins_dir: Path, console) -> Path:
 
 
 _EXACT_COMMIT_RE = re.compile(r"^[0-9a-fA-F]{40}$")
-_INSTALL_METADATA_FILE = ".install-metadata.json"
-_INSTALL_TRANSACTION_FILE = ".install-transaction.json"
-_PROCESS_INSTALL_METADATA_LOCK = threading.RLock()
 
 
-def _lock_file(handle) -> None:
-    """Acquire a blocking one-byte cross-process lock."""
-    if os.name == "nt":
-        import errno
-        import msvcrt
-
-        handle.seek(0, os.SEEK_END)
-        if handle.tell() == 0:
-            handle.write(b"0")
-            handle.flush()
-        while True:
-            handle.seek(0)
-            try:
-                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
-                return
-            except OSError as exc:
-                if exc.errno not in {errno.EACCES, errno.EAGAIN, errno.EDEADLK}:
-                    raise
-                time.sleep(0.1)
-    else:
-        import fcntl
-
-        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-
-
-def _unlock_file(handle) -> None:
-    if os.name == "nt":
-        import msvcrt
-
-        handle.seek(0)
-        msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
-    else:
-        import fcntl
-
-        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
-
-
-def _reject_symlink_components(path: Path, root: Path) -> None:
-    """Reject symlinks below a trusted root before control-file operations."""
-    root = root.absolute()
-    try:
-        relative = path.absolute().relative_to(root)
-    except ValueError as exc:
-        raise PluginOperationError(f"Control path escapes {root}.") from exc
-    current = root
-    for part in relative.parts:
-        current /= part
-        if current.is_symlink():
-            raise PluginOperationError(
-                f"Control path must not contain symlinks: {path}"
-            )
-
-
-def _open_lock_path(path: Path):
-    """Open a regular lock file beneath a held no-follow parent."""
-    if path.is_symlink():
-        raise PluginOperationError(f"Lock path must not be a symlink: {path}")
-    flags = os.O_RDWR | os.O_CREAT | os.O_APPEND | getattr(os, "O_CLOEXEC", 0)
-    try:
-        fd = secure_open_file(path, get_hermes_home(), flags, create_parent=True)
-    except OSError as exc:
-        raise PluginOperationError(
-            f"Could not safely open lock file {path}: {exc}"
-        ) from exc
-    if not stat.S_ISREG(os.fstat(fd).st_mode):
-        os.close(fd)
-        raise PluginOperationError(f"Lock path must be a regular file: {path}")
-    return os.fdopen(fd, "a+b")
-
-
-def _read_control_json(path: Path, label: str) -> object:
-    """Read one regular control file beneath a held no-follow parent."""
-    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
-    try:
-        fd = secure_open_file(path, get_hermes_home(), flags)
-    except OSError as exc:
-        raise PluginOperationError(f"Could not read {label}: {exc}") from exc
-    try:
-        with os.fdopen(fd, "r", encoding="utf-8") as handle:
-            fd = -1
-            return json.load(handle)
-    except json.JSONDecodeError as exc:
-        raise PluginOperationError(f"Could not read {label}: {exc}") from exc
-    finally:
-        if fd >= 0:
-            os.close(fd)
-
-
-@contextmanager
 def _install_metadata_lock():
-    """Serialize profile-local install metadata and target commits."""
-    path = _install_metadata_path().with_suffix(".lock")
-    namespace = secure_parent_directory(path, get_hermes_home(), create=True)
-    try:
-        namespace.__enter__()
-    except OSError as exc:
-        raise PluginOperationError(
-            f"Plugin install namespace is unsafe: {exc}"
-        ) from exc
-    try:
-        with _PROCESS_INSTALL_METADATA_LOCK, _open_lock_path(path) as handle:
-            _lock_file(handle)
-            try:
-                _recover_install_transaction()
-                yield
-            finally:
-                _unlock_file(handle)
-    finally:
-        namespace.__exit__(None, None, None)
+    return _install_state._install_metadata_lock()
 
 
 def _install_metadata_path() -> Path:
-    return get_hermes_home() / "plugins" / _INSTALL_METADATA_FILE
+    return _install_state._install_metadata_path()
 
 
 def _install_transaction_path() -> Path:
-    return get_hermes_home() / "plugins" / _INSTALL_TRANSACTION_FILE
+    return _install_state._install_transaction_path()
 
 
 def _read_install_metadata() -> dict[str, dict[str, object]]:
-    """Read profile-local, non-secret plugin source metadata from disk."""
-    path = _install_metadata_path()
-    if path.is_symlink():
-        raise PluginOperationError(
-            "Plugin install metadata path must not be a symlink."
-        )
-    if not path.exists():
-        return {}
-    value = _read_control_json(path, "plugin install metadata")
-    if not isinstance(value, dict):
-        raise PluginOperationError("Plugin install metadata must be a JSON object.")
-    for key, entry in value.items():
-        if not isinstance(key, str) or not isinstance(entry, dict):
-            raise PluginOperationError(
-                "Plugin install metadata entries must map plugin names to objects."
-            )
-    return value
+    return _install_state._read_install_metadata()
 
 
 def _write_install_metadata(metadata: dict[str, dict[str, object]]) -> None:
-    """Atomically replace the profile-local plugin install metadata sidecar."""
-    path = _install_metadata_path()
-    secure_atomic_write_text(
-        path,
-        json.dumps(metadata, indent=2, sort_keys=True) + "\n",
-        get_hermes_home(),
-    )
+    _install_state._write_install_metadata(metadata)
 
 
 def _plugin_membership(name: str) -> tuple[bool, bool]:
-    from hermes_cli.config import config_write_lock, load_config
-
-    with config_write_lock():
-        config = load_config()
-        plugins = config.get("plugins")
-        plugins = plugins if isinstance(plugins, dict) else {}
-        enabled = plugins.get("enabled")
-        disabled = plugins.get("disabled")
-        return (
-            isinstance(enabled, list) and name in enabled,
-            isinstance(disabled, list) and name in disabled,
-        )
+    return _install_state._plugin_membership(name)
 
 
 def _restore_plugin_membership(
     name: str, was_enabled: bool, was_disabled: bool
 ) -> None:
-    """Restore only *name* without overwriting newer state for other plugins."""
-    from hermes_cli.config import config_write_lock, load_config, save_config
-
-    with config_write_lock():
-        config = load_config()
-        plugins = config.setdefault("plugins", {})
-        if not isinstance(plugins, dict):
-            plugins = {}
-            config["plugins"] = plugins
-        raw_enabled = plugins.get("enabled")
-        raw_disabled = plugins.get("disabled")
-        enabled = set(raw_enabled) if isinstance(raw_enabled, list) else set()
-        disabled = set(raw_disabled) if isinstance(raw_disabled, list) else set()
-        (enabled.add if was_enabled else enabled.discard)(name)
-        (disabled.add if was_disabled else disabled.discard)(name)
-        plugins["enabled"] = sorted(enabled)
-        plugins["disabled"] = sorted(disabled)
-        save_config(
-            config,
-            preserve_plugin_state=False,
-            preserve_platform_toolsets=False,
-        )
+    _install_state._restore_plugin_membership(name, was_enabled, was_disabled)
 
 
 def _write_install_transaction(value: dict[str, object]) -> None:
-    path = _install_transaction_path()
-    secure_atomic_write_text(
-        path,
-        json.dumps(value, indent=2, sort_keys=True) + "\n",
-        get_hermes_home(),
-    )
+    _install_state._write_install_transaction(value)
 
 
 def _recover_install_transaction() -> None:
-    """Roll back an interrupted install before any new plugin mutation."""
-    journal = _install_transaction_path()
-    if journal.is_symlink():
-        raise PluginOperationError(
-            "Plugin install transaction path must not be a symlink."
-        )
-    if not journal.exists():
-        return
-    value = _read_control_json(journal, "plugin install transaction")
-    if not isinstance(value, dict) or value.get("version") != 1:
-        raise PluginOperationError("Plugin install transaction is malformed.")
-
-    name = value.get("plugin_name")
-    transaction_dir = value.get("transaction_dir")
-    old_metadata = value.get("old_metadata")
-    if (
-        not isinstance(name, str)
-        or not isinstance(transaction_dir, str)
-        or not transaction_dir.startswith(".install-")
-        or "/" in transaction_dir
-        or "\\" in transaction_dir
-        or not isinstance(old_metadata, dict)
-        or any(
-            not isinstance(key, str) or not isinstance(entry, dict)
-            for key, entry in old_metadata.items()
-        )
-        or not isinstance(value.get("was_enabled"), bool)
-        or not isinstance(value.get("was_disabled"), bool)
-    ):
-        raise PluginOperationError("Plugin install transaction is malformed.")
-
-    plugins_dir = _plugins_dir()
-    try:
-        target = _sanitize_plugin_name(name, plugins_dir)
-    except ValueError as exc:
-        raise PluginOperationError(str(exc)) from exc
-    transaction_root = plugins_dir / transaction_dir
-    if (
-        transaction_root.is_symlink()
-        or not transaction_root.is_dir()
-        or transaction_root.resolve().parent != plugins_dir.resolve()
-    ):
-        raise PluginOperationError("Plugin install transaction directory is unsafe.")
-    backup = transaction_root / "previous-plugin"
-    if backup.is_symlink() or (backup.exists() and not backup.is_dir()):
-        raise PluginOperationError("Plugin install transaction backup is unsafe.")
-    replaced_existing = value.get("replaced_existing") is True
-
-    from hermes_cli.config import config_write_lock
-
-    with config_write_lock():
-        if replaced_existing and backup.exists():
-            if target.exists():
-                if target.is_dir():
-                    secure_rmtree(target, plugins_dir)
-                else:
-                    secure_unlink(target, plugins_dir)
-            secure_replace(backup, target, plugins_dir)
-        elif replaced_existing and not target.exists():
-            raise PluginOperationError(
-                "Interrupted plugin install is missing both target and backup."
-            )
-        elif not replaced_existing and target.exists():
-            if target.is_dir():
-                secure_rmtree(target, plugins_dir)
-            else:
-                secure_unlink(target, plugins_dir)
-
-        if old_metadata:
-            _write_install_metadata(old_metadata)
-        else:
-            secure_unlink(_install_metadata_path(), get_hermes_home(), missing_ok=True)
-        _restore_plugin_membership(
-            name,
-            value.get("was_enabled") is True,
-            value.get("was_disabled") is True,
-        )
-        secure_unlink(journal, get_hermes_home(), missing_ok=True)
-
-    if transaction_root.exists():
-        try:
-            secure_rmtree(transaction_root, plugins_dir)
-        except OSError:
-            pass
+    _install_state._recover_install_transaction()
 
 
 def _marketplace_metadata(entry) -> dict[str, object]:
-    """Return private-marketplace provenance for atomic install metadata."""
-    return {
-        "marketplace_id": entry.source_id,
-        "marketplace_name": entry.source_name,
-        "marketplace_plugin_name": entry.name,
-        "source": entry.repo,
-        "subdir": entry.subdir,
-        "installed_repo_sha": entry.sha,
-        "installed_tree_sha": entry.tree_sha,
-    }
+    return _install_state._marketplace_metadata(entry)
 
 
 def _marketplace_install(plugin_name: str) -> Optional[dict[str, object]]:
-    value = _read_install_metadata().get(plugin_name)
-    if not isinstance(value, dict) or not value.get("marketplace_id"):
-        return None
-    return value
+    return _install_state._marketplace_install(plugin_name)
 
 
 def _normalize_exact_revision(ref: str) -> str:
@@ -1962,6 +1693,20 @@ def _get_enabled_set() -> set:
         return set(enabled) if isinstance(enabled, list) else set()
     except Exception:
         return set()
+
+
+def _save_enabled_set(enabled: set) -> None:
+    """Replace the enabled set under the shared config transaction."""
+    from hermes_cli.config import config_write_lock, load_config, save_config
+
+    with config_write_lock():
+        config = load_config()
+        plugins = config.setdefault("plugins", {})
+        if not isinstance(plugins, dict):
+            plugins = {}
+            config["plugins"] = plugins
+        plugins["enabled"] = sorted(enabled)
+        save_config(config, preserve_plugin_state=False)
 
 
 def _mutate_plugin_state_locked(

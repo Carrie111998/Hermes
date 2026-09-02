@@ -2466,38 +2466,19 @@ def _(rid, params: dict) -> dict:
             _plugin_status,
             _read_catalog_sidecar,
         )
-
-        def _catalog_pins():
-            """{(source, name): {sha, tree_sha}} from every saved catalog."""
-            try:
-                from hermes_cli.plugin_catalog import load_catalog_live
-
-                pins = {
-                    ("official", e.name): {"sha": e.sha, "tree_sha": ""}
-                    for e in load_catalog_live()
-                }
-            except Exception:
-                pins = {}
-            try:
-                from hermes_cli.plugin_marketplaces import list_marketplaces
-
-                for marketplace in list_marketplaces():
-                    if not marketplace.get("available") or marketplace.get("stale"):
-                        continue
-                    for entry in marketplace.get("entries", []):
-                        if isinstance(entry, dict) and entry.get("name"):
-                            pins[(marketplace["id"], str(entry["name"]))] = {
-                                "sha": str(entry.get("sha") or ""),
-                                "tree_sha": str(entry.get("tree_sha") or ""),
-                            }
-            except Exception:
-                pass
-            return pins
+        from tui_gateway.plugin_marketplace_actions import (
+            MARKETPLACE_ACTIONS,
+            MarketplaceRequestError,
+            catalog_install_args,
+            catalog_pins,
+            manage_marketplace,
+            update_plugin,
+        )
 
         def _rows():
             enabled = _get_enabled_set()
             disabled = _get_disabled_set()
-            pins = _catalog_pins()
+            pins = catalog_pins()
             from hermes_cli.plugins_cmd import _read_install_metadata
 
             install_metadata = _read_install_metadata()
@@ -2594,44 +2575,11 @@ def _(rid, params: dict) -> dict:
                 },
             )
 
-        if action in {
-            "marketplaces",
-            "marketplace_add",
-            "marketplace_remove",
-            "marketplace_refresh",
-        }:
-            from hermes_cli.plugin_marketplaces import (
-                add_marketplace,
-                list_marketplaces,
-                public_marketplace,
-                remove_marketplace,
-            )
-
-            if action == "marketplace_add":
-                marketplace = add_marketplace(str(params.get("url") or "").strip())
-                return _ok(
-                    rid,
-                    {"ok": True, "marketplace": public_marketplace(marketplace)},
-                )
-            if action == "marketplace_remove":
-                source_id = str(params.get("source_id") or "").strip()
-                if not source_id:
-                    return _err(rid, 4019, "marketplace_remove requires 'source_id'")
-                return _ok(
-                    rid,
-                    {"ok": True, "removed": remove_marketplace(source_id)},
-                )
-            return _ok(
-                rid,
-                {
-                    "marketplaces": [
-                        public_marketplace(marketplace)
-                        for marketplace in list_marketplaces(
-                            force=action == "marketplace_refresh"
-                        )
-                    ]
-                },
-            )
+        if action in MARKETPLACE_ACTIONS:
+            try:
+                return _ok(rid, manage_marketplace(action, params))
+            except MarketplaceRequestError as exc:
+                return _err(rid, exc.code, str(exc))
 
         if action == "toggle":
             from hermes_cli.plugins_cmd import dashboard_set_agent_plugin_enabled
@@ -2661,123 +2609,26 @@ def _(rid, params: dict) -> dict:
         if action == "install":
             from hermes_cli.plugins_cmd import dashboard_install_plugin
 
-            ident = (
-                params.get("identifier") or params.get("repo") or ""
-            ).strip()
-            # Curated-catalog install: resolve repo + pinned SHA server-side
-            # (same contract as the dashboard endpoint). ``catalog_name``
-            # alone is enough — identifier may be empty.
-            catalog_name = str(params.get("catalog_name") or "").strip()
-            catalog_source = "official"
-            marketplace_id = str(params.get("marketplace_id") or "").strip()
-            marketplace_plugin_name = str(
-                params.get("marketplace_plugin_name") or ""
-            ).strip()
-            if marketplace_id:
-                if not marketplace_plugin_name:
-                    return _err(
-                        rid,
-                        4019,
-                        "marketplace install requires 'marketplace_plugin_name'",
-                    )
-                catalog_source = marketplace_id
-                catalog_name = marketplace_plugin_name
-            if not ident and not catalog_name:
-                return _err(
-                    rid, 4019,
-                    "plugins.install requires 'identifier', 'repo', or 'catalog_name'",
-                )
+            try:
+                ident, catalog_name, catalog_source = catalog_install_args(params)
+            except MarketplaceRequestError as exc:
+                return _err(rid, exc.code, str(exc))
             result = dashboard_install_plugin(
                 ident,
                 force=bool(params.get("force")),
                 enable=params.get("enable", True),
                 catalog_name=catalog_name or None,
-                catalog_source=catalog_source or "official",
+                catalog_source=catalog_source,
             )
             if not result.get("ok"):
                 return _err(rid, 5026, result.get("error") or "install failed")
             return _ok(rid, result)
 
         if action == "update":
-            from hermes_cli.plugins_cmd import (
-                PluginOperationError,
-                _catalog_install_identifier,
-                _get_live_catalog_entry,
-                _install_plugin_core,
-                _marketplace_install,
-                _marketplace_metadata,
-                _plugins_dir,
-                _sanitize_plugin_name,
-            )
-
-            key = str(params.get("key") or "").strip()
-            if not key:
-                return _err(rid, 4019, "plugins.update requires a canonical 'key'")
             try:
-                target = _sanitize_plugin_name(key, _plugins_dir(), allow_subdir=True)
-            except ValueError as exc:
-                return _err(rid, 4019, str(exc))
-            if not target.is_dir():
-                return _err(rid, 4020, f"Plugin '{key}' is not installed")
-
-            marketplace = _marketplace_install(key) if key == target.name else None
-            sidecar = None if marketplace else _read_catalog_sidecar(target)
-            if marketplace:
-                marketplace_id = str(marketplace["marketplace_id"])
-                marketplace_plugin_name = str(
-                    marketplace.get("marketplace_plugin_name") or target.name
-                )
-                entry = _get_live_catalog_entry(
-                    marketplace_plugin_name,
-                    marketplace_id,
-                    force=True,
-                )
-                if entry is None:
-                    return _err(
-                        rid,
-                        4021,
-                        f"Marketplace source for '{marketplace_plugin_name}' is unavailable",
-                    )
-                installed_tree = str(
-                    marketplace.get("installed_tree_sha") or ""
-                ).lower()
-                if installed_tree and installed_tree == entry.tree_sha:
-                    return _ok(
-                        rid, {"ok": True, "unchanged": True, "sha": entry.sha}
-                    )
-                metadata_extra = _marketplace_metadata(entry)
-            elif sidecar and sidecar.get("catalog_name"):
-                entry = _get_live_catalog_entry(str(sidecar["catalog_name"]))
-                if entry is None:
-                    return _err(
-                        rid,
-                        4021,
-                        f"'{sidecar['catalog_name']}' is no longer in the catalog",
-                    )
-                installed_sha = str(sidecar.get("sha") or "").lower()
-                if installed_sha == entry.sha:
-                    return _ok(
-                        rid, {"ok": True, "unchanged": True, "sha": entry.sha}
-                    )
-                metadata_extra = None
-            else:
-                return _err(
-                    rid,
-                    4020,
-                    f"'{key}' is not a catalog or marketplace install",
-                )
-
-            try:
-                _new_target, _manifest, _installed = _install_plugin_core(
-                    _catalog_install_identifier(entry),
-                    force=True,
-                    ref=entry.sha,
-                    metadata_extra=metadata_extra,
-                    catalog_entry=entry if marketplace is None else None,
-                )
-            except PluginOperationError as exc:
-                return _err(rid, 5026, str(exc))
-            return _ok(rid, {"ok": True, "unchanged": False, "sha": entry.sha})
+                return _ok(rid, update_plugin(params))
+            except MarketplaceRequestError as exc:
+                return _err(rid, exc.code, str(exc))
 
         return _err(rid, 4017, f"unknown plugins action: {action}")
     except Exception as e:

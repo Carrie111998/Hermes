@@ -359,7 +359,7 @@ def config_write_lock():
         flags = os.O_RDWR | os.O_CREAT | os.O_APPEND | getattr(os, "O_CLOEXEC", 0)
         from utils import secure_open_file
 
-        fd = secure_open_file(path, get_hermes_home(), flags, create_parent=True)
+        fd = secure_open_file(path, path.parent, flags, create_parent=True)
         with os.fdopen(fd, "a+b") as handle:
             if os.name == "nt":
                 import errno

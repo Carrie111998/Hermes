@@ -16,6 +16,7 @@ from hermes_cli.plugin_marketplaces import (
     MarketplaceError,
     add_marketplace,
     list_marketplaces,
+    public_marketplace,
     remove_marketplace,
 )
 
@@ -130,6 +131,10 @@ def test_add_lists_and_persists_private_marketplace(tmp_path: Path) -> None:
         ],
         "version": 1,
     }
+
+    public = public_marketplace(added)
+    assert "url" not in public
+    assert "repo" not in public["entries"][0]
 
 
 def test_add_rejects_embedded_credentials() -> None:
@@ -344,7 +349,7 @@ def test_refresh_lock_serializes_independent_processes(tmp_path: Path) -> None:
 
 
 def test_windows_lock_retries_past_msvcrt_ten_second_limit(monkeypatch) -> None:
-    import hermes_cli.plugins_cmd as plugins_cmd
+    import hermes_cli.plugin_install_state as install_state
 
     calls = 0
 
@@ -360,10 +365,10 @@ def test_windows_lock_retries_past_msvcrt_ten_second_limit(monkeypatch) -> None:
         locking=locking,
     )
     with tempfile.TemporaryFile() as handle, monkeypatch.context() as patcher:
-        patcher.setattr(plugins_cmd.os, "name", "nt")
-        patcher.setattr(plugins_cmd.time, "sleep", lambda _seconds: None)
+        patcher.setattr(install_state.os, "name", "nt")
+        patcher.setattr(install_state.time, "sleep", lambda _seconds: None)
         patcher.setitem(sys.modules, "msvcrt", fake_msvcrt)
-        plugins_cmd._lock_file(handle)
+        install_state._lock_file(handle)
 
     assert calls == 13
 

@@ -48,6 +48,7 @@ export function PluginInstallModal() {
   const connection = useStore($connection)
   const activeProfile = useStore($activeGatewayProfile)
   const profileScope = useStore($profileScope)
+
   const agentRequest = useMemo(
     () =>
       request?.scopeKey
@@ -164,6 +165,7 @@ export function PluginInstallModal() {
   const targetIsRemote = request?.scopeKey
     ? request.connectionId !== null && request.connectionId !== 'local'
     : connection?.mode === 'remote'
+
   const agentTargetHint = targetIsRemote ? m.agentTargetRemote(profileLabel) : m.agentTargetLocal(profileLabel)
 
   const sourceLinks = useMemo(() => (request ? resolvePluginSourceLinks(request.repo) : null), [request])
@@ -254,6 +256,7 @@ export function PluginInstallModal() {
           if (result.ok) {
             successes.push(m.desktopSuccess(result.pluginName ?? request.repo))
             await discoverRuntimePlugins()
+
             if (!isCurrent()) {
               return
             }
@@ -264,6 +267,7 @@ export function PluginInstallModal() {
       }
 
       await loadAgentPlugins(agentRequest, request.profile, request.scopeKey)
+
       if (!isCurrent()) {
         return
       }
