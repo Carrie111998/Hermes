@@ -11494,6 +11494,76 @@ def test_snapshot_restore_is_blocked_from_tui_worker():
     )
 
 
+def test_command_dispatch_steer_falls_back_to_send_when_session_idle(monkeypatch):
+    """An idle session must not accept a /steer (#97371).
+
+    AIAgent.steer() parks the text in _pending_steer regardless of whether a
+    turn is live; with no running turn no drain hook ever fires, so the
+    message was silently discarded right after the UI reported "Steer
+    queued". The dispatcher must gate on session["running"] and return the
+    send fallback instead — the same next-turn semantics as /queue.
+    """
+    monkeypatch.setattr(server, "_load_cfg", lambda: {})
+    calls = {}
+
+    class _Agent:
+        def steer(self, text):
+            calls["steer_text"] = text
+            return True
+
+    server._sessions["sid"] = _session(agent=_Agent())  # running=False
+    try:
+        resp = server.handle_request(
+            {
+                "id": "1",
+                "method": "command.dispatch",
+                "params": {
+                    "name": "steer",
+                    "arg": "do not change the config yet",
+                    "session_id": "sid",
+                },
+            }
+        )
+    finally:
+        server._sessions.pop("sid", None)
+
+    assert "result" in resp, resp
+    assert resp["result"]["type"] == "send"
+    assert resp["result"]["message"] == "do not change the config yet"
+    assert "steer_text" not in calls  # idle session must not stash a steer
+
+
+def test_command_dispatch_steer_injects_when_turn_running(monkeypatch):
+    monkeypatch.setattr(server, "_load_cfg", lambda: {})
+    calls = {}
+
+    class _Agent:
+        def steer(self, text):
+            calls["steer_text"] = text
+            return True
+
+    server._sessions["sid"] = _session(agent=_Agent(), running=True)
+    try:
+        resp = server.handle_request(
+            {
+                "id": "1",
+                "method": "command.dispatch",
+                "params": {
+                    "name": "steer",
+                    "arg": "also check auth.log",
+                    "session_id": "sid",
+                },
+            }
+        )
+    finally:
+        server._sessions.pop("sid", None)
+
+    assert "result" in resp, resp
+    assert resp["result"]["type"] == "exec"
+    assert "Steer queued" in resp["result"]["output"]
+    assert calls["steer_text"] == "also check auth.log"
+
+
 def test_command_dispatch_exec_nonzero_surfaces_error(monkeypatch):
     monkeypatch.setattr(
         server,

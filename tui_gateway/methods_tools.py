@@ -807,7 +807,20 @@ def _(rid, params: dict) -> dict:
         if not arg:
             return _err(rid, 4004, "usage: /steer <prompt>")
         agent = session.get("agent") if session else None
-        if agent and hasattr(agent, "steer"):
+        # AIAgent.steer() has no notion of a live turn: it stashes the text
+        # in _pending_steer and returns True unconditionally. On an idle
+        # session no drain hook ever fires (there is no next tool call), so
+        # the message is silently discarded right after the UI reported
+        # "Steer queued" (#97371). Gate on session["running"] — the same
+        # guard the CLI applies via _agent_running and the TUI via its busy
+        # check — so an idle session falls through to the send fallback
+        # below (identical to /queue semantics).
+        if session is not None:
+            with session["history_lock"]:
+                _steer_live = bool(session.get("running"))
+        else:
+            _steer_live = False
+        if _steer_live and agent and hasattr(agent, "steer"):
             try:
                 accepted = agent.steer(arg)
                 if accepted:
