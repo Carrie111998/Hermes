@@ -183,7 +183,7 @@ function isInjectedSystemNote(text: string): boolean {
 const SS_SESSION_KEY = "hermes.m.activeSession";
 const SS_TITLE_KEY = "hermes.m.activeTitle";
 const SS_MOBILE_SESSION_KEY = "hermes.m.mobileSession";
-const BUILD_TAG = "build 2026-09-02.1 · multi-photo";
+const BUILD_TAG = "build 2026-09-02.2 · picker-and-composer-heal";
 
 function ssGet(key: string): string {
   try {
@@ -439,7 +439,17 @@ export default function MobileChatPage() {
     vv.addEventListener("resize", measure);
     vv.addEventListener("scroll", measure);
     window.addEventListener("resize", measure);
+    // iOS standalone: visualViewport events STOP firing after sheet dismissals
+    // (file picker, share sheet), leaving the composer parked at a stale inset.
+    // Watchdog: re-measure on visibility changes and on a short post-interaction
+    // cadence so a stale viewport self-heals instead of waiting for an event
+    // that never comes.
+    const heal = () => requestAnimationFrame(measure);
+    document.addEventListener("visibilitychange", heal);
+    const healTimer = window.setInterval(heal, 1500);
     return () => {
+      document.removeEventListener("visibilitychange", heal);
+      window.clearInterval(healTimer);
       vv.removeEventListener("resize", measure);
       vv.removeEventListener("scroll", measure);
       window.removeEventListener("resize", measure);
@@ -1030,17 +1040,31 @@ const prevSid = ssGet(SS_MOBILE_SESSION_KEY);
     input.type = "file";
     input.accept = "image/*";
     input.multiple = true;
+    let settled = false;
     input.addEventListener("change", () => {
+      settled = true;
       const files = Array.from(input.files ?? []);
+      // iOS standalone PWA: the native picker sheet can stay on screen while
+      // the <input> element exists in the DOM. Detach + blur immediately.
       input.value = "";
+      input.remove();
       if (files.length === 0) return;
-      // Upload sequentially — parallel base64 data-URL conversions of 20
-      // iPhone photos spike memory and trip Safari's per-tab limits.
+      // Upload sequentially, yielding to the main thread between files —
+      // 20 back-to-back base64 conversions of iPhone photos both spike memory
+      // and freeze repaints (picker sheet looks "stuck open").
       (async () => {
-        for (const f of files) {
-          await onAttach(f);
+        for (let i = 0; i < files.length; i++) {
+          await new Promise((r) => requestAnimationFrame(() => r(null)));
+          await onAttach(files[i]);
         }
       })();
+    });
+    // Sheet dismissed without picking anything — detach the input too.
+    input.addEventListener("cancel", () => {
+      if (!settled) {
+        input.value = "";
+        input.remove();
+      }
     });
     input.click();
   }, [onAttach]);
