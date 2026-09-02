@@ -126,6 +126,128 @@ class TestBlocksMutationsInSourceRepo:
         hit, _ = _detect("git co main", repo, repo)
         assert hit is True
 
+    def test_alias_config_read_error_fails_closed(self, repo, monkeypatch):
+        """A subcommand that *could* be a mutating alias must block if the
+        alias config read itself errors (OSError/timeout) -- not be treated
+        as "no such alias" the way a clean returncode=1 is. Regression test
+        for the fail-open gap flagged in PR #81664 review: _read_git_alias
+        must not collapse "config read failed" into the same None as
+        "alias not configured".
+        """
+        import subprocess as subprocess_mod
+        from tools import self_repo_guard as guard_mod
+
+        original_run = subprocess_mod.run
+
+        def _flaky_run(cmd, *args, **kwargs):
+            # Only break the alias config lookup; let git init / other
+            # setup calls through untouched.
+            if len(cmd) >= 4 and cmd[-3:-1] == ["config", "--get"] or (
+                "config" in cmd and "--get" in cmd
+            ):
+                raise OSError("simulated alias config read failure")
+            return original_run(cmd, *args, **kwargs)
+
+        monkeypatch.setattr(guard_mod.subprocess, "run", _flaky_run)
+
+        # "co" is not a known git builtin, so a successful read would return
+        # None (no such alias) and the command would be allowed. With the
+        # read forced to error, the guard must fail closed and block.
+        hit, _ = _detect("git co main", repo, repo)
+        assert hit is True
+
+    def test_alias_chain_at_recursion_boundary_blocks(self, repo):
+        """A 5-level alias chain (a1->a2->a3->a4->a5->checkout) means that
+        by the time depth reaches _MAX_RECURSION (4), the current subcommand
+        (a5) is still an unresolved alias name -- not yet known to be
+        'checkout'. Before the fix, the depth-limit branch returned None
+        ("no mutation found"), silently allowing an alias chain that would
+        have resolved to a destructive command if expansion had continued.
+        """
+        from tools.self_repo_guard import _MAX_RECURSION
+        assert _MAX_RECURSION == 4  # test assumes this exact boundary
+
+        chain = ["a1", "a2", "a3", "a4", "a5"]
+        for i in range(len(chain) - 1):
+            subprocess.run(
+                ["git", "-C", str(repo), "config", f"alias.{chain[i]}", chain[i + 1]],
+                check=True,
+            )
+        subprocess.run(
+            ["git", "-C", str(repo), "config", f"alias.{chain[-1]}", "checkout"],
+            check=True,
+        )
+
+        hit, reason = _detect(f"git {chain[0]} main", repo, repo)
+        assert hit is True
+        assert "depth" in (reason or "").lower()
+
+    def test_alias_chain_below_recursion_boundary_still_blocks_via_mutation(self, repo):
+        """Control case: a shorter alias chain that fully resolves to a
+        destructive subcommand within the recursion budget must still block
+        -- via the direct _mutates_worktree() path, not the depth guard.
+        """
+        chain = ["b1", "b2"]
+        for i in range(len(chain) - 1):
+            subprocess.run(
+                ["git", "-C", str(repo), "config", f"alias.{chain[i]}", chain[i + 1]],
+                check=True,
+            )
+        subprocess.run(
+            ["git", "-C", str(repo), "config", f"alias.{chain[-1]}", "checkout"],
+            check=True,
+        )
+
+        hit, reason = _detect(f"git {chain[0]} main", repo, repo)
+        assert hit is True
+        assert "depth" not in (reason or "").lower()
+
+    def test_nested_shell_recursion_beyond_boundary_blocks(self, repo):
+        """_find_mutation's own recursion counter (independent of the git
+        alias depth counter in _inspect_git) must fail closed once it
+        exceeds _MAX_RECURSION, rather than silently returning None
+        ("no mutation found") for an unanalyzed nested command.
+
+        Calls _find_mutation directly at depth=_MAX_RECURSION+1 to exercise
+        the cutoff deterministically -- constructing an actual shell string
+        with 5+ levels of nested quoting to hit this via _detect() is
+        fragile (each level needs distinct, correctly-escaped quote
+        characters), so the depth parameter is exercised directly instead.
+        """
+        from tools.self_repo_guard import _find_mutation, _MAX_RECURSION
+
+        result = _find_mutation(
+            "git checkout main", repo, repo, depth=_MAX_RECURSION + 1
+        )
+        assert result is not None
+        assert "depth" in result.lower() or "recursion" in result.lower()
+
+    def test_find_mutation_within_recursion_boundary_still_inspects(self, repo):
+        """Control case: at or below the boundary, _find_mutation must
+        still actually inspect the command (not short-circuit), so a
+        destructive command within budget is caught normally.
+        """
+        from tools.self_repo_guard import _find_mutation, _MAX_RECURSION
+
+        result = _find_mutation(
+            "git checkout main", repo, repo, depth=_MAX_RECURSION
+        )
+        assert result is not None
+        assert "checkout" in result.lower()
+
+    def test_alias_read_error_sentinel_distinct_from_no_alias(self):
+        """_read_git_alias must return a distinct value for a config-read
+        error vs. a clean "no such alias" result, so callers can tell them
+        apart and fail closed only on the former.
+        """
+        from tools.self_repo_guard import _read_git_alias, _ALIAS_READ_ERROR
+        import subprocess as subprocess_mod
+
+        # Nonexistent git binary -> OSError inside _read_git_alias.
+        result = _read_git_alias("this-binary-does-not-exist-xyz", Path("."), "co")
+        assert result is _ALIAS_READ_ERROR
+        assert result is not None
+
     def test_mutation_in_command_substitution(self, repo):
         hit, _ = _detect('echo "$(git checkout main)"', repo, repo)
         assert hit is True

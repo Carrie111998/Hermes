@@ -564,7 +564,14 @@ def _inspect_git_worktree(args: list[str], cwd: Path, root: Path) -> str | None:
     return None
 
 
-def _read_git_alias(executable: str, target: Path, alias: str) -> str | None:
+# Distinct sentinel for "the alias config read itself errored" (OSError,
+# subprocess timeout/failure). Kept separate from the clean "no such alias"
+# case (returncode 1, empty value) so callers can fail closed on read
+# errors instead of treating them as "alias not configured -- safe".
+_ALIAS_READ_ERROR = object()
+
+
+def _read_git_alias(executable: str, target: Path, alias: str) -> str | None | object:
     try:
         result = subprocess.run(
             [executable, "-C", str(target), "config", "--get", f"alias.{alias}"],
@@ -574,9 +581,20 @@ def _read_git_alias(executable: str, target: Path, alias: str) -> str | None:
             check=False,
         )
     except (OSError, subprocess.SubprocessError):
+        return _ALIAS_READ_ERROR
+    # ``git config --get`` exits 1 for the clean "no such key" case; that
+    # (plus a successful rc=0 read that happens to yield an empty value) is
+    # the only status treated as "no alias configured, safe to continue".
+    # Every other nonzero status (invalid config file, bad argument, a
+    # partially-written config, etc.) means we could not determine what the
+    # subcommand actually resolves to, so it must not collapse into the
+    # same value as "no alias".
+    if result.returncode == 0:
+        value = result.stdout.strip()
+        return value if value else None
+    if result.returncode == 1:
         return None
-    value = result.stdout.strip()
-    return value if result.returncode == 0 and value else None
+    return _ALIAS_READ_ERROR
 
 
 def _inspect_git(
@@ -602,11 +620,15 @@ def _inspect_git(
     if subcommand in _KNOWN_GIT_BUILTINS:
         return None
     if depth >= _MAX_RECURSION:
-        return None
+        return f"git alias depth >{_MAX_RECURSION}"
 
     alias = inline_aliases.get(subcommand)
     if alias is None:
         alias = _read_git_alias(executable, target, subcommand)
+    if alias is _ALIAS_READ_ERROR:
+        # Cannot determine whether this subcommand is a mutating alias --
+        # fail closed rather than treat a failed read as "no alias".
+        return f"git alias config read failed for '{subcommand}'"
     if not alias:
         return None
     if alias.startswith("!"):
@@ -642,7 +664,7 @@ def _inspect_github_cli(
 
 def _find_mutation(command: str, cwd: Path, root: Path, depth: int = 0) -> str | None:
     if depth > _MAX_RECURSION:
-        return None
+        return f"alias depth >{_MAX_RECURSION}"
 
     masked_command, heredoc_scripts = _mask_heredocs(command)
     for script in heredoc_scripts:
