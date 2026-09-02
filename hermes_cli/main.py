@@ -11083,6 +11083,20 @@ def cmd_update(args):
         )
         return
 
+    # Venvs the reverted TCC interpreter anchor already converted brick the
+    # update flow itself: updater subprocesses exec venv/bin/python3, whose
+    # symlink chain dies in the anchored copy ("No module named
+    # 'encodings'"), so every attempt exits 1 and the desktop handoff
+    # retries forever (#95759). The heal exists in doctor but the handoff
+    # never runs doctor — run it here, before any stage touches the venv.
+    # Best-effort: a failed heal must not block the update itself.
+    if sys.platform == "darwin":
+        try:
+            from hermes_cli.doctor import check_macos_tcc_anchor_removed
+            check_macos_tcc_anchor_removed()
+        except Exception as exc:  # noqa: BLE001 — never block the update
+            print(f"  ⚠ TCC anchor pre-heal skipped: {exc}")
+
     gateway_mode = getattr(args, "gateway", False)
 
     # Protect against mid-update terminal disconnects (SIGHUP) and tolerate
