@@ -834,13 +834,19 @@ def parse_duration(s: str) -> int:
         "2h" → 120
         "1d" → 1440
         "hour" → 60 (bare unit, no leading number)
+        "an hour" → 60 (bare unit with its natural article)
     """
     s = s.strip().lower()
-    match = re.match(r'^(\d*)\s*(m|min|mins|minute|minutes|h|hr|hrs|hour|hours|d|day|days)$', s)
+    # A bare unit is naturally spoken with its article ("in an hour", "in a
+    # minute") — accept and ignore it, same as the article-less bare form.
+    match = re.match(
+        r'^(?:an?\s+)?(\d*)\s*(m|min|mins|minute|minutes|h|hr|hrs|hour|hours|d|day|days)$',
+        s,
+    )
     if not match:
         raise ValueError(
             f"Invalid duration: '{s}'. Use format like '30m', '2h', '1d', "
-            "or a bare unit like 'hour' (defaults to 1)."
+            "or a bare unit like 'hour'/'an hour' (defaults to 1)."
         )
     
     value = int(match.group(1)) if match.group(1) else 1

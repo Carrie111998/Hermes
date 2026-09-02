@@ -50,6 +50,17 @@ class TestParseDuration:
         assert parse_duration("day") == 1440
         assert parse_duration("d") == 1440
 
+    def test_bare_units_accept_their_natural_article(self):
+        """'in an hour' / 'in a minute' are how these durations are actually
+        spoken — the tool schema tells the model to translate the user's own
+        phrasing verbatim (tools/cronjob_tools.py), so 'remind me in an hour'
+        plausibly becomes schedule='in an hour' and must not fail just
+        because the bare-unit form ('in hour') dropped the article."""
+        assert parse_duration("an hour") == 60
+        assert parse_duration("a hour") == 60
+        assert parse_duration("a minute") == 1
+        assert parse_duration("a day") == 1440
+
     def test_every_bare_unit_schedule(self):
         result = parse_schedule("every hour")
         assert result["kind"] == "interval"
@@ -100,6 +111,16 @@ class TestParseSchedule:
         now = datetime.now().astimezone()
         assert run_at > now
         assert run_at < now + timedelta(minutes=31)
+
+    def test_in_duration_with_article_becomes_once(self):
+        """'in an hour' is the natural way to say this and must fire once,
+        exactly like the article-less 'in hour' bare form does."""
+        result = parse_schedule("in an hour")
+        assert result["kind"] == "once"
+        run_at = datetime.fromisoformat(result["run_at"])
+        now = datetime.now().astimezone()
+        assert run_at > now + timedelta(minutes=59)
+        assert run_at < now + timedelta(minutes=61)
 
     def test_every_becomes_interval(self):
         result = parse_schedule("every 2h")
