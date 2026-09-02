@@ -6512,7 +6512,7 @@ class AIAgent:
                 env_url = get_env_prefer_dotenv(pconfig.base_url_env_var).strip().rstrip("/")
             default_base = (pconfig.inference_base_url or "").strip().rstrip("/")
             base_url = env_url or default_base
-            if self.provider == "kimi-coding":
+            if self.provider in {"kimi-coding", "kimi-coding-cn"}:
                 from hermes_cli.auth import _resolve_kimi_base_url
 
                 base_url = _resolve_kimi_base_url(
