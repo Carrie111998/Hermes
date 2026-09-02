@@ -8040,6 +8040,7 @@ def resolve_vision_provider_client(
                 return _finalize(requested, client, final_model)
         # Fallback: try without explicit base_url (old behavior)
         client, final_model = _get_cached_client(requested, resolved_model, async_mode,
+                                                 api_key=resolved_api_key or None,
                                                  api_mode=resolved_api_mode,
                                                  main_runtime=runtime,
                                                  is_vision=True)
@@ -8047,7 +8048,16 @@ def resolve_vision_provider_client(
             return requested, None, None
         return requested, client, final_model
 
+    # Explicit provider selection (including named custom providers, e.g.
+    # auxiliary.vision.provider: my-vision-provider). The resolved per-task
+    # api_key must reach the client builder — dropping it here sent the
+    # credential-pool / auth.json key for the provider instead of the
+    # explicitly configured auxiliary.vision.api_key, 401-ing on named
+    # custom providers whose pool credential differs or is absent (#96232).
+    # ``or None`` keeps the pool/env resolution path byte-identical when no
+    # explicit key was configured.
     client, final_model = _get_cached_client(requested, resolved_model, async_mode,
+                                             api_key=resolved_api_key or None,
                                              api_mode=resolved_api_mode,
                                              main_runtime=runtime,
                                              is_vision=True)
