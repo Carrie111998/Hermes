@@ -659,6 +659,88 @@ def test_named_custom_provider_uses_saved_credentials(monkeypatch):
     assert resolved["source"] == "custom_provider:Local"
 
 
+def test_claude_cli_identity_attached_for_custom_provider(monkeypatch):
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    monkeypatch.setattr(
+        rp,
+        "load_config",
+        lambda: {
+            "providers": {
+                "custom": {
+                    "api": "http://proxy.example/v1",
+                    "api_key": "custom-key",
+                    "default_model": "claude-opus-4-8",
+                    "name": "Custom",
+                },
+            }
+        },
+    )
+
+    resolved = rp.resolve_runtime_provider(
+        requested="custom",
+        target_model="claude-opus-4-8",
+    )
+
+    assert resolved["extra_headers"]["User-Agent"] == (
+        "claude-cli/2.1.233 (external, sdk-cli)"
+    )
+
+
+def test_claude_cli_identity_attached_for_named_provider(monkeypatch):
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    monkeypatch.setattr(
+        rp,
+        "load_config",
+        lambda: {
+            "providers": {
+                "relay-a": {
+                    "api": "http://proxy.example/v1",
+                    "api_key": "custom-key",
+                    "default_model": "claude-opus-4-8",
+                    "name": "Relay A",
+                }
+            }
+        },
+    )
+
+    resolved = rp.resolve_runtime_provider(
+        requested="relay-a",
+        target_model="claude-opus-4-8",
+    )
+
+    assert resolved["extra_headers"]["User-Agent"] == (
+        "claude-cli/2.1.233 (external, sdk-cli)"
+    )
+
+
+def test_claude_cli_identity_not_attached_for_non_claude_model(monkeypatch):
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    monkeypatch.setattr(
+        rp,
+        "load_config",
+        lambda: {
+            "providers": {
+                "custom": {
+                    "api": "http://proxy.example/v1",
+                    "api_key": "custom-key",
+                    "default_model": "gpt-5.6-sol",
+                    "name": "Custom",
+                },
+            }
+        },
+    )
+
+    resolved = rp.resolve_runtime_provider(
+        requested="custom",
+        target_model="gpt-5.6-sol",
+    )
+
+    assert "User-Agent" not in (resolved.get("extra_headers") or {})
+
+
 def test_named_custom_provider_filters_capabilities_at_lookup_boundary(monkeypatch):
     monkeypatch.setattr(
         rp,
