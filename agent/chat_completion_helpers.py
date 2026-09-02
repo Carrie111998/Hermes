@@ -2745,6 +2745,35 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
         )
         return agent._try_activate_fallback(reason)
 
+    # ``require_same_model`` — model-pinned fallback entry.  The entry only
+    # applies when its model matches the model that just failed, so the chain
+    # can express "switch PROVIDERS serving this exact model, never switch to
+    # a different model".  A different-model primary (e.g. claude-opus-5 on a
+    # relay) never activates it and falls through to normal error handling.
+    #
+    # ``match_model`` (optional, list) — alternate wire names the same model is
+    # published under on this provider (e.g. stealth/ox-alpha on Nous/OpenRouter
+    # is x-preview-f-free on opencode-free).  The entry activates when the
+    # failed model equals ``model`` OR any ``match_model`` name.
+    if fb.get("require_same_model"):
+        failed_model = str(getattr(agent, "model", "") or "").strip().lower()
+        accepted = [fb_model.lower()]
+        accepted += [
+            str(n).strip().lower()
+            for n in (fb.get("match_model") or [])
+            if str(n).strip()
+        ]
+        if failed_model not in accepted:
+            logger.info(
+                "Fallback skip: %s/%s has require_same_model but primary model "
+                "is %r — this fallback only serves %s",
+                fb_provider,
+                fb_model,
+                failed_model,
+                ", ".join(accepted),
+            )
+            return agent._try_activate_fallback(reason)
+
     # Skip entries that resolve to the same backend that just failed —
     # falling back to it loops the failure. Identity semantics (which axes
     # distinguish two backends, shim aliases, first-class credential

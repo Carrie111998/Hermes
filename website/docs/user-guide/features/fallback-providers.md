@@ -433,3 +433,22 @@ See [Scheduled Tasks (Cron)](/user-guide/features/cron) for full configuration d
 | Triage specifier | Layered (see above) | `auxiliary.triage_specifier` |
 | Delegation | Inherits the parent's `fallback_providers` chain; optional provider/model override | `delegation.provider` / `delegation.model` |
 | Cron jobs | Inherit the configured `fallback_providers` chain; optional per-job provider override | Per-job `provider` / `model` |
+
+## Model-Pinned Entries
+
+By default every entry in the chain is tried no matter which model failed.
+Add `require_same_model: true` to pin an entry to its own model — it then only
+fires when the failing primary serves that exact model, letting you express
+"switch providers serving this model, never switch models":
+
+```yaml
+fallback_providers:
+  - provider: opencode-free
+    model: x-preview-f-free
+    match_model: [stealth/ox-alpha]   # alternate wire names of the same model
+    require_same_model: true
+```
+
+`match_model` lists additional wire names of the same model on other providers.
+Entries with `require_same_model` are skipped (without error) when the failing
+primary serves a different model — unpinned entries keep today's behavior.
