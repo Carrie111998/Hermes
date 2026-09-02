@@ -1505,6 +1505,53 @@ test('Apply remote preserves an existing URL identity and label without duplicat
   assert.equal(applied.lastUsed, 'hermes-alex')
 })
 
+// Adopting a v1 block can rewrite dial material on an EXISTING id. That is the
+// same "same slot, new authority" change saveRegistryConnection() bumps for; a
+// missed bump leaves pre-edit RouteKeys passing isRouteKeyCurrent() so a stale
+// socket stays publishable against the new gateway (§3.1 §20).
+test('Apply bumps generation when it rewrites dial material on an existing entry', () => {
+  let registry = emptyRegistry()
+  registry = upsertConnection(registry, {
+    id: 'hermes-alex',
+    kind: 'remote',
+    label: 'Existing gateway',
+    url: 'https://gateway.example.com',
+    authMode: 'token',
+    token: { old: true },
+    generation: 3
+  })
+
+  const applied = reconcileAppliedGlobalConnection(registry, {
+    mode: 'remote',
+    remote: { url: 'https://gateway.example.com', authMode: 'token', token: { rotated: true } }
+  })
+
+  const entry = applied.connections.find(connection => connection.id === 'hermes-alex')
+
+  assert.equal(entry?.generation, 4)
+})
+
+test('Apply leaves generation alone when nothing about the dial changed', () => {
+  let registry = emptyRegistry()
+  registry = upsertConnection(registry, {
+    id: 'hermes-alex',
+    kind: 'remote',
+    label: 'Existing gateway',
+    url: 'https://gateway.example.com',
+    authMode: 'oauth',
+    generation: 3
+  })
+
+  const applied = reconcileAppliedGlobalConnection(registry, {
+    mode: 'remote',
+    remote: { url: 'https://gateway.example.com', authMode: 'oauth' }
+  })
+
+  const entry = applied.connections.find(connection => connection.id === 'hermes-alex')
+
+  assert.equal(entry?.generation, 3)
+})
+
 test('Apply local moves primary/current to This device without deleting registered remotes', () => {
   const remoteRegistry = reconcileAppliedGlobalConnection(emptyRegistry(), {
     mode: 'remote',

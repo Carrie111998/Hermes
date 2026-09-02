@@ -51,6 +51,14 @@ export interface RegistryConnection {
   kind: ConnectionKind
   /** Required, unique (case-insensitive) display name — the "device name". */
   label: string
+  /**
+   * Generation — bumped whenever dial material (endpoint/auth/ssh routing)
+   * changes (Magnum Phase 1 / #90149 class E). Distinguishes the same id
+   * slot across mutable edits: stale results from generation N must never
+   * overwrite N+1. Defaults to 1 for registries written before Phase 1;
+   * persisted once bumped. Pure helpers below never synthesize it.
+   */
+  generation?: number
   /** remote/cloud: normalized base URL. */
   url?: string
   /** remote/cloud: 'token' | 'oauth'. */
@@ -906,7 +914,9 @@ export function normalizeConnectionInput(input: ConnectionInput, registry: Conne
       throw new Error(`A connection to this SSH host already exists ("${sshDupe.label}").`)
     }
 
-    return { id, kind: 'ssh', label, ...sshFields }
+    const existingSsh = input.id ? registry.connections.find(c => c.id === input.id) : undefined
+    const sshGen = Number.isInteger((existingSsh as { generation?: unknown } | undefined)?.generation) ? (existingSsh as { generation: number }).generation : 1
+    return { id, kind: 'ssh', label, generation: sshGen, ...sshFields }
   }
 
   if (kind === 'remote' || kind === 'cloud') {
@@ -927,7 +937,9 @@ export function normalizeConnectionInput(input: ConnectionInput, registry: Conne
     }
 
     const authMode = normAuthMode(input.authMode)
-    const entry: RegistryConnection = { id, kind, label, url, authMode }
+    const existingRemote = input.id ? registry.connections.find(c => c.id === input.id) : undefined
+    const remoteGen = Number.isInteger((existingRemote as { generation?: unknown } | undefined)?.generation) ? (existingRemote as { generation: number }).generation : 1
+    const entry: RegistryConnection = { id, kind, label, generation: remoteGen, url, authMode }
 
     // A token is only meaningful for token-auth remotes. Dropping it here is
     // what clears the stale envelope when an entry is switched token→oauth
@@ -1055,7 +1067,7 @@ export function connectionDialFieldsChanged(before: RegistryConnection, after: R
 // ── Registry-level operations (all pure: return a new registry) ────────────
 
 function localEntry(label = 'This device'): RegistryConnection {
-  return { id: LOCAL_CONNECTION_ID, kind: 'local', label }
+  return { id: LOCAL_CONNECTION_ID, kind: 'local', label, generation: 1 }
 }
 
 /**
@@ -1151,7 +1163,8 @@ export function normalizeRegistry(raw: unknown): ConnectionRegistry {
       seenLabels.add(labelKey(label))
       seenIds.add(id)
 
-      const clean: RegistryConnection = { id, kind, label }
+      const rawGen = Number(entry.generation)
+      const clean: RegistryConnection = { id, kind, label, ...(Number.isInteger(rawGen) && rawGen >= 1 ? { generation: rawGen } : { generation: 1 }) }
 
       if (kind === 'remote' || kind === 'cloud') {
         const url = String(entry.url || '').trim()
@@ -1264,6 +1277,7 @@ export function migrateV1ToRegistry(v1: unknown): ConnectionRegistry {
       ),
       kind,
       label,
+      generation: 1,
       url,
       authMode: normAuthMode(block.authMode)
     }
@@ -1318,6 +1332,7 @@ export function migrateV1ToRegistry(v1: unknown): ConnectionRegistry {
       ),
       kind: 'ssh',
       label,
+      generation: 1,
       ...sshFields
     }
 
@@ -1469,7 +1484,7 @@ export function reconcileAppliedGlobalConnection(
       registry.connections.map(connection => connection.label)
     )
 
-  const entry = normalizeConnectionInput(
+  let entry = normalizeConnectionInput(
     {
       id: existing?.id,
       kind,
@@ -1482,6 +1497,17 @@ export function reconcileAppliedGlobalConnection(
     },
     registry
   )
+
+  // Adopting a v1 block can rewrite url/token/headers on an existing id. That is
+  // the same "same slot, different dial material" change saveRegistryConnection()
+  // bumps for — without the bump, RouteKeys minted before the edit keep passing
+  // isRouteKeyCurrent() and stale sockets stay publishable (§3.1 §20).
+  if (existing && connectionDialFieldsChanged(existing, entry)) {
+    const priorGen = Number.isInteger((existing as { generation?: unknown }).generation)
+      ? (existing as { generation: number }).generation
+      : 1
+    entry = { ...entry, generation: priorGen + 1 }
+  }
 
   return {
     ...upsertConnection(registry, entry),

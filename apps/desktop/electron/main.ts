@@ -131,6 +131,7 @@ import {
   backendScopePrefix,
   buildAgentRoster,
   connectionDialFieldsChanged,
+  LOCAL_CONNECTION_ID,
   mergeConnectionInput,
   migrateV1ToRegistry,
   normalizeConnectionInput,
@@ -141,6 +142,7 @@ import {
   registrySourceOwnsPrimaryBackend,
   rememberSshEnumeration,
   removeConnection,
+  type ResolvedConnectionDescriptor,
   resolvedConnectionId,
   resolveRegistryLocalRoute,
   reuseMatchingPrimarySshBackend,
@@ -153,6 +155,12 @@ import {
   upsertConnection
 } from './connection-registry'
 import type { RosterProfileMetadata } from './connection-registry'
+import {
+  descriptorScopeMatchesRoute,
+  isRouteKeyCurrent,
+  makeRouteKey,
+  type RouteKey
+} from './connection-route-identity'
 import { describeCrashReason, installCrashForensics } from './crash-forensics'
 import { adoptServedDashboardToken } from './dashboard-token'
 import { loadOrCreateInstallationId, sshOwnershipId } from './desktop-installation'
@@ -199,6 +207,12 @@ import {
   writeBufferToFile
 } from './gateway-file-download'
 import { startGatewaysAfterUpdateAbort, stopGatewayBeforeUpdate } from './gateway-stop-before-update'
+import {
+  type ActivationReceipt,
+  GatewaySupervisor,
+  type RouteLease,
+  type TransportHandle
+} from './gateway-supervisor'
 import { probeGatewayWebSocket } from './gateway-ws-probe'
 import { registerGitIpc } from './git-ipc'
 import { clearStaleGitLocks } from './gitlock'
@@ -1394,6 +1408,68 @@ const registryDispatchRevalidation = new RemoteRevalidationCoordinator()
 // lifecycles, so concurrent dials for one (connectionId, profile) scope
 // coalesce here — the second caller awaits the first spawn's result.
 const backendDialClaims = new BackendDialClaims()
+// Magnum #94724 Phase 2 — single-owner activation authority (§4 §5 §7)
+// Stale generations never publish; concurrent renderers coalesce by
+// (connectionId, generation, profile). The supervisor owns coalescing,
+// currency and the activation gate; each handler supplies the dial for its own
+// call site and reads the dialed descriptor back off the lease. The descriptor
+// never travels out-of-band, so one route's result can never be published
+// against another's.
+//
+// Dials still go through backendDialClaims under backendScopeKey() so the
+// supervisor shares one claim with redialPoolBackendAfterResume() and the
+// direct callers (#90812) rather than opening a second spawn per profile.
+
+// The backend descriptor handlers return: a resolved connection plus the
+// runtime fields ensureBackend()/ensureRegistryBackend() attach. main.ts builds
+// these untyped in a dozen places, so the index signature keeps that true while
+// naming the fields the supervisor path actually reads.
+interface BackendDescriptor extends ResolvedConnectionDescriptor {
+  [key: string]: unknown
+  port?: unknown
+  profile?: unknown
+  url?: unknown
+}
+
+const gatewaySupervisor = new GatewaySupervisor<BackendDescriptor>({
+  activateTransport: route => dialRouteTransport(route, null),
+  isRouteCurrent: route => {
+    try {
+      return isRouteKeyCurrent(readDesktopConnectionsRegistry(), route)
+    } catch {
+      return false
+    }
+  },
+})
+
+/**
+ * Dial a route and describe the result as transport facts the activation gate
+ * can judge. `dial` overrides how the backend is obtained; null means route by
+ * the route's own connectionId.
+ */
+async function dialRouteTransport(
+  route: RouteKey,
+  dial: null | (() => Promise<BackendDescriptor>)
+): Promise<TransportHandle<BackendDescriptor>> {
+  const cid = String(route.connectionId || '').trim()
+  const profile = String(route.desktopProfile || '').trim() || 'default'
+  const isLocalScope = !cid || cid === LOCAL_CONNECTION_ID
+  const claimKey = backendScopeKey(isLocalScope ? null : cid, profile)
+  const run = dial ?? (() => (isLocalScope ? ensureBackend(profile) : ensureRegistryBackend(cid, profile)))
+  const descriptor = await backendDialClaims.run(claimKey, run)
+
+  return {
+    descriptor,
+    gatewayEpoch: String(route.generation),
+    socketInstanceId: `${claimKey}#${route.generation}`,
+    // A descriptor with no endpoint at all is a dial that resolved without
+    // producing a usable gateway. Local backends carry `port`, remotes carry
+    // `baseUrl` — either one is a reachable gateway.
+    gatewayReady: Boolean(descriptor?.port || descriptor?.baseUrl || descriptor?.url),
+    targetProfileMatches: descriptorScopeMatchesRoute(descriptor, route)
+  }
+}
+
 // True while connection-config:apply soft-rehomes the primary — suppresses the
 // backend-exit toast so an intentional kill doesn't look like a crash.
 let softRehomeInProgress = false
@@ -9412,7 +9488,13 @@ async function saveRegistryConnection(input: any = {}) {
       : input.headers
 
   const merged = mergeConnectionInput({ ...input, token, headers }, existing)
-  const entry = normalizeConnectionInput(merged, registry)
+  let entry = normalizeConnectionInput(merged, registry)
+  // Generation bump: same id slot with different dial material is a new authority.
+  // Stale sockets/results from the prior generation must never overwrite it (§3.1 §20).
+  if (existing && connectionDialFieldsChanged(existing, entry)) {
+    const priorGen = Number.isInteger((existing as { generation?: unknown }).generation) ? (existing as { generation: number }).generation : 1
+    entry = { ...entry, generation: priorGen + 1 }
+  }
 
   // Token-auth remotes must actually have a token to be dialable. OAuth and
   // cloud entries authenticate via cookies/native tokens instead.
@@ -14445,12 +14527,49 @@ function createWindow() {
   })
 }
 
+/**
+ * Unwrap a receipt to the lease that authorizes publication, or throw. Every
+ * non-publishing status raises — a dial that did not produce a usable gateway
+ * must surface as an error, never fall through to some other route's
+ * descriptor.
+ */
+function requireLease<D>(receipt: ActivationReceipt<D>, label: string): RouteLease<D> {
+  switch (receipt.status) {
+    case 'activated':
+    case 'already-active':
+      return receipt.lease
+    case 'superseded':
+    case 'revoked':
+    case 'removed':
+      throw new Error(`Route ${label} superseded during dial (${receipt.reason || receipt.status})`)
+    default:
+      // offline / cancelled / ambiguous
+      throw new Error(
+        `Route ${label} failed to activate (${receipt.status}${receipt.reason ? `: ${receipt.reason}` : ''})`
+      )
+  }
+}
+
 ipcMain.handle('hermes:connection', async (_event, profile) => {
-  // Coalesce concurrent renderer dials for one profile scope (#90812): the
-  // renderer-side reconnect lock is per-window, so two windows waking at once
-  // both land here. The claim key mirrors ensureBackend()'s own profile
-  // normalization so every spelling of the primary coalesces onto one dial.
   const profileKey = profile && String(profile).trim() ? String(profile).trim() : primaryProfileKey()
+  // Magnum Phase 2: supervisor is the single activation gate (generation-bound).
+  // It coalesces concurrent renderer dials by route, invalidates stale
+  // generations, and hands the dialed descriptor back on the lease. The dial
+  // stays ensureBackend() — this handler owns the primary, so routing it by
+  // connectionId would drop the primary's sharedPrimary/descriptorProfile
+  // fields and file it under a registry-scoped pool key.
+  const reg = readDesktopConnectionsRegistry()
+  const primaryConn = reg.connections.find(c => c.id === reg.primary) || reg.connections.find(c => c.kind === 'local')
+  if (primaryConn) {
+    const route = makeRouteKey(primaryConn, profileKey)
+    const receipt = await gatewaySupervisor.activate(route, r => dialRouteTransport(r, () => ensureBackend(profile)))
+    const connection = requireLease(receipt, String(route.connectionId)).descriptor
+    const connectionId = resolvedConnectionId(readDesktopConnectionsRegistry(), connection)
+    return connectionId ? { ...connection, connectionId } : connection
+  }
+
+  // No registry entry to bind identity to (pre-migration profile): fall back to
+  // the direct dial under the same claim key the supervisor would have used.
   const connection = await backendDialClaims.run(backendScopeKey(null, profileKey), () => ensureBackend(profile))
   const connectionId = resolvedConnectionId(readDesktopConnectionsRegistry(), connection)
 
@@ -14465,9 +14584,18 @@ ipcMain.handle('hermes:connection:for', async (_event, payload) => {
   const { connectionId, profile } = payload && typeof payload === 'object' ? (payload as any) : ({} as any)
   const registry = readDesktopConnectionsRegistry()
   const id = String(connectionId || '').trim() || registry.primary
-  // Same single-owner claim as 'hermes:connection', keyed by the composite
-  // (connectionId, profile) scope (#90812): concurrent registry dials for one
-  // scope share the first spawn instead of bootstrapping duplicate remotes.
+  const source = registry.connections.find(c => c.id === id)
+  if (source) {
+    const profKey = String(profile ?? '').trim() || 'default'
+    const route = makeRouteKey(source, profKey)
+    const receipt = await gatewaySupervisor.activate(route, r =>
+      dialRouteTransport(r, () => ensureRegistryBackend(id, profile))
+    )
+
+    return { ...requireLease(receipt, id).descriptor, connectionId: id, registryScoped: true }
+  }
+
+  // Unregistered id: no RouteKey to mint, so dial directly under the same claim.
   const connection = await backendDialClaims.run(backendScopeKey(id, profile), () => ensureRegistryBackend(id, profile))
 
   return { ...connection, connectionId: id, registryScoped: true }
