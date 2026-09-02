@@ -571,8 +571,28 @@ class _SlashWorker:
         with self._lock:
             self._seq += 1
             rid = self._seq
-            self.proc.stdin.write(json.dumps({"id": rid, "command": command}) + "\n")
-            self.proc.stdin.flush()
+            payload = json.dumps({"id": rid, "command": command}) + "\n"
+            # Bound the stdin write: a command larger than the pipe buffer
+            # against a busy child (executing the previous command) would
+            # block this write forever WHILE holding _lock, wedging every
+            # future slash command. The write thread converts that into the
+            # same timeout the response wait already uses.
+            write_done = threading.Event()
+
+            def _write_payload() -> None:
+                try:
+                    self.proc.stdin.write(payload)
+                    self.proc.stdin.flush()
+                except Exception:
+                    pass  # broken pipe surfaces via the queue loop / close()
+                finally:
+                    write_done.set()
+
+            threading.Thread(
+                target=_write_payload, daemon=True, name="slash-worker-stdin"
+            ).start()
+            if not write_done.wait(_SLASH_WORKER_TIMEOUT_S):
+                raise RuntimeError("slash worker stdin write timed out")
 
             while True:
                 try:
