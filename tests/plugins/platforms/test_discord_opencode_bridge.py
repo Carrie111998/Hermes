@@ -349,35 +349,69 @@ class TestOpenCodeBridgeClient:
 
 
 class FakeMessage:
-    def __init__(self, embeds=None, content=""):
+    def __init__(self, embeds=None, content="", channel=None):
         self.embeds = embeds or []
         self.content = content
         self.edits = []
+        self.channel = channel
 
     async def edit(self, **kwargs):
         self.edits.append(kwargs)
         if "embed" in kwargs:
             self.embeds = [kwargs["embed"]]
 
+    async def create_thread(self, name, auto_archive_duration=None, **kwargs):
+        thread = FakeChannel(channel_id=900_000 + (len(self.channel.threads) if self.channel else 0))
+        thread.name = name
+        thread.mention = f"<#{thread.id}>"
+        if self.channel is not None:
+            self.channel.threads.append(thread)
+            self.channel.client.channels[thread.id] = thread
+        return thread
+
 
 class FakeChannel:
-    def __init__(self):
+    def __init__(self, channel_id=123):
+        self.id = channel_id
         self.sent = []
+        self.threads = []
+        self.client = None
+        self.name = ""
+
+    mention = "<#0>"
 
     async def send(self, **kwargs):
         self.sent.append(kwargs)
-        return FakeMessage(embeds=[kwargs["embed"]] if kwargs.get("embed") else [], content=kwargs.get("content", ""))
+        return FakeMessage(
+            embeds=[kwargs["embed"]] if kwargs.get("embed") else [],
+            content=kwargs.get("content", ""),
+            channel=self,
+        )
+
+    async def create_thread(self, name=None, content=None, **kwargs):
+        thread = FakeChannel(channel_id=900_000 + len(self.threads))
+        thread.name = name
+        thread.mention = f"<#{thread.id}>"
+        self.threads.append(thread)
+        if self.client is not None:
+            self.client.channels[thread.id] = thread
+        if content is not None:  # forum-style: starter content is the first message
+            thread.sent.append({"content": content})
+            return SimpleNamespace(thread=thread)
+        return thread
 
 
 class FakeDiscordClient:
     def __init__(self, channel):
         self._channel = channel
+        self.channels = {channel.id: channel}
+        channel.client = self
 
     def get_channel(self, channel_id):
-        return self._channel
+        return self.channels.get(int(channel_id), self._channel if int(channel_id) == self._channel.id else None)
 
     async def fetch_channel(self, channel_id):
-        return self._channel
+        return self.get_channel(channel_id)
 
 
 class FakeAdapter:
@@ -1228,3 +1262,269 @@ class TestQuestionFlow:
         spool = GuardSpool(str(tmp_path))
         spool.write_decision("frage000-0001", "answer", "discord", now=NOW)
         assert json.loads((spool.decisions_dir / "frage000-0001.json").read_text())["decision"] == "reject"
+
+
+# ---------------------------------------------------------------------------
+# Session notices and per-session threads
+# ---------------------------------------------------------------------------
+
+from plugins.platforms.discord.opencode_bridge import ThreadRegistry  # noqa: E402
+
+
+def _notice(notice, session_id="ses-thread-1", **overrides):
+    payload = _fresh(id=f"notice00-{notice}-{len(session_id)}", agent="opencode", kind="notice", notice=notice,
+                     session_id=session_id, text="Bitte Kapitel 3 bauen", started_at=time.time())
+    for key in ("command", "path", "access"):
+        payload.pop(key, None)
+    payload.update(overrides)
+    return payload
+
+
+class TestNoticeParsing:
+    def test_start_notice_parses(self):
+        r = parse_guard_request(_notice("start"), now=time.time())
+        assert r is not None and r.is_notice and r.notice == "start"
+        assert r.text == "Bitte Kapitel 3 bauen" and r.session_id == "ses-thread-1"
+
+    @pytest.mark.parametrize("overrides", [
+        {"notice": "explode"},
+        {"session_id": ""},
+        {"notice": "child"},  # child without parent
+    ])
+    def test_unclear_notices_refused(self, overrides):
+        payload = _notice("start")
+        payload.update(overrides)
+        assert parse_guard_request(payload, now=time.time()) is None
+
+    def test_child_notice_needs_parent(self):
+        r = parse_guard_request(_notice("child", parent_session_id="ses-root"), now=time.time())
+        assert r is not None and r.parent_session_id == "ses-root"
+
+
+class TestThreadRegistry:
+    def test_roundtrip_and_parent_resolution(self, tmp_path):
+        reg = ThreadRegistry(tmp_path / "threads.json")
+        reg.set_thread("root", "42", "123")
+        reg.set_parent("child", "root")
+        reg.set_parent("grandchild", "child")
+        assert reg.thread_for("grandchild") == "42"
+        assert reg.thread_for("unknown") is None
+        again = ThreadRegistry(tmp_path / "threads.json")
+        assert again.thread_for("child") == "42"
+
+    def test_prune_drops_old_threads(self, tmp_path):
+        reg = ThreadRegistry(tmp_path / "threads.json")
+        reg.set_thread("old", "1", "123", now=time.time() - 8 * 24 * 3600)
+        reg.set_thread("new", "2", "123")
+        reg.set_parent("kid", "old")
+        reg.prune()
+        assert reg.thread_for("old") is None and reg.thread_for("new") == "2"
+        assert reg.thread_for("kid") is None
+
+    def test_corrupt_file_is_ignored(self, tmp_path):
+        (tmp_path / "threads.json").write_text("{kaputt", encoding="utf-8")
+        assert ThreadRegistry(tmp_path / "threads.json").thread_for("x") is None
+
+
+class TestSessionThreads:
+    @pytest.mark.asyncio
+    async def test_start_notice_opens_thread_with_prompt(self, tmp_path):
+        bridge, channel, stub = _make_guard_bridge(tmp_path)
+        _write_request(bridge.spool, _notice("start"))
+        posted = await bridge.poll_guard_spool_once()
+        assert posted == 1
+        assert len(channel.threads) == 1
+        thread = channel.threads[0]
+        assert thread.name.startswith("OpenCode · Projekt · ")
+        assert "Session `ses-thread-1`" in channel.sent[0]["content"]
+        assert "Bitte Kapitel 3 bauen" in thread.sent[0]["content"]
+        assert "Sitzung gestartet" in thread.sent[0]["content"]
+        assert bridge.threads.thread_for("ses-thread-1") == str(thread.id)
+        assert os.listdir(bridge.spool.requests_dir) == []  # notice consumed
+
+    @pytest.mark.asyncio
+    async def test_prompts_of_session_land_in_thread(self, tmp_path):
+        bridge, channel, stub = _make_guard_bridge(tmp_path)
+        _write_request(bridge.spool, _notice("start"))
+        await bridge.poll_guard_spool_once()
+        thread = channel.threads[0]
+        _write_request(bridge.spool, _fresh(id="perm0000-thread", session_id="ses-thread-1"))
+        _write_request(bridge.spool, _question_payload(session_id="ses-thread-1"))
+        await bridge.poll_guard_spool_once()
+        assert len(channel.sent) == 1  # only the starter in the channel
+        assert any("Befehlswächter" in m["content"] for m in thread.sent)
+        assert any("Welche Farbe?" in m["content"] for m in thread.sent)
+        # answering inside the thread still writes the decision file
+        view = next(m["view"] for m in thread.sent if "Befehlswächter" in m["content"])
+        from plugins.platforms.discord.opencode_bridge import _get_view_class
+        await _get_view_class().accept(view, _interaction("111", message=FakeMessage(embeds=[])), None)
+        assert _read_decision(bridge, "perm0000-thread")["decision"] == "once"
+
+    @pytest.mark.asyncio
+    async def test_child_session_uses_parent_thread(self, tmp_path):
+        bridge, channel, stub = _make_guard_bridge(tmp_path)
+        _write_request(bridge.spool, _notice("start"))
+        await bridge.poll_guard_spool_once()
+        _write_request(bridge.spool, _notice("child", session_id="ses-kind", parent_session_id="ses-thread-1"))
+        await bridge.poll_guard_spool_once()
+        _write_request(bridge.spool, _fresh(id="perm0000-kind0", session_id="ses-kind"))
+        await bridge.poll_guard_spool_once()
+        assert any("Befehlswächter" in m["content"] for m in channel.threads[0].sent)
+        assert len(channel.sent) == 1
+
+    @pytest.mark.asyncio
+    async def test_prompt_and_result_notices_post_into_thread(self, tmp_path):
+        bridge, channel, stub = _make_guard_bridge(tmp_path)
+        _write_request(bridge.spool, _notice("start"))
+        await bridge.poll_guard_spool_once()
+        _write_request(bridge.spool, _notice("prompt", text="Und jetzt Kapitel 4"))
+        _write_request(bridge.spool, _notice("result", text="Fertig, 2 Dateien."))
+        await bridge.poll_guard_spool_once()
+        texts = [m["content"] for m in channel.threads[0].sent]
+        assert any("Neuer Prompt" in t and "Kapitel 4" in t for t in texts)
+        assert any("Antwort" in t and "Fertig, 2 Dateien." in t for t in texts)
+
+    @pytest.mark.asyncio
+    async def test_second_start_for_same_session_does_not_open_second_thread(self, tmp_path):
+        bridge, channel, stub = _make_guard_bridge(tmp_path)
+        _write_request(bridge.spool, _notice("start"))
+        await bridge.poll_guard_spool_once()
+        _write_request(bridge.spool, _notice("start", id="notice00-start-again"))
+        await bridge.poll_guard_spool_once()
+        assert len(channel.threads) == 1
+        assert len(channel.threads[0].sent) == 2
+
+    @pytest.mark.asyncio
+    async def test_prompt_without_thread_falls_back_to_channel(self, tmp_path):
+        bridge, channel, stub = _make_guard_bridge(tmp_path)
+        _write_request(bridge.spool, _fresh(session_id="ses-unbekannt"))
+        _write_request(bridge.spool, _notice("result", session_id="ses-unbekannt", text="ohne Thread"))
+        await bridge.poll_guard_spool_once()
+        assert channel.threads == []
+        assert any("Befehlswächter" in m["content"] for m in channel.sent)
+        assert any("ohne Thread" in m["content"] for m in channel.sent)
+
+    @pytest.mark.asyncio
+    async def test_failed_notice_is_not_retried(self, tmp_path):
+        bridge, channel, stub = _make_guard_bridge(tmp_path)
+        _write_request(bridge.spool, _notice("start"))
+
+        async def boom(**kwargs):
+            raise RuntimeError("discord down")
+        channel.send = boom
+        await bridge.poll_guard_spool_once()
+        assert os.listdir(bridge.spool.requests_dir) == []
+
+
+class TestBridgeChannelIsThread:
+    """When the configured channel is itself a thread, session threads go to the parent."""
+
+    def _bridge_with_thread_channel(self, tmp_path, monkeypatch):
+        import plugins.platforms.discord.opencode_bridge as bridge_mod
+
+        class FakeThreadType:
+            pass
+
+        class FakeForumType:
+            pass
+
+        class FakeChannelType:
+            public_thread = "public_thread"
+
+        fake_discord = SimpleNamespace(
+            Thread=FakeThreadType,
+            ForumChannel=FakeForumType,
+            ChannelType=FakeChannelType,
+            AllowedMentions=lambda **k: SimpleNamespace(**k),
+        )
+        monkeypatch.setattr(bridge_mod, "discord", fake_discord)
+
+        class FakeBridgeThread(FakeChannel, FakeThreadType):
+            pass
+
+        parent = FakeChannel(channel_id=555)
+        thread_channel = FakeBridgeThread(channel_id=1543687087310643277)
+        thread_channel.parent = parent
+        client = FakeDiscordClient(thread_channel)
+        client.channels[parent.id] = parent
+        parent.client = client
+        adapter = SimpleNamespace(_client=client)
+        config = _bridge_config(guard_dir=str(tmp_path), channel_id=str(thread_channel.id))
+        bridge = OpenCodeBridge(adapter, config, client=StubBridgeClient())
+        return bridge, thread_channel, parent
+
+    @pytest.mark.asyncio
+    async def test_start_creates_thread_in_parent_and_points_from_channel(self, tmp_path, monkeypatch):
+        bridge, thread_channel, parent = self._bridge_with_thread_channel(tmp_path, monkeypatch)
+        _write_request(bridge.spool, _notice("start"))
+        await bridge.poll_guard_spool_once()
+        assert len(parent.threads) == 1, "session thread created in the parent"
+        new_thread = parent.threads[0]
+        assert any(new_thread.mention in m["content"] for m in thread_channel.sent), "pointer posted in the watched thread"
+        assert any("Sitzung gestartet" in m["content"] for m in new_thread.sent)
+        assert bridge.threads.thread_for("ses-thread-1") == str(new_thread.id)
+
+
+# ---------------------------------------------------------------------------
+# Per-agent channels (e.g. #opencode vs #claudecode)
+# ---------------------------------------------------------------------------
+
+
+class TestAgentChannels:
+    def test_valid_mapping_is_kept(self):
+        config = _bridge_config(agent_channels={"claude-code": "777", "opencode": "888"})
+        assert config.channel_for("claude-code") == "777"
+        assert config.channel_for("opencode") == "888"
+        assert config.channel_for("") == "123"  # falls back to channel_id
+
+    @pytest.mark.parametrize("mapping", [
+        {"unbekannt": "777"},          # unknown agent
+        {"claude-code": "nicht-numerisch"},
+        {"claude-code": ""},
+        "kein dict",
+    ])
+    def test_bad_mapping_falls_back(self, mapping):
+        config = _bridge_config(agent_channels=mapping)
+        assert config.channel_for("claude-code") == "123"
+
+    def test_absent_mapping_uses_channel_id(self):
+        assert _bridge_config().channel_for("claude-code") == "123"
+
+    @pytest.mark.asyncio
+    async def test_claude_code_prompt_goes_to_its_own_channel(self, tmp_path):
+        opencode_channel = FakeChannel(channel_id=123)
+        claude_channel = FakeChannel(channel_id=777)
+        client = FakeDiscordClient(opencode_channel)
+        client.channels[claude_channel.id] = claude_channel
+        claude_channel.client = client
+        adapter = SimpleNamespace(_client=client)
+        config = _bridge_config(guard_dir=str(tmp_path), agent_channels={"claude-code": "777"})
+        bridge = OpenCodeBridge(adapter, config, client=StubBridgeClient())
+
+        _write_request(bridge.spool, _fresh(id="perm0000-cc001", agent="claude-code", tool="Bash"))
+        _write_request(bridge.spool, _fresh(id="perm0000-oc001", agent="opencode"))
+        await bridge.poll_guard_spool_once()
+
+        assert len(claude_channel.sent) == 1 and "Claude Code" in claude_channel.sent[0]["content"]
+        assert len(opencode_channel.sent) == 1 and "Befehlswächter" in opencode_channel.sent[0]["content"]
+
+    @pytest.mark.asyncio
+    async def test_claude_code_session_thread_opens_in_its_channel(self, tmp_path):
+        opencode_channel = FakeChannel(channel_id=123)
+        claude_channel = FakeChannel(channel_id=777)
+        client = FakeDiscordClient(opencode_channel)
+        client.channels[claude_channel.id] = claude_channel
+        claude_channel.client = client
+        adapter = SimpleNamespace(_client=client)
+        config = _bridge_config(guard_dir=str(tmp_path), agent_channels={"claude-code": "777"})
+        bridge = OpenCodeBridge(adapter, config, client=StubBridgeClient())
+
+        _write_request(bridge.spool, _notice("start", agent="claude-code"))
+        await bridge.poll_guard_spool_once()
+        assert len(claude_channel.threads) == 1
+        assert opencode_channel.threads == []
+        # a later prompt of that session lands in the same thread
+        _write_request(bridge.spool, _fresh(id="perm0000-cc002", agent="claude-code", session_id="ses-thread-1"))
+        await bridge.poll_guard_spool_once()
+        assert any("Befehlswächter" in m.get("content", "") or "Erlaubnis" in m.get("content", "")
+                   for m in claude_channel.threads[0].sent)

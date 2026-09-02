@@ -142,6 +142,16 @@ SSE_SOURCE = "sse"
 # answered with labels or free text.
 GUARD_KIND_PERMISSION = "permission"
 GUARD_KIND_QUESTION = "question"
+# "notice" = fire-and-forget session events (no decision file): the agent
+# started a session (→ one Discord thread per session, prompts of that
+# session are asked inside it), sent a further prompt, finished a turn, or
+# spawned a child session whose prompts belong to the parent's thread.
+GUARD_KIND_NOTICE = "notice"
+GUARD_NOTICES = frozenset({"start", "prompt", "result", "child"})
+GUARD_THREADS_FILE = "threads.json"
+GUARD_THREAD_TTL_SECONDS = 7 * 24 * 3600
+_NOTICE_TEXT_BUDGET = 1700
+_THREAD_NAME_BUDGET = 100
 GUARD_MAX_QUESTIONS = 4
 GUARD_MAX_OPTIONS = 8
 _DETAILS_BUDGET = 900
@@ -196,6 +206,12 @@ class OpenCodeBridgeConfig:
     # overrides the spool root.
     guard_enabled: bool = True
     guard_dir: str = ""
+    # Optional per-agent channels, e.g. {"claude-code": "123"}: guard prompts
+    # and session threads of that agent go there instead of ``channel_id``.
+    agent_channels: Dict[str, str] = field(default_factory=dict)
+
+    def channel_for(self, agent: str) -> str:
+        return self.agent_channels.get(agent) or self.channel_id
 
 
 def parse_bridge_config(extra: Any) -> OpenCodeBridgeConfig:
@@ -247,6 +263,16 @@ def parse_bridge_config(extra: Any) -> OpenCodeBridgeConfig:
     guard_enabled = guard_enabled if isinstance(guard_enabled, bool) else True
     guard_dir = str(section.get("guard_dir") or "").strip() or default_guard_dir()
 
+    raw_channels = section.get("agent_channels")
+    agent_channels: Dict[str, str] = {}
+    if isinstance(raw_channels, dict):
+        for agent, value in raw_channels.items():
+            agent, value = str(agent).strip(), str(value).strip()
+            # Only known agents and plain numeric ids; anything else is
+            # dropped so a typo cannot silently redirect prompts.
+            if agent in GUARD_AGENTS and value.isdigit():
+                agent_channels[agent] = value
+
     return OpenCodeBridgeConfig(
         enabled=True,
         base_url=base_url,
@@ -255,6 +281,7 @@ def parse_bridge_config(extra: Any) -> OpenCodeBridgeConfig:
         timeout_seconds=timeout_seconds,
         guard_enabled=guard_enabled,
         guard_dir=guard_dir,
+        agent_channels=agent_channels,
     )
 
 
@@ -287,6 +314,11 @@ class OpenCodePermissionRequest:
     tool: str = ""
     details: str = ""
     questions: tuple = ()
+    # Notice-only fields.
+    notice: str = ""
+    text: str = ""
+    started_at: float = 0.0
+    parent_session_id: str = ""
 
     @property
     def short_session_id(self) -> str:
@@ -299,6 +331,10 @@ class OpenCodePermissionRequest:
     @property
     def is_question(self) -> bool:
         return self.is_guard and self.guard_kind == GUARD_KIND_QUESTION
+
+    @property
+    def is_notice(self) -> bool:
+        return self.is_guard and self.guard_kind == GUARD_KIND_NOTICE
 
 
 def parse_permission_event(payload: Any) -> Optional[OpenCodePermissionRequest]:
@@ -379,7 +415,7 @@ def parse_guard_request(
     if agent not in GUARD_AGENTS:
         return None
     kind = payload.get("kind", GUARD_KIND_PERMISSION)
-    if kind not in (GUARD_KIND_PERMISSION, GUARD_KIND_QUESTION):
+    if kind not in (GUARD_KIND_PERMISSION, GUARD_KIND_QUESTION, GUARD_KIND_NOTICE):
         return None
     project = payload.get("project")
     project = project if isinstance(project, str) else ""
@@ -388,7 +424,24 @@ def parse_guard_request(
     details = payload.get("details", "")
     details = details if isinstance(details, str) else ""
     questions: tuple = ()
-    if kind == GUARD_KIND_QUESTION:
+    notice, text, parent_session_id, started_at = "", "", "", 0.0
+    if kind == GUARD_KIND_NOTICE:
+        notice = payload.get("notice")
+        if notice not in GUARD_NOTICES:
+            return None
+        session = payload.get("session_id")
+        if not isinstance(session, str) or not session.strip():
+            return None
+        text = payload.get("text", "")
+        text = text if isinstance(text, str) else ""
+        parent = payload.get("parent_session_id", "")
+        parent_session_id = parent if isinstance(parent, str) else ""
+        if notice == "child" and not parent_session_id:
+            return None
+        started = payload.get("started_at", 0.0)
+        started_at = float(started) if isinstance(started, (int, float)) and not isinstance(started, bool) else 0.0
+        command, path, access = notice, "-", "unklar"
+    elif kind == GUARD_KIND_QUESTION:
         questions = _parse_questions(payload.get("questions"))
         if not questions:
             return None
@@ -433,7 +486,95 @@ def parse_guard_request(
         tool=tool,
         details=details,
         questions=questions,
+        notice=str(notice),
+        text=text,
+        started_at=started_at,
+        parent_session_id=parent_session_id,
     )
+
+
+class ThreadRegistry:
+    """session_id → Discord thread, persisted next to the spool.
+
+    Child sessions (subagents) map to their parent's thread. Entries expire
+    after a week so the file cannot grow without bound.
+    """
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self._sessions: Dict[str, Dict[str, Any]] = {}
+        self._parents: Dict[str, str] = {}
+        self._load()
+
+    def _load(self) -> None:
+        try:
+            data = json.loads(self.path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return
+        if not isinstance(data, dict):
+            return
+        sessions = data.get("sessions")
+        parents = data.get("parents")
+        if isinstance(sessions, dict):
+            self._sessions = {
+                str(k): v for k, v in sessions.items()
+                if isinstance(v, dict) and isinstance(v.get("thread_id"), str)
+            }
+        if isinstance(parents, dict):
+            self._parents = {str(k): str(v) for k, v in parents.items()}
+
+    def _save(self) -> None:
+        payload = {"sessions": self._sessions, "parents": self._parents}
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp_name = tempfile.mkstemp(prefix=".tmp-threads-", suffix=".json", dir=self.path.parent)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                json.dump(payload, handle)
+            os.replace(tmp_name, self.path)
+        except BaseException:
+            try:
+                os.unlink(tmp_name)
+            except OSError:
+                pass
+            raise
+
+    def root_session(self, session_id: str) -> str:
+        seen: Set[str] = set()
+        while session_id in self._parents and session_id not in seen:
+            seen.add(session_id)
+            session_id = self._parents[session_id]
+        return session_id
+
+    def thread_for(self, session_id: str) -> Optional[str]:
+        entry = self._sessions.get(self.root_session(session_id))
+        return entry.get("thread_id") if entry else None
+
+    def set_thread(self, session_id: str, thread_id: str, channel_id: str, *, now: Optional[float] = None) -> None:
+        self._sessions[session_id] = {
+            "thread_id": str(thread_id),
+            "channel_id": str(channel_id),
+            "created_at": time.time() if now is None else now,
+        }
+        self._save()
+
+    def set_parent(self, child_id: str, parent_id: str) -> None:
+        if child_id == parent_id:
+            return
+        self._parents[child_id] = parent_id
+        self._save()
+
+    def prune(self, *, now: Optional[float] = None) -> None:
+        current = time.time() if now is None else now
+        stale = [
+            sid for sid, entry in self._sessions.items()
+            if current - float(entry.get("created_at") or 0) > GUARD_THREAD_TTL_SECONDS
+        ]
+        if not stale:
+            return
+        for sid in stale:
+            del self._sessions[sid]
+        self._parents = {c: p for c, p in self._parents.items() if p in self._sessions}
+        self._save()
 
 
 def _parse_questions(raw: Any) -> tuple:
@@ -547,10 +688,19 @@ class GuardSpool:
                         logger.warning("OpenCode bridge: ignoring malformed guard request %s", name)
                     self._invalid.add(name)
                 continue
-            if self._decision_path(request_id).exists():
+            if not request.is_notice and self._decision_path(request_id).exists():
                 continue  # already answered, guard has not collected it yet
             found.append(request)
         return found
+
+    def remove_request(self, request_id: str) -> None:
+        """Drop a consumed notice file (notices have no decision file)."""
+        if GUARD_ID_RE.match(request_id):
+            self._unlink(self._request_path(request_id))
+
+    @property
+    def threads_path(self) -> Path:
+        return self.root / GUARD_THREADS_FILE
 
     def _drop_if_stale(self, file_path: Path, now: float) -> None:
         try:
@@ -803,6 +953,9 @@ class OpenCodeBridge:
             self._spool = GuardSpool(config.guard_dir)
         else:
             self._spool = None
+        self._threads: Optional[ThreadRegistry] = (
+            ThreadRegistry(self._spool.threads_path) if self._spool is not None else None
+        )
 
     @property
     def config(self) -> OpenCodeBridgeConfig:
@@ -815,6 +968,10 @@ class OpenCodeBridge:
     @property
     def spool(self) -> Optional[GuardSpool]:
         return self._spool
+
+    @property
+    def threads(self) -> Optional[ThreadRegistry]:
+        return self._threads
 
     def start(self) -> None:
         if self._task is None or self._task.done():
@@ -851,6 +1008,22 @@ class OpenCodeBridge:
             logger.warning("OpenCode bridge: guard spool scan failed: %s", exc)
             return 0
         for request in requests:
+            if request.is_notice:
+                try:
+                    if await self._handle_notice(request):
+                        posted += 1
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    logger.warning(
+                        "OpenCode bridge: failed to handle %s notice %s: %s",
+                        request.notice, request.permission_id, exc,
+                    )
+                finally:
+                    # Notices are consumed exactly once; a failed one is not
+                    # retried (a second thread or duplicate post is worse).
+                    self._spool.remove_request(request.permission_id)
+                continue
             if self._registry.is_pending(request.permission_id):
                 continue
             try:
@@ -865,9 +1038,154 @@ class OpenCodeBridge:
                 )
         try:
             self._spool.sweep()
+            if self._threads is not None:
+                self._threads.prune()
         except Exception:  # pragma: no cover - best effort housekeeping
             pass
         return posted
+
+    # ------------------------------------------------------------------
+    # Session threads
+    # ------------------------------------------------------------------
+
+    async def _channel_for_agent(self, agent: str) -> Any:
+        """The Discord channel this agent's prompts belong in."""
+        client = self._adapter._client
+        if client is None:
+            return None
+        channel_id = self._config.channel_for(agent)
+        channel = client.get_channel(int(channel_id))
+        if channel is None:
+            try:
+                channel = await client.fetch_channel(int(channel_id))
+            except Exception as exc:
+                logger.warning("OpenCode bridge: channel %s unreachable (%s)", channel_id, exc)
+                return None
+        return channel
+
+    async def _main_channel(self) -> Any:
+        return await self._channel_for_agent("")
+
+    async def _thread_channel(self, session_id: str) -> Any:
+        """The session's thread, or None when unknown / unreachable."""
+        if self._threads is None or not session_id or session_id == "-":
+            return None
+        thread_id = self._threads.thread_for(session_id)
+        if not thread_id:
+            return None
+        client = self._adapter._client
+        if client is None:
+            return None
+        thread = client.get_channel(int(thread_id))
+        if thread is None:
+            try:
+                thread = await client.fetch_channel(int(thread_id))
+            except Exception as exc:
+                logger.debug("OpenCode bridge: thread %s unreachable (%s)", thread_id, exc)
+                return None
+        return thread
+
+    async def _target_channel(self, request: OpenCodePermissionRequest) -> Any:
+        """Prompts of a session go to its thread, else to the agent's channel."""
+        thread = await self._thread_channel(request.session_id)
+        return thread if thread is not None else await self._channel_for_agent(request.agent)
+
+    @staticmethod
+    def _thread_name(request: OpenCodePermissionRequest) -> str:
+        agent_label = GUARD_AGENTS.get(request.agent, request.agent)
+        project = os.path.basename((request.project or "").rstrip("/")) or "Projekt"
+        when = time.strftime("%d.%m. %H:%M", time.localtime(request.started_at or time.time()))
+        return _truncate(f"{agent_label} · {project} · {when}", _THREAD_NAME_BUDGET)
+
+    def _notice_text(self, request: OpenCodePermissionRequest) -> str:
+        agent_label = GUARD_AGENTS.get(request.agent, request.agent)
+        body = _truncate(request.text.strip(), _NOTICE_TEXT_BUDGET).replace("```", "'''")
+        when = time.strftime("%H:%M", time.localtime(request.started_at or time.time()))
+        if request.notice == "start":
+            return (
+                f"🧵 **{agent_label}-Sitzung gestartet** um {when}\n"
+                f"**Projektordner:** `{_truncate(request.project or '-', _PATH_BUDGET)}` · **Session:** `{request.short_session_id}`\n\n"
+                f"**Prompt:**\n{body or '_(kein Text)_'}"
+            )
+        if request.notice == "prompt":
+            return f"📝 **Neuer Prompt** ({when})\n{body or '_(kein Text)_'}"
+        if request.notice == "result":
+            return f"✅ **Antwort** ({when})\n{body or '_(keine Textantwort)_'}"
+        return body
+
+    async def _open_session_thread(self, request: OpenCodePermissionRequest) -> tuple[Any, Optional[str]]:
+        """Create the session's thread wherever the bridge channel allows it.
+
+        Returns (thread, pending_start_text). The configured channel may be a
+        text channel (thread hangs off a starter message), a forum channel
+        (each session is a new forum post), or itself a thread (Discord
+        forbids nesting, so the session thread is created in the parent and a
+        pointer is posted in the watched thread). pending_start_text is the
+        start message the caller still needs to post into the thread, or None
+        when it was already delivered (forum post content).
+        """
+        channel = await self._channel_for_agent(request.agent)
+        if channel is None:
+            return None, None
+        name = self._thread_name(request)
+        start_text = self._notice_text(request)
+        agent_label = GUARD_AGENTS.get(request.agent, request.agent)
+        project = os.path.basename((request.project or "").rstrip("/")) or "-"
+        pointer = f"🧵 **{agent_label}** · `{project}` · Session `{request.short_session_id}` — Verlauf und Rückfragen im Thread."
+
+        forum_cls = getattr(discord, "ForumChannel", ()) if DISCORD_AVAILABLE else ()
+        thread_cls = getattr(discord, "Thread", ()) if DISCORD_AVAILABLE else ()
+
+        if isinstance(channel, forum_cls):
+            created = await channel.create_thread(name=name, content=start_text)
+            return getattr(created, "thread", created), None
+
+        if isinstance(channel, thread_cls):
+            parent = getattr(channel, "parent", None)
+            if isinstance(parent, forum_cls):
+                created = await parent.create_thread(name=name, content=start_text)
+                thread = getattr(created, "thread", created)
+                pending: Optional[str] = None
+            elif parent is not None:
+                kind = getattr(getattr(discord, "ChannelType", None), "public_thread", None)
+                thread = await parent.create_thread(name=name, type=kind, auto_archive_duration=1440)
+                pending = start_text
+            else:
+                return None, None
+            await channel.send(content=f"{pointer} → {thread.mention}", allowed_mentions=self._allowed_mentions())
+            return thread, pending
+
+        # Plain text channel: thread attached to a starter message.
+        starter = await channel.send(content=pointer, allowed_mentions=self._allowed_mentions())
+        thread = await starter.create_thread(name=name, auto_archive_duration=1440)
+        return thread, start_text
+
+    async def _handle_notice(self, request: OpenCodePermissionRequest) -> bool:
+        """Create/feed the session thread for a notice; True when a message went out."""
+        if self._threads is None:
+            return False
+        if request.notice == "child":
+            self._threads.set_parent(request.session_id, request.parent_session_id)
+            return False
+        thread = await self._thread_channel(request.session_id)
+        if request.notice == "start" and thread is None:
+            thread, pending = await self._open_session_thread(request)
+            if thread is None:
+                return False
+            self._threads.set_thread(request.session_id, str(thread.id), self._config.channel_for(request.agent))
+            logger.info("OpenCode bridge: thread %s opened for session %s", thread.id, request.session_id)
+            if pending is None:
+                return True  # start text already posted (forum post content)
+            await thread.send(content=pending, allowed_mentions=self._allowed_mentions())
+            return True
+        if thread is None:
+            # No thread (notice arrived before its start, or start failed):
+            # fall back to the agent's channel so nothing is lost.
+            thread = await self._channel_for_agent(request.agent)
+            if thread is None:
+                return False
+        await thread.send(content=self._notice_text(request), allowed_mentions=self._allowed_mentions())
+        return True
 
     async def run(self) -> None:
         """Consume the event stream until cancelled."""
@@ -1013,18 +1331,12 @@ class OpenCodeBridge:
         """Post one Accept/Reject prompt; True when a message went out."""
         if not self._registry.register(request.permission_id):
             return False
-        client = self._adapter._client
-        if client is None:
-            self._registry.resolve(request.permission_id, "drop")
-            return False
-        channel = client.get_channel(int(self._config.channel_id))
-        if channel is None:
-            channel = await client.fetch_channel(int(self._config.channel_id))
+        channel = await self._target_channel(request) if request.is_guard else await self._main_channel()
         if channel is None:
             self._registry.resolve(request.permission_id, "drop")
             logger.warning(
                 "OpenCode bridge: channel %s not found, dropping %s",
-                self._config.channel_id, request.permission_id,
+                self._config.channel_for(request.agent), request.permission_id,
             )
             return False
 
