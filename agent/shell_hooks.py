@@ -734,21 +734,14 @@ def _evaluate_result(
         )
 
     stdout = (r["stdout"] or "").strip()
-    parsed = _parse_response(spec.event, stdout)
-
-    if parsed is None and fail_closed and stdout:
-        # The hook produced output we could not turn into a directive.
-        # A fail-closed gate must not silently allow the action on
-        # garbage output (e.g. a stack trace on stdout).
-        try:
-            data = json.loads(stdout)
-            valid_json = isinstance(data, dict)
-        except json.JSONDecodeError:
-            valid_json = False
-        if not valid_json:
-            return _fail_closed_block(
-                spec, "unparseable stdout (expected a JSON object)",
-            )
+    parsed, response_error = _parse_response_with_error(spec.event, stdout)
+    if response_error:
+        logger.warning(
+            "shell hook response rejected (event=%s command=%s): %s",
+            spec.event, spec.command, response_error,
+        )
+        if fail_closed:
+            return _fail_closed_block(spec, response_error)
 
     return parsed
 
@@ -800,42 +793,81 @@ def _parse_response(event: str, stdout: str) -> Optional[Dict[str, Any]]:
     ``{"action": "modify", "args": {...}}`` so callers can merge the
     returned fields into the tool's ``args`` before dispatch.
 
+    The canonical ``{"action": "approve"}`` shape is passed through with
+    optional ``message`` and ``rule_key`` fields so it reaches the shared
+    human-approval gate.
+
     For ``pre_llm_call``, ``{"context": "..."}`` is passed through
     unchanged to match the existing plugin-hook contract.
 
-    Anything else returns ``None``.
+    Valid no-op objects return ``None``. Unsupported directive values are
+    logged, and callers configured with ``fail_closed`` turn them into blocks.
     """
+    parsed, response_error = _parse_response_with_error(event, stdout)
+    if response_error:
+        logger.warning("shell hook response rejected (event=%s): %s", event, response_error)
+    return parsed
+
+
+def response_validation_error(event: str, stdout: str) -> Optional[str]:
+    """Return why non-empty shell-hook stdout cannot be honored, if any."""
+    _, error = _parse_response_with_error(event, stdout)
+    return error
+
+
+def _parse_response_with_error(
+    event: str, stdout: str,
+) -> tuple[Optional[Dict[str, Any]], Optional[str]]:
     stdout = (stdout or "").strip()
     if not stdout:
-        return None
+        return None, None
 
     try:
         data = json.loads(stdout)
     except json.JSONDecodeError:
-        logger.warning(
-            "shell hook stdout was not valid JSON (event=%s): %s",
-            event, stdout[:200],
-        )
-        return None
+        return None, "unparseable stdout (expected a JSON object)"
 
     if not isinstance(data, dict):
-        return None
+        return None, "unparseable stdout (expected a JSON object)"
 
     if event == "pre_tool_call":
         if data.get("action") == "block":
-            return {"action": "block", "message": _block_message(data.get("message"), data.get("reason"))}
+            return {
+                "action": "block",
+                "message": _block_message(data.get("message"), data.get("reason")),
+            }, None
         if data.get("decision") == "block":
-            return {"action": "block", "message": _block_message(data.get("reason"), data.get("message"))}
+            return {
+                "action": "block",
+                "message": _block_message(data.get("reason"), data.get("message")),
+            }, None
+        if data.get("action") == "approve":
+            directive: Dict[str, Any] = {"action": "approve"}
+            message = data.get("message")
+            if isinstance(message, str) and message:
+                directive["message"] = message
+            rule_key = data.get("rule_key")
+            if isinstance(rule_key, str) and rule_key.strip():
+                directive["rule_key"] = rule_key.strip()
+            return directive, None
         # "modify" action — transform tool_input before dispatch
         if data.get("action") == "modify":
             new_args = data.get("args")
             if isinstance(new_args, dict):
-                return {"action": "modify", "args": new_args}
+                return {"action": "modify", "args": new_args}, None
+            return None, "invalid pre_tool_call action 'modify': args must be an object"
         if data.get("decision") == "modify":
             new_args = data.get("tool_input")
             if isinstance(new_args, dict):
-                return {"action": "modify", "args": new_args}
-        return None
+                return {"action": "modify", "args": new_args}, None
+            return None, (
+                "invalid pre_tool_call decision 'modify': tool_input must be an object"
+            )
+        if "action" in data:
+            return None, f"unsupported pre_tool_call action: {data['action']!r}"
+        if "decision" in data:
+            return None, f"unsupported pre_tool_call decision: {data['decision']!r}"
+        return None, None
 
     if event == "pre_verify":
         # "continue" (Hermes) / "block" (Claude-Code Stop: block the stop) both
@@ -845,14 +877,14 @@ def _parse_response(event: str, stdout: str) -> Optional[Dict[str, Any]]:
         if action in {"continue", "block"}:
             message = data.get("message") or data.get("reason")
             if isinstance(message, str) and message.strip():
-                return {"action": "continue", "message": message.strip()}
-        return None
+                return {"action": "continue", "message": message.strip()}, None
+        return None, None
 
     context = data.get("context")
     if isinstance(context, str) and context.strip():
-        return {"context": context}
+        return {"context": context}, None
 
-    return None
+    return None, None
 
 
 # ---------------------------------------------------------------------------

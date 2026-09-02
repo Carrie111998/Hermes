@@ -6582,6 +6582,7 @@ class _PreToolCallDirective:
     action: Optional[str] = None
     message: Optional[str] = None
     rule_key: Optional[str] = None
+    approval_requests: Tuple[Tuple[Optional[str], Optional[str]], ...] = ()
     modified_args: Optional[Dict[str, Any]] = None
 
 
@@ -6630,8 +6631,11 @@ def _get_pre_tool_call_directive_details(
     - ``rule_key`` is optional and only honored for ``approve`` directives. It
       lets plugins choose the allowlist grain for `[a]lways` approvals.
 
-    The first valid directive wins. Invalid or irrelevant hook return values
-    are silently ignored so existing observer-only hooks are unaffected.
+    All hooks run once before control directives are resolved. A valid block
+    dominates every approval regardless of registration order. Otherwise each
+    approval is resolved independently so one rule's grant cannot authorize a
+    different rule. Invalid or irrelevant return values are silently ignored
+    so existing observer-only hooks are unaffected.
     """
     allowed = getattr(_thread_tool_whitelist, "allowed", None)
     if allowed is not None and tool_name not in allowed:
@@ -6656,6 +6660,7 @@ def _get_pre_tool_call_directive_details(
     )
 
     block_msg: Optional[str] = None
+    approval_requests: List[Tuple[Optional[str], Optional[str]]] = []
     modified_args: Optional[Dict[str, Any]] = None
 
     for result in hook_results:
@@ -6686,8 +6691,23 @@ def _get_pre_tool_call_directive_details(
         rule_key = rule_key.strip() if isinstance(rule_key, str) else None
         if not rule_key:
             rule_key = None
+        if action == "block":
+            if block_msg is None:
+                block_msg = message
+        else:
+            approval_requests.append((message, rule_key))
+
+    if block_msg is not None:
         return _PreToolCallDirective(
-            action=action, message=message, rule_key=rule_key,
+            action="block", message=block_msg, modified_args=modified_args,
+        )
+    if approval_requests:
+        message, rule_key = approval_requests[0]
+        return _PreToolCallDirective(
+            action="approve",
+            message=message,
+            rule_key=rule_key,
+            approval_requests=tuple(approval_requests),
             modified_args=modified_args,
         )
 
@@ -6815,12 +6835,21 @@ def _resolve_block_from_details(
                 )
             except Exception:
                 pass
+            requests = details.approval_requests or (
+                (details.message, details.rule_key),
+            )
             try:
-                result = request_tool_approval(
-                    tool_name,
-                    details.message or "",
-                    rule_key=details.rule_key or tool_name,
-                )
+                for message, rule_key in requests:
+                    result = request_tool_approval(
+                        tool_name,
+                        message or "",
+                        rule_key=rule_key or "",
+                    )
+                    if not result.get("approved"):
+                        return str(
+                            result.get("message")
+                            or f"BLOCKED: plugin approval required for {tool_name}"
+                        )
             finally:
                 if approval_tokens is not None:
                     try:
@@ -6831,11 +6860,6 @@ def _resolve_block_from_details(
             # Fail-closed: if the gate itself errors, block rather than
             # silently execute an action a plugin flagged for approval.
             return f"BLOCKED: plugin approval gate failed for {tool_name}"
-        if not result.get("approved"):
-            return str(
-                result.get("message")
-                or f"BLOCKED: plugin approval required for {tool_name}"
-            )
     return None
 
 

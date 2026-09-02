@@ -426,14 +426,16 @@ def _doctor_one(spec, shell_hooks) -> int:
             elapsed = result.get("elapsed_seconds", 0)
             stdout = (result.get("stdout") or "").strip()
             if stdout:
-                try:
-                    json.loads(stdout)
+                response_error = shell_hooks.response_validation_error(
+                    spec.event, stdout,
+                )
+                if response_error:
+                    problems += 1
+                    print(f"      ✗ unsupported response (exit={rc}, "
+                          f"{elapsed}s): {response_error}")
+                else:
                     print(f"      ✓ produced valid JSON on synthetic payload "
                           f"(exit={rc}, {elapsed}s)")
-                except json.JSONDecodeError:
-                    problems += 1
-                    print(f"      ✗ stdout was not valid JSON (exit={rc}, "
-                          f"{elapsed}s): {_truncate(stdout, 120)}")
             else:
                 print(f"      ✓ ran clean with empty stdout "
                       f"(exit={rc}, {elapsed}s) — hook is observer-only")

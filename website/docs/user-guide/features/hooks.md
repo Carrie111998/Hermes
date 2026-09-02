@@ -1648,6 +1648,9 @@ Each time the event fires, Hermes spawns a subprocess for every matching hook (m
 {"action": "modify", "args": {"new_string": "fixed content"}}         // Hermes-canonical
 {"decision": "modify", "tool_input": {"new_string": "fixed content"}} // Claude-Code style
 
+// Require human approval before a pre_tool_call proceeds:
+{"action": "approve", "message": "Confirm sensitive write", "rule_key": "write_file:ssh"}
+
 // Inject context for pre_llm_call:
 {"context": "Today is Friday, 2026-04-17"}
 
@@ -1700,6 +1703,7 @@ With `fail_closed: true`, each of these now **blocks** the tool call with `hook 
 | Command not found / not executable | warn, proceed | **block** |
 | Timeout | warn, proceed | **block** |
 | Non-JSON stdout (e.g. a stack trace) | warn, proceed | **block** |
+| Unsupported `action` / `decision` value | warn, proceed | **block** |
 | Clean exit, valid no-op JSON (`{}`) | proceed | proceed |
 
 `fail_closed` only applies to blocking-capable events (`pre_tool_call` today); setting it on any other event logs a warning at config-parse time and is ignored. `hermes hooks test` reflects these semantics — the `parsed` line shows exactly the block shape the dispatcher would receive.

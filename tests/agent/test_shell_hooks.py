@@ -9,6 +9,7 @@ covered in ``test_shell_hooks_consent.py``.
 from __future__ import annotations
 
 import json
+import sys
 from pathlib import Path
 
 import pytest
@@ -48,6 +49,22 @@ class TestParseResponse:
             '{"decision": "block", "reason": "nope"}',
         )
         assert r == {"action": "block", "message": "nope"}
+
+    def test_approve_canonical_preserves_gate_metadata(self):
+        r = shell_hooks._parse_response(
+            "pre_tool_call",
+            json.dumps({
+                "action": "approve",
+                "message": "confirm sensitive write",
+                "rule_key": "write_file:ssh",
+            }),
+        )
+
+        assert r == {
+            "action": "approve",
+            "message": "confirm sensitive write",
+            "rule_key": "write_file:ssh",
+        }
 
 
 
@@ -200,6 +217,64 @@ class TestCallbackSubprocess:
             args={"command": "rm"},
         )
         assert msg == "blocked-by-shell"
+
+    def test_approve_escalates_through_plugin_manager(self, tmp_path, monkeypatch):
+        from hermes_cli import plugins
+
+        script = _write_script(
+            tmp_path, "approve.py",
+            'print(\'{"action": "approve", "message": "confirm write", '
+            '"rule_key": "write_file:ssh"}\')\n',
+        )
+        command = f'"{sys.executable}" "{script}"'
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+        plugins._plugin_manager = plugins.PluginManager()
+        shell_hooks.register_from_config({
+            "hooks": {"pre_tool_call": [{"command": command}]},
+        }, accept_hooks=True)
+
+        seen = {}
+
+        def approve(tool_name, reason, **kwargs):
+            seen.update(
+                tool_name=tool_name,
+                reason=reason,
+                rule_key=kwargs.get("rule_key"),
+            )
+            return {"approved": True, "message": None}
+
+        monkeypatch.setattr("tools.approval.request_tool_approval", approve)
+
+        assert plugins.resolve_pre_tool_block("write_file", {"path": "id_rsa"}) is None
+        assert seen == {
+            "tool_name": "write_file",
+            "reason": "confirm write",
+            "rule_key": "write_file:ssh",
+        }
+
+    def test_unknown_directive_fails_closed(self, caplog):
+        spec = shell_hooks.ShellHookSpec(
+            event="pre_tool_call",
+            command="policy-hook",
+            fail_closed=True,
+        )
+        result = shell_hooks._evaluate_result(spec, {
+            "error": None,
+            "timed_out": False,
+            "elapsed_seconds": 0.01,
+            "stderr": "",
+            "stdout": '{"action": "permit"}',
+            "returncode": 0,
+        })
+
+        assert result == {
+            "action": "block",
+            "message": (
+                "hook policy-hook failed closed: unsupported pre_tool_call "
+                "action: 'permit'"
+            ),
+        }
+        assert "unsupported pre_tool_call action" in caplog.text
 
     def test_matcher_regex_filters_callback(self, tmp_path, monkeypatch):
         """A matcher set to 'terminal' must not fire for 'web_search'."""

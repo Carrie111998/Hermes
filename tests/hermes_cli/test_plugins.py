@@ -1409,6 +1409,84 @@ class TestResolvePreToolBlock:
             "rule_key": "write_file:ssh",
         }
 
+    def test_later_block_dominates_earlier_approval(self, monkeypatch):
+        from hermes_cli.plugins import resolve_pre_tool_block
+
+        monkeypatch.setattr(
+            "hermes_cli.plugins.invoke_hook",
+            lambda hook_name, **kwargs: [
+                {
+                    "action": "approve",
+                    "message": "confirm sensitive write",
+                    "rule_key": "write_file:ssh",
+                },
+                {"action": "block", "message": "target is forbidden"},
+            ],
+        )
+
+        def _unexpected_approval(*args, **kwargs):
+            raise AssertionError("a hard block must bypass the approval gate")
+
+        monkeypatch.setattr(
+            "tools.approval.request_tool_approval", _unexpected_approval,
+        )
+        assert resolve_pre_tool_block("write_file", {}) == "target is forbidden"
+
+    def test_cached_approval_cannot_bypass_later_block(self, monkeypatch):
+        from hermes_cli.plugins import resolve_pre_tool_block
+
+        monkeypatch.setattr(
+            "hermes_cli.plugins.invoke_hook",
+            lambda hook_name, **kwargs: [
+                {
+                    "action": "approve",
+                    "message": "already approved",
+                    "rule_key": "write_file:cached",
+                },
+                {"action": "block", "message": "independent veto"},
+            ],
+        )
+        approval_calls = []
+        monkeypatch.setattr(
+            "tools.approval.request_tool_approval",
+            lambda *args, **kwargs: approval_calls.append((args, kwargs))
+            or {"approved": True, "message": None},
+        )
+
+        assert resolve_pre_tool_block("write_file", {}) == "independent veto"
+        assert approval_calls == []
+
+    def test_independent_approval_keys_require_independent_decisions(
+        self, monkeypatch,
+    ):
+        from hermes_cli.plugins import resolve_pre_tool_block
+
+        calls = 0
+
+        def _hook_results(hook_name, **kwargs):
+            nonlocal calls
+            calls += 1
+            return [
+                {"action": "approve", "message": "first", "rule_key": "rule:a"},
+                {"action": "approve", "message": "second", "rule_key": "rule:b"},
+            ]
+
+        monkeypatch.setattr("hermes_cli.plugins.invoke_hook", _hook_results)
+        seen = []
+
+        def _approve(tool_name, reason, **kwargs):
+            seen.append((tool_name, reason, kwargs.get("rule_key")))
+            return {"approved": True, "message": None}
+
+        monkeypatch.setattr("tools.approval.request_tool_approval", _approve)
+
+        assert resolve_pre_tool_block("write_file", {}) is None
+        assert calls == 1
+        assert seen == [
+            ("write_file", "first", "rule:a"),
+            ("write_file", "second", "rule:b"),
+        ]
+
 
     def test_approve_gate_exception_fails_closed(self, monkeypatch):
         from hermes_cli.plugins import resolve_pre_tool_block
@@ -1484,20 +1562,20 @@ class TestPreToolCallModify:
         assert block_msg == "still blocked"
         assert modified == {"path": "/safe"}
 
-    def test_modify_after_block_is_invisible(self, monkeypatch):
-        """A modify after a block is never reached — first block wins."""
+    def test_modify_after_block_is_still_accumulated(self, monkeypatch):
+        """Gathering control directives must preserve later modifications."""
         monkeypatch.setattr(
             "hermes_cli.plugins.invoke_hook",
             lambda hook_name, **kwargs: [
                 {"action": "block", "message": "stopped"},
-                {"action": "modify", "args": {"path": "/invisible"}},
+                {"action": "modify", "args": {"path": "/visible"}},
             ],
         )
         block_msg, modified = _dispatch_pre_tool_call_hooks(
             "write_file", {"path": "/original"}
         )
         assert block_msg == "stopped"
-        assert modified is None
+        assert modified == {"path": "/visible"}
 
     def test_modify_with_none_args(self, monkeypatch):
         """Modify should handle None args gracefully."""
