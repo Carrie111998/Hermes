@@ -252,12 +252,19 @@ def build_auto_tts_output_path(platform) -> str:
     (``tools.tts_tool.OPUS_VOICE_PLATFORMS`` — the single source of truth)
     get an explicit ``.ogg`` path; the tool's central container repair
     (``_repair_ogg_container``) then guarantees real Ogg/Opus bytes for every
-    provider, including MP3-only backends like Edge TTS. Everything else
-    keeps the MP3 default.
+    provider, including MP3-only backends like Edge TTS. BlueBubbles gets a
+    24 kHz mono-normalizable WAV source for adapter-owned Opus CAF packaging;
+    everything else keeps the MP3 default.
     """
     from tools.tts_tool import OPUS_VOICE_PLATFORMS
 
-    ext = "ogg" if _platform_name(platform) in OPUS_VOICE_PLATFORMS else "mp3"
+    platform_name = _platform_name(platform)
+    if platform_name == "bluebubbles":
+        ext = "wav"
+    elif platform_name in OPUS_VOICE_PLATFORMS:
+        ext = "ogg"
+    else:
+        ext = "mp3"
     audio_path = os.path.join(
         tempfile.gettempdir(),
         "hermes_voice",
