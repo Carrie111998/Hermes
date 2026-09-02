@@ -62,3 +62,38 @@ class TestCreditsNoticesToggle:
         with patch("hermes_cli.config.load_config", return_value=_cfg(False)):
             agent._emit_credits_notices()
         assert agent.get_credits_state() is not None
+
+
+class TestStampCreditsNoticesPolicy:
+    """The per-turn policy stamp owns the cached flag the gateway re-stamps
+    onto reused agents before each provider run."""
+
+    def test_stamp_overrides_cached_policy(self):
+        agent = _agent_with_state()
+        agent.stamp_credits_notices_policy(False)
+        assert agent._credits_notices_enabled_cache is False
+        assert agent._credits_notices_enabled() is False
+        agent.stamp_credits_notices_policy(True)
+        assert agent._credits_notices_enabled_cache is True
+        assert agent._credits_notices_enabled() is True
+
+    def test_stamp_true_still_emits_depleted(self):
+        agent = _agent_with_state()
+        received = []
+        agent.notice_callback = received.append
+        agent.stamp_credits_notices_policy(True)
+        with patch("hermes_cli.config.load_config", side_effect=AssertionError("must not load")):
+            agent._emit_credits_notices()
+        assert any(getattr(n, "key", None) == "credits.depleted" for n in received)
+
+    def test_stamp_false_gates_emission_without_consulting_config(self):
+        """A stamped False must be authoritative: the agent's own config is
+        never re-read, so a reused agent cannot resurrect a stale enabled
+        policy from disk mid-turn."""
+        agent = _agent_with_state()
+        agent.notice_callback = lambda n: None
+        agent.stamp_credits_notices_policy(False)
+        with patch("hermes_cli.config.load_config", side_effect=AssertionError("must not load")) as mock_load:
+            agent._emit_credits_notices()
+        assert mock_load.call_count == 0
+        assert agent._credits_notices_enabled_cache is False

@@ -4805,6 +4805,37 @@ class AIAgent:
         self._credits_notices_enabled_cache = enabled
         return enabled
 
+    def stamp_credits_notices_policy(self, enabled: bool) -> None:
+        """Stamp the per-turn ``display.credits_notices`` policy onto this agent.
+
+        The messaging gateway re-stamps the ACTIVE profile's policy onto a
+        possibly CACHED (reused) agent at the start of every turn, before the
+        provider runs, so a multiplexed gateway cannot leak one profile's
+        setting into another profile's session.  This method is the
+        gateway-facing encapsulation boundary for the
+        ``_credits_notices_enabled_cache`` write — gateway code must never
+        touch that field directly, keeping the cache private and giving one
+        place to evolve the policy logic.  (The internal
+        ``_credits_notices_enabled()`` read path also lazily initializes the
+        same cache; this method's ownership is scoped to gateway-facing
+        mutations.)  Fail-open semantics (absent or
+        error-shaped config = enabled) are resolved by the caller from the
+        turn's already profile-scoped ``user_config``; this method only
+        records the resolved value.
+
+        Concurrency contract: the gateway guarantees per-session turn
+        serialization (the ``turn.agent`` sentinel claim plus the turn-lease
+        rejection in ``gateway/run.py`` — #64934), so at most one
+        ``run_conversation`` executes per session_key at a time and a reused
+        agent (the cache is keyed by session_key) is never mid-run when this
+        is called.  The stamp, the ``notice_callback`` bind, and the provider
+        run that consumes the value therefore form a single critical section
+        per session_key: the value read mid-run is the value stamped at the
+        start of that same turn.  A lock here would guard only this
+        assignment, not the provider run, and is deliberately not used.
+        """
+        self._credits_notices_enabled_cache = bool(enabled)
+
     def get_credits_state(self):
         """Return the last captured CreditsState, or None."""
         return self._credits_state
