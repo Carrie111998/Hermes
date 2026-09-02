@@ -13283,19 +13283,24 @@ def _run_prompt_submit(
         marker_key = str(session.get("session_key") or "")
         marker_attempt = int(session.pop("_auto_continue_attempt", 0) or 0)
         marker_text = session.pop("_auto_continue_prompt", None) or text
-        if isinstance(marker_text, str) and marker_text.strip():
-            # Publish the original key before the disk write so an interrupt
-            # racing startup can retire it even if compression rotates the
-            # session key later. The post-write cancel check closes the inverse
-            # race where Stop lands first and therefore clears no file yet.
-            with session["history_lock"]:
-                session["_active_turn_marker_key"] = marker_key
-            record_turn_start(marker_home, marker_key, marker_text, attempts=marker_attempt)
-            with session["history_lock"]:
-                marker_cancelled = bool(session.get("_turn_cancel_requested"))
-            if marker_cancelled:
-                clear_turn_marker(marker_home, marker_key)
+        # The finally block always releases these snapshots, including when
+        # turn setup fails before the snapshot below.
+        history = []
         try:
+            if isinstance(marker_text, str) and marker_text.strip():
+                # Publish the original key before the disk write so an interrupt
+                # racing startup can retire it even if compression rotates the
+                # session key later. The post-write cancel check closes the inverse
+                # race where Stop lands first and therefore clears no file yet.
+                with session["history_lock"]:
+                    session["_active_turn_marker_key"] = marker_key
+                record_turn_start(
+                    marker_home, marker_key, marker_text, attempts=marker_attempt
+                )
+                with session["history_lock"]:
+                    marker_cancelled = bool(session.get("_turn_cancel_requested"))
+                if marker_cancelled:
+                    clear_turn_marker(marker_home, marker_key)
             from tools.approval import (
                 reset_current_session_key,
                 set_current_session_key,
