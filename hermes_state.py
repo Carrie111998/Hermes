@@ -4713,6 +4713,14 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 )
                 apply_database_pragmas(self._conn, db_label="state.db")
                 self._conn.execute("PRAGMA foreign_keys=ON")
+                # P1 #101035: normal connections must wait on busy, not fail fast.
+                # _set_journal_mode_no_wait deliberately uses busy_timeout=0 for
+                # exclusive detection, but writer/reader connections should
+                # tolerate concurrent writers.
+                try:
+                    self._conn.execute("PRAGMA busy_timeout=5000")
+                except sqlite3.OperationalError:
+                    pass
                 self._fts_cjk_loaded = load_fts5_cjk_extension(self._conn)
                 self._init_schema()
 
