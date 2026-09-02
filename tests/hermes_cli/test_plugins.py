@@ -507,6 +507,151 @@ class TestPluginLoading:
         assert entry.module is None
         assert "exclusive" in (entry.error or "").lower()
 
+    def test_user_cron_plugin_auto_coerced_to_cron_provider(
+        self, tmp_path, monkeypatch
+    ):
+        """User-installed cron scheduler provider plugins must NOT be loaded
+        by the general PluginManager — they belong to plugins/cron_providers
+        discovery.
+
+        Regression test for the chronos crash (#62951):
+            'PluginContext' object has no attribute 'register_cron_scheduler'
+
+        A plugin that calls ``ctx.register_cron_scheduler`` in its
+        ``__init__.py`` should be auto-detected as ``kind: cron-provider``
+        (mirroring ``plugins/cron_providers/__init__.py:
+        _is_cron_provider_dir``) so the general loader records the manifest
+        but does not import/register() it. The real activation happens
+        through ``plugins/cron_providers/__init__.py`` via ``cron.provider``
+        config.
+        """
+        plugins_dir = tmp_path / "hermes_test" / "plugins"
+        plugin_dir = plugins_dir / "ticktock"
+        plugin_dir.mkdir(parents=True)
+        # No explicit `kind:` — the heuristic should kick in.
+        (plugin_dir / "plugin.yaml").write_text(yaml.dump({"name": "ticktock"}))
+        (plugin_dir / "__init__.py").write_text(
+            "class TickTockScheduler:\n"
+            "    pass\n"
+            "def register(ctx):\n"
+            "    ctx.register_cron_scheduler(TickTockScheduler())\n"
+        )
+        # Even if the user explicitly enables it in config, the loader
+        # should still treat it as cron-provider and skip general loading.
+        hermes_home = tmp_path / "hermes_test"
+        (hermes_home / "config.yaml").write_text(
+            yaml.safe_dump({"plugins": {"enabled": ["ticktock"]}})
+        )
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+        mgr = PluginManager()
+        mgr.discover_and_load()
+
+        entry = next(
+            e for e in mgr._plugins.values() if e.manifest.name == "ticktock"
+        )
+        assert entry.manifest.kind == "cron-provider", (
+            f"Expected auto-coerced kind='cron-provider', got {entry.manifest.kind}"
+        )
+        # Not loaded by general manager (no register() call, no AttributeError).
+        assert not entry.enabled
+        assert entry.module is None
+        assert "cron-provider" in (entry.error or "").lower()
+
+    def test_entrypoint_cron_provider_auto_coerced_to_cron_provider(
+        self, tmp_path, monkeypatch
+    ):
+        """Pip entry-point cron-provider plugins must NOT be imported by the
+        general PluginManager — same contract as memory/model providers
+        (#62951), so a pip cron provider is recorded for introspection and
+        activates only through plugins/cron_providers discovery.
+        """
+        from importlib.metadata import EntryPoint
+        from types import SimpleNamespace
+
+        module_path = tmp_path / "ticktock_ep.py"
+        module_path.write_text(
+            "class TickTockScheduler:\n"
+            "    pass\n"
+            "def register_cron_scheduler(scheduler):\n"
+            "    pass\n"
+        )
+        monkeypatch.syspath_prepend(str(tmp_path))
+
+        ep = EntryPoint(
+            name="ticktock_ep",
+            value="ticktock_ep:register",
+            group=ENTRY_POINTS_GROUP,
+        )
+        monkeypatch.setattr(
+            "hermes_cli.plugins.importlib.metadata.entry_points",
+            lambda: SimpleNamespace(
+                select=lambda group: [ep] if group == ENTRY_POINTS_GROUP else []
+            ),
+        )
+
+        hermes_home = tmp_path / "hermes_test"
+        (hermes_home / "config.yaml").write_text(
+            yaml.safe_dump({"plugins": {"enabled": ["ticktock_ep"]}})
+        )
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+        mgr = PluginManager()
+        mgr.discover_and_load()
+
+        entry = next(
+            e for e in mgr._plugins.values() if e.manifest.name == "ticktock_ep"
+        )
+        assert entry.manifest.kind == "cron-provider", (
+            f"Expected auto-coerced kind='cron-provider', got {entry.manifest.kind}"
+        )
+        assert not entry.enabled
+        assert entry.module is None
+        assert "cron-provider" in (entry.error or "").lower()
+        # The whole point: the module was never imported.
+        assert "ticktock_ep" not in sys.modules
+
+    def test_bundled_chronos_skipped_by_general_manager_and_cron_discovery_activates(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        """E2E regression for #62951: the bundled chronos plugin, when
+        enabled, must be recorded (not loaded) by the general PluginManager
+        with no AttributeError warning, and must still activate through the
+        real cron-provider discovery path.
+        """
+        from plugins.cron_providers import load_cron_scheduler
+
+        hermes_home = tmp_path / "hermes_home"
+        hermes_home.mkdir()
+        (hermes_home / "config.yaml").write_text(
+            yaml.safe_dump({"plugins": {"enabled": ["chronos"]}})
+        )
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+        mgr = PluginManager()
+        with caplog.at_level(logging.WARNING, logger="hermes_cli.plugins"):
+            mgr.discover_and_load()
+
+        # Recorded for introspection, never loaded via PluginContext.
+        entry = next(
+            e
+            for e in mgr._plugins.values()
+            if e.manifest.name == "chronos" and e.manifest.source == "bundled"
+        )
+        assert entry.manifest.kind == "cron-provider"
+        assert not entry.enabled
+        assert entry.module is None
+        # The exact symptom from #62951 must be gone.
+        assert not [
+            r for r in caplog.records if "register_cron_scheduler" in r.getMessage()
+        ]
+        # The module was never imported by the general manager…
+        assert "plugins.cron_providers.chronos" not in sys.modules
+        # …and the real cron-provider discovery path still activates it.
+        scheduler = load_cron_scheduler("chronos")
+        assert scheduler is not None
+        assert type(scheduler).__name__ == "ChronosCronScheduler"
+
     def test_entrypoint_memory_provider_auto_coerced_to_exclusive(
         self, tmp_path, monkeypatch
     ):
