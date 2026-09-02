@@ -10374,9 +10374,15 @@ def _call_llm_impl(
                 "Vision provider %s unavailable, falling back to auto vision backends",
                 resolved_provider,
             )
+            # Do NOT forward resolved_model here: it was configured for the
+            # provider that just failed to resolve, and the auto chain may
+            # land on a different provider (e.g. the main one) whose model
+            # namespace it does not belong to — a bare slug then reaches the
+            # wire and the wrong provider rejects it with a cryptic format
+            # error that masks the dead provider (#94780). Auto derives its
+            # own vision model per selected backend.
             effective_provider, client, final_model = resolve_vision_provider_client(
                 provider="auto",
-                model=resolved_model,
                 async_mode=False,
                 main_runtime=main_runtime,
             )
@@ -11280,9 +11286,10 @@ async def _async_call_llm_impl(
                 "Vision provider %s unavailable, falling back to auto vision backends",
                 resolved_provider,
             )
+            # Same rationale as the sync twin: the failed provider's model
+            # must not travel into the auto chain (#94780).
             effective_provider, client, final_model = resolve_vision_provider_client(
                 provider="auto",
-                model=resolved_model,
                 async_mode=True,
                 main_runtime=main_runtime,
             )
