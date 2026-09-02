@@ -55,6 +55,7 @@ import {
   setBusy,
   setSessions
 } from './session'
+import { normalizeSessionBinding } from './session-binding'
 import { assertSessionOwnerResolved } from './session-owner-resolution'
 import {
   requestForSessionProfile,
@@ -780,24 +781,13 @@ function parseTileList(value: unknown): StoredTile[] {
         .filter((t): t is SessionTile => Boolean(t && typeof (t as SessionTile).storedSessionId === 'string'))
         .map(t => {
           const raw = t as SessionTile
+          const binding = normalizeSessionBinding({ ownerRoute: raw.ownerRoute, storedSessionId: raw.storedSessionId })
 
           return {
             anchor: typeof raw.anchor === 'string' ? raw.anchor : undefined,
             before: typeof raw.before === 'string' || raw.before === null ? raw.before : undefined,
             dir: raw.dir,
-            ownerRoute:
-              raw.ownerRoute &&
-              typeof raw.ownerRoute.connectionId === 'string' &&
-              typeof raw.ownerRoute.profile === 'string'
-                ? {
-                    connectionId: raw.ownerRoute.connectionId,
-                    mode: raw.ownerRoute.mode,
-                    profile: raw.ownerRoute.profile,
-                    ...(typeof raw.ownerRoute.targetProfile === 'string'
-                      ? { targetProfile: raw.ownerRoute.targetProfile }
-                      : {})
-                  }
-                : undefined,
+            ownerRoute: binding?.ownerRoute,
             storedSessionId: raw.storedSessionId,
             workspaceMode: raw.workspaceMode === 'bots' ? 'bots' : 'sessions',
             workspaceOwnerKey:
@@ -1121,13 +1111,14 @@ export function setSessionTileWorkspaceScope(storedSessionId: string, scope: Ses
   rememberBotChatScope(storedSessionId, scope.workspaceMode === 'bots')
 
   const tile = $sessionTiles.get().find(candidate => candidate.storedSessionId === storedSessionId)
+  const sameMode = (tile?.workspaceMode ?? 'sessions') === scope.workspaceMode
   const workspaceOwnerKey = scope.workspaceMode === 'bots' ? scope.workspaceOwnerKey : undefined
-  const ownerRoute = scope.workspaceMode === 'bots' ? scope.ownerRoute : undefined
+  const ownerRoute = sameMode && !scope.ownerRoute ? tile?.ownerRoute : scope.ownerRoute
   const workspaceTabTitle = scope.workspaceMode === 'bots' ? scope.workspaceTabTitle : undefined
 
   if (
     !tile ||
-    ((tile.workspaceMode ?? 'sessions') === scope.workspaceMode &&
+    (sameMode &&
       tile.workspaceOwnerKey === workspaceOwnerKey &&
       tile.ownerRoute?.connectionId === ownerRoute?.connectionId &&
       tile.ownerRoute?.profile === ownerRoute?.profile &&
@@ -1386,7 +1377,7 @@ export function openSessionTile(
         anchor: dock,
         before,
         dir,
-        ownerRoute: workspaceScope.workspaceMode === 'bots' ? workspaceScope.ownerRoute : undefined,
+        ownerRoute: workspaceScope.ownerRoute,
         storedSessionId,
         workspaceMode: workspaceScope.workspaceMode,
         workspaceOwnerKey,

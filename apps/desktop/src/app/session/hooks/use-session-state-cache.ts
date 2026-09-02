@@ -10,6 +10,7 @@ import { setMutableRef } from '@/lib/mutable-ref'
 import {
   $activeSessionId,
   $messages,
+  getSessionOwnerHint,
   setActiveSessionStoredIdRotation,
   setCurrentFastMode,
   setCurrentModel,
@@ -20,7 +21,23 @@ import {
   setTurnStartedAt,
   setYoloActive
 } from '@/store/session'
-import { $sessionStates, $sessionTiles, publishSessionState, releaseSessionTranscript } from '@/store/session-states'
+import {
+  acceptsSessionRuntimeSource,
+  bindingsEqual,
+  bindRuntimeToSession,
+  currentSessionBinding,
+  invalidateSessionRuntimeBinding,
+  normalizeSessionBinding,
+  runtimeForExactSessionBinding
+} from '@/store/session-binding'
+import type { SessionOwnerRoute } from '@/store/session-request-router'
+import {
+  $sessionStates,
+  $sessionTiles,
+  publishSessionState,
+  releaseSessionTranscript,
+  sessionTileOwnerRoute
+} from '@/store/session-states'
 
 import type { ClientSessionState } from '../../types'
 import { SessionStateCache } from '../session-state-cache'
@@ -126,6 +143,45 @@ export function useSessionStateCache({
   }
 
   const sessionStateCache = sessionStateByRuntimeIdRef.current
+
+  const bindKnownRuntime = useCallback(
+    (storedSessionId: string, runtimeId: string, sourceOwner?: SessionOwnerRoute) => {
+      const canonical = currentSessionBinding(storedSessionId)
+      const hintedOwner = sessionTileOwnerRoute(storedSessionId) ?? getSessionOwnerHint(storedSessionId)
+
+      const sourceBinding = sourceOwner
+        ? normalizeSessionBinding({
+            ownerRoute: {
+              ...sourceOwner,
+              profile: canonical?.ownerRoute.profile ?? sourceOwner.profile,
+              targetProfile: sourceOwner.targetProfile ?? sourceOwner.profile
+            },
+            storedSessionId
+          })
+        : null
+
+      if (sourceBinding && canonical && !bindingsEqual(sourceBinding, canonical)) {
+        return false
+      }
+
+      if (!sourceOwner && canonical && runtimeForExactSessionBinding(canonical) !== runtimeId) {
+        return false
+      }
+
+      const binding =
+        canonical ??
+        sourceBinding ??
+        (hintedOwner ? normalizeSessionBinding({ ownerRoute: hintedOwner, storedSessionId }) : null)
+
+      if (binding) {
+        bindRuntimeToSession(binding, runtimeId)
+      }
+
+      return true
+    },
+    []
+  )
+
   const pendingViewStateRef = useRef<{ sessionId: string; state: ClientSessionState } | null>(null)
   const viewSyncRafRef = useRef<number | null>(null)
   const transcriptViewGateByRuntimeIdRef = useRef(new Map<string, symbol>())
@@ -139,7 +195,15 @@ export function useSessionStateCache({
   }, [busy, busyRef])
 
   const ensureSessionState = useCallback(
-    (sessionId: string, storedSessionId?: string | null) => {
+    (sessionId: string, storedSessionId?: string | null, sourceOwner?: SessionOwnerRoute) => {
+      if (
+        storedSessionId &&
+        sourceOwner &&
+        !acceptsSessionRuntimeSource(storedSessionId, sessionId, sourceOwner, sessionId === activeSessionIdRef.current)
+      ) {
+        return createClientSessionState(storedSessionId)
+      }
+
       const existing = sessionStateCache.get(sessionId)
 
       if (existing) {
@@ -160,6 +224,7 @@ export function useSessionStateCache({
           // tracks compression without needing a dummy state write.
           if (existing.storedSessionId && existing.storedSessionId !== storedSessionId) {
             runtimeIdByStoredSessionIdRef.current.delete(existing.storedSessionId)
+            invalidateSessionRuntimeBinding(existing.storedSessionId)
 
             // A rotation event needs a real next id — a null/cleared stored id
             // is a detach, not a rotation the route-follow effect should chase.
@@ -172,7 +237,7 @@ export function useSessionStateCache({
             }
           }
 
-          if (storedSessionId) {
+          if (storedSessionId && bindKnownRuntime(storedSessionId, sessionId, sourceOwner)) {
             runtimeIdByStoredSessionIdRef.current.set(storedSessionId, sessionId)
           }
 
@@ -184,7 +249,7 @@ export function useSessionStateCache({
 
       const created = createClientSessionState(storedSessionId ?? null)
 
-      if (storedSessionId) {
+      if (storedSessionId && bindKnownRuntime(storedSessionId, sessionId, sourceOwner)) {
         runtimeIdByStoredSessionIdRef.current.set(storedSessionId, sessionId)
       }
 
@@ -192,7 +257,7 @@ export function useSessionStateCache({
 
       return created
     },
-    [sessionStateCache]
+    [bindKnownRuntime, sessionStateCache]
   )
 
   const resetViewSync = useCallback(() => {
@@ -341,9 +406,18 @@ export function useSessionStateCache({
     (
       sessionId: string,
       updater: (state: ClientSessionState) => ClientSessionState,
-      storedSessionId?: string | null
+      storedSessionId?: string | null,
+      sourceOwner?: SessionOwnerRoute
     ) => {
-      const previous = ensureSessionState(sessionId, storedSessionId)
+      if (
+        storedSessionId &&
+        sourceOwner &&
+        !acceptsSessionRuntimeSource(storedSessionId, sessionId, sourceOwner, sessionId === activeSessionIdRef.current)
+      ) {
+        return sessionStateCache.get(sessionId) ?? createClientSessionState(storedSessionId)
+      }
+
+      const previous = ensureSessionState(sessionId, storedSessionId, sourceOwner)
       // Give the updater the raw previous state so it can return the same
       // reference when nothing changed (the caller sees a no-op). Previously
       // the param was always a fresh spread, so every call looked like a

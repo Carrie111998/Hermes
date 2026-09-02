@@ -87,20 +87,30 @@ export interface RouteContribution {
   path: string
 }
 
-export function contributedRoutes(): Array<{ key: string; path: string; title?: string; render: () => ReactNode }> {
-  return registry
-    .getArea(ROUTES_AREA)
-    .map(c => ({
-      key: `${c.source ?? 'core'}:${c.id}`,
-      path: (c.data as RouteContribution | undefined)?.path ?? '',
-      title: c.title,
-      render: c.render!
-    }))
+export function contributedRoutes(
+  contributions = registry.getArea(ROUTES_AREA)
+): Array<{ key: string; path: string; title?: string; render: () => ReactNode }> {
+  return contributions
+    .map(c => {
+      const path = routePathname((c.data as RouteContribution | undefined)?.path ?? '')
+
+      return {
+        key: `${c.source ?? 'core'}:${c.id}`,
+        path,
+        title: c.title,
+        render: c.render!
+      }
+    })
     .filter(route => Boolean(route.path.startsWith('/') && route.render) && !RESERVED_PATHS.has(route.path))
 }
 
 function isContributedPath(pathname: string): boolean {
   return contributedRoutes().some(route => route.path === pathname)
+}
+
+/** Whether `to` identifies a currently registered plugin route page. */
+export function isContributedRoute(to: string): boolean {
+  return isContributedPath(routePathname(to))
 }
 
 // ── Contributed sidebar nav — the `sidebar.nav` registry area ────────────────

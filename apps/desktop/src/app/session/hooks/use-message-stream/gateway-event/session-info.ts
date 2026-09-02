@@ -25,6 +25,8 @@ import {
   setWorkspaceCwdOwner,
   setYoloActive
 } from '@/store/session'
+import { acceptsSessionRuntimeSource } from '@/store/session-binding'
+import { type SessionOwnerRoute, sessionOwnerRouteFromRow } from '@/store/session-request-router'
 import { reportInstallMethodWarning } from '@/store/updates'
 
 import { finalizeInterruptedMessages } from '../../use-prompt-actions/rewind'
@@ -97,7 +99,7 @@ function sessionInfoDescribesSelectedSession(storedSessionId: string | undefined
  * keeping the durable selection untouched. A live turn on the old runtime
  * (overlap window during a manual switch) refuses the adoption.
  */
-function maybeRebindPaneToRebuiltRuntime(ctx: GatewayEventContext): boolean {
+function maybeRebindPaneToRebuiltRuntime(ctx: GatewayEventContext, sourceOwner?: SessionOwnerRoute): boolean {
   const { deps, explicitSid, isActiveEvent, payload } = ctx
 
   if (!explicitSid || isActiveEvent || typeof payload?.stored_session_id !== 'string') {
@@ -110,6 +112,17 @@ function maybeRebindPaneToRebuiltRuntime(ctx: GatewayEventContext): boolean {
   // persisted, so it always names one; an unnamed payload has no lineage to
   // match and must not capture the pane's active runtime id.
   if (!selected || !sessionInfoDescribesSelectedSession(payload.stored_session_id, false)) {
+    return false
+  }
+
+  if (
+    !acceptsSessionRuntimeSource(
+      payload.stored_session_id,
+      explicitSid,
+      sourceOwner,
+      !sourceOwner && ctx.fromActiveSource()
+    )
+  ) {
     return false
   }
 
@@ -132,6 +145,10 @@ function maybeRebindPaneToRebuiltRuntime(ctx: GatewayEventContext): boolean {
 export function handleSessionInfoEvent(ctx: GatewayEventContext): boolean {
   const { deps, event, payload, sessionId, explicitSid, isActiveEvent, occurredAt, fromActiveSource } = ctx
 
+  const sourceOwner: SessionOwnerRoute | undefined = event.connectionId
+    ? { connectionId: event.connectionId, profile: event.profile?.trim() || 'default' }
+    : undefined
+
   const {
     activeGatewayProfile,
     activeSessionIdRef,
@@ -149,7 +166,7 @@ export function handleSessionInfoEvent(ctx: GatewayEventContext): boolean {
     // whether this event is the rebuilt runtime announcing itself for the
     // conversation already on screen — if so, re-bind the pane so every
     // subsequent isActiveEvent gate keeps matching (#93942 scenario B).
-    const rebound = maybeRebindPaneToRebuiltRuntime(ctx)
+    const rebound = maybeRebindPaneToRebuiltRuntime(ctx, sourceOwner)
 
     // Apply session-scoped fields when the event targets the active
     // session, OR when it's a global broadcast and we have no session.
@@ -259,7 +276,8 @@ export function handleSessionInfoEvent(ctx: GatewayEventContext): boolean {
       updateSessionState(
         sessionId,
         state => applySessionInfoStatePatch(state, statePatch),
-        payload?.stored_session_id || undefined
+        payload?.stored_session_id || undefined,
+        sourceOwner
       )
     }
 
@@ -376,7 +394,8 @@ export function handleSessionInfoEvent(ctx: GatewayEventContext): boolean {
             turnLive: false
           }
         },
-        payload?.stored_session_id || undefined
+        payload?.stored_session_id || undefined,
+        sourceOwner
       )
 
       if (recoveredIncompleteTurn) {
@@ -449,7 +468,28 @@ export function handleSessionInfoEvent(ctx: GatewayEventContext): boolean {
     const nextTitle = typeof payload?.title === 'string' ? payload.title.trim() : ''
 
     if (storedId && nextTitle) {
-      setSessions(prev => prev.map(s => (sessionMatchesStoredId(s, storedId) ? { ...s, title: nextTitle } : s)))
+      setSessions(prev =>
+        prev.map(session => {
+          if (!sessionMatchesStoredId(session, storedId)) {
+            return session
+          }
+
+          if (sourceOwner) {
+            const rowOwner = sessionOwnerRouteFromRow(session)
+            const sourceTargetProfile = (sourceOwner.targetProfile ?? sourceOwner.profile).trim() || 'default'
+
+            if (
+              !rowOwner ||
+              rowOwner.connectionId !== sourceOwner.connectionId.trim() ||
+              rowOwner.profile !== sourceTargetProfile
+            ) {
+              return session
+            }
+          }
+
+          return { ...session, title: nextTitle }
+        })
+      )
     }
 
     return true
