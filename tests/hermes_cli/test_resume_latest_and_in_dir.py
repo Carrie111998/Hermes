@@ -193,16 +193,22 @@ def test_in_dir_chdirs_before_session_resolution(main_mod, launched, monkeypatch
 
 def test_in_dir_sets_no_restore_cwd(main_mod, launched, monkeypatch, tmp_path):
     import os
+    from agent.runtime_cwd import clear_session_cwd, resolve_agent_cwd
 
     target = tmp_path / "pin-here"
     target.mkdir()
+    configured = tmp_path / "configured-cwd"
+    configured.mkdir()
+    monkeypatch.setenv("TERMINAL_CWD", str(configured))
     start = os.getcwd()
 
     args = _args(resume=None, in_dir=str(target))
     try:
         with pytest.raises(SystemExit):
             main_mod.cmd_chat(args)
+        assert resolve_agent_cwd() == target
     finally:
+        clear_session_cwd()
         os.chdir(start)
 
     assert args.no_restore_cwd is True

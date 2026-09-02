@@ -6263,6 +6263,44 @@ def _ensure_healthy_or_recycle(server: Any, server_name: str) -> None:
         _signal_reconnect(server)
 
 
+def _build_request_context_meta(server) -> dict | None:
+    """Build opt-in MCP request metadata from the active Hermes session.
+
+    Cwd and session identifiers are private execution context, so they are
+    forwarded only when the server explicitly sets ``request_context: true``.
+    The metadata uses MCP's standard ``_meta`` channel and does not change tool
+    arguments or schemas.
+    """
+    config = getattr(server, "_config", None)
+    if not isinstance(config, dict) or config.get("request_context") is not True:
+        return None
+
+    try:
+        from agent.runtime_cwd import resolve_agent_cwd
+        from gateway.session_context import get_session_env
+
+        platform = str(get_session_env("HERMES_SESSION_PLATFORM", "") or "").strip()
+        source = str(get_session_env("HERMES_SESSION_SOURCE", "") or "").strip()
+        session_id = str(get_session_env("HERMES_SESSION_ID", "") or "").strip()
+        if not session_id:
+            session_id = str(
+                get_session_env("HERMES_SESSION_KEY", "") or ""
+            ).strip()
+        cwd = str(resolve_agent_cwd())
+    except Exception as exc:
+        logger.warning("Could not build opt-in MCP request context: %s", exc)
+        return None
+
+    hermes = {
+        "cwd": cwd,
+        "host": "hermes",
+        "source": platform or source or "hermes",
+    }
+    if session_id:
+        hermes["session_id"] = session_id
+    return {"host_context": hermes}
+
+
 def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
     """Return a sync handler that calls an MCP tool via the background loop.
 
@@ -6307,6 +6345,8 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
         if not server:
             _bump_server_error(server_name)
             return tool_error(f"MCP server '{server_name}' is not connected")
+
+        request_meta = _build_request_context_meta(server)
 
         if not server.session:
             # No live session. A reconnect may already be completing (the
@@ -6370,7 +6410,10 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
                             f"MCP stdio subprocess for '{server_name}' had "
                             f"already exited when the call was dispatched"
                         )
-                    _call_coro = server.session.call_tool(tool_name, arguments=args)
+                    call_kwargs = {"arguments": args}
+                    if request_meta is not None:
+                        call_kwargs["meta"] = request_meta
+                    _call_coro = server.session.call_tool(tool_name, **call_kwargs)
                     _watch_children = getattr(server, "_watch_stdio_children", None)
                     _watch_ok = (
                         _watch_children is not None
