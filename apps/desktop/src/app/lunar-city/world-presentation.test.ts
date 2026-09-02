@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest'
 
 import type { WorldEvent } from './world-events'
 
-import { resolveWorldPresentation, stableEventSeed } from './world-presentation'
+import { resolveNpcPersonality, resolveWorldPresentation, stableEventSeed } from './world-presentation'
 
 function event(kind: string, overrides: Partial<WorldEvent> = {}): WorldEvent {
   return {
@@ -69,5 +69,13 @@ describe('world presentation', () => {
     expect(stableEventSeed(event('pr.merge_conflict'))).toBe(stableEventSeed(event('pr.merge_conflict')))
     expect(first).toEqual(second)
     expect(first.npcActivities[0].groundedDialogue).toBeUndefined()
+  })
+
+  it('gives worker classes stable presentation personalities', () => {
+    expect(resolveNpcPersonality('research lead', { agentId: 'researcher' }, event('task.running'))).toBe('curious')
+    expect(resolveNpcPersonality('reviewer', { agentId: 'reviewer' }, event('task.in_review'))).toBe('methodical')
+    expect(resolveNpcPersonality('unknown', { agentId: 'unknown' }, event('task.running'))).toBe(
+      resolveNpcPersonality('unknown', { agentId: 'unknown' }, event('task.running'))
+    )
   })
 })

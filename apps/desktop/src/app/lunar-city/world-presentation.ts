@@ -21,8 +21,11 @@ export type NpcActivityState =
   | 'resting'
   | 'returning'
 
+export type NpcPersonality = 'bold' | 'cautious' | 'curious' | 'methodical' | 'protective' | 'social'
+
 export interface NpcActivity {
   actor: WorldSourceRef
+  personality: NpcPersonality
   state: NpcActivityState
   animationTags: string[]
   target?: WorldSourceRef
@@ -289,14 +292,49 @@ function dialogueFor(event: WorldEvent, state: NpcActivityState): string | undef
   return undefined
 }
 
+export function resolveNpcPersonality(
+  role: string | undefined,
+  actor: WorldSourceRef,
+  event: Pick<WorldEvent, 'id' | 'kind' | 'source'>
+): NpcPersonality {
+  const normalized = role?.trim().toLowerCase() ?? ''
+
+  if (normalized.includes('review') || normalized.includes('qa') || normalized.includes('audit')) {
+    return 'methodical'
+  }
+
+  if (normalized.includes('research') || normalized.includes('science')) {
+    return 'curious'
+  }
+
+  if (normalized.includes('security') || normalized.includes('ops') || normalized.includes('incident')) {
+    return 'protective'
+  }
+
+  if (normalized.includes('release') || normalized.includes('deploy')) {
+    return 'bold'
+  }
+
+  if (normalized.includes('support') || normalized.includes('community') || normalized.includes('social')) {
+    return 'social'
+  }
+
+  const variants: NpcPersonality[] = ['methodical', 'curious', 'protective', 'social', 'cautious', 'bold']
+  const seed = stableEventSeed({ ...event, id: `${event.id}:${actor.agentId ?? actor.taskId ?? ''}` })
+
+  return variants[seed % variants.length]
+}
+
 export function resolveNpcActivity(
   event: WorldEvent,
   actor: WorldSourceRef,
   state: NpcActivityState,
-  animationTags: readonly string[]
+  animationTags: readonly string[],
+  role?: string
 ): NpcActivity {
   return {
     actor,
+    personality: resolveNpcPersonality(role, actor, event),
     state,
     animationTags: [...animationTags],
     ...(event.sourceRef ? { target: event.sourceRef } : {}),
@@ -316,7 +354,8 @@ export function resolveWorldPresentation(
     .map(condition => condition.sourceRef!)
   const participants = uniqueRefs([...(event.sourceRef ? [event.sourceRef] : []), ...related])
   const primaryActor = participants[0] ?? { agentId: `world:${stableEventSeed(event)}` }
-  const npcActivities = [resolveNpcActivity(event, primaryActor, spec.npcState, tags)]
+  const role = typeof event.facts.role === 'string' ? event.facts.role : undefined
+  const npcActivities = [resolveNpcActivity(event, primaryActor, spec.npcState, tags, role)]
 
   if (event.kind === 'pr.merged_stable') {
     npcActivities.push(

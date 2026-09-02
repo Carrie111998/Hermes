@@ -30,7 +30,7 @@ Create the following focused modules:
 
 - `apps/desktop/src/app/lunar-city/world-events.ts` — stable semantic event, condition, source reference, and normalized payload contracts plus pure source normalizers.
 - `apps/desktop/src/app/lunar-city/world-events.test.ts` — table-driven normalizer, fallback, severity, and deduplication tests.
-- `apps/desktop/src/app/lunar-city/world-presentation.ts` — event-to-scene, NPC activity, participant, animation-tag, and deterministic severity resolution.
+- `apps/desktop/src/app/lunar-city/world-presentation.ts` — event-to-scene, NPC activity, worker-class personality, participant, animation-tag, and deterministic severity resolution.
 - `apps/desktop/src/app/lunar-city/world-presentation.test.ts` — deterministic presentation and missing-asset fallback tests.
 - `apps/desktop/src/app/lunar-city/world-sync.ts` — source fan-in, snapshot reconciliation, cursor handling, lifecycle binding, and bounded reopen recap.
 - `apps/desktop/src/app/lunar-city/world-sync.test.ts` — source subscription disposal, replay, reconnect, board scope, and stale-source tests.
@@ -231,9 +231,9 @@ export function resolveWorldPresentation(
 
 Unknown events must resolve to `scene.alert.unclassified`, `alert`, and a readable dialogue marker. Missing specialized tags must retain the semantic tag and append `fallback.generic` rather than failing.
 
-- [ ] **Step 4: Add tests for severity escalation and NPC-style behavior.**
+- [ ] **Step 4: Add tests for severity escalation, NPC-style behavior, and worker-class personality.**
 
-Cover local fire versus district catastrophe, city-wide stable-merge celebration, contextual nearby reactions, task-specific states such as `inspecting`, `repairing`, `carrying`, `talking`, `panicking`, and `celebrating`, and deterministic “comic celebration” as a cosmetic flourish that never changes source facts or status.
+Cover local fire versus district catastrophe, city-wide stable-merge celebration, contextual nearby reactions, task-specific states such as `inspecting`, `repairing`, `carrying`, `talking`, `panicking`, and `celebrating`, and deterministic “comic celebration” as a cosmetic flourish that never changes source facts or status. Verify role metadata maps research, review, operations/security, release, and social/support classes to stable presentation personalities, while unknown classes use an identity-seeded fallback.
 
 - [ ] **Step 5: Run the focused test and commit the presentation registry.**
 

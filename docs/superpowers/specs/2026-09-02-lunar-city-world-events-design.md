@@ -200,6 +200,12 @@ The target feel is a living open-world/cinematic-RPG cast:
   configured identity metadata to choose a consistent silhouette, color
   language, idle style, and reaction set. No invented personality trait may be
   presented as a fact about the real Hermes profile.
+- **Worker-class personalities:** each worker class gets a stable presentation
+  personality profile—such as methodical, curious, protective, social,
+  cautious, or bold—derived from its role metadata and deterministic identity
+  seed. This profile selects idle loops, gestures, reactions, and delivery
+  style; it does not change Hermes behavior or assert private psychological
+  facts about an agent.
 - **Cinematic beats:** important transitions can use short camera-friendly
   performances—inspection, argument over a merge conflict, emergency repair,
   relief after recovery, or a stable-merge celebration—while keeping the
