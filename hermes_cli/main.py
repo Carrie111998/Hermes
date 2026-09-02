@@ -6947,6 +6947,65 @@ def _desktop_launch_options() -> tuple[list[str], str]:
     return flags, disable_gpu
 
 
+def _stale_installed_macos_desktop_app(
+    packaged_executable: Path | None,
+    *,
+    search_bases: list[Path] | None = None,
+) -> Path | None:
+    """Return an installed Hermes.app that is older than ``packaged_executable``.
+
+    Used by ``hermes gui --build-only`` to warn when a terminal rebuild left the
+    Applications (or other) install untouched. Non-darwin and missing inputs
+    return None. When the built executable already lives inside the candidate
+    bundle, do not warn (in-place build).
+    """
+    if packaged_executable is None:
+        return None
+    if sys.platform != "darwin":
+        return None
+    try:
+        built = Path(packaged_executable).resolve()
+        built_mtime = built.stat().st_mtime
+    except OSError:
+        return None
+
+    if search_bases is None:
+        home = Path.home()
+        search_bases = [
+            Path("/Applications"),
+            home / "Applications",
+        ]
+
+    candidates: list[Path] = []
+    for base in search_bases:
+        try:
+            app = Path(base) / "Hermes.app"
+            exe = app / "Contents" / "MacOS" / "Hermes"
+            if not exe.is_file():
+                continue
+            # Same bundle as the build output → not stale.
+            try:
+                if built.resolve() == exe.resolve():
+                    continue
+                # built lives under this app bundle
+                if app.resolve() in built.resolve().parents:
+                    continue
+            except OSError:
+                pass
+            try:
+                inst_mtime = exe.stat().st_mtime
+            except OSError:
+                continue
+            if inst_mtime < built_mtime:
+                candidates.append(app.resolve())
+        except OSError:
+            continue
+    if not candidates:
+        return None
+    # Prefer the oldest stale install if multiple.
+    return min(candidates, key=lambda a: (a / "Contents" / "MacOS" / "Hermes").stat().st_mtime)
+
+
 def cmd_gui(args: argparse.Namespace):
     """Build and launch the native Electron desktop GUI."""
     desktop_dir = PROJECT_ROOT / "apps" / "desktop"
