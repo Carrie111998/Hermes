@@ -128,6 +128,7 @@ except ImportError:
 
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import (
+    gateway_trust_env,
     BasePlatformAdapter,
     MessageEvent,
     MessageType,
@@ -625,6 +626,13 @@ _MATRIX_IMAGE_FILENAME_EXTS = frozenset({
     ".avif",
 })
 
+# Extensions for audio/video/file msgtypes whose ``content.body`` is
+# the uploaded filename when the sender adds no caption.
+_MATRIX_MEDIA_FILENAME_EXTS = frozenset({
+    ".ogg", ".oga", ".opus", ".m4a", ".mp3", ".wav", ".flac", ".aac", ".amr",
+    ".mp4", ".webm", ".mov", ".mkv",
+})
+
 _MATRIX_MODEL_PICKER_REACTIONS = (
     "1\ufe0f\u20e3",
     "2\ufe0f\u20e3",
@@ -693,6 +701,36 @@ def _looks_like_matrix_image_filename(text: str) -> bool:
     return suffix in _MATRIX_IMAGE_FILENAME_EXTS
 
 
+def _looks_like_matrix_media_filename(text: str) -> bool:
+    """Return True when Matrix audio/video/file body text is a transport filename.
+
+    Matrix ``m.audio``/``m.file``/``m.video`` events populate ``content.body``
+    with the uploaded filename when the sender adds no caption.  Same
+    conservative heuristic as :func:`_looks_like_matrix_image_filename` but
+    for non-image media types.
+    """
+    candidate = str(text or "").strip()
+    if not candidate or "\n" in candidate or candidate.endswith("/"):
+        return False
+    # A genuine caption essentially always contains whitespace; a bare
+    # transport filename does not.
+    if any(ch.isspace() for ch in candidate):
+        return False
+
+    name = Path(candidate).name
+    if not name or name != candidate:
+        return False
+
+    suffix = Path(name).suffix.lower()
+    if not suffix:
+        return False
+
+    guessed_type, _ = mimetypes.guess_type(name)
+    if guessed_type and guessed_type.startswith(("audio/", "video/")):
+        return True
+    return suffix in _MATRIX_MEDIA_FILENAME_EXTS
+
+
 def _matrix_event_timestamp_seconds(event: Any) -> float:
     """Return a Matrix event timestamp in seconds, accepting ms or sec values."""
     raw_ts = (
@@ -726,7 +764,7 @@ def _create_matrix_session(proxy_url: str | None):
     import aiohttp
 
     if not proxy_url:
-        return aiohttp.ClientSession(trust_env=True)
+        return aiohttp.ClientSession(trust_env=gateway_trust_env())
 
     if proxy_url.split("://")[0].lower().startswith("socks"):
         try:
@@ -741,7 +779,7 @@ def _create_matrix_session(proxy_url: str | None):
                 "Run: pip install aiohttp-socks",
                 proxy_url,
             )
-            return aiohttp.ClientSession(trust_env=True)
+            return aiohttp.ClientSession(trust_env=gateway_trust_env())
 
     return aiohttp.ClientSession(proxy=proxy_url)
 
@@ -2105,6 +2143,8 @@ class MatrixAdapter(BasePlatformAdapter):
         # Start the sync loop.
         self._sync_task = asyncio.create_task(self._sync_loop())
         self._mark_connected()
+        # Plugin-registered native handlers (Matrix client — event callbacks).
+        self._wire_plugin_handlers(self._client)
         return True
 
     async def disconnect(self) -> None:
@@ -3712,6 +3752,8 @@ class MatrixAdapter(BasePlatformAdapter):
 
         if msgtype == "m.image" and _looks_like_matrix_image_filename(body):
             body = ""
+        elif msgtype in ("m.audio", "m.file", "m.video") and _looks_like_matrix_media_filename(body):
+            body = ""
 
         allow_http_fallback = bool(http_url) and not is_encrypted_media
         media_urls = (
@@ -4237,7 +4279,7 @@ class MatrixAdapter(BasePlatformAdapter):
             thread_sessions_per_user=self.config.extra.get(
                 "thread_sessions_per_user", False
             ),
-            profile=event.source.profile,
+            profile=self._session_key_profile(event.source),
         )
 
     def _enqueue_text_event(self, event: MessageEvent) -> None:
