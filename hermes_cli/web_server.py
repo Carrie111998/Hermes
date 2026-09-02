@@ -16338,6 +16338,15 @@ PTY_REGISTRY = PtySessionRegistry(
 )
 
 
+async def _close_stalled_pty_input(ws: "WebSocket", *, path: str) -> None:
+    """Close only the terminal socket when its child stops accepting input."""
+    _log.warning("pty input stalled path=%s; recycling terminal session", path)
+    try:
+        await ws.close(code=1013, reason="PTY input stalled")
+    except Exception:
+        pass
+
+
 async def _legacy_pump(ws: "WebSocket", bridge) -> None:
     """Original 1:1 socket<->PTY pump: stream until disconnect, then close the
     bridge. Used when no ``?attach=`` token is supplied (keep-alive opt-in).
@@ -16412,7 +16421,9 @@ async def _legacy_pump(ws: "WebSocket", bridge) -> None:
             if match and match.end() == len(raw):
                 bridge.resize(cols=int(match.group(1)), rows=int(match.group(2)))
                 continue
-            bridge.write(raw)
+            if not await bridge.write(raw):
+                await _close_stalled_pty_input(ws, path="legacy")
+                break
     except WebSocketDisconnect:
         pass
     finally:
@@ -17765,7 +17776,10 @@ async def pty_ws(ws: WebSocket) -> None:
     # A fresh xterm cannot reliably reconstruct the TUI from an arbitrary
     # bounded tail of alternate-screen, differential ANSI output. Reused PTYs
     # emit a complete frame after replay so reconnects never reopen blank.
-    await session.attach(ws, force_redraw=not _created)
+    if not await session.attach(ws, force_redraw=not _created):
+        await _close_stalled_pty_input(ws, path="keepalive-redraw")
+        PTY_REGISTRY.detach(attach_token, ws)
+        return
 
     # --- writer loop: WebSocket → PTY master ----------------------------
     # No reader task here: the session's drain task (spawned once per PTY,
@@ -17796,7 +17810,9 @@ async def pty_ws(ws: WebSocket) -> None:
                 session.bridge.resize(cols=int(match.group(1)), rows=int(match.group(2)))
                 continue
 
-            session.bridge.write(raw)
+            if not await session.write(ws, raw):
+                await _close_stalled_pty_input(ws, path="keepalive")
+                break
     except WebSocketDisconnect:
         pass
     finally:

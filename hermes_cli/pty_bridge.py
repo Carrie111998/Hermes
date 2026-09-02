@@ -28,6 +28,7 @@ Design constraints:
 
 from __future__ import annotations
 
+import asyncio
 import errno
 import fcntl
 import os
@@ -91,16 +92,16 @@ class PtyBridge:
 
     Not thread-safe.  A single bridge is owned by the WebSocket handler
     that spawned it; the reader runs in an executor thread while writes
-    happen on the event-loop thread.  Both sides are OK because the
-    kernel PTY is the actual synchronization point — we never call
-    :mod:`ptyprocess` methods concurrently, we only call ``os.read`` and
-    ``os.write`` on the master fd, which is safe.
+    are awaited on the event-loop thread.  The master fd is non-blocking
+    so PTY input backpressure can suspend only the owning WebSocket task,
+    never the dashboard event loop.
     """
 
     def __init__(self, proc: "ptyprocess.PtyProcess"):  # type: ignore[name-defined]
         self._proc = proc
         self._fd: int = proc.fd
         self._closed = False
+        os.set_blocking(self._fd, False)
 
     # -- lifecycle --------------------------------------------------------
 
@@ -200,27 +201,77 @@ class PtyBridge:
             # EIO on Linux = slave side closed.  EBADF = already closed.
             if exc.errno in {errno.EIO, errno.EBADF}:
                 return None
+            # The fd is deliberately non-blocking. Readiness can disappear
+            # between select() and os.read() when close/output races occur.
+            if exc.errno in {errno.EAGAIN, errno.EWOULDBLOCK}:
+                return b""
             raise
         if not data:
             return None
         return data
 
-    def write(self, data: bytes) -> None:
-        """Write raw bytes to the PTY master (i.e. the child's stdin)."""
-        if self._closed or not data:
-            return
-        # os.write can return a short write under load; loop until drained.
+    async def _wait_writable(self, timeout: float) -> bool:
+        """Wait without blocking the event loop until the master accepts input."""
+        if self._closed or timeout <= 0:
+            return False
+        loop = asyncio.get_running_loop()
+        ready = loop.create_future()
+
+        def _mark_ready() -> None:
+            if not ready.done():
+                ready.set_result(None)
+
+        try:
+            loop.add_writer(self._fd, _mark_ready)
+            await asyncio.wait_for(ready, timeout=timeout)
+            return not self._closed
+        except (asyncio.TimeoutError, OSError, ValueError):
+            return False
+        finally:
+            try:
+                loop.remove_writer(self._fd)
+            except (OSError, ValueError):
+                pass
+
+    async def write(self, data: bytes, *, timeout: float = 10.0) -> bool:
+        """Write all raw bytes without ever blocking the dashboard event loop.
+
+        Returns ``False`` when the bridge closes or the child leaves its input
+        buffer full for ``timeout`` seconds. Callers can then recycle only the
+        affected terminal session while the rest of the dashboard stays live.
+        """
+        if self._closed:
+            return False
+        if not data:
+            return True
+
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + max(0.0, timeout)
         view = memoryview(data)
         while view:
+            if self._closed:
+                return False
             try:
                 n = os.write(self._fd, view)
             except OSError as exc:
                 if exc.errno in {errno.EIO, errno.EBADF, errno.EPIPE}:
-                    return
-                raise
-            if n <= 0:
-                return
-            view = view[n:]
+                    return False
+                if exc.errno in {errno.EAGAIN, errno.EWOULDBLOCK}:
+                    n = 0
+                else:
+                    raise
+            if n > 0:
+                view = view[n:]
+                # A very large paste can otherwise monopolize the loop while
+                # the child drains quickly enough to keep the fd writable.
+                if view:
+                    await asyncio.sleep(0)
+                continue
+
+            remaining = deadline - loop.time()
+            if not await self._wait_writable(remaining):
+                return False
+        return True
 
     def resize(self, cols: int, rows: int) -> None:
         """Forward a terminal resize to the child via ``TIOCSWINSZ``.
