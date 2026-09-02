@@ -764,7 +764,10 @@ def _sanitize_subprocess_env(base_env: dict | None, extra_env: dict | None = Non
     # this invariant; Cron scripts use this sanitizer directly (#92998).
     path_key = _path_env_key(sanitized)
     if path_key is not None:
-        sanitized[path_key] = _prepend_hermes_bin_dir(sanitized.get(path_key, ""))
+        merged_path = _prepend_hermes_bin_dir(sanitized.get(path_key, ""))
+        # Opt-in operator override slot, applied last so it lands ahead of the
+        # hermes install dir. No-op unless $HERMES_HOME/agent-bin exists.
+        sanitized[path_key] = _prepend_agent_bin_dir(merged_path)
 
     _apply_windows_msys_bash_env_defaults(sanitized)
 
@@ -1400,6 +1403,61 @@ def _prepend_hermes_bin_dir(existing_path: str) -> str:
     return sep.join([bin_dir, *entries])
 
 
+def _prepend_agent_bin_dir(existing_path: str) -> str:
+    """Prepend the opt-in ``$HERMES_HOME/agent-bin`` override dir if it exists.
+
+    A Hermes-owned slot at the very head of the PATH the agent's shells get, so
+    a shim dropped there — a ``claude``/``codex``/``opencode`` wrapper, a
+    sandbox launcher, a telemetry shim — transparently intercepts that CLI
+    everywhere the agent shells out, without every skill having to know the
+    wrapper's name.  The directory does not exist in a default install and this
+    is then a byte-for-byte no-op, so nobody pays for a feature they did not
+    opt into.
+
+    Deliberately a SEPARATE prepend rather than a change to the ordering in
+    ``_append_missing_sane_path_entries``.  The managed runtime dirs
+    (``$HERMES_HOME/bin``, the managed node) are *appended* on purpose so that
+    "a tool the user deliberately put on their own PATH still wins, and the
+    managed one only fills the gap" (25d0bcd4).  ``agent-bin`` has the opposite
+    intent — an operator override that must beat whatever else is installed —
+    so it gets its own opt-in slot and leaves that decision untouched.
+
+    Call this AFTER :func:`_prepend_hermes_bin_dir` at each PATH-building site:
+    both prepend, so the later call ends up first and ``agent-bin`` shadows even
+    the hermes install dir.
+
+    Resolved per call rather than cached, matching
+    :func:`_managed_runtime_path_entries`: ``get_hermes_home()`` is
+    profile-scoped, and an operator can create the directory mid-process.
+    No-op on Windows, where the native PATH is a deliberate passthrough in the
+    sibling helpers.  First-occurrence wins, so a PATH that already lists the
+    dir is returned unchanged.
+
+    Trust boundary: this slot intercepts every CLI the agent shells out to at
+    higher precedence than the user's own tools, so it must be
+    trusted-operator-owned — never writable by the agent process or by
+    untrusted users unless that interception is the point.  The opt-in (the
+    directory is absent by default) is what keeps a default install outside
+    the boundary.
+    """
+    if _IS_WINDOWS:
+        return existing_path
+    try:
+        from hermes_constants import get_hermes_home
+
+        agent_bin = get_hermes_home() / "agent-bin"
+        if not agent_bin.is_dir():
+            return existing_path
+        bin_dir = str(agent_bin)
+    except Exception:
+        return existing_path
+    sep = os.pathsep
+    entries = [e for e in existing_path.split(sep) if e] if existing_path else []
+    if bin_dir in entries:
+        return existing_path
+    return sep.join([bin_dir, *entries])
+
+
 def _managed_runtime_path_entries() -> list[str]:
     """Return existing Hermes-managed runtime dirs for the terminal subshell PATH.
 
@@ -1571,7 +1629,10 @@ def _make_run_env(env: dict) -> dict:
         # Ensure the hermes install dir is reachable so plugins can shell out
         # to bare ``hermes`` via the terminal tool even when the gateway was
         # launched without it on PATH (systemd, service managers, cron, etc.).
-        run_env[path_key] = _prepend_hermes_bin_dir(new_path)
+        new_path = _prepend_hermes_bin_dir(new_path)
+        # Opt-in operator override slot, applied last so it lands ahead of the
+        # hermes install dir. No-op unless $HERMES_HOME/agent-bin exists.
+        run_env[path_key] = _prepend_agent_bin_dir(new_path)
 
     _inject_context_hermes_home(run_env)
 
