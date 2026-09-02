@@ -2904,12 +2904,17 @@ class GatewaySlashCommandsMixin:
         _quick_key = self._session_key_for_source(event.source) if event.source else None
         if adapter and _quick_key:
             try:
+                kickoff_text = mgr.next_continuation_prompt() or state.goal
                 kickoff_event = MessageEvent(
-                    text=state.goal,
+                    text=kickoff_text,
                     message_type=MessageType.TEXT,
                     source=event.source,
-                    message_id=event.message_id,
-                    channel_prompt=event.channel_prompt,
+                    # The kickoff is a separate inbound lifecycle. Reusing the
+                    # slash command identity makes the platform ledger reject
+                    # the queued turn as a duplicate of the command itself.
+                    message_id=None,
+                    channel_prompt=None,
+                    internal=True,
                 )
                 self._enqueue_fifo(_quick_key, kickoff_event, adapter)
             except Exception as exc:
