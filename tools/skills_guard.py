@@ -242,7 +242,7 @@ THREAT_PATTERNS = [
      "reads known secrets file"),
 
     # ── Exfiltration: programmatic env access ──
-    (r'printenv|env\s*\|',
+    (r'printenv|\benv\s*\|',
      "dump_all_env", "high", "exfiltration",
      "dumps all environment variables"),
     # `os.environ` bare access (dict dump / iteration) is suspicious, but the
@@ -1079,7 +1079,7 @@ def _check_structure(skill_dir: Path, ignore=None) -> List[Finding]:
     Args:
         skill_dir: Path to the skill directory.
         ignore: Optional callable taking a relative posix path and returning
-            True if the path should be excluded (e.g. from `.skillignore`).
+            True if the path should be excluded (e.g. from ``.skillignore``).
             Ignored files are not counted toward the file count, total size,
             or any structural finding.
     """
@@ -1087,6 +1087,7 @@ def _check_structure(skill_dir: Path, ignore=None) -> List[Finding]:
         ignore = lambda _rel: False  # noqa: E731
 
     findings = []
+
     file_count = 0
     total_size = 0
 
