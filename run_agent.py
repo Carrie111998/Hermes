@@ -16,7 +16,7 @@ Features:
 Usage:
     from run_agent import AIAgent
     
-    agent = AIAgent(base_url="http://localhost:30000/v1", model="claude-opus-4-20250514")
+    agent = AIAgent(base_url="http://localhost:30000/v1", model="gpt-5.5")
     response = agent.run_conversation("Tell me about the latest Python updates")
 """
 
@@ -4542,7 +4542,13 @@ class AIAgent:
                     heartbeat_current_worker_from_env,
                     inject_new_comments_from_env,
                 )
-                heartbeat_current_worker_from_env()
+                heartbeat_current_worker_from_env(
+                    on_lease_lost=lambda task_id: request_hard_interrupt(
+                        self,
+                        f"Kanban lease lost for {task_id}; stopping superseded worker.",
+                        tool_reason="kanban lease lost",
+                    )
+                )
                 # Fold any new operator notes into the running turn (OUT-OF-BAND
                 # steer) so the user can talk to a live task without a restart.
                 inject_new_comments_from_env(self)
@@ -9263,9 +9269,10 @@ class AIAgent:
             "task_id": effective_task_id,
             "platform": getattr(self, "platform", None) or "",
         }
-        relay_turn_id = (
-            f"{session_id or 'session'}:{effective_task_id}:{uuid.uuid4().hex[:8]}"
-        )
+        relay_turn_id = str(
+            getattr(self, "_source_provenance_pending_turn_id", "") or ""
+        ) or f"{session_id or 'session'}:{effective_task_id}:{uuid.uuid4().hex[:8]}"
+        self._source_provenance_pending_turn_id = None
         self._relay_pending_turn_id = relay_turn_id
         relay_parent_session_id = (
             str(getattr(self, "_parent_session_id", None) or "")
@@ -9859,6 +9866,17 @@ class AIAgent:
                     # Always clear mid-turn labels when the turn exits — including
                     # interrupted early returns that skip finalize_turn. Keep ts.
                     try:
+                        from agent.source_provenance import SourceProvenanceRegistry
+
+                        provenance_registry = getattr(self, "_source_provenance_registry", None)
+                        if isinstance(provenance_registry, SourceProvenanceRegistry):
+                            provenance_registry.clear_turn(relay_turn_id)
+                            provenance_registry.clear_turn(
+                                str(getattr(self, "_current_turn_id", "") or "")
+                            )
+                    except Exception:
+                        logger.debug("source provenance cleanup failed", exc_info=True)
+                    try:
                         self._reset_activity_labels_after_turn()
                     except Exception:
                         pass
@@ -9924,7 +9942,7 @@ def main(
 
     Args:
         query (str): Natural language query for the agent. Defaults to Python 3.13 example.
-        model (str): Model name to use (OpenRouter format: provider/model). Defaults to anthropic/claude-sonnet-4.6.
+        model (str): Model name to use (OpenAI-compatible format: provider/model). Defaults to openai-codex/gpt-5.5.
         api_key (str): API key for authentication. Uses OPENROUTER_API_KEY env var if not provided.
         base_url (str): Base URL for the model API. Defaults to https://openrouter.ai/api/v1
         max_turns (int): Maximum number of API call iterations. Defaults to 10.

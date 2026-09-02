@@ -624,7 +624,7 @@ def init_agent(
         provider (str): Provider identifier (optional; used for telemetry/routing hints)
         requested_provider (str): Original provider identity before runtime canonicalization
         api_mode (str): API mode override: "chat_completions" or "codex_responses"
-        model (str): Model name to use (default: "anthropic/claude-opus-4.6")
+        model (str): Model name to use (default: "openai-codex/gpt-5.5")
         max_iterations (int): Maximum number of tool calling iterations (default: 90)
         enabled_toolsets (List[str]): Only enable tools from these toolsets (optional)
         disabled_toolsets (List[str]): Disable tools from these toolsets (optional)
