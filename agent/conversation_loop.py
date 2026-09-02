@@ -8528,7 +8528,7 @@ def run_conversation(
                             _empty_retry_budget, wait_time, agent.model,
                         )
                         _budget_note = (
-                            " — high-cost request, reduced retry budget"
+                            " — empty-response guard reduced retry budget"
                             if _empty_retry_budget < _empty_guard.DEFAULT_EMPTY_RETRY_BUDGET
                             else ""
                         )

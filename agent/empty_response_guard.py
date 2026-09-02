@@ -1,4 +1,4 @@
-"""Deterministic-empty detection and cost-aware retry budgets (NS-503).
+"""Deterministic-empty detection and evidence-aware retry budgets (NS-503).
 
 When a provider returns an empty completion, the agent loop retries up to
 3 times and then walks the fallback chain. Every attempt re-sends the full
@@ -25,11 +25,11 @@ Two independent guards, both failing OPEN to today's behaviour:
    stripping, whitespace, flaky decoding) never classify as deterministic
    and keep the full retry budget.
 
-2. **Cost-aware retry budget** — when the estimated input cost of a
-   single empty attempt exceeds the configured threshold (default
-   $0.25), the empty-retry budget for this streak drops from 3 to 1.
-   Unknown pricing, missing usage, or included/subscription routes
-   leave the budget untouched.
+2. **Evidence-aware retry budget** — the empty-retry budget for a streak
+   drops from 3 to 1 after two zero-output attempts from the same route,
+   or when one attempt's estimated input cost exceeds the configured
+   threshold (default $0.25). This keeps the guard reachable for free and
+   unknown-priced models while missing usage still fails open.
 
 Configured via the additive ``agent.empty_response_guard`` section in
 ``config.yaml`` (resolved once at agent init by ``agent_init``)::
@@ -251,11 +251,31 @@ def deterministic_empty(agent: Any) -> bool:
     )
 
 
+def _repeated_zero_output_route(agent: Any) -> bool:
+    """Whether repeated zero-output attempts came from one model route.
+
+    Finish reasons are intentionally excluded: providers may vary generic
+    reasons across otherwise identical empty completions. Route changes,
+    missing usage, and generated output continue to fail open.
+    """
+    attempts = getattr(agent, _ATTEMPTS_ATTR, None) or []
+    if len(attempts) < 2:
+        return False
+    first_route = (attempts[0].model, attempts[0].provider)
+    return all(
+        attempt.usage_present
+        and attempt.zero_output
+        and (attempt.model, attempt.provider) == first_route
+        for attempt in attempts
+    )
+
+
 def empty_retry_budget(agent: Any, response: Any) -> int:
-    """Empty-retry budget for the current streak (3, or 1 when a single
-    attempt is estimated to cost more than the configured threshold)."""
+    """Return 1 after repeated route empties or costly input; otherwise 3."""
     if not guard_enabled(agent):
         return DEFAULT_EMPTY_RETRY_BUDGET
+    if _repeated_zero_output_route(agent):
+        return REDUCED_EMPTY_RETRY_BUDGET
     cost = _estimate_attempt_cost(agent, response)
     if cost is None:
         return DEFAULT_EMPTY_RETRY_BUDGET

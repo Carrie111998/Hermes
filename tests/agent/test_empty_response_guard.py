@@ -159,6 +159,45 @@ class TestDeterministicEmpty:
 
 
 class TestEmptyRetryBudget:
+    def test_zero_priced_route_reduces_after_repeated_zero_output(self, monkeypatch):
+        monkeypatch.setattr(
+            guard, "_estimate_attempt_cost", lambda a, r: Decimal("0")
+        )
+        agent = _agent()
+        _record_streak(
+            agent,
+            [_response(), _response()],
+            finish_reasons=["stop", "length"],
+        )
+
+        assert (
+            guard.empty_retry_budget(agent, _response())
+            == guard.REDUCED_EMPTY_RETRY_BUDGET
+        )
+
+    def test_unknown_pricing_reduces_after_repeated_zero_output(self, monkeypatch):
+        monkeypatch.setattr(guard, "_estimate_attempt_cost", lambda a, r: None)
+        agent = _agent()
+        _record_streak(agent, [_response(), _response()])
+
+        assert (
+            guard.empty_retry_budget(agent, _response())
+            == guard.REDUCED_EMPTY_RETRY_BUDGET
+        )
+
+    def test_behavioral_reduction_requires_same_route(self, monkeypatch):
+        monkeypatch.setattr(guard, "_estimate_attempt_cost", lambda a, r: None)
+        agent = _agent()
+        guard.record_empty_attempt(agent, finish_reason="stop", response=_response())
+        agent._empty_content_retries += 1
+        agent.model = "other/model"
+        guard.record_empty_attempt(agent, finish_reason="stop", response=_response())
+
+        assert (
+            guard.empty_retry_budget(agent, _response())
+            == guard.DEFAULT_EMPTY_RETRY_BUDGET
+        )
+
     def test_default_budget_when_cost_unknown(self, monkeypatch):
         monkeypatch.setattr(guard, "_estimate_attempt_cost", lambda a, r: None)
         assert (

@@ -3563,6 +3563,35 @@ class TestRunConversation:
         # proves determinism, remaining retries are skipped.
         assert result["api_calls"] == 2
 
+    def test_zero_priced_route_stops_after_repeated_zero_output(self, agent):
+        """Route-level evidence reduces retries even when generic finish
+        reasons vary and cost cannot provide a positive signal."""
+        self._setup_agent(agent)
+        agent.base_url = "http://127.0.0.1:1234/v1"
+        zero_usage = {
+            "prompt_tokens": 25_900,
+            "completion_tokens": 0,
+            "total_tokens": 25_900,
+        }
+        responses = [
+            _mock_response(content=None, finish_reason=reason, usage=zero_usage)
+            for reason in ("stop", "unknown", "stop", "unknown")
+        ]
+        agent.client.chat.completions.create.side_effect = responses
+        with (
+            patch(
+                "agent.empty_response_guard._estimate_attempt_cost",
+                return_value=0,
+            ),
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("answer me")
+
+        assert result["completed"] is True
+        assert result["api_calls"] == 2
+
     def test_guard_disabled_via_config_restores_legacy_retries(self, agent):
         """NS-503: agent.empty_response_guard.enabled: false in config.yaml
         (resolved to _empty_guard_enabled at init) restores the legacy
