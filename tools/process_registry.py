@@ -1588,6 +1588,20 @@ class ProcessRegistry:
         # (Ported from openclaw/openclaw#112325.)
         decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
 
+        # Terminal-query responder (ported from openai/codex#41436): programs
+        # in a PTY can block waiting for replies to device-status /
+        # window-size / cursor-position / DEC private-mode queries. Answer
+        # the bounded set and strip the queries from captured output. POSIX
+        # only — Windows ConPTY is a real console host that answers itself
+        # (and pywinpty yields str chunks, not bytes).
+        responder = None
+        if not _IS_WINDOWS:
+            try:
+                from tools.pty_query_responder import PtyQueryResponder
+                responder = PtyQueryResponder(rows=30, cols=120)
+            except Exception:
+                responder = None
+
         def _append_text(text: str):
             with session._lock:
                 session.output_buffer += text
@@ -1602,6 +1616,16 @@ class ProcessRegistry:
                     chunk = pty.read(4096)
                     if chunk:
                         # ptyprocess returns bytes; pywinpty returns str
+                        if responder is not None and isinstance(chunk, bytes):
+                            chunk, replies = responder.process(chunk)
+                            if replies:
+                                try:
+                                    pty.write(replies)
+                                except Exception:
+                                    logger.debug(
+                                        "PTY query response write failed",
+                                        exc_info=True,
+                                    )
                         text = chunk if isinstance(chunk, str) else decoder.decode(chunk)
                         if text:
                             _append_text(text)
@@ -1614,7 +1638,8 @@ class ProcessRegistry:
 
         # Flush any partial multibyte sequence held by the decoder.
         try:
-            tail = decoder.decode(b"", final=True)
+            tail_bytes = responder.flush() if responder is not None else b""
+            tail = decoder.decode(tail_bytes, final=True)
             if tail:
                 _append_text(tail)
         except Exception:
