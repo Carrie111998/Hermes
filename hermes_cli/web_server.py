@@ -15235,7 +15235,11 @@ def _disable_unselected_skills(profile_dir: Path, keep: List[str]) -> int:
         installed: List[str] = []
         skills_root = profile_dir / "skills"
         if skills_root.is_dir():
+            from agent.skill_utils import is_excluded_skill_path
+
             for md in skills_root.rglob("SKILL.md"):
+                if is_excluded_skill_path(md):
+                    continue  # .archive/.library/... contents are not installed skills
                 installed.append(md.parent.name)
         cfg = load_config()
         disabled = get_disabled_skills(cfg)

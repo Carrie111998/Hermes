@@ -154,7 +154,14 @@ def blueprint_spec_for_installed(skill_name: str) -> Optional[BlueprintSpec]:
 
     base = Path(SKILLS_DIR)
     # Skills live at skills/<category>/<name>/SKILL.md or skills/<name>/SKILL.md.
-    candidates = list(base.glob(f"**/{skill_name}/SKILL.md"))
+    # Excluded storage dirs (.archive/.library/...) are never blueprint sources.
+    from agent.skill_utils import is_excluded_skill_path
+
+    candidates = [
+        p
+        for p in base.glob(f"**/{skill_name}/SKILL.md")
+        if not is_excluded_skill_path(p)
+    ]
     for path in candidates:
         try:
             text = path.read_text(encoding="utf-8")

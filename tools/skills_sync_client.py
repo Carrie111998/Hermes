@@ -530,9 +530,13 @@ def _all_local_skill_names() -> List[str]:
     try:
         if not root.exists():
             return []
+        from agent.skill_utils import is_excluded_skill_path
+
         for skill_md in root.rglob("SKILL.md"):
             if skill_md.is_symlink():
                 continue
+            if is_excluded_skill_path(skill_md):
+                continue  # .archive/.library/... are not syncable installed skills
             name: Optional[str] = None
             try:
                 from tools.skill_usage import _read_skill_name
@@ -1710,8 +1714,12 @@ def list_org_skill_names() -> List[str]:
         root = _org_dir() / org_id
         if not root.is_dir():
             return names
+        from agent.skill_utils import is_excluded_skill_path
+
         for skill_md in root.rglob("SKILL.md"):
             rel = skill_md.parent.relative_to(root)
+            if is_excluded_skill_path(skill_md):
+                continue  # .archive/.library/... are not org-shared skills
             if rel.parts:
                 names.append(str(rel).replace("\\", "/"))
     except Exception as e:

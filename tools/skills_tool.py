@@ -84,6 +84,7 @@ from utils import env_var_enabled
 from agent.skill_utils import (
     EXCLUDED_SKILL_DIRS as _EXCLUDED_SKILL_DIRS,
     is_skill_support_path as _is_skill_support_path,
+    is_excluded_skill_path as _is_excluded_skill_path,
 )
 
 logger = logging.getLogger(__name__)
@@ -1282,18 +1283,29 @@ def skill_view(
             seen_md.add(key)
             candidates.append((sd, smd))
 
+        # Explicit-path lookups (e.g. ".archive/2026-08/old-skill") may address
+        # excluded storage dirs for one-off previews; bare names never resolve
+        # into excluded dirs (.archive/.library/...). A path separator is what
+        # makes a lookup "explicit" — a bare dot-prefixed name is still a name.
+        _explicit_lookup = "/" in name or "\\" in name
+
         for search_dir in all_dirs:
             # Strategy 1: direct path (e.g., "mlops/axolotl" or bare "axolotl"
-            # at the top of the dir).
+            # at the top of the dir). Excluded storage dirs are not addressable
+            # by NAME; only an explicit path into them previews content.
             direct_path = search_dir / name
             if (
-                not _is_skill_support_path(direct_path)
+                (
+                    not _is_excluded_skill_path(direct_path)
+                    or _explicit_lookup
+                )
                 and direct_path.is_dir()
                 and (direct_path / "SKILL.md").exists()
             ):
                 _record(direct_path, direct_path / "SKILL.md")
-            elif direct_path.with_suffix(".md").exists() and not _is_skill_support_path(
-                direct_path.with_suffix(".md")
+            elif direct_path.with_suffix(".md").exists() and (
+                not _is_excluded_skill_path(direct_path.with_suffix(".md"))
+                or _explicit_lookup
             ):
                 _record(None, direct_path.with_suffix(".md"))
 
@@ -1303,14 +1315,14 @@ def skill_view(
             if local_category_name:
                 categorized_path = search_dir / local_category_name
                 if (
-                    not _is_skill_support_path(categorized_path)
+                    not _is_excluded_skill_path(categorized_path)
                     and categorized_path.is_dir()
                     and (categorized_path / "SKILL.md").exists()
                 ):
                     _record(categorized_path, categorized_path / "SKILL.md")
                 elif categorized_path.with_suffix(
                     ".md"
-                ).exists() and not _is_skill_support_path(
+                ).exists() and not _is_excluded_skill_path(
                     categorized_path.with_suffix(".md")
                 ):
                     _record(None, categorized_path.with_suffix(".md"))
@@ -1333,11 +1345,12 @@ def skill_view(
                     _record(found_skill_md.parent, found_skill_md)
 
             # Strategy 3: legacy flat <name>.md files anywhere under the dir.
-            # Exclude skill support docs: references/templates/assets/scripts
-            # are loaded through skill_view(skill, file_path=...) and must not
-            # shadow or collide with real skills that share the same basename.
+            # Exclude skill support docs (references/templates/assets/scripts —
+            # loaded through skill_view(skill, file_path=...) and must not
+            # shadow real skills sharing the basename) AND excluded storage
+            # dirs (.archive/.library/...), which are not addressable by name.
             for found_md in search_dir.rglob(f"{name}.md"):
-                if found_md.name != "SKILL.md" and not _is_skill_support_path(
+                if found_md.name != "SKILL.md" and not _is_excluded_skill_path(
                     found_md
                 ):
                     _record(None, found_md)
