@@ -3663,6 +3663,7 @@ def list_tasks(
     *,
     assignee: Optional[str] = None,
     status: Optional[str] = None,
+    block_kind: Optional[str] = None,
     tenant: Optional[str] = None,
     session_id: Optional[str] = None,
     include_archived: bool = False,
@@ -3681,6 +3682,13 @@ def list_tasks(
             raise ValueError(f"status must be one of {sorted(VALID_STATUSES)}")
         query += " AND status = ?"
         params.append(status)
+    if block_kind is not None:
+        if block_kind not in VALID_BLOCK_KINDS:
+            raise ValueError(
+                f"block_kind must be one of {sorted(VALID_BLOCK_KINDS)}"
+            )
+        query += " AND block_kind = ?"
+        params.append(block_kind)
     if tenant is not None:
         query += " AND tenant = ?"
         params.append(tenant)

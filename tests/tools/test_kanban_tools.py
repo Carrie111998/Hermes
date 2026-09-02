@@ -1134,3 +1134,28 @@ def test_attach_url_happy_path_public_host(worker_env, default_url_guard, monkey
         assert Path(atts[0].stored_path).read_bytes() == payload
     finally:
         conn.close()
+
+
+def test_task_summary_dict_carries_block_kind(monkeypatch, tmp_path):
+    """Tool listing rows must expose the block kind.
+
+    Counterpart to test_task_to_dict_carries_block_kind in the CLI tests: the
+    two serializers are independent literals, so each needs its own pin or a
+    dropped key only shows up in one of them.
+    """
+    from pathlib import Path
+
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+
+    from hermes_cli import kanban_db as kb
+    from tools.kanban_tools import _task_summary_dict
+
+    kb.init_db()
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="decide this", assignee="ops")
+        kb.block_task(conn, tid, reason="your call", kind="needs_input")
+        row = _task_summary_dict(kb, conn, kb.get_task(conn, tid))
+    assert row["block_kind"] == "needs_input"

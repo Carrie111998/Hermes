@@ -179,3 +179,20 @@ def test_run_slash_reclaim_running_task(kanban_home):
 # ---------------------------------------------------------------------------
 
 
+
+
+def test_task_to_dict_carries_block_kind(kanban_home):
+    """`--json` rows must expose the block kind.
+
+    This and tools/_task_summary_dict are separate dicts built by hand, so
+    they drift silently: dropping the key from one leaves the other passing.
+    Each front end pins its own.
+    """
+    from hermes_cli import kanban_db as kb
+    from hermes_cli.kanban import _task_to_dict
+
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="decide this", assignee="ops")
+        kb.block_task(conn, tid, reason="your call", kind="needs_input")
+        row = _task_to_dict(kb.get_task(conn, tid))
+    assert row["block_kind"] == "needs_input"

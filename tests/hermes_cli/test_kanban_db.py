@@ -1647,3 +1647,64 @@ def test_bare_connect_does_not_close_on_context_exit(tmp_path):
     # Still usable after with-block exit (the leak).
     conn.execute("SELECT 1").fetchone()
     conn.close()  # explicit close to avoid leaking THIS test
+
+
+# ---------------------------------------------------------------------------
+# list_tasks: block_kind filter
+# ---------------------------------------------------------------------------
+
+def test_list_tasks_rejects_unknown_block_kind(kanban_home):
+    """Bad kinds are refused at the DB layer, naming the valid set.
+
+    Both front ends (CLI --kind, kanban_list tool) lean on this: the CLI's
+    argparse choices catch it earlier, but the tool passes the raw string
+    through, so this is the only thing standing between a model's typo and a
+    silently empty result set.
+    """
+    with kb.connect() as conn:
+        with pytest.raises(ValueError) as e:
+            kb.list_tasks(conn, block_kind="not_a_kind")
+        assert "block_kind must be one of" in str(e.value)
+        for kind in kb.VALID_BLOCK_KINDS:
+            assert kind in str(e.value)
+
+
+def test_list_tasks_filters_by_block_kind(kanban_home):
+    with kb.connect() as conn:
+        waiting = kb.create_task(conn, title="needs a human", assignee="ops")
+        walled = kb.create_task(conn, title="hard wall", assignee="ops")
+        open_card = kb.create_task(conn, title="still going", assignee="ops")
+        assert kb.block_task(conn, waiting, reason="which one?", kind="needs_input")
+        assert kb.block_task(conn, walled, reason="no creds", kind="capability")
+
+        got = {t.id for t in kb.list_tasks(conn, block_kind="needs_input")}
+        assert got == {waiting}, "filter must not leak other kinds"
+        assert {t.id for t in kb.list_tasks(conn, block_kind="capability")} == {walled}
+
+        # Omitting the filter is unchanged: every task still comes back.
+        assert {t.id for t in kb.list_tasks(conn)} >= {waiting, walled, open_card}
+
+
+def test_blocked_plus_needs_input_is_the_waiting_on_human_set(kanban_home):
+    """The pairing the filter exists for.
+
+    `dependency` blocks resolve themselves and must never show up as work
+    waiting on a person; `needs_input` is the set a human actually owes an
+    answer to.
+    """
+    with kb.connect() as conn:
+        human = kb.create_task(conn, title="decide this", assignee="ops")
+        dep = kb.create_task(conn, title="waiting on another card", assignee="ops")
+        wall = kb.create_task(conn, title="no credentials", assignee="ops")
+        kb.block_task(conn, human, reason="your call", kind="needs_input")
+        kb.block_task(conn, dep, reason="blocked on #1", kind="dependency")
+        # `capability` also lands in `blocked`, so status alone cannot
+        # separate it from `needs_input` — that is what makes this a real
+        # test of the kind filter rather than of the status filter.
+        kb.block_task(conn, wall, reason="no creds", kind="capability")
+
+        rows = kb.list_tasks(conn, status="blocked", block_kind="needs_input")
+        assert [t.id for t in rows] == [human]
+        assert all(t.block_kind == "needs_input" for t in rows)
+        # `dependency` waits in todo, never surfacing as work owed a person.
+        assert kb.get_task(conn, dep).status == "todo"

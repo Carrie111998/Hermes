@@ -63,6 +63,7 @@ def _task_to_dict(t: kb.Task) -> dict[str, Any]:
         "body": t.body,
         "assignee": t.assignee,
         "status": t.status,
+        "block_kind": t.block_kind,
         "priority": t.priority,
         "tenant": t.tenant,
         "workspace_kind": t.workspace_kind,
@@ -467,6 +468,11 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_list.add_argument("--assignee", default=None)
     p_list.add_argument("--status", default=None,
                         choices=sorted(kb.VALID_STATUSES))
+    p_list.add_argument("--kind", default=None,
+                        choices=sorted(kb.VALID_BLOCK_KINDS),
+                        help="Filter by block kind. With --status blocked, "
+                             "'--kind needs_input' is the queue waiting on a "
+                             "human.")
     p_list.add_argument("--tenant", default=None)
     p_list.add_argument("--session", default=None,
                         help="Filter by originating chat/agent session id "
@@ -1750,6 +1756,7 @@ def _cmd_list(args: argparse.Namespace) -> int:
             conn,
             assignee=assignee,
             status=args.status,
+            block_kind=getattr(args, "kind", None),
             tenant=args.tenant,
             session_id=args.session,
             include_archived=args.archived,

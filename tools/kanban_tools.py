@@ -497,6 +497,7 @@ def _task_summary_dict(kb, conn, task) -> dict[str, Any]:
         "title": task.title,
         "assignee": task.assignee,
         "status": task.status,
+        "block_kind": task.block_kind,
         "priority": task.priority,
         "tenant": task.tenant,
         "workspace_kind": task.workspace_kind,
@@ -604,6 +605,7 @@ def _handle_list(args: dict, **kw) -> str:
         return guard
     assignee = args.get("assignee")
     status = args.get("status")
+    block_kind = args.get("kind")
     tenant = args.get("tenant")
     include_archived, bool_error = _parse_bool_arg(args, "include_archived")
     if bool_error:
@@ -632,6 +634,7 @@ def _handle_list(args: dict, **kw) -> str:
                 conn,
                 assignee=assignee,
                 status=status,
+                block_kind=block_kind,
                 tenant=tenant,
                 include_archived=include_archived,
                 limit=limit + 1,
@@ -1762,6 +1765,21 @@ KANBAN_LIST_SCHEMA = {
                     "blocked", "done", "archived",
                 ],
                 "description": "Optional task status filter.",
+            },
+            "kind": {
+                "type": "string",
+                # Mirrors kanban_db.VALID_BLOCK_KINDS, the same way
+                # KANBAN_BLOCK_SCHEMA below does: kanban_db is imported
+                # lazily in this module to avoid an import cycle, so it is
+                # not available where these schema dicts are built. Add a
+                # kind there and update both enums. Until then the handler
+                # still validates against the real constant, so an unlisted
+                # kind is rejected by name rather than silently mishandled.
+                "enum": ["dependency", "needs_input", "capability", "transient"],
+                "description": (
+                    "Optional block-kind filter. Pair with status='blocked' to "
+                    "get just the cards waiting on a human: kind='needs_input'."
+                ),
             },
             "tenant": {
                 "type": "string",
