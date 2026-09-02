@@ -9,6 +9,7 @@ import { useLocation } from 'react-router'
 import type { SubmitTextOptions } from '@/app/session/hooks/use-prompt-actions/utils'
 import { sessionShouldHaveTranscript } from '@/app/session/hooks/use-session-actions/utils'
 import { Thread } from '@/components/assistant-ui/thread'
+import { deriveTimelineEntries } from '@/components/assistant-ui/thread/timeline-data'
 import { TranscriptWindowProvider } from '@/components/assistant-ui/thread/transcript-window'
 import { Backdrop } from '@/components/Backdrop'
 import { COMPOSER_HEART_CONFIG, HeartField } from '@/components/chat/vibe-hearts'
@@ -20,7 +21,7 @@ import { ErrorState } from '@/components/ui/error-state'
 import { TitleMenuTrigger } from '@/components/ui/title-menu-trigger'
 import { type HermesGateway } from '@/hermes'
 import { useI18n } from '@/i18n'
-import type { ChatMessage } from '@/lib/chat-messages'
+import { type ChatMessage, chatMessageText } from '@/lib/chat-messages'
 import { NEW_SESSION_TITLE, quickModelOptions, sessionTitle } from '@/lib/chat-runtime'
 import { useIncrementalExternalStoreRuntime } from '@/lib/incremental-external-store-runtime'
 import { modelOptionsQueryKey, requestModelOptions } from '@/lib/model-options'
@@ -250,12 +251,14 @@ function ChatRuntimeBoundary({
   // Sticky-cut continuity across flushes (advanceTranscriptWindow). A ref, not
   // state: it is derived from `messages` and must never trigger a render.
   const windowStateRef = useRef<null | TranscriptWindowState>(null)
+  const [revealTarget, setRevealTarget] = useState<string | null>(null)
 
   // Reset the window on session swap during RENDER, so a large expand from the
   // previous chat can't leak into the next one's first paint (#55191).
   if (windowSessionKey !== runtimeId) {
     setWindowSessionKey(runtimeId)
     setWindowPages(1)
+    setRevealTarget(null)
     windowStateRef.current = null
   }
 
@@ -268,6 +271,48 @@ function ChatRuntimeBoundary({
   }, [messages, windowPages])
 
   const runtimeMessageRepository = useRuntimeMessageRepository(windowedMessages)
+
+  const cancelReveal = useCallback(() => setRevealTarget(null), [])
+
+  const revealMessage = useCallback(
+    (messageId: string) => {
+      if (!view.$messages.get().some(message => message.id === messageId)) {
+        return
+      }
+
+      setRevealTarget(messageId)
+      setWindowPages(pages => pages + 1)
+    },
+    [view]
+  )
+
+  useEffect(() => {
+    const target = revealTarget
+
+    if (!target) {
+      return
+    }
+
+    if (!messages.some(message => message.id === target)) {
+      setRevealTarget(null)
+
+      return
+    }
+
+    if (windowedMessages.some(message => message.id === target)) {
+      setRevealTarget(null)
+
+      return
+    }
+
+    if (windowed) {
+      setWindowPages(pages => pages + 1)
+
+      return
+    }
+
+    setRevealTarget(null)
+  }, [messages, revealTarget, windowed, windowedMessages])
 
   const storedId = useStore(view.$storedId)
   const connection = useStore($connection)
@@ -323,7 +368,35 @@ function ChatRuntimeBoundary({
 
   const olderAvailable = windowed || restBackfillAvailable
 
-  const transcriptWindow = useMemo(() => ({ olderAvailable, expandWindow }), [expandWindow, olderAvailable])
+  const timelinePromptSignature = messages
+    .filter(message => message.role === 'user')
+    .map(message => message.id)
+    .join('\n')
+
+  const timelineEntries = useMemo(
+    () =>
+      deriveTimelineEntries(
+        messages
+          .filter(message => message.role === 'user')
+          .map(message => ({ id: message.id, role: message.role, text: chatMessageText(message) }))
+      ),
+    // User prompt text is immutable for an existing id; edits create a new
+    // message id. Keep assistant streaming out of this derivation.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [timelinePromptSignature]
+  )
+
+  const transcriptWindow = useMemo(
+    () => ({
+      cancelReveal,
+      olderAvailable,
+      expandWindow,
+      revealMessage,
+      revealScope: runtimeId || storedId || '',
+      timelineEntries
+    }),
+    [cancelReveal, expandWindow, olderAvailable, revealMessage, runtimeId, storedId, timelineEntries]
+  )
 
   const runtime = useIncrementalExternalStoreRuntime<ThreadMessage>({
     messageRepository: runtimeMessageRepository,
