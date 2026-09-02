@@ -282,6 +282,13 @@ VALID_HOOKS: Set[str] = {
     #   run_id: int | None, profile_name: str.
     # kanban_task_completed adds: summary: str | None.
     # kanban_task_blocked adds:   reason: str | None.
+    # ``before_kanban_task_complete`` is the sole synchronous policy hook in
+    # this family. It runs before ``complete_task`` writes ``done`` and may
+    # return ``True``/``None`` to allow, or ``False``, a reason string, or
+    # ``{"allow": false, "reason": "..."}`` to veto. It receives the
+    # typed task snapshot, actor and completion metadata; it is intentionally
+    # not a terminal-command parser.
+    "before_kanban_task_complete",
     "kanban_task_claimed",
     "kanban_task_completed",
     "kanban_task_blocked",

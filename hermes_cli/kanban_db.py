@@ -210,6 +210,83 @@ def _fire_kanban_lifecycle_hook(event: str, task_id: str, **fields: Any) -> None
         _log.debug("kanban lifecycle hook %s failed: %s", event, exc)
 
 
+def _completion_actor(actor: Optional[str]) -> str:
+    """Resolve the profile identity that is attempting a task completion."""
+    candidate = actor
+    if candidate is None:
+        try:
+            from hermes_cli.profiles import get_active_profile_name
+
+            candidate = get_active_profile_name()
+        except Exception:
+            candidate = None
+    return _canonical_assignee(candidate) or "unknown"
+
+
+def _completion_veto_reason(results: Iterable[Any]) -> Optional[str]:
+    """Normalize typed ``before_kanban_task_complete`` policy decisions."""
+    for result in results:
+        if result is None or result is True:
+            continue
+        if result is False:
+            return "completion blocked by before_kanban_task_complete policy"
+        if isinstance(result, str):
+            return result.strip() or "completion blocked by policy"
+        if isinstance(result, Mapping):
+            allowed = result.get("allow")
+            if allowed is True:
+                continue
+            reason = result.get("reason")
+            if isinstance(reason, str) and reason.strip():
+                return reason.strip()
+            if allowed is False:
+                return "completion blocked by policy"
+            return "completion policy returned malformed decision"
+        return "completion policy returned unsupported decision"
+    return None
+
+
+def _before_kanban_task_complete(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    actor: str,
+    summary: Optional[str],
+    result: Optional[str],
+    metadata: Optional[dict],
+) -> Optional[str]:
+    """Return a veto reason before the authoritative completion write."""
+    try:
+        # Completion may be invoked by a worker-side Kanban tool, which does
+        # not otherwise need the plugin registry.  Discover configured plugins
+        # here so a typed completion policy is never silently bypassed merely
+        # because this is the first plugin-aware operation in that process.
+        from hermes_cli.plugins import discover_plugins
+
+        discover_plugins()
+        from hermes_cli.lifecycle import has_hook, invoke_hook
+
+        if not has_hook("before_kanban_task_complete"):
+            return None
+        task = get_task(conn, task_id)
+        if task is None:
+            return "task not found"
+        decisions = invoke_hook(
+            "before_kanban_task_complete",
+            task_id=task_id,
+            task=task,
+            actor=actor,
+            summary=summary,
+            result=result,
+            metadata=metadata,
+            board=get_current_board(),
+        )
+        return _completion_veto_reason(decisions)
+    except Exception as exc:
+        # A configured policy that cannot run must not become an allow.
+        return f"before_kanban_task_complete hook failed: {type(exc).__name__}"
+
+
 def _kanban_observer_consumed(event: str) -> bool:
     """Return whether any first-party observer or plugin consumes *event*.
 
@@ -5370,6 +5447,7 @@ def complete_task(
     created_cards: Optional[Iterable[str]] = None,
     expected_run_id: Optional[int] = None,
     fire_lifecycle_hook: bool = True,
+    actor: Optional[str] = None,
 ) -> bool:
     """Transition ``running|ready|blocked|review -> done`` and record ``result``.
 
@@ -5404,6 +5482,7 @@ def complete_task(
     and never blocks.
     """
     now = int(time.time())
+    completion_actor = _completion_actor(actor)
     # Fail before validating cards or staging artifacts; re-check inside the
     # final write transaction below to close the parent-reopen race.
     if not _parents_satisfied(conn, task_id):
@@ -5435,6 +5514,24 @@ def complete_task(
             raise HallucinatedCardsError(phantom_cards, task_id)
     else:
         verified_cards = []
+
+    veto_reason = _before_kanban_task_complete(
+        conn,
+        task_id,
+        actor=completion_actor,
+        summary=summary,
+        result=result,
+        metadata=metadata,
+    )
+    if veto_reason is not None:
+        with write_txn(conn):
+            _append_event(
+                conn,
+                task_id,
+                "completion_blocked_policy",
+                {"actor": completion_actor, "reason": veto_reason[:400]},
+            )
+        return False
 
     metadata = _merge_completion_prose_artifacts(
         conn, task_id, metadata, summary=summary, result=result,
