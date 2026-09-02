@@ -11,9 +11,11 @@ All run zero LLM calls.
 import inspect
 import json
 import time
+from datetime import datetime
 
 import pytest
 
+import hermes_time
 from hermes_state import SessionDB
 from tools.session_search_tool import (
     SESSION_SEARCH_SCHEMA,
@@ -22,6 +24,7 @@ from tools.session_search_tool import (
     _is_compression_ended,
     _resolve_to_parent,
     _session_link,
+    _shape_message,
     session_search,
 )
 
@@ -107,6 +110,81 @@ class TestFormatTimestamp:
         assert "2023" in _format_timestamp(1700000000)
         assert _format_timestamp(None) == "unknown"
         assert _format_timestamp("not-a-number-string") == "not-a-number-string"
+
+
+class TestTimestampsAreTimezoneAnchored:
+    """Regression tests for #75751 — timestamps reached the model unanchored.
+
+    Session timestamps are stored as absolute epoch floats, but the tool used
+    to render them through a naive ``datetime.fromtimestamp()``: the wall clock
+    came from the *server's* zone rather than the configured one, and the
+    output carried no zone marker. The system prompt separately tells the model
+    which zone the user is in, so an unlabelled wall clock gets read as UTC and
+    shifted by the offset a second time — the reported symptom was timestamps
+    exactly one UTC offset away.
+    """
+
+    # 2026-08-01 02:35 EEST (+03:00) == 2026-07-31 23:35 UTC — the hour the
+    # reporter asked "list all commands you executed in the last 4 hours".
+    RIGA_EPOCH = 1785540900.0
+
+    def setup_method(self):
+        hermes_time.reset_cache()
+
+    def teardown_method(self):
+        hermes_time.reset_cache()
+
+    def test_renders_the_configured_zone_not_the_server_zone(self, monkeypatch):
+        monkeypatch.setenv("HERMES_TIMEZONE", "Europe/Riga")
+        hermes_time.reset_cache()
+
+        rendered = _format_timestamp(self.RIGA_EPOCH)
+
+        # Riga wall clock. Under the suite's pinned TZ=UTC the naive render
+        # produced "July 31, 2026 at 11:35 PM" instead.
+        assert "August 01, 2026" in rendered
+        assert "02:35 AM" in rendered
+
+    def test_labels_the_zone_so_the_model_need_not_guess(self, monkeypatch):
+        monkeypatch.setenv("HERMES_TIMEZONE", "Europe/Riga")
+        hermes_time.reset_cache()
+
+        assert "EEST" in _format_timestamp(self.RIGA_EPOCH)
+
+    def test_unconfigured_timezone_still_renders_and_labels(self):
+        # No HERMES_TIMEZONE — fall back to server-local, but stay labelled.
+        # The host decides what to call that zone ("UTC" on the POSIX lanes,
+        # "Coordinated Universal Time" on Windows), so assert the shape of the
+        # output rather than a literal zone name.
+        bare = datetime.fromtimestamp(self.RIGA_EPOCH).astimezone().strftime(
+            "%B %d, %Y at %I:%M %p"
+        )
+
+        rendered = _format_timestamp(self.RIGA_EPOCH)
+
+        assert rendered.startswith(bare)
+        assert rendered[len(bare):].strip(), "server-local render carries no zone label"
+
+    def test_shaped_message_carries_an_offset_bearing_timestamp(self, monkeypatch):
+        monkeypatch.setenv("HERMES_TIMEZONE", "Europe/Riga")
+        hermes_time.reset_cache()
+
+        shaped = _shape_message({
+            "id": 1,
+            "role": "assistant",
+            "content": "ran the command",
+            "timestamp": self.RIGA_EPOCH,
+        })
+
+        # The raw epoch stays put for anything that measures durations...
+        assert shaped["timestamp"] == self.RIGA_EPOCH
+        # ...and the model gets a time it can read without converting.
+        assert shaped["timestamp_iso"] == "2026-08-01T02:35:00+03:00"
+
+    def test_shaped_message_without_a_timestamp_omits_the_iso_field(self):
+        shaped = _shape_message({"id": 1, "role": "user", "content": "hi"})
+
+        assert "timestamp_iso" not in shaped
 
 
 # =========================================================================
