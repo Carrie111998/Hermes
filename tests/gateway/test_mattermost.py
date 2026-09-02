@@ -594,3 +594,98 @@ async def test_mattermost_top_level_channel_post_is_thread_root():
     assert msg_event.message_id == "top_post_123"
 
 
+# ---------------------------------------------------------------------------
+# Standalone send (out-of-process cron delivery) — media descriptor shapes
+# ---------------------------------------------------------------------------
+
+class TestMattermostStandaloneSendMedia:
+    """``_standalone_send`` must accept the media shape the caller actually sends.
+
+    ``tools/send_message_tool`` builds ``media_files`` with
+    ``BasePlatformAdapter.extract_media()``, which returns ``(path, is_voice)``
+    tuples (see ``gateway/platforms/base.py``), and forwards them unchanged to
+    the platform's ``standalone_sender_fn``.
+    """
+
+    @staticmethod
+    def _fake_session(responses):
+        """Build an aiohttp.ClientSession stand-in returning `responses` in order."""
+        calls = []
+
+        def _make_resp(spec):
+            resp = AsyncMock()
+            resp.status = spec["status"]
+            resp.json = AsyncMock(return_value=spec.get("json", {}))
+            resp.text = AsyncMock(return_value=spec.get("text", ""))
+            resp.__aenter__ = AsyncMock(return_value=resp)
+            resp.__aexit__ = AsyncMock(return_value=False)
+            return resp
+
+        prepared = [_make_resp(spec) for spec in responses]
+
+        session = MagicMock()
+
+        def _post(url, **kwargs):
+            calls.append((url, kwargs))
+            return prepared[min(len(calls) - 1, len(prepared) - 1)]
+
+        session.post = MagicMock(side_effect=_post)
+        session.__aenter__ = AsyncMock(return_value=session)
+        session.__aexit__ = AsyncMock(return_value=False)
+        return session, calls
+
+    @pytest.mark.asyncio
+    async def test_tuple_media_descriptor_is_uploaded(self, tmp_path):
+        """A ``(path, is_voice)`` tuple uploads the file and attaches its id."""
+        from plugins.platforms.mattermost.adapter import _standalone_send
+
+        media = tmp_path / "report.pdf"
+        media.write_bytes(b"%PDF-1.4 test")
+
+        pconfig = MagicMock()
+        pconfig.token = "tok"
+        pconfig.extra = {"url": "https://mm.example.com"}
+
+        session, calls = self._fake_session([
+            {"status": 201, "json": {"file_infos": [{"id": "file_1"}]}},
+            {"status": 201, "json": {"id": "post_1"}},
+        ])
+
+        with patch("aiohttp.ClientSession", return_value=session):
+            result = await _standalone_send(
+                pconfig,
+                "chan_1",
+                "here is the report",
+                media_files=[(str(media), False)],
+            )
+
+        assert result.get("error") is None
+        assert result["success"] is True
+        assert result["message_id"] == "post_1"
+        # The upload happened, and the post carries the returned file id.
+        assert calls[0][0].endswith("/api/v4/files")
+        assert calls[1][1]["json"]["file_ids"] == ["file_1"]
+
+    @pytest.mark.asyncio
+    async def test_dict_and_plain_path_descriptors_still_work(self, tmp_path):
+        """Dict and bare-string descriptors keep working."""
+        from plugins.platforms.mattermost.adapter import _standalone_send
+
+        media = tmp_path / "photo.png"
+        media.write_bytes(b"\x89PNG")
+
+        pconfig = MagicMock()
+        pconfig.token = "tok"
+        pconfig.extra = {"url": "https://mm.example.com"}
+
+        for descriptor in ({"path": str(media)}, str(media)):
+            session, calls = self._fake_session([
+                {"status": 201, "json": {"file_infos": [{"id": "file_2"}]}},
+                {"status": 201, "json": {"id": "post_2"}},
+            ])
+            with patch("aiohttp.ClientSession", return_value=session):
+                result = await _standalone_send(
+                    pconfig, "chan_1", "hi", media_files=[descriptor]
+                )
+            assert result["success"] is True, descriptor
+            assert calls[1][1]["json"]["file_ids"] == ["file_2"], descriptor
