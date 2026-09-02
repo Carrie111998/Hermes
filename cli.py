@@ -12537,7 +12537,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             
             print()
             print("  To start the gateway:")
-            print("    python cli.py --gateway")
+            print("    hermes gateway run")
             print()
             print(f"  Configuration file: {display_hermes_home()}/config.yaml")
             print()
