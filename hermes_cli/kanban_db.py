@@ -8131,7 +8131,96 @@ def _record_worker_exit(pid: int, raw_status: int) -> None:
             _recent_worker_exits.pop(_pid, None)
 
 
-def _classify_worker_exit(pid: int) -> "tuple[str, Optional[int]]":
+def worker_exit_record_path(task_id: str, board: Optional[str] = None) -> Path:
+    """Path of the durable per-task worker exit sidecar.
+
+    Lives beside the worker log under the board's ``logs/`` dir so it
+    shares the board's isolation and GC story.
+    """
+    return worker_logs_dir(board=board) / f"{task_id}.exit.json"
+
+
+def record_worker_exit_status(
+    task_id: str,
+    pid: int,
+    exit_code: int,
+    *,
+    board: Optional[str] = None,
+) -> bool:
+    """Durably record a worker's own exit code for later classification.
+
+    Written by the WORKER PROCESS ITSELF on its controlled exit paths
+    (see the kanban exit-code branch in ``cli.py``). This exists because
+    the in-process ``_recent_worker_exits`` registry only works when the
+    dispatcher that spawned the worker is still alive to ``waitpid`` it.
+    Workers are spawned with ``start_new_session=True`` and the Popen
+    handle abandoned, so under one-shot ``hermes kanban dispatch`` the
+    dispatcher exits first, the worker is orphaned to init, init reaps
+    it, and NO hermes process ever observes the wait status. A later
+    dispatch then classifies every death as ``unknown`` -> ``crashed``,
+    which burns the retry budget even for quota-wall exits that were
+    deliberately assigned ``KANBAN_RATE_LIMIT_EXIT_CODE`` so they would
+    NOT count as failures (troubleshooting#83).
+
+    Best-effort: returns False (never raises) when the record cannot be
+    written. Signal deaths (SIGKILL/OOM) cannot be self-recorded and
+    still fall back to ``unknown``, which is the pre-existing behavior.
+    """
+    try:
+        path = worker_exit_record_path(task_id, board=board)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(path.suffix + f".tmp{os.getpid()}")
+        tmp.write_text(
+            json.dumps({
+                "pid": int(pid),
+                "exit_code": int(exit_code),
+                "recorded_at": int(time.time()),
+            }),
+            encoding="utf-8",
+        )
+        tmp.replace(path)
+        return True
+    except Exception:
+        return False
+
+
+def _read_worker_exit_record(
+    task_id: Optional[str],
+    pid: int,
+    *,
+    board: Optional[str] = None,
+) -> Optional[int]:
+    """Return the sidecar-recorded exit code for ``pid``, or None.
+
+    The record must name the same pid we are classifying: a stale
+    sidecar from a previous run of the same task must not be applied to
+    a different worker's death. The consumed record is removed so it can
+    never be read twice.
+    """
+    if not task_id:
+        return None
+    try:
+        path = worker_exit_record_path(task_id, board=board)
+        if not path.exists():
+            return None
+        data = json.loads(path.read_text(encoding="utf-8"))
+        try:
+            path.unlink()
+        except OSError:
+            pass
+        if int(data.get("pid", -1)) != int(pid):
+            return None
+        return int(data["exit_code"])
+    except Exception:
+        return None
+
+
+def _classify_worker_exit(
+    pid: int,
+    task_id: Optional[str] = None,
+    *,
+    board: Optional[str] = None,
+) -> "tuple[str, Optional[int]]":
     """Classify a recently-reaped worker by pid.
 
     Returns ``(kind, code)`` where ``kind`` is one of:
@@ -8147,9 +8236,10 @@ def _classify_worker_exit(pid: int) -> "tuple[str, Optional[int]]":
       counting a failure, so a long quota window can't trip the breaker.
     * ``"nonzero_exit"`` — ``WIFEXITED`` with non-zero status. Real error.
     * ``"signaled"`` — ``WIFSIGNALED`` (OOM killer, SIGKILL, etc). Real crash.
-    * ``"unknown"`` — pid was not in the reap registry (either reaped by
-      something else, or died between reap tick and liveness check). Fall
-      back to existing crashed-counter behavior.
+    * ``"unknown"`` — pid was neither in the reap registry nor covered by
+      a durable exit sidecar (e.g. it was reaped by init after the
+      dispatcher died, and then died by signal so it could not self-
+      record). Fall back to existing crashed-counter behavior.
 
     ``code`` is the exit status (for ``clean_exit`` / ``rate_limited`` /
     ``nonzero_exit``) or the signal number (for ``signaled``), or ``None``
@@ -8157,6 +8247,16 @@ def _classify_worker_exit(pid: int) -> "tuple[str, Optional[int]]":
     """
     entry = _recent_worker_exits.get(int(pid))
     if entry is None:
+        # In-process registry miss: the worker outlived the dispatcher
+        # that spawned it and was reaped by init. Fall back to the durable
+        # sidecar the worker's own exit path wrote (troubleshooting#83).
+        recorded = _read_worker_exit_record(task_id, pid, board=board)
+        if recorded is not None:
+            if recorded == 0:
+                return ("clean_exit", 0)
+            if recorded == KANBAN_RATE_LIMIT_EXIT_CODE:
+                return ("rate_limited", recorded)
+            return ("nonzero_exit", recorded)
         return ("unknown", None)
     raw, _ = entry
     try:
@@ -8925,7 +9025,7 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                 continue
 
             pid = int(row["worker_pid"])
-            kind, code = _classify_worker_exit(pid)
+            kind, code = _classify_worker_exit(pid, row["id"])
             rate_limited_exit = False
             if kind == "clean_exit":
                 # Worker subprocess returned 0 but its task is still

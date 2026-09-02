@@ -1647,3 +1647,79 @@ def test_bare_connect_does_not_close_on_context_exit(tmp_path):
     # Still usable after with-block exit (the leak).
     conn.execute("SELECT 1").fetchone()
     conn.close()  # explicit close to avoid leaking THIS test
+
+
+# ---------------------------------------------------------------------------
+# Durable worker exit sidecar (troubleshooting#83): under one-shot dispatch
+# the dispatcher dies before its workers, init reaps them, and the in-process
+# _recent_worker_exits registry never sees the wait status. The worker's own
+# exit path writes a sidecar; classification falls back to it so quota-wall
+# exits stop burning the retry budget.
+# ---------------------------------------------------------------------------
+
+
+def test_exit_sidecar_classifies_rate_limit_after_dispatcher_death(
+    kanban_home, monkeypatch,
+):
+    """Registry miss + sidecar with the rate-limit sentinel must classify
+    as ``rate_limited`` and requeue without counting a failure."""
+    import hermes_cli.kanban_db as _kb
+
+    monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+
+    with kb.connect() as conn:
+        host = _kb._claimer_id().split(":", 1)[0]
+        tid = kb.create_task(conn, title="sidecar-rl", assignee="a")
+        pid = 81234
+        kb.claim_task(conn, tid, claimer=f"{host}:deaddispatcher")
+        conn.execute(
+            "UPDATE tasks SET worker_pid=?, consecutive_failures=0 WHERE id=?",
+            (pid, tid),
+        )
+        conn.commit()
+
+        # No _record_worker_exit call: the dispatcher that would have
+        # reaped this worker is dead. The worker self-recorded instead.
+        assert pid not in _kb._recent_worker_exits
+        assert _kb.record_worker_exit_status(
+            tid, pid, _kb.KANBAN_RATE_LIMIT_EXIT_CODE
+        )
+
+        crashed = kb.detect_crashed_workers(conn)
+        assert tid not in crashed
+        rl = getattr(_kb.detect_crashed_workers, "_last_rate_limited", [])
+        assert tid in rl
+
+        task = kb.get_task(conn, tid)
+        assert task.status == "ready"
+        assert task.consecutive_failures == 0
+        # Sidecar consumed: a later death of a different pid must not
+        # inherit this record.
+        assert not _kb.worker_exit_record_path(tid).exists()
+
+
+def test_exit_sidecar_ignores_stale_pid_and_falls_back_unknown(
+    kanban_home, monkeypatch,
+):
+    """A sidecar naming a DIFFERENT pid is stale and must not be applied;
+    classification falls back to unknown -> crashed (pre-existing path)."""
+    import hermes_cli.kanban_db as _kb
+
+    monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+
+    with kb.connect() as conn:
+        host = _kb._claimer_id().split(":", 1)[0]
+        tid = kb.create_task(conn, title="sidecar-stale", assignee="a")
+        kb.claim_task(conn, tid, claimer=f"{host}:deaddispatcher")
+        conn.execute("UPDATE tasks SET worker_pid=? WHERE id=?", (91234, tid))
+        conn.commit()
+
+        # Sidecar from a previous run's worker, different pid.
+        assert _kb.record_worker_exit_status(
+            tid, 90000, _kb.KANBAN_RATE_LIMIT_EXIT_CODE
+        )
+
+        kind, code = _kb._classify_worker_exit(91234, tid)
+        assert (kind, code) == ("unknown", None)

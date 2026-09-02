@@ -22371,9 +22371,42 @@ def main(
                                     _exit_code = _RL_CODE
                                 except Exception:
                                     _exit_code = 1
+                        # Durably self-record the worker's exit code beside its
+                        # log (troubleshooting#83): under one-shot dispatch the
+                        # dispatcher is usually dead by now, init reaps this
+                        # process, and no hermes process ever sees the wait
+                        # status — so without this record a later dispatch
+                        # classifies the death as "unknown"/"crashed" and burns
+                        # the retry budget even for quota-wall exits.
+                        if os.environ.get("HERMES_KANBAN_TASK"):
+                            try:
+                                from hermes_cli.kanban_db import (
+                                    record_worker_exit_status as _rec_exit,
+                                )
+                                _rec_exit(
+                                    os.environ["HERMES_KANBAN_TASK"],
+                                    os.getpid(),
+                                    _exit_code,
+                                    board=os.environ.get("HERMES_KANBAN_BOARD"),
+                                )
+                            except Exception:
+                                pass
                         sys.exit(_exit_code)
 
                 # Exit with error code if credentials or agent init fails
+                if os.environ.get("HERMES_KANBAN_TASK"):
+                    try:
+                        from hermes_cli.kanban_db import (
+                            record_worker_exit_status as _rec_exit,
+                        )
+                        _rec_exit(
+                            os.environ["HERMES_KANBAN_TASK"],
+                            os.getpid(),
+                            1,
+                            board=os.environ.get("HERMES_KANBAN_BOARD"),
+                        )
+                    except Exception:
+                        pass
                 sys.exit(1)
             else:
                 # Single-query mode (`hermes chat -q "…"`): skip the welcome
