@@ -1063,6 +1063,19 @@ class SessionSchemaMixin:
         report_startup_progress(600.0, phase="state_db_init_schema")
 
         cursor = self._conn.cursor()
+        # Bound any file-level contention left by a SIGKILL'd predecessor
+        # (e.g. Web Dashboard force-killing a startup gateway mid-migration
+        # and leaving a hot WAL/SHM). Without a busy_timeout the migration
+        # SELECT/INSERT that hits SQLITE_BUSY raises immediately, but the
+        # watchdog lease it just acquired still delays the supervisor's
+        # respawn decision by up to 600s; with a short timeout the writer
+        # waits briefly and either succeeds after the stale lock clears or
+        # fails fast with a retriable busy error rather than hanging the
+        # startup phase indefinitely (#100968).
+        try:
+            cursor.execute("PRAGMA busy_timeout=5000")
+        except Exception:
+            pass
 
         cursor.executescript(SCHEMA_SQL)
 
@@ -1165,6 +1178,13 @@ class SessionSchemaMixin:
             # worst case is up to the lease duration of zombie time on a
             # wedged migration, accepted over per-chunk renewal complexity.
             report_startup_progress(600.0, phase="state_db_data_migrations")
+            # Also bound WAL contention from a SIGKILL'd predecessor that
+            # left a hot journal (#100968); see the matching pragma in
+            # _init_schema above.
+            try:
+                cursor.execute("PRAGMA busy_timeout=5000")
+            except Exception:
+                pass
             # Data migrations that can't be expressed declaratively (row
             # backfills, index changes tied to a specific version step) stay
             # in a version-gated chain. Column additions are handled by

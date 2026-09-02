@@ -434,6 +434,24 @@ def _kill_stale_dashboard_processes(
     if not pids:
         return {"matched": [], "killed": [], "failed": []}
 
+    # Defensive: never SIGKILL a live gateway even if its cmdline was
+    # mis-classified as a dashboard by the ps scan or the spawn ledger
+    # (e.g. a gateway startup that the Web Dashboard force-killed via
+    # SIGKILL leaves a stale gateway.pid/lock; the next gateway boot
+    # then hangs in state_db_data_migrations holding its progress lease
+    # until the watchdog times out — #100968). The dashboard kill path
+    # must own only dashboard/serve backends.
+    try:
+        from hermes_cli.gateway import find_gateway_pids
+
+        gateway_pids = set(find_gateway_pids(all_profiles=True))
+        if gateway_pids:
+            pids = [pid for pid in pids if pid not in gateway_pids]
+            if not pids:
+                return {"matched": [], "killed": [], "failed": []}
+    except Exception:
+        pass
+
     # Before killing, snapshot systemd cgroup info for each PID so we can
     # restart supervised services after the kill (the cgroup disappears
     # along with the process).  Only meaningful on Linux, and only when the
