@@ -2408,6 +2408,10 @@ def init_agent(
     compression_idle_compact_after_seconds = max(
         0, int(_compression_cfg.get("idle_compact_after_seconds", 0))
     )
+    # Optional extra summarizer guidance. Empty / whitespace / non-string
+    # means unset (current Hermes structured compact template). Stored as-is;
+    # the compressor inserts a set string verbatim as the full outcome instruction.
+    compression_summary_instructions = _compression_cfg.get("summary_instructions", "")
 
     # Read optional explicit context_length override for the auxiliary
     # compression model. Custom endpoints often cannot report this via
@@ -2871,6 +2875,7 @@ def init_agent(
             proactive_prune_min_reclaim_tokens=compression_proactive_prune_min_reclaim,
             min_tail_user_messages=compression_min_tail_users,
             tail_mode=compression_tail_mode,
+            summary_instructions=compression_summary_instructions,
         )
     _bind_session_state = getattr(agent.context_compressor, "bind_session_state", None)
     if callable(_bind_session_state):
@@ -2904,6 +2909,8 @@ def init_agent(
             compression_micro_compact_defrag_tokens
         )
     agent.compression_checkpoint_required = compression_checkpoint_required
+    if _cc is not None and hasattr(_cc, "summary_instructions"):
+        _cc.summary_instructions = compression_summary_instructions
     agent.codex_app_server_auto_compaction = codex_app_server_auto_compaction
     agent.codex_responses_native_compaction = codex_responses_native_compaction
     agent.codex_responses_compact_threshold = codex_responses_compact_threshold

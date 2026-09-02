@@ -3439,6 +3439,7 @@ class ContextCompressor(ContextEngine):
         proactive_prune_min_reclaim_tokens: int = 4096,
         min_tail_user_messages: int = 1,
         tail_mode: str = "lean",
+        summary_instructions: str = "",
     ):
         self.model = model
         self.base_url = base_url
@@ -3449,6 +3450,11 @@ class ContextCompressor(ContextEngine):
         # tail + verbatim-user-message summary section + recovery pointers;
         # "legacy" = 0.20*window tail (shipping behavior).
         self.tail_mode = tail_mode if tail_mode in ("legacy", "lean") else "lean"
+        # Optional summarizer outcome instructions (compression.summary_instructions).
+        # Empty / whitespace / non-string = unset (structured compact template).
+        # Read at prompt-build time via getattr so plugin engines can receive a
+        # post-init assign.
+        self.summary_instructions = summary_instructions
         # Per-model threshold overrides (longest substring match wins).
         # Stored as a plain dict; resolved in _resolve_threshold(), then the
         # small-context floor is applied on top.
@@ -5016,6 +5022,19 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
         self.summary_model = ""  # empty = use main model
         self._clear_compression_failure_cooldown()  # no cooldown — retry immediately
 
+    def _effective_summary_instructions(self) -> str:
+        """Return configured summarizer guidance, or "" when unset.
+
+        Empty string, whitespace-only, None, and non-string values all mean
+        unset so the default structured compact template stays in place. The
+        value is returned verbatim (no interpolation) when set and replaces
+        the entire batch template (and micro merge prose).
+        """
+        raw = getattr(self, "summary_instructions", "")
+        if not isinstance(raw, str) or not raw.strip():
+            return ""
+        return raw
+
     def _generate_summary(
         self,
         turns_to_summarize: List[Dict[str, Any]],
@@ -5305,9 +5324,28 @@ repeat each one verbatim here — copy the exact text, do NOT paraphrase, summar
 or describe them. These markers tell the agent which skills must be reloaded before
 use. If none appear, omit this section entirely.]
 
-Target ~{summary_budget + (_LEAN_SESSION_LOG_BUDGET_TOKENS if _session_log_section else 0)} tokens. Be CONCRETE — include file paths, command outputs, error messages, line numbers, and specific values. Avoid vague descriptions like "made some changes" — say exactly what changed.
+Target ~{summary_budget + (_LEAN_SESSION_LOG_BUDGET_TOKENS if _session_log_section else 0)} tokens. """
+        # Concatenate guidance so a configured string is never interpolated
+        # (.format / f-string would expand braces in the user value).
+        _custom_instructions = self._effective_summary_instructions()
+        if _custom_instructions:
+            _outcome_instructions = (
+                _custom_instructions
+                + _temporal_anchoring_rule
+            )
+        else:
+            _concrete_sentence = (
+                "Be CONCRETE — include file paths, command outputs, error messages, "
+                "line numbers, and specific values. Avoid vague descriptions like "
+                '"made some changes" — say exactly what changed.'
+            )
+            _outcome_instructions = (
+                _template_sections
+                + _concrete_sentence
+                + f"""
 {_temporal_anchoring_rule}
 Write only the summary body. Do not include any preamble or prefix."""
+            )
 
         if self._previous_summary:
             # Iterative update: preserve existing info, add new progress.
@@ -5320,7 +5358,25 @@ Write only the summary body. Do not include any preamble or prefix."""
             _bounded_previous_summary = self._bound_summary_input(
                 self._previous_summary
             )
-            prompt = f"""{_summarizer_preamble}
+            if _custom_instructions:
+                prompt = (
+                    f"""{_summarizer_preamble}
+
+You are updating a context compaction summary. A previous compaction produced the summary below. New conversation turns have occurred since then and need to be incorporated.
+
+PREVIOUS SUMMARY:
+{_bounded_previous_summary}
+
+NEW TURNS TO INCORPORATE:
+{content_to_summarize}{_memory_section}
+
+Update the previous summary using these rules:
+
+"""
+                    + _outcome_instructions
+                )
+            else:
+                prompt = f"""{_summarizer_preamble}
 
 You are updating a context compaction summary. A previous compaction produced the summary below. New conversation turns have occurred since then and need to be incorporated.
 
@@ -5332,10 +5388,23 @@ NEW TURNS TO INCORPORATE:
 
 Update the summary using this exact structure. PRESERVE all existing information that is still relevant. ADD new completed actions to the numbered list (continue numbering). Move items from "In Progress" to "Completed Actions" when done. Move answered questions to "Resolved Questions". Update "Active State" to reflect current state. Remove information only if it is clearly obsolete. CRITICAL: Update "## Active Task" to reflect the user's most recent unfulfilled input — this includes any question, decision request, or discussion turn that the assistant has not yet answered. Only write "None" if the last exchange was fully resolved.
 
-{_template_sections}"""
+{_outcome_instructions}"""
         else:
             # First compaction: summarize from scratch
-            prompt = f"""{_summarizer_preamble}
+            if _custom_instructions:
+                prompt = (
+                    f"""{_summarizer_preamble}
+
+Create a structured checkpoint summary for the conversation after earlier turns are compacted. The summary should preserve enough detail for continuity without re-reading the original turns.
+
+TURNS TO SUMMARIZE:
+{content_to_summarize}{_memory_section}
+
+"""
+                    + _outcome_instructions
+                )
+            else:
+                prompt = f"""{_summarizer_preamble}
 
 Create a structured checkpoint summary for the conversation after earlier turns are compacted. The summary should preserve enough detail for continuity without re-reading the original turns.
 
@@ -5344,7 +5413,7 @@ TURNS TO SUMMARIZE:
 
 Use this exact structure:
 
-{_template_sections}"""
+{_outcome_instructions}"""
 
         # Inject focus topic guidance when the user provides one via /compress <focus>.
         # This goes at the end of the prompt so it takes precedence.
@@ -7125,17 +7194,27 @@ This compaction should PRIORITISE preserving all information related to the focu
         else:
             summary_block = "(No previous summary yet.)"
 
+        _merge_prose = (
+            "Merge the exchange's key decisions, requirements, file paths, and "
+            "open questions into the summary.  Preserve the summary's structure.  "
+            "Drop resolved details that are no longer relevant.  Add new decisions, "
+            "file paths, and open questions."
+        )
+        _custom_instructions = self._effective_summary_instructions()
+        # Concatenate guidance so a configured string is never interpolated
+        # (.format / f-string would expand braces in the user value).
+        _guidance = _custom_instructions if _custom_instructions else _merge_prose
         user_prompt = (
             "You are a summarization agent creating a compact record of an "
             "ongoing conversation.  You are given a running summary and the "
-            "next exchange from the conversation.  Merge the exchange's key "
-            "decisions, requirements, file paths, and open questions into the "
-            "summary.  Preserve the summary's structure.  Drop resolved details "
-            "that are no longer relevant.  Add new decisions, file paths, and "
-            "open questions.\n\n"
+            "next exchange from the conversation.  "
+            + _guidance
+            + "\n\n"
             "NEVER include API keys, tokens, passwords, secrets, credentials, "
             "or connection strings in the summary \u2014 replace any that appear "
-            f"with [REDACTED].\n\n"
+            "with [REDACTED].\n\n"
+        )
+        user_prompt = user_prompt + (
             f"## Current Running Summary\n{summary_block}\n\n"
             f"## Next Exchange to Merge\n{exchange_text}\n\n"
             "Return ONLY the updated summary text, no preamble or explanation. "
