@@ -212,6 +212,11 @@ DEFAULT_CONFIG = {
         # (docker/modal/ssh — they have their own probe).  Set False to
         # disable entirely.
         "environment_probe": True,
+        # Live remote-backend probe used to describe Docker/SSH/cloud sandbox
+        # OS, user, home, and cwd in the stable system prompt. Disable this
+        # when an embedder supplies deterministic details via environment_hint
+        # and does not want prompt construction to start a probe environment.
+        "remote_backend_probe": True,
         # Bot Mode teammate-messaging protocol section (silent unless a
         # profile is managed by the desktop's Bot Mode).
         "bot_mode_protocol": True,
