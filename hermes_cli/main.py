@@ -43,7 +43,30 @@ Usage:
     hermes claw migrate --dry-run  # Preview migration without changes
 """
 
-# IMPORTANT: hermes_bootstrap must be the very first import — it sets up
+# ``qualification`` is deliberately dispatched before normal CLI startup.
+# The public contract is observation-only: parsing and reporting this command
+# must not import configuration, logging, plugin, or agent state machinery.
+import sys as _qualification_sys
+
+_qualification_argv = _qualification_sys.argv[1:]
+if _qualification_argv and _qualification_argv[0] == "qualification":
+    from hermes_cli.qualification_cmd import (
+        run_qualification_cli as _run_qualification_cli,
+    )
+
+    raise SystemExit(_run_qualification_cli(_qualification_argv[1:]))
+
+if _qualification_argv and _qualification_argv[0].startswith("-"):
+    from hermes_cli.qualification_cmd import (
+        has_leading_global_option_before_qualification,
+        reject_prefixed_qualification_cli,
+    )
+
+    if has_leading_global_option_before_qualification(_qualification_argv):
+        reject_prefixed_qualification_cli()
+
+# IMPORTANT: for every non-qualification invocation, hermes_bootstrap must be
+# the very first import — it sets up
 # UTF-8 stdio on Windows so print()/subprocess children don't hit
 # UnicodeEncodeError with non-ASCII characters.  No-op on POSIX.
 #
@@ -488,6 +511,7 @@ from hermes_cli.subcommands.webhook import build_webhook_parser
 from hermes_cli.subcommands.hooks import build_hooks_parser
 from hermes_cli.subcommands.doctor import build_doctor_parser
 from hermes_cli.subcommands.verify import build_verify_parser
+from hermes_cli.subcommands.qualification import build_qualification_parser
 from hermes_cli.subcommands.security import build_security_parser
 from hermes_cli.subcommands.approvals import build_approvals_parser
 from hermes_cli.subcommands.dump import build_dump_parser
@@ -5941,6 +5965,13 @@ def cmd_verify(args):
     from hermes_cli.verify_cmd import run_verify_command
 
     sys.exit(run_verify_command(args))
+
+
+def cmd_qualification(args):
+    """Describe a public, observation-only qualification scenario."""
+    from hermes_cli.qualification_cmd import run_qualification_command
+
+    return run_qualification_command(args)
 
 
 def cmd_security(args):
@@ -12685,6 +12716,7 @@ _BUILTIN_SUBCOMMANDS = frozenset(
         "webhook", "whatsapp", "whatsapp-cloud", "worktree", "chat", "secrets", "security",
         "browser",
         "verify",
+        "qualification",
         # Help-ish invocations — plugin commands not being listed in
         # top-level --help is an acceptable trade-off for skipping an
         # expensive eager import of every bundled plugin module.
@@ -13980,6 +14012,11 @@ def main():
     # verify command  (parser built in hermes_cli/subcommands/verify.py)
     # =========================================================================
     build_verify_parser(subparsers, cmd_verify=cmd_verify)
+
+    # =========================================================================
+    # qualification command (observation-only public contract)
+    # =========================================================================
+    build_qualification_parser(subparsers, cmd_qualification=cmd_qualification)
 
     # =========================================================================
     # security command — on-demand supply-chain audit
