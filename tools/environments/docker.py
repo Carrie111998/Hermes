@@ -1121,6 +1121,28 @@ class DockerEnvironment(BaseEnvironment):
                     cache_mount["host_path"],
                     cache_mount["container_path"],
                 )
+
+            # Mount HERMES_HOME context files (SOUL.md, persona, scripts) so
+            # the agent inside the container sees the host's custom persona
+            # instead of a stale/empty default (#100900).
+            try:
+                from tools.credential_files import get_hermes_context_mounts
+
+                for ctx_mount in get_hermes_context_mounts():
+                    src = Path(ctx_mount["host_path"])
+                    if not src.exists():
+                        continue
+                    volume_args.extend([
+                        "-v",
+                        f"{ctx_mount['host_path']}:{ctx_mount['container_path']}:ro",
+                    ])
+                    logger.info(
+                        "Docker: mounting HERMES_HOME context %s -> %s",
+                        ctx_mount["host_path"],
+                        ctx_mount["container_path"],
+                    )
+            except Exception as ce:
+                logger.debug("Docker: could not load HERMES_HOME context mounts: %s", ce)
         except Exception as e:
             logger.debug("Docker: could not load credential file mounts: %s", e)
 
