@@ -4499,7 +4499,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                     finish_reason = "stop"
                 continue
 
-            delta = chunk.choices[0].delta
+            delta = getattr(chunk.choices[0], "delta", None)
             if hasattr(chunk, "model") and chunk.model:
                 model_name = chunk.model
 
