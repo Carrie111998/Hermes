@@ -351,6 +351,35 @@ class TestSegmentBreakOnToolBoundary:
             f"Cursor found in finalized segment: {thinking_texts[-1]!r}"
         )
 
+    @pytest.mark.asyncio
+    async def test_run_does_not_send_short_held_prefix_at_tool_boundary(self):
+        """A skipped short cursor preview must not be finalized as a message."""
+        adapter = MagicMock()
+        adapter.send = AsyncMock(
+            side_effect=[
+                SimpleNamespace(success=True, message_id="msg_1"),
+            ]
+        )
+        adapter.edit_message = AsyncMock(return_value=SimpleNamespace(success=True))
+        adapter.MAX_MESSAGE_LENGTH = 4096
+
+        consumer = GatewayStreamConsumer(
+            adapter,
+            "chat_123",
+            StreamConsumerConfig(edit_interval=0.01, buffer_threshold=1, cursor=" ▉"),
+        )
+        consumer.on_delta("I")
+        task = asyncio.create_task(consumer.run())
+        await asyncio.sleep(0.08)
+        consumer.on_delta(None)
+        consumer.on_delta("Done")
+        consumer.finish()
+        await task
+
+        sent_texts = [call.kwargs.get("content", "") for call in adapter.send.call_args_list]
+        assert "I" not in sent_texts
+        assert "Done" in sent_texts
+
 
     @pytest.mark.asyncio
     async def test_segment_break_clears_failed_edit_fallback_state(self):
@@ -1487,4 +1516,3 @@ class TestFlushPendingSync:
 
         consumer.finish()
         await task
-

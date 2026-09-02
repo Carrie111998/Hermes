@@ -276,6 +276,10 @@ class GatewayStreamConsumer:
         # turn-final payload for multi-message deliveries (#78541).
         self._stream_ledger = ""
         self._message_id: Optional[str] = None
+        # A short cursor-suffixed prefix may be held back by _send_or_edit.
+        # Remember it so a following tool-boundary finalize does not strip the
+        # cursor and send that same prefix as a standalone message.
+        self._short_cursor_prefix_pending = False
         # Wall-clock timestamp (time.monotonic) when ``_message_id`` was
         # first assigned from a successful first-send.  Used by the
         # fresh-final logic to detect long-lived previews whose edit
@@ -3133,7 +3137,22 @@ class GatewayStreamConsumer:
                 and self.cfg.cursor
                 and self.cfg.cursor in text
                 and len(_visible_stripped) < _MIN_NEW_MSG_CHARS):
+            self._short_cursor_prefix_pending = True
             return True  # too short for a standalone message — accumulate more
+
+        # The segment-break path finalizes without appending the cursor. If a
+        # short cursor-era prefix was held back above, do not turn it into a
+        # standalone one-character message at the tool boundary. The next
+        # segment will still be delivered normally, while a real turn-final
+        # one-character answer keeps its existing delivery semantics.
+        if (
+            self._short_cursor_prefix_pending
+            and finalize
+            and not is_turn_final
+            and len(_visible_stripped) < _MIN_NEW_MSG_CHARS
+        ):
+            self._short_cursor_prefix_pending = False
+            return True
 
         # Native streaming transport (e.g. WeCom): every frame — first send,
         # mid-stream updates, and the final answer — flows through
