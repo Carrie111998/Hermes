@@ -185,6 +185,51 @@ def test_start_server_insecure_public_no_longer_bypasses_gate(monkeypatch):
     assert web_server.app.state.auth_required is True
 
 
+def test_fail_closed_gate_surfaces_every_bundled_providers_skip_reason(monkeypatch):
+    """The gate's refusal must name EVERY bundled provider that declined to
+    register, not just nous (#88959).
+
+    This drives a REAL plugin discovery, not monkeypatched module state:
+    the provider plugins are imported by the plugin manager under the
+    ``hermes_plugins.*`` namespace and ``register()`` writes LAST_SKIP_REASON
+    there. A helper that imports ``plugins.dashboard_auth.<name>`` instead
+    reads a second module object from the same file whose ``register()``
+    never ran — its reason always reads empty, and monkeypatching those
+    package-path modules would green-light exactly that broken helper.
+    """
+    for env_var in (
+        "HERMES_DASHBOARD_OAUTH_CLIENT_ID",
+        "HERMES_DASHBOARD_BASIC_AUTH_USERNAME",
+        "HERMES_DASHBOARD_OIDC_ISSUER",
+        "HERMES_DASHBOARD_OIDC_CLIENT_ID",
+        "HERMES_DASHBOARD_DRAIN_SECRET",
+    ):
+        monkeypatch.delenv(env_var, raising=False)
+
+    from hermes_cli.dashboard_auth import clear_providers
+    from hermes_cli.plugins import discover_plugins
+
+    discover_plugins()  # idempotent; the gate helper relies on this too
+    clear_providers()
+
+    _stub_uvicorn_run(monkeypatch)
+    web_server.app.state.auth_required = None
+    with pytest.raises(SystemExit) as exc_info:
+        web_server.start_server(
+            host="0.0.0.0", port=9119,
+            open_browser=False, allow_public=True,
+        )
+    message = str(exc_info.value)
+    for provider_name in ("nous", "basic", "self_hosted", "drain"):
+        line = next(
+            (ln for ln in message.splitlines() if ln.startswith(f"  • {provider_name}: ")),
+            "",
+        )
+        # Prefix present AND a non-empty reason after it — an empty-reason
+        # read means the helper looked at a module whose register() never ran.
+        assert line > f"  • {provider_name}: ", provider_name
+
+
 def test_start_server_public_without_insecure_records_auth_required(monkeypatch):
     """Public bind without --insecure: the gate engages and auth_required=True.
 

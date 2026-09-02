@@ -841,6 +841,43 @@ def _dashboard_public_hosts() -> frozenset[str]:
     return frozenset({hostname.lower()})
 
 
+def _collect_provider_skip_reasons() -> "list[str]":
+    """Every loaded dashboard-auth provider's LAST_SKIP_REASON, prefixed.
+
+    Provider plugins are imported by the plugin manager under the
+    ``hermes_plugins.*`` namespace (``_NS_PARENT``), so ``register()`` — the
+    only writer of ``LAST_SKIP_REASON`` — runs on the manager's module
+    object. Importing ``plugins.dashboard_auth.<name>`` here instead would
+    materialize a second module object from the same file whose
+    ``register()`` never ran, so every reason would read empty — the
+    pre-existing nous-only branch never fired for exactly that reason.
+    Reading off the plugin objects the manager already holds after
+    discovery also covers third-party ``dashboard_auth/*`` plugins instead
+    of a hardcoded name list. Discovery/lookup failures count as no reason
+    (the provider may not be installed at all).
+    """
+    reasons: "list[str]" = []
+    try:
+        from hermes_cli.plugins import discover_plugins, get_plugin_manager
+
+        discover_plugins()  # idempotent — register() must have run first
+        manager = get_plugin_manager()
+        for lookup_key, loaded in sorted(manager._plugins.items()):
+            if not lookup_key.startswith("dashboard_auth/"):
+                continue
+            reason = (
+                getattr(loaded.module, "LAST_SKIP_REASON", "")
+                if loaded.module is not None
+                else ""
+            )
+            if reason:
+                provider_name = lookup_key.partition("/")[-1]
+                reasons.append(f"  • {provider_name}: {reason}")
+    except Exception:
+        pass
+    return reasons
+
+
 def should_require_auth(host: str, allow_public: bool = False) -> bool:
     """Return True iff the dashboard auth gate must be active.
 
@@ -19851,16 +19888,7 @@ def start_server(
             # module-level ``LAST_SKIP_REASON`` string for this purpose;
             # without it the operator would only see "no providers" which
             # is misleading when the provider IS installed but unconfigured.
-            skip_reasons: list[str] = []
-            try:
-                from plugins.dashboard_auth import nous as _nous_plugin
-
-                if _nous_plugin.LAST_SKIP_REASON:
-                    skip_reasons.append(
-                        f"  • nous: {_nous_plugin.LAST_SKIP_REASON}"
-                    )
-            except Exception:
-                pass
+            skip_reasons = _collect_provider_skip_reasons()
 
             # Name the exact reason the gate engaged. When the bind itself is
             # loopback the ONLY trigger is dashboard.public_url — an operator
