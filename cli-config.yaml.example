@@ -1067,6 +1067,14 @@ skills:
   # Set to 0 to disable.
   creation_nudge_interval: 15
 
+  # Background-review (autonomous skill curation) write safety.
+  # Default true: the review fork must load the exact target via skill_view()
+  # in the same turn it patches. Some models split read/write across turns or
+  # lose the turn-scoped marker (see issue #73965), refusing every patch.
+  # Set false to let the fork patch without re-reading.
+  background_review:
+    require_read_before_write: true
+
   # External skill directories — share skills across tools/agents without
   # copying them into ~/.hermes/skills/.  Each path is expanded (~ and ${VAR})
   # and resolved to an absolute path.  External dirs are read-only: skill

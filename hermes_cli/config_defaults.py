@@ -2329,6 +2329,17 @@ DEFAULT_CONFIG = {
         "inline_shell": False,
         # Timeout (seconds) for each !`cmd` snippet when inline_shell is on.
         "inline_shell_timeout": 10,
+        # Background-review (autonomous skill curation) write safety.
+        # The read-before-write guard requires the review fork to load the
+        # exact target via skill_view() in the same turn it patches. Models
+        # that split read/write across turns (or lose the turn-scoped marker
+        # across worker threads — see issue #73965) can never satisfy it, so
+        # every autonomous skill patch is refused. Set false to let the fork
+        # patch without re-reading (trusts the model not to blind-edit stale
+        # content). Default true = shipped-safe.
+        "background_review": {
+            "require_read_before_write": True,
+        },
         # Run the keyword/pattern security scanner on skills the agent
         # writes via skill_manage (create/edit/patch).  Off by default
         # because the agent can already execute the same code paths via
