@@ -769,11 +769,6 @@ def _make_callback_handler() -> tuple[type, dict]:
             # here would break login against those providers.
             iss = params.get("iss", [None])[0]
 
-            result["auth_code"] = code
-            result["state"] = state
-            result["error"] = error
-            result["iss"] = iss
-
             body = (
                 "<html><body><h2>Authorization Successful</h2>"
                 "<p>You can close this tab and return to Hermes.</p></body></html>"
@@ -781,10 +776,21 @@ def _make_callback_handler() -> tuple[type, dict]:
                 "<html><body><h2>Authorization Failed</h2>"
                 f"<p>Error: {error or 'unknown'}</p></body></html>"
             )
-            self.send_response(200)
-            self.send_header("Content-Type", "text/html; charset=utf-8")
-            self.end_headers()
-            self.wfile.write(body.encode())
+            # Complete the browser response before publishing the callback result.
+            # The waiter tears down the temporary server as soon as it sees the
+            # result; publishing first lets a reverse proxy race that shutdown and
+            # surface a 502 even though token exchange succeeds.
+            try:
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.end_headers()
+                self.wfile.write(body.encode())
+            finally:
+                # A browser disconnect must not discard an otherwise valid code.
+                result["auth_code"] = code
+                result["state"] = state
+                result["error"] = error
+                result["iss"] = iss
 
         def log_message(self, fmt: str, *args: Any) -> None:
             logger.debug("OAuth callback: %s", fmt % args)

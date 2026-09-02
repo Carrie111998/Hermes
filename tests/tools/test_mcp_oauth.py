@@ -447,6 +447,41 @@ class TestCallbackHandlerIsolation:
         assert result["auth_code"] is None
         assert result["error"] == "access_denied"
 
+    def test_handler_does_not_complete_flow_before_response_is_written(self):
+        """The CLI must stay alive until a reverse proxy receives the success page."""
+        import threading
+
+        HandlerClass, result = _make_callback_handler()
+        write_started = threading.Event()
+        allow_write = threading.Event()
+
+        class BlockingWriter(BytesIO):
+            def write(self, data):
+                write_started.set()
+                assert allow_write.wait(timeout=5)
+                return super().write(data)
+
+        handler = object.__new__(HandlerClass)
+        handler.path = "/callback?code=test123&state=mystate"
+        handler.wfile = BlockingWriter()
+        handler.send_response = MagicMock()
+        handler.send_header = MagicMock()
+        handler.end_headers = MagicMock()
+
+        thread = threading.Thread(target=handler.do_GET)
+        thread.start()
+        assert write_started.wait(timeout=5)
+        try:
+            assert result["auth_code"] is None
+            assert result["state"] is None
+        finally:
+            allow_write.set()
+            thread.join(timeout=5)
+
+        assert not thread.is_alive()
+        assert result["auth_code"] == "test123"
+        assert result["state"] == "mystate"
+
 
 # ---------------------------------------------------------------------------
 # TOCTOU port reservation (#22161)
