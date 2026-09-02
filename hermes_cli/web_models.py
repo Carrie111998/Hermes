@@ -182,6 +182,18 @@ class _MoaReferenceControls(BaseModel):
         return timeout
 
 
+class MoaRoutingPayload(BaseModel):
+    mode: Literal["always", "never", "auto"] = "always"
+    threshold: int = 3
+
+    @field_validator("threshold")
+    @classmethod
+    def threshold_must_be_positive(cls, value: int) -> int:
+        if value < 1:
+            raise ValueError("routing threshold must be at least 1")
+        return value
+
+
 class MoaPresetPayload(_MoaReferenceControls):
     reference_models: list[MoaModelSlot] = []
     aggregator: MoaModelSlot = MoaModelSlot()
@@ -195,6 +207,9 @@ class MoaPresetPayload(_MoaReferenceControls):
     # that round-trip the GET payload don't silently erase hand-set values.
     reference_max_tokens: Optional[int] = None
     fanout: Optional[str] = None
+    # None means an older client omitted this field. The PUT path preserves an
+    # existing policy instead of silently resetting it to historical "always".
+    routing: Optional[MoaRoutingPayload] = None
     enabled: bool = True
 
 
@@ -211,6 +226,7 @@ class MoaConfigPayload(_MoaReferenceControls):
     max_tokens: int = 4096
     reference_max_tokens: Optional[int] = None
     fanout: Optional[str] = None
+    routing: Optional[MoaRoutingPayload] = None
     enabled: bool = True
     profile: Optional[str] = None
 

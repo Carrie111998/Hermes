@@ -768,6 +768,7 @@ function MoaModelsModal({
       reference_timeout: draft.reference_timeout,
       degraded_reference_policy: draft.degraded_reference_policy,
       max_tokens: draft.max_tokens,
+      routing: { mode: "always", threshold: 3 },
       enabled: draft.enabled,
     };
     setDraft((prev) => ({
@@ -889,6 +890,50 @@ function MoaModelsModal({
             <div className="flex items-center gap-2 border border-border/50 bg-muted/20 px-3 py-2">
               <div className="min-w-0 flex-1 truncate font-mono text-xs text-text-secondary">{slotLabel(preset.aggregator)}</div>
               <Button size="sm" outlined onClick={() => setPicker({ kind: "aggregator" })}>Change</Button>
+            </div>
+          </div>
+
+          <div className="space-y-2 border border-border/50 bg-muted/20 px-3 py-3">
+            <div className="text-display text-xs font-medium tracking-wider">Conditional routing</div>
+            <p className="text-xs text-text-secondary">
+              Always preserves classic MoA. Auto consults reference models only for prompts that benefit from deliberation. Aggregator only skips reference models.
+            </p>
+            <div className="flex items-center gap-3">
+              <select
+                aria-label="MoA routing mode"
+                className="border border-border bg-background px-2 py-1 text-xs"
+                value={preset.routing?.mode ?? "always"}
+                onChange={(event) => updateSelectedPreset((prev) => ({
+                  ...prev,
+                  routing: {
+                    mode: event.target.value as "always" | "never" | "auto",
+                    threshold: prev.routing?.threshold ?? 3,
+                  },
+                }))}
+              >
+                <option value="always">Always fan out</option>
+                <option value="auto">Auto</option>
+                <option value="never">Aggregator only</option>
+              </select>
+              {(preset.routing?.mode ?? "always") === "auto" && (
+                <label className="flex items-center gap-2 text-xs text-text-secondary">
+                  Threshold
+                  <input
+                    aria-label="MoA routing threshold"
+                    className="w-16 border border-border bg-background px-2 py-1 text-xs"
+                    type="number"
+                    min={1}
+                    value={preset.routing?.threshold ?? 3}
+                    onChange={(event) => updateSelectedPreset((prev) => ({
+                      ...prev,
+                      routing: {
+                        mode: prev.routing?.mode ?? "auto",
+                        threshold: Math.max(1, Number(event.target.value) || 1),
+                      },
+                    }))}
+                  />
+                </label>
+              )}
             </div>
           </div>
 

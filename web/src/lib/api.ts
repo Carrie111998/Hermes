@@ -2465,6 +2465,8 @@ export interface MoaConfigResponse {
     reference_max_tokens?: number | null;
     /** Fan-out cadence (user_turn default | per_iteration | every_n:N) — round-tripped. */
     fanout?: string;
+    /** Conditional direct-versus-advisor routing. */
+    routing?: { mode: "always" | "never" | "auto"; threshold: number };
     enabled: boolean;
   }>;
   reference_models: MoaModelSlot[];

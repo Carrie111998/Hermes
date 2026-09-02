@@ -1838,6 +1838,7 @@ from hermes_cli.web_models import (  # noqa: F401
     ModelAssignment,
     MoaModelSlot,
     _MoaReferenceControls,
+    MoaRoutingPayload,
     MoaPresetPayload,
     MoaConfigPayload,
     FsWriteText,
@@ -7779,7 +7780,7 @@ def set_moa_models(body: MoaConfigPayload, profile: Optional[str] = None):
             return {k: v for k, v in slot.dict().items() if v is not None}
 
         def _preset_dict(preset: MoaPresetPayload) -> dict:
-            return {
+            result = {
                 "reference_models": [_slot_dict(slot) for slot in preset.reference_models],
                 "aggregator": _slot_dict(preset.aggregator),
                 "reference_temperature": preset.reference_temperature,
@@ -7791,14 +7792,45 @@ def set_moa_models(body: MoaConfigPayload, profile: Optional[str] = None):
                 "fanout": preset.fanout,
                 "enabled": preset.enabled,
             }
+            if preset.routing is not None:
+                result["routing"] = preset.routing.model_dump()
+            return result
 
         with _profile_scope(body.profile or profile):
             cfg = load_config()
+            existing_moa = cfg.get("moa") if isinstance(cfg.get("moa"), dict) else {}
+            existing_presets = (
+                existing_moa.get("presets")
+                if isinstance(existing_moa.get("presets"), dict)
+                else {}
+            )
             if body.presets:
+                raw_presets = {}
+                for name, preset in body.presets.items():
+                    saved_preset = _preset_dict(preset)
+                    existing_preset = existing_presets.get(name)
+                    existing_routing = (
+                        existing_preset.get("routing")
+                        if isinstance(existing_preset, dict)
+                        else None
+                    )
+                    if (
+                        not isinstance(existing_routing, dict)
+                        and not existing_presets
+                        and name == body.default_preset
+                        and isinstance(existing_moa.get("routing"), dict)
+                    ):
+                        existing_routing = existing_moa["routing"]
+                    if (
+                        "routing" not in saved_preset
+                        and isinstance(existing_routing, dict)
+                    ):
+                        saved_preset["routing"] = dict(existing_routing)
+                    raw_presets[name] = saved_preset
                 raw = {
                     "default_preset": body.default_preset,
                     "active_preset": body.active_preset,
-                    "presets": {name: _preset_dict(preset) for name, preset in body.presets.items()},
+                    "presets": raw_presets,
                 }
             else:
                 raw = _preset_dict(
@@ -7812,9 +7844,24 @@ def set_moa_models(body: MoaConfigPayload, profile: Optional[str] = None):
                         max_tokens=body.max_tokens,
                         reference_max_tokens=body.reference_max_tokens,
                         fanout=body.fanout,
+                        routing=body.routing,
                         enabled=body.enabled,
                     )
                 )
+                if "routing" not in raw:
+                    existing_routing = existing_moa.get("routing")
+                    if not isinstance(existing_routing, dict):
+                        existing_name = str(
+                            existing_moa.get("default_preset") or body.default_preset or ""
+                        )
+                        existing_preset = existing_presets.get(existing_name)
+                        existing_routing = (
+                            existing_preset.get("routing")
+                            if isinstance(existing_preset, dict)
+                            else None
+                        )
+                    if isinstance(existing_routing, dict):
+                        raw["routing"] = dict(existing_routing)
 
             # Reject-don't-repair: normalize_moa_config() silently swaps any
             # preset containing incomplete slots for the hardcoded defaults —
