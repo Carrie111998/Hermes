@@ -23,6 +23,7 @@ import os
 import re
 import smtplib
 import socket
+from functools import partial
 
 # Profile-scoped secret reader for multiplexing support (PR #50094)
 from agent.secret_scope import UnscopedSecretError as _UnscopedSecretError
@@ -627,6 +628,10 @@ class EmailAdapter(BasePlatformAdapter):
 
         logger.info("[Email] Adapter initialized for %s", self._address)
 
+    def _outbound_is_suppressed(self) -> bool:
+        """Return the outbound policy, including lightweight test adapters."""
+        return bool(getattr(self, "_read_only", False))
+
     def _trim_seen_uids(self) -> None:
         """Keep only the most recent UIDs to prevent unbounded memory growth.
 
@@ -784,7 +789,7 @@ class EmailAdapter(BasePlatformAdapter):
             )
             return False
 
-        if self._read_only:
+        if self._outbound_is_suppressed():
             logger.info("[Email] Read-only mode: SMTP connection test skipped.")
         else:
             try:
@@ -1199,7 +1204,7 @@ class EmailAdapter(BasePlatformAdapter):
         standalone cron/report delivery uses the same config gate in
         ``_standalone_send``.
         """
-        if self._read_only:
+        if self._outbound_is_suppressed():
             return self._read_only_suppress(
                 recipient, kind, subject=subject, metadata=metadata
             ).message_id or "read-only-suppressed"
@@ -1223,7 +1228,7 @@ class EmailAdapter(BasePlatformAdapter):
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
         """Send an email reply to the given address."""
-        if self._read_only:
+        if self._outbound_is_suppressed():
             return self._read_only_suppress(chat_id, metadata=metadata)
         try:
             loop = asyncio.get_running_loop()
@@ -1316,7 +1321,7 @@ class EmailAdapter(BasePlatformAdapter):
         images). No hard cap — email clients handle dozens of
         attachments fine, subject to SMTP message size limits.
         """
-        if self._read_only:
+        if self._outbound_is_suppressed():
             self._read_only_suppress(chat_id, "image batch", metadata=metadata)
             return
         if not images:
@@ -1348,11 +1353,13 @@ class EmailAdapter(BasePlatformAdapter):
             loop = asyncio.get_running_loop()
             await loop.run_in_executor(
                 None,
-                self._send_email_with_attachments,
-                chat_id,
-                body,
-                local_paths,
-                metadata,
+                partial(
+                    self._send_email_with_attachments,
+                    chat_id,
+                    body,
+                    local_paths,
+                    metadata=metadata,
+                ),
             )
         except Exception as e:
             logger.error("[Email] Multi-image send failed, falling back: %s", e, exc_info=True)
@@ -1418,7 +1425,7 @@ class EmailAdapter(BasePlatformAdapter):
     ) -> SendResult:
         """Send a file as an email attachment."""
         metadata = kwargs.get("metadata")
-        if self._read_only:
+        if self._outbound_is_suppressed():
             return self._read_only_suppress(chat_id, "document", metadata=metadata)
         try:
             loop = asyncio.get_running_loop()
