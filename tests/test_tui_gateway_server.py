@@ -713,16 +713,13 @@ def test_slash_exec_keeps_tui_skills_commands_on_the_worker_path():
     server._sessions["sid"] = _session(slash_worker=worker)
 
     try:
-        response = server.handle_request(
+        response = _dispatch_sync(
             {
                 "id": "skills-audit",
                 "method": "slash.exec",
-                "params": {
-                    "command": "skills audit",
-                    "session_id": "sid",
-                    "surface": "tui",
-                },
-            }
+                "params": {"command": "skills audit", "session_id": "sid"},
+            },
+            server._stdio_transport,
         )
     finally:
         server._sessions.pop("sid", None)
@@ -732,10 +729,10 @@ def test_slash_exec_keeps_tui_skills_commands_on_the_worker_path():
     worker.run.assert_called_once_with("skills audit")
 
 
-def test_slash_exec_refuses_unlabeled_non_review_skills_subcommands(monkeypatch):
+def test_slash_exec_refuses_spoofed_tui_surface_without_stdio_transport(monkeypatch):
     class _ExplodingWorker:
         def __init__(self, *args, **kwargs):
-            raise AssertionError("slash worker should not run for an unlabeled caller")
+            raise AssertionError("slash worker should not run for an untrusted surface label")
 
     server._sessions["sid"] = _session()
     monkeypatch.setattr(server, "_SlashWorker", _ExplodingWorker)
@@ -745,7 +742,11 @@ def test_slash_exec_refuses_unlabeled_non_review_skills_subcommands(monkeypatch)
             {
                 "id": "skills-install",
                 "method": "slash.exec",
-                "params": {"command": "skills install example", "session_id": "sid"},
+                "params": {
+                    "command": "skills install example",
+                    "session_id": "sid",
+                    "surface": "tui",
+                },
             }
         )
     finally:

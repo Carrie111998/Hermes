@@ -206,13 +206,16 @@ export function useSlashCompletions(options: {
         // the full `/personality alice` token instead of stranding `/alice`.
         const replaceFromRaw = result.replace_from
         const hasReplaceFrom = typeof replaceFromRaw === 'number'
+
         const inferredArgCompletion =
           desktopSubcommandAllowlist(commandText(text.trimStart().split(/\s+/, 1)[0] ?? '')) !== null &&
           /\s/.test(text.trimStart())
+
         const inferredReplaceFrom = text.match(/\S+$/)?.index ?? text.length
         const replaceFrom = hasReplaceFrom ? replaceFromRaw : inferredReplaceFrom
         const isArgCompletion = hasReplaceFrom ? replaceFrom > 1 : inferredArgCompletion
         const rawPrefix = isArgCompletion ? text.slice(0, replaceFrom) : ''
+
         const prefix =
           !hasReplaceFrom && rawPrefix && !/\s$/.test(rawPrefix) ? `${rawPrefix} ` : rawPrefix
 

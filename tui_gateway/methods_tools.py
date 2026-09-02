@@ -1203,10 +1203,10 @@ def _(rid, params: dict) -> dict:
     _cmd_base = (_cmd_parts[0] if _cmd_parts else "").lower()
     _cmd_arg = _cmd_parts[1] if len(_cmd_parts) > 1 else ""
 
-    # /skills has an interactive hub for terminal clients.  slash.exec is a
-    # non-interactive transport, so enforce the registry's desktop review
-    # slice here too instead of trusting every frontend to apply the metadata.
-    if _cmd_base == "skills" and params.get("surface") != "tui":
+    # /skills has an interactive hub for the stdio TUI.  Every other transport
+    # gets the registry's review-only slice.  Bind that decision to the server-
+    # selected transport: an RPC param claiming ``surface=tui`` is not authority.
+    if _cmd_base == "skills" and current_transport() is not _stdio_transport:
         from hermes_cli.commands import resolve_command
         from hermes_cli.write_approval_commands import handle_pending_subcommand
         from hermes_constants import (
