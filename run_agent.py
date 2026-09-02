@@ -64,6 +64,8 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from hermes_constants import get_hermes_home
+from session_turn_lease import SESSION_TURN_LEASE_WAIT_REFRESH_STATUS_TEMPLATE  # noqa: F401
+from session_turn_lease import format_session_turn_lease_wait_refresh as _lease_refresh
 
 
 def _launch_cwd_for_session(source: str) -> Optional[str]:
@@ -309,16 +311,6 @@ def _is_ephemeral_scaffolding(msg: Any) -> bool:
 
 
 _MAX_TOOL_WORKERS = 8
-
-# Wording of the periodic refresh emitted while a cross-process session turn
-# lease is held elsewhere (``_on_session_turn_lease_wait``). The refresh only
-# makes sense on surfaces that can update the initial wait notice in place;
-# gateway/run.py derives its no-in-place-update suppression matcher from this
-# constant (#89166) — never re-inline the wording at either site.
-SESSION_TURN_LEASE_WAIT_REFRESH_STATUS_TEMPLATE = (
-    "⏳ Still waiting for the other Hermes process on "
-    "this session ({elapsed_seconds}s)..."
-)
 
 # Intrinsic marker stamped on a message dict once it has been written to the
 # SQLite session store.  Used by ``_flush_messages_to_session_db`` to decide
@@ -9384,11 +9376,7 @@ class AIAgent:
                             "waiting for it to finish before starting your turn..."
                         )
                     else:
-                        self._emit_status(
-                            SESSION_TURN_LEASE_WAIT_REFRESH_STATUS_TEMPLATE.format(
-                                elapsed_seconds=int(elapsed)
-                            )
-                        )
+                        self._emit_status(_lease_refresh(int(elapsed)))
 
                 if not _turn_db.acquire_session_turn_lease(
                     session_id,

@@ -68,6 +68,8 @@ from agent.turn_context import (
 )
 from hermes_cli.config import _is_ssh_remote_tilde_cwd, cfg_get
 from hermes_cli.fallback_config import get_fallback_chain
+from session_turn_lease import is_session_turn_lease_wait_refresh as _is_lease_refresh
+from session_turn_lease import session_turn_lease_refresh_re as _session_turn_lease_refresh_re
 
 # --- Agent cache tuning ---------------------------------------------------
 # Bounds the per-session AIAgent cache to prevent unbounded growth in
@@ -1173,27 +1175,6 @@ def _clarify_send_then_wait(fut, *, clarify_id: str, session_key: str, clarify_m
         # Timeout or session-boundary cancellation
         return f"[user did not respond within {int(timeout / 60)}m]"
     return response
-_SESSION_TURN_LEASE_REFRESH_RE = None
-
-
-def _session_turn_lease_refresh_re():
-    """Compile-once matcher for run_agent's periodic lease-wait refresh.
-
-    Derived from the SAME template constant the emit site formats
-    (SESSION_TURN_LEASE_WAIT_REFRESH_STATUS_TEMPLATE, #89166) — never
-    re-inlined wording, same convention as _COMPRESSION_PROGRESS_STATUS_RE
-    (#69550). The import stays lazy because gateway/run.py never imports
-    run_agent at module scope.
-    """
-    global _SESSION_TURN_LEASE_REFRESH_RE
-    if _SESSION_TURN_LEASE_REFRESH_RE is None:
-        from run_agent import SESSION_TURN_LEASE_WAIT_REFRESH_STATUS_TEMPLATE
-
-        _SESSION_TURN_LEASE_REFRESH_RE = re.compile(
-            _status_template_to_regex(SESSION_TURN_LEASE_WAIT_REFRESH_STATUS_TEMPLATE),
-            re.IGNORECASE,
-        )
-    return _SESSION_TURN_LEASE_REFRESH_RE
 
 
 def _should_suppress_lease_wait_refresh(adapter, message: str) -> bool:
@@ -1207,10 +1188,8 @@ def _should_suppress_lease_wait_refresh(adapter, message: str) -> bool:
     chat message (#89166). Suppress the refresh there; the initial notice and
     the lease-timeout warning use different wording and are always delivered.
     """
-    if callable(getattr(adapter, "send_or_update_status", None)):
-        return False
-    return bool(_session_turn_lease_refresh_re().search(str(message or "")))
-
+    can_update = callable(getattr(adapter, "send_or_update_status", None))
+    return not can_update and _is_lease_refresh(message)
 
 
 def _resolve_progress_thread_id(

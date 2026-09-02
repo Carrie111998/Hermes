@@ -20,9 +20,15 @@ from unittest.mock import AsyncMock
 from gateway.config import Platform
 from gateway.run import (
     _prepare_gateway_status_message,
+    _session_turn_lease_refresh_re,
     _should_suppress_lease_wait_refresh,
 )
 from run_agent import SESSION_TURN_LEASE_WAIT_REFRESH_STATUS_TEMPLATE
+from session_turn_lease import (
+    SESSION_TURN_LEASE_WAIT_REFRESH_STATUS_TEMPLATE as OWNER_TEMPLATE,
+    format_session_turn_lease_wait_refresh,
+    session_turn_lease_refresh_re,
+)
 
 INITIAL_WAIT_NOTICE = (
     "⏳ Another Hermes process is using this session; "
@@ -51,33 +57,29 @@ def _adapter_with_status_update():
 
 
 def _prepared_refresh(elapsed_seconds: int) -> str:
-    message = SESSION_TURN_LEASE_WAIT_REFRESH_STATUS_TEMPLATE.format(
-        elapsed_seconds=elapsed_seconds
-    )
-    prepared = _prepare_gateway_status_message(
-        Platform.WECOM, "lifecycle", message
-    )
+    message = format_session_turn_lease_wait_refresh(elapsed_seconds)
+    prepared = _prepare_gateway_status_message(Platform.WECOM, "lifecycle", message)
     assert prepared is not None, "refresh must survive the noise filter first"
     return prepared
+
+
+def test_refresh_owner_preserves_original_import_seams():
+    assert SESSION_TURN_LEASE_WAIT_REFRESH_STATUS_TEMPLATE is OWNER_TEMPLATE
+    assert _session_turn_lease_refresh_re is session_turn_lease_refresh_re
 
 
 def test_refresh_suppressed_on_adapter_without_in_place_updates():
     adapter = _adapter_without_status_update()
     for elapsed in (15, 30, 105, 120):
         assert (
-            _should_suppress_lease_wait_refresh(
-                adapter, _prepared_refresh(elapsed)
-            )
+            _should_suppress_lease_wait_refresh(adapter, _prepared_refresh(elapsed))
             is True
         )
 
 
 def test_refresh_delivered_when_adapter_updates_in_place():
     adapter = _adapter_with_status_update()
-    assert (
-        _should_suppress_lease_wait_refresh(adapter, _prepared_refresh(15))
-        is False
-    )
+    assert _should_suppress_lease_wait_refresh(adapter, _prepared_refresh(15)) is False
 
 
 def test_initial_wait_notice_never_suppressed():
