@@ -88,6 +88,12 @@ def reset_scene():
                     block.remove(item)
 
 
+def subcollection(parent, name):
+    child = bpy.data.collections.new(name)
+    parent.children.link(child)
+    return child
+
+
 def create_materials():
     return {
         "floor": lunar.material("Hero floor graphite PBR", (0.15, 0.17, 0.2), metallic=0.38, roughness=0.34),
@@ -523,19 +529,19 @@ def main():
     for index, (asset_id, role, title, accent) in enumerate(BUILDINGS):
         x = -12 + (index % 4) * 8
         y = 5.4 if index < 4 else 0.6
-        make_building(asset_id, role, title, accent, x, y, buildings, mats)
+        make_building(asset_id, role, title, accent, x, y, subcollection(buildings, f"Hero Asset - {asset_id}"), mats)
 
     for index, (asset_id, role, species, accent) in enumerate(LEADERS):
         x = -14 + index * 4
-        make_character(asset_id, role, f"{role.upper()} LEADER - {species}", accent, x, -4.7, characters, mats, "leader")
+        make_character(asset_id, role, f"{role.upper()} LEADER - {species}", accent, x, -4.7, subcollection(characters, f"Hero Asset - {asset_id}"), mats, "leader")
 
     for index, (asset_id, role, personality, accent) in enumerate(WORKERS):
         x = -10 + index * 4
-        make_character(asset_id, role, f"{role.upper()} WORKER - {personality}", accent, x, -8.0, characters, mats, "worker")
+        make_character(asset_id, role, f"{role.upper()} WORKER - {personality}", accent, x, -8.0, subcollection(characters, f"Hero Asset - {asset_id}"), mats, "worker")
 
     for index, (asset_id, role, personality, accent) in enumerate(CHILDREN):
         x = -6 + index * 4
-        make_character(asset_id, role, f"CHILD - {personality}", accent, x, -10.9, characters, mats, "child")
+        make_character(asset_id, role, f"CHILD - {personality}", accent, x, -10.9, subcollection(characters, f"Hero Asset - {asset_id}"), mats, "child")
 
     label("hero_asset_title", "LUNAR CITY HERO ASSETS - MESH SHELLS / RIG WIRES / ROLE PROPS", (0, 9.7, 0.72), mats["text"], props, 0.28)
     setup_camera_and_lighting(root)
@@ -567,10 +573,40 @@ def main():
         "assetCount": scene["asset_count"],
         "heroMeshComponentCount": scene["hero_mesh_components"],
         "sculptedSurfaceComponentCount": scene["sculpted_surface_components"],
-        "buildings": [{"id": asset_id, "role": role, "title": title, "lod": ["hero", "high", "medium", "low"]} for asset_id, role, title, _accent in BUILDINGS],
-        "leaders": [{"id": asset_id, "role": role, "identity": species, "animationClips": ["idle", "walk", "work", "talk", "panic", "celebrate"]} for asset_id, role, species, _accent in LEADERS],
-        "workers": [{"id": asset_id, "role": role, "personality": personality, "animationClips": ["idle", "walk", "work", "carry", "repair", "celebrate"]} for asset_id, role, personality, _accent in WORKERS],
-        "children": [{"id": asset_id, "role": role, "personality": personality, "animationClips": ["idle", "walk", "talk", "panic", "celebrate", "rest"]} for asset_id, role, personality, _accent in CHILDREN],
+        "buildings": [
+            {"id": asset_id, "role": role, "title": title, "collection": f"Hero Asset - {asset_id}", "lod": ["hero", "high", "medium", "low"]}
+            for asset_id, role, title, _accent in BUILDINGS
+        ],
+        "leaders": [
+            {
+                "id": asset_id,
+                "role": role,
+                "identity": species,
+                "collection": f"Hero Asset - {asset_id}",
+                "animationClips": ["idle", "walk", "work", "talk", "panic", "celebrate"],
+            }
+            for asset_id, role, species, _accent in LEADERS
+        ],
+        "workers": [
+            {
+                "id": asset_id,
+                "role": role,
+                "personality": personality,
+                "collection": f"Hero Asset - {asset_id}",
+                "animationClips": ["idle", "walk", "work", "carry", "repair", "celebrate"],
+            }
+            for asset_id, role, personality, _accent in WORKERS
+        ],
+        "children": [
+            {
+                "id": asset_id,
+                "role": role,
+                "personality": personality,
+                "collection": f"Hero Asset - {asset_id}",
+                "animationClips": ["idle", "walk", "talk", "panic", "celebrate", "rest"],
+            }
+            for asset_id, role, personality, _accent in CHILDREN
+        ],
         "validation": {
             "allAssetsVisibleInReviewScene": True,
             "usesSeparateHeroAssetScene": True,

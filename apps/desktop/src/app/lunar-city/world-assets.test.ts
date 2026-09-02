@@ -66,13 +66,13 @@ describe('Lunar City asset manifest', () => {
       readFileSync(join(process.cwd(), 'public/lunar-city/hero-assets/hero-assets-manifest.json'), 'utf8')
     ) as {
       assetCount: number
-      buildings: unknown[]
-      children: unknown[]
+      buildings: Array<{ collection: string; id: string }>
+      children: Array<{ collection: string; id: string }>
       heroMeshComponentCount: number
-      leaders: unknown[]
+      leaders: Array<{ collection: string; id: string }>
       sculptedSurfaceComponentCount: number
       validation: Record<string, boolean>
-      workers: unknown[]
+      workers: Array<{ collection: string; id: string }>
     }
 
     expect(manifest.assetCount).toBe(26)
@@ -85,5 +85,8 @@ describe('Lunar City asset manifest', () => {
     expect(manifest.validation.usesContinuousSculptedSurfaces).toBe(true)
     expect(manifest.validation.freeLocalGenerationOnly).toBe(true)
     expect(manifest.validation.noRawSoulContent).toBe(true)
+    for (const asset of [...manifest.buildings, ...manifest.leaders, ...manifest.workers, ...manifest.children]) {
+      expect(asset.collection).toBe(`Hero Asset - ${asset.id}`)
+    }
   })
 })
