@@ -14,6 +14,7 @@ from acp.schema import (
     ToolCallProgress,
     ToolKind,
 )
+from agent.tool_result_classification import is_skill_view_dedup_result
 
 logger = logging.getLogger(__name__)
 
@@ -226,6 +227,9 @@ def _tool_result_failed(result: Optional[str], tool_name: str | None = None) -> 
     # failed in Zed instead of misleadingly green.
     if isinstance(result, str) and result.startswith("Error executing tool '"):
         return True
+
+    if is_skill_view_dedup_result(tool_name or "", result):
+        return False
 
     data = _json_loads_maybe(result)
     if not isinstance(data, dict):
@@ -444,6 +448,8 @@ def _format_skill_view_result(result: Optional[str]) -> Optional[str]:
     data = _json_loads_maybe(result)
     if not isinstance(data, dict):
         return None
+    if is_skill_view_dedup_result("skill_view", data):
+        return f"Skill already loaded: {data.get('error')}"
     if data.get("success") is False:
         return f"Skill view failed: {data.get('error', 'unknown error')}"
     name = str(data.get("name") or "skill")

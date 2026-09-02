@@ -2001,7 +2001,7 @@ SKILLS_LIST_SCHEMA = {
 
 SKILL_VIEW_SCHEMA = {
     "name": "skill_view",
-    "description": "Skills allow for loading information about specific tasks and workflows, as well as scripts and templates. Load a skill's full content or access its linked files (references, templates, scripts). First call returns SKILL.md content plus a 'linked_files' dict showing available references/templates/scripts. To access those, call again with file_path parameter.",
+    "description": "Skills allow for loading information about specific tasks and workflows, as well as scripts and templates. Load a skill's full content or access its linked files (references, templates, scripts). First call returns SKILL.md content plus a 'linked_files' dict showing available references/templates/scripts. To access those, call again with file_path parameter. Do not repeat the same name/file_path after a successful load; act on the loaded content instead.",
     "parameters": {
         "type": "object",
         "properties": {
@@ -2040,10 +2040,9 @@ _skill_view_tracker_lock = threading.Lock()
 _SKILL_VIEW_DEDUP_CAP = 200
 
 _SKILL_VIEW_DEDUP_MESSAGE = (
-    "Skill content unchanged since it was loaded earlier in this "
-    "conversation — refer to the earlier skill_view result; it is still "
-    "current and complete. (Re-issued after context compression, this "
-    "returns the full content again.)"
+    "Skill content is already loaded and unchanged. Execute the loaded "
+    "instructions now with the required action tool, or answer from the "
+    "loaded content. Re-reading cannot make progress."
 )
 
 
@@ -2111,13 +2110,13 @@ def _check_skill_view_dedup(task_id, name, file_path) -> str | None:
                 return None
             return json.dumps(
                 {
-                    "success": True,
-                    "status": "unchanged",
+                    "success": False,
+                    "status": "deduplicated",
                     "name": rec_name,
                     "file": file_path or "SKILL.md",
                     "dedup": True,
                     "content_returned": False,
-                    "message": _SKILL_VIEW_DEDUP_MESSAGE,
+                    "error": _SKILL_VIEW_DEDUP_MESSAGE,
                 },
                 ensure_ascii=False,
             )
