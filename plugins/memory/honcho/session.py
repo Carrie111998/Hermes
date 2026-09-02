@@ -88,6 +88,11 @@ class HonchoSession:
     created_at: datetime = field(default_factory=datetime.now)
     updated_at: datetime = field(default_factory=datetime.now)
     metadata: dict[str, Any] = field(default_factory=dict)
+    _flush_lock: threading.Lock = field(
+        default_factory=threading.Lock,
+        repr=False,
+        compare=False,
+    )
 
     def add_message(self, role: str, content: str, **kwargs: Any) -> None:
         """Add a message to the local cache."""
@@ -659,6 +664,11 @@ class HonchoSessionManager:
 
     def _flush_session(self, session: HonchoSession) -> bool:
         """Internal: write unsynced messages to Honcho synchronously."""
+        with session._flush_lock:
+            return self._flush_session_locked(session)
+
+    def _flush_session_locked(self, session: HonchoSession) -> bool:
+        """Write one session while its per-session flush lock is held."""
         if not session.messages:
             return True
 

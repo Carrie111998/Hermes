@@ -1,9 +1,11 @@
 """Tests for plugins/memory/honcho/session.py — HonchoSession and helpers."""
 
+import threading
 import time
 
 from datetime import datetime
 from types import SimpleNamespace
+from typing import Any, cast
 from unittest.mock import MagicMock, patch
 
 from plugins.memory.honcho.session import (
@@ -131,6 +133,81 @@ class TestManagerCacheOps:
         assert keys == {"k1", "k2"}
         s1_info = next(s for s in sessions if s["key"] == "k1")
         assert s1_info["message_count"] == 1
+
+
+class TestConcurrentSessionFlush:
+    def test_overlap_serializes_existing_batch_and_flushes_late_message_once(self):
+        mgr = HonchoSessionManager()
+        session = HonchoSession(
+            key="overlap",
+            user_peer_id="user",
+            assistant_peer_id="assistant",
+            honcho_session_id="overlap-session",
+        )
+        session.add_message("user", "hello")
+        session.add_message("assistant", "hi")
+        mgr._cache[session.key] = session
+
+        user_peer = MagicMock()
+        assistant_peer = MagicMock()
+        user_peer.message.side_effect = lambda content: ("user", content)
+        assistant_peer.message.side_effect = lambda content: ("assistant", content)
+        mgr._get_or_create_peer = MagicMock(
+            side_effect=lambda peer_id: user_peer if peer_id == "user" else assistant_peer
+        )
+        mgr._authed_call = MagicMock(side_effect=lambda _label, operation: operation())
+
+        first_upload_started = threading.Event()
+        release_upload = threading.Event()
+        uploads = []
+
+        class ObservedLock:
+            def __init__(self):
+                self._lock = threading.Lock()
+                self.waiting = threading.Event()
+
+            def __enter__(self):
+                if not self._lock.acquire(blocking=False):
+                    self.waiting.set()
+                    self._lock.acquire()
+                return self
+
+            def __exit__(self, exc_type, exc_value, traceback):
+                self._lock.release()
+
+        observed_lock = ObservedLock()
+        session._flush_lock = cast(Any, observed_lock)
+
+        sdk_session = MagicMock()
+
+        def add_messages(messages):
+            uploads.append(list(messages))
+            if len(uploads) == 1:
+                first_upload_started.set()
+                assert release_upload.wait(timeout=2)
+
+        sdk_session.add_messages.side_effect = add_messages
+        mgr._sessions_cache[session.honcho_session_id] = sdk_session
+
+        first = threading.Thread(target=mgr._flush_session, args=(session,))
+        second = threading.Thread(target=mgr._flush_session, args=(session,))
+        first.start()
+        assert first_upload_started.wait(timeout=2)
+        session.add_message("user", "late")
+        second.start()
+        second_waited = observed_lock.waiting.wait(timeout=2)
+        release_upload.set()
+        first.join(timeout=2)
+        second.join(timeout=2)
+
+        assert second_waited
+        assert not first.is_alive()
+        assert not second.is_alive()
+        assert uploads == [
+            [("user", "hello"), ("assistant", "hi")],
+            [("user", "late")],
+        ]
+        assert all(message.get("_synced") is True for message in session.messages)
 
 
 class TestPeerLookupHelpers:
