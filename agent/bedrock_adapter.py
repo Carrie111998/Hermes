@@ -1140,6 +1140,180 @@ def _converse_stop_reason_to_openai(stop_reason: str) -> str:
     return mapping.get(stop_reason, "stop")
 
 
+# ---------------------------------------------------------------------------
+# Chat-template tool-call scaffolding leaking into the text channel (#54283)
+# ---------------------------------------------------------------------------
+#
+# Some Bedrock models emit a fragment of their own chat-template tool-call
+# scaffolding into the assistant TEXT channel, *alongside* — not instead of —
+# a perfectly well-formed ``toolUse`` block. Tool calling still works; the
+# user just sees template garbage glued to the end of the model's prose.
+#
+# Measured against Converse with a single ``get_weather`` tool, "What is the
+# weather in Tokyo?":
+#
+#   deepseek.v3.2   text: "I'll get the current weather in Tokyo for you.\n\n"
+#                         "<｜DSML｜function_calls"
+#                   toolUse: name=get_weather input={"city": "Tokyo"}   <- fine
+#
+# 20 streaming runs leaked 20 times, 10 in us-east-1 and 10 in us-west-2; the
+# non-streaming path leaks too. Sometimes there is no prose in front of the
+# fragment at all — one measured non-streaming response had the text block
+# set to exactly "\n\n<｜DSML｜function_calls" — which is why the cut has to
+# be able to reduce the content to nothing.
+#
+# Of the seven non-Claude Bedrock models tried (deepseek.v3.2, minimax-m2.5,
+# kimi-k2-thinking, kimi-k2.5, llama4-maverick, nova-pro, deepseek-r1) only
+# deepseek.v3.2 leaks.
+#
+# Two properties of the real leak decide the shape of this code, and both
+# contradict the description in #54283:
+#
+# 1. The leaked fragment is TRUNCATED and UNTERMINATED. Bedrock cuts the
+#    model off part-way through the scaffolding, so there is no closing tag
+#    and no inner ``invoke``/``parameter`` element — measured directly:
+#    ``"invoke" in leaked`` is False, ``"parameter" in leaked`` is False,
+#    ``"</" in leaked`` is False. A regex matching a balanced DSML block
+#    therefore matches nothing and silently does nothing. Cutting from the
+#    opening marker to end-of-text is the only thing that works.
+#
+# 2. The delimiter is U+FF5C FULLWIDTH VERTICAL LINE, not ASCII "|".
+#    ``"|" in "<｜DSML｜function_calls"`` is False. It renders
+#    near-identically on an issue page, so it is written as an escape here to
+#    keep it from being "fixed" into an ASCII pipe by a later editor.
+#
+# Only the marker measured above is listed. It is a tuple because DeepSeek's
+# chat template has sibling tool-call tokens and which one survives the
+# truncation is not under our control, so a second entry should not require
+# restructuring — but nothing else has been *observed*, and unobserved
+# markers are deliberately not guessed at.
+_TOOL_CALL_SCAFFOLDING_MARKERS: Tuple[str, ...] = (
+    "<\uff5cDSML\uff5c",   # renders as <｜DSML｜ ; U+FF5C, not ASCII "|"
+)
+
+
+def strip_tool_call_scaffolding(text: str) -> str:
+    """Cut leaked chat-template tool-call scaffolding off the end of ``text``.
+
+    Truncates from the first scaffolding marker to end-of-string, then drops
+    the whitespace the model put in front of it. Text with no marker is
+    returned unchanged, byte for byte — including its trailing whitespace —
+    so this is a provable no-op for every model that does not leak.
+    """
+    if not text:
+        return text
+    cut = len(text)
+    for marker in _TOOL_CALL_SCAFFOLDING_MARKERS:
+        index = text.find(marker)
+        if index != -1:
+            cut = min(cut, index)
+    if cut == len(text):
+        return text
+    return text[:cut].rstrip()
+
+
+def _assemble_assistant_text(text_parts: List[str]) -> Optional[str]:
+    """Join assistant text blocks, minus any leaked tool-call scaffolding.
+
+    Applied to the joined string rather than per-block: everything after the
+    marker is scaffolding, including any later block.
+    """
+    if not text_parts:
+        return None
+    text = "\n".join(text_parts)
+    if not any(marker in text for marker in _TOOL_CALL_SCAFFOLDING_MARKERS):
+        return text
+    return strip_tool_call_scaffolding(text) or None
+
+
+class _ScaffoldingDeltaFilter:
+    """Hold-back filter that keeps leaked scaffolding out of live output.
+
+    Sanitizing only the assembled text is not enough. ``on_text_delta`` fires
+    while ``has_tool_use`` is still False, and the measured event order is
+    text deltas first, ``contentBlockStart(toolUse)`` after — so by the time
+    anything knows a tool call is coming, the fragment has already been
+    printed to the CLI and pushed out as a progressive gateway update.
+
+    The mechanism: withhold the longest tail of the stream that is still a
+    proper prefix of a marker, release it as soon as the next delta proves it
+    was ordinary text, and suppress everything from a completed marker onward.
+
+    Why hold back at all, rather than test each delta on its own? Bedrock
+    chunks the fragment differently between runs — three consecutive runs of
+    the same prompt against deepseek.v3.2 gave
+
+        run 1:  "...for you.\\n\\n<｜DSML｜function"  +  "_calls"
+        run 2:  "...for you.\\n\\n<｜DSML｜function_calls"
+        run 3:  "...for you.\\n\\n"  +  "<｜DSML｜function_calls"
+
+    — but to be straight about the evidence: the marker itself arrived whole
+    in every run measured, those 3 plus 20 more at 10 per region, 23 for 23.
+    A stateless matcher would have caught all of them. This class is defence,
+    not a reproduction. It is kept because delta boundaries are the service's
+    to place and form no part of the Converse contract, the boundaries around
+    the marker demonstrably do move, and the first time one lands inside the
+    marker a stateless matcher ships the raw fragment straight to the screen.
+    The price is ~30 lines that provably cannot lose text — :meth:`flush`
+    releases a partial marker rather than eating it. The test covering a split
+    marker is therefore synthetic, and says so.
+
+    One asymmetry is unavoidable: the live stream keeps the whitespace that
+    preceded the marker (``"...for you.\\n\\n"``) because it was already on
+    screen before the marker arrived, while the assembled content has it
+    rstripped off. Nothing compares the two, and the persisted text is the
+    one worth having tidy.
+    """
+
+    def __init__(self) -> None:
+        self._pending = ""
+        self._suppressing = False
+
+    def feed(self, text: str) -> str:
+        """Return the portion of ``text`` that is safe to emit right now."""
+        if self._suppressing:
+            return ""
+        buffered = self._pending + text
+        self._pending = ""
+        cut = len(buffered)
+        for marker in _TOOL_CALL_SCAFFOLDING_MARKERS:
+            index = buffered.find(marker)
+            if index != -1:
+                cut = min(cut, index)
+        if cut != len(buffered):
+            self._suppressing = True
+            return buffered[:cut]
+        held = self._partial_marker_suffix_length(buffered)
+        if held:
+            self._pending = buffered[len(buffered) - held:]
+            return buffered[:len(buffered) - held]
+        return buffered
+
+    def flush(self) -> str:
+        """Release any still-ambiguous tail at end of stream.
+
+        A tail that is only a *partial* marker is emitted rather than dropped.
+        Bedrock was never observed to truncate mid-marker — the fragment
+        always arrived complete — so this fires when the stream ends early
+        (interrupt, ``max_tokens``) and the choice there is between showing a
+        few stray characters and silently eating real output. Showing them is
+        the lesser failure, and it keeps this filter unable to lose text.
+        """
+        if self._suppressing:
+            return ""
+        pending, self._pending = self._pending, ""
+        return pending
+
+    @staticmethod
+    def _partial_marker_suffix_length(buffered: str) -> int:
+        longest = max(len(marker) for marker in _TOOL_CALL_SCAFFOLDING_MARKERS)
+        for length in range(min(longest - 1, len(buffered)), 0, -1):
+            tail = buffered[-length:]
+            if any(marker.startswith(tail) for marker in _TOOL_CALL_SCAFFOLDING_MARKERS):
+                return length
+        return 0
+
+
 def normalize_converse_response(response: Dict) -> SimpleNamespace:
     """Convert a Bedrock Converse API response to an OpenAI-compatible object.
 
@@ -1213,7 +1387,7 @@ def normalize_converse_response(response: Dict) -> SimpleNamespace:
     # Build the message object
     msg = SimpleNamespace(
         role="assistant",
-        content="\n".join(text_parts) if text_parts else None,
+        content=_assemble_assistant_text(text_parts),
         tool_calls=tool_calls if tool_calls else None,
         reasoning_content="\n\n".join(reasoning_parts) if reasoning_parts else None,
         reasoning_details=reasoning_details or None,
@@ -1323,6 +1497,11 @@ def stream_converse_with_callbacks(
     has_tool_use = False
     stop_reason = "end_turn"
     usage_data: Dict[str, int] = {}
+    # Guards the LIVE output only. ``current_text_buffer`` keeps the raw text
+    # and the assembled result is cleaned once, at the bottom, by
+    # _assemble_assistant_text() — so there is a single place that decides
+    # where the cut goes.
+    scaffolding_filter = _ScaffoldingDeltaFilter()
 
     for event in event_stream.get("stream", []):
         # Wire-level liveness signal: fire on EVERY yielded event (text, tool
@@ -1369,9 +1548,15 @@ def stream_converse_with_callbacks(
                 block["text"] = block.get("text", "") + text
                 current_text_buffer.append(text)
                 # Fire text delta callback only when no tool calls are present
-                # (same semantics as Anthropic/chat_completions streaming)
+                # (same semantics as Anthropic/chat_completions streaming).
+                # Note this fires while has_tool_use is still False: the
+                # measured event order is text deltas first, toolUse block
+                # after, which is exactly why leaked scaffolding reaches the
+                # screen and why the filter has to sit here (#54283).
                 if on_text_delta and not has_tool_use:
-                    on_text_delta(text)
+                    visible = scaffolding_filter.feed(text)
+                    if visible:
+                        on_text_delta(visible)
             elif "toolUse" in delta:
                 if current_tool is not None:
                     current_tool["input_json"] += delta["toolUse"].get("input", "")
@@ -1435,13 +1620,21 @@ def stream_converse_with_callbacks(
                 "cacheWriteInputTokens": meta_usage.get("cacheWriteInputTokens", 0),
             }
 
+    # Release any tail the scaffolding filter is still holding back. Skipped
+    # once a toolUse block has been seen, because at that point a held partial
+    # marker is the leak itself rather than ordinary text cut short.
+    if on_text_delta and not has_tool_use:
+        held = scaffolding_filter.flush()
+        if held:
+            on_text_delta(held)
+
     # Flush remaining text
     if current_text_buffer:
         text_parts.append("".join(current_text_buffer))
 
     msg = SimpleNamespace(
         role="assistant",
-        content="\n".join(text_parts) if text_parts else None,
+        content=_assemble_assistant_text(text_parts),
         tool_calls=tool_calls if tool_calls else None,
         reasoning_content="\n\n".join(reasoning_parts) if reasoning_parts else None,
         reasoning_details=reasoning_details or None,
