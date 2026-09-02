@@ -220,6 +220,10 @@ describe('deciding whether bytes are actually an image', () => {
     assert.equal(imageMime('image/png', HTML_BYTES), '')
   })
 
+  test('sniffing works when the server omits content type', () => {
+    assert.equal(imageMime(undefined, PNG), 'image/png')
+  })
+
   test('an SVG whose opening tag is past the sniff window is trusted on its header', () => {
     const padded = new Uint8Array([...Buffer.from(`<!--${'x'.repeat(2000)}--><svg/>`)])
 

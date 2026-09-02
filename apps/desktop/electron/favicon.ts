@@ -288,7 +288,7 @@ export function sniffImageMime(bytes: Uint8Array): string {
  * HTML challenge page under `content-type: image/png` often enough that
  * believing the server is how you end up rendering a broken-image box.
  */
-export function imageMime(declared: string, bytes: Uint8Array): string {
+export function imageMime(declared: null | string | undefined, bytes: Uint8Array): string {
   if (bytes.length < 48) {
     return ''
   }
@@ -297,7 +297,7 @@ export function imageMime(declared: string, bytes: Uint8Array): string {
 
   // An SVG that opens with a license comment long enough to push `<svg` past
   // the sniff window is still an SVG if the server said so.
-  return sniffed || (declared.toLowerCase().includes('svg') ? 'image/svg+xml' : '')
+  return sniffed || (declared?.toLowerCase().includes('svg') ? 'image/svg+xml' : '')
 }
 
 export const toDataUrl = (mime: string, bytes: Uint8Array): string =>
