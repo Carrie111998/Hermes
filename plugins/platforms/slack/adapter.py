@@ -6733,9 +6733,12 @@ class SlackAdapter(BasePlatformAdapter):
             # while the gateway was down never reached the session. On the
             # FIRST ordinary reply per thread in this process, fetch the
             # delta past the persisted watermark and inject anything missed
-            # as part of this new turn. Checked at most once per thread per
-            # process; a non-empty watermark plus an empty delta costs one
-            # cached conversations.replies call.
+            # as part of this new turn. A session created by a top-level thread
+            # root can legitimately have no watermark because reply bookkeeping
+            # has not run yet. In that case, recover everything after the root
+            # instead of skipping recovery altogether. Checked at most once per
+            # thread per process; an empty delta costs one cached
+            # conversations.replies call.
             rehydration_key = self._thread_rehydration_key(
                 channel_id, event_thread_ts, user_id, team_id
             )
@@ -6746,17 +6749,16 @@ class SlackAdapter(BasePlatformAdapter):
                     user_id=user_id,
                     team_id=team_id,
                 )
-                if watermark_ts:
-                    thread_context = await self._fetch_thread_context(
-                        channel_id=channel_id,
-                        thread_ts=event_thread_ts,
-                        current_ts=ts,
-                        team_id=team_id,
-                        after_ts=watermark_ts,
-                        force_refresh=True,
-                    )
-                    if thread_context:
-                        channel_context = thread_context
+                thread_context = await self._fetch_thread_context(
+                    channel_id=channel_id,
+                    thread_ts=event_thread_ts,
+                    current_ts=ts,
+                    team_id=team_id,
+                    after_ts=watermark_ts or event_thread_ts,
+                    force_refresh=True,
+                )
+                if thread_context:
+                    channel_context = thread_context
                 self._set_thread_watermark(
                     channel_id=channel_id,
                     thread_ts=event_thread_ts,
@@ -8804,7 +8806,9 @@ class SlackAdapter(BasePlatformAdapter):
         """Persist the latest Slack thread ts seen by this session.
 
         Stored via SessionStore session metadata so it survives gateway
-        restarts, unlike the in-memory _thread_context_cache.
+        restarts, unlike the in-memory _thread_context_cache. Socket Mode can
+        deliver an older queued event after a newer one during reconnect, so
+        never let that delayed event move the consumption watermark backward.
         """
         session_store = getattr(self, "_session_store", None)
         if (
@@ -8819,6 +8823,16 @@ class SlackAdapter(BasePlatformAdapter):
         if not session_key:
             return
         try:
+            current_ts = self._get_thread_watermark(
+                channel_id=channel_id,
+                thread_ts=thread_ts,
+                user_id=user_id,
+                team_id=team_id,
+            )
+            if current_ts and self._slack_timestamp_sort_key(
+                watermark_ts
+            ) <= self._slack_timestamp_sort_key(current_ts):
+                return
             session_store.set_session_metadata(
                 session_key,
                 self._thread_watermark_key(channel_id, thread_ts),

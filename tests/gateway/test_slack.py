@@ -3153,6 +3153,87 @@ class TestThreadReplyHandling:
         # Watermark advanced to the trigger ts.
         assert metadata["slack_thread_watermark:C123:123.000"] == "123.456"
 
+    @pytest.mark.asyncio
+    async def test_restart_recovers_missed_reply_without_watermark(
+        self, adapter_with_session_store, mock_session_store
+    ):
+        """The first reply after restart must recover an earlier Slack reply
+        even when the top-level root predates reply-watermark bookkeeping. A
+        later delivery of that older event must not move the recovered thread's
+        watermark backward."""
+        mock_session_store._entries = {"any": MagicMock()}
+        adapter_with_session_store._has_active_session_for_thread = MagicMock(
+            return_value=True
+        )
+        metadata = {}
+        mock_session_store.get_session_metadata = MagicMock(
+            side_effect=lambda sk, k, d=None: metadata.get(k, d)
+        )
+        mock_session_store.set_session_metadata = MagicMock(
+            side_effect=lambda sk, k, v: metadata.__setitem__(k, v) or True
+        )
+        adapter_with_session_store._app.client.conversations_replies = AsyncMock(
+            return_value={
+                "messages": [
+                    {
+                        "ts": "123.000",
+                        "user": "U_USER",
+                        "text": "<@U_BOT> create a support artifact",
+                    },
+                    {
+                        "ts": "123.100",
+                        "user": "U_BOT",
+                        "bot_id": "B_BOT",
+                        "text": "What is the verified email?",
+                    },
+                    {
+                        "ts": "123.200",
+                        "user": "U_USER",
+                        "text": "teacher@example.com",
+                    },
+                    {
+                        "ts": "123.300",
+                        "user": "U_USER",
+                        "text": "try again",
+                    },
+                ]
+            }
+        )
+        adapter_with_session_store._user_name_cache = {
+            ("T_TEAM", "U_USER"): "User",
+        }
+
+        await adapter_with_session_store._handle_slack_message({
+            "text": "try again",
+            "user": "U_USER",
+            "channel": "C123",
+            "ts": "123.300",
+            "thread_ts": "123.000",
+            "channel_type": "channel",
+            "team": "T_TEAM",
+        })
+
+        adapter_with_session_store._app.client.conversations_replies.assert_awaited_once()
+        retry_event = adapter_with_session_store.handle_message.call_args[0][0]
+        assert "teacher@example.com" in retry_event.channel_context
+        assert metadata["slack_thread_watermark:C123:123.000"] == "123.300"
+
+        # Slack may deliver the older email event after the retry during
+        # reconnect. It is still a normal turn, but its timestamp cannot roll
+        # the persisted recovery boundary backward.
+        await adapter_with_session_store._handle_slack_message({
+            "text": "teacher@example.com",
+            "user": "U_USER",
+            "channel": "C123",
+            "ts": "123.200",
+            "thread_ts": "123.000",
+            "channel_type": "channel",
+            "team": "T_TEAM",
+        })
+
+        assert adapter_with_session_store.handle_message.await_count == 2
+        assert metadata["slack_thread_watermark:C123:123.000"] == "123.300"
+
 
 # ---------------------------------------------------------------------------
 # TestAssistantThreadLifecycle

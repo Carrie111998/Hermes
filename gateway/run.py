@@ -6355,6 +6355,7 @@ class TurnRunner:
                 chat_type=ctx.source.chat_type,
                 thread_id=ctx.source.thread_id,
                 gateway_session_key=ctx.session_key,
+                gateway_session_source=ctx.source.to_dict(),
                 session_db=getattr(self._runner._session_db, "_db", self._runner._session_db),
                 # Reload from disk — do not reuse the startup snapshot (#60955).
                 fallback_model=self._runner._refresh_fallback_model(),
@@ -6378,6 +6379,9 @@ class TurnRunner:
 
         # Per-message state — callbacks and reasoning config change every
         # turn and must not be baked into the cached agent constructor.
+        # Refresh source metadata on cached agents because the sender and
+        # message fields can change while the stable chat route stays fixed.
+        agent._gateway_session_source = ctx.source.to_dict()
         # Gate on needs_progress_queue (tool_progress OR thinking_progress)
         # rather than tool_progress alone: the progress_callback also relays
         # _thinking assistant scratch text, which is gated on
@@ -18777,6 +18781,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     "pre_gateway_dispatch",
                     event=event,
                     gateway=self,
+                    session_key=self._session_key_for_source(source),
+                    source=source.to_dict(),
                     # getattr: bare-runner tests build GatewayRunner via
                     # object.__new__ without __init__ (pitfall #17), and the
                     # hook must not fail dispatch over a missing attribute.
