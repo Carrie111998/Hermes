@@ -298,6 +298,28 @@ class TestGatewaySurfacesNullResponse:
         assert "500 Internal Server Error" in response
         assert "/reset" in response
 
+    def test_model_timeout_surfaces_hint(self):
+        """Regression: when the model stream times out mid-turn the agent
+        marks the turn failed with 'interrupted waiting for model response'
+        but final_response is empty.  The gateway must surface a clear
+        user-facing hint instead of silently dropping the turn."""
+        from gateway.run import _normalize_empty_agent_response
+
+        agent_result = {
+            "final_response": None,
+            "api_calls": 4,
+            "failed": True,
+            "error": "Operation interrupted waiting for model response #4",
+        }
+
+        response = agent_result.get("final_response") or ""
+        response = _normalize_empty_agent_response(
+            agent_result, response, history_len=10,
+        )
+
+        assert response, "Model-timeout turn must surface a user-facing hint"
+        assert "stopped responding" in response.lower()
+        assert "continue" in response.lower()
 
     def test_silent_drop_after_stop_surfaces_hint(self):
         """Regression for #31884: after /stop, the next user message hits a

@@ -4591,6 +4591,28 @@ def _normalize_empty_agent_response(
             p in error_str
             for p in ("context", "token", "too large", "too long", "exceed", "payload")
         ) or ("400" in error_str and history_len > 50)
+        # Detect model/stream timeout where the agent produced reasoning
+        # but the connection dropped before final_response was assembled.
+        # The error text bubbles up from the stale-kill path in
+        # chat_completion_helpers.py ("Stream stale for … Killing connection")
+        # and may also be worded as "interrupted waiting for model response".
+        # Without this the gateway silently swallows the turn.
+        is_model_timeout = any(
+            pat in error_str
+            for pat in (
+                "interrupted waiting for model response",
+                "stream stale for",
+                "non-streaming api call stale for",
+                "killing connection",
+                "no first byte from provider",
+                "no response from provider",
+            )
+        )
+        if is_model_timeout:
+            return (
+                "⚠️ The model stopped responding (stream timeout). "
+                "Send 'continue' or retry your message."
+            )
         if is_context_failure:
             return (
                 "⚠️ Session too large for the model's context window.\n"
