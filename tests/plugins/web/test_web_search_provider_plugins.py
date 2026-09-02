@@ -343,3 +343,101 @@ class TestErrorResponseShapes:
     """When credentials are missing, plugins return typed errors, not raises."""
 
 
+# ---------------------------------------------------------------------------
+# Firecrawl keyed extract: refusal vs empty page (issue #99533)
+# ---------------------------------------------------------------------------
+
+
+class TestFirecrawlKeyedExtractRefusals:
+    """A non-2xx Firecrawl scrape with no content must surface as an
+    ``error`` result, not a successful empty extraction.
+
+    Firecrawl's /scrape endpoint does not raise for 401/403/404/5xx — it
+    returns a payload whose ``metadata.statusCode`` carries the target's
+    real status while ``markdown``/``html`` are empty. Without the gate,
+    the refusal is indistinguishable from a genuinely blank page and the
+    keyless rescue in ``web_tools._rescue_extract`` (which fires only
+    when every result carries an error) never runs (issue #99533).
+    """
+
+    @staticmethod
+    def _provider_with_payload(
+        monkeypatch: pytest.MonkeyPatch, payload: dict
+    ) -> "object":
+        import plugins.web.firecrawl.provider as p
+
+        class FakeClient:
+            def scrape(self, url=None, formats=None):
+                return payload
+
+        monkeypatch.setattr(p, "_use_keyless_ring", lambda: False)
+        monkeypatch.setattr(p, "_get_firecrawl_client", lambda: FakeClient())
+        monkeypatch.setattr(p, "check_website_access", lambda u: None)
+        monkeypatch.setattr(p, "is_safe_url", lambda u: True)
+        return p.FirecrawlWebSearchProvider()
+
+    def test_refusal_with_no_content_becomes_error(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        payload = {
+            "markdown": "",
+            "html": "",
+            "metadata": {
+                "title": "Access denied",
+                "sourceURL": "https://example.com/paywalled",
+                "statusCode": 403,
+                "error": "Forbidden",
+            },
+        }
+        prov = self._provider_with_payload(monkeypatch, payload)
+        out = asyncio.run(
+            prov.extract(["https://example.com/paywalled"], format="markdown")
+        )
+        assert "error" in out[0]
+        assert "HTTP 403" in out[0]["error"]
+        assert "Forbidden" in out[0]["error"]
+        assert out[0]["content"] == ""
+
+    def test_non_2xx_with_usable_content_stays_success(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # A soft-blocked page that still yields text must not be gated.
+        payload = {
+            "markdown": "partial text behind a soft block",
+            "html": "<p>partial text behind a soft block</p>",
+            "metadata": {
+                "title": "Soft block",
+                "sourceURL": "https://example.com/soft",
+                "statusCode": 403,
+            },
+        }
+        prov = self._provider_with_payload(monkeypatch, payload)
+        out = asyncio.run(
+            prov.extract(["https://example.com/soft"], format="markdown")
+        )
+        assert "error" not in out[0]
+        assert out[0]["content"] == "partial text behind a soft block"
+
+    def test_2xx_empty_page_stays_empty_success(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        payload = {
+            "markdown": "",
+            "html": "",
+            "metadata": {
+                "title": "",
+                "sourceURL": "https://example.com/blank",
+                "statusCode": 200,
+            },
+        }
+        prov = self._provider_with_payload(monkeypatch, payload)
+        out = asyncio.run(
+            prov.extract(["https://example.com/blank"], format="markdown")
+        )
+        assert "error" not in out[0]
+        # content is a str on every path — the markdown branch used to
+        # leak None when Firecrawl returned no markdown (issue #99533).
+        assert out[0]["content"] == ""
+        assert isinstance(out[0]["content"], str)
+
+

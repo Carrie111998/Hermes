@@ -759,9 +759,46 @@ class FirecrawlWebSearchProvider(WebSearchProvider):
 
                 # Choose markdown vs html according to the requested format
                 if format == "markdown" or (format is None and content_markdown):
-                    chosen_content = content_markdown
+                    chosen_content = content_markdown or ""
                 else:
                     chosen_content = content_html or content_markdown or ""
+
+                # A non-2xx scrape that yielded nothing is a refusal, not an
+                # empty page. Firecrawl's /scrape returns the target's real
+                # status in metadata.statusCode instead of raising, so without
+                # this gate the refusal presents as a successful empty result
+                # and the keyless rescue in web_tools._rescue_extract (which
+                # fires only when every result carries an error) never runs.
+                try:
+                    scrape_status = int(metadata.get("statusCode") or 0)
+                except (TypeError, ValueError):
+                    scrape_status = 0
+                if (
+                    chosen_content == ""
+                    and scrape_status
+                    and not 200 <= scrape_status < 300
+                ):
+                    reason = metadata.get("error")
+                    logger.info(
+                        "Firecrawl scrape refused for %s: HTTP %s",
+                        final_url,
+                        scrape_status,
+                    )
+                    results.append(
+                        {
+                            "url": final_url,
+                            "title": title,
+                            "content": "",
+                            "raw_content": "",
+                            "error": (
+                                f"Target returned HTTP {scrape_status} with no "
+                                f"content"
+                                + (f": {reason}" if reason else "")
+                            ),
+                            "metadata": metadata,
+                        }
+                    )
+                    continue
 
                 results.append(
                     {
