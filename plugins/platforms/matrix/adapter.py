@@ -2228,6 +2228,8 @@ class MatrixAdapter(BasePlatformAdapter):
         last_event_id = None
         for i, chunk in enumerate(chunks):
             msg_content = self._build_text_message_content(chunk)
+            if metadata and metadata.get("_interim_send"):
+                msg_content["msgtype"] = "m.notice"
 
             # Prefer explicit Matrix HTML payload (always-visible Tool activity list).
             if i == 0 and metadata and metadata.get("matrix_formatted_body"):
@@ -2377,6 +2379,8 @@ class MatrixAdapter(BasePlatformAdapter):
 
         formatted = self.format_message(content)
         new_content = self._build_text_message_content(formatted)
+        msgtype = "m.notice" if metadata and metadata.get("_interim_send") else "m.text"
+        new_content["msgtype"] = msgtype
         # Prefer explicit Matrix HTML payload (always-visible Tool activity list).
         if metadata and metadata.get("matrix_formatted_body"):
             html = _sanitize_matrix_html(str(metadata.get("matrix_formatted_body") or ""))
@@ -2384,7 +2388,7 @@ class MatrixAdapter(BasePlatformAdapter):
                 new_content["format"] = "org.matrix.custom.html"
                 new_content["formatted_body"] = html
         msg_content: Dict[str, Any] = {
-            "msgtype": "m.text",
+            "msgtype": msgtype,
             "body": f"* {formatted}",
             "m.new_content": new_content,
         }
