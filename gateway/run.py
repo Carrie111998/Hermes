@@ -3342,12 +3342,16 @@ def _resolve_runtime_agent_kwargs() -> dict:
     _env_mt = os.environ.get("HERMES_MAX_TOKENS")
     if _env_mt:
         try:
-            max_tokens = int(_env_mt)
+            _env_val = int(_env_mt)
+            # > 0: a malformed global value falls through to the per-provider
+            # cap instead of suppressing it (parity with the CLI helper).
+            if _env_val > 0:
+                max_tokens = _env_val
         except (ValueError, TypeError):
             max_tokens = None
     elif isinstance(model_cfg, dict):
         mt = model_cfg.get("max_tokens")
-        if isinstance(mt, int):
+        if isinstance(mt, int) and mt > 0:
             max_tokens = mt
     # Fall back to a per-provider output cap (custom_providers max_output_tokens)
     # only when the documented global model.max_tokens isn't set, so the global
