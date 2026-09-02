@@ -544,7 +544,7 @@ def do_install(identifier: str, category: str = "", force: bool = False,
                console: Optional[Console] = None, skip_confirm: bool = False,
                invalidate_cache: bool = True,
                name_override: str = "",
-               source_id: Optional[str] = None) -> None:
+               source_id: Optional[str] = None) -> bool:
     """Fetch, quarantine, scan, confirm, and install a skill.
 
     ``name_override`` lets non-interactive callers (slash commands, gateway,
@@ -560,6 +560,12 @@ def do_install(identifier: str, category: str = "", force: bool = False,
     identifier cannot be fuzzy-resolved to a same-named skill in a different
     registry. Skill names are not namespaced across registries, so an
     unconstrained resolve can silently change a skill's provenance.
+
+    Returns ``True`` on a completed install, ``False`` on any early exit
+    (fetch failure, blocked scan, user cancellation, invalid input, etc).
+    Non-interactive callers (notably ``hermes skills install`` on the CLI)
+    use this to set a non-zero process exit code instead of silently
+    reporting success on a failed install (#98725).
     """
     from tools.skills_hub import (
         GitHubAuth, create_source_router, ensure_hub_dirs,
@@ -585,13 +591,13 @@ def do_install(identifier: str, category: str = "", force: bool = False,
                 f"Refusing to resolve '{identifier}' against other registries "
                 f"(that would change the skill's provenance).\n"
             )
-            return
+            return False
 
     # If identifier looks like a short name (no slashes), resolve it via search
     if "/" not in identifier:
         identifier = _resolve_short_name(identifier, sources, c)
         if not identifier:
-            return
+            return False
 
     c.print(f"\n[bold]Fetching:[/] {identifier}")
 
@@ -615,7 +621,7 @@ def do_install(identifier: str, category: str = "", force: bool = False,
             )
         else:
             c.print()
-        return
+        return False
 
     # URL-sourced skills may arrive with an empty name when SKILL.md has no
     # ``name:`` in frontmatter AND the URL path doesn't yield a valid
@@ -632,7 +638,7 @@ def do_install(identifier: str, category: str = "", force: bool = False,
                 "Must be a lowercase identifier (letters, digits, hyphens, "
                 "underscores; starts with a letter).\n"
             )
-            return
+            return False
         elif skip_confirm:
             # Non-interactive surface (slash command / TUI / gateway). Can't
             # prompt — emit an actionable error.
@@ -647,14 +653,14 @@ def do_install(identifier: str, category: str = "", force: bool = False,
                 "[dim]Or ask the SKILL.md's author to add a `name:` field to "
                 "its YAML frontmatter.[/]\n"
             )
-            return
+            return False
         else:
             # Interactive TTY — prompt.
             url = bundle_meta.get("url") or identifier
             chosen = _prompt_for_skill_name(c, url)
             if not chosen:
                 c.print("[dim]Installation cancelled.[/]\n")
-                return
+                return False
             bundle.name = chosen
             bundle_meta["awaiting_name"] = False
         # Keep SkillMeta in sync so downstream "already installed" checks,
@@ -684,7 +690,7 @@ def do_install(identifier: str, category: str = "", force: bool = False,
         c.print(f"[yellow]Warning:[/] '{bundle.name}' is already installed at {existing['install_path']}")
         if not force:
             c.print("Use --force to reinstall.\n")
-            return
+            return False
 
     extra_metadata = dict(getattr(meta, "extra", {}) or {})
     extra_metadata.update(getattr(bundle, "metadata", {}) or {})
@@ -697,7 +703,7 @@ def do_install(identifier: str, category: str = "", force: bool = False,
         from tools.skills_hub import append_audit_log
         append_audit_log("BLOCKED", bundle.name, bundle.source,
                          bundle.trust_level, "invalid_path", str(exc))
-        return
+        return False
     c.print(f"[dim]Quarantined to {q_path.relative_to(q_path.parent.parent.parent)}[/]")
 
     # Scan
@@ -739,7 +745,7 @@ def do_install(identifier: str, category: str = "", force: bool = False,
         append_audit_log("BLOCKED", bundle.name, bundle.source,
                          bundle.trust_level, result.verdict,
                          f"{len(result.findings)}_findings")
-        return
+        return False
 
     # Advisory SkillEvaluator Tier 1 scan (optional second opinion).
     # Warn-and-continue by design: PII-class findings are informational
@@ -783,7 +789,7 @@ def do_install(identifier: str, category: str = "", force: bool = False,
         if answer not in {"y", "yes"}:
             c.print("[dim]Installation cancelled.[/]\n")
             shutil.rmtree(q_path, ignore_errors=True)
-            return
+            return False
 
     # Install
     try:
@@ -794,7 +800,7 @@ def do_install(identifier: str, category: str = "", force: bool = False,
         from tools.skills_hub import append_audit_log
         append_audit_log("BLOCKED", bundle.name, bundle.source,
                          bundle.trust_level, "invalid_path", str(exc))
-        return
+        return False
     from tools.skills_hub import SKILLS_DIR
     c.print(f"[bold green]Installed:[/] {install_dir.resolve().relative_to(Path(SKILLS_DIR).resolve()).as_posix()}")
     c.print(f"[dim]Files: {', '.join(bundle.files.keys())}[/]\n")
@@ -850,6 +856,8 @@ def do_install(identifier: str, category: str = "", force: bool = False,
     else:
         c.print("[dim]Skill will be available in your next session.[/]")
         c.print("[dim]Use /reset to start a new session now, or --now to activate immediately (invalidates prompt cache).[/]\n")
+
+    return True
 
 
 def do_inspect(identifier: str, console: Optional[Console] = None) -> None:
@@ -1817,8 +1825,14 @@ def do_snapshot_import(input_path: str, force: bool = False,
 # CLI argparse entry point
 # ---------------------------------------------------------------------------
 
-def skills_command(args) -> None:
-    """Router for `hermes skills <subcommand>` — called from hermes_cli/main.py."""
+def skills_command(args) -> Optional[bool]:
+    """Router for `hermes skills <subcommand>` — called from hermes_cli/main.py.
+
+    Returns ``False`` when the routed subcommand reports failure (currently
+    only ``install`` does), so ``cmd_skills`` in ``hermes_cli/main.py`` can
+    turn it into a non-zero process exit code. Every other subcommand
+    returns ``None`` (implicit success), matching prior behavior.
+    """
     action = getattr(args, "skills_action", None)
 
     if action == "browse":
@@ -1827,9 +1841,11 @@ def skills_command(args) -> None:
         do_search(args.query, source=args.source, limit=args.limit,
                   as_json=getattr(args, "json", False))
     elif action == "install":
-        do_install(args.identifier, category=args.category, force=args.force,
-                   skip_confirm=getattr(args, "yes", False),
-                   name_override=getattr(args, "name", "") or "")
+        ok = do_install(args.identifier, category=args.category, force=args.force,
+                         skip_confirm=getattr(args, "yes", False),
+                         name_override=getattr(args, "name", "") or "")
+        if not ok:
+            return False
     elif action == "inspect":
         do_inspect(args.identifier)
     elif action == "list":
