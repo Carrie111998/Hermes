@@ -1,5 +1,397 @@
 {
   "assetCount": 26,
+  "assetQuality": [
+    {
+      "animationRigWireCount": 0,
+      "collection": "Hero Asset - archive",
+      "heroComponentCount": 35,
+      "id": "archive",
+      "lodPolicy": [
+        "hero",
+        "high",
+        "medium",
+        "low"
+      ],
+      "proceduralPbrMaterialCount": 35,
+      "retopologyTarget": "quad_dominant_smart_low_poly",
+      "sculptedSurfaceCount": 4
+    },
+    {
+      "animationRigWireCount": 0,
+      "collection": "Hero Asset - arts-studio",
+      "heroComponentCount": 30,
+      "id": "arts-studio",
+      "lodPolicy": [
+        "hero",
+        "high",
+        "medium",
+        "low"
+      ],
+      "proceduralPbrMaterialCount": 30,
+      "retopologyTarget": "quad_dominant_smart_low_poly",
+      "sculptedSurfaceCount": 4
+    },
+    {
+      "animationRigWireCount": 4,
+      "collection": "Hero Asset - child-bold",
+      "heroComponentCount": 16,
+      "id": "child-bold",
+      "lodPolicy": [
+        "hero",
+        "high",
+        "medium",
+        "low"
+      ],
+      "proceduralPbrMaterialCount": 16,
+      "retopologyTarget": "quad_dominant_smart_low_poly",
+      "sculptedSurfaceCount": 7
+    },
+    {
+      "animationRigWireCount": 4,
+      "collection": "Hero Asset - child-cautious",
+      "heroComponentCount": 16,
+      "id": "child-cautious",
+      "lodPolicy": [
+        "hero",
+        "high",
+        "medium",
+        "low"
+      ],
+      "proceduralPbrMaterialCount": 16,
+      "retopologyTarget": "quad_dominant_smart_low_poly",
+      "sculptedSurfaceCount": 7
+    },
+    {
+      "animationRigWireCount": 4,
+      "collection": "Hero Asset - child-curious",
+      "heroComponentCount": 16,
+      "id": "child-curious",
+      "lodPolicy": [
+        "hero",
+        "high",
+        "medium",
+        "low"
+      ],
+      "proceduralPbrMaterialCount": 16,
+      "retopologyTarget": "quad_dominant_smart_low_poly",
+      "sculptedSurfaceCount": 7
+    },
+    {
+      "animationRigWireCount": 4,
+      "collection": "Hero Asset - child-social",
+      "heroComponentCount": 16,
+      "id": "child-social",
+      "lodPolicy": [
+        "hero",
+        "high",
+        "medium",
+        "low"
+      ],
+      "proceduralPbrMaterialCount": 16,
+      "retopologyTarget": "quad_dominant_smart_low_poly",
+      "sculptedSurfaceCount": 7
+    },
+    {
+      "animationRigWireCount": 0,
+      "collection": "Hero Asset - council-hall",
+      "heroComponentCount": 24,
+      "id": "council-hall",
+      "lodPolicy": [
+        "hero",
+        "high",
+        "medium",
+        "low"
+      ],
+      "proceduralPbrMaterialCount": 24,
+      "retopologyTarget": "quad_dominant_smart_low_poly",
+      "sculptedSurfaceCount": 4
+    },
+    {
+      "animationRigWireCount": 0,
+      "collection": "Hero Asset - engineering-workshop",
+      "heroComponentCount": 28,
+      "id": "engineering-workshop",
+      "lodPolicy": [
+        "hero",
+        "high",
+        "medium",
+        "low"
+      ],
+      "proceduralPbrMaterialCount": 28,
+      "retopologyTarget": "quad_dominant_smart_low_poly",
+      "sculptedSurfaceCount": 4
+    },
+    {
+      "animationRigWireCount": 3,
+      "collection": "Hero Asset - leader-archive",
+      "heroComponentCount": 37,
+      "id": "leader-archive",
+      "lodPolicy": [
+        "hero",
+        "high",
+        "medium",
+        "low"
+      ],
+      "proceduralPbrMaterialCount": 37,
+      "retopologyTarget": "quad_dominant_smart_low_poly",
+      "sculptedSurfaceCount": 7
+    },
+    {
+      "animationRigWireCount": 3,
+      "collection": "Hero Asset - leader-creative",
+      "heroComponentCount": 29,
+      "id": "leader-creative",
+      "lodPolicy": [
+        "hero",
+        "high",
+        "medium",
+        "low"
+      ],
+      "proceduralPbrMaterialCount": 29,
+      "retopologyTarget": "quad_dominant_smart_low_poly",
+      "sculptedSurfaceCount": 7
+    },
+    {
+      "animationRigWireCount": 3,
+      "collection": "Hero Asset - leader-engineering",
+      "heroComponentCount": 29,
+      "id": "leader-engineering",
+      "lodPolicy": [
+        "hero",
+        "high",
+        "medium",
+        "low"
+      ],
+      "proceduralPbrMaterialCount": 29,
+      "retopologyTarget": "quad_dominant_smart_low_poly",
+      "sculptedSurfaceCount": 7
+    },
+    {
+      "animationRigWireCount": 3,
+      "collection": "Hero Asset - leader-governance",
+      "heroComponentCount": 29,
+      "id": "leader-governance",
+      "lodPolicy": [
+        "hero",
+        "high",
+        "medium",
+        "low"
+      ],
+      "proceduralPbrMaterialCount": 29,
+      "retopologyTarget": "quad_dominant_smart_low_poly",
+      "sculptedSurfaceCount": 7
+    },
+    {
+      "animationRigWireCount": 3,
+      "collection": "Hero Asset - leader-knowledge",
+      "heroComponentCount": 37,
+      "id": "leader-knowledge",
+      "lodPolicy": [
+        "hero",
+        "high",
+        "medium",
+        "low"
+      ],
+      "proceduralPbrMaterialCount": 37,
+      "retopologyTarget": "quad_dominant_smart_low_poly",
+      "sculptedSurfaceCount": 7
+    },
+    {
+      "animationRigWireCount": 3,
+      "collection": "Hero Asset - leader-medical",
+      "heroComponentCount": 28,
+      "id": "leader-medical",
+      "lodPolicy": [
+        "hero",
+        "high",
+        "medium",
+        "low"
+      ],
+      "proceduralPbrMaterialCount": 28,
+      "retopologyTarget": "quad_dominant_smart_low_poly",
+      "sculptedSurfaceCount": 7
+    },
+    {
+      "animationRigWireCount": 3,
+      "collection": "Hero Asset - leader-research",
+      "heroComponentCount": 29,
+      "id": "leader-research",
+      "lodPolicy": [
+        "hero",
+        "high",
+        "medium",
+        "low"
+      ],
+      "proceduralPbrMaterialCount": 29,
+      "retopologyTarget": "quad_dominant_smart_low_poly",
+      "sculptedSurfaceCount": 7
+    },
+    {
+      "animationRigWireCount": 3,
+      "collection": "Hero Asset - leader-review",
+      "heroComponentCount": 28,
+      "id": "leader-review",
+      "lodPolicy": [
+        "hero",
+        "high",
+        "medium",
+        "low"
+      ],
+      "proceduralPbrMaterialCount": 28,
+      "retopologyTarget": "quad_dominant_smart_low_poly",
+      "sculptedSurfaceCount": 7
+    },
+    {
+      "animationRigWireCount": 0,
+      "collection": "Hero Asset - library",
+      "heroComponentCount": 35,
+      "id": "library",
+      "lodPolicy": [
+        "hero",
+        "high",
+        "medium",
+        "low"
+      ],
+      "proceduralPbrMaterialCount": 35,
+      "retopologyTarget": "quad_dominant_smart_low_poly",
+      "sculptedSurfaceCount": 4
+    },
+    {
+      "animationRigWireCount": 0,
+      "collection": "Hero Asset - research-lab",
+      "heroComponentCount": 28,
+      "id": "research-lab",
+      "lodPolicy": [
+        "hero",
+        "high",
+        "medium",
+        "low"
+      ],
+      "proceduralPbrMaterialCount": 28,
+      "retopologyTarget": "quad_dominant_smart_low_poly",
+      "sculptedSurfaceCount": 4
+    },
+    {
+      "animationRigWireCount": 0,
+      "collection": "Hero Asset - review-office",
+      "heroComponentCount": 27,
+      "id": "review-office",
+      "lodPolicy": [
+        "hero",
+        "high",
+        "medium",
+        "low"
+      ],
+      "proceduralPbrMaterialCount": 27,
+      "retopologyTarget": "quad_dominant_smart_low_poly",
+      "sculptedSurfaceCount": 4
+    },
+    {
+      "animationRigWireCount": 0,
+      "collection": "Hero Asset - triage-clinic",
+      "heroComponentCount": 24,
+      "id": "triage-clinic",
+      "lodPolicy": [
+        "hero",
+        "high",
+        "medium",
+        "low"
+      ],
+      "proceduralPbrMaterialCount": 24,
+      "retopologyTarget": "quad_dominant_smart_low_poly",
+      "sculptedSurfaceCount": 4
+    },
+    {
+      "animationRigWireCount": 4,
+      "collection": "Hero Asset - worker-audit",
+      "heroComponentCount": 16,
+      "id": "worker-audit",
+      "lodPolicy": [
+        "hero",
+        "high",
+        "medium",
+        "low"
+      ],
+      "proceduralPbrMaterialCount": 16,
+      "retopologyTarget": "quad_dominant_smart_low_poly",
+      "sculptedSurfaceCount": 7
+    },
+    {
+      "animationRigWireCount": 4,
+      "collection": "Hero Asset - worker-operations",
+      "heroComponentCount": 16,
+      "id": "worker-operations",
+      "lodPolicy": [
+        "hero",
+        "high",
+        "medium",
+        "low"
+      ],
+      "proceduralPbrMaterialCount": 16,
+      "retopologyTarget": "quad_dominant_smart_low_poly",
+      "sculptedSurfaceCount": 7
+    },
+    {
+      "animationRigWireCount": 4,
+      "collection": "Hero Asset - worker-release",
+      "heroComponentCount": 16,
+      "id": "worker-release",
+      "lodPolicy": [
+        "hero",
+        "high",
+        "medium",
+        "low"
+      ],
+      "proceduralPbrMaterialCount": 16,
+      "retopologyTarget": "quad_dominant_smart_low_poly",
+      "sculptedSurfaceCount": 7
+    },
+    {
+      "animationRigWireCount": 4,
+      "collection": "Hero Asset - worker-research",
+      "heroComponentCount": 16,
+      "id": "worker-research",
+      "lodPolicy": [
+        "hero",
+        "high",
+        "medium",
+        "low"
+      ],
+      "proceduralPbrMaterialCount": 16,
+      "retopologyTarget": "quad_dominant_smart_low_poly",
+      "sculptedSurfaceCount": 7
+    },
+    {
+      "animationRigWireCount": 4,
+      "collection": "Hero Asset - worker-review",
+      "heroComponentCount": 16,
+      "id": "worker-review",
+      "lodPolicy": [
+        "hero",
+        "high",
+        "medium",
+        "low"
+      ],
+      "proceduralPbrMaterialCount": 16,
+      "retopologyTarget": "quad_dominant_smart_low_poly",
+      "sculptedSurfaceCount": 7
+    },
+    {
+      "animationRigWireCount": 4,
+      "collection": "Hero Asset - worker-support",
+      "heroComponentCount": 16,
+      "id": "worker-support",
+      "lodPolicy": [
+        "hero",
+        "high",
+        "medium",
+        "low"
+      ],
+      "proceduralPbrMaterialCount": 16,
+      "retopologyTarget": "quad_dominant_smart_low_poly",
+      "sculptedSurfaceCount": 7
+    }
+  ],
   "blend": "lunar-city/hero-assets/lunar-city-hero-assets.blend",
   "buildingPreview": "lunar-city/hero-assets/lunar-city-hero-buildings.png",
   "buildings": [
@@ -310,6 +702,7 @@
     "allAssetsVisibleInReviewScene": true,
     "freeLocalGenerationOnly": true,
     "noRawSoulContent": true,
+    "tracksPerAssetQuality": true,
     "usesContinuousCharacterCoreMeshes": true,
     "usesContinuousCharacterLimbMeshes": true,
     "usesContinuousSculptedSurfaces": true,

@@ -687,6 +687,37 @@ def setup_camera_and_lighting(target):
     target["lighting_profile"] = "hero_asset_review"
 
 
+def asset_quality_entries():
+    grouped = {}
+    for obj in bpy.data.objects:
+        asset_id = obj.get("asset_id")
+        if not asset_id:
+            continue
+        entry = grouped.setdefault(
+            asset_id,
+            {
+                "id": asset_id,
+                "collection": f"Hero Asset - {asset_id}",
+                "heroComponentCount": 0,
+                "sculptedSurfaceCount": 0,
+                "proceduralPbrMaterialCount": 0,
+                "animationRigWireCount": 0,
+                "lodPolicy": ["hero", "high", "medium", "low"],
+                "retopologyTarget": "quad_dominant_smart_low_poly",
+            },
+        )
+        entry["heroComponentCount"] += 1
+        if obj.get("mesh_construction"):
+            entry["sculptedSurfaceCount"] += 1
+        if obj.get("component") == "animation-wire-rig" or obj.get("component") == "flexible-antenna-rig":
+            entry["animationRigWireCount"] += 1
+        for material_slot in getattr(obj, "material_slots", []):
+            material = material_slot.material
+            if material and material.get("surface_pipeline"):
+                entry["proceduralPbrMaterialCount"] += 1
+    return [grouped[key] for key in sorted(grouped)]
+
+
 def main():
     HERO_DIR.mkdir(parents=True, exist_ok=True)
     reset_scene()
@@ -735,6 +766,7 @@ def main():
     scene["sculpted_character_core_components"] = sum(1 for obj in bpy.data.objects if str(obj.get("mesh_construction", "")).startswith("continuous_") and obj.get("asset_kind") == "character")
     scene["sculpted_character_limb_components"] = sum(1 for obj in bpy.data.objects if obj.get("mesh_construction") == "continuous_tapered_limb_skin")
     pbr_materials = sorted({mat.name for mat in bpy.data.materials if mat.get("surface_pipeline")})
+    quality_entries = asset_quality_entries()
 
     manifest = {
         "schemaVersion": 1,
@@ -752,6 +784,7 @@ def main():
         "sculptedCharacterLimbComponentCount": scene["sculpted_character_limb_components"],
         "proceduralPbrMaterialCount": len(pbr_materials),
         "proceduralPbrMaterials": pbr_materials,
+        "assetQuality": quality_entries,
         "buildings": [
             {"id": asset_id, "role": role, "title": title, "collection": f"Hero Asset - {asset_id}", "lod": ["hero", "high", "medium", "low"]}
             for asset_id, role, title, _accent in BUILDINGS
@@ -795,6 +828,7 @@ def main():
             "usesContinuousCharacterCoreMeshes": scene["sculpted_character_core_components"] >= (len(LEADERS) + len(WORKERS) + len(CHILDREN)) * 2,
             "usesContinuousCharacterLimbMeshes": scene["sculpted_character_limb_components"] >= (len(LEADERS) + len(WORKERS) + len(CHILDREN)) * 4,
             "usesProceduralPbrMaterials": len(pbr_materials) >= 12,
+            "tracksPerAssetQuality": len(quality_entries) == len(BUILDINGS) + len(LEADERS) + len(WORKERS) + len(CHILDREN),
         },
     }
     HERO_MANIFEST.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
