@@ -14,7 +14,7 @@ from agent import afk
 
 
 def _hold_afk_transaction(ready, release):
-    with afk._transaction():
+    with afk.locked_state():
         ready.set()
         release.wait(5)
 
@@ -28,6 +28,29 @@ def _engage_afk_after_signal(attempted, completed, errors):
     else:
         errors.put("<no error>")
         completed.set()
+
+
+def test_locked_state_yields_valid_off_snapshot(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    with afk.locked_state() as state:
+        assert state is None
+
+
+def test_locked_state_yields_valid_engaged_snapshot(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    afk.engage("away")
+
+    with afk.locked_state() as state:
+        assert state["reason"] == "away"
+
+
+def test_locked_state_yields_unverifiable_snapshot_fail_closed(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    afk.state_path().write_text("not json", encoding="utf-8")
+
+    with afk.locked_state() as state:
+        assert state == {"unverifiable": True}
 
 
 def test_state_is_shared_by_profiles_under_one_default_root(monkeypatch, tmp_path):

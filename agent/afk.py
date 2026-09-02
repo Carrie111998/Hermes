@@ -463,10 +463,17 @@ def _read_state(root: _Root) -> dict | None:
 
 
 def get_state() -> dict | None:
+    with locked_state() as state:
+        return state
+
+
+@contextmanager
+def locked_state():
+    """Yield one validated AFK snapshot while holding the AFK file lock."""
     with _transaction() as root:
         state = _read_state(root)
         root.revalidate()
-        return state
+        yield state
 
 
 def is_afk() -> bool:
@@ -596,7 +603,14 @@ def engage(reason: str | None = None) -> dict:
             raise AfkStateChangedUnconfirmed(
                 "AFK state could not be verified", changed=True
             )
-        return result
+    # Wake approval waiters only after releasing the AFK file lock.  The
+    # approval queue takes its own lock and must never invert AFK->queue order.
+    try:
+        from tools.approval import cancel_gateway_approvals_for_afk
+        cancel_gateway_approvals_for_afk()
+    except Exception:
+        pass
+    return result
 
 
 def clear() -> bool:
