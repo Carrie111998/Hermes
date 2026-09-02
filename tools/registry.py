@@ -293,9 +293,10 @@ def _prune_check_fn_caches(now: float) -> None:
     for key, (timestamp, _) in list(_check_fn_cache.items()):
         if now - timestamp >= _CHECK_FN_TTL_SECONDS:
             _check_fn_cache.pop(key, None)
-    for key, timestamp in list(_check_fn_last_good.items()):
-        if now - timestamp >= _CHECK_FN_FAILURE_GRACE_SECONDS:
-            _check_fn_last_good.pop(key, None)
+    # Keep last-good timestamps beyond the 60s functional grace window. They
+    # no longer keep a tool available once grace expires; they only distinguish
+    # "never available here" (INFO) from "was available, now down" (WARNING).
+    # Growth remains bounded by _CHECK_FN_CACHE_MAX below.
     while len(_check_fn_cache) >= _CHECK_FN_CACHE_MAX:
         _check_fn_cache.pop(next(iter(_check_fn_cache)))
     while len(_check_fn_last_good) >= _CHECK_FN_CACHE_MAX:
@@ -433,7 +434,13 @@ def _check_fn_cached(fn: Callable) -> bool:
 
         # No recent success (or grace expired) — honor the failure. Log it so
         # silent tool loss in quiet mode (subagents) is diagnosable.
-        logger.warning(
+        # A clean False with no prior success is the normal feature-gate path
+        # (headless browser absent, Kanban mode disabled, optional SDK missing).
+        # Keep it diagnosable in agent.log without polluting errors.log. A probe
+        # exception or a check that previously succeeded remains a warning.
+        log_level = logging.WARNING if raised or last_good is not None else logging.INFO
+        logger.log(
+            log_level,
             "check_fn %s %s; dependent tools will be unavailable this turn",
             getattr(fn, "__qualname__", fn),
             "raised" if raised else "returned False",
