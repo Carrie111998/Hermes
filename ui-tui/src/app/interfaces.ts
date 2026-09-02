@@ -460,9 +460,11 @@ export interface InputHandlerContext {
     enabled: boolean
     recordKey: ParsedVoiceRecordKey
     recording: boolean
+    realtimeActive: boolean
     setProcessing: StateSetter<boolean>
     setRecording: StateSetter<boolean>
     setVoiceEnabled: StateSetter<boolean>
+    stopRealtime: () => void
     setVoiceTts: StateSetter<boolean>
   }
   wheelStep: number
@@ -555,6 +557,7 @@ export interface SlashHandlerContext {
     trimLastExchange: (items: Msg[]) => Msg[]
   }
   voice: {
+    controlRealtimeVoice: (action: 'start' | 'status' | 'stop') => void
     setVoiceEnabled: StateSetter<boolean>
     setVoiceRecordKey: (v: ParsedVoiceRecordKey) => void
     setVoiceTts: StateSetter<boolean>

@@ -312,6 +312,17 @@ export const sessionCommands: SlashCommand[] = [
   },
 
   {
+    help: 'native realtime duplex voice: [start|stop|status]',
+    name: 'talk',
+    run: (arg, ctx) => {
+      const normalized = (arg ?? '').trim().toLowerCase()
+      const action = normalized === 'stop' || normalized === 'status' ? normalized : 'start'
+
+      ctx.voice.controlRealtimeVoice(action)
+    }
+  },
+
+  {
     help: 'voice mode: [on|off|tts|status]',
     name: 'voice',
     run: (arg, ctx) => {

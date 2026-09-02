@@ -1,3 +1,6 @@
+import { spawn, type ChildProcess } from 'node:child_process'
+import { resolve } from 'node:path'
+
 import {
   forceRedraw,
   type ScrollBoxHandle,
@@ -199,7 +202,9 @@ export function useMainApp(gw: GatewayClient) {
   const [voiceTts, setVoiceTts] = useState(false)
   const [voiceRecording, setVoiceRecording] = useState(false)
   const [voiceProcessing, setVoiceProcessing] = useState(false)
+  const [realtimeVoiceActive, setRealtimeVoiceActive] = useState(false)
   const [voiceRecordKey, setVoiceRecordKey] = useState<ParsedVoiceRecordKey>(DEFAULT_VOICE_RECORD_KEY)
+  const realtimeVoiceRef = useRef<ChildProcess | null>(null)
   const [sessionStartedAt, setSessionStartedAt] = useState(() => Date.now())
   const [dashboardFreshSessionId, setDashboardFreshSessionId] = useState<null | string>(null)
   const [turnStartedAt, setTurnStartedAt] = useState<null | number>(null)
@@ -456,6 +461,98 @@ export function useMainApp(gw: GatewayClient) {
   )
 
   const sys = useCallback((text: string) => appendMessage({ role: 'system', text }), [appendMessage])
+
+  const controlRealtimeVoice = useCallback(
+    (action: 'start' | 'status' | 'stop') => {
+      const active = realtimeVoiceRef.current
+
+      if (action === 'status') {
+        sys(`Native realtime voice: ${active ? 'ON' : 'OFF'}`)
+        return
+      }
+
+      if (action === 'stop') {
+        if (!active) {
+          sys('Native realtime voice is not running.')
+          return
+        }
+
+        sys('Stopping native realtime voice…')
+        active.kill('SIGINT')
+        return
+      }
+
+      if (active) {
+        sys('Native realtime voice is already running. Use /talk stop to end it.')
+        return
+      }
+
+      const python = process.env.HERMES_PYTHON?.trim()
+      const sourceRoot = process.env.HERMES_PYTHON_SRC_ROOT?.trim()
+
+      if (!python || !sourceRoot) {
+        sys('Native realtime voice requires a source-aware Hermes launch. Restart with hermes --tui --dev.')
+        return
+      }
+
+      const child = spawn(python, [resolve(sourceRoot, 'hermes'), 'talk'], {
+        cwd: process.cwd(),
+        env: process.env,
+        stdio: ['ignore', 'pipe', 'pipe']
+      })
+      realtimeVoiceRef.current = child
+      setRealtimeVoiceActive(true)
+      setVoiceEnabled(true)
+      setVoiceRecording(true)
+      setVoiceProcessing(false)
+      sys('Native realtime voice started · speak naturally · /talk stop to end')
+
+      let errorText = ''
+
+      child.stderr?.setEncoding('utf8')
+      child.stderr?.on('data', chunk => {
+        errorText = `${errorText}${String(chunk)}`.slice(-4000)
+      })
+      child.once('error', error => {
+        if (realtimeVoiceRef.current !== child) {
+          return
+        }
+
+        realtimeVoiceRef.current = null
+        setRealtimeVoiceActive(false)
+        setVoiceRecording(false)
+        setVoiceEnabled(false)
+        sys(`Native realtime voice failed: ${error.message}`)
+      })
+      child.once('exit', code => {
+        if (realtimeVoiceRef.current !== child) {
+          return
+        }
+
+        realtimeVoiceRef.current = null
+        setRealtimeVoiceActive(false)
+        setVoiceRecording(false)
+        setVoiceProcessing(false)
+        setVoiceEnabled(false)
+        const detail = errorText.trim().split('\n').at(-1)
+
+        if (code && detail) {
+          sys(`Native realtime voice ended (${code}): ${detail}`)
+        } else {
+          sys('Native realtime voice ended.')
+        }
+      })
+    },
+    [sys]
+  )
+
+  useEffect(
+    () => () => {
+      realtimeVoiceRef.current?.kill('SIGINT')
+      realtimeVoiceRef.current = null
+    },
+    []
+  )
 
   // Hot-loaded user widgets announce themselves — a silently-registered
   // widget is indistinguishable from a failed one. Errors surface too.
@@ -832,12 +929,14 @@ export function useMainApp(gw: GatewayClient) {
     gateway,
     terminal: { hasSelection, scrollRef, scrollWithSelection, selection, stdout },
     voice: {
+      realtimeActive: realtimeVoiceActive,
       enabled: voiceEnabled,
       recordKey: voiceRecordKey,
       recording: voiceRecording,
       setProcessing: setVoiceProcessing,
       setRecording: setVoiceRecording,
       setVoiceEnabled,
+      stopRealtime: () => controlRealtimeVoice('stop'),
       setVoiceTts
     },
     wheelStep: WHEEL_SCROLL_STEP
@@ -974,7 +1073,7 @@ export function useMainApp(gw: GatewayClient) {
         },
         slashFlightRef,
         transcript: { page, panel, send, setHistoryItems, sys, trimLastExchange: session.trimLastExchange },
-        voice: { setVoiceEnabled, setVoiceRecordKey, setVoiceTts }
+        voice: { controlRealtimeVoice, setVoiceEnabled, setVoiceRecordKey, setVoiceTts }
       }),
     [
       catalog,
@@ -984,6 +1083,7 @@ export function useMainApp(gw: GatewayClient) {
       dieWithCode,
       gateway,
       hasSelection,
+      controlRealtimeVoice,
       maybeWarn,
       page,
       panel,
