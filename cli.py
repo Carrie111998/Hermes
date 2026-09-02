@@ -28,6 +28,7 @@ import copy
 import os
 import shutil
 import sys
+import typing
 import json
 import re
 import concurrent.futures
@@ -21752,6 +21753,39 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
     )
 
 
+def _exit_needs_tty() -> "typing.NoReturn":
+    """Report the missing TTY and exit 1."""
+    print(
+        "Error: interactive chat requires a terminal (stdin is not a TTY).\n"
+        "Run 'hermes chat' directly in a terminal, or pass a one-shot query:\n"
+        '  hermes chat -q "your prompt"',
+        file=sys.stderr,
+    )
+    sys.exit(1)
+
+
+def will_enter_interactive_repl(
+    *,
+    query: str | None = None,
+    q: str | None = None,
+    image: str | None = None,
+    list_tools: bool = False,
+    list_toolsets: bool = False,
+    gateway: bool = False,
+) -> bool:
+    """True when this invocation will end up in the interactive REPL.
+
+    Every other entry point produces its output and returns before
+    ``cli.run()``: ``--gateway`` starts the messaging gateway, ``--list-tools``
+    / ``--list-toolsets`` print and exit, and ``--query``/``-q``/``--image``
+    take the one-shot path. Only a bare invocation reaches prompt_toolkit,
+    which is the one case that needs a real terminal.
+    """
+    if gateway or list_tools or list_toolsets:
+        return False
+    return not (query or q or image)
+
+
 def main(
     query: str = None,
     q: str = None,
@@ -21847,6 +21881,29 @@ def main(
         print("Starting Hermes Gateway (messaging platforms)...")
         asyncio.run(start_gateway())
         return
+
+    # ── Interactive mode requires a real TTY ──────────────────────────────
+    # prompt_toolkit's vt100 input registers stdin's fd with the asyncio
+    # selector (Application.run -> _attached_input -> loop.add_reader), which a
+    # redirected stdin cannot satisfy. `nohup hermes chat`, a pipe, or any
+    # non-interactive subprocess therefore died with a bare
+    #
+    #     OSError: [Errno 22] Invalid argument
+    #       ... selectors.py in register -> self._selector.control([kev], 0, 0)
+    #
+    # raised out of prompt_toolkit — after paying for git worktree setup, full
+    # agent init, and the entire welcome banner. Check before any of that and
+    # exit with an actionable message instead. Mirrors the _require_tty() guard
+    # hermes_cli/main.py already applies to its other interactive commands
+    # (model, tools, whatsapp).
+    if will_enter_interactive_repl(
+        query=query,
+        q=q,
+        image=image,
+        list_tools=list_tools,
+        list_toolsets=list_toolsets,
+    ) and not sys.stdin.isatty():
+        _exit_needs_tty()
 
     # Skip worktree for list commands (they exit immediately)
     if not list_tools and not list_toolsets:
@@ -22401,6 +22458,21 @@ def main(
             _finalize_single_query(cli)
         return
     
+    # Backstop: the early guard above is the one that fires in practice (it
+    # runs before worktree setup and agent init, so the user does not pay for
+    # either), but it necessarily predicts which branch main() will take. This
+    # check sits on the actual REPL entry, where no prediction is involved, so a
+    # future flag that carves out a new non-interactive path — or reorders the
+    # dispatch below — cannot silently bypass the TTY requirement and reintroduce
+    # the raw `OSError: [Errno 22]` from prompt_toolkit.
+    #
+    # Only stdin is checked, deliberately. prompt_toolkit tolerates a non-TTY
+    # stdout: with a pty stdin and a piped stdout, Application.run() completes
+    # normally (verified against the vendored prompt_toolkit), so gating on
+    # stdout too would break `hermes chat | tee session.log`, which works today.
+    if not sys.stdin.isatty():
+        _exit_needs_tty()
+
     # Run interactive mode
     cli.run()
 
