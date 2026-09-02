@@ -266,6 +266,8 @@ mattermost:
 
 The option defaults to `false`. It only observes explicitly allowed channels while mention gating is enabled. The sender must pass the existing user allowlist; bot, webhook, system, command, DM, free-response, and out-of-scope posts are not observed. Observed text is shared within its channel or existing thread and is supplied as context, not as a pending request, on a later mention.
 
+To explicitly allow passive observation in every otherwise eligible channel, use `allowed_channels: ["*"]`. The quotes are required by YAML.
+
 ## Troubleshooting
 
 ### Bot is not responding to messages

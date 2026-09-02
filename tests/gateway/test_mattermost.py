@@ -495,6 +495,17 @@ class TestMattermostPassiveObservation:
         assert self.store.sources[0].user_id is None
 
     @pytest.mark.asyncio
+    async def test_wildcard_observes_any_channel_without_dispatch(self, monkeypatch):
+        self._enable(monkeypatch)
+        self.adapter.config.extra["allowed_channels"] = ["*"]
+        self.adapter.set_authorization_check(lambda *_: True)
+
+        await self.adapter._handle_ws_event(self._event(channel_id="chan_other"))
+
+        self.adapter.handle_message.assert_not_awaited()
+        assert self.store.messages[0][0] == "chan_other:-"
+
+    @pytest.mark.asyncio
     async def test_fails_closed_without_authorization(self, monkeypatch):
         self._enable(monkeypatch)
 

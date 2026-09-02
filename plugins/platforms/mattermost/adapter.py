@@ -837,7 +837,7 @@ class MattermostAdapter(BasePlatformAdapter):
             and require_mention
             and not is_free_channel
             and allowed_channels
-            and channel_id in allowed_channels
+            and ("*" in allowed_channels or channel_id in allowed_channels)
         )
 
     @staticmethod
@@ -1007,7 +1007,11 @@ class MattermostAdapter(BasePlatformAdapter):
                 allowed_channels = {
                     c.strip() for c in str(allowed_raw).split(",") if c.strip()
                 }
-            if allowed_channels and channel_id not in allowed_channels:
+            if (
+                allowed_channels
+                and "*" not in allowed_channels
+                and channel_id not in allowed_channels
+            ):
                 logger.debug(
                     "Mattermost: ignoring message in non-allowed channel: %s",
                     channel_id,
