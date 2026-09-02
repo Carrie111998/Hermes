@@ -973,6 +973,37 @@ class TestWaitForCallbackPasteIntegration:
         err = capsys.readouterr().err
         assert "paste the redirect URL" in err
 
+    def test_paste_prompt_not_started_while_prompt_toolkit_is_active(
+        self, monkeypatch, capsys
+    ):
+        """OAuth must not compete with prompt_toolkit for the same stdin."""
+        import tools.mcp_oauth as mod
+        from prompt_toolkit.application.current import set_app
+
+        mod._oauth_port = _find_free_port()
+        monkeypatch.setattr(mod, "_is_interactive", lambda: True)
+        readline_called = mod.threading.Event()
+
+        def record_readline():
+            readline_called.set()
+            return ""
+
+        monkeypatch.setattr(
+            mod.sys, "stdin", MagicMock(readline=record_readline)
+        )
+
+        async def instant_sleep(_):
+            pass
+
+        with set_app(object()), patch.object(mod.asyncio, "sleep", instant_sleep):
+            with pytest.raises(OAuthNonInteractiveError):
+                asyncio.run(_wait_for_callback())
+
+        assert not readline_called.wait(1)
+        err = capsys.readouterr().err
+        assert "paste the redirect URL" not in err
+        assert "paste is unavailable while the Hermes prompt owns" in err
+
     def test_paste_prompt_NOT_shown_when_interactivity_suppressed(self, monkeypatch, capsys):
         """Background MCP discovery must not race the CLI/TUI stdin reader."""
         import tools.mcp_oauth as mod
