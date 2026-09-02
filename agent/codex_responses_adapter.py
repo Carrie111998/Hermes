@@ -86,13 +86,49 @@ _HARMONY_CONTROL_TOKEN_RE = re.compile(
 _FULLWIDTH_PIPE = "\uff5c"
 
 
+# Category Cf as a character class.  The obvious spelling of the guard below \u2014
+# ``any(unicodedata.category(char) == "Cf" for char in text)`` \u2014 is a
+# Python-level loop with one C call per character, and preflight runs it over
+# every string in the request.  On a long history (hundreds of KB per call,
+# dozens of calls per turn) that single line dominates preflight cost.  Cf is
+# only 21 contiguous ranges, so a compiled class does the same scan inside the
+# regex engine instead.
+#
+# Hardcoded rather than derived at import: building it from ``unicodedata``
+# costs ~80ms of startup per process, and this module is imported by every
+# short-lived agent subprocess.  ``test_cf_class_matches_unicodedata``
+# re-derives the set and fails if a future Unicode revision adds a codepoint,
+# so drift is caught in CI rather than silently narrowing the guard.
+_FORMAT_CONTROL_RE = re.compile(
+    "[\U000000ad\U00000600-\U00000605\U0000061c\U000006dd\U0000070f"
+    "\U00000890-\U00000891\U000008e2\U0000180e\U0000200b-\U0000200f"
+    "\U0000202a-\U0000202e\U00002060-\U00002064\U00002066-\U0000206f"
+    "\U0000feff\U0000fff9-\U0000fffb\U000110bd\U000110cd"
+    "\U00013430-\U00013438\U0001bca0-\U0001bca3\U0001d173-\U0001d17a"
+    "\U000e0001\U000e0020-\U000e007f]"
+)
+
+
+def _has_format_control(text: str) -> bool:
+    """True when ``text`` contains a Unicode format (Cf) codepoint.
+
+    ``str.isascii()`` short-circuits the scan: no Cf codepoint is ASCII, and
+    CPython stores the ASCII-ness of a ``str`` in its header, so the common
+    case (code, logs, command output) answers in constant time without touching
+    the buffer at all.
+    """
+    if text.isascii():
+        return False
+    return _FORMAT_CONTROL_RE.search(text) is not None
+
+
 def _neutralize_harmony_tokens(text: str) -> str:
     """Keep Harmony source readable without emitting reserved wire tokens."""
     if not text or "<" not in text or "|" not in text:
         return text
 
     replacement = rf"<{_FULLWIDTH_PIPE}\1{_FULLWIDTH_PIPE}>"
-    if not any(unicodedata.category(char) == "Cf" for char in text):
+    if not _has_format_control(text):
         return _HARMONY_CONTROL_TOKEN_RE.sub(replacement, text)
 
     # U+200B is confirmed to be stripped by the Codex backend before its
