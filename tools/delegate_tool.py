@@ -2978,11 +2978,22 @@ def _run_single_child(
         # Python stack (see #14726 — 0-API-call hangs are opaque without it).
         _worker_thread_holder: Dict[str, Optional[threading.Thread]] = {"t": None}
 
+        # Keep a bounded copy of streamed answer text so a timeout returns the
+        # child's useful work instead of replacing it with ``summary: None``.
+        _partial_text_parts: List[str] = []
+        _partial_text_limit = 12_000
+
         def _relay_child_text(delta: str) -> None:
             # Forward the child's streamed reply text up the progress relay so
             # gateway watch windows mirror it live (subagent.text → message.delta).
             # Inert under CLI/TUI: their progress handlers ignore non-tool events.
-            if not delta or not child_progress_cb:
+            if not delta:
+                return
+            _partial_text_parts.append(delta)
+            _partial_text = "".join(_partial_text_parts)
+            if len(_partial_text) > _partial_text_limit:
+                _partial_text_parts[:] = [_partial_text[-_partial_text_limit:]]
+            if not child_progress_cb:
                 return
             try:
                 child_progress_cb("subagent.text", preview=delta)
@@ -3024,6 +3035,7 @@ def _run_single_child(
 
             is_timeout = isinstance(_timeout_exc, (FuturesTimeoutError, TimeoutError))
             duration = round(time.monotonic() - child_start, 2)
+            partial_summary = "".join(_partial_text_parts).strip()
             logger.warning(
                 "Subagent %d %s after %.1fs",
                 task_index,
@@ -3070,7 +3082,7 @@ def _run_single_child(
                         ),
                         status="timeout" if is_timeout else "error",
                         duration_seconds=duration,
-                        summary="",
+                        summary=partial_summary,
                     )
                 except Exception:
                     pass
@@ -3100,7 +3112,7 @@ def _run_single_child(
             _error_entry = {
                 "task_index": task_index,
                 "status": "timeout" if is_timeout else "error",
-                "summary": None,
+                "summary": partial_summary or None,
                 "error": _err,
                 "exit_reason": "timeout" if is_timeout else "error",
                 "api_calls": child_api_calls,
