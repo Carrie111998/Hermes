@@ -14626,6 +14626,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # confirmed-delivered has its answer in the ledger — redelivering it
         # is strictly cheaper and more correct than re-running the whole turn.
         self._schedule_resume_pending_sessions()
+        self._restore_heartbeat_watches()
         await self._finish_startup_restore()
 
         # Surface state.db init failures to the user's messaging platforms
@@ -16157,6 +16158,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         except Exception:
                             logger.debug(
                                 "resume-pending reschedule after %s reconnect failed",
+                                platform.value,
+                                exc_info=True,
+                            )
+                        # Symmetric with resume-pending above: a platform that
+                        # was offline at startup never got its persisted
+                        # heartbeats restored (the startup pass skips
+                        # sessions whose adapter isn't connected yet).
+                        try:
+                            self._restore_heartbeat_watches(platform=platform)
+                        except Exception:
+                            logger.debug(
+                                "heartbeat watch restore after %s reconnect failed",
                                 platform.value,
                                 exc_info=True,
                             )
@@ -24231,9 +24244,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         The registry maps ``quick_key`` → ``(source, session_id)`` so the
         poller can rebuild a MessageEvent and enqueue via the adapter FIFO.
-        In-memory by design: heartbeat STATE survives restarts in SessionDB,
-        but firing resumes when the user touches /heartbeat again in the new
-        gateway process (documented; durable schedules belong to cron).
+        In-memory by design: heartbeat STATE survives restarts in SessionDB;
+        the watch itself is rebuilt on restart by
+        ``_restore_heartbeat_watches()`` from that state plus the session's
+        persisted routing (durable schedules belong to cron).
         """
         watch = getattr(self, "_heartbeat_watch", None)
         if watch is None:
@@ -24246,6 +24260,86 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         watch = getattr(self, "_heartbeat_watch", None)
         if watch:
             watch.pop(quick_key, None)
+
+    def _restore_heartbeat_watches(self, platform=None) -> int:
+        """Re-populate ``_heartbeat_watch`` from persisted session state.
+
+        Heartbeat STATE (``heartbeat:<session_id>`` in ``state_meta``)
+        survives a gateway restart, but the in-memory watch registry does
+        not, so firing silently stopped until ``/heartbeat`` was touched
+        again. The routing a watch needs (platform, chat/thread, profile)
+        already survives restart too, as ``SessionEntry.origin`` — the same
+        field ``_schedule_resume_pending_sessions`` uses to reconstruct a
+        MessageEvent — so no new persistence is needed to rebuild it.
+
+        ``platform`` scopes the pass the same way the resume-pending
+        reschedule does, so a platform reconnecting after startup restores
+        only its own sessions' watches. Idempotent: re-running just
+        overwrites the same dict entries and no-ops the poller start.
+
+        A platform-scoped pass (reconnect) also prunes any watch already
+        registered for that platform but not re-confirmed active this
+        round — e.g. a heartbeat cleared while the adapter was down, whose
+        clear couldn't reach ``_unregister_heartbeat_watch``. The startup
+        pass (``platform=None``) skips this: the registry is empty then,
+        so there is nothing to prune.
+        """
+        from hermes_cli.heartbeat import load_heartbeat
+
+        try:
+            with self.session_store._lock:  # noqa: SLF001 — snapshot under lock
+                self.session_store._ensure_loaded_locked()  # noqa: SLF001
+                candidates = [
+                    entry for entry in self.session_store._entries.values()  # noqa: SLF001
+                    if entry.origin is not None
+                    and (platform is None or entry.origin.platform == platform)
+                ]
+        except Exception as exc:
+            logger.warning("Failed to enumerate sessions for heartbeat restore: %s", exc)
+            return 0
+
+        restored = 0
+        confirmed_keys = set()
+        for entry in candidates:
+            try:
+                state = load_heartbeat(entry.session_id)
+            except Exception as exc:
+                logger.debug(
+                    "heartbeat restore: load failed for %s: %s", entry.session_key, exc
+                )
+                continue
+            # Only an active heartbeat is registered — paused/cleared/absent
+            # state must not resume firing on its own.
+            if state is None or state.status != "active":
+                continue
+            adapter = self._adapter_for_source(entry.origin)
+            if adapter is None:
+                logger.debug(
+                    "heartbeat restore: adapter not ready for %s, deferring to reconnect",
+                    entry.session_key,
+                )
+                continue
+            self._register_heartbeat_watch(entry.session_key, entry.origin, entry.session_id)
+            confirmed_keys.add(entry.session_key)
+            restored += 1
+
+        if platform is not None:
+            watch = getattr(self, "_heartbeat_watch", None) or {}
+            stale_keys = [
+                key
+                for key, (source, _sid) in watch.items()
+                if key not in confirmed_keys and getattr(source, "platform", None) == platform
+            ]
+            for key in stale_keys:
+                self._unregister_heartbeat_watch(key)
+            if stale_keys:
+                logger.info(
+                    "Pruned %d stale heartbeat watch(es) for platform %s", len(stale_keys), platform
+                )
+
+        if restored:
+            logger.info("Restored %d persisted heartbeat watch(es) after restart", restored)
+        return restored
 
     def _start_heartbeat_poller(self) -> None:
         """Start the single gateway-wide heartbeat poll task (idempotent)."""
