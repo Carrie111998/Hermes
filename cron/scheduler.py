@@ -4535,14 +4535,22 @@ def _run_job_script(
         path = (scripts_dir / raw).resolve()
 
     # Guard against path traversal, absolute path injection, and symlink
-    # escape — scripts MUST reside within HERMES_HOME/scripts/.
-    try:
-        path.relative_to(scripts_dir_resolved)
-    except ValueError:
-        return False, (
-            f"Blocked: script path resolves outside the scripts directory "
-            f"({scripts_dir_resolved}): {script_path!r}"
-        )
+    # escape — scripts MUST reside within HERMES_HOME/scripts/. Nix store
+    # symlinks under hermes-cron-script-* are immutable derivations managed
+    # by the Nix activation script; they cannot be hijacked by an attacker.
+    _is_nix_symlink = (
+        str(path).startswith("/nix/store/")
+        and "-hermes-cron-script-" in str(path)
+        and ((scripts_dir / raw).is_symlink() if not raw.is_absolute() else raw.is_symlink())
+    )
+    if not _is_nix_symlink:
+        try:
+            path.relative_to(scripts_dir_resolved)
+        except ValueError:
+            return False, (
+                f"Blocked: script path resolves outside the scripts directory "
+                f"({scripts_dir_resolved}): {script_path!r}"
+            )
 
     if not path.exists():
         return False, f"Script not found: {path}"
@@ -6321,7 +6329,7 @@ def run_job(
         max_iterations = _resolve_turn_limit(_mt)
 
         # Provider routing
-        pr = _cfg.get("provider_routing") or {}
+        pr = _cfg.get("provider_routing", {})
 
         from hermes_cli.runtime_provider import (
             resolve_runtime_provider,
