@@ -113,8 +113,17 @@ class HookRegistry:
 
                 hook_name = manifest.get("name", hook_dir.name)
                 events = manifest.get("events", [])
-                if not events:
-                    print(f"[hooks] Skipping {hook_name}: no events declared", flush=True)
+                if not isinstance(events, list) or not events:
+                    print(
+                        f"[hooks] Skipping {hook_name}: events must be a non-empty list of non-empty strings",
+                        flush=True,
+                    )
+                    continue
+                if any(not isinstance(event, str) or not event.strip() for event in events):
+                    print(
+                        f"[hooks] Skipping {hook_name}: events must be a non-empty list of non-empty strings",
+                        flush=True,
+                    )
                     continue
 
                 # Dynamically load the handler module.
