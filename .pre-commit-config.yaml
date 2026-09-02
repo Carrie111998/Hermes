@@ -1,0 +1,43 @@
+# Hermes Agent — local security + quality pre-commit gate.
+# Installed by Lyons Command Center hardening pass (2026-08-29).
+# Additive only: does not modify existing CI; gives local/PR authors a fast gate.
+# Run: pre-commit run --all-files
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-yaml
+      - id: check-added-large-files
+        args: ['--maxkb=2000']
+      - id: detect-private-key
+        # agent/redact.py legitimately contains the literal regex
+        # r"-----BEGIN[A-Z ]*PRIVATE KEY-----..." used by the redactor; the
+        # naive hook matches that string, so scope it out (gitleaks still
+        # covers real keys across the tree).
+        exclude: '^agent/redact\.py$'
+      - id: check-merge-conflict
+
+  - repo: https://github.com/PyCQA/bandit
+    rev: 1.9.4
+    hooks:
+      - id: bandit
+        args: ['-c', 'pyproject.toml', '-q']
+        # Scan first-party Python only; skip tests, vendored, generated.
+        files: ^(hermes_cli|agent|tools|gateway|acp_adapter|plugins)/
+
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.18.4
+    hooks:
+      - id: gitleaks
+        args: ['detect', '--no-banner', '--redact']
+
+  - repo: local
+    hooks:
+      - id: pip-audit-installed-deps
+        name: pip-audit (installed venv)
+        entry: bash -c 'venv/Scripts/python.exe -m pip_audit --require-hashes || venv/Scripts/python.exe -m pip_audit'
+        language: system
+        pass_filenames: false
+        stages: [manual]

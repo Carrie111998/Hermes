@@ -204,6 +204,17 @@ jobs:
       scan: ${{ needs.detect.outputs.scan == 'true' }}
       deps: ${{ needs.detect.outputs.deps == 'true' }}
 
+  security-sast:
+    name: Security SAST & secrets
+    needs: detect
+    # Runs whenever Python or dependency files change (fail-open on push).
+    if: needs.detect.outputs.python == 'true' || needs.detect.outputs.deps == 'true'
+    uses: ./.github/workflows/security-sast.yml
+    with:
+      event_name: ${{ needs.detect.outputs.event_name }}
+      python: ${{ needs.detect.outputs.python == 'true' }}
+      deps: ${{ needs.detect.outputs.deps == 'true' }}
+
   review-labels:
     name: Review label gate
     needs: [detect, supply-chain]
@@ -249,6 +260,7 @@ jobs:
       - docker-lint
       - profile-artifact-check
       - supply-chain
+      - security-sast
       - review-labels
       - osv-scanner
       # The image build runs in its own workflow (docker.yml) and reports

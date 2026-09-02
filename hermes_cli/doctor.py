@@ -115,9 +115,14 @@ def _hermes_database_paths(hermes_home: Path) -> list[tuple[str, Path]]:
         for name in _QUICK_STATE_FILES
         if name.endswith(".db")
     ]
-    # Non-default kanban boards each keep their own kanban.db.
-    for board_db in sorted((hermes_home / "kanban" / "boards").glob("*/kanban.db")):
-        entries.append((str(board_db.relative_to(hermes_home)), board_db))
+    # Non-default kanban boards each keep their own kanban.db. Boards may be
+    # nested arbitrarily deep under <hermes_home>/kanban/boards/, so recurse
+    # rather than matching a single level — a shallow glob silently misses
+    # deeper boards and under-reports the WAL-reset exposure. Display names use
+    # POSIX separators so the report is identical across platforms.
+    for board_db in sorted((hermes_home / "kanban" / "boards").rglob("kanban.db")):
+        display = str(board_db.relative_to(hermes_home)).replace(os.sep, "/")
+        entries.append((display, board_db))
     return entries
 
 
