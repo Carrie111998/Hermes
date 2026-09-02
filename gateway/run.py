@@ -18681,6 +18681,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """
         source = event.source
 
+        # Heartbeat delivery accounting (#92837): a tagged staged tick
+        # reaching the live message pipeline is REAL delivery evidence —
+        # this is the only place a claimed heartbeat tick is confirmed as
+        # fired. Best-effort: a failure leaves the claim for the poll's
+        # claim-timeout abandonment path instead.
+        try:
+            self._confirm_heartbeat_delivery_for_event(event)
+        except Exception:
+            logger.debug("heartbeat delivery confirmation failed", exc_info=True)
+
         # 🔴 Cross-session leak guard. This handler runs inside a per-message
         # asyncio task created via create_task(), which snapshots the spawning
         # context with copy_context(). If a *concurrent* message had already
@@ -24239,13 +24249,252 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if watch is None:
             watch = {}
             self._heartbeat_watch = watch
+        is_new = quick_key not in watch
         watch[quick_key] = (source, session_id)
+        if is_new:
+            # A fresh registration means whatever in-process staging context
+            # a prior claim had is gone (watch/queue rebuilt under the live
+            # process). Clear a persisted in-flight claim from a live
+            # process so the next poll re-claims the tick instead of the
+            # heartbeat stalling forever (#92837 orphan-claim recovery).
+            try:
+                from hermes_cli.heartbeat import (
+                    HeartbeatManager,
+                    _PROCESS_START_SKEW_TOLERANCE_SECONDS,
+                    _PROCESS_START_TS,
+                )
+
+                inflight = getattr(self, "_heartbeat_inflight", None)
+                if inflight:
+                    inflight.pop(quick_key, None)
+                mgr = HeartbeatManager(session_id=session_id)
+                st = mgr.state
+                if (
+                    st is not None
+                    and st.claimed_at is not None
+                    and st.claimed_at
+                    >= _PROCESS_START_TS - _PROCESS_START_SKEW_TOLERANCE_SECONDS
+                ):
+                    mgr.abandon_claim(
+                        "heartbeat watch (re)registered; prior in-flight "
+                        "staging context lost"
+                    )
+            except Exception as exc:
+                logger.debug("heartbeat watch registration claim cleanup failed: %s", exc)
         self._start_heartbeat_poller()
 
     def _unregister_heartbeat_watch(self, quick_key: str) -> None:
+        """Stop tracking a session and resolve any in-flight claim.
+
+        Called on /heartbeat clear (and any future teardown path). The
+        inflight entry and the persisted claim are dropped together so the
+        stored state keeps no dangling claim that could stall a later
+        re-registration (#92837).
+        """
         watch = getattr(self, "_heartbeat_watch", None)
-        if watch:
-            watch.pop(quick_key, None)
+        entry = watch.pop(quick_key, None) if watch else None
+        inflight = getattr(self, "_heartbeat_inflight", None)
+        if inflight:
+            inflight.pop(quick_key, None)
+        if entry is not None:
+            _source, session_id = entry
+            try:
+                from hermes_cli.heartbeat import HeartbeatManager
+
+                mgr = HeartbeatManager(session_id=session_id)
+                if mgr.state is not None and mgr.state.claimed_at is not None:
+                    # The watch is gone: an in-flight claim can never be
+                    # resolved by the poller. Abandon it so the audit trail
+                    # stays truthful and the persisted state is clean.
+                    mgr.abandon_claim("heartbeat watch unregistered")
+            except Exception as exc:
+                logger.debug("heartbeat watch unregister claim cleanup failed: %s", exc)
+
+    def _confirm_heartbeat_delivery_for_event(self, event: Any) -> None:
+        """Record the heartbeat fire when the staged tick truly becomes a turn.
+
+        The poll tags the staged event with ``_hermes_heartbeat_tick``; only
+        a tagged event reaching the live message pipeline
+        (:meth:`_handle_message`) is REAL evidence that the tick was
+        consumed as a turn, so this is the only confirmation path in the
+        gateway. Any other signal (activity timestamps, slot churn) is NOT
+        consumption evidence and must not confirm a delivery — unconfirmed
+        claims resolve through the claim timeout in the poll instead.
+        Best-effort: a failure here leaves the claim for that timeout path.
+        """
+        if not getattr(event, "_hermes_heartbeat_tick", False):
+            return
+        watch = getattr(self, "_heartbeat_watch", None)
+        if not watch:
+            return
+        source = getattr(event, "source", None)
+        if source is None:
+            return
+        quick_key = self._session_key_for_source(source)
+        entry = watch.get(quick_key)
+        if not entry:
+            return
+        _source, session_id = entry
+        from hermes_cli.heartbeat import HeartbeatManager
+
+        HeartbeatManager(session_id=session_id).confirm_delivery()
+
+    def _heartbeat_event_pending(self, quick_key: str, adapter: Any) -> bool:
+        """True when a staged heartbeat tick is still waiting for a turn.
+
+        The staged event is tagged with ``_hermes_heartbeat_tick`` so it can
+        be told apart from ordinary follow-ups sharing the pending slot or
+        the /queue overflow list.
+        """
+        slot = getattr(adapter, "_pending_messages", None) or {}
+        event = slot.get(quick_key)
+        if event is not None and getattr(event, "_hermes_heartbeat_tick", False):
+            return True
+        peek = getattr(self, "_peek_session_state", None)
+        q_state = peek(quick_key) if peek is not None else None
+        overflow = getattr(getattr(q_state, "conversation", None), "queued_events", None) or []
+        return any(getattr(e, "_hermes_heartbeat_tick", False) for e in overflow)
+
+    def _heartbeat_discard_staged_tick(self, quick_key: str, adapter: Any) -> None:
+        """Remove a stale staged heartbeat tick from the pending slot and
+        the /queue overflow so an abandoned claim can re-stage cleanly
+        instead of piling tagged events into the backlog (#92837)."""
+        slot = getattr(adapter, "_pending_messages", None) or {}
+        event = slot.get(quick_key)
+        if event is not None and getattr(event, "_hermes_heartbeat_tick", False):
+            slot.pop(quick_key, None)
+        peek = getattr(self, "_peek_session_state", None)
+        q_state = peek(quick_key) if peek is not None else None
+        overflow = getattr(getattr(q_state, "conversation", None), "queued_events", None)
+        if overflow:
+            overflow[:] = [
+                e for e in overflow if not getattr(e, "_hermes_heartbeat_tick", False)
+            ]
+
+    async def _poll_heartbeat_delivery_accounting_once(self) -> None:
+        """Poll due heartbeats once with delivery-confirmed accounting.
+
+        (Named ``_heartbeat_delivery_accounting`` to stay distinct from the
+        open PR #85133's ``_poll_heartbeat_watches_once``, which covers the
+        complementary wake-up concern — entering an idle session through
+        the adapter. Both are needed; this PR does not depend on #85133.)
+
+        A due tick is claimed and staged into the adapter's pending slot
+        WITHOUT counting a fire. The fire is confirmed only when the tagged
+        staged event actually enters the live message pipeline as a turn
+        (``_confirm_heartbeat_delivery_for_event``). Claims that never
+        produce a turn are resolved loudly instead of hanging silently:
+
+        - staged event vanished without consumption (session reset /
+          stale-lock heal / eviction) → abandoned with a warning, counted
+          in ``missed_count``, tick stays due;
+        - staged event stuck in the pending slot past ``claim_timeout_seconds``
+          with no turn starting → same abandonment (issue #92837's main
+          failure mode: the loss must be visible), the stale staged tick
+          is discarded, and the still-due tick is re-claimed and re-staged.
+
+        While a claim is in flight, no second tick is claimed, so missed
+        intervals coalesce instead of stacking a backlog (issue #92837).
+        """
+        watch = getattr(self, "_heartbeat_watch", None)
+        if not watch:
+            return
+        inflight = getattr(self, "_heartbeat_inflight", None)
+        if inflight is None:
+            inflight = {}
+            self._heartbeat_inflight = inflight
+
+        from hermes_cli.heartbeat import HeartbeatLoadCache, HeartbeatManager
+
+        # mtime-checked state cache: each watched session would otherwise
+        # re-read its heartbeat state from SessionDB on every poll (5s) on
+        # the event-loop thread. With the cache, an unchanged poll does
+        # zero reads and a changed DB re-reads each state at most once —
+        # never once per watch per poll.
+        cache = getattr(self, "_heartbeat_load_cache", None)
+        if cache is None:
+            cache = HeartbeatLoadCache()
+            self._heartbeat_load_cache = cache
+
+        for quick_key, (source, session_id) in list(watch.items()):
+            try:
+                # Busy sessions coalesce their tick to the next idle poll.
+                if quick_key in self._running_agents:
+                    continue
+
+                adapter = self._adapter_for_source(source)
+                if adapter is None:
+                    # No live consumer: never claim a tick that has no
+                    # delivery path, so the persisted state stays truthful.
+                    continue
+
+                mgr = HeartbeatManager(session_id=session_id, state=cache.load(session_id))
+                if not mgr.has_heartbeat():
+                    watch.pop(quick_key, None)
+                    inflight.pop(quick_key, None)
+                    continue
+
+                stage_ts = inflight.get(quick_key)
+                if stage_ts is not None:
+                    if time.time() - stage_ts >= mgr.claim_timeout_seconds:
+                        # The staged tick produced no turn within the
+                        # claim window (idle-evicted session, stuck
+                        # pending slot, vanished drain). Abandon loudly:
+                        # warn + missed_count, drop the stale staged tick
+                        # so the retry starts clean. The tick stays due;
+                        # the next poll re-claims it.
+                        mgr.abandon_claim(
+                            f"no turn consumed the staged tick within "
+                            f"{mgr.claim_timeout_seconds:.0f}s"
+                        )
+                        inflight.pop(quick_key, None)
+                        self._heartbeat_discard_staged_tick(quick_key, adapter)
+                        continue
+                    if self._heartbeat_event_pending(quick_key, adapter):
+                        # Still staged and inside the claim window — leave
+                        # the claim in flight. A later poll either sees the
+                        # turn (confirmed at the drain) or the timeout.
+                        continue
+                    if mgr.state.claimed_at is not None:
+                        # The staged event is gone but the claim was never
+                        # confirmed — it was discarded without any turn
+                        # (session reset / stale-lock heal / eviction).
+                        # Unrelated session activity is NOT delivery
+                        # evidence; count it missed. The tick stays due;
+                        # the next poll re-claims it.
+                        mgr.abandon_claim(
+                            "staged heartbeat prompt vanished without a turn "
+                            "(session reset / stale-lock heal / eviction?)"
+                        )
+                        inflight.pop(quick_key, None)
+                        continue
+                    # Already confirmed by the consumption hook when the
+                    # tagged event became a real turn.
+                    inflight.pop(quick_key, None)
+                    continue
+
+                prompt = mgr.due_prompt()
+                if not prompt:
+                    continue
+                hb_event = MessageEvent(
+                    text=prompt,
+                    message_type=MessageType.TEXT,
+                    source=source,
+                    message_id=None,
+                    channel_prompt=None,
+                )
+                # Tag the staged event: the ONLY thing that confirms this
+                # tick's delivery is this exact event entering the live
+                # message pipeline as a turn.
+                hb_event._hermes_heartbeat_tick = True  # type: ignore[attr-defined]
+                try:
+                    self._enqueue_fifo(quick_key, hb_event, adapter)
+                except Exception as exc:
+                    mgr.abandon_claim(f"delivery handoff failed: {exc}")
+                    continue
+                inflight[quick_key] = time.time()
+            except Exception as exc:
+                logger.debug("heartbeat poll for %s failed: %s", quick_key, exc)
 
     def _start_heartbeat_poller(self) -> None:
         """Start the single gateway-wide heartbeat poll task (idempotent)."""
@@ -24266,33 +24515,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # this covers only the degraded path where that warm-up
                 # failed.
                 await self._warm_goals_session_db("heartbeat poll")
-                for quick_key, (source, session_id) in list(watch.items()):
-                    try:
-                        # Busy sessions coalesce their tick to the next idle poll.
-                        if quick_key in self._running_agents:
-                            continue
-                        from hermes_cli.heartbeat import HeartbeatManager
-
-                        mgr = HeartbeatManager(session_id=session_id)
-                        if not mgr.has_heartbeat():
-                            watch.pop(quick_key, None)
-                            continue
-                        prompt = mgr.due_prompt()
-                        if not prompt:
-                            continue
-                        adapter = self._adapter_for_source(source)
-                        if adapter is None:
-                            continue
-                        hb_event = MessageEvent(
-                            text=prompt,
-                            message_type=MessageType.TEXT,
-                            source=source,
-                            message_id=None,
-                            channel_prompt=None,
-                        )
-                        self._enqueue_fifo(quick_key, hb_event, adapter)
-                    except Exception as exc:
-                        logger.debug("heartbeat poll for %s failed: %s", quick_key, exc)
+                await self._poll_heartbeat_delivery_accounting_once()
 
         try:
             task = asyncio.create_task(_poll_loop())

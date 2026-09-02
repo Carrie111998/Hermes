@@ -2255,6 +2255,16 @@ DEFAULT_CONFIG = {
         "self_paced_ceiling_seconds": 900,
     },
 
+    # Heartbeats — recurring re-entry prompts for the current session
+    # (/heartbeat every 10m ...). A due tick is CLAIMED first and only
+    # recorded as fired once the staged prompt really becomes a turn. A
+    # claim that produces no turn within this window is abandoned with a
+    # warning, counted in missed_count, and the tick stays due for retry
+    # (issue #92837: never let a lost wake be silent).
+    "heartbeat": {
+        "claim_timeout_seconds": 300,
+    },
+
     # Mixture of Agents — named presets used by /moa. A preset is an execution
     # mode around the main model, not a provider/model itself: references +
     # aggregator synthesize private guidance before each main-model iteration.

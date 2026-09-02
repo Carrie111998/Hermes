@@ -13388,26 +13388,61 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 while not getattr(self, "_should_exit", False):
                     time.sleep(POLL_SECONDS)
                     try:
-                        mgr = self._get_heartbeat_manager()
-                        if mgr is None or not mgr.is_active():
-                            continue
-                        busy = (
-                            self._agent_running
-                            or getattr(self, "_voice_recording", False)
-                            or getattr(self, "_voice_processing", False)
-                            or not self._pending_input.empty()
-                        )
-                        if busy:
-                            continue
-                        prompt = mgr.due_prompt()
-                        if prompt:
-                            self._pending_input.put(prompt)
+                        self._heartbeat_watchdog_tick()
                     except Exception as exc:
                         logging.debug("heartbeat watchdog tick failed: %s", exc)
             finally:
                 self._heartbeat_watchdog_started = False
 
         threading.Thread(target=_loop, daemon=True, name="heartbeat-watchdog").start()
+
+    def _heartbeat_watchdog_tick(self) -> None:
+        """One watchdog iteration: inject a due heartbeat prompt if idle.
+
+        Extracted from the watchdog loop so the claim/confirm/abandon
+        protection is unit-testable without driving the thread. A claimed
+        tick is confirmed only after the prompt is queued into the live
+        REPL's input queue; if the confirmation itself blows up (persisted
+        write hiccup), the claim is abandoned here so it can never wedge —
+        the manager-level claim timeout remains the backstop if even the
+        abandonment fails.
+        """
+        mgr = self._get_heartbeat_manager()
+        if mgr is None or not mgr.is_active():
+            return
+        busy = (
+            self._agent_running
+            or getattr(self, "_voice_recording", False)
+            or getattr(self, "_voice_processing", False)
+            or not self._pending_input.empty()
+        )
+        if busy:
+            return
+        prompt = mgr.due_prompt()
+        if not prompt:
+            return
+        try:
+            self._pending_input.put(prompt)
+        except Exception as exc:
+            mgr.abandon_claim(f"input queue handoff failed: {exc}")
+            return
+        # The input queue is the live REPL loop's acceptance boundary:
+        # once queued, the prompt WILL become a turn. Only now is the
+        # tick truthfully fired.
+        try:
+            mgr.confirm_delivery()
+        except Exception as exc:
+            try:
+                mgr.abandon_claim(f"delivery confirmation failed: {exc}")
+            except Exception:
+                # If even the abandonment can't persist, the manager's
+                # claim timeout will resolve the claim on a later poll.
+                logging.debug(
+                    "heartbeat claim abandonment after confirm failure "
+                    "also failed: %s",
+                    exc,
+                    exc_info=True,
+                )
 
     # ────────────────────────────────────────────────────────────────
     # /loop — recurring in-session wakeups (Claude Code /loop parity)

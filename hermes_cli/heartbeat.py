@@ -33,6 +33,7 @@ import logging
 import re
 import time
 from dataclasses import dataclass, asdict
+from pathlib import Path
 from typing import Any, Dict, Optional
 
 logger = logging.getLogger(__name__)
@@ -43,6 +44,52 @@ logger = logging.getLogger(__name__)
 MIN_INTERVAL_SECONDS = 60
 # How often drivers poll for due heartbeats. Not user-facing.
 POLL_SECONDS = 5.0
+
+# Claim-timeout fallback (seconds): how long a claimed-but-unconfirmed tick
+# may stay in flight before it is abandoned with a warning, counted in
+# missed_count, and left due for retry (issue #92837 expectation #3: a
+# claimed tick that produces no turn must be loud, never silent). The
+# authoritative default lives in the config defaults
+# (hermes_cli.config_defaults.DEFAULT_CONFIG["heartbeat"][
+# "claim_timeout_seconds"]); this constant only covers the degraded case
+# where the config can't be read. Drivers can also pin a value per manager
+# via HeartbeatManager(claim_timeout_seconds=...).
+_CLAIM_TIMEOUT_FALLBACK_SECONDS = 300.0
+
+
+def _default_claim_timeout_seconds() -> float:
+    """Resolve the heartbeat claim timeout from config (best-effort).
+
+    Reads ``heartbeat.claim_timeout_seconds`` from the user config; on any
+    failure (unreadable config, missing key, bad value) falls back to
+    :data:`_CLAIM_TIMEOUT_FALLBACK_SECONDS`. Never raises.
+    """
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        hb_cfg = (load_config_readonly() or {}).get("heartbeat") or {}
+        val = hb_cfg.get("claim_timeout_seconds")
+        if val is not None:
+            return float(val)
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.debug("HeartbeatManager: claim-timeout config read failed: %s", exc)
+    return _CLAIM_TIMEOUT_FALLBACK_SECONDS
+
+
+# Import time of this module — a proxy for "this process started". A
+# persisted claim older than this timestamp was made by a previous process
+# that died between claiming a tick and confirming/abandoning it, so the
+# claim can never be resolved and must be treated as a missed delivery.
+# Best-effort: wall clock only, so a backwards NTP step after import makes
+# this process's own later claims (recorded on the stepped-back clock) look
+# older than the start marker. Only claims older than start minus the skew
+# tolerance below are treated as orphans; steps larger than the tolerance
+# are out of scope for this proxy.
+_PROCESS_START_TS = time.time()
+# Wall-clock skew tolerance (seconds) for the previous-process orphan test
+# above: a claim recorded up to this far before _PROCESS_START_TS still
+# reads as a live-process claim, absorbing backwards NTP steps.
+_PROCESS_START_SKEW_TOLERANCE_SECONDS = 120.0
 
 HEARTBEAT_PROMPT_TEMPLATE = (
     "[Heartbeat — recurring instruction, fires every {interval}]\n"
@@ -99,7 +146,18 @@ def format_interval(seconds: int) -> str:
 
 @dataclass
 class HeartbeatState:
-    """Serializable per-session heartbeat."""
+    """Serializable per-session heartbeat.
+
+    Firing is split into three phases so the persisted audit trail never
+    claims a delivery that did not happen (issue #92837):
+
+    - ``due_prompt()`` *claims* a due tick (``claimed_at``) without
+      counting a fire.
+    - ``confirm_delivery()`` records the fire *only* after the prompt was
+      actually handed to a live input path / consumed by a turn.
+    - ``abandon_claim()`` counts the claim as missed and leaves the tick
+      due so the next poll retries.
+    """
 
     prompt: str
     interval_seconds: int
@@ -107,6 +165,14 @@ class HeartbeatState:
     created_at: float = 0.0
     last_fired_at: float = 0.0
     fire_count: int = 0
+    # Set while a due tick is claimed but its delivery is unconfirmed.
+    claimed_at: Optional[float] = None
+    # When the last confirmed delivery actually happened (turn enqueued /
+    # consumed), as opposed to when it was merely claimed.
+    last_delivered_at: float = 0.0
+    # Claims that were never confirmed delivered (dropped handoff, vanished
+    # staged prompt, crash between claim and confirm).
+    missed_count: int = 0
 
     def to_json(self) -> str:
         return json.dumps(asdict(self), ensure_ascii=False)
@@ -121,6 +187,11 @@ class HeartbeatState:
             created_at=float(data.get("created_at", 0.0) or 0.0),
             last_fired_at=float(data.get("last_fired_at", 0.0) or 0.0),
             fire_count=int(data.get("fire_count", 0) or 0),
+            claimed_at=(
+                float(data["claimed_at"]) if data.get("claimed_at") is not None else None
+            ),
+            last_delivered_at=float(data.get("last_delivered_at", 0.0) or 0.0),
+            missed_count=int(data.get("missed_count", 0) or 0),
         )
 
     def is_due(self, now: Optional[float] = None) -> bool:
@@ -194,6 +265,66 @@ def save_heartbeat(session_id: str, state: HeartbeatState) -> None:
         logger.debug("HeartbeatManager: set_meta failed: %s", exc)
 
 
+# Sentinel for HeartbeatManager(..., state=...): "not provided, load from
+# disk" must stay distinguishable from None ("no heartbeat persisted").
+_UNSET_STATE = object()
+
+
+class HeartbeatLoadCache:
+    """mtime-checked cache of heartbeat states for poll-loop reuse.
+
+    The gateway poll constructs a HeartbeatManager per watched session
+    every ``POLL_SECONDS``; each construction otherwise re-reads the state
+    from SessionDB on the event-loop thread. This cache keeps repeated
+    polls O(1) in disk I/O: states are reloaded only when the SessionDB
+    files (``state.db`` / ``state.db-wal``) changed since the last load,
+    so a stable poll across N watches does zero DB reads, and a poll that
+    follows a DB change re-reads each state at most once.
+
+    Cached HeartbeatState objects are handed to managers by reference;
+    mutations are persisted through save_heartbeat, which bumps the DB
+    mtime and thereby invalidates the cache on the next load.
+    """
+
+    def __init__(self) -> None:
+        self._fingerprint: Optional[tuple] = None
+        self._states: Dict[str, Optional[HeartbeatState]] = {}
+
+    def _db_fingerprint(self) -> Optional[tuple]:
+        db = _get_session_db()
+        if db is None:
+            return None
+        try:
+            main = Path(str(db.db_path))
+            wal = Path(str(db.db_path) + "-wal")
+            parts: list = [main.stat().st_mtime_ns, main.stat().st_size]
+            try:
+                parts.append(wal.stat().st_mtime_ns)
+                parts.append(wal.stat().st_size)
+            except OSError:
+                # No WAL file (yet): nothing to add.
+                parts.append(0)
+                parts.append(0)
+            return tuple(parts)
+        except (AttributeError, OSError, TypeError):  # pragma: no cover - defensive
+            return None
+
+    def load(self, session_id: str) -> Optional[HeartbeatState]:
+        fingerprint = self._db_fingerprint()
+        if fingerprint is None:
+            # No SessionDB handle to fingerprint: the cache cannot stay
+            # fresh, fall through to the uncached load.
+            return load_heartbeat(session_id)
+        if fingerprint != self._fingerprint:
+            self._fingerprint = fingerprint
+            self._states = {}
+        if session_id in self._states:
+            return self._states[session_id]
+        state = load_heartbeat(session_id)
+        self._states[session_id] = state
+        return state
+
+
 # ──────────────────────────────────────────────────────────────────────
 # Manager — the surface CLI + gateway talk to
 # ──────────────────────────────────────────────────────────────────────
@@ -204,13 +335,39 @@ class HeartbeatManager:
 
     Drivers (CLI thread / gateway task) call :meth:`due_prompt` on a poll
     cadence while the session is idle; a non-None return is the user-role
-    message to inject. Firing is recorded immediately so a slow turn can't
-    double-fire.
+    message to inject.
+
+    A non-None return only *claims* the tick (``claimed_at``); it does not
+    count a fire. The driver MUST call :meth:`confirm_delivery` once the
+    prompt is actually handed to a live input path (CLI input queue) or
+    consumed by a turn (gateway pending-slot drain), or
+    :meth:`abandon_claim` when the handoff fails. This keeps the persisted
+    ``fire_count``/``last_fired_at`` truthful: a claimed-but-undelivered
+    tick is reported as missed instead of silently counted as fired
+    (#92837). The in-flight claim also prevents overlapping polls from
+    double-claiming the same tick, so no backlog can pile up.
     """
 
-    def __init__(self, session_id: str):
+    def __init__(
+        self,
+        session_id: str,
+        claim_timeout_seconds: Optional[float] = None,
+        state: Optional[HeartbeatState] = _UNSET_STATE,
+    ):
         self.session_id = session_id
-        self._state: Optional[HeartbeatState] = load_heartbeat(session_id)
+        # How long a claimed tick may wait for a turn before it is
+        # abandoned with a warning, counted missed, and re-claimed. None
+        # resolves the config default (heartbeat.claim_timeout_seconds).
+        self.claim_timeout_seconds = (
+            float(claim_timeout_seconds)
+            if claim_timeout_seconds is not None
+            else _default_claim_timeout_seconds()
+        )
+        # state=... lets hot loops (gateway poll) inject a HeartbeatLoadCache
+        # hit and skip the synchronous disk read; anything else loads fresh.
+        if state is _UNSET_STATE:
+            state = load_heartbeat(session_id)
+        self._state: Optional[HeartbeatState] = state
 
     @property
     def state(self) -> Optional[HeartbeatState]:
@@ -228,6 +385,8 @@ class HeartbeatManager:
             return "No heartbeat. Set one with /heartbeat every <interval> <prompt>."
         every = format_interval(s.interval_seconds)
         fired = f", fired {s.fire_count}×" if s.fire_count else ""
+        if s.missed_count:
+            fired += f", missed {s.missed_count}×"
         if s.status == "active":
             anchor = s.last_fired_at or s.created_at
             next_in = max(0, int(anchor + s.interval_seconds - time.time()))
@@ -259,6 +418,9 @@ class HeartbeatManager:
         if not self._state:
             return None
         self._state.status = "paused"
+        # Drop any in-flight claim: a paused heartbeat must not deliver,
+        # and the claimed prompt will not be confirmed.
+        self._state.claimed_at = None
         save_heartbeat(self.session_id, self._state)
         return self._state
 
@@ -268,6 +430,7 @@ class HeartbeatManager:
         self._state.status = "active"
         # Re-anchor so resuming doesn't instantly fire a stale tick.
         self._state.last_fired_at = time.time()
+        self._state.claimed_at = None
         save_heartbeat(self.session_id, self._state)
         return self._state
 
@@ -279,23 +442,124 @@ class HeartbeatManager:
         self._state = None
         return True
 
-    # --- driver entry point --------------------------------------------
+    # --- driver entry points --------------------------------------------
 
     def due_prompt(self, now: Optional[float] = None) -> Optional[str]:
         """Return the injection prompt if the heartbeat is due, else None.
 
-        Records the fire immediately (before the turn runs) so overlapping
-        polls or a long turn can never double-fire the same tick. Missed
-        ticks coalesce into one — the anchor resets to NOW, not to the
-        theoretical schedule.
+        A non-None return only *claims* the tick — ``fire_count`` and
+        ``last_fired_at`` are deliberately NOT advanced here. The driver
+        must call :meth:`confirm_delivery` once the prompt is accepted into
+        a live input path (or consumed by a turn), or :meth:`abandon_claim`
+        when the handoff fails.
+
+        While a claim is in flight (claimed but unconfirmed), further polls
+        return None so overlapping polls can never double-claim the same
+        tick, and missed intervals coalesce into one delivery instead of a
+        backlog. Two in-flight hazards are resolved here instead of
+        stalling silently (issue #92837):
+
+        - A claim left behind by a previous process (crash between claim
+          and handoff) is logged as a missed delivery and cleared.
+        - A claim from a LIVE process that produced no turn within
+          ``claim_timeout_seconds`` (staged prompt stuck with no consumer:
+          idle-evicted session, vanished drain, wedged input queue) is
+          abandoned with a warning, counted in ``missed_count``, and the
+          still-due tick is re-claimed in the same call.
         """
         s = self._state
         if s is None or not s.is_due(now):
             return None
-        s.last_fired_at = now if now is not None else time.time()
-        s.fire_count += 1
+        now = now if now is not None else time.time()
+        if s.claimed_at is not None:
+            if (
+                s.claimed_at
+                < _PROCESS_START_TS - _PROCESS_START_SKEW_TOLERANCE_SECONDS
+            ):
+                # The claiming process died before confirming/abandoning.
+                # The tick never became a turn — count it missed, surface
+                # the loss, and let the next poll re-claim the still-due
+                # tick instead of silently stalling. (Claims inside the
+                # skew tolerance stay live-process claims: wall-clock
+                # claims recorded after a backwards NTP step can read
+                # slightly older than _PROCESS_START_TS without being
+                # orphans.)
+                logger.warning(
+                    "HeartbeatManager: session %s heartbeat tick was claimed at %.0f "
+                    "but never confirmed delivered (previous process died mid-handoff); "
+                    "counting as missed and keeping the tick due",
+                    self.session_id,
+                    s.claimed_at,
+                )
+                s.missed_count += 1
+                s.claimed_at = None
+                save_heartbeat(self.session_id, s)
+                # The tick is still due: leave it for the next poll to
+                # re-claim (mirrors the pre-claim-timeout contract).
+                return None
+            elif now - s.claimed_at >= self.claim_timeout_seconds:
+                # Live-process claim that never became a turn within the
+                # claim window. Abandon loudly (warning + missed_count)
+                # and fall through: the tick is still due and gets a
+                # fresh claim below, so the heartbeat keeps trying
+                # instead of hanging forever with no signal.
+                self.abandon_claim(
+                    f"no turn consumed the claimed tick within "
+                    f"{self.claim_timeout_seconds:.0f}s"
+                )
+            else:
+                # In-flight claim from this process: the driver has not
+                # resolved it yet — never claim the same tick twice.
+                return None
+        s.claimed_at = now
         save_heartbeat(self.session_id, s)
         return s.render_prompt()
+
+    def confirm_delivery(self, now: Optional[float] = None) -> bool:
+        """Record the fire for the in-flight claim after real delivery.
+
+        The ONLY place ``fire_count`` and ``last_fired_at`` advance. Call
+        this after the claimed prompt was accepted into a live input path
+        (CLI input queue) or accepted into the live pipeline (gateway, at
+        the turn's acceptance boundary in ``_handle_message`` — turn
+        START, not completion; do NOT move this call post-turn or
+        unconfirmed claims would stall again). Returns True when a claim
+        was pending; False when there was nothing to confirm (e.g. the
+        claim was already abandoned, or the heartbeat was paused in
+        between — in which case the delivery is ignored).
+        """
+        s = self._state
+        if s is None or s.claimed_at is None:
+            return False
+        ts = now if now is not None else time.time()
+        s.last_fired_at = s.claimed_at
+        s.fire_count += 1
+        s.last_delivered_at = ts
+        s.claimed_at = None
+        save_heartbeat(self.session_id, s)
+        return True
+
+    def abandon_claim(self, reason: str = "") -> bool:
+        """Give up on the in-flight claim and count it as a missed delivery.
+
+        The fire counters are untouched, so the persisted audit trail
+        reports the truth: the tick was due, was handed off, but never
+        became a turn. The tick stays due and is re-claimed on the next
+        poll. Returns True when a claim was pending.
+        """
+        s = self._state
+        if s is None or s.claimed_at is None:
+            return False
+        s.missed_count += 1
+        s.claimed_at = None
+        save_heartbeat(self.session_id, s)
+        logger.warning(
+            "HeartbeatManager: session %s heartbeat tick claimed but never became "
+            "a turn%s; counting as missed and keeping the tick due",
+            self.session_id,
+            f": {reason}" if reason else "",
+        )
+        return True
 
 
 def migrate_heartbeat_to_session(old_session_id: str, new_session_id: str) -> bool:

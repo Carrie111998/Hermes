@@ -5668,6 +5668,7 @@ _OPEN_DICT_TOP_LEVEL_KEYS = frozenset({
     "secrets",
     "goals",
     "loops",
+    "heartbeat",
 })
 
 # Top-level keys whose sub-keys are partially schema-defined (e.g. on a
