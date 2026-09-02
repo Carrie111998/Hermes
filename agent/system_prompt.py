@@ -728,9 +728,10 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     # sessions (bot_mode_probe.bot_mode_session_state): a bot's canonical
     # "Bot Chat" (the conversation teammate bots message into via
     # `hermes -p <bot> chat --in ~ -c "Bot Chat"` and the desktop pins), or
-    # a messaging-gateway chat (Discord, Telegram, ...) whose OWN profile is
-    # Bot-Mode-managed — so a bot can route teammates from its chats, not
-    # only from its Bot Chat. All other sessions never carry it — the
+    # a classified human messaging chat (Discord, Telegram, ...) routed to a
+    # real profile in a Bot-Mode-participating install — so a bot can route
+    # teammates from its chats, not only from its Bot Chat. All other sessions
+    # never carry it — the
     # desktop's composer middleware owns the @mention send path. Title and
     # platform are read once at first build and the rendered prompt is
     # cached + DB-restored, so this is cache-safe.

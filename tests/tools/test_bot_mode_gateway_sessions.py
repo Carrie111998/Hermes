@@ -64,6 +64,18 @@ SELF_OWNED_SOURCES = (
     "", "cli", "tui", "desktop", "cron", "kanban", "subagent", "test",
     "webhook", "api_server", "msgraph_webhook", "local", "acp", "webui",
 )
+CANONICAL_BOT_CHAT_SOURCES = ("", "cli", "tui", "desktop")
+DENIED_BOT_CHAT_SOURCES = tuple(
+    sorted(
+        (
+            set(SELF_OWNED_SOURCES)
+            | set(BUILTIN_DENIED_SOURCES)
+            | set(BUNDLED_DENIED_SOURCES)
+            | {"not-a-platform"}
+        )
+        - set(CANONICAL_BOT_CHAT_SOURCES)
+    )
+)
 
 
 def _make_hermes_home(
@@ -144,13 +156,24 @@ def test_bot_managed_gateway_session_is_routed(tmp_path):
     assert state["session_kind"] == "gateway"
 
 
-def test_canonical_bot_chat_kind_unchanged(tmp_path):
+@pytest.mark.parametrize("platform", CANONICAL_BOT_CHAT_SOURCES)
+def test_canonical_bot_chat_kind_unchanged(tmp_path, platform):
     home = _make_hermes_home(tmp_path, managed_profiles=("yuki",))
     yuki_home = home / "profiles" / "yuki"
-    agent = _FakeAgent(yuki_home, title="Bot Chat")
+    agent = _FakeAgent(yuki_home, title="Bot Chat", platform=platform)
     state = bot_mode_probe.bot_mode_session_state(agent)
     assert state["managed"] is True
     assert state["session_kind"] == "bot_chat"
+
+
+@pytest.mark.parametrize("platform", DENIED_BOT_CHAT_SOURCES)
+def test_exact_bot_chat_title_does_not_bypass_denied_source(tmp_path, platform):
+    home = _make_hermes_home(tmp_path, managed_profiles=("yuki",))
+    yuki_home = home / "profiles" / "yuki"
+    agent = _FakeAgent(yuki_home, title="Bot Chat", platform=platform)
+
+    assert bot_mode_probe.bot_mode_session_state(agent)["session_kind"] is None
+    assert bot_mode_dm.ensure_message_agent_tool(agent) is False
 
 
 def test_installed_profile_without_own_bot_metadata_is_roster_managed(tmp_path):

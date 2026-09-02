@@ -94,11 +94,12 @@ def _absolute_without_symlink_resolution(path: Path) -> Path:
 
 
 def _is_roster_profile_dir(root: Path, candidate: Path) -> bool:
-    """Match the lightweight profile-directory contract used by profiles.list.
+    """Validate a security-filtered profile-roster directory.
 
-    Invalid/tombstoned names and symlinks fail closed. Resolving only after the
-    lexical parent check prevents ``profiles/<name>`` links from escaping the
-    install and being reclassified as another install's default profile.
+    This follows ``profiles.list`` name/tombstone rules and additionally rejects
+    symlinks. Resolving only after the lexical parent check prevents
+    ``profiles/<name>`` links from escaping the install and being reclassified
+    as another install's default profile.
     """
     try:
         root = _absolute_without_symlink_resolution(root)
@@ -122,7 +123,7 @@ def _is_roster_profile_dir(root: Path, candidate: Path) -> bool:
 
 
 def _roster(root: Path) -> list[tuple[str, Path]]:
-    """The same valid default + named profile directories as profiles.list."""
+    """Valid default + named profile directories, with symlinks denied."""
     root = _absolute_without_symlink_resolution(root)
     entries: list[tuple[str, Path]] = []
     if _is_roster_profile_dir(root, root):
@@ -186,6 +187,7 @@ def is_bot_mode_roster_profile(home: str | os.PathLike | None = None) -> bool:
 # also contains API endpoints, automation event streams, and agent-to-agent task
 # protocols. A newly registered adapter therefore fails closed until its trust
 # model is reviewed here.
+_CANONICAL_BOT_CHAT_SESSION_SOURCES = frozenset({"", "cli", "tui", "desktop"})
 _MESSAGING_GATEWAY_SESSION_SOURCES = frozenset({
     # Built-in adapters.
     "telegram", "discord", "whatsapp", "whatsapp_cloud", "slack", "signal",
@@ -196,6 +198,13 @@ _MESSAGING_GATEWAY_SESSION_SOURCES = frozenset({
 })
 
 
+def _session_source(agent: object) -> str:
+    try:
+        return str(getattr(agent, "platform", "") or "").strip().lower()
+    except Exception:
+        return ""
+
+
 def is_messaging_gateway_session(agent: object) -> bool:
     """True only for classified human messaging-gateway conversations.
 
@@ -204,8 +213,7 @@ def is_messaging_gateway_session(agent: object) -> bool:
     ``Platform`` values. Stable for a session's lifetime; never raises.
     """
     try:
-        source = str(getattr(agent, "platform", "") or "").strip().lower()
-        return source in _MESSAGING_GATEWAY_SESSION_SOURCES
+        return _session_source(agent) in _MESSAGING_GATEWAY_SESSION_SOURCES
     except Exception:
         return False
 
@@ -306,7 +314,11 @@ def bot_mode_session_state(
             roster_profile = is_bot_mode_roster_profile(resolved)
             if not managed:
                 state = {"managed": False, "session_kind": None}
-            elif roster_profile and title == BOT_CHAT_TITLE:
+            elif (
+                roster_profile
+                and title == BOT_CHAT_TITLE
+                and _session_source(agent) in _CANONICAL_BOT_CHAT_SESSION_SOURCES
+            ):
                 state = {"managed": True, "session_kind": "bot_chat"}
             elif roster_profile and is_messaging_gateway_session(agent):
                 state = {"managed": True, "session_kind": "gateway"}

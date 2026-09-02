@@ -257,8 +257,9 @@ def message_agent_tool(
         if not state["session_kind"]:
             return _err(
                 "message_agent is only available in a Bot Mode session — a "
-                "canonical 'Bot Chat' or a messaging chat of a Bot-Mode-managed "
-                "profile. This session is not one; do not retry."
+                "canonical 'Bot Chat' or a classified human messaging chat "
+                "bound to a real profile in a Bot-Mode-participating install. "
+                "This session is not one; do not retry."
             )
         del state
     except Exception as exc:  # pragma: no cover — defensive
