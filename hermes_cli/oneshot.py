@@ -489,7 +489,23 @@ def _run_agent(
         # gateway sessions.
         _fb = get_fallback_chain(cfg)
 
+        # Resolve max_iterations the same way cli.py does: agent.max_turns
+        # → root max_turns (back-compat) → HERMES_MAX_ITERATIONS env var
+        # → unlimited. Without this, every -z run fell back to the
+        # AIAgent constructor default regardless of config/env (fixes #99957).
+        from hermes_cli.config import resolve_turn_limit as _resolve_turn_limit
+
+        _agent_mt = cfg.get("agent", {}).get("max_turns") if isinstance(cfg.get("agent"), dict) else None
+        _root_mt = cfg.get("max_turns")
+        if _agent_mt is not None:
+            _max_iterations = _resolve_turn_limit(_agent_mt)
+        elif _root_mt is not None:
+            _max_iterations = _resolve_turn_limit(_root_mt)
+        else:
+            _max_iterations = _resolve_turn_limit(os.getenv("HERMES_MAX_ITERATIONS"))
+
         agent = AIAgent(
+            max_iterations=_max_iterations,
             api_key=runtime.get("api_key"),
             base_url=runtime.get("base_url"),
             provider=runtime.get("provider"),
