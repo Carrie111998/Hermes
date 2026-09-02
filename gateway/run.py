@@ -3524,6 +3524,11 @@ def _event_media_is_stt_input(event, index: int) -> bool:
     message_type = getattr(event, "message_type", None)
     if message_type in {MessageType.AUDIO, MessageType.DOCUMENT}:
         return False
+    if (
+        getattr(event, "metadata", {}).get("telegram_video_note")
+        and _event_media_type_at(event, index).startswith("video/")
+    ):
+        return True
     return (
         message_type == MessageType.VOICE
         or _event_media_type_at(event, index).startswith("audio/")
