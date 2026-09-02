@@ -4505,6 +4505,43 @@ class TestPtyWebSocket:
         q = {"token": tok, **params}
         return f"/api/pty?{urlencode(q)}"
 
+    def test_resolve_chat_argv_forwards_startup_query(self, monkeypatch):
+        import hermes_cli.main as main_mod
+
+        monkeypatch.setattr(
+            main_mod,
+            "_make_tui_argv",
+            lambda project_root, tui_dev=False: (
+                ["node", "dist/entry.js"],
+                "/tmp/ui-tui",
+            ),
+        )
+
+        _argv, _cwd, env = self.ws_module._resolve_chat_argv(
+            query="Continue work on Wealth Engine"
+        )
+
+        assert env["HERMES_TUI_QUERY"] == "Continue work on Wealth Engine"
+
+    def test_query_parameter_is_forwarded_to_async_chat_resolver(self, monkeypatch):
+        captured: dict = {}
+
+        async def fake_resolve(**kwargs):
+            captured.update(kwargs)
+            return (["/bin/sh", "-c", "printf query-forwarded"], None, None)
+
+        monkeypatch.setattr(self.ws_module, "_resolve_chat_argv_async", fake_resolve)
+
+        with self.client.websocket_connect(
+            self._url(query="  Continue Wealth Engine  ")
+        ) as conn:
+            try:
+                conn.receive_bytes()
+            except Exception:
+                pass
+
+        assert captured["query"] == "Continue Wealth Engine"
+
 
 
     def test_tui_python_command_uses_child_path(self, tmp_path):
