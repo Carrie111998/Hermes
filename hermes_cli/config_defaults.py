@@ -2130,6 +2130,14 @@ DEFAULT_CONFIG = {
         # "hindsight", "holographic", "retaindb", "byterover".
         # Only ONE external provider is allowed at a time.
         "provider": "",
+        # Seconds a turn waits for an EXTERNAL provider's prefetch (recall)
+        # before continuing without injected memory; the built-in local
+        # provider is unaffected. A timed-out worker is NOT cancelled and
+        # later turns skip while it lives, so a provider slower than this
+        # never gets applied at all. Measure your provider's real p95 and
+        # keep this above it; a local reranker or large graph can push a
+        # single recall past 20s.
+        "external_prefetch_timeout": 8.0,
     },
 
     # Subagent delegation — override the provider:model used by delegate_task
