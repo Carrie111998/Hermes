@@ -38,6 +38,7 @@ from gateway.session import (
     AsyncSessionStore,
     SessionSource,
     build_session_key,
+    is_internal_subagent_row,
     is_shared_multi_user_session,
 )
 from hermes_cli.config import atomic_config_write, cfg_get, clear_model_endpoint_credentials
@@ -5312,6 +5313,24 @@ class GatewaySlashCommandsMixin:
 
         # Clear any running agent for this session key
         self._release_running_agent_state(session_key)
+
+        # A delegate/subagent transcript is an internal execution record, not a
+        # conversation (#92859). switch_session() refuses it outright, which
+        # would surface here as the generic "Failed to switch session." Detect
+        # it first so an explicit `/resume <subagent id>` explains itself
+        # instead of looking like a transient failure. Mirrors the guard's own
+        # fail-open posture: if the row can't be read, fall through and let
+        # switch_session decide.
+        if self._session_db:
+            try:
+                target_row = await self._session_db.get_session(target_id)
+            except Exception:
+                logger.debug(
+                    "resume subagent pre-check failed for %s", target_id, exc_info=True
+                )
+                target_row = None
+            if is_internal_subagent_row(target_row):
+                return t("gateway.resume.blocked_subagent", name=name)
 
         # Switch the session entry to point at the old session
         new_entry = await self.async_session_store.switch_session(session_key, target_id)
