@@ -65,6 +65,7 @@ from gateway.platforms.base import (
     cache_audio_from_bytes,
     cache_document_from_bytes,
     cache_image_from_bytes,
+    classify_send_error,
 )
 from hermes_constants import get_hermes_home
 from utils import atomic_json_write
@@ -124,6 +125,65 @@ def _is_stale_session_ret(
     if ret != RATE_LIMIT_ERRCODE and errcode != RATE_LIMIT_ERRCODE:
         return False
     return (errmsg or "").lower() == "unknown error"
+
+
+def _sendmessage_response_error(resp: Dict[str, Any]) -> Optional[RuntimeError]:
+    """Return a RuntimeError when an iLink sendmessage response is non-zero.
+
+    iLink marks success with ``ret=0``/``errcode=0`` (or by omitting both).
+    Any non-zero value means the server refused the message — a response
+    that is never inspected is exactly the false-success state of #94146,
+    where Hermes reported the send as accepted while nothing was delivered.
+    """
+    ret = resp.get("ret")
+    errcode = resp.get("errcode")
+    if (ret is not None and ret not in {0,}) or (errcode is not None and errcode not in {0,}):
+        errmsg = str(resp.get("errmsg") or resp.get("msg") or "unknown error")[:200]
+        if ret == RATE_LIMIT_ERRCODE or errcode == RATE_LIMIT_ERRCODE:
+            # Wording matches the existing rate-limit text so
+            # classify_send_error() maps it to ``rate_limited`` and the retry
+            # layer honors cooldown semantics instead of the plain-text
+            # formatting fallback.
+            return RuntimeError(
+                f"iLink sendmessage rate limited: ret={ret} errcode={errcode} errmsg={errmsg}"
+            )
+        return RuntimeError(
+            f"iLink sendmessage error: ret={ret} errcode={errcode} errmsg={errmsg}"
+        )
+    return None
+
+
+def _log_send_response(
+    name: str,
+    endpoint: str,
+    chat_id: str,
+    client_id: str,
+    resp: Dict[str, Any],
+    *,
+    context_token: bool,
+) -> None:
+    """Log one sanitized line per sendmessage response (#94146 observability).
+
+    Success responses previously logged nothing, so a server-side
+    accepted-but-dropped send was indistinguishable from a healthy one.
+    Fields: endpoint ``ret`` ``errcode`` ``errmsg`` (truncated), client-id
+    prefix, whether a context token was attached.
+    """
+    ret = resp.get("ret")
+    errcode = resp.get("errcode")
+    errmsg = str(resp.get("errmsg") or resp.get("msg") or "")[:200] or "-"
+    ok = _sendmessage_response_error(resp) is None
+    (logger.info if ok else logger.warning)(
+        "[%s] %s to=%s client_id=%s ret=%s errcode=%s errmsg=%s context_token=%s",
+        name,
+        endpoint,
+        _safe_id(chat_id),
+        str(client_id)[:12],
+        ret,
+        errcode,
+        errmsg,
+        "yes" if context_token else "no",
+    )
 
 
 MEDIA_IMAGE = 1
@@ -511,7 +571,7 @@ async def _send_typing(
     typing_ticket: str,
     status: int,
 ) -> None:
-    await _api_post(
+    resp = await _api_post(
         session,
         base_url=base_url,
         endpoint=EP_SEND_TYPING,
@@ -523,6 +583,13 @@ async def _send_typing(
         token=token,
         timeout_ms=CONFIG_TIMEOUT_MS,
     )
+    # #94146: typing bursts hit the same server-side rate limit as text
+    # sends, but the response was never inspected — a throttled typing
+    # signal was 100% invisible. Surface it so the suppression trigger is
+    # observable instead of silent.
+    error = _sendmessage_response_error(resp)
+    if error is not None:
+        raise error
 
 
 async def _get_config(
@@ -1791,6 +1858,50 @@ class WeixinAdapter(BasePlatformAdapter):
         self._rate_limit_events.clear()
         self._rate_limit_circuit_until = 0.0
 
+    def _invalidate_context_token(self, chat_id: str, reason: str) -> None:
+        """Drop the cached ``context_token`` for a peer and persist removal.
+
+        #94146: a stale/poisoned context token is a plausible server-side
+        suppression trigger. Once the rate-limit circuit opens we stop
+        reusing it, so the next send after the cooldown falls back to the
+        tokenless degraded path iLink accepts. Mirrors the session-expired
+        recovery in ``_send_text_chunk_locked``.
+        """
+        key = self._token_store._key(self._account_id, chat_id)
+        if self._token_store._cache.pop(key, None) is None:
+            return
+        try:
+            self._token_store._persist(self._account_id)
+        except Exception:
+            pass
+        logger.warning(
+            "[%s] invalidated cached context_token for %s (%s); next send will retry tokenless",
+            self.name, _safe_id(chat_id), reason,
+        )
+
+    def _send_result_from_exception(self, chat_id: str, exc: Exception) -> SendResult:
+        """Build a classified ``SendResult`` from a send exception.
+
+        #94146: rate-limited failures previously surfaced as bare
+        ``SendResult(success=False, error=...)`` without ``retryable``/
+        ``retry_after``/``error_kind``, so the gateway's retry layer treated
+        them as non-network failures and mangled the reply through the
+        "plain-text fallback" instead of retrying after the cooldown.
+        """
+        error_str = str(exc)
+        kind = classify_send_error(exc, error_str)
+        retry_after: Optional[float] = None
+        if kind == "rate_limited":
+            remaining = self._rate_limit_cooldown_remaining()
+            retry_after = remaining if remaining > 0 else 5.0
+        return SendResult(
+            success=False,
+            error=error_str,
+            error_kind=kind,
+            retryable=kind in {"rate_limited", "transient"},
+            retry_after=retry_after,
+        )
+
     async def _send_text_chunk(
         self,
         *,
@@ -1838,6 +1949,29 @@ class WeixinAdapter(BasePlatformAdapter):
                     context_token=context_token,
                     client_id=client_id,
                 )
+                # #94146: every sendmessage response is logged sanitized so an
+                # accepted-but-dropped send is distinguishable in logs, and
+                # non-dict responses can no longer fall through as success.
+                if resp is None:
+                    logger.warning(
+                        "[%s] sendmessage returned EMPTY response to=%s client_id=%s; "
+                        "treating as accepted (no server acknowledgement received)",
+                        self.name, _safe_id(chat_id), str(client_id)[:12],
+                    )
+                elif not isinstance(resp, dict):
+                    raise RuntimeError(
+                        "iLink sendmessage returned unexpected response type: "
+                        f"{type(resp).__name__}"
+                    )
+                else:
+                    _log_send_response(
+                        self.name,
+                        "sendmessage",
+                        chat_id,
+                        client_id,
+                        resp,
+                        context_token=bool(context_token),
+                    )
                 # Check iLink response for session-expired error
                 if resp and isinstance(resp, dict):
                     ret = resp.get("ret")
@@ -1874,6 +2008,14 @@ class WeixinAdapter(BasePlatformAdapter):
                                 f"iLink sendmessage rate limited: ret={ret} errcode={errcode} errmsg={errmsg}"
                             )
                             if self._record_rate_limit_event():
+                                # #94146 recovery: a poisoned/stale context
+                                # token may keep the server-side session
+                                # suppressed. Stop reusing it; the retry after
+                                # the cooldown falls back to the tokenless
+                                # degraded path.
+                                self._invalidate_context_token(
+                                    chat_id, "rate-limit circuit opened"
+                                )
                                 last_error = self._rate_limit_error()
                                 break
                             if attempt >= self._send_chunk_retries:
@@ -1961,6 +2103,17 @@ class WeixinAdapter(BasePlatformAdapter):
 
             # Deliver text content.
             chunks = [c for c in self._split_text(self.format_message(final_content)) if c and c.strip()]
+            if not chunks:
+                # #94146: an empty chunk list previously returned
+                # SendResult(success=True, message_id=None) — a false success
+                # with nothing sent. Make it a visible failure instead.
+                return SendResult(
+                    success=False,
+                    error=(
+                        "Weixin: no deliverable content in reply "
+                        "(empty after formatting/splitting)"
+                    ),
+                )
             for idx, chunk in enumerate(chunks):
                 client_id = f"hermes-weixin-{uuid.uuid4().hex}"
                 await self._send_text_chunk(
@@ -1975,7 +2128,7 @@ class WeixinAdapter(BasePlatformAdapter):
             return SendResult(success=True, message_id=last_message_id)
         except Exception as exc:
             logger.error("[%s] send failed to=%s: %s", self.name, _safe_id(chat_id), exc)
-            return SendResult(success=False, error=str(exc))
+            return self._send_result_from_exception(chat_id, exc)
 
     async def _ensure_typing_ticket(self, chat_id: str) -> Optional[str]:
         """Return a valid typing ticket, refreshing from getConfig if expired.
@@ -2014,6 +2167,24 @@ class WeixinAdapter(BasePlatformAdapter):
             )
         return None
 
+    def _log_typing_failure(self, action: str, chat_id: str, exc: Exception) -> None:
+        """Log a typing failure, at WARNING when it is a rate limit.
+
+        #94146: typing/interim bursts are a suspected trigger for server-side
+        suppression, but throttled typing signals were previously swallowed
+        at debug level — invisible in production logs.
+        """
+        if classify_send_error(exc, str(exc)) == "rate_limited":
+            logger.warning(
+                "[%s] %s rate limited for %s: %s",
+                self.name, action, _safe_id(chat_id), exc,
+            )
+        else:
+            logger.debug(
+                "[%s] %s failed for %s: %s",
+                self.name, action, _safe_id(chat_id), exc,
+            )
+
     async def send_typing(self, chat_id: str, metadata: Optional[Dict[str, Any]] = None) -> None:
         if not self._send_session or not self._token:
             return
@@ -2030,7 +2201,7 @@ class WeixinAdapter(BasePlatformAdapter):
                 status=TYPING_START,
             )
         except Exception as exc:
-            logger.debug("[%s] typing start failed for %s: %s", self.name, _safe_id(chat_id), exc)
+            self._log_typing_failure("typing start", chat_id, exc)
 
     async def stop_typing(self, chat_id: str) -> None:
         if not self._send_session or not self._token:
@@ -2048,7 +2219,7 @@ class WeixinAdapter(BasePlatformAdapter):
                 status=TYPING_STOP,
             )
         except Exception as exc:
-            logger.debug("[%s] typing stop failed for %s: %s", self.name, _safe_id(chat_id), exc)
+            self._log_typing_failure("typing stop", chat_id, exc)
 
     async def send_image(
         self,
@@ -2110,7 +2281,7 @@ class WeixinAdapter(BasePlatformAdapter):
             return SendResult(success=True, message_id=message_id)
         except Exception as exc:
             logger.error("[%s] send_document failed to=%s: %s", self.name, _safe_id(chat_id), exc)
-            return SendResult(success=False, error=str(exc))
+            return self._send_result_from_exception(chat_id, exc)
 
     async def send_video(
         self,
@@ -2127,7 +2298,7 @@ class WeixinAdapter(BasePlatformAdapter):
             return SendResult(success=True, message_id=message_id)
         except Exception as exc:
             logger.error("[%s] send_video failed to=%s: %s", self.name, _safe_id(chat_id), exc)
-            return SendResult(success=False, error=str(exc))
+            return self._send_result_from_exception(chat_id, exc)
 
     async def send_voice(
         self,
@@ -2154,7 +2325,7 @@ class WeixinAdapter(BasePlatformAdapter):
             return SendResult(success=True, message_id=message_id)
         except Exception as exc:
             logger.error("[%s] send_voice failed to=%s: %s", self.name, _safe_id(chat_id), exc)
-            return SendResult(success=False, error=str(exc))
+            return self._send_result_from_exception(chat_id, exc)
 
     async def _download_remote_media(self, url: str) -> str:
         from tools.url_safety import is_safe_url
@@ -2242,7 +2413,7 @@ class WeixinAdapter(BasePlatformAdapter):
         last_message_id = None
         if caption:
             last_message_id = f"hermes-weixin-{uuid.uuid4().hex}"
-            await _send_message(
+            caption_resp = await _send_message(
                 self._send_session,
                 base_url=self._base_url,
                 token=self._token,
@@ -2251,9 +2422,19 @@ class WeixinAdapter(BasePlatformAdapter):
                 context_token=context_token,
                 client_id=last_message_id,
             )
+            _log_send_response(
+                self.name, "sendmessage", chat_id, last_message_id, caption_resp,
+                context_token=bool(context_token),
+            )
+            caption_err = _sendmessage_response_error(caption_resp)
+            if caption_err is not None:
+                # #94146: media sends previously ignored iLink error
+                # responses entirely — a throttled caption/media send was
+                # reported to the user as success while nothing arrived.
+                raise caption_err
 
         last_message_id = f"hermes-weixin-{uuid.uuid4().hex}"
-        await _api_post(
+        media_resp = await _api_post(
             self._send_session,
             base_url=self._base_url,
             endpoint=EP_SEND_MESSAGE,
@@ -2265,12 +2446,19 @@ class WeixinAdapter(BasePlatformAdapter):
                     "message_type": MSG_TYPE_BOT,
                     "message_state": MSG_STATE_FINISH,
                     "item_list": [media_item],
-                    **({"context_token": context_token} if context_token else {}),
+                    **( {"context_token": context_token} if context_token else {}),
                 }
             },
             token=self._token,
             timeout_ms=API_TIMEOUT_MS,
         )
+        _log_send_response(
+            self.name, "sendmessage", chat_id, last_message_id, media_resp,
+            context_token=bool(context_token),
+        )
+        media_err = _sendmessage_response_error(media_resp)
+        if media_err is not None:
+            raise media_err
         return last_message_id
 
     def _outbound_media_builder(self, path: str, force_file_attachment: bool = False):
@@ -2385,10 +2573,13 @@ async def send_weixin_direct(
             and send_session._loop is asyncio.get_running_loop()):
         last_result: Optional[SendResult] = None
         cleaned = live_adapter.format_message(message)
-        if cleaned:
-            last_result = await live_adapter.send(chat_id, cleaned)
-            if not last_result.success:
-                return {"error": f"Weixin send failed: {last_result.error}"}
+        if not cleaned:
+            # #94146: an empty message previously skipped the send and still
+            # returned success=True with message_id=None — a false success.
+            return {"error": "Weixin send failed: no deliverable content in message"}
+        last_result = await live_adapter.send(chat_id, cleaned)
+        if not last_result.success:
+            return {"error": f"Weixin send failed: {last_result.error}"}
 
         for media_path, _is_voice in media_files or []:
             ext = Path(media_path).suffix.lower()
@@ -2430,10 +2621,13 @@ async def send_weixin_direct(
 
         last_result: Optional[SendResult] = None
         cleaned = adapter.format_message(message)
-        if cleaned:
-            last_result = await adapter.send(chat_id, cleaned)
-            if not last_result.success:
-                return {"error": f"Weixin send failed: {last_result.error}"}
+        if not cleaned:
+            # #94146: an empty message previously skipped the send and still
+            # returned success=True with message_id=None — a false success.
+            return {"error": "Weixin send failed: no deliverable content in message"}
+        last_result = await adapter.send(chat_id, cleaned)
+        if not last_result.success:
+            return {"error": f"Weixin send failed: {last_result.error}"}
 
         for media_path, _is_voice in media_files or []:
             ext = Path(media_path).suffix.lower()
