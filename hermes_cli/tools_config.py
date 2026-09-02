@@ -1936,8 +1936,25 @@ def _run_cua_driver_installer(
                     logger.debug("cua-driver installer output:\n%s", result.stdout)
         installed_binary = _resolved_cua_driver_cmd()
         if result.returncode == 0 and installed_binary:
-            if is_windows and not _repair_cua_driver_autostart_windows(
-                installed_binary, verbose=verbose
+            # Unattended refreshes (installer_timeout set) pass -NoAutoStart
+            # above specifically to skip install.ps1's self-elevating
+            # Register-CuaDriverAutostart branch (#87703) — but
+            # _repair_cua_driver_autostart_windows has its OWN independent
+            # self-elevating branch (Start-Process ... -Verb RunAs -Wait, up
+            # to 300s) that fires whenever the task isn't ALREADY registered,
+            # regardless of installer_timeout. -NoAutoStart guarantees it
+            # won't be registered on a first-time unattended install, so this
+            # call would reopen the exact hidden-UAC-prompt hang -NoAutoStart
+            # was added to avoid. Skip it here too when unattended, same
+            # tradeoff -NoAutoStart already accepts: an unregistered task
+            # stays unregistered until the next interactive
+            # `computer-use install --upgrade` re-registers it.
+            if (
+                is_windows
+                and installer_timeout is None
+                and not _repair_cua_driver_autostart_windows(
+                    installed_binary, verbose=verbose
+                )
             ):
                 _print_warning(
                     "    cua-driver installed, but auto-start was not registered."
