@@ -558,6 +558,62 @@ class TestCheckForSkillUpdates:
         assert results[0]["name"] == "demo-skill"
         assert results[0]["status"] == "update_available"
 
+    def test_skips_bundle_fetch_when_immutable_revision_is_unchanged(self):
+        lock = MagicMock()
+        lock.list_installed.return_value = [{
+            "name": "demo-skill",
+            "source": "github",
+            "identifier": "owner/repo/demo-skill",
+            "content_hash": "installed-hash",
+            "install_path": "demo-skill",
+            "metadata": {"source_revision": "abc123"},
+        }]
+
+        source = MagicMock(spec=SkillSource)
+        source.source_id.return_value = "github"
+        source.current_revision.return_value = "abc123"
+        source.fetch.side_effect = AssertionError("unchanged revision must not fetch bundle")
+
+        results = check_for_skill_updates(lock=lock, sources=[source])
+
+        assert results == [{
+            "name": "demo-skill",
+            "identifier": "owner/repo/demo-skill",
+            "source": "github",
+            "status": "up_to_date",
+            "current_hash": "installed-hash",
+            "latest_hash": "installed-hash",
+        }]
+        source.fetch.assert_not_called()
+
+    def test_fetches_bundle_when_immutable_revision_changed(self):
+        lock = MagicMock()
+        lock.list_installed.return_value = [{
+            "name": "demo-skill",
+            "source": "github",
+            "identifier": "owner/repo/demo-skill",
+            "content_hash": "oldhash",
+            "install_path": "demo-skill",
+            "metadata": {"source_revision": "abc123"},
+        }]
+
+        source = MagicMock(spec=SkillSource)
+        source.source_id.return_value = "github"
+        source.current_revision.return_value = "def456"
+        source.fetch.return_value = SkillBundle(
+            name="demo-skill",
+            files={"SKILL.md": "new content"},
+            source="github",
+            identifier="owner/repo/demo-skill",
+            trust_level="community",
+        )
+
+        results = check_for_skill_updates(lock=lock, sources=[source])
+
+        assert results[0]["status"] == "update_available"
+        source.fetch.assert_called_once_with("owner/repo/demo-skill")
+
+
 class TestCreateSourceRouter:
 
     def test_url_source_runs_before_github_source(self):

@@ -605,6 +605,10 @@ class SkillSource(ABC):
         """Unique identifier for this source (e.g. 'github', 'clawhub')."""
         ...
 
+    def current_revision(self, identifier: str) -> Optional[str]:
+        """Return an immutable upstream revision when the source exposes one."""
+        return None
+
     def trust_level_for(self, identifier: str) -> str:
         """Determine trust level for a skill from this source."""
         return "community"
@@ -868,6 +872,17 @@ class GitHubSource(SkillSource):
                 "source_revision": revision,
             },
         )
+
+    def current_revision(self, identifier: str) -> Optional[str]:
+        """Return the repository tree revision without downloading a bundle."""
+        parts = identifier.split("/", 2)
+        if len(parts) < 3:
+            return None
+
+        repo = f"{parts[0]}/{parts[1]}"
+        if self._get_repo_tree(repo) is None:
+            return None
+        return self._tree_revisions.get(repo)
 
     def inspect(self, identifier: str) -> Optional[SkillMeta]:
         """Fetch just the SKILL.md metadata for preview."""
@@ -4465,6 +4480,33 @@ def check_for_skill_updates(
                 "status": "unavailable",
             })
             continue
+
+        metadata = entry.get("metadata")
+        recorded_revision = (
+            metadata.get("source_revision", "")
+            if isinstance(metadata, dict)
+            else ""
+        )
+        if recorded_revision:
+            revision_matches = False
+            for src in candidate_sources:
+                try:
+                    revision_matches = src.current_revision(identifier) == recorded_revision
+                except Exception:
+                    revision_matches = False
+                if revision_matches:
+                    break
+            if revision_matches:
+                current_hash = entry.get("content_hash", "")
+                results.append({
+                    "name": entry.get("name", ""),
+                    "identifier": identifier,
+                    "source": source_name,
+                    "status": "up_to_date",
+                    "current_hash": current_hash,
+                    "latest_hash": current_hash,
+                })
+                continue
 
         bundle = None
         for src in candidate_sources:
