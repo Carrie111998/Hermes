@@ -50,13 +50,104 @@ def _get_registered() -> Dict[str, str]:
         return val
 
 
-# Cache for config-based file list (loaded once per process).
-_config_files: List[Dict[str, str]] | None = None
+# Cache for the config-based file list, keyed by the resolved HERMES_HOME the
+# entries were loaded for. In a multiplexed gateway the active home is
+# profile-scoped (``hermes_constants.set_hermes_home_override``), while this
+# module-global cache outlives any single profile scope. Keying by home keeps
+# one profile's approved credential paths from being handed to another profile's
+# sandbox — the same cross-session bleed the ContextVar-backed skill registry
+# above guards against. Resolving the paths per-home also survives the
+# set/reset-in-place override pattern (a plain unkeyed cache would not, since the
+# home token reset does not reset this cache).
+_config_files_by_home: Dict[str, List[Dict[str, str]]] = {}
 
 
 def _resolve_hermes_home() -> Path:
     from hermes_constants import get_hermes_home
     return get_hermes_home()
+
+
+def _admit_credential_relpath(relative_path: str, *, source: str) -> Optional[Path]:
+    """Resolve *relative_path* to an admissible host credential file, or ``None``.
+
+    The single containment + master-store policy gate shared by BOTH the skill
+    registration path (:func:`register_credential_file`) and the config path
+    (:func:`_load_config_files`), so the two admission surfaces can never drift.
+    A mount is admitted only when the path:
+
+    * is relative (absolute paths bypass the HERMES_HOME sandbox entirely);
+    * stays inside HERMES_HOME after symlink/``..`` resolution, so a declaration
+      like ``../../.ssh/id_rsa`` cannot exfiltrate host files into a sandbox;
+    * points at an existing file; and
+    * is NOT one of the MASTER credential stores the agent is denied from
+      reading. Containment alone is insufficient because HERMES_HOME is exactly
+      where the master stores live: a caller legitimately needs its own service
+      token (``google_token.json``); it never needs ``.env`` (every provider
+      key), ``auth.json`` (all provider tokens and OAuth grants), ``mcp-tokens/``
+      or the Bitwarden plaintext cache. Those are refused via the canonical read
+      deny-list (``agent.file_safety.get_read_block_error``) — the same guard
+      that stops the agent reading them with ``read_file``, so the mount surface
+      can never hand a caller what the read surface denies it.
+
+    Fails CLOSED: if the canonical guard can't be imported or raises, the mount
+    is refused rather than risk bind-mounting a master store into a sandbox
+    (#67665). *source* is a short label ("skill"/"config") used only for logging.
+    """
+    hermes_home = _resolve_hermes_home()
+
+    # Reject absolute paths — they bypass the HERMES_HOME sandbox entirely.
+    if os.path.isabs(relative_path):
+        logger.warning(
+            "credential_files: rejected absolute %s path %r (must be relative to HERMES_HOME)",
+            source, relative_path,
+        )
+        return None
+
+    host_path = hermes_home / relative_path
+
+    # Resolve symlinks and normalise ``..`` before the containment check so
+    # that traversal like ``../.ssh/id_rsa`` cannot escape HERMES_HOME.
+    from tools.path_security import validate_within_dir
+
+    containment_error = validate_within_dir(host_path, hermes_home)
+    if containment_error:
+        logger.warning(
+            "credential_files: rejected %s path traversal %r (%s)",
+            source, relative_path, containment_error,
+        )
+        return None
+
+    resolved = host_path.resolve()
+    if not resolved.is_file():
+        logger.debug("credential_files: skipping %s %s (not found)", source, resolved)
+        return None
+
+    # Master credential stores are never mountable, even though they sit inside
+    # HERMES_HOME and therefore pass the containment check above. Fails CLOSED.
+    if get_read_block_error is None:
+        logger.error(
+            "credential_files: refusing %s %r — agent.file_safety could not be "
+            "imported, so the master-store deny-list cannot be consulted",
+            source, relative_path,
+        )
+        return None
+    try:
+        denied = get_read_block_error(str(resolved))
+    except Exception:
+        logger.exception(
+            "credential_files: refusing %s %r — read guard raised", source, relative_path
+        )
+        return None
+    if denied:
+        logger.warning(
+            "credential_files: refused %s %r — it is a credential store the agent "
+            "is denied from reading; mount your own service token, not the master "
+            "key files",
+            source, relative_path,
+        )
+        return None
+
+    return resolved
 
 
 def register_credential_file(
@@ -66,80 +157,12 @@ def register_credential_file(
     """Register a credential file for mounting into remote sandboxes.
 
     *relative_path* is relative to ``HERMES_HOME`` (e.g. ``google_token.json``).
-    Returns True if the file exists on the host and was registered.
-
-    Security: rejects absolute paths and path traversal sequences (``..``).
-    The resolved host path must remain inside HERMES_HOME so that a malicious
-    skill cannot declare ``required_credential_files: ['../../.ssh/id_rsa']``
-    and exfiltrate sensitive host files into a container sandbox.
-
-    Containment alone is not sufficient, because HERMES_HOME is exactly where
-    the MASTER credential stores live. A skill legitimately needs its own
-    service token (``google_token.json``); it never needs ``.env`` (every
-    provider key), ``auth.json`` (all provider tokens and OAuth grants),
-    ``mcp-tokens/`` or the Bitwarden plaintext cache. Those are refused via
-    the canonical read deny-list (``agent.file_safety.get_read_block_error``)
-    — the same guard that stops the agent reading them with ``read_file``, so
-    the mount surface cannot hand a skill what the read surface denies it.
+    Returns True if the file passes the shared admission policy
+    (:func:`_admit_credential_relpath` — relative, contained, existing, and not
+    a master credential store) and was registered.
     """
-    hermes_home = _resolve_hermes_home()
-
-    # Reject absolute paths — they bypass the HERMES_HOME sandbox entirely.
-    if os.path.isabs(relative_path):
-        logger.warning(
-            "credential_files: rejected absolute path %r (must be relative to HERMES_HOME)",
-            relative_path,
-        )
-        return False
-
-    host_path = hermes_home / relative_path
-
-    # Resolve symlinks and normalise ``..`` before the containment check so
-    # that traversal like ``../. ssh/id_rsa`` cannot escape HERMES_HOME.
-    from tools.path_security import validate_within_dir
-
-    containment_error = validate_within_dir(host_path, hermes_home)
-    if containment_error:
-        logger.warning(
-            "credential_files: rejected path traversal %r (%s)",
-            relative_path,
-            containment_error,
-        )
-        return False
-
-    resolved = host_path.resolve()
-    if not resolved.is_file():
-        logger.debug("credential_files: skipping %s (not found)", resolved)
-        return False
-
-    # Master credential stores are never mountable, even though they sit
-    # inside HERMES_HOME and therefore pass the containment check above.
-    # Fails CLOSED: if the canonical guard can't be consulted we refuse the
-    # mount rather than risk bind-mounting auth.json into a sandbox. The
-    # import lives at module top (no circular-import concern — file_safety is
-    # stdlib-only); the sentinel + logger.exception keep guard failures
-    # debuggable instead of silently swallowed (#67665).
-    if get_read_block_error is None:
-        logger.error(
-            "credential_files: refusing %r — agent.file_safety could not be "
-            "imported, so the master-store deny-list cannot be consulted",
-            relative_path,
-        )
-        return False
-    try:
-        denied = get_read_block_error(str(resolved))
-    except Exception:
-        logger.exception(
-            "credential_files: refusing %r — read guard raised", relative_path
-        )
-        return False
-    if denied:
-        logger.warning(
-            "credential_files: refused %r — it is a credential store the agent "
-            "is denied from reading; a skill may mount its own service token, "
-            "not the master key files",
-            relative_path,
-        )
+    resolved = _admit_credential_relpath(relative_path, source="skill")
+    if resolved is None:
         return False
 
     container_path = f"{container_base.rstrip('/')}/{relative_path}"
@@ -174,38 +197,66 @@ def register_credential_files(
 
 
 def _load_config_files() -> List[Dict[str, str]]:
-    """Load ``terminal.credential_files`` from config.yaml (cached)."""
-    global _config_files
-    if _config_files is not None:
-        return _config_files
+    """Load ``terminal.credential_files`` from config.yaml (cached per home).
+
+    The cache is keyed by the *canonical* home identity, not the raw override
+    spelling, so that a later profile with a different home never receives an
+    earlier profile's cached host paths. ``hermes_home_key`` runs
+    ``expanduser`` + ``resolve(strict=False)`` + ``normcase``, which follows
+    symlinks: a stable alias path (e.g. ``profiles/current``) that is
+    atomically retargeted from home A to home B yields a *different* key even
+    though the active ``HERMES_HOME`` override string is unchanged, so the
+    retarget can no longer serve A's cached host paths under B.
+
+    The key AND the load must observe *one* home snapshot. ``read_raw_config``
+    re-derives the config path from the live ``HERMES_HOME`` and each
+    ``_admit_credential_relpath`` re-runs :func:`_resolve_hermes_home`; if the
+    alias is retargeted A -> B *during a single cache miss* (after the key is
+    captured but before the read/admission run), B's config and B's token path
+    would be realized and then cached under A's key. To close that intra-load
+    boundary we resolve the canonical home once, derive the key from that exact
+    object, and pin it as the context-local ``HERMES_HOME`` override for the
+    duration of the read + admission so both consume the same snapshot; the
+    mutable alias spelling is never re-read inside the operation. Pinning the
+    resolved path (not the alias) means ``read_raw_config`` keeps its own
+    cache/parse/fail-open semantics unchanged — it simply reads the canonical
+    home's ``config.yaml`` directly.
+    """
+    from hermes_constants import (
+        hermes_home_key,
+        reset_hermes_home_override,
+        set_hermes_home_override,
+    )
+
+    # Snapshot the canonical home once (symlink-resolved) so a mid-miss alias
+    # retarget cannot make the key and the realized paths disagree.
+    canonical_home = _resolve_hermes_home().resolve()
+    home_key = hermes_home_key(canonical_home)
+    cached = _config_files_by_home.get(home_key)
+    if cached is not None:
+        return cached
 
     result: List[Dict[str, str]] = []
+    # Pin the snapshot for every home resolution inside the miss: the raw-config
+    # read and each admission both consult this exact object rather than the
+    # mutable alias, so no B path can be realized and cached under A's key.
+    override_token = set_hermes_home_override(canonical_home)
     try:
         from hermes_cli.config import read_raw_config
-        hermes_home = _resolve_hermes_home()
         cfg = read_raw_config()
         cred_files = cfg_get(cfg, "terminal", "credential_files")
         if isinstance(cred_files, list):
-            from tools.path_security import validate_within_dir
-
             for item in cred_files:
                 if isinstance(item, str) and item.strip():
                     rel = item.strip()
-                    if os.path.isabs(rel):
-                        logger.warning(
-                            "credential_files: rejected absolute config path %r", rel,
-                        )
-                        continue
-                    host_path = hermes_home / rel
-                    containment_error = validate_within_dir(host_path, hermes_home)
-                    if containment_error:
-                        logger.warning(
-                            "credential_files: rejected config path traversal %r (%s)",
-                            rel, containment_error,
-                        )
-                        continue
-                    resolved_path = host_path.resolve()
-                    if resolved_path.is_file():
+                    # Route config entries through the SAME admission policy as
+                    # skill registration: containment plus the master-store
+                    # deny-list. Previously the config path checked only
+                    # absolute/traversal + existence, so a config entry such as
+                    # ``auth.json`` or ``.env`` mounted straight into the sandbox,
+                    # bypassing the read deny-list the skill path enforces.
+                    resolved_path = _admit_credential_relpath(rel, source="config")
+                    if resolved_path is not None:
                         container_path = f"/root/.hermes/{rel}"
                         result.append({
                             "host_path": str(resolved_path),
@@ -213,9 +264,11 @@ def _load_config_files() -> List[Dict[str, str]]:
                         })
     except Exception as e:
         logger.warning("Could not read terminal.credential_files from config: %s", e)
+    finally:
+        reset_hermes_home_override(override_token)
 
-    _config_files = result
-    return _config_files
+    _config_files_by_home[home_key] = result
+    return result
 
 
 def get_credential_file_mounts() -> List[Dict[str, str]]:
@@ -597,7 +650,13 @@ def iter_cache_files(
 
 
 def clear_credential_files() -> None:
-    """Reset the skill-scoped registry (e.g. on session reset)."""
+    """Reset the skill-scoped registry (e.g. on session reset).
+
+    Also drops the config-file cache so a session reset re-reads
+    ``terminal.credential_files`` — picking up config rotation/removal instead
+    of serving a stale per-home snapshot.
+    """
     _get_registered().clear()
+    _config_files_by_home.clear()
 
 
