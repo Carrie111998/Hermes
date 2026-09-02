@@ -8,10 +8,13 @@ tests — grouping identity, header-routed separation, list-of-dict model
 declarations, and display-only RID stripping.
 """
 
+import pytest
+
 import hermes_cli.providers as providers_mod
 from hermes_cli.model_switch import (
     format_model_for_display,
     list_authenticated_providers,
+    strip_bedrock_profile_prefix_for_display,
 )
 
 
@@ -84,5 +87,68 @@ class TestFormatModelForDisplay:
     def test_palantir_rid_stripped_to_trailing_slug(self):
         rid = "ri.language-model-service..language-model.anthropic-claude-4-7-opus"
         assert format_model_for_display(rid) == "anthropic-claude-4-7-opus"
+
+    def test_bedrock_profile_prefix_is_not_stripped_here(self):
+        """The Bedrock strip lives in its own helper on purpose: this function
+        also feeds the model-switch self-identification note, where collapsing
+        ``us.X`` to ``X`` would read as "switched from X to X"."""
+        profile = "us.anthropic.claude-sonnet-4-5-20250929-v1:0"
+        assert format_model_for_display(profile) == profile
+
+
+class TestStripBedrockProfilePrefixForDisplay:
+    """Every profile ID below is a real one, confirmed against
+    ``ListInferenceProfiles``. That matters more than it looks: a
+    string-transform test passes just as happily on an ID that no region
+    serves, so an invented ID here would quietly stop being evidence that
+    the helper handles the shapes Bedrock actually returns."""
+
+    @pytest.mark.parametrize("profile,expected", [
+        ("us.anthropic.claude-sonnet-4-5-20250929-v1:0",
+         "anthropic.claude-sonnet-4-5-20250929-v1:0"),
+        ("eu.anthropic.claude-sonnet-4-5-20250929-v1:0",
+         "anthropic.claude-sonnet-4-5-20250929-v1:0"),
+        ("global.anthropic.claude-sonnet-4-5-20250929-v1:0",
+         "anthropic.claude-sonnet-4-5-20250929-v1:0"),
+        ("apac.anthropic.claude-sonnet-4-20250514-v1:0",
+         "anthropic.claude-sonnet-4-20250514-v1:0"),
+        ("us.meta.llama4-scout-17b-instruct-v1:0",
+         "meta.llama4-scout-17b-instruct-v1:0"),
+        ("us.deepseek.r1-v1:0", "deepseek.r1-v1:0"),
+    ])
+    def test_geo_prefix_stripped(self, profile, expected):
+        assert strip_bedrock_profile_prefix_for_display(profile) == expected
+
+    @pytest.mark.parametrize("model_id", [
+        # Bare foundation IDs: no profile prefix to remove.
+        "anthropic.claude-sonnet-4-5-20250929-v1:0",
+        "meta.llama4-scout-17b-instruct-v1:0",
+        "mistral.pixtral-large-2502-v1:0",
+        "deepseek.v3.2",
+        "moonshotai.kimi-k2.5",
+        "amazon.nova-pro-v1:0",
+        # Not Bedrock at all.
+        "claude-sonnet-4-20250514",
+        "meta-llama/Llama-3.3-70B-Instruct",
+        "gpt-5-4",
+    ])
+    def test_non_profile_ids_are_untouched(self, model_id):
+        assert strip_bedrock_profile_prefix_for_display(model_id) == model_id
+
+    def test_vendor_is_never_eaten_when_no_dotted_tail_remains(self):
+        """The guard that matters: a name whose first dotted token happens to
+        collide with a geo token must not lose it, because a real Bedrock ID
+        always has a ``vendor.model`` tail left over and this one does not."""
+        assert strip_bedrock_profile_prefix_for_display("me.some-model") == "me.some-model"
+        assert strip_bedrock_profile_prefix_for_display("ca.thing-v1:0") == "ca.thing-v1:0"
+
+    def test_empty_and_prefix_only_are_safe(self):
+        assert strip_bedrock_profile_prefix_for_display("") == ""
+        assert strip_bedrock_profile_prefix_for_display("us.") == "us."
+
+    def test_only_the_leading_prefix_goes(self):
+        """Strip once, not repeatedly — the second token is the vendor."""
+        assert strip_bedrock_profile_prefix_for_display(
+            "us.us.anthropic.claude-sonnet-4-5") == "us.anthropic.claude-sonnet-4-5"
 
 

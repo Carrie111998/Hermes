@@ -372,6 +372,43 @@ class TestIdleSinceLastTurn:
 
 
 
+class TestBedrockProfilePrefixInStatusBar:
+    """A Bedrock inference-profile prefix must not spend the status bar's
+    truncation budget — it names the routing profile, not the model."""
+
+    def test_us_prefix_stripped_from_model_short(self):
+        cli_obj = _make_cli("us.anthropic.claude-sonnet-4-5-20250929-v1:0")
+        snapshot = cli_obj._get_status_bar_snapshot()
+        assert snapshot["model_short"] == "anthropic.claude-sonnet..."
+        # The un-truncated name keeps the full profile ID: callers that compare
+        # or re-send it must see what Bedrock actually wants on the wire.
+        assert snapshot["model_name"] == "us.anthropic.claude-sonnet-4-5-20250929-v1:0"
+
+    def test_the_model_family_survives_truncation(self):
+        """The point of the change: before stripping, both of these truncated
+        to ``us.anthropic.claude-...`` territory and burned three characters
+        on routing metadata."""
+        sonnet = _make_cli(
+            "us.anthropic.claude-sonnet-4-5-20250929-v1:0"
+        )._get_status_bar_snapshot()["model_short"]
+        llama = _make_cli(
+            "us.meta.llama4-scout-17b-instruct-v1:0"
+        )._get_status_bar_snapshot()["model_short"]
+        assert not sonnet.startswith("us.")
+        assert not llama.startswith("us.")
+        assert "sonnet" in sonnet
+        assert "llama4-scout" in llama
+
+    def test_bare_foundation_id_is_unchanged(self):
+        cli_obj = _make_cli("deepseek.v3.2")
+        assert cli_obj._get_status_bar_snapshot()["model_short"] == "deepseek.v3.2"
+
+    def test_non_bedrock_model_is_unchanged(self):
+        cli_obj = _make_cli("anthropic/claude-sonnet-4-20250514")
+        assert cli_obj._get_status_bar_snapshot()["model_short"] == (
+            "claude-sonnet-4-20250514")
+
+
 class TestStatusBarFieldConfig:
     """Tests for display.status_bar.fields config customization (#41909)."""
 

@@ -421,6 +421,72 @@ def format_model_for_display(model_name: str) -> str:
     return model_name
 
 
+# Bedrock cross-region inference profiles prefix the foundation-model ID with a
+# geography token:
+#
+#   us.anthropic.claude-sonnet-4-5-20250929-v1:0
+#
+# The token identifies the routing profile, not the model, so in the
+# width-constrained status bar (which truncates to 23 characters plus an
+# ellipsis) it is 3-7 characters of pure overhead — and it costs them at the
+# front, where the model identity lives:
+#
+#   before   us.anthropic.claude-son...
+#   after    anthropic.claude-sonnet...
+#
+# Wire-side copies of this prefix list already exist in
+# agent/bedrock_adapter.py (``is_anthropic_bedrock_model``) and
+# agent/usage_pricing.py. They are deliberately not imported here: importing
+# agent.bedrock_adapter costs ~1.2s of module init, which is not something to
+# put on a status-bar refresh path. If those three ever need to move to one
+# shared constant, it has to land in a module that is cheap to import.
+
+# Attested by ListInferenceProfiles: "global." and "us." (us-east-1), "eu."
+# (eu-west-1, eu-central-1), "apac." (ap-southeast-1), "jp." (ap-northeast-1),
+# "au." (ap-southeast-2), "ca." (ca-central-1).
+#
+# "ap.", "sa.", "me." and "af." are not attested — no profile using them turned
+# up in any region checked, and the AWS docs enumerate no complete prefix list
+# ("tied to a geography (such as US, EU, or APAC)" is as specific as they get).
+# They are kept because the strip is display-only and only fires when a dotted
+# vendor component survives, so a prefix AWS never ships costs nothing; if it
+# does ship one, the status bar gets the shortening for free.
+_BEDROCK_INFERENCE_PROFILE_PREFIXES: tuple[str, ...] = (
+    "global.", "us.", "eu.", "apac.", "au.", "jp.", "ca.",   # attested
+    "ap.", "sa.", "me.", "af.",                              # not attested
+)
+
+
+def strip_bedrock_profile_prefix_for_display(model_name: str) -> str:
+    """Drop a Bedrock inference-profile geography prefix, for display only.
+
+    ``us.anthropic.claude-sonnet-4-5-20250929-v1:0`` becomes
+    ``anthropic.claude-sonnet-4-5-20250929-v1:0``.
+
+    Only strips when a dotted vendor component remains, so an ID that merely
+    happens to begin with a short token is left alone rather than having its
+    vendor eaten.
+
+    This is a DISPLAY-ONLY helper, for the same reason as
+    :func:`format_model_for_display`: Bedrock requires the full profile ID on
+    the wire, and anything that compares, persists, or re-sends the name must
+    keep the original.
+
+    Deliberately *not* folded into :func:`format_model_for_display`. That
+    function's other callers build the model-switch self-identification note,
+    and collapsing ``us.X`` to ``X`` there would render a switch between the
+    bare foundation ID and its own US profile as "switched from X to X".
+    """
+    if not model_name:
+        return model_name
+    lowered = model_name.lower()
+    for prefix in _BEDROCK_INFERENCE_PROFILE_PREFIXES:
+        if lowered.startswith(prefix):
+            tail = model_name[len(prefix):]
+            return tail if "." in tail else model_name
+    return model_name
+
+
 # ---------------------------------------------------------------------------
 def is_nous_hermes_non_agentic(model_name: str) -> bool:
     """Return True if *model_name* is a real Nous Hermes 3/4 chat model.
