@@ -6118,11 +6118,13 @@ def launchd_restart():
         _clear_launchd_unsupported_marker()
 
 
-# launchd will not relaunch a KeepAlive job more than about once per 10s.  A
+# Hermes generates its launchd plist with ``ThrottleInterval=30``.  A
 # self-restart that exits promptly therefore leaves the label registered with
-# NO pid for most of that window, so any verification budget shorter than the
-# throttle reports a healthy restart as a failure.
-LAUNCHD_SUPERVISION_VERIFY_TIMEOUT = 20.0
+# NO pid for nearly that full window.  Keep verification comfortably beyond
+# the configured throttle so a healthy, supervised respawn is not reported as
+# an incomplete update and the Desktop hand-off does not reopen without its
+# backend.
+LAUNCHD_SUPERVISION_VERIFY_TIMEOUT = 45.0
 
 
 def wait_for_launchd_gateway_supervision(

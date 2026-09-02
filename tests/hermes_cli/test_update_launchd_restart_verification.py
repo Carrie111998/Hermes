@@ -96,23 +96,24 @@ class TestWaitForLaunchdGatewaySupervision:
         assert gateway_cli.wait_for_launchd_gateway_supervision(label=LABEL) is True
         assert clock.slept == []
 
-    def test_waits_out_the_launchd_respawn_throttle(self, monkeypatch, clock):
-        """A pid that only appears after ~10s is a SUCCESS, not a failure.
+    def test_waits_out_the_generated_launchd_respawn_throttle(
+        self, monkeypatch, clock
+    ):
+        """A pid delayed by our 30s plist throttle is a success, not a failure.
 
-        launchd will not relaunch a KeepAlive job more than about once per 10
-        seconds, so a gateway that exits promptly leaves the label registered
-        with no pid for most of that window.  A one-shot check - or any budget
-        shorter than the throttle - would report a perfectly healthy restart as
-        a silent failure, which is a worse bug than the one being fixed.
+        Hermes generates the gateway LaunchAgent with ``ThrottleInterval=30``.
+        The verifier must therefore stay alive beyond that full interval; using
+        launchd's 10s default here makes a healthy update fail before the plist's
+        configured respawn is even eligible to occur.
         """
-        # 0.5s poll interval: 20 misses is ~10s of throttle, then the pid lands.
-        probe = _supervision_returning(*([False] * 20 + [True]))
+        # 0.5s poll interval: 60 misses is ~30s of throttle, then the pid lands.
+        probe = _supervision_returning(*([False] * 60 + [True]))
         monkeypatch.setattr(
             gateway_cli, "_launchctl_label_supervising_process", probe
         )
 
         assert gateway_cli.wait_for_launchd_gateway_supervision(label=LABEL) is True
-        assert sum(clock.slept) == pytest.approx(10.0)
+        assert sum(clock.slept) == pytest.approx(30.0)
 
     def test_gives_up_at_the_deadline(self, monkeypatch, clock):
         """A job that never comes back must fail, and must fail bounded."""
