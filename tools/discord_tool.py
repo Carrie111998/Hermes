@@ -450,6 +450,113 @@ def _channel_info(token: str, channel_id: str, **_kwargs: Any) -> str:
     })
 
 
+_CREATABLE_CHANNEL_TYPES = {
+    "text": 0,
+    "category": 4,
+}
+
+
+def _channel_summary(channel: Dict[str, Any]) -> Dict[str, Any]:
+    """Return the stable fields callers need after a channel mutation."""
+    return {
+        "id": channel["id"],
+        "guild_id": channel.get("guild_id"),
+        "name": channel.get("name"),
+        "type": _channel_type_name(channel["type"]),
+        "parent_id": channel.get("parent_id"),
+        "topic": channel.get("topic"),
+        "position": channel.get("position"),
+        "nsfw": channel.get("nsfw", False),
+    }
+
+
+def _create_channel(
+    token: str,
+    guild_id: str,
+    name: str,
+    channel_type: str = "text",
+    parent_id: str = "",
+    topic: Optional[str] = None,
+    nsfw: Optional[bool] = None,
+    rate_limit_per_user: Optional[int] = None,
+    **_kwargs: Any,
+) -> str:
+    """Create a guild text channel or category."""
+    type_id = _CREATABLE_CHANNEL_TYPES.get(channel_type)
+    if type_id is None:
+        return tool_error(
+            "Unsupported channel_type. Use one of: text, category."
+        )
+    if channel_type == "category" and (
+        topic is not None or nsfw is not None or rate_limit_per_user is not None
+    ):
+        return tool_error(
+            "category creation does not accept topic, nsfw, or rate_limit_per_user."
+        )
+    if rate_limit_per_user is not None and not 0 <= rate_limit_per_user <= 21600:
+        return tool_error("rate_limit_per_user must be between 0 and 21600 seconds.")
+    body: Dict[str, Any] = {"name": name, "type": type_id}
+    if parent_id:
+        body["parent_id"] = parent_id
+    if topic is not None:
+        body["topic"] = topic
+    if nsfw is not None:
+        body["nsfw"] = nsfw
+    if rate_limit_per_user is not None:
+        body["rate_limit_per_user"] = rate_limit_per_user
+    channel = _discord_request("POST", f"/guilds/{guild_id}/channels", token, body=body)
+    return json.dumps({"success": True, "channel": _channel_summary(channel)})
+
+
+def _edit_channel(
+    token: str,
+    channel_id: str,
+    name: str = "",
+    parent_id: str = "",
+    topic: Optional[str] = None,
+    position: Optional[int] = None,
+    nsfw: Optional[bool] = None,
+    rate_limit_per_user: Optional[int] = None,
+    **_kwargs: Any,
+) -> str:
+    """Edit explicit fields on a guild channel or category."""
+    body: Dict[str, Any] = {}
+    if name:
+        body["name"] = name
+    if parent_id:
+        body["parent_id"] = None if parent_id.lower() == "null" else parent_id
+    if topic is not None:
+        body["topic"] = topic
+    if position is not None:
+        body["position"] = position
+    if nsfw is not None:
+        body["nsfw"] = nsfw
+    if rate_limit_per_user is not None:
+        if not 0 <= rate_limit_per_user <= 21600:
+            return tool_error("rate_limit_per_user must be between 0 and 21600 seconds.")
+        body["rate_limit_per_user"] = rate_limit_per_user
+    if not body:
+        return tool_error(
+            "edit_channel requires at least one explicit edit field: name, parent_id, "
+            "topic, position, nsfw, or rate_limit_per_user."
+        )
+    channel = _discord_request("PATCH", f"/channels/{channel_id}", token, body=body)
+    return json.dumps({"success": True, "channel": _channel_summary(channel)})
+
+
+def _delete_channel(token: str, channel_id: str, **_kwargs: Any) -> str:
+    """Delete a guild channel or category."""
+    channel = _discord_request("DELETE", f"/channels/{channel_id}", token)
+    return json.dumps({
+        "success": True,
+        "deleted_channel": {
+            "id": channel["id"],
+            "name": channel.get("name"),
+            "type": _channel_type_name(channel["type"]),
+        },
+    })
+
+
 def _list_roles(token: str, guild_id: str, **_kwargs: Any) -> str:
     """List all roles in a guild."""
     roles = _discord_request("GET", f"/guilds/{guild_id}/roles", token)
@@ -643,6 +750,9 @@ _ACTIONS = {
     "unpin_message": _unpin_message,
     "delete_message": _delete_message,
     "create_thread": _create_thread,
+    "create_channel": _create_channel,
+    "edit_channel": _edit_channel,
+    "delete_channel": _delete_channel,
     "add_role": _add_role,
     "remove_role": _remove_role,
 }
@@ -670,6 +780,9 @@ _ACTION_MANIFEST: List[Tuple[str, str, str]] = [
     ("unpin_message", "(channel_id, message_id)", "unpin a message"),
     ("delete_message", "(channel_id, message_id)", "delete a message"),
     ("create_thread", "(channel_id, name)", "create a public thread; optional message_id anchor"),
+    ("create_channel", "(guild_id, name)", "create a guild text channel or category"),
+    ("edit_channel", "(channel_id)", "rename, move, or edit a guild channel/category"),
+    ("delete_channel", "(channel_id)", "delete a guild channel or category"),
     ("add_role", "(guild_id, user_id, role_id)", "assign a role"),
     ("remove_role", "(guild_id, user_id, role_id)", "remove a role"),
 ]
@@ -691,6 +804,9 @@ _REQUIRED_PARAMS: Dict[str, List[str]] = {
     "unpin_message": ["channel_id", "message_id"],
     "delete_message": ["channel_id", "message_id"],
     "create_thread": ["channel_id", "name"],
+    "create_channel": ["guild_id", "name"],
+    "edit_channel": ["channel_id"],
+    "delete_channel": ["channel_id"],
     "add_role": ["guild_id", "user_id", "role_id"],
     "remove_role": ["guild_id", "user_id", "role_id"],
 }
@@ -850,7 +966,35 @@ def _build_schema(
         },
         "name": {
             "type": "string",
-            "description": "New thread name (create_thread).",
+            "description": "Thread or channel name (create_thread, create_channel, edit_channel).",
+        },
+        "channel_type": {
+            "type": "string",
+            "enum": ["text", "category"],
+            "description": "Guild channel type (create_channel; default text).",
+        },
+        "parent_id": {
+            "type": "string",
+            "description": "Parent category ID. Pass the literal string 'null' to remove it (edit_channel).",
+        },
+        "topic": {
+            "type": "string",
+            "description": "Channel topic. Pass an empty string to clear it (create_channel, edit_channel).",
+        },
+        "position": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Channel sorting position (edit_channel).",
+        },
+        "nsfw": {
+            "type": "boolean",
+            "description": "Whether the channel is age-restricted (create_channel, edit_channel).",
+        },
+        "rate_limit_per_user": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 21600,
+            "description": "Slowmode seconds for a text channel (create_channel, edit_channel).",
         },
         "limit": {
             "type": "integer",
@@ -932,6 +1076,15 @@ _ACTION_403_HINT = {
     "create_thread": (
         "Bot lacks CREATE_PUBLIC_THREADS in this channel, or cannot view it."
     ),
+    "create_channel": (
+        "Bot lacks MANAGE_CHANNELS in this server. Ask the server admin to grant it."
+    ),
+    "edit_channel": (
+        "Bot lacks MANAGE_CHANNELS for this channel or category."
+    ),
+    "delete_channel": (
+        "Bot lacks MANAGE_CHANNELS for this channel or category."
+    ),
     "add_role": (
         "Either the bot lacks MANAGE_ROLES, or the target role sits higher "
         "than the bot's highest role. Roles can only be assigned below the "
@@ -998,6 +1151,12 @@ def _run_discord_action(
     before: str = "",
     after: str = "",
     auto_archive_duration: int = 1440,
+    channel_type: str = "text",
+    parent_id: str = "",
+    topic: Optional[str] = None,
+    position: Optional[int] = None,
+    nsfw: Optional[bool] = None,
+    rate_limit_per_user: Optional[int] = None,
 ) -> str:
     """Shared handler logic for both discord tools."""
     token = _get_bot_token()
@@ -1029,6 +1188,12 @@ def _run_discord_action(
         "message_id": message_id,
         "query": query,
         "name": name,
+        "channel_type": channel_type,
+        "parent_id": parent_id,
+        "topic": topic,
+        "position": position,
+        "nsfw": nsfw,
+        "rate_limit_per_user": rate_limit_per_user,
     }
 
     missing = [p for p in _REQUIRED_PARAMS.get(action, []) if not local_vars.get(p)]
@@ -1051,6 +1216,12 @@ def _run_discord_action(
             before=before,
             after=after,
             auto_archive_duration=auto_archive_duration,
+            channel_type=channel_type,
+            parent_id=parent_id,
+            topic=topic,
+            position=position,
+            nsfw=nsfw,
+            rate_limit_per_user=rate_limit_per_user,
         )
     except DiscordAPIError as e:
         logger.warning("Discord API error in %s action '%s': %s", tool_label, action, e)
@@ -1080,6 +1251,8 @@ _HANDLER_DEFAULTS = {
     "action": "", "guild_id": "", "channel_id": "", "user_id": "",
     "role_id": "", "message_id": "", "query": "", "name": "",
     "limit": 50, "before": "", "after": "", "auto_archive_duration": 1440,
+    "channel_type": "text", "parent_id": "", "topic": None,
+    "position": None, "nsfw": None, "rate_limit_per_user": None,
 }
 
 
