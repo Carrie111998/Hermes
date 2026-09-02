@@ -85,6 +85,23 @@ def _rich_api_kwargs(adapter):
     return call.kwargs["api_kwargs"]
 
 
+def test_rich_message_payload_sanitizes_unsupported_links():
+    adapter = _make_adapter()
+    raw = (
+        "## Overview\n\n"
+        "| Section | Status |\n|---|---|\n| Main | Done |\n\n"
+        "Already underway in [Long-Term Fix Research](Long-Term Fix Research).\n"
+        "See [Session Alpha](@session:default/12345) and [Docs](https://docs.hermes.ai).\n"
+        "Code: `[Keep](Keep)`."
+    )
+    payload = adapter._rich_message_payload(raw)
+    markdown = payload["markdown"]
+    assert "Already underway in Long-Term Fix Research." in markdown
+    assert "See Session Alpha and [Docs](https://docs.hermes.ai)." in markdown
+    assert "`[Keep](Keep)`" in markdown
+    assert "@session" not in markdown
+
+
 @pytest.mark.asyncio
 async def test_details_without_math_still_uses_rich_send():
     adapter = _make_adapter()

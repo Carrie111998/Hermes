@@ -534,6 +534,58 @@ def _rich_normalize_linebreaks(text: str) -> str:
     return ''.join(out)
 
 
+_SUPPORTED_TELEGRAM_LINK_SCHEMES = ("http://", "https://", "tg://", "mailto:", "tel:")
+
+
+def _is_supported_telegram_url(url: str) -> bool:
+    """Return True if url is a valid external URL or deep link supported by Telegram."""
+    if not url:
+        return False
+    url = url.strip()
+    return any(url.lower().startswith(scheme) for scheme in _SUPPORTED_TELEGRAM_LINK_SCHEMES)
+
+
+def _sanitize_unsupported_markdown_links(text: str) -> str:
+    """Degrade unsupported/internal/schemeless markdown links to their display text.
+
+    E.g. ``[Session Title](@session:profile/id)`` or ``[Title](Title)``
+    becomes ``Session Title`` or ``Title``. Valid links (``https://...``,
+    ``tg://...``) are preserved unchanged.
+    """
+    if not text:
+        return text
+
+    placeholders: dict = {}
+    counter = [0]
+
+    def _ph(val: str) -> str:
+        key = f"\x00PH_LINK_{counter[0]}\x00"
+        counter[0] += 1
+        placeholders[key] = val
+        return key
+
+    # 1. Protect fenced code blocks
+    text = re.sub(r'(```(?:[^\n]*\n)?[\s\S]*?```)', lambda m: _ph(m.group(0)), text)
+    # 2. Protect inline code
+    text = re.sub(r'(`[^`]+`)', lambda m: _ph(m.group(0)), text)
+
+    # 3. Degrade unsupported markdown links
+    def _replace_link(m):
+        display = m.group(1)
+        target = m.group(2).strip()
+        if _is_supported_telegram_url(target):
+            return m.group(0)
+        return display
+
+    text = re.sub(r'\[([^\]]+)\]\(([^()]*(?:\([^()]*\)[^()]*)*)\)', _replace_link, text)
+
+    # 4. Restore placeholders
+    for k, v in placeholders.items():
+        text = text.replace(k, v)
+
+    return text
+
+
 # Watchdog bound for `await updater.stop()`. When the underlying TCP socket is
 # in CLOSE-WAIT the PTB polling task is blocked on epoll on the dead socket and
 # never wakes, so an unguarded stop() hangs indefinitely and wedges the whole
@@ -2193,8 +2245,11 @@ class TelegramAdapter(BasePlatformAdapter):
         Single newlines are normalized to Markdown hard breaks so that
         multi-line content (slash-command lists, etc.) renders correctly
         in the rich-message path.  See ``_rich_normalize_linebreaks``.
+        Unsupported/schemeless/internal links (e.g. desktop-only ``@session:``)
+        are sanitized to their plain display text.
         """
-        payload: Dict[str, Any] = {"markdown": _rich_normalize_linebreaks(content)}
+        cleaned = _sanitize_unsupported_markdown_links(content)
+        payload: Dict[str, Any] = {"markdown": _rich_normalize_linebreaks(cleaned)}
         if skip_entity_detection:
             payload["skip_entity_detection"] = True
         return payload
@@ -8827,10 +8882,16 @@ class TelegramAdapter(BasePlatformAdapter):
 
         # 3) Convert markdown links – escape the display text; inside the URL
         #    only ')' and '\' need escaping per the MarkdownV2 spec.
+        #    Degrade unsupported, internal, or schemeless destinations (e.g.
+        #    @session:... or [Title](Title)) to plain escaped display text.
         def _convert_link(m):
-            display = _escape_mdv2(m.group(1))
-            url = m.group(2).replace('\\', '\\\\').replace(')', '\\)')
-            return _ph(f'[{display}]({url})')
+            display = m.group(1)
+            raw_url = m.group(2).strip()
+            if not _is_supported_telegram_url(raw_url):
+                return _ph(_escape_mdv2(display))
+            escaped_display = _escape_mdv2(display)
+            escaped_url = raw_url.replace('\\', '\\\\').replace(')', '\\)')
+            return _ph(f'[{escaped_display}]({escaped_url})')
 
         text = re.sub(r'\[([^\]]+)\]\(([^()]*(?:\([^()]*\)[^()]*)*)\)', _convert_link, text)
 

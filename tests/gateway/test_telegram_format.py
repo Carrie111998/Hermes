@@ -207,6 +207,25 @@ class TestFormatMessageLinks:
         # The ) in URL should be escaped
         assert "\\)" in result
 
+    def test_unsupported_link_destination_degrades_to_plain_text(self, adapter):
+        result = adapter.format_message("Already underway in [Long-Term Fix Research](Long-Term Fix Research).")
+        assert "Already underway in Long\\-Term Fix Research\\." in result
+        assert "(" not in result
+        assert "[" not in result
+
+    def test_desktop_session_reference_degrades_to_display_text(self, adapter):
+        result = adapter.format_message("Refer to [Previous Task](@session:default/20260722_204335_d62c16) for context.")
+        assert "Refer to Previous Task for context\\." in result
+        assert "@session" not in result
+
+    def test_valid_web_and_deep_links_preserved(self, adapter):
+        result = adapter.format_message(
+            "Visit [Docs](https://example.com) or [Telegram](tg://resolve?domain=bot) or [Email](mailto:a@b.com)."
+        )
+        assert "[Docs](https://example.com)" in result
+        assert "[Telegram](tg://resolve?domain=bot)" in result
+        assert "[Email](mailto:a@b.com)" in result
+
 
 # =========================================================================
 # format_message - BUG: italic regex spans newlines
