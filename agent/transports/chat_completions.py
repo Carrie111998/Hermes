@@ -1057,15 +1057,21 @@ class ChatCompletionsTransport(ProviderTransport):
             )
 
         # Preserve reasoning fields separately.  DeepSeek/Moonshot use
-        # ``reasoning_content``; others use ``reasoning``.  Downstream code
-        # (_extract_reasoning, thinking-prefill retry) reads both distinctly,
-        # so keep them apart in provider_data rather than merging.
+        # ``reasoning_content``; others use ``reasoning``.  Some compatible
+        # relays use ``thinking``, which is only a fallback when neither
+        # standard text field is present. Downstream code (_extract_reasoning,
+        # thinking-prefill retry) reads the standard fields distinctly, so keep
+        # them apart in provider_data rather than merging.
         reasoning = getattr(msg, "reasoning", None)
         reasoning_content = getattr(msg, "reasoning_content", None)
         if reasoning_content is None and hasattr(msg, "model_extra"):
             model_extra = getattr(msg, "model_extra", None) or {}
             if isinstance(model_extra, dict) and "reasoning_content" in model_extra:
                 reasoning_content = model_extra["reasoning_content"]
+        if not reasoning and not reasoning_content:
+            thinking = getattr(msg, "thinking", None)
+            if thinking:
+                reasoning = thinking
 
         provider_data: Dict[str, Any] = {}
         if reasoning_content is not None:
