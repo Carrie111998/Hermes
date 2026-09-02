@@ -540,6 +540,59 @@ def install_modify_other_keys_aliases() -> int:
                 ANSI_SEQUENCES[seq] = key_val
                 changed += 1
 
+    # -- Kitty functional keys WITH a real modifier (#90640) ----
+    # The registrations above cover the bare key and its lock twins, but kitty
+    # sends Ctrl+KP_Enter as ESC[57414;5u and Shift+KP_Left as ESC[57417;2u.
+    # Those had no entry at all, so every modified keypad press leaked its raw
+    # CSI into the buffer — and only on kitty, since the PUA codepoints are its
+    # encoding alone. Rather than invent a meaning, mirror whatever the
+    # EQUIVALENT non-keypad key already resolves to at the same modifier: the
+    # tables above have already mapped those correctly, so KP_Left inherits
+    # exactly what Left does and cannot drift away from it.
+    _KP_EQUIV_CSI: dict[int, str] = {
+        57417: "D",
+        57418: "C",
+        57419: "A",
+        57420: "B",  # Left/Right/Up/Down
+        57423: "H",
+        57424: "F",  # Home/End
+    }
+    _KP_EQUIV_TILDE: dict[int, int] = {
+        57421: 5,
+        57422: 6,
+        57425: 2,
+        57426: 3,  # PgUp/PgDn/Insert/Delete
+    }
+    # KP_Enter resolves to Keys.ControlM rather than a character, so it matches
+    # neither branch above; point it at Enter's own CSI-u codepoint so
+    # Ctrl+KP_Enter inherits the Ctrl+Enter newline alias installed earlier.
+    _KP_EQUIV_CSIU: dict[int, int] = {57414: 13}
+    for code, key_val in functional_map.items():
+        for base_mod in (2, 3, 4, 5, 6, 7, 8):
+            for mod in _lock_variants(base_mod):
+                seq = f"\x1b[{code};{mod}u"
+                if seq in ANSI_SEQUENCES:
+                    continue
+                if code in _KP_EQUIV_CSI:
+                    source = f"\x1b[1;{mod}{_KP_EQUIV_CSI[code]}"
+                elif code in _KP_EQUIV_TILDE:
+                    source = f"\x1b[{_KP_EQUIV_TILDE[code]};{mod}~"
+                elif code in _KP_EQUIV_CSIU:
+                    source = f"\x1b[{_KP_EQUIV_CSIU[code]};{mod}u"
+                elif isinstance(key_val, str) and len(key_val) == 1:
+                    source = f"\x1b[{ord(key_val)};{mod}u"
+                else:
+                    # Ignore-mapped keys (locks, media, bare modifiers) stay
+                    # consumed under every modifier rather than leaking.
+                    if key_val is Keys.Ignore:
+                        ANSI_SEQUENCES[seq] = Keys.Ignore
+                        changed += 1
+                    continue
+                equivalent = ANSI_SEQUENCES.get(source)
+                if equivalent is not None:
+                    ANSI_SEQUENCES[seq] = equivalent
+                    changed += 1
+
     # New longer sequences can flip "is this a prefix of a longer match?"
     # answers the VT100 parser already cached — drop the cache so parsers
     # created before this install (or in earlier tests) can't misparse.
