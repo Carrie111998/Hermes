@@ -9,14 +9,21 @@ store at ``~/.hermes/checkpoints/``.  Actions:
     hermes checkpoints prune [opts]  # force a sweep (ignores the 24h marker)
     hermes checkpoints clear [-f]    # nuke the entire base (asks first)
     hermes checkpoints clear-legacy  # delete just the legacy-* archives
+    hermes checkpoints activate DIR  # atomically activate a repaired store copy
+    hermes checkpoints deactivate    # restore the legacy store/ as canonical
 
 Examples::
 
     hermes checkpoints
     hermes checkpoints prune --retention-days 3 --max-size-mb 200
     hermes checkpoints clear -f
+    hermes checkpoints activate /mnt/recovery/store.repaired
 
-None of these require the agent to be running.  Safe to call any time.
+None of these require the agent to be running.  Activation/deactivation
+and checkpoint operations serialize through one interprocess store lock,
+so running them while Hermes is live is safe: operations queue behind each
+other instead of racing (a busy store reports it and fails closed rather
+than corrupting state).
 """
 
 from __future__ import annotations
@@ -62,6 +69,12 @@ def cmd_status(args: argparse.Namespace) -> int:
     print(f"Total size:      {_fmt_bytes(info['total_size_bytes'])}")
     print(f"  store/         {_fmt_bytes(info['store_size_bytes'])}")
     print(f"  legacy-*       {_fmt_bytes(info['legacy_size_bytes'])}")
+    active = info.get("active_generation")
+    if active:
+        print(f"  active gen     {active}")
+    selector_error = info.get("selector_error")
+    if selector_error:
+        print(f"  selector       BROKEN — {selector_error}")
     print(f"Projects:        {info['project_count']}")
 
     projects = sorted(
@@ -90,6 +103,14 @@ def cmd_status(args: argparse.Namespace) -> int:
             print(f"  {arch['name']:<40}  {_fmt_bytes(arch['size_bytes']):>10}")
         print()
         print("Clear with: hermes checkpoints clear-legacy")
+
+    generations = info.get("generations", [])
+    if generations:
+        print()
+        print("Store generations (atomic activation; never auto-deleted):")
+        for gen in generations:
+            marker = "  <- active" if gen.get("is_active") else ""
+            print(f"  {gen['name']:<40}  {_fmt_bytes(gen['size_bytes']):>10}{marker}")
     return 0
 
 
@@ -229,6 +250,54 @@ def cmd_clear_legacy(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_activate(args: argparse.Namespace) -> int:
+    from tools.checkpoint_manager import activate_store_generation
+
+    src = Path(args.source).expanduser()
+    result = activate_store_generation(src)
+    if not result.get("success"):
+        print(f"Activation failed: {result.get('error')}")
+        return 1
+    print(f"Activated generation {result['generation']}.")
+    previous = result.get("previous")
+    print(f"Previous selection: {previous or 'legacy store/'}")
+    print(f"Generation path:    {result['store']}")
+    print()
+    print("Neither store was moved or deleted. Roll back with:")
+    if previous:
+        print("  hermes checkpoints activate <previous-generation-dir>")
+    print("  hermes checkpoints deactivate   (back to the legacy store/)")
+    return 0
+
+
+def cmd_deactivate(args: argparse.Namespace) -> int:
+    from tools.checkpoint_manager import store_status, deactivate_store_generation
+
+    info = store_status()
+    active = info.get("active_generation")
+    if not active:
+        if info.get("selector_error"):
+            print(f"Cannot deactivate: {info['selector_error']}")
+            print("Fix or remove the store.current file manually, then retry.")
+            return 1
+        print("Nothing to deactivate — no store.current pointer is present.")
+        return 0
+    print(f"Active generation: {active}")
+    print("This removes the store.current pointer so the legacy store/")
+    print("becomes canonical again. Generations are kept on disk; delete")
+    print("them manually only when you no longer need the recovery copies.")
+    if not args.force and not _confirm("Proceed?"):
+        print("Aborted.")
+        return 1
+
+    result = deactivate_store_generation()
+    if not result.get("success"):
+        print(f"Deactivation failed: {result.get('error')}")
+        return 1
+    print("Legacy store/ is canonical again.")
+    return 0
+
+
 def register_cli(parser: argparse.ArgumentParser) -> None:
     """Wire subcommands onto the ``hermes checkpoints`` parser."""
     parser.set_defaults(func=cmd_status)  # bare `hermes checkpoints` → status
@@ -279,3 +348,21 @@ def register_cli(parser: argparse.ArgumentParser) -> None:
     p_legacy.add_argument("-f", "--force", action="store_true",
                           help="Skip confirmation prompt")
     p_legacy.set_defaults(func=cmd_clear_legacy)
+
+    p_activate = subs.add_parser(
+        "activate",
+        help="Atomically activate a verified store copy (issue #93314 recovery)",
+    )
+    p_activate.add_argument(
+        "source", metavar="DIR",
+        help="Path to the repaired store candidate (copied, never moved)",
+    )
+    p_activate.set_defaults(func=cmd_activate)
+
+    p_deactivate = subs.add_parser(
+        "deactivate",
+        help="Restore the legacy store/ as the canonical checkpoint store",
+    )
+    p_deactivate.add_argument("-f", "--force", action="store_true",
+                              help="Skip confirmation prompt")
+    p_deactivate.set_defaults(func=cmd_deactivate)
