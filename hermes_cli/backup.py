@@ -775,13 +775,19 @@ def _foreign_db_holder_pids(db_path: Path) -> Optional[List[int]]:
             fd_dir = f"/proc/{pid}/fd"
             try:
                 fds = os.listdir(fd_dir)
-            except OSError:
+            except FileNotFoundError:
+                # The process exited after the /proc PID listing.
                 continue
+            except OSError:
+                return None
             for fd in fds:
                 try:
                     target = os.readlink(f"{fd_dir}/{fd}")
-                except OSError:
+                except FileNotFoundError:
+                    # The descriptor closed after its directory was listed.
                     continue
+                except OSError:
+                    return None
                 if _canonical(target) in watched:
                     pids.append(pid)
                     break
@@ -812,8 +818,10 @@ def _safe_restore_db(src: Path, dst: Path) -> bool:
     the WAL journal is updated correctly, and all connections (old and
     new) converge on the restored data.
 
-    Falls back to the unlink+move approach on failure so restore never
-    blocks on a transient error.
+    Falls back to the unlink+move approach only after holder inspection
+    completes without finding another process that has the database or its
+    sidecars open. Refuses the destructive fallback when inspection is
+    unavailable or incomplete.
     """
     try:
         dst_conn = sqlite3.connect(str(dst))
@@ -847,6 +855,15 @@ def _safe_restore_db(src: Path, dst: Path) -> bool:
 
         try:
             holders = _foreign_db_holder_pids(dst)
+            if holders is None:
+                logger.error(
+                    "Refusing unlink+move restore of %s: database-holder "
+                    "inspection is unavailable, so the destructive fallback "
+                    "cannot be proven safe. Resolve the SQLite restore error "
+                    "and retry.",
+                    dst,
+                )
+                return False
             if holders:
                 # Replacing the inode under a live holder is the #90950
                 # corruption class: the holder keeps writing through a
@@ -1599,6 +1616,31 @@ def _quick_snapshot_root(hermes_home: Optional[Path] = None) -> Path:
     return home / _QUICK_SNAPSHOTS_DIR
 
 
+def _resolve_quick_snapshot_dir(
+    snapshot_id: str,
+    hermes_home: Optional[Path] = None,
+) -> Optional[Path]:
+    """Return a contained quick-snapshot directory, or None when invalid."""
+    root = _quick_snapshot_root(hermes_home)
+    if (
+        not snapshot_id
+        or "/" in snapshot_id
+        or "\\" in snapshot_id
+        or snapshot_id in (".", "..")
+    ):
+        logger.error("Invalid snapshot_id: %s", snapshot_id)
+        return None
+
+    snap_dir = root / snapshot_id
+    try:
+        snap_dir.resolve().relative_to(root.resolve())
+    except (OSError, ValueError):
+        logger.error("Snapshot path traversal blocked for id: %s", snapshot_id)
+        return None
+
+    return snap_dir if snap_dir.is_dir() else None
+
+
 def create_quick_snapshot(
     label: Optional[str] = None,
     hermes_home: Optional[Path] = None,
@@ -1879,24 +1921,8 @@ def restore_quick_snapshot(
     Returns True if at least one file was restored.
     """
     home = hermes_home or get_hermes_home()
-    root = _quick_snapshot_root(home)
-
-    # Security: reject snapshot_id values that contain path separators or
-    # traversal sequences so that `root / snapshot_id` stays inside root.
-    if not snapshot_id or "/" in snapshot_id or "\\" in snapshot_id or snapshot_id in (".", ".."):
-        logger.error("Invalid snapshot_id: %s", snapshot_id)
-        return False
-
-    snap_dir = root / snapshot_id
-
-    # Confirm the resolved path is still inside root (handles symlinks etc.)
-    try:
-        snap_dir.resolve().relative_to(root.resolve())
-    except ValueError:
-        logger.error("Snapshot path traversal blocked for id: %s", snapshot_id)
-        return False
-
-    if not snap_dir.is_dir():
+    snap_dir = _resolve_quick_snapshot_dir(snapshot_id, home)
+    if snap_dir is None:
         return False
 
     manifest_path = snap_dir / "manifest.json"
@@ -1934,7 +1960,8 @@ def restore_quick_snapshot(
                 # (gateway, dashboard, another CLI session) see the
                 # restored data instead of continuing to serve stale
                 # cached pages from a replaced inode (issue #65942).
-                _safe_restore_db(src, dst)
+                if not _safe_restore_db(src, dst):
+                    return False
             else:
                 shutil.copy2(src, dst)
             restored += 1

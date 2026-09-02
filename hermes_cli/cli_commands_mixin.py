@@ -360,8 +360,11 @@ class CLICommandsMixin:
             /snapshot prune [N]        — prune to N snapshots (default 20)
         """
         from hermes_cli.backup import (
-            create_quick_snapshot, list_quick_snapshots,
-            restore_quick_snapshot, prune_quick_snapshots,
+            _resolve_quick_snapshot_dir,
+            create_quick_snapshot,
+            list_quick_snapshots,
+            prune_quick_snapshots,
+            restore_quick_snapshot,
         )
         from hermes_constants import display_hermes_home
 
@@ -435,7 +438,13 @@ class CLICommandsMixin:
                     "to pick up state.db changes."
                 )
             else:
-                print(f"  Snapshot not found: {snap_id}")
+                if _resolve_quick_snapshot_dir(snap_id) is not None:
+                    print(
+                        "  Restore failed or was refused. Check the Hermes logs "
+                        "for the specific cause, then retry."
+                    )
+                else:
+                    print(f"  Snapshot not found: {snap_id}")
 
         elif subcmd == "prune":
             keep = 20
