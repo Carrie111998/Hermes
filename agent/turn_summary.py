@@ -26,6 +26,7 @@ terminal, an agent, or a network call.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Any
 
 __all__ = [
@@ -34,6 +35,7 @@ __all__ = [
     "format_turn_summary",
     "format_token_flow",
     "format_elapsed",
+    "format_completion_time",
 ]
 
 
@@ -228,6 +230,13 @@ def format_elapsed(seconds: float) -> str:
         return f"{seconds:.1f}s"
     minutes, rest = divmod(int(round(seconds)), 60)
     return f"{minutes}m{rest:02d}s"
+
+
+def format_completion_time(completed_at: datetime) -> str:
+    # Compact local wall-clock label, e.g. 9:06 AM.
+    # Timezone selection belongs to the caller.
+    label = completed_at.strftime("%I:%M %p")
+    return label[1:] if label.startswith("0") else label
 
 
 def _pluralize(count: int, plural_noun: str) -> str:
