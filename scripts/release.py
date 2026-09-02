@@ -2649,6 +2649,19 @@ def main():
                         help="Which semver component to bump")
     parser.add_argument("--publish", action="store_true",
                         help="Actually create the tag and GitHub release (otherwise dry run)")
+    parser.add_argument("--prepare-only", action="store_true",
+                        help="Two-phase release, phase 1: commit the version bump "
+                             "(when --bump is given) and STOP — no tag, no push, "
+                             "no release. Exit code 0 on success. The intended "
+                             "macOS flow is: --bump minor --prepare-only, then "
+                             "build the DMG (npm run tauri:build), then "
+                             "--publish --no-bump so the artifact gate validates "
+                             "against this exact final HEAD.")
+    parser.add_argument("--no-bump", action="store_true",
+                        help="Skip the version bump commit (phase 2 of the "
+                             "two-phase flow: the bump was already committed "
+                             "by --prepare-only; the DMG was built at that "
+                             "HEAD; now gate + tag + push + release only).")
     parser.add_argument("--date", type=str,
                         help="Override CalVer date (format: YYYY.M.D)")
     parser.add_argument("--first-release", action="store_true",
@@ -2720,13 +2733,13 @@ def main():
     else:
         print(changelog)
 
-    if args.publish:
+    if args.publish or args.prepare_only:
         print(f"\n{'='*60}")
-        print("  Publishing release...")
+        print(f"  {'Preparing' if args.prepare_only else 'Publishing'} release...")
         print(f"{'='*60}")
 
         # Update version files
-        if args.bump:
+        if args.bump and not args.no_bump:
             update_version_files(new_version, calver_date)
             print(f"  ✓ Updated version files to v{new_version} ({calver_date})")
 
@@ -2744,6 +2757,21 @@ def main():
                 print(f"  ✗ Failed to commit version bump: {commit_result.stderr.strip()}")
                 return
             print("  ✓ Committed version bump")
+
+        # --prepare-only: two-phase lifecycle, phase 1 complete. The version
+        # bump commit IS the mutation contract for this phase — no tag, no
+        # push, no release. The caller now builds the DMG at this exact HEAD
+        # (cd apps/bootstrap-installer && npm run tauri:build), then runs
+        # phase 2: `--publish --no-bump` so the artifact gate validates the
+        # manifest against THIS HEAD before tagging (#100600 review blocker:
+        # the previously documented flow required flags that did not exist).
+        if args.prepare_only:
+            print(f"\n  ✓ Prepared v{new_version} (bump committed; no tag created).")
+            print("  Next (macOS release host):")
+            print("    1. cd apps/bootstrap-installer && npm run tauri:build")
+            print("    2. python scripts/release.py --publish --no-bump "
+                  f"--date {calver_date}")
+            return
 
         # ── macOS DMG attachment gate (#85422) — runs BEFORE tag/push. ────
         # Every revalidation of the stale public artifact — across v0.20.2
