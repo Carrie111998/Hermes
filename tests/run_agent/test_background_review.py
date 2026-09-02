@@ -885,3 +885,76 @@ def test_skill_patch_off_silent_verbose_shows_diff():
     )
     assert len(verbose) == 1
     assert "demo" in verbose[0] and "→" in verbose[0]
+
+
+def _skill_batch_review():
+    operations = [
+        {
+            "name": "demo",
+            "action": "patch",
+            "old_string": "old",
+            "new_string": "new",
+        },
+        {
+            "name": "demo",
+            "action": "write_file",
+            "file_path": "references/batch.md",
+            "file_content": "details",
+        },
+    ]
+    return [
+        {
+            "role": "assistant",
+            "tool_calls": [
+                {
+                    "id": "call_skill_batch",
+                    "function": {
+                        "name": "skill_manage",
+                        "arguments": _json.dumps({"operations": operations}),
+                    },
+                }
+            ],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "call_skill_batch",
+            "content": _json.dumps(
+                {
+                    "success": True,
+                    "operations_applied": 2,
+                    "results": [
+                        {"name": "demo", "action": "patch", "success": True},
+                        {
+                            "name": "demo",
+                            "action": "write_file",
+                            "file_path": "references/batch.md",
+                            "success": True,
+                        },
+                    ],
+                }
+            ),
+        },
+    ]
+
+
+def test_skill_batch_on_surfaces_each_successful_mutation():
+    actions = summarize_background_review_actions(
+        _skill_batch_review(), [], notification_mode="on"
+    )
+
+    assert actions == [
+        "Patched SKILL.md in skill 'demo'.",
+        "Wrote references/batch.md in skill 'demo'.",
+    ]
+
+
+def test_skill_batch_verbose_uses_operation_details_not_placeholder():
+    actions = summarize_background_review_actions(
+        _skill_batch_review(), [], notification_mode="verbose"
+    )
+
+    assert len(actions) == 2
+    assert "demo" in actions[0]
+    assert '"old" → "new"' in actions[0]
+    assert actions[1] == "📝 Wrote references/batch.md in skill 'demo'."
+    assert all("?" not in action for action in actions)

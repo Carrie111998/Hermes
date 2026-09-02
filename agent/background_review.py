@@ -726,6 +726,57 @@ _COMBINED_REVIEW_PROMPT = (
 
 
 
+def _summarize_skill_batch_results(
+    results: Any,
+    operations: Any,
+    *,
+    verbose: bool,
+) -> List[str]:
+    """Project successful ``skill_manage operations[]`` results into notices."""
+    if not isinstance(results, list):
+        return []
+    ops = operations if isinstance(operations, list) else []
+    actions: List[str] = []
+    for index, raw_result in enumerate(results):
+        if not isinstance(raw_result, dict) or raw_result.get("success") is False:
+            continue
+        op = ops[index] if index < len(ops) and isinstance(ops[index], dict) else {}
+        name = str(raw_result.get("name") or op.get("name") or "").strip()
+        action = str(raw_result.get("action") or op.get("action") or "").strip()
+        if not name or not action:
+            continue
+        file_path = str(
+            raw_result.get("file_path") or op.get("file_path") or ""
+        ).strip()
+        target = file_path or "SKILL.md"
+
+        if action == "patch":
+            if verbose and (op.get("old_string") or op.get("new_string")):
+                old_text = str(op.get("old_string") or "")
+                new_text = str(op.get("new_string") or "")
+                old_preview = old_text[:80].replace("\n", " ") + (
+                    "…" if len(old_text) > 80 else ""
+                )
+                new_preview = new_text[:80].replace("\n", " ") + (
+                    "…" if len(new_text) > 80 else ""
+                )
+                actions.append(
+                    f'📝 Skill \'{name}\' patched: "{old_preview}" → "{new_preview}"'
+                )
+            else:
+                actions.append(f"Patched {target} in skill '{name}'.")
+        elif action == "write_file":
+            prefix = "📝 " if verbose else ""
+            actions.append(f"{prefix}Wrote {target} in skill '{name}'.")
+        elif action == "remove_file":
+            prefix = "📝 " if verbose else ""
+            actions.append(f"{prefix}Removed {target} from skill '{name}'.")
+        elif action == "create":
+            prefix = "📝 " if verbose else ""
+            actions.append(f"{prefix}Skill '{name}' created.")
+    return actions
+
+
 def summarize_background_review_actions(
     review_messages: List[Dict],
     prior_snapshot: List[Dict],
@@ -832,6 +883,14 @@ def summarize_background_review_actions(
             detail = {}
         target = data.get("target", "") or detail.get("target", "")
         is_skill = detail.get("tool") == "skill_manage"
+        operations = detail.get("operations")
+        if is_skill and isinstance(data.get("results"), list):
+            batch_actions = _summarize_skill_batch_results(
+                data["results"], operations, verbose=verbose
+            )
+            if batch_actions:
+                actions.extend(batch_actions)
+                continue
 
         message_lower = message.lower()
         if not verbose:
