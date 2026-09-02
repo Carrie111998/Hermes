@@ -408,6 +408,11 @@ def _split_host_port(value: str) -> tuple[str, int | None]:
         host, _, maybe_port = raw.rpartition(":")
         if maybe_port.isdigit():
             return host.lower().rstrip("."), int(maybe_port)
+        if host:
+            # "host:" with an empty port segment: the dangling separator
+            # previously flowed into the hostname ("example.com:") and
+            # produced malformed URLs / ssh targets downstream.
+            return host.lower().rstrip("."), None
     return raw.lower().strip("[]").rstrip("."), None
 
 
