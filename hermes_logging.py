@@ -711,13 +711,54 @@ def _stop_queue_listener() -> None:
         _stop_queue_listener_locked()
 
 
-def _register_queued_handler(handler: logging.Handler) -> None:
+def _duplicate_queued_handler_exists(resolved: Path) -> bool:
+    """True when ``_queued_file_handlers`` already covers *resolved*.
+
+    Caller MUST hold ``_queue_state_lock``: this is a read of shared state
+    that decides whether a handler gets appended, so it has to be atomic
+    with the append itself (#100261).
+    """
+    for existing in _queued_file_handlers:
+        if (
+            isinstance(existing, RotatingFileHandler)
+            and Path(getattr(existing, "baseFilename", "")).resolve() == resolved
+        ):
+            return True  # already attached
+        if getattr(existing, "_hermes_routed_log_path", None) == resolved:
+            return True  # already covered by the profile router
+    return False
+
+
+def _register_queued_handler(
+    handler: logging.Handler,
+    *,
+    dedupe_path: Optional[Path] = None,
+) -> bool:
     """Route *handler* through the shared async queue instead of attaching it to
     *root* directly, so emitting threads never block on file I/O or the
     cross-process rotation lock.  The ``QueueListener`` applies each handler's
-    own level and filters on its worker thread."""
+    own level and filters on its worker thread.
+
+    When *dedupe_path* is given, the "is this path already covered?" check is
+    re-run INSIDE ``_queue_state_lock`` and the handler is dropped if another
+    thread won the race. Returns True when the handler was registered.
+
+    Without that re-check, two threads calling ``setup_logging()``
+    concurrently could both pass an unlocked dedupe scan and both append a
+    handler for the same file — the listener was then rebuilt with both and
+    every record written twice for the life of the process (#100261).
+    """
     global _log_queue, _queue_listener, _queue_atexit_registered
     with _queue_state_lock:
+        if dedupe_path is not None and _duplicate_queued_handler_exists(dedupe_path):
+            # Lost the race: another thread registered this path while we
+            # were building the handler. Close ours so the just-opened file
+            # descriptor isn't leaked, then drop it.
+            try:
+                handler.close()
+            except Exception:
+                pass
+            return False
         if _log_queue is None:
             _log_queue = queue.SimpleQueue()
             qh = _NonFormattingQueueHandler(_log_queue)
@@ -741,6 +782,7 @@ def _register_queued_handler(handler: logging.Handler) -> None:
             # so the listener stops before its file handlers are closed.
             atexit.register(_stop_queue_listener)
             _queue_atexit_registered = True
+        return True
 
 
 def flush_log_queue() -> None:
@@ -897,6 +939,13 @@ def _add_rotating_handler(
     """Add a ``RotatingFileHandler`` to *logger*, skipping if one already
     exists for the same resolved file path (idempotent).
 
+    Thread-safe: the cheap pre-check below is an optimization only. The
+    authoritative dedupe happens inside ``_register_queued_handler`` under
+    ``_queue_state_lock`` (#100261) — without that, two concurrent
+    ``setup_logging()`` calls could both pass an unlocked scan and register
+    two handlers for one file, duplicating every record for the life of the
+    process.
+
     Parameters
     ----------
     log_filter
@@ -904,14 +953,11 @@ def _add_rotating_handler(
         for gateway.log).
     """
     resolved = path.resolve()
-    for existing in _queued_file_handlers:
-        if (
-            isinstance(existing, RotatingFileHandler)
-            and Path(getattr(existing, "baseFilename", "")).resolve() == resolved
-        ):
-            return  # already attached
-        if getattr(existing, "_hermes_routed_log_path", None) == resolved:
-            return  # already covered by the profile router
+    # Fast path: avoid building a handler (and creating its file) when the
+    # path is obviously already covered. Re-checked under the lock below.
+    with _queue_state_lock:
+        if _duplicate_queued_handler_exists(resolved):
+            return
 
     from hermes_constants import mkdir_under_hermes_home
     mkdir_under_hermes_home(path.parent)
@@ -925,7 +971,8 @@ def _add_rotating_handler(
         handler.addFilter(log_filter)
     # Route through the async queue instead of ``logger.addHandler(handler)`` so
     # the rotation-lock wait never runs on the caller's (often event-loop) thread.
-    _register_queued_handler(handler)
+    # dedupe_path makes the registration atomic with the duplicate check.
+    _register_queued_handler(handler, dedupe_path=resolved)
 
 
 def _read_logging_config():
