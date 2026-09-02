@@ -804,3 +804,87 @@ class TestValidateRequestedModelNousPortalRecommendations:
             result = validate_requested_model("inclusionai/ling-2.6-flash", "nous")
         mock_portal.assert_not_called()
         assert result["accepted"] is True
+
+
+# ---------------------------------------------------------------------------
+# Named custom providers (custom:<key>) — #100088
+# ---------------------------------------------------------------------------
+
+
+class TestNamedCustomProviderCatalog:
+    """``custom:<key>`` must resolve its OWN config, not the global model.* block.
+
+    ``providers:`` entries are keyed by their bare config key while the router
+    addresses them by ``custom:`` slug. A slug-only lookup returns {}, so every
+    named custom provider fell through to ``model.base_url`` or to an empty
+    catalog and the picker showed 0 models.
+    """
+
+    NAMED = "custom:my-vllm"
+    BARE_KEY = "my-vllm"
+
+    @pytest.fixture
+    def named_provider_config(self):
+        """providers.my-vllm with its own base_url and a static model block."""
+        return {
+            "name": "my-vllm",
+            "base_url": "https://vllm.internal/v1",
+            "models": {"local/qwen": {}, "local/llama": {}},
+        }
+
+    def test_alias_resolution_includes_bare_config_key(self):
+        """The bare key must be among the aliases tried for a slug."""
+        from hermes_cli.models import _custom_provider_aliases
+
+        aliases = _custom_provider_aliases(self.NAMED)
+        assert self.BARE_KEY in aliases
+        # The slug itself stays first so an exact match is never shadowed.
+        assert aliases[0] == self.NAMED
+        # No double-prefixed junk (custom:custom:<key>).
+        assert not [a for a in aliases if a.count("custom:") > 1]
+
+    def test_slug_lookup_falls_back_to_bare_key(self, named_provider_config):
+        """A slug miss must retry under the bare key rather than giving up."""
+        from hermes_cli.models import _get_provider_config_dict
+
+        providers_cfg = {self.BARE_KEY: named_provider_config}
+        with patch("hermes_cli.config.load_config", return_value={"providers": providers_cfg}):
+            # Slug-only: this is the lookup that used to return {}.
+            assert _get_provider_config_dict(self.NAMED) == {}
+            # Bare key: where the config actually lives.
+            entry = _get_provider_config_dict(self.BARE_KEY)
+        assert entry.get("base_url") == named_provider_config["base_url"]
+
+    def test_named_custom_provider_offers_its_configured_models(
+        self, named_provider_config
+    ):
+        """Regression: the picker showed 0 models for every custom:<key>."""
+        providers_cfg = {self.BARE_KEY: named_provider_config}
+        with patch("hermes_cli.config.load_config", return_value={"providers": providers_cfg}), \
+             patch("hermes_cli.models.fetch_api_models", return_value=[]) as mock_fetch:
+            models = provider_model_ids(self.NAMED)
+
+        assert models, "named custom provider must not report an empty catalog"
+        assert set(models) == set(named_provider_config["models"])
+        # Its OWN endpoint was queried, not the global model.base_url.
+        assert mock_fetch.call_args is not None
+        assert mock_fetch.call_args[0][1] == named_provider_config["base_url"]
+
+    def test_live_discovery_wins_over_static_block(self, named_provider_config):
+        """A reachable endpoint still takes precedence over `models:`."""
+        providers_cfg = {self.BARE_KEY: named_provider_config}
+        with patch("hermes_cli.config.load_config", return_value={"providers": providers_cfg}), \
+             patch("hermes_cli.models.fetch_api_models",
+                   return_value=["live/model-a"]):
+            models = provider_model_ids(self.NAMED)
+        assert models == ["live/model-a"]
+
+    def test_bare_custom_provider_unchanged(self):
+        """The global `custom` provider must keep reading model.base_url."""
+        with patch("hermes_cli.models._get_custom_base_url",
+                   return_value="https://global.example/v1"), \
+             patch("hermes_cli.models.fetch_api_models",
+                   return_value=["global/model"]) as mock_fetch:
+            models = provider_model_ids("custom")
+        assert models == ["global/model"]
+        assert mock_fetch.call_args[0][1] == "https://global.example/v1"

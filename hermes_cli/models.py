@@ -3094,6 +3094,44 @@ def _get_provider_config_dict(provider: str) -> dict[str, Any]:
     return {}
 
 
+def _custom_provider_aliases(provider: str) -> tuple[str, ...]:
+    """Every config key a ``custom:<name>`` provider may be filed under.
+
+    ``providers:`` entries are keyed by their bare config key
+    (``providers.anymodel``) while the router addresses them by slug
+    (``custom:anymodel``).  A slug-only lookup therefore misses every named
+    custom provider (#100088), so callers must try both spellings.  Ordered
+    most-specific first; the bare suffix is last so an unrelated provider that
+    happens to be named ``custom`` cannot shadow a real entry.
+    """
+    key = str(provider or "").strip()
+    if not key:
+        return ()
+    lowered = key.lower()
+    aliases = [lowered]
+    if lowered.startswith("custom:"):
+        suffix = lowered.split(":", 1)[1].strip()
+        if suffix:
+            aliases.append(suffix)
+    # The display name may differ from the config key; resolve it too.
+    try:
+        from hermes_cli.providers import custom_provider_aliases
+
+        for name in tuple(custom_provider_aliases(key)):
+            name = str(name).strip().lower()
+            if not name or name in aliases:
+                continue
+            # custom_provider_aliases() re-prefixes its own input, yielding
+            # junk like "custom:custom:anymodel" for a slug; skip those so a
+            # garbage key can never be preferred over a real one.
+            if name.count("custom:") > 1:
+                continue
+            aliases.append(name)
+    except Exception:
+        pass
+    return tuple(dict.fromkeys(a for a in aliases if a))
+
+
 def _root_for_ollama_native_api(base_url: str) -> str:
     """Convert an OpenAI-style Ollama base URL to the native API root."""
     root = str(base_url or "").strip().rstrip("/")
@@ -4470,13 +4508,30 @@ def provider_model_ids(provider: Optional[str], *, force_refresh: bool = False) 
                     return live
         except Exception:
             pass
-    if normalized == "custom":
-        base_url = _get_custom_base_url()
+    if normalized == "custom" or normalized.startswith("custom:"):
+        # Named custom providers (``custom:<key>``) carry their own
+        # ``base_url`` / ``api_key`` / ``models`` — but under the BARE config
+        # key (``providers.anymodel``), not the ``custom:`` slug the rest of
+        # the code routes on. Looking the slug up directly returns {},
+        # so every named provider silently fell through to the global
+        # ``model.base_url`` or to an empty catalog (#100088). Resolve through
+        # the provider's own alias set instead.
+        entry = {}
+        if normalized != "custom":
+            entry = _get_provider_config_dict(normalized)
+            if not entry:
+                for alias in _custom_provider_aliases(normalized):
+                    candidate = _get_provider_config_dict(alias)
+                    if candidate:
+                        entry = candidate
+                        break
+        base_url = str(entry.get("base_url") or "").strip() or _get_custom_base_url()
         if base_url:
             model_cfg = _get_model_config_dict()
             # Try common API key env vars for custom endpoints
             api_key = (
-                str(model_cfg.get("api_key", "") or "").strip()
+                str(entry.get("api_key") or "").strip()
+                or str(model_cfg.get("api_key", "") or "").strip()
                 or os.getenv("CUSTOM_API_KEY", "")
                 or os.getenv("OPENAI_API_KEY", "")
                 or os.getenv("OPENROUTER_API_KEY", "")
@@ -4485,6 +4540,14 @@ def provider_model_ids(provider: Optional[str], *, force_refresh: bool = False) 
             live = fetch_api_models(api_key, base_url, api_mode=api_mode)
             if live:
                 return live
+        # A configured ``models:`` block is an explicit static catalog. Honour
+        # it even when live discovery is off or the endpoint is unreachable —
+        # the user wrote these down on purpose.
+        configured = entry.get("models")
+        if isinstance(configured, dict) and configured:
+            return [str(m) for m in configured]
+        elif isinstance(configured, list) and configured:
+            return [str(m) for m in configured]
     # Bedrock uses live discovery keyed by the resolved AWS region so that
     # EU/AP users see eu.*/ap.* model IDs instead of the static us.* list.
     # Note: early return intentionally skips _MODELS_DEV_PREFERRED merge
