@@ -460,6 +460,29 @@ def _rewrite_known_bang_command(text: str) -> str:
     return text
 
 
+_SLACK_REQUERY_PATTERNS = (
+    re.compile(
+        r"(?:방금|이전|위|앞서).{0,24}(?:보고|데이터|결과|값).{0,24}"
+        r"(?:다시|재조회|새로|최신|갱신|업데이트)"
+    ),
+    re.compile(
+        r"(?:다시|재조회|새로|최신).{0,16}(?:값|데이터|결과).{0,16}"
+        r"(?:가져|가저|가지고\s*와|조회|확인|갱신|업데이트)"
+    ),
+    re.compile(
+        r"(?:값|데이터|결과).{0,16}(?:다시|재조회|새로|최신).{0,16}"
+        r"(?:가져|가저|가지고\s*와|조회|확인|갱신|업데이트)"
+    ),
+)
+
+
+def _slack_requery_intent(text: str) -> bool:
+    """Recognize only explicit Korean requests to refresh prior report data."""
+    return bool(text) and any(
+        pattern.search(text) for pattern in _SLACK_REQUERY_PATTERNS
+    )
+
+
 def _slack_permalink_path(channel_id: str | None, message_ts: str | None) -> str:
     """The workspace-independent tail of a Slack message permalink.
 
@@ -6452,6 +6475,8 @@ class SlackAdapter(BasePlatformAdapter):
             (bot_uid and f"<@{bot_uid}>" in routing_text)
             or self._slack_message_matches_mention_patterns(routing_text)
         )
+        is_requery = _slack_requery_intent(routing_text)
+        is_addressed = is_mentioned or is_requery
         event_thread_ts = event.get("thread_ts")
         is_thread_reply = bool(event_thread_ts and event_thread_ts != ts)
         # Internal routing paths (reaction triggers) are pre-authorized as
@@ -6500,7 +6525,7 @@ class SlackAdapter(BasePlatformAdapter):
             self_uids = {u for u in (bot_uid, self._bot_user_id) if u}
             if (
                 self._slack_ignore_other_user_mentions()
-                and not is_mentioned
+                and not is_addressed
                 and not self._slack_message_mentions_self(routing_text, self_uids)
                 and self._slack_message_addressed_to_other_user(routing_text, self_uids)
             ):
@@ -6528,7 +6553,7 @@ class SlackAdapter(BasePlatformAdapter):
                 if (
                     self._slack_thread_require_mention()
                     and is_thread_reply
-                    and not is_mentioned
+                    and not is_addressed
                 ):
                     logger.debug(
                         "[Slack] Ignoring thread reply without mention "
@@ -6537,12 +6562,12 @@ class SlackAdapter(BasePlatformAdapter):
                         event_thread_ts,
                     )
                     return
-            elif self._slack_strict_mention() and not is_mentioned:
+            elif self._slack_strict_mention() and not is_addressed:
                 return  # Strict mode: ignore until @-mentioned again
             elif (
                 self._slack_thread_require_mention()
                 and is_thread_reply
-                and not is_mentioned
+                and not is_addressed
             ):
                 logger.debug(
                     "[Slack] Ignoring thread reply without mention "
@@ -6551,7 +6576,7 @@ class SlackAdapter(BasePlatformAdapter):
                     event_thread_ts,
                 )
                 return
-            elif not is_mentioned:
+            elif not is_addressed:
                 if not await self._should_wake_on_unmentioned_message(
                     event_thread_ts=event_thread_ts,
                     channel_id=channel_id,
@@ -6646,6 +6671,12 @@ class SlackAdapter(BasePlatformAdapter):
         # command routing can misclassify it as conversational text.
         # ``channel_context`` is prepended only after command dispatch.
         channel_context = None
+        if is_requery and not is_thread_reply:
+            channel_context = await self._fetch_requery_context(
+                channel_id=channel_id,
+                current_ts=ts,
+                team_id=team_id,
+            )
         # Thread-root images recovered on the cold-start hydrate: when the
         # bot is mentioned mid-thread for the first time, the thread root is
         # very often the artifact the mention is about ("@bot what's in this
@@ -6696,7 +6727,7 @@ class SlackAdapter(BasePlatformAdapter):
             self._mark_thread_rehydration_checked(
                 channel_id, event_thread_ts, user_id, team_id
             )
-        elif is_thread_reply and has_active_thread_session and is_mentioned:
+        elif is_thread_reply and has_active_thread_session and is_addressed:
             # Explicit @mention on an active thread is a fresh intent signal:
             # the user expects the bot to read the CURRENT thread state, which
             # may include replies (e.g. from other bots/integrations) that
@@ -6778,6 +6809,14 @@ class SlackAdapter(BasePlatformAdapter):
                     watermark_ts=ts,
                     team_id=team_id,
                 )
+
+        if is_requery and is_thread_reply:
+            channel_context = (
+                "[Slack 재조회 지시] 스레드의 이전 수치를 반복하지 말고 연결된 "
+                "보고서의 원본 도구를 새로 실행해 그 결과만 답하십시오. 컨텍스트가 "
+                "불충분하거나 여러 보고서가 후보이면 어느 보고서인지 먼저 "
+                "물으십시오.\n\n" + (channel_context or "")
+            )
 
         # Determine message type
         msg_type = MessageType.TEXT
@@ -7159,7 +7198,9 @@ class SlackAdapter(BasePlatformAdapter):
         # MPIMs are shared surfaces: reacting to every group-DM message (even
         # when unmentioned) is visible noise to the whole group, so they must
         # be @mentioned to earn a reaction — same as any channel.
-        _should_react = (is_one_to_one_dm or is_mentioned) and self._reactions_enabled()
+        _should_react = (
+            (is_one_to_one_dm or is_mentioned) or is_requery
+        ) and self._reactions_enabled()
         if _should_react:
             self._reacting_message_ids.add(
                 self._workspace_message_marker(team_id, ts)
@@ -8052,6 +8093,117 @@ class SlackAdapter(BasePlatformAdapter):
             msg_text = (msg_text + "\n" + addendum).strip() if msg_text else addendum
 
         return msg_text
+
+    async def _fetch_requery_context(
+        self,
+        channel_id: str,
+        current_ts: str,
+        team_id: str = "",
+    ) -> str:
+        """Recover a nearby self-authored root report for a fresh-data request."""
+        session_store = getattr(self, "_session_store", None)
+        list_sessions = getattr(session_store, "list_sessions", None)
+        try:
+            session_entries: Any = list_sessions() if callable(list_sessions) else []
+        except Exception as exc:
+            logger.warning("[Slack] Failed to snapshot re-query sessions: %s", exc)
+            session_entries = []
+        canonical_threads = {
+            str(origin.thread_id)
+            for entry in session_entries
+            if (origin := getattr(entry, "origin", None))
+            and origin.platform == Platform.SLACK
+            and str(origin.chat_id) == str(channel_id)
+            and origin.user_id == "system:cron"
+            and origin.thread_id
+            and (
+                not team_id
+                or not getattr(origin, "scope_id", None)
+                or str(origin.scope_id) == str(team_id)
+            )
+        }
+        if len(canonical_threads) > 1:
+            return (
+                "[Slack 재조회 컨텍스트] 가까운 보고서가 여러 개입니다. "
+                "어느 보고서인지 사용자에게 물어보고 원본 도구를 실행하지 마십시오.\n\n"
+            )
+
+        try:
+            client = self._get_client(channel_id, team_id=team_id)
+            bot_uid = self._team_bot_user_ids.get(team_id, self._bot_user_id)
+            candidates = []
+            history_messages = []
+            if canonical_threads:
+                thread_ts = next(iter(canonical_threads))
+                result = await client.conversations_replies(
+                    channel=channel_id,
+                    ts=thread_ts,
+                    limit=1,
+                    inclusive=True,
+                )
+                messages = (result or {}).get("messages", [])
+                if messages:
+                    message = messages[0]
+                    if (
+                        message.get("user") == bot_uid
+                        and str(message.get("ts") or "") == thread_ts
+                    ):
+                        text = self._render_message_text(
+                            message, bot_uid=bot_uid or ""
+                        ).strip()
+                        if len(text) >= 40:
+                            candidates.append(text)
+
+            if not candidates:
+                result = await client.conversations_history(
+                    channel=channel_id,
+                    latest=current_ts,
+                    inclusive=False,
+                    limit=50,
+                )
+                history_messages = (result or {}).get("messages", [])
+            for message in history_messages:
+                message_ts = str(message.get("ts") or "")
+                thread_ts = str(message.get("thread_ts") or "")
+                if (
+                    message.get("user") != bot_uid
+                    or (thread_ts and thread_ts != message_ts)
+                    or not message_ts
+                ):
+                    continue
+                text = self._render_message_text(
+                    message, bot_uid=bot_uid or ""
+                ).strip()
+                if len(text) >= 40:
+                    candidates.append(text)
+                if len(candidates) == 3:
+                    break
+        except (TypeError, ValueError) as exc:
+            logger.debug("[Slack] Invalid re-query history timestamp: %s", exc)
+            candidates = []
+        except Exception as exc:
+            logger.warning("[Slack] Failed to recover re-query context: %s", exc)
+            candidates = []
+
+        if not candidates:
+            return (
+                "[Slack 재조회 컨텍스트] 연결할 최근 보고서를 찾지 못했습니다. "
+                "어느 보고서인지 사용자에게 물어보고 원본 도구를 실행하지 마십시오.\n\n"
+            )
+        if len(candidates) > 1:
+            return (
+                "[Slack 재조회 컨텍스트] 가까운 보고서가 여러 개입니다. "
+                "어느 보고서인지 사용자에게 물어보고 원본 도구를 실행하지 마십시오.\n\n"
+            )
+
+        from gateway.session import neutralize_untrusted_inline_text
+
+        prior = neutralize_untrusted_inline_text(candidates[0], max_chars=12000)
+        return (
+            "[Slack 재조회 컨텍스트] 사용자는 이전 수치의 반복이 아니라 새 수치를 "
+            "요청했습니다. 연결된 보고서의 원본 도구를 새로 실행하고 그 결과만 "
+            f"답하십시오.\n[이전 보고서] {prior}\n\n"
+        )
 
     async def _fetch_thread_context(
         self,
