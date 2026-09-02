@@ -467,6 +467,45 @@ class TestClassifyApiError:
         assert result.reason == FailoverReason.format_error
         assert result.retryable is False
 
+    @pytest.mark.parametrize(
+        "error_payload",
+        [
+            {
+                "error_code": "invalid_reasoning_effort",
+                "retryable": False,
+            },
+            {
+                "code": 400,
+                "error_code": "invalid_reasoning_effort",
+                "retryable": False,
+            },
+            {
+                "param": "reasoning.effort",
+                "retryable": False,
+            },
+        ],
+    )
+    def test_400_invalid_reasoning_effort_never_compresses(self, error_payload):
+        """A reasoning-configuration rejection is not context overflow."""
+        e = MockAPIError(
+            "Error code: 400 - invalid request",
+            status_code=400,
+            body={"error": error_payload},
+        )
+
+        result = classify_api_error(
+            e,
+            provider="custom",
+            model="gpt-5.6-sol",
+            approx_tokens=750,
+            context_length=1024,
+        )
+
+        assert result.reason == FailoverReason.format_error
+        assert result.retryable is False
+        assert result.should_compress is False
+        assert result.should_fallback is True
+
     def test_message_only_overloaded_without_status_is_overloaded(self):
         """Some Anthropic-compatible proxies surface 'overloaded' in the
         message with no 503/529 status_code. It must classify as overloaded
