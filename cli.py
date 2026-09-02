@@ -7407,6 +7407,13 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
     def _pet_start_anim(self) -> None:
         if self._pet_anim_running:
             return
+        # Don't start the pet animation when stdout is not a TTY (e.g. in a
+        # Docker container with the json-file logging driver).  Every redraw
+        # frame would otherwise be captured by the logging driver and written
+        # to the container's log file, causing ~4 GB/day of log growth
+        # (#61964).
+        if not os.isatty(sys.stdout.fileno()):
+            return
         self._pet_resolve_config()
         with self._pet_lock:
             kitty = self._pet_enabled and self._pet_renderer is not None and self._pet_renderer.mode == "kitty"
