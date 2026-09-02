@@ -92,6 +92,11 @@ _CAPTIONABLE_EXTS = _IMAGE_EXTS | _VIDEO_EXTS | {
 _TELEGRAM_CAPTION_LIMIT = 1024
 _DEFAULT_CAPTION_LIMIT = 4096
 
+# Versioned capability for platform plugins that need the host-normalized send
+# payload. Plugins can feature-detect this constant and decline to register a
+# full-request handler on older hosts that only pass model-facing ``args``.
+PLUGIN_SEND_HANDLER_NORMALIZED_CONTEXT = 1
+
 def prepare_send_message_platforms() -> None:
     """Load enabled standalone plugins before tool schemas/cache keys are built."""
     from hermes_cli.plugins import discover_plugins
@@ -1109,6 +1114,44 @@ async def _send_via_adapter(
     }
 
 
+async def _call_plugin_send_handler(
+    handler,
+    args,
+    chat_id,
+    platform_name,
+    pconfig,
+    *,
+    message,
+    thread_id,
+    media_files,
+    force_document,
+):
+    """Invoke a plugin handler while preserving four-argument compatibility."""
+    import inspect
+
+    kwargs = {}
+    try:
+        parameters = inspect.signature(handler).parameters.values()
+        if any(
+            parameter.name == "normalized"
+            or parameter.kind is inspect.Parameter.VAR_KEYWORD
+            for parameter in parameters
+        ):
+            kwargs["normalized"] = {
+                "message": message,
+                "thread_id": thread_id,
+                "media_files": media_files,
+                "force_document": force_document,
+            }
+    except (TypeError, ValueError):
+        pass
+
+    result = handler(args or {}, chat_id, platform_name, pconfig, **kwargs)
+    if inspect.isawaitable(result):
+        result = await result
+    return result
+
+
 async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None, media_files=None, force_document=False, args=None):
     """Route a message to the appropriate platform sender.
 
@@ -1186,6 +1229,34 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
         chunks = BasePlatformAdapter.truncate_message(message, max_len, len_fn=_len_fn)
     else:
         chunks = [message]
+
+    # Dynamically registered platform handlers own their complete send path.
+    # Dispatch them once, before the generic non-media rejection/chunk loop,
+    # and pass the host-normalized payload when the handler opts into it. This
+    # keeps cron/CLI calls (which have no model-facing ``args``) lossless while
+    # preserving the legacy four-argument handler contract.
+    from gateway.config import _BUILTIN_PLATFORM_VALUES
+
+    if platform_name not in _BUILTIN_PLATFORM_VALUES:
+        from gateway.platform_registry import platform_registry
+
+        entry = platform_registry.get(platform_name)
+        handler = entry.send_message_handler if entry is not None else None
+        if handler is not None:
+            try:
+                return await _call_plugin_send_handler(
+                    handler,
+                    args,
+                    chat_id,
+                    platform_name,
+                    pconfig,
+                    message=message,
+                    thread_id=thread_id,
+                    media_files=media_files,
+                    force_document=force_document,
+                )
+            except Exception as e:
+                return {"error": f"Plugin send_message handler failed: {e}"}
 
     # --- Telegram: special handling for media attachments ---
     # _send_telegram now owns text chunking internally — it formats the full
