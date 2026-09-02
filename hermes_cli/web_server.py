@@ -5146,33 +5146,31 @@ async def update_hermes():
             "update_command": "managed outside dashboard",
         }
 
-    # Shared admission gate (#91277 Phase 3): marker-first, then the
-    # docker/nix/apt heuristics — one decision with the CLI paths. The
-    # response keeps the pre-existing per-kind error codes the dashboard UI
-    # already keys on.
-    from hermes_cli.update_contract import (
-        evaluate_update_admission,
-        record_refusal_receipt,
-    )
-
-    refusal = evaluate_update_admission(PROJECT_ROOT)
-    if refusal is not None:
-        _record_completed_action("hermes-update", refusal.message, exit_code=1)
-        record_refusal_receipt(refusal)
-        error_code = {
-            "docker": "docker_update_unsupported",
-            "image-marker": "docker_update_unsupported",
-            "image-marker-invalid": "docker_update_unsupported",
-            "apt": "apt_update_required",
-            "nix": "nix_update_unsupported",
-        }.get(refusal.code, "update_not_in_place")
+    install_method = detect_install_method(PROJECT_ROOT)
+    if install_method == "docker":
+        message = format_docker_update_message()
+        _record_completed_action("hermes-update", message, exit_code=1)
         return {
             "ok": False,
             "pid": None,
             "name": "hermes-update",
-            "error": error_code,
-            "message": refusal.message,
-            "update_command": refusal.update_command,
+            "error": "docker_update_unsupported",
+            "message": message,
+            "update_command": recommended_update_command_for_method(install_method),
+        }
+
+    if is_nix_install_method(install_method) or install_method == "apt":
+        message = recommended_update_command_for_method(install_method)
+        _record_completed_action("hermes-update", message, exit_code=1)
+        return {
+            "ok": False,
+            "pid": None,
+            "name": "hermes-update",
+            "error": (
+                "apt_update_required" if install_method == "apt" else "nix_update_unsupported"
+            ),
+            "message": message,
+            "update_command": message,
         }
 
     existing = _ACTION_PROCS.get("hermes-update")
@@ -16019,6 +16017,7 @@ def _get_usage_analytics(days: int = 30, profile: Optional[str] = None):
                    SUM(input_tokens) as input_tokens,
                    SUM(output_tokens) as output_tokens,
                    SUM(cache_read_tokens) as cache_read_tokens,
+                   SUM(cache_write_tokens) as cache_write_tokens,
                    SUM(reasoning_tokens) as reasoning_tokens,
                    COALESCE(SUM(estimated_cost_usd), 0) as estimated_cost,
                    COALESCE(SUM(actual_cost_usd), 0) as actual_cost,
@@ -16053,6 +16052,7 @@ def _get_usage_analytics(days: int = 30, profile: Optional[str] = None):
             SELECT SUM(input_tokens) as total_input,
                    SUM(output_tokens) as total_output,
                    SUM(cache_read_tokens) as total_cache_read,
+                   SUM(cache_write_tokens) as total_cache_write,
                    SUM(reasoning_tokens) as total_reasoning,
                    COALESCE(SUM(estimated_cost_usd), 0) as total_estimated_cost,
                    COALESCE(SUM(actual_cost_usd), 0) as total_actual_cost,

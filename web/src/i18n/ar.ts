@@ -170,6 +170,7 @@ export const ar = defineLocale({
     edits: "تم إدارة العامل",
     lastUsed: "آخر استخدام",
     input: "إدخال",
+    cacheRead: "قراءة ذاكرة التخزين المؤقت",
     output: "إخراج",
     total: "الإجمالي",
     noUsageData: "لا توجد بيانات استخدام لهذه الفترة",

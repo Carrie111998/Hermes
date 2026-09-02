@@ -189,6 +189,7 @@ export const ko: Translations = {
     edits: "에이전트 관리",
     lastUsed: "마지막 사용",
     input: "입력",
+    cacheRead: "캐시 읽기",
     output: "출력",
     total: "합계",
     noUsageData: "이 기간에 대한 사용 데이터가 없습니다",

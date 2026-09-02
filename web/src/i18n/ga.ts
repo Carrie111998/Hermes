@@ -189,6 +189,7 @@ export const ga: Translations = {
     edits: "Bainistithe ag an Agent",
     lastUsed: "Úsáidte go deireanach",
     input: "Ionchur",
+    cacheRead: "Léamh taisce",
     output: "Aschur",
     total: "Iomlán",
     noUsageData: "Gan sonraí úsáide don tréimhse seo",

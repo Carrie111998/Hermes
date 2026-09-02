@@ -228,6 +228,7 @@ export interface Translations {
     edits: string;
     lastUsed: string;
     input: string;
+    cacheRead: string;
     output: string;
     total: string;
     noUsageData: string;

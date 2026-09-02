@@ -189,6 +189,7 @@ export const pt: Translations = {
     edits: "Geridas pelo agente",
     lastUsed: "Última utilização",
     input: "Entrada",
+    cacheRead: "Leitura de cache",
     output: "Saída",
     total: "Total",
     noUsageData: "Sem dados de utilização para este período",

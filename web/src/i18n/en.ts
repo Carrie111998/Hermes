@@ -214,6 +214,7 @@ export const en: Translations = {
     edits: "Agent Managed",
     lastUsed: "Last Used",
     input: "Input",
+    cacheRead: "Cache Read",
     output: "Output",
     total: "Total",
     noUsageData: "No usage data for this period",

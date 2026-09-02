@@ -189,6 +189,7 @@ export const hu: Translations = {
     edits: "Ügynök által kezelve",
     lastUsed: "Utoljára használva",
     input: "Bemenet",
+    cacheRead: "Gyorsítótár-olvasás",
     output: "Kimenet",
     total: "Összesen",
     noUsageData: "Nincs használati adat erre az időszakra",

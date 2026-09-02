@@ -189,6 +189,7 @@ export const tr: Translations = {
     edits: "Agent Yönetildi",
     lastUsed: "Son Kullanım",
     input: "Giriş",
+    cacheRead: "Önbellek Okuma",
     output: "Çıkış",
     total: "Toplam",
     noUsageData: "Bu dönem için kullanım verisi yok",

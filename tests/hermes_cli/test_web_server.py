@@ -3067,6 +3067,48 @@ class TestNewEndpoints:
         mock_generate.assert_not_called()
         assert any(tool["tool"] == "read_file" for tool in resp.json()["tools"])
 
+    def test_analytics_usage_includes_cache_write_tokens(self):
+        """Daily rows + totals expose the raw cache-write bucket (#95707).
+
+        ``input_tokens`` is stored as the residual after subtracting both
+        cache-read and cache-write tokens (see ``agent/usage_pricing.py``), so
+        the dashboard needs ``cache_write_tokens`` alongside
+        ``cache_read_tokens`` to display truthful input accounting.
+        """
+        from hermes_state import SessionDB
+
+        db = SessionDB()
+        try:
+            db.create_session(
+                session_id="cache-write-analytics-test",
+                source="cli",
+                model="openai/gpt-5.2",
+            )
+            db.update_token_counts(
+                "cache-write-analytics-test",
+                input_tokens=477,
+                output_tokens=30392,
+                cache_read_tokens=12953064,
+                cache_write_tokens=598311,
+            )
+        finally:
+            db.close()
+
+        resp = self.client.get("/api/analytics/usage?days=7")
+        assert resp.status_code == 200
+        data = resp.json()
+
+        daily = data["daily"]
+        assert len(daily) == 1
+        assert daily[0]["input_tokens"] == 477
+        assert daily[0]["cache_read_tokens"] == 12953064
+        assert daily[0]["cache_write_tokens"] == 598311
+
+        totals = data["totals"]
+        assert totals["total_input"] == 477
+        assert totals["total_cache_read"] == 12953064
+        assert totals["total_cache_write"] == 598311
+
 # ---------------------------------------------------------------------------
 # Desktop-owned loopback backends are not gated by dashboard.public_url (#96490)
 # ---------------------------------------------------------------------------
