@@ -407,6 +407,54 @@ def test_create_send_drive_publish_and_replay_without_client_transport(tmp_path:
     assert service.status("room-1")["working"] is False
 
 
+def test_task_projection_recovers_source_after_policy_compaction(tmp_path: Path):
+    db = tmp_path / "state.db"
+    service = HostedRoomService(_server(), db_path=db)
+    service.local_profiles = lambda: ("default", "ops")
+    service.create_room(
+        room_id="room-1",
+        name="Release room",
+        members=[
+            {"member_id": "default", "profile": "default", "handle": "hermes"},
+            {"member_id": "ops", "profile": "ops", "handle": "ops"},
+        ],
+    )
+    source = _append_room_event(
+        db,
+        room_id="room-1",
+        event_id="user-1",
+        kind="message.user",
+        actor={"kind": "user", "id": "desktop"},
+        payload={"text": "@ops inspect", "thread_id": "thread-1"},
+    )
+    service._policy_snapshot(hosted_rooms.room_state(db, room_id="room-1"))
+    current = hosted_rooms.room_state(db, room_id="room-1")
+    _append_room_event(
+        db,
+        room_id="room-1",
+        event_id="activity-1",
+        kind="room.activity",
+        actor={"kind": "gateway", "id": current["authority_gateway_id"]},
+        payload={
+            "status": "settled",
+            "reason_code": "silent_round",
+            "thread_id": "thread-1",
+            "discussion_event_id": "user-1",
+        },
+        authority_gateway_id=current["authority_gateway_id"],
+        authority_epoch=current["authority_epoch"],
+    )
+    service._policy_snapshot(hosted_rooms.room_state(db, room_id="room-1"))
+
+    events = service.policy_checkpoint.events_for_task(
+        room_id="room-1", source_event_seq=source["seq"]
+    )
+
+    assert [(event["seq"], event["kind"]) for event in events] == [
+        (source["seq"], "message.user")
+    ]
+
+
 def test_restart_republishes_terminal_task_before_admitting_more(tmp_path: Path):
     db = tmp_path / "state.db"
     service = HostedRoomService(_server(), db_path=db)

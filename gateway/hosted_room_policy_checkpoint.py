@@ -632,22 +632,39 @@ class HostedRoomPolicyCheckpoint:
                    WHERE room_id=? AND seq=?""",
                 (room_id, source_event_seq),
             ).fetchone()
+            source_event = None
             if source is None:
-                return []
+                source_row = conn.execute(
+                    """SELECT room_id, seq, event_id, kind, actor_json,
+                              authority_epoch, payload_json, created_at
+                       FROM hosted_room_events
+                       WHERE room_id=? AND seq=? AND kind='message.user'""",
+                    (room_id, source_event_seq),
+                ).fetchone()
+                if source_row is None:
+                    return []
+                source_event = self._event_from_room_row(source_row)
+                discussion_event_id = str(source_event["event_id"])
+                thread_id = str(source_event["payload"].get("thread_id") or "")
+                if not thread_id:
+                    return []
+            else:
+                discussion_event_id = str(source["discussion_event_id"])
+                thread_id = str(source["thread_id"])
             active_rows = conn.execute(
                 """SELECT event_json FROM hosted_room_policy_events
                    WHERE room_id=? AND discussion_event_id=?
                    ORDER BY seq LIMIT ?""",
                 (
                     room_id,
-                    str(source["discussion_event_id"]),
+                    discussion_event_id,
                     MAX_ACTIVE_POLICY_EVENTS + 1,
                 ),
             ).fetchall()
             transcript_events = self._transcript_events(
                 conn,
                 room_id=room_id,
-                thread_id=str(source["thread_id"]),
+                thread_id=thread_id,
             )
         if len(active_rows) > MAX_ACTIVE_POLICY_EVENTS:
             raise RuntimeError("task policy projection exceeded its bound")
@@ -656,6 +673,7 @@ class HostedRoomPolicyCheckpoint:
             for event in (
                 *transcript_events,
                 *(json.loads(row["event_json"]) for row in active_rows),
+                *((source_event,) if source_event is not None else ()),
             )
         }
         return [events_by_seq[seq] for seq in sorted(events_by_seq)]
