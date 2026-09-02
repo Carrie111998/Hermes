@@ -2988,15 +2988,13 @@ class MCPServerTask:
         if not pids or self._is_http():
             return False
         for pid in pids:
-            # windows-footgun: ok — psutil.pid_exists handles Windows; the
-            # os.kill probe below only runs when psutil is unavailable.
+            # psutil.pid_exists is the liveness probe — os.kill signal
+            # permission is irrelevant to whether a pid exists.
             import psutil
 
-            if not psutil.pid_exists(pid):
-                continue  # this one is dead
-            return True  # alive (signal permission irrelevant for liveness)
-            return False  # at least one child alive
-        return True
+            if psutil.pid_exists(pid):
+                return False  # at least one child alive → not all dead
+        return True  # every tracked child has exited
 
     async def _watch_stdio_children(self) -> None:
         """Poll child liveness while a stdio RPC is in flight (#81995).
