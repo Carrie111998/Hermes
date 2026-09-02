@@ -3212,6 +3212,31 @@ def cmd_chat(args):
     _guard_noninteractive_user_config(args)
     use_tui = _resolve_use_tui(args)
 
+    # Modified-key input support (#87390): install in ONE place that every
+    # interactive mode passes through. The legacy cli.py import shim only
+    # executes on some dispatch paths, and the alias tables alone are not
+    # sufficient: prompt_toolkit inserts ``KeyPress.data`` verbatim, so a
+    # decoded Shift+letter arrives as key='K' with data=<raw ESC sequence>
+    # and leaks into the buffer. Both layers must be active.
+    try:
+        from hermes_cli.pt_input_extras import (
+            install_cmd_backspace_alias,
+            install_ctrl_enter_alias,
+            install_ignored_terminal_sequences,
+            install_keypress_data_normalization,
+            install_modify_other_keys_aliases,
+            install_shift_enter_alias,
+        )
+
+        install_shift_enter_alias()
+        install_ctrl_enter_alias()
+        install_cmd_backspace_alias()
+        install_modify_other_keys_aliases()
+        install_ignored_terminal_sequences()
+        install_keypress_data_normalization()
+    except Exception:
+        pass  # never fail startup over keyboard-protocol niceties
+
     # --in DIR: run in DIR. Must happen before any session resolution so the
     # workspace-scoped "latest"/-c lookups key off DIR, and it pins the
     # session there — an explicit --in wins over a resumed session's

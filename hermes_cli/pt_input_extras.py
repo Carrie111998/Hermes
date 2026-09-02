@@ -586,3 +586,55 @@ def install_ignored_terminal_sequences() -> int:
     if changed:
         _clear_vt100_prefix_cache()
     return changed
+
+
+def install_keypress_data_normalization() -> bool:
+    """Normalize ``KeyPress.data`` for decoded modified keys at parse time.
+
+    prompt_toolkit inserts ``key_press.data`` verbatim for printable keys.
+    A modified key decoded through the alias tables above arrives as a
+    single-character string key (e.g. ``'K'``) whose *data* payload is still
+    the full escape sequence (e.g. ``ESC[27;2;75~``), so the raw sequence —
+    not the character — lands in the buffer (#87390 family). Mapping tables
+    alone are therefore insufficient.
+
+    This wraps each :class:`Vt100Parser` instance's per-instance
+    ``feed_key_callback`` once, at construction time: when the resolved key is
+    a single printable character but its data is an escape sequence, rewrite
+    data to the key character. Idempotent; fail-silent so exotic PT forks or
+    future refactors never break interpreter startup.
+    """
+    try:
+        from prompt_toolkit.input.vt100_parser import Vt100Parser
+        from prompt_toolkit.key_binding.key_processor import KeyPress
+
+        if getattr(Vt100Parser, "_hermes_data_normalized", False):
+            return False
+
+        original_init = Vt100Parser.__init__
+
+        def _normalizing_init(parser, feed_key_callback, *args, **kwargs):
+            user_callback = feed_key_callback
+
+            def callback(key_press):
+                try:
+                    key = key_press.key
+                    if (
+                        type(key) is str  # exclude Keys enum members
+                        and len(key) == 1
+                        and key_press.data != key
+                        and isinstance(key_press.data, str)
+                        and key_press.data.startswith("\x1b")
+                    ):
+                        key_press = KeyPress(key, key)
+                except Exception:
+                    pass
+                return user_callback(key_press)
+
+            return original_init(parser, callback, *args, **kwargs)
+
+        Vt100Parser.__init__ = _normalizing_init  # type: ignore[method-assign]
+        Vt100Parser._hermes_data_normalized = True  # type: ignore[attr-defined]
+        return True
+    except Exception:
+        return False
