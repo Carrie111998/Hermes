@@ -30,7 +30,7 @@ def test_sibling_container_config_sites_carry_docker_network():
     import tools.code_execution_tool as code_execution_tool
     import tools.file_tools as file_tools
 
-    for module in (terminal_tool, file_tools, code_execution_tool):
+    for module in (terminal_tool, code_execution_tool):
         tree = ast.parse(inspect.getsource(module))
         sites = 0
         for node in ast.walk(tree):
@@ -45,6 +45,10 @@ def test_sibling_container_config_sites_carry_docker_network():
                     f"(line {node.lineno})"
                 )
         assert sites >= 1, f"expected at least one container_config site in {module.__name__}"
+
+    # File tools delegate construction to the terminal's canonical builder,
+    # which covers docker_network alongside every other Docker setting.
+    assert "_container_config_from_config(config)" in inspect.getsource(file_tools)
 
 
 def _reuse_guard_harness(monkeypatch, *, existing_mode: str, network: bool):

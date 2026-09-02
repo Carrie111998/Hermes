@@ -1433,6 +1433,7 @@ def _get_file_ops(task_id: str = "default") -> ShellFileOperations:
         _resolve_container_task_id,
         _resolve_task_host_cwd,
         _is_unusable_container_cwd,
+        _container_config_from_config,
         _CONTAINER_BACKENDS,
     )
     import time
@@ -1541,18 +1542,7 @@ def _get_file_ops(task_id: str = "default") -> ShellFileOperations:
             from tools.terminal_tool import _is_container_backend as _is_container
 
             if _is_container(env_type):
-                container_config = {
-                    "container_cpu": config.get("container_cpu", 1),
-                    "container_memory": config.get("container_memory", 5120),
-                    "container_disk": config.get("container_disk", 51200),
-                    "container_persistent": config.get("container_persistent", True),
-                    "vercel_runtime": config.get("vercel_runtime", ""),
-                    "docker_volumes": config.get("docker_volumes", []),
-                    "docker_mount_cwd_to_workspace": config.get("docker_mount_cwd_to_workspace", False),
-                    "docker_forward_env": config.get("docker_forward_env", []),
-                    "docker_run_as_host_user": config.get("docker_run_as_host_user", False),
-                    "docker_network": config.get("docker_network", True),
-                }
+                container_config = _container_config_from_config(config)
 
             ssh_config = None
             if env_type == "ssh":
