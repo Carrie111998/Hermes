@@ -57,6 +57,84 @@ def test_kanban_list_json_includes_session_id(kanban_home):
     )
 
 
+def test_kanban_create_stamps_session_id_from_flag(kanban_home):
+    """`create --session` stamps session_id on the new task (#92583), the
+    same field `create --session` did nothing with before this — only
+    `list --session` could filter on it."""
+    raw = kc.run_slash("create --session chat-99 --json my-task")
+    payload = json.loads(raw)
+    assert payload["session_id"] == "chat-99"
+
+
+def test_kanban_create_subscribes_tui_session_via_session_key(kanban_home, monkeypatch):
+    """CLI create running inside a TUI/desktop session (HERMES_SESSION_KEY
+    set, no gateway platform/chat_id) auto-subscribes the same way the
+    kanban_create tool already does (#92583), so the TUI notification
+    poller can wake the originating pane."""
+    monkeypatch.delenv("HERMES_SESSION_PLATFORM", raising=False)
+    monkeypatch.delenv("HERMES_SESSION_CHAT_ID", raising=False)
+    monkeypatch.delenv("HERMES_SESSION_ID", raising=False)
+    monkeypatch.setenv("HERMES_SESSION_KEY", "tui-cli-abc")
+
+    raw = kc.run_slash("create --json tui-created-task")
+    payload = json.loads(raw)
+    task_id = payload["id"]
+
+    with kb.connect() as conn:
+        subs = list(kb.list_notify_subs(conn, task_id))
+    assert len(subs) == 1
+    assert subs[0]["platform"] == "tui"
+    assert subs[0]["chat_id"] == "tui-cli-abc"
+
+
+def test_kanban_create_session_flag_wins_over_env(kanban_home, monkeypatch):
+    """`--session` takes precedence over `$HERMES_SESSION_ID` (#92583):
+    an explicit flag is a deliberate override and must not be shadowed by
+    whatever the calling session happens to export."""
+    monkeypatch.setenv("HERMES_SESSION_ID", "env-session")
+
+    raw = kc.run_slash("create --session flag-session --json my-task")
+    payload = json.loads(raw)
+    assert payload["session_id"] == "flag-session"
+
+
+def test_kanban_create_subscribes_gateway_session(kanban_home, monkeypatch):
+    """CLI create running inside a gateway (telegram/discord/etc) session
+    (`HERMES_SESSION_PLATFORM`/`HERMES_SESSION_CHAT_ID` set) subscribes
+    against that real chat, not the TUI fallback path (#92583)."""
+    monkeypatch.setenv("HERMES_SESSION_PLATFORM", "telegram")
+    monkeypatch.setenv("HERMES_SESSION_CHAT_ID", "chat-42")
+    monkeypatch.delenv("HERMES_SESSION_KEY", raising=False)
+    monkeypatch.delenv("HERMES_SESSION_ID", raising=False)
+
+    raw = kc.run_slash("create --json gateway-created-task")
+    payload = json.loads(raw)
+    task_id = payload["id"]
+
+    with kb.connect() as conn:
+        subs = list(kb.list_notify_subs(conn, task_id))
+    assert len(subs) == 1
+    assert subs[0]["platform"] == "telegram"
+    assert subs[0]["chat_id"] == "chat-42"
+
+
+def test_kanban_create_does_not_subscribe_plain_cli_session(kanban_home, monkeypatch):
+    """A bare CLI invocation with no session env has no persistent delivery
+    channel, so no subscription row is written."""
+    monkeypatch.delenv("HERMES_SESSION_PLATFORM", raising=False)
+    monkeypatch.delenv("HERMES_SESSION_CHAT_ID", raising=False)
+    monkeypatch.delenv("HERMES_SESSION_KEY", raising=False)
+    monkeypatch.delenv("HERMES_SESSION_ID", raising=False)
+
+    raw = kc.run_slash("create --json plain-cli-task")
+    payload = json.loads(raw)
+    task_id = payload["id"]
+
+    with kb.connect() as conn:
+        subs = list(kb.list_notify_subs(conn, task_id))
+    assert subs == []
+
+
 def test_kanban_show_text_renders_graph_with_open_connection(kanban_home):
     with kb.connect_closing() as conn:
         parent_id = kb.create_task(conn, title="parent task")

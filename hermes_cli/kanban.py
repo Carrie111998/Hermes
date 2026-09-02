@@ -381,6 +381,11 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                                "worktree under the project's primary repo with a "
                                "deterministic branch. See `hermes project list`.")
     p_create.add_argument("--tenant", default=None, help="Tenant namespace")
+    p_create.add_argument("--session", default=None,
+                          help="Originating chat/agent session id to stamp on the "
+                               "task, so `kanban list --session` can find it. "
+                               "Defaults to $HERMES_SESSION_ID or $HERMES_SESSION_KEY "
+                               "when unset.")
     p_create.add_argument("--priority", type=int, default=0, help="Priority tiebreaker")
     p_create.add_argument("--triage", action="store_true",
                           help="Park in triage — a specifier will flesh out the spec and promote to todo")
@@ -1662,6 +1667,12 @@ def _cmd_create(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 2
+    session_id = (
+        getattr(args, "session", None)
+        or os.environ.get("HERMES_SESSION_ID")
+        or os.environ.get("HERMES_SESSION_KEY")
+        or None
+    )
     with kb.connect_closing() as conn:
         task_id = kb.create_task(
             conn,
@@ -1686,7 +1697,14 @@ def _cmd_create(args: argparse.Namespace) -> int:
             goal_mode=bool(getattr(args, "goal_mode", False)),
             goal_max_turns=getattr(args, "goal_max_turns", None),
             initial_status=getattr(args, "initial_status", "running"),
+            session_id=session_id,
         )
+        # Parity with the kanban_create tool (#92583): a persistent TUI/
+        # desktop session env is enough to auto-subscribe, so the completion
+        # notification reaches the pane that asked for this card. No-op for
+        # plain CLI/cron callers with no such env — see _maybe_auto_subscribe.
+        from tools.kanban_tools import _maybe_auto_subscribe
+        _maybe_auto_subscribe(conn, task_id)
         task = kb.get_task(conn, task_id)
     if getattr(args, "json", False):
         print(json.dumps(_task_to_dict(task), indent=2, ensure_ascii=False))
