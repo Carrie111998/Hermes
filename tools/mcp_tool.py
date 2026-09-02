@@ -861,6 +861,40 @@ def _is_method_not_found_error(exc: BaseException) -> bool:
     )
 
 
+# 2026-08-19 mcp SDK 2.0 bump: JSONRPCDispatcher.send_raw_request (mcp.shared.
+# jsonrpc_dispatcher) unconditionally stamps an ``_meta`` key into every
+# outgoing request's params -- even a bare ``tools/list``/``ping`` call that
+# supplied no params at all -- to carry OpenTelemetry trace context (SEP-414)
+# and progress tokens. When neither is active the stamp is contentless
+# (``params: {"_meta": {}}``), but some pre-2026 servers treat ANY non-empty
+# ``params`` on these two nominally-parameterless methods as a protocol
+# violation and reject them with -32602 (verified live against
+# ecc-memory-mcp; see _install_bare_params_quirk for the fix). -32602 is also
+# the standard code a server legitimately returns for a bad tools/call
+# argument, so this checks the server's own "does not accept parameters"
+# wording rather than trusting the bare code, to avoid mis-firing on
+# unrelated -32602s.
+_JSONRPC_INVALID_PARAMS = -32602
+
+
+def _rejects_bare_params_error(exc: BaseException) -> bool:
+    """True when *exc* is a server's structural refusal of ANY ``params``
+    on a nominally-parameterless call (``tools/list`` / ``ping``).
+
+    Mirrors _is_method_not_found_error's structural-then-substring shape.
+    """
+    if "does not accept parameters" not in str(exc).lower():
+        return False
+    # Structural: mcp.shared.exceptions.MCPError carries ErrorData.code. When
+    # a code IS available, require it to actually be -32602 so an unrelated
+    # error that happens to share this wording is never misclassified.
+    # Structureless exceptions (message surfaced as plain text, no .error)
+    # fall through on the wording match alone.
+    err = getattr(exc, "error", None)
+    code = getattr(err, "code", None)
+    return code is None or code == _JSONRPC_INVALID_PARAMS
+
+
 # ---------------------------------------------------------------------------
 # MCP tool description content scanning
 # ---------------------------------------------------------------------------
@@ -927,6 +961,97 @@ def _prepend_path(env: dict, directory: str) -> dict:
     return updated
 
 
+# tools/list and ping are the only calls this module makes with no real
+# argument content, so they're the only ones _install_bare_params_quirk
+# ever needs to rewrite. (tools/call etc. always carry real params, which
+# the quirk deliberately leaves untouched — see its docstring.)
+_BARE_PARAMS_METHODS = ("tools/list", "ping")
+
+
+def _install_bare_params_quirk(session: Any, server_name: str) -> None:
+    """Patch *session* so ``tools/list``/``ping`` requests wire-omit
+    ``params`` instead of carrying mcp SDK 2.0's contentless ``_meta`` stamp.
+
+    There is no supported SDK-level way to suppress that stamp: even
+    ``list_tools(params=None)`` (the default) still gets it, because
+    ``JSONRPCDispatcher.send_raw_request`` sets
+    ``out_params["_meta"] = out_meta`` unconditionally, several layers below
+    any public ``ClientSession`` call (confirmed by tracing a live
+    ecc-memory-mcp connection). This instead patches
+    ``session._dispatcher._write`` -- the one place that sees the
+    fully-built request right before it reaches the wire -- to rebuild just
+    the affected request.
+
+    The rebuild never passes ``params=`` to ``JSONRPCRequest`` at all (not
+    even ``params=None``): constructing the model with that keyword marks
+    the field "set" in Pydantic's ``__pydantic_fields_set__``, and the
+    stdio/HTTP transports serialize with
+    ``model_dump_json(exclude_unset=True)`` (see ``notify()`` in
+    jsonrpc_dispatcher.py, which carries the same constraint) -- so an
+    explicit ``None`` would still ship as ``"params": null``, which JSON-RPC
+    2.0 forbids and which this exact class of server also rejects, just
+    with a different error (-32600) than the one this quirk fixes. Leaving
+    the keyword out entirely is the only way ``exclude_unset`` drops it.
+
+    A request that carries real ``_meta`` content (an active OpenTelemetry
+    trace context, or a progress token) is left untouched even after this
+    runs -- only a request whose params would otherwise be *nothing but* an
+    empty ``_meta`` gets rewritten, so this never discards information the
+    server or an observability backend might actually want.
+
+    Scoped to this one session's dispatcher instance: each ``MCPServerTask``
+    owns its own ``ClientSession``/``JSONRPCDispatcher`` (a fresh one per
+    connection), so this neither changes how any other configured server is
+    talked to nor needs an explicit reset on reconnect -- a fresh dispatcher
+    means a fresh, un-patched ``_write``. Idempotent, so the keepalive probe
+    and tool discovery can both call it without checking first.
+    """
+    dispatcher = getattr(session, "_dispatcher", None)
+    if dispatcher is None or getattr(dispatcher, "_hermes_bare_params_patched", False):
+        return
+    json_rpc_request = _mcp_types().JSONRPCRequest
+    orig_write = dispatcher._write
+
+    async def _write_omitting_bare_params(message, metadata=None):
+        if (
+            isinstance(message, json_rpc_request)
+            and message.method in _BARE_PARAMS_METHODS
+            and message.params is not None
+            and set(message.params) <= {"_meta"}
+            and not (message.params.get("_meta") or None)
+        ):
+            message = json_rpc_request(jsonrpc=message.jsonrpc, id=message.id, method=message.method)
+        return await orig_write(message, metadata)
+
+    dispatcher._write = _write_omitting_bare_params
+    dispatcher._hermes_bare_params_patched = True
+    logger.info(
+        "MCP server '%s': rejects any params on '%s' (-32602 does not "
+        "accept parameters) — omitting mcp SDK 2.0's empty metadata stamp "
+        "on this connection's tools/list and ping calls going forward.",
+        server_name, "' / '".join(_BARE_PARAMS_METHODS),
+    )
+
+
+async def _call_retrying_bare_params_quirk(session: Any, server_name: str, call):
+    """Await ``call()``; on the server's bare-params rejection, install
+    ``_install_bare_params_quirk`` on *session* and retry exactly once.
+
+    One retry is deliberate: after the quirk installs, a repeat of the same
+    failure is a genuine error, not something this module knows how to
+    route around. ``session`` may be ``None`` (e.g. a test double with no
+    real dispatcher) — the installer no-ops in that case and the retry
+    simply reproduces the original failure.
+    """
+    try:
+        return await call()
+    except Exception as exc:
+        if not _rejects_bare_params_error(exc):
+            raise
+        _install_bare_params_quirk(session, server_name)
+        return await call()
+
+
 # Safety cap on nextCursor pagination loops so a misbehaving server that
 # returns a cursor forever cannot spin discovery indefinitely. 50 pages at
 # the common 50-100 items/page covers thousands of tools/resources/prompts.
@@ -964,7 +1089,15 @@ async def _paginate_full_list(list_method, items_attr: str, server_name: str,
     cursor = None
     for _ in range(_MCP_LIST_MAX_PAGES):
         if not cursor:
-            result = await list_method()
+            # Bound method (session.list_tools / .list_resources / ...) —
+            # recover the session it's bound to so a bare-params rejection
+            # (see _rejects_bare_params_error) can be routed around without
+            # widening this function's signature. list_method.__self__ is
+            # None only for a plain function/mock (e.g. in tests), in which
+            # case the retry helper's install step is a harmless no-op.
+            result = await _call_retrying_bare_params_quirk(
+                getattr(list_method, "__self__", None), server_name, list_method
+            )
         else:
             # Cursor continuation differs by SDK generation: mcp 1.x
             # accepts ``cursor=``, mcp 2.0 takes ``params=`` (a
@@ -2868,7 +3001,10 @@ class MCPServerTask:
         """
         if not self._ping_unsupported:
             try:
-                await asyncio.wait_for(self.session.send_ping(), timeout=30.0)
+                await _call_retrying_bare_params_quirk(
+                    self.session, self.name,
+                    lambda: asyncio.wait_for(self.session.send_ping(), timeout=30.0),
+                )
                 return
             except Exception as exc:
                 if _is_method_not_found_error(exc):
@@ -2911,7 +3047,10 @@ class MCPServerTask:
                     raise
 
         # Fallback probe for servers without ping support.
-        await asyncio.wait_for(self.session.list_tools(), timeout=30.0)
+        await _call_retrying_bare_params_quirk(
+            self.session, self.name,
+            lambda: asyncio.wait_for(self.session.list_tools(), timeout=30.0),
+        )
 
     def _mark_session_proven(self) -> None:
         """Record that the current session demonstrated real health.
