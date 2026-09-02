@@ -91,9 +91,9 @@ Safety guarantees (all modes, any age):
   `git worktree add .worktrees/<name> <branch>` away from restored. If the
   remote can't be reached, the tree is preserved.
 - Trees **in use by a running hermes session** are never touched.
-- **Untracked-only scratch** (PR body drafts, notes) is archived to
-  `~/.hermes/archive/worktree-prune/` before its tree is removed — never
-  destroyed.
+- **Untracked-only scratch** (PR body drafts, notes) is archived in the active
+  Hermes profile's `archive/worktree-prune/` directory before its tree is
+  removed — never destroyed.
 - Branch deletion is content-gated, not name-gated: any local branch whose
   commits are all on upstream is safe to delete; branches with unique work,
   checked-out branches, and `main`/`master`/`develop` are always kept.
