@@ -2312,14 +2312,11 @@ def _run_post_setup(post_setup_key: str):
         # The plugin ships in the repo but doesn't load until the user enables
         # it (standalone plugins are opt-in).
         try:
-            from hermes_cli.plugins_cmd import _get_enabled_set, _save_enabled_set
-            enabled = _get_enabled_set()
-            if "observability/langfuse" in enabled or "langfuse" in enabled:
-                _print_success("    Plugin observability/langfuse already enabled")
-            else:
-                enabled.add("observability/langfuse")
-                _save_enabled_set(enabled)
+            from hermes_cli.plugins_cmd import _mutate_plugin_state
+            if _mutate_plugin_state(enable={"observability/langfuse"}):
                 _print_success("    Plugin observability/langfuse enabled")
+            else:
+                _print_success("    Plugin observability/langfuse already enabled")
         except Exception as exc:
             _print_warning(f"    Could not enable plugin automatically: {exc}")
             _print_info("    Run manually: hermes plugins enable observability/langfuse")
@@ -3028,7 +3025,7 @@ def _save_platform_tools(config: dict, platform: str, enabled_toolset_keys: Set[
                 if remaining != parsed_disabled:
                     agent_cfg["disabled_toolsets"] = remaining
 
-    save_config(config)
+    save_config(config, preserve_platform_toolsets=False)
 
 
 def _toolset_has_keys(

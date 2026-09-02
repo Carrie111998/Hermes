@@ -3578,7 +3578,7 @@ def _run_blank_slate_setup(config: dict, hermes_home, is_existing: bool):
     # ── Step 3: Lock in the minimal toolset + minimized config knobs ──
     _blank_slate_minimal_toolsets(config)
     _blank_slate_minimize_config(config)
-    save_config(config)
+    save_config(config, preserve_platform_toolsets=False)
     print()
     print_success("Minimal baseline applied:")
     print_info("  Toolsets: file, terminal, vision, skills (everything else off)")

@@ -344,7 +344,11 @@ def _migrate_to_21(results: Dict[str, Any], quiet: bool) -> None:
 
         plugins_cfg["enabled"] = grandfathered
         config["plugins"] = plugins_cfg
-        _persist_migration(config)
+        _persist_migration(
+            config,
+            preserve_plugin_state=False,
+            preserve_platform_toolsets=True,
+        )
         results["config_added"].append(
             f"plugins.enabled (opt-in allow-list, {len(grandfathered)} grandfathered)"
         )
@@ -816,7 +820,11 @@ def _migrate_to_38(results: Dict[str, Any], quiet: bool) -> None:
 
     plugins["enabled"] = [value for value in enabled if value not in removed]
     config["plugins"] = plugins
-    _persist_migration(config)
+    _persist_migration(
+        config,
+        preserve_plugin_state=False,
+        preserve_platform_toolsets=True,
+    )
     message = (
         "Removed legacy Relay plugin from plugins.enabled: "
         f"{', '.join(removed)}. Configure native Relay plugins with "
@@ -853,7 +861,11 @@ def _migrate_to_39(results: Dict[str, Any], quiet: bool) -> None:
         if changed:
             config[section] = mapping
     if changed:
-        _persist_migration(config)
+        _persist_migration(
+            config,
+            preserve_plugin_state=True,
+            preserve_platform_toolsets=False,
+        )
         results["config_added"].append("removed retired 'bfl' toolset from saved toolset lists")
         if not quiet:
             print(

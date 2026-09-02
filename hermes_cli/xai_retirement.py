@@ -172,6 +172,19 @@ def _walk_to_parent(yaml_doc: Any, dotted_path: str) -> "tuple[Any, str]":
 def apply_migration(
     config_path: Path,
     issues: List[RetirementIssue],
+    *,
+    backup: bool = True,
+) -> ApplyResult:
+    from hermes_cli.config import config_write_lock
+
+    with config_write_lock():
+        return _apply_migration_locked(config_path, issues, backup=backup)
+
+
+def _apply_migration_locked(
+    config_path: Path,
+    issues: List[RetirementIssue],
+    *,
     backup: bool = True,
 ) -> ApplyResult:
     """Rewrite ``config_path`` in-place so each issue is resolved.

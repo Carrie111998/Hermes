@@ -4324,6 +4324,12 @@ class PluginManager:
         sessions without requiring a full agent restart.
         """
         with self._discovery_lock, _plugin_home_scope(self.home_path):
+            # Recover any crash-interrupted artifact/provenance/config commit
+            # before plugin code can be imported from the replaced directory.
+            from hermes_cli.plugins_cmd import _install_metadata_lock
+
+            with _install_metadata_lock():
+                pass
             if self._discovered and not force:
                 return
             if force:
