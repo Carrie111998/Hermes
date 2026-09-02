@@ -1,0 +1,244 @@
+#!/usr/bin/env python3
+"""hermes-shellbridge - HOST half of the Hermes SSH file/image bridge.
+
+Runs on the Hermes host. Talks to the hermes-shellctl daemon on the
+user's machine through a reverse SSH forward (RemoteForward
+127.0.0.1:8765 -> the user's daemon). Commands:
+
+  get <local-path>   pull a file from the user's machine into the
+                     gateway images/downloads dir; print the gateway
+                     path the TUI attaches.
+  paste              pull the user's clipboard image/file into the
+                     gateway and print an attach hint.
+  send <gateway-path> push a gateway file to the user's machine and
+                     open it.
+  ping               check the client daemon + capabilities.
+
+Image files land in the gateway images dir and carry an ``/image``
+hint so the TUI attaches them as visual content; everything else
+(pdf, zip, csv, docx, arbitrary binaries) lands in the downloads dir
+with a plain-path hint. stdlib only.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import time
+import urllib.error
+import urllib.request
+from urllib.parse import quote
+
+CLIENT_URL = os.environ.get(
+    "HERMES_SHELLCTL_URL", "http://127.0.0.1:8765"
+)
+_CLIENT_TOK_VAR = "HERMES_SHELLCTL_" + "TOKEN"
+CLIENT_TOKEN = os.environ.get(_CLIENT_TOK_VAR, "")
+IMAGES_DIR = os.environ.get(
+    "HERMES_SHELLBRIDGE_IMAGES_DIR",
+    os.path.join(
+        os.path.expanduser(
+            os.environ.get("HERMES_HOME", "~/.hermes")
+        ),
+        "images",
+    ),
+)
+FILES_DIR = os.environ.get(
+    "HERMES_SHELLBRIDGE_FILES_DIR",
+    os.path.join(
+        os.path.expanduser(
+            os.environ.get("HERMES_HOME", "~/.hermes")
+        ),
+        "downloads",
+    ),
+)
+
+# Image extensions that should land in IMAGES_DIR + carry an `/image`
+# hint so the TUI attaches them as visual content. Everything else is
+# a general file -> FILES_DIR + a plain-path hint.
+_IMAGE_EXTS = {
+    ".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp",
+    ".tiff", ".tif", ".heic", ".heif", ".svg",
+}
+
+
+def _is_image_name(name):
+    return os.path.splitext(name or "")[1].lower() in _IMAGE_EXTS
+
+
+def _client_req(method, path, body=None, timeout=130):
+    req = urllib.request.Request(
+        CLIENT_URL + path, data=body, method=method
+    )
+    if CLIENT_TOKEN:
+        req.add_header("X-Shellctl-Token", CLIENT_TOKEN)
+    if body is not None:
+        req.add_header("Content-Type", "application/octet-stream")
+    return urllib.request.urlopen(req, timeout=timeout)
+
+
+def _emit(obj):
+    print(json.dumps(obj), flush=True)
+
+
+def _save_into(target_dir, data, name):
+    os.makedirs(target_dir, exist_ok=True)
+    safe = os.path.basename(name) or ("shellctl-%d" % int(time.time()))
+    stem, ext = os.path.splitext(safe)
+    for suffix in range(10000):
+        candidate = safe if suffix == 0 else "%s-%d%s" % (stem, suffix, ext)
+        dest = os.path.join(target_dir, candidate)
+        try:
+            with open(dest, "xb") as f:
+                f.write(data)
+            return dest
+        except FileExistsError:
+            continue
+    raise OSError("could not allocate a unique destination filename")
+
+
+def _save_into_images(data, name):
+    return _save_into(IMAGES_DIR, data, name)
+
+
+def _save_into_files(data, name):
+    return _save_into(FILES_DIR, data, name)
+
+
+def cmd_ping(args):
+    try:
+        with _client_req("GET", "/ping", timeout=8) as r:
+            _emit({"ok": True, **json.loads(r.read())})
+        return 0
+    except Exception as e:  # noqa: BLE001
+        _emit({
+            "ok": False,
+            "error": "client unreachable at %s: %s" % (CLIENT_URL, e),
+        })
+        return 1
+
+
+def cmd_get(args):
+    try:
+        with _client_req(
+            "GET", "/pull?path=" + quote(args.path), timeout=130
+        ) as r:
+            data = r.read()
+    except urllib.error.HTTPError as e:
+        _emit({
+            "ok": False,
+            "error": "pull failed: HTTP %d %r" % (
+                e.code, e.read()[:200]
+            ),
+        })
+        return 1
+    except Exception as e:  # noqa: BLE001
+        _emit({"ok": False, "error": "pull failed: %s" % e})
+        return 1
+    name = os.path.basename(args.path)
+    is_image = _is_image_name(args.path)
+    dest = (
+        _save_into_images(data, name)
+        if is_image
+        else _save_into_files(data, name)
+    )
+    hint = ("/image " + dest) if is_image else dest
+    _emit({
+        "ok": True, "path": dest, "bytes": len(data), "hint": hint,
+    })
+    return 0
+
+
+def cmd_paste(args):
+    try:
+        with _client_req("GET", "/clipboard", timeout=60) as r:
+            data = r.read()
+            hdr_name = r.headers.get("X-Clipboard-Filename") or ""
+            hdr_kind = (
+                r.headers.get("X-Clipboard-Kind") or ""
+            ).lower()
+    except urllib.error.HTTPError as e:
+        _emit({
+            "ok": False,
+            "error": "no clipboard content: HTTP %d %s" % (
+                e.code, e.read()[:200]
+            ),
+        })
+        return 1
+    except Exception as e:  # noqa: BLE001
+        _emit({
+            "ok": False, "error": "clipboard pull failed: %s" % e,
+        })
+        return 1
+    # Save bytes VERBATIM under the real filename the daemon reported,
+    # so an image keeps its format and a pdf/zip lands intact. Legacy
+    # daemons send no headers -> fall back to the historical
+    # clip-<ts>.png image behavior.
+    name = (
+        os.path.basename(hdr_name)
+        if hdr_name
+        else ("clip-%d.png" % int(time.time()))
+    )
+    is_image = hdr_kind == "image" or (
+        not hdr_kind and _is_image_name(name)
+    )
+    dest = (
+        _save_into_images(data, name)
+        if is_image
+        else _save_into_files(data, name)
+    )
+    hint = ("/image " + dest) if is_image else ("/get " + dest)
+    _emit({
+        "ok": True,
+        "path": dest,
+        "bytes": len(data),
+        "kind": "image" if is_image else "file",
+        "hint": hint,
+    })
+    return 0
+
+
+def cmd_send(args):
+    path = os.path.expanduser(args.path)
+    if not os.path.isfile(path):
+        _emit({"ok": False, "error": "gateway file not found: " + path})
+        return 1
+    with open(path, "rb") as f:
+        data = f.read()
+    openq = "0" if args.no_open else "1"
+    try:
+        with _client_req(
+            "POST",
+            "/push?name=%s&open=%s" % (
+                quote(os.path.basename(path)), openq
+            ),
+            body=data,
+            timeout=130,
+        ) as r:
+            _emit({"ok": True, **json.loads(r.read())})
+        return 0
+    except Exception as e:  # noqa: BLE001
+        _emit({"ok": False, "error": "push failed: %s" % e})
+        return 1
+
+
+def main(argv=None):
+    p = argparse.ArgumentParser(
+        prog="hermes-shellbridge", description=__doc__
+    )
+    sub = p.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("ping").set_defaults(func=cmd_ping)
+    g = sub.add_parser("get")
+    g.add_argument("path")
+    g.set_defaults(func=cmd_get)
+    sub.add_parser("paste").set_defaults(func=cmd_paste)
+    s = sub.add_parser("send")
+    s.add_argument("path")
+    s.add_argument("--no-open", action="store_true")
+    s.set_defaults(func=cmd_send)
+    args = p.parse_args(argv)
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1543,6 +1543,9 @@ _CATEGORY_MERGE: Dict[str, str] = {
     # `session.terminal_continue` is the only schema-surfaced session field —
     # fold it into general rather than spawning a one-field orphan category.
     "session": "general",
+    # `shellctl.allowed_root` is the only schema-surfaced shellctl field. Keep
+    # it with the terminal settings that own the SSH bridge workflow.
+    "shellctl": "terminal",
 }
 
 # Display order for tabs — unlisted categories sort alphabetically after these.
