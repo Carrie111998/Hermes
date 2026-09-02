@@ -42,6 +42,14 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
 
+try:
+    import tomllib
+except ImportError:
+    try:
+        import tomli as tomllib  # type: ignore[no-redef]
+    except ImportError:
+        tomllib = None  # type: ignore[assignment]
+
 logger = logging.getLogger(__name__)
 
 
@@ -65,6 +73,8 @@ class MigrationReport:
     migrated_plugins: list[str] = field(default_factory=list)
     plugin_query_error: Optional[str] = None
     wrote_permissions_default: Optional[str] = None
+    reconciled_user_servers: list[str] = field(default_factory=list)
+    preserved_user_servers: list[str] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
     written: bool = False
     dry_run: bool = False
@@ -85,6 +95,16 @@ class MigrationReport:
                 lines.append(f"  - {name}{note}")
         else:
             lines.append("No MCP servers found in Hermes config.")
+        if self.reconciled_user_servers:
+            lines.append(
+                f"Reconciled {len(self.reconciled_user_servers)} duplicate unmanaged MCP server(s): "
+                f"{', '.join(self.reconciled_user_servers)}"
+            )
+        if self.preserved_user_servers:
+            lines.append(
+                f"Preserved {len(self.preserved_user_servers)} user-owned MCP server(s): "
+                f"{', '.join(self.preserved_user_servers)}"
+            )
         if self.migrated_plugins:
             lines.append(
                 f"Migrated {len(self.migrated_plugins)} native Codex plugin(s):"
@@ -304,6 +324,53 @@ def render_codex_toml_section(
     return "\n".join(out) + "\n"
 
 
+def _update_bracket_depth(line: str, current_depth: int = 0) -> int:
+    """Track bracket depth across lines, ignoring brackets inside strings and comments."""
+    depth = max(0, current_depth)
+    cursor = 0
+    length = len(line)
+    in_single_quote = False
+    in_double_quote = False
+    escaped = False
+
+    while cursor < length:
+        c = line[cursor]
+        if escaped:
+            escaped = False
+            cursor += 1
+            continue
+
+        if in_double_quote:
+            if c == "\\":
+                escaped = True
+            elif c == '"':
+                in_double_quote = False
+            cursor += 1
+            continue
+
+        if in_single_quote:
+            if c == "'":
+                in_single_quote = False
+            cursor += 1
+            continue
+
+        if c == '"':
+            in_double_quote = True
+        elif c == "'":
+            in_single_quote = True
+        elif c == "#":
+            # Rest of line is a comment
+            break
+        elif c in "[{":
+            depth += 1
+        elif c in "]}":
+            if depth > 0:
+                depth -= 1
+        cursor += 1
+
+    return depth
+
+
 def _insert_managed_block_at_top_level(user_text: str, managed_block: str) -> str:
     """Insert Hermes' managed Codex TOML block while keeping root keys root-scoped.
 
@@ -318,11 +385,12 @@ def _insert_managed_block_at_top_level(user_text: str, managed_block: str) -> st
 
     lines = user_text.splitlines(keepends=True)
     first_table_idx: Optional[int] = None
+    bracket_depth = 0
     for idx, line in enumerate(lines):
-        stripped = line.lstrip()
-        if stripped.startswith("["):
+        if bracket_depth == 0 and _looks_like_table_header(line):
             first_table_idx = idx
             break
+        bracket_depth = _update_bracket_depth(line, bracket_depth)
 
     if first_table_idx is None:
         prefix = user_text.rstrip("\n")
@@ -335,70 +403,273 @@ def _insert_managed_block_at_top_level(user_text: str, managed_block: str) -> st
     return f"{managed_block}\n{suffix}"
 
 
+def _parse_toml_table_header(line: str) -> Optional[tuple[tuple[str, ...], bool]]:
+    """Parse a line to determine if it is a valid TOML table header.
+
+    Supports bare keys (``foo-bar``), double-quoted basic strings (``"foo.bar"``
+    with standard escape sequences), and single-quoted literal strings (``'foo.bar'``),
+    with arbitrary whitespace around dots/brackets and optional trailing comments.
+
+    Returns:
+        ((key_segment, ...), is_array_of_tables) if the line is a table header,
+        or None if it is not (e.g. key-value assignment, array continuation,
+        comment, blank line).
+    """
+    stripped = line.strip()
+    if not stripped.startswith("["):
+        return None
+    is_array = stripped.startswith("[[")
+    cursor = 2 if is_array else 1
+    segments: list[str] = []
+    length = len(stripped)
+
+    while cursor < length:
+        # Skip whitespace
+        while cursor < length and stripped[cursor] in " \t":
+            cursor += 1
+        if cursor >= length:
+            return None
+
+        char = stripped[cursor]
+        if char == '"':
+            # Basic string
+            cursor += 1
+            escaped_chars: list[str] = []
+            while cursor < length:
+                c = stripped[cursor]
+                if c == "\\":
+                    cursor += 1
+                    if cursor >= length:
+                        return None
+                    esc = stripped[cursor]
+                    if esc == '"':
+                        escaped_chars.append('"')
+                    elif esc == "\\":
+                        escaped_chars.append("\\")
+                    elif esc == "b":
+                        escaped_chars.append("\b")
+                    elif esc == "t":
+                        escaped_chars.append("\t")
+                    elif esc == "n":
+                        escaped_chars.append("\n")
+                    elif esc == "f":
+                        escaped_chars.append("\f")
+                    elif esc == "r":
+                        escaped_chars.append("\r")
+                    elif esc == "u" and cursor + 4 < length:
+                        try:
+                            escaped_chars.append(chr(int(stripped[cursor + 1 : cursor + 5], 16)))
+                            cursor += 4
+                        except ValueError:
+                            return None
+                    elif esc == "U" and cursor + 8 < length:
+                        try:
+                            escaped_chars.append(chr(int(stripped[cursor + 1 : cursor + 9], 16)))
+                            cursor += 8
+                        except ValueError:
+                            return None
+                    else:
+                        return None
+                    cursor += 1
+                elif c == '"':
+                    break
+                else:
+                    escaped_chars.append(c)
+                    cursor += 1
+            if cursor >= length or stripped[cursor] != '"':
+                return None
+            cursor += 1  # Skip closing quote
+            segments.append("".join(escaped_chars))
+        elif char == "'":
+            # Literal string
+            cursor += 1
+            start = cursor
+            while cursor < length and stripped[cursor] != "'":
+                cursor += 1
+            if cursor >= length or stripped[cursor] != "'":
+                return None
+            segments.append(stripped[start:cursor])
+            cursor += 1  # Skip closing single quote
+        elif char.isalnum() or char in "-_":
+            # Bare key
+            start = cursor
+            while cursor < length and (stripped[cursor].isalnum() or stripped[cursor] in "-_"):
+                cursor += 1
+            segments.append(stripped[start:cursor])
+        elif char == "]" or (is_array and char == "]" and cursor + 1 < length and stripped[cursor + 1] == "]"):
+            break
+        else:
+            return None
+
+        # Skip whitespace after key segment
+        while cursor < length and stripped[cursor] in " \t":
+            cursor += 1
+        if cursor >= length:
+            return None
+
+        if stripped[cursor] == ".":
+            cursor += 1
+            # Dot must be followed by a key segment, not closing bracket or another dot
+            peek = cursor
+            while peek < length and stripped[peek] in " \t":
+                peek += 1
+            if peek >= length or stripped[peek] in ("]", "."):
+                return None
+            continue
+        elif is_array and stripped[cursor : cursor + 2] == "]]":
+            cursor += 2
+            break
+        elif not is_array and stripped[cursor] == "]":
+            cursor += 1
+            break
+        else:
+            return None
+
+    if not segments:
+        return None
+
+    # Check the remainder of the line: only whitespace and optional '#' comment allowed
+    rest = stripped[cursor:].strip()
+    if rest and not rest.startswith("#"):
+        return None
+
+    return (tuple(segments), is_array)
+
+
+def _looks_like_table_header(line: str) -> bool:
+    """Return True if ``line`` is a TOML table header."""
+    return _parse_toml_table_header(line) is not None
+
+
+def _find_unmanaged_mcp_servers(toml_text: str) -> set[str]:
+    """Return the set of MCP server names defined in unmanaged tables."""
+    found = set()
+    lines = toml_text.splitlines()
+    bracket_depth = 0
+    in_bare_mcp_servers = False
+
+    for line in lines:
+        parsed = None
+        if bracket_depth == 0:
+            parsed = _parse_toml_table_header(line)
+
+        if parsed is not None:
+            path, _is_array = parsed
+            if len(path) >= 2 and path[0] == "mcp_servers":
+                found.add(path[1])
+                in_bare_mcp_servers = False
+            elif len(path) == 1 and path[0] == "mcp_servers":
+                in_bare_mcp_servers = True
+            else:
+                in_bare_mcp_servers = False
+        elif in_bare_mcp_servers and bracket_depth == 0:
+            stripped = line.strip()
+            if stripped and not stripped.startswith("#") and "=" in stripped:
+                key = stripped.split("=", 1)[0].strip()
+                if key:
+                    if (key.startswith('"') and key.endswith('"')) or (key.startswith("'") and key.endswith("'")):
+                        key = key[1:-1]
+                    found.add(key.split(".")[0])
+
+        bracket_depth = _update_bracket_depth(line, bracket_depth)
+
+    return found
+
+
+def _reconcile_unmanaged_tables(
+    toml_text: str,
+    server_names_to_reconcile: set[str],
+    strip_plugins: bool = False,
+) -> str:
+    """Strip pre-existing unmanaged TOML tables that would conflict with the
+    new managed section.
+
+    Specifically:
+    1. Cascading strip for [mcp_servers.<name>] AND all its sub-tables
+       [mcp_servers.<name>.*] (e.g. .env, .headers, .settings) whose server
+       name is in server_names_to_reconcile.
+    2. Strips legacy bare [mcp_servers] section headers outside the managed
+       block ONLY IF they contain no user key-value assignments (pure empty/
+       comment markers), preventing TOML table-redefinition errors while
+       guaranteeing no user data loss for legacy inline server definitions.
+    3. If strip_plugins is True, strips all [plugins.*] tables outside the
+       managed block (because plugin/list is authoritative), and strips bare
+       [plugins] headers if empty.
+    4. Preserves all other user-owned tables ([projects.*], [features],
+       [mcp_servers.<other>], [mcp_servers.<other>.*], comments, blanks).
+    """
+    if not server_names_to_reconcile and not strip_plugins:
+        return toml_text
+
+    lines = toml_text.splitlines(keepends=True)
+    sections: list[tuple[Optional[tuple[str, ...]], bool, list[str]]] = []
+
+    current_path: Optional[tuple[str, ...]] = None
+    current_is_array: bool = False
+    current_lines: list[str] = []
+    bracket_depth = 0
+
+    for line in lines:
+        parsed = None
+        if bracket_depth == 0:
+            parsed = _parse_toml_table_header(line)
+
+        if parsed is not None:
+            sections.append((current_path, current_is_array, current_lines))
+            current_path, current_is_array = parsed
+            current_lines = [line]
+        else:
+            current_lines.append(line)
+
+        bracket_depth = _update_bracket_depth(line, bracket_depth)
+
+    sections.append((current_path, current_is_array, current_lines))
+
+    out_lines: list[str] = []
+    for path, _is_arr, sec_lines in sections:
+        if path is None:
+            out_lines.extend(sec_lines)
+            continue
+
+        if len(path) >= 2 and path[0] == "mcp_servers" and path[1] in server_names_to_reconcile:
+            continue
+
+        if len(path) == 1 and path[0] == "mcp_servers":
+            body_lines = sec_lines[1:]
+            has_content = any(
+                bool(l.strip() and not l.strip().startswith("#"))
+                for l in body_lines
+            )
+            if not has_content:
+                continue
+            else:
+                out_lines.extend(sec_lines)
+                continue
+
+        if strip_plugins and len(path) >= 1 and path[0] == "plugins":
+            if len(path) >= 2:
+                continue
+            else:
+                body_lines = sec_lines[1:]
+                has_content = any(
+                    bool(l.strip() and not l.strip().startswith("#"))
+                    for l in body_lines
+                )
+                if not has_content:
+                    continue
+                else:
+                    out_lines.extend(sec_lines)
+                    continue
+
+        out_lines.extend(sec_lines)
+
+    return "".join(out_lines)
+
+
 def _strip_unmanaged_plugin_tables(toml_text: str) -> str:
     """Remove ``[plugins."<name>@<marketplace>"]`` tables that live OUTSIDE the
-    managed block.
-
-    Codex itself writes these tables when the user runs ``codex plugins enable``
-    directly (i.e. before Hermes' migrate has ever touched the file). When we
-    later run migrate, ``_query_codex_plugins()`` reports the same plugins via
-    the live ``plugin/list`` RPC and we re-emit them inside the managed block.
-    The result without this strip is duplicate ``[plugins."X@Y"]`` table
-    headers — codex's strict TOML parser then refuses to load the file.
-
-    We own the ``[plugins.*]`` namespace once migrate has run, so dropping any
-    pre-existing ``[plugins.*]`` tables is safe: ``plugin/list`` is the source
-    of truth for what's actually installed. The caller is expected to only
-    invoke this strip when ``plugin/list`` succeeded — otherwise we'd lose
-    plugins the user installed via ``codex`` without a way to re-emit them.
-
-    Behavior:
-      * Lines beginning with ``[plugins.`` start a swallow region that ends at
-        the next non-``[plugins.`` table header or end-of-file.
-      * Content inside the managed block is untouched (callers should run
-        ``_strip_existing_managed_block`` first so the managed block has
-        already been removed when this runs).
-    """
-    lines = toml_text.splitlines(keepends=True)
-    out: list[str] = []
-    in_plugin_table = False
-    for line in lines:
-        stripped = line.lstrip()
-        # Only treat a line as a table header when it has the shape
-        # ``[...]`` (optionally followed by a comment). Multi-line array
-        # continuations like ``["nested"],`` also start with ``[`` after
-        # lstrip but are not headers — without this guard they would
-        # falsely flip ``in_plugin_table`` to False mid-table and leak
-        # array fragments into the output.
-        if _looks_like_table_header(stripped):
-            in_plugin_table = stripped.startswith("[plugins.")
-            if in_plugin_table:
-                continue
-        if in_plugin_table:
-            # Swallow keys/comments/blanks until the next table header.
-            continue
-        out.append(line)
-    return "".join(out)
-
-
-def _looks_like_table_header(stripped_line: str) -> bool:
-    """Return True if ``stripped_line`` is a TOML table header.
-
-    A header has the shape ``[name]`` or ``[[name]]`` (array-of-tables),
-    optionally followed by a comment. The closing ``]`` (or ``]]``) must
-    appear on the same line, and no key-assignment ``=`` can precede it.
-    This distinguishes real headers from multi-line array continuation
-    lines that also start with ``[`` after ``lstrip()``.
-    """
-    if not stripped_line.startswith("["):
-        return False
-    # Drop trailing comment so e.g. ``[features]  # note`` still matches.
-    head = stripped_line.split("#", 1)[0].rstrip()
-    if not head.endswith("]"):
-        return False
-    # ``key = [x]`` would have an ``=`` before the bracket; a header doesn't.
-    bracket_idx = head.index("]")
-    return "=" not in head[: bracket_idx + 1]
+    managed block."""
+    return _reconcile_unmanaged_tables(toml_text, set(), strip_plugins=True)
 
 
 def _strip_existing_managed_block(toml_text: str) -> str:
@@ -614,6 +885,7 @@ def migrate(
     discover_plugins: bool = True,
     default_permission_profile: Optional[str] = ":workspace",
     expose_hermes_tools: bool = True,
+    conflict_policy: str = "replace_with_managed",
 ) -> MigrationReport:
     """Translate Hermes mcp_servers config + Codex curated plugins into
     ~/.codex/config.toml.
@@ -640,11 +912,22 @@ def migrate(
             memory, skills, etc.) as an MCP server in ~/.codex/config.toml
             so the codex subprocess can call back into Hermes for tools
             codex doesn't have built in. Set False to opt out.
+        conflict_policy: "replace_with_managed" (default) to cleanly replace
+            conflicting unmanaged tables with Hermes-managed ones, or
+            "preserve_user" to retain user-owned definitions outside the
+            managed block.
     """
     report = MigrationReport(dry_run=dry_run)
     codex_home = codex_home or Path.home() / ".codex"
     target = codex_home / "config.toml"
     report.target_path = target
+
+    if conflict_policy not in {"replace_with_managed", "preserve_user"}:
+        report.errors.append(
+            f"unrecognized conflict_policy {conflict_policy!r}; "
+            f"expected 'replace_with_managed' or 'preserve_user'"
+        )
+        return report
 
     hermes_servers = (hermes_config or {}).get("mcp_servers") or {}
     if not isinstance(hermes_servers, dict):
@@ -698,32 +981,59 @@ def migrate(
         if "hermes-tools" not in report.migrated:
             report.migrated.append("hermes-tools")
 
-    # Build the new managed block
-    managed_block = render_codex_toml_section(
-        translated, plugins=plugins,
-        default_permission_profile=default_permission_profile,
-    )
-
     # Read existing codex config if any, strip the prior managed block,
-    # append the new one.
+    # reconcile unmanaged conflicting tables, append the new managed block.
     if target.exists():
         try:
             existing = target.read_text(encoding="utf-8")
         except Exception as exc:
             report.errors.append(f"could not read {target}: {exc}")
             return report
+
         without_managed = _strip_existing_managed_block(existing)
-        # Bug B: when plugin/list ran authoritatively, codex's own
-        # [plugins."<name>@<marketplace>"] tables outside our managed block
-        # would survive _strip_existing_managed_block and then collide with
-        # the entries we re-emit inside the managed block — producing
-        # duplicate-table-header parse errors on codex's next startup. Drop
-        # those pre-existing tables since plugin/list is the source of truth.
-        if plugin_query_succeeded:
-            without_managed = _strip_unmanaged_plugin_tables(without_managed)
-        new_text = _insert_managed_block_at_top_level(without_managed, managed_block)
+        unmanaged_servers = _find_unmanaged_mcp_servers(without_managed)
+
+        if conflict_policy == "preserve_user":
+            for name in list(translated.keys()):
+                if name in unmanaged_servers:
+                    translated.pop(name, None)
+                    report.preserved_user_servers.append(name)
+            servers_to_reconcile = set(translated.keys())
+        else:
+            for name in translated:
+                if name in unmanaged_servers:
+                    report.reconciled_user_servers.append(name)
+            servers_to_reconcile = set(translated.keys())
+
+        # Strip user-owned [mcp_servers.*] tables for servers we are emitting
+        # in the managed block, as well as [plugins.*] tables if plugin query succeeded.
+        reconciled = _reconcile_unmanaged_tables(
+            without_managed,
+            servers_to_reconcile,
+            strip_plugins=plugin_query_succeeded,
+        )
+
+        managed_block = render_codex_toml_section(
+            translated,
+            plugins=plugins,
+            default_permission_profile=default_permission_profile,
+        )
+        new_text = _insert_managed_block_at_top_level(reconciled, managed_block)
     else:
+        managed_block = render_codex_toml_section(
+            translated,
+            plugins=plugins,
+            default_permission_profile=default_permission_profile,
+        )
         new_text = managed_block
+
+    # Pre-write validation guard: ensure generated text is strictly valid TOML
+    if tomllib is not None:
+        try:
+            tomllib.loads(new_text)
+        except Exception as exc:
+            report.errors.append(f"generated TOML failed syntax validation: {exc}")
+            return report
 
     if dry_run:
         return report
@@ -755,3 +1065,25 @@ def migrate(
     except Exception as exc:
         report.errors.append(f"could not write {target}: {exc}")
     return report
+
+
+def migrate_codex_config(
+    hermes_config: dict,
+    *,
+    codex_home: Optional[Path] = None,
+    dry_run: bool = False,
+    discover_plugins: bool = True,
+    default_permission_profile: Optional[str] = ":workspace",
+    expose_hermes_tools: bool = True,
+    conflict_policy: str = "replace_with_managed",
+) -> MigrationReport:
+    """Public helper for noninteractive migration invocations."""
+    return migrate(
+        hermes_config=hermes_config,
+        codex_home=codex_home,
+        dry_run=dry_run,
+        discover_plugins=discover_plugins,
+        default_permission_profile=default_permission_profile,
+        expose_hermes_tools=expose_hermes_tools,
+        conflict_policy=conflict_policy,
+    )
