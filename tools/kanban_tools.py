@@ -1116,12 +1116,21 @@ def _handle_comment(args: dict, **kw) -> str:
 
 
 def _handle_attach(args: dict, **kw) -> str:
-    """Attach an inline (base64) file to a task.
+    """Attach a file to a task, from a local path or inline base64.
 
-    Mirrors the dashboard's upload endpoint for the agent surface: decode
-    the payload, enforce the shared size cap, write it under the per-task
+    Mirrors the dashboard's upload endpoint for the agent surface: read the
+    bytes, enforce the shared size cap, write them under the per-task
     attachments dir, and record the metadata row — all via
     ``kanban_db.store_attachment_bytes`` so the three surfaces stay in lockstep.
+
+    ``source_path`` exists because base64 was the only accepted source, and
+    that makes the tool unusable for anything but small files: the agent has
+    to emit the whole encoded payload inside one response, so a ~7.5 KB
+    report becomes ~10 KB of base64 and hits the output-token limit. The
+    length-continuation retries then re-emit the same payload and truncate
+    again, and the turn is abandoned with a partial attachment written. The
+    CLI (``hermes kanban attach <task> <path>``) has always taken a path;
+    this closes the gap between the two surfaces.
     """
     from hermes_cli import kanban_db as kb
 
@@ -1137,17 +1146,55 @@ def _handle_attach(args: dict, **kw) -> str:
     if ownership_err:
         return ownership_err
     filename = args.get("filename")
+    if (not filename or not str(filename).strip()) and args.get("source_path"):
+        import os as _os
+
+        filename = _os.path.basename(str(args["source_path"]).rstrip("/\\"))
     if not filename or not str(filename).strip():
         return tool_error("filename is required")
     content_b64 = args.get("content_base64")
-    if not content_b64 or not str(content_b64).strip():
-        return tool_error("content_base64 is required")
-    import base64
-    import binascii
-    try:
-        data = base64.b64decode(str(content_b64), validate=True)
-    except (binascii.Error, ValueError) as e:
-        return tool_error(f"content_base64 is not valid base64: {e}")
+    source_path = args.get("source_path")
+    has_b64 = bool(content_b64 and str(content_b64).strip())
+    has_path = bool(source_path and str(source_path).strip())
+    if has_b64 and has_path:
+        return tool_error(
+            "pass either source_path or content_base64, not both"
+        )
+    if not has_b64 and not has_path:
+        return tool_error("source_path or content_base64 is required")
+
+    if has_path:
+        # Read locally rather than making the model carry the bytes. Size is
+        # checked here as well as in store_attachment_bytes so an oversized
+        # file is rejected before it is read into memory.
+        import os
+
+        raw_path = os.path.expanduser(str(source_path))
+        if not os.path.isabs(raw_path):
+            raw_path = os.path.abspath(raw_path)
+        if not os.path.isfile(raw_path):
+            return tool_error(f"source_path is not a file: {source_path}")
+        try:
+            actual = os.path.getsize(raw_path)
+        except OSError as e:
+            return tool_error(f"cannot stat source_path: {e}")
+        if actual > kb.KANBAN_ATTACHMENT_MAX_BYTES:
+            return tool_error(
+                f"source_path is {actual} bytes, over the "
+                f"{kb.KANBAN_ATTACHMENT_MAX_BYTES}-byte attachment cap"
+            )
+        try:
+            with open(raw_path, "rb") as fh:
+                data = fh.read()
+        except OSError as e:
+            return tool_error(f"cannot read source_path: {e}")
+    else:
+        import base64
+        import binascii
+        try:
+            data = base64.b64decode(str(content_b64), validate=True)
+        except (binascii.Error, ValueError) as e:
+            return tool_error(f"content_base64 is not valid base64: {e}")
     content_type = args.get("content_type")
     board = args.get("board")
     try:
@@ -2036,11 +2083,14 @@ KANBAN_COMMENT_SCHEMA = {
 KANBAN_ATTACH_SCHEMA = {
     "name": "kanban_attach",
     "description": (
-        "Attach a file to a task by passing its bytes inline (base64). "
+        "Attach a file to a task — pass source_path for a file already on "
+        "disk (preferred), or content_base64 to supply the bytes inline. "
         "Use for genuine file artifacts the next worker or a human should "
         "be able to download — generated reports, images, exports. The "
         "file is stored as a real attachment (not a comment link) under "
-        "the task's attachments dir, capped at 25 MB. Prefer "
+        "the task's attachments dir, capped at 25 MB. Write the file out "
+        "first and pass its path: base64 has to travel inside one model "
+        "response, so it only works for very small files. Prefer "
         "kanban_attach_url when you only have a URL."
     ),
     "parameters": {
@@ -2057,9 +2107,23 @@ KANBAN_ATTACH_SCHEMA = {
                     "Directory components are stripped; only the leaf is kept."
                 ),
             },
+            "source_path": {
+                "type": "string",
+                "description": (
+                    "Path to a local file to attach. Preferred over "
+                    "content_base64: Hermes reads the bytes itself, so the "
+                    "payload never has to fit in one model response. If "
+                    "filename is omitted it defaults to this path's leaf."
+                ),
+            },
             "content_base64": {
                 "type": "string",
-                "description": "The file contents, base64-encoded. Max 25 MB decoded.",
+                "description": (
+                    "The file contents, base64-encoded. Max 25 MB decoded. "
+                    "Use source_path instead when the file is on disk — "
+                    "anything more than a few KB will not fit in one "
+                    "response once encoded."
+                ),
             },
             "content_type": {
                 "type": "string",
@@ -2067,7 +2131,7 @@ KANBAN_ATTACH_SCHEMA = {
             },
             "board": _board_schema_prop(),
         },
-        "required": ["filename", "content_base64"],
+        "required": [],
     },
 }
 

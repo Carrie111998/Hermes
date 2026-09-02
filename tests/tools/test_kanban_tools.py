@@ -996,6 +996,124 @@ def allow_private_urls(monkeypatch):
     url_safety._reset_allow_private_cache()
 
 
+def test_attach_from_source_path(worker_env, tmp_path):
+    """A file on disk is attached by path — the bytes never travel through
+    the model. This is the case base64 could not serve: a report only a few
+    KB long becomes an oversized single response once encoded."""
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+
+    src = tmp_path / "report.md"
+    payload = ("# Report" + os.linesep + "x" * 7500).encode()
+    src.write_bytes(payload)
+
+    out = kt._handle_attach({"source_path": str(src)})
+    d = json.loads(out)
+    assert d.get("ok") is True, d
+    assert d["size"] == len(payload)
+
+    conn = kb.connect()
+    try:
+        rows = kb.list_attachments(conn, worker_env)
+    finally:
+        conn.close()
+    assert len(rows) == 1
+    row = rows[0]
+    # filename defaults to the path's leaf when not supplied
+    assert row.filename == "report.md"
+    # stored bytes are identical to the source, not a re-encode
+    with open(row.stored_path, "rb") as fh:
+        assert fh.read() == payload
+
+
+def test_attach_source_path_explicit_filename_wins(worker_env, tmp_path):
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+
+    src = tmp_path / "scratch-name.md"
+    src.write_bytes(b"body")
+    out = kt._handle_attach({"source_path": str(src), "filename": "final.md"})
+    assert json.loads(out).get("ok") is True
+
+    conn = kb.connect()
+    try:
+        rows = kb.list_attachments(conn, worker_env)
+    finally:
+        conn.close()
+    assert rows[0].filename == "final.md"
+
+
+def test_attach_rejects_both_sources(worker_env, tmp_path):
+    """Supplying both is a caller bug, not something to resolve silently."""
+    import base64
+
+    from tools import kanban_tools as kt
+
+    src = tmp_path / "a.md"
+    src.write_bytes(b"body")
+    out = kt._handle_attach({
+        "source_path": str(src),
+        "content_base64": base64.b64encode(b"other").decode(),
+    })
+    d = json.loads(out)
+    assert "error" in d
+    assert "not both" in d["error"]
+
+
+def test_attach_requires_a_source(worker_env):
+    from tools import kanban_tools as kt
+
+    d = json.loads(kt._handle_attach({"filename": "a.md"}))
+    assert "error" in d
+    assert "source_path or content_base64" in d["error"]
+
+
+def test_attach_source_path_must_be_a_file(worker_env, tmp_path):
+    """A missing path and a directory both fail the same way — neither can
+    produce bytes, and the message names the offending value."""
+    from tools import kanban_tools as kt
+
+    missing = json.loads(
+        kt._handle_attach({"source_path": str(tmp_path / "nope.md")})
+    )
+    assert "error" in missing and "not a file" in missing["error"]
+
+    a_dir = json.loads(kt._handle_attach({"source_path": str(tmp_path)}))
+    assert "error" in a_dir and "not a file" in a_dir["error"]
+
+
+def test_attach_source_path_over_cap_is_rejected_before_read(
+    worker_env, tmp_path, monkeypatch
+):
+    """Size is checked from the stat, so an oversized file is refused without
+    being read into memory."""
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+
+    monkeypatch.setattr(kb, "KANBAN_ATTACHMENT_MAX_BYTES", 16)
+    src = tmp_path / "big.bin"
+    src.write_bytes(b"z" * 64)
+
+    d = json.loads(kt._handle_attach({"source_path": str(src)}))
+    assert "error" in d
+    assert "cap" in d["error"]
+
+
+def test_attach_base64_still_works(worker_env):
+    """The inline path stays supported — existing callers must not break."""
+    import base64
+
+    from tools import kanban_tools as kt
+
+    out = kt._handle_attach({
+        "filename": "small.txt",
+        "content_base64": base64.b64encode(b"hello").decode(),
+    })
+    d = json.loads(out)
+    assert d.get("ok") is True
+    assert d["size"] == 5
+
+
 def test_attach_url_rejects_non_http_scheme(worker_env):
     from tools import kanban_tools as kt
 
