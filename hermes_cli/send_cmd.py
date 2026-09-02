@@ -375,15 +375,36 @@ def cmd_send(args: argparse.Namespace) -> None:
     # encrypted Matrix must never construct a second crypto machine in this
     # CLI process, and a raw Client-Server API request would be plaintext.
     try:
-        from gateway.control_socket import query_gateway_control
+        from gateway.control_socket import (
+            query_gateway_control,
+            resolve_client_socket_path,
+        )
         from hermes_constants import get_hermes_home
 
-        live_result = query_gateway_control(
-            get_hermes_home(),
-            "send-message",
-            payload={"target": target, "message": message},
-            timeout=40.0,
+        gateway_home = get_hermes_home()
+        is_matrix_target = target.split(":", 1)[0].strip().lower() == "matrix"
+        gateway_socket_present = (
+            is_matrix_target
+            and resolve_client_socket_path(gateway_home) is not None
         )
+        if gateway_socket_present:
+            live_result = query_gateway_control(
+                gateway_home,
+                "send-message",
+                payload={"target": target, "message": message},
+                timeout=40.0,
+            )
+            if live_result is None:
+                # The request may already have been accepted. Never retry an
+                # ambiguous Matrix send through a second transport/process.
+                live_result = {
+                    "error": (
+                        "Running gateway did not confirm the Matrix send; "
+                        "refusing an unsafe standalone retry"
+                    )
+                }
+        else:
+            live_result = None
     except Exception:
         live_result = None
     if live_result is not None:
