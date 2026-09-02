@@ -2659,6 +2659,11 @@ DEFAULT_CONFIG = {
         # modal; HERMES_TUI_NO_CONFIRM=1 force-skips that modal regardless of
         # the configured value.
         "destructive_slash_confirm": True,
+        # Agent-tool calls that change model routing require confirmation even
+        # when approvals.mode is off. Direct human CLI writes do not traverse
+        # the agent-tool approval boundary; an explicitly user-directed agent
+        # write marks that intent with ``hermes config set --yes``.
+        "model_config_confirm": True,
     },
 
     # Permanently allowed dangerous command patterns (added via "always" approval)

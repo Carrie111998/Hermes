@@ -23,13 +23,83 @@ import threading
 import time
 import unicodedata
 import uuid
-from typing import Optional
+from typing import NamedTuple, Optional
 from hermes_cli.config import cfg_get
 
 from tools.interrupt import is_interrupted
 from utils import env_var_enabled, is_truthy_value
 
 logger = logging.getLogger(__name__)
+
+
+class ModelConfigChange(NamedTuple):
+    """A direct ``hermes config set`` targeting model routing."""
+
+    key: str
+    user_directed: bool
+
+
+_MODEL_CONFIG_PATTERN_KEY = "agent:model-routing-config"
+_MODEL_CONFIG_LEAF_KEYS = {"model", "provider", "base_url"}
+
+
+def _is_model_routing_key(key: str) -> bool:
+    normalized = key.strip().lower()
+    if normalized == "model" or normalized.startswith("model."):
+        return True
+    if normalized in {"delegation.model", "delegation.provider"}:
+        return True
+    parts = normalized.split(".")
+    return (
+        len(parts) >= 3
+        and parts[0] == "auxiliary"
+        and parts[-1] in _MODEL_CONFIG_LEAF_KEYS
+    )
+
+
+def detect_model_config_change(command: str) -> ModelConfigChange | None:
+    """Recognize direct agent invocations that alter model routing.
+
+    Human terminal invocations never pass through this agent-tool guard.
+    ``--yes`` marks a change explicitly directed by the user in the current
+    conversation.
+    """
+    if not isinstance(command, str) or not command.strip():
+        return None
+    for word_start, _, raw_word in _iter_shell_command_word_spans(command):
+        executable = os.path.basename(
+            _deobfuscate_shell_word_for_detection(raw_word)
+        ).lower()
+        if executable not in {"hermes", "hermes.exe"}:
+            continue
+        try:
+            words = shlex.split(command[word_start:], posix=os.name != "nt")
+        except ValueError:
+            continue
+        try:
+            config_index = words.index("config", 1)
+        except ValueError:
+            continue
+        if config_index + 1 >= len(words):
+            continue
+        action = words[config_index + 1]
+        if action not in {"set", "unset"}:
+            continue
+
+        set_args = words[config_index + 2 :]
+        user_directed = "--yes" in set_args
+        positionals = [
+            word for word in set_args if word not in {"--force", "--yes"}
+        ]
+        required_positionals = 2 if action == "set" else 1
+        if (
+            len(positionals) >= required_positionals
+            and _is_model_routing_key(positionals[0])
+        ):
+            return ModelConfigChange(
+                positionals[0].strip().lower(), user_directed
+            )
+    return None
 
 # Freeze YOLO mode at module import time. Reading os.environ on every call
 # would allow any skill running inside the process to set this variable and
@@ -3463,6 +3533,38 @@ def _get_approval_mode() -> str:
     return _normalize_approval_mode(mode)
 
 
+def _model_config_confirmation_enabled() -> bool:
+    """Return the independent model-routing confirmation policy."""
+    return is_truthy_value(
+        _get_approval_config().get("model_config_confirm", True)
+    )
+
+
+def _apply_warning_approval_choice(
+    choice: str,
+    warnings: list[tuple[str, str, bool]],
+    session_key: str,
+) -> None:
+    """Persist the scope selected for a combined command warning."""
+    for key, _, is_tirith in warnings:
+        if choice == "session" or (choice == "always" and is_tirith):
+            approve_session(session_key, key)
+        elif choice == "always" and key == _MODEL_CONFIG_PATTERN_KEY:
+            approve_session(session_key, key)
+            try:
+                from hermes_cli.config import set_config_value
+
+                set_config_value("approvals.model_config_confirm", "false")
+            except (Exception, SystemExit) as exc:
+                logger.warning(
+                    "Failed to persist model-config confirmation opt-out: %s", exc
+                )
+        elif choice == "always":
+            approve_session(session_key, key)
+            approve_permanent(key)
+            save_permanent_allowlist(_permanent_approved)
+
+
 def is_approval_bypass_active_for_session(session_key: str) -> bool:
     """Return whether one exact session bypasses Hermes approval prompts.
 
@@ -4775,13 +4877,25 @@ def check_all_command_guards(command: str, env_type: str,
                        deny_pattern, command[:200])
         return _user_deny_block_result(deny_pattern)
 
-    # --yolo or approvals.mode=off: bypass all approval prompts.
+    model_config_change = detect_model_config_change(command)
+    model_config_guard = bool(
+        model_config_change
+        and not model_config_change.user_directed
+        and _model_config_confirmation_enabled()
+    )
+
+    # --yolo or approvals.mode=off: bypass ordinary approval prompts. The
+    # model-routing gate is independent because these writes affect every
+    # subsequent agent/subagent request and its billing route.
     # Gateway /yolo is session-scoped; CLI --yolo remains process-scoped.
     approval_mode = _get_approval_mode()
-    if _YOLO_MODE_FROZEN or is_current_session_yolo_enabled() or approval_mode == "off":
+    if (
+        not model_config_guard
+        and (_YOLO_MODE_FROZEN or is_current_session_yolo_enabled() or approval_mode == "off")
+    ):
         return {"approved": True, "message": None}
 
-    if _command_matches_permanent_allowlist(command):
+    if not model_config_guard and _command_matches_permanent_allowlist(command):
         return {"approved": True, "message": None}
 
     approval_callback = _resolve_cli_approval_callback(approval_callback)
@@ -4803,6 +4917,21 @@ def check_all_command_guards(command: str, env_type: str,
     # Preserve the existing non-interactive behavior: outside CLI/gateway/ask
     # flows, we do not block on approvals and we skip external guard work.
     if not is_cli and not is_gateway and not is_ask:
+        if model_config_guard:
+            return {
+                "approved": False,
+                "message": (
+                    "BLOCKED: An agent-originated model-routing config change "
+                    "requires user confirmation, but no interactive approval "
+                    "surface is available. If the user explicitly requested this "
+                    "exact change, retry with `hermes config set --yes ...`."
+                ),
+                "pattern_key": _MODEL_CONFIG_PATTERN_KEY,
+                "description": (
+                    f"Agent requested a model-routing config change to "
+                    f"{model_config_change.key}"
+                ),
+            }
         # Single-query (-q) sessions: respect single_query_mode config
         if _is_single_query_approval_context():
             if _get_single_query_approval_mode() == "deny":
@@ -5042,6 +5171,13 @@ def check_all_command_guards(command: str, env_type: str,
 
     # Dangerous command check (detection only, no approval)
     is_dangerous, pattern_key, description = detect_dangerous_command(command)
+    if model_config_guard:
+        is_dangerous = True
+        pattern_key = _MODEL_CONFIG_PATTERN_KEY
+        description = (
+            f"Agent requested a model-routing config change to "
+            f"{model_config_change.key}"
+        )
 
     # --- Phase 2: Decide ---
 
@@ -5075,7 +5211,7 @@ def check_all_command_guards(command: str, env_type: str,
     # Inspired by OpenAI Codex's Smart Approvals guardian subagent
     # (openai/codex#13860).
     smart_denied_for_owner = False
-    if approval_mode == "smart":
+    if approval_mode == "smart" and not model_config_guard:
         combined_desc_for_llm = "; ".join(desc for _, desc, _ in warnings)
         observer_payload = _prepare_smart_approval_observer(
             command=command,
@@ -5178,15 +5314,9 @@ def check_all_command_guards(command: str, env_type: str,
                     "user_consent": False,
                 }
             if not smart_denied_for_owner:
-                for key, _, is_tirith in warnings:
-                    if transport_choice == "session" or (
-                        transport_choice == "always" and is_tirith
-                    ):
-                        approve_session(session_key, key)
-                    elif transport_choice == "always":
-                        approve_session(session_key, key)
-                        approve_permanent(key)
-                        save_permanent_allowlist(_permanent_approved)
+                _apply_warning_approval_choice(
+                    transport_choice, warnings, session_key
+                )
             _reset_denials(session_key)
             return {
                 "approved": True,
@@ -5294,13 +5424,7 @@ def check_all_command_guards(command: str, env_type: str,
             # older client returns "session" or "always". Manual and ESCALATE
             # choices retain their existing persistence semantics.
             if not smart_denied_for_owner:
-                for key, _, is_tirith in warnings:
-                    if choice == "session" or (choice == "always" and is_tirith):
-                        approve_session(session_key, key)
-                    elif choice == "always":
-                        approve_session(session_key, key)
-                        approve_permanent(key)
-                        save_permanent_allowlist(_permanent_approved)
+                _apply_warning_approval_choice(choice, warnings, session_key)
 
             # A human approval (including an ESCALATE-then-approve or a
             # smart-DENY owner override) resets the consecutive-denial tally.
@@ -5421,15 +5545,7 @@ def check_all_command_guards(command: str, env_type: str,
     # Smart-DENY owner overrides are one-operation scoped. Preserve existing
     # persistence for manual mode and smart ESCALATE.
     if not smart_denied_for_owner:
-        for key, _, is_tirith in warnings:
-            if choice == "session" or (choice == "always" and is_tirith):
-                # tirith: session only (no permanent broad allowlisting)
-                approve_session(session_key, key)
-            elif choice == "always":
-                # dangerous patterns: permanent allowed
-                approve_session(session_key, key)
-                approve_permanent(key)
-                save_permanent_allowlist(_permanent_approved)
+        _apply_warning_approval_choice(choice, warnings, session_key)
 
     # A human approval resets the consecutive-denial tally.
     _reset_denials(session_key)

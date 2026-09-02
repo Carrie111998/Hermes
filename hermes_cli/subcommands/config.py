@@ -46,12 +46,22 @@ def build_config_parser(subparsers, *, cmd_config: Callable) -> None:
         help="Skip the unknown-key notice printed after writing a key the "
         "running version doesn't recognize (the value is saved either way).",
     )
+    config_set.add_argument(
+        "--yes",
+        action="store_true",
+        help="Mark an agent-run model-routing change as explicitly user-directed",
+    )
 
     # config unset
     config_unset = config_subparsers.add_parser(
         "unset", help="Remove a configuration value"
     )
     config_unset.add_argument("key", nargs="?", help="Configuration key to remove")
+    config_unset.add_argument(
+        "--yes",
+        action="store_true",
+        help="Mark an agent-run model-routing change as explicitly user-directed",
+    )
 
     # config path
     config_subparsers.add_parser("path", help="Print config file path")

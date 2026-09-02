@@ -357,6 +357,7 @@ def _reset_cached_sudo_passwords() -> None:
 # Dangerous command detection + approval now consolidated in tools/approval.py
 from tools.approval import (
     check_all_command_guards as _check_all_guards_impl,
+    detect_model_config_change,
 )
 
 
@@ -1134,6 +1135,8 @@ TERMINAL_TOOL_DESCRIPTION = """Execute shell commands. The host OS, shell, and t
 
 Do NOT use cat/head/tail (use read_file), grep/rg/find/ls (use search_files), sed/awk (use patch), or echo/heredoc file creation (use write_file). Reserve terminal for: builds, installs, git, processes, scripts, network, package managers — anything that needs a shell. Output is auto-truncated with the full text saved to a file — never pipe through tail/head to shorten it.
 Environment state persists: activate a virtualenv or export variables once per session, not before every command.
+
+Never silently rewrite model-routing config. For `model.*`, `delegation.model`, `delegation.provider`, or auxiliary model/provider/base-URL changes, use `hermes config set --yes ...` / `config unset --yes ...` only when the user explicitly directed that exact change; otherwise omit `--yes` so Hermes asks for confirmation. Always report the persisted change.
 
 Foreground (default): returns INSTANTLY when the command finishes, even with a high timeout — set timeout generously for long builds.
 Background: set background=true (returns a session_id); add notify=true for bounded tasks, leave silent only for servers/daemons that never exit. After starting a server, verify readiness with a health check in a separate call (no blind sleep loops); manage with process(action="poll"/"wait").
@@ -3270,6 +3273,7 @@ def terminal_tool(
         # Pre-exec security checks (tirith + dangerous command detection)
         # Skip check if force=True (user has confirmed they want to run it)
         approval_note = None
+        model_config_change = detect_model_config_change(command)
         # True when the user explicitly approved this run (or pre-confirmed via
         # force).  Drives the clean-interrupt-slate clear before env.execute so
         # an approved command can't be SIGINT-killed by a bit that landed during
@@ -3374,6 +3378,11 @@ def terminal_tool(
                 # cannot occur here and this note never co-occurs with rc=130.
                 if approval_note:
                     result_data["approval"] = approval_note
+                if model_config_change:
+                    result_data["notice"] = (
+                        "⚠ Agent started a model-routing config change: "
+                        f"{model_config_change.key}."
+                    )
                 if pty_disabled_reason:
                     result_data["pty_note"] = pty_disabled_reason
 
@@ -3887,6 +3896,17 @@ def terminal_tool(
                     result_dict["approval"] = approval_note.rstrip(".") + ", then interrupted."
                 else:
                     result_dict["approval"] = approval_note
+            if model_config_change and returncode == 0:
+                notice = (
+                    "⚠ Agent changed model-routing config: "
+                    f"{model_config_change.key}."
+                )
+                result_dict["notice"] = notice
+                result_dict["output"] = (
+                    f"{notice}\n{result_dict['output']}"
+                    if result_dict["output"]
+                    else notice
+                )
             if exit_note:
                 result_dict["exit_code_meaning"] = exit_note
             if failure_hint:
