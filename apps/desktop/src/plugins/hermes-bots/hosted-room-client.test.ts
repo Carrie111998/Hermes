@@ -58,7 +58,7 @@ describe('hosted Group Chat capability negotiation', () => {
         driver: true,
         persistent_process: true,
         authority_gateway_id: 'install:home',
-        features: ['peer_route_grant_fingerprint'],
+        features: ['peer_route_grant_fingerprint', 'reciprocal_room_control'],
         methods: ['groups.peer.revoke_exact'],
         max_log_limit: 250
       },
@@ -79,6 +79,7 @@ describe('hosted Group Chat capability negotiation', () => {
       exactPeerGrantRevoke: true,
       persistentProcess: true,
       routeGrantFingerprint: true,
+      reciprocalControl: true,
       maxLogLimit: 250
     })
     expect(isHostedRoomContinuityEligible(capable)).toBe(true)

@@ -480,6 +480,26 @@ describe('gateway mirror', () => {
     expect(Object.keys(snapshot.rooms)).toEqual([])
   })
 
+  it('publishes a newly created silent room so messaging clients can discover it', async () => {
+    const { chat } = await loadRoom()
+
+    const snapshot = chat.groupChatSyncSnapshot({
+      Planning: {
+        desktopAuthorityHash: 'a'.repeat(64),
+        log: [],
+        members: [{ name: 'research' }, { name: 'builder' }],
+        roomId: 'room-planning',
+        watermarks: {}
+      }
+    })
+
+    expect(snapshot.rooms['id:room-planning']).toMatchObject({
+      desktopAuthorityHash: 'a'.repeat(64),
+      name: 'Planning',
+      roomId: 'room-planning'
+    })
+  })
+
   it('an empty hydrate cannot erase a shared room mirror', async () => {
     const room = await loadRoom()
     const before = room.gateway.rpc.length
