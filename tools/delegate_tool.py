@@ -4171,15 +4171,57 @@ def delegate_task(
     from gateway.session_context import current_run_binding
 
     _bound_run_binding = current_run_binding()
+    _gateway_server = None
     try:
         from tui_gateway import server as _gateway_server
         from tui_gateway.transport import current_transport as _current_transport
 
-        _live_session_record = _gateway_server._current_runtime_session_record.get()
-        _live_transport = _current_transport()
+        _context_session_record = _gateway_server._current_runtime_session_record.get()
+        _context_transport = _current_transport()
     except Exception:
-        _live_session_record = None
-        _live_transport = None
+        _context_session_record = None
+        _context_transport = None
+
+    _live_session_record = _context_session_record
+    _live_transport = _context_transport
+    if _bound_run_binding is not None:
+        # The ContextVar is only the turn's captured expectation. Resolve the
+        # public UI id against the live registry under its existing authority
+        # helper so a replaced or rebound row cannot pass on stale context.
+        if _gateway_server is None:
+            return tool_error(
+                "Delegation refused: the live UI session authority is unavailable."
+            )
+        _authority = _gateway_server._current_session_steer_authority(
+            _bound_run_binding.ui_session_id
+        )
+        _authority_transport, _authority_record = _authority
+        if (
+            _authority_record is None
+            or _authority_record is not _context_session_record
+            or _authority_transport is not _context_transport
+        ):
+            return tool_error(
+                "Delegation refused: the live UI session was replaced or "
+                "rebound after this turn was bound. Start a new conversation turn."
+            )
+        _live_session_record = _authority_record
+        _live_transport = _authority_transport
+    elif _context_session_record is not None and _gateway_server is not None:
+        # Lazy capture still needs registry admission. There is no UI id in the
+        # ContextVar before the first delegation, so resolve the exact record
+        # and transport by identity under the same registry lock.
+        with _gateway_server._sessions_lock:
+            _registered = any(
+                record is _context_session_record
+                and record.get("transport") is _context_transport
+                for record in list(_gateway_server._sessions.values())
+            )
+        if not _registered:
+            return tool_error(
+                "Delegation refused: the originating live UI session is no "
+                "longer registered. Start a new conversation turn."
+            )
 
     if _bound_run_binding is not None or _live_session_record is not None:
         if _live_session_record is None:
