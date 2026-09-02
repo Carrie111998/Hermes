@@ -196,6 +196,12 @@ def _run_async(coro):
         try:
             return future.result(timeout=300)
         except concurrent.futures.TimeoutError:
+            # Hardcore fix per holny review: shared pool retains wedged worker.
+            # Evict the pool so 4 stuck threads don't deadlock the gateway.
+            try:
+                _evict_tool_thread_pool()
+            except Exception:
+                pass
             # Cancel the coroutine inside its own loop so the worker thread
             # can wind down instead of running forever.
             if loop_ready.wait(timeout=1.0) and worker_loop is not None:
@@ -206,11 +212,6 @@ def _run_async(coro):
                     # Loop already closed — nothing to cancel.
                     pass
             raise
-        finally:
-            # wait=False: don't block the caller on a stuck coroutine. We've
-            # already requested cancellation above; the worker will exit
-            # once the coroutine observes it (usually at the next await).
-            pool.shutdown(wait=False)
 
     # If we're on a worker thread (e.g., parallel tool execution in
     # delegate_task), use a per-thread persistent loop.  This avoids
@@ -233,12 +234,31 @@ def _run_async(coro):
 _tool_thread_pool = None
 _tool_thread_pool_lock = threading.Lock()
 
+
 def _get_tool_thread_pool():
     global _tool_thread_pool
     with _tool_thread_pool_lock:
         if _tool_thread_pool is None or getattr(_tool_thread_pool, '_shutdown', False):
             _tool_thread_pool = concurrent.futures.ThreadPoolExecutor(max_workers=4, thread_name_prefix='hermes-tool')
         return _tool_thread_pool
+
+
+def _evict_tool_thread_pool():
+    """Drop wedged pool after timeout — next call gets fresh pool."""
+    global _tool_thread_pool
+    with _tool_thread_pool_lock:
+        pool = _tool_thread_pool
+        _tool_thread_pool = None
+    if pool is not None:
+        try:
+            pool.shutdown(wait=False, cancel_futures=True)
+        except TypeError:
+            try:
+                pool.shutdown(wait=False)
+            except Exception:
+                pass
+
+
 discover_builtin_tools()
 
 # MCP tool discovery (external MCP servers from config) used to run here as
