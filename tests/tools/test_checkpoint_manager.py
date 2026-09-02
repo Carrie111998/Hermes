@@ -113,6 +113,119 @@ class TestStoreInit:
         # Idempotent.
         assert _init_store(store, str(work_dir)) is None
 
+    def test_reused_store_repairs_gc_pruned_dirs(
+        self, work_dir, checkpoint_base, monkeypatch
+    ):
+        """An existing store whose refs/heads/ (and branches/) were pruned by
+        ``git gc`` must be repaired on reuse — otherwise every git add -A
+        fails with 'fatal: not a git repository' (#94257)."""
+        monkeypatch.setattr("tools.checkpoint_manager.CHECKPOINT_BASE", checkpoint_base)
+        store = _store_path(checkpoint_base)
+        assert _init_store(store, str(work_dir)) is None
+
+        # Simulate gc --prune=now on a bare store with only packed refs.
+        # The packed ref must point at a real object (as it would after a
+        # real gc) — a dangling hash makes git show-ref fail the store on
+        # its own, independent of the repair being tested.
+        import shutil
+        from tools.checkpoint_manager import _run_git
+
+        (work_dir / "f.txt").write_text("content", encoding="utf-8")
+        ok, blob_hash, stderr = _run_git(
+            ["hash-object", "-w", str(work_dir / "f.txt")], store, str(work_dir)
+        )
+        assert ok, f"git hash-object failed: {stderr}"
+
+        shutil.rmtree(store / "refs" / "heads")
+        shutil.rmtree(store / "branches", ignore_errors=True)
+        (store / "packed-refs").write_text(
+            "# pack-refs with: peeled fully-peeled sorted \n"
+            f"{blob_hash.strip()} refs/heads/some-project\n",
+            encoding="utf-8",
+        )
+        assert not (store / "refs" / "heads").exists()
+
+        # Re-running init on the existing store repairs the pruned dirs.
+        assert _init_store(store, str(work_dir)) is None
+        assert (store / "refs" / "heads").is_dir()
+        assert (store / "branches").is_dir()
+
+        # And a working-tree command against the reused store now succeeds.
+        ok, _, stderr = _run_git(["add", "-A"], store, str(work_dir))
+        assert ok, f"git add -A against reused store failed: {stderr}"
+
+        # Stale packed refs (pointing at refs the current HEAD doesn't use)
+        # don't confuse the repaired store — show-ref still resolves them.
+        ok, out, stderr = _run_git(["show-ref"], store, str(work_dir))
+        assert ok, f"git show-ref against repaired store failed: {stderr}"
+        assert "refs/heads/some-project" in out
+
+        # The repair helper only recreates refs/heads + branches; the rest
+        # of the fresh-init layout (info/exclude) is gc-stable and must
+        # survive the reuse path untouched.
+        assert (store / "info" / "exclude").exists()
+
+    def test_run_git_self_heals_mid_lifetime_gc_prune(
+        self, work_dir, checkpoint_base, monkeypatch
+    ):
+        """A store pruned by gc *while the session keeps running* (auto-prune
+        re-gcs on a ~24h cadence) is not covered by the init-time repair:
+        every op must heal itself on first failure — _run_git repairs and
+        retries once (#94257 mid-lifetime variant)."""
+        monkeypatch.setattr("tools.checkpoint_manager.CHECKPOINT_BASE", checkpoint_base)
+        store = _store_path(checkpoint_base)
+        assert _init_store(store, str(work_dir)) is None
+
+        (work_dir / "f.txt").write_text("content", encoding="utf-8")
+        ok, _, stderr = _run_git(["add", "-A"], store, str(work_dir))
+        assert ok, f"git add -A failed: {stderr}"
+
+        # Simulate the mid-lifetime prune: refs/heads/ stripped after init,
+        # packed ref pointing at a real object (as after a real gc).
+        ok, blob_hash, stderr = _run_git(
+            ["hash-object", "-w", str(work_dir / "f.txt")], store, str(work_dir)
+        )
+        assert ok, f"git hash-object failed: {stderr}"
+        shutil.rmtree(store / "refs" / "heads")
+        shutil.rmtree(store / "branches", ignore_errors=True)
+        (store / "packed-refs").write_text(
+            "# pack-refs with: peeled fully-peeled sorted \n"
+            f"{blob_hash.strip()} refs/heads/some-project\n",
+            encoding="utf-8",
+        )
+        assert not (store / "refs" / "heads").exists()
+
+        # The first op after the prune fails rc=128, repairs, retries once,
+        # and succeeds — no restart or re-init needed.
+        ok, _, stderr = _run_git(["add", "-A"], store, str(work_dir))
+        assert ok, f"git add -A did not self-heal after mid-lifetime prune: {stderr}"
+
+    def test_run_git_unrelated_rc128_is_not_repaired(
+        self, work_dir, checkpoint_base, monkeypatch
+    ):
+        """rc=128 failures without the 'not a git repository' signature keep
+        their original semantics: no repair, single execution."""
+        monkeypatch.setattr("tools.checkpoint_manager.CHECKPOINT_BASE", checkpoint_base)
+        store = _store_path(checkpoint_base)
+        assert _init_store(store, str(work_dir)) is None
+
+        repairs = []
+        monkeypatch.setattr(
+            "tools.checkpoint_manager._repair_bare_repo_dirs",
+            lambda s: repairs.append(s),
+        )
+        # On an empty (unborn) store, --verify of a missing ref fails rc=128
+        # with a different message.
+        ok, _, stderr = _run_git(
+            ["rev-parse", "--verify", "refs/heads/definitely-missing"],
+            store,
+            str(work_dir),
+            allowed_returncodes={128},
+        )
+        assert not ok
+        assert "not a git repository" not in stderr
+        assert repairs == []
+
     def test_legacy_migration_archives_prev2_repos(
         self, checkpoint_base, work_dir,
     ):

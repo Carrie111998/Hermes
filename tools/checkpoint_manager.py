@@ -380,8 +380,8 @@ def _run_git(
     cmd = ["git"] + list(args)
     allowed_returncodes = allowed_returncodes or set()
 
-    try:
-        result = subprocess.run(
+    def _execute() -> subprocess.CompletedProcess:
+        return subprocess.run(
             cmd,
             capture_output=True,
             text=True, encoding='utf-8', errors='replace',
@@ -394,6 +394,22 @@ def _run_git(
             # conhost flash on Windows (no-op on POSIX).
             creationflags=windows_hide_flags(),
         )
+
+    try:
+        result = _execute()
+        # Auto-prune re-gcs the store on a ~24h cadence while the gateway
+        # keeps running, so the store can be pruned mid-lifetime — after
+        # that every command dies with rc=128 "fatal: not a git repository"
+        # until the dirs are recreated, and the init-time repair only helps
+        # sessions that start against an already-broken store (#94257).
+        # Guarded to that exact signature so unrelated rc=128s keep their
+        # original semantics; a second failure propagates unchanged.
+        if (
+            result.returncode == 128
+            and "not a git repository" in result.stderr
+        ):
+            _repair_bare_repo_dirs(store)
+            result = _execute()
         ok = result.returncode == 0
         stdout = result.stdout.strip()
         stderr = result.stderr.strip()
@@ -490,6 +506,12 @@ def _init_store(store: Path, working_dir: str) -> Optional[str]:
         _migrate_legacy_store(base)
 
     if (store / "HEAD").exists():
+        # Reusing an existing store: ``git gc`` may have pruned the empty
+        # refs/heads/ (and branches/) dirs, which makes every later
+        # ``git add -A`` fail with "fatal: not a git repository" and
+        # disables checkpoints for the session. Repair on reuse, matching
+        # what the operation paths already do (#94257).
+        _repair_bare_repo_dirs(store)
         return None
 
     store.mkdir(parents=True, exist_ok=True)
