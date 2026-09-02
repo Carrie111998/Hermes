@@ -78,6 +78,17 @@ def _is_glm_5_3(model: str | None) -> bool:
     return any(token in m for token in ("glm-5.3", "glm-5-3", "glm-5p3"))
 
 
+def _is_glm_5_3_flash(model: str | None) -> bool:
+    """Detect GLM-5.3-flash — narrower effort vocabulary on BigModel.
+
+    The standard endpoint (open.bigmodel.cn/api/paas/v4) rejects ``medium``
+    for glm-5.3-flash with HTTP 400 (code 1210): only ``low``/``high``/``max``
+    are accepted (verified live 2026-08-30).  The non-flash glm-5.3 accepts
+    the full graded scale, so the two need separate declared vocabularies.
+    """
+    return _is_glm_5_3(model) and "flash" in (model or "").strip().lower()
+
+
 def _glm_5_2_reasoning_effort(
     reasoning_config: dict | None, *, model: str | None = None
 ) -> str | None:
@@ -100,17 +111,23 @@ def _glm_5_2_reasoning_effort(
         return None
 
     # Per-model vocabulary declared in agent.reasoning_effort; xhigh rounds
-    # up to max on both. 5.2 cannot think less than high; 5.3 accepts a
-    # graded scale down to low (issue #91789).
+    # up to max on all GLM-5.x. 5.2 cannot think less than high; 5.3 accepts
+    # a graded scale down to low (issue #91789); 5.3-flash on the standard
+    # BigModel endpoint drops ``medium`` (HTTP 400, verified 2026-08-30) and
+    # maps it to high.
     from agent.reasoning_effort import (
         GLM52_EFFORTS,
         GLM52_OVERRIDES,
         GLM53_EFFORTS,
+        GLM53_FLASH_EFFORTS,
+        GLM53_FLASH_OVERRIDES,
         GLM53_OVERRIDES,
         clamp_effort,
     )
 
-    if _is_glm_5_3(model):
+    if _is_glm_5_3_flash(model):
+        efforts, overrides, floor = GLM53_FLASH_EFFORTS, GLM53_FLASH_OVERRIDES, "high"
+    elif _is_glm_5_3(model):
         efforts, overrides, floor = GLM53_EFFORTS, GLM53_OVERRIDES, "low"
     else:
         efforts, overrides, floor = GLM52_EFFORTS, GLM52_OVERRIDES, "high"
