@@ -85,6 +85,76 @@ class TestUnifiedDashboardRouting:
         assert execs == []
 
 
+class TestDashboardAlreadyListeningBrowserOpen:
+    """Regression for issue #96166: a headless/non-TTY invocation (e.g. a
+    launchd-supervised service) hitting the "dashboard already listening"
+    branch must not call webbrowser.open() -- doing so unconditionally
+    turned a KeepAlive-configured supervisor's respawn loop into an
+    infinite tab-spawn loop, since the branch exits 0 on every spawn."""
+
+    def test_headless_does_not_open_a_browser_tab(self, main_mod, monkeypatch):
+        monkeypatch.delenv("HERMES_HOME", raising=False)
+        monkeypatch.setattr(
+            "hermes_cli.profiles.get_active_profile_name", lambda: "fiona"
+        )
+        monkeypatch.setattr(main_mod, "_dashboard_listening", lambda host, port: True)
+        monkeypatch.setattr(
+            "hermes_cli.auth._can_open_graphical_browser", lambda: False
+        )
+        opens = []
+        monkeypatch.setattr("webbrowser.open", lambda url: opens.append(url))
+
+        with pytest.raises(SystemExit) as exc:
+            main_mod.cmd_dashboard(_args(no_open=False))
+
+        assert exc.value.code == 0
+        assert opens == []
+
+    def test_graphical_browser_available_still_opens_a_tab(self, main_mod, monkeypatch):
+        """Sanity: the interactive case is unaffected -- a genuinely
+        available GUI browser still opens, matching pre-fix behavior."""
+        monkeypatch.delenv("HERMES_HOME", raising=False)
+        monkeypatch.setattr(
+            "hermes_cli.profiles.get_active_profile_name", lambda: "fiona"
+        )
+        monkeypatch.setattr(main_mod, "_dashboard_listening", lambda host, port: True)
+        monkeypatch.setattr(
+            "hermes_cli.auth._can_open_graphical_browser", lambda: True
+        )
+        opens = []
+        monkeypatch.setattr("webbrowser.open", lambda url: opens.append(url))
+
+        with pytest.raises(SystemExit) as exc:
+            main_mod.cmd_dashboard(_args(no_open=False))
+
+        assert exc.value.code == 0
+        assert len(opens) == 1
+        assert "profile=fiona" in opens[0]
+
+    def test_no_open_flag_still_short_circuits_before_any_browser_check(self, main_mod, monkeypatch):
+        """--no-open must still work exactly as before -- the new guard is
+        an additional condition, not a replacement for this one."""
+        monkeypatch.delenv("HERMES_HOME", raising=False)
+        monkeypatch.setattr(
+            "hermes_cli.profiles.get_active_profile_name", lambda: "fiona"
+        )
+        monkeypatch.setattr(main_mod, "_dashboard_listening", lambda host, port: True)
+        checked = []
+        monkeypatch.setattr(
+            "hermes_cli.auth._can_open_graphical_browser",
+            lambda: checked.append(1) or True,
+        )
+        opens = []
+        monkeypatch.setattr("webbrowser.open", lambda url: opens.append(url))
+
+        with pytest.raises(SystemExit) as exc:
+            main_mod.cmd_dashboard(_args(no_open=True))
+
+        assert exc.value.code == 0
+        assert opens == []
+        assert checked == []
+
+
 class TestInteractiveDashboardAuthSetup:
 
     def test_loopback_proxy_public_url_offers_auth_setup(

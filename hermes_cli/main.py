@@ -12334,8 +12334,11 @@ def cmd_dashboard(args):
             print(f"  Managing profile '{_launch_profile}': {url}")
             if not args.no_open:
                 try:
-                    import webbrowser
-                    webbrowser.open(url)
+                    from hermes_cli.auth import _can_open_graphical_browser
+
+                    if _can_open_graphical_browser():
+                        import webbrowser
+                        webbrowser.open(url)
                 except Exception:
                     pass
             sys.exit(0)
