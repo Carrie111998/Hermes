@@ -211,6 +211,23 @@ def _handle(name: str) -> str:
     return "hermes" if name == "default" else name
 
 
+def _sender_display_name(home: Path, handle: str) -> str:
+    """Bounded, single-line presentation name; never a routing identity."""
+    try:
+        from hermes_cli.profiles import read_profile_meta
+
+        display_name = str(read_profile_meta(home).get("display_name") or "")
+        # Profile metadata is presentation-only but still untrusted input.
+        # Replace every non-printing code point (C0/C1 controls, bidi format
+        # controls, zero-width format characters) before whitespace folding so
+        # the attribution prefix cannot hide or reorder its visible identity.
+        printable = "".join(char if char.isprintable() else " " for char in display_name)
+        normalized = " ".join(printable.split())[:64]
+        return normalized or handle
+    except Exception:
+        return handle
+
+
 def _resolve_local_name(target: str, roster: list[str]) -> Optional[str]:
     """Map a target handle to a profile name ('hermes' → 'default')."""
     want = target.strip()
@@ -289,7 +306,8 @@ def message_agent_tool(
         return _err("target is required.", roster=teammates, peers=peers)
 
     sender_handle = _handle(me)
-    prefix = f"Message from 🤖 {sender_handle} (@{sender_handle}): "
+    sender_display_name = _sender_display_name(Path(home), sender_handle)
+    prefix = f"Message from 🤖 {sender_display_name} (@{sender_handle}): "
 
     # ── peer target: '<peer>/<agent>' or a bare registered peer name ──
     peer_match = _PEER_TARGET_RE.match(raw_target)
@@ -337,7 +355,8 @@ def message_agent_tool(
         # relay roster lists agents on the other connections; delivery rides
         # the Desktop's own persistent socket to that gateway.
         relayed = _try_relay_delivery(
-            root, raw_target, body, me, sender_handle, task_id=task_id, agent=agent
+            root, raw_target, body, me, sender_handle, prefix,
+            task_id=task_id, agent=agent
         )
         if relayed is not None:
             return relayed
@@ -353,7 +372,8 @@ def message_agent_tool(
         # 'default' messaging the cloud 'default') — try the relay before
         # calling it a self-message.
         relayed = _try_relay_delivery(
-            root, raw_target, body, me, sender_handle, task_id=task_id, agent=agent
+            root, raw_target, body, me, sender_handle, prefix,
+            task_id=task_id, agent=agent
         )
         if relayed is not None:
             return relayed
@@ -386,6 +406,7 @@ def _try_relay_delivery(
     body: str,
     me: str,
     sender_handle: str,
+    attribution_prefix: str,
     *,
     task_id: Optional[str],
     agent: Any,
@@ -427,7 +448,7 @@ def _try_relay_delivery(
             envelope = enqueue_envelope(
                 root,
                 target=match,
-                message=f"Message from 🤖 {sender_handle} (@{sender_handle}): {body}",
+                message=attribution_prefix + body,
                 sender_profile=me,
                 sender_handle=sender_handle,
             )

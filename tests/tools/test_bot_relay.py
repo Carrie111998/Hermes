@@ -21,6 +21,7 @@ import pytest
 from tools import bot_relay
 from tools.bot_mode_dm import (
     MESSAGE_AGENT_TOOL_NAME,
+    _sender_display_name,
     ensure_message_agent_tool,
     message_agent_tool,
 )
@@ -328,6 +329,107 @@ def test_relay_route_queues_envelope_and_spawns_waiter(tmp_path, monkeypatch):
     assert pending[0]["message"].startswith("Message from 🤖 hermes (@hermes): ping")
     # waiter watches this envelope's reply file
     assert pending[0]["id"] in spawned["command"]
+
+
+def test_relay_waiter_spawn_keeps_canonical_bot_chat_wake_key(tmp_path, monkeypatch):
+    """The waiter uses terminal's real API and preserves the owning session key."""
+    home = _managed_home(tmp_path)
+    bot_relay.write_remote_roster(home, [
+        {"profile": "scout", "handle": "scout", "connection_id": "cloud-1"},
+    ])
+    captured = {}
+
+    def terminal_api(
+        command,
+        *,
+        background,
+        notify_on_complete,
+        task_id,
+        workdir,
+        _host_local,
+    ):
+        captured.update(
+            command=command,
+            background=background,
+            notify_on_complete=notify_on_complete,
+            task_id=task_id,
+            workdir=workdir,
+            host_local=_host_local,
+        )
+        return json.dumps({"session_id": "proc-relay-waiter"})
+
+    monkeypatch.setattr("tools.terminal_tool.terminal_tool", terminal_api)
+
+    out = json.loads(message_agent_tool(
+        target="scout",
+        message="status?",
+        task_id="canonical-bot-chat-key",
+        agent=_FakeAgent(home),
+    ))
+
+    assert out["status"] == "sent"
+    assert captured["task_id"] == "canonical-bot-chat-key"
+    assert captured["notify_on_complete"] is True
+    assert captured["background"] is True
+    [envelope] = bot_relay.claim_pending_envelopes(home)
+    assert envelope["id"] in captured["command"]
+
+
+def test_relay_default_sender_uses_display_name_but_keeps_stable_identity(tmp_path, monkeypatch):
+    """Default-profile attribution is friendly; routing ids remain canonical."""
+    home = _managed_home(tmp_path)
+    (home / "profile.yaml").write_text(
+        "display_name: |\n  Research\n  Lead\n",
+        encoding="utf-8",
+    )
+    bot_relay.write_remote_roster(home, [
+        {"profile": "scout", "handle": "scout", "connection_id": "cloud-1",
+         "connection_label": "Hermes Cloud"},
+    ])
+    monkeypatch.setattr(
+        "tools.bot_mode_dm._spawn_delivery",
+        lambda *a, **k: json.dumps({"status": "sent"}),
+    )
+
+    out = json.loads(message_agent_tool(
+        target="scout", message="status?", agent=_FakeAgent(home)
+    ))
+
+    assert out["status"] == "sent"
+    [envelope] = bot_relay.claim_pending_envelopes(home)
+    assert envelope["message"] == "Message from 🤖 Research Lead (@hermes): status?"
+    assert envelope["from_profile"] == "default"
+    assert envelope["from_handle"] == "hermes"
+
+
+def test_sender_display_name_is_bounded_printable_and_falls_back(tmp_path, monkeypatch):
+    home = _managed_home(tmp_path)
+
+    monkeypatch.setattr(
+        "hermes_cli.profiles.read_profile_meta",
+        lambda _home: {"display_name": "Ops\x00\x1b[31m\x9b Lead\u202e\u2066"},
+    )
+    display = _sender_display_name(home, "hermes")
+    assert display == "Ops [31m Lead"
+    assert display.isprintable()
+
+    monkeypatch.setattr(
+        "hermes_cli.profiles.read_profile_meta",
+        lambda _home: {"display_name": "λ" * 100},
+    )
+    assert _sender_display_name(home, "hermes") == "λ" * 64
+
+    monkeypatch.setattr(
+        "hermes_cli.profiles.read_profile_meta",
+        lambda _home: {"display_name": "\n\t"},
+    )
+    assert _sender_display_name(home, "hermes") == "hermes"
+
+    def unreadable_meta(_home):
+        raise ValueError("malformed profile metadata")
+
+    monkeypatch.setattr("hermes_cli.profiles.read_profile_meta", unreadable_meta)
+    assert _sender_display_name(home, "hermes") == "hermes"
 
 
 def test_relay_route_ambiguous_target_errors_with_forms(tmp_path, monkeypatch):
