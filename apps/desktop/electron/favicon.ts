@@ -86,7 +86,16 @@ export function isPublicHttpUrl(raw: string): boolean {
 
 const absolute = (href: string, base: string): string => {
   try {
-    const url = new URL(href.trim(), base)
+    // HTML attributes commonly encode query separators as `&amp;`. Decode the
+    // small set of entities that affect URL resolution before handing the
+    // value to URL; the favicon parser intentionally remains dependency-free.
+    const decoded = href
+      .trim()
+      .replace(/&amp;/gi, '&')
+      .replace(/&#38;/gi, '&')
+      .replace(/&#x26;/gi, '&')
+
+    const url = new URL(decoded, base)
 
     return url.protocol === 'http:' || url.protocol === 'https:' ? url.toString() : ''
   } catch {

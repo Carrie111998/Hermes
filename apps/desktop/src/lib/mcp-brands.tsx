@@ -119,6 +119,18 @@ export const MCP_BRAND_ICONS: Record<string, McpBrand> = {
   zapier: { Icon: SiZapier, color: '#FF4A00' }
 }
 
+/** Catalog sources that publish documentation on a code-hosting domain. Use
+ * the product's own public origin for the favicon so the list does not paint
+ * a generic GitHub mark as the MCP's identity. */
+const MCP_FAVICON_SOURCES: Record<string, string> = {
+  'aws-knowledge': 'https://aws.amazon.com',
+  gamma: 'https://developers.gamma.app',
+  globalping: 'https://globalping.io'
+}
+
+export const faviconSourceFor = (name: string, source?: null | string): null | string =>
+  MCP_FAVICON_SOURCES[name] ?? source ?? null
+
 /** Inline-glyph color for a brand: monochrome marks inherit the surrounding
  *  text color; branded marks use the brand color. */
 export const brandGlyphStyle = (brand: McpBrand): { color: string } | undefined =>

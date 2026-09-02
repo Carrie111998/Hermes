@@ -3,7 +3,7 @@ import { afterEach, describe, expect, it } from 'vitest'
 
 import { AvatarChip } from '@/components/ui/avatar-chip'
 
-import { brandFor } from './mcp-brands'
+import { brandFor, faviconSourceFor } from './mcp-brands'
 
 afterEach(cleanup)
 
@@ -79,6 +79,18 @@ const CATALOG_FALLBACKS = [
 ]
 
 describe('MCP catalog brand glyphs', () => {
+  it('uses product origins when a catalog source is hosted on a code platform', () => {
+    expect(faviconSourceFor('aws-knowledge', 'https://awslabs.github.io/mcp/servers/aws-knowledge-mcp-server/')).toBe(
+      'https://aws.amazon.com'
+    )
+    expect(faviconSourceFor('globalping', 'https://github.com/jsdelivr/globalping-mcp-server')).toBe(
+      'https://globalping.io'
+    )
+    expect(faviconSourceFor('gamma', 'https://developers.gamma.app/docs/gamma-mcp-server')).toBe(
+      'https://developers.gamma.app'
+    )
+  })
+
   it.each(CATALOG_BRANDS)('resolves %s to a real icon instead of a letter fallback', name => {
     const brand = brandFor(name)
     const { container } = render(<AvatarChip brand={brand} name={name} />)

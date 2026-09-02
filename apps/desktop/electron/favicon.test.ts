@@ -72,6 +72,15 @@ describe('reading a page for the marks it declares', () => {
     )
   })
 
+  test('decodes HTML-encoded query separators in declared icon URLs', () => {
+    const found = iconCandidatesFromHtml(
+      '<link rel="icon" href="/~gitbook/image?url=icon.png&amp;width=48&amp;height=48">',
+      'https://developers.gamma.app'
+    )
+
+    assert.equal(found[0].url, 'https://developers.gamma.app/~gitbook/image?url=icon.png&width=48&height=48')
+  })
+
   test('a <base href> wins over the page URL, as a browser would resolve it', () => {
     const found = iconCandidatesFromHtml(
       '<base href="https://cdn.acme.test/"><link rel="icon" href="mark.png">',
