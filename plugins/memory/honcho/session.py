@@ -278,8 +278,14 @@ class HonchoSessionManager:
         except Exception:
             return False
 
-    def _force_reauth(self) -> bool:
+    def _force_reauth(self, failed_access_token: str | None = None) -> bool:
         """Rotate the token after a 401 and rebind the client.
+
+        ``failed_access_token`` is the bearer the failing operation actually
+        sent (snapshotted by ``_authed_call`` BEFORE the operation ran — the
+        live client's ``api_key`` is mutated in place by sibling waiters and
+        the proactive refresh, so reading it here would see the already
+        rotated token and defeat the adopt-if-disk-moved check).
 
         False for a static API key, a dead grant, or a failed exchange.
         """
@@ -290,7 +296,10 @@ class HonchoSessionManager:
             host = getattr(self._config, "host", "") or ""
             if not host:
                 return False
-            token = oauth.force_refresh_token(self._bound_config_path(), host)
+            token = oauth.force_refresh_token(
+                self._bound_config_path(), host,
+                failed_access_token=failed_access_token,
+            )
             if not token:
                 return False
             if not oauth.apply_token_to_client(self.honcho, token):
@@ -315,6 +324,15 @@ class HonchoSessionManager:
             exc = HonchoAuthError(_REAUTH_REQUIRED_MESSAGE)
             self._record_auth_failure(exc)
             raise exc
+        # Snapshot the bearer BEFORE running the operation: on a 401 this is
+        # the token the server actually rejected. The live client's api_key
+        # is mutated in place by sibling waiters and the proactive refresh,
+        # so reading it after the failure could hand force_refresh_token an
+        # already-rotated token and trigger a needless second exchange.
+        try:
+            failed_token = getattr(getattr(self.honcho, "_http", None), "api_key", None)
+        except Exception:
+            failed_token = None
         try:
             result = operation()
         except HonchoAuthError:
@@ -326,7 +344,7 @@ class HonchoSessionManager:
                 "Honcho %s hit an auth error; forcing token refresh and "
                 "retrying once: %s", op_name, _redact_tokens(str(e)),
             )
-            if not self._force_reauth():
+            if not self._force_reauth(failed_access_token=failed_token):
                 self._record_auth_failure(e)
                 raise HonchoAuthError(_auth_error_message(e)) from e
             try:

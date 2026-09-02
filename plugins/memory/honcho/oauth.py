@@ -415,6 +415,21 @@ def _rotate_and_persist(
         rotated = _exchange_with_retry(cred, now=now)
     except OAuthRefreshError as exc:
         if exc.permanent:
+            # A permanent rejection can mean we replayed a refresh token that
+            # a sibling process already rotated (the cross-process file lock
+            # is best-effort). Re-read disk before declaring the grant dead:
+            # if the persisted refresh token moved, adopt the sibling's grant.
+            disk = OAuthCredential.from_host_block(
+                (_read_config(path).get("hosts") or {}).get(host) or {}
+            )
+            if disk is not None and disk.refresh_token != cred.refresh_token:
+                _dead_grants.pop(key, None)
+                _expiry_cache[key] = (disk.expires_at, disk.access_token)
+                logger.info(
+                    "Honcho OAuth %s for host %s lost a rotation race; "
+                    "adopted the newer on-disk grant", op_label, host,
+                )
+                return disk
             _mark_grant_dead(key, cred)
             logger.error(
                 "Honcho OAuth grant for host %s is no longer valid (%s); "
@@ -539,10 +554,16 @@ def ensure_fresh_token(
         return rotated.access_token, True
 
 
-def force_refresh_token(path: Path, host: str) -> str | None:
+def force_refresh_token(
+    path: Path, host: str, *, failed_access_token: str | None = None
+) -> str | None:
     """Rotate ``host``'s access token now, ignoring local expiry.
 
     Recovers a 401 on a token the local clock still thinks is valid.
+    ``failed_access_token`` is the token the server just rejected; when disk
+    already holds a different token, a sibling (thread or process) rotated the
+    single-use refresh token first — adopt its grant instead of re-exchanging,
+    which would replay a stale refresh token and can revoke the whole grant.
     """
     now = time.time()
     key = (str(path), host)
@@ -558,8 +579,19 @@ def force_refresh_token(path: Path, host: str) -> str | None:
             # An exchange just failed transiently; don't force another full
             # cycle — callers fail open and retry after the cooldown.
             return None
+        # Another thread or process already rotated: adopt the newer on-disk
+        # token instead of exchanging again. The caller tells us which access
+        # token 401'd; disk having moved off it is the authoritative signal
+        # (the in-process expiry cache is empty in sibling processes and
+        # already equal to disk after the first waiter in this one).
+        if (
+            failed_access_token
+            and cred.access_token != failed_access_token
+            and not cred.is_expired(now=now)
+        ):
+            _expiry_cache[key] = (cred.expires_at, cred.access_token)
+            return cred.access_token
         cached = _expiry_cache.get(key)
-        # Another thread or process already rotated: adopt the newer on-disk token.
         if cached is not None and cred.access_token != cached[1] and not cred.is_expired(now=now):
             _expiry_cache[key] = (cred.expires_at, cred.access_token)
             return cred.access_token
