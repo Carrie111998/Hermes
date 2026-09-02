@@ -49,7 +49,9 @@ def test_room_dispatch_errors_never_expose_local_paths():
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(("adapter_name", "implementation_name"), _HTTP_HANDLER_DELEGATES)
+@pytest.mark.parametrize(
+    ("adapter_name", "implementation_name"), _HTTP_HANDLER_DELEGATES
+)
 async def test_run_http_handlers_delegate_without_changing_method_surface(
     monkeypatch, adapter_name, implementation_name
 ):
@@ -180,6 +182,7 @@ def test_roomlink_and_run_route_tuples_are_shard_owned():
         ("GET", "/v1/room-members/capabilities"),
         ("POST", "/v1/room-members/grants/refresh"),
         ("POST", "/v1/room-members/grants/revoke"),
+        ("POST", "/v1/room-members/grants/revoke-exact"),
         ("GET", "/v1/room-controls/{room_id}"),
         ("POST", "/v1/room-controls/{room_id}"),
         ("DELETE", "/v1/room-controls/{room_id}"),

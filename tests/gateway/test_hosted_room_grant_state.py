@@ -11,6 +11,7 @@ from gateway import hosted_room_grant_state as grant_state
 
 def _claims() -> dict:
     return {
+        "grant_id": "grant-test",
         "room_id": "room-1",
         "home_install_id": "install-home",
         "authority_gateway_id": "install-home",

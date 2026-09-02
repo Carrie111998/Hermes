@@ -1398,8 +1398,7 @@ class PeerRunsHTTPClient:
             catalog = GatewayRoomCatalog.from_mapping(probe.get("catalog"))
             if (
                 execution_policy_digest is not None
-                and catalog.execution_policy.policy_digest
-                != execution_policy_digest
+                and catalog.execution_policy.policy_digest != execution_policy_digest
             ):
                 raise PeerRunsHTTPError(
                     "peer room execution policy needs reauthorization",
@@ -1419,7 +1418,7 @@ class PeerRunsHTTPClient:
                 )
         except Exception:
             try:
-                self.revoke_grant(grant=replacement)
+                self.revoke_grant_exact(grant=replacement)
             except Exception:
                 logger.warning(
                     "Could not revoke an unpublished refreshed room grant",
@@ -1427,6 +1426,16 @@ class PeerRunsHTTPClient:
                 )
             raise
         return {**refreshed, "catalog": probe.get("catalog")}
+
+    def revoke_grant_exact(self, *, grant: str) -> Mapping[str, Any]:
+        """Retire a single bearer, never the concurrent room grant replacing it."""
+        self._require_room_grant(grant)
+        return self._request(
+            "/v1/room-members/grants/revoke-exact",
+            method="POST",
+            body={},
+            room_grant=grant,
+        )
 
     def revoke_grant(self, *, grant: str) -> Mapping[str, Any]:
         """Revoke this grant's exact room/home/target/profile scope."""

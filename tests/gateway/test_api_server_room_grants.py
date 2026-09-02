@@ -366,6 +366,7 @@ async def test_grant_revoke_cleans_reciprocal_control_on_the_target(
         "member_id": "member-peer",
         "target_profile": "reviewer",
         "target_install_id": "install-target",
+        "grant_id": "grant-revocation-test",
         "home_install_id": "install-home",
         "authority_gateway_id": "install-home",
         "authority_epoch": 1,

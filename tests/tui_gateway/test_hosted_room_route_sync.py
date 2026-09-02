@@ -81,6 +81,11 @@ class _RefreshingPeerClient(_FakePeerClient):
     def __init__(self, replacement: str) -> None:
         super().__init__()
         self.replacement = replacement
+        self.exact_revoked = []
+
+    def revoke_grant_exact(self, *, grant):
+        self.exact_revoked.append(grant)
+        return {"revoked": True}
 
     def refresh_grant(self, **_kwargs):
         return {"grant": self.replacement}
@@ -734,6 +739,7 @@ def test_unpublished_refreshed_grant_is_revoked_before_dispatch():
     with pytest.raises(hosted_rooms.HostedRoomError, match="fenced"):
         tracked.dispatch(dispatch=dispatch.as_mapping(), grant=old_grant)
 
-    assert peer.revoked == [new_grant]
+    assert peer.exact_revoked == [new_grant]
+    assert peer.revoked == []
     assert peer.dispatches == []
     assert route_status == ["needs_reauthorization"]

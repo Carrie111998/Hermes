@@ -65,15 +65,21 @@ def revoke_grant_state(
     *,
     claims: Mapping[str, Any],
     expires_at: float,
+    exact: bool = False,
 ) -> None:
     """Best-effort every store, then report the first revocation failure."""
 
-    from gateway.hosted_room_storage import revoke_room_grant_scope
+    from gateway.hosted_room_storage import (
+        revoke_room_grant_id,
+        revoke_room_grant_scope,
+    )
+
+    revoke = revoke_room_grant_id if exact else revoke_room_grant_scope
 
     first_error: Exception | None = None
     for db_path in db_paths:
         try:
-            revoke_room_grant_scope(
+            revoke(
                 db_path,
                 claims=claims,
                 expires_at=expires_at,

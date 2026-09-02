@@ -113,6 +113,7 @@ _REVOKED_GRANT_SCHEMA_COLUMNS = frozenset({
     "expires_at",
     "revoked_before",
 })
+_REVOKED_GRANT_ID_SCHEMA_COLUMNS = frozenset({"scope_key", "grant_id", "expires_at"})
 _PEER_RESERVATION_SCHEMA_COLUMNS = frozenset({
     "room_id",
     "member_id",

@@ -316,6 +316,7 @@ class HostedRoomService(HostedRoomArtifactMixin):
         client: HostedRoomPeerClient,
         target_url: str | None = None,
         catalog: GatewayRoomCatalog | None = None,
+        expected_grant_sha256: str | None = None,
     ) -> None:
         """Persist and publish one verified route with its scoped grant."""
         if target_url is None or catalog is None:
@@ -323,39 +324,31 @@ class HostedRoomService(HostedRoomArtifactMixin):
         bind_store = getattr(client, "bind_receipt_store", None)
         if callable(bind_store):
             bind_store(self.db_path)
-        if catalog is not None:
-            if not route.execution_policy_digest:
-                route = replace(
-                    route,
-                    execution_policy_digest=(catalog.execution_policy.policy_digest),
-                )
-            if (
-                route.capability_digest != catalog.catalog_digest
-                or route.execution_policy_digest
-                != catalog.execution_policy.policy_digest
-            ):
-                raise ValueError("peer route does not match its target catalog")
-        hosted_room_links.save_room_link(
-            self.db_path,
-            hosted_room_links.make_stored_link(
-                room_id=room_id,
-                member_id=member_id,
-                target_url=target_url,
-                target_profile=route.target_profile,
-                grant=route.grant,
-                catalog=catalog,
-                cancellation_scope_id=route.cancellation_scope_id,
-                trace_id=route.trace_id,
-            ),
+        if not route.execution_policy_digest:
+            route = replace(
+                route, execution_policy_digest=catalog.execution_policy.policy_digest
+            )
+        if (
+            route.capability_digest != catalog.catalog_digest
+            or route.execution_policy_digest != catalog.execution_policy.policy_digest
+        ):
+            raise ValueError("peer route does not match its target catalog")
+        stored = hosted_room_links.make_stored_link(
+            room_id=room_id,
+            member_id=member_id,
+            target_url=target_url,
+            target_profile=route.target_profile,
+            grant=route.grant,
+            catalog=catalog,
+            cancellation_scope_id=route.cancellation_scope_id,
+            trace_id=route.trace_id,
         )
-        # Persistence is the publication boundary. A failed disk write must
-        # never leave a process-local route that disappears after restart.
         with self._policy_lock:
+            hosted_room_links.save_room_link(
+                self.db_path, stored, expected_grant_sha256=expected_grant_sha256
+            )
             key = (room_id, member_id)
-            if hosted_rooms.room_link_retirement_started(
-                self.db_path,
-                room_id=room_id,
-            ):
+            if hosted_rooms.room_link_retirement_started(self.db_path, room_id=room_id):
                 raise hosted_rooms.HostedRoomError(
                     "Group Chat route registration is fenced"
                 )
@@ -997,6 +990,9 @@ class HostedRoomService(HostedRoomArtifactMixin):
                 cancellation_scope_id=stored.cancellation_scope_id,
                 trace_id=stored.trace_id,
             ),
+            expected_grant_sha256=hashlib.sha256(
+                route.grant.encode("utf-8")
+            ).hexdigest(),
         )
         with self._policy_lock:
             self.peer_routes[key] = rotated_route
@@ -1061,6 +1057,9 @@ class HostedRoomService(HostedRoomArtifactMixin):
                     cancellation_scope_id=stored.cancellation_scope_id,
                     trace_id=stored.trace_id,
                 ),
+                expected_grant_sha256=hashlib.sha256(
+                    route.grant.encode("utf-8")
+                ).hexdigest(),
             )
             with self._policy_lock:
                 self.peer_routes[key] = refreshed
@@ -1079,6 +1078,43 @@ class HostedRoomService(HostedRoomArtifactMixin):
                 if room_id is None or key[0] == room_id
             ]
         return sorted(rows, key=lambda row: (row["room_id"], row["member_id"]))
+
+    def status_with_grant_fingerprints(self, room_id: str) -> dict[str, Any]:
+        """Snapshot reconnect status and non-secret grant identity atomically."""
+        with self._policy_lock:
+            links, _errors = hosted_room_links.load_room_links_tolerant(self.db_path)
+            member_ids = {link.member_id for link in links if link.room_id == room_id}
+            member_ids.update(
+                member
+                for room, member in self._persisted_peer_route_keys
+                if room == room_id
+            )
+            for member_id in member_ids:
+                self._hydrate_persisted_peer_route(room_id, member_id)
+            status = self.status(room_id)
+            return {
+                **status,
+                "peer_routes": [
+                    {
+                        **row,
+                        **(
+                            {
+                                "grant_sha256": hashlib.sha256(
+                                    route.grant.encode("utf-8")
+                                ).hexdigest()
+                            }
+                            if (
+                                route := self.peer_routes.get((
+                                    room_id,
+                                    str(row.get("member_id") or ""),
+                                ))
+                            )
+                            else {}
+                        ),
+                    }
+                    for row in status.get("peer_routes", [])
+                ],
+            }
 
     def _events(self, room_id: str) -> list[dict[str, Any]]:
         events: list[dict[str, Any]] = []
@@ -1902,13 +1938,17 @@ class _RouteStatusPeerClient:
                                         )
                                 self._on_refreshed(replacement, refreshed_catalog)
                             except Exception:
-                                revoke = getattr(self._client, "revoke_grant", None)
-                                if not callable(revoke):
-                                    raise RuntimeError(
-                                        "unpublished refreshed grant cannot be revoked"
-                                    )
-                                revoke(grant=replacement)
+                                revoke = getattr(
+                                    self._client, "revoke_grant_exact", None
+                                )
                                 self._on_reauthorization()
+                                try:
+                                    if callable(revoke):
+                                        revoke(grant=replacement)
+                                    else:
+                                        logger.warning("Peer cannot retire an unpublished grant exactly")
+                                except Exception:
+                                    logger.warning("Exact unpublished-grant cleanup could not be confirmed")
                                 raise
                             kwargs = {**kwargs, "grant": replacement}
             try:

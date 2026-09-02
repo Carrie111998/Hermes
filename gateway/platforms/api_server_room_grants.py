@@ -51,6 +51,16 @@ def _room_grant_error_response(exc: Exception, *, _openai_error) -> "web.Respons
 
 
 def _http_routes(self) -> list[tuple[str, str, Any]]:
+    async def revoke_exact(request):
+        from gateway.platforms import api_server
+
+        return await _handle_room_member_grant_revoke_exact(
+            self,
+            request,
+            _openai_error=api_server._openai_error,
+            _api_request_profile=api_server._api_request_profile,
+        )
+
     from gateway.platforms import (
         api_server_room_artifacts,
         api_server_room_attachments,
@@ -78,6 +88,7 @@ def _http_routes(self) -> list[tuple[str, str, Any]]:
             "/v1/room-members/grants/revoke",
             self._handle_room_member_grant_revoke,
         ),
+        ("POST", "/v1/room-members/grants/revoke-exact", revoke_exact),
     ]
     routes.extend(api_server_room_controls._http_routes(self))
     routes.extend(api_server_room_attachments._http_routes(self))
@@ -383,6 +394,67 @@ async def _handle_room_member_grant_refresh(
             "execution_policy": execution_policy,
         }
     )
+
+
+async def _handle_room_member_grant_revoke_exact(
+    self,
+    request: "web.Request",
+    *,
+    _openai_error,
+    _api_request_profile,
+) -> "web.Response":
+    """Retire only an unpublished bearer without disrupting its replacement."""
+    body, error = await self._read_json_body(request)
+    if error:
+        return error
+    if body:
+        return web.json_response(
+            _openai_error(
+                "Grant revoke accepts no fields.", code="invalid_room_grant_revoke"
+            ),
+            status=400,
+        )
+    try:
+        from gateway import hosted_rooms
+        from gateway.hosted_room_peer import decode_room_grant
+        from gateway.hosted_room_grant_state import (
+            grant_state_db_paths,
+            revoke_grant_state,
+        )
+
+        token = self._room_grant_token(request)
+        if not token:
+            raise ValueError("room grant is missing")
+        claims = decode_room_grant(
+            self._room_grant_secret(),
+            token,
+            permission="status",
+            allow_expired_for_revocation=True,
+        )
+        if (
+            claims["target_profile"] != (_api_request_profile.get() or "default")
+            or claims["target_install_id"] != hosted_rooms.local_authority_gateway_id()
+        ):
+            raise ValueError("room grant target does not match this profile")
+        revoke_grant_state(
+            grant_state_db_paths(),
+            claims=claims,
+            expires_at=float(claims.get("status_expires_at", claims["expires_at"])),
+            exact=True,
+        )
+    except Exception:
+        return web.json_response(
+            _openai_error(
+                "Room authorization is invalid or expired.",
+                err_type="gateway_auth_error",
+                code="invalid_room_grant",
+            ),
+            status=401,
+        )
+    return web.json_response({
+        "object": "hermes.room_member.grant.revocation",
+        "revoked": True,
+    })
 
 
 async def _handle_room_member_grant_revoke(

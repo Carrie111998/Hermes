@@ -16,6 +16,17 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator, Mapping, NoReturn
 
+from gateway.hosted_room_link_records import (
+    room_link_record,
+    begin_room_link_retirement,
+    room_link_retirement_started,
+    complete_room_link_retirement,
+    list_room_link_records,
+    upsert_room_link_record,
+    update_room_link_status,
+    delete_room_link_records,
+)
+
 from gateway.hosted_room_contract import (
     AuthorityConflictError,
     HostedRoomError,
@@ -33,6 +44,7 @@ from gateway.hosted_room_contract import (
     _REMOTE_RUN_SCHEMA_COLUMNS,
     _REPLICA_RESERVATION_COLUMNS,
     _RETIRED_ROOM_SCHEMA_COLUMNS,
+    _REVOKED_GRANT_ID_SCHEMA_COLUMNS,
     _REVOKED_GRANT_SCHEMA_COLUMNS,
     _ROOM_RESERVATION_SCHEMA_COLUMNS,
     _ROOM_SAFETY_TRIGGERS,
@@ -222,6 +234,14 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
         )"""
     )
     conn.execute(
+        """CREATE TABLE IF NOT EXISTS hosted_room_revoked_grant_ids (
+            scope_key TEXT NOT NULL,
+            grant_id TEXT NOT NULL,
+            expires_at REAL NOT NULL,
+            PRIMARY KEY (scope_key, grant_id)
+        )"""
+    )
+    conn.execute(
         """CREATE TABLE IF NOT EXISTS hosted_room_peer_reservations (
             room_id TEXT NOT NULL,
             member_id TEXT NOT NULL,
@@ -237,7 +257,8 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
         )"""
     )
     peer_reservation_columns = {
-        row[1] for row in conn.execute("PRAGMA table_info(hosted_room_peer_reservations)")
+        row[1]
+        for row in conn.execute("PRAGMA table_info(hosted_room_peer_reservations)")
     }
     if "mutation_id" not in peer_reservation_columns:
         conn.execute(
@@ -690,14 +711,17 @@ def _schema_is_current(conn: sqlite3.Connection) -> bool:
         row[1] for row in conn.execute("PRAGMA table_info(hosted_room_links)")
     )
     disband_fence_columns = frozenset(
-        row[1]
-        for row in conn.execute("PRAGMA table_info(hosted_room_disband_fences)")
+        row[1] for row in conn.execute("PRAGMA table_info(hosted_room_disband_fences)")
     )
     remote_run_columns = frozenset(
         row[1] for row in conn.execute("PRAGMA table_info(hosted_room_remote_runs)")
     )
     revoked_grant_columns = frozenset(
         row[1] for row in conn.execute("PRAGMA table_info(hosted_room_revoked_grants)")
+    )
+    revoked_grant_id_columns = frozenset(
+        row[1]
+        for row in conn.execute("PRAGMA table_info(hosted_room_revoked_grant_ids)")
     )
     peer_reservation_columns = frozenset(
         row[1]
@@ -737,6 +761,13 @@ def _schema_is_current(conn: sqlite3.Connection) -> bool:
         return False
     if not _REVOKED_GRANT_SCHEMA_COLUMNS.issubset(revoked_grant_columns):
         return False
+    if not _REVOKED_GRANT_ID_SCHEMA_COLUMNS.issubset(revoked_grant_id_columns):
+        return False
+    if _primary_key_columns(conn, "hosted_room_revoked_grant_ids") != (
+        "scope_key",
+        "grant_id",
+    ):
+        return False
     if not _PEER_RESERVATION_SCHEMA_COLUMNS.issubset(peer_reservation_columns):
         return False
     if not _QUARANTINE_SCHEMA_COLUMNS.issubset(quarantine_columns):
@@ -762,248 +793,6 @@ def _schema_is_current(conn: sqlite3.Connection) -> bool:
     return index is not None and _ROOM_SAFETY_TRIGGERS.issubset(triggers)
 
 
-def room_link_record(
-    db_path: Path | str,
-    *,
-    room_id: str,
-    member_id: str,
-) -> dict[str, Any] | None:
-    """Return one private RoomLink record by its exact identity."""
-
-    with _transaction(db_path) as conn:
-        row = conn.execute(
-            """SELECT room_id, member_id, target_url, target_profile, grant,
-                      catalog_json, cancellation_scope_id, trace_id,
-                      transport_security, status, updated_at
-                 FROM hosted_room_links
-                WHERE room_id=? AND member_id=?""",
-            (room_id, member_id),
-        ).fetchone()
-    return dict(row) if row is not None else None
-
-
-def begin_room_link_retirement(
-    db_path: Path | str,
-    *,
-    room_id: str,
-    authority_gateway_id: str,
-    authority_epoch: int,
-    now: float | None = None,
-) -> dict[str, Any]:
-    """Fence new route writes before remote revocation and room disband."""
-
-    limits = _public_api()
-    room_id = _validate_identifier(
-        room_id,
-        label="room_id",
-        max_chars=limits.MAX_ROOM_ID_CHARS,
-    )
-    authority_gateway_id = _validate_identifier(
-        authority_gateway_id,
-        label="authority_gateway_id",
-        max_chars=limits.MAX_ACTOR_ID_CHARS,
-    )
-    if (
-        isinstance(authority_epoch, bool)
-        or not isinstance(authority_epoch, int)
-        or authority_epoch < 1
-    ):
-        raise HostedRoomError("authority_epoch must be a positive integer")
-    timestamp = float(time.time() if now is None else now)
-    with _transaction(db_path, immediate=True) as conn:
-        room = conn.execute(
-            """SELECT authority_gateway_id, authority_epoch
-                 FROM hosted_rooms
-                WHERE room_id=?""",
-            (room_id,),
-        ).fetchone()
-        lineage = (authority_gateway_id, authority_epoch)
-        if (
-            room is not None
-            and (str(room["authority_gateway_id"]), int(room["authority_epoch"]))
-            != lineage
-        ):
-            raise AuthorityConflictError("Group Chat route fence authority changed")
-        existing = conn.execute(
-            """SELECT authority_gateway_id, authority_epoch, started_at,
-                      revocation_complete_at
-                 FROM hosted_room_disband_fences WHERE room_id=?""",
-            (room_id,),
-        ).fetchone()
-        if existing is not None:
-            if (
-                str(existing["authority_gateway_id"]),
-                int(existing["authority_epoch"]),
-            ) != lineage:
-                raise AuthorityConflictError("Group Chat route fence authority changed")
-            return dict(existing)
-        conn.execute(
-            """INSERT INTO hosted_room_disband_fences(
-                   room_id, authority_gateway_id, authority_epoch, started_at
-               ) VALUES (?, ?, ?, ?)""",
-            (room_id, *lineage, timestamp),
-        )
-        return {
-            "room_id": room_id,
-            "authority_gateway_id": lineage[0],
-            "authority_epoch": lineage[1],
-            "started_at": timestamp,
-            "revocation_complete_at": None,
-        }
-
-
-def room_link_retirement_started(db_path: Path | str, *, room_id: str) -> bool:
-    """Return whether this room has crossed the no-new-route boundary."""
-
-    with _transaction(db_path) as conn:
-        row = conn.execute(
-            "SELECT 1 FROM hosted_room_disband_fences WHERE room_id=?",
-            (room_id,),
-        ).fetchone()
-    return row is not None
-
-
-def complete_room_link_retirement(
-    db_path: Path | str,
-    *,
-    room_id: str,
-    authority_gateway_id: str,
-    authority_epoch: int,
-    now: float | None = None,
-) -> None:
-    """Allow route deletion only after every remote grant was revoked."""
-
-    limits = _public_api()
-    room_id = _validate_identifier(
-        room_id,
-        label="room_id",
-        max_chars=limits.MAX_ROOM_ID_CHARS,
-    )
-    authority_gateway_id = _validate_identifier(
-        authority_gateway_id,
-        label="authority_gateway_id",
-        max_chars=limits.MAX_ACTOR_ID_CHARS,
-    )
-    if (
-        isinstance(authority_epoch, bool)
-        or not isinstance(authority_epoch, int)
-        or authority_epoch < 1
-    ):
-        raise HostedRoomError("authority_epoch must be a positive integer")
-    timestamp = float(time.time() if now is None else now)
-    with _transaction(db_path, immediate=True) as conn:
-        cursor = conn.execute(
-            """UPDATE hosted_room_disband_fences
-                  SET revocation_complete_at=COALESCE(revocation_complete_at, ?)
-                WHERE room_id=? AND authority_gateway_id=? AND authority_epoch=?""",
-            (timestamp, room_id, authority_gateway_id, authority_epoch),
-        )
-        if cursor.rowcount != 1:
-            raise AuthorityConflictError("Group Chat route fence authority changed")
-
-
-def list_room_link_records(db_path: Path | str) -> list[dict[str, Any]]:
-    """Return private RoomLink records without logging or formatting grants."""
-    with _transaction(db_path) as conn:
-        rows = conn.execute(
-            """SELECT room_id, member_id, target_url, target_profile, grant,
-                      catalog_json, cancellation_scope_id, trace_id,
-                      transport_security, status, updated_at
-                 FROM hosted_room_links
-             ORDER BY room_id, member_id"""
-        ).fetchall()
-    return [dict(row) for row in rows]
-
-
-def upsert_room_link_record(
-    db_path: Path | str,
-    *,
-    record: Mapping[str, Any],
-    max_links: int,
-) -> None:
-    """Atomically insert or replace one private RoomLink record."""
-    with _transaction(db_path, immediate=True) as conn:
-        fenced = conn.execute(
-            "SELECT 1 FROM hosted_room_disband_fences WHERE room_id=?",
-            (record["room_id"],),
-        ).fetchone()
-        if fenced is not None:
-            raise HostedRoomError("Group Chat route registration is fenced")
-        existing = conn.execute(
-            "SELECT 1 FROM hosted_room_links WHERE room_id=? AND member_id=?",
-            (record["room_id"], record["member_id"]),
-        ).fetchone()
-        if existing is None:
-            count = int(
-                conn.execute("SELECT COUNT(*) FROM hosted_room_links").fetchone()[0]
-            )
-            if count >= max_links:
-                raise HostedRoomError("too many stored room links")
-        conn.execute(
-            """INSERT INTO hosted_room_links(
-                   room_id, member_id, target_url, target_profile, grant,
-                   catalog_json, cancellation_scope_id, trace_id,
-                   transport_security, status, updated_at
-               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-               ON CONFLICT(room_id, member_id) DO UPDATE SET
-                   target_url=excluded.target_url,
-                   target_profile=excluded.target_profile,
-                   grant=excluded.grant,
-                   catalog_json=excluded.catalog_json,
-                   cancellation_scope_id=excluded.cancellation_scope_id,
-                   trace_id=excluded.trace_id,
-                   transport_security=excluded.transport_security,
-                   status=excluded.status,
-                   updated_at=excluded.updated_at""",
-            (
-                record["room_id"],
-                record["member_id"],
-                record["target_url"],
-                record["target_profile"],
-                record["grant"],
-                record["catalog_json"],
-                record["cancellation_scope_id"],
-                record["trace_id"],
-                record["transport_security"],
-                record["status"],
-                record["updated_at"],
-            ),
-        )
-
-
-def update_room_link_status(
-    db_path: Path | str,
-    *,
-    room_id: str,
-    member_id: str,
-    status: str,
-    now: float | None = None,
-) -> bool:
-    """Persist a non-secret route health classification."""
-    with _transaction(db_path, immediate=True) as conn:
-        cursor = conn.execute(
-            """UPDATE hosted_room_links SET status=?, updated_at=?
-                 WHERE room_id=? AND member_id=?""",
-            (
-                status,
-                float(now if now is not None else time.time()),
-                room_id,
-                member_id,
-            ),
-        )
-        return cursor.rowcount == 1
-
-
-def delete_room_link_records(db_path: Path | str, *, room_id: str) -> int:
-    """Delete persisted peer routes after their target grants are revoked."""
-    with _transaction(db_path, immediate=True) as conn:
-        cursor = conn.execute(
-            "DELETE FROM hosted_room_links WHERE room_id=?",
-            (room_id,),
-        )
-        return cursor.rowcount
-
-
 def _room_grant_scope_key(claims: Mapping[str, Any]) -> str:
     """Return a stable non-secret key for one room/home/target/profile scope."""
     import hashlib
@@ -1025,6 +814,39 @@ def _room_grant_scope_key(claims: Mapping[str, Any]) -> str:
     return hashlib.sha256(
         json.dumps(fields, sort_keys=True, separators=(",", ":")).encode("utf-8")
     ).hexdigest()
+
+
+def revoke_room_grant_id(
+    db_path: Path | str,
+    *,
+    claims: Mapping[str, Any],
+    expires_at: float,
+    now: float | None = None,
+) -> None:
+    """Revoke only one bearer grant without fencing concurrent replacements."""
+
+    timestamp = float(now if now is not None else time.time())
+    expiry = float(expires_at)
+    if expiry <= timestamp:
+        return
+    grant_id = _validate_identifier(
+        claims.get("grant_id"), label="grant_id", max_chars=256
+    )
+    scope_key = _room_grant_scope_key(claims)
+    with _transaction(db_path, immediate=True) as conn:
+        conn.execute(
+            "DELETE FROM hosted_room_revoked_grant_ids WHERE expires_at<=?",
+            (timestamp,),
+        )
+        conn.execute(
+            """INSERT INTO hosted_room_revoked_grant_ids(
+                   scope_key, grant_id, expires_at
+               ) VALUES (?, ?, ?)
+               ON CONFLICT(scope_key, grant_id) DO UPDATE SET
+                   expires_at=MAX(hosted_room_revoked_grant_ids.expires_at,
+                                  excluded.expires_at)""",
+            (scope_key, grant_id, expiry),
+        )
 
 
 def revoke_room_grant_scope(
@@ -1351,7 +1173,18 @@ def room_grant_is_revoked(
     timestamp = float(now if now is not None else time.time())
     scope_key = _room_grant_scope_key(claims)
     issued_at = float(claims.get("issued_at") or 0)
+    grant_id = _validate_identifier(
+        claims.get("grant_id"), label="grant_id", max_chars=256
+    )
+    scope_key = _room_grant_scope_key(claims)
     with _transaction(db_path) as conn:
+        exact = conn.execute(
+            """SELECT 1 FROM hosted_room_revoked_grant_ids
+                 WHERE scope_key=? AND grant_id=? AND expires_at>?""",
+            (scope_key, grant_id, timestamp),
+        ).fetchone()
+        if exact is not None:
+            return True
         row = conn.execute(
             """SELECT revoked_before FROM hosted_room_revoked_grants
                  WHERE scope_key=? AND expires_at>?""",
