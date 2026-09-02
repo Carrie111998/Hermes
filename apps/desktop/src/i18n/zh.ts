@@ -1315,6 +1315,11 @@ export const zh: Translations = {
       moaNewPresetPlaceholder: '新预设',
       moaAddPreset: '添加预设',
       moaDefault: '默认：',
+      moaReferenceToggle: (enabled, index) => `${enabled ? '禁用' : '启用'}参考 ${index}`,
+      moaReferenceTitle: index => `参考 ${index}`,
+      moaRemove: '移除',
+      moaAddReference: '添加参考模型',
+      moaAggregator: '聚合器',
       tasks: {
         vision: { label: '视觉', hint: '图片分析' },
         compression: { label: '压缩', hint: '上下文压缩' },

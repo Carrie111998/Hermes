@@ -1187,7 +1187,7 @@ export function ModelSettings({ onMainModelChanged, scopeProfile }: ModelSetting
               <ListRow
                 action={
                   <Switch
-                    aria-label={`${slot.enabled !== false ? 'Disable' : 'Enable'} reference ${index + 1}`}
+                    aria-label={m.moaReferenceToggle(slot.enabled !== false, index + 1)}
                     checked={slot.enabled !== false}
                     disabled={applying}
                     onCheckedChange={checked =>
@@ -1264,7 +1264,7 @@ export function ModelSettings({ onMainModelChanged, scopeProfile }: ModelSetting
                       size="sm"
                       variant="ghost"
                     >
-                      Remove
+                      {m.moaRemove}
                     </Button>
                   </div>
                 }
@@ -1275,7 +1275,7 @@ export function ModelSettings({ onMainModelChanged, scopeProfile }: ModelSetting
                   </span>
                 }
                 key={`${selectedMoaPreset}-${index}`}
-                title={`Reference ${index + 1}`}
+                title={m.moaReferenceTitle(index + 1)}
               />
             ))}
             <Button
@@ -1289,7 +1289,7 @@ export function ModelSettings({ onMainModelChanged, scopeProfile }: ModelSetting
               size="sm"
               variant="textStrong"
             >
-              Add reference model
+              {m.moaAddReference}
             </Button>
             <ListRow
               below={
@@ -1351,7 +1351,7 @@ export function ModelSettings({ onMainModelChanged, scopeProfile }: ModelSetting
                   {currentMoaPreset.aggregator.provider} · {currentMoaPreset.aggregator.model}
                 </span>
               }
-              title="Aggregator"
+              title={m.moaAggregator}
             />
           </div>
         </section>
