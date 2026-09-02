@@ -94,19 +94,34 @@ class DocsIndex:
 
     def search(self, query: str, limit: int = 10) -> list[dict[str, Any]]:
         """FTS5 search returning {slug, title, section, snippet}."""
-        # FTS5 rank-based search with snippet extraction
-        rows = self._conn.execute(
-            """
-            SELECT slug, title, section,
-                   snippet(docs, 1, '<<', '>>', '...', 32) AS snippet_text,
-                   rank
-            FROM docs
-            WHERE docs MATCH ?
-            ORDER BY rank
-            LIMIT ?
-            """,
-            (query, limit),
-        ).fetchall()
+        try:
+            rows = self._conn.execute(
+                """
+                SELECT slug, title, section,
+                       snippet(docs, 3, '<<', '>>', '...', 32) AS snippet_text,
+                       rank
+                FROM docs
+                WHERE docs MATCH ?
+                ORDER BY rank
+                LIMIT ?
+                """,
+                (query, limit),
+            ).fetchall()
+        except sqlite3.OperationalError:
+            # Treat unsanitary FTS5 syntax as a plain phrase search
+            phrase = " ".join(query.split())
+            rows = self._conn.execute(
+                """
+                SELECT slug, title, section,
+                       snippet(docs, 3, '<<', '>>', '...', 32) AS snippet_text,
+                       rank
+                FROM docs
+                WHERE docs MATCH ?
+                ORDER BY rank
+                LIMIT ?
+                """,
+                (f'"{phrase}"', limit),
+            ).fetchall()
 
         return [
             {
@@ -161,7 +176,8 @@ class DocsIndex:
             self._conn.close()
 
     def __del__(self) -> None:
-        self.close()
+        if self._conn:
+            self.close()
 
 
 # ── MCP Server ──────────────────────────────────────────────────────────
@@ -171,8 +187,9 @@ def _get_index_path() -> Path:
     env_path = os.environ.get("HERMES_DOCS_INDEX_PATH")
     if env_path:
         return Path(env_path)
-    # Default: next to this script or in CWD
-    return Path.cwd() / DocsIndex.DB_FILENAME
+    # Default: ~/.hermes/hermes_docs_index.sqlite so rebuild and server
+    # use the same database regardless of working directory.
+    return Path.home() / ".hermes" / DocsIndex.DB_FILENAME
 
 
 def _build_tools(index: DocsIndex) -> list:
@@ -224,7 +241,8 @@ def _build_tools(index: DocsIndex) -> list:
     def list_pages(section: str) -> str:
         """List all documentation pages within a given section.
 
-        Example sections: 'getting-started', 'user-guide', 'features', 'reference'
+        Pass the section name as it appears in list_sections output,
+        for example: 'Getting Started', 'User Guide', 'Features', 'Reference'.
         """
         pages = index.list_pages_in_section(section)
         return json.dumps({"section": section, "pages": pages}, indent=2)
