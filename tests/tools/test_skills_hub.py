@@ -558,7 +558,76 @@ class TestCheckForSkillUpdates:
         assert results[0]["name"] == "demo-skill"
         assert results[0]["status"] == "update_available"
 
-    def test_skips_bundle_fetch_when_skill_tree_is_unchanged(self):
+    def test_complete_github_bundle_records_revision_fast_path_proof(self):
+        source = GitHubSource(auth=MagicMock(spec=GitHubAuth))
+        source._tree_cache["owner/repo"] = ("main", [
+            {
+                "path": "demo-skill/SKILL.md",
+                "type": "blob",
+                "mode": "100644",
+                "sha": "skill-md",
+            },
+            {
+                "path": "demo-skill/references/guide.md",
+                "type": "blob",
+                "mode": "100644",
+                "sha": "guide",
+            },
+        ])
+        source._tree_revisions["owner/repo"] = "a" * 40
+        source._fetch_file_content = MagicMock(return_value="---\nname: demo-skill\n---\n")
+        source._fetch_file_bytes = MagicMock(return_value=b"guide")
+
+        bundle = source.fetch("owner/repo/demo-skill")
+
+        assert bundle is not None
+        assert bundle.metadata["source_tree_complete"] is True
+
+    def test_partial_github_bundle_does_not_enable_revision_fast_path(self):
+        source = GitHubSource(auth=MagicMock(spec=GitHubAuth))
+        source._tree_cache["owner/repo"] = ("main", [
+            {
+                "path": "demo-skill/SKILL.md",
+                "type": "blob",
+                "mode": "100644",
+                "sha": "skill-md",
+            },
+            {
+                "path": "demo-skill/references/guide.md",
+                "type": "blob",
+                "mode": "100644",
+                "sha": "guide",
+            },
+        ])
+        source._tree_revisions["owner/repo"] = "a" * 40
+        source._fetch_file_content = MagicMock(return_value="---\nname: demo-skill\n---\n")
+        source._fetch_file_bytes = MagicMock(return_value=None)
+
+        partial_bundle = source.fetch("owner/repo/demo-skill")
+
+        assert partial_bundle is not None
+        assert partial_bundle.metadata["source_tree_complete"] is False
+
+        lock = MagicMock()
+        lock.list_installed.return_value = [{
+            "name": "demo-skill",
+            "source": "github",
+            "identifier": "owner/repo/demo-skill",
+            "content_hash": bundle_content_hash(partial_bundle),
+            "install_path": "demo-skill",
+            "metadata": partial_bundle.metadata,
+        }]
+        checker = MagicMock(spec=SkillSource)
+        checker.source_id.return_value = "github"
+        checker.is_revision_content_current.return_value = True
+        checker.fetch.return_value = partial_bundle
+
+        check_for_skill_updates(lock=lock, sources=[checker])
+
+        checker.is_revision_content_current.assert_not_called()
+        checker.fetch.assert_called_once_with("owner/repo/demo-skill")
+
+    def test_legacy_revision_without_completeness_marker_falls_back_to_fetch(self):
         lock = MagicMock()
         lock.list_installed.return_value = [{
             "name": "demo-skill",
@@ -567,6 +636,35 @@ class TestCheckForSkillUpdates:
             "content_hash": "installed-hash",
             "install_path": "demo-skill",
             "metadata": {"source_revision": "abc123"},
+        }]
+        source = MagicMock(spec=SkillSource)
+        source.source_id.return_value = "github"
+        source.is_revision_content_current.return_value = True
+        source.fetch.return_value = SkillBundle(
+            name="demo-skill",
+            files={"SKILL.md": "same content"},
+            source="github",
+            identifier="owner/repo/demo-skill",
+            trust_level="community",
+        )
+
+        check_for_skill_updates(lock=lock, sources=[source])
+
+        source.is_revision_content_current.assert_not_called()
+        source.fetch.assert_called_once_with("owner/repo/demo-skill")
+
+    def test_skips_bundle_fetch_when_skill_tree_is_unchanged(self):
+        lock = MagicMock()
+        lock.list_installed.return_value = [{
+            "name": "demo-skill",
+            "source": "github",
+            "identifier": "owner/repo/demo-skill",
+            "content_hash": "installed-hash",
+            "install_path": "demo-skill",
+            "metadata": {
+                "source_revision": "abc123",
+                "source_tree_complete": True,
+            },
         }]
 
         source = MagicMock(spec=SkillSource)
@@ -594,7 +692,10 @@ class TestCheckForSkillUpdates:
             "identifier": "owner/repo/demo-skill",
             "content_hash": "oldhash",
             "install_path": "demo-skill",
-            "metadata": {"source_revision": "abc123"},
+            "metadata": {
+                "source_revision": "abc123",
+                "source_tree_complete": True,
+            },
         }]
 
         source = MagicMock(spec=SkillSource)

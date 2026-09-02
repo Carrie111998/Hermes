@@ -796,6 +796,7 @@ class GitHubSource(SkillSource):
             return None
 
         files: Dict[str, Union[str, bytes]] = {"SKILL.md": skill_md}
+        source_tree_complete = tree is not None
         if tree is not None:
             # Download the FULL skill directory, not just SKILL.md-linked
             # paths. Link-driven fetching silently dropped every support file
@@ -828,6 +829,7 @@ class GitHubSource(SkillSource):
                     return None
                 content = self._fetch_file_bytes(repo, item_path, ref=pinned_ref)
                 if content is None:
+                    source_tree_complete = False
                     logger.warning("Failed to fetch referenced skill support "
                                    "file; continuing without it: %s", item_path)
                     continue
@@ -879,6 +881,7 @@ class GitHubSource(SkillSource):
                     if revision else f"https://github.com/{repo}/{skill_path}"
                 ),
                 "source_revision": revision,
+                "source_tree_complete": source_tree_complete,
             },
         )
 
@@ -4572,7 +4575,12 @@ def check_for_skill_updates(
                 if isinstance(metadata, dict)
                 else ""
             )
-            if revision:
+            tree_complete = (
+                metadata.get("source_tree_complete") is True
+                if isinstance(metadata, dict)
+                else False
+            )
+            if revision and tree_complete:
                 revision_checks.append((entry.get("identifier", ""), revision))
         if revision_checks:
             try:
@@ -4607,7 +4615,12 @@ def check_for_skill_updates(
             if isinstance(metadata, dict)
             else ""
         )
-        if recorded_revision:
+        source_tree_complete = (
+            metadata.get("source_tree_complete") is True
+            if isinstance(metadata, dict)
+            else False
+        )
+        if recorded_revision and source_tree_complete:
             revision_matches = False
             for src in candidate_sources:
                 try:
