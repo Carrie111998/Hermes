@@ -15,6 +15,7 @@ from tools.skills_sync import (
     _write_manifest,
     _discover_bundled_skills,
     _compute_relative_dest,
+    _copy_skill_writable,
     _dir_hash,
     sync_skills,
     reset_bundled_skill,
@@ -520,6 +521,111 @@ class TestSyncSkills:
             result2 = sync_skills(quiet=True)
             assert "new-skill" in result2["copied"]
             assert (skills_dir / "category" / "new-skill" / "SKILL.md").exists()
+
+
+class TestCopySkillWritable:
+    """#101226: a bundled/optional skill copied from an immutable source (Nix
+    store, Homebrew Cellar -- dirs r-xr-xr-x, files r--r--r--) must land
+    owner-writable in ~/.hermes/skills/, not inherit the source's read-only
+    mode via shutil.copytree's default copy2 behavior."""
+
+    @staticmethod
+    def _make_readonly_source(root: Path) -> Path:
+        """Build a small skill tree and chmod it read-only, dirs and files
+        alike -- the same shape a Nix-store bundled source has."""
+        src = root / "ro-source" / "some-skill"
+        nested = src / "references"
+        nested.mkdir(parents=True)
+        (src / "SKILL.md").write_text("# read-only source\n")
+        (nested / "ref.md").write_text("# nested ref\n")
+
+        ro_dir = (
+            stat.S_IRUSR | stat.S_IXUSR | stat.S_IRGRP | stat.S_IXGRP
+            | stat.S_IROTH | stat.S_IXOTH
+        )
+        os.chmod(nested / "ref.md", stat.S_IREAD)
+        os.chmod(src / "SKILL.md", stat.S_IREAD)
+        os.chmod(nested, ro_dir)
+        os.chmod(src, ro_dir)
+        return src
+
+    @staticmethod
+    def _assert_owner_writable(path: Path) -> None:
+        mode = stat.S_IMODE(path.stat().st_mode)
+        assert mode & stat.S_IWUSR, f"{path} is not owner-writable (mode {oct(mode)})"
+
+    @pytest.mark.skipif(os.name == "nt", reason="POSIX permission bits are platform-specific")
+    def test_copy_from_readonly_source_is_owner_writable(self, tmp_path):
+        src = self._make_readonly_source(tmp_path)
+        dest = tmp_path / "dest" / "some-skill"
+
+        try:
+            _copy_skill_writable(src, dest)
+
+            # Content came across correctly.
+            assert (dest / "SKILL.md").read_text() == "# read-only source\n"
+            assert (dest / "references" / "ref.md").read_text() == "# nested ref\n"
+
+            # Every file and directory in the copy is owner-writable,
+            # regardless of the source's mode -- so it can be edited AND
+            # later removed with a plain shutil.rmtree, no special helper.
+            self._assert_owner_writable(dest)
+            self._assert_owner_writable(dest / "SKILL.md")
+            self._assert_owner_writable(dest / "references")
+            self._assert_owner_writable(dest / "references" / "ref.md")
+
+            # Prove it's not just chmod-in-place: a plain rmtree (no
+            # _rmtree_writable) must now succeed on the copy.
+            shutil.rmtree(dest)
+            assert not dest.exists()
+        finally:
+            for p in (src / "references", src):
+                if p.exists():
+                    os.chmod(p, stat.S_IRWXU)
+
+    @pytest.mark.skipif(os.name == "nt", reason="POSIX permission bits are platform-specific")
+    def test_fresh_sync_from_readonly_bundled_source_is_editable(self, tmp_path):
+        """End-to-end: sync_skills() against a read-only-source bundled dir
+        (the Nix/Homebrew install shape) must not leave the user unable to
+        edit or reset the skill it just seeded."""
+        bundled = tmp_path / "bundled_skills"
+        skill = bundled / "some-skill"
+        skill.mkdir(parents=True)
+        (skill / "SKILL.md").write_text("# bundled\n")
+
+        ro_dir = (
+            stat.S_IRUSR | stat.S_IXUSR | stat.S_IRGRP | stat.S_IXGRP
+            | stat.S_IROTH | stat.S_IXOTH
+        )
+        os.chmod(skill / "SKILL.md", stat.S_IREAD)
+        os.chmod(skill, ro_dir)
+
+        skills_dir = tmp_path / "user_skills"
+        manifest_file = skills_dir / ".bundled_manifest"
+
+        try:
+            from contextlib import ExitStack
+            with ExitStack() as stack:
+                stack.enter_context(patch("tools.skills_sync._get_bundled_dir", return_value=bundled))
+                stack.enter_context(patch(
+                    "tools.skills_sync._get_optional_dir",
+                    return_value=bundled.parent / "optional-skills",
+                ))
+                stack.enter_context(patch("tools.skills_sync.SKILLS_DIR", skills_dir))
+                stack.enter_context(patch("tools.skills_sync.MANIFEST_FILE", manifest_file))
+                result = sync_skills(quiet=True)
+
+            assert "some-skill" in result["copied"]
+            dest = skills_dir / "some-skill"
+            self._assert_owner_writable(dest)
+            self._assert_owner_writable(dest / "SKILL.md")
+
+            # The curator/user can actually edit the synced copy now.
+            (dest / "SKILL.md").write_text("# edited\n")
+            assert (dest / "SKILL.md").read_text() == "# edited\n"
+        finally:
+            if skill.exists():
+                os.chmod(skill, stat.S_IRWXU)
 
 
 class TestGetBundledDir:

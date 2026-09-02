@@ -431,7 +431,7 @@ def restore_official_optional_skill(name: str, *, restore: bool = False) -> dict
                 backed_up.append(_move_to_restore_backup(dest, backup_root))
             if not dest.exists():
                 dest.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copytree(src, dest)
+                _copy_skill_writable(src, dest)
                 restored.append(folder_name)
         elif not canonical_ok:
             continue
@@ -868,7 +868,7 @@ def sync_skills(quiet: bool = False) -> dict:
                         )
                 else:
                     dest.parent.mkdir(parents=True, exist_ok=True)
-                    shutil.copytree(skill_src, dest)
+                    _copy_skill_writable(skill_src, dest)
                     copied.append(skill_name)
                     manifest[skill_name] = bundled_hash
                     if not quiet:
@@ -924,7 +924,7 @@ def sync_skills(quiet: bool = False) -> dict:
                         _rmtree_writable(backup)
                     shutil.move(str(dest), str(backup))
                     try:
-                        shutil.copytree(skill_src, dest)
+                        _copy_skill_writable(skill_src, dest)
                         manifest[skill_name] = bundled_hash
                         updated.append(skill_name)
                         if not quiet:
@@ -1008,6 +1008,32 @@ def sync_skills(quiet: bool = False) -> dict:
         # callers report "opted out" rather than a normal full sync.
         "skipped_opt_out": essential_only,
     }
+
+
+def _copy_skill_writable(src: Path, dest: Path) -> None:
+    """Copy a skill directory, dropping the source's permissions.
+
+    Bundled/optional-skill sources may be immutable (Nix store, Homebrew
+    Cellar) where directories are ``r-xr-xr-x`` and files ``r--r--r--``.
+    ``shutil.copytree`` uses ``copy2`` by default, which preserves that mode
+    (and mtime) on the synced copy -- making it unwritable to the user and
+    the curator, and leaving ``diff_bundled_skill``/``reset_bundled_skill``
+    nothing to diff or reset. The unwritable tree also used to break cleanup
+    until ``_rmtree_writable`` was added for that side (#34860, #34972);
+    fixing permissions here, at the copy, means an unwritable tree is never
+    created in the first place. See #101226.
+    """
+    import stat
+
+    shutil.copytree(src, dest)
+    for p in [dest, *dest.rglob("*")]:
+        try:
+            mode = p.stat().st_mode | stat.S_IWUSR
+            if p.is_dir():
+                mode |= stat.S_IXUSR
+            p.chmod(mode)
+        except OSError:
+            pass
 
 
 def _rmtree_writable(path: Path) -> None:
