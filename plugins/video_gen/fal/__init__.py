@@ -313,6 +313,45 @@ FAL_FAMILIES: Dict[str, Dict[str, Any]] = {
         "negative": True,
         "seed": True,
     },
+    "wan-3.0": {
+        "display": "Wan 3.0",
+        "speed": "~60-180s",
+        "price": "premium",
+        "strengths": "Alibaba latest gen. 2-30s clips, native audio, up to 1080p, lip-sync.",
+        "tier": "premium",
+        "text_endpoint": "alibaba/wan-3.0/text-to-video",
+        "image_endpoint": "alibaba/wan-3.0/image-to-video",
+        # Wan 3.0 i2v uses `start_image_url` (like Kling 4K) and both
+        # modalities accept aspect_ratio (schema default "adaptive" —
+        # omitted from the enum so the endpoint handles auto selection).
+        "image_param_key": "start_image_url",
+        # Duration is a JSON integer 2-30 (nullable = smart duration).
+        "duration_int": True,
+        # Audio toggle key is `audio`, not the usual `generate_audio`.
+        "audio_param_key": "audio",
+        "aspect_ratios": ("16:9", "4:3", "1:1", "3:4", "9:16"),
+        "resolutions": ("480p", "720p", "1080p"),
+        "durations": (2, 30),
+        "audio": True,
+        "negative": False,
+    },
+    "wan-3.0-prime": {
+        "display": "Wan 3.0 Prime",
+        "speed": "~60-180s",
+        "price": "premium",
+        "strengths": "Alibaba premium tier. Faster iteration, higher fidelity, 2-30s, native audio.",
+        "tier": "premium",
+        "text_endpoint": "alibaba/wan-3.0-prime/text-to-video",
+        "image_endpoint": "alibaba/wan-3.0-prime/image-to-video",
+        "image_param_key": "start_image_url",
+        "duration_int": True,
+        "audio_param_key": "audio",
+        "aspect_ratios": ("16:9", "4:3", "1:1", "3:4", "9:16"),
+        "resolutions": ("480p", "720p", "1080p"),
+        "durations": (2, 30),
+        "audio": True,
+        "negative": False,
+    },
     "happy-horse": {
         "display": "Happy Horse 1.0",
         "speed": "~60-120s",
@@ -520,7 +559,9 @@ def _build_payload(
             payload["duration"] = f"{clamped}{suffix}"
 
     if family.get("audio") and audio is not None:
-        payload["generate_audio"] = bool(audio)
+        # Most FAL endpoints call the toggle `generate_audio`; a few (Wan 3.0)
+        # use a different key, declared per-family via `audio_param_key`.
+        payload[family.get("audio_param_key") or "generate_audio"] = bool(audio)
 
     if family.get("negative") and negative_prompt:
         payload["negative_prompt"] = negative_prompt
