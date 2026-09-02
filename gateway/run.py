@@ -23418,6 +23418,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # persistence contract explicit and lets any future non-persisting
             # runtime opt into a gateway-side write by returning False.
             agent_persisted = agent_result.get("agent_persisted", self._session_db is not None)
+            # A Codex app-server flush can fail after writing a prefix. The
+            # intrinsic marker identifies rows already committed by the agent,
+            # allowing gateway fallback persistence to recover only the suffix
+            # without duplicating the inbound user turn.
+            from run_agent import _DB_PERSISTED_MARKER
 
             # Find only the NEW messages from this turn (skip history we loaded).
             # Use the filtered history length (history_offset) that was actually
@@ -23527,7 +23532,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             _user_msg_id_attached = True
                         await self.async_session_store.append_to_transcript(
                             session_entry.session_id, entry,
-                            skip_db=agent_persisted,
+                            skip_db=(
+                                agent_persisted
+                                or bool(msg.get(_DB_PERSISTED_MARKER))
+                            ),
                         )
             
             # Token counts and model are now persisted by the agent directly.
@@ -29065,6 +29073,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         ("compression", "proactive_prune_min_result_chars"),
         ("compression", "proactive_prune_min_reclaim_tokens"),
         ("compression", "min_tail_user_messages"),
+        ("agent", "codex_app_server_turn_timeout"),
+        ("agent", "codex_app_server_post_tool_quiet_timeout"),
+        ("agent", "codex_app_server_require_explicit_cwd"),
+        ("agent", "codex_app_server_workspace_roots"),
+        ("agent", "codex_app_server_exclusive_cwd"),
+        ("agent", "codex_app_server_deadline_continuation"),
+        ("agent", "codex_app_server_codex_home"),
         ("agent", "disabled_toolsets"),
         ("memory", "provider"),
         ("checkpoints", "enabled"),

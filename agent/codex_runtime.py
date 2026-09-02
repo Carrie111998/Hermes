@@ -16,16 +16,471 @@ compatibility.
 
 from __future__ import annotations
 
+from copy import deepcopy
+import hashlib
 import json
 import logging
 import os
+import re
 import time
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Callable, Dict, List
 
 from agent.stream_single_writer import claim_stream_writer, stream_writer_is_current
 
 logger = logging.getLogger(__name__)
+
+
+_CODEX_THREAD_MAP_KEY = "_codex_app_server_workspace_threads"
+_CODEX_THREAD_MAP_VERSION = 1
+_CODEX_THREAD_MAP_MAX_ENTRIES = 32
+_RUNTIME_CWD_MARKER_PREFIX = "[HERMES_RUNTIME_CWD"
+_RUNTIME_CWD_MARKER_RE = re.compile(
+    r"\[HERMES_RUNTIME_CWD=([^\[\]\r\n]+)\]"
+)
+_RUNTIME_CWD_MARKER_SCAN_BYTES = 1024
+_CODEX_DEADLINE_CONTINUATION_LIVENESS_WINDOW = 30.0
+_CODEX_DEADLINE_CONTINUATION_PROMPT = (
+    "Continue exactly where you stopped. Do not restart or repeat completed work; "
+    "finish the original request."
+)
+
+
+class _CodexRuntimeCwdError(ValueError):
+    """Sanitized, user-facing failure of the explicit cwd contract."""
+
+
+_CODEX_ORDERED_TEXT_METADATA = frozenset({"reasoning", "reasoning_content"})
+_CODEX_ORDERED_LIST_METADATA = frozenset(
+    {"reasoning_details", "codex_reasoning_items", "codex_message_items"}
+)
+
+
+def _normalize_codex_projected_messages(
+    projected_messages: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Return persistence-ready copies of Codex app-server projections.
+
+    Codex can complete an ``agentMessage`` commentary item immediately before
+    a tool-shaped item. The projector faithfully represents those as a text
+    assistant message followed by an empty assistant tool-call envelope, but
+    persisting that pair violates Hermes' assistant/tool alternation contract.
+    Fold only that exact shape into the standard OpenAI assistant message that
+    carries both ``content`` and ``tool_calls``.
+
+    Projection objects belong to the app-server turn result, so this boundary
+    never mutates or aliases them. Distinct metadata is retained from both
+    messages; ordered reasoning fields are concatenated in event order. If two
+    scalar metadata values conflict, leave the pair unchanged rather than lose
+    either value under an ambiguous merge.
+    """
+    normalized: List[Dict[str, Any]] = []
+    for source_message in projected_messages:
+        message = deepcopy(source_message)
+        if not (
+            normalized
+            and isinstance(message, dict)
+            and message.get("role") == "assistant"
+            and isinstance(normalized[-1], dict)
+            and normalized[-1].get("role") == "assistant"
+            and isinstance(normalized[-1].get("content"), str)
+            and normalized[-1]["content"].strip()
+            and not normalized[-1].get("tool_calls")
+            and (
+                message.get("content") is None
+                or (
+                    isinstance(message.get("content"), str)
+                    and not message["content"].strip()
+                )
+            )
+            and isinstance(message.get("tool_calls"), list)
+            and message["tool_calls"]
+        ):
+            normalized.append(message)
+            continue
+
+        commentary = normalized[-1]
+        merged = deepcopy(commentary)
+        mergeable = True
+        for key, value in message.items():
+            if key in {"role", "content"}:
+                continue
+            if key not in merged or key == "tool_calls":
+                merged[key] = value
+                continue
+            existing = merged[key]
+            if existing == value:
+                continue
+            if (
+                key in _CODEX_ORDERED_TEXT_METADATA
+                and isinstance(existing, str)
+                and isinstance(value, str)
+            ):
+                merged[key] = "\n".join(part for part in (existing, value) if part)
+                continue
+            if (
+                key in _CODEX_ORDERED_LIST_METADATA
+                and isinstance(existing, list)
+                and isinstance(value, list)
+            ):
+                merged[key] = existing + value
+                continue
+            mergeable = False
+            break
+
+        if mergeable:
+            normalized[-1] = merged
+        else:
+            normalized.append(message)
+    return normalized
+
+
+def _canonical_default_codex_cwd(agent: Any) -> str:
+    """Return the canonical cwd used when no structured marker is present."""
+    from agent.runtime_cwd import resolve_agent_cwd
+
+    raw = getattr(agent, "session_cwd", None) or str(resolve_agent_cwd())
+    return str(Path(raw).resolve())
+
+
+def _marker_scan_prefix(text: str) -> str:
+    """Return at most the first 1 KiB of UTF-8 input without a partial rune."""
+    return text.encode("utf-8")[:_RUNTIME_CWD_MARKER_SCAN_BYTES].decode(
+        "utf-8", errors="ignore"
+    )
+
+
+def _resolve_codex_handoff_cwd(
+    agent: Any,
+    user_message: Any,
+) -> tuple[str, Any]:
+    """Resolve the turn's effective repository cwd and Codex-visible input.
+
+    A valid structured marker is removed from the Codex input only. Hermes'
+    own transcript keeps the original handoff message, including its routing
+    metadata, because the standard turn path has already appended it.
+    """
+    default_cwd = _canonical_default_codex_cwd(agent)
+    text = user_message if isinstance(user_message, str) else None
+    prefix = _marker_scan_prefix(text) if text is not None else ""
+    marker_mentions = prefix.count(_RUNTIME_CWD_MARKER_PREFIX)
+    matches = list(_RUNTIME_CWD_MARKER_RE.finditer(prefix))
+
+    if marker_mentions and (marker_mentions != 1 or len(matches) != 1):
+        raise _CodexRuntimeCwdError(
+            "Codex app-server repository cwd marker is malformed. Use "
+            "[HERMES_RUNTIME_CWD=/absolute/path] in the first 1 KiB."
+        )
+
+    if not matches:
+        if getattr(
+            agent, "codex_app_server_require_explicit_cwd", False
+        ) is True:
+            raise _CodexRuntimeCwdError(
+                "Codex app-server requires an explicit repository cwd marker "
+                "in the first 1 KiB: "
+                "[HERMES_RUNTIME_CWD=/absolute/path]."
+            )
+        return default_cwd, user_message
+
+    match = matches[0]
+    raw_path = match.group(1)
+    if raw_path != raw_path.strip():
+        raise _CodexRuntimeCwdError(
+            "Codex app-server repository cwd marker is malformed. The path "
+            "must not have leading or trailing whitespace."
+        )
+    candidate = Path(raw_path)
+    if not candidate.is_absolute():
+        raise _CodexRuntimeCwdError(
+            "Codex app-server repository cwd must be an absolute path."
+        )
+    try:
+        candidate = candidate.resolve()
+    except (OSError, RuntimeError, ValueError):
+        raise _CodexRuntimeCwdError(
+            "Codex app-server repository cwd could not be resolved."
+        ) from None
+    if not candidate.is_dir():
+        raise _CodexRuntimeCwdError(
+            "Codex app-server repository cwd must be an existing directory."
+        )
+
+    configured_roots = getattr(
+        agent, "codex_app_server_workspace_roots", []
+    )
+    raw_roots = [default_cwd] if configured_roots == [] else configured_roots
+    if not isinstance(raw_roots, list) or not raw_roots:
+        raise _CodexRuntimeCwdError(
+            "agent.codex_app_server_workspace_roots must be a list of "
+            "existing absolute directories."
+        )
+
+    roots: list[Path] = []
+    for raw_root in raw_roots:
+        if not isinstance(raw_root, str) or not raw_root.strip():
+            raise _CodexRuntimeCwdError(
+                "agent.codex_app_server_workspace_roots must contain only "
+                "existing absolute directories."
+            )
+        root = Path(raw_root)
+        if not root.is_absolute():
+            raise _CodexRuntimeCwdError(
+                "agent.codex_app_server_workspace_roots must contain only "
+                "existing absolute directories."
+            )
+        try:
+            root = root.resolve()
+        except (OSError, RuntimeError, ValueError):
+            raise _CodexRuntimeCwdError(
+                "agent.codex_app_server_workspace_roots contains a directory "
+                "that could not be resolved."
+            ) from None
+        if not root.is_dir():
+            raise _CodexRuntimeCwdError(
+                "agent.codex_app_server_workspace_roots must contain only "
+                "existing absolute directories."
+            )
+        roots.append(root)
+
+    if not any(candidate == root or root in candidate.parents for root in roots):
+        raise _CodexRuntimeCwdError(
+            "Codex app-server repository cwd is outside the configured "
+            "workspace roots."
+        )
+
+    assert text is not None
+    codex_input = text[: match.start()] + text[match.end() :]
+    return str(candidate), codex_input
+
+
+def _codex_cwd_lock_path(
+    cwd: str,
+    *,
+    hermes_home: Path | None = None,
+) -> Path:
+    """Return a profile-local advisory-lock path for one canonical CWD."""
+    canonical = str(Path(cwd).resolve())
+    lock_identity = os.path.normcase(canonical)
+    readable = re.sub(r"[^A-Za-z0-9._-]+", "-", Path(canonical).name).strip("-")
+    digest = hashlib.sha256(lock_identity.encode("utf-8")).hexdigest()[:16]
+    if hermes_home is None:
+        from hermes_constants import get_hermes_home
+
+        hermes_home = get_hermes_home()
+    return (
+        Path(hermes_home)
+        / "runtime"
+        / "codex-cwd-locks"
+        / f"{(readable or 'cwd')[:32].lower()}-{digest}.lock"
+    )
+
+
+def _try_acquire_codex_cwd_lock(cwd: str):
+    """Acquire a non-blocking advisory lock for one canonical CWD."""
+    handle = None
+    try:
+        path = _codex_cwd_lock_path(cwd)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            os.chmod(path.parent, 0o700)
+        except OSError:
+            if os.name != "nt":
+                raise
+        handle = path.open("a+b")
+        try:
+            os.chmod(path, 0o600)
+        except OSError:
+            if os.name != "nt":
+                raise
+        if os.name == "nt":  # pragma: no cover - exercised on Windows CI
+            import msvcrt
+
+            if path.stat().st_size == 0:
+                handle.write(b"0")
+                handle.flush()
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except (BlockingIOError, OSError):
+        if handle is not None:
+            handle.close()
+        return None
+    return handle
+
+
+def _git_metadata_for_cwd(cwd: str) -> tuple[str | None, str | None]:
+    """Return best-effort repository root and branch without mutating Git."""
+    try:
+        from hermes_cli._subprocess_compat import bounded_git_probe
+
+        repo_root = bounded_git_probe(
+            ["git", "-C", cwd, "rev-parse", "--show-toplevel"],
+            timeout=5.0,
+        )
+        if not repo_root:
+            return None, None
+        branch = bounded_git_probe(
+            ["git", "-C", cwd, "branch", "--show-current"],
+            timeout=5.0,
+        )
+    except Exception:
+        return None, None
+    return repo_root or None, branch or None
+
+
+def _persist_codex_effective_cwd(agent: Any, cwd: str) -> None:
+    """Persist the app-server's authoritative workspace through SessionDB."""
+    db, session_id = _codex_thread_store(agent)
+    updater = getattr(db, "update_session_cwd", None) if db is not None else None
+    if not callable(updater) or not session_id:
+        return
+    repo_root, branch = _git_metadata_for_cwd(cwd)
+    try:
+        updater(
+            session_id,
+            cwd,
+            git_branch=branch,
+            git_repo_root=repo_root,
+            replace_git_meta=True,
+        )
+    except Exception:
+        logger.warning("codex effective cwd metadata persistence failed", exc_info=True)
+
+
+def _codex_thread_store(agent: Any) -> tuple[Any, str] | tuple[None, None]:
+    if getattr(agent, "_persist_disabled", False):
+        return None, None
+    db = getattr(agent, "_session_db", None)
+    session_id = str(getattr(agent, "session_id", "") or "").strip()
+    if db is None or not session_id:
+        return None, None
+    return db, session_id
+
+
+def _load_codex_workspace_thread(agent: Any, cwd: str) -> str | None:
+    """Read this Hermes session's prior Codex thread for one canonical cwd."""
+    db, session_id = _codex_thread_store(agent)
+    if db is None or session_id is None:
+        return None
+    getter = getattr(db, "get_session_model_config_value", None)
+    if not callable(getter):
+        return None
+    try:
+        mapping = getter(session_id, _CODEX_THREAD_MAP_KEY, None)
+    except Exception:
+        logger.warning(
+            "codex app-server workspace continuity could not be loaded"
+        )
+        return None
+    if not isinstance(mapping, dict):
+        return None
+    if mapping.get("version") != _CODEX_THREAD_MAP_VERSION:
+        return None
+    threads = mapping.get("threads")
+    if not isinstance(threads, dict):
+        return None
+    thread_id = threads.get(cwd)
+    if not isinstance(thread_id, str) or not thread_id.strip():
+        return None
+    return thread_id.strip()
+
+
+def _persist_codex_workspace_thread(
+    agent: Any,
+    cwd: str,
+    thread_id: str,
+) -> bool:
+    """Persist and LRU-bound a per-workspace Codex thread mapping."""
+    db, session_id = _codex_thread_store(agent)
+    if db is None or session_id is None:
+        return False
+    getter = getattr(db, "get_session_model_config_value", None)
+    patcher = getattr(db, "patch_session_model_config", None)
+    if not callable(getter) or not callable(patcher):
+        return False
+    try:
+        raw = getter(session_id, _CODEX_THREAD_MAP_KEY, None)
+        if (
+            isinstance(raw, dict)
+            and raw.get("version") == _CODEX_THREAD_MAP_VERSION
+        ):
+            raw_threads = raw.get("threads")
+            raw_order = raw.get("order")
+        else:
+            raw_threads = None
+            raw_order = None
+
+        threads = {
+            str(key): value
+            for key, value in (
+                raw_threads.items() if isinstance(raw_threads, dict) else []
+            )
+            if isinstance(key, str)
+            and isinstance(value, str)
+            and key
+            and value.strip()
+        }
+        order = []
+        for item in raw_order if isinstance(raw_order, list) else []:
+            if (
+                isinstance(item, str)
+                and item in threads
+                and item != cwd
+                and item not in order
+            ):
+                order.append(item)
+        for existing_cwd in threads:
+            if existing_cwd != cwd and existing_cwd not in order:
+                order.append(existing_cwd)
+
+        threads[cwd] = str(thread_id)
+        order.append(cwd)
+        while len(order) > _CODEX_THREAD_MAP_MAX_ENTRIES:
+            threads.pop(order.pop(0), None)
+
+        patcher(
+            session_id,
+            {
+                _CODEX_THREAD_MAP_KEY: {
+                    "version": _CODEX_THREAD_MAP_VERSION,
+                    "threads": threads,
+                    "order": order,
+                }
+            },
+        )
+        return True
+    except Exception:
+        # Never include the nested mapping or exception text here: either can
+        # contain internal Codex identifiers.
+        logger.warning(
+            "codex app-server workspace continuity could not be persisted"
+        )
+        return False
+
+
+def _codex_cwd_failure_result(
+    messages: List[Dict[str, Any]],
+    error: str,
+) -> Dict[str, Any]:
+    """Return the normal app-server early-result shape without a fake answer."""
+    return {
+        "final_response": "",
+        "messages": messages,
+        "api_calls": 0,
+        "completed": False,
+        "partial": True,
+        "interrupted": False,
+        "error": error,
+        "timed_out": False,
+        "agent_persisted": True,
+        "codex_thread_id": None,
+        "codex_turn_id": None,
+    }
 
 
 def _codex_request_failure_details(error: BaseException) -> tuple[int | None, str]:
@@ -102,6 +557,43 @@ def _coerce_usage_int(value: Any) -> int:
     return 0
 
 
+_CODEX_USAGE_TOTAL_KEYS = (
+    "inputTokens",
+    "cachedInputTokens",
+    "outputTokens",
+    "reasoningOutputTokens",
+    "totalTokens",
+)
+_CODEX_USAGE_REQUIRED_TOTAL_KEYS = frozenset(
+    {"inputTokens", "outputTokens", "totalTokens"}
+)
+
+
+def _codex_turn_usage(turn: Any) -> dict[str, Any] | None:
+    """Prefer a monotonic cumulative-total delta; safely fall back to last."""
+    start = getattr(turn, "token_usage_total_start", None)
+    end = getattr(turn, "token_usage_total", None)
+    if isinstance(start, dict) and start and isinstance(end, dict) and end:
+        complete = _CODEX_USAGE_REQUIRED_TOTAL_KEYS.issubset(start) and (
+            _CODEX_USAGE_REQUIRED_TOTAL_KEYS.issubset(end)
+        )
+        if complete:
+            delta: dict[str, int] = {}
+            for key in _CODEX_USAGE_TOTAL_KEYS:
+                if key not in start or key not in end:
+                    continue
+                before = _coerce_usage_int(start.get(key))
+                after = _coerce_usage_int(end.get(key))
+                if after < before:
+                    delta = {}
+                    break
+                delta[key] = after - before
+            if delta:
+                return delta
+    last = getattr(turn, "token_usage_last", None)
+    return dict(last) if isinstance(last, dict) and last else None
+
+
 def _record_codex_app_server_usage(agent, turn) -> dict[str, Any]:
     """Translate Codex app-server token usage into Hermes accounting.
 
@@ -118,7 +610,7 @@ def _record_codex_app_server_usage(agent, turn) -> dict[str, Any]:
     """
     agent.session_api_calls += 1
 
-    usage = getattr(turn, "token_usage_last", None)
+    usage = _codex_turn_usage(turn)
     if not isinstance(usage, dict) or not usage:
         compressor = getattr(agent, "context_compressor", None)
         if (
@@ -251,6 +743,44 @@ def _record_codex_app_server_usage(agent, turn) -> dict[str, Any]:
     }
 
 
+def _merge_codex_usage_results(
+    results: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Combine the at-most-two accounting receipts from continuation."""
+    populated = [item for item in results if item]
+    if not populated:
+        return {}
+    numeric_keys = {
+        "prompt_tokens",
+        "completion_tokens",
+        "total_tokens",
+        "input_tokens",
+        "output_tokens",
+        "cache_read_tokens",
+        "cache_write_tokens",
+        "reasoning_tokens",
+    }
+    merged: dict[str, Any] = {
+        key: sum(_coerce_usage_int(item.get(key)) for item in populated)
+        for key in numeric_keys
+    }
+    merged["last_prompt_tokens"] = _coerce_usage_int(
+        populated[-1].get("last_prompt_tokens")
+    )
+    costs = [
+        float(item["estimated_cost_usd"])
+        for item in populated
+        if item.get("estimated_cost_usd") is not None
+    ]
+    merged["estimated_cost_usd"] = sum(costs) if costs else None
+    for key in ("cost_status", "cost_source"):
+        merged[key] = next(
+            (item.get(key) for item in reversed(populated) if item.get(key)),
+            None,
+        )
+    return merged
+
+
 def _record_codex_app_server_compaction(
     agent,
     turn,
@@ -270,10 +800,8 @@ def _record_codex_app_server_compaction(
     thread_id = getattr(turn, "thread_id", None) or ""
     turn_id = getattr(turn, "turn_id", None) or ""
     logger.info(
-        "codex app-server compaction observed: session=%s thread=%s turn=%s force=%s",
+        "codex app-server compaction observed: session=%s force=%s",
         getattr(agent, "session_id", None) or "none",
-        thread_id,
-        turn_id,
         force,
     )
     if not force:
@@ -689,6 +1217,59 @@ def run_codex_app_server_turn(
     effective_task_id: str,
     should_review_memory: bool = False,
 ) -> Dict[str, Any]:
+    """Resolve workspace policy and hold the optional CWD writer lock."""
+    if getattr(agent, "compression_checkpoint_required", False) is True:
+        return _run_codex_app_server_turn_impl(
+            agent,
+            user_message=user_message,
+            original_user_message=original_user_message,
+            messages=messages,
+            effective_task_id=effective_task_id,
+            should_review_memory=should_review_memory,
+        )
+
+    try:
+        resolved = _resolve_codex_handoff_cwd(agent, user_message)
+    except _CodexRuntimeCwdError as exc:
+        return _codex_cwd_failure_result(messages, str(exc))
+
+    effective_cwd, _codex_user_input = resolved
+    _persist_codex_effective_cwd(agent, effective_cwd)
+
+    lock_handle = None
+    if getattr(agent, "codex_app_server_exclusive_cwd", False) is True:
+        lock_handle = _try_acquire_codex_cwd_lock(effective_cwd)
+        if lock_handle is None:
+            return _codex_cwd_failure_result(
+                messages,
+                "BLOCKED_CONCURRENT_WRITER: another Codex app-server turn "
+                "already owns this canonical CWD.",
+            )
+    try:
+        return _run_codex_app_server_turn_impl(
+            agent,
+            user_message=user_message,
+            original_user_message=original_user_message,
+            messages=messages,
+            effective_task_id=effective_task_id,
+            should_review_memory=should_review_memory,
+            _resolved_cwd_input=resolved,
+        )
+    finally:
+        if lock_handle is not None:
+            lock_handle.close()
+
+
+def _run_codex_app_server_turn_impl(
+    agent,
+    *,
+    user_message: str,
+    original_user_message: Any,
+    messages: List[Dict[str, Any]],
+    effective_task_id: str,
+    should_review_memory: bool = False,
+    _resolved_cwd_input: tuple[str, Any] | None = None,
+) -> Dict[str, Any]:
     """Codex app-server runtime path. Hands the entire turn to a `codex
     app-server` subprocess and projects its events back into Hermes'
     messages list so memory/skill review keep working.
@@ -712,16 +1293,48 @@ def run_codex_app_server_turn(
 
     from agent.transports.codex_app_server_session import (
         CodexAppServerSession,
+        TurnResult,
         _ServerRequestRouting,
     )
+    from agent.transports.codex_app_server import CodexAppServerError
+
+    if _resolved_cwd_input is None:
+        try:
+            effective_cwd, codex_user_input = _resolve_codex_handoff_cwd(
+                agent, user_message
+            )
+        except _CodexRuntimeCwdError as exc:
+            return _codex_cwd_failure_result(messages, str(exc))
+    else:
+        effective_cwd, codex_user_input = _resolved_cwd_input
+
+    # One AIAgent can receive handoffs for multiple repositories. A live Codex
+    # process owns exactly one cwd/thread, so a workspace change retires it and
+    # constructs another session from that workspace's durable mapping.
+    codex_session = getattr(agent, "_codex_session", None)
+    if codex_session is not None:
+        active_cwd = getattr(agent, "_codex_session_cwd", None)
+        if active_cwd is None:
+            legacy_cwd = getattr(codex_session, "_cwd", None)
+            if isinstance(legacy_cwd, (str, os.PathLike)):
+                active_cwd = str(Path(legacy_cwd).resolve())
+            else:
+                # Compatibility for pre-existing test doubles and sessions
+                # created before this attribute existed.
+                active_cwd = effective_cwd
+            agent._codex_session_cwd = active_cwd
+        if active_cwd != effective_cwd:
+            try:
+                codex_session.close()
+            except Exception:
+                pass
+            agent._codex_session = None
+            agent._codex_session_cwd = None
 
     # Lazy session: one CodexAppServerSession per AIAgent instance.
     # Spawned on first turn, reused across turns, closed at AIAgent
     # shutdown (see _cleanup hook).
     if not hasattr(agent, "_codex_session") or agent._codex_session is None:
-        from agent.runtime_cwd import resolve_agent_cwd
-
-        cwd = getattr(agent, "session_cwd", None) or str(resolve_agent_cwd())
         # Approval callback: defer to Hermes' standard prompt flow if a
         # CLI thread has installed one. Gateway / cron contexts get the
         # codex-side fail-closed default.
@@ -759,8 +1372,11 @@ def run_codex_app_server_turn(
         # users see no live tool-progress or interim commentary while
         # codex_app_server is running — only the final answer (#33200).
         # Supersedes the narrower item/started-only bridge from #38835.
+        prior_thread_id = _load_codex_workspace_thread(agent, effective_cwd)
         agent._codex_session = CodexAppServerSession(
-            cwd=cwd,
+            cwd=effective_cwd,
+            prior_thread_id=prior_thread_id,
+            codex_home=getattr(agent, "codex_app_server_codex_home", None),
             approval_callback=approval_callback,
             request_routing=_ServerRequestRouting(
                 auto_approve_exec=auto_approve_requests,
@@ -768,15 +1384,136 @@ def run_codex_app_server_turn(
             ),
             on_event=make_codex_app_server_event_bridge(agent),
         )
+        agent._codex_session_cwd = effective_cwd
 
     # NOTE: the user message is ALREADY appended to messages by the
     # standard run_conversation() flow (line ~11823) before the early
     # return reaches us. Do NOT append again — that would duplicate.
 
+    continued_from_turn = None
+    continuation_count = 0
     try:
-        turn = agent._codex_session.run_turn(user_input=user_message)
+        turn_timeout = float(
+            getattr(agent, "codex_app_server_turn_timeout", 600.0)
+        )
+        post_tool_quiet_timeout = float(
+            getattr(
+                agent,
+                "codex_app_server_post_tool_quiet_timeout",
+                90.0,
+            )
+        )
+        turn_deadline = time.monotonic() + turn_timeout
+        try:
+            thread_id = agent._codex_session.ensure_started(
+                startup_timeout=turn_timeout
+            )
+        except TimeoutError:
+            turn = TurnResult(
+                error=f"turn timed out after {turn_timeout}s",
+                interrupted=True,
+                timed_out=True,
+                should_retire=True,
+            )
+            agent._codex_session._interrupt_event.clear()
+        except CodexAppServerError as exc:
+            # Preserve run_turn's established startup-error semantics while
+            # ensuring successful starts are persisted before the turn begins.
+            turn = TurnResult(
+                error=agent._codex_session._format_startup_error(exc),
+                should_retire=True,
+            )
+            agent._codex_session._interrupt_event.clear()
+        else:
+            _persist_codex_workspace_thread(agent, effective_cwd, thread_id)
+            turn = agent._codex_session.run_turn(
+                user_input=codex_user_input,
+                turn_timeout=turn_timeout,
+                post_tool_quiet_timeout=post_tool_quiet_timeout,
+                turn_deadline=turn_deadline,
+            )
+
+            last_liveness_at = getattr(turn, "last_liveness_at", None)
+            recent_liveness = (
+                isinstance(last_liveness_at, (int, float))
+                and time.monotonic() - float(last_liveness_at)
+                <= _CODEX_DEADLINE_CONTINUATION_LIVENESS_WINDOW
+            )
+            if (
+                getattr(agent, "codex_app_server_deadline_continuation", False)
+                is True
+                and getattr(turn, "timed_out", False)
+                and recent_liveness
+            ):
+                # The interrupted transport is retired. Resume the same durable
+                # Codex thread in one fresh process and issue a fixed internal
+                # continuation that is never appended to Hermes history.
+                continued_from_turn = turn
+                continuation_count = 1
+                old_session = agent._codex_session
+                approval_callback = getattr(old_session, "_approval_callback", None)
+                request_routing = getattr(old_session, "_routing", None)
+                on_event = getattr(old_session, "_on_event", None)
+                try:
+                    old_session.close()
+                except Exception:
+                    pass
+                agent._codex_session = CodexAppServerSession(
+                    cwd=effective_cwd,
+                    prior_thread_id=turn.thread_id or thread_id,
+                    codex_home=getattr(agent, "codex_app_server_codex_home", None),
+                    approval_callback=approval_callback,
+                    request_routing=request_routing,
+                    on_event=on_event,
+                )
+                agent._codex_session_cwd = effective_cwd
+                continuation_deadline = time.monotonic() + turn_timeout
+                try:
+                    resumed_thread_id = agent._codex_session.ensure_started(
+                        startup_timeout=turn_timeout
+                    )
+                    _persist_codex_workspace_thread(
+                        agent, effective_cwd, resumed_thread_id
+                    )
+                    continued_turn = agent._codex_session.run_turn(
+                        user_input=_CODEX_DEADLINE_CONTINUATION_PROMPT,
+                        turn_timeout=turn_timeout,
+                        post_tool_quiet_timeout=post_tool_quiet_timeout,
+                        turn_deadline=continuation_deadline,
+                    )
+                except TimeoutError:
+                    continued_turn = TurnResult(
+                        error=f"turn timed out after {turn_timeout}s",
+                        interrupted=True,
+                        timed_out=True,
+                        should_retire=True,
+                    )
+                except CodexAppServerError as exc:
+                    continued_turn = TurnResult(
+                        error=agent._codex_session._format_startup_error(exc),
+                        should_retire=True,
+                    )
+                except RuntimeError as exc:
+                    continued_turn = TurnResult(
+                        error=agent._codex_session._format_error_with_stderr(
+                            "codex app-server continuation startup failed", exc
+                        ),
+                        should_retire=True,
+                    )
+                continued_turn.projected_messages = (
+                    list(turn.projected_messages)
+                    + list(continued_turn.projected_messages)
+                )
+                continued_turn.tool_iterations += turn.tool_iterations
+                turn = continued_turn
     except Exception as exc:
-        logger.exception("codex app-server turn failed")
+        # Avoid traceback rendering here: a protocol exception can embed the
+        # internal thread id in its message. The exception class is enough for
+        # operator triage; user-facing Codex RPC errors are sanitized below.
+        logger.error(
+            "codex app-server turn failed: exception_type=%s",
+            type(exc).__name__,
+        )
         # Crash → unconditionally drop the session so the next turn
         # respawns from scratch instead of reusing a dead client.
         try:
@@ -784,6 +1521,7 @@ def run_codex_app_server_turn(
         except Exception:
             pass
         agent._codex_session = None
+        agent._codex_session_cwd = None
         _user_interrupted = bool(
             getattr(agent, "_interrupt_requested", False)
         )
@@ -794,9 +1532,18 @@ def run_codex_app_server_turn(
         )
         if _user_interrupted:
             agent.clear_interrupt()
+        if isinstance(exc, CodexAppServerError):
+            safe_error = (
+                "Codex app-server request failed "
+                f"(JSON-RPC code {exc.code})."
+            )
+        else:
+            from agent.redact import redact_sensitive_text
+
+            safe_error = redact_sensitive_text(str(exc), force=True)
         return {
             "final_response": (
-                f"Codex app-server turn failed: {exc}. "
+                f"Codex app-server turn failed: {safe_error} "
                 f"Fall back to default runtime with `/codex-runtime auto`."
             ),
             "messages": messages,
@@ -809,7 +1556,7 @@ def run_codex_app_server_turn(
                 if _interrupt_message
                 else {}
             ),
-            "error": str(exc),
+            "error": safe_error,
         }
 
     # This runtime bypasses the normal conversation-loop finalizer. Mirror its
@@ -830,60 +1577,60 @@ def run_codex_app_server_turn(
     # rather than riding the broken process. Mirrors openclaw beta.8's
     # "retire timed-out app-server clients" fix.
     if getattr(turn, "should_retire", False):
-        logger.warning(
-            "codex app-server session retired (turn error: %s)",
-            turn.error,
-        )
+        logger.warning("codex app-server session retired after a turn failure")
         try:
             agent._codex_session.close()
         except Exception:
             pass
         agent._codex_session = None
+        agent._codex_session_cwd = None
 
     # Splice projected messages into the conversation. The projector emits
     # standard {role, content, tool_calls, tool_call_id} entries, which
     # is exactly what curator.py / sessions DB expect.
+    _codex_flush_ok = True
     if turn.projected_messages:
         from agent.message_metadata import append_message
+        from agent.transports.codex_app_server_session import (
+            _INITIAL_USER_ECHO_MARKER,
+        )
 
-        for projected_message in turn.projected_messages:
+        for projected_message in _normalize_codex_projected_messages(
+            turn.projected_messages
+        ):
+            # Session projection marks turn/start's user echo explicitly. Never
+            # infer redundancy from content here: a legitimate turn/steer can
+            # repeat the initial text exactly, or the initial echo may be absent.
+            if projected_message.pop(_INITIAL_USER_ECHO_MARKER, False):
+                continue
             append_message(messages, projected_message)
 
-        # Persist the newly-projected assistant/tool messages ourselves.
-        # This path is an early return that bypasses conversation_loop, whose
-        # normal per-step _persist_session() calls would otherwise flush them.
-        # The inbound user turn was already flushed at turn start
-        # (turn_context.py _persist_session), and _flush_messages_to_session_db
-        # is idempotent via the intrinsic _DB_PERSISTED_MARKER — so this writes
-        # ONLY the new codex projected rows and does NOT re-write the user turn.
-        # Keeping the agent as the sole persister lets us return
-        # agent_persisted=True below, so the gateway skips its own DB write and
-        # we avoid the #860/#42039 duplicate user-message write (append_message
-        # is a raw INSERT with no dedup, so a gateway re-write would duplicate
-        # the already-flushed user turn). See gateway/run.py agent_persisted.
-        if getattr(agent, "_session_db", None) is not None:
-            try:
-                _codex_flush_ok = agent._flush_messages_to_session_db(messages)
-            except Exception:
-                _codex_flush_ok = False
-                logger.warning(
-                    "codex app-server projected-message flush failed",
-                    exc_info=True,
-                )
-            if _codex_flush_ok is False:
-                # Unlike the chat-completions loop (which fails closed BEFORE
-                # projection — see conversation_loop session_persistence_failed),
-                # codex output has already streamed to the user by the time this
-                # flush runs, so there is nothing left to withhold. We cannot
-                # flip agent_persisted=False either: the gateway fallback write
-                # would re-INSERT the already-flushed user turn (#860/#42039).
-                # Surface the durability gap loudly instead of a silent debug.
-                logger.warning(
-                    "codex app-server turn was delivered but could NOT be "
-                    "persisted to the session DB (session=%s) — this turn "
-                    "will be missing after restart/resume",
-                    getattr(agent, "session_id", None),
-                )
+    # Persist the turn-owned message list even when Codex produced no
+    # projections. A failed turn can still leave an unpersisted inbound user row;
+    # reporting success in that case would make the gateway skip its recovery
+    # write. The flush is idempotent via each message's _db_persisted marker.
+    if getattr(agent, "_session_db", None) is not None:
+        try:
+            _codex_flush_ok = agent._flush_messages_to_session_db(messages)
+        except Exception:
+            _codex_flush_ok = False
+            logger.warning(
+                "codex app-server message flush failed",
+                exc_info=True,
+            )
+        if _codex_flush_ok is False:
+            # Unlike the chat-completions loop (which fails closed BEFORE
+            # projection — see conversation_loop session_persistence_failed),
+            # Codex output may already have streamed by the time this flush runs.
+            # Report partial persistence truthfully. Gateway fallback writes
+            # inspect each message's intrinsic _db_persisted marker, skipping the
+            # already-written prefix while recovering only the unpersisted suffix.
+            logger.warning(
+                "codex app-server turn was delivered but could NOT be "
+                "persisted to the session DB (session=%s) — this turn "
+                "will be missing after restart/resume",
+                getattr(agent, "session_id", None),
+            )
 
 
     # Counter ticks for the agent-improvement loop.
@@ -896,9 +1643,16 @@ def run_codex_app_server_turn(
     agent._iters_since_skill = (
         getattr(agent, "_iters_since_skill", 0) + turn.tool_iterations
     )
+    usage_results: list[dict[str, Any]] = []
+    if continued_from_turn is not None:
+        _record_codex_app_server_compaction(agent, continued_from_turn)
+        usage_results.append(
+            _record_codex_app_server_usage(agent, continued_from_turn)
+        )
     _record_codex_app_server_compaction(agent, turn)
-    usage_result = _record_codex_app_server_usage(agent, turn)
-    api_calls = 1
+    usage_results.append(_record_codex_app_server_usage(agent, turn))
+    usage_result = _merge_codex_usage_results(usage_results)
+    api_calls = 1 + continuation_count
 
     # Now check the skill nudge AFTER iters were incremented — same
     # pattern the chat_completions path uses (line ~15432).
@@ -927,9 +1681,12 @@ def run_codex_app_server_turn(
     # Background review fork — same cadence + signature as the default
     # path (line ~15449). Only fires when a trigger actually tripped AND
     # we have a real final response.
+    _timed_out = bool(getattr(turn, "timed_out", False))
     if (
         turn.final_text
         and not turn.interrupted
+        and turn.error is None
+        and not _timed_out
         and (should_review_memory or should_review_skills)
     ):
         try:
@@ -941,11 +1698,19 @@ def run_codex_app_server_turn(
         except Exception:
             logger.debug("background review spawn raised", exc_info=True)
 
+    _successful_turn = (
+        not _timed_out and not turn.interrupted and turn.error is None
+    )
+
     return {
-        "final_response": turn.final_text,
+        # A deadline can arrive after one or more agentMessage items. Keep
+        # those projected messages for diagnostics/history, but never expose
+        # their last text as a successful terminal response without the
+        # matching turn/completed notification.
+        "final_response": turn.final_text if _successful_turn else "",
         "messages": messages,
         "api_calls": api_calls,
-        "completed": not turn.interrupted and turn.error is None,
+        "completed": _successful_turn,
         "partial": turn.interrupted or turn.error is not None,
         "interrupted": _user_interrupted,
         **(
@@ -954,6 +1719,7 @@ def run_codex_app_server_turn(
             else {}
         ),
         "error": turn.error,
+        "timed_out": _timed_out,
         # The codex app-server runtime IS an early-return path that bypasses
         # conversation_loop, but we flush the projected assistant/tool messages
         # ourselves above (see the _flush_messages_to_session_db call after
@@ -961,13 +1727,13 @@ def run_codex_app_server_turn(
         # start (turn_context._persist_session) and the flush dedups via
         # _DB_PERSISTED_MARKER, so state.db ends up with each real message
         # exactly once and session_search / conversation-distill see the full
-        # gateway conversation. Report agent_persisted=True so the gateway
-        # skips its own append_to_transcript DB write — writing again there
-        # would re-INSERT the already-flushed user turn (append_message has no
-        # dedup), reintroducing the #860 / #42039 duplicate-write bug.
-        "agent_persisted": True,
+        # gateway conversation. A failed partial flush reports False so the
+        # gateway can recover only rows that lack _db_persisted; already-written
+        # rows remain skipped and cannot be duplicated.
+        "agent_persisted": _codex_flush_ok is not False,
         "codex_thread_id": turn.thread_id,
         "codex_turn_id": turn.turn_id,
+        "continued": continuation_count,
         **usage_result,
     }
 

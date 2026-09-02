@@ -126,6 +126,31 @@ DEFAULT_CONFIG = {
         # on a genuinely hung build. Raise it for deployments with many slow
         # or unreachable MCP servers.
         "build_wait_timeout": 600,
+        # Absolute wall-clock deadline (seconds) for one Codex app-server
+        # turn. This is independent of terminal.timeout because Codex owns
+        # its inner tool loop. Positive numeric values only; invalid values
+        # fall back to the backward-compatible 600-second default.
+        "codex_app_server_turn_timeout": 600,
+        # Fast-fail a Codex app-server turn that emits a tool result and then
+        # no further protocol activity. Long-running coding profiles may raise
+        # this independently from the absolute turn deadline.
+        "codex_app_server_post_tool_quiet_timeout": 90,
+        # Optional structured handoff boundary for Codex app-server turns.
+        # False preserves the historical implicit agent cwd. When true, each
+        # handoff must carry [HERMES_RUNTIME_CWD=/absolute/repository].
+        "codex_app_server_require_explicit_cwd": False,
+        # Absolute directories that may contain a marked repository cwd. An
+        # empty list means the normal resolved agent cwd is the sole root.
+        "codex_app_server_workspace_roots": [],
+        # Opt-in single-writer advisory lock keyed by canonical CWD. False
+        # preserves parallel app-server sessions across Hermes processes.
+        "codex_app_server_exclusive_cwd": False,
+        # Opt-in one-time continuation when the absolute deadline interrupts
+        # a turn that emitted recent, turn-scoped protocol activity.
+        "codex_app_server_deadline_continuation": False,
+        # Optional Codex CLI home for the spawned app-server. Relative paths
+        # resolve below HERMES_HOME; Hermes does not create or authenticate it.
+        "codex_app_server_codex_home": None,
         # Max app-level retry attempts for API errors (connection drops,
         # provider timeouts, 5xx, etc.) before the agent surfaces the
         # failure.  The OpenAI SDK already does its own low-level retries

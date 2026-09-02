@@ -20,6 +20,7 @@ preserved.
 from __future__ import annotations
 
 import logging
+import math
 import os
 import re
 import sys
@@ -27,6 +28,7 @@ import threading
 import time
 import uuid
 from datetime import datetime
+from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 from urllib.parse import parse_qs, urlparse, urlunparse
 
@@ -507,6 +509,60 @@ def _normalize_run_budget_seconds(value) -> Optional[float]:
     if seconds != seconds or seconds <= 0:  # NaN or non-positive
         return None
     return seconds
+
+
+def _normalize_codex_app_server_turn_timeout(value: Any) -> float:
+    """Coerce the configured Codex app-server turn deadline.
+
+    The historical hardcoded deadline was 600 seconds, so missing or invalid
+    values retain that behavior. Booleans are rejected even though ``bool`` is
+    numeric in Python, and non-finite/non-positive values cannot disable or
+    wedge the outer deadline accidentally.
+    """
+    default = 600.0
+    if isinstance(value, bool):
+        return default
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError):
+        return default
+    if not math.isfinite(seconds) or seconds <= 0:
+        return default
+    return seconds
+
+
+def _normalize_codex_app_server_post_tool_quiet_timeout(value: Any) -> float:
+    """Coerce the Codex post-tool inactivity watchdog interval.
+
+    Keep the historical 90-second default for backward compatibility, while
+    allowing long-running coding profiles to align this watchdog with their
+    absolute turn deadline. Invalid values must not disable the watchdog.
+    """
+    default = 90.0
+    if isinstance(value, bool):
+        return default
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError):
+        return default
+    if not math.isfinite(seconds) or seconds <= 0:
+        return default
+    return seconds
+
+
+def _normalize_codex_app_server_codex_home(value: Any) -> Optional[str]:
+    """Resolve an optional Codex home without creating or inspecting it.
+
+    Relative paths are anchored to the active Hermes home so the setting stays
+    profile-aware. Empty and non-string values preserve Codex's normal home
+    selection.
+    """
+    if not isinstance(value, str) or not value.strip():
+        return None
+    path = Path(value.strip()).expanduser()
+    if not path.is_absolute():
+        path = get_hermes_home() / path
+    return str(path.resolve(strict=False))
 
 
 def _refuse_checkpoint_required_on_codex_app_server(
@@ -2056,6 +2112,58 @@ def init_agent(
         agent.run_budget_seconds = _normalize_run_budget_seconds(
             _agent_section.get("run_budget_seconds")
         )
+
+    # Codex app-server owns the entire inner tool loop, so terminal.timeout
+    # cannot bound a turn on this runtime. Keep the historical 600-second
+    # deadline by default while allowing long-running profiles to raise it.
+    agent.codex_app_server_turn_timeout = (
+        _normalize_codex_app_server_turn_timeout(
+            _agent_section.get("codex_app_server_turn_timeout", 600)
+        )
+    )
+    # Codex can legitimately spend longer than 90 seconds reasoning after a
+    # tool result. Keep the historical watchdog default, but let long-running
+    # profiles raise it independently from the absolute turn deadline.
+    agent.codex_app_server_post_tool_quiet_timeout = (
+        _normalize_codex_app_server_post_tool_quiet_timeout(
+            _agent_section.get("codex_app_server_post_tool_quiet_timeout", 90)
+        )
+    )
+    _require_codex_cwd = _agent_section.get(
+        "codex_app_server_require_explicit_cwd", False
+    )
+    agent.codex_app_server_require_explicit_cwd = (
+        _require_codex_cwd if isinstance(_require_codex_cwd, bool) else False
+    )
+    _codex_workspace_roots = _agent_section.get(
+        "codex_app_server_workspace_roots", []
+    )
+    if _codex_workspace_roots is None:
+        _codex_workspace_roots = []
+    agent.codex_app_server_workspace_roots = (
+        list(_codex_workspace_roots)
+        if isinstance(_codex_workspace_roots, list)
+        else _codex_workspace_roots
+    )
+    _exclusive_codex_cwd = _agent_section.get(
+        "codex_app_server_exclusive_cwd", False
+    )
+    agent.codex_app_server_exclusive_cwd = (
+        _exclusive_codex_cwd
+        if isinstance(_exclusive_codex_cwd, bool)
+        else False
+    )
+    _deadline_continuation = _agent_section.get(
+        "codex_app_server_deadline_continuation", False
+    )
+    agent.codex_app_server_deadline_continuation = (
+        _deadline_continuation
+        if isinstance(_deadline_continuation, bool)
+        else False
+    )
+    agent.codex_app_server_codex_home = _normalize_codex_app_server_codex_home(
+        _agent_section.get("codex_app_server_codex_home")
+    )
 
     # Empty-response retry guard config (NS-503): additive
     # ``agent.empty_response_guard`` subsection. Resolution is tolerant —

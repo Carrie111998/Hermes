@@ -146,6 +146,58 @@ class TestExtractCacheBustingConfig:
     """Verify _extract_cache_busting_config pulls the documented subset of
     config values that must invalidate the cached agent on change."""
 
+    def test_reads_codex_app_server_turn_timeout(self):
+        from gateway.run import GatewayRunner
+
+        out = GatewayRunner._extract_cache_busting_config(
+            {"agent": {"codex_app_server_turn_timeout": 3600}}
+        )
+
+        assert out["agent.codex_app_server_turn_timeout"] == 3600
+
+    def test_reads_codex_app_server_post_tool_quiet_timeout(self):
+        from gateway.run import GatewayRunner
+
+        out = GatewayRunner._extract_cache_busting_config(
+            {"agent": {"codex_app_server_post_tool_quiet_timeout": 3600}}
+        )
+
+        assert out["agent.codex_app_server_post_tool_quiet_timeout"] == 3600
+
+    def test_reads_codex_app_server_cwd_contract(self):
+        from gateway.run import GatewayRunner
+
+        out = GatewayRunner._extract_cache_busting_config(
+            {
+                "agent": {
+                    "codex_app_server_require_explicit_cwd": True,
+                    "codex_app_server_workspace_roots": ["/srv/repos"],
+                }
+            }
+        )
+
+        assert out["agent.codex_app_server_require_explicit_cwd"] is True
+        assert out["agent.codex_app_server_workspace_roots"] == [
+            "/srv/repos"
+        ]
+
+    def test_reads_generic_codex_app_server_hardening_options(self):
+        from gateway.run import GatewayRunner
+
+        out = GatewayRunner._extract_cache_busting_config(
+            {
+                "agent": {
+                    "codex_app_server_exclusive_cwd": True,
+                    "codex_app_server_deadline_continuation": True,
+                    "codex_app_server_codex_home": "codex-home",
+                }
+            }
+        )
+
+        assert out["agent.codex_app_server_exclusive_cwd"] is True
+        assert out["agent.codex_app_server_deadline_continuation"] is True
+        assert out["agent.codex_app_server_codex_home"] == "codex-home"
+
 
     def test_reads_compression_subkeys(self):
         from gateway.run import GatewayRunner
@@ -1111,4 +1163,3 @@ class TestCrossProcessInvalidationDefersCleanup:
         # Stale entry was popped, hard-teardown path never used.
         assert "telegram:s1" not in runner._agent_cache
         runner._cleanup_agent_resources.assert_not_called()
-

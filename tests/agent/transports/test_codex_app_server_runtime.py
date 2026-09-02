@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import pytest
 
+from agent.agent_init import _normalize_codex_app_server_codex_home
 from hermes_cli.runtime_provider import (
     _VALID_API_MODES,
     _maybe_apply_codex_app_server_runtime,
@@ -209,6 +210,45 @@ class TestSpawnEnvIsolation:
         # And HOME still passes through unchanged
         assert captured["env"].get("HOME") == "/users/alice"
 
+    def test_spawn_uses_selected_repository_cwd(self, monkeypatch, tmp_path):
+        """The OS process and JSON-RPC thread share the selected repo cwd."""
+        import subprocess
+        from agent.transports import codex_app_server as cas
+
+        captured = {}
+
+        class FakePopen:
+            def __init__(self, cmd, *args, **kwargs):
+                captured["cwd"] = kwargs.get("cwd")
+                self.stdin = None
+                self.stdout = None
+                self.stderr = None
+                self.pid = 1
+                self.returncode = None
+
+            def poll(self):
+                return None
+
+            def terminate(self):
+                pass
+
+            def wait(self, timeout=None):
+                return 0
+
+            def kill(self):
+                pass
+
+        monkeypatch.setattr(subprocess, "Popen", FakePopen)
+        repo = tmp_path / "repo"
+        repo.mkdir()
+
+        client = cas.CodexAppServerClient(
+            codex_bin="codex", cwd=str(repo.resolve())
+        )
+        client._closed = True
+
+        assert captured["cwd"] == str(repo.resolve())
+
     def test_kanban_worker_adds_only_kanban_writable_root(self, monkeypatch):
         """Codex-runtime Kanban workers need to write board state outside
         their scratch/worktree workspace, but should not fall back to
@@ -340,3 +380,18 @@ class TestSpawnEnvSecretStripping:
         env = self._capture_spawn_env(monkeypatch)
         assert env.get("OPENAI_API_KEY") == "sk-codex-needs-this"
 
+
+class TestCodexHomeConfig:
+    def test_relative_codex_home_is_anchored_to_hermes_home(
+        self, monkeypatch, tmp_path
+    ):
+        profile_home = tmp_path / "profile"
+        monkeypatch.setenv("HERMES_HOME", str(profile_home))
+
+        assert _normalize_codex_app_server_codex_home("codex-home") == str(
+            (profile_home / "codex-home").resolve()
+        )
+
+    @pytest.mark.parametrize("value", [None, "", "   ", 123])
+    def test_empty_or_non_string_codex_home_preserves_codex_default(self, value):
+        assert _normalize_codex_app_server_codex_home(value) is None
