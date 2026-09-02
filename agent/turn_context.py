@@ -826,6 +826,14 @@ def build_turn_context(
     append_message(messages, user_msg)
     current_turn_user_idx = len(messages) - 1
     agent._persist_user_message_idx = current_turn_user_idx
+    from agent.message_observability import log_message_shape
+
+    log_message_shape(
+        logger,
+        "build_turn_context",
+        messages,
+        conversation_history_count=len(conversation_history or []),
+    )
 
     # Track user turns for memory flush and periodic nudge logic.
     agent._user_turn_count += 1

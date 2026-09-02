@@ -934,6 +934,13 @@ def _dispatch_nonstreaming_api_request(agent, api_kwargs: dict, *, make_client):
     interrupt, abort, cancellation, and close semantics stay in the callers —
     this helper only issues the request.
     """
+    from agent.ollama_native_adapter import (
+        create_native_ollama_chat,
+        should_use_native_ollama,
+    )
+
+    if should_use_native_ollama(agent):
+        return create_native_ollama_chat(agent, api_kwargs)
     if agent.api_mode == "codex_responses":
         request_client = make_client("codex_stream_request")
         return agent._run_codex_stream(
@@ -4251,6 +4258,15 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                     pool=_conn_cap,
                 ),
             }
+            from agent.ollama_native_adapter import (
+                create_native_ollama_chat,
+                should_use_native_ollama,
+            )
+
+            if should_use_native_ollama(agent):
+                last_chunk_time["t"] = time.time()
+                agent._touch_activity("waiting for provider response (streaming)")
+                return create_native_ollama_chat(agent, stream_kwargs)
             # Native Gemini rejects OpenAI's usage-streaming extension.
             if not is_native_gemini_base_url(agent.base_url):
                 stream_kwargs["stream_options"] = {"include_usage": True}

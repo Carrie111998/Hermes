@@ -1124,6 +1124,16 @@ def _provider_request(
             **dict(final.get("extra_headers") or {}),
             **headers,
         }
+    from agent.message_observability import log_message_shape
+
+    _final_messages = final.get("messages")
+    if not isinstance(_final_messages, list):
+        _final_messages = final.get("input")
+    log_message_shape(
+        logger,
+        "relay_provider_callback",
+        _final_messages if isinstance(_final_messages, list) else [],
+    )
     return final
 
 
