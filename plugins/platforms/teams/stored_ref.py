@@ -25,10 +25,50 @@ Poster = Callable[[str, Mapping[str, str], Dict[str, Any]], Awaitable[tuple[int,
 _REQUIRED = ("kind", "bot_app_id", "service_url", "conversation_id", "tenant_id")
 _CONV_ID_RE = re.compile(r"^[A-Za-z0-9:@\-_.]+$")
 _STEM_RE = re.compile(r"[^A-Za-z0-9._-]+")
+_GROUP_ADDRESSED_VIA = frozenset({"mention", "reply_to_own"})
 
 
 class StoredRefError(ValueError):
     """Stored reference is missing, the wrong kind, or policy-blocked."""
+
+
+def group_inbound_addresses_bot(
+    *,
+    bot_app_id: str,
+    entities: Any = None,
+    reply_to_id: Optional[str] = None,
+    own_activity_ids: Any = None,
+) -> Optional[str]:
+    """Return how a group inbound addressed this bot, or None.
+
+    A group message addresses the bot only when it @mentions the bot app
+    id (``28:{bot_app_id}``) or replies to one of this bot's own
+    activity ids. Any other group message must not unlock a send.
+    """
+    bot = str(bot_app_id or "").strip()
+    if not bot:
+        return None
+    bot_ids = {bot, f"28:{bot}"}
+    for ent in entities or []:
+        if isinstance(ent, Mapping):
+            typ = ent.get("type")
+            mentioned = ent.get("mentioned")
+        else:
+            typ = getattr(ent, "type", None)
+            mentioned = getattr(ent, "mentioned", None)
+        if str(typ or "").lower() != "mention":
+            continue
+        if isinstance(mentioned, Mapping):
+            mid = mentioned.get("id")
+        else:
+            mid = getattr(mentioned, "id", None) if mentioned is not None else None
+        if str(mid or "") in bot_ids:
+            return "mention"
+    reply = str(reply_to_id or "").strip()
+    own = {str(x) for x in (own_activity_ids or []) if str(x).strip()}
+    if reply and reply in own:
+        return "reply_to_own"
+    return None
 
 
 def classify_stored_ref(
@@ -41,6 +81,11 @@ def classify_stored_ref(
         raise StoredRefError(f"stored ref missing fields: {', '.join(missing)}")
     kind = str(ref.get("kind") or "").strip()
     if kind in ("group", "groupChat"):
+        via = str(ref.get("addressed_via") or "").strip()
+        if via not in _GROUP_ADDRESSED_VIA:
+            raise StoredRefError(
+                "group inbound must mention this bot or reply to this bot"
+            )
         if not str(ref.get("addressed_by") or "").strip():
             raise StoredRefError("group ref requires inbound addresser")
     elif kind != "personal":
@@ -98,6 +143,7 @@ def persist_inbound_ref(
     person: Optional[str] = None,
     filename_stem: Optional[str] = None,
     inbound_activity_id: Optional[str] = None,
+    addressed_via: Optional[str] = None,
 ) -> Path:
     if conversation_type == "personal":
         kind = "personal"
@@ -119,9 +165,15 @@ def persist_inbound_ref(
     if user_id:
         ref["user_id"] = user_id
     if kind == "groupChat":
+        via = str(addressed_via or "").strip()
+        if via not in _GROUP_ADDRESSED_VIA:
+            raise StoredRefError(
+                "group inbound must mention this bot or reply to this bot"
+            )
         addresser = user_id or aad_object_id
         if not addresser:
             raise StoredRefError("group ref requires inbound addresser")
+        ref["addressed_via"] = via
         ref["addressed_by"] = str(addresser)
         if inbound_activity_id:
             ref["last_inbound_activity_id"] = str(inbound_activity_id)

@@ -14,6 +14,7 @@ from plugins.platforms.teams.stored_ref import (
     StoredRefError,
     activity_post_url,
     classify_stored_ref,
+    group_inbound_addresses_bot,
     load_stored_refs,
     persist_inbound_ref,
     send_from_stored_ref,
@@ -43,13 +44,36 @@ def test_classify_accepts_personal_matching_bot():
 
 
 def test_classify_rejects_group_without_inbound_addresser():
-    with pytest.raises(StoredRefError, match="addresser"):
+    with pytest.raises(StoredRefError, match="mention this bot or reply"):
         classify_stored_ref(_throwaway(kind="groupChat"), expected_bot_app_id=BOT)
 
 
-def test_classify_accepts_group_after_inbound_addresser():
+def test_classify_rejects_group_with_sender_but_no_bot_address():
+    with pytest.raises(StoredRefError, match="mention this bot or reply"):
+        classify_stored_ref(
+            _throwaway(kind="groupChat", addressed_by="29:customer-roster"),
+            expected_bot_app_id=BOT,
+        )
+
+
+def test_classify_accepts_group_after_mention():
     classify_stored_ref(
-        _throwaway(kind="groupChat", addressed_by="29:customer-roster"),
+        _throwaway(
+            kind="groupChat",
+            addressed_by="29:customer-roster",
+            addressed_via="mention",
+        ),
+        expected_bot_app_id=BOT,
+    )
+
+
+def test_classify_accepts_group_after_reply_to_own():
+    classify_stored_ref(
+        _throwaway(
+            kind="groupChat",
+            addressed_by="29:customer-roster",
+            addressed_via="reply_to_own",
+        ),
         expected_bot_app_id=BOT,
     )
 
@@ -227,6 +251,7 @@ def _group_ref(**overrides):
         kind="groupChat",
         conversation_id="19:group-throwaway",
         addressed_by="29:customer-roster",
+        addressed_via="mention",
         last_inbound_activity_id="activity-inbound-1",
     )
     ref.update(overrides)
@@ -272,3 +297,82 @@ def test_group_send_replies_in_addressed_thread():
     assert result["success"] is True
     assert result["message_id"] == "activity-group-reply"
     assert posted["body"]["replyToId"] == "activity-inbound-1"
+
+
+def test_group_inbound_mention_addresses_bot():
+    assert (
+        group_inbound_addresses_bot(
+            bot_app_id=BOT,
+            entities=[{"type": "mention", "mentioned": {"id": f"28:{BOT}"}}],
+        )
+        == "mention"
+    )
+
+
+def test_group_inbound_reply_to_own_addresses_bot():
+    assert (
+        group_inbound_addresses_bot(
+            bot_app_id=BOT,
+            reply_to_id="activity-own-1",
+            own_activity_ids=["activity-own-1"],
+        )
+        == "reply_to_own"
+    )
+
+
+def test_group_inbound_ambient_does_not_address_bot():
+    assert (
+        group_inbound_addresses_bot(
+            bot_app_id=BOT,
+            entities=[],
+            reply_to_id="activity-someone-else",
+            own_activity_ids=["activity-own-1"],
+        )
+        is None
+    )
+
+
+def test_persist_rejects_unmentioned_group(tmp_path: Path):
+    with pytest.raises(StoredRefError, match="mention this bot or reply"):
+        persist_inbound_ref(
+            tmp_path,
+            conversation_id="19:group-throwaway",
+            conversation_type="groupChat",
+            service_url="https://smba.trafficmanager.net/teams/",
+            tenant_id="00000000-0000-0000-0000-000000000002",
+            bot_app_id=BOT,
+            user_id="29:customer-roster",
+            inbound_activity_id="activity-ambient",
+        )
+    assert list(tmp_path.glob("*.json")) == []
+
+
+def test_adapter_does_not_persist_unmentioned_group(tmp_path: Path, monkeypatch):
+    from plugins.platforms.teams.adapter import TeamsAdapter
+
+    adapter = object.__new__(TeamsAdapter)
+    adapter._client_id = BOT
+    adapter._tenant_id = "00000000-0000-0000-0000-000000000002"
+    adapter._stored_refs = {}
+    adapter._own_activity_ids = {}
+    monkeypatch.setattr(adapter, "_stored_ref_dir", lambda: tmp_path)
+
+    class _Conv:
+        conversation_type = "groupChat"
+        id = "19:group-throwaway"
+        tenant_id = "00000000-0000-0000-0000-000000000002"
+
+    class _Activity:
+        service_url = "https://smba.trafficmanager.net/teams/"
+        id = "activity-ambient"
+        entities = []
+        reply_to_id = None
+
+    class _From:
+        aad_object_id = "00000000-0000-0000-0000-000000000001"
+        id = "29:customer-roster"
+        name = "Customer"
+
+    adapter._persist_inbound_stored_ref(_Activity(), _Conv(), _From())
+    assert list(tmp_path.glob("*.json")) == []
+    assert adapter._stored_refs == {}

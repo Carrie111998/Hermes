@@ -825,6 +825,9 @@ class TeamsAdapter(BasePlatformAdapter):
         # Disk-backed slim refs (teams/conversation_refs/*.json) for proactive
         # send after restart — in-memory conv refs do not survive (#1218).
         self._stored_refs: Dict[str, Dict[str, Any]] = {}
+        # Activity ids this bot sent, keyed by conversation id. Group inbound
+        # is addressed only via @mention or reply-to-one-of-these.
+        self._own_activity_ids: Dict[str, set[str]] = {}
 
     async def connect(self, *, is_reconnect: bool = False) -> bool:
         # Defensive re-check: create_adapter() already ran the installer
@@ -954,7 +957,28 @@ class TeamsAdapter(BasePlatformAdapter):
         service_url = getattr(activity, "service_url", None) or ""
         if not conv_id or not service_url:
             return
-        from plugins.platforms.teams.stored_ref import StoredRefError, persist_inbound_ref
+        from plugins.platforms.teams.stored_ref import (
+            StoredRefError,
+            group_inbound_addresses_bot,
+            persist_inbound_ref,
+        )
+
+        addressed_via = None
+        if conv_type in ("groupChat", "group"):
+            reply_to = getattr(activity, "reply_to_id", None) or getattr(
+                activity, "replyToId", None
+            )
+            addressed_via = group_inbound_addresses_bot(
+                bot_app_id=self._client_id,
+                entities=getattr(activity, "entities", None),
+                reply_to_id=reply_to,
+                own_activity_ids=self._own_activity_ids.get(str(conv_id)),
+            )
+            if not addressed_via:
+                logger.info(
+                    "[teams] stored-ref persist skipped: group inbound did not address this bot"
+                )
+                return
 
         try:
             persist_inbound_ref(
@@ -968,6 +992,7 @@ class TeamsAdapter(BasePlatformAdapter):
                 user_id=getattr(from_account, "id", None),
                 person=getattr(from_account, "name", None),
                 inbound_activity_id=getattr(activity, "id", None),
+                addressed_via=addressed_via,
             )
             self._load_stored_refs()
         except StoredRefError as exc:
@@ -1455,6 +1480,8 @@ class TeamsAdapter(BasePlatformAdapter):
                         retryable=True,
                     )
                 last_message_id = result.get("message_id")
+            if last_message_id:
+                self._own_activity_ids.setdefault(chat_id, set()).add(str(last_message_id))
             return SendResult(success=True, message_id=last_message_id)
 
         last_message_id = None
@@ -1479,6 +1506,8 @@ class TeamsAdapter(BasePlatformAdapter):
             except Exception as e:
                 return SendResult(success=False, error=str(e), retryable=True)
 
+        if last_message_id:
+            self._own_activity_ids.setdefault(chat_id, set()).add(str(last_message_id))
         return SendResult(success=True, message_id=last_message_id)
 
     async def send_typing(self, chat_id: str, metadata: Optional[Dict[str, Any]] = None) -> None:
