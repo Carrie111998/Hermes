@@ -324,9 +324,17 @@ def _git_env(
         env["GIT_INDEX_FILE"] = str(index_file)
     else:
         env.pop("GIT_INDEX_FILE", None)
-    env["GIT_CONFIG_GLOBAL"] = os.devnull
-    env["GIT_CONFIG_SYSTEM"] = os.devnull
-    env["GIT_CONFIG_NOSYSTEM"] = "1"
+    # Windows: os.devnull is 'nul', which git can't stat as a config path.
+    # Also, GIT_CONFIG_NOSYSTEM=1 triggers a MSYS path-translation bug on
+    # Windows that makes git try to stat 'nul' — avoid it there.
+    if os.name == "nt":
+        env["GIT_CONFIG_GLOBAL"] = ""
+        env["GIT_CONFIG_SYSTEM"] = ""
+        # Do NOT set GIT_CONFIG_NOSYSTEM on Windows — it causes 'stat nul' error
+    else:
+        env["GIT_CONFIG_GLOBAL"] = os.devnull
+        env["GIT_CONFIG_SYSTEM"] = os.devnull
+        env["GIT_CONFIG_NOSYSTEM"] = "1"
     return env
 
 
@@ -501,9 +509,17 @@ def _init_store(store: Path, working_dir: str) -> Optional[str]:
     # subprocess with just the config-isolation env vars.
     from tools.environments.local import build_subprocess_env
     init_env = build_subprocess_env(scrub_secrets=False, inherit_profile_home=False)
-    init_env["GIT_CONFIG_GLOBAL"] = os.devnull
-    init_env["GIT_CONFIG_SYSTEM"] = os.devnull
-    init_env["GIT_CONFIG_NOSYSTEM"] = "1"
+    # Windows: os.devnull is 'nul', which git can't stat as a config path.
+    # Also, GIT_CONFIG_NOSYSTEM=1 triggers a MSYS path-translation bug on
+    # Windows that makes git try to stat 'nul' — avoid it there.
+    if os.name == "nt":
+        init_env["GIT_CONFIG_GLOBAL"] = ""
+        init_env["GIT_CONFIG_SYSTEM"] = ""
+        # Do NOT set GIT_CONFIG_NOSYSTEM on Windows
+    else:
+        init_env["GIT_CONFIG_GLOBAL"] = os.devnull
+        init_env["GIT_CONFIG_SYSTEM"] = os.devnull
+        init_env["GIT_CONFIG_NOSYSTEM"] = "1"
     # Drop any inherited GIT_* that would interfere.
     for k in ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_NAMESPACE",
               "GIT_ALTERNATE_OBJECT_DIRECTORIES"):
