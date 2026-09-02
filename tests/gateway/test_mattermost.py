@@ -262,6 +262,38 @@ class TestMattermostSend:
         assert payload["root_id"] == "bad_root"
 
 
+class TestMattermostTyping:
+    def setup_method(self):
+        self.adapter = _make_adapter()
+        self.adapter._bot_user_id = "bot_user_id"
+        self.adapter._api_post = AsyncMock()
+
+    @pytest.mark.asyncio
+    async def test_typing_in_thread_uses_same_root_as_reply(self):
+        self.adapter._reply_mode = "thread"
+
+        await self.adapter.send_typing(
+            "channel_1",
+            metadata={"thread_id": "root_post"},
+        )
+
+        self.adapter._api_post.assert_awaited_once_with(
+            "users/bot_user_id/typing",
+            {"channel_id": "channel_1", "parent_id": "root_post"},
+        )
+
+    @pytest.mark.asyncio
+    async def test_typing_without_thread_stays_in_channel(self):
+        self.adapter._reply_mode = "thread"
+
+        await self.adapter.send_typing("channel_1")
+
+        self.adapter._api_post.assert_awaited_once_with(
+            "users/bot_user_id/typing",
+            {"channel_id": "channel_1"},
+        )
+
+
 # ---------------------------------------------------------------------------
 # WebSocket event parsing
 # ---------------------------------------------------------------------------
@@ -298,6 +330,56 @@ class TestMattermostWebSocketParsing:
         # @mention is stripped from the message text
         assert msg_event.text == "Hello from Matrix!"
         assert msg_event.message_id == "post_abc"
+
+
+    @pytest.mark.asyncio
+    async def test_top_level_dm_in_thread_mode_uses_post_as_thread_root(self):
+        """DM roots and replies must resolve to the same Hermes session key."""
+        self.adapter._reply_mode = "thread"
+        post_data = {
+            "id": "dm_root",
+            "user_id": "user_123",
+            "channel_id": "dm_channel",
+            "message": "hello",
+        }
+        event = {
+            "event": "posted",
+            "data": {
+                "post": json.dumps(post_data),
+                "channel_type": "D",
+                "sender_name": "@alice",
+            },
+        }
+
+        await self.adapter._handle_ws_event(event)
+
+        msg_event = self.adapter.handle_message.call_args[0][0]
+        assert msg_event.source.thread_id == "dm_root"
+
+    @pytest.mark.asyncio
+    async def test_thread_reply_keeps_mattermost_root_id(self):
+        """Replies continue to use the original Mattermost root id."""
+        self.adapter._reply_mode = "thread"
+        post_data = {
+            "id": "dm_reply",
+            "root_id": "dm_root",
+            "user_id": "user_123",
+            "channel_id": "dm_channel",
+            "message": "follow-up",
+        }
+        event = {
+            "event": "posted",
+            "data": {
+                "post": json.dumps(post_data),
+                "channel_type": "D",
+                "sender_name": "@alice",
+            },
+        }
+
+        await self.adapter._handle_ws_event(event)
+
+        msg_event = self.adapter.handle_message.call_args[0][0]
+        assert msg_event.source.thread_id == "dm_root"
 
 
     @pytest.mark.asyncio

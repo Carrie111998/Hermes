@@ -2241,6 +2241,34 @@ class SessionStore:
             profile=self._resolve_profile_for_key(source),
         )
 
+    def _legacy_mattermost_dm_session_key(self, source: SessionSource) -> Optional[str]:
+        """Return the pre-thread-root key for a Mattermost DM source.
+
+        Before Mattermost synthetic thread roots were applied to DMs, a
+        top-level post was routed to the bare DM key and its threaded follow-up
+        was routed to ``<bare DM key>:<root_id>``. A legacy entry is safe to
+        adopt only when its origin message is exactly the incoming thread root;
+        otherwise another Mattermost thread in the same DM could inherit the
+        wrong transcript.
+        """
+        if (
+            source.platform != Platform.MATTERMOST
+            or source.chat_type != "dm"
+            or not source.thread_id
+        ):
+            return None
+        legacy_source = replace(source, thread_id=None)
+        return build_session_key(
+            legacy_source,
+            group_sessions_per_user=getattr(
+                self.config, "group_sessions_per_user", True
+            ),
+            thread_sessions_per_user=getattr(
+                self.config, "thread_sessions_per_user", False
+            ),
+            profile=self._resolve_profile_for_key(source),
+        )
+
     def _legacy_slack_session_key(self, source: SessionSource) -> Optional[str]:
         """Return the pre-workspace Slack key for an explicitly scoped source.
 
@@ -2930,6 +2958,44 @@ class SessionStore:
         #     across workspaces and a shared transcript leaking to a second
         #     tenant is exactly the bug this fix removes.
         migrated_legacy_entry: Optional[SessionEntry] = None
+
+        # Mattermost DM sessions created before top-level posts became
+        # synthetic thread roots used the bare DM key. Adopt that entry when
+        # the recorded origin post is the exact root of this incoming thread.
+        # This preserves continuity across the routing-key fix without
+        # allowing one DM thread to borrow another thread's transcript.
+        mattermost_legacy_key = self._legacy_mattermost_dm_session_key(source)
+        if mattermost_legacy_key and not force_new:
+            with self._lock:
+                self._ensure_loaded_locked()
+                legacy_entry = self._entries.get(mattermost_legacy_key)
+                legacy_origin = getattr(legacy_entry, "origin", None)
+                adopt = bool(
+                    session_key not in self._entries
+                    and legacy_entry is not None
+                    and legacy_origin is not None
+                    and legacy_origin.platform == Platform.MATTERMOST
+                    and legacy_origin.chat_type == "dm"
+                    and legacy_origin.chat_id == source.chat_id
+                    and str(legacy_origin.message_id or "")
+                    == str(source.thread_id)
+                )
+                if adopt:
+                    migrated_legacy_entry = self._entries.pop(mattermost_legacy_key)
+                    migrated_legacy_entry.session_key = session_key
+                    migrated_legacy_entry.origin = source
+                    migrated_legacy_entry.platform = source.platform
+                    migrated_legacy_entry.chat_type = source.chat_type
+                    self._entries[session_key] = migrated_legacy_entry
+            if migrated_legacy_entry is not None:
+                self._save_entries()
+                self._record_gateway_session_peer(
+                    migrated_legacy_entry.session_id,
+                    session_key,
+                    source,
+                    display_name=migrated_legacy_entry.display_name,
+                )
+
         legacy_key = self._legacy_slack_session_key(source)
         if legacy_key and not force_new:
             with self._lock:

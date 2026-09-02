@@ -435,9 +435,14 @@ class MattermostAdapter(BasePlatformAdapter):
         self, chat_id: str, metadata: Optional[Dict[str, Any]] = None
     ) -> None:
         """Send a typing indicator."""
+        payload = {"channel_id": chat_id}
+        if self._reply_mode == "thread" and isinstance(metadata, dict):
+            thread_id = metadata.get("thread_id") or metadata.get("root_id")
+            if thread_id:
+                payload["parent_id"] = str(thread_id)
         await self._api_post(
             f"users/{self._bot_user_id}/typing",
-            {"channel_id": chat_id},
+            payload,
         )
 
     async def edit_message(
@@ -928,14 +933,14 @@ class MattermostAdapter(BasePlatformAdapter):
         sender_name = data.get("sender_name", "").lstrip("@") or sender_id
 
         # Thread support: if the post is in a thread, use root_id. In
-        # thread mode, top-level channel posts are valid roots for progress.
+        # thread mode, every top-level post is also a synthetic thread root,
+        # including Mattermost DMs. Outbound replies already use the triggering
+        # post id as root_id in this mode; using the same id here keeps the
+        # initial turn and all follow-ups on one Hermes session key. The old
+        # channel-only guard caused DM replies to switch from the bare DM key
+        # to a new ``...:<root_id>`` key on the first follow-up.
         thread_id = post.get("root_id") or None
-        if (
-            not thread_id
-            and self._reply_mode == "thread"
-            and channel_type_raw != "D"
-            and post_id
-        ):
+        if not thread_id and self._reply_mode == "thread" and post_id:
             thread_id = post_id
 
         # Determine message type.

@@ -628,6 +628,71 @@ class TestSlackWorkspaceSessionIsolation:
         )
 
 
+class TestMattermostThreadSessionContinuity:
+    @pytest.fixture()
+    def store(self, tmp_path):
+        config = GatewayConfig()
+        with patch("gateway.session.SessionStore._ensure_loaded"):
+            session_store = SessionStore(sessions_dir=tmp_path, config=config)
+        session_store._db = None
+        session_store._loaded = True
+        return session_store
+
+    def test_legacy_bare_dm_is_adopted_by_its_thread_root(self, store):
+        root = SessionSource(
+            platform=Platform.MATTERMOST,
+            chat_id="dm_channel",
+            chat_type="dm",
+            user_id="user_123",
+            message_id="root_post",
+        )
+        reply = replace(root, thread_id="root_post", message_id="reply_post")
+        legacy_key = build_session_key(root)
+        thread_key = build_session_key(reply)
+        legacy_entry = SessionEntry(
+            session_key=legacy_key,
+            session_id="legacy-session",
+            created_at=datetime.now(),
+            updated_at=datetime.now(),
+            origin=root,
+            platform=Platform.MATTERMOST,
+            chat_type="dm",
+        )
+        store._entries[legacy_key] = legacy_entry
+
+        resolved = store.get_or_create_session(reply)
+
+        assert resolved.session_id == "legacy-session"
+        assert resolved.session_key == thread_key
+        assert legacy_key not in store._entries
+        assert store._entries[thread_key] is resolved
+
+    def test_other_mattermost_dm_root_does_not_adopt_legacy_session(self, store):
+        root = SessionSource(
+            platform=Platform.MATTERMOST,
+            chat_id="dm_channel",
+            chat_type="dm",
+            user_id="user_123",
+            message_id="root_post",
+        )
+        reply = replace(root, thread_id="different_root", message_id="reply_post")
+        legacy_key = build_session_key(root)
+        store._entries[legacy_key] = SessionEntry(
+            session_key=legacy_key,
+            session_id="legacy-session",
+            created_at=datetime.now(),
+            updated_at=datetime.now(),
+            origin=root,
+            platform=Platform.MATTERMOST,
+            chat_type="dm",
+        )
+
+        resolved = store.get_or_create_session(reply)
+
+        assert resolved.session_id != "legacy-session"
+        assert legacy_key in store._entries
+
+
 class TestWhatsAppSessionKeyConsistency:
     """Regression: WhatsApp session keys must collapse JID/LID aliases to a
     single stable identity for both DM chat_ids and group participant_ids."""
