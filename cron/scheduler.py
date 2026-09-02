@@ -4859,8 +4859,19 @@ def _build_job_prompt(
                 if not output_files:
                     continue  # silent skip — no output yet
                 latest_output = output_files[0].read_text(encoding="utf-8").strip()
-                # Truncate to 8K characters to avoid prompt bloat
-                _MAX_CONTEXT_CHARS = 8000
+                # The archive file is a wrapper ("# Cron Job … ## Prompt …
+                # ## Response …"). Injecting the whole wrapper back into the
+                # prompt compounds recursively: each run embeds the previous
+                # run's wrapper, which embeds the one before it, and models
+                # start mimicking the header format in their own reports.
+                # Extract the "## Response" section so continuity sees only
+                # what the job actually SAID last time.
+                _m = re.search(r"^## Response\s*\n\n?(.*)$", latest_output,
+                               re.S | re.M)
+                if _m:
+                    latest_output = _m.group(1).strip()
+                # Truncate to 4K characters to avoid prompt bloat
+                _MAX_CONTEXT_CHARS = 4000
                 if len(latest_output) > _MAX_CONTEXT_CHARS:
                     latest_output = latest_output[:_MAX_CONTEXT_CHARS] + "\n\n[... output truncated ...]"
                 if latest_output:
