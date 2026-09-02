@@ -285,8 +285,12 @@ export function createBackendOwnership(deps: BackendOwnershipDeps) {
 }
 
 export function backendCommandMatches(command: unknown): boolean {
+  const str = String(command ?? '')
+  if (/\b(?:gateway|cron|daemon|tools|doctor|acp|status|setup)\b/i.test(str)) {
+    return false
+  }
   return /(?:^|[\s/\\"])(?:hermes(?:\.exe)?|hermes_cli\.main|hermes_cli[/\\]main\.py)"?(?:\s+(?:--profile|-p)\s+\S+)?\s+(?:serve|dashboard)(?:\s|$)/i.test(
-    String(command ?? '')
+    str
   )
 }
 
