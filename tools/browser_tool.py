@@ -2491,8 +2491,13 @@ def _write_owner_pid(socket_dir: str, session_name: str) -> None:
                      session_name, exc)
 
 
-def _verify_reapable_browser_daemon(daemon_pid: int, socket_dir: str,
-                                    session_name: str) -> bool:
+def _verify_reapable_browser_daemon(
+    daemon_pid: int,
+    socket_dir: str,
+    session_name: str,
+    *,
+    expected_start: Optional[int] = None,
+) -> bool:
     """Confirm a live PID is genuinely *this* session's agent-browser daemon.
 
     The orphan reaper scans world-writable, predictably-named temp paths
@@ -2532,6 +2537,14 @@ def _verify_reapable_browser_daemon(daemon_pid: int, socket_dir: str,
 
     try:
         proc = psutil.Process(daemon_pid)
+        if expected_start is not None:
+            # Use the same cross-platform fingerprint source as the caller and
+            # final termination guard. Linux returns /proc start ticks; other
+            # platforms return quantized psutil epoch time.
+            from gateway.status import get_process_start_time
+
+            if get_process_start_time(daemon_pid) != expected_start:
+                return False
         name = (proc.name() or "").lower()
         cmdline = " ".join(proc.cmdline() or []).lower()
     except psutil.NoSuchProcess:
@@ -2544,11 +2557,16 @@ def _verify_reapable_browser_daemon(daemon_pid: int, socket_dir: str,
             daemon_pid, session_name, exc)
         return False
 
-    looks_like_browser = "agent-browser" in name or "agent-browser" in cmdline
+    harness_daemon = session_name.startswith("hermes_bh_")
+    if harness_daemon:
+        looks_like_browser = "browser_harness.daemon" in cmdline
+    else:
+        looks_like_browser = "agent-browser" in name or "agent-browser" in cmdline
     if not looks_like_browser:
+        expected_kind = "browser-harness" if harness_daemon else "agent-browser"
         logger.warning(
-            "Refusing to reap PID %d (session %s): not an agent-browser "
-            "process (name=%r)", daemon_pid, session_name, name)
+            "Refusing to reap PID %d (session %s): not a %s "
+            "process (name=%r)", daemon_pid, session_name, expected_kind, name)
         return False
 
     # Binding check: the live process must reference *this* socket dir.
@@ -2558,8 +2576,11 @@ def _verify_reapable_browser_daemon(daemon_pid: int, socket_dir: str,
         socket_base_l and socket_base_l in cmdline)
     if not bound:
         try:
-            env_dir = (proc.environ() or {}).get(
-                "AGENT_BROWSER_SOCKET_DIR", "")
+            env = proc.environ() or {}
+            env_dir = env.get(
+                "BH_RUNTIME_DIR" if harness_daemon else "AGENT_BROWSER_SOCKET_DIR",
+                "",
+            )
             bound = bool(env_dir) and os.path.normpath(env_dir) == \
                 os.path.normpath(socket_dir)
         except (psutil.AccessDenied, psutil.NoSuchProcess, OSError):
@@ -2721,7 +2742,11 @@ def _reap_orphaned_browser_sessions():
                 continue
 
         # owner_alive is False (dead owner) OR legacy daemon not tracked here.
-        pid_file = os.path.join(socket_dir, f"{session_name}.pid")
+        harness_daemon = session_name.startswith("hermes_bh_")
+        pid_file = os.path.join(
+            socket_dir,
+            "bu.pid" if harness_daemon else f"{session_name}.pid",
+        )
         if not os.path.isfile(pid_file):
             # A newly-created session directory exists briefly before
             # agent-browser writes its PID/owner files. Another Hermes process
@@ -2754,26 +2779,26 @@ def _reap_orphaned_browser_sessions():
         # otherwise (don't touch the process, leave the socket dir for a later
         # sweep once the imposter PID is gone).  Fixes the arbitrary same-user
         # process DoS in issue #14073.
+        # Capture the process generation before identity verification. Passing
+        # the same fingerprint into both verification and termination closes
+        # the verify→start-time PID-recycle window.
+        from gateway.status import get_process_start_time
+        daemon_start = get_process_start_time(daemon_pid)
+        if daemon_start is None:
+            logger.warning(
+                "Refusing to reap browser daemon PID %d (session %s): "
+                "no start-time fingerprint available", daemon_pid, session_name)
+            continue
         if not _verify_reapable_browser_daemon(
-                daemon_pid, socket_dir, session_name):
+                daemon_pid, socket_dir, session_name,
+                expected_start=daemon_start):
             continue
 
         # Daemon is alive and its owner is dead (or legacy + untracked).  Reap.
         # Use the process-tree termination helper so Chromium children
         # (renderer, GPU, etc.) are cleaned up, not just the daemon parent.
         try:
-            from gateway.status import get_process_start_time
             from tools.process_registry import ProcessRegistry
-            daemon_start = get_process_start_time(daemon_pid)
-            if daemon_start is None:
-                # Identity can't be fingerprinted — the verify above matched,
-                # but without a start time _terminate_host_pid cannot rule out
-                # a recycle between verify and kill. Refuse; a later sweep
-                # retries once the process table settles.
-                logger.warning(
-                    "Refusing to reap browser daemon PID %d (session %s): "
-                    "no start-time fingerprint available", daemon_pid, session_name)
-                continue
             ProcessRegistry._terminate_host_pid(daemon_pid, daemon_start)
             logger.info("Reaped orphaned browser daemon PID %d (session %s)",
                         daemon_pid, session_name)
