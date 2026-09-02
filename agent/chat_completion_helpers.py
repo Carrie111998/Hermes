@@ -815,6 +815,23 @@ def _check_stale_giveup(agent) -> None:
         )
 
 
+def _cap_implicit_stale_timeout_to_run_budget(
+    agent, timeout: float, *, explicit: bool
+) -> float:
+    """Cap implicit provider patience to half the active run's remaining time."""
+    if explicit:
+        return timeout
+    run_budget = getattr(agent, "run_budget_seconds", None)
+    started = getattr(agent, "_run_budget_started_at", None)
+    if not run_budget or not started:
+        return timeout
+    try:
+        remaining = float(run_budget) - (time.time() - float(started))
+    except (TypeError, ValueError):
+        return timeout
+    return min(timeout, max(60.0, remaining * 0.5))
+
+
 def _derive_stream_stale_timeout(agent, api_kwargs: dict) -> float:
     """Stale-stream patience for a provider that is never a local endpoint.
 
@@ -826,6 +843,10 @@ def _derive_stream_stale_timeout(agent, api_kwargs: dict) -> float:
     stale-stream detector below.
     """
     _cfg_stale = get_provider_stale_timeout(agent.provider, agent.model)
+    _explicit = (
+        _cfg_stale is not None
+        or os.getenv("HERMES_STREAM_STALE_TIMEOUT") is not None
+    )
     if _cfg_stale is not None:
         _base = _cfg_stale
     else:
@@ -850,7 +871,9 @@ def _derive_stream_stale_timeout(agent, api_kwargs: dict) -> float:
         _reasoning_floor = _bedrock_reasoning_stale_floor(api_kwargs["modelId"])
     if _reasoning_floor is not None:
         _timeout = max(_timeout, _reasoning_floor)
-    return _timeout
+    return _cap_implicit_stale_timeout_to_run_budget(
+        agent, _timeout, explicit=_explicit
+    )
 
 
 def _bedrock_reasoning_stale_floor(model_id: object) -> "float | None":
@@ -5451,29 +5474,9 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             agent.base_url, _stream_stale_timeout,
         )
     else:
-        # Scale the stale timeout for large contexts: slow models (like Opus)
-        # can legitimately think for minutes before producing the first token
-        # when the context is large.  Without this, the stale detector kills
-        # healthy connections during the model's thinking phase, producing
-        # spurious RemoteProtocolError ("peer closed connection").
-        _est_tokens = estimate_request_context_tokens(api_kwargs)
-        if _est_tokens > 100_000:
-            _stream_stale_timeout = max(_stream_stale_timeout_base, 300.0)
-        elif _est_tokens > 50_000:
-            _stream_stale_timeout = max(_stream_stale_timeout_base, 240.0)
-        else:
-            _stream_stale_timeout = _stream_stale_timeout_base
-        # Reasoning-model floor: known reasoning models (Nemotron 3 Ultra,
-        # OpenAI o1/o3, Anthropic Opus 4.x thinking, DeepSeek R1, Qwen QwQ,
-        # xAI Grok reasoning, etc.) routinely exceed the default 180s chat-
-        # model threshold during their thinking phase.  The cloud gateway
-        # upstream kills the socket first, surfacing as BrokenPipeError.
-        # Raises the floor only — never overrides explicit user config
-        # (handled by get_provider_stale_timeout above).
-        from agent.reasoning_timeouts import get_reasoning_stale_timeout_floor
-        _reasoning_floor = get_reasoning_stale_timeout_floor(api_kwargs.get("model"))
-        if _reasoning_floor is not None:
-            _stream_stale_timeout = max(_stream_stale_timeout, _reasoning_floor)
+        # Cloud paths share Bedrock's provider/context/reasoning derivation so
+        # the run-budget cap cannot drift between streaming transports.
+        _stream_stale_timeout = _derive_stream_stale_timeout(agent, api_kwargs)
 
     # Delegated children and gateway cron turns run the streaming request
     # INLINE on the conversation thread: spawning the interrupt worker inside
