@@ -925,7 +925,7 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     if skills_prompt:
         volatile_parts.append(skills_prompt)
 
-    if agent._memory_store:
+    if agent._memory_store and getattr(agent, "_memory_mode", "full") != "on_demand":
         if agent._memory_enabled:
             mem_block = agent._memory_store.format_for_system_prompt("memory")
             if mem_block:
@@ -936,11 +936,13 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
             if user_block:
                 volatile_parts.append(user_block)
 
-    # External memory provider system prompt block (additive to built-in).
-    # Gated on the same check ``inject_memory_provider_tools`` uses so we
-    # never advertise provider tools that the agent's toolset configuration
-    # has already gated off (#81014).
-    if agent._memory_manager:
+    # The provider prompt must only appear when its tools are exposed, and never
+    # for on_demand or off sub-agents: on_demand may call provider tools but must
+    # not receive the provider's full context in its initial prompt.
+    if agent._memory_manager and getattr(agent, "_memory_mode", "full") not in (
+        "on_demand",
+        "off",
+    ):
         try:
             from agent.memory_manager import memory_provider_tools_exposed as _mem_exposed
         except Exception:
