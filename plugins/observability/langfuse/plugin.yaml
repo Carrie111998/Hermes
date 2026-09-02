@@ -5,6 +5,10 @@ author: NousResearch
 requires_env:
   - HERMES_LANGFUSE_PUBLIC_KEY
   - HERMES_LANGFUSE_SECRET_KEY
+python_dependencies:
+  # propagate_attributes is imported unconditionally at module import and was
+  # added in 3.9.0 (absent in 3.8.1). Upper bound per the dependency policy.
+  - "langfuse>=3.9.0,<5"
 hooks:
   - pre_api_request
   - post_api_request
