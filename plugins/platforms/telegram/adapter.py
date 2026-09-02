@@ -5852,7 +5852,30 @@ class TelegramAdapter(BasePlatformAdapter):
         edits target the most recent visible message.
         """
         if not self._bot:
-            return SendResult(success=False, error="Not connected")
+            # The reconnect watcher may have retired this adapter and installed
+            # a connected replacement in runner.adapters. Mirror send()'s
+            # replacement-awareness (#94498) so in-flight progress/heartbeat
+            # edits resolve through the live adapter instead of failing as a
+            # permanent "Not connected" and fragmenting into fresh messages
+            # (#98228).
+            live = self._replacement_telegram_adapter()
+            if live is not None:
+                return await live.edit_message(
+                    chat_id, message_id, content, finalize=finalize, metadata=metadata,
+                )
+            if self._is_permanent_fatal() or not await self._wait_for_reconnection():
+                return SendResult(
+                    success=False,
+                    error="Not connected",
+                    retryable=not self._is_permanent_fatal(),
+                )
+            live = self._replacement_telegram_adapter()
+            if not self._bot and live is not None:
+                return await live.edit_message(
+                    chat_id, message_id, content, finalize=finalize, metadata=metadata,
+                )
+            if not self._bot:
+                return SendResult(success=False, error="Not connected", retryable=True)
 
         # Rich finalize (Bot API 10.1): when the completed content has
         # constructs the legacy MarkdownV2 edit degrades (tables → bullet
@@ -6263,7 +6286,20 @@ class TelegramAdapter(BasePlatformAdapter):
         caller leaves the preview in place and logs at debug level.
         """
         if not self._bot:
-            return False
+            # Retired adapter after a replacement reconnect: delegate cleanup to
+            # the live adapter so post-delivery deletion of temporary progress/
+            # heartbeat messages still succeeds (#98228). Mirrors send()/
+            # edit_message() replacement-awareness.
+            live = self._replacement_telegram_adapter()
+            if live is not None:
+                return await live.delete_message(chat_id, message_id)
+            if self._is_permanent_fatal() or not await self._wait_for_reconnection():
+                return False
+            live = self._replacement_telegram_adapter()
+            if not self._bot and live is not None:
+                return await live.delete_message(chat_id, message_id)
+            if not self._bot:
+                return False
         try:
             await self._bot.delete_message(
                 chat_id=normalize_telegram_chat_id(chat_id),
