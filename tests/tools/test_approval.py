@@ -471,6 +471,82 @@ class TestSensitiveCopyMovePattern:
             assert dangerous is False, cmd
 
 
+class TestCredentialDirectoryWrites:
+    """Writes into credential DIRECTORIES under $HOME must require approval.
+
+    ``agent/file_safety.build_write_denied_prefixes`` already denies every one
+    of these to write_file/patch, but the terminal path had no matching rule, so
+    ``echo x >> ~/.aws/credentials`` and ``cp evil ~/.kube/config`` were
+    auto-approved. That is the unpaired half-door shape described on
+    ``TestSensitiveCopyMovePattern`` — the file-write side gated, the terminal
+    side open — measured as 8 paths denied by the file guard but ungated in the
+    terminal across all seven write vectors.
+    """
+
+    CREDENTIAL_PATHS = (
+        "~/.aws/credentials",
+        "~/.gnupg/secring.gpg",
+        "~/.kube/config",
+        "~/.docker/config.json",
+        "~/.config/gh/hosts.yml",
+        "~/.azure/accessTokens.json",
+        "~/.config/gcloud/credentials.db",
+    )
+
+    def test_every_write_vector_is_gated(self):
+        vectors = (
+            "echo x >> {p}",
+            "echo x > {p}",
+            "echo x | tee -a {p}",
+            "cp /tmp/evil {p}",
+            "mv /tmp/evil {p}",
+            "install -m600 /tmp/c {p}",
+            "sed -i 's/a/b/' {p}",
+        )
+        for path in self.CREDENTIAL_PATHS:
+            for vector in vectors:
+                command = vector.format(p=path)
+                dangerous, key, _ = detect_dangerous_command(command)
+                assert dangerous is True, command
+                assert key is not None, command
+
+    def test_ordinary_config_subdirs_stay_safe(self):
+        """``~/.config`` holds ordinary application config. Only the ``gh`` and
+        ``gcloud`` credential subdirectories may be gated — gating all of
+        ``~/.config`` would prompt on routine editor and service files."""
+        for command in (
+            "echo x >> ~/.config/nvim/init.lua",
+            "cp theme.json ~/.config/Code/User/settings.json",
+            "echo x > ~/.config/htop/htoprc",
+            "sed -i 's/a/b/' ~/.config/systemd/user/app.service",
+        ):
+            dangerous, key, _ = detect_dangerous_command(command)
+            assert dangerous is False, command
+            assert key is None, command
+
+    def test_near_miss_names_stay_safe(self):
+        """Prefix matching must not catch names that merely start the same."""
+        for command in (
+            "echo x >> ~/.awsome/notes.txt",
+            "echo x >> ~/.dockerignore",
+            "echo x >> ~/.kubeconfig-notes",
+            "cp a.txt ~/.gnupgnotes",
+        ):
+            dangerous, key, _ = detect_dangerous_command(command)
+            assert dangerous is False, command
+
+    def test_reads_out_of_credential_dirs_stay_safe(self):
+        """Only the write DESTINATION is gated; reading out is covered by the
+        read and media guards, mirroring the existing ``~/.ssh`` behaviour."""
+        for command in (
+            "cp ~/.aws/credentials /tmp/x",
+            "cat ~/.kube/config",
+            "grep -r host ~/.docker/config.json",
+        ):
+            dangerous, key, _ = detect_dangerous_command(command)
+            assert dangerous is False, command
+
+
 class TestSensitiveInPlaceEditPattern:
     """Detect in-place edits to user startup and credential files."""
 
