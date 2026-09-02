@@ -7,6 +7,8 @@ import subprocess
 import sys
 import types
 import urllib.error
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from threading import Thread
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -158,7 +160,7 @@ def test_maton_gmail_probe_uses_gateway_without_local_oauth(api_module, monkeypa
         return FakeResponse()
 
     api_module._ensure_authenticated = MagicMock()
-    monkeypatch.setattr(api_module.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(api_module, "_maton_urlopen", fake_urlopen)
 
     api_module.gmail_probe(api_module.argparse.Namespace())
 
@@ -245,7 +247,7 @@ def test_maton_gmail_search_encodes_query_and_message_path(
         assert timeout == 30
         return _maton_response(next(responses))
 
-    monkeypatch.setattr(api_module.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(api_module, "_maton_urlopen", fake_urlopen)
     api_module.gmail_search(api_module.argparse.Namespace(
         query="is:unread from:a+b@example.com", max=7,
     ))
@@ -288,7 +290,7 @@ def test_maton_gmail_get_encodes_path_and_shapes_output(api_module, monkeypatch,
         captured["request"] = request
         return _maton_response(message)
 
-    monkeypatch.setattr(api_module.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(api_module, "_maton_urlopen", fake_urlopen)
     api_module.gmail_get(api_module.argparse.Namespace(message_id="id/with space"))
 
     assert captured["request"].full_url.endswith(
@@ -318,7 +320,7 @@ def test_maton_gmail_labels_shapes_output(api_module, monkeypatch, capsys):
             {"id": "Label_1", "name": "Review"},
         ]})
 
-    monkeypatch.setattr(api_module.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(api_module, "_maton_urlopen", fake_urlopen)
     api_module.gmail_labels(api_module.argparse.Namespace())
 
     assert captured["request"].full_url.endswith("users/me/labels")
@@ -338,7 +340,7 @@ def test_maton_gmail_modify_posts_body_and_shapes_output(
         captured["request"] = request
         return _maton_response({"id": "id/1", "labelIds": ["STARRED"]})
 
-    monkeypatch.setattr(api_module.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(api_module, "_maton_urlopen", fake_urlopen)
     api_module.gmail_modify(api_module.argparse.Namespace(
         message_id="id/1", add_labels="STARRED,IMPORTANT", remove_labels="INBOX",
     ))
@@ -371,7 +373,7 @@ def test_maton_gmail_reports_http_error(api_module, monkeypatch, capsys):
     error = urllib.error.HTTPError(
         "https://gateway.maton.ai", 429, "rate limited", {}, io.BytesIO(b"slow down"),
     )
-    monkeypatch.setattr(api_module.urllib.request, "urlopen", MagicMock(side_effect=error))
+    monkeypatch.setattr(api_module, "_maton_urlopen", MagicMock(side_effect=error))
 
     with pytest.raises(SystemExit) as exc:
         api_module._run_maton_gmail("users/me/messages")
@@ -383,7 +385,7 @@ def test_maton_gmail_reports_http_error(api_module, monkeypatch, capsys):
 def test_maton_gmail_reports_url_error(api_module, monkeypatch, capsys):
     monkeypatch.setenv("MATON_API_KEY", "maton.test")
     error = urllib.error.URLError("gateway unavailable")
-    monkeypatch.setattr(api_module.urllib.request, "urlopen", MagicMock(side_effect=error))
+    monkeypatch.setattr(api_module, "_maton_urlopen", MagicMock(side_effect=error))
 
     with pytest.raises(SystemExit) as exc:
         api_module._run_maton_gmail("users/me/messages")
@@ -395,7 +397,7 @@ def test_maton_gmail_reports_url_error(api_module, monkeypatch, capsys):
 def test_maton_gmail_rejects_non_json_response(api_module, monkeypatch, capsys):
     monkeypatch.setenv("MATON_API_KEY", "maton.test")
     monkeypatch.setattr(
-        api_module.urllib.request, "urlopen",
+        api_module, "_maton_urlopen",
         MagicMock(return_value=_maton_response(b"not json")),
     )
 
@@ -404,6 +406,63 @@ def test_maton_gmail_rejects_non_json_response(api_module, monkeypatch, capsys):
 
     assert exc.value.code == 1
     assert "Unexpected non-JSON output" in capsys.readouterr().err
+
+
+def test_maton_gmail_rejects_cross_origin_redirect_without_forwarding_auth(
+    api_module, monkeypatch, capsys,
+):
+    monkeypatch.setenv("MATON_API_KEY", "maton.test")
+    received_headers = {}
+
+    class RedirectTarget(BaseHTTPRequestHandler):
+        def do_GET(self):
+            received_headers.update(self.headers)
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b'{}')
+
+        def log_message(self, format, *args):
+            pass
+
+    target = HTTPServer(("127.0.0.1", 0), RedirectTarget)
+
+    class RedirectSource(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(302)
+            self.send_header(
+                "Location",
+                f"http://127.0.0.1:{target.server_address[1]}/capture",
+            )
+            self.end_headers()
+
+        def log_message(self, format, *args):
+            pass
+
+    source = HTTPServer(("127.0.0.1", 0), RedirectSource)
+    threads = [
+        Thread(target=server.serve_forever, daemon=True)
+        for server in (source, target)
+    ]
+    for thread in threads:
+        thread.start()
+
+    monkeypatch.setattr(
+        api_module,
+        "MATON_GMAIL_BASE_URL",
+        f"http://127.0.0.1:{source.server_address[1]}",
+    )
+    try:
+        with pytest.raises(SystemExit) as exc:
+            api_module._run_maton_gmail("users/me/messages")
+    finally:
+        source.shutdown()
+        target.shutdown()
+        source.server_close()
+        target.server_close()
+
+    assert exc.value.code == 1
+    assert received_headers == {}
+    assert "request failed (302)" in capsys.readouterr().err
 
 
 

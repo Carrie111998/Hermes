@@ -58,6 +58,19 @@ SCOPES = [
 ]
 
 
+class _RejectRedirects(urllib.request.HTTPRedirectHandler):
+    """Keep bearer credentials bound to the configured Maton origin."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def _maton_urlopen(request, *, timeout):
+    return urllib.request.build_opener(_RejectRedirects()).open(
+        request, timeout=timeout,
+    )
+
+
 def _normalize_authorized_user_payload(payload: dict) -> dict:
     normalized = dict(payload)
     if not normalized.get("type"):
@@ -128,7 +141,7 @@ def _run_maton_gmail(
 
     request = urllib.request.Request(url, data=data, headers=headers, method=method)
     try:
-        with urllib.request.urlopen(request, timeout=30) as response:
+        with _maton_urlopen(request, timeout=30) as response:
             payload = response.read()
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode("utf-8", errors="replace")
