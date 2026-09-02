@@ -36,7 +36,7 @@ describe('renderVoiceWaveform', () => {
 
   it('distinguishes transport startup from active listening', () => {
     expect(voiceVisualizationFooter('waiting')).toBe('Waiting for realtime voice…')
-    expect(voiceVisualizationFooter('listening')).toBe('Listening · press the voice key to stop')
+    expect(voiceVisualizationFooter('listening', 'Ctrl+O')).toBe('Listening · Ctrl+O to stop')
   })
 
   it('preserves distinct solving and composing phases', () => {

@@ -2,6 +2,19 @@ import type { ChildProcess } from 'node:child_process'
 
 let activeProcess: ChildProcess | null = null
 let stopPromise: Promise<void> | null = null
+const backpressuredInputs = new WeakSet<NonNullable<ChildProcess['stdin']>>()
+
+export function writeRealtimeVoiceControl(child: ChildProcess, payload: string, required = true): void {
+  const input = child.stdin
+
+  if (!input?.writable || (!required && backpressuredInputs.has(input))) {
+    return
+  }
+  if (!input.write(payload)) {
+    backpressuredInputs.add(input)
+    input.once('drain', () => backpressuredInputs.delete(input))
+  }
+}
 
 export const registerRealtimeVoiceProcess = (child: ChildProcess): void => {
   if (activeProcess && activeProcess !== child) {
@@ -73,6 +86,9 @@ export const stopRegisteredRealtimeVoiceProcess = (graceMs = 1_500): Promise<voi
 }
 
 export type RealtimeVoicePhase = 'composing' | 'listening' | 'solving'
+export const MAX_REALTIME_VOICE_FRAME_CHARS = 65_536
+export const MAX_REALTIME_VOICE_TEXT_CHARS = 10_000
+
 
 export interface RealtimeVoiceTranscript {
   final: boolean
@@ -94,11 +110,19 @@ export const parseRealtimeVoicePhase = (line: string): RealtimeVoicePhase | null
     return null
   }
 
+  if (line.length > MAX_REALTIME_VOICE_FRAME_CHARS) {
+    return null
+  }
+
   const phase = line.slice(STATE_PREFIX.length).trim()
   return phase === 'listening' || phase === 'solving' || phase === 'composing' ? phase : null
 }
 
 export const parseRealtimeVoiceEvent = (line: string): RealtimeVoiceEvent | null => {
+  if (line.length > MAX_REALTIME_VOICE_FRAME_CHARS) {
+    return null
+  }
+
   if (!line.startsWith(EVENT_PREFIX)) {
     return null
   }
@@ -147,7 +171,15 @@ export const parseRealtimeVoiceEvent = (line: string): RealtimeVoiceEvent | null
 }
 
 export const encodeRealtimeVoiceDelegationResult = (id: string, output: string): string =>
-  `${JSON.stringify({ type: 'delegate.result', id, output })}\n`
+  `${JSON.stringify({
+    type: 'delegate.result',
+    id,
+    output: output.slice(0, MAX_REALTIME_VOICE_TEXT_CHARS)
+  })}\n`
 
 export const encodeRealtimeVoiceDelegationProgress = (id: string, text: string): string =>
-  `${JSON.stringify({ type: 'delegate.progress', id, text })}\n`
+  `${JSON.stringify({
+    type: 'delegate.progress',
+    id,
+    text: text.slice(0, MAX_REALTIME_VOICE_TEXT_CHARS)
+  })}\n`

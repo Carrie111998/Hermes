@@ -22,6 +22,7 @@ import {
 } from '../lib/inputMetrics.js'
 import { PerfPane } from '../lib/perfPane.js'
 import { composerPromptText } from '../lib/prompt.js'
+import { formatVoiceRecordKey } from '../lib/platform.js'
 import { ActiveWidgetSlot, AmbientDock, AmbientRail, useAmbientRailWidth } from '../sdk/host.js'
 
 import { AgentsOverlay } from './agentsOverlay.js'
@@ -389,6 +390,7 @@ const ComposerPane = memo(function ComposerPane({
             <VoiceVisualizer
               columns={composer.cols}
               mode={voiceMode}
+              stopKeyLabel={formatVoiceRecordKey(composer.voiceRecordKey)}
               t={ui.theme}
               transcript={status.realtimeVoiceTranscript}
               visualizer={status.realtimeVoiceVisualizer}

@@ -6,10 +6,13 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import {
   encodeRealtimeVoiceDelegationProgress,
   encodeRealtimeVoiceDelegationResult,
+  MAX_REALTIME_VOICE_FRAME_CHARS,
+  MAX_REALTIME_VOICE_TEXT_CHARS,
   parseRealtimeVoiceEvent,
   parseRealtimeVoicePhase,
   registerRealtimeVoiceProcess,
-  stopRegisteredRealtimeVoiceProcess
+  stopRegisteredRealtimeVoiceProcess,
+  writeRealtimeVoiceControl
 } from '../domain/realtimeVoice.js'
 
 afterEach(() => {
@@ -65,7 +68,23 @@ describe('realtime voice lifecycle', () => {
       text: 'checking tests'
     })
   })
+
+  it('bounds every child protocol frame and delegated context payload', () => {
+    const oversizedEvent = `talk: event ${'x'.repeat(MAX_REALTIME_VOICE_FRAME_CHARS)}`
+    const oversizedState = `talk: state ${'x'.repeat(MAX_REALTIME_VOICE_FRAME_CHARS)}`
+    const oversizedText = 'x'.repeat(MAX_REALTIME_VOICE_TEXT_CHARS + 100)
+
+    expect(parseRealtimeVoiceEvent(oversizedEvent)).toBeNull()
+    expect(parseRealtimeVoicePhase(oversizedState)).toBeNull()
+    expect(
+      JSON.parse(encodeRealtimeVoiceDelegationResult('call-1', oversizedText)).output
+    ).toHaveLength(MAX_REALTIME_VOICE_TEXT_CHARS)
+    expect(
+      JSON.parse(encodeRealtimeVoiceDelegationProgress('call-1', oversizedText)).text
+    ).toHaveLength(MAX_REALTIME_VOICE_TEXT_CHARS)
+  })
 })
+
 
 describe('realtime voice child supervision', () => {
   const childProcess = (exitOnInterrupt: boolean) => {
@@ -87,6 +106,28 @@ describe('realtime voice child supervision', () => {
 
     return child as unknown as ChildProcess
   }
+
+  it('drops optional progress while child stdin is backpressured', () => {
+    const input = new EventEmitter() as EventEmitter & {
+      writable: boolean
+      write: ReturnType<typeof vi.fn>
+    }
+    input.writable = true
+    input.write = vi.fn().mockReturnValueOnce(false).mockReturnValue(true)
+    const child = { stdin: input } as unknown as ChildProcess
+
+    writeRealtimeVoiceControl(child, 'progress-1', false)
+    writeRealtimeVoiceControl(child, 'progress-2', false)
+    writeRealtimeVoiceControl(child, 'result', true)
+    input.emit('drain')
+    writeRealtimeVoiceControl(child, 'progress-3', false)
+
+    expect(input.write.mock.calls.map(([payload]) => payload)).toEqual([
+      'progress-1',
+      'result',
+      'progress-3'
+    ])
+  })
 
   it('stops the registered child once with SIGINT', async () => {
     const child = childProcess(true)

@@ -9,6 +9,7 @@ export interface VoiceVisualizerProps {
   columns: number
   mode: RealtimeVoicePhase | 'waiting'
   t: Theme
+  stopKeyLabel: string
   transcript?: RealtimeVoiceTranscript | null
   visualizer: 'orb' | 'waveform'
 }
@@ -81,17 +82,20 @@ export function renderVoiceVisualization(
   }).lines
 }
 
-export function voiceVisualizationFooter(mode: VoiceVisualizerProps['mode']): string {
+export function voiceVisualizationFooter(
+  mode: VoiceVisualizerProps['mode'],
+  stopKeyLabel = 'voice key'
+): string {
   if (mode === 'waiting') {
     return 'Waiting for realtime voice…'
   }
   if (mode === 'listening') {
-    return 'Listening · press the voice key to stop'
+    return `Listening · ${stopKeyLabel} to stop`
   }
   return mode === 'composing' ? 'Speaking…' : 'Solving…'
 }
 
-export function VoiceVisualizer({ columns, mode, t, transcript, visualizer }: VoiceVisualizerProps) {
+export function VoiceVisualizer({ columns, mode, stopKeyLabel, t, transcript, visualizer }: VoiceVisualizerProps) {
   const [frame, setFrame] = useState(0)
 
   useEffect(() => {
@@ -109,7 +113,7 @@ export function VoiceVisualizer({ columns, mode, t, transcript, visualizer }: Vo
     () => renderVoiceVisualization(visualizer, renderWidth, frame, mode),
     [frame, mode, renderWidth, visualizer]
   )
-  const footer = voiceVisualizationFooter(mode)
+  const footer = voiceVisualizationFooter(mode, stopKeyLabel)
 
   return (
     <Box borderColor={t.color.border} borderStyle="single" flexDirection="column" width={panelWidth}>
