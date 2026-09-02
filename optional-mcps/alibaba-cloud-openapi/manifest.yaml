@@ -1,0 +1,70 @@
+# Nous-approved MCP catalog entry.
+# Presence in this directory = approval. Merged via PR review.
+manifest_version: 1
+
+name: alibaba-cloud-openapi
+description: Alibaba Cloud API discovery and documentation through the official OpenAPI MCP proxy.
+source: https://github.com/aliyun/alibabacloud-api-mcp-server
+
+# Official local stdio proxy to Alibaba Cloud's account-specific Streamable
+# HTTP service. v0.2.17 was released on 2026-08-07. The upstream-enforced
+# allowlist intentionally omits every execution, script, IaC, task, and
+# presigned-URL tool.
+transport:
+  type: stdio
+  command: uvx
+  args:
+    - "alibabacloud.mcp-proxy==0.2.17"
+    - --site-type
+    - CN
+    - --allow-tools
+    - "AlibabaCloud___ListProducts,AlibabaCloud___ListApis,AlibabaCloud___GetApiDefinition,AlibabaCloud___SearchApis,AlibabaCloud___ListProductRegions,AlibabaCloud___GenerateCLICommand,AlibabaCloud___SearchDocuments,AlibabaCloud___GetDocument,AlibabaCloud___GetDocumentTree,AlibabaCloud___GrepDocuments"
+  version: "0.2.17"
+  env:
+    ALIBABA_CLOUD_ACCESS_KEY_ID: "${ALIBABA_CLOUD_ACCESS_KEY_ID}"
+    ALIBABA_CLOUD_ACCESS_KEY_SECRET: "${ALIBABA_CLOUD_ACCESS_KEY_SECRET}"
+
+auth:
+  type: api_key
+  env:
+    - name: ALIBABA_CLOUD_ACCESS_KEY_ID
+      prompt: "Alibaba Cloud RAM AccessKey ID"
+      required: true
+      secret: true
+    - name: ALIBABA_CLOUD_ACCESS_KEY_SECRET
+      prompt: "Alibaba Cloud RAM AccessKey Secret"
+      required: true
+      secret: true
+
+tools:
+  default_enabled:
+    - AlibabaCloud___ListProducts
+    - AlibabaCloud___ListApis
+    - AlibabaCloud___GetApiDefinition
+    - AlibabaCloud___SearchApis
+    - AlibabaCloud___ListProductRegions
+    - AlibabaCloud___GenerateCLICommand
+    - AlibabaCloud___SearchDocuments
+    - AlibabaCloud___GetDocument
+    - AlibabaCloud___GetDocumentTree
+    - AlibabaCloud___GrepDocuments
+
+suggest:
+  keywords:
+    - alibaba cloud
+    - aliyun
+    - 阿里云
+  hosts:
+    - aliyun.com
+    - alibabacloud.com
+
+post_install: |
+  Use a dedicated least-privilege RAM identity — never an Alibaba Cloud account
+  or root AccessKey. Initially attach only
+  `AliyunOpenAPIMCPServerStaticCredentialAccess`; business-product permissions
+  are unnecessary for this catalog entry's discovery/documentation surface.
+
+  This entry deliberately excludes CallCLI, RunScript, RunIaC, GetTask, and
+  GetPresignedUrl at the proxy itself. Create a separately reviewed advanced
+  configuration with RAM, safety, and boundary policies if execution is ever
+  required. The current Alibaba Cloud integration guide requires Python 3.13+.
