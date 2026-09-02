@@ -585,6 +585,19 @@ def _spawn(spec: ShellHookSpec, stdin_json: str) -> Dict[str, Any]:
     _popen_kwargs: Dict[str, Any] = (
         {"creationflags": windows_hide_flags()} if IS_WINDOWS else {"process_group": 0}
     )
+    # Carry delegated-child lineage across the fork. ``env=None`` inherits
+    # ``os.environ``, which drops the ContextVar marking a ``delegate_task``
+    # child (ContextVars do not cross a process boundary), so a hook gating on
+    # caller identity sees every child invocation as if it came from the
+    # parent. The same helper also scrubs dispatcher-owned ``HERMES_KANBAN_*``
+    # that would otherwise leak into the hook. It returns ``None`` outside a
+    # delegated child, preserving normal inherit semantics — the contract
+    # already used by tts_tool, transcription_tools and code_execution_tool.
+    from agent.delegation_context import delegated_child_subprocess_env
+
+    _hook_env = delegated_child_subprocess_env()
+    if _hook_env is not None:
+        _popen_kwargs["env"] = _hook_env
     try:
         proc = subprocess.Popen(
             argv,
