@@ -4979,6 +4979,55 @@ class TestRunConversation:
         # context_length was NOT mutated by an output-cap error.
         assert agent.context_compressor.context_length == 200_000
 
+    def test_llama_cpp_combined_budget_retries_with_smaller_output_cap(self, agent):
+        """Current llama.cpp reports prompt + reserved output as one total.
+
+        The exact live failure was misrouted into input compression.  When the
+        protected transcript could not shrink, Hermes returned ``Cannot
+        compress further`` without retrying even though the prompt itself fit
+        and lowering the 32K output reservation was sufficient.
+        """
+        self._setup_agent(agent)
+        agent.api_mode = "chat_completions"
+        agent.provider = "custom"
+        agent.base_url = "http://127.0.0.1:8091/v1"
+        agent.model = "qwen3.6-27b-uncensored"
+        agent.max_tokens = 32_768
+        agent.compression_enabled = True
+        agent.context_compressor.context_length = 65_536
+        agent.context_compressor.should_compress = MagicMock(return_value=True)
+
+        error_msg = (
+            "request (67585 tokens) exceeds the available context size "
+            "(65536 tokens), try increasing it"
+        )
+        exc = Exception(error_msg)
+        exc.status_code = 400
+        exc.code = 400
+
+        ok_resp = _mock_response(content="continued", finish_reason="stop")
+        agent.client.chat.completions.create.side_effect = [exc, ok_resp]
+
+        def _no_progress(messages, system_message, **kwargs):
+            return messages, system_message
+
+        with (
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+            patch.object(agent.context_compressor, "update_model"),
+            patch.object(agent, "_compress_context", side_effect=_no_progress),
+        ):
+            result = agent.run_conversation("continue the project")
+
+        assert result["completed"] is True
+        assert result["final_response"] == "continued"
+        assert not result.get("compression_exhausted")
+        assert agent.client.chat.completions.create.call_count == 2
+        second_call = agent.client.chat.completions.create.call_args_list[1].kwargs
+        assert 1 <= second_call["max_tokens"] < 32_768
+        assert agent.context_compressor.context_length == 65_536
+
     def test_output_cap_retry_compression_no_progress_terminates_bounded(self, agent):
         """Regression: when the compressor cannot reduce the request (zero
         progress AND no images to strip), the output-cap retry must terminate

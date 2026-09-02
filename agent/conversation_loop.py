@@ -5807,6 +5807,34 @@ def run_conversation(
                 # compress history and retry, not abort immediately.
                 status_code = getattr(api_error, "status_code", None)
 
+                # Keep the exact output reservation that was sent on the wire.
+                # Current llama.cpp reports prompt + reserved output as one
+                # combined request total, so the error text alone cannot tell
+                # an oversized prompt from an oversized max_tokens setting.
+                # Middleware may rewrite the request, therefore read the final
+                # payload rather than agent.max_tokens.
+                _request_output_tokens = None
+                if isinstance(api_kwargs, dict):
+                    for _output_key in (
+                        "max_output_tokens",
+                        "max_completion_tokens",
+                        "max_tokens",
+                    ):
+                        _output_value = api_kwargs.get(_output_key)
+                        if (
+                            isinstance(_output_value, int)
+                            and not isinstance(_output_value, bool)
+                            and _output_value > 0
+                        ):
+                            _request_output_tokens = _output_value
+                            break
+                _parsed_output_cap_budget = (
+                    parse_available_output_tokens_from_error(
+                        error_msg,
+                        requested_output_tokens=_request_output_tokens,
+                    )
+                )
+
                 # ── Respect disabled auto-compaction on overflow ──────
                 # Ported from anomalyco/opencode#30749.  When the user has
                 # turned auto-compaction off (``compression.enabled: false``),
@@ -5834,8 +5862,11 @@ def run_conversation(
                     FailoverReason.context_overflow,
                 }
                 _is_output_cap_error = (
-                    is_output_cap_error(error_msg)
-                    or parse_available_output_tokens_from_error(error_msg) is not None
+                    is_output_cap_error(
+                        error_msg,
+                        requested_output_tokens=_request_output_tokens,
+                    )
+                    or _parsed_output_cap_budget is not None
                 )
                 if (
                     classified.reason in _overflow_reasons
@@ -5962,7 +5993,7 @@ def run_conversation(
                 # widened is_context_length_error entry, and is reused as
                 # available_out inside the handler.
                 _wrapped_output_cap_budget = (
-                    parse_available_output_tokens_from_error(error_msg)
+                    _parsed_output_cap_budget
                     if classified.reason == FailoverReason.rate_limit
                     else None
                 )
@@ -6338,7 +6369,7 @@ def run_conversation(
                     #
                     # Note: max_tokens = output token cap (one response).
                     #       context_length = total window (input + output combined).
-                    available_out = parse_available_output_tokens_from_error(error_msg)
+                    available_out = _parsed_output_cap_budget
                     if available_out is not None:
                         # This is an output-cap error, not input overflow.
                         # The provider's available_tokens is the authoritative
@@ -6444,7 +6475,10 @@ def run_conversation(
                     # re-sends the same max_tokens, gets the identical 400, and
                     # death-loops until "cannot compress further" (#55546).
                     # Fail fast with an actionable message instead of looping.
-                    if is_output_cap_error(error_msg):
+                    if is_output_cap_error(
+                        error_msg,
+                        requested_output_tokens=_request_output_tokens,
+                    ):
                         agent._flush_status_buffer()
                         agent._vprint(
                             f"{agent.log_prefix}❌ The provider rejected the request because "

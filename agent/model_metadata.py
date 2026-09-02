@@ -1817,7 +1817,11 @@ def get_context_length_from_provider_error(
     return None
 
 
-def parse_available_output_tokens_from_error(error_msg: str) -> Optional[int]:
+def parse_available_output_tokens_from_error(
+    error_msg: str,
+    *,
+    requested_output_tokens: Optional[int] = None,
+) -> Optional[int]:
     """Detect an "output cap too large" error and return how many output tokens are available.
 
     Background — two distinct context errors exist:
@@ -1835,6 +1839,43 @@ def parse_available_output_tokens_from_error(error_msg: str) -> Optional[int]:
     the error does not look like a max_tokens-too-large error.
     """
     error_lower = error_msg.lower()
+
+    # Current llama.cpp chat-completions servers report the TOTAL request
+    # reservation (measured prompt + requested max_tokens) without naming the
+    # two components:
+    #
+    #   request (67585 tokens) exceeds the available context size
+    #   (65536 tokens), try increasing it
+    #
+    # On its own that wording is ambiguous: it could describe an input that
+    # already exceeds the window.  The exact wire request removes the
+    # ambiguity because Hermes knows the output reservation it sent.  Infer
+    # the measured input as ``total - requested_output`` and only classify the
+    # failure as output-cap-shaped when that input fits by itself.  If it does
+    # not fit, return None and let the ordinary compression path handle the
+    # genuine prompt overflow.
+    _llama_combined_budget: Optional[int] = None
+    _m_llama_combined = re.search(
+        r'request\s*\(\s*(\d+)\s*tokens?\s*\)\s*exceeds\s*the\s*'
+        r'available\s*context\s*size\s*\(\s*(\d+)\s*tokens?\s*\)',
+        error_lower,
+    )
+    if (
+        _m_llama_combined
+        and isinstance(requested_output_tokens, int)
+        and not isinstance(requested_output_tokens, bool)
+        and requested_output_tokens > 0
+    ):
+        _request_total = int(_m_llama_combined.group(1))
+        _context_size = int(_m_llama_combined.group(2))
+        _inferred_input = _request_total - requested_output_tokens
+        _available = _context_size - _inferred_input
+        if (
+            _request_total > _context_size
+            and 0 <= _inferred_input < _context_size
+            and 1 <= _available < requested_output_tokens
+        ):
+            _llama_combined_budget = _available
 
     # Must look like an output-cap error, not a prompt-length error.
     is_output_cap_error = (
@@ -1869,9 +1910,12 @@ def parse_available_output_tokens_from_error(error_msg: str) -> Optional[int]:
         # This is independent of the input context window.
         "exceeds model" in error_lower
         and "maximum output tokens" in error_lower
-    )
+    ) or _llama_combined_budget is not None
     if not is_output_cap_error:
         return None
+
+    if _llama_combined_budget is not None:
+        return _llama_combined_budget
 
     # Generic model-output-cap form:
     #   "max_tokens (98304) exceeds model's maximum output tokens (65536)"
@@ -1975,7 +2019,11 @@ def parse_available_output_tokens_from_error(error_msg: str) -> Optional[int]:
     return None
 
 
-def is_output_cap_error(error_msg: str) -> bool:
+def is_output_cap_error(
+    error_msg: str,
+    *,
+    requested_output_tokens: Optional[int] = None,
+) -> bool:
     """Return True if a 400 is about the OUTPUT cap (max_tokens) being too large.
 
     This is the broader sibling of :func:`parse_available_output_tokens_from_error`:
@@ -1999,6 +2047,18 @@ def is_output_cap_error(error_msg: str) -> bool:
     path (a real input overflow can also mention max_tokens).
     """
     error_lower = error_msg.lower()
+
+    # The current llama.cpp combined-budget wording does not mention
+    # max_tokens.  It is only safe to call it output-cap-shaped when the wire
+    # reservation lets the parser prove that the input fits independently.
+    if requested_output_tokens is not None and (
+        parse_available_output_tokens_from_error(
+            error_msg,
+            requested_output_tokens=requested_output_tokens,
+        )
+        is not None
+    ):
+        return True
 
     mentions_output_param = (
         "max_tokens" in error_lower
