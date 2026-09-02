@@ -231,6 +231,31 @@ class TestCollectKanbanNotifications:
         assert len(rows) == 1
         assert rows[0]["chat_id"] == SESSION_KEY
 
+    def test_review_requested_delivers_and_advances_cursor(self):
+        # review_requested was missing from _KANBAN_NOTIFY_KINDS while the
+        # gateway notifier (gateway/kanban_watchers.py TERMINAL_KINDS) claimed
+        # it, so Desktop sessions silently parked in review (issue #99436).
+        tid = _create_subscribed_task()
+        conn = kb.connect()
+        try:
+            assert kb.request_review(
+                conn, tid, summary="implemented the widget", reviewer="reviewer"
+            )
+        finally:
+            conn.close()
+
+        first = _collect_kanban_notifications(_session())
+
+        assert len(first) == 1
+        assert tid in first[0]
+        assert "ready for review" in first[0]
+        assert "implemented the widget" in first[0]
+        # Cursor advanced past the claimed event: no replay on the next poll.
+        assert _collect_kanban_notifications(_session()) == []
+        # review_requested is not terminal — the sub stays alive for the
+        # later changes_requested/completed cycle.
+        assert len(_sub_rows(tid)) == 1
+
 
 class TestFormatKanbanEventText:
     SUB = {"task_id": "t_abc123"}
@@ -261,6 +286,49 @@ class TestFormatKanbanEventText:
         ev = SimpleNamespace(kind="timed_out", payload={"limit_seconds": "not-a-number"})
         text = _format_kanban_event_text(self.SUB, self.TASK, ev, "")
         assert "timed out" in text
+
+    def test_review_requested_includes_title_and_summary(self):
+        ev = SimpleNamespace(
+            kind="review_requested",
+            payload={"summary": "shipped the widget", "reviewer": "reviewer"},
+        )
+        text = _format_kanban_event_text(self.SUB, self.TASK, ev, "main")
+        assert "ready for review" in text
+        assert "build the thing" in text
+        assert "shipped the widget" in text
+        assert "[main]" in text
+        assert "@worker" in text
+
+    def test_changes_requested_includes_reason_and_provenance(self):
+        ev = SimpleNamespace(
+            kind="changes_requested",
+            payload={
+                "reason": "missing tests",
+                "reviewer": "reviewer",
+                "implementer": "worker",
+            },
+        )
+        text = _format_kanban_event_text(self.SUB, self.TASK, ev, "main")
+        assert "review requested changes/BLOCK" in text
+        assert "missing tests" in text
+        assert "reviewer @reviewer" in text
+        assert "implementer @worker" in text
+        assert "@worker" in text  # assignee tag, like every sibling branch
+
+    def test_changes_requested_without_reason_falls_back(self):
+        ev = SimpleNamespace(kind="changes_requested", payload={})
+        text = _format_kanban_event_text(self.SUB, self.TASK, ev, "")
+        assert "reviewer feedback requires changes" in text
+
+    def test_block_loop_detected_includes_recurrences_and_reason(self):
+        ev = SimpleNamespace(
+            kind="block_loop_detected",
+            payload={"reason": "flaky dep", "recurrences": 3},
+        )
+        text = _format_kanban_event_text(self.SUB, self.TASK, ev, "main")
+        assert "routed to TRIAGE" in text
+        assert "flaky dep" in text
+        assert "blocked 3x" in text
 
 
 class TestNotificationPollerLoopKanbanWiring:

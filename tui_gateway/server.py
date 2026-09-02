@@ -12347,10 +12347,14 @@ def _notification_event_dedup_key(evt: dict) -> tuple:
 
 # Mirror gateway/kanban_watchers.py TERMINAL_KINDS: claim silent kinds too so
 # the cursor advances past them and they can't wedge a later completed/blocked
-# event behind an unclaimed row.
+# event behind an unclaimed row. ``review_requested``/``changes_requested``/
+# ``block_loop_detected`` must be here as well: TUI/Desktop subscriptions are
+# served exclusively by this poller (no "tui" messaging adapter), so a kind
+# missing from this tuple is structurally undeliverable to Desktop sessions.
 _KANBAN_NOTIFY_KINDS = (
     "completed", "blocked", "gave_up", "crashed", "timed_out",
     "status", "archived", "unblocked",
+    "review_requested", "changes_requested", "block_loop_detected",
 )
 _KANBAN_SILENT_KINDS = frozenset({"archived", "unblocked"})
 _KANBAN_POLL_SECONDS = 5.0
@@ -12494,6 +12498,28 @@ def _format_kanban_event_text(sub: dict, task, ev, board_slug: str) -> Optional[
         return f"⏱ {board_tag}{tag}Kanban {task_id} timed out (max_runtime={limit}s); will retry"
     if kind == "status":
         return f"🔄 {board_tag}{tag}Kanban {task_id} → {payload.get('status') or ''}"
+    if kind == "review_requested":
+        handoff = ""
+        summary = payload.get("summary")
+        if summary:
+            handoff = f"\n{str(summary)[:200]}"
+        return f"👀 {board_tag}{tag}Kanban {task_id} ready for review — {title}{handoff}"
+    if kind == "changes_requested":
+        reason = str(payload.get("reason") or "")[:160]
+        reviewer = str(payload.get("reviewer") or "")[:48]
+        implementer = str(payload.get("implementer") or "")[:48]
+        reason_text = reason or "reviewer feedback requires changes"
+        provenance = ""
+        if reviewer:
+            provenance += f" — reviewer @{reviewer}"
+        if implementer:
+            provenance += f" → implementer @{implementer}"
+        return f"🛑 {board_tag}{tag}Kanban {task_id} review requested changes/BLOCK: {reason_text}{provenance}"
+    if kind == "block_loop_detected":
+        reason = f": {str(payload.get('reason'))[:160]}" if payload.get("reason") else ""
+        recurrences = payload.get("recurrences")
+        rc = f" (blocked {recurrences}x for the same cause)" if recurrences else ""
+        return f"🛑 {board_tag}{tag}Kanban {task_id} routed to TRIAGE — needs a human decision{rc}{reason}"
     return None
 
 
