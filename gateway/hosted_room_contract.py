@@ -6,7 +6,7 @@ import hashlib
 import json
 import re
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 
 PROTOCOL_VERSION = 2
@@ -25,6 +25,7 @@ MAX_ROOM_LIST_LIMIT = 500
 MAX_ACTIVE_ROOMS = 256
 MAX_DISBANDED_ROOM_TOMBSTONES = 512
 DISBANDED_ROOM_RETENTION_SECONDS = 90 * 24 * 60 * 60
+DISBANDED_REPLICA_RETENTION_SECONDS = 90 * 24 * 60 * 60
 MAX_EVENTS_PER_ROOM = 50_000
 MAX_ROOM_EVENT_BYTES = 256 * 1024 * 1024
 # Leave substantial headroom below the pre-update state.db snapshot ceiling.
@@ -116,6 +117,41 @@ _PEER_RESERVATION_SCHEMA_COLUMNS = frozenset({
     "created_at",
     "updated_at",
 })
+_QUARANTINE_SCHEMA_COLUMNS = frozenset({"room_id", "reason", "detected_at"})
+_ROOM_RESERVATION_SCHEMA_COLUMNS = frozenset({
+    "room_id",
+    "owner_kind",
+    "reserved_at",
+})
+_REPLICA_RESERVATION_COLUMNS = frozenset({
+    "room_id",
+    "created_at",
+})
+_REPLICA_EVENT_SCHEMA_COLUMNS = frozenset({
+    "room_id",
+    "seq",
+    "event_id",
+    "kind",
+    "actor_json",
+    "authority_epoch",
+    "payload_json",
+    "created_at",
+})
+_EVENT_BUDGET_SCHEMA_COLUMNS = frozenset({"singleton", "event_bytes"})
+_ROOM_SAFETY_TRIGGERS = frozenset({
+    "trg_hosted_rooms_reject_reserved_insert",
+    "trg_hosted_rooms_reserve_insert",
+    "trg_hosted_replicas_reject_reserved_insert",
+    "trg_hosted_replicas_reserve_insert",
+    "trg_hosted_events_reject_quarantined_insert",
+    "trg_hosted_events_quarantine_unsafe_lineage",
+    "trg_hosted_events_shared_budget",
+    "trg_hosted_replica_events_shared_budget",
+    "trg_hosted_events_budget_account_insert",
+    "trg_hosted_events_budget_account_delete",
+    "trg_hosted_replica_events_budget_account_insert",
+    "trg_hosted_replica_events_budget_account_delete",
+})
 
 _EVENT_KINDS_BY_ACTOR = {
     "user": frozenset({"message.user"}),
@@ -179,8 +215,14 @@ class AuthoritySupersededError(AuthorityConflictError):
     """Raised when a successful authority claim was later superseded."""
 
 
+class RoomQuarantinedError(AuthorityConflictError):
+    """Raised when an unsafe legacy takeover must remain read-only."""
+
+    reason = "room_authority_quarantined"
+
+
 def _public_limits():
-    """Resolve re-exported limits late to preserve the public patch seam."""
+    """Resolve re-exported limits late to preserve the original public seam."""
     from gateway import hosted_rooms
 
     return hosted_rooms
