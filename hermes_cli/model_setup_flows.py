@@ -2615,10 +2615,25 @@ def _model_flow_bedrock(config, current_model=""):
 
         deduped.sort(key=_sort_key)
         model_list = [m["id"] for m in deduped]
-        print(
-            f"  Found {len(model_list)} text model(s) (filtered from {len(live_models)} total)"
-        )
+
+        # Which of these accept image input. The picker offers inference
+        # profiles (bare foundation IDs are deduplicated away just above), and
+        # ListInferenceProfiles reports no modalities, so this is only accurate
+        # because profiles inherit them from their foundation model.
+        from agent.bedrock_adapter import vision_capable_bedrock_model_ids
+
+        vision_ids = vision_capable_bedrock_model_ids(deduped)
+        if vision_ids:
+            print(
+                f"  Found {len(model_list)} text model(s), {len(vision_ids)} also "
+                f"accept image input (filtered from {len(live_models)} total)"
+            )
+        else:
+            print(
+                f"  Found {len(model_list)} text model(s) (filtered from {len(live_models)} total)"
+            )
     else:
+        vision_ids = []
         model_list = _PROVIDER_MODELS.get("bedrock", [])
         if model_list:
             print(
@@ -2637,6 +2652,7 @@ def _model_flow_bedrock(config, current_model=""):
             current_model=current_model,
             confirm_provider="bedrock",
             confirm_base_url=f"https://bedrock-runtime.{region}.amazonaws.com",
+            vision_model_ids=vision_ids,
         )
     else:
         try:

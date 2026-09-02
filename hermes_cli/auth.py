@@ -8365,6 +8365,7 @@ def _prompt_model_selection(
     confirm_provider: str = "",
     confirm_base_url: str = "",
     confirm_api_key: str = "",
+    vision_model_ids: Optional[List[str]] = None,
 ) -> Optional[str]:
     """Interactive model selection. Puts current_model first with a marker. Returns chosen model ID or None.
 
@@ -8373,6 +8374,11 @@ def _prompt_model_selection(
 
     If *unavailable_models* is provided, those models are shown grayed out
     and unselectable, with an upgrade link to *portal_url*.
+
+    If *vision_model_ids* is provided, those models get a ``(vision)`` marker
+    in their displayed label so image-capable models are distinguishable at the
+    point of choosing one. Display-only — the returned value is always the
+    plain model ID.
     """
     from hermes_cli.cli_output import line_input
     from hermes_cli.models import (
@@ -8381,6 +8387,7 @@ def _prompt_model_selection(
     )
 
     _unavailable = unavailable_models or []
+    _vision = set(vision_model_ids or [])
     # Sale chrome (★ / -N% / was) is Nous Portal-only — never for OpenRouter
     # or other providers even if pricing.original is somehow present.
     sale_chrome = (confirm_provider or "").strip().lower() == "nous"
@@ -8485,6 +8492,8 @@ def _prompt_model_selection(
         """Build a rich radiolist row: yellow ★/% , dim was, plain prices."""
         if not has_pricing:
             segs: list[tuple[str, str | None]] = [(mid, None)]
+            if mid in _vision:
+                segs.append(("  (vision)", "dim"))
             if mid == current_model:
                 segs.append(("  ← currently in use", None))
             return segs
@@ -8511,6 +8520,8 @@ def _prompt_model_selection(
             segs.append((f"  -{pct}%", "yellow"))
             if was_inp or was_out:
                 segs.append((f"  was {was_inp}/{was_out}", "dim"))
+        if mid in _vision:
+            segs.append(("  (vision)", "dim"))
         if mid == current_model:
             segs.append(("  ← currently in use", None))
         return segs

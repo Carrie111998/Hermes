@@ -896,6 +896,300 @@ class TestDiscoverBedrockModels:
         assert models == []
 
 
+class TestInferenceProfileModalityInheritance:
+    """Inference profiles should inherit modalities from their foundation model.
+
+    ListInferenceProfiles doesn't expose modalities, so profiles previously
+    defaulted to TEXT-only — excluding vision-capable Claude profiles
+    (e.g. us.anthropic.claude-sonnet-4-6) from IMAGE-input filtering in the
+    /model picker.  Ref: PR #7920 feedback from @ptlally.
+    """
+
+    def test_profile_inherits_image_input_from_foundation(self):
+        from agent.bedrock_adapter import discover_bedrock_models, reset_discovery_cache
+        reset_discovery_cache()
+
+        mock_client = MagicMock()
+        mock_client.list_foundation_models.return_value = {
+            "modelSummaries": [{
+                "modelId": "anthropic.claude-sonnet-4-6",
+                "modelName": "Claude Sonnet 4.6",
+                "providerName": "Anthropic",
+                "inputModalities": ["TEXT", "IMAGE"],
+                "outputModalities": ["TEXT"],
+                "responseStreamingSupported": True,
+                "modelLifecycle": {"status": "ACTIVE"},
+            }],
+        }
+        mock_client.list_inference_profiles.return_value = {
+            "inferenceProfileSummaries": [{
+                "inferenceProfileId": "us.anthropic.claude-sonnet-4-6",
+                "inferenceProfileName": "US Claude Sonnet 4.6",
+                "status": "ACTIVE",
+                "models": [{"modelArn": "arn:aws:bedrock:us-east-1::foundation-model/anthropic.claude-sonnet-4-6"}],
+            }],
+        }
+
+        with patch("agent.bedrock_adapter._get_bedrock_control_client", return_value=mock_client):
+            models = discover_bedrock_models("us-east-1")
+
+        profile = [m for m in models if m["id"] == "us.anthropic.claude-sonnet-4-6"]
+        assert len(profile) == 1
+        assert "IMAGE" in profile[0]["input_modalities"]
+        assert "TEXT" in profile[0]["input_modalities"]
+
+    def test_profile_inherits_via_regional_prefix_when_arn_absent(self):
+        """When the profile has no model ARN, fall back to stripping the regional prefix."""
+        from agent.bedrock_adapter import discover_bedrock_models, reset_discovery_cache
+        reset_discovery_cache()
+
+        mock_client = MagicMock()
+        mock_client.list_foundation_models.return_value = {
+            "modelSummaries": [{
+                "modelId": "anthropic.claude-sonnet-4-6",
+                "modelName": "Claude Sonnet 4.6",
+                "providerName": "Anthropic",
+                "inputModalities": ["TEXT", "IMAGE"],
+                "outputModalities": ["TEXT"],
+                "responseStreamingSupported": True,
+                "modelLifecycle": {"status": "ACTIVE"},
+            }],
+        }
+        mock_client.list_inference_profiles.return_value = {
+            "inferenceProfileSummaries": [{
+                "inferenceProfileId": "us.anthropic.claude-sonnet-4-6",
+                "inferenceProfileName": "US Claude Sonnet 4.6",
+                "status": "ACTIVE",
+                "models": [],  # no ARN — must fall back to prefix stripping
+            }],
+        }
+
+        with patch("agent.bedrock_adapter._get_bedrock_control_client", return_value=mock_client):
+            models = discover_bedrock_models("us-east-1")
+
+        profile = [m for m in models if m["id"] == "us.anthropic.claude-sonnet-4-6"]
+        assert len(profile) == 1
+        assert "IMAGE" in profile[0]["input_modalities"]
+
+    def test_profile_defaults_to_text_when_no_foundation_match(self):
+        """Profiles with no matching foundation model keep the TEXT-only default."""
+        from agent.bedrock_adapter import discover_bedrock_models, reset_discovery_cache
+        reset_discovery_cache()
+
+        mock_client = MagicMock()
+        mock_client.list_foundation_models.return_value = {"modelSummaries": []}
+        mock_client.list_inference_profiles.return_value = {
+            "inferenceProfileSummaries": [{
+                "inferenceProfileId": "us.unknown.model-v1",
+                "inferenceProfileName": "Unknown Model",
+                "status": "ACTIVE",
+                "models": [],
+            }],
+        }
+
+        with patch("agent.bedrock_adapter._get_bedrock_control_client", return_value=mock_client):
+            models = discover_bedrock_models("us-east-1")
+
+        assert len(models) == 1
+        assert models[0]["input_modalities"] == ["TEXT"]
+
+    def test_profile_inherits_output_modalities_too(self):
+        """The patch changes both modality fields, so pin both.
+
+        A multimodal-output model is the case that discriminates: it passes
+        discovery's ``"TEXT" in outputModalities`` gate, so it reaches the
+        lookup table, and its profile must come out with the *same* pair rather
+        than the ``["TEXT"]`` default.
+        """
+        from agent.bedrock_adapter import discover_bedrock_models, reset_discovery_cache
+        reset_discovery_cache()
+
+        mock_client = MagicMock()
+        mock_client.list_foundation_models.return_value = {
+            "modelSummaries": [{
+                "modelId": "vendor.omni-v1",
+                "modelName": "Omni",
+                "providerName": "Vendor",
+                "inputModalities": ["TEXT", "IMAGE"],
+                "outputModalities": ["TEXT", "IMAGE"],
+                "responseStreamingSupported": True,
+                "modelLifecycle": {"status": "ACTIVE"},
+            }],
+        }
+        mock_client.list_inference_profiles.return_value = {
+            "inferenceProfileSummaries": [{
+                "inferenceProfileId": "us.vendor.omni-v1",
+                "inferenceProfileName": "US Omni",
+                "status": "ACTIVE",
+                "models": [{"modelArn": "arn:aws:bedrock:us-east-1::foundation-model/vendor.omni-v1"}],
+            }],
+        }
+
+        with patch("agent.bedrock_adapter._get_bedrock_control_client", return_value=mock_client):
+            models = discover_bedrock_models("us-east-1")
+
+        profile = [m for m in models if m["id"] == "us.vendor.omni-v1"]
+        assert len(profile) == 1
+        assert profile[0]["output_modalities"] == ["TEXT", "IMAGE"]
+        assert profile[0]["input_modalities"] == ["TEXT", "IMAGE"]
+
+    def test_profile_of_a_filtered_out_foundation_model_stays_text_only(self):
+        """Known limitation, pinned so it is a decision and not a surprise.
+
+        Foundation discovery keeps only ACTIVE, streaming, text-output models,
+        so a profile whose underlying model was dropped by that gate has
+        nothing to inherit from and keeps the ``["TEXT"]`` default. Profiles
+        themselves are not subject to that gate, so such a profile is still
+        listed — it is simply described conservatively rather than accurately.
+        Fixing that means widening foundation discovery, which changes what the
+        picker offers and belongs in its own change.
+        """
+        from agent.bedrock_adapter import discover_bedrock_models, reset_discovery_cache
+        reset_discovery_cache()
+
+        mock_client = MagicMock()
+        mock_client.list_foundation_models.return_value = {
+            "modelSummaries": [{
+                "modelId": "vendor.image-only-v1",
+                "modelName": "Image Only",
+                "providerName": "Vendor",
+                "inputModalities": ["TEXT"],
+                "outputModalities": ["IMAGE"],  # dropped: no TEXT output
+                "responseStreamingSupported": True,
+                "modelLifecycle": {"status": "ACTIVE"},
+            }],
+        }
+        mock_client.list_inference_profiles.return_value = {
+            "inferenceProfileSummaries": [{
+                "inferenceProfileId": "us.vendor.image-only-v1",
+                "inferenceProfileName": "US Image Only",
+                "status": "ACTIVE",
+                "models": [{"modelArn": "arn:aws:bedrock:us-east-1::foundation-model/vendor.image-only-v1"}],
+            }],
+        }
+
+        with patch("agent.bedrock_adapter._get_bedrock_control_client", return_value=mock_client):
+            models = discover_bedrock_models("us-east-1")
+
+        assert [m["id"] for m in models] == ["us.vendor.image-only-v1"]
+        assert models[0]["output_modalities"] == ["TEXT"]
+
+
+class TestVisionCapableBedrockModelIds:
+    """The consumer of the inherited metadata.
+
+    Without the inheritance above, every entry the /model picker offers is a
+    profile stamped TEXT-only, so this helper would report *nothing* as
+    vision-capable no matter how many vision models were available.
+    """
+
+    def test_selects_models_with_image_input(self):
+        from agent.bedrock_adapter import vision_capable_bedrock_model_ids
+
+        models = [
+            {"id": "us.anthropic.claude-sonnet-4-6",
+             "input_modalities": ["TEXT", "IMAGE"]},
+            {"id": "us.deepseek.r1-v1:0", "input_modalities": ["TEXT"]},
+            {"id": "us.meta.llama4-maverick",
+             "input_modalities": ["TEXT", "IMAGE"]},
+        ]
+        assert vision_capable_bedrock_model_ids(models) == [
+            "us.anthropic.claude-sonnet-4-6",
+            "us.meta.llama4-maverick",
+        ]
+
+    def test_preserves_caller_order(self):
+        """The picker sorts before calling, so the result must not reorder."""
+        from agent.bedrock_adapter import vision_capable_bedrock_model_ids
+
+        models = [
+            {"id": "z.model", "input_modalities": ["IMAGE"]},
+            {"id": "a.model", "input_modalities": ["IMAGE"]},
+        ]
+        assert vision_capable_bedrock_model_ids(models) == ["z.model", "a.model"]
+
+    def test_missing_or_empty_modalities_are_not_vision(self):
+        from agent.bedrock_adapter import vision_capable_bedrock_model_ids
+
+        assert vision_capable_bedrock_model_ids([{"id": "a"}]) == []
+        assert vision_capable_bedrock_model_ids(
+            [{"id": "a", "input_modalities": []}]
+        ) == []
+        assert vision_capable_bedrock_model_ids(
+            [{"id": "a", "input_modalities": None}]
+        ) == []
+
+    def test_matching_is_case_insensitive(self):
+        """Modalities come off the wire from AWS; don't assume upper case."""
+        from agent.bedrock_adapter import vision_capable_bedrock_model_ids
+
+        assert vision_capable_bedrock_model_ids(
+            [{"id": "a", "input_modalities": ["text", "image"]}]
+        ) == ["a"]
+
+    def test_end_to_end_from_discovery(self):
+        """Discovery → consumer, with no hand-built modality dicts in between.
+
+        This is the assertion that fails without the inheritance fix: the
+        profile is what the picker offers, and it must come out vision-capable.
+        """
+        from agent.bedrock_adapter import (
+            discover_bedrock_models,
+            reset_discovery_cache,
+            vision_capable_bedrock_model_ids,
+        )
+        reset_discovery_cache()
+
+        mock_client = MagicMock()
+        mock_client.list_foundation_models.return_value = {
+            "modelSummaries": [
+                {
+                    "modelId": "anthropic.claude-sonnet-4-6",
+                    "modelName": "Claude Sonnet 4.6",
+                    "providerName": "Anthropic",
+                    "inputModalities": ["TEXT", "IMAGE"],
+                    "outputModalities": ["TEXT"],
+                    "responseStreamingSupported": True,
+                    "modelLifecycle": {"status": "ACTIVE"},
+                },
+                {
+                    "modelId": "deepseek.r1-v1:0",
+                    "modelName": "DeepSeek R1",
+                    "providerName": "DeepSeek",
+                    "inputModalities": ["TEXT"],
+                    "outputModalities": ["TEXT"],
+                    "responseStreamingSupported": True,
+                    "modelLifecycle": {"status": "ACTIVE"},
+                },
+            ],
+        }
+        mock_client.list_inference_profiles.return_value = {
+            "inferenceProfileSummaries": [
+                {
+                    "inferenceProfileId": "us.anthropic.claude-sonnet-4-6",
+                    "inferenceProfileName": "US Claude Sonnet 4.6",
+                    "status": "ACTIVE",
+                    "models": [{"modelArn": "arn:aws:bedrock:us-east-1::foundation-model/anthropic.claude-sonnet-4-6"}],
+                },
+                {
+                    "inferenceProfileId": "us.deepseek.r1-v1:0",
+                    "inferenceProfileName": "US DeepSeek R1",
+                    "status": "ACTIVE",
+                    "models": [{"modelArn": "arn:aws:bedrock:us-east-1::foundation-model/deepseek.r1-v1:0"}],
+                },
+            ],
+        }
+
+        with patch("agent.bedrock_adapter._get_bedrock_control_client", return_value=mock_client):
+            models = discover_bedrock_models("us-east-1")
+
+        profiles = [m for m in models if m["id"].startswith("us.")]
+        assert len(profiles) == 2, "both profiles should be discovered"
+        assert vision_capable_bedrock_model_ids(profiles) == [
+            "us.anthropic.claude-sonnet-4-6"
+        ]
+
+
 class TestExtractProviderFromArn:
     def test_extracts_anthropic(self):
         from agent.bedrock_adapter import _extract_provider_from_arn
