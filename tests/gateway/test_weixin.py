@@ -879,3 +879,71 @@ class TestWeixinVoiceGatewayHandoff:
             "the wrong transcript instead of re-transcribing (#27300)."
         )
 
+
+
+class TestWeixinSyntheticMessageId:
+    """iLink does not always populate ``message_id``. When it is absent the
+    primary dedup is skipped and the content-fingerprint fallback only covers
+    text, so a re-delivered image or voice note is reprocessed on every
+    arrival. ``_synthetic_message_id`` closes that hole.
+    """
+
+    def _image_message(self, **overrides):
+        message = {
+            "from_user_id": "wxid_user1",
+            "create_time": 1756000000,
+            "sequence": 42,
+            "message_type": 3,
+            "item_list": [{"type": 3, "image_item": {"cdn_url": "https://cdn/x.jpg"}}],
+        }
+        message.update(overrides)
+        return message
+
+    def test_same_envelope_yields_same_id(self):
+        """A re-delivery of the same message must collapse onto one identity."""
+        first = weixin._synthetic_message_id(self._image_message())
+        second = weixin._synthetic_message_id(self._image_message())
+        assert first
+        assert first == second
+        assert first.startswith("weixin-synthetic-")
+
+    def test_rotating_context_token_does_not_change_identity(self):
+        """context_token rotates between retries; keying on it would give each
+        retry a fresh identity and defeat the dedup entirely.
+        """
+        a = weixin._synthetic_message_id(self._image_message(context_token="tok-a"))
+        b = weixin._synthetic_message_id(self._image_message(context_token="tok-b"))
+        assert a == b
+
+    def test_unknown_extension_fields_do_not_change_identity(self):
+        a = weixin._synthetic_message_id(self._image_message())
+        b = weixin._synthetic_message_id(self._image_message(some_future_field="x"))
+        assert a == b
+
+    def test_ordinal_field_keeps_legitimate_repeats_distinct(self):
+        """Sending the same sticker twice is not a duplicate delivery — the
+        ordinal fields must keep the two apart (see #29779 / #36750).
+        """
+        a = weixin._synthetic_message_id(self._image_message(create_time=1756000000, sequence=42))
+        b = weixin._synthetic_message_id(self._image_message(create_time=1756000009, sequence=43))
+        assert a != b
+
+    def test_different_payload_yields_different_id(self):
+        a = weixin._synthetic_message_id(self._image_message())
+        b = weixin._synthetic_message_id(self._image_message(
+            item_list=[{"type": 3, "image_item": {"cdn_url": "https://cdn/y.jpg"}}]))
+        assert a != b
+
+    def test_no_ordinal_field_returns_empty(self):
+        """Sender plus payload alone cannot tell a resend from a genuine
+        repeat, so the caller is left on its existing path instead.
+        """
+        message = self._image_message()
+        for key in ("create_time", "sequence", "seq"):
+            message.pop(key, None)
+        assert weixin._synthetic_message_id(message) == ""
+
+    def test_blank_ordinal_values_count_as_absent(self):
+        message = self._image_message(create_time="", sequence="")
+        message.pop("seq", None)
+        assert weixin._synthetic_message_id(message) == ""

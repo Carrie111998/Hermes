@@ -971,6 +971,48 @@ def _coerce_bool(value: Any, default: bool = True) -> bool:
     return default
 
 
+# Envelope fields that iLink keeps stable across a re-delivery. ``context_token``
+# is deliberately absent: it rotates by design. Unknown extension fields are
+# excluded for the same reason — a rotating field would give the same message a
+# fresh identity on every retry, which is the bug this is meant to close.
+_SYNTHETIC_ID_FIELDS = (
+    "from_user_id", "create_time", "sequence", "seq",
+    "client_id", "message_type",
+)
+# At least one of these must be present. Sender plus payload alone cannot tell a
+# resend from someone genuinely sending the same sticker twice.
+_SYNTHETIC_ID_ORDINALS = ("create_time", "sequence", "seq")
+
+
+def _synthetic_message_id(message: Dict[str, Any]) -> str:
+    """Derive a replay identity for an inbound message that carries no ``message_id``.
+
+    iLink does not always populate ``message_id``. When it is absent the primary
+    dedup is skipped, and the content-fingerprint fallback only covers text — so
+    a re-delivered image or voice note is processed again on every arrival.
+
+    Including an ordinal field keeps two legitimately identical messages from the
+    same sender distinct, so this does not widen the over-aggressive dedup
+    behaviour reported in #29779 and #36750.
+
+    Returns an empty string when no ordinal field is present, leaving the caller
+    on its existing path rather than risking a wrong identity.
+    """
+    if not any(str(message.get(key) or "").strip() for key in _SYNTHETIC_ID_ORDINALS):
+        return ""
+    identity: Dict[str, Any] = {
+        key: message.get(key)
+        for key in _SYNTHETIC_ID_FIELDS
+        if message.get(key) is not None
+    }
+    identity["item_list"] = message.get("item_list") or []
+    encoded = json.dumps(
+        identity, ensure_ascii=False, sort_keys=True,
+        separators=(",", ":"), default=str,
+    ).encode()
+    return "weixin-synthetic-" + hashlib.sha256(encoded).hexdigest()
+
+
 def _extract_text(item_list: List[Dict[str, Any]]) -> str:
     for item in item_list:
         if item.get("type") == ITEM_TEXT:
@@ -1490,6 +1532,11 @@ class WeixinAdapter(BasePlatformAdapter):
             return
 
         message_id = str(message.get("message_id") or "").strip()
+        if not message_id:
+            # No platform id: fall back to an envelope-derived identity so a
+            # re-delivered non-text message is not reprocessed. Empty when the
+            # envelope carries nothing stable enough to key on.
+            message_id = _synthetic_message_id(message)
         if message_id and self._dedup.is_duplicate(message_id):
             return
 
