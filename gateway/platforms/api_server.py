@@ -1427,6 +1427,7 @@ try:
         pause_job as _cron_pause,
         resume_job as _cron_resume,
         trigger_job as _cron_trigger,
+        get_job_results as _cron_get_results,
     )
     from cron.scheduler import (
         CronSchedulerRegistrationError as _CronSchedulerRegistrationError,
@@ -1442,6 +1443,7 @@ except ImportError:
     _cron_pause = None
     _cron_resume = None
     _cron_trigger = None
+    _cron_get_results = None
 
     class _CronSchedulerRegistrationError(RuntimeError):
         pass
@@ -2255,6 +2257,7 @@ class APIServerAdapter(BasePlatformAdapter):
             ("GET", "/api/jobs", self._handle_list_jobs),
             ("POST", "/api/jobs", self._handle_create_job),
             ("GET", "/api/jobs/{job_id}", self._handle_get_job),
+            ("GET", "/api/jobs/{job_id}/results", self._handle_get_job_results),
             ("PATCH", "/api/jobs/{job_id}", self._handle_update_job),
             ("DELETE", "/api/jobs/{job_id}", self._handle_delete_job),
             ("POST", "/api/jobs/{job_id}/pause", self._handle_pause_job),
@@ -3544,6 +3547,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     "method": "GET",
                     "path": "/v1/artifacts/download/{artifact_id}",
                 },
+                "job_results": {"method": "GET", "path": "/api/jobs/{job_id}/results"},
             },
         })
 
@@ -6837,6 +6841,83 @@ class APIServerAdapter(BasePlatformAdapter):
             if not job:
                 return web.json_response({"error": "Job not found"}, status=404)
             return web.json_response({"job": job})
+        except Exception as e:
+            return web.json_response({"error": _redact_api_error_text(e)}, status=500)
+
+    _MAX_JOB_RESULTS_LIMIT = 100
+    _DEFAULT_JOB_RESULTS_LIMIT = 20
+
+    async def _handle_get_job_results(self, request: "web.Request") -> "web.Response":
+        """GET /api/jobs/{job_id}/results — poll a job's newest saved outputs.
+
+        Read-only, bounded, and cursor-based so a client can poll for new
+        cron output without re-downloading everything each time:
+
+        - ``after=<cursor>`` — the client's high-water mark. Only results
+          strictly newer than this cursor are ever considered, for the
+          whole polling round. Pass the ``next_after`` from a previous
+          *round's* response (any page of it — ``next_after`` is stable
+          across pages of the same round) back in to start the next round.
+        - ``before=<cursor>`` — intra-round paging cursor. Only results
+          strictly older than this cursor are considered. Pass the
+          previous page's ``next_before`` back in to keep walking older
+          results within the same round (same ``after``); omit it to get
+          the newest unseen page. Cursors are the run's timestamp-based
+          output filename, which increases monotonically per job, so
+          ``(after, before)`` is an exact, gap-free, duplicate-free
+          half-open window.
+        - ``limit=<n>`` — clamped to (0, 100], default 20.
+
+        A full poll of everything newer than a high-water mark: call with
+        ``after`` set and no ``before``; while the response's ``has_more``
+        is true, call again with the same ``after`` and
+        ``before=<previous next_before>``. ``next_before`` is ``null``
+        once ``has_more`` is false.
+
+        Never touches anything outside the job's own output directory: the
+        job_id is validated by ``_check_job_id`` (12-hex format) before
+        this handler runs, and ``get_job_results`` re-validates the id as a
+        safe single path component and rejects an ``after``/``before``
+        cursor containing a path separator. A job with no output directory
+        yet (never run, or fully pruned) returns an empty result list
+        rather than an error.
+        """
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        cron_err = self._check_jobs_available()
+        if cron_err:
+            return cron_err
+        job_id, id_err = self._check_job_id(request)
+        if id_err:
+            return id_err
+        try:
+            job = _cron_get(job_id)
+            if not job:
+                return web.json_response({"error": "Job not found"}, status=404)
+        except Exception as e:
+            return web.json_response({"error": _redact_api_error_text(e)}, status=500)
+
+        after = request.query.get("after") or None
+        before = request.query.get("before") or None
+        raw_limit = request.query.get("limit")
+        try:
+            limit = (
+                self._DEFAULT_JOB_RESULTS_LIMIT
+                if raw_limit is None
+                else int(raw_limit)
+            )
+        except (TypeError, ValueError):
+            return web.json_response(
+                {"error": "limit must be an integer"}, status=400,
+            )
+        limit = max(1, min(limit, self._MAX_JOB_RESULTS_LIMIT))
+
+        try:
+            page = _cron_get_results(job_id, after=after, before=before, limit=limit)
+            return web.json_response(page)
+        except ValueError as e:
+            return web.json_response({"error": _redact_api_error_text(e)}, status=400)
         except Exception as e:
             return web.json_response({"error": _redact_api_error_text(e)}, status=500)
 

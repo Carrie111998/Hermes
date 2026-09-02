@@ -1257,6 +1257,152 @@ class TestSaveJobOutput:
         assert "test123" in str(output_file)
 
 
+class TestGetJobResults:
+    """Bounded, cursor-based polling over a job's saved output files."""
+
+    def test_no_output_dir_returns_empty(self, tmp_cron_dir):
+        """A job that never produced output must not error — just empty results."""
+        from cron.jobs import get_job_results
+        page = get_job_results("nooutputjob")
+        assert page["results"] == []
+        assert page["has_more"] is False
+        assert page["next_after"] is None
+        assert page["next_before"] is None
+
+    def test_returns_newest_first_bounded_by_limit(self, tmp_cron_dir):
+        from cron.jobs import get_job_results
+        for i in range(5):
+            save_job_output("polljob", f"run {i}")
+            # Ensure distinct, increasing timestamps in the filename.
+            import time as _time
+            _time.sleep(1.01)
+
+        page = get_job_results("polljob", limit=2)
+        assert len(page["results"]) == 2
+        assert page["has_more"] is True
+        # Newest content first.
+        assert page["results"][0]["content"] == "run 4"
+        assert page["results"][1]["content"] == "run 3"
+        # next_after is the true newest cursor regardless of paging position.
+        assert page["next_after"] == page["results"][0]["cursor"]
+        # next_before is the oldest cursor on *this* page — pass it back as
+        # `before` to keep paging older results within the same round.
+        assert page["next_before"] == page["results"][1]["cursor"]
+
+    def test_after_cursor_returns_only_newer_results(self, tmp_cron_dir):
+        """A polling client passes the last-seen cursor back in via `after` and
+        must get only results strictly newer than it — never a repeat of
+        anything already delivered, and nothing at all if the job hasn't
+        produced new output since."""
+        from cron.jobs import get_job_results
+        import time as _time
+
+        save_job_output("polljob2", "run 0")
+        first_page = get_job_results("polljob2")
+        assert [r["content"] for r in first_page["results"]] == ["run 0"]
+        cursor = first_page["next_after"]
+
+        # No new output yet: polling again with the same cursor yields nothing.
+        assert get_job_results("polljob2", after=cursor)["results"] == []
+
+        # A new run lands; polling with the old cursor surfaces only the new one.
+        _time.sleep(1.01)
+        save_job_output("polljob2", "run 1")
+        next_page = get_job_results("polljob2", after=cursor)
+        assert [r["content"] for r in next_page["results"]] == ["run 1"]
+        assert next_page["has_more"] is False
+        assert next_page["next_before"] is None
+
+    def test_limit_is_clamped(self, tmp_cron_dir):
+        from cron.jobs import get_job_results, _MAX_JOB_RESULTS
+        save_job_output("clampjob", "one run")
+        page = get_job_results("clampjob", limit=999999)
+        # Clamp doesn't error and the ceiling constant caps what would be requested.
+        assert len(page["results"]) <= _MAX_JOB_RESULTS
+        page_zero = get_job_results("clampjob", limit=0)
+        assert len(page_zero["results"]) >= 1  # clamps up to at least 1, not to 0
+
+    def test_rejects_path_escaping_job_id(self, tmp_cron_dir):
+        from cron.jobs import get_job_results
+        for bad_id in ("../escape", "a/b", "..", ".", "/etc/passwd"):
+            with pytest.raises(ValueError):
+                get_job_results(bad_id)
+
+    def test_rejects_path_escaping_cursor(self, tmp_cron_dir):
+        from cron.jobs import get_job_results
+        save_job_output("cursorjob", "content")
+        for bad_cursor in ("../escape.md", "a/b.md", ".", ".."):
+            with pytest.raises(ValueError):
+                get_job_results("cursorjob", after=bad_cursor)
+            with pytest.raises(ValueError):
+                get_job_results("cursorjob", before=bad_cursor)
+
+    def test_content_preserved_exactly(self, tmp_cron_dir):
+        """Result content must round-trip byte-for-byte for chat rendering."""
+        from cron.jobs import get_job_results
+        text = "# Heading\n\nSome **markdown** with emoji 🎉 and unicode café.\n"
+        save_job_output("exactjob", text)
+        page = get_job_results("exactjob")
+        assert page["results"][0]["content"] == text
+
+    def test_before_cursor_pages_intra_round_without_gaps_or_duplicates(self, tmp_cron_dir):
+        """The bug this whole feature exists to avoid: a client polling with
+        `after=next_after` from a page that had `has_more=True` must be able
+        to retrieve the *older* remaining unseen files, not get stuck. Walk a
+        real store with more files than `limit` using the `before` cursor and
+        prove the full walk is exactly the unseen set, in order, no repeats."""
+        from cron.jobs import get_job_results
+        import time as _time
+
+        n = 7
+        for i in range(n):
+            save_job_output("pagingjob", f"run {i}")
+            _time.sleep(1.01)
+
+        # First round: nothing seen yet.
+        seen_cursors: list = []
+        seen_contents: list = []
+        before = None
+        first_next_after = None
+        pages_fetched = 0
+        while True:
+            page = get_job_results("pagingjob", limit=3, before=before)
+            pages_fetched += 1
+            if first_next_after is None:
+                first_next_after = page["next_after"]
+            else:
+                # next_after must be stable across every page of the round.
+                assert page["next_after"] == first_next_after
+            seen_cursors.extend(r["cursor"] for r in page["results"])
+            seen_contents.extend(r["content"] for r in page["results"])
+            if not page["has_more"]:
+                assert page["next_before"] is None
+                break
+            before = page["next_before"]
+            assert pages_fetched <= n  # guard against infinite loop on a bug
+
+        # No gaps, no duplicates: exactly every saved run, newest first.
+        assert seen_contents == [f"run {n - 1 - i}" for i in range(n)]
+        assert len(seen_cursors) == len(set(seen_cursors)) == n
+
+        # Second round: poll again using the high-water mark from round one.
+        # With nothing new produced, the round must be immediately empty and
+        # never resurface anything already delivered.
+        round_two_after = first_next_after
+        empty_page = get_job_results("pagingjob", after=round_two_after, limit=3)
+        assert empty_page["results"] == []
+        assert empty_page["has_more"] is False
+        assert empty_page["next_before"] is None
+
+        # A new run lands after round one finished; round two must surface
+        # only that one new file, not re-walk anything from round one.
+        _time.sleep(1.01)
+        save_job_output("pagingjob", "run new")
+        round_two_page = get_job_results("pagingjob", after=round_two_after, limit=3)
+        assert [r["content"] for r in round_two_page["results"]] == ["run new"]
+        assert round_two_page["has_more"] is False
+
+
 class TestCronOutputRetention:
     """Per-run cron output must self-prune so long deploys don't fill the disk (#52383)."""
 

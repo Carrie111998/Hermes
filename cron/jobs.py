@@ -497,6 +497,123 @@ def _job_output_dir(job_id: str) -> Path:
     return _current_cron_store().output_dir / text
 
 
+# Hard ceiling on results returned per poll — a client-supplied ``limit`` is
+# clamped into (0, _MAX_JOB_RESULTS] so a single request can't be made to walk
+# an unbounded number of saved output files.
+_MAX_JOB_RESULTS = 100
+_DEFAULT_JOB_RESULTS = 20
+
+
+def get_job_results(
+    job_id: str,
+    *,
+    after: Optional[str] = None,
+    before: Optional[str] = None,
+    limit: int = _DEFAULT_JOB_RESULTS,
+) -> Dict[str, Any]:
+    """Return saved output files for ``job_id``, newest first, bounded by ``limit``.
+
+    Two cursors serve two different purposes and must not be conflated:
+
+    - ``after`` is the client's **high-water mark** — "I have already seen
+      everything up to and including this cursor." Only files strictly
+      newer than ``after`` (``name > after``) are ever considered. It stays
+      fixed for the whole polling *round* (it does not advance while a
+      client pages backwards through one round's results).
+    - ``before`` is an **intra-round paging cursor** — "give me the next,
+      older slice of the files I haven't finished walking yet." Only files
+      strictly older than ``before`` (``name < before``) are considered.
+      Pass the previous response's ``next_before`` back in to keep walking
+      older results within the same round; omit it (or pass ``None``) to
+      start (or restart) at the newest unseen file.
+
+    A full polling round therefore looks like: call with ``after=<last
+    high-water mark>`` and no ``before``; if ``has_more`` is true, keep
+    calling with the same ``after`` and ``before=<previous next_before>``
+    until ``has_more`` is false. Every file strictly newer than the
+    starting ``after`` is visited exactly once across that walk — newest
+    first, no gaps, no duplicates — because each page's range is the
+    half-open interval ``(after, before)`` and consecutive pages tile that
+    interval without overlap.
+
+    Response fields:
+
+    - ``next_after`` — the cursor of the single newest file matching
+      ``after`` in the store *right now*, independent of ``before``/paging
+      position. Stable across every page of the same round: capture it
+      once (from any page) and use it as ``after`` for the *next* round's
+      first call. ``None`` (or the original ``after``) when nothing newer
+      than ``after`` exists.
+    - ``next_before`` — the cursor of the oldest file returned in *this*
+      page, to pass back as ``before`` for the next page of the same
+      round. ``None`` whenever ``has_more`` is false (nothing older left
+      to page to in this round).
+
+    Raises ``ValueError`` for a malformed/path-escaping ``job_id`` (see
+    ``_job_output_dir``) or a malformed/path-escaping ``after``/``before``
+    cursor, so callers can turn that into a 400, never a leak outside the
+    cron output sandbox. A missing output directory (job has never
+    produced output, or was pruned to zero) is not an error — it yields an
+    empty result set.
+    """
+    job_output_dir = _job_output_dir(job_id)
+    try:
+        clamped_limit = int(limit)
+    except (TypeError, ValueError):
+        clamped_limit = _DEFAULT_JOB_RESULTS
+    clamped_limit = max(1, min(clamped_limit, _MAX_JOB_RESULTS))
+
+    def _validate_cursor(value: Optional[str], label: str) -> str:
+        text = str(value).strip() if value else ""
+        if text and ("/" in text or "\\" in text or text in {".", ".."}):
+            raise ValueError(f"Invalid {label}: {value!r}")
+        return text
+
+    after_cursor = _validate_cursor(after, "cursor")
+    before_cursor = _validate_cursor(before, "before cursor")
+
+    try:
+        all_files = sorted(
+            (f for f in job_output_dir.glob("*.md") if f.is_file()),
+            key=lambda f: f.name,
+            reverse=True,
+        )
+    except OSError:
+        all_files = []
+
+    # Files newer than the high-water mark — the full unseen set for this
+    # round. This does NOT get filtered by ``before``, so its head is a
+    # stable "true newest" regardless of where a paging walk currently is.
+    files_after = (
+        [f for f in all_files if f.name > after_cursor] if after_cursor else all_files
+    )
+    next_after = files_after[0].name if files_after else (after or None)
+
+    files = (
+        [f for f in files_after if f.name < before_cursor]
+        if before_cursor
+        else files_after
+    )
+
+    page = files[:clamped_limit]
+    has_more = len(files) > clamped_limit
+    results = []
+    for f in page:
+        try:
+            content = f.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        results.append({"cursor": f.name, "content": content})
+
+    return {
+        "job_id": job_id,
+        "results": results,
+        "has_more": has_more,
+        "next_after": next_after,
+        "next_before": page[-1].name if has_more else None,
+    }
+
+
 def _normalize_skill_list(skill: Optional[str] = None, skills: Optional[Any] = None) -> List[str]:
     """Normalize legacy/single-skill and multi-skill inputs into a unique ordered list."""
     if skills is None:
