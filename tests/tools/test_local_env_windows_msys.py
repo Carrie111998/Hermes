@@ -51,6 +51,15 @@ from tools.environments.local import (
 )
 
 
+def _selected_bash_drive_path(native: str) -> str:
+    """Return a drive path using the spelling of the resolved bash backend."""
+    normalized = native.replace("\\", "/")
+    drive = normalized[0].lower()
+    tail = normalized[2:]
+    root = "/mnt" if local_mod._uses_wsl_bash() else ""
+    return f"{root}/{drive}{tail}"
+
+
 # ---------------------------------------------------------------------------
 # _msys_to_windows_path — pure-function unit tests
 # ---------------------------------------------------------------------------
@@ -87,6 +96,31 @@ class TestWindowsToMsysPath:
         assert _windows_to_msys_path("/tmp/foo") == "/tmp/foo"
         assert _windows_to_msys_path(r"\\server\share") == r"\\server\share"
 
+    @pytest.mark.windows_only
+    def test_wsl_launcher_uses_mnt_drive_prefix(self, monkeypatch):
+        monkeypatch.setattr(
+            local_mod,
+            "_resolved_bash_path",
+            r"C:\Windows\System32\bash.exe",
+        )
+        assert _windows_to_msys_path(r"C:\Users\NVIDIA") == "/mnt/c/Users/NVIDIA"
+
+    @pytest.mark.windows_only
+    def test_failed_bash_resolution_is_cached(self, monkeypatch):
+        calls = 0
+
+        def fail_to_find_bash():
+            nonlocal calls
+            calls += 1
+            raise RuntimeError("Git Bash not found")
+
+        monkeypatch.setattr(local_mod, "_resolved_bash_path", None)
+        monkeypatch.setattr(local_mod, "_find_bash", fail_to_find_bash)
+
+        assert _windows_to_msys_path(r"C:\Users\NVIDIA") == "/c/Users/NVIDIA"
+        assert _windows_to_msys_path(r"D:\Projects") == "/d/Projects"
+        assert calls == 1
+
 
 # ---------------------------------------------------------------------------
 # _bash_safe_path / _quote_bash_path — shell-script interpolation
@@ -95,13 +129,17 @@ class TestWindowsToMsysPath:
 @pytest.mark.windows_only
 class TestBashSafePath:
     def test_native_windows_path_becomes_msys(self):
-        assert _bash_safe_path(r"C:\Users\alice\notes.txt") == "/c/Users/alice/notes.txt"
+        native = r"C:\Users\alice\notes.txt"
+        assert _bash_safe_path(native) == _selected_bash_drive_path(native)
 
     def test_quote_bash_path_quotes_mixed_windows_path(self):
         quoted = _quote_bash_path(
             r"C:\Users\Alexander\AppData\Local\Temp\hermes-snap-abc.sh"
         )
-        assert "/c/Users/Alexander/AppData/Local/Temp/hermes-snap-abc.sh" in quoted
+        expected = _selected_bash_drive_path(
+            r"C:\Users\Alexander\AppData\Local\Temp\hermes-snap-abc.sh"
+        )
+        assert expected in quoted
         assert "\\" not in quoted
 
 
@@ -305,7 +343,8 @@ class TestWrapCommandWindowsNativeCwd:
         env._snapshot_ready = True
         wrapped = env._wrap_command("pwd", r"C:\Users\liush")
 
-        assert "builtin cd -- /c/Users/liush || exit 126" in wrapped
+        expected = _selected_bash_drive_path(r"C:\Users\liush")
+        assert f"builtin cd -- {expected} || exit 126" in wrapped
         assert r"builtin cd -- C:\Users\liush || exit 126" not in wrapped
 
     def test_init_session_bootstrap_rewrites_backslash_snapshot_paths(self, monkeypatch):
@@ -330,5 +369,6 @@ class TestWrapCommandWindowsNativeCwd:
             env.init_session()
 
         script = captured["script"]
-        assert "/c/Users/Alexander/AppData/Local/Temp/hermes-snap-deadbeef.sh" in script
+        expected = _selected_bash_drive_path(snap)
+        assert expected in script
         assert r"C:\Users\Alexander\AppData" not in script
