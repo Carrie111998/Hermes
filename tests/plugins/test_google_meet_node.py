@@ -1,9 +1,8 @@
 """Tests for the google_meet node primitive.
 
 Covers protocol helpers, the file-backed registry, the server's
-token-and-dispatch machinery, a mocked client, and the CLI plumbing.
-We never open a real socket — websockets.serve / websockets.sync.client
-are fully mocked.
+token-and-dispatch machinery, a mocked client, a real localhost WebSocket
+round trip, and the CLI plumbing.
 """
 
 from __future__ import annotations
@@ -11,6 +10,9 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import sys
+import threading
+import types
 from pathlib import Path
 
 import pytest
@@ -88,6 +90,199 @@ def _run(coro):
     return asyncio.new_event_loop().run_until_complete(coro) if False else asyncio.run(coro)
 
 
+def test_server_handle_request_rejects_bad_token(tmp_path):
+    from plugins.google_meet.node.server import NodeServer
+    from plugins.google_meet.node import protocol
+
+    s = NodeServer(token_path=tmp_path / "t.json")
+    s.ensure_token()
+    bad = protocol.make_request("ping", "not-the-token", {})
+    resp = asyncio.run(s._handle_request(bad))
+    assert resp["type"] == "error"
+    assert "token" in resp["error"].lower()
+
+
+def test_server_handle_request_ping(tmp_path):
+    from plugins.google_meet.node.server import NodeServer
+    from plugins.google_meet.node import protocol
+
+    s = NodeServer(token_path=tmp_path / "t.json", display_name="node-x")
+    tok = s.ensure_token()
+    req = protocol.make_request("ping", tok, {})
+    resp = asyncio.run(s._handle_request(req))
+    assert resp["type"] == "pong"
+    assert resp["id"] == req["id"]
+    assert resp["payload"]["display_name"] == "node-x"
+
+
+def test_server_handle_request_status_dispatches_to_pm(tmp_path, monkeypatch):
+    from plugins.google_meet.node.server import NodeServer
+    from plugins.google_meet.node import protocol
+    from plugins.google_meet import process_manager as pm
+
+    monkeypatch.setattr(pm, "status",
+                        lambda: {"ok": True, "alive": True, "meetingId": "abc"})
+
+    s = NodeServer(token_path=tmp_path / "t.json")
+    tok = s.ensure_token()
+    req = protocol.make_request("status", tok, {})
+    resp = asyncio.run(s._handle_request(req))
+    assert resp["type"] == "response"
+    assert resp["id"] == req["id"]
+    assert resp["payload"] == {"ok": True, "alive": True, "meetingId": "abc"}
+
+
+def test_server_handle_request_start_bot_dispatches(tmp_path, monkeypatch):
+    from plugins.google_meet.node.server import NodeServer
+    from plugins.google_meet.node import protocol
+    from plugins.google_meet import process_manager as pm
+
+    captured = {}
+
+    def fake_start(**kwargs):
+        captured.update(kwargs)
+        return {"ok": True, "pid": 42, "meeting_id": "abc-defg-hij"}
+
+    monkeypatch.setattr(pm, "start", fake_start)
+
+    s = NodeServer(token_path=tmp_path / "t.json")
+    tok = s.ensure_token()
+    req = protocol.make_request("start_bot", tok, {
+        "url": "https://meet.google.com/abc-defg-hij",
+        "guest_name": "Bot",
+        "duration": "30m",
+    })
+    resp = asyncio.run(s._handle_request(req))
+    assert resp["type"] == "response"
+    assert resp["payload"]["ok"] is True
+    assert captured["url"] == "https://meet.google.com/abc-defg-hij"
+    assert captured["guest_name"] == "Bot"
+    assert captured["duration"] == "30m"
+
+
+def test_server_handle_request_start_bot_missing_url(tmp_path):
+    from plugins.google_meet.node.server import NodeServer
+    from plugins.google_meet.node import protocol
+
+    s = NodeServer(token_path=tmp_path / "t.json")
+    tok = s.ensure_token()
+    req = protocol.make_request("start_bot", tok, {"guest_name": "x"})
+    resp = asyncio.run(s._handle_request(req))
+    assert resp["type"] == "error"
+    assert "url" in resp["error"]
+
+
+def test_server_handle_request_stop_dispatches(tmp_path, monkeypatch):
+    from plugins.google_meet.node.server import NodeServer
+    from plugins.google_meet.node import protocol
+    from plugins.google_meet import process_manager as pm
+
+    got = {}
+
+    def fake_stop(*, reason="requested"):
+        got["reason"] = reason
+        return {"ok": True, "reason": reason}
+
+    monkeypatch.setattr(pm, "stop", fake_stop)
+
+    s = NodeServer(token_path=tmp_path / "t.json")
+    tok = s.ensure_token()
+    req = protocol.make_request("stop", tok, {"reason": "user-cancel"})
+    resp = asyncio.run(s._handle_request(req))
+    assert resp["type"] == "response"
+    assert got["reason"] == "user-cancel"
+
+
+def test_server_handle_request_transcript(tmp_path, monkeypatch):
+    from plugins.google_meet.node.server import NodeServer
+    from plugins.google_meet.node import protocol
+    from plugins.google_meet import process_manager as pm
+
+    got = {}
+
+    def fake_transcript(last=None, *, include_finished=False, session_id=None):
+        got["last"] = last
+        got["include_finished"] = include_finished
+        got["session_id"] = session_id
+        return {"ok": True, "lines": ["a", "b"], "total": 2}
+
+    monkeypatch.setattr(pm, "transcript", fake_transcript)
+
+    s = NodeServer(token_path=tmp_path / "t.json")
+    tok = s.ensure_token()
+    req = protocol.make_request(
+        "transcript",
+        tok,
+        {"last": 5, "include_finished": True, "session_id": "s1"},
+    )
+    resp = asyncio.run(s._handle_request(req))
+    assert resp["type"] == "response"
+    assert resp["payload"]["lines"] == ["a", "b"]
+    assert got["last"] == 5
+    assert got["include_finished"] is True
+    assert got["session_id"] == "s1"
+
+
+def test_server_handle_request_say_delegates_to_process_manager(tmp_path, monkeypatch):
+    from plugins.google_meet.node.server import NodeServer
+    from plugins.google_meet.node import protocol
+    from plugins.google_meet import process_manager as pm
+
+    got = {}
+
+    def fake_enqueue_say(text):
+        got["text"] = text
+        return {"ok": True, "enqueued_id": "q1"}
+
+    monkeypatch.setattr(pm, "enqueue_say", fake_enqueue_say)
+
+    s = NodeServer(token_path=tmp_path / "t.json")
+    tok = s.ensure_token()
+    req = protocol.make_request("say", tok, {"text": "hello"})
+    resp = asyncio.run(s._handle_request(req))
+    assert resp["type"] == "response"
+    assert resp["payload"]["ok"] is True
+    assert resp["payload"]["enqueued_id"] == "q1"
+    assert got["text"] == "hello"
+
+
+def test_server_handle_request_say_without_active_preserves_rejection(tmp_path, monkeypatch):
+    from plugins.google_meet.node.server import NodeServer
+    from plugins.google_meet.node import protocol
+    from plugins.google_meet import process_manager as pm
+
+    monkeypatch.setattr(
+        pm,
+        "enqueue_say",
+        lambda text: {"ok": False, "reason": "no active meeting"},
+    )
+
+    s = NodeServer(token_path=tmp_path / "t.json")
+    tok = s.ensure_token()
+    req = protocol.make_request("say", tok, {"text": "hi"})
+    resp = asyncio.run(s._handle_request(req))
+    assert resp["type"] == "response"
+    assert resp["payload"] == {"ok": False, "reason": "no active meeting"}
+
+
+def test_server_handle_request_wraps_pm_exceptions(tmp_path, monkeypatch):
+    from plugins.google_meet.node.server import NodeServer
+    from plugins.google_meet.node import protocol
+    from plugins.google_meet import process_manager as pm
+
+    def boom():
+        raise ValueError("kaboom")
+
+    monkeypatch.setattr(pm, "status", boom)
+
+    s = NodeServer(token_path=tmp_path / "t.json")
+    tok = s.ensure_token()
+    req = protocol.make_request("status", tok, {})
+    resp = asyncio.run(s._handle_request(req))
+    assert resp["type"] == "error"
+    assert "kaboom" in resp["error"]
+
+
 # ---------------------------------------------------------------------------
 # client.py
 # ---------------------------------------------------------------------------
@@ -122,8 +317,20 @@ def _install_fake_ws(monkeypatch, reply_builder):
         fake_ws_holder["kwargs"] = kwargs
         return ws
 
-    # Patch the concrete import site inside client._rpc
-    import websockets.sync.client as wsc  # type: ignore
+    # Patch the concrete import site inside client._rpc. The package is optional
+    # at runtime, so tests install a fake module tree when it is not present.
+    try:
+        import websockets.sync.client as wsc  # type: ignore
+    except ModuleNotFoundError:
+        websockets_mod = types.ModuleType("websockets")
+        sync_mod = types.ModuleType("websockets.sync")
+        wsc = types.ModuleType("websockets.sync.client")
+        wsc.connect = None
+        sync_mod.client = wsc
+        websockets_mod.sync = sync_mod
+        monkeypatch.setitem(sys.modules, "websockets", websockets_mod)
+        monkeypatch.setitem(sys.modules, "websockets.sync", sync_mod)
+        monkeypatch.setitem(sys.modules, "websockets.sync.client", wsc)
     monkeypatch.setattr(wsc, "connect", _connect)
     return fake_ws_holder
 
@@ -148,6 +355,41 @@ def test_client_rpc_sends_correct_envelope_and_parses_response(monkeypatch):
     assert sent["payload"] == {"hello": 1}
     assert sent["id"]  # non-empty
     assert holder["url"] == "ws://remote:1"
+
+
+def test_client_server_ping_roundtrip_over_localhost(tmp_path):
+    from plugins.google_meet.node import protocol
+    from plugins.google_meet.node.client import NodeClient
+    from plugins.google_meet.node.server import NodeServer
+    from websockets.sync.server import serve
+
+    node = NodeServer(
+        token_path=tmp_path / "token.json",
+        display_name="local-node",
+    )
+    token = node.ensure_token()
+
+    def handler(connection):
+        request = protocol.decode(connection.recv())
+        response = asyncio.run(node._handle_request(request))
+        connection.send(protocol.encode(response))
+
+    with serve(handler, "127.0.0.1", 0) as server:
+        port = server.socket.getsockname()[1]
+        server_thread = threading.Thread(target=server.serve_forever)
+        server_thread.start()
+        try:
+            result = NodeClient(
+                f"ws://127.0.0.1:{port}",
+                token,
+                timeout=2.0,
+            ).ping()
+        finally:
+            server.shutdown()
+            server_thread.join(timeout=2.0)
+
+    assert result["display_name"] == "local-node"
+    assert isinstance(result["ts"], float)
 
 
 # ---------------------------------------------------------------------------
