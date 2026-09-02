@@ -1984,8 +1984,21 @@ def _cleanup_gateway_service(name: str, profile_dir: Path) -> None:
     import platform as _platform
 
     # Derive service name for this profile
-    # Temporarily set HERMES_HOME so _profile_suffix resolves correctly
+    # Temporarily set HERMES_HOME so _profile_suffix resolves correctly.
+    # get_hermes_home() checks the context-local override BEFORE the env
+    # var, so mutating only os.environ leaves an ambient override (the
+    # dashboard delete endpoint, profile-scoped gateway contexts) shadowing
+    # the target profile: _profile_suffix() then derives the default — or
+    # the wrong profile's — service name, and the real plist/service file
+    # survives the delete. Scope both layers to profile_dir and restore
+    # both in the finally block.
+    from hermes_constants import (
+        reset_hermes_home_override,
+        set_hermes_home_override,
+    )
+
     old_home = os.environ.get("HERMES_HOME")
+    token = set_hermes_home_override(profile_dir)
     try:
         os.environ["HERMES_HOME"] = str(profile_dir)
         from hermes_cli.gateway import get_service_name, get_launchd_plist_path
@@ -2021,6 +2034,7 @@ def _cleanup_gateway_service(name: str, profile_dir: Path) -> None:
     except Exception as e:
         print(f"⚠ Service cleanup: {e}")
     finally:
+        reset_hermes_home_override(token)
         if old_home is not None:
             os.environ["HERMES_HOME"] = old_home
         elif "HERMES_HOME" in os.environ:
