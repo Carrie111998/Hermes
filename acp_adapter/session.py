@@ -191,6 +191,11 @@ class SessionManager:
     via ``session_search``.
     """
 
+    # Cap on the failed-restore reason registry (see __init__); ~2× the
+    # largest plausible live-session population, far above what any one
+    # editor connection can hold open.
+    _RESTORE_ERRORS_MAX = 128
+
     def __init__(self, agent_factory=None, db=None):
         """
         Args:
@@ -204,6 +209,14 @@ class SessionManager:
         self._lock = Lock()
         self._agent_factory = agent_factory
         self._db_instance = db  # None → lazy-init on first use
+        # Fail-loud (robustness): records WHY a recent `_restore` of a session
+        # failed (e.g. "No LLM provider configured"), so the server can surface
+        # the real reason to the client instead of a generic "session not found".
+        # Bounded (oldest evicted beyond _RESTORE_ERRORS_MAX): entries are
+        # cleared on successful restore or removal, but a session that keeps
+        # failing and is never removed would otherwise pin one string per
+        # session id for process lifetime.
+        self._restore_errors: Dict[str, str] = {}
 
     # ---- public API ---------------------------------------------------------
 
@@ -241,8 +254,26 @@ class SessionManager:
         # Attempt to restore from database.
         return self._restore(session_id)
 
+    def last_restore_error(self, session_id: str) -> Optional[str]:
+        """The reason a recent `_restore` of *session_id* failed, if any.
+
+        Set by `_restore` when the agent could not be rebuilt; consulted by the
+        server so a failed restore surfaces the real cause instead of a generic
+        "session not found". Cleared on a successful restore or removal.
+        """
+        return self._restore_errors.get(session_id)
+
+    def _record_restore_error(self, session_id: str, reason: str) -> None:
+        """Record *reason* for *session_id*, evicting oldest beyond the cap."""
+        # Re-insert so a repeatedly failing session counts as newest.
+        self._restore_errors.pop(session_id, None)
+        self._restore_errors[session_id] = reason
+        while len(self._restore_errors) > self._RESTORE_ERRORS_MAX:
+            self._restore_errors.pop(next(iter(self._restore_errors)))
+
     def remove_session(self, session_id: str) -> bool:
         """Remove a session from memory and database. Returns True if it existed."""
+        self._restore_errors.pop(session_id, None)
         with self._lock:
             existed = self._sessions.pop(session_id, None) is not None
         db_existed = self._delete_persisted(session_id)
@@ -568,9 +599,19 @@ class SessionManager:
                 base_url=restored_base_url,
                 api_mode=restored_api_mode,
             )
-        except Exception:
-            logger.warning("Failed to recreate agent for ACP session %s", session_id, exc_info=True)
+        except Exception as exc:
+            # Fail loud (robustness): record the real reason so the server can
+            # tell the client why the session can't run, instead of returning a
+            # bare None that surfaces as a generic "session not found".
+            reason = str(exc).strip() or exc.__class__.__name__
+            self._record_restore_error(session_id, reason)
+            logger.warning(
+                "Failed to recreate agent for ACP session %s: %s",
+                session_id, reason, exc_info=True,
+            )
             return None
+        # Successful restore — clear any stale failure record.
+        self._restore_errors.pop(session_id, None)
 
         state = SessionState(
             session_id=session_id,
