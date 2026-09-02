@@ -464,7 +464,7 @@ import subprocess
 import tempfile
 import time as _time_mod
 from pathlib import Path
-from typing import Optional
+from typing import Iterable, Optional
 
 
 import functools as _functools
@@ -2111,6 +2111,89 @@ They never indicate a changed dependency — the authoritative check is the
 catches.
 """
 
+_NPM_LOCK_DEPENDENCY_KEYS = (
+    "dependencies",
+    "devDependencies",
+    "optionalDependencies",
+    "peerDependencies",
+)
+
+
+def _lockfile_dependency_candidates(package_name: str, dep_name: str) -> list[str]:
+    """Return package-lock paths npm may use to resolve *dep_name* from a package."""
+    parts = package_name.split("/") if package_name else []
+    candidates: list[str] = []
+    for index in range(len(parts), 0, -1):
+        candidate = "/".join([*parts[:index], "node_modules", dep_name])
+        candidates.append(candidate)
+    candidates.append(f"node_modules/{dep_name}")
+    return candidates
+
+
+def _lockfile_dependency_closure(
+    packages: dict, start_names: Iterable[str]
+) -> set[str]:
+    """Return package-lock entries reachable from workspace package entries."""
+    seen: set[str] = set()
+    pending = [name for name in start_names if name in packages]
+
+    while pending:
+        name = pending.pop()
+        if name in seen:
+            continue
+        seen.add(name)
+
+        pkg = packages.get(name)
+        if not isinstance(pkg, dict):
+            continue
+
+        resolved = pkg.get("resolved")
+        if pkg.get("link") and isinstance(resolved, str) and resolved in packages:
+            pending.append(resolved)
+
+        for key in _NPM_LOCK_DEPENDENCY_KEYS:
+            deps = pkg.get(key)
+            if not isinstance(deps, dict):
+                continue
+            for dep_name in deps:
+                for dep_entry in _lockfile_dependency_candidates(name, dep_name):
+                    if dep_entry in packages:
+                        pending.append(dep_entry)
+                        break
+
+    return seen
+
+
+def _tui_lockfile_package_scope(
+    root: Path, ws_root: Path, packages: dict
+) -> set[str] | None:
+    """Return package-lock entries relevant to the TUI workspace.
+
+    ``npm install --workspace ui-tui`` intentionally leaves unrelated
+    workspaces out of npm's hidden lockfile.  Comparing the whole root
+    lockfile therefore creates a false positive after a scoped install.
+    """
+    if ws_root == root:
+        return None
+
+    try:
+        workspace = root.relative_to(ws_root).as_posix()
+    except ValueError:
+        return None
+
+    start_names = [workspace]
+    workspace_packages = root / "packages"
+    if workspace_packages.is_dir():
+        prefix = f"{workspace}/packages/"
+        start_names.extend(
+            name
+            for name in packages
+            if isinstance(name, str) and name.startswith(prefix)
+        )
+
+    scoped = _lockfile_dependency_closure(packages, start_names)
+    return scoped or None
+
 
 def _workspace_root(dir: Path) -> Path:
     """Return the npm workspace root for *dir*.
@@ -2366,7 +2449,12 @@ def _tui_need_npm_install(root: Path) -> bool:
         if selected:
             closure = _npm_lock_workspace_closure(wanted, selected)
 
+    relevant_packages = _tui_lockfile_package_scope(root, ws_root, wanted)
+
     for name, pkg in wanted.items():
+        if relevant_packages is not None and name not in relevant_packages:
+            continue
+
         if not name:
             continue
 
