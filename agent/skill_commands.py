@@ -14,6 +14,7 @@ from typing import Any, Dict, Optional
 
 from hermes_constants import display_hermes_home
 from agent.prompt_cache_boundary import register_stable_prefix
+from agent.skill_utils import EXCLUDED_SKILL_DIRS
 from agent.skill_preprocessing import (
     expand_inline_shell as _expand_inline_shell,
     load_skills_config as _load_skills_config,
@@ -471,7 +472,7 @@ def scan_skill_commands() -> Dict[str, Dict[str, Any]]:
                 else iter_skill_index_files(scan_dir, "SKILL.md")
             )
             for skill_md in _iter:
-                if any(part in {'.git', '.github', '.hub', '.archive'} for part in skill_md.parts):
+                if any(part in EXCLUDED_SKILL_DIRS for part in skill_md.parts):
                     continue
                 try:
                     content = skill_md.read_text(encoding='utf-8')
