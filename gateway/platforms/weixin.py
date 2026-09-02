@@ -895,6 +895,45 @@ def _pack_markdown_blocks_for_weixin(content: str, max_length: int) -> List[str]
     )
 
 
+def _strip_fenced_block_for_weixin(block: str) -> str:
+    lines = block.splitlines()
+    if len(lines) >= 2 and _FENCE_RE.match(lines[0].strip()) and _FENCE_RE.match(lines[-1].strip()):
+        return "\n".join(lines[1:-1]).strip()
+    return block.strip()
+
+
+def _split_copyable_aware_blocks_for_weixin(content: str, max_length: int) -> List[str]:
+    """Keep copyable fenced blocks separate while compacting normal reading text."""
+
+    chunks: List[str] = []
+    reading_blocks: List[str] = []
+
+    def flush_reading() -> None:
+        if not reading_blocks:
+            return
+        reading = "\n\n".join(block for block in reading_blocks if block).strip()
+        reading_blocks.clear()
+        if not reading:
+            return
+        chunks.extend(_pack_markdown_blocks_for_weixin(reading, max_length))
+
+    for block in _split_markdown_blocks(content):
+        first_line = block.splitlines()[0].strip() if block else ""
+        is_fenced_block = bool(_FENCE_RE.match(first_line))
+        if is_fenced_block:
+            flush_reading()
+            copyable_text = _strip_fenced_block_for_weixin(block)
+            if len(copyable_text) <= max_length:
+                chunks.append(copyable_text)
+            else:
+                chunks.extend(BasePlatformAdapter.truncate_message(copyable_text, max_length))
+            continue
+        reading_blocks.append(block)
+
+    flush_reading()
+    return [chunk for chunk in chunks if chunk and chunk.strip()]
+
+
 def _split_text_for_weixin_delivery(
     content: str, max_length: int, split_per_line: bool = False,
 ) -> List[str]:
@@ -915,6 +954,14 @@ def _split_text_for_weixin_delivery(
     """
     if not content:
         return []
+    has_fenced_block = any(
+        _FENCE_RE.match(block.splitlines()[0].strip())
+        for block in _split_markdown_blocks(content)
+        if block
+    )
+    if has_fenced_block:
+        return _split_copyable_aware_blocks_for_weixin(content, max_length) or [content]
+
     if split_per_line:
         # Legacy: one message per top-level delivery unit.
         if len(content) <= max_length and "\n" not in content:
@@ -1228,14 +1275,14 @@ class WeixinAdapter(BasePlatformAdapter):
         )
         self._rate_limit_circuit_until = 0.0
         self._rate_limit_events: List[float] = []
-        self._dm_policy = str(extra.get("dm_policy") or _wx_secret("WEIXIN_DM_POLICY", "pairing")).strip().lower()
-        self._group_policy = str(extra.get("group_policy") or _wx_secret("WEIXIN_GROUP_POLICY", "disabled")).strip().lower()
+        self._dm_policy = str(extra.get("dm_policy") or os.getenv("WEIXIN_DM_POLICY", "pairing")).strip().lower()
+        self._group_policy = str(extra.get("group_policy") or os.getenv("WEIXIN_GROUP_POLICY", "disabled")).strip().lower()
         allow_from = extra.get("allow_from")
         if allow_from is None:
-            allow_from = _wx_secret("WEIXIN_ALLOWED_USERS", "")
+            allow_from = os.getenv("WEIXIN_ALLOWED_USERS", "")
         group_allow_from = extra.get("group_allow_from")
         if group_allow_from is None:
-            group_allow_from = _wx_secret("WEIXIN_GROUP_ALLOWED_USERS", "")
+            group_allow_from = os.getenv("WEIXIN_GROUP_ALLOWED_USERS", "")
         self._allow_from = self._coerce_list(allow_from)
         self._group_allow_from = self._coerce_list(group_allow_from)
         self._split_multiline_messages = _coerce_bool(
@@ -1540,11 +1587,9 @@ class WeixinAdapter(BasePlatformAdapter):
             await self.handle_message(event)
 
     def _open_dm_opted_in(self) -> bool:
-        # Scoped reads (#93522): the default profile's allow-all flag must
-        # not leak into a multiplexed secondary profile's admission gate.
-        if (_wx_secret("GATEWAY_ALLOW_ALL_USERS", "") or "").lower() in {"true", "1", "yes"}:
+        if os.getenv("GATEWAY_ALLOW_ALL_USERS", "").lower() in {"true", "1", "yes"}:
             return True
-        return (_wx_secret("WEIXIN_ALLOW_ALL_USERS", "") or "").lower() in {"true", "1", "yes"}
+        return os.getenv("WEIXIN_ALLOW_ALL_USERS", "").lower() in {"true", "1", "yes"}
 
     def _is_dm_allowed(self, sender_id: str) -> bool:
         if self._dm_policy == "disabled":
