@@ -402,12 +402,14 @@ def _parse_reasoning_config(effort) -> dict | None:
 
 
 def _parse_service_tier_config(raw: str) -> str | None:
-    """Parse a persisted service-tier preference into a Responses API value."""
+    """Parse a persisted fast-mode preference: None, "priority", "auto", or "cold"."""
     value = str(raw or "").strip().lower()
     if not value or value in {"normal", "default", "standard", "off", "none"}:
         return None
     if value in {"fast", "priority", "on"}:
         return "priority"
+    if value in {"auto", "cold"}:
+        return value
     logger.warning("Unknown service_tier '%s', ignoring", raw)
     return None
 
@@ -5257,6 +5259,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         self.resume_display = CLI_CONFIG["display"].get("resume_display", "full")
         # bell_on_complete: play terminal bell (\a) when agent finishes a response
         self.bell_on_complete = CLI_CONFIG["display"].get("bell_on_complete", False)
+        # bell_on_prompt: play terminal bell (\a) whenever a blocking prompt
+        # modal opens (clarify, approval, sudo password, secret capture)
+        self.bell_on_prompt = CLI_CONFIG["display"].get("bell_on_prompt", False)
         # show_reasoning: display model thinking/reasoning before the response
         self.show_reasoning = CLI_CONFIG["display"].get("show_reasoning", True)
         # reasoning_full: when reasoning display is on, print the post-response
@@ -12086,7 +12091,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             if not providers:
                 _cprint("  No authenticated providers found.")
                 _cprint("")
-                _cprint("  /model <name>                        switch model (persists)")
+                _cprint("  /model <name>                        switch model (this session)")
+                _cprint("  /model <name> --global               switch model and persist as default")
                 _cprint("  /model <name> --once                 switch for the next turn only")
                 _cprint("  /model <name> --session              switch for this session only")
                 _cprint("  /model --provider <slug>             switch provider")
@@ -14758,7 +14764,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         sees the updated tools on the next turn.
         """
         try:
-            from tools.mcp_tool import shutdown_mcp_servers, discover_mcp_tools, _servers, _lock
+            from tools.mcp_tool import (
+                shutdown_mcp_servers, discover_mcp_tools, reprobe_tool_availability, _servers, _lock,
+            )
 
             # Capture old server names
             with _lock:
@@ -14770,6 +14778,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             # Shutdown existing connections
             shutdown_mcp_servers()
 
+            # Explicit reload also re-probes tool availability (check_fn).
+            reprobe_tool_availability()
             # Reconnect (reads config.yaml fresh)
             new_tools = discover_mcp_tools()
 
@@ -15765,6 +15775,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         # _voice_message_prefix property and its usage in _process_message().
 
         tts_status = " (TTS enabled)" if self._voice_tts else ""
+        if self._voice_tts:
+            # Speech output is on from the start — warm the engine now so the
+            # first spoken reply doesn't pay the model load as dead air.
+            self._tts_lease_async(True)
         # Use the startup-pinned cache so the advertised shortcut always
         # matches the live prompt_toolkit binding — reading live config
         # here would drift after a mid-session config edit (Copilot
@@ -15822,6 +15836,11 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             self._voice_mode = False
             self._voice_tts = False
             self._voice_continuous = False
+
+        # Speech output is off with the mode — release the TTS engine lease so
+        # a resident local model (piper/kittentts) is freed once nothing else
+        # in this process still needs it.
+        self._tts_lease_async(False)
 
         # Shut down the persistent audio stream in background
         if recorder is not None:
@@ -16070,6 +16089,29 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         if not owned:
             _cprint(f"  {_DIM}Enable with /wake on{_RST}")
 
+    def _tts_lease_async(self, active: bool) -> None:
+        """Acquire/release this CLI's TTS engine lease in the background.
+
+        The /voice tts toggle (and voice-mode on/off with speech output set)
+        is the "TTS is about to be needed / no longer needed" signal:
+        acquiring pre-loads the configured provider so the first reply starts
+        hot; releasing lets the last-holder path unload resident local models.
+        Never blocks the toggle and never fails it.
+        """
+
+        def _run():
+            try:
+                from tools.tts_tool import acquire_tts_lease, release_tts_lease
+
+                if active:
+                    acquire_tts_lease("cli:voice-tts")
+                else:
+                    release_tts_lease("cli:voice-tts")
+            except Exception as e:
+                logger.debug("voice: tts lease active=%s failed: %s", active, e)
+
+        threading.Thread(target=_run, name="tts-lease-cli", daemon=True).start()
+
     def _toggle_voice_tts(self):
         """Toggle TTS output for voice mode."""
         if not self._voice_mode:
@@ -16084,6 +16126,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             from tools.tts_tool import check_tts_requirements
             if not check_tts_requirements():
                 _cprint(f"{_DIM}Warning: No TTS provider available. Install edge-tts or set API keys.{_RST}")
+
+        # Toggle = warm-up / release signal for the TTS engine (see
+        # tools.tts_tool.acquire_tts_lease).
+        self._tts_lease_async(self._voice_tts)
 
         _cprint(f"{_ACCENT}Voice TTS {status}.{_RST}")
 
@@ -16124,6 +16170,39 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         if len(outcome) > 120:
             outcome = outcome[:119] + "…"
         _cprint(f"\n{_DIM}{icon} {label}: {detail} → {outcome}{_RST}")
+
+    def _ring_bell(self, prompt: bool = False, context: str = "", detail: str = "") -> None:
+        """Write a terminal bell (\\a) if the matching display.bell_* flag is on.
+
+        ``prompt=True`` is the blocking-modal variant (clarify / approval /
+        sudo / secret capture) gated by ``display.bell_on_prompt``; the default
+        is the end-of-turn bell gated by ``display.bell_on_complete``. Works
+        over SSH — the BEL propagates to the user's terminal.
+
+        The same flag also emits an OSC 9 desktop notification (Ghostty,
+        iTerm2, Kitty, WezTerm) and, inside a supporting Warp build, a
+        ``warp://cli-agent`` OSC 777 event — see ``hermes_cli.terminal_notify``.
+        ``context`` is the short notification body (e.g. "approval").
+        """
+        flag = "bell_on_prompt" if prompt else "bell_on_complete"
+        if not getattr(self, flag, False):
+            return
+        try:
+            sys.stdout.write("\a")
+            sys.stdout.flush()
+        except Exception:
+            pass
+        try:
+            from hermes_cli.terminal_notify import notify as _terminal_notify
+
+            _terminal_notify(
+                context or ("input needed" if prompt else "turn complete"),
+                prompt=prompt,
+                session_id=getattr(self, "session_id", "") or "",
+                detail=detail,
+            )
+        except Exception:
+            pass
 
     def _clarify_callback(self, question, choices, multi_select=False, questions=None):
         """
@@ -16172,6 +16251,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         self._clarify_freetext = is_open_ended
         self._clarify_multi_base = None
 
+        self._ring_bell(prompt=True, context="clarify")
         # Trigger an immediate prompt_toolkit repaint from this (non-main)
         # thread. Modal prompts must paint at once and must not be gated by the
         # _invalidate throttle / resize guard — see _paint_now / _invalidate (#41098).
@@ -16363,6 +16443,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         self._clarify_state = state
         self._clarify_batch_set_active(state, 0)
         self._clarify_deadline = None if timeout <= 0 else _time.monotonic() + timeout
+        self._ring_bell(prompt=True, context="clarify")
         self._paint_now()
 
         _last_countdown_refresh = _time.monotonic()
@@ -16413,6 +16494,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             "response_queue": response_queue,
         }
         self._sudo_deadline = _time.monotonic() + timeout
+        self._ring_bell(prompt=True, context="sudo password")
 
         # Modal prompt — paint immediately, bypassing the throttle/resize guard
         # so the prompt can't be dropped and time out unseen (#41098).
@@ -16482,6 +16564,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             }
             self._approval_deadline = _time.monotonic() + timeout
 
+            self._ring_bell(prompt=True, context="approval", detail=command)
             # Modal prompt — paint immediately, bypassing the throttle/resize
             # guard. A throttled paint here can be silently dropped (250ms
             # window collision or in-flight resize), leaving the panel unseen so
@@ -17625,9 +17708,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
 
             # Play terminal bell when agent finishes (if enabled).
             # Works over SSH — the bell propagates to the user's terminal.
-            if self.bell_on_complete:
-                sys.stdout.write("\a")
-                sys.stdout.flush()
+            self._ring_bell(context="turn complete")
 
             # Notify when iteration budget was hit
             if result and not result.get("completed") and not result.get("interrupted"):
