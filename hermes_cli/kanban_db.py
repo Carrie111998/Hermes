@@ -1049,6 +1049,38 @@ def remove_board(slug: str, *, archive: bool = True) -> dict:
 # Data classes
 # ---------------------------------------------------------------------------
 
+
+class CreateTaskResult(str):
+    """Task id with explicit create-versus-reuse outcome metadata.
+
+    This remains a ``str`` subclass so existing callers can pass the return
+    value directly to SQLite queries, path helpers, and public APIs that have
+    historically consumed ``create_task()`` as a plain task id.
+    """
+
+    created: bool
+
+    def __new__(cls, task_id: str, *, created: bool) -> "CreateTaskResult":
+        value = str.__new__(cls, task_id)
+        value.created = bool(created)
+        return value
+
+    def __getnewargs_ex__(self) -> tuple[tuple[str], dict[str, bool]]:
+        return ((str(self),), {"created": self.created})
+
+    @property
+    def task_id(self) -> str:
+        return str(self)
+
+    @property
+    def existing(self) -> bool:
+        return not self.created
+
+    @property
+    def reused(self) -> bool:
+        return self.existing
+
+
 @dataclass
 class Task:
     """In-memory view of a row from the ``tasks`` table."""
@@ -2539,12 +2571,60 @@ def init_db(
     return path
 
 
+def _assert_active_idempotency_keys_unique(
+    conn: sqlite3.Connection,
+    *,
+    columns: Optional[set[str]] = None,
+) -> None:
+    """Refuse ambiguous active idempotency keys before mutating legacy tasks."""
+    if columns is None:
+        columns = {
+            row["name"] for row in conn.execute("PRAGMA table_info(tasks)")
+        }
+    if not {"id", "status", "idempotency_key"}.issubset(columns):
+        return
+
+    duplicate_rows = conn.execute(
+        """
+        SELECT idempotency_key, id
+          FROM tasks
+         WHERE idempotency_key IS NOT NULL
+           AND status != 'archived'
+           AND idempotency_key IN (
+               SELECT idempotency_key
+                 FROM tasks
+                WHERE idempotency_key IS NOT NULL
+                  AND status != 'archived'
+                GROUP BY idempotency_key
+               HAVING COUNT(*) > 1
+           )
+         ORDER BY idempotency_key, id
+        """
+    ).fetchall()
+    if not duplicate_rows:
+        return
+
+    duplicates: dict[str, list[str]] = {}
+    for row in duplicate_rows:
+        duplicates.setdefault(row["idempotency_key"], []).append(row["id"])
+    details = "; ".join(
+        f"{key!r}: {', '.join(task_ids)}" for key, task_ids in duplicates.items()
+    )
+    raise ValueError(
+        "cannot enforce active Kanban idempotency-key uniqueness; "
+        f"duplicate non-archived tasks exist ({details}). No tasks were changed."
+    )
+
+
 def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     """Add columns that were introduced after v1 release to legacy DBs.
 
     Called by ``init_db`` so opening an old DB is always safe.
     """
     cols = {row["name"] for row in conn.execute("PRAGMA table_info(tasks)")}
+    # Reject legacy ambiguity before any additive ALTER or backfill below so a
+    # failed migration leaves the task table's schema and rows unchanged.
+    _assert_active_idempotency_keys_unique(conn, columns=cols)
     if "tenant" not in cols:
         _add_column_if_missing(conn, "tasks", "tenant", "tenant TEXT")
     if "result" not in cols:
@@ -2701,6 +2781,15 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_tasks_idempotency ON tasks(idempotency_key)"
     )
+    if "status" in cols:
+        # Recheck at the constraint boundary in case a writer bypassed the
+        # cross-process initialization lock while additive migration ran.
+        _assert_active_idempotency_keys_unique(conn, columns=cols)
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_tasks_idempotency_active_unique "
+            "ON tasks(idempotency_key) "
+            "WHERE idempotency_key IS NOT NULL AND status != 'archived'"
+        )
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_tasks_session_id ON tasks(session_id)"
     )
@@ -3166,6 +3255,43 @@ def _canonical_assignee(assignee: Optional[str]) -> Optional[str]:
     return normalize_profile_name(assignee)
 
 
+def _assert_idempotency_contract_matches(
+    existing: Task,
+    *,
+    idempotency_key: str,
+    title: str,
+    assignee: Optional[str],
+    workspace_kind: str,
+    workspace_path: Optional[str],
+    skills: Optional[list[str]],
+) -> None:
+    expected = {
+        "title": title.strip(),
+        "assignee": assignee,
+        "workspace_kind": workspace_kind,
+        "workspace_path": workspace_path,
+        "skills": tuple(skills or ()),
+    }
+    actual = {
+        "title": existing.title,
+        "assignee": existing.assignee,
+        "workspace_kind": existing.workspace_kind,
+        "workspace_path": existing.workspace_path,
+        "skills": tuple(existing.skills or ()),
+    }
+    mismatches = [
+        f"{field}: expected {expected[field]!r}, existing {actual[field]!r}"
+        for field in expected
+        if expected[field] != actual[field]
+    ]
+    if mismatches:
+        raise ValueError(
+            f"idempotency key {idempotency_key!r} already belongs to task "
+            f"{existing.id!r} with a different semantic contract "
+            f"({'; '.join(mismatches)})"
+        )
+
+
 def create_task(
     conn: sqlite3.Connection,
     *,
@@ -3194,19 +3320,21 @@ def create_task(
     board: Optional[str] = None,
     project_id: Optional[str] = None,
     project_source_task_id: Optional[str] = None,
-) -> str:
+) -> CreateTaskResult:
     """Create a new task and optionally link it under parent tasks.
 
-    Returns the new task id.  Status is ``ready`` when there are no
+    Returns a string-compatible task id with explicit ``created`` / ``existing``
+    metadata. Status is ``ready`` when there are no
     parents (or all parents already ``done``), otherwise ``todo``.
     If ``triage=True``, status is forced to ``triage`` regardless of
     parents — a specifier/triager is expected to promote the task to
     ``todo`` once the spec is fleshed out.
 
     If ``idempotency_key`` is provided and a non-archived task with the
-    same key already exists, returns the existing task's id instead of
-    creating a duplicate. Useful for retried webhooks / automation that
-    should not double-write.
+    same key and semantic contract already exists, returns the existing task's
+    id instead of creating a duplicate. A mismatch in title, assignee,
+    workspace kind/path, or skills fails closed. Useful for retried webhooks /
+    automation that should not double-write.
 
     ``max_runtime_seconds`` caps how long a worker may run before the
     dispatcher SIGTERMs (then SIGKILLs after a grace window) and
@@ -3404,21 +3532,6 @@ def create_task(
             )
         skills_list = cleaned
 
-    # Idempotency check — return the existing task instead of creating a
-    # duplicate. Done BEFORE entering write_txn to keep the fast path fast
-    # and to avoid holding a write lock during the lookup. Race is
-    # acceptable: two concurrent creators with the same key might both
-    # insert, at which point both rows exist but the next lookup stabilises.
-    if idempotency_key:
-        row = conn.execute(
-            "SELECT id FROM tasks WHERE idempotency_key = ? "
-            "AND status != 'archived' "
-            "ORDER BY created_at DESC LIMIT 1",
-            (idempotency_key,),
-        ).fetchone()
-        if row:
-            return row["id"]
-
     now = int(time.time())
 
     # Resolve workspace_path from board-level default_workdir when the
@@ -3441,6 +3554,38 @@ def create_task(
         if board_default:
             workspace_path = str(board_default)
 
+    def _existing_idempotency_result() -> Optional[CreateTaskResult]:
+        if idempotency_key is None:
+            return None
+        existing_row = conn.execute(
+            "SELECT * FROM tasks WHERE idempotency_key = ? "
+            "AND status != 'archived'",
+            (idempotency_key,),
+        ).fetchone()
+        if existing_row is None:
+            return None
+        existing_task = Task.from_row(existing_row)
+        expected_workspace_path = workspace_path
+        if (
+            project_obj is not None
+            and workspace_kind == "worktree"
+            and project_repo
+            and expected_workspace_path is None
+        ):
+            expected_workspace_path = os.path.join(
+                project_repo, ".worktrees", existing_task.id
+            )
+        _assert_idempotency_contract_matches(
+            existing_task,
+            idempotency_key=idempotency_key,
+            title=title,
+            assignee=assignee,
+            workspace_kind=workspace_kind,
+            workspace_path=expected_workspace_path,
+            skills=skills_list,
+        )
+        return CreateTaskResult(existing_task.id, created=False)
+
     # Retry once on the extremely unlikely id collision.
     for attempt in range(2):
         task_id = _new_task_id()
@@ -3449,6 +3594,10 @@ def create_task(
             # compose create_task calls under one outer commit so the
             # dispatcher can never observe a partially constructed graph.
             with write_txn(conn, allow_nested=True):
+                existing_result = _existing_idempotency_result()
+                if existing_result is not None:
+                    return existing_result
+
                 # Determine task status from parent status, unless the caller
                 # parks it directly in blocked for human-ops review or in
                 # triage for a specifier.
@@ -3566,8 +3715,14 @@ def create_task(
                     },
                 )
                 _inherit_notify_subs(conn, task_id, parents, created_at=now)
-            return task_id
+            return CreateTaskResult(task_id, created=True)
         except sqlite3.IntegrityError:
+            # A writer outside the normal BEGIN IMMEDIATE path may have won the
+            # partial-unique-index race after our lookup. Read back its row and
+            # apply the same semantic-collision guard before reporting reuse.
+            existing_result = _existing_idempotency_result()
+            if existing_result is not None:
+                return existing_result
             if attempt == 1:
                 raise
             # Retry with a fresh id.

@@ -650,7 +650,12 @@ def create_task(payload: CreateTaskBody, board: Optional[str] = Query(None)):
             board=board,
         )
         task = kanban_db.get_task(conn, task_id)
-        body: dict[str, Any] = {"task": _task_dict(task) if task else None}
+        body: dict[str, Any] = {
+            "task": _task_dict(task) if task else None,
+            "created": task_id.created,
+            "existing": task_id.existing,
+            "reused": task_id.reused,
+        }
         # Surface a dispatcher-presence warning so the UI can show a
         # banner when a `ready` task would otherwise sit idle because no
         # gateway is running (or dispatch_in_gateway=false). Only emit

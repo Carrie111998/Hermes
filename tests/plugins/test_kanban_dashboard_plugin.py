@@ -116,6 +116,57 @@ def test_create_task_appears_on_board(client):
     assert "researcher" in data["assignees"]
 
 
+def test_create_task_api_reports_created_then_reused(client):
+    payload = {
+        "title": "Quarterly assessment",
+        "assignee": "researcher",
+        "workspace_kind": "scratch",
+        "skills": ["audit"],
+        "idempotency_key": "quarterly-assessment-2026-q3",
+    }
+
+    first = client.post("/api/plugins/kanban/tasks", json=payload)
+    second = client.post("/api/plugins/kanban/tasks", json=payload)
+
+    assert first.status_code == 200, first.text
+    assert second.status_code == 200, second.text
+    first_body = first.json()
+    second_body = second.json()
+    assert first_body["task"]["id"] == second_body["task"]["id"]
+    assert first_body["created"] is True
+    assert first_body["existing"] is False
+    assert first_body["reused"] is False
+    assert second_body["created"] is False
+    assert second_body["existing"] is True
+    assert second_body["reused"] is True
+
+
+def test_create_task_api_rejects_idempotency_contract_mismatch_without_mutation(client):
+    payload = {
+        "title": "Quarterly assessment",
+        "assignee": "researcher",
+        "workspace_kind": "scratch",
+        "skills": ["audit"],
+        "idempotency_key": "quarterly-assessment-2026-q4",
+    }
+    first = client.post("/api/plugins/kanban/tasks", json=payload)
+
+    mismatch = client.post(
+        "/api/plugins/kanban/tasks",
+        json={**payload, "title": "Different assessment"},
+    )
+
+    assert first.status_code == 200, first.text
+    assert mismatch.status_code == 400, mismatch.text
+    assert "different semantic contract" in mismatch.json()["detail"]
+    with kb.connect() as conn:
+        rows = conn.execute(
+            "SELECT title FROM tasks WHERE idempotency_key = ?",
+            (payload["idempotency_key"],),
+        ).fetchall()
+    assert [row["title"] for row in rows] == [payload["title"]]
+
+
 def test_patch_board_sets_project_directory(client, tmp_path):
     """Board-level default_workdir must be editable after creation."""
     kb.create_board("late-config")

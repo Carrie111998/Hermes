@@ -1486,6 +1486,9 @@ def _handle_create(args: dict, **kw) -> str:
             subscribed = _maybe_auto_subscribe(conn, new_tid)
             return _ok(
                 task_id=new_tid,
+                created=new_tid.created,
+                existing=new_tid.existing,
+                reused=new_tid.reused,
                 status=new_task.status if new_task else None,
                 workspace_kind=new_task.workspace_kind if new_task else None,
                 workspace_path=new_task.workspace_path if new_task else None,
@@ -2157,7 +2160,8 @@ KANBAN_CREATE_SCHEMA = {
         "orchestrator workers to fan out — decompose work into child "
         "tasks with specific assignees, link them into a pipeline, "
         "then complete your own task. The dispatcher picks up the new "
-        "tasks on its next tick and spawns the assigned profiles."
+        "tasks on its next tick and spawns the assigned profiles. The result "
+        "retains task_id and explicitly reports created, existing, and reused."
     ),
     "parameters": {
         "type": "object",
@@ -2245,8 +2249,9 @@ KANBAN_CREATE_SCHEMA = {
                 "type": "string",
                 "description": (
                     "If a non-archived task with this key already "
-                    "exists, return that task's id instead of creating "
-                    "a duplicate. Useful for retry-safe automation."
+                    "exists with the same title, assignee, workspace, and skills, "
+                    "return that task's id with existing/reused=true instead of "
+                    "creating a duplicate. A semantic mismatch is rejected."
                 ),
             },
             "max_runtime_seconds": {
