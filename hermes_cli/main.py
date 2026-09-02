@@ -10864,6 +10864,20 @@ def _resolve_update_branch(args) -> str:
     return (getattr(args, "branch", None) or "main").strip() or "main"
 
 
+def _resolve_update_ref(args) -> str | None:
+    """Return a stripped ``--ref`` pin, or None when the flag was omitted."""
+    raw = getattr(args, "ref", None)
+    if raw is None:
+        return None
+    stripped = str(raw).strip()
+    return stripped or None
+
+
+def _update_branch_explicit(args) -> bool:
+    """True when the caller passed a non-empty ``--branch`` value."""
+    return bool((getattr(args, "branch", None) or "").strip())
+
+
 def _size_delta_label(saved_mb: float) -> str:
     """Human label for a before/after database size delta, in MB.
 
@@ -10927,13 +10941,25 @@ def cmd_update(args):
         record_refusal_receipt(refusal)
         sys.exit(2)
 
+    update_ref = _resolve_update_ref(args)
+    branch_explicit = _update_branch_explicit(args)
+    if update_ref and branch_explicit:
+        print("✗ --ref and --branch are mutually exclusive.")
+        print("  Use --ref to pin a tag or commit; use --branch to track a branch tip.")
+        sys.exit(1)
+
     if getattr(args, "check", False):
+        # --check is branch-tip only. A pin is a checkout, not "is origin/X ahead?".
+        if update_ref:
+            print("✗ --check does not support --ref.")
+            print("  --check compares against a branch tip. Use --branch to select the branch.")
+            sys.exit(1)
         # --check honors --branch so the "any new commits?" answer matches
         # what a subsequent `hermes update --branch=<x>` would actually pull.
         branch = _resolve_update_branch(args)
         _self()._cmd_update_check(
             branch=branch,
-            branch_explicit=bool(getattr(args, "branch", None)),
+            branch_explicit=branch_explicit,
         )
         return
 
