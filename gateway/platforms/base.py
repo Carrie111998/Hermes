@@ -4779,23 +4779,40 @@ class BasePlatformAdapter(ABC):
         
         Returns:
             Tuple of (list of (url, alt_text) pairs, cleaned content with image tags removed).
+
+        Scanning runs on ``_mask_protected_spans(content)`` — a copy where
+        fenced code blocks, inline code, and blockquotes are replaced with
+        spaces of equal length. Invariants future regex authors must keep:
+        the mask is length-preserving (match offsets stay valid against the
+        original ``content``, which ``cleaned`` is derived from) and it
+        substitutes plain spaces only — it never normalizes newlines (CRLF
+        payloads keep their offsets) nor introduces characters that could
+        themselves parse as image syntax.
         """
         images = []
         cleaned = content
-        
+
+        # Scan a masked copy so image-syntax EXAMPLES — markdown/HTML image
+        # tags inside fenced code blocks, inline code, or blockquotes — are
+        # never queued for delivery or stripped from the text (#93724). The
+        # same guard extract_media has had since #36275; the offset-preserving
+        # mask keeps match offsets valid, and `cleaned` still operates on the
+        # original content so protected examples survive verbatim.
+        scan_content = BasePlatformAdapter._mask_protected_spans(content)
+
         # Match markdown images: ![alt](url)
         md_pattern = r'!\[([^\]]*)\]\((https?://[^\s\)]+)\)'
-        for match in re.finditer(md_pattern, content):
+        for match in re.finditer(md_pattern, scan_content):
             alt_text = match.group(1)
             url = match.group(2)
             # Only extract URLs that look like actual images
             if any(url.lower().endswith(ext) or ext in url.lower() for ext in
                    ['.png', '.jpg', '.jpeg', '.gif', '.webp', 'fal.media', 'fal-cdn', 'replicate.delivery']):
                 images.append((url, alt_text))
-        
+
         # Match HTML img tags: <img src="url"> or <img src="url"></img> or <img src="url"/>
         html_pattern = r'<img\s+src=["\']?(https?://[^\s"\'<>]+)["\']?\s*/?>\s*(?:</img>)?'
-        for match in re.finditer(html_pattern, content):
+        for match in re.finditer(html_pattern, scan_content):
             url = match.group(1)
             images.append((url, ""))
         
