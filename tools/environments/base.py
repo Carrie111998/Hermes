@@ -897,7 +897,14 @@ class BaseEnvironment(ABC):
         # Values stay in environment memory and never enter the shell command
         # string, so secrets are not exposed through process arguments/logs.
         saved_names: list[tuple[str, str, str]] = []
-        for name in passthrough_names:
+        # TERMINAL_CWD rides the same save/restore path: the local backend's
+        # run env carries a per-command pin (see LocalEnvironment._run_bash),
+        # and restoring it after the snapshot source keeps a stale
+        # process-global value — frozen into the shared snapshot by an
+        # earlier command — from overriding the pin in nested subprocesses
+        # (#95078). Backends that never set it simply restore unset.
+        restore_names = list(passthrough_names) + ["TERMINAL_CWD"]
+        for name in restore_names:
             marker = f"_HERMES_RUNTIME_PASSTHROUGH_{name}"
             present = f"{marker}_PRESENT"
             value = f"{marker}_VALUE"
@@ -1478,6 +1485,12 @@ class BaseEnvironment(ABC):
             exec_command = _rewrite_compound_background(exec_command)
         effective_timeout = timeout or self.timeout
         effective_cwd = cwd or self.cwd
+        # Surface the per-command cwd to backend _run_bash implementations
+        # so they can pin the spawned process's cwd-carrier env to it (the
+        # local backend rewrites its run-env TERMINAL_CWD; without this a
+        # stale process-global value leaks into nested Hermes subprocesses,
+        # #95078).
+        self._command_env_cwd = effective_cwd
 
         # Merge sudo stdin with caller stdin
         if sudo_stdin is not None and stdin_data is not None:

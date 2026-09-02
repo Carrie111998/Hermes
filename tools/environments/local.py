@@ -2114,6 +2114,15 @@ class LocalEnvironment(BaseEnvironment):
                 cmd_string = _prepend_shell_init(cmd_string, init_files)
         args = [bash, "-l", "-c", cmd_string] if login else [bash, "-c", cmd_string]
         run_env = _make_run_env(self.env)
+        # Pin the cwd-carrier env to the per-command cwd (set by the base
+        # execute) so a nested Hermes subprocess cannot inherit a stale
+        # process-global TERMINAL_CWD from a long-lived backend and resolve
+        # its agent cwd to the wrong project (#95078). The command's shell
+        # already `cd`s here via _wrap_command, so the OS cwd and the carrier
+        # agree for the child.
+        _pinned_cwd = getattr(self, "_command_env_cwd", "")
+        if _pinned_cwd:
+            run_env["TERMINAL_CWD"] = _pinned_cwd
 
         # Recover when the cwd has been deleted out from under us — usually by
         # a previous tool call that ran ``rm -rf`` on its own working dir
