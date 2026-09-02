@@ -10717,6 +10717,27 @@ def _retag_legacy_worker_sessions(workspaces_root_path: str) -> None:
         _log.debug("kanban worker: legacy session retag skipped (%s)", exc)
 
 
+def _worker_session_title(
+    board: str, task_title: str, run_id: Optional[int]
+) -> str:
+    """Build a bounded, word-safe project-sidebar title for a worker run."""
+    import textwrap
+
+    run_suffix = f" · run {run_id}" if run_id is not None else ""
+    title_prefix = f"{board} · {task_title}"
+    # Keep this aligned with SessionDB.MAX_TITLE_LENGTH; the regression test
+    # binds the formatter to that public contract without creating a core-state
+    # import in the Kanban persistence module.
+    max_prefix = max(1, 100 - len(run_suffix))
+    if len(title_prefix) > max_prefix:
+        title_prefix = textwrap.shorten(
+            title_prefix,
+            width=max_prefix,
+            placeholder="…",
+        )
+    return title_prefix + run_suffix
+
+
 def _default_spawn(
     task: Task,
     workspace: str,
@@ -10774,13 +10795,9 @@ def _default_spawn(
         env["HERMES_TENANT"] = task.tenant
     env["HERMES_KANBAN_TASK"] = task.id
     env["HERMES_KANBAN_WORKSPACE"] = workspace
-    # Tag the worker's session so it lands in state.db as `kanban`, not as an
-    # untitled `cli` row. A worker is a dispatcher-owned run whose transcript is
-    # read on the board and in `hermes kanban log` — it is not a conversation
-    # the user started, so every session-browsing surface (desktop sidebar, TUI
-    # resume picker, session_search) filters it out by source. Without this the
-    # sidebar renders one row per attempt, labeled with the worker's own prompt
-    # ("work kanban task t_…").
+    # Keep dispatcher runs distinguishable from interactive sessions. Global
+    # Recents can still omit this source, while the project tree renders it from
+    # the persisted workspace metadata below.
     env["HERMES_SESSION_SOURCE"] = "kanban"
     # Pin TERMINAL_CWD to the task's workspace so the worker's file tools and
     # context-file loader anchor on the workspace, not whatever cwd the
@@ -10835,6 +10852,13 @@ def _default_spawn(
     # board slug still forces it to the right directory.
     resolved_board = _normalize_board_slug(board) or get_current_board()
     env["HERMES_KANBAN_BOARD"] = resolved_board
+    # The worker prompt is intentionally machine-shaped (the task id is the
+    # durable lookup key), so give its transcript a separate human-facing name.
+    # Keep the run suffix when truncating: it makes retries distinct without
+    # exposing the task's random id in the project sidebar.
+    env["HERMES_KANBAN_SESSION_TITLE"] = _worker_session_title(
+        resolved_board, task.title, task.current_run_id
+    )
     # HERMES_PROFILE is the author the kanban_comment tool defaults to.
     # `hermes -p <assignee>` activates the profile, but the env var is
     # what the tool reads — set it explicitly here so comments are

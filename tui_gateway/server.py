@@ -15706,7 +15706,12 @@ def _scan_discovered_repos_remote(conn, policy: dict) -> bool:
 
 
 def _discover_repos_payload(
-    db, *, conn=None, backfill: bool = True, include_cached: bool = True
+    db,
+    *,
+    conn=None,
+    backfill: bool = True,
+    include_cached: bool = True,
+    exclude_sources: list[str] | None = None,
 ) -> list[dict]:
     """Merge filesystem-scanned repos (cached) with session-derived repo roots.
 
@@ -15728,7 +15733,7 @@ def _discover_repos_payload(
 
     # Session-derived roots (common repo root, folding worktrees; cached) +
     # backfill the column so persisted git_repo_root matches the tree grouping.
-    cwd_rows = list(db.distinct_session_cwds())
+    cwd_rows = list(db.distinct_session_cwds(exclude_sources=exclude_sources))
     # Warm the per-cwd git probes in parallel so a cold first paint doesn't
     # serialize one subprocess per distinct cwd before this loop reads the cache.
     git_probe.warm_roots(str(r.get("cwd") or "") for r in cwd_rows)
@@ -15795,11 +15800,11 @@ def _discover_repos_payload(
     return out
 
 
-# Sources excluded from the project tree: cron runs, and kanban dispatcher
-# workers, are not user conversations. Subagent/compression children are
-# already dropped by list_sessions_rich(include_children=False); cron has its
-# own section, and kanban runs are read on the board.
-_PROJECT_TREE_EXCLUDED_SOURCES = ["cron", "kanban"]
+# Cron has its own section. Kanban workers remain absent from global Recents,
+# but are first-class project transcripts when their persisted cwd resolves
+# under a named project. Subagent/compression children are already dropped by
+# list_sessions_rich(include_children=False).
+_PROJECT_TREE_EXCLUDED_SOURCES = ["cron"]
 
 
 def _project_tree_row(r: dict) -> dict:
@@ -15851,25 +15856,6 @@ def _project_tree_inputs(
     which already has sessions — avoiding the distinct-cwd scan + git probes on
     that per-turn path. One projects.db connection serves both reads.
     """
-    rows = db.list_sessions_rich(
-        limit=session_limit,
-        offset=0,
-        order_by_last_active=True,
-        min_message_count=1,
-        include_children=False,
-        exclude_sources=_PROJECT_TREE_EXCLUDED_SOURCES,
-        include_archived=False,
-        # `_project_tree_row` keeps ~18 fields and drops the rest, so selecting
-        # the system-prompt blob only to discard it costs tens of MB of B-tree
-        # reads per build on a long-lived database.
-        compact_rows=True,
-    )
-    sessions = [_project_tree_row(r) for r in rows]
-    # Parallel-warm the git cache so build_tree's resolver reads it instead of
-    # cold-probing each cwd in sequence (matters on the drill-in path, which
-    # skips the discovery warm-up below).
-    git_probe.warm_roots(s["cwd"] for s in sessions if s.get("cwd"))
-
     from hermes_cli import projects_db as pdb
 
     policy = _repo_discovery_policy()
@@ -15890,10 +15876,55 @@ def _project_tree_inputs(
                 conn=conn,
                 backfill=False,
                 include_cached=policy["enabled"],
+                exclude_sources=["kanban"],
             )
             if include_discovered
             else []
         )
+
+    project_folders = [
+        str(folder.get("path") or "")
+        for project in projects
+        for folder in (project.get("folders") or [])
+        if str(folder.get("path") or "").strip()
+    ]
+    common_query = {
+        "limit": session_limit,
+        "offset": 0,
+        "order_by_last_active": True,
+        "min_message_count": 1,
+        "include_children": False,
+        "include_archived": False,
+        # `_project_tree_row` keeps ~18 fields and drops the rest, so selecting
+        # the system-prompt blob only to discard it costs tens of MB of B-tree
+        # reads per build on a long-lived database.
+        "compact_rows": True,
+    }
+    # Query ordinary sessions separately so recent excluded scratch workers
+    # cannot consume the page limit before filtering. Kanban rows are fetched
+    # only below registered project folders, which keeps them out of Home and
+    # auto-project discovery while making project worktree transcripts visible.
+    rows = db.list_sessions_rich(
+        exclude_sources=[*_PROJECT_TREE_EXCLUDED_SOURCES, "kanban"],
+        **common_query,
+    )
+    by_id = {str(row.get("id")): row for row in rows}
+    for folder in project_folders:
+        for row in db.list_sessions_rich(
+            source="kanban",
+            cwd_prefix=folder,
+            **common_query,
+        ):
+            by_id[str(row.get("id"))] = row
+    rows = sorted(
+        by_id.values(),
+        key=lambda row: float(row.get("last_active") or row.get("started_at") or 0),
+        reverse=True,
+    )[:session_limit]
+    sessions = [_project_tree_row(row) for row in rows]
+    # Parallel-warm only the retained session roots so excluded scratch workers
+    # do not trigger pointless git probes.
+    git_probe.warm_roots(s["cwd"] for s in sessions if s.get("cwd"))
 
     return sessions, projects, discovered, active_id
 

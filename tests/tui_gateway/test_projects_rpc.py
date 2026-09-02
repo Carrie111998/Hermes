@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import json
 import os
 import subprocess
 import threading
@@ -686,13 +687,15 @@ def _create_project(home: Path, name: str, folder: Path, *, use: bool = False) -
         reset_hermes_home_override(token)
 
 
-def _create_session(home: Path, session_id: str, cwd: Path) -> None:
+def _create_session(
+    home: Path, session_id: str, cwd: Path, *, source: str = "cli"
+) -> None:
     """Seed one message-bearing session in ``home``'s state.db."""
     from hermes_state import SessionDB
 
     db = SessionDB(db_path=home / "state.db")
     try:
-        db.create_session(session_id, "cli", cwd=str(cwd))
+        db.create_session(session_id, source, cwd=str(cwd))
         db.append_message(session_id, "user", f"hello from {session_id}")
     finally:
         db.close()
@@ -770,6 +773,47 @@ def test_projects_reads_are_scoped_to_the_requested_profile(monkeypatch, tmp_pat
     lane = coder_sessions["project"]["repos"][0]["groups"][0]
     assert [s["id"] for s in lane["sessions"]] == ["coder-session"]
     assert [s["profile"] for s in lane["sessions"]] == ["coder"]
+
+
+def test_projects_tree_includes_kanban_worker_sessions(monkeypatch, tmp_path):
+    """A rooted Kanban run is visible inside its named project, not orphaned."""
+    home = _profile_dir(tmp_path, "launch")
+    repo = tmp_path / "repos" / "dunbar-dossier"
+    repo.mkdir(parents=True)
+    _bind_profiles(monkeypatch, tmp_path, {"default": home})
+    project = _create_project(home, "Dunbar Dossier", repo, use=True)
+    _create_session(home, "kanban-worker", repo, source="kanban")
+
+    with _serving_launch_profile(home):
+        tree = _call("projects.tree")
+        detail = _call(
+            "projects.project_sessions", {"project_id": project["id"]}
+        )
+
+    assert tree["scoped_session_ids"] == ["kanban-worker"]
+    lane = detail["project"]["repos"][0]["groups"][0]
+    assert [session["id"] for session in lane["sessions"]] == ["kanban-worker"]
+
+
+def test_projects_tree_excludes_kanban_sessions_outside_registered_projects(
+    monkeypatch, tmp_path
+):
+    """Scratch and legacy workers do not leak into Home or auto-projects."""
+    home = _profile_dir(tmp_path, "launch")
+    repo = tmp_path / "repos" / "dunbar-dossier"
+    scratch = tmp_path / "kanban" / "workspaces" / "t_legacy"
+    (repo / ".git").mkdir(parents=True)
+    (scratch / ".git").mkdir(parents=True)
+    _bind_profiles(monkeypatch, tmp_path, {"default": home})
+    _create_project(home, "Dunbar Dossier", repo, use=True)
+    _create_session(home, "ordinary-project-session", repo)
+    _create_session(home, "unbound-kanban-worker", scratch, source="kanban")
+
+    with _serving_launch_profile(home):
+        tree = _call("projects.tree", {"session_limit": 1})
+
+    assert "ordinary-project-session" in json.dumps(tree)
+    assert "unbound-kanban-worker" not in json.dumps(tree)
 
 
 def test_projects_tree_is_scoped_to_the_requested_profile(monkeypatch, tmp_path):

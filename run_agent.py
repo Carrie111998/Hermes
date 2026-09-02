@@ -69,16 +69,17 @@ from hermes_constants import get_hermes_home
 def _launch_cwd_for_session(source: str) -> Optional[str]:
     """Working directory to stamp on a new session row, or None.
 
-    Only local CLI sessions get a recorded cwd: the directory the process was
-    launched from is meaningful for ``hermes -c`` / ``--resume`` (relaunch
-    where you left off). Gateway/cron/remote-backend sessions have no stable
-    host cwd to restore, so they record nothing.
+    Local CLI and Kanban worker sessions get a recorded cwd. For the CLI this
+    restores where an interactive session left off; for Kanban it anchors the
+    worker transcript to the named project that owns its isolated worktree.
+    Gateway/cron/remote-backend sessions have no stable host cwd to restore, so
+    they record nothing.
 
     ``TERMINAL_ENV`` is set by the CLI's config bridge (``load_cli_config``);
     a non-"local" backend (docker/ssh/modal/...) means the host cwd is
     irrelevant to the agent's tools, so we skip it there too.
     """
-    if source != "cli":
+    if source not in ("cli", "kanban"):
         return None
     backend = (os.environ.get("TERMINAL_ENV") or "local").strip().lower()
     if backend and backend != "local":
@@ -755,6 +756,16 @@ class AIAgent:
                 cwd=_launch_cwd_for_session(source),
                 profile_name=_profile_for_session,
             )
+            if source == "kanban":
+                worker_title = str(
+                    os.environ.get("HERMES_KANBAN_SESSION_TITLE", "") or ""
+                ).strip()
+                if worker_title:
+                    self._session_db.set_auto_title(
+                        self.session_id,
+                        worker_title,
+                        source=self._session_db.TITLE_SOURCE_LLM,
+                    )
             self._session_db_created = True
         except Exception as e:
             # Transient failure (e.g. SQLite lock). Keep _session_db alive —
