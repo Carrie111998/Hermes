@@ -79,7 +79,7 @@ def _is_dispatcher_owned_worker() -> bool:
 
         return is_dispatcher_owned_worker_context()
     except Exception:
-        return True
+        return False
 
 
 def _reject_delegated_child_mutation(tool_name: str) -> Optional[str]:
@@ -163,6 +163,21 @@ def _worker_run_id(task_id: str) -> Optional[int]:
     try:
         return int(raw)
     except ValueError:
+        return None
+
+
+def _worker_session_id(task_id: str) -> Optional[str]:
+    """Return the durable session only for this dispatcher-owned worker."""
+    if (
+        not _is_dispatcher_owned_worker()
+        or os.environ.get("HERMES_KANBAN_TASK") != task_id
+    ):
+        return None
+    try:
+        from gateway.session_context import get_session_env
+
+        return get_session_env("HERMES_SESSION_ID") or None
+    except Exception:
         return None
 
 
@@ -884,6 +899,7 @@ def _handle_block(args: dict, **kw) -> str:
                 reason=reason,
                 kind=kind,
                 expected_run_id=_worker_run_id(tid),
+                worker_session_id=_worker_session_id(tid),
             )
             if not ok:
                 return tool_error(

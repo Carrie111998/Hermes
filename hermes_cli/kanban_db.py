@@ -1141,6 +1141,10 @@ class Task:
     # Unblock-loop counter. See the column comment in SCHEMA_SQL and
     # ``BLOCK_RECURRENCE_LIMIT``. Reset only on successful completion.
     block_recurrences: int = 0
+    # Durable session owned by the profile that last blocked the task. Stored
+    # separately from session_id (the task's origin conversation) so an
+    # unblocked worker can resume its own execution context.
+    worker_session_id: Optional[str] = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
@@ -1234,6 +1238,9 @@ class Task:
                 int(row["block_recurrences"])
                 if "block_recurrences" in keys and row["block_recurrences"] is not None
                 else 0
+            ),
+            worker_session_id=(
+                row["worker_session_id"] if "worker_session_id" in keys else None
             ),
         )
 
@@ -1410,6 +1417,9 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- set the env var. Indexed so per-session list queries stay cheap on
     -- larger boards.
     session_id           TEXT,
+    -- Durable profile-local worker session used to resume an execution after
+    -- a human-input block. NULL until a dispatcher-owned worker blocks.
+    worker_session_id    TEXT,
     -- Typed block reason set by ``block_task`` (one of VALID_BLOCK_KINDS, or
     -- NULL for legacy/un-typed blocks). Drives routing: ``dependency`` never
     -- sits in ``blocked`` (goes to ``todo`` for parent-gating); the others go
@@ -2674,6 +2684,11 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             conn, "tasks", "session_id", "session_id TEXT"
         )
 
+    if "worker_session_id" not in cols:
+        _add_column_if_missing(
+            conn, "tasks", "worker_session_id", "worker_session_id TEXT"
+        )
+
     if "block_kind" not in cols:
         # Typed block reason (VALID_BLOCK_KINDS) or NULL for legacy/un-typed
         # blocks. Existing blocked rows get NULL, which is treated as a
@@ -3719,7 +3734,8 @@ def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) 
     profile = _canonical_assignee(profile)
     with write_txn(conn):
         row = conn.execute(
-            "SELECT status, claim_lock, assignee FROM tasks WHERE id = ?", (task_id,)
+            "SELECT status, claim_lock, assignee, worker_session_id FROM tasks WHERE id = ?",
+            (task_id,),
         ).fetchone()
         if not row:
             return False
@@ -3727,6 +3743,12 @@ def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) 
             raise RuntimeError(
                 f"cannot reassign {task_id}: currently running (claimed). "
                 "Wait for completion or reclaim the stale lock first."
+            )
+        if row["worker_session_id"] and row["assignee"] != profile:
+            raise RuntimeError(
+                f"cannot reassign session-bound task {task_id} from "
+                f"{row['assignee'] or 'none'} to {profile or 'none'}: "
+                "the durable worker session belongs to the current profile"
             )
         if row["assignee"] != profile:
             # The retry guard is scoped to the task/profile combination. A
@@ -5212,6 +5234,18 @@ def reassign_task(
     Returns True if the reassign landed. ``profile`` may be ``None`` to
     unassign entirely.
     """
+    profile = _canonical_assignee(profile)
+    row = conn.execute(
+        "SELECT assignee, worker_session_id FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    if row is None:
+        return False
+    if row["worker_session_id"] and row["assignee"] != profile:
+        # Authorization must happen before reclaim_task(), which can terminate
+        # the current worker and close its run. A profile-local session cannot
+        # be transferred implicitly to another profile's HERMES_HOME.
+        return False
     if reclaim_first:
         # Safe to call even if nothing to reclaim.
         reclaim_task(conn, task_id, reason=reason or "reassign")
@@ -6261,6 +6295,7 @@ def block_task(
     reason: Optional[str] = None,
     kind: Optional[str] = None,
     expected_run_id: Optional[int] = None,
+    worker_session_id: Optional[str] = None,
 ) -> bool:
     """Transition ``running``/``ready`` → ``blocked`` (or route elsewhere).
 
@@ -6301,6 +6336,12 @@ def block_task(
         ).fetchone()
         if cur_row is None:
             return False
+        def persist_worker_session() -> None:
+            if worker_session_id:
+                conn.execute(
+                    "UPDATE tasks SET worker_session_id = COALESCE(worker_session_id, ?) WHERE id = ?",
+                    (worker_session_id, task_id),
+                )
         source_status = (
             _retry_status_for_run(conn, task_id)
             if cur_row["status"] == "running"
@@ -6335,6 +6376,7 @@ def block_task(
             )
             if cur.rowcount != 1:
                 return False
+            persist_worker_session()
             run_id = _end_run(
                 conn, task_id,
                 outcome="blocked", status="blocked",
@@ -6393,6 +6435,7 @@ def block_task(
             )
             if cur.rowcount != 1:
                 return False
+            persist_worker_session()
             run_id = _end_run(
                 conn, task_id,
                 outcome="blocked", status="blocked",
@@ -6447,6 +6490,7 @@ def block_task(
                 )
             if cur.rowcount != 1:
                 return False
+            persist_worker_session()
             run_id = _end_run(
                 conn, task_id,
                 outcome="blocked", status="blocked",
@@ -10881,6 +10925,8 @@ def _default_spawn(
     # branch, not a nested one.
     if task.reasoning_effort:
         cmd.extend(["--reasoning", task.reasoning_effort])
+    if task.worker_session_id:
+        cmd.extend(["--resume", task.worker_session_id])
     worker_toolsets = _resolve_worker_cli_toolsets(env.get("HERMES_HOME"))
     if worker_toolsets:
         cmd.extend(["--toolsets", ",".join(worker_toolsets)])
