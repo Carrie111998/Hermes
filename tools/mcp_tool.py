@@ -119,6 +119,7 @@ from urllib.parse import urlparse
 
 from tools.registry import tool_error
 from tools.ansi_strip import strip_unicode_tags
+from agent.redact import normalize_tool_output, normalize_tool_output_content
 
 logger = logging.getLogger(__name__)
 
@@ -2062,6 +2063,10 @@ class SamplingHandler:
                     "role": "tool",
                     "tool_call_id": _tool_use_id(tr),
                     "content": self._extract_tool_result_text(tr),
+                    "tool_call_id": tr.toolUseId,
+                    "content": normalize_tool_output(
+                        self._extract_tool_result_text(tr)
+                    ),
                 })
 
             # Emit assistant tool_calls message
@@ -2105,7 +2110,10 @@ class SamplingHandler:
                                 type(block).__name__,
                             )
                     if parts:
-                        messages.append({"role": msg.role, "content": parts})
+                        messages.append({
+                            "role": msg.role,
+                            "content": normalize_tool_output_content(parts),
+                        })
 
         return messages
 
