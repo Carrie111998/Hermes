@@ -873,16 +873,21 @@ _CODEX_GPT54_GPT55_COMPACTION_THRESHOLD = 0.85
 _CODEX_SPARK_COMPACTION_THRESHOLD = 0.70
 
 
-def _is_codex_gpt54_or_gpt55(model: Optional[str], provider: Optional[str] = None) -> bool:
-    """True for gpt-5.4 / gpt-5.5 / gpt-5.6 on the ChatGPT Codex OAuth backend.
+def _is_codex_gpt54_or_gpt55(model: Optional[str], provider: Optional[str] = None, *, api_mode: Optional[str] = None) -> bool:
+    """True for gpt-5.4 / gpt-5.5 / gpt-5.6 on the Codex OAuth / api_mode=codex_responses backends.
 
-    Matches only the Codex OAuth route (provider ``openai-codex``), not the
-    direct OpenAI API, OpenRouter, or GitHub Copilot paths — those expose a
-    larger context window for the same slug and must keep the user's default
-    compaction threshold. ``-pro`` variants and dated snapshots are matched
-    via prefix so the override tracks every 272K-capped family (5.4, 5.5,
-    5.6 sol/terra/luna incl. their ``-pro`` modes) without re-listing every
-    variant. (Name kept for backward compatibility with the
+    Matches (a) the Codex OAuth route (provider ``openai-codex``), and
+    (b) any custom provider whose ``api_mode`` is ``codex_responses``
+    (e.g. proxy endpoints that forward to the Codex endpoint family, which
+    shares the same 272K server-side cap). Clients speaking
+    ``chat_completions`` or other API families keep the user's default
+    compaction threshold — those expose a larger context window for the
+    same slug.
+
+    ``-pro`` variants and dated snapshots are matched via prefix so the
+    override tracks every 272K-capped family (5.4, 5.5, 5.6 sol/terra/
+    luna incl. their ``-pro`` modes) without re-listing every variant.
+    (Name kept for backward compatibility with the
     ``compression.codex_gpt55_autoraise`` config key.) The exact
     ``gpt-daybreak-blue-latest`` Codex slug is also a verified Sol-family
     alias and receives the same autoraise.
@@ -893,7 +898,7 @@ def _is_codex_gpt54_or_gpt55(model: Optional[str], provider: Optional[str] = Non
     global ``compression.threshold`` (default 50%, ~450K).
     """
     prov = (provider or "").strip().lower()
-    if prov != "openai-codex":
+    if prov != "openai-codex" and (api_mode or "").strip().lower() != "codex_responses":
         return False
     bare = (model or "").strip().lower().rsplit("/", 1)[-1]
     from agent.model_metadata import is_codex_context_variant
@@ -955,6 +960,7 @@ def _compression_threshold_for_model(
     provider: Optional[str] = None,
     *,
     allow_codex_gpt55_autoraise: bool = True,
+    api_mode: Optional[str] = None,
 ) -> Optional[float]:
     """Return a context-compression threshold override for specific models.
 
@@ -982,7 +988,7 @@ def _compression_threshold_for_model(
     """
     if _is_arcee_trinity_thinking(model):
         return 0.75
-    if allow_codex_gpt55_autoraise and _is_codex_gpt54_or_gpt55(model, provider):
+    if allow_codex_gpt55_autoraise and _is_codex_gpt54_or_gpt55(model, provider, api_mode=api_mode):
         return _CODEX_GPT54_GPT55_COMPACTION_THRESHOLD
     if _is_codex_spark(model, provider):
         return _CODEX_SPARK_COMPACTION_THRESHOLD
