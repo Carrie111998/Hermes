@@ -4759,14 +4759,18 @@ def save_env_value(key: str, value: str):
     # writer didn't match it, a save would append a SECOND line and a later
     # delete of that line would silently resurrect the old exported value
     # (#40041: "token detected but cannot be replaced through the UI").
-    found = False
-    for i, line in enumerate(lines):
-        if _env_line_defines_key(line, key):
-            lines[i] = f"{key}={serialized_value}\n"
-            found = True
-            break
-
-    if not found:
+    #
+    # A file can carry MORE than one line assigning the same key (hand-edits,
+    # partial writes from older versions). load_env() lets the LAST line win,
+    # so updating only the first match would leave a stale later line that
+    # resurrects the old value on the next load. Replace the FIRST matching
+    # line with the fresh assignment and drop every later duplicate.
+    match_indexes = [i for i, line in enumerate(lines) if _env_line_defines_key(line, key)]
+    if match_indexes:
+        lines[match_indexes[0]] = f"{key}={serialized_value}\n"
+        for i in reversed(match_indexes[1:]):
+            del lines[i]
+    else:
         # Ensure there's a newline at the end of the file before appending
         if lines and not lines[-1].endswith("\n"):
             lines[-1] += "\n"

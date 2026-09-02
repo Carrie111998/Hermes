@@ -43,6 +43,7 @@ from typing import Any, Dict, List
 
 __all__ = [
     "save_provider_env_credential",
+    "propagate_provider_env_credential_to_profiles",
     "remove_provider_env_credential",
     "purge_env_credential_references",
 ]
@@ -281,6 +282,124 @@ def save_provider_env_credential(env_var: str, value: str) -> Dict[str, Any]:
         pass
 
     return {"ok": True, "key": env_var, "config_updates": config_updates}
+
+
+def _iter_profile_env_paths() -> List[tuple]:
+    """(name, path) for every profile-scoped ``.env`` besides the active home.
+
+    Enumerates the SAME homes ``hermes profile list`` shows: the default home
+    (``~/.hermes/.env`` when running inside ``~/.hermes/profiles/<name>``) and
+    every sibling profile under the shared ``profiles/`` root. The ACTIVE home
+    is excluded — the caller just saved the key there and it is the source of
+    truth. Homes without a ``.env`` are skipped: propagation must never
+    introduce a credential into a profile that deliberately keeps the var
+    unset (an isolated test/staging profile must stay keyless).
+    """
+    from hermes_constants import (
+        get_default_hermes_root,
+        get_hermes_home,
+    )
+
+    active = get_hermes_home().resolve()
+    root = get_default_hermes_root()
+
+    candidates: List[tuple] = []
+    if root == active:
+        # Running in the default home — profiles live under root/profiles/.
+        profiles_root = root / "profiles"
+    else:
+        # Running inside a profile — include the default home as a candidate.
+        candidates.append(("default", root / ".env"))
+        profiles_root = root / "profiles"
+    if profiles_root.is_dir():
+        for entry in sorted(profiles_root.iterdir()):
+            if not entry.is_dir() or entry.name.startswith("."):
+                # Skip tombstones like ``profiles/.deleted`` (see
+                # ``named_profile_home``) and other hidden entries.
+                continue
+            candidates.append((entry.name, entry / ".env"))
+
+    out: List[tuple] = []
+    seen = {str(active)}
+    for name, env_path in candidates:
+        resolved_parent = env_path.parent.resolve()
+        if str(resolved_parent) in seen:
+            continue
+        if not env_path.exists():
+            continue
+        seen.add(str(resolved_parent))
+        out.append((name, env_path))
+    return out
+
+
+def propagate_provider_env_credential_to_profiles(
+    env_var: str, value: str, *, apply: bool = True
+) -> Dict[str, Any]:
+    """Copy a just-saved credential to every OTHER profile that defines the var.
+
+    A rotated provider key is one credential for the whole machine, but the
+    ``hermes model`` / ``hermes setup`` flows only write the ACTIVE profile's
+    ``.env``. Every sibling profile that shares the provider keeps running on
+    the dead key (401s, stalled cron jobs) until the user re-runs the wizard
+    N times. This is the explicit multi-profile propagation step the save
+    flows now offer after a key rotation.
+
+    Only profiles whose ``.env`` ALREADY defines ``env_var`` are updated:
+    propagation mirrors an existing credential, it must not provision one
+    into a profile that intentionally keeps the var unset. Profiles with a
+    DIFFERENT value are updated too — a rotation replaces the machine-wide
+    credential, and the old value is by definition dead. (A profile with a
+    deliberately different key is rare; if it exists, the user simply
+    re-runs the wizard inside that profile after propagation.)
+
+    ``apply=False`` is a dry run for the caller's prompt: it reports which
+    profiles WOULD be updated, without writing anything.
+
+    ``config.yaml`` mirrors (``model.api_key``) holding the OLD value are
+    scrubbed per target profile too, mirroring
+    :func:`save_provider_env_credential`'s #62269 fix across homes.
+
+    Secrecy contract holds: returns per-profile key NAMES and status only,
+    never credential material.
+    """
+    from hermes_constants import (
+        reset_hermes_home_override,
+        set_hermes_home_override,
+    )
+    from hermes_cli.config import load_env, save_env_value
+
+    updated: List[str] = []
+    in_sync: List[str] = []
+    skipped: List[str] = []
+    for name, env_path in _iter_profile_env_paths():
+        token = set_hermes_home_override(str(env_path.parent))
+        try:
+            target_env = load_env()
+            old_value = target_env.get(env_var)
+            if old_value is None:
+                # Profile never configured this credential — leave it alone.
+                skipped.append(name)
+                continue
+            if old_value == value:
+                # Already holds the new key — nothing to propagate.
+                in_sync.append(name)
+                continue
+            if apply:
+                save_env_value(env_var, value)
+                # save_env_value can silently no-op (managed-scope guard).
+                # Verify the write landed before reporting the profile as
+                # updated — a false "updated" would hide a stale key.
+                if load_env().get(env_var) != value:
+                    skipped.append(name)
+                    continue
+                _scrub_config_yaml_mirrors(old_value, value)
+        except Exception:
+            skipped.append(name)
+            continue
+        finally:
+            reset_hermes_home_override(token)
+        updated.append(name)
+    return {"updated": updated, "in_sync": in_sync, "skipped": skipped}
 
 
 def remove_provider_env_credential(env_var: str) -> Dict[str, Any]:
