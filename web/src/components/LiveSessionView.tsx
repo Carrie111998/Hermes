@@ -126,7 +126,7 @@ export function LiveSessionView({ sessionId, isActive }: LiveSessionViewProps) {
     <div className="flex h-full min-h-0 flex-col bg-background">
       <div className="flex flex-wrap items-center gap-2 border-b border-border px-3 py-2">
         <Eye className="h-4 w-4 text-muted-foreground" aria-hidden />
-        <Typography variant="small" className="text-muted-foreground">
+        <Typography variant="sm" className="text-muted-foreground">
           {readOnlyHint}
         </Typography>
         <div className="ml-auto flex items-center gap-2">
@@ -165,11 +165,11 @@ export function LiveSessionView({ sessionId, isActive }: LiveSessionViewProps) {
 
       <div className="min-h-0 flex-1 overflow-y-auto px-3 py-3">
         {loading && messages.length === 0 ? (
-          <Typography variant="small" className="text-muted-foreground">
+          <Typography variant="sm" className="text-muted-foreground">
             Loading…
           </Typography>
         ) : messages.length === 0 ? (
-          <Typography variant="small" className="text-muted-foreground">
+          <Typography variant="sm" className="text-muted-foreground">
             No messages yet.
           </Typography>
         ) : (
