@@ -454,7 +454,7 @@ def test_pdf_upload_is_refused_before_room_admission_without_poppler(
         ],
     )
     monkeypatch.setattr(
-        "tui_gateway.hosted_room_service.shutil.which",
+        "tui_gateway.hosted_room_artifact_service.shutil.which",
         lambda _name: None,
     )
 
