@@ -1660,6 +1660,71 @@ def test_resolve_named_custom_runtime_pool_result_includes_extra_headers(monkeyp
     assert resolved["requested_provider"] == "custom:lmstudio"
 
 
+def test_providers_dict_entry_with_list_base_url_is_skipped_not_crash(monkeypatch):
+    """A ``providers:`` entry whose base_url/api/url is a YAML list must be
+    ignored during custom provider resolution instead of raising
+    ``'list' object has no attribute 'strip'``.
+
+    Regression for #96512: ``vision_analyze`` with an auxiliary vision model
+    on a custom OpenAI-compatible provider crashed with that AttributeError
+    deep inside ``_get_named_custom_provider`` whenever the matching entry
+    carried a non-string base URL, and the tool surfaced the raw
+    ``'list' object has no attribute 'strip'`` string. Mirrors the legacy
+    ``custom_providers`` scan, which already guards name/base_url types.
+    """
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.setenv("MYGATEWAY_TEST_KEY", "test-key-value")
+    monkeypatch.setattr(
+        rp,
+        "load_config",
+        lambda: {
+            "providers": {
+                "mygateway": {
+                    "name": "mygateway",
+                    "base_url": ["http://localhost:4000/v1"],
+                    "key_env": "MYGATEWAY_TEST_KEY",
+                    "default_model": "databricks-gemini-3-7-flash",
+                }
+            }
+        },
+    )
+
+    # Must not raise; the malformed entry is treated as unmatched.
+    assert rp._get_named_custom_provider("custom:mygateway") is None
+    assert rp._get_named_custom_provider("mygateway") is None
+
+
+def test_providers_dict_scan_continues_past_list_base_url_entry(monkeypatch):
+    """A malformed entry must not shadow later well-formed matches: the
+    providers scan keeps going and resolves the next candidate key."""
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.setenv("GOODGATEWAY_TEST_KEY", "test-key-value")
+    monkeypatch.setattr(
+        rp,
+        "load_config",
+        lambda: {
+            "providers": {
+                "broken": {
+                    "name": "broken",
+                    "api": ["http://localhost:9999/v1"],
+                },
+                "good": {
+                    "name": "good",
+                    "base_url": "http://localhost:4000/v1",
+                    "key_env": "GOODGATEWAY_TEST_KEY",
+                    "default_model": "databricks-gemini-3-7-flash",
+                },
+            }
+        },
+    )
+
+    resolved = rp._get_named_custom_provider("custom:good")
+
+    assert resolved is not None
+    assert resolved["base_url"] == "http://localhost:4000/v1"
+    assert resolved["api_key"] == "test-key-value"
+
+
 def test_resolve_runtime_provider_opencode_free_keyless_despite_exhausted_pool(monkeypatch):
     """OpenCode Free is keyless: an exhausted credential pool must not raise
     a missing-credential error. The provider resolves with the keyless

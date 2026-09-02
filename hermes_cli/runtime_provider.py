@@ -843,6 +843,19 @@ def _get_named_custom_provider(requested_provider: str) -> Optional[Dict[str, An
             ):
                 # Found match by provider key
                 base_url = entry.get("api") or entry.get("url") or entry.get("base_url") or ""
+                if base_url and not isinstance(base_url, str):
+                    # A malformed entry (e.g. a YAML list under base_url/api)
+                    # must not crash every auxiliary resolve with
+                    # ``'list' object has no attribute 'strip'`` (#96512) —
+                    # treat it as unmatched, mirroring the legacy
+                    # ``custom_providers`` scan's isinstance guard below.
+                    logger.warning(
+                        "providers.%s: base_url/api/url must be a string, got %s "
+                        "— entry ignored during custom provider resolution",
+                        ep_name,
+                        type(base_url).__name__,
+                    )
+                    continue
                 if base_url:
                     result: Dict[str, Any] = {
                         "name": entry.get("name", ep_name),
