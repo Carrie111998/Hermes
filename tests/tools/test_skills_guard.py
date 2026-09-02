@@ -461,6 +461,35 @@ class TestFalsePositiveReductions:
         findings = scan_file(f, "lib.py")
         assert any(fi.pattern_id == "python_os_environ" for fi in findings)
 
+    def test_shell_rc_pattern_ignores_attribute_access(self, tmp_path):
+        # ``.profile`` is both a shell startup file and the way every language
+        # spells attribute access. Ordinary code produced one medium finding
+        # per line, burying the findings a reviewer needs to read.
+        code = tmp_path / "provider.py"
+        code.write_text(
+            "self.profile = load_plugin()\n"
+            "assert self.profile.name == 'x'\n"
+            "return user.profile\n"
+        )
+        assert not [
+            fi for fi in scan_file(code, "provider.py")
+            if fi.pattern_id == "shell_rc_mod"
+        ]
+
+        # Real references, in the forms they actually appear in, still flag.
+        sh = tmp_path / "setup.sh"
+        sh.write_text(
+            "echo 'export X=1' >> ~/.profile\n"
+            'cp "$HOME/.profile" /tmp/p\n'
+            "source ./.profile\n"
+            "cat ~/.zshrc ~/.bash_profile\n"
+        )
+        flagged = {
+            fi.line for fi in scan_file(sh, "setup.sh")
+            if fi.pattern_id == "shell_rc_mod"
+        }
+        assert flagged == {1, 2, 3, 4}
+
 
 # ---------------------------------------------------------------------------
 # .skillignore / .clawhubignore support

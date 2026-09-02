@@ -363,7 +363,16 @@ THREAT_PATTERNS = [
     (r'\bcrontab\b',
      "persistence_cron", "medium", "persistence",
      "modifies cron jobs"),
-    (r'\.(bashrc|zshrc|profile|bash_profile|bash_login|zprofile|zlogin)\b',
+    # ``profile`` is split out and anchored: the other names are distinctive
+    # enough that a bare ``.zshrc`` is always the file, but ``.profile`` is
+    # also how every language spells attribute access (``self.profile``,
+    # ``user.profile``), which flooded scans of ordinary code. Requiring a
+    # non-identifier character before the dot keeps real paths (``~/.profile``,
+    # ``"$HOME/.profile"``, ``./.profile``) and drops attribute reads.
+    (r'\.(bashrc|zshrc|bash_profile|bash_login|zprofile|zlogin)\b',
+     "shell_rc_mod", "medium", "persistence",
+     "references shell startup file"),
+    (r'(?<![A-Za-z0-9_])\.profile\b',
      "shell_rc_mod", "medium", "persistence",
      "references shell startup file"),
     (r'authorized_keys',
