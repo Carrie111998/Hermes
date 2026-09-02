@@ -5520,6 +5520,58 @@ class TestCredentialPoolRecovery:
         assert context["message"] == "Weekly credits exhausted."
         assert context["reset_at"] == "2026-04-12T10:30:00Z"
 
+    def test_extract_api_error_context_relative_ratelimit_reset_header(
+        self, agent, monkeypatch
+    ):
+        """x-ratelimit-reset carrying relative "seconds until reset" (the
+        convention of the x-ratelimit-reset-* family) must be converted to an
+        absolute timestamp. Stored raw, credential_pool's
+        _parse_absolute_timestamp would read "42" as epoch-1970+42s — a
+        cooldown already decades in the past — so the just-rate-limited
+        credential would be immediately re-selectable in a tight loop."""
+        from agent import agent_runtime_helpers
+
+        monkeypatch.setattr(agent_runtime_helpers.time, "time", lambda: 1_000.0)
+        error = SimpleNamespace(
+            body=None,
+            response=SimpleNamespace(headers={"x-ratelimit-reset": "42"}),
+        )
+
+        context = agent._extract_api_error_context(error)
+
+        assert context["reset_at"] == pytest.approx(1_042.0)
+
+    def test_extract_api_error_context_epoch_ratelimit_reset_header(self, agent):
+        """Plausible epoch values (seconds or milliseconds) must be kept
+        as-is — credential_pool._parse_absolute_timestamp handles both."""
+        error = SimpleNamespace(
+            body=None,
+            response=SimpleNamespace(
+                headers={"x-ratelimit-reset": "1767381900"}
+            ),
+        )
+
+        context = agent._extract_api_error_context(error)
+
+        assert context["reset_at"] == "1767381900"
+
+    def test_extract_api_error_context_retry_after_beats_ratelimit_reset(
+        self, agent, monkeypatch
+    ):
+        from agent import agent_runtime_helpers
+
+        monkeypatch.setattr(agent_runtime_helpers.time, "time", lambda: 1_000.0)
+        error = SimpleNamespace(
+            body=None,
+            response=SimpleNamespace(
+                headers={"retry-after": "30", "x-ratelimit-reset": "42"}
+            ),
+        )
+
+        context = agent._extract_api_error_context(error)
+
+        assert context["reset_at"] == pytest.approx(1_030.0)
+
     def test_extract_api_error_context_uses_type_as_reason(self, agent):
         error = SimpleNamespace(
             body={

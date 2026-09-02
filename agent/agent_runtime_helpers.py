@@ -5065,7 +5065,25 @@ def extract_api_error_context(error: Exception) -> Dict[str, Any]:
                 pass
         ratelimit_reset = headers.get("x-ratelimit-reset")
         if ratelimit_reset and "reset_at" not in context:
-            context["reset_at"] = ratelimit_reset
+            # Providers disagree on this header's unit: OpenRouter sends epoch
+            # milliseconds, GitHub-style APIs send epoch seconds, and many
+            # OpenAI-compat shims send relative "seconds until reset" (the
+            # convention of the x-ratelimit-reset-requests/-tokens family —
+            # see rate_limit_tracker.py). Plausible epochs pass through raw
+            # (credential_pool._parse_absolute_timestamp handles s vs ms);
+            # small numerics are relative deltas and must be offset from now,
+            # or the pool would read "42" as epoch-1970+42s — a cooldown
+            # already expired, nullifying the credential's exhaustion window.
+            try:
+                _reset_numeric = float(ratelimit_reset)
+            except (TypeError, ValueError):
+                # Non-numeric (e.g. ISO-8601) — downstream parses it.
+                context["reset_at"] = ratelimit_reset
+            else:
+                if _reset_numeric >= 1_000_000_000:
+                    context["reset_at"] = ratelimit_reset
+                elif _reset_numeric >= 0:
+                    context["reset_at"] = time.time() + _reset_numeric
 
     if "message" not in context:
         raw_message = str(error).strip()
