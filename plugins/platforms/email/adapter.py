@@ -171,6 +171,25 @@ def _close_imap(imap: "imaplib.IMAP4") -> None:
             pass
 
 
+def _select_inbox(imap: "imaplib.IMAP4") -> None:
+    """Select INBOX or preserve the server's primary failure response.
+
+    ``imaplib`` does not raise when a server answers ``NO`` to ``SELECT``.
+    Continuing in the AUTH state makes the following UID SEARCH fail with a
+    misleading secondary error, so fail before issuing selected-state commands.
+    """
+    status, data = imap.select("INBOX")
+    if status == "OK":
+        return
+
+    detail: Any = data[0] if data else ""
+    if isinstance(detail, bytes):
+        detail = detail.decode("utf-8", errors="replace")
+    detail = str(detail).strip()
+    suffix = f": {detail}" if detail else ""
+    raise imaplib.IMAP4.error(f"SELECT INBOX failed ({status}){suffix}")
+
+
 def _create_ipv4_connection(
     host: str,
     port: int,
@@ -787,7 +806,7 @@ class EmailAdapter(BasePlatformAdapter):
                 imap = self._connect_imap()
                 imap.login(self._address, self._password)
                 _send_imap_id(imap)
-                imap.select("INBOX")
+                _select_inbox(imap)
                 snapshot = self._seen_uids_snapshot.get(self._address)
                 if is_reconnect and snapshot is not None:
                     # Reconnect within the same process: restore the previous
@@ -932,7 +951,7 @@ class EmailAdapter(BasePlatformAdapter):
             try:
                 imap.login(self._address, self._password)
                 _send_imap_id(imap)
-                imap.select("INBOX")
+                _select_inbox(imap)
 
                 status, data = imap.uid("search", None, "UNSEEN")
                 if status != "OK" or not data or not data[0]:
