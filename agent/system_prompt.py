@@ -1081,8 +1081,9 @@ def invalidate_system_prompt(agent: Any) -> None:
     if hasattr(agent, _snapshot_attr):
         agent._plugin_system_prompt_sections_previous = getattr(agent, _snapshot_attr)
         delattr(agent, _snapshot_attr)
-    if agent._memory_store:
-        agent._memory_store.load_from_disk()
+    memory_store = getattr(agent, "_memory_store", None)
+    if memory_store:
+        memory_store.load_from_disk()
 
 
 def reconstruct_static_prefix(
