@@ -66,6 +66,13 @@ const RELAY_DELIVER_TIMEOUT_MS = RELAY_DELIVER_BACKEND_CEILING_MS + RELAY_DELIVE
 // to ONE drain. The interval poll above stays as the backstop for older
 // backends (and connections whose events don't reach the tap).
 const RELAY_PUSH_DEBOUNCE_MS = 250
+// A registry route can disappear for a few seconds while its SSH tunnel or
+// gateway is restarting. The envelope is already durably claimed by the relay
+// at that point, so classifying one stale route snapshot as a permanent
+// delivery failure loses an otherwise healthy message. Re-read the registry
+// for one bounded gateway-start window before posting a terminal reply.
+const RELAY_ROUTE_RECONNECT_GRACE_MS = 30_000
+const RELAY_ROUTE_RECONNECT_POLL_MS = 500
 
 /** Everything the two loops mutate. */
 interface RelayLifecycle {
@@ -107,6 +114,7 @@ const relayRouteRetentions = new Map<string, () => void>()
  *  label fields are read defensively in relayAgentsOn and never arrive. */
 interface RelayConnection {
   id: string
+  recoveryRelease?: () => void
   route: ProfileRoute & { connectionLabel?: string; label?: string }
 }
 
@@ -197,6 +205,141 @@ async function relayConnections(): Promise<RelayConnection[]> {
     }))
   } catch {
     return []
+  }
+}
+
+/** Re-acquire one route after a transient registry/tunnel restart.
+ *
+ * The caller has already claimed the envelope, so this waits in place and
+ * never re-enqueues or duplicates it. A genuinely removed connection still
+ * receives the existing terminal error after the bounded grace window. */
+async function waitForRelayConnection(
+  connectionId: string,
+  profile: string
+): Promise<RelayConnection | undefined> {
+  const deadline = Date.now() + RELAY_ROUTE_RECONNECT_GRACE_MS
+
+  // profileRoutes is an inventory read; it does not itself re-open a dropped
+  // SSH/backend socket. Ask the existing non-foregrounding warm path to dial
+  // the target, then poll only for its credential-free route to reappear.
+  if (typeof host.warmAgent === 'function') {
+    try {
+      await host.warmAgent(connectionId, profile)
+    } catch {
+      // A failed pre-dial can still race with the Desktop's own reconnect.
+      // Keep the bounded inventory loop below as the final authority.
+    }
+  }
+
+  // A remembered SSH roster can momentarily suppress its undialed seed route
+  // even though the connection still exists in the authoritative registry.
+  // Build the same credential-free descriptor Electron would return so the
+  // request path itself can complete the lazy dial. Registry membership is
+  // re-read first; arbitrary/stale ids are never synthesized.
+  if (typeof host.connections === 'function') {
+    try {
+      const registered = await host.connections()
+
+      const source = (Array.isArray(registered) ? registered : []).find(
+        connection => String(connection?.id || '') === connectionId
+      )
+
+      if (source) {
+        const kind = String(source.kind || '')
+
+        const targetProfile =
+          kind === 'ssh' && typeof source.remoteProfile === 'string' && source.remoteProfile.trim()
+            ? source.remoteProfile.trim()
+            : profile
+
+        const recovered: RelayConnection = {
+          id: connectionId,
+          route: {
+            connectionId,
+            mode: kind === 'local' ? 'local' : 'remote',
+            profile,
+            targetProfile
+          }
+        }
+
+        // `warmAgent` can lose a race with a gateway restart. The SDK's
+        // retained-profile door both dials and waits for readiness without
+        // foregrounding the connection. Keep its temporary lease until the
+        // standing relay retention below takes ownership of the socket.
+        if (typeof host.retainProfile !== 'function') {
+          return recovered
+        }
+
+        while (!relay.disposed && Date.now() < deadline) {
+          try {
+            recovered.recoveryRelease = await host.retainProfile(recovered.route)
+
+            return recovered
+          } catch {
+            await new Promise<void>(resolve => setTimeout(resolve, RELAY_ROUTE_RECONNECT_POLL_MS))
+          }
+        }
+      }
+    } catch {
+      // Fall through to bounded route inventory polling.
+    }
+  }
+
+  while (!relay.disposed && Date.now() < deadline) {
+    await new Promise<void>(resolve => setTimeout(resolve, RELAY_ROUTE_RECONNECT_POLL_MS))
+
+    const match = (await relayConnections()).find(connection => connection.id === connectionId)
+
+    if (match) {
+      return match
+    }
+  }
+
+  return undefined
+}
+
+/** Rebuild the relay mesh after a cold Desktop launch.
+ *
+ * The registry persists every gateway, but profileRoutes only includes routes
+ * whose backend has been opened in this renderer lifetime. Without this boot
+ * step a relaunch silently shrinks the roster to the active connection until
+ * the user visits every gateway by hand. Warm each registered source without
+ * foregrounding it, wait for the credential-free routes, then resync. */
+async function bootstrapRelayConnections() {
+  if (typeof host.connections !== 'function' || typeof host.warmAgent !== 'function') {
+    return
+  }
+
+  try {
+    const registered = await host.connections()
+
+    const ids = new Set(
+      (Array.isArray(registered) ? registered : [])
+        .map(connection => String(connection?.id || ''))
+        .filter(Boolean)
+    )
+
+    for (const id of ids) {
+      host.warmAgent(id, 'default')
+    }
+
+    const deadline = Date.now() + RELAY_ROUTE_RECONNECT_GRACE_MS
+
+    while (!relay.disposed && Date.now() < deadline) {
+      const live = new Set((await relayConnections()).map(connection => connection.id))
+
+      if ([...ids].every(id => live.has(id))) {
+        break
+      }
+
+      await new Promise<void>(resolve => setTimeout(resolve, RELAY_ROUTE_RECONNECT_POLL_MS))
+    }
+
+    if (!relay.disposed) {
+      await syncRelayRosters()
+    }
+  } catch {
+    // Older/in-flight registries fall back to the standing roster/drain loops.
   }
 }
 
@@ -363,7 +506,8 @@ async function drainRelayOutboxes() {
         }
 
         const envelopeId = String(envelope?.id || '')
-        const target = byId.get(String(envelope?.target_connection || ''))
+        const targetConnectionId = String(envelope?.target_connection || '')
+        let target = byId.get(targetConnectionId)
 
         const postReply = async (payload: { error?: string; reason?: string; reply?: string }) => {
           try {
@@ -381,11 +525,27 @@ async function drainRelayOutboxes() {
         }
 
         if (!target) {
+          target = await waitForRelayConnection(
+            targetConnectionId,
+            String(envelope?.target_profile || 'default')
+          )
+        }
+
+        if (!target) {
           await postReply({
             error: `connection '${envelope?.target_connection}' is not connected to this Desktop right now`
           })
 
           continue
+        }
+
+        // The route returned after this drain's original retention snapshot.
+        // Pin it now so delivery and the next loop reuse the recovered socket.
+        if (!byId.has(target.id)) {
+          byId.set(target.id, target)
+          syncRelayRetention([...connections, target])
+          target.recoveryRelease?.()
+          delete target.recoveryRelease
         }
 
         // Needs-attention hook (#93091 item 3): a delivered background DM is
@@ -467,6 +627,7 @@ export function startBotRelay() {
   if (relay.rosterTimer === null) {
     relay.rosterTimer = setInterval(() => void syncRelayRosters(), RELAY_ROSTER_INTERVAL_MS)
     void syncRelayRosters()
+    void bootstrapRelayConnections()
   }
 
   if (relay.drainTimer === null) {

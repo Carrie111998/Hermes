@@ -29,10 +29,13 @@ import type { ProfileRoute } from './types'
 const { clearBotAttentionMock, hostMock, noteBotAttentionMock, UnboundedCache } = vi.hoisted(() => ({
   clearBotAttentionMock: vi.fn(),
   hostMock: {
+    connections: vi.fn(),
     onEvent: vi.fn(),
     profileRoutes: vi.fn(),
     requestProfile: vi.fn(),
-    retainProfileSocket: vi.fn()
+    retainProfile: vi.fn(),
+    retainProfileSocket: vi.fn(),
+    warmAgent: vi.fn()
   } as Record<string, unknown>,
   noteBotAttentionMock: vi.fn(),
   // Stand-in for the SDK's LruCache. Its ceiling has its own unit test and no
@@ -54,6 +57,7 @@ vi.mock('./data', () => ({
 
 const RELAY_PUSH_DEBOUNCE_MS = 250
 const RELAY_DRAIN_INTERVAL_MS = 30_000
+const RELAY_ROUTE_RECONNECT_GRACE_MS = 30_000
 
 const route = (id: string): ProfileRoute => ({
   connectionId: id,
@@ -129,9 +133,12 @@ beforeEach(() => {
   vi.useFakeTimers()
   vi.clearAllMocks()
   hostMock.onEvent = vi.fn(() => vi.fn())
+  hostMock.connections = vi.fn(async () => [])
   hostMock.profileRoutes = vi.fn(async () => [route('a'), route('b')])
   hostMock.requestProfile = vi.fn(async () => ({}))
+  hostMock.retainProfile = vi.fn(async () => vi.fn())
   hostMock.retainProfileSocket = vi.fn(() => vi.fn())
+  hostMock.warmAgent = vi.fn()
 })
 
 afterEach(() => {
@@ -139,6 +146,24 @@ afterEach(() => {
 })
 
 describe('push-notified drain (#93091)', () => {
+  it('warms every registered gateway after a cold renderer launch', async () => {
+    hostMock.connections = vi.fn(async () => [{ id: 'a' }, { id: 'b' }, { id: 'c' }])
+    hostMock.profileRoutes = vi.fn(async () => [route('a'), route('b'), route('c')])
+    respondWith(() => ({ envelopes: [] }))
+
+    const { startBotRelay, stopBotRelay } = await loadRelay()
+
+    startBotRelay()
+    await vi.advanceTimersByTimeAsync(1000)
+
+    expect(hostMock.warmAgent).toHaveBeenCalledTimes(3)
+    expect(hostMock.warmAgent).toHaveBeenCalledWith('a', 'default')
+    expect(hostMock.warmAgent).toHaveBeenCalledWith('b', 'default')
+    expect(hostMock.warmAgent).toHaveBeenCalledWith('c', 'default')
+
+    stopBotRelay()
+  })
+
   it('collapses a burst of pending signals into ONE drain', async () => {
     const calls = respondWith(() => ({ envelopes: [] }))
     const { startBotRelay, stopBotRelay } = await loadRelay()
@@ -522,11 +547,133 @@ describe('the drain loop wires drain → deliver → reply', () => {
 
     startBotRelay()
     await pushAndSettle()
+    await vi.advanceTimersByTimeAsync(RELAY_ROUTE_RECONNECT_GRACE_MS + 1000)
 
     expect(calls.some(call => call.method === 'bot_relay.deliver')).toBe(false)
     expect(calls.find(call => call.method === 'bot_relay.reply')?.params.error).toMatch(
       /'ghost' is not connected to this Desktop right now/
     )
+
+    stopBotRelay()
+  })
+
+  it('re-acquires a target route that reconnects after the envelope was claimed', async () => {
+    const calls = respondWith(call => {
+      if (call.method === 'bot_relay.outbox.drain') {
+        return { envelopes: call.connectionId === 'a' ? [envelope] : [] }
+      }
+
+      if (call.method === 'bot_relay.deliver') {
+        return { reply: 'reconnected' }
+      }
+
+      return {}
+    })
+
+    const { startBotRelay, stopBotRelay } = await loadRelay()
+
+    startBotRelay()
+    await vi.advanceTimersByTimeAsync(0)
+    calls.length = 0
+
+    // The drain sees only the sender. The first bounded re-read sees the
+    // target return and must deliver the already-claimed envelope exactly once.
+    hostMock.profileRoutes = vi
+      .fn()
+      .mockResolvedValueOnce([route('a'), route('c')])
+      .mockResolvedValue([route('a'), route('b'), route('c')])
+
+    await pushAndSettle()
+    await vi.advanceTimersByTimeAsync(1000)
+
+    expect(hostMock.warmAgent).toHaveBeenCalledWith('b', 'ops')
+    expect(calls.filter(call => call.method === 'bot_relay.deliver')).toEqual([
+      expect.objectContaining({ connectionId: 'b', params: { message: 'status?', profile: 'ops' } })
+    ])
+    expect(calls.find(call => call.method === 'bot_relay.reply')?.params).toMatchObject({
+      id: 'env-1',
+      reply: 'reconnected'
+    })
+
+    stopBotRelay()
+  })
+
+  it('synthesizes a credential-free route for a registered SSH target whose seed is absent', async () => {
+    hostMock.connections = vi.fn(async () => [{ id: 'a', kind: 'local' }, { id: 'b', kind: 'ssh' }])
+    hostMock.profileRoutes = vi.fn(async () => [route('a'), route('c')])
+
+    const calls = respondWith(call => {
+      if (call.method === 'bot_relay.outbox.drain') {
+        return { envelopes: call.connectionId === 'a' ? [envelope] : [] }
+      }
+
+      if (call.method === 'bot_relay.deliver') {
+        return { reply: 'lazy dial complete' }
+      }
+
+      return {}
+    })
+
+    const { startBotRelay, stopBotRelay } = await loadRelay()
+
+    startBotRelay()
+    await vi.advanceTimersByTimeAsync(0)
+    calls.length = 0
+    await pushAndSettle()
+
+    expect(hostMock.warmAgent).toHaveBeenCalledWith('b', 'ops')
+    expect(calls.find(call => call.method === 'bot_relay.deliver')).toMatchObject({
+      connectionId: 'b',
+      params: { message: 'status?', profile: 'ops' }
+    })
+    expect(calls.find(call => call.method === 'bot_relay.reply')?.params).toMatchObject({
+      id: 'env-1',
+      reply: 'lazy dial complete'
+    })
+
+    stopBotRelay()
+  })
+
+  it('waits for the registered target warm dial before using its synthesized route', async () => {
+    let finishWarm!: () => void
+
+    const warmPending = new Promise<void>(resolve => {
+      finishWarm = resolve
+    })
+
+    hostMock.connections = vi.fn(async () => [{ id: 'a', kind: 'local' }, { id: 'b', kind: 'ssh' }])
+    hostMock.profileRoutes = vi.fn(async () => [route('a'), route('c')])
+    hostMock.warmAgent = vi.fn(() => warmPending)
+
+    const calls = respondWith(call => {
+      if (call.method === 'bot_relay.outbox.drain') {
+        return { envelopes: call.connectionId === 'a' ? [envelope] : [] }
+      }
+
+      if (call.method === 'bot_relay.deliver') {
+        return { reply: 'dial was ready' }
+      }
+
+      return {}
+    })
+
+    const { startBotRelay, stopBotRelay } = await loadRelay()
+
+    startBotRelay()
+    await vi.advanceTimersByTimeAsync(0)
+    calls.length = 0
+    const drain = pushAndSettle()
+    await vi.advanceTimersByTimeAsync(100)
+
+    expect(calls.some(call => call.method === 'bot_relay.deliver')).toBe(false)
+
+    finishWarm()
+    await drain
+
+    expect(calls.find(call => call.method === 'bot_relay.deliver')).toMatchObject({
+      connectionId: 'b',
+      params: { message: 'status?', profile: 'ops' }
+    })
 
     stopBotRelay()
   })

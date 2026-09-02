@@ -495,44 +495,55 @@ def waiter_command(root: Path | str, envelope: dict) -> str:
         f"@{envelope.get('target_handle', '')} "
         f"on {envelope.get('target_connection', '')}"
     )
-    # Encode label with !r so roster fields cannot break out of the generated
-    # python -c source (quotes, parens, or extra statements in connection_id).
-    # The raw-string prefix keeps Windows paths viable: repr escapes each
-    # backslash ("C:\\Users\\..."), but the Windows execution layer the
-    # waiter runs under folds "\\" back to "\", which turns "\U" into an
-    # invalid unicode escape and SyntaxErrors the whole script (#93590).
-    # With the r prefix the folded single backslash parses as a literal.
-    # POSIX paths contain no backslashes, so the prefix is a no-op there,
-    # and \' inside a raw literal still cannot terminate the string, so
-    # the injection defense above is unchanged.
-    code = (
-        "import json,os,sys,time\n"
-        f"p = r{reply_path!r}\n"
-        f"label = r{label!r}\n"
-        f"deadline = time.time() + {REPLY_WAIT_SECONDS}\n"
-        "while time.time() < deadline:\n"
-        "    if os.path.exists(p):\n"
-        "        d = json.load(open(p, encoding='utf-8'))\n"
-        "        if d.get('error'):\n"
-        # The typed reason code (#93091) rides ahead of the free text so the
-        # sending agent can branch on it (auth vs rate limit vs offline)
-        # without parsing provider prose.
-        "            code = str(d.get('reason') or '').strip()\n"
-        "            tag = ' [reason: ' + code + ']' if code else ''\n"
-        "            print('Delivery to ' + label + ' failed' + tag + ': ' + d['error'])\n"
-        "            sys.exit(1)\n"
-        "        print('Reply from ' + label + ':')\n"
-        "        print(d.get('reply') or '(empty reply)')\n"
-        "        sys.exit(0)\n"
-        # 250ms cadence: the reply file is written once by the target
-        # gateway's deliver path; a 2s sleep here added up to 2s of dead
-        # air to every cross-machine reply for no benefit (stat is cheap).
-        "    time.sleep(0.25)\n"
-        f"print('No reply from ' + label + ' within {REPLY_WAIT_SECONDS}s. The message may "
-        "still be delivered when the Desktop reconnects; do not resend blindly.')\n"
-        "sys.exit(1)\n"
+    # Use this module's fixed entrypoint instead of generated ``python -c``.
+    # The unattended dangerous-command gate correctly rejects arbitrary
+    # inline Python, which previously left an already-queued envelope without
+    # a reply watcher and made the sender misreport the delivery as failed.
+    return shlex.join(
+        [
+            sys.executable or "python3",
+            "-m",
+            "tools.bot_relay",
+            "wait",
+            reply_path,
+            label,
+            str(REPLY_WAIT_SECONDS),
+        ]
     )
-    return f"{shlex.quote(sys.executable or 'python3')} -c {shlex.quote(code)}"
+
+
+def wait_for_reply(reply_path: Path | str, label: str, timeout_seconds: float) -> int:
+    """Print one relay reply for the process-completion notification path."""
+    path = Path(reply_path)
+    timeout = max(0.0, float(timeout_seconds))
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if path.exists():
+            data = json.loads(path.read_text(encoding="utf-8"))
+            if data.get("error"):
+                reason = str(data.get("reason") or "").strip()
+                tag = f" [reason: {reason}]" if reason else ""
+                print(f"Delivery to {label} failed{tag}: {data['error']}")
+                return 1
+            print(f"Reply from {label}:")
+            print(data.get("reply") or "(empty reply)")
+            return 0
+        time.sleep(0.25)
+    print(
+        f"No reply from {label} within {timeout:g}s. The message may still be "
+        "delivered when the Desktop reconnects; do not resend blindly."
+    )
+    return 1
+
+
+def _main(argv: list[str]) -> int:
+    if len(argv) != 5 or argv[1] != "wait":
+        return 2
+    try:
+        timeout = float(argv[4])
+    except ValueError:
+        return 2
+    return wait_for_reply(argv[2], argv[3], timeout)
 
 
 # ── delivery command (used by the deliver RPC on the TARGET gateway) ────────
@@ -677,3 +688,7 @@ def acquire_turn_lock(
                 pass
     finally:
         os.close(fd)
+
+
+if __name__ == "__main__":
+    raise SystemExit(_main(sys.argv))
