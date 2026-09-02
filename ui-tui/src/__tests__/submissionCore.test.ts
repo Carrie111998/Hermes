@@ -162,33 +162,31 @@ describe('submissionCore.submitDelegatedPrompt', () => {
     patchUiState({ sid: 'sess-1' })
   })
 
-  it.each([
-    '!rm -rf /',
-    '/quit',
-    'inspect ${HOME}/secrets',
-    'search weather\nthen summarize'
-  ])('submits provider text literally to the owning session: %s', async text => {
-    const { gw } = makeDeferredGateway()
-    const appendMessage = vi.fn()
+  it.each(['!rm -rf /', '/quit', 'inspect ${HOME}/secrets', 'search weather\nthen summarize'])(
+    'submits provider text literally to the owning session: %s',
+    async text => {
+      const { gw } = makeDeferredGateway()
+      const appendMessage = vi.fn()
 
-    await submitDelegatedPrompt(text, 'sess-1', { appendMessage, gw })
+      await submitDelegatedPrompt(text, 'sess-1', { appendMessage, gw })
 
-    expect(gw.request).toHaveBeenCalledTimes(1)
-    expect(gw.request).toHaveBeenCalledWith('prompt.submit', {
-      session_id: 'sess-1',
-      text
-    })
-    expect(appendMessage).toHaveBeenCalledWith({ role: 'user', text })
-    expect(getUiState().busy).toBe(true)
-  })
+      expect(gw.request).toHaveBeenCalledTimes(1)
+      expect(gw.request).toHaveBeenCalledWith('prompt.submit', {
+        session_id: 'sess-1',
+        text
+      })
+      expect(appendMessage).toHaveBeenCalledWith({ role: 'user', text })
+      expect(getUiState().busy).toBe(true)
+    }
+  )
 
   it('rejects delegation while the session is already busy', async () => {
     const { gw } = makeDeferredGateway()
     patchUiState({ busy: true })
 
-    await expect(
-      submitDelegatedPrompt('/quit', 'sess-1', { appendMessage: vi.fn(), gw })
-    ).rejects.toThrow('already running')
+    await expect(submitDelegatedPrompt('/quit', 'sess-1', { appendMessage: vi.fn(), gw })).rejects.toThrow(
+      'already running'
+    )
     expect(gw.request).not.toHaveBeenCalled()
   })
 
