@@ -616,6 +616,23 @@ class EmailAdapter(BasePlatformAdapter):
         #       skip_attachments: true
         self._skip_attachments = extra.get("skip_attachments", False)
 
+        # Read-only / no-auto-reply mode — configured via config.yaml:
+        #   platforms:
+        #     email:
+        #       read_only: true
+        # or the EMAIL_READ_ONLY=true env mirror (parity with the other EMAIL_*
+        # vars). When enabled the adapter still polls IMAP and dispatches
+        # incoming mail normally, but every outgoing send is suppressed (no SMTP)
+        # so a mailbox can be used purely as a read feed without ever replying to
+        # the sender (#99876). Suppressed sends return success so the gateway's
+        # delivery ledger treats them as delivered rather than retrying — the
+        # failure loop that disabling the SMTP credential would cause. Default
+        # OFF (behaviour unchanged unless explicitly enabled).
+        if "read_only" in extra:
+            self._read_only = bool(extra["read_only"])
+        else:
+            self._read_only = _esecret_bool("EMAIL_READ_ONLY", False)
+
         # Require the sender's From: domain to be authenticated (SPF/DKIM/DMARC)
         # before trusting it for authorization. The From: header is
         # attacker-controlled and unauthenticated by IMAP, so an allowlist keyed
@@ -1202,6 +1219,20 @@ class EmailAdapter(BasePlatformAdapter):
         logger.info("[Email] New message from %s: %s", sender_addr, subject)
         await self.handle_message(event)
 
+    def _read_only_suppress(self, target: str, kind: str = "message") -> SendResult:
+        """Suppress an outgoing send in read-only mode (#99876).
+
+        Logs the drop and returns success so the gateway's delivery ledger
+        treats the reply as delivered rather than retrying it (the failure
+        loop a disabled SMTP credential would cause). Incoming IMAP delivery
+        is unaffected.
+        """
+        logger.info(
+            "[Email] read-only mode: suppressed outgoing %s to %s (no SMTP send)",
+            kind, target,
+        )
+        return SendResult(success=True, message_id="read-only-suppressed")
+
     async def send(
         self,
         chat_id: str,
@@ -1210,6 +1241,8 @@ class EmailAdapter(BasePlatformAdapter):
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
         """Send an email reply to the given address."""
+        if getattr(self, "_read_only", False):
+            return self._read_only_suppress(chat_id)
         try:
             loop = asyncio.get_running_loop()
             message_id = await loop.run_in_executor(
@@ -1307,6 +1340,9 @@ class EmailAdapter(BasePlatformAdapter):
         images). No hard cap — email clients handle dozens of
         attachments fine, subject to SMTP message size limits.
         """
+        if getattr(self, "_read_only", False):
+            self._read_only_suppress(chat_id, "image batch")
+            return
         if not images:
             return
 
@@ -1409,6 +1445,8 @@ class EmailAdapter(BasePlatformAdapter):
         **kwargs,
     ) -> SendResult:
         """Send a file as an email attachment."""
+        if getattr(self, "_read_only", False):
+            return self._read_only_suppress(chat_id, "document")
         try:
             loop = asyncio.get_running_loop()
             message_id = await loop.run_in_executor(
