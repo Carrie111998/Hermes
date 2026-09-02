@@ -31,12 +31,17 @@ from __future__ import annotations
 import json
 import logging
 import os
+from pathlib import Path
+
 from typing import Any, Optional
 
 from agent.redact import redact_sensitive_text
+from hermes_cli import kanban_publication
 from hermes_cli.goals import judge_goal
 from tools.registry import registry, tool_error
 from hermes_cli.config import cfg_get, load_config
+
+_publication_command = kanban_publication.command
 
 logger = logging.getLogger(__name__)
 
@@ -210,6 +215,42 @@ def _enforce_worker_task_ownership(tid: str) -> Optional[str]:
             f"tasks, or kanban_create to spawn follow-up work."
         )
     return None
+
+
+def _publication_gate(
+    task: Any,
+    metadata: Optional[dict],
+    *,
+    repo_path: Optional[str] = None,
+    branch: Optional[str] = None,
+    expected_base: Optional[str] = None,
+    pr_number: Optional[int] = None,
+) -> Optional[str]:
+    """Prove a Forge implementation was published before completion."""
+    if task is None:
+        return None
+    # The task row is authoritative. Publication proof is deliberately passed
+    # through explicit arguments; free-form metadata can never satisfy it or
+    # opt out of a persisted policy.
+    policy = getattr(task, "publication_required", None)
+    required = policy if policy is not None else True
+    if required is not True:
+        return None
+    if policy is None and getattr(task, "assignee", None) != "forge":
+        return None
+    if repo_path is None or branch is None or expected_base is None or pr_number is None:
+        return "publication proof rejected: missing explicit field(s)"
+    if not Path(str(repo_path)).expanduser().is_dir():
+        return "publication proof rejected: repo_path is not an existing directory"
+    try:
+        normalized_pr_number = int(pr_number)
+    except (TypeError, ValueError):
+        return "publication proof rejected: pr_number must be an integer"
+    return kanban_publication.verify(
+        repo_path=str(repo_path), branch=str(branch),
+        expected_base=str(expected_base), pr_number=normalized_pr_number,
+        command_runner=_publication_command,
+    )
 
 
 def _connect(board: Optional[str] = None):
@@ -555,6 +596,7 @@ def _handle_show(args: dict, **kw) -> str:
                     "current_run_id": t.current_run_id,
                     "model_override": t.model_override,
                     "provider_override": t.provider_override,
+                    "publication_required": t.publication_required,
                 }
 
             def _run_dict(r):
@@ -673,6 +715,10 @@ def _handle_complete(args: dict, **kw) -> str:
         return ownership_err
     summary = args.get("summary")
     metadata = args.get("metadata")
+    repo_path = args.get("repo_path")
+    branch = args.get("branch")
+    expected_base = args.get("expected_base")
+    pr_number = args.get("pr_number")
     result = args.get("result")
     if summary:
         summary = redact_sensitive_text(str(summary), force=True)
@@ -784,6 +830,10 @@ def _handle_complete(args: dict, **kw) -> str:
                     conn, tid,
                     result=result, summary=summary, metadata=metadata,
                     created_cards=created_cards,
+                    repo_path=repo_path,
+                    branch=branch,
+                    expected_base=expected_base,
+                    pr_number=pr_number,
                     expected_run_id=_worker_run_id(tid),
                 )
             except kb.ArtifactPreservationError as artifact_err:
@@ -1429,6 +1479,9 @@ def _handle_create(args: dict, **kw) -> str:
     if goal_bool_error:
         return tool_error(goal_bool_error)
     goal_max_turns = args.get("goal_max_turns")
+    publication_required = args.get("publication_required")
+    if publication_required is not None and not isinstance(publication_required, bool):
+        return tool_error("publication_required must be a boolean when provided")
     model_override = args.get("model")
     provider_override = args.get("provider")
     if provider_override and not model_override:
@@ -1481,6 +1534,7 @@ def _handle_create(args: dict, **kw) -> str:
                 initial_status=str(initial_status),
                 created_by=os.environ.get("HERMES_PROFILE") or "worker",
                 session_id=session_id,
+                publication_required=publication_required,
             )
             new_task = kb.get_task(conn, new_tid)
             subscribed = _maybe_auto_subscribe(conn, new_tid)
@@ -1491,6 +1545,7 @@ def _handle_create(args: dict, **kw) -> str:
                 workspace_path=new_task.workspace_path if new_task else None,
                 project_id=new_task.project_id if new_task else None,
                 subscribed=subscribed,
+                publication_required=new_task.publication_required if new_task else None,
             )
         finally:
             conn.close()
@@ -1817,13 +1872,21 @@ KANBAN_COMPLETE_SCHEMA = {
             },
             "metadata": {
                 "type": "object",
+                "additionalProperties": True,
                 "description": (
                     "Free-form dict of structured facts about this "
                     "attempt — {\"changed_files\": [...], \"tests_run\": 12, "
                     "\"findings\": [...]}. Surfaced to downstream "
-                    "workers alongside ``summary``."
+                    "workers alongside ``summary``. Publication proof must be "
+                    "provided through the explicit repo_path, branch, expected_base, "
+                    "and pr_number arguments. Use publication_required=false for "
+                    "explicitly authorized NO COMMIT/PUSH/PR work."
                 ),
             },
+            "repo_path": {"type": "string", "description": "Explicit repository root for publication proof."},
+            "branch": {"type": "string", "description": "Explicit checked-out branch for publication proof."},
+            "expected_base": {"type": "string", "description": "Explicit expected pull-request base branch."},
+            "pr_number": {"type": "integer", "description": "Explicit open GitHub pull-request number."},
             "result": {
                 "type": "string",
                 "description": (
@@ -2302,6 +2365,10 @@ KANBAN_CREATE_SCHEMA = {
                     "is blocked for review. Ignored unless goal_mode is "
                     "true. Defaults to the goal-engine default (20)."
                 ),
+            },
+            "publication_required": {
+                "type": "boolean",
+                "description": "Persisted publication policy; omitted defaults true for Forge and false otherwise.",
             },
             "model": {
                 "type": "string",

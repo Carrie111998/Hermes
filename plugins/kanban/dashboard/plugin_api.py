@@ -839,6 +839,10 @@ class UpdateTaskBody(BaseModel):
     # complete --summary ... --metadata ...``.
     summary: Optional[str] = None
     metadata: Optional[dict] = None
+    repo_path: Optional[str] = None
+    branch: Optional[str] = None
+    expected_base: Optional[str] = None
+    pr_number: Optional[int] = None
     # Per-task model/provider override (the board's model dropdown).
     # ``model_override=""`` clears both. ``clear_model_override=True`` is
     # the explicit clear signal — needed because Optional[str]=None means
@@ -898,12 +902,19 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
             s = payload.status
             ok = True
             if s == "done":
-                ok = kanban_db.complete_task(
-                    conn, task_id,
-                    result=payload.result,
-                    summary=payload.summary,
-                    metadata=payload.metadata,
-                )
+                try:
+                    ok = kanban_db.complete_task(
+                        conn, task_id,
+                        result=payload.result,
+                        summary=payload.summary,
+                        metadata=payload.metadata,
+                        repo_path=payload.repo_path,
+                        branch=payload.branch,
+                        expected_base=payload.expected_base,
+                        pr_number=payload.pr_number,
+                    )
+                except kanban_db.kanban_publication.PublicationProofError as exc:
+                    raise HTTPException(status_code=409, detail=str(exc))
             elif s == "blocked":
                 ok = kanban_db.block_task(conn, task_id, reason=payload.block_reason)
             elif s == "scheduled":
@@ -1304,6 +1315,10 @@ class BulkTaskBody(BaseModel):
     result: Optional[str] = None
     summary: Optional[str] = None
     metadata: Optional[dict] = None
+    repo_path: Optional[str] = None
+    branch: Optional[str] = None
+    expected_base: Optional[str] = None
+    pr_number: Optional[int] = None
     reclaim_first: bool = False
     # Bulk model/provider override — same semantics as UpdateTaskBody.
     model_override: Optional[str] = None
@@ -1347,6 +1362,10 @@ def bulk_update(payload: BulkTaskBody, board: Optional[str] = Query(None)):
                             result=payload.result,
                             summary=payload.summary,
                             metadata=payload.metadata,
+                            repo_path=payload.repo_path,
+                            branch=payload.branch,
+                            expected_base=payload.expected_base,
+                            pr_number=payload.pr_number,
                         )
                     elif s == "blocked":
                         ok = kanban_db.block_task(conn, tid)
@@ -1447,6 +1466,8 @@ def bulk_update(payload: BulkTaskBody, board: Optional[str] = Query(None)):
                             entry.update(ok=False, error="reasoning override refused")
                     except (ValueError, RuntimeError) as e:
                         entry.update(ok=False, error=str(e))
+            except kanban_db.kanban_publication.PublicationProofError as e:
+                entry.update(ok=False, error=str(e))
             except Exception as e:  # defensive — one bad id shouldn't kill the batch
                 entry.update(ok=False, error=str(e))
             results.append(entry)

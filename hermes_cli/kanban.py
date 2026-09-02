@@ -81,6 +81,7 @@ def _task_to_dict(t: kb.Task) -> dict[str, Any]:
         "session_id": t.session_id,
         "workflow_template_id": t.workflow_template_id,
         "current_step_key": t.current_step_key,
+        "publication_required": t.publication_required,
     }
 
 
@@ -384,6 +385,8 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_create.add_argument("--priority", type=int, default=0, help="Priority tiebreaker")
     p_create.add_argument("--triage", action="store_true",
                           help="Park in triage — a specifier will flesh out the spec and promote to todo")
+    p_create.add_argument("--publication-required", action=argparse.BooleanOptionalAction,
+                          default=None, help="Require Forge publication proof (default depends on assignee)")
     p_create.add_argument("--idempotency-key", default=None,
                           help="Dedup key. If a non-archived task with this key exists, "
                                "its id is returned instead of creating a duplicate.")
@@ -636,8 +639,11 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                             help="Structured handoff summary for downstream tasks. "
                                  "Falls back to --result if omitted.")
     p_complete.add_argument("--metadata", default=None,
-                            help='JSON dict of structured facts (e.g. \'{"changed_files": [...], '
-                                 '"tests_run": 12}\'). Stored on the closing run.')
+                            help="JSON dict of structured facts. Stored on the closing run.")
+    p_complete.add_argument("--repo-path", default=None)
+    p_complete.add_argument("--branch", default=None)
+    p_complete.add_argument("--expected-base", default=None)
+    p_complete.add_argument("--pr-number", type=int, default=None)
 
     p_edit = sub.add_parser(
         "edit",
@@ -1685,6 +1691,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
             provider_override=getattr(args, "provider_override", None),
             goal_mode=bool(getattr(args, "goal_mode", False)),
             goal_max_turns=getattr(args, "goal_max_turns", None),
+            publication_required=getattr(args, "publication_required", None),
             initial_status=getattr(args, "initial_status", "running"),
         )
         task = kb.get_task(conn, task_id)
@@ -2407,13 +2414,21 @@ def _cmd_complete(args: argparse.Namespace) -> int:
                 failed.append(tid)
                 continue
 
-            if not kb.complete_task(
-                conn, tid,
-                result=args.result,
-                summary=summary,
-                metadata=metadata,
-                expected_run_id=_worker_run_id_for(tid),
-            ):
+            try:
+                completed = kb.complete_task(
+                    conn, tid, result=args.result, summary=summary,
+                    metadata=metadata,
+                    repo_path=getattr(args, "repo_path", None),
+                    branch=getattr(args, "branch", None),
+                    expected_base=getattr(args, "expected_base", None),
+                    pr_number=getattr(args, "pr_number", None),
+                    expected_run_id=_worker_run_id_for(tid),
+                )
+            except kb.kanban_publication.PublicationProofError as exc:
+                print(f"cannot complete {tid}: {exc}", file=sys.stderr)
+                failed.append(tid)
+                continue
+            if not completed:
                 failed.append(tid)
                 print(f"cannot complete {tid} (unknown id or terminal state)", file=sys.stderr)
             else:
