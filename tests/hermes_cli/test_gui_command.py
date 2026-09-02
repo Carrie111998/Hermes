@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import io
 import subprocess
 import sys
 from pathlib import Path
@@ -80,10 +81,9 @@ def _make_packaged_executable(root: Path, monkeypatch) -> Path:
     branch, so faking the platform here only proved the test and the code
     agreed about a host neither was running on.
 
-    Note the Linux arm also lays down ``chrome-sandbox``. ``cmd_gui`` refuses to
-    launch without it (Electron's setuid sandbox helper), which the old
-    darwin-by-default fake concealed — on Linux the packaged tree genuinely has
-    to include it.
+    Note the Linux arm also lays down ``chrome-sandbox`` because packaged
+    Electron bundles it. ``cmd_gui`` only needs to configure it on hosts whose
+    policy blocks Chromium's normal user-namespace sandbox.
     """
     desktop_dir = root / "apps" / "desktop"
     if sys.platform == "darwin":
@@ -149,6 +149,7 @@ def test_gui_installs_packages_and_launches_desktop_app(tmp_path, monkeypatch):
          patch("hermes_cli.main._desktop_build_needed", return_value=True), \
          patch("hermes_cli.main._write_desktop_build_stamp"), \
          patch("hermes_cli.main._desktop_macos_relaunchable_fixup"), \
+         patch("hermes_cli.main._desktop_linux_needs_no_sandbox", return_value=False), \
          patch("hermes_cli.main._desktop_linux_sandbox_fixup", return_value=True), \
          patch("hermes_cli.main._register_linux_desktop_entry"), \
          patch("hermes_cli.main.subprocess.run", side_effect=_pack_into_staging(root)) as mock_run, \
@@ -214,6 +215,7 @@ def test_gui_install_env_prepends_managed_node_on_bare_path(tmp_path, monkeypatc
          patch("hermes_cli.main._desktop_build_needed", return_value=True), \
          patch("hermes_cli.main._write_desktop_build_stamp"), \
          patch("hermes_cli.main._desktop_macos_relaunchable_fixup"), \
+         patch("hermes_cli.main._desktop_linux_needs_no_sandbox", return_value=False), \
          patch("hermes_cli.main._desktop_linux_sandbox_fixup", return_value=True), \
          patch("hermes_cli.main.subprocess.run", return_value=launch_ok), \
          pytest.raises(SystemExit):
@@ -971,6 +973,49 @@ def test_relaunchable_fixup_legacy_adhoc_success_still_verifies_and_never_delete
 
 
 @pytest.mark.linux_only
+def test_desktop_linux_needs_no_sandbox_when_user_namespaces_are_disabled(monkeypatch):
+    """A disabled kernel user-namespace policy still requires the SUID helper."""
+    monkeypatch.setattr(cli_main.sys, "platform", "linux")
+    monkeypatch.setattr(cli_main.os, "geteuid", lambda: 1000)
+
+    def fake_open(path, *args, **kwargs):
+        if path == "/proc/sys/kernel/unprivileged_userns_clone":
+            return io.StringIO("0\n")
+        raise OSError(path)
+
+    monkeypatch.setattr("builtins.open", fake_open)
+
+    assert cli_main._desktop_linux_needs_no_sandbox() is True
+
+
+@pytest.mark.linux_only
+def test_desktop_linux_namespace_probe_matches_chromium_identity_mapping(monkeypatch):
+    """AppArmor probe requires Chromium's identity map and second user namespace."""
+    monkeypatch.setattr(cli_main.sys, "platform", "linux")
+    monkeypatch.setattr(cli_main.os, "geteuid", lambda: 1000)
+
+    def fake_open(path, *args, **kwargs):
+        if path == "/proc/sys/kernel/apparmor_restrict_unprivileged_userns":
+            return io.StringIO("1\n")
+        raise OSError(path)
+
+    monkeypatch.setattr("builtins.open", fake_open)
+    monkeypatch.setattr(cli_main.shutil, "which", lambda name: "/usr/bin/unshare" if name == "unshare" else None)
+    with patch("hermes_cli.main.subprocess.run", return_value=subprocess.CompletedProcess([], 0)) as run:
+        assert cli_main._desktop_linux_needs_no_sandbox() is False
+
+    assert run.call_args.args[0] == [
+        "/usr/bin/unshare",
+        "--user",
+        "--map-current-user",
+        "--",
+        "/usr/bin/unshare",
+        "--user",
+        "true",
+    ]
+
+
+@pytest.mark.linux_only
 def test_gui_registers_linux_desktop_entry_before_launch(tmp_path, monkeypatch):
     """`hermes desktop` gives the app a launcher presence on Linux."""
     root = _make_desktop_tree(tmp_path)
@@ -994,6 +1039,26 @@ def test_gui_registers_linux_desktop_entry_before_launch(tmp_path, monkeypatch):
         cli_main.cmd_gui(_ns())
 
     assert registered == [root]
+
+
+@pytest.mark.linux_only
+def test_gui_linux_namespace_sandbox_launch_skips_suid_fixup(tmp_path, monkeypatch):
+    """Hosts with user namespaces launch without a mutable SUID helper."""
+    root = _make_desktop_tree(tmp_path)
+    monkeypatch.setattr(cli_main, "PROJECT_ROOT", root)
+    packaged_exe = _make_packaged_executable(root, monkeypatch)
+    launch_ok = subprocess.CompletedProcess([str(packaged_exe)], 0)
+
+    with patch("hermes_cli.main._desktop_linux_needs_no_sandbox", return_value=False), \
+         patch("hermes_cli.main._desktop_linux_sandbox_fixup") as mock_fixup, \
+         patch("hermes_cli.linux_desktop_entry.install_desktop_entry", return_value=None), \
+         patch("hermes_cli.main.subprocess.run", return_value=launch_ok) as mock_run, \
+         pytest.raises(SystemExit) as exc:
+        cli_main.cmd_gui(_ns(skip_build=True))
+
+    assert exc.value.code == 0
+    mock_fixup.assert_not_called()
+    assert mock_run.call_args.args[0] == [str(packaged_exe)]
 
 
 @pytest.mark.linux_only
@@ -1106,6 +1171,7 @@ def test_gui_bridges_ozone_hint_to_launch_env(tmp_path, monkeypatch):
          patch("hermes_cli.main._desktop_build_needed", return_value=True), \
          patch("hermes_cli.main._write_desktop_build_stamp"), \
          patch("hermes_cli.main._desktop_macos_relaunchable_fixup"), \
+         patch("hermes_cli.main._desktop_linux_needs_no_sandbox", return_value=False), \
          patch("hermes_cli.main._desktop_linux_sandbox_fixup", return_value=True), \
          patch("hermes_cli.config.load_config", return_value=cfg), \
          patch("hermes_cli.linux_desktop_entry.install_desktop_entry", return_value=None), \
@@ -1122,6 +1188,7 @@ def test_gui_bridges_ozone_hint_to_launch_env(tmp_path, monkeypatch):
          patch("hermes_cli.main._desktop_build_needed", return_value=True), \
          patch("hermes_cli.main._write_desktop_build_stamp"), \
          patch("hermes_cli.main._desktop_macos_relaunchable_fixup"), \
+         patch("hermes_cli.main._desktop_linux_needs_no_sandbox", return_value=False), \
          patch("hermes_cli.main._desktop_linux_sandbox_fixup", return_value=True), \
          patch("hermes_cli.config.load_config", return_value=cfg), \
          patch("hermes_cli.linux_desktop_entry.install_desktop_entry", return_value=None), \
@@ -1203,6 +1270,7 @@ def test_gui_linux_packaged_launch_bridges_detected_password_store(tmp_path, mon
          patch("hermes_cli.main._desktop_build_needed", return_value=True), \
          patch("hermes_cli.main._write_desktop_build_stamp"), \
          patch("hermes_cli.main._desktop_macos_relaunchable_fixup"), \
+         patch("hermes_cli.main._desktop_linux_needs_no_sandbox", return_value=False), \
          patch("hermes_cli.main._desktop_linux_sandbox_fixup", return_value=True), \
          patch("hermes_cli.config.load_config", return_value={}), \
          patch("hermes_cli.linux_desktop_entry.install_desktop_entry", return_value=None), \
@@ -1254,6 +1322,7 @@ def test_gui_config_password_store_skips_detection(tmp_path, monkeypatch):
          patch("hermes_cli.main._desktop_build_needed", return_value=True), \
          patch("hermes_cli.main._write_desktop_build_stamp"), \
          patch("hermes_cli.main._desktop_macos_relaunchable_fixup"), \
+         patch("hermes_cli.main._desktop_linux_needs_no_sandbox", return_value=False), \
          patch("hermes_cli.main._desktop_linux_sandbox_fixup", return_value=True), \
          patch("hermes_cli.config.load_config", return_value=cfg), \
          patch("hermes_cli.linux_desktop_entry.install_desktop_entry", return_value=None), \
@@ -1283,6 +1352,7 @@ def test_gui_explicit_password_store_env_wins_over_config_and_detection(tmp_path
          patch("hermes_cli.main._desktop_build_needed", return_value=True), \
          patch("hermes_cli.main._write_desktop_build_stamp"), \
          patch("hermes_cli.main._desktop_macos_relaunchable_fixup"), \
+         patch("hermes_cli.main._desktop_linux_needs_no_sandbox", return_value=False), \
          patch("hermes_cli.main._desktop_linux_sandbox_fixup", return_value=True), \
          patch("hermes_cli.config.load_config", return_value=cfg), \
          patch("hermes_cli.linux_desktop_entry.install_desktop_entry", return_value=None), \

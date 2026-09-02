@@ -8262,33 +8262,71 @@ def _force_adhoc_macos_signing(env: dict, *, source_mode: bool) -> bool:
 
 
 def _desktop_linux_needs_no_sandbox() -> bool:
-    """Return True when Chromium/Electron should bypass the Linux sandbox.
+    """Return True when host policy blocks Chromium's namespace sandbox.
 
-    Ubuntu 23.10+ can enable AppArmor's
-    ``apparmor_restrict_unprivileged_userns`` hardening, which breaks
-    Chromium/Electron's user-namespace sandbox for normal users unless the app
-    ships a working root-owned 4755 ``chrome-sandbox`` helper. In headless or
-    non-interactive CLI contexts we may be unable to ``sudo chown/chmod`` that
-    helper, so detect the host restriction and fall back to ``--no-sandbox``
-    rather than hard-failing the launcher.
+    Linux Chromium normally uses unprivileged user namespaces and does not need
+    a privileged ``chrome-sandbox`` helper. A disabled
+    ``unprivileged_userns_clone`` sysctl or zero user-namespace limit always
+    blocks that path. Ubuntu's AppArmor restriction is more nuanced: a profile
+    can explicitly grant an executable ``userns`` access, so on such hosts we
+    probe the same identity-map and second namespace sequence Chromium uses
+    before requesting the SUID helper.
 
     We intentionally do NOT return True for root users here: running Electron as
     root without a sandbox is a qualitatively riskier path than launching as an
-    unprivileged desktop user on an AppArmor-restricted host. The root case
-    should remain an explicit user choice.
+    unprivileged desktop user on a restricted host. The root case should remain
+    an explicit user choice.
     """
-    if os.environ.get("ELECTRON_DISABLE_SANDBOX", 0) == "1":
+    if os.environ.get("ELECTRON_DISABLE_SANDBOX", "0") == "1":
         return True
 
     if sys.platform != "linux":
         return False
     if hasattr(os, "geteuid") and os.geteuid() == 0:
         return False
-    try:
-        with open("/proc/sys/kernel/apparmor_restrict_unprivileged_userns", encoding="utf-8") as f:
-            return f.read().strip() == "1"
-    except OSError:
+
+    def read_proc(path: str) -> str | None:
+        try:
+            with open(path, encoding="utf-8") as f:
+                return f.read().strip()
+        except OSError:
+            return None
+
+    if read_proc("/proc/sys/kernel/unprivileged_userns_clone") == "0":
+        return True
+
+    namespace_limit = read_proc("/proc/sys/user/max_user_namespaces")
+    if namespace_limit is not None:
+        try:
+            if int(namespace_limit) <= 0:
+                return True
+        except ValueError:
+            return False
+
+    if read_proc("/proc/sys/kernel/apparmor_restrict_unprivileged_userns") != "1":
         return False
+
+    unshare = shutil.which("unshare")
+    if not unshare:
+        return True
+    try:
+        return subprocess.run(
+            [
+                unshare,
+                "--user",
+                "--map-current-user",
+                "--",
+                unshare,
+                "--user",
+                "true",
+            ],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=1,
+        ).returncode != 0
+    except (OSError, subprocess.TimeoutExpired):
+        return True
 
 
 def _desktop_linux_userns_sandbox_available() -> bool:
@@ -8817,8 +8855,12 @@ def cmd_gui(args: argparse.Namespace):
         sys.exit(1)
 
     launch_command = [str(packaged_executable)]
-    if not _desktop_linux_sandbox_fixup(packaged_executable):
-        if _desktop_linux_needs_no_sandbox() and _desktop_linux_sandbox_helper_is_regular_file(packaged_executable):
+    # Rebuilt packages live beneath the user's home, so chrome-sandbox cannot
+    # retain root:root 4755 ownership across ordinary self-updates. On hosts
+    # with a usable user-namespace sandbox this is expected and secure; only
+    # request the privileged helper when host policy blocks that normal path.
+    if _desktop_linux_needs_no_sandbox() and not _desktop_linux_sandbox_fixup(packaged_executable):
+        if _desktop_linux_sandbox_helper_is_regular_file(packaged_executable):
             print("⚠ Falling back to --no-sandbox because this Linux host restricts unprivileged user namespaces and the Electron sandbox helper could not be configured.")
             launch_command.append("--no-sandbox")
         else:
