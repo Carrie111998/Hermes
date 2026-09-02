@@ -63,6 +63,18 @@
       "capabilities": ["tools"],
       "api_version": 1,
       "added_at": "2026-08-12"
+    },
+    {
+      "name": "memobase",
+      "description": "Memobase memory provider — automatic per-turn recall backed by a self-hosted user-profile + event-timeline server.",
+      "author": "fred0m",
+      "tags": ["memory", "provider", "memobase", "recall"],
+      "repo": "fred0m/hermes-memobase-provider",
+      "ref": "3ae63360acb582528ad5f2367da09c42e89399af",
+      "homepage": "https://github.com/fred0m/hermes-memobase-provider",
+      "capabilities": ["tools"],
+      "api_version": 1,
+      "added_at": "2026-08-27"
     }
   ]
 }
