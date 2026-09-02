@@ -17,6 +17,7 @@ import tempfile
 import unittest
 import zipfile
 from unittest import mock
+from unittest.mock import patch
 
 from tools.read_extract import (
     ExtractionError,
@@ -512,6 +513,20 @@ class TestDocxExtraction(unittest.TestCase):
         text = extract_document_text(p)
         self.assertIn("Hello World", text)
         self.assertIn("Second", text)
+
+    def test_archive_member_budget_is_enforced(self):
+        p = os.path.join(self.tmp, "oversized.docx")
+        _write_docx(p, self._doc("<w:p><w:r><w:t>text</w:t></w:r></w:p>"))
+        with patch("tools.read_extract.MAX_ARCHIVE_MEMBER_BYTES", 8):
+            with self.assertRaisesRegex(ExtractionError, "member is too large"):
+                extract_document_text(p)
+
+    def test_archive_member_count_budget_is_enforced(self):
+        p = os.path.join(self.tmp, "many.docx")
+        _write_docx(p, self._doc("<w:p><w:r><w:t>text</w:t></w:r></w:p>"))
+        with patch("tools.read_extract.MAX_ARCHIVE_MEMBERS", 1):
+            with self.assertRaisesRegex(ExtractionError, "too many archive members"):
+                extract_document_text(p)
 
 
     def test_missing_document_xml_raises(self):

@@ -23,8 +23,9 @@ import tempfile
 import threading
 import time
 import zipfile
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Iterator, Optional
 from xml.etree import ElementTree as ET
 
 __all__ = [
@@ -50,6 +51,10 @@ MAX_XLSX_BYTES = 50 * 1024 * 1024
 # after conversion, so an unbounded input can pin a tool turn and spike RAM.
 MAX_ANYDOC_BYTES = 50 * 1024 * 1024
 MAX_DOCUMENT_BYTES = 50 * 1024 * 1024
+MAX_ARCHIVE_INPUT_BYTES = 32 * 1024 * 1024
+MAX_ARCHIVE_MEMBERS = 4096
+MAX_ARCHIVE_MEMBER_BYTES = 32 * 1024 * 1024
+MAX_ARCHIVE_TOTAL_BYTES = 128 * 1024 * 1024
 _MAX_XLSX_ROWS_PER_SHEET = 5000
 _MAX_XLSX_COLS = 256
 
@@ -674,12 +679,45 @@ def _zip_xml(zf: zipfile.ZipFile, name: str) -> ET.Element:
         raise ExtractionError(f"Malformed XML in {name}: {exc}") from exc
 
 
-def _extract_docx(path: str) -> str:
+@contextmanager
+def _bounded_zip(path: str, kind: str) -> Iterator[zipfile.ZipFile]:
+    """Open an OOXML archive after enforcing compressed and expanded budgets."""
+    try:
+        input_bytes = Path(path).stat().st_size
+    except OSError as exc:
+        raise ExtractionError(str(exc)) from exc
+    if input_bytes > MAX_ARCHIVE_INPUT_BYTES:
+        raise ExtractionError(
+            f"{kind} exceeds the {MAX_ARCHIVE_INPUT_BYTES}-byte input limit"
+        )
+
     try:
         with zipfile.ZipFile(path) as zf:
-            root = _zip_xml(zf, "word/document.xml")
+            members = zf.infolist()
+            if len(members) > MAX_ARCHIVE_MEMBERS:
+                raise ExtractionError(
+                    f"{kind} has too many archive members ({len(members)})"
+                )
+            total_bytes = 0
+            for member in members:
+                if member.file_size > MAX_ARCHIVE_MEMBER_BYTES:
+                    raise ExtractionError(
+                        f"{kind} archive member is too large: {member.filename}"
+                    )
+                total_bytes += member.file_size
+                if total_bytes > MAX_ARCHIVE_TOTAL_BYTES:
+                    raise ExtractionError(
+                        f"{kind} exceeds the {MAX_ARCHIVE_TOTAL_BYTES}-byte expanded limit"
+                    )
+            yield zf
     except zipfile.BadZipFile as exc:
-        raise ExtractionError(f"Not a valid DOCX: {exc}") from exc
+        raise ExtractionError(f"Not a valid {kind}: {exc}") from exc
+
+
+def _extract_docx(path: str) -> str:
+    try:
+        with _bounded_zip(path, "DOCX") as zf:
+            root = _zip_xml(zf, "word/document.xml")
     except OSError as exc:
         raise ExtractionError(str(exc)) from exc
 
@@ -702,7 +740,7 @@ def _extract_docx(path: str) -> str:
 
 def _extract_xlsx(path: str) -> str:
     try:
-        with zipfile.ZipFile(path) as zf:
+        with _bounded_zip(path, "XLSX") as zf:
             names = set(zf.namelist())
             shared = _shared_strings(zf, names)
             sheets = _workbook_sheets(zf)
@@ -723,8 +761,6 @@ def _extract_xlsx(path: str) -> str:
                 if not rows:
                     out.append("(empty)")
                 out.append("")
-    except zipfile.BadZipFile as exc:
-        raise ExtractionError(f"Not a valid XLSX: {exc}") from exc
     except OSError as exc:
         raise ExtractionError(str(exc)) from exc
 
