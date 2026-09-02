@@ -100,8 +100,8 @@ class TestLocalEnvironmentExecute:
 
     def test_cat_deterministic_content(self, env, tmp_path):
         f = tmp_path / "det.txt"
-        f.write_text(SIMPLE_CONTENT)
-        result = env.execute(f"cat {f}")
+        f.write_text(SIMPLE_CONTENT, newline="")
+        result = env.execute(f"cat {env._quote_shell_path(str(f))}")
         assert result["returncode"] == 0
         assert result["output"] == SIMPLE_CONTENT
         _assert_clean(result["output"])
@@ -227,8 +227,9 @@ class TestSearch:
 class TestExpandPath:
     def test_tilde_exact(self, ops):
         result = ops._expand_path("~/test.txt")
-        expected = f"{Path.home()}/test.txt"
-        assert result == expected
+        from tools.environments.local import _msys_to_windows_path
+
+        assert Path(_msys_to_windows_path(result)) == Path.home() / "test.txt"
         _assert_clean(result)
 
 
@@ -263,8 +264,8 @@ class TestTerminalOutputCleanliness:
 
     def test_cat(self, env, tmp_path):
         f = tmp_path / "cat_test.txt"
-        f.write_text("CAT_CONTENT_EXACT\n")
-        result = env.execute(f"cat {f}")
+        f.write_text("CAT_CONTENT_EXACT\n", newline="")
+        result = env.execute(f"cat {env._quote_shell_path(str(f))}")
         assert result["output"] == "CAT_CONTENT_EXACT\n"
         _assert_clean(result["output"])
 

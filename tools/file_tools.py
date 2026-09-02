@@ -49,7 +49,14 @@ def _expand_tilde(path: str) -> str:
     except Exception:
         home = None
     if home and (path == "~" or path.startswith("~/")):
-        return home if path == "~" else os.path.join(home, path[2:])
+        if path == "~":
+            return home
+        # A profile home can intentionally describe a POSIX filesystem even
+        # when the gateway itself runs on Windows (Docker/SSH/profile tests).
+        # Do not inject host separators into that foreign path namespace.
+        if home.startswith("/"):
+            return posixpath.join(home, path[2:])
+        return os.path.join(home, path[2:])
     return os.path.expanduser(path)
 
 
@@ -441,9 +448,15 @@ def _path_resolution_warning(filepath: str, resolved: Path, task_id: str = "defa
             resolved.relative_to(root)
             return None  # Inside the workspace — expected.
         except ValueError:
+            # ``repr`` doubles every Windows backslash, making the warning name
+            # a path that cannot be copied or searched.  Preserve the exact path
+            # spelling while still neutralising line-break injection.
+            shown_input = str(filepath).replace("\r", "\\r").replace("\n", "\\n")
+            shown_resolved = str(resolved).replace("\r", "\\r").replace("\n", "\\n")
+            shown_root = str(root).replace("\r", "\\r").replace("\n", "\\n")
             return (
-                f"Relative path {filepath!r} resolved to {str(resolved)!r}, which is "
-                f"OUTSIDE the active workspace ({str(root)!r}). The edit will land in "
+                f"Relative path `{shown_input}` resolved to `{shown_resolved}`, which is "
+                f"OUTSIDE the active workspace (`{shown_root}`). The edit will land in "
                 f"a different directory than the terminal's cwd. If this is not "
                 f"intended (e.g. a git-worktree session writing into the main "
                 f"checkout), pass an absolute path under the workspace instead."
@@ -527,11 +540,16 @@ def _rewrite_v4a_patch_paths_for_host(
 
 def _is_blocked_device_path(path: str) -> bool:
     """Return True for concrete device/fd paths that can hang reads."""
-    normalized = os.path.normpath(_expand_tilde(path))
-    if normalized in _BLOCKED_DEVICE_PATHS:
+    expanded = _expand_tilde(path)
+    normalized = os.path.normpath(expanded)
+    # Preserve POSIX semantics lexically even when the gateway runs on Windows
+    # and the target filesystem is a Docker/SSH environment.  ``ntpath`` turns
+    # ``/proc/x`` into ``\\proc\\x`` and previously disabled every guard below.
+    posix_normalized = posixpath.normpath(expanded.replace("\\", "/"))
+    if normalized in _BLOCKED_DEVICE_PATHS or posix_normalized in _BLOCKED_DEVICE_PATHS:
         return True
     # /proc/self/fd/0-2 and /proc/<pid>/fd/0-2 are Linux aliases for stdio
-    if normalized.startswith("/proc/") and normalized.endswith(
+    if posix_normalized.startswith("/proc/") and posix_normalized.endswith(
         ("/fd/0", "/fd/1", "/fd/2")
     ):
         return True
@@ -544,7 +562,7 @@ def _is_blocked_device_path(path: str) -> bool:
     # load addresses — an ASLR oracle on par with maps. /proc/*/pagemap exposes
     # virtual->physical translation. Both are blocked alongside the maps family.
     # endswith matches both /proc/<pid>/X and /proc/<pid>/task/<tid>/X.
-    if normalized.startswith("/proc/") and normalized.endswith(
+    if posix_normalized.startswith("/proc/") and posix_normalized.endswith(
         (
             "/environ",
             "/cmdline",
@@ -569,6 +587,8 @@ def _is_blocked_device(filepath: str, base_dir: str | Path | None = None) -> boo
     the final resolved path so aliases to devices cannot bypass the guard.
     """
     expanded = _expand_tilde(filepath)
+    if _is_blocked_device_path(expanded):
+        return True
     if base_dir is not None and not os.path.isabs(expanded):
         expanded = os.path.join(os.fspath(base_dir), expanded)
     normalized = os.path.normpath(expanded)
@@ -692,14 +712,23 @@ def _check_sensitive_path(filepath: str, task_id: str = "default") -> str | None
     except (OSError, ValueError):
         resolved = filepath
     normalized = os.path.normpath(_expand_tilde(filepath))
+    posix_normalized = posixpath.normpath(_expand_tilde(filepath).replace("\\", "/"))
     _err = (
         f"Refusing to write to sensitive system path: {filepath}\n"
         "Use the terminal tool with sudo if you need to modify system files."
     )
     for prefix in _SENSITIVE_PATH_PREFIXES:
-        if resolved.startswith(prefix) or normalized.startswith(prefix):
+        if (
+            resolved.startswith(prefix)
+            or normalized.startswith(prefix)
+            or posix_normalized.startswith(prefix)
+        ):
             return _err
-    if resolved in _SENSITIVE_EXACT_PATHS or normalized in _SENSITIVE_EXACT_PATHS:
+    if (
+        resolved in _SENSITIVE_EXACT_PATHS
+        or normalized in _SENSITIVE_EXACT_PATHS
+        or posix_normalized in _SENSITIVE_EXACT_PATHS
+    ):
         return _err
     # Prevent agents from modifying the Hermes config file directly.
     # approvals.mode and other security settings live here; a malicious or

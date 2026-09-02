@@ -255,16 +255,20 @@ def make_real_subprocess_env(cwd: str, include_stderr: bool = False) -> MagicMoc
     env.cwd = cwd
 
     def execute(command, **kwargs):
+        from tools.environments.local import _find_bash
+
         completed = subprocess.run(
-            command,
-            shell=True,
-            text=True,
+            [_find_bash(), "-c", command],
             capture_output=True,
-            input=kwargs.get("stdin_data"),
+            input=(
+                kwargs["stdin_data"].encode("utf-8")
+                if kwargs.get("stdin_data") is not None
+                else None
+            ),
         )
-        output = completed.stdout
+        output = completed.stdout.decode("utf-8", errors="replace")
         if include_stderr:
-            output += completed.stderr
+            output += completed.stderr.decode("utf-8", errors="replace")
         return {
             "output": output,
             "returncode": completed.returncode,
@@ -586,6 +590,7 @@ class _DeletedTestGitBaselineCheck:
 # Atomic write: umask-default permissions for new files
 # =========================================================================
 
+@pytest.mark.linux_only
 class TestAtomicWriteNewFilePermissions:
     """_atomic_write should apply umask-default perms to new files (not 0600)."""
 
