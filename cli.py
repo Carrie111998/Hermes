@@ -4792,10 +4792,20 @@ def _collect_query_images(query: str | None, image_arg: str | None = None) -> tu
     return message, deduped
 
 
-# Strip OSC escape sequences (e.g. OSC-8 hyperlinks) that prompt_toolkit's
-# ANSI parser can't handle — it strips \x1b but passes the payload through
-# as literal text, garbling the TUI output.
+# prompt_toolkit's ANSI parser cannot parse OSC commands directly. Preserve
+# OSC-8 hyperlinks as zero-width escapes (SOH/STX), which prompt_toolkit writes
+# through to the terminal without counting them toward the rendered width.
+# Unsupported OSC commands are still removed.
 _OSC_ESCAPE_RE = re.compile(r"\x1b\][\s\S]*?(?:\x07|\x1b\\)")
+
+
+def _preserve_osc8_hyperlinks(output: str) -> str:
+    """Keep OSC-8 links for the terminal while stripping unsupported OSC."""
+    def _replace(match: re.Match) -> str:
+        sequence = match.group(0)
+        return f"\x01{sequence}\x02" if sequence.startswith("\x1b]8;") else ""
+
+    return _OSC_ESCAPE_RE.sub(_replace, output)
 
 
 class ChatConsole:
@@ -4824,10 +4834,9 @@ class ChatConsole:
         self._inner.width = shutil.get_terminal_size((80, 24)).columns
         self._inner.print(*args, **kwargs)
         output = self._buffer.getvalue()
-        # Strip OSC escape sequences (e.g. OSC-8 hyperlinks) before
-        # routing through prompt_toolkit's ANSI parser, which only
-        # handles CSI/SGR and passes OSC payload through as literal text.
-        output = _OSC_ESCAPE_RE.sub("", output)
+        # Keep OSC-8 links as prompt_toolkit zero-width escapes so the
+        # terminal receives the URI; remove other unsupported OSC commands.
+        output = _preserve_osc8_hyperlinks(output)
         for line in output.rstrip("\n").split("\n"):
             _cprint(line)
 

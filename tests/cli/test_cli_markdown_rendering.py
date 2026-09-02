@@ -3,6 +3,7 @@ from io import StringIO
 from rich.console import Console
 from rich.markdown import Markdown
 
+import cli
 from cli import _render_final_assistant_content
 
 
@@ -34,6 +35,31 @@ def test_final_assistant_content_keeps_non_path_markdown_escapes():
 
 
 
+
+
+def test_chat_console_preserves_markdown_hyperlink_for_terminal(monkeypatch):
+    printed = []
+    monkeypatch.setattr(cli, "_cprint", printed.append)
+
+    cli.ChatConsole().print(
+        _render_final_assistant_content(
+            "[OWC Express 1M2 80G enclosure](https://example.com/owc)"
+        )
+    )
+
+    output = "\n".join(printed)
+    assert "OWC Express 1M2 80G enclosure" in output
+    assert "https://example.com/owc" in output
+    assert "\x01\x1b]8;" in output
+    assert "\x02" in output
+
+
+def test_non_hyperlink_osc_remains_stripped():
+    output = cli._preserve_osc8_hyperlinks(
+        "title\x1b]0;hidden title\x07 body"
+    )
+
+    assert output == "title body"
 
 
 def test_strip_mode_preserves_lists():
