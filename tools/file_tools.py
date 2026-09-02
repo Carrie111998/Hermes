@@ -1514,7 +1514,9 @@ def _get_file_ops(task_id: str = "default") -> ShellFileOperations:
             # bypass the guard.  Valid in-container override paths (RL/benchmark
             # sandboxes that set cwd to /workspace, /root, etc.) are absolute
             # non-host paths and pass through untouched.
-            if env_type in _CONTAINER_BACKENDS and _is_unusable_container_cwd(cwd):
+            from tools.terminal_tool import _is_container_backend as _is_container_backend
+
+            if _is_container_backend(env_type) and _is_unusable_container_cwd(cwd):
                 if cwd != config["cwd"]:
                     logger.info(
                         "Ignoring host/relative cwd override %r for %s backend "
