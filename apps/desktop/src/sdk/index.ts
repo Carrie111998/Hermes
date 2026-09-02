@@ -24,7 +24,6 @@ import type { ReactNode } from 'react'
 import { PRIMARY_SESSION_VIEW } from '@/app/chat/session-view'
 import { openSession, type OpenSessionIntent } from '@/app/open-session'
 import type { ClientSessionState } from '@/app/types'
-import type { HermesConnection } from '@/global'
 import {
   $narrowViewport,
   $newSessionTabAction,
@@ -42,6 +41,7 @@ import {
 import { onGatewayEvent } from '@/contrib/events'
 import { registry } from '@/contrib/registry'
 import type { WorkspaceMode } from '@/contrib/types'
+import type { HermesConnection } from '@/global'
 import { deleteProfile, getLogs, getStatus, hermesApi, type HermesGateway } from '@/hermes'
 import {
   $gateway,

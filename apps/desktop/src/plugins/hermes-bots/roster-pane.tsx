@@ -244,22 +244,27 @@ export function BotsPane() {
   const gatewayState = useValue(host.state.gateway)
   const gatewayUp = gatewayState === 'open'
   const gatewayConnection = useValue(host.state.gatewayConnection)
+
   // #101195: what the waiting card names. Prefer the live WS target (it is
   // re-minted per dial, so it names the endpoint CURRENTLY being retried);
   // fall back to the HTTP baseUrl for early-boot (pre-dial) frames. Hide
   // credentials embedded in query strings.
   const connectionEndpoint = (() => {
     const raw = gatewayConnection?.wsUrl || gatewayConnection?.baseUrl || ''
-    if (!raw) return null
+
+    if (!raw) {return null}
+
     try {
       const url = new URL(raw)
       url.search = ''
       url.hash = ''
+
       return url.toString()
     } catch {
       return raw
     }
   })()
+
   const activeProfile = (useValue(host.state.profile) || 'default').trim() || 'default'
   const [createOpen, setCreateOpen] = useState(false)
   const [groupCreateOpen, setGroupCreateOpen] = useState(false)

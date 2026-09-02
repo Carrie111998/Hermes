@@ -1,9 +1,8 @@
 import { describe, expect, it } from 'vitest'
 
-import { HermesConnection } from '@/global'
-import { $connection, setConnection } from '@/store/session'
-
+import type { HermesConnection } from '@/global'
 import { host } from '@/sdk'
+import { $connection, setConnection } from '@/store/session'
 
 /**
  * #101195 regression: the forever-"Waiting for the gateway connection…" card
