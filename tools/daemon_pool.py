@@ -66,8 +66,12 @@ class DaemonThreadPoolExecutor(ThreadPoolExecutor):
         return super().submit(_run_with_context, *args, **kwargs)
 
     def _adjust_thread_count(self) -> None:
-        # Mirrors CPython's implementation (3.8–3.13) with two changes:
-        # daemon=True and no _threads_queues registration.
+        # Compatible with CPython 3.8–3.14.
+        # CPython 3.14 removed the ``_initializer``/``_initargs`` instance
+        # attributes and changed ``_worker`` to take a pre-built worker context
+        # object (``self._create_worker_context()``) instead of the positional
+        # ``(work_queue, initializer, initargs)`` triple. Detect which API the
+        # running interpreter expects so the same source works on every version.
         if self._idle_semaphore.acquire(timeout=0):
             return
 
@@ -77,15 +81,25 @@ class DaemonThreadPoolExecutor(ThreadPoolExecutor):
         num_threads = len(self._threads)
         if num_threads < self._max_workers:
             thread_name = "%s_%d" % (self._thread_name_prefix or self, num_threads)
-            t = threading.Thread(
-                name=thread_name,
-                target=_worker,
-                args=(
+            if hasattr(self, "_create_worker_context"):
+                # Python 3.14+: _worker(executor_ref, worker_context, work_queue)
+                worker_args = (
+                    weakref.ref(self, weakref_cb),
+                    self._create_worker_context(),
+                    self._work_queue,
+                )
+            else:
+                # Python 3.8–3.13: _worker(executor_ref, work_queue, initializer, initargs)
+                worker_args = (
                     weakref.ref(self, weakref_cb),
                     self._work_queue,
                     self._initializer,
                     self._initargs,
-                ),
+                )
+            t = threading.Thread(
+                name=thread_name,
+                target=_worker,
+                args=worker_args,
                 daemon=True,
             )
             t.start()
