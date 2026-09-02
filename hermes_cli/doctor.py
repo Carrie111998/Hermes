@@ -1255,6 +1255,151 @@ def check_macos_full_disk_access() -> None:
     )
 
 
+def _doctor_mcp_servers(manual_issues: list[str]) -> None:
+    """Static preflight for configured MCP servers.
+
+    Answers "are my MCP servers launchable?" without starting any of them:
+    no subprocess, no network. The live handshake stays behind
+    ``hermes doctor --live``, which initializes every server for real.
+
+    Each check mirrors the code path the real launch takes, so the report
+    reflects what the server would actually get rather than a re-reading of
+    the raw config.
+    """
+    try:
+        from tools.mcp_tool import (
+            InvalidMcpUrlError,
+            _build_safe_env,
+            _load_mcp_config,
+            _resolve_stdio_command,
+            _validate_remote_mcp_url,
+        )
+    except Exception as e:
+        check_warn(f"MCP server preflight unavailable: {e}")
+        return
+
+    try:
+        servers = _load_mcp_config()
+    except Exception as e:
+        check_warn(f"Could not read mcp_servers: {e}")
+        return
+
+    if not servers:
+        check_info("No MCP servers configured")
+        return
+
+    problems = 0
+    for name in sorted(servers):
+        entry = servers[name]
+        if not isinstance(entry, dict):
+            check_fail(f"MCP server '{name}': malformed entry",
+                       f"expected a mapping, got {type(entry).__name__}")
+            manual_issues.append(
+                f"Fix mcp_servers.{name} in config.yaml — it must be a mapping."
+            )
+            problems += 1
+            continue
+
+        has_url = "url" in entry
+        has_command = "command" in entry
+
+        if not has_url and not has_command:
+            check_fail(f"MCP server '{name}': no transport configured",
+                       "needs 'command' (stdio) or 'url' (http)")
+            manual_issues.append(
+                f"Add a 'command' (stdio) or 'url' (http) key to mcp_servers.{name}."
+            )
+            problems += 1
+            continue
+
+        if has_url and has_command:
+            # Matches the runtime warning in MCPServer.connect(): url wins.
+            check_warn(f"MCP server '{name}': both 'url' and 'command' set",
+                       "HTTP transport is used; 'command' is ignored")
+            problems += 1
+
+        if has_url:
+            try:
+                _validate_remote_mcp_url(name, entry.get("url"))
+                check_ok(f"MCP server '{name}' (http)", "url looks valid")
+            except InvalidMcpUrlError as e:
+                check_fail(f"MCP server '{name}': invalid url", str(e))
+                manual_issues.append(
+                    f"Fix the 'url' for mcp_servers.{name} — it must be an http(s) URL."
+                )
+                problems += 1
+            headers = entry.get("headers")
+            if headers is not None and not isinstance(headers, dict):
+                check_warn(f"MCP server '{name}': 'headers' is not a mapping",
+                           f"got {type(headers).__name__}; it will be ignored")
+                problems += 1
+            continue
+
+        args = entry.get("args")
+        if args is not None and not isinstance(args, list):
+            check_warn(f"MCP server '{name}': 'args' is not a list",
+                       f"got {type(args).__name__}")
+            problems += 1
+
+        user_env = entry.get("env") if isinstance(entry.get("env"), dict) else None
+        try:
+            child_env = _build_safe_env(user_env)
+        except Exception:
+            child_env = dict(os.environ)
+
+        command = entry.get("command")
+        resolved = None
+        if isinstance(command, str) and command.strip():
+            try:
+                resolved, _ = _resolve_stdio_command(command, child_env)
+            except Exception as e:
+                check_warn(f"MCP server '{name}': could not resolve command", str(e))
+                problems += 1
+        else:
+            check_fail(f"MCP server '{name}': 'command' must be a non-empty string",
+                       f"got {type(command).__name__}")
+            manual_issues.append(f"Set a valid 'command' for mcp_servers.{name}.")
+            problems += 1
+
+        if resolved is not None:
+            # _resolve_stdio_command echoes the input back when nothing on PATH
+            # matches, so a bare name here means resolution failed.
+            if os.sep not in resolved and not os.path.isabs(resolved):
+                check_fail(f"MCP server '{name}': command '{command}' not found on PATH")
+                check_info(
+                    f"Install it, or set an absolute path for mcp_servers.{name}.command"
+                )
+                manual_issues.append(
+                    f"MCP server '{name}': '{command}' is not on PATH — install it or use an absolute path."
+                )
+                problems += 1
+            elif not os.path.exists(resolved):
+                check_fail(f"MCP server '{name}': command not found", resolved)
+                manual_issues.append(
+                    f"MCP server '{name}': {resolved} does not exist."
+                )
+                problems += 1
+            else:
+                missing_env = sorted(
+                    k for k in (user_env or {})
+                    if not str(child_env.get(k, "")).strip()
+                )
+                if missing_env:
+                    check_warn(f"MCP server '{name}' (stdio): empty env value(s)",
+                               ", ".join(missing_env))
+                    check_info(
+                        "Set these in ~/.hermes/.env — the server subprocess receives them empty."
+                    )
+                    problems += 1
+                else:
+                    check_ok(f"MCP server '{name}' (stdio)", os.path.basename(resolved))
+
+    if problems == 0:
+        check_ok(f"All {len(servers)} configured MCP server(s) look launchable")
+    else:
+        check_info("Run `hermes doctor --live` to actually start each server and list its tools")
+
+
 def run_doctor(args):
     """Run diagnostic checks."""
     should_fix = getattr(args, 'fix', False)
@@ -1373,6 +1518,13 @@ def run_doctor(args):
             check_ok("No suspicious MCP stdio commands")
     except Exception as e:
         check_warn(f"MCP security check failed: {e}")
+
+    _section("MCP Servers")
+    try:
+        _doctor_mcp_servers(manual_issues)
+    except Exception as e:
+        # A preflight bug must never block the rest of doctor.
+        check_warn(f"MCP server preflight failed: {e}")
     
     _section("Python Environment")
     py_version = sys.version_info
