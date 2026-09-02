@@ -521,6 +521,50 @@ class TestSyncSkills:
             assert "new-skill" in result2["copied"]
             assert (skills_dir / "category" / "new-skill" / "SKILL.md").exists()
 
+    def test_drifted_destination_reported_not_masked(self, tmp_path):
+        """A destination that drifted while the bundled source was unchanged
+        (curator restore, partial install, interrupted sync) must surface as
+        user-modified, not stay silently "up to date" forever (#97791)."""
+        bundled = self._setup_bundled(tmp_path)
+        skills_dir = tmp_path / "user_skills"
+        manifest_file = skills_dir / ".bundled_manifest"
+
+        # First sync: everything copied, manifest baselined.
+        with self._patches(bundled, skills_dir, manifest_file):
+            sync_skills(quiet=True)
+            manifest_after_first = _read_manifest()
+        assert manifest_after_first["new-skill"] == _dir_hash(bundled / "category" / "new-skill")
+
+        # Drift the destination without touching the bundled source.
+        (skills_dir / "category" / "new-skill" / "main.py").unlink()
+
+        with self._patches(bundled, skills_dir, manifest_file):
+            result = sync_skills(quiet=True)
+
+        assert result["user_modified"] == ["new-skill"], (
+            "A drifted destination was masked by the manifest hash match — "
+            "the skill stays broken indefinitely and no command reports it"
+        )
+        assert "new-skill" not in result["updated"]
+
+    def test_second_sync_of_stock_copy_stays_skipped(self, tmp_path):
+        """The unchanged-source fast path must keep skipping a healthy copy:
+        no update churn, no user-modified noise on an already-synced tree."""
+        bundled = self._setup_bundled(tmp_path)
+        skills_dir = tmp_path / "user_skills"
+        manifest_file = skills_dir / ".bundled_manifest"
+
+        with self._patches(bundled, skills_dir, manifest_file):
+            sync_skills(quiet=True)
+            result2 = sync_skills(quiet=True)
+            manifest2 = _read_manifest()
+
+        assert result2["copied"] == []
+        assert result2["updated"] == []
+        assert result2["user_modified"] == []
+        assert manifest2["new-skill"] == _dir_hash(bundled / "category" / "new-skill")
+        assert manifest2["old-skill"] == _dir_hash(bundled / "old-skill")
+
 
 class TestGetBundledDir:
     def test_env_var_override_with_default_fallback(self, tmp_path, monkeypatch):
@@ -575,6 +619,8 @@ class TestResetBundledSkill:
 
         with self._patches(bundled, skills_dir, manifest_file):
             # Sanity check: without reset, sync would flag it user_modified
+            # (the documented reset-based recovery contract — see
+            # website/docs/user-guide/features/skills.md).
             pre = sync_skills(quiet=True)
             assert "google-workspace" in pre["user_modified"]
 

@@ -301,6 +301,31 @@ def _dir_hash(directory: Path) -> str:
     return hasher.hexdigest()
 
 
+def _stat_fingerprint(directory: Path) -> Optional[Tuple[int, int]]:
+    """Cheap (file count, total size) fingerprint of a directory tree.
+
+    Unlike :func:`_dir_hash` this never reads file contents, so it is safe to
+    run on every sync as a fast-path guard. Returns ``None`` when the tree
+    cannot be scanned — callers treat that as "fingerprints disagree" and
+    fall back to the full content hash.
+
+    Known trade-off: two trees with the same file count and total size but
+    different contents compare equal, so same-size destination drift stays
+    masked until the bundled source changes (the #97791 class is structural
+    drift — missing/moved files — which this pair detects).
+    """
+    count = 0
+    total = 0
+    try:
+        for fpath in directory.rglob("*"):
+            if fpath.is_file():
+                count += 1
+                total += fpath.stat().st_size
+    except (OSError, IOError):
+        return None
+    return (count, total)
+
+
 def _safe_rel_install_path(path: Path, base: Path) -> str:
     """Return a normalized relative POSIX path, rejecting traversal/absolute paths."""
     rel = path.relative_to(base)
@@ -884,12 +909,18 @@ def sync_skills(quiet: bool = False) -> dict:
 
             # If the bundled source still matches the version recorded when
             # it was installed, there is no update to apply. Avoid recursively
-            # hashing the user's copy just to rediscover that fact; when the
-            # bundled source changes, the normal user-modification check below
-            # still protects local edits before any overwrite.
+            # hashing the user's copy just to rediscover that fact — but only
+            # after a cheap stat fingerprint confirms the copy is structurally
+            # intact. The manifest is a claim, not the truth: a destination
+            # that drifted while the source was unchanged (curator restore,
+            # partial install, interrupted sync, hand-copied older version)
+            # would otherwise stay masked as "up to date" forever (#97791).
+            # When the bundled source changes, the normal user-modification
+            # check below still protects local edits before any overwrite.
             if origin_hash and bundled_hash == origin_hash:
-                skipped += 1
-                continue
+                if _stat_fingerprint(dest) == _stat_fingerprint(skill_src):
+                    skipped += 1
+                    continue
 
             user_hash = _dir_hash(dest)
 
