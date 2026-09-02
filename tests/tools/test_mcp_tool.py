@@ -475,6 +475,60 @@ class TestCheckFunction:
 # ---------------------------------------------------------------------------
 
 class TestRunOnMcpLoop:
+    def test_progress_state_refreshes_idle_deadline_without_cross_talk(self):
+        from tools.mcp_tool import _McpProgressState
+
+        first = _McpProgressState(10, max_timeout=30)
+        second = _McpProgressState(10, max_timeout=30)
+        first_deadline = first.deadline()
+        second_deadline = second.deadline()
+
+        time.sleep(0.05)
+        first.touch()
+
+        assert first.deadline() > first_deadline
+        assert second.deadline() <= second_deadline
+
+    def test_progress_state_respects_absolute_deadline(self):
+        from tools.mcp_tool import _McpProgressState
+
+        state = _McpProgressState(30, max_timeout=0.01)
+        time.sleep(0.02)
+        state.touch()
+
+        assert state.deadline() < time.monotonic()
+
+    def test_deadline_provider_is_polled_while_waiting(self):
+        import concurrent.futures
+        import tools.mcp_tool as mcp
+
+        async def _sample():
+            return "ok"
+
+        future = MagicMock()
+        future.result.side_effect = [concurrent.futures.TimeoutError(), "ok"]
+        future.done.return_value = False
+        deadline_provider = MagicMock(return_value=time.monotonic() + 1)
+        fake_loop = MagicMock()
+        fake_loop.is_running.return_value = True
+
+        def schedule(coro, _loop, **_kwargs):
+            coro.close()
+            return future
+
+        with (
+            patch.object(mcp, "_mcp_loop", fake_loop),
+            patch("agent.async_utils.safe_schedule_threadsafe", side_effect=schedule),
+            patch("tools.interrupt.is_interrupted", return_value=False),
+        ):
+            assert mcp._run_on_mcp_loop(
+                _sample,
+                timeout=30,
+                deadline_provider=deadline_provider,
+            ) == "ok"
+
+        assert deadline_provider.call_count >= 2
+
     def test_scheduler_failure_closes_factory_coroutine(self):
         """If run_coroutine_threadsafe raises, the factory's coroutine is closed."""
         import gc
@@ -550,7 +604,7 @@ class TestToolHandler:
 
     def _patch_mcp_loop(self, coro_side_effect=None):
         """Return a patch for _run_on_mcp_loop that runs the coroutine directly."""
-        def fake_run(coro_or_factory, timeout=30):
+        def fake_run(coro_or_factory, timeout=30, **_kwargs):
             coro = coro_or_factory() if callable(coro_or_factory) else coro_or_factory
             return asyncio.run(coro)
         if coro_side_effect:
@@ -572,7 +626,10 @@ class TestToolHandler:
             with self._patch_mcp_loop():
                 result = json.loads(handler({"name": "world"}))
             assert result["result"] == "hello world"
-            mock_session.call_tool.assert_called_once_with("greet", arguments={"name": "world"})
+            call = mock_session.call_tool.call_args
+            assert call.args == ("greet",)
+            assert call.kwargs["arguments"] == {"name": "world"}
+            assert callable(call.kwargs["progress_callback"])
         finally:
             _servers.pop("test_srv", None)
 
@@ -603,7 +660,10 @@ class TestToolHandler:
                 result = json.loads(handler({"name": "world"}))
             assert result["result"] == "reconnected"
             reconnect.assert_called_once()
-            mock_session.call_tool.assert_called_once_with("greet", arguments={"name": "world"})
+            call = mock_session.call_tool.call_args
+            assert call.args == ("greet",)
+            assert call.kwargs["arguments"] == {"name": "world"}
+            assert callable(call.kwargs["progress_callback"])
         finally:
             _servers.pop("test_srv", None)
 
@@ -1583,7 +1643,8 @@ class TestConfigurableTimeouts:
         try:
             handler = _make_tool_handler("test_srv", "my_tool", 180)
             with patch("tools.mcp_tool._run_on_mcp_loop") as mock_run:
-                def fake_run(coro, timeout=30):
+                def fake_run(coro, timeout=30, **_kwargs):
+                    coro = coro() if callable(coro) else coro
                     coro.close()
                     return json.dumps({"result": "ok"})
 
@@ -1596,6 +1657,38 @@ class TestConfigurableTimeouts:
                        call_kwargs[1].get("timeout") == 180
         finally:
             _servers.pop("test_srv", None)
+
+    def test_progress_callback_refreshes_deadline(self):
+        from tools.mcp_tool import _make_tool_handler, _servers
+
+        deadlines = {}
+
+        async def call_tool(_name, **kwargs):
+            await asyncio.sleep(0.01)
+            await kwargs["progress_callback"](1, 2, "working")
+            return _make_call_result("ok", is_error=False)
+
+        mock_session = MagicMock()
+        mock_session.call_tool = AsyncMock(side_effect=call_tool)
+        server = _make_mock_server("progress_srv", session=mock_session)
+        _servers["progress_srv"] = server
+
+        try:
+            handler = _make_tool_handler("progress_srv", "long_tool", 10)
+
+            def fake_run(coro, timeout=30, deadline_provider=None):
+                coro = coro() if callable(coro) else coro
+                deadlines["before"] = deadline_provider()
+                result = asyncio.run(coro)
+                deadlines["after"] = deadline_provider()
+                return json.dumps({"result": json.loads(result)["result"]})
+
+            with patch("tools.mcp_tool._run_on_mcp_loop", side_effect=fake_run):
+                assert json.loads(handler({}))['result'] == "ok"
+
+            assert deadlines["after"] > deadlines["before"]
+        finally:
+            _servers.pop("progress_srv", None)
 
 
 # ---------------------------------------------------------------------------

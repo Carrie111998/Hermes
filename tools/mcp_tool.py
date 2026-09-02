@@ -578,6 +578,8 @@ def _resolve_tool_timeout(config: dict) -> float:
     return _DEFAULT_TOOL_TIMEOUT
 
 
+# Progress may extend the idle timeout, but never beyond this total multiplier.
+_MCP_PROGRESS_MAX_TIMEOUT_FACTOR = 4
 _DEFAULT_CONNECT_TIMEOUT = 60    # seconds for initial connection per server
 _MAX_RECONNECT_RETRIES = 5
 _MAX_INITIAL_CONNECT_RETRIES = 3 # retries for the very first connection attempt
@@ -5561,13 +5563,45 @@ def _wrap_with_dashboard_oauth_flow(coro):
     return _scoped()
 
 
-def _run_on_mcp_loop(coro_or_factory, timeout: float = 30):
+class _McpProgressState:
+    """Track an MCP call's idle and absolute progress-aware deadlines."""
+
+    def __init__(self, idle_timeout: float, max_timeout: Optional[float] = None):
+        now = time.monotonic()
+        self._lock = threading.Lock()
+        self._last_progress_at = now
+        self._idle_timeout = float(idle_timeout)
+        self._absolute_deadline = (
+            None if max_timeout is None else now + float(max_timeout)
+        )
+
+    def touch(self) -> None:
+        """Refresh the idle deadline when the server reports progress."""
+        with self._lock:
+            self._last_progress_at = time.monotonic()
+
+    def deadline(self) -> float:
+        """Return the next deadline, capped by the absolute call limit."""
+        with self._lock:
+            deadline = self._last_progress_at + self._idle_timeout
+            if self._absolute_deadline is not None:
+                deadline = min(deadline, self._absolute_deadline)
+            return deadline
+
+
+def _run_on_mcp_loop(
+    coro_or_factory,
+    timeout: float = 30,
+    deadline_provider: Optional[Callable[[], float]] = None,
+):
     """Schedule a coroutine on the MCP event loop and block until done.
 
     Accepts either a coroutine object or a zero-arg callable that returns one.
     Callers can pass a factory to avoid constructing coroutine objects when
     the MCP loop is unavailable (which would otherwise leak the coroutine
     frame and emit ``"coroutine was never awaited"`` warnings).
+    ``deadline_provider`` may return a monotonic absolute deadline that is
+    refreshed while the coroutine is running (for example, by MCP progress).
 
     Poll in short intervals so the calling agent thread can honor user
     interrupts while the MCP work is still running on the background loop.
@@ -5613,6 +5647,8 @@ def _run_on_mcp_loop(coro_or_factory, timeout: float = 30):
             raise InterruptedError("User sent a new message")
 
         wait_timeout = 0.1
+        if deadline_provider is not None:
+            deadline = deadline_provider()
         if deadline is not None:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
@@ -6142,8 +6178,13 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
                     )
                 return tool_error(f"MCP server '{server_name}' is not connected")
 
-        async def _call():
+        async def _call(progress_state):
             _mark_server_call_started(server)
+
+            async def _progress_callback(progress, total, message):
+                del progress, total, message
+                progress_state.touch()
+
             async with server._rpc_lock, _track_inflight_rpc(
                 server, server_name, f"tools/call {tool_name}"
             ):
@@ -6182,14 +6223,22 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
                             f"exited; failing the call fast instead of "
                             f"waiting {float(tool_timeout):.0f}s"
                         )
-                    _call_coro = server.session.call_tool(tool_name, arguments=args)
+                    _call_coro = server.session.call_tool(
+                        tool_name,
+                        arguments=args,
+                        progress_callback=_progress_callback,
+                    )
                     _watch_children = getattr(server, "_watch_stdio_children", None)
+                    _watch_children_coro = (
+                        _watch_children() if _watch_children is not None else None
+                    )
                     _watch_ok = (
-                        _watch_children is not None
-                        and inspect.isawaitable(_watch_children())
+                        inspect.isawaitable(_watch_children_coro)
                         and asyncio.iscoroutine(_call_coro)
                     )
                     if not _watch_ok:
+                        if inspect.iscoroutine(_watch_children_coro):
+                            _watch_children_coro.close()
                         # Stubbed sessions (MagicMock in tests) return a
                         # non-awaitable, or there is no child-watcher to race
                         # against: plain await is exactly the pre-#81995
@@ -6205,7 +6254,7 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
                         # the call immediately instead of riding out the full
                         # tool timeout.
                         rpc_task = asyncio.ensure_future(_call_coro)
-                        watch_task = asyncio.ensure_future(_watch_children())
+                        watch_task = asyncio.ensure_future(_watch_children_coro)
                         try:
                             done, _pending = await asyncio.wait(
                                 {rpc_task, watch_task},
@@ -6368,7 +6417,15 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
             return json.dumps({"result": text_result}, ensure_ascii=False)
 
         def _call_once():
-            return _run_on_mcp_loop(_call, timeout=tool_timeout)
+            progress_state = _McpProgressState(
+                tool_timeout,
+                max_timeout=tool_timeout * _MCP_PROGRESS_MAX_TIMEOUT_FACTOR,
+            )
+            return _run_on_mcp_loop(
+                lambda: _call(progress_state),
+                timeout=tool_timeout,
+                deadline_provider=progress_state.deadline,
+            )
 
         try:
             result = _call_once()
