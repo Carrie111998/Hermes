@@ -1422,6 +1422,7 @@ try:
     from cron.jobs import (
         list_jobs as _cron_list,
         get_job as _cron_get,
+        _normalize_reasoning_effort as _cron_normalize_reasoning_effort,
         update_job as _cron_update,
         remove_job as _cron_remove,
         pause_job as _cron_pause,
@@ -1438,6 +1439,7 @@ except ImportError:
     _cron_get = None
     _cron_create = None
     _cron_update = None
+    _cron_normalize_reasoning_effort = None
     _cron_remove = None
     _cron_pause = None
     _cron_resume = None
@@ -1462,12 +1464,16 @@ def _notify_cron_provider_jobs_changed() -> None:
 # (every handler runs _check_auth, and connect() refuses to start without
 # API_SERVER_KEY), so this is not the trust boundary — it's parity with the
 # tool path so a malicious prompt is rejected the same way regardless of
-# which surface created the job.  Imported defensively: a missing scanner
-# must not disable the cron REST API.
+# which surface created the job.  Imported defensively so missing optional
+# tool hardening does not disable the rest of the cron REST API.
 try:
-    from tools.cronjob_tools import _scan_cron_prompt as _scan_cron_prompt
+    from tools.cronjob_tools import (
+        _scan_cron_prompt as _scan_cron_prompt,
+        _validate_cron_script_path as _validate_cron_script_path,
+    )
 except Exception:  # pragma: no cover - scanner is optional hardening
     _scan_cron_prompt = None
+    _validate_cron_script_path = None
 
 
 class _ProviderAuthResolutionError(RuntimeError):
@@ -6724,7 +6730,20 @@ class APIServerAdapter(BasePlatformAdapter):
 
     _JOB_ID_RE = __import__("re").compile(r"[a-f0-9]{12}")
     # Allowed fields for update — prevents clients injecting arbitrary keys
-    _UPDATE_ALLOWED_FIELDS = {"name", "schedule", "prompt", "deliver", "skills", "skill", "repeat", "enabled"}
+    _UPDATE_ALLOWED_FIELDS = {
+        "name",
+        "schedule",
+        "prompt",
+        "deliver",
+        "skills",
+        "skill",
+        "repeat",
+        "enabled",
+        "context_from",
+        "no_agent",
+        "script",
+        "reasoning_effort",
+    }
     _MAX_NAME_LENGTH = 200
     _MAX_PROMPT_LENGTH = 5000
 
@@ -6750,6 +6769,61 @@ class APIServerAdapter(BasePlatformAdapter):
                 {"error": "Invalid job ID format"}, status=400,
             )
         return job_id, None
+
+    @staticmethod
+    def _validate_extended_job_fields(
+        fields: Dict[str, Any], existing_job: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Validate REST-only cron fields like the agent-facing cronjob tool."""
+        if "context_from" in fields:
+            refs = fields["context_from"]
+            if not isinstance(refs, list):
+                raise ValueError("context_from must be a list of job IDs")
+            normalized_refs = []
+            for ref in refs:
+                if not isinstance(ref, str) or not ref.strip():
+                    raise ValueError(
+                        "context_from entries must be non-empty job ID strings"
+                    )
+                ref = ref.strip()
+                if ref.lower() != "self" and not _cron_get(ref):
+                    raise ValueError(f"context_from job '{ref}' not found")
+                normalized_refs.append(ref)
+            fields["context_from"] = normalized_refs or None
+
+        if "no_agent" in fields and not isinstance(fields["no_agent"], bool):
+            raise ValueError("no_agent must be a boolean")
+
+        if "script" in fields:
+            script = fields["script"]
+            if script is not None and not isinstance(script, str):
+                raise ValueError("script must be a string or null")
+            if _validate_cron_script_path is None:
+                raise ValueError("Cron script path validation is unavailable")
+            script_error = _validate_cron_script_path(script)
+            if script_error:
+                raise ValueError(script_error)
+            fields["script"] = (script.strip() or None) if script is not None else None
+
+        if {"no_agent", "script"}.intersection(fields):
+            effective_no_agent = fields.get(
+                "no_agent", (existing_job or {}).get("no_agent", False)
+            )
+            effective_script = fields.get(
+                "script", (existing_job or {}).get("script")
+            )
+            if effective_no_agent and not effective_script:
+                raise ValueError("no_agent=True requires a script")
+
+        if "reasoning_effort" in fields:
+            effort = fields["reasoning_effort"]
+            if effort is not None and not isinstance(effort, str):
+                raise ValueError("reasoning_effort must be a string or null")
+            if _cron_normalize_reasoning_effort is None:
+                raise ValueError("Cron reasoning effort validation is unavailable")
+            fields["reasoning_effort"] = _cron_normalize_reasoning_effort(
+                effort
+            )
 
     async def _handle_list_jobs(self, request: "web.Request") -> "web.Response":
         """GET /api/jobs — list all cron jobs."""
@@ -6783,6 +6857,12 @@ class APIServerAdapter(BasePlatformAdapter):
             skills = body.get("skills")
             repeat = body.get("repeat")
 
+            extended = {
+                key: body[key]
+                for key in ("context_from", "no_agent", "script", "reasoning_effort")
+                if key in body
+            }
+
             if not name:
                 return web.json_response({"error": "Name is required"}, status=400)
             if len(name) > self._MAX_NAME_LENGTH:
@@ -6802,6 +6882,8 @@ class APIServerAdapter(BasePlatformAdapter):
             if repeat is not None and (not isinstance(repeat, int) or repeat < 1):
                 return web.json_response({"error": "Repeat must be a positive integer"}, status=400)
 
+            self._validate_extended_job_fields(extended)
+
             kwargs = {
                 "prompt": prompt,
                 "schedule": schedule,
@@ -6813,11 +6895,16 @@ class APIServerAdapter(BasePlatformAdapter):
                 kwargs["skills"] = skills
             if repeat is not None:
                 kwargs["repeat"] = repeat
+            kwargs.update(extended)
 
             job = _cron_create(**kwargs)
             return web.json_response({"job": job})
         except _CronSchedulerRegistrationError as e:
             return web.json_response(e.to_dict(), status=424)
+        except ValueError as e:
+            return web.json_response(
+                {"error": _redact_api_error_text(e)}, status=400
+            )
         except Exception as e:
             return web.json_response({"error": _redact_api_error_text(e)}, status=500)
 
@@ -6870,11 +6957,22 @@ class APIServerAdapter(BasePlatformAdapter):
                 scan_error = _scan_cron_prompt(sanitized["prompt"])
                 if scan_error:
                     return web.json_response({"error": scan_error}, status=400)
+            if {
+                "context_from", "no_agent", "script", "reasoning_effort"
+            }.intersection(sanitized):
+                existing_job = _cron_get(job_id)
+                if not existing_job:
+                    return web.json_response({"error": "Job not found"}, status=404)
+                self._validate_extended_job_fields(sanitized, existing_job)
             job = _cron_update(job_id, sanitized)
             if not job:
                 return web.json_response({"error": "Job not found"}, status=404)
             _notify_cron_provider_jobs_changed()
             return web.json_response({"job": job})
+        except ValueError as e:
+            return web.json_response(
+                {"error": _redact_api_error_text(e)}, status=400
+            )
         except Exception as e:
             return web.json_response({"error": _redact_api_error_text(e)}, status=500)
 
