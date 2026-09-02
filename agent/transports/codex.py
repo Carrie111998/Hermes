@@ -358,23 +358,15 @@ def _is_azure_foundry_responses(params: Dict[str, Any]) -> bool:
 
 
 def _is_post_tool_replay(messages: Optional[List[Dict[str, Any]]]) -> bool:
-    """Return True when ``messages`` end on a tool result awaiting a follow-up.
+    """Return True when ``messages`` replay a completed tool-call history.
 
-    Azure Foundry only rejects the *post-tool follow-up* payload — the shape
-    where a prior assistant ``function_call`` and its ``function_call_output``
-    are replayed alongside an encrypted ``reasoning`` item (HTTP 400
-    invalid_payload). Detecting that shape here keeps reasoning suppression
-    scoped to the failing turn, so ordinary (non-tool) Foundry multi-turn
-    continuity is left unchanged.
-
-    The test is on the *trailing* messages, not on the history as a whole.
-    Scanning the whole history for any tool call plus any tool result makes
-    the predicate sticky: one tool call early in a conversation would then
-    suppress reasoning on every later turn, including plain user follow-ups
-    that Foundry accepts. The rejected payload is specifically the turn whose
-    last item is a tool result, so that is what this matches: the final
-    non-system message is a ``tool`` result, and the assistant message that
-    issued its ``tool_call_id`` is present.
+    Azure Foundry rejects the payload shape where a prior assistant
+    ``function_call`` and its ``function_call_output`` are replayed alongside
+    an encrypted ``reasoning`` item (HTTP 400 ``invalid_payload``). This
+    includes ordinary later user follow-ups after the assistant has already
+    answered the tool result: the old tool history is still present on the
+    wire. Suppression is therefore scoped to Azure conversations with a
+    completed, paired tool exchange, not to all Responses requests.
 
     Tool-call identity is resolved the same way
     ``_chat_messages_to_responses_input`` resolves it, because the pairing
@@ -404,31 +396,27 @@ def _is_post_tool_replay(messages: Optional[List[Dict[str, Any]]]) -> bool:
             ids.add(canonical)
         return ids
 
-    trailing = set()
-    for msg in reversed(messages or ()):
+    saw_tool_result = False
+    issued_tool_ids = set()
+    result_tool_ids = set()
+    for msg in messages or ():
         if not isinstance(msg, dict):
-            return False
+            continue
         role = msg.get("role")
         if role == "system":
             continue
         if role == "tool":
             ids = _pair_ids(msg.get("tool_call_id"))
-            if not ids:
-                return False
-            trailing |= ids
+            if ids:
+                saw_tool_result = True
+                result_tool_ids |= ids
             continue
-        # First message before the trailing run of tool results. It must be
-        # the assistant turn that issued them for this to be the follow-up
-        # payload; a non-empty ``trailing`` is what proves the run existed.
-        if role != "assistant":
-            return False
-        return any(
-            trailing & _pair_ids(call.get("id"), call.get("call_id"))
-            for call in msg.get("tool_calls") or []
-            if isinstance(call, dict)
-        )
+        if role == "assistant":
+            for call in msg.get("tool_calls") or []:
+                if isinstance(call, dict):
+                    issued_tool_ids |= _pair_ids(call.get("id"), call.get("call_id"))
 
-    return False
+    return saw_tool_result and bool(issued_tool_ids & result_tool_ids)
 
 
 def _native_compaction_active(context_management: Any) -> bool:
