@@ -132,10 +132,18 @@ def _start_loopback_listener(flow) -> "http.server.HTTPServer":
             code = (qs.get("code") or [None])[0]
             state = (qs.get("state") or [None])[0]
             error = (qs.get("error") or [None])[0]
+            # RFC 9207 authorization-response issuer. mcp 2.0 validates it
+            # against the discovered metadata and REJECTS a response that
+            # omits it when the server advertised
+            # ``authorization_response_iss_parameter_supported`` — dropping it
+            # here fails Desktop login against every such provider (all
+            # Cloudflare MCP servers) with "Authorization response missing
+            # iss parameter".
+            iss = (qs.get("iss") or [None])[0]
             body = b"<h1>Authorization received</h1><p>You can close this tab and return to Hermes.</p>"
             status = 200
             try:
-                flow.deliver_callback(code=code, state=state, error=error)
+                flow.deliver_callback(code=code, state=state, error=error, iss=iss)
             except Exception:
                 body = b"<h1>OAuth callback rejected</h1><p>The callback was invalid or already used.</p>"
                 status = 400
@@ -401,13 +409,19 @@ def deliver_callback_flow(
     code: Optional[str],
     state: Optional[str],
     error: Optional[str] = None,
+    iss: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Relay a client-captured OAuth redirect into a session's flow.
 
     Remote-backend companion to ``start_flow(client_redirect_uri=...)``: the
     desktop app's loopback listener caught the provider redirect on the USER'S
-    machine and forwards ``code``/``state`` (or ``error``) here. Security
-    properties are unchanged from the gateway-listener path — the underlying
+    machine and forwards ``code``/``state`` (or ``error``) here, plus the
+    RFC 9207 ``iss`` issuer when the provider sent one — mcp 2.0 rejects a
+    response that omits it when the server advertised
+    ``authorization_response_iss_parameter_supported``, so a relay that drops
+    it fails against every such provider exactly like the listener paths did
+    before they preserved it. Security properties are unchanged from the
+    gateway-listener path — the underlying
     ``DashboardOAuthFlow.deliver_callback`` verifies ``state`` against the
     pinned authorization request (constant-time compare) and rejects replays,
     so a forged or replayed relay fails identically to a forged loopback hit.
@@ -423,7 +437,7 @@ def deliver_callback_flow(
 
     flow = rec["flow"]
     try:
-        flow.deliver_callback(code=code, state=state, error=error)
+        flow.deliver_callback(code=code, state=state, error=error, iss=iss)
     except ValueError as exc:
         return {"ok": False, "error_message": str(exc)}
     return {"ok": True, "session_id": session_id}
