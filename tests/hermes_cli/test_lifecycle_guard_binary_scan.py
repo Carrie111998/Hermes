@@ -13,7 +13,10 @@ from pathlib import Path
 
 import pytest
 
-REPO = Path(__file__).resolve().parents[1]
+# parents[2] = repo root: parents[1] resolves to tests/, whose empty
+# tests/cron/__init__.py shadows the real cron package and makes this file
+# import the installed (uncapped) cron.lifecycle_guard instead of the repo's.
+REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO))
 
 from cron.lifecycle_guard import (
