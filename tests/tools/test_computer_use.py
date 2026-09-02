@@ -1409,8 +1409,13 @@ class TestCuaDriverSessionReconnect:
             returncode = 0
             stderr = ""
             # Daemon returns a path, not inline base64.
-            stdout = ('{"element_count": 7, "tree_markdown": "- [0] AXButton",'
-                      ' "screenshot_file_path": "%s"}' % str(shot))
+            stdout = json.dumps(
+                {
+                    "element_count": 7,
+                    "tree_markdown": "- [0] AXButton",
+                    "screenshot_file_path": str(shot),
+                }
+            )
 
         import subprocess as _sp
         orig_run = _sp.run
@@ -1928,6 +1933,49 @@ class TestZIndexSorting:
         desktop = next(w for w in out if w["app_name"] == "Desktop")
         assert desktop["z_index"] == 0
 
+    def test_windows_default_capture_skips_system_and_automation_overlays(self):
+        """Live Windows repro: helper HWNDs outrank the real foreground app."""
+        from tools.computer_use.cua_backend import (
+            _ingest_windows,
+            _select_capture_target,
+        )
+
+        windows = _ingest_windows([
+            {"app_name": "codex-computer-use.exe", "pid": 1,
+             "window_id": 11, "is_on_screen": True,
+             "title": "Codex Computer Use Cursor Overlay", "z_index": 16},
+            {"app_name": "ClickToDo.exe", "pid": 2, "window_id": 22,
+             "is_on_screen": True, "title": "Click to Do", "z_index": 14},
+            {"app_name": "cua-driver.exe", "pid": 3, "window_id": 33,
+             "is_on_screen": True,
+             "title": "Cua.AgentCursorOverlay.default", "z_index": 12},
+            {"app_name": "Notepad.exe", "pid": 4, "window_id": 44,
+             "is_on_screen": True, "title": "Untitled - Notepad",
+             "z_index": 10},
+        ])
+
+        with patch("tools.computer_use.cua_backend.sys.platform", "win32"):
+            target = _select_capture_target(windows, app_requested=False)
+
+        assert target["app_name"] == "Notepad.exe"
+        assert target["window_id"] == 44
+
+    def test_windows_explicit_overlay_target_is_preserved(self):
+        from tools.computer_use.cua_backend import (
+            _ingest_windows,
+            _select_capture_target,
+        )
+
+        overlay = _ingest_windows([{
+            "app_name": "ClickToDo.exe", "pid": 2, "window_id": 22,
+            "is_on_screen": True, "title": "Click to Do", "z_index": 14,
+        }])
+
+        with patch("tools.computer_use.cua_backend.sys.platform", "win32"):
+            target = _select_capture_target(overlay, app_requested=True)
+
+        assert target["window_id"] == 22
+
 class TestImageMimeTypePropagation:
     """Surface 7 (NousResearch/hermes-agent#47072): trycua/cua#1961 made
     `mimeType` part of every MCP image-part response, so the wrapper no
@@ -2172,9 +2220,10 @@ class TestElementTokenAttachment:
     1. capture() refreshes a per-snapshot {index -> token} map from
        structuredContent.elements.
     2. Whenever an action carrying element_index is about to hit cua-driver,
-       look up the matching token and attach it — but ONLY for tools that
-       advertise `accessibility.element_tokens` (Surface 4 gate). Older
-       drivers reject unknown args via additionalProperties=false.
+       look up the matching token and attach it when the tool advertises
+       `accessibility.element_tokens` OR its live schema accepts
+       `element_token`. Older drivers reject unknown args via
+       additionalProperties=false, so a schema without the field fails closed.
     3. cua-driver prefers token over index when both are supplied, so
        sending both is safe and stale-detection becomes explicit.
     """
@@ -2196,6 +2245,7 @@ class TestElementTokenAttachment:
                 return cap in capabilities.get(tool, set())
             return any(cap in caps for caps in capabilities.values())
         backend._session.supports_capability = _supports
+        backend._session.supports_input_property.return_value = False
         backend._active_pid = 111
         backend._active_window_id = 222
         return backend
@@ -2211,6 +2261,28 @@ class TestElementTokenAttachment:
         assert args["element_index"] == 5
         # The matching token rode along — cua-driver will prefer it.
         assert args["element_token"] == "s0001:5"
+
+    def test_token_attached_when_live_schema_accepts_it_without_capability(self):
+        """cua-driver 0.22.1 exposes the field but no capability token."""
+        backend = self._backend_with_session({"click": set()})
+        backend._session.supports_input_property.return_value = True
+        backend._snapshot_tokens = {5: "s0001:5"}
+
+        backend.click(element=5, button="left")
+
+        name, args = backend._session.call_tool.call_args.args
+        assert name == "click"
+        assert args["element_index"] == 5
+        assert args["element_token"] == "s0001:5"
+
+    def test_token_omitted_when_capability_and_schema_both_lack_field(self):
+        backend = self._backend_with_session({"click": set()})
+        backend._snapshot_tokens = {5: "s0001:5"}
+
+        backend.click(element=5, button="left")
+
+        _, args = backend._session.call_tool.call_args.args
+        assert "element_token" not in args
 
 
     def test_capture_refreshes_snapshot_tokens(self):

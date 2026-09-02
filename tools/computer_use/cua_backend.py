@@ -213,6 +213,23 @@ _NON_APP_WINDOW_TITLE_PREFIXES = (
     "GNOME Shell",
 )
 
+# Windows exposes several full-display helper/overlay windows at the top of
+# list_windows' z-order. They are real HWNDs and therefore targetable, but an
+# unqualified capture of one is either blank (Click to Do) or shows automation
+# chrome instead of the app the person is using. Explicit app/pid/window
+# targeting still honors them; this list only steers default capture.
+_WINDOWS_NON_APP_PROCESS_NAMES = frozenset({
+    "clicktodo.exe",
+    "codex-computer-use.exe",
+    "cua-driver.exe",
+})
+_WINDOWS_NON_APP_TITLE_PREFIXES = (
+    "Click to Do",
+    "Codex Computer Use Cursor Overlay",
+    "ChatGPT is using your computer",
+    "Cua.AgentCursorOverlay.",
+)
+
 
 # Env var cua-driver reads to gate its anonymous usage telemetry (PostHog).
 # Setting it to "0" disables telemetry; absence => the binary's own default
@@ -476,6 +493,15 @@ def _linux_x11_active_window_id() -> Optional[int]:
 def _is_real_app_window(w: Dict[str, Any]) -> bool:
     """Return False for desktop/shell helper windows that capture as empty."""
     title = w.get("title", "")
+    if sys.platform == "win32":
+        app_name = str(w.get("app_name", "")).strip().lower()
+        if app_name in _WINDOWS_NON_APP_PROCESS_NAMES:
+            return False
+        if any(
+            title.lower().startswith(prefix.lower())
+            for prefix in _WINDOWS_NON_APP_TITLE_PREFIXES
+        ):
+            return False
     return not any(
         title.startswith(p) or title.lower().startswith(p.lower())
         for p in _NON_APP_WINDOW_TITLE_PREFIXES
@@ -493,20 +519,25 @@ def _select_capture_target(
     Callers pass windows already sorted by ``z_index`` descending (higher =
     frontmost). When ordering is informative, keep that frontmost contract.
     For unqualified default captures (no app filter and no exact
-    pid/window_id) on Linux, desktop/shell helper windows (GNOME ``ding``
-    "Desktop Icons", ``@!x,y;BDHF`` backdrop helpers) are skipped first —
-    they are targetable X11 windows but capture as empty. Then, when every
-    remaining candidate shares the same ``z_index`` (tied or unknown, the
-    common Linux/X11 case), prefer ``_NET_ACTIVE_WINDOW`` over list order
-    (#58026). Exact-target captures must not pay for an ``xprop`` probe.
+    pid/window_id), desktop/shell helpers are skipped first: GNOME ``ding`` /
+    ``@!x,y;BDHF`` backdrop helpers on Linux and full-display system/automation
+    overlays on Windows. They are targetable native windows but capture as
+    empty or as automation chrome. On Linux, when every remaining candidate
+    shares the same ``z_index`` (tied or unknown, the common X11 case), prefer
+    ``_NET_ACTIVE_WINDOW`` over list order (#58026). Exact-target captures
+    must not pay for an ``xprop`` probe.
     """
     candidates = [w for w in windows if not w["off_screen"]]
     pool = candidates
-    if not exact_target and not app_requested and sys.platform == "linux":
+    if (
+        not exact_target
+        and not app_requested
+        and sys.platform in {"linux", "win32"}
+    ):
         real_apps = [w for w in candidates if _is_real_app_window(w)]
         if real_apps:
             pool = real_apps
-        if pool and _z_index_uninformative(pool):
+        if sys.platform == "linux" and pool and _z_index_uninformative(pool):
             active_id = _linux_x11_active_window_id()
             if active_id is not None:
                 for w in pool:
@@ -4079,9 +4110,12 @@ class CuaDriverBackend(ComputerUseBackend):
            supplied. Returns an explicit 'stale' error if the snapshot
            has been superseded."
 
-        Gated on the per-tool capability claim so we don't send the
-        field to drivers that predate the surface (which would reject
-        the schema with `additionalProperties: false`).
+        Gated on either the per-tool capability claim or the live tool
+        schema. cua-driver 0.22.1 accepts and requires ``element_token``
+        for snapshot-scoped element actions, but advertises an empty
+        optional-capabilities list. The schema is the authoritative
+        compatibility boundary for that driver shape; older drivers that
+        predate the field still fail closed because their schema omits it.
         """
         idx = args.get("element_index")
         if not isinstance(idx, int):
@@ -4089,8 +4123,11 @@ class CuaDriverBackend(ComputerUseBackend):
         token = self._snapshot_tokens.get(idx)
         if not token:
             return
-        if not self._session.supports_capability(
-            "accessibility.element_tokens", tool=tool
+        if not (
+            self._session.supports_capability(
+                "accessibility.element_tokens", tool=tool
+            )
+            or self._session.supports_input_property(tool, "element_token")
         ):
             return
         args["element_token"] = token
