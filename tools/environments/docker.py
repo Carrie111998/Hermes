@@ -101,6 +101,100 @@ def _normalize_env_dict(env: dict | None) -> dict[str, str]:
     return normalized
 
 
+
+
+def _normalize_runtime_mounts(runtime_mounts: list[dict] | None) -> list[dict[str, object]]:
+    """Validate infrastructure-owned bind mounts before Docker CLI assembly."""
+    if runtime_mounts is None:
+        return []
+    if not isinstance(runtime_mounts, list):
+        raise ValueError("runtime_mounts must be a list")
+    normalized: list[dict[str, object]] = []
+    targets: set[str] = set()
+    for index, mount in enumerate(runtime_mounts):
+        if not isinstance(mount, dict):
+            raise ValueError(f"runtime mount #{index} must be a mapping")
+        source = str(mount.get("source") or "").strip()
+        target = str(mount.get("target") or "").strip()
+        if not source or not target:
+            raise ValueError(f"runtime mount #{index} requires source and target")
+        # The dispatcher/runtime layer already canonicalizes local sources.  At
+        # this point source may be a translated path on a remote Docker host,
+        # so do not os.path.exists() it from the Hermes machine.
+        if not target.startswith("/"):
+            raise ValueError(f"runtime mount #{index} target must be absolute")
+        if "," in source or "," in target:
+            raise ValueError("runtime mount paths containing commas are unsupported")
+        if target in targets:
+            raise ValueError(f"duplicate runtime mount target: {target}")
+        targets.add(target)
+        normalized.append({
+            "source": source,
+            "target": target,
+            "read_only": bool(mount.get("read_only", False)),
+            "purpose": str(mount.get("purpose") or "runtime"),
+        })
+    return normalized
+
+
+
+_MOUNT_CAPABLE_EXTRA_ARG_FLAGS = frozenset({
+    "-v",
+    "--volume",
+    "--mount",
+    "--volumes-from",
+})
+
+
+def _normalize_docker_extra_args(extra_args: list | None) -> list[str]:
+    """Preserve the historical extra-arg surface while dropping bad types."""
+    validated: list[str] = []
+    for arg in extra_args or []:
+        if not isinstance(arg, str):
+            logger.warning("Ignoring non-string docker_extra_args entry: %r", arg)
+            continue
+        validated.append(arg)
+    return validated
+
+
+def _mount_capable_extra_args(extra_args: list[str]) -> list[str]:
+    """Return Docker run args that can add host/volume filesystem mounts."""
+    collisions: list[str] = []
+    for arg in extra_args:
+        if arg == "-v" or arg.startswith("-v="):
+            collisions.append(arg)
+            continue
+        # Docker/pflag also accepts a short option with its value attached.
+        if arg.startswith("-v") and not arg.startswith("--") and len(arg) > 2:
+            collisions.append(arg)
+            continue
+        if any(
+            arg == flag or arg.startswith(f"{flag}=")
+            for flag in _MOUNT_CAPABLE_EXTRA_ARG_FLAGS
+            if flag != "-v"
+        ):
+            collisions.append(arg)
+    return collisions
+
+def _runtime_mount_args(runtime_mounts: list[dict] | None) -> tuple[list[str], set[str]]:
+    """Render strict Docker ``--mount type=bind`` argv for runtime mounts.
+
+    ``--mount`` fails when a bind source is missing instead of silently creating
+    an empty host directory like ``-v`` can.  That failure mode is essential for
+    Kanban durability: a wrong host path must fail the worker, never create an
+    ephemeral-looking success somewhere else.
+    """
+    mounts = _normalize_runtime_mounts(runtime_mounts)
+    args: list[str] = []
+    targets: set[str] = set()
+    for mount in mounts:
+        spec = f"type=bind,src={mount['source']},dst={mount['target']}"
+        if mount["read_only"]:
+            spec += ",readonly"
+        args.extend(["--mount", spec])
+        targets.add(str(mount["target"]))
+    return args, targets
+
 def _load_hermes_env_vars() -> dict[str, str]:
     """Load ~/.hermes/.env values without failing Docker command execution."""
     try:
@@ -681,7 +775,7 @@ def _build_security_args(run_as_host_user: bool, run_exec: bool = False) -> list
     return args + list(_PRIVDROP_CAP_ARGS)
 
 
-def _image_uses_init_entrypoint(docker_exe: str, image: str) -> bool:
+def _image_uses_init_entrypoint(docker_exe: str, image: str, pin_args: list[str] | None = None) -> bool:
     """Return True if ``image``'s entrypoint is the s6-overlay ``/init``.
 
     Such images (e.g. anything built on ``s6-overlay``, including
@@ -693,7 +787,7 @@ def _image_uses_init_entrypoint(docker_exe: str, image: str) -> bool:
     """
     try:
         result = subprocess.run(
-            [docker_exe, "image", "inspect", image,
+            [docker_exe, *(pin_args or []), "image", "inspect", image,
              "--format", "{{json .Config.Entrypoint}}"],
             capture_output=True,
             text=True, encoding='utf-8', errors='replace',
@@ -748,7 +842,7 @@ _storage_opt_ok: Optional[bool] = None  # cached result across instances
 _cgroup_limits_ok: Optional[bool] = None  # cached result across instances
 
 
-def _cgroup_limits_available(image: str) -> bool:
+def _cgroup_limits_available(image: str, pin_args: list[str] | None = None) -> bool:
     """Probe whether cgroup resource limits work in this environment.
 
     Tests ``--cpus``, ``--memory`` and ``--pids-limit`` together by spawning
@@ -775,7 +869,7 @@ def _cgroup_limits_available(image: str) -> bool:
 
     try:
         result = subprocess.run(
-            [docker_exe, "run", "--rm",
+            [docker_exe, *(pin_args or []), "run", "--rm",
              "--cpus", "0.5", "--memory", "64m", "--pids-limit", "32",
              image, "sleep", "0"],
             capture_output=True,
@@ -800,11 +894,13 @@ def _cgroup_limits_available(image: str) -> bool:
     return _cgroup_limits_ok
 
 
-def _ensure_docker_available() -> None:
+def _ensure_docker_available(pin_args: list[str] | None = None) -> None:
     """Best-effort check that the docker CLI is available before use.
 
     Reuses ``find_docker()`` so this preflight stays consistent with the rest of
     the Docker backend, including known non-PATH Docker Desktop locations.
+    When a Kanban task runtime resolved an endpoint selector, the availability
+    probe targets THAT daemon via explicit ``--context``/``--host`` args.
     """
     docker_exe = find_docker()
     if not docker_exe:
@@ -824,7 +920,7 @@ def _ensure_docker_available() -> None:
 
     try:
         result = subprocess.run(
-            [docker_exe, "version"],
+            [docker_exe, *(pin_args or []), "version"],
             capture_output=True,
             text=True, encoding='utf-8', errors='replace',
             timeout=5,
@@ -909,6 +1005,7 @@ class DockerEnvironment(BaseEnvironment):
         persistent_filesystem: bool = False,
         task_id: str = "default",
         volumes: list = None,
+        runtime_mounts: list[dict] | None = None,
         forward_env: list[str] | None = None,
         env: dict | None = None,
         network: bool = True,
@@ -918,6 +1015,10 @@ class DockerEnvironment(BaseEnvironment):
         extra_args: list = None,
         persist_across_processes: bool = True,
         shm_size: str = _DEFAULT_SHM_SIZE,
+        # P1-C: frozen Docker endpoint selector for Kanban task runtimes. When
+        # set, every lifecycle call is pinned to the resolved daemon so ambient
+        # DOCKER_* state can never retarget it mid-flight.
+        endpoint_selector=None,
         shared_container_key: str = "",
     ):
         if cwd == "~":
@@ -932,6 +1033,20 @@ class DockerEnvironment(BaseEnvironment):
         self._task_id = task_id
         self._forward_env = _normalize_forward_env_names(forward_env)
         self._env = _normalize_env_dict(env)
+        self._runtime_mounts = _normalize_runtime_mounts(runtime_mounts)
+        # Validate profile/user extra args BEFORE Docker availability/cgroup
+        # probes.  When task runtime mounts are authoritative, no lower-priority
+        # Docker flag may add or inherit another filesystem mount.  Benign
+        # extra args retain their historical last-wins position below.
+        validated_extra = _normalize_docker_extra_args(extra_args)
+        if self._runtime_mounts:
+            mount_extra = _mount_capable_extra_args(validated_extra)
+            if mount_extra:
+                raise ValueError(
+                    "docker_extra_args cannot add host/volume mounts while "
+                    "task-scoped runtime mounts are active: "
+                    + ", ".join(repr(arg) for arg in mount_extra)
+                )
         self._init_unset_passthrough_names: tuple[str, ...] = ()
         self._container_id: Optional[str] = None
         self._labels: dict[str, str] = {}
@@ -947,25 +1062,34 @@ class DockerEnvironment(BaseEnvironment):
             logger.warning("docker_volumes config is not a list: %r", volumes)
             volumes = []
 
-        # Fail fast if Docker is not available.
-        _ensure_docker_available()
+        # Fail fast if Docker is not available. When a Kanban task runtime
+        # resolved an endpoint selector, the availability probe must target
+        # THAT daemon — an unpinned probe could pass on ambient DOCKER_* state
+        # while every pinned lifecycle call would hit a different/unreachable
+        # daemon.
+        _ensure_docker_available(
+            list(endpoint_selector.cli_args) if endpoint_selector else []
+        )
 
         # Build resource limit args (gated by cgroup availability probe so
         # they degrade gracefully on hosts without controller delegation,
         # e.g. unprivileged LXCs). The probe runs once per process and is
         # cached host-wide.
         resource_args = []
-        if cpu > 0 and _cgroup_limits_available(image):
+        _cgroup_pin_args = (
+            list(endpoint_selector.cli_args) if endpoint_selector else []
+        )
+        if cpu > 0 and _cgroup_limits_available(image, _cgroup_pin_args):
             resource_args.extend(["--cpus", str(cpu)])
-        if memory > 0 and _cgroup_limits_available(image):
+        if memory > 0 and _cgroup_limits_available(image, _cgroup_pin_args):
             resource_args.extend(["--memory", f"{memory}m"])
-        if _cgroup_limits_available(image):
+        if _cgroup_limits_available(image, _cgroup_pin_args):
             resource_args.extend(["--pids-limit", _DEFAULT_PIDS_LIMIT])
         # /dev/shm size (not cgroup-gated: --shm-size is a tmpfs mount option,
         # no controller delegation required). Skip when the user already sets
         # it via docker_extra_args, or opted out with an empty/"0" value.
         shm = str(shm_size or "").strip()
-        if shm and shm != "0" and not _extra_args_set_shm_size(extra_args):
+        if shm and shm != "0" and not _extra_args_set_shm_size(validated_extra):
             resource_args.extend(["--shm-size", shm])
         if disk > 0 and sys.platform != "darwin":
             if self._storage_opt_supported():
@@ -983,9 +1107,19 @@ class DockerEnvironment(BaseEnvironment):
         # mode uses tmpfs (ephemeral, fast, gone on cleanup).
         from tools.environments.base import get_sandbox_dir
 
+        # Dispatcher/runtime mounts are infrastructure-owned and authoritative.
+        # When present, user/profile docker_volumes are ignored so a shared
+        # worker profile cannot widen a task's host filesystem view.
+        runtime_volume_args, runtime_targets = _runtime_mount_args(self._runtime_mounts)
+        volume_args = list(runtime_volume_args)
+        workspace_explicitly_mounted = "/workspace" in runtime_targets
+        if self._runtime_mounts and volumes:
+            logger.warning(
+                "Ignoring profile docker_volumes because task-scoped runtime mounts are active"
+            )
+            volumes = []
+
         # User-configured volume mounts (from config.yaml docker_volumes)
-        volume_args = []
-        workspace_explicitly_mounted = False
         for vol in (volumes or []):
             if not isinstance(vol, str):
                 logger.warning("Docker volume entry is not a string: %r", vol)
@@ -1343,6 +1477,14 @@ class DockerEnvironment(BaseEnvironment):
         # Resolve the docker executable once so it works even when
         # /usr/local/bin is not in PATH (common on macOS gateway/service).
         self._docker_exe = find_docker() or "docker"
+        # P1-C: frozen endpoint selector. When a Kanban task runtime resolved
+        # one, EVERY lifecycle call (version probe, inspect, run, start, exec,
+        # ps, rm) is pinned to that exact daemon with explicit --context /
+        # --host global args — ambient DOCKER_* state can never retarget them.
+        self._endpoint_selector = endpoint_selector
+        self._pin_args: list[str] = (
+            list(endpoint_selector.cli_args) if endpoint_selector else []
+        )
 
         # s6-overlay images (e.g. hermes-agent:latest) already use /init as PID 1
         # and exec /run/s6/basedir/bin/init during startup. For those images we
@@ -1350,7 +1492,9 @@ class DockerEnvironment(BaseEnvironment):
         # /run with exec instead of noexec, or s6 stage0 dies with exit 126
         # "Permission denied". Detected once here; defaults are kept on any
         # inspection failure. See issue #34628.
-        image_uses_s6_init = _image_uses_init_entrypoint(self._docker_exe, image)
+        image_uses_s6_init = _image_uses_init_entrypoint(
+            self._docker_exe, image, self._pin_args
+        )
         if image_uses_s6_init:
             logger.info(
                 "Docker: image %s uses /init (s6-overlay) as entrypoint — "
@@ -1363,14 +1507,9 @@ class DockerEnvironment(BaseEnvironment):
         )
 
         logger.info("Docker volume_args: %s", volume_args)
-        # User-supplied extra docker run flags (docker_extra_args in config.yaml).
-        # Appended last so they can override defaults if needed.
-        validated_extra = []
-        for arg in (extra_args or []):
-            if not isinstance(arg, str):
-                logger.warning("Ignoring non-string docker_extra_args entry: %r", arg)
-                continue
-            validated_extra.append(arg)
+        # User-supplied benign extra Docker run flags keep their historical
+        # last-wins position. Mount-capable forms were rejected before any
+        # Docker call when task-scoped runtime mounts are active.
         if egress_env_overrides:
             _extra_collisions = _extra_args_egress_collisions(
                 validated_extra, _critical_egress_names,
@@ -1477,7 +1616,7 @@ class DockerEnvironment(BaseEnvironment):
                     )
                     try:
                         subprocess.run(
-                            [self._docker_exe, "rm", "-f", container_id],
+                            [self._docker_exe, *self._pin_args, "rm", "-f", container_id],
                             capture_output=True,
                             text=True, encoding="utf-8", errors="replace",
                             timeout=30,
@@ -1493,7 +1632,7 @@ class DockerEnvironment(BaseEnvironment):
                 if state != "running":
                     try:
                         subprocess.run(
-                            [self._docker_exe, "start", container_id],
+                            [self._docker_exe, *self._pin_args, "start", container_id],
                             capture_output=True,
                             text=True, encoding='utf-8', errors='replace',
                             timeout=30,
@@ -1520,7 +1659,7 @@ class DockerEnvironment(BaseEnvironment):
             # there creates two competing inits and breaks startup (#34628).
             init_args = [] if image_uses_s6_init else ["--init"]
             run_cmd = [
-                self._docker_exe, "run", "-d",
+                self._docker_exe, *self._pin_args, "run", "-d",
                 *init_args,
                 "--name", container_name,
                 *label_args,
@@ -1553,7 +1692,7 @@ class DockerEnvironment(BaseEnvironment):
                     container_name, e,
                 )
                 subprocess.run(
-                    [self._docker_exe, "rm", "-f", container_name],
+                    [self._docker_exe, *self._pin_args, "rm", "-f", container_name],
                     capture_output=True, timeout=10,
                     stdin=subprocess.DEVNULL,
                 )
@@ -1671,7 +1810,7 @@ class DockerEnvironment(BaseEnvironment):
                   stdin_data: str | None = None) -> subprocess.Popen:
         """Spawn a bash process inside the Docker container."""
         assert self._container_id, "Container not started"
-        cmd = [self._docker_exe, "exec"]
+        cmd = [self._docker_exe, *self._pin_args, "exec"]
         if stdin_data is not None:
             cmd.append("-i")
 
@@ -1751,7 +1890,7 @@ class DockerEnvironment(BaseEnvironment):
             else:
                 try:
                     subprocess.run(
-                        [self._docker_exe, "start", cid],
+                        [self._docker_exe, *self._pin_args, "start", cid],
                         capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=30, check=True,
                         stdin=subprocess.DEVNULL,
                     )
@@ -1773,7 +1912,7 @@ class DockerEnvironment(BaseEnvironment):
                 for k, v in self._labels.items():
                     label_args.extend(["--label", f"{k}={v}"])
                 run_cmd = [
-                    self._docker_exe, "run", "-d",
+                    self._docker_exe, *self._pin_args, "run", "-d",
                     *init_args,
                     "--name", new_name,
                     *label_args,
@@ -1880,7 +2019,7 @@ class DockerEnvironment(BaseEnvironment):
         try:
             result = subprocess.run(
                 [
-                    self._docker_exe, "inspect",
+                    self._docker_exe, *self._pin_args, "inspect",
                     "--format", "{{.HostConfig.NetworkMode}}",
                     container_id,
                 ],
@@ -1940,7 +2079,7 @@ class DockerEnvironment(BaseEnvironment):
                 fmt = '{{.ID}}\t{{.State}}\t{{.Label "' + _EGRESS_LABEL_KEY + '"}}'
             result = subprocess.run(
                 [
-                    self._docker_exe, "ps", "-a",
+                    self._docker_exe, *self._pin_args, "ps", "-a",
                     *filters,
                     "--format", fmt,
                 ],
@@ -2071,13 +2210,14 @@ class DockerEnvironment(BaseEnvironment):
         # Capture state needed by the worker before we null out the attrs —
         # the worker thread can outlive ``self``.
         docker_exe = self._docker_exe
+        pin_args = list(self._pin_args)
         log_id = container_id[:12]
 
         def _do_cleanup() -> None:
             if should_stop:
                 try:
                     subprocess.run(
-                        [docker_exe, "stop", "-t", "10", container_id],
+                        [docker_exe, *pin_args, "stop", "-t", "10", container_id],
                         capture_output=True, timeout=30,
                         stdin=subprocess.DEVNULL,
                     )
@@ -2086,7 +2226,7 @@ class DockerEnvironment(BaseEnvironment):
             if should_remove:
                 try:
                     subprocess.run(
-                        [docker_exe, "rm", "-f", container_id],
+                        [docker_exe, *pin_args, "rm", "-f", container_id],
                         capture_output=True, timeout=30,
                         stdin=subprocess.DEVNULL,
                     )

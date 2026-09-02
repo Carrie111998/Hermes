@@ -21828,7 +21828,27 @@ def main(
     # Signal to terminal_tool that we're in interactive mode
     # This enables interactive sudo password prompts with timeout
     os.environ["HERMES_INTERACTIVE"] = "1"
-    
+
+    # P1-B: one-shot dispatcher ownership bootstrap. When the dispatcher
+    # spawned this process as a Kanban worker, the unconsumed ownership marker
+    # is validated against the runtime identity, positive dispatcher authority
+    # is recorded in ContextVar state, and the marker is removed from the env
+    # so ordinary child subprocesses cannot inherit or reconstruct ownership.
+    # Any validation failure denies authority (fail closed) but does NOT crash
+    # the CLI: an unauthorized process simply runs without task-mount rights.
+    if os.environ.get("HERMES_KANBAN_WORKER_OWNERSHIP") or (
+        os.environ.get("HERMES_SESSION_SOURCE", "").lower() == "kanban"
+    ):
+        from agent.delegation_context import bootstrap_dispatcher_authority
+
+        try:
+            _auth_token = bootstrap_dispatcher_authority(
+                task_id=os.environ.get("HERMES_KANBAN_TASK", ""),
+                workspace=os.environ.get("HERMES_KANBAN_WORKSPACE"),
+            )
+        except Exception as exc:  # noqa: BLE001 — denial is a policy state
+            logger.warning("Kanban worker authority denied: %s", exc)
+
     # Handle gateway mode (messaging + cron)
     if gateway:
         import asyncio

@@ -438,6 +438,11 @@ def test_every_dispatcher_kanban_var_is_identity_gated():
         "HERMES_KANBAN_BRANCH",
         "HERMES_KANBAN_GOAL_MODE",
         "HERMES_KANBAN_GOAL_MAX_TURNS",
+        # One-shot dispatcher ownership proof: consumed (removed from env) at
+        # worker bootstrap, never inherited by child subprocesses. Not part of
+        # KANBAN_ENV_KEYS because scrub_kanban_env must not strip it from a
+        # delegated-child env where it no longer exists anyway.
+        "HERMES_KANBAN_WORKER_OWNERSHIP",
     }
     uncovered = injected - set(KANBAN_ENV_KEYS) - behaviour_only
     assert not uncovered, (

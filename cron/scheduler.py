@@ -6062,6 +6062,13 @@ def run_job(
         # concurrent cron jobs on the parallel pool.  contextvars.copy_context()
         # at the run_conversation hop carries this into the agent thread.
         _non_dispatcher_token = enter_non_dispatcher_owned_context()
+        # P1-B: the veto dominates every nesting depth — a cron job fired
+        # in-process from an authorized worker must not be able to recover
+        # dispatcher authority through delegate inheritance.
+        from agent.delegation_context import non_dispatcher_authority_veto
+
+        _veto_ctx = non_dispatcher_authority_veto()
+        _veto_ctx.__enter__()
         if _job_workdir:
             logger.info("Job '%s': using task-scoped workdir %s", job_id, _job_workdir)
 
@@ -6971,6 +6978,10 @@ def run_job(
             _cron_session_var.reset(_cron_session_token)
         if _non_dispatcher_token is not None:
             exit_non_dispatcher_owned_context(_non_dispatcher_token)
+        try:
+            _veto_ctx.__exit__(None, None, None)
+        except Exception:
+            pass
         for _var_name in _cron_delivery_vars:
             _VAR_MAP[_var_name].set("")
         if _session_db:

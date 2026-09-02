@@ -164,6 +164,10 @@ def _make_execute_only_env(forward_env=None):
     env._timeout_result = lambda timeout: {"output": f"timed out after {timeout}", "returncode": 124}
     env._container_id = "test-container"
     env._docker_exe = "/usr/bin/docker"
+    # P1-C: DockerEnvironment.__init__ always pins a frozen endpoint selector
+    # for Kanban runtimes; the fast-path unit fixture must mirror the
+    # no-selector default so _run_bash/_execute that read _pin_args work.
+    env._pin_args = []
     # Base class attributes needed by unified execute()
     env._session_id = "test123"
     env._snapshot_path = "/tmp/hermes-snap-test123.sh"
