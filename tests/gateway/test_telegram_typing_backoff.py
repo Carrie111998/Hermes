@@ -1,6 +1,7 @@
 """Telegram typing indicator transient backoff tests."""
 
 import sys
+import time
 from pathlib import Path
 from unittest.mock import AsyncMock
 
@@ -84,3 +85,29 @@ async def test_typing_bad_thread_failure_does_not_cool_down(monkeypatch):
 
     assert adapter._bot.send_chat_action.await_count == 2
     assert "123" not in adapter._telegram_typing_cooldown_until
+
+
+@pytest.mark.asyncio
+async def test_send_typing_noops_during_send_cooldown():
+    """sendChatAction must not fire while the chat is in send cooldown.
+
+    The per-chat send cooldown (#66722) gates send()/edit. Typing used to
+    walk past it and keep hammering a flood-limited chat (#99643).
+    """
+    adapter = _make_adapter()
+    adapter._bot.send_chat_action = AsyncMock(return_value=None)
+    adapter._send_cooldown_until = {"123": time.monotonic() + 30.0}
+
+    await adapter.send_typing("123")
+
+    adapter._bot.send_chat_action.assert_not_called()
+
+    # A different chat is not blocked.
+    await adapter.send_typing("456")
+    adapter._bot.send_chat_action.assert_called_once()
+
+    # After the cooldown expires, typing resumes.
+    adapter._send_cooldown_until["123"] = time.monotonic() - 0.1
+    adapter._bot.send_chat_action.reset_mock()
+    await adapter.send_typing("123")
+    adapter._bot.send_chat_action.assert_called_once()

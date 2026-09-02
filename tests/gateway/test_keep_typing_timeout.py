@@ -234,3 +234,107 @@ class TestKeepTypingTimeoutPerTick:
             ("discord-chat", True),
         ]
         assert "discord-chat" not in adapter._typing_paused
+
+
+class TestKeepTypingPerChatClock:
+    """Telegram rate-limits sendChatAction per CHAT, but _keep_typing runs
+    per SESSION. DM topics share one chat_id; without a shared clock, N
+    concurrent sessions multiply the refresh rate until Telegram flood-bans
+    the chat (#99643).
+    """
+
+    def test_claim_typing_tick_is_per_chat_not_per_session(self):
+        adapter = _StubAdapter()
+        assert adapter._claim_typing_tick("chat-1", 2.0, now=10.0) is True
+        # Sibling session in the same chat must not double the rate.
+        assert adapter._claim_typing_tick("chat-1", 2.0, now=10.5) is False
+        assert adapter._claim_typing_tick("chat-1", 2.0, now=11.9) is False
+        # A different chat has its own slot.
+        assert adapter._claim_typing_tick("chat-2", 2.0, now=10.5) is True
+        # After the interval the original chat can fire again.
+        assert adapter._claim_typing_tick("chat-1", 2.0, now=12.0) is True
+
+    @pytest.mark.asyncio
+    async def test_two_sessions_same_chat_do_not_double_rate(self, monkeypatch):
+        adapter = _StubAdapter()
+        calls = []
+
+        async def recording_send_typing(chat_id, metadata=None):
+            calls.append(chat_id)
+
+        monkeypatch.setattr(adapter, "send_typing", recording_send_typing)
+        adapter.stop_typing = MagicMock(return_value=asyncio.sleep(0))
+
+        stop_event = asyncio.Event()
+        # Interval longer than the observation window so each loop fires
+        # only its first tick. Without the per-chat clock that is 2 sends.
+        task_a = asyncio.create_task(
+            adapter._keep_typing("shared-dm", interval=10.0, stop_event=stop_event)
+        )
+        task_b = asyncio.create_task(
+            adapter._keep_typing("shared-dm", interval=10.0, stop_event=stop_event)
+        )
+        await asyncio.sleep(0.05)
+        stop_event.set()
+        await asyncio.wait_for(asyncio.gather(task_a, task_b), timeout=1.0)
+
+        assert calls == ["shared-dm"], (
+            f"two sessions in the same chat must share one typing tick, "
+            f"got {calls!r}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_two_sessions_different_chats_keep_independent_clocks(
+        self, monkeypatch
+    ):
+        adapter = _StubAdapter()
+        calls = []
+
+        async def recording_send_typing(chat_id, metadata=None):
+            calls.append(chat_id)
+
+        monkeypatch.setattr(adapter, "send_typing", recording_send_typing)
+        adapter.stop_typing = MagicMock(return_value=asyncio.sleep(0))
+
+        stop_event = asyncio.Event()
+        task_a = asyncio.create_task(
+            adapter._keep_typing("dm-a", interval=10.0, stop_event=stop_event)
+        )
+        task_b = asyncio.create_task(
+            adapter._keep_typing("dm-b", interval=10.0, stop_event=stop_event)
+        )
+        await asyncio.sleep(0.05)
+        stop_event.set()
+        await asyncio.wait_for(asyncio.gather(task_a, task_b), timeout=1.0)
+
+        assert sorted(calls) == ["dm-a", "dm-b"]
+
+    @pytest.mark.asyncio
+    async def test_failed_tick_releases_slot_for_sibling(self, monkeypatch):
+        """A winner whose send_typing errors must not starve the chat (#99676)."""
+        adapter = _StubAdapter()
+        calls = []
+
+        async def failing_then_ok(chat_id, metadata=None):
+            calls.append(chat_id)
+            if len(calls) == 1:
+                raise RuntimeError("transport down")
+
+        monkeypatch.setattr(adapter, "send_typing", failing_then_ok)
+        adapter.stop_typing = MagicMock(return_value=asyncio.sleep(0))
+
+        stop_event = asyncio.Event()
+        task_a = asyncio.create_task(
+            adapter._keep_typing("shared-dm", interval=10.0, stop_event=stop_event)
+        )
+        await asyncio.sleep(0.02)
+        task_b = asyncio.create_task(
+            adapter._keep_typing("shared-dm", interval=10.0, stop_event=stop_event)
+        )
+        await asyncio.sleep(0.05)
+        stop_event.set()
+        await asyncio.wait_for(asyncio.gather(task_a, task_b), timeout=1.0)
+
+        assert calls == ["shared-dm", "shared-dm"], (
+            f"sibling must pick up the next tick after a failed send, got {calls!r}"
+        )

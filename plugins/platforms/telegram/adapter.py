@@ -8714,9 +8714,33 @@ class TelegramAdapter(BasePlatformAdapter):
         self._telegram_typing_cooldown_until.pop(str(chat_id), None)
         return False
 
+    def _send_in_cooldown(self, chat_id: str) -> bool:
+        """True when this chat is inside the per-chat send cooldown (#66722).
+
+        Typing must not hammer sendChatAction while send()/edit is already
+        flood-limited. getattr-guard: the dict is populated by send() when
+        that gate is present; tests (and older adapters) may set it directly.
+        Stamped with ``time.monotonic()``.
+        """
+        until_map = getattr(self, "_send_cooldown_until", None)
+        if not until_map:
+            return False
+        until = until_map.get(str(chat_id))
+        if until is None:
+            return False
+        try:
+            until_ts = float(until)
+        except (TypeError, ValueError):
+            return False
+        return time.monotonic() < until_ts
+
     async def send_typing(self, chat_id: str, metadata: Optional[Dict[str, Any]] = None) -> None:
-        """Send typing indicator."""
-        if not self._bot or self._typing_in_cooldown(chat_id):
+        """Send typing indicator.
+
+        No-ops while the chat is in the per-chat send cooldown so a known
+        flood window quiesces typing traffic instead of extending it.
+        """
+        if not self._bot or self._typing_in_cooldown(chat_id) or self._send_in_cooldown(chat_id):
             return
 
         _is_dm_topic: bool = False

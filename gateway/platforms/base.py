@@ -3349,6 +3349,14 @@ class BasePlatformAdapter(ABC):
         # Chats where typing indicator is paused (e.g. during approval waits).
         # _keep_typing skips send_typing when the chat_id is in this set.
         self._typing_paused: set = set()
+        # Shared per-chat typing keep-alive clock (chat_id -> monotonic ts).
+        # Telegram rate-limits sendChatAction per CHAT, but _keep_typing runs
+        # per SESSION. DM topics share one chat_id, so N concurrent sessions
+        # would otherwise each refresh every 2s (N x 0.5 calls/s against a
+        # ~1 msg/s envelope) until Telegram flood-bans the chat (#99643).
+        # Same class of gate as progress edits: one tick per chat per
+        # interval, regardless of how many sessions are active in it.
+        self._typing_clock: Dict[str, float] = {}
         # Dynamic working-state status text per chat (chat_id -> phrase).
         # Set by the gateway on tool starts ("is running pytest…") and read
         # by adapters whose typing indicator renders text (Slack's
@@ -5494,6 +5502,45 @@ class BasePlatformAdapter(ABC):
 
         return paths, cleaned
 
+    def _claim_typing_tick(
+        self,
+        chat_id: str,
+        interval: float,
+        *,
+        now: float | None = None,
+    ) -> bool:
+        """Claim the shared per-chat typing keep-alive slot.
+
+        Telegram rate-limits sendChatAction per CHAT, but ``_keep_typing``
+        runs per SESSION. DM topics share one chat_id, so N concurrent
+        sessions would each refresh every ``interval`` seconds (N x 0.5
+        calls/s against a ~1 msg/s envelope) until Telegram flood-bans
+        the chat (#99643).
+
+        Same class of gate as progress edits: one tick per chat per
+        interval, regardless of how many sessions are active in it.
+
+        Returns True if this caller owns the tick and should ``send_typing``.
+        asyncio is single-threaded, so stamping the clock *before* awaiting
+        send_typing makes the claim atomic against sibling loops.
+        """
+        clock = getattr(self, "_typing_clock", None)
+        if clock is None:
+            self._typing_clock = {}
+            clock = self._typing_clock
+        key = str(chat_id)
+        if now is None:
+            now = time.monotonic()
+        last = clock.get(key, 0.0)
+        try:
+            gap = float(interval)
+        except (TypeError, ValueError):
+            gap = 2.0
+        if gap > 0.0 and (now - last) < gap:
+            return False
+        clock[key] = now
+        return True
+
     async def _keep_typing(
         self,
         chat_id: str,
@@ -5506,6 +5553,10 @@ class BasePlatformAdapter(ABC):
         
         Telegram/Discord typing status expires after ~5 seconds, so we refresh every 2
         to recover quickly after progress messages interrupt it.
+
+        Typing refreshes are gated on a shared per-chat clock so concurrent
+        sessions in the same chat (Telegram DM topics share one chat_id) do
+        not multiply sendChatAction traffic past the platform flood envelope.
         
         Skips send_typing when the chat is in ``_typing_paused`` (e.g. while
         the agent is waiting for dangerous-command approval).  This is critical
@@ -5530,22 +5581,34 @@ class BasePlatformAdapter(ABC):
                 if stop_event is not None and stop_event.is_set():
                     return
                 if chat_id not in self._typing_paused:
-                    try:
-                        await asyncio.wait_for(
-                            self.send_typing(chat_id, metadata=metadata),
-                            timeout=_send_typing_timeout,
-                        )
-                    except asyncio.TimeoutError:
-                        # Slow network — abandon this tick, keep the loop
-                        # on schedule so the next send_typing fires fresh.
-                        pass
-                    except asyncio.CancelledError:
-                        raise
-                    except Exception as typing_err:
-                        logger.debug(
-                            "[%s] send_typing error (non-fatal): %s",
-                            self.name, typing_err,
-                        )
+                    # Stamp happens inside the claim, before the await. If
+                    # this send never actually delivers, restore the previous
+                    # stamp so a sibling session can take the next tick
+                    # instead of a wedged winner blacking out the chat.
+                    clock = getattr(self, "_typing_clock", None)
+                    if clock is None:
+                        self._typing_clock = {}
+                        clock = self._typing_clock
+                    key = str(chat_id)
+                    prev = clock.get(key, 0.0)
+                    if self._claim_typing_tick(chat_id, interval):
+                        try:
+                            await asyncio.wait_for(
+                                self.send_typing(chat_id, metadata=metadata),
+                                timeout=_send_typing_timeout,
+                            )
+                        except asyncio.TimeoutError:
+                            # Slow network — abandon this tick, keep the loop
+                            # on schedule so the next send_typing fires fresh.
+                            clock[key] = prev
+                        except asyncio.CancelledError:
+                            raise
+                        except Exception as typing_err:
+                            clock[key] = prev
+                            logger.debug(
+                                "[%s] send_typing error (non-fatal): %s",
+                                self.name, typing_err,
+                            )
                 if stop_event is None:
                     await asyncio.sleep(interval)
                     continue
