@@ -2561,7 +2561,11 @@ class PhotonAdapter(BasePlatformAdapter):
                 retryable=e.retryable,
             )
         except Exception as e:
-            return SendResult(success=False, error=str(e))
+            # str(e) can be empty (e.g. httpx.ReadTimeout carries no message),
+            # and an empty error string slips past _send_with_retry's timeout
+            # guard, whose substring match then enables the plain-text resend
+            # of a request the sidecar may already have delivered.
+            return SendResult(success=False, error=f"{type(e).__name__}: {e}")
         self._record_sent_message(data.get("messageId"))
         return SendResult(success=True, message_id=data.get("messageId"))
 
