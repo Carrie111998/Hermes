@@ -5,6 +5,7 @@ import pytest
 from pathlib import Path
 
 from tools.memory_tool import (
+    ENTRY_DELIMITER,
     MemoryStore,
     memory_tool,
     _scan_memory_content,
@@ -487,6 +488,89 @@ class TestExternalDriftGuard:
 
         result = store.replace("memory", "Entry two", "Entry two replaced.")
         assert result["success"] is True
+
+    def test_legacy_sectioned_file_is_adopted_not_refused(self, store):
+        """A pre-§ ``##``-sectioned MEMORY.md stays writable (#94121).
+
+        It parses as ONE entry the size of the whole file, so the
+        entry-size signal used to fire on every call and freeze the store
+        with a .bak snapshot and no migration path.
+        """
+        path = store._path_for("memory")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            "## Vendors\nAcme ships on Tuesdays.\n\n"
+            "## Standing orders\nAlways confirm totals.\n\n"
+            "## Pin board\nQ3 review is on the 14th.\n",
+            encoding="utf-8",
+        )
+
+        store.load_from_disk()
+        assert len(store.memory_entries) == 3
+        assert store.memory_entries[0].startswith("## Vendors")
+
+        result = store.replace("memory", "Acme ships", "## Vendors\nAcme ships daily.")
+
+        assert result["success"] is True, result.get("error")
+        # The successful write persists the store in § form; every legacy
+        # section survives it.
+        updated = path.read_text(encoding="utf-8")
+        assert ENTRY_DELIMITER in updated
+        assert "Acme ships daily." in updated
+        assert "Standing orders" in updated
+        assert "Pin board" in updated
+
+    def test_legacy_preamble_is_kept_as_an_entry(self, store):
+        """Content above the first heading is content, not something to drop."""
+        path = store._path_for("memory")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            "User prefers brevity.\n\n## Vendors\nAcme.\n\n## Pin board\nQ3.\n",
+            encoding="utf-8",
+        )
+
+        store.load_from_disk()
+
+        assert store.memory_entries[0] == "User prefers brevity."
+        assert len(store.memory_entries) == 3
+
+    def test_oversized_legacy_section_is_still_drift(self, store):
+        """Adoption does not weaken the guard against free-form appends.
+
+        A section larger than the whole-store limit is the shape #26045
+        cares about: an external writer dumping a blob the tool would
+        truncate on flush. It is still refused, with the backup.
+        """
+        path = store._path_for("memory")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            "## Vendors\n" + "x" * 800 + "\n\n## Pin board\nQ3 review.\n",
+            encoding="utf-8",
+        )
+        original = path.read_text(encoding="utf-8")
+
+        result = store.replace("memory", "Q3 review", "Q3 review moved.")
+
+        assert result["success"] is False
+        assert "drift_backup" in result
+        assert path.read_text(encoding="utf-8") == original
+
+    def test_single_heading_entry_is_not_split(self, store):
+        """One heading is an entry that starts with markdown, not a document."""
+        store.add("memory", "## Deploy runbook\nRun the smoke tests first.")
+
+        store.load_from_disk()
+
+        assert store.memory_entries == ["## Deploy runbook\nRun the smoke tests first."]
+
+    def test_delimited_store_with_headings_keeps_its_entries(self, store):
+        """A § file is a tool-written store however its entries are written."""
+        store.add("memory", "## Vendors\nAcme.")
+        store.add("memory", "## Pin board\nQ3.")
+
+        store.load_from_disk()
+
+        assert store.memory_entries == ["## Vendors\nAcme.", "## Pin board\nQ3."]
 
     def test_drift_guard_also_protects_user_target(self, store):
         """USER.md gets the same guarantee as MEMORY.md."""
