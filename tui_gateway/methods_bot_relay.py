@@ -77,11 +77,13 @@ def _(rid, params: dict) -> dict:
     """Deliver a relayed DM into a profile's Bot Chat ON THIS GATEWAY.
 
     Params: ``profile`` (target on this install), ``message`` (already
-    attribution-prefixed by the sender gateway). Runs the same one-turn
-    ``hermes -p <profile> chat -c "Bot Chat"`` transport local DMs use and
-    returns ``{reply}`` — the target agent's response text. Blocking by
-    design (the Desktop calls it from its relay worker, off any UI path;
-    the RPC pool keeps it off the WS reader thread).
+    attribution-prefixed by the sender gateway). Prefers the gateway HTTP
+    API (``tools.bot_relay.deliver_via_gateway_api`` via ``httpx``) and
+    falls back to the legacy ``hermes -p <profile> chat -c "Bot Chat"``
+    subprocess when the gateway API is unavailable — same one-turn
+    semantics either way. Returns ``{reply}`` — the target agent's response
+    text. Blocking by design (the Desktop calls it from its relay worker,
+    off any UI path; the RPC pool keeps it off the WS reader thread).
     """
     import os
     import subprocess
@@ -94,7 +96,7 @@ def _(rid, params: dict) -> dict:
         return _err(rid, 4090, "profile and message required")
     try:
         from tools.bot_mode_dm import MESSAGE_MAX_CHARS
-        from tools.bot_relay import acquire_turn_lock, local_delivery_command
+        from tools.bot_relay import acquire_turn_lock, deliver_via_gateway_api
 
         if len(message) > MESSAGE_MAX_CHARS + 200:  # + attribution headroom
             return _err(rid, 4091, "message too long")
@@ -109,18 +111,26 @@ def _(rid, params: dict) -> dict:
         if resolved not in known:
             return _err(rid, 4092, f"no profile '{profile}' on this gateway")
 
-        fd, tmp = tempfile.mkstemp(prefix="hermes-relay-dm-", suffix=".txt", text=True)
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as f:
-                f.write(message)
-            # Per-profile turn lock (#93091): serialize with any other
-            # delivery turn into this profile (relay or local message_agent).
-            # The lock covers only the turn execution window. Worst-case
-            # handler hold is lock wait (bot_mode.turn_wait_seconds, default
-            # 120s) + the 600s turn timeout below — doubled when the retry
-            # policy grants one bounded re-run — so clients calling
-            # bot_relay.deliver must tolerate ~1320s before assuming failure.
-            with acquire_turn_lock(root, resolved):
+        # Per-profile turn lock (#93091): serialize with any other
+        # delivery turn into this profile (relay or local message_agent).
+        # The lock covers only the turn execution window. Worst-case
+        # handler hold is lock wait (bot_mode.turn_wait_seconds, default
+        # 120s) + the 600s turn timeout below — doubled when the retry
+        # policy grants one bounded re-run — so clients calling
+        # bot_relay.deliver must tolerate ~1320s before assuming failure.
+        with acquire_turn_lock(root, resolved):
+            # ponytail #95741: prefer gateway API (httpx, no subprocess)
+            # over spawning a full CLI. One replacement here covers every
+            # relay delivery path; fallback preserves standalone installs.
+            reply = deliver_via_gateway_api(resolved, message, timeout=600)
+            if reply is not None:
+                return _ok(rid, {"reply": reply})
+            from tools.bot_relay import local_delivery_command
+
+            fd, tmp = tempfile.mkstemp(prefix="hermes-relay-dm-", suffix=".txt", text=True)
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    f.write(message)
                 proc = subprocess.run(
                     local_delivery_command(resolved, tmp),
                     capture_output=True,
@@ -153,11 +163,11 @@ def _(rid, params: dict) -> dict:
                             errors="replace",
                             timeout=600,
                         )
-        finally:
-            try:
-                os.unlink(tmp)
-            except OSError:
-                pass
+            finally:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
         if proc.returncode != 0:
             from tools.bot_failure_reasons import classify_agent_error
 
