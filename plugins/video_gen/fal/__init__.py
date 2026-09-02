@@ -22,6 +22,8 @@ Model families (most expose both t2v + i2v; gemini-omni-flash is image-to-video 
     minimax-h3-max     minimax/h3-max/text-to-video               /  minimax/h3-max/image-to-video
     flux-3             blackforestlabs/flux-3/text-to-video       /  blackforestlabs/flux-3/image-to-video
     grok-imagine-1.5   xai/grok-imagine-video/v1.5/text-to-video  /  xai/grok-imagine-video/v1.5/image-to-video
+    kling-v3           fal-ai/kling-video/v3/standard/text-to-video /  fal-ai/kling-video/v3/standard/image-to-video
+    kling-v3-pro       fal-ai/kling-video/v3/pro/text-to-video    /  fal-ai/kling-video/v3/pro/image-to-video
     kling-v3-4k        fal-ai/kling-video/v3/4k/text-to-video     /  fal-ai/kling-video/v3/4k/image-to-video
     happy-horse        alibaba/happy-horse/text-to-video          /  alibaba/happy-horse/image-to-video
 
@@ -293,6 +295,45 @@ FAL_FAMILIES: Dict[str, Dict[str, Any]] = {
         "audio": False,  # no generate_audio TOGGLE — audio is always on
         "audio_native": True,  # native audio in every generation (fal docs)  # audio is native; no generate_audio key
         "negative": False,
+        "seed": False,
+    },
+    "kling-v3": {
+        "display": "Kling 3.0 (Standard)",
+        "speed": "~60-180s",
+        "price": "premium",
+        "strengths": "Kuaishou frontier core model. Cinematic motion, native audio, 3-15s.",
+        "tier": "premium",
+        "text_endpoint": "fal-ai/kling-video/v3/standard/text-to-video",
+        "image_endpoint": "fal-ai/kling-video/v3/standard/image-to-video",
+        # i2v uses `start_image_url` and its schema has no aspect_ratio key
+        # (derived from the input image).
+        "image_param_key": "start_image_url",
+        "image_drop_keys": ("aspect_ratio",),
+        "aspect_ratios": ("16:9", "9:16", "1:1"),
+        # No resolution key in the v3 schema.
+        "resolutions": None,
+        "durations": (3, 15),
+        # generate_audio is a real bool (default true; audio-on costs more).
+        "audio": True,
+        "negative": True,
+        # No `seed` field in the v3 input schema.
+        "seed": False,
+    },
+    "kling-v3-pro": {
+        "display": "Kling 3.0 Pro",
+        "speed": "~60-180s",
+        "price": "premium",
+        "strengths": "Kling 3.0 top quality tier. Cinematic motion, native audio, 3-15s.",
+        "tier": "premium",
+        "text_endpoint": "fal-ai/kling-video/v3/pro/text-to-video",
+        "image_endpoint": "fal-ai/kling-video/v3/pro/image-to-video",
+        "image_param_key": "start_image_url",
+        "image_drop_keys": ("aspect_ratio",),
+        "aspect_ratios": ("16:9", "9:16", "1:1"),
+        "resolutions": None,
+        "durations": (3, 15),
+        "audio": True,
+        "negative": True,
         "seed": False,
     },
     "kling-v3-4k": {
@@ -806,7 +847,7 @@ class FALVideoGenProvider(VideoGenProvider):
         return {
             "name": "FAL",
             "badge": "paid",
-            "tag": "LTX, Pixverse, Seedance 2.0/2.5/Mini, Veo 3.1, MiniMax H3, FLUX 3, Kling 4K, Happy Horse, Grok Imagine, Gemini Omni — text-to-video & image-to-video",
+            "tag": "LTX, Pixverse, Seedance 2.0/2.5/Mini, Veo 3.1, MiniMax H3, FLUX 3, Kling 3.0/4K, Happy Horse, Grok Imagine, Gemini Omni — text-to-video & image-to-video",
             "env_vars": [
                 {
                     "key": "FAL_KEY",
