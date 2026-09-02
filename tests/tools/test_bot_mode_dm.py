@@ -445,11 +445,61 @@ def test_delivery_runner_surfaces_live_owner_refusal(tmp_path, capsys):
     assert "NOT delivered" in payload["error"]
 
 
+def test_delivery_runner_hands_off_to_live_owner(tmp_path, monkeypatch, capsys):
+    """#101060: when Desktop owns Bot Chat, local delivery uses the live-owner
+    handoff instead of the fenced-out CLI subprocess."""
+    dm_file = tmp_path / "message.txt"
+    dm_file.write_text("Message from 🤖 forge (@forge): ping", encoding="utf-8")
+    profile_home = tmp_path / "profiles" / "ops"
+    profile_home.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(
+        bot_mode_dm,
+        "_hermes_root",
+        lambda home: tmp_path,
+    )
+    calls = []
+
+    def fake_find(home):
+        assert Path(home) == profile_home
+        return "canonical"
+
+    def fake_deliver(home, session_id, content, **kwargs):
+        calls.append((Path(home), session_id, content, kwargs))
+        return {"status": "delivered", "delivery_id": "a" * 32, "reply": "pong"}
+
+    monkeypatch.setattr(
+        "tools.bot_live_delivery.find_canonical_live_owner", fake_find
+    )
+    monkeypatch.setattr(
+        "tools.bot_live_delivery.deliver_to_live_owner", fake_deliver
+    )
+    spawned = []
+    monkeypatch.setattr(
+        subprocess, "run", lambda *a, **k: spawned.append(a) or None
+    )
+
+    returncode = bot_mode_dm._run_delivery(
+        ["hermes", "-p", "ops", "chat", "-c", "Bot Chat"],
+        str(dm_file),
+        stdin_file=False,
+    )
+
+    assert returncode == 0
+    assert not spawned
+    assert calls and calls[0][1] == "canonical"
+    assert "ping" in calls[0][2]
+    assert capsys.readouterr().out.strip() == "pong"
+    assert not dm_file.exists()
+
+
 def test_query_file_delivery_closes_stdin_for_initial_attempt_and_retry(
     tmp_path, monkeypatch
 ):
     dm_file = tmp_path / "message.txt"
     dm_file.write_text("secret", encoding="utf-8")
+    (tmp_path / "profiles" / "researcher").mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     calls = []
     responses = [
         subprocess.CompletedProcess([], 1, stdout="", stderr="HTTP 429 rate limit"),

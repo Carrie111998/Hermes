@@ -693,7 +693,10 @@ def _claim_active_session_slot(
             session_id=session_key,
             surface=surface,
             config=_load_cfg(),
-            metadata={"live_session_id": live_session_id},
+            metadata={
+                "live_session_id": live_session_id,
+                "bot_live_delivery_consumer": True,
+            },
             registry_home=profile_home,
             track_liveness=track_liveness,
         )
@@ -837,7 +840,10 @@ def _transfer_active_session_slot(
         if transfer_active_session(
             lease,
             session_id=new_session_id,
-            metadata={"live_session_id": sid},
+            metadata={
+                "live_session_id": sid,
+                "bot_live_delivery_consumer": True,
+            },
         ):
             return True
     except Exception:
@@ -12593,6 +12599,73 @@ def _collect_kanban_notifications(session: dict) -> list:
     return texts
 
 
+def _poll_bot_live_delivery_once(sid: str, session: dict) -> bool:
+    """Claim and start one Bot DM addressed to this live session owner.
+
+    Local ``message_agent`` deliveries that would otherwise die on the
+    single-owner lease (#101060) write a pending request under the profile
+    runtime dir; idle Desktop/TUI owners drain one at a time here and run it
+    through ``_run_prompt_submit`` so the DM lands in the open Bot Chat.
+    """
+    with session["history_lock"]:
+        if session.get("running") or session.get("_closing"):
+            return False
+
+        from tools.bot_live_delivery import (
+            claim_pending_delivery,
+            complete_delivery,
+        )
+
+        profile_home = session.get("profile_home") or _session_home(session)
+        session_key = str(session.get("session_key") or "")
+        claimed = claim_pending_delivery(profile_home, session_key)
+        if claimed is None:
+            return False
+        session["running"] = True
+
+    delivery_id = str(claimed["id"])
+
+    def terminal_receipt(terminal: dict[str, Any]) -> None:
+        status = str(terminal.get("status") or "failed")
+        error = str(terminal.get("error") or "")
+        reason = ""
+        if status == "cancelled":
+            reason = "cancelled"
+        elif status != "settled":
+            from tools.bot_failure_reasons import classify_agent_error
+
+            reason = classify_agent_error(error)
+        complete_delivery(
+            profile_home,
+            delivery_id,
+            status=status,
+            reply=str(terminal.get("text") or "") if status == "settled" else "",
+            error=error,
+            reason=reason,
+        )
+
+    rid = f"__bot_dm__{delivery_id}"
+    _emit("message.start", sid)
+    started = _run_prompt_submit(
+        rid,
+        sid,
+        session,
+        claimed["message"],
+        terminal_callback=terminal_receipt,
+    )
+    if not started:
+        with session["history_lock"]:
+            session["running"] = False
+        complete_delivery(
+            profile_home,
+            delivery_id,
+            status="failed",
+            error="live session owner could not start the delivery turn",
+            reason="unknown",
+        )
+    return started
+
+
 def _notification_poller_loop(
     stop_event: threading.Event, sid: str, session: dict
 ) -> None:
@@ -12618,6 +12691,10 @@ def _notification_poller_loop(
     _last_loop_poll = 0.0
     while not stop_event.is_set() and not session.get("_finalized"):
         _now = time.monotonic()
+        try:
+            _poll_bot_live_delivery_once(sid, session)
+        except Exception:
+            logger.debug("Bot live-owner delivery poll failed", exc_info=True)
         # ── /loop wakeup driver ──────────────────────────────────────
         # Fire a due /loop tick for THIS session while it's idle. Same
         # claim-under-lock pattern as the kanban dispatch below. Active

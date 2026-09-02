@@ -576,8 +576,42 @@ def _run_delivery(argv: list[str], dm_file: str, *, stdin_file: bool) -> int:
     compression lever; no fresh session is ever minted. Auth/quota/config
     failures never retry. Peer transports (stdin mode) retry on their own
     gateway's deliver path, not here.
+
+    When the target's canonical Bot Chat already has a Desktop/TUI owner
+    (#101060), the one-shot CLI would be fenced out by the single-owner
+    lease. Hand the message to that owner via ``tools.bot_live_delivery``
+    instead so the DM lands as a normal turn in the open chat.
     """
     try:
+        if not stdin_file and len(argv) >= 3 and argv[1] == "-p":
+            from tools.bot_live_delivery import (
+                deliver_to_live_owner,
+                find_canonical_live_owner,
+            )
+            from tools.bot_relay import turn_wait_seconds
+
+            ambient_home = Path(
+                os.getenv("HERMES_HOME") or os.path.expanduser("~/.hermes")
+            )
+            root = _hermes_root(ambient_home)
+            profile = str(argv[2])
+            profile_home = root if profile == "default" else root / "profiles" / profile
+            live_session_id = find_canonical_live_owner(profile_home)
+            if live_session_id:
+                content = Path(dm_file).read_text(encoding="utf-8")
+                outcome = deliver_to_live_owner(
+                    profile_home,
+                    live_session_id,
+                    content,
+                    owner_wait_seconds=turn_wait_seconds(),
+                    receipt_wait_seconds=600,
+                )
+                if outcome.get("status") == "delivered":
+                    print(str(outcome.get("reply") or ""))
+                    return 0
+                print(json.dumps(outcome, ensure_ascii=False))
+                return 1
+
         with _delivery_lock(argv, stdin_file=stdin_file):
             if stdin_file:
                 # Keep the file open until the transport exits; cleanup occurs
