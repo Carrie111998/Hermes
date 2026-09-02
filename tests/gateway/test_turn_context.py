@@ -16,6 +16,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from gateway.config import Platform
+from gateway.platforms.base import MessageType
 from gateway.session import SessionSource
 from gateway.turn_context import TurnContext
 
@@ -47,6 +48,33 @@ class TestTurnContext:
         ctx = TurnContext(last_progress_msg=last_progress_msg)
         ctx.last_progress_msg[0] = "🔍 web_search"
         assert last_progress_msg[0] == "🔍 web_search"
+
+    def test_message_type_defaults_to_none(self):
+        assert TurnContext().message_type is None
+
+
+class TestVoiceTextSuppression:
+    def test_enabled_for_voice_turn(self):
+        from gateway.run import _voice_turn_suppresses_text
+
+        assert _voice_turn_suppresses_text(
+            MessageType.VOICE, {"voice": {"suppress_text": True}}
+        )
+
+    @pytest.mark.parametrize(
+        ("message_type", "config"),
+        [
+            (MessageType.TEXT, {"voice": {"suppress_text": True}}),
+            (MessageType.VOICE, {"voice": {"suppress_text": False}}),
+            (MessageType.VOICE, {}),
+            (MessageType.VOICE, {"voice": "invalid"}),
+            (None, {"voice": {"suppress_text": True}}),
+        ],
+    )
+    def test_disabled_for_non_matching_turns(self, message_type, config):
+        from gateway.run import _voice_turn_suppresses_text
+
+        assert not _voice_turn_suppresses_text(message_type, config)
 
 
 class TestTurnRunner:

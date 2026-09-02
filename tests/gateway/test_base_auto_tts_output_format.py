@@ -94,8 +94,7 @@ async def _run_auto_tts(adapter: _DummyAdapter, platform: Platform):
     adapter._keep_typing = _hold_typing()
     adapter._should_auto_tts_for_chat = lambda _chat_id: True
     adapter.play_tts = AsyncMock(return_value=SendResult(success=True, message_id="tts-1"))
-    long_reply = "x" * 2000  # avoid the telegram caption-collapse path
-    adapter.set_message_handler(lambda _event: asyncio.sleep(0, result=long_reply))
+    adapter.set_message_handler(lambda _event: asyncio.sleep(0, result="reply text"))
     event = _make_voice_event(platform)
     requested = []
 
@@ -141,3 +140,15 @@ async def test_base_auto_tts_skips_playback_when_tool_reports_failure():
     adapter.play_tts.assert_not_awaited()
     # Text reply still goes out.
     assert adapter.sent and adapter.sent[0]["content"] == "reply text"
+
+
+@pytest.mark.asyncio
+async def test_base_auto_tts_caption_suppresses_separate_text():
+    """A successful short Telegram voice reply is delivered as one audio bubble."""
+    adapter = _DummyAdapter(Platform.TELEGRAM)
+    requested, adapter = await _run_auto_tts(adapter, Platform.TELEGRAM)
+
+    assert requested and requested[0].endswith(".ogg")
+    adapter.play_tts.assert_awaited_once()
+    assert adapter.play_tts.await_args.kwargs["caption"] == "reply text"
+    assert adapter.sent == []

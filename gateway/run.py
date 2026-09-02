@@ -4826,6 +4826,16 @@ def _reconnect_needs_attention(info: dict, now: float) -> bool:
     return (now - queued_at) >= _RECONNECT_ATTENTION_AFTER_SECONDS
 
 
+def _voice_turn_suppresses_text(message_type: Any, user_config: Any) -> bool:
+    """Return whether this inbound voice turn opted out of text delivery."""
+    if getattr(message_type, "value", message_type) != MessageType.VOICE.value:
+        return False
+    if not isinstance(user_config, dict):
+        return False
+    voice_config = user_config.get("voice")
+    return isinstance(voice_config, dict) and voice_config.get("suppress_text") is True
+
+
 class TurnRunner:
     """Per-turn collaborator carrying the tool-progress callbacks that used to
     be nested closures inside ``GatewayRunner._run_agent_inner``.
@@ -6029,6 +6039,8 @@ class TurnRunner:
             if _plat_streaming is None
             else bool(_plat_streaming)
         )
+        if _voice_turn_suppresses_text(ctx.message_type, ctx.user_config):
+            _streaming_enabled = False
         _want_stream_deltas = _streaming_enabled
         _want_interim_messages = ctx.interim_assistant_messages_enabled
         _want_interim_consumer = _want_interim_messages
@@ -31623,6 +31635,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             persist_user_message=persist_user_message,
             persist_user_timestamp=persist_user_timestamp,
             persist_user_display_kind=persist_user_display_kind,
+            message_type=message_type,
         )
         turn_runner = TurnRunner(self, turn_ctx)
         # Callback invoked by agent on tool lifecycle events — extracted to
