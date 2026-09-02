@@ -251,7 +251,20 @@ def _apply_mcp_preset(
 
 # ─── Discovery (temporary connect) ───────────────────────────────────────────
 
-def _resolve_mcp_server_config(config: dict) -> dict:
+def _has_unresolved_env_ref(value: Any) -> bool:
+    """Return True when an interpolated MCP config still contains an env ref."""
+    if isinstance(value, str):
+        return bool(re.search(r"\$\{(?:env:)?[A-Za-z_][A-Za-z0-9_]*\}", value))
+    if isinstance(value, dict):
+        return any(_has_unresolved_env_ref(v) for v in value.values())
+    if isinstance(value, list):
+        return any(_has_unresolved_env_ref(v) for v in value)
+    return False
+
+
+def _resolve_mcp_server_config(
+    config: dict, *, load_external_secrets: bool = True
+) -> dict:
     """Resolve ``${ENV}`` placeholders in a server config before connecting.
 
     Mirrors ``_load_mcp_config()`` in ``tools/mcp_tool.py``: load
@@ -269,14 +282,32 @@ def _resolve_mcp_server_config(config: dict) -> dict:
     if current_secret_scope() is None:
         try:
             from hermes_cli.env_loader import load_hermes_dotenv
-            load_hermes_dotenv()
+            load_hermes_dotenv(load_external_secrets=load_external_secrets)
         except Exception:  # pragma: no cover — defensive
             pass
-    return _interpolate_env_vars(config)
+    resolved = _interpolate_env_vars(config)
+    # OAuth login normally needs only public server metadata and should not
+    # hydrate a whole company secret inventory. Preserve compatibility for a
+    # pre-registered confidential client, though: if its explicit ${VAR}
+    # remains unresolved after dotenv/scoped-env loading, fall back to the
+    # configured external sources and interpolate once more.
+    if not load_external_secrets and _has_unresolved_env_ref(resolved):
+        try:
+            from hermes_cli.env_loader import load_hermes_dotenv
+            load_hermes_dotenv(load_external_secrets=True)
+        except Exception:  # pragma: no cover — defensive
+            pass
+        resolved = _interpolate_env_vars(config)
+    return resolved
 
 
 def _probe_single_server(
-    name: str, config: dict, connect_timeout: Optional[float] = None, *, details: Optional[dict] = None
+    name: str,
+    config: dict,
+    connect_timeout: Optional[float] = None,
+    *,
+    details: Optional[dict] = None,
+    load_external_secrets: bool = True,
 ) -> List[Tuple[str, str]]:
     """Temporarily connect to one MCP server, list its tools, disconnect.
 
@@ -299,7 +330,9 @@ def _probe_single_server(
         _parse_boolish,
     )
 
-    config = _resolve_mcp_server_config(config)
+    config = _resolve_mcp_server_config(
+        config, load_external_secrets=load_external_secrets
+    )
     if connect_timeout is None:
         raw_timeout = config.get("connect_timeout", 30)
         try:
@@ -857,7 +890,10 @@ def _reauth_oauth_server(name: str, server_config: dict) -> bool:
         _login_connect_timeout = max(_login_connect_timeout, 315.0)
         with force_interactive_oauth():
             tools = _probe_single_server(
-                name, server_config, connect_timeout=_login_connect_timeout
+                name,
+                server_config,
+                connect_timeout=_login_connect_timeout,
+                load_external_secrets=False,
             )
         # A clean probe is NOT proof of authentication. Some MCP servers
         # (notably Google's official Drive server) serve initialize +

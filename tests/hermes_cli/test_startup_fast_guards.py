@@ -22,6 +22,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+from hermes_cli._startup_fast import should_load_external_secrets
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
 # Modules that must NEVER be imported by the fast path. Each one either
@@ -104,3 +106,24 @@ def test_fast_version_reports_install_method_stamp(tmp_path):
     result = _run_version({"HERMES_HOME": str(home), "TERMUX_VERSION": ""})
     assert result.returncode == 0, result.stderr
     assert "Install method: git" in result.stdout
+
+
+def test_offline_cli_commands_skip_external_secret_hydration():
+    """Offline config/help paths must never query external secret managers."""
+    assert not should_load_external_secrets(["config", "set", "x", "y"])
+    assert should_load_external_secrets(["config", "show"])
+    assert should_load_external_secrets(["config", "get", "OPENAI_API_KEY"])
+    assert should_load_external_secrets(["config", "check"])
+    assert should_load_external_secrets(["config", "migrate"])
+    assert not should_load_external_secrets(["mcp", "login", "hubspot"])
+    assert not should_load_external_secrets(["mcp", "reauth", "hubspot"])
+    assert not should_load_external_secrets(["mcp", "list", "--help"])
+    assert not should_load_external_secrets(["doctor", "--help"])
+
+
+def test_runtime_cli_commands_still_load_external_secrets():
+    """Chat, gateways, and MCP probes retain normal credential hydration."""
+    assert should_load_external_secrets([])
+    assert should_load_external_secrets(["chat"])
+    assert should_load_external_secrets(["gateway", "run"])
+    assert should_load_external_secrets(["mcp", "test", "github"])
