@@ -824,6 +824,10 @@ class TelegramAdapter(BasePlatformAdapter):
         # While True, send() short-circuits to a failure so callers
         # (cron live-adapter branch) fall through to standalone delivery.
         self._send_path_degraded: bool = False
+        # Last receive-path health published to gateway_state.json, so the
+        # heartbeat writes only on a transition. None until connect() stamps
+        # the first state.
+        self._published_polling_degraded: Optional[bool] = None
         self._general_request_drain_lock = asyncio.Lock()
         # DM Topics: map of topic_name -> message_thread_id (populated at startup)
         self._dm_topics: Dict[str, int] = {}
@@ -903,9 +907,76 @@ class TelegramAdapter(BasePlatformAdapter):
     def _mark_connected(self) -> None:
         self._drop_delayed_deliveries = False
         super()._mark_connected()
+        # connect() has just published "connected"; the heartbeat republishes
+        # only when the receive path's health moves away from that.
+        self._published_polling_degraded = False
         # Drain anything held while we were down. PTB will not redeliver —
         # these events exist only in our hold queue now.
         self._schedule_held_inbound_redispatch()
+
+    def _publish_polling_health(self) -> None:
+        """Mirror receive-path health into the published platform state.
+
+        ``_mark_connected()`` stamps ``connected`` once, and nothing rewrites
+        it until the adapter disconnects or the recovery ladder escalates to a
+        fatal.  When polling dies in between — the ladder is still retrying, or
+        has itself wedged — ``gateway_state.json`` keeps reporting ``connected``
+        with ``error_code: null``, byte-for-byte what a healthy adapter
+        publishes, so an operator or dashboard cannot tell the two apart
+        (#101391: ~11h of false ``connected`` on one seat).
+
+        ``_send_path_degraded`` is already the adapter's own answer — set at
+        every polling-death site, cleared in ``_record_polling_progress()`` on a
+        confirmed ``getUpdates`` round-trip — and ``send()`` already fails
+        closed on it.  Publishing it costs the Bot API nothing and, unlike an
+        external ``getUpdates`` probe, cannot perturb the adapter it measures.
+        """
+        if getattr(self, "_polling_teardown_started", False):
+            return
+        # disconnect() clears _running before it raises the teardown fence, so
+        # this also keeps a mid-tick heartbeat from stamping health over the
+        # "disconnected" state that _mark_disconnected() just published.
+        if not getattr(self, "_running", False):
+            return
+        # A fatal (retryable or not) is the stronger verdict and owns the state.
+        if self.has_fatal_error:
+            return
+
+        degraded = bool(getattr(self, "_send_path_degraded", False))
+        if degraded == getattr(self, "_published_polling_degraded", None):
+            return
+        self._published_polling_degraded = degraded
+
+        if degraded:
+            # "retrying" is the existing vocabulary for alive-but-not-serving
+            # (GatewayRunner already publishes it around reconnects); no reader
+            # needs to learn a new state value to stop trusting this adapter.
+            self._write_runtime_status_safe(
+                "polling_degraded",
+                platform_state="retrying",
+                error_code=None,
+                error_message=(
+                    "Telegram polling is not delivering updates; background "
+                    "recovery in progress"
+                ),
+            )
+            logger.warning(
+                "[%s] Telegram receive path degraded; publishing platform "
+                "state 'retrying' until getUpdates progress is confirmed",
+                self.name,
+            )
+        else:
+            self._write_runtime_status_safe(
+                "connected",
+                platform_state="connected",
+                error_code=None,
+                error_message=None,
+            )
+            logger.warning(
+                "[%s] Telegram receive path recovered; publishing platform "
+                "state 'connected'",
+                self.name,
+            )
 
     def _mark_disconnected(self) -> None:
         self._drop_delayed_deliveries = True
@@ -3274,6 +3345,14 @@ class TelegramAdapter(BasePlatformAdapter):
                     return
                 if self.has_fatal_error:
                     return
+
+                # Reconcile the published platform state with the receive
+                # path's real health before probing (#101391). This loop is the
+                # only thing that runs for the whole lifetime of the polling
+                # connection and is not gated behind the recovery ladder, so a
+                # death the ladder never recovers from still becomes visible in
+                # gateway_state.json instead of staying "connected" forever.
+                self._publish_polling_health()
 
                 # Independent wedged-recovery watchdog (#66377): if the tracked
                 # recovery task has hung (any await no local bound covers), every
