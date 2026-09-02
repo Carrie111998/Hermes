@@ -69,6 +69,14 @@ class FailoverReason(enum.Enum):
     invalid_encrypted_content = "invalid_encrypted_content"  # Responses replay blob rejected — strip replay state and retry
     multimodal_tool_content_unsupported = "multimodal_tool_content_unsupported"  # Provider rejected list-type content in tool messages (e.g. Xiaomi MiMo) — downgrade to text and retry
 
+    # Server-classified errors carrying a structured ``code`` the classifier
+    # does not recognize. The server explicitly labelled the failure, so its
+    # verdict on retry semantics is authoritative: 403 is terminal for the
+    # request (no refresh/rotation/fallback can help), 429 is a per-user
+    # limit that resets on its own schedule (wait, don't rotate).
+    entitlement_blocked = "entitlement_blocked"  # Coded 403 — server rejected this request; recovery is on the user's side
+    user_rate_limit = "user_rate_limit"          # Coded 429 — per-user limit; honor Retry-After, never rotate/fallback
+
     # Provider-specific
     thinking_signature = "thinking_signature"  # Anthropic thinking block sig invalid
     long_context_tier = "long_context_tier"    # Anthropic "extra usage" tier gate
@@ -164,6 +172,48 @@ def _billing_ambiguity_context(error_msg: str) -> Dict[str, Any]:
 # provider-scoped: other providers' generic billing codes historically remain
 # auth failures when they arrive as 403.
 _XAI_SPENDING_LIMIT_ERROR_CODE = "personal-team-blocked:spending-limit"
+
+# Provider name spellings that identify the Nous Inference API. Mirrors the
+# alias set used elsewhere in the codebase (see tools/delegate_tool.py).
+_NOUS_PROVIDER_ALIASES = frozenset({"nous", "nous-portal", "nousresearch"})
+
+# Structured error codes with established classification behavior — a coded
+# error carrying one of these keeps its existing rule and never falls through
+# to the generic unrecognized-code handling below.
+#
+# Contract: every code ``_classify_by_error_code`` claims, plus the codes the
+# status-based paths themselves key on. Derived by exercising the classifier's
+# own claim logic (see ``_known_structured_error_codes``) rather than
+# hand-maintained, so adding a known code cannot drift out of sync with this
+# set.
+_KNOWN_CODE_CLAIM_CHECKS = (
+    # _classify_by_error_code's claimed sets
+    frozenset({"resource_exhausted", "throttled", "rate_limit_exceeded"}),
+    lambda: _BILLING_ERROR_CODES,
+    frozenset({"model_not_found", "model_not_available", "invalid_model"}),
+    frozenset({"context_length_exceeded", "max_tokens_exceeded"}),
+    frozenset({"invalid_encrypted_content"}),
+    # Status-path codes with their own behavior regardless of body shape
+    frozenset({"usage_limit_reached", "invalid_request_error",
+               "unknown_parameter", "unsupported_parameter"}),
+)
+
+
+def _known_structured_error_codes() -> frozenset:
+    """Codes with established classification behavior (see above contract)."""
+    codes: set = set()
+    for entry in _KNOWN_CODE_CLAIM_CHECKS:
+        if callable(entry):
+            codes.update(entry())
+        else:
+            codes.update(entry)
+    return frozenset(codes)
+
+
+def _is_unrecognized_structured_code(error_code: str) -> bool:
+    """True when ``error_code`` carries no established classification rule."""
+    return (error_code or "").strip().lower() not in _known_structured_error_codes()
+
 
 # Structured provider codes that mean the account cannot serve paid traffic
 # until credits/subscription capacity is restored. xAI returns its explicit
@@ -1287,6 +1337,24 @@ def _classify_by_status(
                 should_rotate_credential=True,
                 should_fallback=True,
             )
+        # Server-classified 403: the body carries a structured ``code`` this
+        # classifier does not recognize. The server labelled the failure
+        # itself, so its verdict is authoritative — the request is terminal
+        # (retrying, refreshing, or rotating credentials cannot change the
+        # server's decision) and the body ``message`` is user-actionable.
+        # Surface it verbatim instead of the misleading generic auth path,
+        # and burn no credential refresh on the way out.
+        if (
+            error_code
+            and provider in _NOUS_PROVIDER_ALIASES
+            and _is_unrecognized_structured_code(error_code)
+        ):
+            return result_fn(
+                FailoverReason.entitlement_blocked,
+                retryable=False,
+                should_rotate_credential=False,
+                should_fallback=False,
+            )
         return result_fn(
             FailoverReason.auth,
             retryable=False,
@@ -1427,6 +1495,24 @@ def _classify_by_status(
                 retryable=False,
                 should_rotate_credential=True,
                 should_fallback=True,
+            )
+        # Server-classified 429: a structured ``code`` this classifier does
+        # not recognize marks a per-user limit that resets on its own
+        # schedule. The wait is the recovery — honor Retry-After (the retry
+        # loop reads it) — but neither credential rotation (the limit is on
+        # the user, not the key) nor provider fallback (the limit follows the
+        # user to any credential on the same account) can help. The body
+        # ``message`` is authoritative and user-actionable.
+        if (
+            error_code
+            and provider in _NOUS_PROVIDER_ALIASES
+            and _is_unrecognized_structured_code(error_code)
+        ):
+            return result_fn(
+                FailoverReason.user_rate_limit,
+                retryable=True,
+                should_rotate_credential=False,
+                should_fallback=False,
             )
         return result_fn(
             FailoverReason.rate_limit,

@@ -51,6 +51,10 @@ _REASON_TO_LAYER = {
     "auth_permanent": LAYER_AUTH,
     "billing": LAYER_BILLING,
     "billing_unverified": LAYER_BILLING,
+    # Server-classified authorization rejection (coded 403): the provider's
+    # verdict, not a transport or format problem — the auth layer's
+    # "authentication/authorization failed" framing fits.
+    "entitlement_blocked": LAYER_AUTH,
 }
 
 # Transport-ish reasons: the failure is between us and the base_url, not a
@@ -76,6 +80,8 @@ _NON_RETRYABLE_REASONS = {
     "model_not_found",
     "format_error",
     "ssl_cert_verification",
+    # Server-classified coded 403 — terminal for the request.
+    "entitlement_blocked",
 }
 
 # Providers whose base_url is user-supplied rather than a known vendor —

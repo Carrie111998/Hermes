@@ -67,6 +67,7 @@ class TestFailoverReason:
             "multimodal_tool_content_unsupported",
             "provider_policy_blocked",
             "content_policy_blocked",
+            "entitlement_blocked", "user_rate_limit",
             "thinking_signature", "long_context_tier",
             "oauth_long_context_beta_forbidden",
             "llama_cpp_grammar_pattern",

@@ -5950,6 +5950,12 @@ def run_conversation(
                     FailoverReason.rate_limit,
                     FailoverReason.billing,
                     FailoverReason.upstream_rate_limit,
+                    # Coded per-user 429: shares the rate-limit retry plumbing
+                    # (Retry-After / adaptive backoff / status line) but must
+                    # NOT rotate credentials or fall back — the limit is on
+                    # the user, so both are useless. Excluded from the eager-
+                    # fallback predicate below.
+                    FailoverReason.user_rate_limit,
                 }
                 # Relay-wrapped output-cap errors: some gateways wrap an
                 # upstream "[400]: max_tokens (...) exceeds model's maximum
@@ -5983,7 +5989,14 @@ def run_conversation(
                 if _is_zai_coding_overload:
                     max_retries = max(max_retries, zai_coding_overload_retry_ceiling())
                 _should_fallback = (
-                    (is_rate_limited and _wrapped_output_cap_budget is None)
+                    (
+                        is_rate_limited
+                        # A coded per-user 429 never benefits from switching
+                        # providers — the limit follows the user's account, so
+                        # the wait is the only recovery.
+                        and classified.reason != FailoverReason.user_rate_limit
+                        and _wrapped_output_cap_budget is None
+                    )
                     or (_is_transport_failure and retry_count >= 2)
                 )
                 if _should_fallback and agent._fallback_index < len(agent._fallback_chain):
@@ -6730,6 +6743,16 @@ def run_conversation(
                     )
                 ) and not is_context_length_error
 
+                # Server-classified coded errors carry the server's own
+                # verdict: the 403 decision and the 429 per-user limit follow
+                # the user's account, so switching providers (like refreshing
+                # or rotating credentials) cannot change the outcome. Honor
+                # that verdict at every fallback gate below.
+                _no_fallback_verdict = classified.reason in {
+                    FailoverReason.entitlement_blocked,
+                    FailoverReason.user_rate_limit,
+                }
+
                 if is_client_error:
                     # Copilot self-heal BEFORE fallback: a stale/degraded
                     # credential surfaces as a 400
@@ -6763,14 +6786,18 @@ def run_conversation(
                     # exists; otherwise "trying fallback..." is a lie and the
                     # session looks like it's recovering when it's about to
                     # abort silently (#35314, #17446).
-                    if agent._has_pending_fallback():
+                    if _no_fallback_verdict:
+                        # Server said switching providers cannot help — skip
+                        # the attempt entirely (and the lying announcement).
+                        pass
+                    elif agent._has_pending_fallback():
                         if classified.reason == FailoverReason.content_policy_blocked:
                             agent._buffer_status("⚠️ Provider safety filter blocked this request — trying fallback...")
                         elif classified.reason == FailoverReason.ssl_cert_verification:
                             agent._buffer_status("⚠️ TLS certificate verification failed — trying fallback...")
                         else:
                             agent._buffer_status(f"⚠️ Non-retryable error (HTTP {status_code}) — trying fallback...")
-                    if agent._try_activate_fallback():
+                    if not _no_fallback_verdict and agent._try_activate_fallback():
                         active_system_prompt = _sync_failover_system_message(
                             agent, api_messages, active_system_prompt)
                         retry_count = 0
@@ -6792,7 +6819,18 @@ def run_conversation(
                     # it verbatim (e.g. a cron failure notification dumped a
                     # ~60KB Cloudflare challenge page as 31 Discord messages).
                     _nonretryable_summary = agent._summarize_api_error(api_error)
-                    if classified.reason == FailoverReason.content_policy_blocked:
+                    if classified.reason == FailoverReason.entitlement_blocked:
+                        # Server-classified coded 403: the server's own
+                        # message is authoritative and user-actionable —
+                        # use it as the turn's error verbatim instead of the
+                        # generic "Non-retryable error (HTTP 403)" auth
+                        # phrasing that misdirects toward key/credential
+                        # fixes. Falls back to the summary when the body
+                        # carried no message.
+                        _verbatim = (classified.message or _nonretryable_summary).strip()
+                        _nonretryable_summary = _verbatim
+                        agent._emit_status(f"❌ {_verbatim}")
+                    elif classified.reason == FailoverReason.content_policy_blocked:
                         agent._emit_status(
                             f"❌ Provider safety filter blocked this request: "
                             f"{_nonretryable_summary}"
@@ -6961,6 +6999,11 @@ def run_conversation(
                         "completed": False,
                         "failed": True,
                         "error": _nonretryable_summary,
+                        # Surface the classified reason so UI consumers can
+                        # render the right recovery signal instead of
+                        # re-deriving it from the error text.
+                        "failure_reason": classified.reason.value,
+                        "failure_retryable": bool(classified.retryable),
                     }
 
                 if retry_count >= max_retries:
@@ -6982,9 +7025,14 @@ def run_conversation(
                         agent._fallback_activated = False
                         continue
                     # Try fallback before giving up entirely
-                    if agent._has_pending_fallback():
+                    if _no_fallback_verdict:
+                        # Server said switching providers cannot help (coded
+                        # per-user limit / terminal coded 403) — skip the
+                        # attempt and its announcement.
+                        pass
+                    elif agent._has_pending_fallback():
                         agent._buffer_status(f"⚠️ Max retries ({max_retries}) exhausted — trying fallback...")
-                    if agent._try_activate_fallback():
+                    if not _no_fallback_verdict and agent._try_activate_fallback():
                         active_system_prompt = _sync_failover_system_message(
                             agent, api_messages, active_system_prompt)
                         retry_count = 0
