@@ -532,6 +532,7 @@ def _coerce_job_text(value: Any, fallback: str = "") -> str:
 
 # Fields whose presence in an update can turn a runnable job into an empty one.
 _PAYLOAD_FIELDS = frozenset({"prompt", "script", "skill", "skills", "no_agent"})
+_DELIVERY_SOURCES = frozenset({"agent", "script"})
 
 EMPTY_PAYLOAD_ERROR = (
     "Cron job has nothing to run: the prompt is blank and no script or "
@@ -2205,6 +2206,7 @@ def _validate_job_mode_invariants(
     monitor_url: Optional[str],
     no_agent: bool,
     script: Optional[str],
+    delivery_source: Optional[str] = None,
 ) -> None:
     """Shared create/update validation for job execution-mode invariants.
 
@@ -2225,6 +2227,29 @@ def _validate_job_mode_invariants(
         )
     if no_agent and not script:
         raise ValueError(NO_AGENT_WITHOUT_SCRIPT_ERROR)
+    if delivery_source == "script" and no_agent:
+        raise ValueError(
+            "delivery_source='script' cannot be combined with no_agent=True — "
+            "no_agent already delivers script stdout without running an agent."
+        )
+    if delivery_source == "script" and not script:
+        raise ValueError(
+            "delivery_source='script' requires a pre-run script."
+        )
+
+
+def _normalize_delivery_source(value: Any) -> Optional[str]:
+    """Normalize the opt-in delivery source; ``None`` means legacy agent output."""
+    if value is None:
+        return None
+    normalized = str(value).strip().lower()
+    if normalized in {"", "agent"}:
+        return None
+    if normalized not in _DELIVERY_SOURCES:
+        raise ValueError(
+            "delivery_source must be one of: agent, script"
+        )
+    return normalized
 
 
 def create_job(
@@ -2248,6 +2273,7 @@ def create_job(
     monitor_script: Optional[str] = None,
     monitor_url: Optional[str] = None,
     reasoning_effort: Optional[str] = None,
+    delivery_source: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Create a new cron job.
@@ -2315,6 +2341,11 @@ def create_job(
                 exactly like config-set effort. Inert with ``no_agent=True``
                 (no LLM call to configure). None/empty = unset (job follows
                 config resolution, pre-existing behavior).
+        delivery_source: Optional operator-owned delivery boundary. ``script``
+                keeps the agent run and full saved transcript, but successful
+                chat delivery uses the pre-run script stdout as its body. Script
+                failure fails closed and never falls back to agent narration.
+                ``None``/``agent`` preserves the existing final-response path.
 
     Returns:
         The created job dict
@@ -2344,6 +2375,7 @@ def create_job(
     normalized_base_url = _normalize_job_optional_text(base_url, strip_trailing_slash=True)
     normalized_script = str(script).strip() if isinstance(script, str) else None
     normalized_script = normalized_script or None
+    normalized_delivery_source = _normalize_delivery_source(delivery_source)
     normalized_toolsets = [str(t).strip() for t in enabled_toolsets if str(t).strip()] if enabled_toolsets else None
     normalized_toolsets = normalized_toolsets or None
     normalized_workdir = _normalize_workdir(workdir)
@@ -2366,6 +2398,7 @@ def create_job(
         normalized_monitor_url,
         normalized_no_agent,
         normalized_script,
+        normalized_delivery_source,
     )
 
     # Normalize context_from: accept str or list of str, store as list or None
@@ -2457,6 +2490,8 @@ def create_job(
         "enabled_toolsets": normalized_toolsets,
         "workdir": normalized_workdir,
     }
+    if normalized_delivery_source is not None:
+        job["delivery_source"] = normalized_delivery_source
     # Only persist attach_to_session when explicitly set, so existing jobs and
     # the common case stay byte-identical (absent key => fall back to the
     # global cron.mirror_delivery config, default off).
@@ -2572,6 +2607,11 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
                     _mv = str(_mv).strip() if isinstance(_mv, str) else None
                     updates[_mon_field] = _mv or None
 
+            if "delivery_source" in updates:
+                updates["delivery_source"] = _normalize_delivery_source(
+                    updates["delivery_source"]
+                )
+
             # Validate/normalize the per-job reasoning effort pin the same
             # way create_job does: canonical grammar only, empty string (or
             # None) clears. Invalid values raise BEFORE the merge so the
@@ -2624,7 +2664,13 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
             # monitor: the scheduler's no_agent short-circuit runs before
             # the monitor gate). Scoped to changed fields so legacy records
             # untouched by this update keep loading.
-            if {"monitor_script", "monitor_url", "no_agent", "script"}.intersection(updates):
+            if {
+                "monitor_script",
+                "monitor_url",
+                "no_agent",
+                "script",
+                "delivery_source",
+            }.intersection(updates):
                 _upd_script = updated.get("script")
                 _upd_script = str(_upd_script).strip() if isinstance(_upd_script, str) else None
                 _validate_job_mode_invariants(
@@ -2632,6 +2678,7 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
                     updated.get("monitor_url") or None,
                     bool(updated.get("no_agent")),
                     _upd_script or None,
+                    updated.get("delivery_source") or None,
                 )
 
             if any(k in updates for k in _PAYLOAD_FIELDS):

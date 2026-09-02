@@ -71,6 +71,17 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
         ),
     )
     cron_create.add_argument(
+        "--delivery-source",
+        choices=("agent", "script"),
+        default=None,
+        help=(
+            "Select successful delivery content. 'agent' (default) delivers "
+            "the agent's final response. 'script' requires --script, still "
+            "runs the agent, saves its transcript, and delivers the pre-run "
+            "script stdout as the delivery body; script failure fails closed."
+        ),
+    )
+    cron_create.add_argument(
         "--monitor-script",
         dest="monitor_script",
         help=(
@@ -191,6 +202,16 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
         action="store_const",
         const=False,
         help="Disable no-agent mode on this job (reverts to LLM-driven execution).",
+    )
+    cron_edit.add_argument(
+        "--delivery-source",
+        choices=("agent", "script"),
+        default=None,
+        help=(
+            "Set successful delivery content. 'script' requires a pre-run "
+            "script and never falls back to agent text; 'agent' restores the "
+            "default final-response delivery."
+        ),
     )
     cron_edit.add_argument(
         "--continuity",

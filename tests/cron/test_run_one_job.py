@@ -78,6 +78,149 @@ def test_run_one_job_success_sequence(monkeypatch):
     assert calls[-1] == ("mark", "j2", True)
 
 
+def test_script_delivery_source_hands_exact_stdout_to_delivery(monkeypatch):
+    """Agent narration stays auditable but never enters the delivery body."""
+    delivered = []
+    marked = []
+    saved = []
+    payload = (
+        "**Research report**\nExact script output\n"
+        'TELEGRAM_BUTTONS:{"inline_keyboard":[[{"text":"Chart","url":"https://example.com"}]]}'
+    )
+
+    def fake_run_job(job, *, script_delivery_capture=None, **_kw):
+        script_delivery_capture.append((True, payload))
+        return True, "full transcript including model narration", "I will persist this next.", None
+
+    monkeypatch.setattr(s, "run_job", fake_run_job)
+    monkeypatch.setattr(
+        s,
+        "save_job_output",
+        lambda job_id, output: saved.append((job_id, output)) or "/tmp/out.md",
+    )
+    monkeypatch.setattr(
+        s,
+        "_deliver_result",
+        lambda _job, content, **_kw: delivered.append(content) or None,
+    )
+    monkeypatch.setattr(
+        s,
+        "mark_job_run",
+        lambda job_id, ok, error=None, **_kw: marked.append((job_id, ok, error)),
+    )
+
+    assert s.run_one_job(
+        {
+            "id": "script-source",
+            "name": "research",
+            "deliver": "telegram",
+            "delivery_source": "script",
+        }
+    ) is True
+    assert delivered == [payload]
+    assert "I will persist" not in delivered[0]
+    assert "TELEGRAM_BUTTONS:" in delivered[0]
+    assert saved == [
+        ("script-source", "full transcript including model narration")
+    ]
+    assert marked == [("script-source", True, None)]
+
+
+def test_script_delivery_source_honors_silent_stdout(monkeypatch):
+    delivered = []
+
+    def fake_run_job(job, *, script_delivery_capture=None, **_kw):
+        script_delivery_capture.append((True, "[SILENT]"))
+        return True, "saved agent transcript", "agent narration", None
+
+    monkeypatch.setattr(s, "run_job", fake_run_job)
+    monkeypatch.setattr(s, "save_job_output", lambda *_a, **_kw: "/tmp/out.md")
+    monkeypatch.setattr(
+        s,
+        "_deliver_result",
+        lambda _job, content, **_kw: delivered.append(content) or None,
+    )
+    monkeypatch.setattr(s, "mark_job_run", lambda *_a, **_kw: None)
+
+    assert s.run_one_job(
+        {
+            "id": "script-silent",
+            "name": "research",
+            "deliver": "telegram",
+            "delivery_source": "script",
+        }
+    ) is True
+    assert delivered == []
+
+
+def test_script_delivery_source_does_not_require_agent_final_text(monkeypatch):
+    delivered = []
+    marked = []
+
+    def fake_run_job(job, *, script_delivery_capture=None, **_kw):
+        script_delivery_capture.append((True, "authoritative report"))
+        return True, "saved agent transcript", "", None
+
+    monkeypatch.setattr(s, "run_job", fake_run_job)
+    monkeypatch.setattr(s, "save_job_output", lambda *_a, **_kw: "/tmp/out.md")
+    monkeypatch.setattr(
+        s,
+        "_deliver_result",
+        lambda _job, content, **_kw: delivered.append(content) or None,
+    )
+    monkeypatch.setattr(
+        s,
+        "mark_job_run",
+        lambda job_id, ok, error=None, **_kw: marked.append((job_id, ok, error)),
+    )
+
+    assert s.run_one_job(
+        {
+            "id": "script-empty-agent",
+            "name": "research",
+            "deliver": "telegram",
+            "delivery_source": "script",
+        }
+    ) is True
+    assert delivered == ["authoritative report"]
+    assert marked == [("script-empty-agent", True, None)]
+
+
+def test_script_delivery_source_never_falls_back_when_capture_is_missing(monkeypatch):
+    delivered = []
+    marked = []
+
+    monkeypatch.setattr(
+        s,
+        "run_job",
+        lambda *_a, **_kw: (True, "saved transcript", "unsafe agent narration", None),
+    )
+    monkeypatch.setattr(s, "save_job_output", lambda *_a, **_kw: "/tmp/out.md")
+    monkeypatch.setattr(
+        s,
+        "_deliver_result",
+        lambda _job, content, **_kw: delivered.append(content) or None,
+    )
+    monkeypatch.setattr(
+        s,
+        "mark_job_run",
+        lambda job_id, ok, error=None, **_kw: marked.append((job_id, ok, error)),
+    )
+
+    assert s.run_one_job(
+        {
+            "id": "script-missing",
+            "name": "research",
+            "deliver": "telegram",
+            "delivery_source": "script",
+        }
+    ) is True
+    assert len(delivered) == 1
+    assert "unsafe agent narration" not in delivered[0]
+    assert "without a captured pre-run script result" in delivered[0]
+    assert marked[0][1] is False
+
+
 def test_run_one_job_exception_delivers_failure_alert(monkeypatch):
     """An exception escaping the run body must not become a silent error row."""
     delivered = []
@@ -376,5 +519,3 @@ def test_run_one_job_installs_secret_scope_under_multiplex(monkeypatch, tmp_path
     assert scope_during_delivery["base_url"] == "https://openrouter.ai/api/v1"
     # And it was torn down after the full lifecycle returned (no leak).
     assert ss.current_secret_scope() is None
-
-

@@ -22,6 +22,74 @@ def tmp_cron_dir(tmp_path, monkeypatch):
 
 class TestCronCommandLifecycle:
 
+    def test_create_and_edit_script_delivery_source(self, tmp_cron_dir, capsys):
+        parser = argparse.ArgumentParser(prog="hermes")
+        subparsers = parser.add_subparsers(dest="command")
+        build_cron_parser(subparsers, cmd_cron=cron_command)
+
+        create_args = parser.parse_args(
+            [
+                "cron",
+                "create",
+                "every 1h",
+                "Analyze the report",
+                "--script",
+                "report.py",
+                "--delivery-source",
+                "script",
+            ]
+        )
+        assert cron_command(create_args) == 0
+        job = list_jobs()[0]
+        assert job["delivery_source"] == "script"
+
+        edit_args = parser.parse_args(
+            [
+                "cron",
+                "edit",
+                job["id"],
+                "--delivery-source",
+                "agent",
+            ]
+        )
+        assert cron_command(edit_args) == 0
+        assert get_job(job["id"]).get("delivery_source") is None
+
+        enable_args = parser.parse_args(
+            [
+                "cron",
+                "edit",
+                job["id"],
+                "--delivery-source",
+                "script",
+            ]
+        )
+        assert cron_command(enable_args) == 0
+        assert get_job(job["id"])["delivery_source"] == "script"
+        assert "Delivery source: script stdout" in capsys.readouterr().out
+
+    def test_create_script_delivery_without_script_fails_closed(
+        self, tmp_cron_dir, capsys
+    ):
+        parser = argparse.ArgumentParser(prog="hermes")
+        subparsers = parser.add_subparsers(dest="command")
+        build_cron_parser(subparsers, cmd_cron=cron_command)
+
+        args = parser.parse_args(
+            [
+                "cron",
+                "create",
+                "every 1h",
+                "Analyze the report",
+                "--delivery-source",
+                "script",
+            ]
+        )
+
+        assert cron_command(args) == 1
+        assert list_jobs() == []
+        assert "requires a pre-run script" in capsys.readouterr().out
+
     def test_edit_persists_user_owned_inference_pins(self, tmp_cron_dir, capsys):
         job = create_job(prompt="Daily report", schedule="every 1h")
         parser = argparse.ArgumentParser(prog="hermes")

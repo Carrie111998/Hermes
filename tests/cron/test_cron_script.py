@@ -70,6 +70,64 @@ class TestJobScriptField:
         updated = update_job(job["id"], {"script": "/new/script.py"})
         assert updated["script"] == "/new/script.py"
 
+    def test_script_delivery_source_is_explicit_and_validated(self, cron_env):
+        from cron.jobs import create_job
+
+        default_job = create_job(prompt="Analyze", schedule="every 1h")
+        assert "delivery_source" not in default_job
+
+        job = create_job(
+            prompt="Analyze",
+            schedule="every 1h",
+            script="report.py",
+            delivery_source="script",
+        )
+        assert job["delivery_source"] == "script"
+
+        with pytest.raises(ValueError, match="requires a pre-run script"):
+            create_job(
+                prompt="Analyze",
+                schedule="every 1h",
+                delivery_source="script",
+            )
+
+        with pytest.raises(ValueError, match="cannot be combined with no_agent"):
+            create_job(
+                prompt="Analyze",
+                schedule="every 1h",
+                script="report.py",
+                no_agent=True,
+                delivery_source="script",
+            )
+
+    def test_update_revalidates_script_delivery_source(self, cron_env):
+        from cron.jobs import create_job, get_job, update_job
+
+        job = create_job(
+            prompt="Analyze",
+            schedule="every 1h",
+            script="report.py",
+            delivery_source="script",
+        )
+
+        with pytest.raises(ValueError, match="requires a pre-run script"):
+            update_job(job["id"], {"script": None})
+        assert get_job(job["id"])["script"] == "report.py"
+
+        updated = update_job(job["id"], {"delivery_source": "agent"})
+        assert updated.get("delivery_source") is None
+
+    def test_invalid_delivery_source_is_rejected(self, cron_env):
+        from cron.jobs import create_job
+
+        with pytest.raises(ValueError, match="must be one of: agent, script"):
+            create_job(
+                prompt="Analyze",
+                schedule="every 1h",
+                script="report.py",
+                delivery_source="model",
+            )
+
 
 def test_cronjob_tool_rejects_stale_past_one_shot(cron_env, monkeypatch):
     from tools.cronjob_tools import cronjob
@@ -106,6 +164,166 @@ class TestRunJobScript:
         success, output = _run_job_script("relative.py")
         assert success is True
         assert output == "relative works"
+
+    def test_script_delivery_capture_executes_gate_once(
+        self, cron_env, monkeypatch
+    ):
+        import cron.scheduler as scheduler
+
+        calls = []
+        capture = []
+
+        def fake_script(*_args, **_kwargs):
+            calls.append("script")
+            return True, '{"wakeAgent": false}'
+
+        monkeypatch.setattr(
+            "hermes_cli.config.require_parseable_user_config", lambda: None
+        )
+        monkeypatch.setattr(
+            scheduler, "_run_job_script_with_claim_heartbeat", fake_script
+        )
+
+        success, _doc, final, error = scheduler.run_job(
+            {
+                "id": "capture-once",
+                "name": "capture-once",
+                "prompt": "Analyze",
+                "script": "report.py",
+                "delivery_source": "script",
+            },
+            script_delivery_capture=capture,
+        )
+
+        assert success is True
+        assert final == scheduler.SILENT_MARKER
+        assert error is None
+        assert calls == ["script"]
+        assert capture == [(True, '{"wakeAgent": false}')]
+
+    def test_empty_script_delivery_output_is_silent_and_auditable(
+        self, cron_env, monkeypatch
+    ):
+        import cron.scheduler as scheduler
+        import run_agent
+
+        capture = []
+
+        monkeypatch.setattr(
+            "hermes_cli.config.require_parseable_user_config", lambda: None
+        )
+        monkeypatch.setattr(
+            scheduler,
+            "_run_job_script_with_claim_heartbeat",
+            lambda *_args, **_kwargs: (True, ""),
+        )
+        monkeypatch.setattr(
+            run_agent,
+            "AIAgent",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                AssertionError("agent must not run for empty script output")
+            ),
+        )
+
+        success, doc, final, error = scheduler.run_job(
+            {
+                "id": "capture-empty",
+                "name": "capture-empty",
+                "prompt": "Analyze",
+                "script": "report.py",
+                "delivery_source": "script",
+            },
+            script_delivery_capture=capture,
+        )
+
+        assert success is True
+        assert final == scheduler.SILENT_MARKER
+        assert error is None
+        assert "silent (empty script output); agent not run" in doc
+        assert capture == [(True, "")]
+
+    def test_script_delivery_failure_fails_before_agent_construction(
+        self, cron_env, monkeypatch
+    ):
+        import cron.scheduler as scheduler
+        import run_agent
+
+        calls = []
+        capture = []
+
+        def fake_script(*_args, **_kwargs):
+            calls.append("script")
+            return False, "exit code 1: upstream unavailable"
+
+        def unexpected_agent(*_args, **_kwargs):
+            raise AssertionError("agent must not be constructed after script failure")
+
+        monkeypatch.setattr(
+            "hermes_cli.config.require_parseable_user_config", lambda: None
+        )
+        monkeypatch.setattr(
+            scheduler, "_run_job_script_with_claim_heartbeat", fake_script
+        )
+        monkeypatch.setattr(run_agent, "AIAgent", unexpected_agent)
+
+        success, doc, final, error = scheduler.run_job(
+            {
+                "id": "capture-fail",
+                "name": "capture-fail",
+                "prompt": "Analyze",
+                "script": "report.py",
+                "delivery_source": "script",
+            },
+            script_delivery_capture=capture,
+        )
+
+        assert success is False
+        assert final == ""
+        assert "script failed; agent not run" in doc
+        assert "upstream unavailable" in error
+        assert calls == ["script"]
+        assert capture == [(False, "exit code 1: upstream unavailable")]
+
+    @pytest.mark.parametrize("invalid_source", ["Script", "script ", "model"])
+    def test_noncanonical_runtime_delivery_source_fails_closed(
+        self, cron_env, invalid_source
+    ):
+        import cron.scheduler as scheduler
+
+        success, _doc, final, error = scheduler.run_job(
+            {
+                "id": "invalid-source",
+                "name": "invalid-source",
+                "prompt": "Analyze",
+                "script": "report.py",
+                "delivery_source": invalid_source,
+            }
+        )
+
+        assert success is False
+        assert final == ""
+        assert "Invalid delivery_source" in error
+        assert "Refusing agent-response fallback" in error
+
+    @pytest.mark.parametrize(
+        "detail",
+        [
+            "Script timed out after 60s: report.py",
+            "HTTP 429: rate limit exceeded",
+            "authentication failed",
+        ],
+    )
+    def test_delivery_script_failure_summary_names_script_not_provider(self, detail):
+        from cron.scheduler import _summarize_cron_failure_for_delivery
+
+        summary = _summarize_cron_failure_for_delivery(
+            {"id": "delivery-timeout", "name": "research"},
+            f"Pre-run delivery script failed: {detail}",
+        )
+
+        assert "pre-run delivery script failed" in summary
+        assert "No model was invoked" in summary
+        assert "provider" not in summary.lower()
 
 
     def test_script_subprocess_env_sanitized(self, cron_env, monkeypatch):

@@ -482,6 +482,53 @@ class TestAgentCannotSetModelPin:
         assert stored["name"] == "renamed"
 
 
+class TestAgentCannotSetDeliverySource:
+    """The delivery boundary is operator-owned like inference pins."""
+
+    @pytest.fixture(autouse=True)
+    def _setup_cron_dir(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("cron.jobs.CRON_DIR", tmp_path / "cron")
+        monkeypatch.setattr("cron.jobs.JOBS_FILE", tmp_path / "cron" / "jobs.json")
+        monkeypatch.setattr("cron.jobs.OUTPUT_DIR", tmp_path / "cron" / "output")
+
+    def test_schema_has_no_delivery_source_param(self):
+        from tools.cronjob_tools import CRONJOB_SCHEMA
+
+        assert "delivery_source" not in CRONJOB_SCHEMA["parameters"]["properties"]
+
+    def test_handler_update_leaves_operator_delivery_source_untouched(self):
+        from cron.jobs import get_job
+        from tools.registry import registry
+
+        created = json.loads(
+            cronjob(
+                action="create",
+                prompt="Check",
+                schedule="every 1h",
+                script="report.py",
+                delivery_source="script",
+            )
+        )
+        job_id = created["job_id"]
+
+        updated = json.loads(
+            registry.dispatch(
+                "cronjob",
+                {
+                    "action": "update",
+                    "job_id": job_id,
+                    "name": "renamed",
+                    "delivery_source": "agent",
+                },
+            )
+        )
+
+        assert updated["success"] is True
+        stored = get_job(job_id)
+        assert stored["delivery_source"] == "script"
+        assert stored["name"] == "renamed"
+
+
 class TestRegisteredHandlerForwardsAttachToSession:
     """#84802 — schema + cronjob() already accept attach_to_session, but the
     registry adapter must forward it or create silently drops the field and

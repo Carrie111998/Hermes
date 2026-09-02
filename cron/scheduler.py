@@ -353,6 +353,11 @@ def _summarize_cron_failure_for_delivery(job: dict, error: str | None) -> str:
             f"⚠️ Cron '{job_name}' failed: script timed out. "
             "No model was invoked. Full details saved in cron output."
         )
+    if lower.startswith("pre-run delivery script failed"):
+        return (
+            f"⚠️ Cron '{job_name}' failed: pre-run delivery script failed. "
+            "No model was invoked. Full details saved in cron output."
+        )
 
     # Provider/API failures are the common noisy path. Keep these short.
     # Match 429 as a whole token (#83188 @cation98): bare substring matching
@@ -5483,6 +5488,7 @@ def run_job(
     job: dict,
     *,
     defer_agent_teardown: Optional[list] = None,
+    script_delivery_capture: Optional[list] = None,
     extra_prompt: Optional[str] = None,
     cancel_event: Optional[_CancelEventLike] = None,
     execution_id: Optional[str] = None,
@@ -5504,11 +5510,31 @@ def run_job(
     prompt=...)`` (#57331). Appended to the stored prompt for this fire only —
     never persisted to the job definition.
 
+    ``script_delivery_capture``: optional caller-owned list populated with the
+    cached ``(success, stdout)`` result of the agent job's pre-run script. This
+    lets the end-to-end firing path use that exact stdout as an explicit
+    delivery boundary without executing the script a second time.
+
     Returns:
         Tuple of (success, full_output_doc, final_response, error_message)
     """
     job_id = job["id"]
     job_name = str(job.get("name") or job.get("prompt") or job_id or "cron job")
+    raw_delivery_source = job.get("delivery_source")
+    if raw_delivery_source not in {None, "", "agent", "script"}:
+        error = (
+            f"Invalid delivery_source {raw_delivery_source!r}; expected "
+            "'agent' or 'script'. Refusing agent-response fallback."
+        )
+        return False, f"# Cron Job: {job_name}\n\nError: {error}\n", "", error
+    if raw_delivery_source == "script" and (
+        job.get("no_agent") or not str(job.get("script") or "").strip()
+    ):
+        error = (
+            "delivery_source='script' requires an agent-backed job with a "
+            "pre-run script. Refusing agent-response fallback."
+        )
+        return False, f"# Cron Job: {job_name}\n\nError: {error}\n", "", error
 
     # Fail closed on a corrupt config.yaml before any agent-driven work
     # (issue #81952): a cron fire is fully non-interactive, and continuing
@@ -5752,7 +5778,20 @@ def run_job(
         prerun_script = _run_job_script_with_claim_heartbeat(
             job, script_path, cancel_event=cancel_event,
         )
+        if script_delivery_capture is not None:
+            script_delivery_capture.append(prerun_script)
         _ran_ok, _script_output = prerun_script
+        if raw_delivery_source == "script" and not _ran_ok:
+            error = f"Pre-run delivery script failed: {_script_output}"
+            failed_doc = (
+                f"# Cron Job: {job_name}\n\n"
+                f"**Job ID:** {job_id}\n"
+                f"**Run Time:** {_hermes_now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+                "**Delivery Source:** script stdout\n"
+                "**Status:** script failed; agent not run\n\n"
+                f"{_script_output}\n"
+            )
+            return False, failed_doc, "", error
         if _ran_ok and not _parse_wake_gate(_script_output):
             logger.info(
                 "Job '%s' (ID: %s): wakeAgent=false, skipping agent run",
@@ -5795,6 +5834,15 @@ def run_job(
         return False, blocked_doc, "", str(block_exc)
     if prompt is None:
         logger.info("Job '%s': script produced no output, skipping AI call.", job_name)
+        if raw_delivery_source == "script":
+            silent_doc = (
+                f"# Cron Job: {job_name}\n\n"
+                f"**Job ID:** {job_id}\n"
+                f"**Run Time:** {_hermes_now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+                "**Delivery Source:** script stdout\n"
+                "**Status:** silent (empty script output); agent not run\n"
+            )
+            return True, silent_doc, SILENT_MARKER, None
         return True, "", SILENT_MARKER, None
     _cron_session_id = f"cron_{job_id}_{_hermes_now().strftime('%Y%m%d_%H%M%S')}"
 
@@ -7252,11 +7300,13 @@ def _run_one_job_body(
         # below once delivery is done. Defense-in-depth alongside the
         # interpreter-shutdown guard in _deliver_result.
         _deferred_agents: list = []
+        _script_delivery_capture: list = []
         try:
             if fire_claim_lost is None:
                 success, output, final_response, error = run_job(
                     job,
                     defer_agent_teardown=_deferred_agents,
+                    script_delivery_capture=_script_delivery_capture,
                     extra_prompt=extra_prompt,
                     execution_id=execution_id,
                 )
@@ -7264,6 +7314,7 @@ def _run_one_job_body(
                 success, output, final_response, error = run_job(
                     job,
                     defer_agent_teardown=_deferred_agents,
+                    script_delivery_capture=_script_delivery_capture,
                     extra_prompt=extra_prompt,
                     cancel_event=fire_claim_lost,
                     execution_id=execution_id,
@@ -7364,6 +7415,29 @@ def _run_one_job_body(
             drift_skip = drift_skip_silent or (
                 bool(error) and DRIFT_SKIP_MARKER in str(error)
             )
+            if (
+                success
+                and job.get("delivery_source") == "script"
+                and not _script_delivery_capture
+                and not _is_cron_silence_response(final_response)
+            ):
+                success = False
+                error = (
+                    "Script delivery source completed without a captured "
+                    "pre-run script result; refusing agent-response fallback."
+                )
+            if (
+                success
+                and job.get("delivery_source") == "script"
+                and _script_delivery_capture
+                and not _script_delivery_capture[-1][0]
+            ):
+                success = False
+                error = (
+                    "Pre-run delivery script failed; refusing agent-response "
+                    "fallback."
+                )
+
             if blocked_config and not success:
                 # Blocked-config alert: bypass the generic failure summarizer
                 # (whose auth/timeout heuristics would mislabel this as a
@@ -7381,7 +7455,14 @@ def _run_one_job_body(
                 )
             else:
                 if success:
-                    deliver_content = final_response
+                    if job.get("delivery_source") == "script" and _script_delivery_capture:
+                        _script_stdout = _script_delivery_capture[-1][1]
+                        if not _parse_wake_gate(_script_stdout):
+                            deliver_content = SILENT_MARKER
+                        else:
+                            deliver_content = _script_stdout
+                    else:
+                        deliver_content = final_response
                 else:
                     # Durable failure incident: record this job+error
                     # signature once and, when the operator already acked it,
@@ -7499,7 +7580,11 @@ def _run_one_job_body(
         # Treat empty final_response as a soft failure so last_status
         # is not "ok" — the agent ran but produced nothing useful.
         # (issue #8585)
-        if success and not final_response.strip():
+        if (
+            success
+            and job.get("delivery_source") != "script"
+            and not final_response.strip()
+        ):
             success = False
             error = "Agent completed but produced empty response (model error, timeout, or misconfiguration)"
 
