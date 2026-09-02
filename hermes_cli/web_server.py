@@ -17380,6 +17380,10 @@ async def console_ws(ws: WebSocket) -> None:
     )
 
     active_task: asyncio.Task | None = None
+    # Strong refs to superseded in-flight commands: overwriting active_task
+    # drops the only reference, and the loop holds tasks weakly — a mid-run
+    # GC reap would abort the old command silently (and leak its exception).
+    console_tasks: set = set()
     pending_confirmation: Optional[str] = None
     command_generation = 0
 
@@ -17475,9 +17479,13 @@ async def console_ws(ws: WebSocket) -> None:
         nonlocal active_task, command_generation
         command_generation += 1
         command_id = command_generation
-        active_task = asyncio.create_task(
+        task = asyncio.create_task(
             run_command(line, confirmed=confirmed, command_id=command_id)
         )
+        console_tasks.add(task)
+        if hasattr(task, "add_done_callback"):
+            task.add_done_callback(console_tasks.discard)
+        active_task = task
 
     try:
         while True:
