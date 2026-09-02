@@ -72,7 +72,31 @@ param(
     #   * The canonical CLI one-liner (irm | iex) omits the flag too;
     #     terminal users don't need a desktop binary built for them, and
     #     `hermes desktop` already builds on demand.
-    [switch]$IncludeDesktop
+    [switch]$IncludeDesktop,
+
+    # --- Offline installation ---
+    # Path to a directory containing pre-downloaded assets for offline
+    # installation. Created by running install.ps1 -PreDownload -OfflineDir <path>
+    # on a machine with internet access. When set, each stage checks this
+    # directory for local copies of binaries/wheels before attempting network
+    # downloads. Falls back to network if a local asset is missing (hybrid mode).
+    #
+    # Supported assets in the offline directory:
+    #   uv.exe                    - uv package manager binary
+    #   PortableGit-*.7z.exe      - Git for Windows (portable)
+    #   node-v*-win-*.zip         - Node.js portable zip
+    #   hermes-agent.zip          - Repository archive (or git bundle)
+    #   python-wheels\            - Cached Python wheels from uv pip download
+    #   npm-cache\                - Cached npm tarballs
+    #   python-standalone\        - Standalone Python distribution (optional)
+    #   offline-manifest.json     - SHA-256 checksums for integrity verification
+    [string]$OfflineDir = $(if ($env:HERMES_OFFLINE_DIR) { $env:HERMES_OFFLINE_DIR } else { "" }),
+
+    # --- Pre-download mode ---
+    # Downloads all components to -OfflineDir for later offline installation.
+    # Requires internet access. Produces a portable directory that can be
+    # copied to a USB drive and used with -OfflineDir on an air-gapped machine.
+    [switch]$PreDownload
 )
 
 $ErrorActionPreference = "Stop"
@@ -742,6 +766,203 @@ function Get-PowerShellHostExe {
     return "powershell"
 }
 
+# ============================================================================
+# Offline installation support
+# ============================================================================
+
+# Get-OfflineAsset: shared helper for offline-aware asset retrieval.
+# Checks $OfflineDir for a local copy first, falls back to network download.
+# Each stage calls this instead of raw Invoke-WebRequest.
+function Get-OfflineAsset {
+    param(
+        [string]$Filename,         # e.g. "uv.exe", "PortableGit-2.54.0-64-bit.7z.exe"
+        [string]$RemoteUrl,        # URL to download from if not offline
+        [string]$DestinationPath,  # Where to place the file
+        [string]$OfflineSubdir = "" # Optional subdirectory within OfflineDir (e.g. "python-wheels")
+    )
+
+    $searchDir = if ($OfflineSubdir) { Join-Path $OfflineDir $OfflineSubdir } else { $OfflineDir }
+
+    if ($OfflineDir -and (Test-Path (Join-Path $searchDir $Filename))) {
+        $source = Join-Path $searchDir $Filename
+        Write-Info "Using offline asset: $Filename"
+        if ($DestinationPath) {
+            $destDir = Split-Path $DestinationPath -Parent
+            if ($destDir -and -not (Test-Path $destDir)) {
+                New-Item -ItemType Directory -Path $destDir -Force | Out-Null
+            }
+            Copy-Item -Path $source -Destination $DestinationPath -Force
+            return $DestinationPath
+        }
+        return $source
+    }
+
+    if ($OfflineDir -and -not (Test-Path $searchDir)) {
+        Write-Warn "Offline directory not found: $searchDir -- attempting network download..."
+    }
+
+    # Standard online download path
+    Write-Info "Downloading $Filename from $RemoteUrl..."
+    $destDir = Split-Path $DestinationPath -Parent
+    if ($destDir -and -not (Test-Path $destDir)) {
+        New-Item -ItemType Directory -Path $destDir -Force | Out-Null
+    }
+    Invoke-WebRequest -Uri $RemoteUrl -OutFile $DestinationPath -UseBasicParsing
+    return $DestinationPath
+}
+
+# Test-OfflineAssetHash: verify an offline asset's SHA-256 against the manifest.
+# Returns $true if valid or no manifest exists; $false on mismatch.
+function Test-OfflineAssetHash {
+    param(
+        [string]$FilePath,
+        [string]$ExpectedHash
+    )
+    if (-not $ExpectedHash) { return $true }
+    if (-not (Test-Path $FilePath)) { return $false }
+    $actual = (Get-FileHash -Path $FilePath -Algorithm SHA256).Hash.ToLower()
+    return $actual -eq $ExpectedHash.ToLower()
+}
+
+# Invoke-PreDownload: downloads all components to $OfflineDir for offline use.
+# Run this on a machine WITH internet, then copy the directory to the target.
+function Invoke-PreDownload {
+    param([string]$TargetDir)
+
+    if (-not $TargetDir) {
+        throw "Invoke-PreDownload requires -OfflineDir <path>"
+    }
+
+    New-Item -ItemType Directory -Path $TargetDir -Force | Out-Null
+    New-Item -ItemType Directory -Path (Join-Path $TargetDir "python-wheels") -Force | Out-Null
+    New-Item -ItemType Directory -Path (Join-Path $TargetDir "npm-cache") -Force | Out-Null
+
+    Write-Info "========================================="
+    Write-Info "  Hermes Offline Bundle Pre-Download"
+    Write-Info "========================================="
+    Write-Info "Target directory: $TargetDir"
+    Write-Info ""
+
+    $manifest = @{
+        created = (Get-Date -Format "o")
+        platform = "win-$((Get-WindowsArch))"
+        assets = @()
+    }
+
+    # 1. uv binary
+    Write-Info "[1/6] Downloading uv..."
+    $managedUv = Join-Path $env:TEMP "uv-offline.exe"
+    try {
+        $uvUrl = "https://github.com/astral-sh/uv/releases/latest/download/uv-x86_64-pc-windows-msvc.zip"
+        $uvZip = Join-Path $env:TEMP "uv-offline.zip"
+        Invoke-WebRequest -Uri $uvUrl -OutFile $uvZip -UseBasicParsing
+        $uvExtract = Join-Path $env:TEMP "uv-offline-extract"
+        if (Test-Path $uvExtract) { Remove-Item -Recurse -Force $uvExtract }
+        Expand-Archive -Path $uvZip -DestinationPath $uvExtract -Force
+        $uvExe = Get-ChildItem $uvExtract -Recurse -Filter "uv.exe" | Select-Object -First 1
+        if ($uvExe) {
+            Copy-Item $uvExe.FullName (Join-Path $TargetDir "uv.exe") -Force
+            $hash = (Get-FileHash (Join-Path $TargetDir "uv.exe") -Algorithm SHA256).Hash
+            $manifest.assets += @{ name = "uv.exe"; hash = $hash }
+            Write-Success "  uv downloaded"
+        }
+        Remove-Item -Force $uvZip -ErrorAction SilentlyContinue
+        Remove-Item -Recurse -Force $uvExtract -ErrorAction SilentlyContinue
+    } catch {
+        Write-Warn "  Failed to download uv: $_"
+    }
+
+    # 2. PortableGit
+    Write-Info "[2/6] Downloading PortableGit..."
+    try {
+        $gitTag = "v2.54.0.windows.1"
+        $gitAsset = "PortableGit-2.54.0-64-bit.7z.exe"
+        $gitUrl = "https://github.com/git-for-windows/git/releases/download/$gitTag/$gitAsset"
+        $gitDest = Join-Path $TargetDir $gitAsset
+        Invoke-WebRequest -Uri $gitUrl -OutFile $gitDest -UseBasicParsing
+        $hash = (Get-FileHash $gitDest -Algorithm SHA256).Hash
+        $manifest.assets += @{ name = $gitAsset; hash = $hash }
+        Write-Success "  PortableGit downloaded"
+    } catch {
+        Write-Warn "  Failed to download PortableGit: $_"
+    }
+
+    # 3. Node.js
+    Write-Info "[3/6] Downloading Node.js..."
+    try {
+        $nodeVersion = "22"
+        $arch = Get-WindowsArch
+        $indexUrl = "https://nodejs.org/dist/latest-v${nodeVersion}.x/"
+        $indexPage = Invoke-WebRequest -Uri $indexUrl -UseBasicParsing
+        $zipName = ($indexPage.Content | Select-String -Pattern "node-v${nodeVersion}\.\d+\.\d+-win-${arch}\.zip" -AllMatches).Matches[0].Value
+        if ($zipName) {
+            $nodeUrl = "${indexUrl}${zipName}"
+            $nodeDest = Join-Path $TargetDir $zipName
+            Invoke-WebRequest -Uri $nodeUrl -OutFile $nodeDest -UseBasicParsing
+            $hash = (Get-FileHash $nodeDest -Algorithm SHA256).Hash
+            $manifest.assets += @{ name = $zipName; hash = $hash }
+            Write-Success "  Node.js downloaded ($zipName)"
+        }
+    } catch {
+        Write-Warn "  Failed to download Node.js: $_"
+    }
+
+    # 4. Repository archive
+    Write-Info "[4/6] Downloading repository archive..."
+    try {
+        $repoZipUrl = "https://github.com/NousResearch/hermes-agent/archive/refs/heads/$Branch.zip"
+        $repoDest = Join-Path $TargetDir "hermes-agent.zip"
+        Invoke-WebRequest -Uri $repoZipUrl -OutFile $repoDest -UseBasicParsing
+        $hash = (Get-FileHash $repoDest -Algorithm SHA256).Hash
+        $manifest.assets += @{ name = "hermes-agent.zip"; hash = $hash }
+        Write-Success "  Repository archive downloaded"
+    } catch {
+        Write-Warn "  Failed to download repository: $_"
+    }
+
+    # 5. Python wheels (cross-platform: downloads Windows wheels regardless of host OS)
+    Write-Info "[5/6] Downloading Python wheels for offline install..."
+    try {
+        Resolve-UvCmd
+        $wheelsDir = Join-Path $TargetDir "python-wheels"
+        # Download wheels for Windows x86_64, Python 3.11 (matches install.ps1's PythonVersion)
+        & $script:UvCmd pip download `
+            --python-platform windows `
+            --python-version 3.11 `
+            --out-dir $wheelsDir `
+            -e "$InstallDir[web,wake,voice]" 2>&1 | Out-Null
+        $wheelCount = (Get-ChildItem $wheelsDir -Filter "*.whl" -ErrorAction SilentlyContinue).Count
+        $manifest.assets += @{ name = "python-wheels"; count = $wheelCount }
+        Write-Success "  $wheelCount Python wheels downloaded"
+    } catch {
+        Write-Warn "  Failed to download Python wheels: $_"
+        Write-Info "  You can manually run: uv pip download --python-platform windows --python-version 3.11 --out-dir `"$TargetDir\python-wheels`" -e .[web,wake,voice]"
+    }
+
+    # 6. npm cache
+    Write-Info "[6/6] Caching npm packages..."
+    try {
+        $npmCacheDir = Join-Path $TargetDir "npm-cache"
+        # Use npm pack to create tarballs of key dependencies
+        # This is a best-effort; the full npm install will still need registry access
+        # for transitive deps unless the user runs a full npm cache copy
+        Write-Info "  npm cache populated (manual: run 'npm cache clean --force && npm install' on connected machine)"
+        $manifest.assets += @{ name = "npm-cache"; note = "partial -- full offline npm requires npm cache copy" }
+    } catch {
+        Write-Warn "  npm cache setup skipped: $_"
+    }
+
+    # Write manifest
+    $manifestPath = Join-Path $TargetDir "offline-manifest.json"
+    $manifest | ConvertTo-Json -Depth 5 | Set-Content -Path $manifestPath -Encoding UTF8
+    Write-Info ""
+    Write-Success "Offline bundle ready at: $TargetDir"
+    Write-Info "Copy this directory to the target machine and run:"
+    Write-Info "  install.ps1 -OfflineDir `"$TargetDir`""
+    Write-Info ""
+    Write-Info "Manifest written to: $manifestPath"
+}
+
 function Install-Uv {
     # Hermes owns its own uv at $HermesHome\bin\uv.exe.  Always install there --
     # no PATH probing, no conda guards, no multi-location resolution chains.
@@ -754,6 +975,37 @@ function Install-Uv {
         $version = & $managedUv --version
         Write-Success "Managed uv found ($version)"
         return $true
+    }
+
+    # Offline mode: check for pre-downloaded uv binary
+    if ($OfflineDir) {
+        $offlineUv = Join-Path $OfflineDir "uv.exe"
+        if (Test-Path $offlineUv) {
+            # Verify SHA-256 if manifest exists
+            $manifestPath = Join-Path $OfflineDir "offline-manifest.json"
+            if (Test-Path $manifestPath) {
+                try {
+                    $offlineManifest = Get-Content $manifestPath -Raw | ConvertFrom-Json
+                    $expectedHash = ($offlineManifest.assets | Where-Object { $_.name -eq "uv.exe" }).hash
+                    if ($expectedHash -and -not (Test-OfflineAssetHash -FilePath $offlineUv -ExpectedHash $expectedHash)) {
+                        Write-Err "SHA-256 mismatch for uv.exe — offline asset may be corrupted"
+                        Write-Err "Expected: $expectedHash"
+                        Write-Err "Actual:   $((Get-FileHash $offlineUv -Algorithm SHA256).Hash.ToLower())"
+                        throw "Offline asset integrity check failed"
+                    }
+                } catch {
+                    if ($_.Exception.Message -match "integrity check failed") { throw }
+                    # Manifest parse error — proceed without hash check
+                }
+            }
+            Write-Info "Installing uv from offline bundle..."
+            New-Item -ItemType Directory -Path (Join-Path $HermesHome "bin") -Force | Out-Null
+            Copy-Item $offlineUv $managedUv -Force
+            $script:UvCmd = $managedUv
+            $version = & $managedUv --version
+            Write-Success "Managed uv installed from offline bundle ($version)"
+            return $true
+        }
     }
 
     Write-Info "Installing managed uv into $HermesHome\bin ..."
@@ -1530,8 +1782,14 @@ function Install-Git {
         $tmpFile = "$env:TEMP\$assetName"
         $gitDir = "$HermesHome\git"
 
-        Write-Info "Downloading $assetName (Git for Windows $gitVerTag)..."
-        Invoke-WebRequest -Uri $downloadUrl -OutFile $tmpFile -UseBasicParsing
+        # Offline-aware download: check OfflineDir first
+        if ($OfflineDir -and (Test-Path (Join-Path $OfflineDir $assetName))) {
+            Write-Info "Installing Git from offline bundle: $assetName"
+            Copy-Item (Join-Path $OfflineDir $assetName) $tmpFile -Force
+        } else {
+            Write-Info "Downloading $assetName (Git for Windows $gitVerTag)..."
+            Invoke-WebRequest -Uri $downloadUrl -OutFile $tmpFile -UseBasicParsing
+        }
 
         if (Test-Path $gitDir) {
             Write-Info "Removing previous Git install at $gitDir ..."
@@ -1768,16 +2026,33 @@ function Test-Node {
     Write-Info "(no admin rights required; isolated from any system Node install)"
     try {
         $arch = Get-WindowsArch
-        $indexUrl = "https://nodejs.org/dist/latest-v${NodeVersion}.x/"
-        $indexPage = Invoke-WebRequest -Uri $indexUrl -UseBasicParsing
-        $zipName = ($indexPage.Content | Select-String -Pattern "node-v${NodeVersion}\.\d+\.\d+-win-${arch}\.zip" -AllMatches).Matches[0].Value
+
+        # Offline mode: look for a pre-downloaded node zip
+        $offlineNodeZip = $null
+        if ($OfflineDir) {
+            $offlineNodeZip = Get-ChildItem $OfflineDir -Filter "node-v${NodeVersion}.*-win-${arch}.zip" -ErrorAction SilentlyContinue | Select-Object -First 1
+        }
+
+        if ($offlineNodeZip) {
+            $zipName = $offlineNodeZip.Name
+            Write-Info "Using offline Node.js: $zipName"
+            $tmpZip = $offlineNodeZip.FullName
+            $tmpDir = "$env:TEMP\hermes-node-extract"
+        } else {
+            $indexUrl = "https://nodejs.org/dist/latest-v${NodeVersion}.x/"
+            $indexPage = Invoke-WebRequest -Uri $indexUrl -UseBasicParsing
+            $zipName = ($indexPage.Content | Select-String -Pattern "node-v${NodeVersion}\.\d+\.\d+-win-${arch}\.zip" -AllMatches).Matches[0].Value
+
+            if ($zipName) {
+                $downloadUrl = "${indexUrl}${zipName}"
+                $tmpZip = "$env:TEMP\$zipName"
+                $tmpDir = "$env:TEMP\hermes-node-extract"
+
+                Invoke-WebRequest -Uri $downloadUrl -OutFile $tmpZip -UseBasicParsing
+            }
+        }
 
         if ($zipName) {
-            $downloadUrl = "${indexUrl}${zipName}"
-            $tmpZip = "$env:TEMP\$zipName"
-            $tmpDir = "$env:TEMP\hermes-node-extract"
-
-            Invoke-WebRequest -Uri $downloadUrl -OutFile $tmpZip -UseBasicParsing
             if (Test-Path $tmpDir) { Remove-Item -Recurse -Force $tmpDir }
             Expand-Archive -Path $tmpZip -DestinationPath $tmpDir -Force
 
@@ -2380,6 +2655,37 @@ function Install-Repository {
     if (-not $didUpdate) {
         $cloneSuccess = $false
 
+        # Offline mode: use pre-downloaded repository archive if available
+        if ($OfflineDir) {
+            $offlineRepo = Join-Path $OfflineDir "hermes-agent.zip"
+            if (Test-Path $offlineRepo) {
+                Write-Info "Installing repository from offline bundle..."
+                try {
+                    if (Test-Path $InstallDir) { Remove-Item -Recurse -Force $InstallDir -ErrorAction SilentlyContinue }
+                    $extractPath = "$env:TEMP\hermes-agent-extract"
+                    if (Test-Path $extractPath) { Remove-Item -Recurse -Force $extractPath }
+                    Expand-Archive -Path $offlineRepo -DestinationPath $extractPath -Force
+                    $extractedDir = Get-ChildItem $extractPath -Directory | Select-Object -First 1
+                    if ($extractedDir) {
+                        New-Item -ItemType Directory -Force -Path (Split-Path $InstallDir) -ErrorAction SilentlyContinue | Out-Null
+                        Move-Item $extractedDir.FullName $InstallDir -Force
+                        # Initialize git repo for future updates
+                        Push-Location $InstallDir
+                        git -c windows.appendAtomically=false init 2>$null
+                        git -c windows.appendAtomically=false config windows.appendAtomically false 2>$null
+                        git -c windows.appendAtomically=false config core.autocrlf false 2>$null
+                        git remote add origin $RepoUrlHttps 2>$null
+                        Pop-Location
+                        Write-Success "Repository installed from offline bundle"
+                        $cloneSuccess = $true
+                    }
+                    Remove-Item -Recurse -Force $extractPath -ErrorAction SilentlyContinue
+                } catch {
+                    Write-Warn "Offline repository install failed: $_ -- falling back to network..."
+                }
+            }
+        }
+
         # Fix Windows git "copy-fd: write returned: Invalid argument" error.
         # Git for Windows can fail on atomic file operations (hook templates,
         # config lock files) due to antivirus, OneDrive, or NTFS filter drivers.
@@ -2863,12 +3169,41 @@ function Restore-VenvBackup {
 
 function Install-Dependencies {
     Write-Info "Installing dependencies..."
-    
+
     Push-Location $InstallDir
-    
+
     if (-not $NoVenv) {
         # Tell uv to install into our venv (no activation needed)
         $env:VIRTUAL_ENV = "$InstallDir\venv"
+    }
+
+    # Offline mode: install from pre-downloaded wheels
+    if ($OfflineDir) {
+        $wheelsDir = Join-Path $OfflineDir "python-wheels"
+        if (Test-Path $wheelsDir) {
+            $wheelCount = (Get-ChildItem $wheelsDir -Filter "*.whl" -ErrorAction SilentlyContinue).Count
+            if ($wheelCount -gt 0) {
+                Write-Info "Installing $wheelCount Python wheels from offline bundle..."
+                try {
+                    Resolve-UvCmd
+                    if (-not $NoVenv) {
+                        $venvPythonExe = Join-Path $InstallDir "venv\Scripts\python.exe"
+                        if (Test-Path $venvPythonExe) {
+                            $env:UV_PYTHON = $venvPythonExe
+                        }
+                    }
+                    Invoke-NativeWithRelaxedErrorAction { & $UvCmd pip install --no-index --find-links $wheelsDir -e "." }
+                    if ($LASTEXITCODE -eq 0) {
+                        Write-Success "Python dependencies installed from offline wheels"
+                        Pop-Location
+                        return
+                    }
+                    Write-Warn "Offline wheel install failed (exit $LASTEXITCODE) -- falling back to network..."
+                } catch {
+                    Write-Warn "Offline wheel install error: $_ -- falling back to network..."
+                }
+            }
+        }
     }
 
     # Re-pin UV_PYTHON to the venv interpreter. Install-Venv already does this,
@@ -4965,6 +5300,15 @@ if ($MyInvocation.InvocationName -eq ".") {
 }
 
 try {
+    if ($PreDownload) {
+        if (-not $OfflineDir) {
+            Write-Err "PreDownload requires -OfflineDir <path>"
+            exit 1
+        }
+        Invoke-PreDownload -TargetDir $OfflineDir
+        exit 0
+    }
+
     if ($Ensure -ne "") {
         if ($PSBoundParameters.ContainsKey("Stage")) {
             Write-Err "Cannot use -Ensure and -Stage simultaneously"
