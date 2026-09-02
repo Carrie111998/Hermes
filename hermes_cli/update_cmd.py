@@ -11072,7 +11072,7 @@ def _fleet_probe_expected_runtimes(
     * ``pre_restart_pids`` non-empty, or ``None`` (pre-state unreadable —
       cannot prove nothing was running; same contract as
       ``_restart_phase_failure_is_incomplete``, #78574).
-    * the pre-update plan inventoried ≥1 runtime.
+    * the pre-update plan inventoried ≥1 runtime with ``kind == "gateway"``.
 
     ``windows_resume_token`` is deliberately EXCLUDED (#93406 residual). The
     pause/resume token is bookkeeping for ``_pause_windows_gateways_for_update``
@@ -11095,6 +11095,18 @@ def _fleet_probe_expected_runtimes(
     parameter stays in the signature so the call site keeps passing the token
     (cheap, explicit, and the docstring is where the exclusion is explained).
 
+    The plan-runtime check is gateway-scoped for the same reason (#97332):
+    the plan inventory also carries ``kind="serve"`` / ``kind="dashboard"``
+    records (#95576), and ``collect_fleet_versions()`` verifies gateway
+    identities only — a serve/dashboard backend never publishes the
+    ``gateway_state.json`` row the probe would need. Counting any non-empty
+    plan therefore made a dashboard-only update (gateway never started)
+    wait out the probe for rows that cannot exist, print the
+    incomplete-verification warning, and exit 1 after a successful update.
+    Only a ``kind == "gateway"`` record is evidence that gateway rows were
+    expected; the restarted/killed/pre-restart-PID signals above still fail
+    closed unchanged.
+
     The same condition gates the 2.0s settle sleep: a freshly restarted
     gateway needs the settle window to rewrite ``gateway_state.json``.
 
@@ -11109,7 +11121,15 @@ def _fleet_probe_expected_runtimes(
         return True
     try:
         if pre_update_plan is not None and pre_update_plan.runtimes:
-            return True
+            # Gateway-scoped on purpose (#97332): serve/dashboard plan
+            # records have no collect_fleet_versions() row, so only a
+            # kind == "gateway" runtime is evidence that gateway rows were
+            # expected.
+            if any(
+                getattr(runtime, "kind", None) == "gateway"
+                for runtime in pre_update_plan.runtimes
+            ):
+                return True
     except Exception:
         pass
     return False
