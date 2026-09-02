@@ -1436,8 +1436,15 @@ export function TextInput({
       const range = selRange()
       const delFwd = k.delete || fwdDel.current
 
+      // A ctrl-modified keypress never types its letter into the composer:
+      // hermes-ink maps C0 controls to {name: <letter>, ctrl: true} (e.g. the
+      // gateway's PTY reattach force-redraw byte \x0c arrives as ctrl+'l'),
+      // and terminal convention is that Ctrl+<letter> is a shortcut or signal,
+      // not text — quoted-insert already has its own Ctrl+V path above.
       const isPrintableInput =
-        (event.keypress.isPasted || inp.length > 0) && PRINTABLE.test(inp.replace(BRACKET_PASTE, ''))
+        !k.ctrl &&
+        (event.keypress.isPasted || inp.length > 0) &&
+        PRINTABLE.test(inp.replace(BRACKET_PASTE, ''))
 
       if (!isPrintableInput) {
         flushKeyBurst()
@@ -1574,7 +1581,7 @@ export function TextInput({
         } else {
           ;({ cursor: c, value: v } = killToLineEnd(v, c))
         }
-      } else if (event.keypress.isPasted || inp.length > 0) {
+      } else if (event.keypress.isPasted || (inp.length > 0 && !k.ctrl)) {
         const bracketed = event.keypress.isPasted || inp.includes('[200~')
         const text = inp.replace(BRACKET_PASTE, '').replace(/\r\n/g, '\n').replace(/\r/g, '\n')
 
