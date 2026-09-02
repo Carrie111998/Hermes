@@ -579,24 +579,6 @@ try:
     for _pp in _list_providers_for_registry():
         if _pp.name in PROVIDER_REGISTRY:
             continue
-        if _pp.auth_type == "external_process":
-            # An external-process provider (an ACP CLI driven over stdio) has no
-            # API-key env vars to resolve — its credentials come from
-            # resolve_external_process_provider_credentials(), keyed on this
-            # auth_type. Registering it here is what lets a provider shipped
-            # outside this tree pass resolve_provider()'s known-provider gate;
-            # without it, `hermes -m <that provider>` dies with
-            # "Unknown provider" before any client is ever built.
-            PROVIDER_REGISTRY[_pp.name] = ProviderConfig(
-                id=_pp.name,
-                name=_pp.display_name or _pp.name,
-                auth_type="external_process",
-                inference_base_url=_pp.base_url,
-            )
-            for _alias in _pp.aliases:
-                if _alias not in PROVIDER_REGISTRY:
-                    PROVIDER_REGISTRY[_alias] = PROVIDER_REGISTRY[_pp.name]
-            continue
         if _pp.auth_type != "api_key" or not _pp.env_vars:
             continue
         # Skip providers that need custom token resolution or are special-cased
@@ -5329,11 +5311,13 @@ def _xai_oauth_state_from_store(auth_store: Dict[str, Any]) -> Optional[Dict[str
 
 def _xai_oauth_state_has_usable_tokens(state: Optional[Dict[str, Any]]) -> bool:
     tokens = state.get("tokens") if isinstance(state, dict) else None
-    return (
-        isinstance(tokens, dict)
-        and bool(str(tokens.get("access_token", "") or "").strip())
-        and bool(str(tokens.get("refresh_token", "") or "").strip())
-    )
+    if not isinstance(tokens, dict):
+        return False
+    access = str(tokens.get("access_token", "") or "").strip()
+    refresh = str(tokens.get("refresh_token", "") or "").strip()
+    if access and refresh:
+        return True
+    return bool(access)
 
 
 def _read_xai_oauth_tokens(*, _lock: bool = True) -> Dict[str, Any]:
@@ -5369,13 +5353,6 @@ def _read_xai_oauth_tokens(*, _lock: bool = True) -> Dict[str, Any]:
             "xAI OAuth state is missing access_token. Re-authenticate with `hermes model`.",
             provider="xai-oauth",
             code="xai_auth_missing_access_token",
-            relogin_required=True,
-        )
-    if not refresh_token:
-        raise AuthError(
-            "xAI OAuth state is missing refresh_token. Re-authenticate with `hermes model`.",
-            provider="xai-oauth",
-            code="xai_auth_missing_refresh_token",
             relogin_required=True,
         )
     return {
@@ -5873,27 +5850,18 @@ def _adopt_or_quarantine_xai_oauth_refresh_failure(
             )
             return peer_tokens
 
-        q_state = _load_provider_state(store, "xai-oauth") or {}
-        q_tokens = dict(q_state.get("tokens") or {})
-        store_refresh = str(q_tokens.get("refresh_token") or "").strip()
-        if store_refresh and store_refresh != spent_refresh:
-            return None
-        q_tokens.pop("access_token", None)
-        q_tokens.pop("refresh_token", None)
-        q_state["tokens"] = q_tokens
-        q_state["last_auth_error"] = {
-            "provider": "xai-oauth",
-            "code": exc.code or "xai_refresh_failed",
-            "message": str(exc),
-            "reason": "runtime_refresh_failure",
-            "relogin_required": True,
-            "at": datetime.now(timezone.utc).isoformat(),
-        }
-        _store_provider_state(store, "xai-oauth", q_state, set_active=False)
-        _save_auth_store(store)
+        # Never pop the shared grant. Desktop + gateway + extra `--profile default`
+        # backends race xAI's single-use refresh; quarantine was deleting a still
+        # usable access JWT and taking CLI down with "No xAI OAuth credentials stored".
+        if peer_access:
+            logger.warning(
+                "xAI OAuth refresh failed (%s); keeping stored tokens (access present)",
+                getattr(exc, "code", None),
+            )
+            return peer_tokens
     except Exception as save_exc:
         logger.debug(
-            "xAI OAuth: failed to persist quarantined state: %s", save_exc,
+            "xAI OAuth: failed to inspect store after refresh failure: %s", save_exc,
         )
     return None
 
@@ -8281,52 +8249,25 @@ def resolve_external_process_provider_credentials(provider_id: str) -> Dict[str,
     if not base_url:
         base_url = pconfig.inference_base_url
 
-    # How to launch the CLI comes from the provider's own profile, so a provider
-    # shipped outside this tree describes its binary/args instead of inheriting
-    # another vendor's. copilot-acp's values live in its profile, which is why
-    # HERMES_COPILOT_ACP_COMMAND / COPILOT_CLI_PATH / HERMES_COPILOT_ACP_ARGS
-    # keep working unchanged.
-    profile = None
-    try:
-        from providers import get_provider_profile as _get_provider_profile
-
-        profile = _get_provider_profile(provider_id)
-    except Exception:
-        profile = None
-
-    command_env_vars = tuple(getattr(profile, "process_command_env_vars", ()) or ())
-    default_command = str(getattr(profile, "process_command", "") or "")
-    default_args = list(getattr(profile, "process_args", ()) or [])
-    args_env_var = str(getattr(profile, "process_args_env_var", "") or "")
-
-    command = ""
-    for _var in command_env_vars:
-        command = os.getenv(_var, "").strip()
-        if command:
-            break
-    if not command:
-        command = default_command
-
-    raw_args = os.getenv(args_env_var, "").strip() if args_env_var else ""
-    args = shlex.split(raw_args) if raw_args else list(default_args)
-
+    command = (
+        os.getenv("HERMES_COPILOT_ACP_COMMAND", "").strip()
+        or os.getenv("COPILOT_CLI_PATH", "").strip()
+        or "copilot"
+    )
+    raw_args = os.getenv("HERMES_COPILOT_ACP_ARGS", "").strip()
+    args = shlex.split(raw_args) if raw_args else ["--acp", "--stdio"]
     resolved_command = shutil.which(command) if command else None
     if not resolved_command and not base_url.startswith("acp+tcp://"):
-        _hint = (
-            " or set " + "/".join(command_env_vars) if command_env_vars else ""
-        )
         raise AuthError(
-            f"Could not find the '{provider_id}' CLI command "
-            f"'{command or '(none configured)'}'. Install it{_hint}.",
+            f"Could not find the Copilot CLI command '{command}'. "
+            "Install GitHub Copilot CLI or set HERMES_COPILOT_ACP_COMMAND/COPILOT_CLI_PATH.",
             provider=provider_id,
-            code="missing_external_process_cli",
+            code="missing_copilot_cli",
         )
 
     return {
         "provider": provider_id,
-        # Placeholder credential: the subprocess owns real auth. Keyed on the
-        # provider id so each external-process provider gets a distinct value.
-        "api_key": pconfig.id or provider_id,
+        "api_key": "copilot-acp",
         "base_url": base_url.rstrip("/"),
         "command": resolved_command or command,
         "args": args,
