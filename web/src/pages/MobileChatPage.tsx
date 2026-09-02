@@ -183,7 +183,7 @@ function isInjectedSystemNote(text: string): boolean {
 const SS_SESSION_KEY = "hermes.m.activeSession";
 const SS_TITLE_KEY = "hermes.m.activeTitle";
 const SS_MOBILE_SESSION_KEY = "hermes.m.mobileSession";
-const BUILD_TAG = "build 2026-08-31.7 · photo-send-fix";
+const BUILD_TAG = "build 2026-09-02.1 · multi-photo";
 
 function ssGet(key: string): string {
   try {
@@ -1029,9 +1029,18 @@ const prevSid = ssGet(SS_MOBILE_SESSION_KEY);
     const input = document.createElement("input");
     input.type = "file";
     input.accept = "image/*";
+    input.multiple = true;
     input.addEventListener("change", () => {
-      void onAttach(input.files?.[0] ?? null);
+      const files = Array.from(input.files ?? []);
       input.value = "";
+      if (files.length === 0) return;
+      // Upload sequentially — parallel base64 data-URL conversions of 20
+      // iPhone photos spike memory and trip Safari's per-tab limits.
+      (async () => {
+        for (const f of files) {
+          await onAttach(f);
+        }
+      })();
     });
     input.click();
   }, [onAttach]);
