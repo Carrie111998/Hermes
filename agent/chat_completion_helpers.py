@@ -4334,6 +4334,25 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
 
         def _relay_final_response() -> dict[str, Any]:
             tool_calls = [tool_calls_acc[index] for index in sorted(tool_calls_acc)]
+            reasoning_text = "".join(reasoning_parts)
+            if not reasoning_text:
+                # Providers that inline reasoning (MiniMax-M3 streams
+                #  thinking… response in content) never send a reasoning
+                # delta — recover what the think scrubber stripped so the
+                # structured reasoning_content field stays populated
+                # (#89647).
+                _think_scrubber = getattr(agent, "_stream_think_scrubber", None)
+                if _think_scrubber is not None:
+                    reasoning_text = _think_scrubber.reasoning()
+            # Heal the pool entry after a successful served request (#95166)
+            pool = getattr(agent, "_credential_pool", None)
+            if pool is not None:
+                api_key = getattr(agent, "api_key", None)
+                if api_key:
+                    from agent.credential_pool import STATUS_EXHAUSTED, STATUS_DEAD
+                    for entry in pool.entries():
+                        if entry.runtime_api_key == api_key and entry.last_status in (STATUS_EXHAUSTED, STATUS_DEAD):
+                            pool._mark_healthy(entry)
             return {
                 "model": model_name,
                 "choices": [
@@ -4341,7 +4360,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                         "message": {
                             "role": role,
                             "content": "".join(content_parts) or None,
-                            "reasoning_content": "".join(reasoning_parts) or None,
+                            "reasoning_content": reasoning_text or None,
                             "tool_calls": tool_calls or None,
                         },
                         "finish_reason": finish_reason or "stop",

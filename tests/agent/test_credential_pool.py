@@ -2079,3 +2079,48 @@ class TestCredentialPoolQueryLocking:
             inner.release()
 
         assert done.wait(timeout=2.0), f"{method}() did not complete after lock release"
+
+
+class TestMarkHealthy:
+    """_mark_healthy clears a transient failure verdict (#95166)."""
+
+    def test_clears_exhausted_status(self, tmp_path, monkeypatch):
+        from agent.credential_pool import CredentialPool, PooledCredential, STATUS_EXHAUSTED, STATUS_OK
+
+        entry = PooledCredential(
+            provider="test", id="e1", label="", auth_type="api_key", priority=0,
+            source="env", access_token="sk-test",
+            last_status=STATUS_EXHAUSTED, last_status_at=1000.0,
+            last_error_code=429, last_error_reason="rate_limit",
+        )
+        pool = CredentialPool(provider="test", entries=[entry])
+        healed = pool._mark_healthy(entry)
+        assert healed.last_status == STATUS_OK
+        assert healed.last_status_at is None
+        assert healed.last_error_code is None
+
+    def test_skips_already_healthy_entry(self, tmp_path, monkeypatch):
+        from agent.credential_pool import CredentialPool, PooledCredential, STATUS_OK
+
+        entry = PooledCredential(
+            provider="test", id="e1", label="", auth_type="api_key", priority=0,
+            source="env", access_token="sk-test",
+            last_status=STATUS_OK,
+        )
+        pool = CredentialPool(provider="test", entries=[entry])
+        healed = pool._mark_healthy(entry)
+        assert healed.last_status == STATUS_OK
+
+    def test_clears_dead_status(self, tmp_path, monkeypatch):
+        from agent.credential_pool import CredentialPool, PooledCredential, STATUS_OK, STATUS_DEAD
+
+        entry = PooledCredential(
+            provider="test", id="e1", label="", auth_type="api_key", priority=0,
+            source="test", access_token="sk-test",
+            last_status=STATUS_DEAD, last_status_at=1000.0,
+            last_error_code=401, last_error_reason="token_invalidated",
+        )
+        pool = CredentialPool(provider="test", entries=[entry])
+        healed = pool._mark_healthy(entry)
+        assert healed.last_status == STATUS_OK
+        assert healed.last_error_code is None
