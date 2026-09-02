@@ -167,6 +167,35 @@ def _archive_untracked(tree: Path, untracked: List[str]) -> Optional[Path]:
         return None
 
 
+_SHALLOW_REASON = (
+    "repository is still shallow — merged/unpushed verdicts are not trustworthy"
+)
+
+
+def _history_is_trustworthy(repo_root: str, _cli) -> bool:
+    """Deepen a shallow repo, and report whether history can now be trusted.
+
+    ``_deepen_shallow_repo`` returns whether the repo is actually non-shallow
+    afterwards, and its contract is explicit that "on failure (offline, no
+    remote) callers keep today's preserve-everything behavior". Both audits
+    called it and discarded the answer, then read ``--merged`` /
+    ``rev-list --count`` / ``git cherry`` as fact — the verdicts that decide
+    whether a tree is reaped and whether a ref is deleted.
+
+    Logged at WARNING, not INFO: the user asked for a reclaim pass, and
+    "nothing was reclaimable" and "nothing could be judged" are different
+    answers.
+    """
+    if not _cli._repo_is_shallow(repo_root):
+        return True
+    if _cli._deepen_shallow_repo(repo_root):
+        return True
+    logger.warning(
+        "Worktree reclaim in %s is preserving everything: %s", repo_root, _SHALLOW_REASON
+    )
+    return False
+
+
 def audit_worktrees(repo_root: str, *, with_sizes: bool = True) -> List[TreeRecord]:
     """Classify every tree under ``.worktrees/`` without mutating anything."""
     import cli as _cli  # lazy: cli.py is heavy
@@ -175,8 +204,7 @@ def audit_worktrees(repo_root: str, *, with_sizes: bool = True) -> List[TreeReco
     if not worktrees_dir.exists():
         return []
 
-    if _cli._repo_is_shallow(repo_root):
-        _cli._deepen_shallow_repo(repo_root)
+    trustworthy = _history_is_trustworthy(repo_root, _cli)
 
     merge_cache = _cli._load_worktree_merge_cache()
     cache_size_before = len(merge_cache)
@@ -203,6 +231,11 @@ def audit_worktrees(repo_root: str, *, with_sizes: bool = True) -> List[TreeReco
             branch = ""
 
         def rec(verdict: str, reason: str, untracked: Optional[List[str]] = None):
+            # A shallow graft makes "merged"/"unpushed" unanswerable, and the
+            # reap path also deletes the tree's branch. Keep the tree, and say
+            # why, rather than dropping it from the listing entirely.
+            if not trustworthy and verdict != "keep":
+                verdict, reason, untracked = "keep", _SHALLOW_REASON, []
             records.append(TreeRecord(
                 name=entry.name, path=str(entry), branch=branch,
                 age_days=age_days, size_mb=size_mb,
@@ -342,8 +375,7 @@ def audit_branches(repo_root: str) -> List[BranchRecord]:
     """
     import cli as _cli
 
-    if _cli._repo_is_shallow(repo_root):
-        _cli._deepen_shallow_repo(repo_root)
+    trustworthy = _history_is_trustworthy(repo_root, _cli)
 
     upstream = None
     for candidate in ("origin/HEAD", "origin/main", "origin/master"):
@@ -370,6 +402,8 @@ def audit_branches(repo_root: str) -> List[BranchRecord]:
     merged = {b.strip() for b in merged_result.stdout.splitlines() if b.strip()}
 
     def _classify_branch(branch: str) -> BranchRecord:
+        if not trustworthy:
+            return BranchRecord(branch, "keep", _SHALLOW_REASON)
         if branch in _PROTECTED_BRANCHES or branch in active:
             return BranchRecord(branch, "keep", "protected or checked out")
         if branch in merged:
