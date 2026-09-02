@@ -99,6 +99,56 @@ def test_search_memo_never_caches_failures():
     assert memo.lookup("firecrawl", "q", 5) is None
 
 
+def test_search_memo_never_caches_successful_but_empty_results():
+    """HTTP-success with zero usable results is transient, not cacheable (#95516)."""
+    memo = SearchMemo()
+    memo.store("firecrawl", "q", 5, {"success": True, "data": {"web": []}})
+    assert memo.lookup("firecrawl", "q", 5) is None
+
+
+def test_search_memo_never_caches_malformed_web_shapes():
+    """Missing/malformed data.web must not create a TTL entry (#95516)."""
+    memo = SearchMemo()
+    for bad in (
+        {"success": True},                                # no data at all
+        {"success": True, "data": {}},                    # no web key
+        {"success": True, "data": {"web": "not-a-list"}},
+        {"success": True, "data": {"web": [None, 7]}},    # list of non-dicts
+        {"success": True, "data": {"web": [{"url": "   "}]}},   # blank url
+        {"success": True, "data": {"web": [{"title": "no url"}]}},  # no url
+    ):
+        memo.store("firecrawl", "q", 5, bad)
+        assert memo.lookup("firecrawl", "q", 5) is None, bad
+
+
+def test_search_memo_caches_when_at_least_one_usable_result():
+    """One usable url among noise is enough — only fully-empty shapes skip."""
+    memo = SearchMemo()
+    resp = {
+        "success": True,
+        "data": {"web": [{"title": "t", "url": "https://e.com/1"}]},
+    }
+    memo.store("firecrawl", "q", 5, resp)
+    assert memo.lookup("firecrawl", "q", 5) is not None
+
+
+def test_search_memo_caches_mixed_noise_with_one_usable_result():
+    """Blank-url noise next to one usable url still caches — pins the
+    any() (not all()) semantics of the usable-result guard."""
+    memo = SearchMemo()
+    resp = {
+        "success": True,
+        "data": {
+            "web": [
+                {"url": ""},                    # blank url — noise
+                {"url": "https://e.com/1"},     # one usable result
+            ]
+        },
+    }
+    memo.store("firecrawl", "q", 5, resp)
+    assert memo.lookup("firecrawl", "q", 5) is not None
+
+
 def test_search_memo_disabled_by_config(monkeypatch):
     monkeypatch.setattr(wrc, "_web_config", lambda: {"cache_enabled": False})
     memo = SearchMemo()
