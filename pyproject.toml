@@ -579,6 +579,7 @@ py-modules = [
   "hermes_startup_watchdog",
   "hermes_time",
   "hermes_logging",
+  "hermes_systemd_planned_stop",
   "utils",
   "mcp_serve",
 ]

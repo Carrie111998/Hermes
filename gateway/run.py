@@ -32498,6 +32498,36 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         return response
 
 
+def _classify_shutdown_signal(received_signal=None) -> tuple[bool, bool]:
+    """Return ``(planned_takeover, planned_stop)`` for a shutdown signal.
+
+    Keep the marker decisions in one function shared by the real POSIX signal
+    handler and its Windows/file-watcher equivalent. In particular, a SIGTERM
+    preceded by systemd's ``ExecStop`` marker must take the planned-stop path,
+    not the unexpected-signal path that asks the service manager to restart us.
+    """
+    planned_takeover = False
+    try:
+        from gateway.status import consume_takeover_marker_for_self
+
+        planned_takeover = consume_takeover_marker_for_self()
+    except Exception as exc:
+        logger.debug("Takeover marker check failed: %s", exc)
+
+    if received_signal == signal.SIGINT:
+        return planned_takeover, True
+    if planned_takeover:
+        return planned_takeover, False
+
+    try:
+        from gateway.status import consume_planned_stop_marker_for_self
+
+        return planned_takeover, consume_planned_stop_marker_for_self()
+    except Exception as exc:
+        logger.debug("Planned stop marker check failed: %s", exc)
+        return planned_takeover, False
+
+
 def _run_planned_stop_watcher(
     stop_event: threading.Event,
     runner,
@@ -33390,33 +33420,7 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     # Set up signal handlers
     def shutdown_signal_handler(received_signal=None):
         nonlocal _signal_initiated_shutdown
-        # Planned --replace takeover check: when a sibling gateway is
-        # taking over via --replace, it wrote a marker naming this PID
-        # before sending SIGTERM. If present, treat the signal as a
-        # planned shutdown and exit 0 so systemd's Restart=on-failure
-        # doesn't revive us (which would flap-fight the replacer when
-        # both services are enabled, e.g. hermes.service + hermes-
-        # gateway.service from pre-rename installs).
-        planned_takeover = False
-        try:
-            from gateway.status import consume_takeover_marker_for_self
-            planned_takeover = consume_takeover_marker_for_self()
-        except Exception as e:
-            logger.debug("Takeover marker check failed: %s", e)
-
-        # Planned stop check: service managers and `hermes gateway stop`
-        # also send SIGTERM, which is indistinguishable from an unexpected
-        # external kill unless the CLI marks it first. SIGINT comes from an
-        # interactive Ctrl+C and is likewise an intentional foreground stop.
-        planned_stop = False
-        if received_signal == signal.SIGINT:
-            planned_stop = True
-        elif not planned_takeover:
-            try:
-                from gateway.status import consume_planned_stop_marker_for_self
-                planned_stop = consume_planned_stop_marker_for_self()
-            except Exception as e:
-                logger.debug("Planned stop marker check failed: %s", e)
+        planned_takeover, planned_stop = _classify_shutdown_signal(received_signal)
 
         # Fast (<10ms) snapshot of who's asking us to shut down — runs
         # synchronously inside the asyncio signal handler, so we keep it
