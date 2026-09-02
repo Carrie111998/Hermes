@@ -268,7 +268,7 @@ def _iter_git_invocations(command: str, cwd: Path) -> Iterable[GitInvocation]:
         try:
             tokens = shlex.split(segment)
         except ValueError:
-            if "git" in segment:
+            if _command_has_git_executable_token(segment):
                 yield GitInvocation(_UNSAFE_GIT_CWD_SUBCOMMAND, [], current_cwd)
             continue
         if not tokens:
@@ -303,7 +303,7 @@ def _iter_git_invocations(command: str, cwd: Path) -> Iterable[GitInvocation]:
 
 
 def _is_git_executable_token(token: str) -> bool:
-    return Path(token).name == "git"
+    return Path(token.strip("()")).name == "git"
 
 
 def _path_has_shell_expansion(value: str) -> bool:
@@ -338,10 +338,87 @@ def _has_unquoted_shell_paren(value: str) -> bool:
     return False
 
 
+_GIT_EXECUTABLE_TOKEN_RE = re.compile(r"(?:^|[;|&\n\t ])git(?:[;|&\n\t ]|$)")
+
+
+def _command_has_git_executable_token(command: str) -> bool:
+    """True when git appears as a path basename token, not a hostname substring."""
+    try:
+        tokens = _shell_payload_tokens(command)
+    except ValueError:
+        return bool(_GIT_EXECUTABLE_TOKEN_RE.search(f" {command} "))
+    return any(_is_git_executable_token(token) for token in tokens)
+
+
+def _iter_unquoted_substitutions(command: str) -> Iterable[str]:
+    """Yield $(...) and backtick payloads that the shell would expand."""
+    in_single = False
+    in_double = False
+    escaped = False
+    index = 0
+    while index < len(command):
+        char = command[index]
+        if escaped:
+            escaped = False
+            index += 1
+            continue
+        if char == "\\" and not in_single:
+            escaped = True
+            index += 1
+            continue
+        if char == "'" and not in_double:
+            in_single = not in_single
+            index += 1
+            continue
+        if char == '"' and not in_single:
+            in_double = not in_double
+            index += 1
+            continue
+        if in_single:
+            index += 1
+            continue
+        if command.startswith("$(", index):
+            depth = 1
+            cursor = index + 2
+            while cursor < len(command) and depth:
+                if command.startswith("$(", cursor):
+                    depth += 1
+                    cursor += 2
+                    continue
+                nested = command[cursor]
+                if nested == "(":
+                    depth += 1
+                elif nested == ")":
+                    depth -= 1
+                cursor += 1
+            payload = command[index + 2 :] if depth else command[index + 2 : cursor - 1]
+            yield payload
+            index = cursor if not depth else len(command)
+            continue
+        if char == "`":
+            cursor = index + 1
+            while cursor < len(command) and command[cursor] != "`":
+                cursor += 1
+            yield command[index + 1 : cursor]
+            index = cursor + 1 if cursor < len(command) else len(command)
+            continue
+        index += 1
+
+
+def _substitution_contains_git_command(command: str) -> bool:
+    payloads = list(_iter_unquoted_substitutions(command))
+    if not payloads:
+        return False
+    return any(
+        _payload_has_git_command(payload) or _substitution_contains_git_command(payload)
+        for payload in payloads
+    )
+
+
 def _has_unverifiable_shell_git(command: str) -> bool:
     # Command substitution can redirect the git target at runtime and is
     # intentionally fail-closed rather than partially shell-parsed.
-    if "$(" in command and "git" in command:
+    if _substitution_contains_git_command(command):
         return True
 
     if _shell_command_executes_git(command):
@@ -349,10 +426,20 @@ def _has_unverifiable_shell_git(command: str) -> bool:
 
     # Only unquoted parentheses imply shell grouping/subshell syntax. Quoted
     # parentheses are common in conventional commit scopes and format strings.
-    return _has_unquoted_shell_paren(command) and "git" in command
+    return _has_unquoted_shell_paren(command) and _command_has_git_executable_token(command)
 
 
 _SHELL_NAMES = frozenset({"sh", "bash", "zsh", "dash", "ash", "ksh"})
+_SHELL_WRAPPERS = frozenset({
+    "env",
+    "command",
+    "nice",
+    "nohup",
+    "timeout",
+    "stdbuf",
+    "ionice",
+    "time",
+})
 
 
 def _shell_command_executes_git(command: str) -> bool:
@@ -360,7 +447,9 @@ def _shell_command_executes_git(command: str) -> bool:
     try:
         tokens = _shell_payload_tokens(command)
     except ValueError:
-        return "git" in command and (" -c " in f" {command} " or " -lc " in f" {command} ")
+        return _command_has_git_executable_token(command) and (
+            " -c " in f" {command} " or " -lc " in f" {command} "
+        )
 
     command_position = True
     index = 0
@@ -378,6 +467,16 @@ def _shell_command_executes_git(command: str) -> bool:
             continue
 
         name = Path(token).name
+        if name in _SHELL_WRAPPERS:
+            index += 1
+            if (
+                name == "timeout"
+                and index < len(tokens)
+                and not tokens[index].startswith("-")
+                and Path(tokens[index]).name not in _SHELL_NAMES
+            ):
+                index += 1
+            continue
         if name in _SHELL_NAMES:
             payload = _shell_c_payload(tokens, index)
             if payload is not None and _payload_has_git_command(payload):
@@ -400,9 +499,15 @@ def _shell_payload_tokens(payload: str) -> list[str]:
 def _shell_c_payload(tokens: list[str], shell_index: int) -> Optional[str]:
     index = shell_index + 1
     while index < len(tokens) and tokens[index].startswith("-"):
-        if tokens[index] in {"-c", "-lc"}:
+        token = tokens[index]
+        if token in {"-c", "-lc"}:
             return tokens[index + 1] if index + 1 < len(tokens) else None
-        if tokens[index] in {"-o", "-O"} and index + 1 < len(tokens):
+        if (
+            not token.startswith("--")
+            and "c" in token[1:]
+        ):
+            return tokens[index + 1] if index + 1 < len(tokens) else None
+        if token in {"-o", "-O"} and index + 1 < len(tokens):
             index += 2
             continue
         index += 1

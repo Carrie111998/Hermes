@@ -372,3 +372,87 @@ def test_non_repo_invocation_does_not_hide_later_mutation(tmp_path):
 
     assert error is not None
     assert "outside authoritative workspace binding" in error
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "python3 -c \"print('https://github.example.org/example/project')\"",
+        "python3 -c \"x = (1, 2); print('found .git marker')\"",
+        "curl https://github.example.org/example/project",
+        "echo $(curl https://github.example.org/example/project)",
+    ],
+)
+def test_github_substring_and_python_parens_are_not_git(command, tmp_path):
+    bound_repo = _git_repo(tmp_path / "bound")
+    tokens = _gateway_session(bound_repo)
+    try:
+        error = check_terminal_side_effect_allowed(command, bound_repo)
+    finally:
+        clear_session_vars(tokens)
+
+    assert error is None
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "echo $(git rev-parse HEAD)",
+        "echo $(git -C /tmp/other status)",
+        "(git commit -m grouped)",
+    ],
+)
+def test_real_git_in_substitution_or_group_still_fails_closed(command, tmp_path):
+    bound_repo = _git_repo(tmp_path / "bound")
+    tokens = _gateway_session(bound_repo)
+    try:
+        error = check_terminal_side_effect_allowed(command, bound_repo)
+    finally:
+        clear_session_vars(tokens)
+
+    assert error is not None
+    assert "cannot verify" in error
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        'echo "$(git -C /tmp/other commit -m update)"',
+        "echo `git -C /tmp/other commit -m update`",
+        'echo "`git -C /tmp/other commit -m update`"',
+        "env bash -c 'git -C /tmp/other commit -m update'",
+        "command bash -c 'git -C /tmp/other commit -m update'",
+        "nice bash -c 'git -C /tmp/other commit -m update'",
+        "timeout 5 bash -c 'git -C /tmp/other commit -m update'",
+        "bash -xc 'git -C /tmp/other commit -m update'",
+        "nohup bash -c 'git -C /tmp/other commit -m update'",
+    ],
+)
+def test_wrapped_substitution_and_shell_git_still_fails_closed(command, tmp_path):
+    bound_repo = _git_repo(tmp_path / "bound")
+    tokens = _gateway_session(bound_repo)
+    try:
+        error = check_terminal_side_effect_allowed(command, bound_repo)
+    finally:
+        clear_session_vars(tokens)
+
+    assert error is not None
+    assert "cannot verify" in error
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "echo '$(git rev-parse HEAD)'",
+        "python3 -c \"print('(git)')\"",
+    ],
+)
+def test_quoted_git_text_is_not_an_executable(command, tmp_path):
+    bound_repo = _git_repo(tmp_path / "bound")
+    tokens = _gateway_session(bound_repo)
+    try:
+        error = check_terminal_side_effect_allowed(command, bound_repo)
+    finally:
+        clear_session_vars(tokens)
+
+    assert error is None
