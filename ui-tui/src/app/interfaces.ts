@@ -557,7 +557,7 @@ export interface SlashHandlerContext {
     trimLastExchange: (items: Msg[]) => Msg[]
   }
   voice: {
-    controlRealtimeVoice: (action: 'start' | 'status' | 'stop') => void
+    controlRealtimeVoice: (action: 'start' | 'status' | 'stop', visualizer?: 'orb' | 'waveform') => void
     setVoiceEnabled: StateSetter<boolean>
     setVoiceRecordKey: (v: ParsedVoiceRecordKey) => void
     setVoiceTts: StateSetter<boolean>
@@ -611,6 +611,8 @@ export interface AppLayoutStatusProps {
   stickyPrompt: string
   turnStartedAt: null | number
   voiceLabel: string
+  realtimeVoiceConnecting: boolean
+  realtimeVoiceVisualizer: 'orb' | 'waveform'
   voiceProcessing: boolean
   voiceRecording: boolean
 }

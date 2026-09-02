@@ -581,9 +581,17 @@ describe('createSlashHandler', () => {
     const slash = createSlashHandler(ctx)
 
     expect(slash('/talk')).toBe(true)
+    expect(slash('/talk orb')).toBe(true)
+    expect(slash('/talk waveform')).toBe(true)
     expect(slash('/talk stop')).toBe(true)
     expect(slash('/talk status')).toBe(true)
-    expect(ctx.voice.controlRealtimeVoice.mock.calls).toEqual([['start'], ['stop'], ['status']])
+    expect(ctx.voice.controlRealtimeVoice.mock.calls).toEqual([
+      ['start', undefined],
+      ['start', 'orb'],
+      ['start', 'waveform'],
+      ['stop'],
+      ['status']
+    ])
     expect(ctx.gateway.rpc).not.toHaveBeenCalled()
   })
 

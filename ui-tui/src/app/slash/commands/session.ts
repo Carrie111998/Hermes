@@ -312,13 +312,19 @@ export const sessionCommands: SlashCommand[] = [
   },
 
   {
-    help: 'native realtime duplex voice: [start|stop|status]',
+    help: 'native realtime duplex voice: [orb|waveform|stop|status]',
     name: 'talk',
     run: (arg, ctx) => {
       const normalized = (arg ?? '').trim().toLowerCase()
-      const action = normalized === 'stop' || normalized === 'status' ? normalized : 'start'
 
-      ctx.voice.controlRealtimeVoice(action)
+      if (normalized === 'stop' || normalized === 'status') {
+        ctx.voice.controlRealtimeVoice(normalized)
+        return
+      }
+
+      const visualizer = normalized === 'waveform' || normalized === 'orb' ? normalized : undefined
+
+      ctx.voice.controlRealtimeVoice('start', visualizer)
     }
   },
 

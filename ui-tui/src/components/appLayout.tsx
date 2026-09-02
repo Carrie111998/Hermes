@@ -280,7 +280,13 @@ const ComposerPane = memo(function ComposerPane({
   const ui = useStore($uiState)
   const isBlocked = useStore($isBlocked)
   const sh = (composer.inputBuf[0] ?? composer.input).startsWith('!')
-  const voiceMode = status.voiceRecording ? 'listening' : status.voiceProcessing ? 'thinking' : null
+  const voiceMode = status.realtimeVoiceConnecting
+    ? 'waiting'
+    : status.voiceRecording
+      ? 'listening'
+      : status.voiceProcessing
+        ? 'thinking'
+        : null
 
   const promptText = composerPromptText(
     ui.theme.brand.prompt,
@@ -386,7 +392,12 @@ const ComposerPane = memo(function ComposerPane({
 
         {!isBlocked &&
           (voiceMode ? (
-            <VoiceVisualizer columns={composer.cols} mode={voiceMode} t={ui.theme} />
+            <VoiceVisualizer
+              columns={composer.cols}
+              mode={voiceMode}
+              t={ui.theme}
+              visualizer={status.realtimeVoiceVisualizer}
+            />
           ) : (
             <>
               {composer.inputBuf.map((line, i) => (

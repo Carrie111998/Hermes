@@ -202,6 +202,8 @@ export function useMainApp(gw: GatewayClient) {
   const [voiceTts, setVoiceTts] = useState(false)
   const [voiceRecording, setVoiceRecording] = useState(false)
   const [voiceProcessing, setVoiceProcessing] = useState(false)
+  const [realtimeVoiceConnecting, setRealtimeVoiceConnecting] = useState(false)
+  const [realtimeVoiceVisualizer, setRealtimeVoiceVisualizer] = useState<'orb' | 'waveform'>('orb')
   const [realtimeVoiceActive, setRealtimeVoiceActive] = useState(false)
   const [voiceRecordKey, setVoiceRecordKey] = useState<ParsedVoiceRecordKey>(DEFAULT_VOICE_RECORD_KEY)
   const realtimeVoiceRef = useRef<ChildProcess | null>(null)
@@ -463,7 +465,7 @@ export function useMainApp(gw: GatewayClient) {
   const sys = useCallback((text: string) => appendMessage({ role: 'system', text }), [appendMessage])
 
   const controlRealtimeVoice = useCallback(
-    (action: 'start' | 'status' | 'stop') => {
+    (action: 'start' | 'status' | 'stop', visualizer?: 'orb' | 'waveform') => {
       const active = realtimeVoiceRef.current
 
       if (action === 'status') {
@@ -495,20 +497,40 @@ export function useMainApp(gw: GatewayClient) {
         return
       }
 
-      const child = spawn(python, [resolve(sourceRoot, 'hermes'), 'talk'], {
+      if (visualizer) {
+        setRealtimeVoiceVisualizer(visualizer)
+      }
+
+      const child = spawn(python, ['-u', resolve(sourceRoot, 'hermes'), 'talk'], {
         cwd: process.cwd(),
         env: process.env,
         stdio: ['ignore', 'pipe', 'pipe']
       })
       realtimeVoiceRef.current = child
       setRealtimeVoiceActive(true)
+      setRealtimeVoiceConnecting(true)
       setVoiceEnabled(true)
-      setVoiceRecording(true)
+      setVoiceRecording(false)
       setVoiceProcessing(false)
-      sys('Native realtime voice started · speak naturally · /talk stop to end')
+      sys('Connecting native realtime voice…')
 
       let errorText = ''
 
+      let readyText = ''
+      child.stdout?.setEncoding('utf8')
+      const onStdout = (chunk: string) => {
+        readyText = `${readyText}${chunk}`.slice(-2048)
+
+        if (!readyText.includes('talk: connected (') || realtimeVoiceRef.current !== child) {
+          return
+        }
+
+        child.stdout?.off('data', onStdout)
+        setRealtimeVoiceConnecting(false)
+        setVoiceRecording(true)
+        sys('Native realtime voice ready · listening · Ctrl+B to end')
+      }
+      child.stdout?.on('data', onStdout)
       child.stderr?.setEncoding('utf8')
       child.stderr?.on('data', chunk => {
         errorText = `${errorText}${String(chunk)}`.slice(-4000)
@@ -523,6 +545,7 @@ export function useMainApp(gw: GatewayClient) {
         setVoiceRecording(false)
         setVoiceEnabled(false)
         sys(`Native realtime voice failed: ${error.message}`)
+        setRealtimeVoiceConnecting(false)
       })
       child.once('exit', code => {
         if (realtimeVoiceRef.current !== child) {
@@ -535,6 +558,7 @@ export function useMainApp(gw: GatewayClient) {
         setVoiceProcessing(false)
         setVoiceEnabled(false)
         const detail = errorText.trim().split('\n').at(-1)
+        setRealtimeVoiceConnecting(false)
 
         if (code && detail) {
           sys(`Native realtime voice ended (${code}): ${detail}`)
@@ -1359,11 +1383,15 @@ export function useMainApp(gw: GatewayClient) {
       turnStartedAt: ui.sid ? turnStartedAt : null,
       // CLI parity: the classic prompt_toolkit status bar shows a red dot
       // on REC (cli.py:_get_voice_status_fragments line 2344).
-      voiceLabel: voiceRecording
-        ? '● REC'
-        : voiceProcessing
-          ? '◉ STT'
-          : `voice ${voiceEnabled ? 'on' : 'off'}${voiceTts ? ' [tts]' : ''}`,
+      voiceLabel: realtimeVoiceConnecting
+        ? '○ WAIT'
+        : voiceRecording
+          ? '● REC'
+          : voiceProcessing
+            ? '◉ STT'
+            : `voice ${voiceEnabled ? 'on' : 'off'}${voiceTts ? ' [tts]' : ''}`,
+      realtimeVoiceConnecting,
+      realtimeVoiceVisualizer,
       voiceProcessing,
       voiceRecording
     }),
@@ -1375,6 +1403,8 @@ export function useMainApp(gw: GatewayClient) {
       sessionStartedAt,
       stickyPrompt,
       turnStartedAt,
+      realtimeVoiceConnecting,
+      realtimeVoiceVisualizer,
       ui,
       voiceEnabled,
       voiceProcessing,

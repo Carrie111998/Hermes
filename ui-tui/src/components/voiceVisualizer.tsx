@@ -6,8 +6,9 @@ import type { Theme } from '../theme.js'
 
 export interface VoiceVisualizerProps {
   columns: number
-  mode: 'listening' | 'thinking'
+  mode: 'listening' | 'thinking' | 'waiting'
   t: Theme
+  visualizer: 'orb' | 'waveform'
 }
 
 const FRAME_MS = 80
@@ -35,7 +36,38 @@ export function renderVoiceWaveform(width: number, frame: number, active: boolea
   return output
 }
 
-export function VoiceVisualizer({ columns, mode, t }: VoiceVisualizerProps) {
+export function renderVoiceVisualization(
+  visualizer: 'orb' | 'waveform',
+  width: number,
+  frame: number,
+  mode: VoiceVisualizerProps['mode']
+): string[] {
+  const active = mode === 'listening'
+
+  if (visualizer === 'waveform') {
+    return renderVoiceWaveform(width, frame, active)
+  }
+
+  const orbState = mode === 'waiting' ? 'connecting' : active ? 'listening' : 'solving'
+
+  return renderTuiOrb(orbState, {
+    columns: width,
+    rows: ORB_ROWS,
+    speed: active ? 0.72 : 0.55,
+    threshold: active ? 0.18 : 0.21,
+    time: frame * (FRAME_MS / 1000)
+  }).lines
+}
+
+export function voiceVisualizationFooter(mode: VoiceVisualizerProps['mode']): string {
+  return mode === 'waiting'
+    ? 'Waiting for realtime voice…'
+    : mode === 'listening'
+      ? 'Listening · press the voice key to stop'
+      : 'Transcribing…'
+}
+
+export function VoiceVisualizer({ columns, mode, t, visualizer }: VoiceVisualizerProps) {
   const [frame, setFrame] = useState(0)
 
   useEffect(() => {
@@ -46,36 +78,24 @@ export function VoiceVisualizer({ columns, mode, t }: VoiceVisualizerProps) {
 
   const panelWidth = Math.max(24, columns - 2)
   const innerWidth = panelWidth - 2
-  const orbColumns = Math.min(ORB_COLUMNS, Math.max(6, innerWidth - 2))
-  const waveWidth = Math.max(0, innerWidth - orbColumns - 2)
+  const orbColumns = Math.min(ORB_COLUMNS, Math.max(6, innerWidth))
+  const orbPadding = Math.max(0, Math.floor((innerWidth - orbColumns) / 2))
   const active = mode === 'listening'
-  const orb = useMemo(
-    () =>
-      renderTuiOrb(active ? 'listening' : 'solving', {
-        columns: orbColumns,
-        rows: ORB_ROWS,
-        speed: active ? 0.72 : 0.55,
-        threshold: active ? 0.18 : 0.21,
-        time: frame * (FRAME_MS / 1000)
-      }).lines,
-    [active, frame, orbColumns]
+  const renderWidth = visualizer === 'orb' ? orbColumns : innerWidth
+  const lines = useMemo(
+    () => renderVoiceVisualization(visualizer, renderWidth, frame, mode),
+    [frame, mode, renderWidth, visualizer]
   )
-  const waveform = useMemo(() => renderVoiceWaveform(waveWidth, frame, active), [active, frame, waveWidth])
+  const footer = voiceVisualizationFooter(mode)
 
   return (
     <Box borderColor={t.color.border} borderStyle="single" flexDirection="column" width={panelWidth}>
-      {orb.map((line, index) => (
-        <Box key={index}>
-          <Text color={t.color.accent}>{line}</Text>
-          {waveWidth > 0 ? (
-            <>
-              <Text>{'  '}</Text>
-              <Text color={active ? t.color.ok : t.color.warn}>{waveform[index]}</Text>
-            </>
-          ) : null}
-        </Box>
+      {lines.map((line, index) => (
+        <Text color={visualizer === 'orb' ? t.color.accent : active ? t.color.ok : t.color.warn} key={index}>
+          {visualizer === 'orb' ? `${' '.repeat(orbPadding)}${line}` : line}
+        </Text>
       ))}
-      <Text color={t.color.muted}>{active ? 'Listening · press the voice key to stop' : 'Transcribing…'}</Text>
+      <Text color={t.color.muted}>{footer}</Text>
     </Box>
   )
 }
