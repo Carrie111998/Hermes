@@ -69,6 +69,7 @@ class _FakeSessionDB:
         self.last_include_children: Optional[bool] = None
         self.list_calls = 0
         self.messages_calls = 0
+        self.last_include_compacted: Optional[bool] = None
 
     def list_sessions_rich(
         self,
@@ -100,8 +101,13 @@ class _FakeSessionDB:
             for i in range(effective)
         ]
 
-    def get_messages(self, session_id: str) -> List[Dict[str, Any]]:
+    def get_messages(
+        self,
+        session_id: str,
+        include_compacted: bool = False,
+    ) -> List[Dict[str, Any]]:
         self.messages_calls += 1
+        self.last_include_compacted = include_compacted
         return [
             {"role": "user", "content": f"ask {session_id}"},
             {
@@ -149,6 +155,49 @@ def test_scan_sessions_default_scans_all_history_not_first_200(plugin_api):
     )
     assert len(result["sessions"]) == 500
     assert result["scan_meta"]["sessions_total"] == 500
+
+
+def test_scan_sessions_includes_compacted_history(plugin_api):
+    """Lifetime achievements must include events moved into compacted history."""
+    fake_db = _FakeSessionDB(session_count=1)
+    original_get_messages = fake_db.get_messages
+
+    def get_messages_with_compacted_tts(
+        session_id: str,
+        include_compacted: bool = False,
+    ) -> List[Dict[str, Any]]:
+        messages = original_get_messages(session_id, include_compacted)
+        if include_compacted:
+            messages.append(
+                {
+                    "role": "assistant",
+                    "tool_calls": [{"function": {"name": "text_to_speech"}}],
+                }
+            )
+        return messages
+
+    fake_db.get_messages = get_messages_with_compacted_tts
+    _install_fake_session_db(plugin_api, fake_db)
+
+    result = plugin_api.scan_sessions()
+
+    assert fake_db.last_include_compacted is True
+    assert result["aggregate"]["tts_calls"] == 1
+
+
+def test_load_checkpoint_discards_active_only_scan_results(plugin_api):
+    """Cached stats from the active-only scanner must not survive the fix."""
+    path = plugin_api.checkpoint_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        '{"schema_version": 1, "generated_at": 1, '
+        '"sessions": {"session-1": {"stats": {"tts_calls": 1}}}}',
+        encoding="utf-8",
+    )
+
+    checkpoint = plugin_api.load_checkpoint()
+
+    assert checkpoint["sessions"] == {}
 
 
 def test_evaluate_all_first_run_returns_pending_and_starts_background_scan(plugin_api):

@@ -32,6 +32,7 @@ except Exception:  # Allows local unit tests without dashboard dependencies.
 router = APIRouter()
 
 SNAPSHOT_TTL_SECONDS = 120
+CHECKPOINT_SCHEMA_VERSION = 2
 _SCAN_LOCK = threading.Lock()
 _SNAPSHOT_CACHE: Optional[Dict[str, Any]] = None
 _SNAPSHOT_CACHE_AT = 0
@@ -233,18 +234,21 @@ def save_snapshot(data: Dict[str, Any]) -> None:
 def load_checkpoint() -> Dict[str, Any]:
     path = checkpoint_path()
     if not path.exists():
-        return {"schema_version": 1, "generated_at": 0, "sessions": {}}
+        return {"schema_version": CHECKPOINT_SCHEMA_VERSION, "generated_at": 0, "sessions": {}}
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
-        if isinstance(data, dict):
-            data.setdefault("schema_version", 1)
+        # Deliberately reuse the cache only when the schema matches exactly.
+        # v1 checkpoints were produced by the active-only scanner and therefore
+        # undercount lifetime achievements; do NOT restore lenient loading —
+        # discarding them forces a one-time full rescan with compacted history.
+        if isinstance(data, dict) and data.get("schema_version") == CHECKPOINT_SCHEMA_VERSION:
             data.setdefault("generated_at", 0)
             data.setdefault("sessions", {})
             if isinstance(data.get("sessions"), dict):
                 return data
     except Exception:
         pass
-    return {"schema_version": 1, "generated_at": 0, "sessions": {}}
+    return {"schema_version": CHECKPOINT_SCHEMA_VERSION, "generated_at": 0, "sessions": {}}
 
 
 def save_checkpoint(data: Dict[str, Any]) -> None:
@@ -649,7 +653,7 @@ def scan_sessions(
                 stats = dict(cached_stats)
                 reused += 1
             else:
-                messages = db.get_messages(sid)
+                messages = db.get_messages(sid, include_compacted=True)
                 stats = analyze_messages(sid, meta.get("title") or meta.get("preview") or "Untitled", messages)
                 rescanned += 1
 
@@ -680,7 +684,7 @@ def scan_sessions(
                     pass
 
         save_checkpoint({
-            "schema_version": 1,
+            "schema_version": CHECKPOINT_SCHEMA_VERSION,
             "generated_at": int(time.time()),
             "sessions": checkpoint_sessions,
         })
