@@ -165,6 +165,11 @@ def get_sessions(
                 compact_rows=not full,
                 include_pinned=True,
             )
+            if sessions:
+                roots = [s.get("_lineage_root_id") or s["id"] for s in sessions]
+                revisions = db.get_display_revisions(roots)
+                for session, root_id in zip(sessions, roots):
+                    session["display_revision"] = revisions[root_id]
             total = db.session_count(
                 source=source or None,
                 sources=source_list or None,
@@ -663,7 +668,29 @@ async def get_session_messages(
     offset: int = Query(0, ge=0),
     order: Optional[str] = Query(None),
     include_compacted: bool = Query(False),
+    known_display_revision: Optional[str] = Query(None),
 ):
+    # Keep the established positional function signature intact for internal
+    # callers and tests. FastAPI supplies the appended query value as a string;
+    # a direct call that omits it leaves the Query default object here.
+    raw_known_display_revision = (
+        known_display_revision if isinstance(known_display_revision, str) else None
+    )
+    parsed_known_display_revision: Optional[int] = None
+    if raw_known_display_revision is not None:
+        valid_revision = (
+            bool(raw_known_display_revision)
+            and len(raw_known_display_revision) <= 19
+            and all("0" <= character <= "9" for character in raw_known_display_revision)
+        )
+        parsed_revision = int(raw_known_display_revision) if valid_revision else None
+        if parsed_revision is None or parsed_revision > (1 << 63) - 1:
+            raise HTTPException(
+                status_code=400,
+                detail="known_display_revision must be a non-negative integer",
+            )
+        parsed_known_display_revision = parsed_revision
+
     if order not in (None, "oldest", "latest"):
         raise HTTPException(
             status_code=400,
@@ -685,50 +712,52 @@ async def get_session_messages(
             default_page = limit is None
             latest_page = order == "latest" or (order is None and default_page)
             _limit = 500 if default_page else min(limit, 500)
-            return sid, _limit, db.get_messages(
-                sid,
-                limit=_limit,
-                offset=offset,
-                latest=latest_page,
-                include_compacted=include_compacted,
-            )
+            try:
+                return db.get_display_message_page(
+                    sid,
+                    limit=_limit,
+                    offset=offset,
+                    latest=latest_page,
+                    include_compacted=include_compacted,
+                    known_display_revision=parsed_known_display_revision,
+                )
+            except KeyError:
+                return None
         finally:
             db.close()
 
     result = await asyncio.to_thread(_read)
     if result is None:
         raise HTTPException(status_code=404, detail="Session not found")
-    sid, _limit, messages = result
-    from agent.compaction_display import project_compaction_message_for_display
-    from agent.context_compressor import is_compaction_summary_message
+    if not result["unchanged"]:
+        from agent.compaction_display import (
+            project_compaction_message_for_display,
+            suppress_redundant_compaction_projection_sources,
+        )
+        from agent.context_compressor import is_compaction_summary_message
 
-    projected_messages = []
-    for message in messages:
-        if not is_compaction_summary_message(message):
-            projected_messages.append(message)
-            continue
-        display_view = project_compaction_message_for_display(message)
-        projected = message.copy()
-        if display_view is None:
-            if not projected.get("display_kind"):
-                projected["display_kind"] = "hidden"
-        else:
-            # Keep the physical content for inspection/export compatibility;
-            # Desktop consumes this display-only projection. A legacy hidden
-            # wrapper must not hide a successfully recovered live ask.
-            projected["display_content"] = display_view.get("content")
-            projected.pop("display_kind", None)
-        projected_messages.append(projected)
-    return {
-        "session_id": sid,
-        "messages": projected_messages,
-        "pagination": {
-            "limit": _limit,
-            "offset": offset,
-            "order": order or ("latest" if limit is None else "oldest"),
-            "returned": len(projected_messages),
-        },
-    }
+        projected_messages = []
+        display_messages = suppress_redundant_compaction_projection_sources(
+            result["messages"]
+        )
+        for message in display_messages:
+            if not is_compaction_summary_message(message):
+                projected_messages.append(message)
+                continue
+            display_view = project_compaction_message_for_display(message)
+            projected = message.copy()
+            if display_view is None:
+                if not projected.get("display_kind"):
+                    projected["display_kind"] = "hidden"
+            else:
+                # Keep the physical content for inspection/export compatibility;
+                # Desktop consumes this display-only projection. A legacy hidden
+                # wrapper must not hide a successfully recovered live ask.
+                projected["display_content"] = display_view.get("content")
+                projected.pop("display_kind", None)
+            projected_messages.append(projected)
+        result["messages"] = projected_messages
+    return result
 
 
 @manage_router.delete("/api/sessions/{session_id}")

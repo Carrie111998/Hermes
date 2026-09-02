@@ -26,6 +26,8 @@ from hermes_state_common import (
 # keep that logger identity so log filtering/capture behavior is unchanged.
 logger = logging.getLogger("hermes_state")
 
+_MESSAGE_CLONE_LINEAGE_EXPORT_VERSION = 1
+
 
 class SessionPortabilityMixin:
     """See module docstring — mixin for SessionDB (Port cluster)."""
@@ -266,13 +268,49 @@ class SessionPortabilityMixin:
         decoded = self._decode_content(row["content"])
         return decoded if isinstance(decoded, str) else ""
 
+    def _export_message_clone_edges(self, message_ids) -> List[Dict[str, int]]:
+        ids = {int(message_id) for message_id in message_ids if message_id is not None}
+        if not ids:
+            return []
+        edges: List[Dict[str, int]] = []
+        ordered_ids = list(ids)
+        with self._lock:
+            for start in range(0, len(ordered_ids), 900):
+                chunk = ordered_ids[start:start + 900]
+                placeholders = ",".join("?" for _ in chunk)
+                rows = self._conn.execute(
+                    "SELECT source_message_id, clone_message_id "
+                    "FROM message_clone_lineage "
+                    f"WHERE source_message_id IN ({placeholders})",
+                    chunk,
+                ).fetchall()
+                edges.extend(
+                    {
+                        "source_message_id": int(row["source_message_id"]),
+                        "clone_message_id": int(row["clone_message_id"]),
+                    }
+                    for row in rows
+                    if int(row["clone_message_id"]) in ids
+                )
+        edges.sort(key=lambda edge: (edge["source_message_id"], edge["clone_message_id"]))
+        return edges
+
     def export_session(self, session_id: str) -> Optional[Dict[str, Any]]:
         """Export a single session with all its messages as a dict."""
         session = self.get_session(session_id)
         if not session:
             return None
         messages = self.get_messages(session_id)
-        return {**session, "messages": messages}
+        result = {**session, "messages": messages}
+        edges = self._export_message_clone_edges(
+            message.get("id") for message in messages
+        )
+        if edges:
+            result["message_clone_lineage_version"] = (
+                _MESSAGE_CLONE_LINEAGE_EXPORT_VERSION
+            )
+            result["message_clone_lineage"] = edges
+        return result
 
     def export_session_lineage(self, session_id: str) -> Optional[Dict[str, Any]]:
         """Export a compression lineage as one logical session dict."""
@@ -286,6 +324,24 @@ class SessionPortabilityMixin:
                 segments.append(segment)
         if not segments:
             return None
+        lineage_message_ids = {
+            message.get("id")
+            for segment in segments
+            for message in (segment.get("messages") or [])
+            if message.get("id") is not None
+        }
+        lineage_edges = self._export_message_clone_edges(lineage_message_ids)
+        for segment in segments:
+            segment.pop("message_clone_lineage_version", None)
+            segment.pop("message_clone_lineage", None)
+        if lineage_edges:
+            # Put the lineage-wide edge set on one segment so callers that
+            # import ``payload['segments']`` (profile adoption) retain
+            # cross-segment source/clone identity without duplicating edges.
+            segments[-1]["message_clone_lineage_version"] = (
+                _MESSAGE_CLONE_LINEAGE_EXPORT_VERSION
+            )
+            segments[-1]["message_clone_lineage"] = lineage_edges
         base = dict(segments[-1])
         total_messages = sum(len(seg.get("messages") or []) for seg in segments)
         base["segments"] = segments
@@ -304,6 +360,27 @@ class SessionPortabilityMixin:
         for session in sessions:
             messages = self.get_messages(session["id"])
             results.append({**session, "messages": messages})
+        message_owner_by_id = {
+            int(message["id"]): result
+            for result in results
+            for message in (result.get("messages") or [])
+            if isinstance(message.get("id"), int)
+            and not isinstance(message.get("id"), bool)
+        }
+        edges = self._export_message_clone_edges(message_owner_by_id)
+        edges_by_carrier: Dict[str, List[Dict[str, int]]] = {}
+        carrier_by_id: Dict[str, Dict[str, Any]] = {}
+        for edge in edges:
+            carrier = message_owner_by_id[edge["clone_message_id"]]
+            carrier_id = str(carrier["id"])
+            carrier_by_id[carrier_id] = carrier
+            edges_by_carrier.setdefault(carrier_id, []).append(edge)
+        for carrier_id, carrier_edges in edges_by_carrier.items():
+            carrier = carrier_by_id[carrier_id]
+            carrier["message_clone_lineage_version"] = (
+                _MESSAGE_CLONE_LINEAGE_EXPORT_VERSION
+            )
+            carrier["message_clone_lineage"] = carrier_edges
         return results
 
     def adopt_session_lineage_from(
@@ -535,6 +612,9 @@ class SessionPortabilityMixin:
         seen_ids: set[str] = set()
         total_messages = 0
         total_bytes = 0
+        exported_message_id_counts: Dict[int, int] = {}
+        exported_message_session_by_id: Dict[int, str] = {}
+        clone_edge_records: List[tuple[int, str, int, int]] = []
         session_text_fields = (
             "source",
             "user_id",
@@ -597,6 +677,26 @@ class SessionPortabilityMixin:
                     )
                 )
                 continue
+            raw_clone_edges = raw.get("message_clone_lineage") or []
+            clone_lineage_version = raw.get("message_clone_lineage_version")
+            if not isinstance(raw_clone_edges, list):
+                errors.append(
+                    self._import_error(
+                        index, session_id, "message_clone_lineage must be a list"
+                    )
+                )
+                continue
+            if raw_clone_edges and (
+                clone_lineage_version != _MESSAGE_CLONE_LINEAGE_EXPORT_VERSION
+            ):
+                errors.append(
+                    self._import_error(
+                        index,
+                        session_id,
+                        "unsupported message_clone_lineage_version",
+                    )
+                )
+                continue
 
             try:
                 session_bytes = len(
@@ -636,6 +736,7 @@ class SessionPortabilityMixin:
                 clean_messages: List[Dict[str, Any]] = []
                 for message_index, message in enumerate(messages):
                     clean_message = dict(message)
+                    exported_message_id = clean_message.get("id")
                     role = clean_message.get("role")
                     if not isinstance(role, str) or not role:
                         raise ValueError(f"messages[{message_index}].role must be a non-empty string")
@@ -649,6 +750,28 @@ class SessionPortabilityMixin:
                         clean_message.get("token_count"), "token_count"
                     )
                     clean_messages.append(clean_message)
+                clean_clone_edges: List[tuple[int, int]] = []
+                for edge_index, edge in enumerate(raw_clone_edges):
+                    if not isinstance(edge, dict):
+                        raise ValueError(
+                            f"message_clone_lineage[{edge_index}] must be an object"
+                        )
+                    source_id = edge.get("source_message_id")
+                    clone_id = edge.get("clone_message_id")
+                    if any(
+                        isinstance(value, bool)
+                        or not isinstance(value, int)
+                        or value <= 0
+                        for value in (source_id, clone_id)
+                    ):
+                        raise ValueError(
+                            f"message_clone_lineage[{edge_index}] ids must be positive integers"
+                        )
+                    if source_id == clone_id:
+                        raise ValueError(
+                            f"message_clone_lineage[{edge_index}] cannot self-reference"
+                        )
+                    clean_clone_edges.append((source_id, clone_id))
             except ValueError as exc:
                 errors.append(self._import_error(index, session_id, str(exc)))
                 continue
@@ -664,9 +787,43 @@ class SessionPortabilityMixin:
                 )
                 continue
             seen_ids.add(session_id)
-            normalized.append(
-                {"index": index, "session": clean_session, "messages": clean_messages}
+            for message in clean_messages:
+                exported_message_id = message.get("id")
+                if (
+                    isinstance(exported_message_id, int)
+                    and not isinstance(exported_message_id, bool)
+                    and exported_message_id > 0
+                ):
+                    exported_message_id_counts[exported_message_id] = (
+                        exported_message_id_counts.get(exported_message_id, 0) + 1
+                    )
+                    exported_message_session_by_id[exported_message_id] = session_id
+            clone_edge_records.extend(
+                (index, session_id, source_id, clone_id)
+                for source_id, clone_id in clean_clone_edges
             )
+            normalized.append(
+                {
+                    "index": index,
+                    "session": clean_session,
+                    "messages": clean_messages,
+                }
+            )
+
+        for index, session_id, source_id, clone_id in clone_edge_records:
+            for field, message_id in (
+                ("source_message_id", source_id),
+                ("clone_message_id", clone_id),
+            ):
+                count = exported_message_id_counts.get(message_id, 0)
+                if count != 1:
+                    error = (
+                        f"message_clone_lineage {field} must reference exactly "
+                        "one imported message"
+                    )
+                    item = self._import_error(index, session_id, error)
+                    if item not in errors:
+                        errors.append(item)
 
         if errors:
             return {
@@ -681,7 +838,48 @@ class SessionPortabilityMixin:
             imported_ids: List[str] = []
             skipped_ids: List[str] = []
             parent_updates: List[tuple[str, str]] = []
+            topology_ids: set[str] = set()
+            topology_roots_before: set[str] = set()
+            imported_message_id_map: Dict[int, int] = {}
             detached = 0
+
+            payload_session_ids = [
+                str(item["session"].get("id") or "").strip()
+                for item in normalized
+            ]
+            existing_payload_session_ids: set[str] = set()
+            for start in range(0, len(payload_session_ids), 900):
+                chunk = payload_session_ids[start:start + 900]
+                if not chunk:
+                    continue
+                placeholders = ",".join("?" for _ in chunk)
+                existing_payload_session_ids.update(
+                    row["id"]
+                    for row in conn.execute(
+                        f"SELECT id FROM sessions WHERE id IN ({placeholders})",
+                        chunk,
+                    ).fetchall()
+                )
+            for index, session_id, source_id, clone_id in clone_edge_records:
+                source_session_id = exported_message_session_by_id[source_id]
+                clone_session_id = exported_message_session_by_id[clone_id]
+                source_skipped = source_session_id in existing_payload_session_ids
+                clone_skipped = clone_session_id in existing_payload_session_ids
+                if source_skipped != clone_skipped:
+                    return {
+                        "ok": False,
+                        "imported": 0,
+                        "skipped": 0,
+                        "detached": 0,
+                        "errors": [
+                            self._import_error(
+                                index,
+                                session_id,
+                                "message clone provenance crosses skipped and "
+                                "imported sessions; refusing a partial component import",
+                            )
+                        ],
+                    }
 
             for item in normalized:
                 raw = item["session"]
@@ -784,6 +982,18 @@ class SessionPortabilityMixin:
                     session_id,
                     sanitized_messages,
                 )
+                for message in sanitized_messages:
+                    exported_message_id = message.get("id")
+                    inserted_message_id = message.get("_row_id")
+                    if (
+                        isinstance(exported_message_id, int)
+                        and not isinstance(exported_message_id, bool)
+                        and exported_message_id > 0
+                        and inserted_message_id is not None
+                    ):
+                        imported_message_id_map[int(exported_message_id)] = int(
+                            inserted_message_id
+                        )
                 conn.execute(
                     "UPDATE sessions SET message_count = ?, tool_call_count = ? WHERE id = ?",
                     (total_messages, total_tool_calls, session_id),
@@ -821,16 +1031,44 @@ class SessionPortabilityMixin:
                     (parent_id,),
                 ).fetchone()
                 if parent_exists and not _would_create_cycle(session_id, parent_id):
-                    conn.execute(
+                    pair_ids = {session_id, parent_id}
+                    pair_roots_before = self._display_roots_from_conn(
+                        conn, pair_ids
+                    )
+                    attached = conn.execute(
                         "UPDATE sessions SET parent_session_id = ? WHERE id = ?",
                         (parent_id, session_id),
                     )
+                    if attached.rowcount == 1:
+                        topology_ids.update(pair_ids)
+                        topology_roots_before.update(pair_roots_before)
                 else:
                     # Drop only the closing edge. Later entries can still attach
                     # to this now-root session, preserving the acyclic portion
                     # of a malformed imported lineage.
                     parent_by_child.pop(session_id, None)
                     detached += 1
+
+            if topology_ids:
+                self._invalidate_display_topology(
+                    conn, topology_roots_before, topology_ids
+                )
+
+            remapped_edges = {
+                (
+                    imported_message_id_map[source_id],
+                    imported_message_id_map[clone_id],
+                )
+                for _index, _session_id, source_id, clone_id in clone_edge_records
+                if source_id in imported_message_id_map
+                and clone_id in imported_message_id_map
+            }
+            if remapped_edges:
+                conn.executemany(
+                    "INSERT INTO message_clone_lineage "
+                    "(source_message_id, clone_message_id) VALUES (?, ?)",
+                    sorted(remapped_edges),
+                )
 
             return {
                 "ok": True,

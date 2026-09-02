@@ -66,6 +66,8 @@ from hermes_state_common import (  # noqa: F401  (re-exported for back-compat)
     _FTS_CJK_TRIGGERS,
     _FTS_TRIGGERS,
     _LISTABLE_CHILD_SQL,
+    _NOT_BRANCH_MARKER_CHILD_SQL,
+    _NOT_DELEGATE_MARKER_CHILD_SQL,
     _PREVIEW_ELIGIBLE_SQL,
     _PREVIEW_RAW_SELECT,
     _RECOVERABLE_END_REASONS,
@@ -88,6 +90,7 @@ from hermes_state_common import (  # noqa: F401  (re-exported for back-compat)
     FTS_TRIGRAM_SQL,
     LEGACY_FTS_SQL,
     LEGACY_FTS_TRIGRAM_SQL,
+    MESSAGE_CLONE_LINEAGE_LEGACY_CEILING_KEY,
     MAX_FTS5_QUERY_CHARS,
     SCHEMA_SQL,
     SCHEMA_VERSION,
@@ -5159,6 +5162,12 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         self._fts_cjk_available = False
         self._fts_unavailable_warned = False
         self._conn = None
+        # Set only when a fallback-reader rollback poisoned the primary
+        # connection and its replacement could not be opened.  This is
+        # deliberately distinct from ordinary ``close()`` semantics, which
+        # historically leave ``_conn`` as ``None`` without making a bare
+        # ``_read_ctx`` acquisition fail.
+        self._primary_connection_recovery_failed = False
         # Async token accounting (see queue_token_counts). The condition
         # guards queue + writer state; it is distinct from self._lock so
         # enqueue/flush bookkeeping never contends with SQLite writes.
@@ -5598,6 +5607,22 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         except queue.Empty:
             return self._get_read_conn()
 
+    def _return_read_conn(self, conn) -> None:
+        """Return a healthy checked-out reader, or close it if the pool closed."""
+        returned = False
+        with self._read_conns_lock:
+            if not self._read_conns_closed:
+                try:
+                    self._read_pool.put_nowait(conn)
+                    returned = True
+                except queue.Full:
+                    pass
+        if not returned:
+            # close() has already drained the pool, so this connection is
+            # surplus. queue.Full is unreachable while permits and maxsize
+            # match, but closing remains the safe behavior if they drift.
+            self._close_read_conn(conn)
+
     @contextmanager
     def _read_ctx(self) -> Iterator[sqlite3.Connection]:
         """Yield a connection for read-only statements.
@@ -5616,30 +5641,13 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         slower under a burst, and the alternative is EMFILE, which takes the
         whole process down in a way a restart-on-exit supervisor cannot see.
         """
+        self._raise_if_primary_connection_recovery_failed()
         conn = self._checkout_read_conn()
         if conn is not None:
             try:
                 yield conn
             finally:
-                returned = False
-                with self._read_conns_lock:
-                    if not self._read_conns_closed:
-                        try:
-                            self._read_pool.put_nowait(conn)
-                            returned = True
-                        except queue.Full:
-                            pass
-                if not returned:
-                    # close() has already drained the pool, so this connection
-                    # is surplus. Close it here — dropping it on the floor is
-                    # what leaked the fd.
-                    #
-                    # queue.Full is now unreachable in practice (permits and
-                    # maxsize are both _READ_POOL_MAX, so there can never be a
-                    # ninth connection to return), but the branch stays: it is
-                    # load-bearing if those two ever drift apart, and a leak is
-                    # the failure mode it prevents.
-                    self._close_read_conn(conn)
+                self._return_read_conn(conn)
             return
         with self._lock:
             if self._conn is None:
@@ -5724,6 +5732,145 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         # cannot have lost it, so no _init_schema here (no DDL races with
         # sibling processes during teardown).
         self._conn = conn
+
+    def _raise_if_primary_connection_recovery_failed(self) -> None:
+        """Fail closed after a poisoned primary connection cannot reopen."""
+        if self._primary_connection_recovery_failed:
+            raise RuntimeError(
+                "SessionDB primary connection is unavailable after failed recovery"
+            )
+
+    def _replace_primary_connection_after_read_failure(self, failed_conn) -> None:
+        """Discard a poisoned fallback reader and reopen the primary handle.
+
+        ``_read_transaction_ctx`` normally uses a pooled WAL reader, but may
+        fall back to ``self._conn`` for non-WAL databases or a saturated pool.
+        A failed ROLLBACK leaves that shared connection unsafe for subsequent
+        reads and writes, so it must never remain installed.
+        """
+        if self._conn is failed_conn:
+            self._conn = None
+        self._close_connection_quietly(failed_conn)
+
+        # Reconnecting resolves the database path again.  Preserve the same
+        # generation/identity guard used by the close-race reopen path so a
+        # failed read cleanup cannot silently adopt a replaced state.db.
+        self._raise_if_db_replaced()
+
+        replacement = None
+        try:
+            if self.read_only:
+                replacement = _connect_tracked_db(
+                    f"file:{self.db_path}?mode=ro",
+                    tracking_path=self.db_path,
+                    uri=True,
+                    check_same_thread=False,
+                    timeout=1.0,
+                    isolation_level=None,
+                )
+            else:
+                replacement = _connect_tracked_db(
+                    str(self.db_path),
+                    check_same_thread=False,
+                    timeout=1.0,
+                    isolation_level=None,
+                )
+            replacement.row_factory = sqlite3.Row
+            apply_database_pragmas(replacement, db_label="state.db")
+            if not self.read_only:
+                replacement.execute("PRAGMA foreign_keys=ON")
+                self._fts_cjk_loaded = load_fts5_cjk_extension(replacement)
+            self._conn = replacement
+            self._primary_connection_recovery_failed = False
+        except BaseException as exc:
+            self._close_connection_quietly(replacement)
+            self._primary_connection_recovery_failed = True
+            logger.error(
+                "failed to replace poisoned primary read connection for %s (%s)",
+                self.db_path,
+                type(exc).__name__,
+            )
+
+    @contextmanager
+    def _read_transaction_on_conn(self, conn, *, pooled: bool):
+        """Run one deferred read transaction on an already-owned connection."""
+        healthy = False
+
+        try:
+            if conn.in_transaction:
+                raise RuntimeError(
+                    "read connection unexpectedly has an active transaction"
+                )
+            conn.execute("BEGIN")
+            try:
+                yield conn
+            except BaseException:
+                try:
+                    conn.execute("ROLLBACK")
+                    if conn.in_transaction:
+                        raise RuntimeError(
+                            "read transaction rollback left connection active"
+                        )
+                    healthy = True
+                except BaseException as cleanup_exc:
+                    logger.warning(
+                        "read transaction rollback failed for %s (%s); "
+                        "discarding connection",
+                        self.db_path,
+                        type(cleanup_exc).__name__,
+                    )
+                    if not pooled:
+                        self._replace_primary_connection_after_read_failure(conn)
+                raise
+            else:
+                try:
+                    conn.execute("ROLLBACK")
+                    if conn.in_transaction:
+                        raise RuntimeError(
+                            "read transaction rollback left connection active"
+                        )
+                except BaseException:
+                    if not pooled:
+                        self._replace_primary_connection_after_read_failure(conn)
+                    raise
+                else:
+                    healthy = True
+        finally:
+            if pooled:
+                if healthy:
+                    self._return_read_conn(conn)
+                else:
+                    self._close_read_conn(conn)
+
+    @contextmanager
+    def _read_transaction_ctx(self):
+        """Yield one connection pinned to a single deferred read snapshot.
+
+        Read connections run in autocommit mode, so merely keeping the same
+        connection does not keep consecutive SELECTs on the same SQLite
+        snapshot. ``BEGIN`` is deferred: the first SELECT establishes the WAL
+        snapshot without taking a write lock. Always roll it back before the
+        connection returns to the pool, including when a read raises.
+        """
+        self._raise_if_primary_connection_recovery_failed()
+        conn = self._checkout_read_conn()
+        if conn is not None:
+            with self._read_transaction_on_conn(conn, pooled=True) as read_conn:
+                yield read_conn
+            return
+
+        # The pool miss falls back to the shared writer. Keep the ownership
+        # syntactically and operationally explicit: both connection selection
+        # and the entire transaction run under the writer lock.
+        with self._lock:
+            self._raise_if_primary_connection_recovery_failed()
+            if self._conn is None:
+                self._reopen_after_close_locked(context="read transaction")
+            primary_conn = cast(sqlite3.Connection, self._conn)
+            with self._read_transaction_on_conn(
+                primary_conn, pooled=False
+            ) as read_conn:
+                yield read_conn
 
     # ── Core write helper ──
 
@@ -6034,6 +6181,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             fn_started = False
             try:
                 with self._lock:
+                    self._raise_if_primary_connection_recovery_failed()
                     if self._conn is None:
                         # close() ran while this writer was still unwinding
                         # (#94736) — reopen instead of dying on None.execute.
@@ -7706,7 +7854,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             if (donor["source"] or "") != (orphan["source"] or ""):
                 return False
 
-            conn.execute(
+            topology_ids = {donor_id, orphan_id}
+            roots_before = self._display_roots_from_conn(conn, topology_ids)
+
+            adopted = conn.execute(
                 """UPDATE sessions
                       SET session_key = ?,
                           chat_id = COALESCE(chat_id, ?),
@@ -7729,6 +7880,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     orphan_id,
                 ),
             )
+            if adopted.rowcount != 1:
+                return False
             # Retire the predecessor under a reason recovery does NOT treat
             # as resumable — 'agent_close'/'ws_orphan_reap' would keep it in
             # the running, and the newly keyed orphan could lose the chat
@@ -7737,6 +7890,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 "UPDATE sessions SET ended_at = COALESCE(ended_at, ?), "
                 "end_reason = 'superseded_by_repair' WHERE id = ?",
                 (time.time(), donor_id),
+            )
+            self._invalidate_display_topology(
+                conn, roots_before, topology_ids
             )
             return True
 
@@ -8050,17 +8206,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 ).fetchall()
                 if tail_rows:
                     tail_ids = [int(r["id"]) for r in tail_rows]
-                    placeholders = ",".join("?" for _ in tail_ids)
-                    clone_cols = [
-                        c for c in self._message_column_names(conn)
-                        if c not in ("id", "session_id", "active", "compacted")
-                    ]
-                    col_list = ", ".join(clone_cols)
-                    conn.execute(
-                        f"INSERT INTO messages ({col_list}, session_id, active, compacted) "
-                        f"SELECT {col_list}, ?, 1, 0 FROM messages "
-                        f"WHERE id IN ({placeholders}) ORDER BY id",
-                        [child_session_id, *tail_ids],
+                    self._clone_message_rows_with_lineage(
+                        conn,
+                        tail_ids,
+                        child_session_id,
                     )
                     total_messages += len(tail_ids)
                     for r in tail_rows:
@@ -8084,6 +8233,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 raise RuntimeError(
                     f"Compression parent changed during publication: {parent_session_id}"
                 )
+            self._bump_display_revision(conn, parent_session_id)
 
         self._execute_write(_do)
 
@@ -8137,6 +8287,13 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         intentionally need to re-end a closed session with a new reason.
         """
         def _do(conn):
+            child_rows = conn.execute(
+                "SELECT id FROM sessions WHERE parent_session_id = ?",
+                (session_id,),
+            ).fetchall()
+            topology_ids = {session_id}
+            topology_ids.update(row["id"] for row in child_rows)
+            roots_before = self._display_roots_from_conn(conn, topology_ids)
             changed = conn.execute(
                 "UPDATE sessions SET ended_at = ?, end_reason = ? "
                 "WHERE id = ? AND ended_at IS NULL",
@@ -8146,6 +8303,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             # the first end_reason wins, so a no-op must not rotate the peer.
             if changed:
                 self._bump_conversation_generation(conn, session_id, end_reason)
+                self._invalidate_display_topology(
+                    conn, roots_before, topology_ids
+                )
         self._execute_write(_do)
 
     def reopen_session(self, session_id: str) -> None:
@@ -8155,6 +8315,13 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         children that still depend on the parent's mutable end_reason.
         """
         def _do(conn):
+            child_rows = conn.execute(
+                "SELECT id FROM sessions WHERE parent_session_id = ?",
+                (session_id,),
+            ).fetchall()
+            topology_ids = {session_id}
+            topology_ids.update(row["id"] for row in child_rows)
+            roots_before = self._display_roots_from_conn(conn, topology_ids)
             placeholders = ",".join("?" for _ in _RESET_END_REASONS)
             # WHERE shape shared with _RESET_CHILD_SQL's fallback arm via
             # _legacy_reset_child_sql so the stamping and the listing
@@ -8169,10 +8336,15 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 f"AND {_legacy_reset_child_sql('child', placeholders)}",
                 (session_id, *_RESET_END_REASONS),
             )
-            conn.execute(
-                "UPDATE sessions SET ended_at = NULL, end_reason = NULL WHERE id = ?",
+            updated = conn.execute(
+                "UPDATE sessions SET ended_at = NULL, end_reason = NULL "
+                "WHERE id = ? AND (ended_at IS NOT NULL OR end_reason IS NOT NULL)",
                 (session_id,),
             )
+            if updated.rowcount == 1:
+                self._invalidate_display_topology(
+                    conn, roots_before, topology_ids
+                )
         self._execute_write(_do)
 
     def promote_to_session_reset(
@@ -10505,6 +10677,24 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             ).fetchone()
         return dict(row) if row else None
 
+    def _resolve_session_id_from_conn(
+        self, conn, session_id_or_prefix: str
+    ) -> Optional[str]:
+        exact = conn.execute(
+            "SELECT id FROM sessions WHERE id = ?", (session_id_or_prefix,)
+        ).fetchone()
+        if exact:
+            return exact["id"]
+        escaped = _escape_like(session_id_or_prefix)
+        cursor = conn.execute(
+            "SELECT id FROM sessions WHERE id LIKE ? ESCAPE '\\' ORDER BY started_at DESC LIMIT 2",
+            (f"{escaped}%",),
+        )
+        matches = [row["id"] for row in cursor.fetchall()]
+        if len(matches) == 1:
+            return matches[0]
+        return None
+
     def resolve_session_id(self, session_id_or_prefix: str) -> Optional[str]:
         """Resolve an exact or uniquely prefixed session ID to the full ID.
 
@@ -10512,20 +10702,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         prefix and returns the single matching session ID if the prefix is
         unambiguous. Returns None for no matches or ambiguous prefixes.
         """
-        exact = self.get_session(session_id_or_prefix)
-        if exact:
-            return exact["id"]
-
-        escaped = _escape_like(session_id_or_prefix)
+        self.flush_token_counts()
         with self._read_ctx() as conn:
-            cursor = conn.execute(
-                "SELECT id FROM sessions WHERE id LIKE ? ESCAPE '\\' ORDER BY started_at DESC LIMIT 2",
-                (f"{escaped}%",),
-            )
-            matches = [row["id"] for row in cursor.fetchall()]
-        if len(matches) == 1:
-            return matches[0]
-        return None
+            return self._resolve_session_id_from_conn(conn, session_id_or_prefix)
 
     # Maximum length for session titles
     MAX_TITLE_LENGTH = 100
@@ -11236,7 +11415,227 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
         return f"{base} #{max_num + 1}"
 
-    def get_compression_tip(self, session_id: str) -> Optional[str]:
+    def _display_lineage_root_from_conn(self, conn, session_id: str) -> str:
+        """Resolve a session's backward compression-only display root."""
+        current = session_id
+        seen = set()
+        for _ in range(100):
+            if not current or current in seen:
+                break
+            seen.add(current)
+            row = conn.execute(
+                """
+                SELECT child.id, child.parent_session_id, parent.end_reason,
+                       json_extract(COALESCE(child.model_config, '{}'), '$._branched_from') AS branched_from,
+                       json_extract(COALESCE(child.model_config, '{}'), '$._delegate_from') AS delegated_from,
+                       child.source
+                FROM sessions child
+                LEFT JOIN sessions parent ON parent.id = child.parent_session_id
+                WHERE child.id = ?
+                """,
+                (current,),
+            ).fetchone()
+            if row is None:
+                break
+            if (
+                not row["parent_session_id"]
+                or row["end_reason"] != "compression"
+                or row["branched_from"] == row["parent_session_id"]
+                or row["delegated_from"] == row["parent_session_id"]
+                or (row["source"] or "") == "tool"
+            ):
+                break
+            current = row["parent_session_id"]
+        return current or session_id
+
+    def _display_revision_from_conn(self, conn, lineage_root_id: str) -> int:
+        row = conn.execute(
+            "SELECT revision FROM conversation_display_revisions WHERE lineage_root_id = ?",
+            (lineage_root_id,),
+        ).fetchone()
+        return int(row["revision"]) if row else 0
+
+    def _display_roots_from_conn(self, conn, session_ids) -> set[str]:
+        return {
+            self._display_lineage_root_from_conn(conn, session_id)
+            for session_id in session_ids
+            if session_id
+        }
+
+    def _invalidate_display_topology(
+        self,
+        conn,
+        roots_before: set[str],
+        affected_session_ids,
+    ) -> None:
+        """Invalidate every display root on both sides of a topology write.
+
+        A parent/end-reason change can move a requested session from one
+        display root to another.  Merely incrementing each root independently
+        is not enough: equal counters on the old and new roots would make a
+        conditional read falsely report ``unchanged``.  Advance only the
+        affected roots to one shared value above every pre-write counter.
+        """
+        roots = set(roots_before)
+        roots.update(self._display_roots_from_conn(conn, affected_session_ids))
+        roots.discard("")
+        if not roots:
+            return
+        next_revision = max(
+            self._display_revision_from_conn(conn, root_id) for root_id in roots
+        ) + 1
+        now = time.time()
+        for root_id in roots:
+            conn.execute(
+                """
+                INSERT INTO conversation_display_revisions
+                    (lineage_root_id, revision, updated_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(lineage_root_id) DO UPDATE SET
+                    revision = excluded.revision,
+                    updated_at = excluded.updated_at
+                """,
+                (root_id, next_revision, now),
+            )
+
+    def _capture_display_ancestor_roots(
+        self, conn, session_ids
+    ) -> set[str]:
+        """Snapshot request roots whose selected path contains a session.
+
+        Destructive writes must call this before changing message eligibility
+        or deleting a session: afterwards the authoritative resolver may no
+        longer select the descendant whose disappearance needs to invalidate
+        an ancestor's conditional display read.
+        """
+        roots: set[str] = set()
+        for session_id in session_ids:
+            if session_id:
+                roots.update(
+                    self._display_ancestor_roots_for_session_from_conn(
+                        conn, session_id
+                    )
+                )
+        return roots
+
+    @staticmethod
+    def _surviving_children_for_deleted_sessions(
+        conn, deleted_session_ids
+    ) -> set[str]:
+        deleted_ids = {session_id for session_id in deleted_session_ids if session_id}
+        if not deleted_ids:
+            return set()
+        ids = list(deleted_ids)
+        placeholders = ",".join("?" for _ in ids)
+        rows = conn.execute(
+            f"SELECT id FROM sessions "
+            f"WHERE parent_session_id IN ({placeholders}) "
+            f"AND id NOT IN ({placeholders})",
+            [*ids, *ids],
+        ).fetchall()
+        return {row["id"] for row in rows}
+
+    def _bump_display_revision(
+        self,
+        conn,
+        session_id: str,
+        roots_before: Optional[set[str]] = None,
+    ) -> int:
+        own_root_id = self._display_lineage_root_from_conn(conn, session_id)
+        roots = set(roots_before or ())
+        roots.update(
+            self._display_ancestor_roots_for_session_from_conn(conn, session_id)
+        )
+        revisions = {
+            root_id: self._bump_display_revision_root(conn, root_id)
+            for root_id in roots
+        }
+        return revisions[own_root_id]
+
+    def _display_ancestor_roots_for_session_from_conn(
+        self, conn, session_id: str
+    ) -> set[str]:
+        """Return request roots whose authoritative path includes a session.
+
+        Markerless recovery/adoption continuations are intentionally separate
+        display roots when requested directly, yet an ancestor request may
+        resolve through them.  A write to that descendant must invalidate both
+        caches.  Ask the shared resolver for each distinct ancestor root so
+        branch/delegate/reset/tool exclusions cannot drift from display reads.
+        """
+        roots = {self._display_lineage_root_from_conn(conn, session_id)}
+        checked_roots = set(roots)
+        current = session_id
+        seen = {current}
+        for _ in range(100):
+            row = conn.execute(
+                "SELECT parent_session_id FROM sessions WHERE id = ?",
+                (current,),
+            ).fetchone()
+            if row is None or not row["parent_session_id"]:
+                break
+            parent_id = row["parent_session_id"]
+            if parent_id in seen:
+                break
+            seen.add(parent_id)
+            root_id = self._display_lineage_root_from_conn(conn, parent_id)
+            if root_id not in checked_roots:
+                checked_roots.add(root_id)
+                _tip_id, lineage_ids = self._resolve_resume_lineage_from_conn(
+                    conn, root_id
+                )
+                if session_id not in lineage_ids:
+                    break
+                roots.add(root_id)
+            current = parent_id
+        return roots
+
+    def _bump_display_revision_root(self, conn, lineage_root_id: str) -> int:
+        now = time.time()
+        conn.execute(
+            """
+            INSERT INTO conversation_display_revisions (lineage_root_id, revision, updated_at)
+            VALUES (?, 1, ?)
+            ON CONFLICT(lineage_root_id) DO UPDATE SET
+                revision = conversation_display_revisions.revision + 1,
+                updated_at = excluded.updated_at
+            """,
+            (lineage_root_id, now),
+        )
+        return self._display_revision_from_conn(conn, lineage_root_id)
+
+    def get_display_revision(self, session_id: str) -> int:
+        with self._read_ctx() as conn:
+            root_id = self._display_lineage_root_from_conn(conn, session_id)
+            return self._display_revision_from_conn(conn, root_id)
+
+    def get_display_lineage_identity(self, session_id: str) -> tuple[str, str]:
+        with self._read_ctx() as conn:
+            root_id = self._display_lineage_root_from_conn(conn, session_id)
+            return root_id, self._get_compression_tip_from_conn(conn, root_id)
+
+    def get_display_revisions(self, lineage_root_ids: list[str]) -> dict[str, int]:
+        root_ids = list(dict.fromkeys(root_id for root_id in lineage_root_ids if root_id))
+        revisions = {root_id: 0 for root_id in root_ids}
+        if not root_ids:
+            return revisions
+
+        with self._read_ctx() as conn:
+            for offset in range(0, len(root_ids), 900):
+                chunk = root_ids[offset:offset + 900]
+                placeholders = ", ".join("?" for _ in chunk)
+                rows = conn.execute(
+                    "SELECT lineage_root_id, revision "
+                    "FROM conversation_display_revisions "
+                    f"WHERE lineage_root_id IN ({placeholders})",
+                    chunk,
+                ).fetchall()
+                revisions.update(
+                    {row["lineage_root_id"]: int(row["revision"]) for row in rows}
+                )
+        return revisions
+
+    def _get_compression_tip_from_conn(self, conn, session_id: str) -> Optional[str]:
         """Walk the compression-continuation chain forward and return the tip.
 
         A compression continuation is a child of a session whose
@@ -11262,31 +11661,30 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         # Bound the walk defensively — compression chains this deep are
         # pathological and shouldn't happen in practice. 100 = plenty.
         for _ in range(100):
-            with self._read_ctx() as conn:
-                cursor = conn.execute(
-                    f"""
-                    SELECT child.id
-                    FROM sessions parent
-                    JOIN sessions child ON child.parent_session_id = parent.id
-                    WHERE parent.id = ?
-                      AND parent.end_reason = 'compression'
-                      AND json_extract(COALESCE(child.model_config, '{{}}'), '$._branched_from') IS NULL
-                      AND json_extract(COALESCE(child.model_config, '{{}}'), '$._delegate_from') IS NULL
-                      AND COALESCE(child.source, '') != 'tool'
-                    ORDER BY
-                      CASE
-                        WHEN child.end_reason = 'compression' THEN 0
-                        WHEN child.ended_at IS NULL THEN 1
-                        ELSE 2
-                      END,
-                      {_sql_session_last_active("child")} DESC,
-                      child.started_at DESC,
-                      child.id DESC
-                    LIMIT 1
-                    """,
-                    (current,),
-                )
-                row = cursor.fetchone()
+            cursor = conn.execute(
+                f"""
+                SELECT child.id
+                FROM sessions parent
+                JOIN sessions child ON child.parent_session_id = parent.id
+                WHERE parent.id = ?
+                  AND parent.end_reason = 'compression'
+                """
+                + self._NON_CONTINUATION_CHILD_FILTER_SQL.format(alias="child.")
+                + f"""
+                ORDER BY
+                  CASE
+                    WHEN child.end_reason = 'compression' THEN 0
+                    WHEN child.ended_at IS NULL THEN 1
+                    ELSE 2
+                  END,
+                  {_sql_session_last_active("child")} DESC,
+                  child.started_at DESC,
+                  child.id DESC
+                LIMIT 1
+                """,
+                (current, current, current),
+            )
+            row = cursor.fetchone()
             if row is None:
                 return current
             child_id = row["id"]
@@ -11295,6 +11693,81 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             seen.add(child_id)
             current = child_id
         return current
+
+    def _path_between_sessions_from_conn(
+        self, conn, root_id: str, tip_id: str
+    ) -> list[str]:
+        """Return the recorded root-to-tip parent path, failing closed."""
+        reverse_path = []
+        current = tip_id
+        seen = set()
+        for _ in range(100):
+            if not current or current in seen:
+                return [root_id]
+            seen.add(current)
+            reverse_path.append(current)
+            if current == root_id:
+                return list(reversed(reverse_path))
+            row = conn.execute(
+                "SELECT parent_session_id FROM sessions WHERE id = ?",
+                (current,),
+            ).fetchone()
+            if row is None:
+                return [root_id]
+            current = row["parent_session_id"]
+        return [root_id]
+
+    def _resolve_resume_lineage_from_conn(
+        self, conn, session_id: str
+    ) -> tuple[str, list[str]]:
+        """Resolve the resume target and its safe visible path in one snapshot."""
+        compression_tip = self._get_compression_tip_from_conn(conn, session_id)
+        fallback_tip = compression_tip or session_id
+        fallback_path = self._path_between_sessions_from_conn(
+            conn, session_id, fallback_tip
+        )
+        current = fallback_tip
+        current_path = list(fallback_path)
+        seen = set(current_path)
+        best_id = None
+        best_path = None
+
+        for _ in range(32):
+            row = conn.execute(
+                "SELECT 1 FROM messages WHERE session_id = ? LIMIT 1",
+                (current,),
+            ).fetchone()
+            if row is not None:
+                best_id = current
+                best_path = list(current_path)
+
+            child_row = conn.execute(
+                "SELECT id FROM sessions AS child "
+                "WHERE child.parent_session_id = ? "
+                f"  AND {_NOT_BRANCH_MARKER_CHILD_SQL.format(a='child')} "
+                f"  AND {_NOT_DELEGATE_MARKER_CHILD_SQL.format(a='child')} "
+                "  AND json_extract(COALESCE(child.model_config, '{}'), '$._reset_from') IS NULL "
+                f"  AND NOT {_legacy_reset_child_sql('child', _RESET_END_REASONS_SQL)} "
+                "  AND COALESCE(child.source, '') != 'tool' "
+                "ORDER BY child.started_at DESC, child.id DESC LIMIT 1",
+                (current,),
+            ).fetchone()
+            if child_row is None:
+                break
+            child_id = child_row["id"]
+            if not child_id or child_id in seen:
+                break
+            seen.add(child_id)
+            current = child_id
+            current_path.append(child_id)
+
+        if best_id is not None and best_path is not None:
+            return best_id, best_path
+        return fallback_tip, fallback_path
+
+    def get_compression_tip(self, session_id: str) -> Optional[str]:
+        with self._read_ctx() as conn:
+            return self._get_compression_tip_from_conn(conn, session_id)
 
     # Columns excluded from compact_rows projections: only the payload-heavy
     # blob no list consumer renders. Everything else — including gateway
@@ -11433,7 +11906,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             #      child started), covering branch sessions created before the
             #      marker existed.
             where_clauses.append(_LISTABLE_CHILD_SQL)
-            where_clauses.append(f"{_delegate_from_json('s.model_config')} IS NULL")
+            where_clauses.append(_NOT_DELEGATE_MARKER_CHILD_SQL.format(a="s"))
 
         include_sources = [source] if source else list(sources or [])
         if include_sources:
@@ -11555,8 +12028,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     JOIN sessions parent ON parent.id = c.cur_id
                     JOIN sessions child ON child.parent_session_id = c.cur_id
                     WHERE parent.end_reason = 'compression'
-                      AND json_extract(COALESCE(child.model_config, '{{}}'), '$._branched_from') IS NULL
-                      AND json_extract(COALESCE(child.model_config, '{{}}'), '$._delegate_from') IS NULL
+                      AND {_NOT_BRANCH_MARKER_CHILD_SQL.format(a='child')}
+                      AND {_NOT_DELEGATE_MARKER_CHILD_SQL.format(a='child')}
                       AND COALESCE(child.source, '') != 'tool'
                 ),
                 chain_max AS (
@@ -12143,6 +12616,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     "UPDATE sessions SET message_count = message_count + 1 WHERE id = ?",
                     (session_id,),
                 )
+            self._bump_display_revision(conn, session_id)
             return msg_id
 
         # Transcript append is THE critical write: its failure aborts the
@@ -12215,7 +12689,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             )
             from agent.transcript_repair import resolve_and_repair_transcript_batch
 
-            inserted_rows = resolve_and_repair_transcript_batch(
+            inserted_rows, repaired_visible_rows = resolve_and_repair_transcript_batch(
                 conn,
                 session_id,
                 messages,
@@ -12241,6 +12715,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     "UPDATE sessions SET message_count = message_count + ? WHERE id = ?",
                     (inserted, session_id),
                 )
+            if inserted > 0 or repaired_visible_rows > 0:
+                self._bump_display_revision(conn, session_id)
             return inserted
 
         # Same criticality as append_message: this IS the turn's transcript.
@@ -12262,23 +12738,45 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         if not session_id or not content or not display_kind:
             return False
 
+        stored_display_kind = _scrub_surrogates(display_kind)
+        stored_display_metadata = self._encode_display_metadata(display_metadata)
+
         def _do(conn):
             row = conn.execute(
-                "SELECT id FROM messages WHERE session_id = ? AND role = ? "
+                "SELECT id, display_kind, display_metadata FROM messages "
+                "WHERE session_id = ? AND role = ? "
                 "AND content = ? AND active = 1 ORDER BY id DESC LIMIT 1",
                 (session_id, role, self._encode_content(content)),
             ).fetchone()
             if row is None:
                 return False
-            conn.execute(
+            current_display_metadata = self._decode_display_metadata(
+                row["display_metadata"]
+            )
+            requested_display_metadata = self._decode_display_metadata(
+                stored_display_metadata
+            )
+            if current_display_metadata == {}:
+                current_display_metadata = None
+            if requested_display_metadata == {}:
+                requested_display_metadata = None
+            if (
+                row["display_kind"] == stored_display_kind
+                and current_display_metadata == requested_display_metadata
+            ):
+                return False
+            updated = conn.execute(
                 "UPDATE messages SET display_kind = ?, display_metadata = ? WHERE id = ?",
                 (
-                    _scrub_surrogates(display_kind),
-                    self._encode_display_metadata(display_metadata),
-                    row[0],
+                    stored_display_kind,
+                    stored_display_metadata,
+                    row["id"],
                 ),
             )
-            return True
+            if updated.rowcount > 0:
+                self._bump_display_revision(conn, session_id)
+                return True
+            return False
 
         return bool(self._execute_write(_do))
 
@@ -12315,6 +12813,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
             meta = self._decode_display_metadata(row[0]) or {}
             existing = meta.get(self.REACTIONS_METADATA_KEY)
+            visible_before = [
+                r for r in (existing if isinstance(existing, list) else [])
+                if isinstance(r, dict)
+            ]
             reactions = [
                 r
                 for r in (existing if isinstance(existing, list) else [])
@@ -12346,6 +12848,12 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 "UPDATE messages SET display_metadata = ? WHERE id = ?",
                 (self._encode_display_metadata(meta) if meta else None, message_row_id),
             )
+            if self._encode_display_metadata(
+                {self.REACTIONS_METADATA_KEY: visible_before}
+            ) != self._encode_display_metadata(
+                {self.REACTIONS_METADATA_KEY: reactions}
+            ):
+                self._bump_display_revision(conn, session_id)
             return reactions
 
         return self._execute_write(_do)
@@ -12632,7 +13140,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         process cannot archive or replace a turn that is still being produced.
         """
 
-        active_clause = " AND active = 1" if active_only else ""
+        active_clause = " AND active = 1" if active_only or archive_dropped else ""
 
         def _do(conn):
             if reject_active_turn_lease:
@@ -12654,6 +13162,13 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     and session["end_reason"] == "compression"
                 ):
                     raise CompressionSessionClosedError(session_id)
+            affected_before = conn.execute(
+                f"SELECT 1 FROM messages WHERE session_id = ?{active_clause} LIMIT 1",
+                (session_id,),
+            ).fetchone() is not None
+            roots_before = self._capture_display_ancestor_roots(
+                conn, [session_id]
+            )
             if archive_dropped:
                 # Content-preserving UPDATE: the rows keep their FTS entries
                 # (the messages_fts triggers fire on INSERT / DELETE / UPDATE
@@ -12681,6 +13196,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 "UPDATE sessions SET message_count = ?, tool_call_count = ? WHERE id = ?",
                 (total_messages, total_tool_calls, session_id),
             )
+            if affected_before or total_messages > 0:
+                self._bump_display_revision(
+                    conn, session_id, roots_before=roots_before
+                )
 
         self._execute_write(_do)
 
@@ -12809,6 +13328,14 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     conn, session_id, model_config_patch, on_missing="raise"
                 )
 
+            had_active_messages = conn.execute(
+                "SELECT 1 FROM messages WHERE session_id = ? AND active = 1 LIMIT 1",
+                (session_id,),
+            ).fetchone() is not None
+            roots_before = self._capture_display_ancestor_roots(
+                conn, [session_id]
+            )
+
             # Concurrent tail: active rows that arrived after the watermark.
             # Snapshot their ids and tool_calls now — the clone below needs a
             # stable id list, and the tool-call count keeps sessions.* honest.
@@ -12897,17 +13424,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 # Re-sequence the concurrent tail after the compacted set via
                 # a pure-SQL column clone: no decode/re-encode round trip, no
                 # field drift — new id, active=1, compacted=0, all else exact.
-                placeholders = ",".join("?" for _ in tail_ids)
-                clone_cols = [
-                    c for c in self._message_column_names(conn)
-                    if c not in ("id", "active", "compacted")
-                ]
-                col_list = ", ".join(clone_cols)
-                conn.execute(
-                    f"INSERT INTO messages ({col_list}, active, compacted) "
-                    f"SELECT {col_list}, 1, 0 FROM messages "
-                    f"WHERE id IN ({placeholders}) ORDER BY id",
+                self._clone_message_rows_with_lineage(
+                    conn,
                     tail_ids,
+                    session_id,
                 )
                 inserted += len(tail_ids)
                 tool_calls_total += tail_tool_calls
@@ -12925,6 +13445,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     "model_config = ? WHERE id = ?",
                     (inserted, tool_calls_total, patched_model_config, session_id),
                 )
+            if had_active_messages or inserted > 0:
+                self._bump_display_revision(
+                    conn, session_id, roots_before=roots_before
+                )
             return inserted
 
         return self._execute_write(_do)
@@ -12937,6 +13461,80 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         cols = [r[1] for r in conn.execute("PRAGMA table_info(messages)").fetchall()]
         self._message_columns_cache = cols
         return cols
+
+    def _record_message_clone_lineage(
+        self,
+        conn,
+        source_ids: list[int],
+        clone_session_id: str,
+        clone_floor: int,
+    ) -> None:
+        """Record exact source/clone identity after a SQL tail copy."""
+        clone_ids = [
+            int(row["id"])
+            for row in conn.execute(
+                "SELECT id FROM messages "
+                "WHERE session_id = ? AND id > ? ORDER BY id",
+                (clone_session_id, clone_floor),
+            ).fetchall()
+        ]
+        if len(clone_ids) != len(source_ids):
+            raise RuntimeError(
+                "message clone provenance count did not match copied tail"
+            )
+        conn.executemany(
+            "INSERT INTO message_clone_lineage "
+            "(source_message_id, clone_message_id) VALUES (?, ?)",
+            list(zip(source_ids, clone_ids)),
+        )
+
+    def _clone_message_rows_with_lineage(
+        self,
+        conn,
+        source_ids: list[int],
+        clone_session_id: str,
+    ) -> int:
+        """Clone message rows and atomically record exact source identity.
+
+        Every state-layer compaction path that carries a protected tail must
+        use this primitive. Chunking stays below SQLite's common variable
+        limit, and each chunk records provenance before the write transaction
+        can commit.
+        """
+        source_ids = [int(source_id) for source_id in source_ids]
+        if not source_ids:
+            return 0
+        if len(set(source_ids)) != len(source_ids):
+            raise ValueError("message clone source ids must be unique")
+        source_ids.sort()
+        clone_cols = [
+            column
+            for column in self._message_column_names(conn)
+            if column not in ("id", "session_id", "active", "compacted")
+        ]
+        col_list = ", ".join(clone_cols)
+        for start in range(0, len(source_ids), 800):
+            chunk = source_ids[start:start + 800]
+            placeholders = ",".join("?" for _ in chunk)
+            clone_floor = int(
+                conn.execute(
+                    "SELECT COALESCE(MAX(id), 0) FROM messages"
+                ).fetchone()[0]
+            )
+            conn.execute(
+                f"INSERT INTO messages "
+                f"({col_list}, session_id, active, compacted) "
+                f"SELECT {col_list}, ?, 1, 0 FROM messages "
+                f"WHERE id IN ({placeholders}) ORDER BY id",
+                [clone_session_id, *chunk],
+            )
+            self._record_message_clone_lineage(
+                conn,
+                chunk,
+                clone_session_id,
+                clone_floor,
+            )
+        return len(source_ids)
 
     def set_latest_user_api_content(
         self, session_id: str, content: Any, api_content: str
@@ -12969,6 +13567,255 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             return cursor.rowcount
 
         return self._execute_write(_do)
+
+    def _remove_proven_message_clone_sources(
+        self, conn, rows, selected_session_ids
+    ) -> list:
+        """Hide sources cloned into the selected display lineage.
+
+        Role/content/timestamp (or even every payload column) can legitimately
+        match across two messages.  The compaction writers record the exact
+        source/clone edge. A rewound clone remains the authoritative logical
+        row even while inactive, so its parent source must not resurrect; a
+        physical clone deletion cascades the edge and makes the source visible
+        again. A clone on an unselected successor is not authoritative for the
+        selected lineage and must not hide its shared ancestor's source.
+        """
+        rows = list(rows)
+        visible_ids = {int(row["id"]) for row in rows}
+        selected_session_ids = list(dict.fromkeys(selected_session_ids))
+        if not visible_ids or not selected_session_ids:
+            return rows
+        hidden_source_ids: set[int] = set()
+        ids = list(visible_ids)
+        source_chunk_size = max(1, 900 - len(selected_session_ids))
+        session_placeholders = ",".join(
+            "?" for _ in selected_session_ids
+        )
+        for start in range(0, len(ids), source_chunk_size):
+            chunk = ids[start:start + source_chunk_size]
+            source_placeholders = ",".join("?" for _ in chunk)
+            mappings = conn.execute(
+                "SELECT lineage.source_message_id "
+                "FROM message_clone_lineage AS lineage "
+                "JOIN messages AS clone "
+                "ON clone.id = lineage.clone_message_id "
+                "WHERE lineage.source_message_id IN "
+                f"({source_placeholders}) "
+                f"AND clone.session_id IN ({session_placeholders})",
+                [*chunk, *selected_session_ids],
+            ).fetchall()
+            hidden_source_ids.update(
+                int(mapping["source_message_id"])
+                for mapping in mappings
+            )
+        return [
+            row for row in rows if int(row["id"]) not in hidden_source_ids
+        ]
+
+    def _dedupe_legacy_message_clone_rows(self, conn, rows) -> list:
+        """Preserve pre-provenance display behavior below a durable boundary.
+
+        Existing installations already collapsed column-identical compaction
+        copies in display reads. The first schema open that creates the exact
+        lineage table records the then-current maximum message id. Only rows at
+        or below that boundary retain the historical display heuristic; later
+        equal rows remain distinct unless an explicit clone edge proves their
+        identity. No inferred edge is persisted.
+        """
+        rows = list(rows)
+        boundary_row = conn.execute(
+            "SELECT value FROM state_meta WHERE key = ? LIMIT 1",
+            (MESSAGE_CLONE_LINEAGE_LEGACY_CEILING_KEY,),
+        ).fetchone()
+        if boundary_row is None:
+            return rows
+        try:
+            legacy_ceiling = int(boundary_row[0])
+        except (TypeError, ValueError):
+            return rows
+        if legacy_ceiling <= 0:
+            return rows
+
+        seen: dict = {}
+        for row in rows:
+            if int(row["id"]) > legacy_ceiling:
+                continue
+            dedupe_content = row["content"]
+            if row["role"] == "user":
+                from agent.context_compressor import split_user_originated_turn
+
+                candidate = {
+                    "role": "user",
+                    "content": self._decode_content(row["content"]),
+                    "display_kind": row["display_kind"],
+                    "display_metadata": self._decode_display_metadata(
+                        row["display_metadata"]
+                    ),
+                }
+                handoff, live_view = split_user_originated_turn(candidate)
+                if handoff is not None and live_view is not None:
+                    dedupe_content = self._encode_content(
+                        live_view.get("content")
+                    )
+            key = (
+                row["role"],
+                dedupe_content,
+                row["timestamp"],
+                row["tool_call_id"],
+                row["tool_calls"],
+                row["tool_name"],
+            )
+            current = seen.get(key)
+            if current is None or (row["active"], row["id"]) > (
+                current["active"],
+                current["id"],
+            ):
+                seen[key] = row
+
+        retained_legacy_ids = {int(row["id"]) for row in seen.values()}
+        return [
+            row
+            for row in rows
+            if int(row["id"]) > legacy_ceiling
+            or int(row["id"]) in retained_legacy_ids
+        ]
+
+    @staticmethod
+    def _page_message_rows(rows, *, limit, offset, latest) -> list:
+        rows = list(rows)
+        if latest:
+            rows.reverse()
+        rows = rows[offset:]
+        if limit is not None:
+            rows = rows[:limit]
+        if latest:
+            rows.reverse()
+        return rows
+
+    def _get_message_rows_from_conn(
+        self,
+        conn,
+        session_id: str,
+        include_inactive: bool = False,
+        include_compacted: bool = False,
+        limit: Optional[int] = None,
+        offset: int = 0,
+        latest: bool = False,
+        after_id: Optional[int] = None,
+    ) -> list:
+        if after_id is not None and (latest or offset):
+            raise ValueError("after_id is incompatible with latest/offset paging")
+        if after_id is not None and include_compacted:
+            raise ValueError("after_id is incompatible with include_compacted (deduped display reads use offset paging)")
+        if include_inactive:
+            # Audit / debug reads: every row, including soft-deleted.
+            active_clause = ""
+        elif include_compacted:
+            # Display history: active rows plus rows preserved by in-place
+            # compaction (active=0, compacted=1), but never soft-deleted
+            # Undo/Rewind rows (active=0, compacted=0).
+            active_clause = " AND (active = 1 OR compacted = 1)"
+        else:
+            active_clause = " AND active = 1"
+        keyset_clause = " AND id > ?" if after_id is not None else ""
+        sql = (
+            "SELECT * FROM messages WHERE session_id = ?"
+            f"{active_clause}{keyset_clause} ORDER BY id {'DESC' if latest else 'ASC'}"
+        )
+        params: list = [session_id]
+        if after_id is not None:
+            params.append(after_id)
+        if include_compacted:
+            # Compaction epochs can copy a protected tail into a new
+            # generation. Read the full display set so explicit clone edges
+            # can be resolved before paging; never infer identity from equal
+            # payload columns.
+            cursor = conn.execute(
+                "SELECT * FROM messages WHERE session_id = ?" + active_clause
+                + " ORDER BY id ASC",
+                [session_id],
+            )
+            visible_rows = self._remove_proven_message_clone_sources(
+                conn, cursor.fetchall(), [session_id]
+            )
+            rows = self._page_message_rows(
+                self._dedupe_legacy_message_clone_rows(
+                    conn, visible_rows
+                ),
+                limit=limit,
+                offset=offset,
+                latest=latest,
+            )
+        else:
+            if limit is not None or offset:
+                # SQLite's OFFSET requires LIMIT; -1 means "no limit".
+                sql += " LIMIT ? OFFSET ?"
+                params.extend([-1 if limit is None else limit, offset])
+            cursor = conn.execute(sql, params)
+            rows = cursor.fetchall()
+            if latest:
+                rows.reverse()
+        return rows
+
+    def _get_display_lineage_message_rows_from_conn(
+        self,
+        conn,
+        session_ids: list[str],
+        *,
+        include_compacted: bool,
+        limit: Optional[int],
+        offset: int,
+        latest: bool,
+    ) -> list:
+        if len(session_ids) == 1:
+            return self._get_message_rows_from_conn(
+                conn,
+                session_ids[0],
+                include_compacted=include_compacted,
+                limit=limit,
+                offset=offset,
+                latest=latest,
+            )
+
+        rows = []
+        for session_id in session_ids:
+            rows.extend(
+                self._get_message_rows_from_conn(
+                    conn,
+                    session_id,
+                    include_compacted=include_compacted,
+                    latest=False,
+                )
+            )
+        visible_rows = self._remove_proven_message_clone_sources(
+            conn, rows, session_ids
+        )
+        return self._page_message_rows(
+            self._dedupe_legacy_message_clone_rows(conn, visible_rows),
+            limit=limit,
+            offset=offset,
+            latest=latest,
+        )
+
+    def _decode_message_rows(self, rows) -> List[Dict[str, Any]]:
+        result = []
+        for row in rows:
+            msg = dict(row)
+            if msg.pop("_compressed_summary", 0):
+                msg["_compressed_summary"] = True
+            if "content" in msg:
+                msg["content"] = self._decode_content(msg["content"])
+            if msg.get("tool_calls"):
+                try:
+                    msg["tool_calls"] = json.loads(msg["tool_calls"])
+                except (json.JSONDecodeError, TypeError):
+                    logger.warning("Failed to deserialize tool_calls in get_messages, falling back to []")
+                    msg["tool_calls"] = []
+            if msg.get("display_metadata") is not None:
+                msg["display_metadata"] = self._decode_display_metadata(msg["display_metadata"])
+            result.append(msg)
+        return result
 
     def get_messages(
         self,
@@ -13011,113 +13858,73 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         page seeks on huge transcripts where OFFSET degrades to O(n) per
         page. Ascending order only (incompatible with ``latest``/``offset``).
         """
-        if after_id is not None and (latest or offset):
-            raise ValueError("after_id is incompatible with latest/offset paging")
-        if after_id is not None and include_compacted:
-            raise ValueError("after_id is incompatible with include_compacted (deduped display reads use offset paging)")
-        if include_inactive:
-            # Audit / debug reads: every row, including soft-deleted.
-            active_clause = ""
-        elif include_compacted:
-            # Display history: active rows plus rows preserved by in-place
-            # compaction (active=0, compacted=1), but never soft-deleted
-            # Undo/Rewind rows (active=0, compacted=0).
-            active_clause = " AND (active = 1 OR compacted = 1)"
-        else:
-            active_clause = " AND active = 1"
-        keyset_clause = " AND id > ?" if after_id is not None else ""
-        sql = (
-            "SELECT * FROM messages WHERE session_id = ?"
-            f"{active_clause}{keyset_clause} ORDER BY id {'DESC' if latest else 'ASC'}"
-        )
-        params: list = [session_id]
-        if after_id is not None:
-            params.append(after_id)
-        if include_compacted:
-            # Compaction epochs copy the protected tail into each new
-            # generation, so the same logical message can exist as several
-            # rows (identical role/content/timestamp) with different active
-            # flags and ids. A display read must surface each message exactly
-            # once: prefer the live row, then the newest generation. Read the
-            # full display set (a session's rows are bounded; the UI-level
-            # 500-row cap lives in the endpoint, not here), dedupe in Python,
-            # then apply paging.
-            with self._read_ctx() as conn:
-                cursor = conn.execute(
-                    "SELECT * FROM messages WHERE session_id = ?" + active_clause
-                    + " ORDER BY id ASC",
-                    [session_id],
-                )
-                all_rows = cursor.fetchall()
-            seen: dict = {}
-            for row in all_rows:
-                dedupe_content = row["content"]
-                if row["role"] == "user":
-                    from agent.context_compressor import split_user_originated_turn
+        with self._read_ctx() as conn:
+            rows = self._get_message_rows_from_conn(
+                conn,
+                session_id,
+                include_inactive=include_inactive,
+                include_compacted=include_compacted,
+                limit=limit,
+                offset=offset,
+                latest=latest,
+                after_id=after_id,
+            )
+        return self._decode_message_rows(rows)
 
-                    candidate = {
-                        "role": "user",
-                        "content": self._decode_content(row["content"]),
-                        "display_kind": row["display_kind"],
-                        "display_metadata": self._decode_display_metadata(
-                            row["display_metadata"]
-                        ),
-                    }
-                    handoff, live_view = split_user_originated_turn(candidate)
-                    if handoff is not None and live_view is not None:
-                        dedupe_content = self._encode_content(
-                            live_view.get("content")
-                        )
-                # Tool fields participate in the dedupe key: compaction copies
-                # them verbatim, so identical tool messages across generations
-                # still collapse, while distinct tool calls that happen to
-                # share role/content/timestamp are never merged.
-                key = (
-                    row["role"],
-                    dedupe_content,
-                    row["timestamp"],
-                    row["tool_call_id"],
-                    row["tool_calls"],
-                    row["tool_name"],
+    def get_display_message_page(
+        self,
+        requested_session_id: str,
+        *,
+        limit: int,
+        offset: int = 0,
+        latest: bool = True,
+        include_compacted: bool = True,
+        known_display_revision: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """Load one conditional transcript page from one SQLite snapshot."""
+        rows = None
+        with self._read_transaction_ctx() as conn:
+            resolved_id = self._resolve_session_id_from_conn(
+                conn, requested_session_id
+            )
+            if resolved_id is None:
+                raise KeyError(f"Session not found: {requested_session_id}")
+            root_id = self._display_lineage_root_from_conn(conn, resolved_id)
+            tip_id, lineage_ids = self._resolve_resume_lineage_from_conn(
+                conn, root_id
+            )
+            revision = self._display_revision_from_conn(conn, root_id)
+            unchanged = (
+                isinstance(known_display_revision, int)
+                and not isinstance(known_display_revision, bool)
+                and known_display_revision >= 0
+                and known_display_revision == revision
+            )
+            if not unchanged:
+                rows = self._get_display_lineage_message_rows_from_conn(
+                    conn,
+                    lineage_ids,
+                    include_compacted=include_compacted,
+                    limit=limit,
+                    offset=offset,
+                    latest=latest,
                 )
-                cur = seen.get(key)
-                if cur is None or (row["active"], row["id"]) > (cur["active"], cur["id"]):
-                    seen[key] = row
-            rows = sorted(seen.values(), key=lambda r: r["id"])
-            if latest:
-                rows = rows[::-1]
-            rows = rows[offset:]
-            if limit is not None:
-                rows = rows[:limit]
-            if latest:
-                rows = rows[::-1]
-        else:
-            if limit is not None or offset:
-                # SQLite's OFFSET requires LIMIT; -1 means "no limit".
-                sql += " LIMIT ? OFFSET ?"
-                params.extend([-1 if limit is None else limit, offset])
-            with self._read_ctx() as conn:
-                cursor = conn.execute(sql, params)
-                rows = cursor.fetchall()
-            if latest:
-                rows.reverse()
-        result = []
-        for row in rows:
-            msg = dict(row)
-            if msg.pop("_compressed_summary", 0):
-                msg["_compressed_summary"] = True
-            if "content" in msg:
-                msg["content"] = self._decode_content(msg["content"])
-            if msg.get("tool_calls"):
-                try:
-                    msg["tool_calls"] = json.loads(msg["tool_calls"])
-                except (json.JSONDecodeError, TypeError):
-                    logger.warning("Failed to deserialize tool_calls in get_messages, falling back to []")
-                    msg["tool_calls"] = []
-            if msg.get("display_metadata") is not None:
-                msg["display_metadata"] = self._decode_display_metadata(msg["display_metadata"])
-            result.append(msg)
-        return result
+
+        messages = [] if unchanged else self._decode_message_rows(rows)
+        return {
+            "session_id": tip_id,
+            "lineage_root_id": root_id,
+            "resolved_tip_id": tip_id,
+            "display_revision": revision,
+            "unchanged": unchanged,
+            "messages": messages,
+            "pagination": {
+                "limit": limit,
+                "offset": offset,
+                "order": "latest" if latest else "oldest",
+                "returned": len(messages),
+            },
+        }
 
     def find_pr_url_messages(self, session_ids: List[str]) -> List[Dict[str, Any]]:
         """Tool results in these sessions that mention a GitHub PR url.
@@ -13249,74 +14056,14 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         """
         if not session_id:
             return session_id
-
-        # Follow the compression-continuation chain forward to the live tip
-        # FIRST. Auto-compression ends the current session and forks a
-        # continuation child, but a long-lived parent keeps its own flushed
-        # message rows — so the empty-head walk below never redirects it, and
-        # resuming the parent id reloads the pre-compression transcript while
-        # the turns generated *after* compression (and their responses) sit in
-        # the continuation. ``get_compression_tip`` is lineage-aware: it only
-        # follows children whose parent ended with ``end_reason='compression'``
-        # (created after the parent was ended), so delegation / branch children
-        # never hijack the resume. This is the fix for the desktop "I came back
-        # and the reply isn't there" report on large sessions.
         try:
-            tip = self.get_compression_tip(session_id)
+            with self._read_ctx() as conn:
+                tip, _path = self._resolve_resume_lineage_from_conn(
+                    conn, session_id
+                )
+            return tip
         except Exception:
-            tip = session_id
-        if tip and tip != session_id:
-            session_id = tip
-
-        with self._read_ctx() as conn:
-            current = session_id
-            seen = {current}
-            best = None  # tracks the last (deepest) node with messages
-
-            for _ in range(32):
-                # Check if the current node has messages.
-                try:
-                    row = conn.execute(
-                        "SELECT 1 FROM messages WHERE session_id = ? LIMIT 1",
-                        (current,),
-                    ).fetchone()
-                except Exception:
-                    return session_id
-                if row is not None:
-                    best = current
-
-                # Walk to the most-recently-started child — but skip explicit
-                # branch (`_branched_from`), delegate/subagent (`_delegate_from`),
-                # reset-continuation (`_reset_from` or the legacy same-key
-                # heuristic — a post-reset conversation must never be reached
-                # by resuming the parent the user reset away), and tool
-                # children. They also carry a ``parent_session_id`` yet
-                # are NOT compression continuations; following them would hijack
-                # the resume target to an unrelated session (e.g. a subagent
-                # run). This mirrors the child-exclusion in ``get_compression_tip``.
-                try:
-                    child_row = conn.execute(
-                        "SELECT id FROM sessions AS child "
-                        "WHERE child.parent_session_id = ? "
-                        "  AND json_extract(COALESCE(child.model_config, '{}'), '$._branched_from') IS NULL "
-                        "  AND json_extract(COALESCE(child.model_config, '{}'), '$._delegate_from') IS NULL "
-                        "  AND json_extract(COALESCE(child.model_config, '{}'), '$._reset_from') IS NULL "
-                        f"  AND NOT {_legacy_reset_child_sql('child', _RESET_END_REASONS_SQL)} "
-                        "  AND COALESCE(child.source, '') != 'tool' "
-                        "ORDER BY child.started_at DESC, child.id DESC LIMIT 1",
-                        (current,),
-                    ).fetchone()
-                except Exception:
-                    return session_id
-                if child_row is None:
-                    break
-                child_id = child_row["id"] if hasattr(child_row, "keys") else child_row[0]
-                if not child_id or child_id in seen:
-                    break
-                seen.add(child_id)
-                current = child_id
-
-            return best if best is not None else session_id
+            return session_id
 
     def get_messages_as_conversation(
         self,
@@ -13344,9 +14091,11 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         Inspection/export consumers keep the default and see the transcript
         verbatim.
         """
-        session_ids = [session_id]
-        if include_ancestors and not self._is_explicit_branch_session(session_id):
-            session_ids = self._session_lineage_root_to_tip(session_id)
+        session_ids = (
+            self._history_lineage_root_to_tip(session_id)
+            if include_ancestors
+            else [session_id]
+        )
 
         active_clause = "" if include_inactive else " AND active = 1"
         with self._read_ctx() as conn:
@@ -13597,11 +14346,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         halves the resume's DB work versus two separate calls, with byte-identical
         output (see test_get_resume_conversations_matches_separate_reads).
         """
-        session_ids = (
-            [session_id]
-            if self._is_explicit_branch_session(session_id)
-            else self._session_lineage_root_to_tip(session_id)
-        )
+        session_ids = self._history_lineage_root_to_tip(session_id)
         with self._read_ctx() as conn:
             placeholders = ",".join("?" for _ in session_ids)
             rows = conn.execute(
@@ -13639,7 +14384,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
     def get_resume_message_count(self, session_id: str) -> int:
         """Count active rows that a full resume would materialize."""
-        session_ids = self._session_lineage_root_to_tip(session_id)
+        session_ids = self._history_lineage_root_to_tip(session_id)
         placeholders = ",".join("?" for _ in session_ids)
         with self._read_ctx() as conn:
             row = conn.execute(
@@ -13670,7 +14415,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             # return value, and an unbounded lineage COUNT here would do the
             # exact pathological work the disable exists to avoid.
             return 0
-        session_ids = self._session_lineage_root_to_tip(session_id)
+        session_ids = self._history_lineage_root_to_tip(session_id)
         placeholders = ",".join("?" for _ in session_ids)
         with self._read_ctx() as conn:
             row = conn.execute(
@@ -13741,10 +14486,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         returns ONLY the genuine ancestor messages, identified by
         ``session_id != tip_session_id``. (#65919)
         """
-        if self._is_explicit_branch_session(session_id):
-            return []
-
-        session_ids = self._session_lineage_root_to_tip(session_id)
+        session_ids = self._history_lineage_root_to_tip(session_id)
         if len(session_ids) <= 1:
             return []
         with self._read_ctx() as conn:
@@ -13791,19 +14533,52 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             return False
         with self._read_ctx() as conn:
             row = conn.execute(
-                "SELECT model_config FROM sessions WHERE id = ?",
+                "SELECT parent_session_id, model_config FROM sessions WHERE id = ?",
                 (session_id,),
             ).fetchone()
         if row is None:
             return False
-        raw_config = row["model_config"] if hasattr(row, "keys") else row[0]
+        parent_id = row["parent_session_id"] if hasattr(row, "keys") else row[0]
+        raw_config = row["model_config"] if hasattr(row, "keys") else row[1]
         if not raw_config:
             return False
         try:
             config = json.loads(raw_config) if isinstance(raw_config, str) else raw_config
         except (json.JSONDecodeError, TypeError):
             return False
-        return isinstance(config, dict) and bool(config.get("_branched_from"))
+        return (
+            isinstance(config, dict)
+            and bool(parent_id)
+            and config.get("_branched_from") == parent_id
+        )
+
+    def _history_lineage_root_to_tip(self, session_id: str) -> List[str]:
+        """Return history segments, stopping at a parent-bound branch edge."""
+        lineage = self._session_lineage_root_to_tip(session_id)
+        if len(lineage) <= 1:
+            return lineage
+        placeholders = ",".join("?" for _ in lineage)
+        with self._read_ctx() as conn:
+            rows = conn.execute(
+                "SELECT id, parent_session_id, model_config FROM sessions "
+                f"WHERE id IN ({placeholders})",
+                tuple(lineage),
+            ).fetchall()
+        by_id = {row["id"]: row for row in rows}
+        for index, sid in enumerate(lineage):
+            row = by_id.get(sid)
+            if row is None or not row["parent_session_id"]:
+                continue
+            raw_config = row["model_config"]
+            try:
+                config = json.loads(raw_config) if isinstance(raw_config, str) else raw_config
+            except (json.JSONDecodeError, TypeError):
+                continue
+            if isinstance(config, dict) and config.get("_branched_from") == row[
+                "parent_session_id"
+            ]:
+                return lineage[index:]
+        return lineage
 
     def get_conversation_root(self, session_id: str) -> str:
         """Return the ROOT id of *session_id*'s lineage chain.
@@ -14020,6 +14795,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 reject_active_turn_lease=True,
                 reject_active_compression_lock=True,
             )
+            roots_before = self._capture_display_ancestor_roots(
+                conn, [session_id]
+            )
 
             if expected_active_ids is not None:
                 active_rows = conn.execute(
@@ -14110,6 +14888,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 "WHERE id = ?",
                 (message_count, tool_call_count, session_id),
             )
+            if ids or replacement_message_id is not None:
+                self._bump_display_revision(
+                    conn, session_id, roots_before=roots_before
+                )
             head_row = conn.execute(
                 "SELECT MAX(id) FROM messages WHERE session_id = ? AND active = 1",
                 (session_id,),
@@ -14156,6 +14938,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     f"UPDATE messages SET active = 1 WHERE id IN ({placeholders})",
                     ids,
                 )
+                self._bump_display_revision(conn, session_id)
             return len(ids)
 
         return self._execute_write(_do)
@@ -14246,7 +15029,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             # count lines up with the rows: roots plus user-visible branch/reset
             # children.
             where_clauses.append(_LISTABLE_CHILD_SQL)
-            where_clauses.append(f"{_delegate_from_json('s.model_config')} IS NULL")
+            where_clauses.append(_NOT_DELEGATE_MARKER_CHILD_SQL.format(a="s"))
         include_sources = [source] if source else list(sources or [])
         if include_sources:
             placeholders = ",".join("?" for _ in include_sources)
@@ -14315,7 +15098,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
         if exclude_children:
             where_clauses.append(_LISTABLE_CHILD_SQL)
-            where_clauses.append(f"{_delegate_from_json('s.model_config')} IS NULL")
+            where_clauses.append(_NOT_DELEGATE_MARKER_CHILD_SQL.format(a="s"))
         if archived_only:
             where_clauses.append("s.archived = 1")
         elif not include_archived:
@@ -14396,7 +15179,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         delegated = cfg.get("_delegate_from")
         if parent_id:
             return branched == parent_id or delegated == parent_id
-        return branched is not None or delegated is not None
+        # A branch marker describes the direct fork edge and has no orphan
+        # exception. Delegate orphans remain a separate established safety
+        # fence for cleanup (mirroring _DELEGATE_MARKER_CHILD_SQL).
+        return delegated is not None and delegated != ""
 
     def is_explicit_fork_child(self, session_id: str) -> bool:
         """True when ``session_id`` is a /branch, delegate, or tool child row.
@@ -14543,13 +15329,20 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
     def clear_messages(self, session_id: str) -> None:
         """Delete all messages for a session and reset its counters."""
         def _do(conn):
-            conn.execute(
+            roots_before = self._capture_display_ancestor_roots(
+                conn, [session_id]
+            )
+            deleted = conn.execute(
                 "DELETE FROM messages WHERE session_id = ?", (session_id,)
             )
             conn.execute(
                 "UPDATE sessions SET message_count = 0, tool_call_count = 0 WHERE id = ?",
                 (session_id,),
             )
+            if deleted.rowcount > 0:
+                self._bump_display_revision(
+                    conn, session_id, roots_before=roots_before
+                )
         self._execute_write(_do)
 
     @staticmethod
@@ -14632,13 +15425,17 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             )
             if cursor.fetchone() is None:
                 return False
+            delegate_ids = _collect_delegate_child_ids(conn, [session_id])
+            actual_ids = {session_id, *delegate_ids}
             if expected_ids is not None:
-                actual_ids = {
-                    session_id,
-                    *_collect_delegate_child_ids(conn, [session_id]),
-                }
                 if actual_ids != expected_ids:
                     return False
+            roots_before = self._capture_display_ancestor_roots(
+                conn, actual_ids
+            )
+            surviving_child_ids = self._surviving_children_for_deleted_sessions(
+                conn, actual_ids
+            )
             removed_delegate_ids.extend(_delete_delegate_children(conn, [session_id]))
             # Orphan remaining child sessions (branches, etc.) so FK is satisfied.
             conn.execute(
@@ -14649,6 +15446,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             conn.execute("DELETE FROM messages WHERE session_id = ?", (session_id,))
             conn.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
             self._delete_unreferenced_system_prompts(conn)
+            self._invalidate_display_topology(
+                conn, roots_before, surviving_child_ids
+            )
             return True
 
         deleted = self._execute_write(_do)
@@ -14756,6 +15556,14 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 return 0
 
             existing_placeholders = ",".join("?" * len(existing))
+            delegate_ids = _collect_delegate_child_ids(conn, existing)
+            deleted_ids = {*existing, *delegate_ids}
+            roots_before = self._capture_display_ancestor_roots(
+                conn, [*existing, *delegate_ids]
+            )
+            surviving_child_ids = self._surviving_children_for_deleted_sessions(
+                conn, deleted_ids
+            )
             removed_delegate_ids.extend(_delete_delegate_children(conn, existing))
             # Orphan remaining children whose parent is in the kill list so the
             # FK constraint stays satisfied. Pin children whose parent
@@ -14776,6 +15584,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 existing,
             )
             self._delete_unreferenced_system_prompts(conn)
+            self._invalidate_display_topology(
+                conn, roots_before, surviving_child_ids
+            )
             removed_ids.extend(existing)
             return len(existing)
 
@@ -15266,6 +16077,12 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             if not session_ids:
                 return 0
 
+            roots_before = self._capture_display_ancestor_roots(
+                conn, session_ids
+            )
+            surviving_child_ids = self._surviving_children_for_deleted_sessions(
+                conn, session_ids
+            )
             # Orphan any sessions whose parent is about to be deleted
             placeholders = ",".join("?" * len(session_ids))
             conn.execute(
@@ -15279,6 +16096,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 conn.execute("DELETE FROM sessions WHERE id = ?", (sid,))
                 removed_ids.append(sid)
             self._delete_unreferenced_system_prompts(conn)
+            self._invalidate_display_topology(
+                conn, roots_before, surviving_child_ids
+            )
             return len(session_ids)
 
         count = self._execute_write(_do)
@@ -15370,10 +16190,19 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             ids = _find_affected(conn)
             if ids:
                 placeholders = ",".join("?" * len(ids))
+                sessions = conn.execute(
+                    f"SELECT DISTINCT session_id FROM messages WHERE id IN ({placeholders})",
+                    ids,
+                ).fetchall()
+                roots = self._capture_display_ancestor_roots(
+                    conn, [row["session_id"] for row in sessions]
+                )
                 conn.execute(
                     f"UPDATE messages SET content = '' WHERE id IN ({placeholders})",
                     ids,
                 )
+                for root_id in roots:
+                    self._bump_display_revision_root(conn, root_id)
             return ids
 
         affected_ids = self._execute_write(_do)
