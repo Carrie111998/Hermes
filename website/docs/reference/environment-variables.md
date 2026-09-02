@@ -340,6 +340,7 @@ These are set automatically by the Docker terminal backend when `proxy.enabled: 
 | `DISCORD_HOME_CHANNEL` | Default Discord channel for cron delivery |
 | `DISCORD_HOME_CHANNEL_NAME` | Display name for the Discord home channel |
 | `DISCORD_COMMAND_SYNC_POLICY` | Discord slash-command startup sync policy: `safe` (diff and reconcile), `bulk` (legacy `tree.sync()`), or `off` |
+| `HERMES_DISCORD_COMMAND_SYNC_TIMEOUT` | Seconds allowed for the `safe` slash-command sync reconciliation before it is cancelled and retried on the next reconnect (default 600) |
 | `DISCORD_REQUIRE_MENTION` | Require an @mention before responding in server channels |
 | `DISCORD_FREE_RESPONSE_CHANNELS` | Comma-separated channel IDs where mention is not required |
 | `DISCORD_AUTO_THREAD` | Auto-thread long replies when supported |

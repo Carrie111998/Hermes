@@ -77,6 +77,12 @@ _DISCORD_NONCONVERSATIONAL_STATE_FILENAME = "discord_nonconversational_messages.
 
 _DISCORD_COMMAND_SYNC_MUTATION_INTERVAL_SECONDS = 4.5
 _DISCORD_COMMAND_SYNC_MAX_RATE_LIMIT_SLEEP_SECONDS = 30.0
+# Whole-reconciliation budget for the safe slash-command sync path. Large
+# fleets with dozens of commands reconcile one HTTP mutation at a time
+# (spaced by _DISCORD_COMMAND_SYNC_MUTATION_INTERVAL_SECONDS), so the total
+# can legitimately exceed this bound on slow days; operators can raise it via
+# HERMES_DISCORD_COMMAND_SYNC_TIMEOUT instead of losing syncs to the timeout.
+_DISCORD_COMMAND_SYNC_TIMEOUT_DEFAULT_SECONDS = 600.0
 # Discord enforces a hard cap of 100 global application (slash) commands per
 # app. Registering more makes the ENTIRE sync fail with error 30032
 # ("Maximum number of application commands reached"), which silently breaks
@@ -608,6 +614,20 @@ def _discord_ready_timeout_seconds() -> float:
                 raw,
             )
     return 30.0
+
+
+def _discord_command_sync_timeout_seconds() -> float:
+    """Return the bounded wait for the safe slash-command sync reconciliation."""
+    raw = os.getenv("HERMES_DISCORD_COMMAND_SYNC_TIMEOUT", "").strip()
+    if raw:
+        try:
+            return max(1.0, float(raw))
+        except ValueError:
+            logger.warning(
+                "Ignoring invalid HERMES_DISCORD_COMMAND_SYNC_TIMEOUT=%r",
+                raw,
+            )
+    return _DISCORD_COMMAND_SYNC_TIMEOUT_DEFAULT_SECONDS
 
 
 class VoiceReceiver:
@@ -2480,7 +2500,10 @@ class DiscordAdapter(BasePlatformAdapter):
                 # discord.py can otherwise sit inside one long retry sleep
                 # before surfacing the 429. Keep the whole sync bounded and
                 # persist Discord's retry-after when it refuses the batch.
-                summary = await asyncio.wait_for(self._safe_sync_slash_commands(), timeout=600)
+                summary = await asyncio.wait_for(
+                    self._safe_sync_slash_commands(),
+                    timeout=_discord_command_sync_timeout_seconds(),
+                )
             except Exception as e:
                 if not self._is_discord_rate_limit(e):
                     raise
