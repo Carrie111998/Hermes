@@ -986,7 +986,8 @@ function Install-Uv {
             if (Test-Path $manifestPath) {
                 try {
                     $offlineManifest = Get-Content $manifestPath -Raw | ConvertFrom-Json
-                    $expectedHash = ($offlineManifest.assets | Where-Object { $_.name -eq "uv.exe" }).hash
+                    $uvAsset = $offlineManifest.assets | Where-Object { $_.name -eq "uv.exe" }
+                    $expectedHash = if ($uvAsset) { $uvAsset.hash } else { $null }
                     if ($expectedHash -and -not (Test-OfflineAssetHash -FilePath $offlineUv -ExpectedHash $expectedHash)) {
                         Write-Err "SHA-256 mismatch for uv.exe — offline asset may be corrupted"
                         Write-Err "Expected: $expectedHash"
