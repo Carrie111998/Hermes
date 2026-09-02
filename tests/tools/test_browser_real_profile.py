@@ -983,6 +983,7 @@ class TestReviewRound3:
                    return_value=(str(tmp_path), None)) as snap, \
              patch("hermes_cli.browser_connect.chromium_executable",
                    return_value="/usr/bin/chrome"), \
+             patch.object(bt, "_real_profile_chrome_procs", []), \
              patch.object(bt.subprocess, "Popen", side_effect=fake_popen), \
              patch.object(bt, "_agent_browser_get_cdp",
                           side_effect=[None, "http://127.0.0.1:41000"]), \
