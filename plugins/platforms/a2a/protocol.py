@@ -30,7 +30,7 @@ from collections import OrderedDict, defaultdict, deque
 from concurrent.futures import Future
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 PROTOCOL_VERSION = "1.0"
 
@@ -574,6 +574,31 @@ metrics = Metrics()
 # Task store — pending AND completed tasks (queryable via tasks/get, tasks/list)
 # --------------------------------------------------------------------------
 
+_MESSAGE_PROTO_FIELDS = frozenset({
+    "messageId", "contextId", "taskId", "role", "parts", "metadata",
+    "extensions", "referenceTaskIds",
+})
+
+
+def task_history_message(message: Any, task_id: str, context_id: str) -> Optional[dict]:
+    """Build the receiver-owned Message record stored under ``Task.history``.
+
+    Preserve the A2A Message correlation and task-tree fields while dropping
+    caller-only keys that strict ProtoJSON clients would reject.  The returned
+    copy is receiver-owned; the inbound request object is never mutated.
+    """
+    if not isinstance(message, dict):
+        return None
+    out = {
+        key: copy.deepcopy(value)
+        for key, value in message.items()
+        if key in _MESSAGE_PROTO_FIELDS
+    }
+    out["taskId"] = task_id
+    out["contextId"] = context_id
+    return out
+
+
 class TaskStore:
     """In-memory store of A2A tasks, kept after completion for tasks/get.
 
@@ -598,7 +623,9 @@ class TaskStore:
         return True
 
     def create(self, task_id: str, context_id: str, peer: str,
-               agent_slug: str = "", tenant: str = "") -> dict:
+               agent_slug: str = "", tenant: str = "",
+               message: Optional[dict] = None) -> dict:
+        history_message = task_history_message(message, task_id, context_id)
         rec = {
             "task_id": task_id,
             "context_id": context_id,
@@ -611,6 +638,7 @@ class TaskStore:
             "created_iso": now_iso(),
             "push_url": "",
             "push_config_id": "",
+            "history": [history_message] if history_message is not None else [],
         }
         with self._lock:
             self._tasks[task_id] = rec
@@ -748,14 +776,25 @@ class TaskStore:
             return page, next_offset, total
         return page, next_offset
 
-    def fail_orphans(self, timeout_seconds: int = 300) -> list[str]:
+    def fail_orphans(
+        self,
+        timeout_seconds: int = 300,
+        timeout_for: Optional[Callable[[dict], float]] = None,
+    ) -> list[str]:
         with self._lock:
             now = time.time()
-            stale = [
-                tid for tid, rec in self._tasks.items()
-                if rec["state"] not in TERMINAL_STATES
-                and now - rec["created_at"] > timeout_seconds
-            ]
+            stale = []
+            for tid, rec in self._tasks.items():
+                if rec["state"] in TERMINAL_STATES:
+                    continue
+                limit = float(timeout_seconds)
+                if timeout_for is not None:
+                    try:
+                        limit = max(limit, float(timeout_for(rec)))
+                    except (TypeError, ValueError):
+                        pass
+                if now - rec["created_at"] > limit:
+                    stale.append(tid)
         failed = []
         for tid in stale:
             if self.complete(tid, STATE_FAILED, "[task orphaned — no reply produced]"):
@@ -782,6 +821,11 @@ class TaskStore:
             task.pop("artifacts", None)
         if history_length == 0:
             task.pop("history", None)
+        elif rec.get("history"):
+            history = rec["history"]
+            if history_length is not None:
+                history = history[-max(0, int(history_length)):]
+            task["history"] = copy.deepcopy(history)
         return copy.deepcopy(task)
 
 # --------------------------------------------------------------------------

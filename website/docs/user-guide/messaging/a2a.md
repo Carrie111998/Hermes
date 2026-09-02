@@ -27,6 +27,7 @@ gateway:
       enabled: true
       extra:
         port: 9900
+        reply_timeout: 900  # optional; default 300 seconds
 ```
 
 The outbound client tools ship as the `a2a` toolset, **off by default** — enable it per platform:
@@ -83,12 +84,23 @@ Secure by default; every widening step is explicit:
 
 - **No token ⇒ localhost only.** The server binds `127.0.0.1`. Remote exposure requires a bearer token **and** an explicit `A2A_HOST`.
 - **Per-peer tokens** — `A2A_PEER_TOKENS="alice:tok1,bob:tok2"` gives each peer its own credential; the authenticated name drives rate limiting, trust, and audit.
-- **Prompt-injection filtering** — inbound text is filtered and framed as untrusted peer input. Remote peers cannot invoke operator slash commands.
+- **Prompt-injection filtering** — inbound text is filtered before framing. Remote peers cannot invoke operator slash commands.
+- **Governor framing** — identities listed in `a2a.governor_peers` receive delegated-authority framing only when their identity is proven by a matching `A2A_PEER_TOKENS` credential. Shared-token and loopback-IP identities remain untrusted peer input. Filtering, redaction, slash-command isolation, and higher-priority safety rules stay active.
 - **Outbound redaction** — credential-shaped strings (API keys, JWTs, tokens) are scrubbed from replies.
 - **Audit log** — every exchange appends to `~/.hermes/a2a_audit.jsonl`.
 - **Anti-loop** — per-context turn caps stop two agents ping-ponging forever.
 
 ## Configuration reference
+
+Governor peers are configured in `config.yaml`; credentials remain in the environment:
+
+```yaml
+a2a:
+  governor_peers:
+    - alice
+```
+
+A listed name is authoritative only when the request authenticates through the corresponding named entry in `A2A_PEER_TOKENS`.
 
 | Env var | Default | Meaning |
 |---|---|---|
@@ -102,7 +114,7 @@ Secure by default; every widening step is explicit:
 | `A2A_ALLOW_ALL_USERS` | `false` | Allow any authenticated peer (dev only) |
 | `A2A_RATE_LIMIT` | `60` | Requests/minute per identity |
 | `A2A_MAX_PINGPONG_TURNS` | `5` | Anti-loop turn cap per context (max 20) |
-| `A2A_REPLY_TIMEOUT` | `300` | Seconds to wait for the agent's reply |
+| `A2A_REPLY_TIMEOUT` | `300` | Legacy environment fallback for the reply timeout; prefer `gateway.platforms.a2a.extra.reply_timeout` |
 | `A2A_PUSH_SECRET` | bearer token | HMAC secret for push-notification signing |
 | `A2A_ADVERTISED_TOOLSETS` | all registered | Restrict which skills appear on the Agent Card |
 
