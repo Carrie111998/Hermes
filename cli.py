@@ -10013,6 +10013,22 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
     
     def show_tools(self):
         """Display available tools with kawaii ASCII art."""
+        # Slash workers have no late-refresh: join in-flight MCP discovery
+        # with a generous bound so a slow stdio handshake doesn't silently
+        # omit a server from the catalog (#92330). Free when discovery is
+        # already finished; the TUI path late-refreshes and skips this.
+        import os as _os
+        import tempfile as _tempfile
+
+        marker = _os.path.join(_tempfile.gettempdir(), "hermes-slash-worker-marker")
+        if _os.path.exists(marker):
+            try:
+                from hermes_cli.mcp_startup import join_mcp_discovery
+
+                join_mcp_discovery(timeout=30.0)
+            except Exception:
+                pass
+
         # Pre-assembly list: /tools is a discovery/inspection surface, so it
         # must show the full catalog including tools deferred behind the
         # tool_search bridge (users check this to verify an MCP installed).
