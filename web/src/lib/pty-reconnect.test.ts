@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  isPtyFocusReport,
   shouldBlockPtyInput,
   shouldReconnectPtyOnPageResume,
 } from "./pty-reconnect";
@@ -80,6 +81,20 @@ describe("shouldReconnectPtyOnPageResume", () => {
     ).toBe(false);
   });
 
+  it("does not reconnect an open PTY just because the socket ref is briefly missing", () => {
+    // window `focus` / visibilitychange on OS app-switch can read wsRef as
+    // null for a tick. ptyState still "open" must not tear down xterm.
+    expect(
+      shouldReconnectPtyOnPageResume({
+        isActive: true,
+        visibilityState: "visible",
+        online: true,
+        socketReadyState: null,
+        ptyState: "open",
+      }),
+    ).toBe(false);
+  });
+
   it("does not fire a redundant reconnect while a connect is in flight (wsRef not yet assigned)", () => {
     // The async socket-open IIFE has begun but not yet assigned wsRef, so
     // socketReadyState reads null. Without the connectInFlight guard this
@@ -109,6 +124,16 @@ describe("shouldReconnectPtyOnPageResume", () => {
         connectInFlight: true,
       }),
     ).toBe(true);
+  });
+});
+
+describe("isPtyFocusReport", () => {
+  it("recognizes DECSET 1004 focus-in / focus-out and ignores other input", () => {
+    expect(isPtyFocusReport("\x1b[I")).toBe(true);
+    expect(isPtyFocusReport("\x1b[O")).toBe(true);
+    expect(isPtyFocusReport("v")).toBe(false);
+    expect(isPtyFocusReport("\x1b[<0;12;8M")).toBe(false);
+    expect(isPtyFocusReport("\x1b[A")).toBe(false);
   });
 });
 
