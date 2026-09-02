@@ -34,6 +34,8 @@ from concurrent.futures import (
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlsplit, urlunsplit
 
+from agent.tool_guardrails import commit_subagent_spawn
+
 from toolsets import TOOLSETS
 from agent.interrupt_compat import request_hard_interrupt
 
@@ -4106,8 +4108,25 @@ def delegate_task(
             return tool_error(f"Task {i} output_schema invalid: {schema_err}")
         task_schemas.append(coerced_schema)
 
-    overall_start = time.monotonic()
+    charged = commit_subagent_spawn(len(task_list))
+    rejected = len(task_list) - charged
     results = []
+    rejected_tasks = []
+    if rejected > 0:
+        # Report dropped task labels separately: aggregation requires each
+        # ``results`` entry to be a child-result mapping with task_index.
+        rejected_tasks = [
+            {
+                "task_index": index,
+                "goal": task.get("goal", ""),
+                "status": "rejected",
+                "reason": "per-turn subagent spawn cap reached",
+            }
+            for index, task in enumerate(task_list[charged:], start=charged)
+        ]
+        task_list = task_list[:charged]
+
+    overall_start = time.monotonic()
 
     n_tasks = len(task_list)
     # Track goal labels for progress display (truncated for readability)
@@ -4429,6 +4448,8 @@ def delegate_task(
             "results": results,
             "total_duration_seconds": total_duration,
         }
+        if rejected_tasks:
+            combined["rejected_tasks"] = rejected_tasks
         if live_paths:
             combined["live_transcripts"] = list(live_paths)
         return combined
