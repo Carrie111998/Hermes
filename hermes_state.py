@@ -13347,6 +13347,29 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             active_clause = " AND (active = 1 OR compacted = 1)"
         else:
             active_clause = " AND active = 1"
+        needs_display_dedupe = include_compacted
+        if include_compacted and not include_inactive:
+            # Desktop always opts into compacted display history, including
+            # for sessions that have never compacted. Avoid turning those
+            # ordinary bounded reads into a full transcript materialization:
+            # without archived rows there cannot be cross-generation copies
+            # to dedupe, so SQL pagination is already exact.
+            with self._read_ctx() as conn:
+                needs_display_dedupe = (
+                    conn.execute(
+                        "SELECT 1 FROM messages "
+                        "WHERE session_id = ? AND active = 0 AND compacted = 1 "
+                        "LIMIT 1",
+                        [session_id],
+                    ).fetchone()
+                    is not None
+                )
+            if not needs_display_dedupe:
+                # Keep the fast query active-only even if a concurrent
+                # compaction commits after the probe. That request may see the
+                # new compacted tail on its next refresh, but it cannot mix
+                # duplicate generations in one non-deduped page.
+                active_clause = " AND active = 1"
         keyset_clause = " AND id > ?" if after_id is not None else ""
         sql = (
             "SELECT * FROM messages WHERE session_id = ?"
@@ -13355,28 +13378,55 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         params: list = [session_id]
         if after_id is not None:
             params.append(after_id)
-        if include_compacted:
+        display_perf = None
+        if needs_display_dedupe:
             # Compaction epochs copy the protected tail into each new
             # generation, so the same logical message can exist as several
             # rows (identical role/content/timestamp) with different active
             # flags and ids. A display read must surface each message exactly
-            # once: prefer the live row, then the newest generation. Read the
-            # full display set (a session's rows are bounded; the UI-level
-            # 500-row cap lives in the endpoint, not here), dedupe in Python,
-            # then apply paging.
-            with self._read_ctx() as conn:
-                cursor = conn.execute(
-                    "SELECT * FROM messages WHERE session_id = ?" + active_clause
-                    + " ORDER BY id ASC",
-                    [session_id],
-                )
-                all_rows = cursor.fetchall()
-            seen: dict = {}
-            for row in all_rows:
+            # once: prefer the live row, then the newest generation. Collapse
+            # byte-identical copies in SQLite so LIMIT applies before rows are
+            # transferred to and decoded by Python. Composite user carriers
+            # are the one exception: their persisted wrapper differs from the
+            # original turn even though their display projection is identical.
+            # Only summary carriers can change content during display
+            # projection. Normalize those rows in Python, then look up only
+            # the exact raw rows matching their projected dedupe keys. This
+            # keeps legacy imports with coarse timestamps bounded too.
+            from agent.context_compressor import (
+                _MERGED_SUMMARY_DELIMITER,
+                split_user_originated_turn,
+            )
+
+            # The full end marker contains a Unicode em dash, which structured
+            # content stores as a JSON escape. Its stable ASCII core matches
+            # both scalar and sentinel-encoded multimodal carrier content.
+            summary_end_probe = "END OF CONTEXT SUMMARY"
+            carrier_predicate = (
+                "(instr(CAST(content AS TEXT), ?) > 0"
+                " OR instr(CAST(content AS TEXT), ?) > 0)"
+            )
+            ranked_display_rows = (
+                "WITH ranked_display_rows AS ("
+                " SELECT id, ROW_NUMBER() OVER ("
+                "  PARTITION BY role, content,"
+                f" CASE WHEN role = 'user' AND {carrier_predicate}"
+                " THEN display_kind END,"
+                " timestamp, tool_call_id, tool_calls, tool_name"
+                "  ORDER BY active DESC, id DESC"
+                " ) AS duplicate_rank"
+                " FROM messages WHERE session_id = ?" + active_clause
+                + ")"
+            )
+            ranked_params = [
+                summary_end_probe,
+                _MERGED_SUMMARY_DELIMITER,
+                session_id,
+            ]
+
+            def _display_dedupe_key(row):
                 dedupe_content = row["content"]
                 if row["role"] == "user":
-                    from agent.context_compressor import split_user_originated_turn
-
                     candidate = {
                         "role": "user",
                         "content": self._decode_content(row["content"]),
@@ -13394,7 +13444,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 # them verbatim, so identical tool messages across generations
                 # still collapse, while distinct tool calls that happen to
                 # share role/content/timestamp are never merged.
-                key = (
+                return (
                     row["role"],
                     dedupe_content,
                     row["timestamp"],
@@ -13402,17 +13452,149 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     row["tool_calls"],
                     row["tool_name"],
                 )
-                cur = seen.get(key)
-                if cur is None or (row["active"], row["id"]) > (cur["active"], cur["id"]):
-                    seen[key] = row
-            rows = sorted(seen.values(), key=lambda r: r["id"])
-            if latest:
-                rows = rows[::-1]
+
+            display_started = time.perf_counter()
+            with self._read_ctx() as conn:
+                # Keep the collision probe and the page query on one SQLite
+                # snapshot. Without this, a compaction commit between them can
+                # introduce a new carrier generation after the losing ids were
+                # computed and briefly surface a duplicate in the UI.
+                started_read_txn = not conn.in_transaction
+                if started_read_txn:
+                    conn.execute("BEGIN")
+                try:
+                    collision_sql_started = time.perf_counter()
+                    carrier_rows = conn.execute(
+                        ranked_display_rows
+                        + " SELECT m.* FROM messages AS m"
+                        " JOIN ranked_display_rows AS ranked ON ranked.id = m.id"
+                        " WHERE ranked.duplicate_rank = 1 AND m.role = 'user'"
+                        " AND (instr(CAST(m.content AS TEXT), ?) > 0"
+                        " OR instr(CAST(m.content AS TEXT), ?) > 0)"
+                        " ORDER BY m.id ASC",
+                        [
+                            *ranked_params,
+                            summary_end_probe,
+                            _MERGED_SUMMARY_DELIMITER,
+                        ],
+                    ).fetchall()
+                    collision_sql_seconds = (
+                        time.perf_counter() - collision_sql_started
+                    )
+
+                    normalize_started = time.perf_counter()
+                    collision_rows_by_id = {row["id"]: row for row in carrier_rows}
+                    collision_keys = {
+                        row["id"]: _display_dedupe_key(row) for row in carrier_rows
+                    }
+                    projected_keys = {
+                        key
+                        for row in carrier_rows
+                        for key in [collision_keys[row["id"]]]
+                        if key[1] != row["content"]
+                    }
+                    normalize_seconds = time.perf_counter() - normalize_started
+
+                    # A carrier projection can collide only with another
+                    # carrier or with a raw user row whose content and tool
+                    # identity exactly match the projected key. Rank that
+                    # narrow subset with the same rule as the main CTE.
+                    projected_match_sql = (
+                        "SELECT * FROM ("
+                        " SELECT m.*, ROW_NUMBER() OVER ("
+                        "  PARTITION BY CASE WHEN "
+                        "  (instr(CAST(m.content AS TEXT), ?) > 0"
+                        "   OR instr(CAST(m.content AS TEXT), ?) > 0)"
+                        "  THEN m.display_kind END"
+                        "  ORDER BY m.active DESC, m.id DESC"
+                        " ) AS projected_rank"
+                        " FROM messages AS m WHERE m.session_id = ?"
+                        + active_clause
+                        + " AND m.role IS ? AND m.content IS ?"
+                        " AND m.timestamp IS ? AND m.tool_call_id IS ?"
+                        " AND m.tool_calls IS ? AND m.tool_name IS ?"
+                        ") WHERE projected_rank = 1"
+                    )
+                    collision_lookup_started = time.perf_counter()
+                    for key in projected_keys:
+                        matched_rows = conn.execute(
+                            projected_match_sql,
+                            [
+                                summary_end_probe,
+                                _MERGED_SUMMARY_DELIMITER,
+                                session_id,
+                                *key,
+                            ],
+                        ).fetchall()
+                        for row in matched_rows:
+                            collision_rows_by_id[row["id"]] = row
+                    collision_sql_seconds += (
+                        time.perf_counter() - collision_lookup_started
+                    )
+
+                    normalize_started = time.perf_counter()
+                    collision_rows = sorted(
+                        collision_rows_by_id.values(), key=lambda row: row["id"]
+                    )
+                    collision_winners: dict = {}
+                    collision_members: dict = {}
+                    for row in collision_rows:
+                        key = collision_keys.get(row["id"])
+                        if key is None:
+                            key = _display_dedupe_key(row)
+                        collision_members.setdefault(key, []).append(row)
+                        current = collision_winners.get(key)
+                        if current is None or (row["active"], row["id"]) > (
+                            current["active"],
+                            current["id"],
+                        ):
+                            collision_winners[key] = row
+                    excluded_ids = {
+                        row["id"]
+                        for key, members in collision_members.items()
+                        if len(members) > 1
+                        for row in members
+                        if row["id"] != collision_winners[key]["id"]
+                    }
+                    normalize_seconds += time.perf_counter() - normalize_started
+
+                    page_sql = (
+                        ranked_display_rows
+                        + " SELECT m.* FROM messages AS m"
+                        " JOIN ranked_display_rows AS ranked ON ranked.id = m.id"
+                        " WHERE ranked.duplicate_rank = 1"
+                        f" ORDER BY m.id {'DESC' if latest else 'ASC'}"
+                    )
+                    page_params: list = list(ranked_params)
+                    if limit is not None and offset >= 0:
+                        # Every excluded id can remove at most one fetched row,
+                        # so this overfetch is sufficient without putting a
+                        # potentially-large NOT IN list into SQLite.
+                        page_sql += " LIMIT ?"
+                        page_params.append(offset + limit + len(excluded_ids))
+                    page_sql_started = time.perf_counter()
+                    rows = conn.execute(page_sql, page_params).fetchall()
+                    page_sql_rows = len(rows)
+                    page_sql_seconds = time.perf_counter() - page_sql_started
+                finally:
+                    if started_read_txn:
+                        conn.execute("ROLLBACK")
+
+            if excluded_ids:
+                rows = [row for row in rows if row["id"] not in excluded_ids]
             rows = rows[offset:]
             if limit is not None:
                 rows = rows[:limit]
             if latest:
                 rows = rows[::-1]
+            display_perf = {
+                "started": display_started,
+                "collision_sql_seconds": collision_sql_seconds,
+                "normalize_seconds": normalize_seconds,
+                "page_sql_seconds": page_sql_seconds,
+                "collision_rows": len(collision_rows),
+                "page_rows": page_sql_rows,
+            }
         else:
             if limit is not None or offset:
                 # SQLite's OFFSET requires LIMIT; -1 means "no limit".
@@ -13423,6 +13605,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 rows = cursor.fetchall()
             if latest:
                 rows.reverse()
+        decode_started = time.perf_counter()
         result = []
         for row in rows:
             msg = dict(row)
@@ -13439,6 +13622,28 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             if msg.get("display_metadata") is not None:
                 msg["display_metadata"] = self._decode_display_metadata(msg["display_metadata"])
             result.append(msg)
+        if display_perf is not None:
+            decode_seconds = time.perf_counter() - decode_started
+            total_seconds = time.perf_counter() - display_perf["started"]
+            if total_seconds >= 0.25:
+                logger.warning(
+                    "Slow compacted session display read: session=%s total_ms=%.1f "
+                    "collision_sql_ms=%.1f normalize_ms=%.1f page_sql_ms=%.1f "
+                    "decode_ms=%.1f collision_rows=%d page_rows=%d returned=%d "
+                    "limit=%s offset=%d latest=%s",
+                    session_id,
+                    total_seconds * 1000,
+                    display_perf["collision_sql_seconds"] * 1000,
+                    display_perf["normalize_seconds"] * 1000,
+                    display_perf["page_sql_seconds"] * 1000,
+                    decode_seconds * 1000,
+                    display_perf["collision_rows"],
+                    display_perf["page_rows"],
+                    len(result),
+                    limit,
+                    offset,
+                    latest,
+                )
         return result
 
     def find_pr_url_messages(self, session_ids: List[str]) -> List[Dict[str, Any]]:
