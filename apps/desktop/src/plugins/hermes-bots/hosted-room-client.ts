@@ -52,6 +52,7 @@ export interface HostedRoomCapability {
   maxLogLimit?: number
   persistentProcess: boolean | null
   routeGrantFingerprint: boolean
+  reciprocalControl: boolean
   reason: null | string
   roomLink: null | RoomLinkCapability
 }
@@ -358,6 +359,7 @@ export function classifyHostedRoomCapability(
       authorityId: null,
       persistentProcess: null,
       routeGrantFingerprint: false,
+      reciprocalControl: false,
       roomLink: null,
       limits: HOSTED_ROOM_CLIENT_LIMITATIONS
     }
@@ -374,10 +376,14 @@ export function classifyHostedRoomCapability(
       authorityId: null,
       persistentProcess: null,
       routeGrantFingerprint: false,
+      reciprocalControl: false,
       roomLink: null,
       limits: HOSTED_ROOM_CLIENT_LIMITATIONS
     }
   }
+
+  const features = Array.isArray(capabilities.features) ? capabilities.features.map(String) : []
+  const reciprocalControl = features.includes('reciprocal_room_control')
 
   if (capabilities.driver !== true) {
     return {
@@ -388,6 +394,7 @@ export function classifyHostedRoomCapability(
       authorityId: null,
       persistentProcess: capabilities.persistent_process === true,
       routeGrantFingerprint: false,
+      reciprocalControl,
       roomLink: roomLinkCapability(capabilities.room_link),
       limits: HOSTED_ROOM_CLIENT_LIMITATIONS
     }
@@ -404,6 +411,7 @@ export function classifyHostedRoomCapability(
       authorityId: null,
       persistentProcess: capabilities.persistent_process === true,
       routeGrantFingerprint: false,
+      reciprocalControl,
       roomLink: roomLinkCapability(capabilities.room_link),
       limits: HOSTED_ROOM_CLIENT_LIMITATIONS
     }
@@ -419,6 +427,7 @@ export function classifyHostedRoomCapability(
     persistentProcess: capabilities.persistent_process === true,
     routeGrantFingerprint:
       Array.isArray(capabilities.features) && capabilities.features.includes('peer_route_grant_fingerprint'),
+    reciprocalControl,
     roomLink: roomLinkCapability(capabilities.room_link),
     maxLogLimit: positiveInteger(capabilities.max_log_limit, 100) || 100,
     limits: hostedCapabilityLimits(capabilities)

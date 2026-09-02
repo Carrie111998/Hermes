@@ -1367,6 +1367,9 @@ def _prune_disbanded_rooms_locked(
         "hosted_room_driver_leases",
         "hosted_room_remote_runs",
         "hosted_room_links",
+        "hosted_room_control_commands",
+        "hosted_room_control_tokens",
+        "hosted_room_peer_controls",
         "hosted_room_peer_reservations",
         "hosted_room_events",
     )

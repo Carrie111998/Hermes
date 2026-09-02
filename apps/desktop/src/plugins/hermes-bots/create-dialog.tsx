@@ -44,6 +44,7 @@ import { AvatarPicker } from './avatar-picker'
 import { $selectedBot } from './bot-state'
 import { createCanonicalChat } from './canonical-chat'
 import { $botMeta, botHandle, botRosterKey, filterBots, ROSTER_KEY, saveBotMeta } from './data'
+import { prepareDesktopRoomAuthority } from './desktop-room-command-runtime'
 import { labeled, ResizableFrame } from './dialog-parts'
 import {
   $groupChats,
@@ -1345,6 +1346,8 @@ export function CreateGroupChatDialog({ open, roster, onClose, onCreated }: Crea
         }
       }
 
+      const desktopAuthority = hosted ? null : await prepareDesktopRoomAuthority()
+
       for (const owner of metadataOwners) {
         await saveBotMeta(owner, groupMembershipPatch(botRosterMeta(owner, allMeta), groupName, true))
       }
@@ -1356,6 +1359,12 @@ export function CreateGroupChatDialog({ open, roster, onClose, onCreated }: Crea
         room.members = roomMembers
         room.roomId = roomId
         room.continuityMode = hosted?.continuityMode || 'desktop'
+
+        if (desktopAuthority) {
+          room.desktopAuthorityHash = desktopAuthority.desktopAuthorityHash
+          room.desktopAuthorityToken = desktopAuthority.desktopAuthorityToken
+          room.desktopCoordinatorId = desktopAuthority.desktopCoordinatorId
+        }
 
         if (hosted) {
           room.hosted = hosted.authorityId

@@ -554,8 +554,8 @@ describe('hosted Group Chat runtime', () => {
 
   it('reconciles peer members without rewriting them onto the home gateway', async () => {
     const routes = [
-      { connectionId: 'gateway-a', mode: 'remote' as const, profile: 'default', targetProfile: 'default' },
-      { connectionId: 'gateway-b', mode: 'remote' as const, profile: 'default', targetProfile: 'default' }
+      { connectionId: 'gateway-b', mode: 'remote' as const, profile: 'default', targetProfile: 'default' },
+      { connectionId: 'gateway-a', mode: 'remote' as const, profile: 'default', targetProfile: 'default' }
     ]
 
     const serverMembers = [
@@ -585,6 +585,7 @@ describe('hosted Group Chat runtime', () => {
         return {
           authority_gateway_id: `install:${connectionId}`,
           driver: true,
+          features: ['reciprocal_room_control'],
           persistent_process: true
         }
       }
@@ -625,6 +626,22 @@ describe('hosted Group Chat runtime', () => {
         return { events: [], has_more: false, latest_seq: 0 }
       }
 
+      if (method === 'groups.control.invite') {
+        return {
+          authority_epoch: 1,
+          authority_gateway_id: 'install:gateway-a',
+          control_token: 'private-control-token',
+          expires_at: 253_402_300_799,
+          home_url: 'https://gateway-a.example.test:19445',
+          member_count: 2,
+          room_name: 'Distributed'
+        }
+      }
+
+      if (method === 'groups.control.register') {
+        return { registered: true }
+      }
+
       throw new Error(`unexpected method: ${method}`)
     }, routes)
 
@@ -647,6 +664,16 @@ describe('hosted Group Chat runtime', () => {
       expect.objectContaining({ connectionId: 'gateway-a', name: 'research' }),
       expect.objectContaining({ connectionId: 'gateway-b', name: 'builder' })
     ])
+    await vi.waitFor(() => {
+      expect(loaded.calls.find(call => call.method === 'groups.control.register')).toMatchObject({
+        connectionId: 'gateway-b',
+        params: {
+          member_id: 'member-2-builder',
+          profile: 'builder',
+          room_id: 'room-1'
+        }
+      })
+    })
 
     loaded.runtime.stopHostedRoomRuntime()
   })
@@ -1137,31 +1164,55 @@ describe('hosted Group Chat runtime', () => {
     }
   )
 
-  it('creates a multi-host Group Chat with target-issued scoped grants', async () => {
-    const routes = [
-      { connectionId: 'host-a', mode: 'remote' as const, profile: 'default', targetProfile: 'default' },
-      { connectionId: 'host-b', mode: 'remote' as const, profile: 'default', targetProfile: 'default' },
-      { connectionId: 'host-b', mode: 'remote' as const, profile: 'builder', targetProfile: 'builder' }
-    ]
+  it.each([true, false])(
+    'creates a multi-host Group Chat with target-issued scoped grants (reciprocal control: %s)',
+    async reciprocalControl => {
+      const routes = [
+        { connectionId: 'host-a', mode: 'remote' as const, profile: 'default', targetProfile: 'default' },
+        { connectionId: 'host-b', mode: 'remote' as const, profile: 'default', targetProfile: 'default' },
+        { connectionId: 'host-b', mode: 'remote' as const, profile: 'builder', targetProfile: 'builder' }
+      ]
 
-    const loaded = await loadRuntime((method, _params, route) => {
-      const connectionId = String(route?.connectionId || '')
+      const loaded = await loadRuntime((method, _params, route) => {
+        const connectionId = String(route?.connectionId || '')
 
-      if (method === 'groups.capabilities') {
-        return {
-          authority_gateway_id: `install:${connectionId}`,
-          driver: true,
-          persistent_process: true,
-          room_link: {
-            enabled: true,
-            endpoint: {
-              available: true,
-              url: `https://${connectionId}.example.test:19445`
-            },
+        if (method === 'groups.capabilities') {
+          return {
+            authority_gateway_id: `install:${connectionId}`,
+            driver: true,
+            persistent_process: true,
+            features: reciprocalControl ? ['reciprocal_room_control'] : [],
+            room_link: {
+              enabled: true,
+              endpoint: {
+                available: true,
+                url: `https://${connectionId}.example.test:19445`
+              },
+              catalog: {
+                attachments: false,
+                catalog_digest: `digest:${connectionId}`,
+                installation_id: `install:${connectionId}`,
+                link_modes: ['direct'],
+                persistent_process: true,
+                protocol_versions: [2],
+                text: true
+              }
+            }
+          }
+        }
+
+        if (method === 'groups.list') {
+          return { rooms: [] }
+        }
+
+        if (method === 'groups.peer.invite') {
+          return {
+            grant: 'grant:builder',
+            target_profile: 'builder',
             catalog: {
               attachments: false,
-              catalog_digest: `digest:${connectionId}`,
-              installation_id: `install:${connectionId}`,
+              catalog_digest: 'digest:host-b',
+              installation_id: 'install:host-b',
               link_modes: ['direct'],
               persistent_process: true,
               protocol_versions: [2],
@@ -1169,102 +1220,112 @@ describe('hosted Group Chat runtime', () => {
             }
           }
         }
-      }
 
-      if (method === 'groups.list') {
-        return { rooms: [] }
-      }
-
-      if (method === 'groups.peer.invite') {
-        return {
-          grant: 'grant:builder',
-          target_profile: 'builder',
-          catalog: {
-            attachments: false,
-            catalog_digest: 'digest:host-b',
-            installation_id: 'install:host-b',
-            link_modes: ['direct'],
-            persistent_process: true,
-            protocol_versions: [2],
-            text: true
+        if (method === 'groups.create') {
+          return {
+            room: {
+              authority_epoch: 1,
+              authority_gateway_id: 'install:host-a',
+              room_id: 'room-multi'
+            }
           }
         }
-      }
 
-      if (method === 'groups.create') {
-        return {
-          room: {
+        if (method === 'groups.control.invite') {
+          return {
             authority_epoch: 1,
             authority_gateway_id: 'install:host-a',
-            room_id: 'room-multi'
+            control_token: 'private-control-token',
+            expires_at: 2_000_000_000,
+            home_url: 'https://host-a.example.test:19445',
+            member_count: 2,
+            room_name: 'Multi'
           }
         }
-      }
 
-      if (method === 'groups.peer.register') {
-        return { registered: true }
-      }
+        if (method === 'groups.control.register') {
+          return { registered: true }
+        }
 
-      throw new Error(`unexpected method: ${method}`)
-    }, routes)
+        if (method === 'groups.peer.register') {
+          return { registered: true }
+        }
 
-    const storage = scriptedStorage(loaded.storage).storage
+        throw new Error(`unexpected method: ${method}`)
+      }, routes)
 
-    await loaded.runtime.startHostedRoomRuntime(storage)
+      const storage = scriptedStorage(loaded.storage).storage
 
-    const members: GroupMember[] = [
-      {
-        connectionId: 'host-a',
-        name: 'research',
-        route: routes[0],
-        sourceScoped: true,
-        targetProfile: 'research'
-      },
-      {
-        connectionId: 'host-b',
-        name: 'builder',
-        route: routes[2],
-        sourceScoped: true,
-        targetProfile: 'builder'
-      }
-    ]
+      await loaded.runtime.startHostedRoomRuntime(storage)
 
-    const probe = await loaded.runtime.probeHostedRoomMembers(members)
+      const members: GroupMember[] = [
+        {
+          connectionId: 'host-a',
+          name: 'research',
+          route: routes[0],
+          sourceScoped: true,
+          targetProfile: 'research'
+        },
+        {
+          connectionId: 'host-b',
+          name: 'builder',
+          route: routes[2],
+          sourceScoped: true,
+          targetProfile: 'builder'
+        }
+      ]
 
-    expect(probe.route).toMatchObject({
-      homeConnectionId: 'host-a',
-      kind: 'multi-gateway',
-      remoteConnectionIds: ['host-b']
-    })
-    await expect(
-      loaded.runtime.createAutonomousHostedGroupChat({
-        members: [
-          { handle: 'research', member: members[0], profile: 'research' },
-          { handle: 'builder', member: members[1], profile: 'builder' }
-        ],
-        name: 'Multi',
-        probe,
-        roomId: 'room-multi'
+      const probe = await loaded.runtime.probeHostedRoomMembers(members)
+
+      expect(probe.route).toMatchObject({
+        homeConnectionId: 'host-a',
+        kind: 'multi-gateway',
+        remoteConnectionIds: ['host-b']
       })
-    ).resolves.toMatchObject({
-      authorityId: 'install:host-a',
-      connectionId: 'host-a',
-      continuityMode: 'distributed'
-    })
+      await expect(
+        loaded.runtime.createAutonomousHostedGroupChat({
+          members: [
+            { handle: 'research', member: members[0], profile: 'research' },
+            { handle: 'builder', member: members[1], profile: 'builder' }
+          ],
+          name: 'Multi',
+          probe,
+          roomId: 'room-multi'
+        })
+      ).resolves.toMatchObject({
+        authorityId: 'install:host-a',
+        connectionId: 'host-a',
+        continuityMode: 'distributed'
+      })
 
-    expect(loaded.calls.find(call => call.method === 'groups.peer.invite')?.connectionId).toBe('host-b')
-    expect(loaded.calls.find(call => call.method === 'groups.create')?.connectionId).toBe('host-a')
-    expect(loaded.calls.find(call => call.method === 'groups.peer.register')?.params).toMatchObject({
-      grant: 'grant:builder',
-      member_id: 'member-2-builder',
-      room_id: 'room-multi',
-      target_profile: 'builder',
-      target_url: 'https://host-b.example.test:19445/p/builder'
-    })
-    expect((loaded.storage.get('hosted-room-cleanup-v1') as { operations: unknown[] }).operations).toEqual([])
+      expect(loaded.calls.find(call => call.method === 'groups.peer.invite')?.connectionId).toBe('host-b')
+      expect(loaded.calls.find(call => call.method === 'groups.create')?.connectionId).toBe('host-a')
+      expect(loaded.calls.find(call => call.method === 'groups.peer.register')?.params).toMatchObject({
+        grant: 'grant:builder',
+        member_id: 'member-2-builder',
+        room_id: 'room-multi',
+        target_profile: 'builder',
+        target_url: 'https://host-b.example.test:19445/p/builder'
+      })
 
-    loaded.runtime.stopHostedRoomRuntime()
-  })
+      if (reciprocalControl) {
+        expect(loaded.calls.find(call => call.method === 'groups.control.register')?.params).toMatchObject({
+          authority_gateway_id: 'install:host-a',
+          member_count: 2,
+          member_id: 'member-2-builder',
+          profile: 'builder',
+          room_id: 'room-multi',
+          room_name: 'Multi'
+        })
+      } else {
+        expect(loaded.calls.some(call => call.method.startsWith('groups.control.'))).toBe(false)
+      }
+
+      expect((loaded.storage.get('hosted-room-cleanup-v1') as { operations: unknown[] }).operations).toEqual([])
+
+      loaded.runtime.stopHostedRoomRuntime()
+    }
+  )
 
   it('durably disbands and revokes a partial multi-host setup', async () => {
     const routes = [
@@ -1734,6 +1795,12 @@ describe('hosted Group Chat runtime', () => {
     expect(
       loaded.runtime.hostedRoomDriverDisplayStatus({ kind: 'ready' }, { counts: { queued: 1 }, working: false })
     ).toMatchObject({ kind: 'queued', canStop: true })
+    expect(
+      loaded.runtime.hostedRoomDriverDisplayStatus(
+        { kind: 'needs-attention' },
+        { counts: { stopping: 1 }, working: true }
+      )
+    ).toMatchObject({ kind: 'stopping', canStop: false })
     expect(loaded.runtime.hostedRoomPollFingerprint({ revision: 4, latest_seq: 9 })).toBe('4:9')
   })
 })

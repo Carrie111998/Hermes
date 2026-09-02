@@ -6805,9 +6805,10 @@ class TelegramAdapter(BasePlatformAdapter):
                 )
             if not buttons:
                 return SendResult(success=False, error="No choices")
-            # Two buttons per row keeps labels readable on mobile.
+            row_size = 1 if any(choice.get("full_width") for choice in choices) else 2
+            # Settings stay compact; navigation choices can request a full row.
             keyboard = InlineKeyboardMarkup(
-                [buttons[i:i + 2] for i in range(0, len(buttons), 2)]
+                [buttons[i:i + row_size] for i in range(0, len(buttons), row_size)]
             )
 
             thread_id = metadata.get("thread_id") if metadata else None
@@ -6829,8 +6830,10 @@ class TelegramAdapter(BasePlatformAdapter):
             )
 
             self._choice_picker_state[str(chat_id)] = {
+                "expires_at": time.monotonic() + 120,
                 "msg_id": msg.message_id,
                 "choices": choices,
+                "requester_user_id": str((metadata or {}).get("requester_user_id") or ""),
                 "session_key": session_key,
                 "on_choice_selected": on_choice_selected,
             }
@@ -6853,6 +6856,20 @@ class TelegramAdapter(BasePlatformAdapter):
         # picker message.
         query_message = getattr(query, "message", None)
         query_chat = getattr(query_message, "chat", None)
+        query_message_id = getattr(query_message, "message_id", None)
+        if query_message_id != state.get("msg_id"):
+            await query.answer(text="This menu has expired. Run the command again.")
+            return
+        if time.monotonic() > float(state.get("expires_at") or 0):
+            self._choice_picker_state.pop(chat_id, None)
+            await query.answer(text="This menu has expired. Run the command again.")
+            return
+        requester_user_id = str(state.get("requester_user_id") or "")
+        if requester_user_id and requester_user_id != str(
+            getattr(query.from_user, "id", "")
+        ):
+            await query.answer(text="⛔ This menu belongs to another user.")
+            return
         if not self._is_callback_user_authorized(
             str(getattr(query.from_user, "id", "")),
             chat_id=getattr(query_message, "chat_id", None),
@@ -10948,6 +10965,10 @@ class TelegramAdapter(BasePlatformAdapter):
             message_id=str(message.message_id),
             is_bot=bool(getattr(user, "is_bot", False)) if user else False,
         )
+        source.is_one_to_one = (
+            str(getattr(chat, "type", "") or "").casefold() == "private"
+        )
+        source.message_is_edit = getattr(message, "edit_date", None) is not None
         
         # Extract reply context if this message is a reply.
         # Prefer Telegram's native partial quote (message.quote, TextQuote)
