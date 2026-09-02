@@ -7544,16 +7544,28 @@ def _dashboard_skew_restart_hint() -> str:
     The same FastAPI app backs the browser dashboard *and* Desktop-owned
     ``hermes serve --isolated`` (local or SSH). Hardcoding a systemd unit
     misleads macOS/launchd hosts and Desktop SSH backends, which have no
-    ``hermes-dashboard`` unit (#97046).
+    ``hermes-dashboard`` unit (#97046). On macOS the guard previously
+    suggested a non-existent ``systemctl`` command, leaving the orphaned
+    dashboard unkillable without manual ``ps`` hunting (#101561).
     """
     if os.environ.get("HERMES_SERVE_HEADLESS") == "1":
         return (
             "restart the Desktop-owned backend to load the new code "
-            "(use Restart backend in Hermes Desktop, or quit and reopen the app)"
+            "(use Restart backend in Hermes Desktop, or quit and reopen the app). "
+            "If the 503 persists, an orphaned dashboard process survived the restart — "
+            "kill it with: pkill -f 'hermes dashboard' && pkill -f 'hermes serve'"
+        )
+    if sys.platform == "darwin":
+        return (
+            "restart this Hermes process to load the new code "
+            "(hermes gateway restart, or launchctl kickstart -k gui/$UID/com.nousresearch.hermes; "
+            "if the 503 persists, an orphaned dashboard survived — kill it with: "
+            "pkill -f 'hermes dashboard' && pkill -f 'hermes serve')"
         )
     return (
         "restart this Hermes process to load the new code "
-        "(hermes dashboard --port <port>, or the equivalent service restart for this install)"
+        "(hermes dashboard --port <port>, or the equivalent service restart for this install; "
+        "if the 503 persists, kill the orphan with: pkill -f 'hermes dashboard')"
     )
 
 
