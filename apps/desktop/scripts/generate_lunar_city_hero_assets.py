@@ -161,11 +161,184 @@ def cone(name, location, radius1, radius2, depth, mat, target, asset_id, kind, r
     return mark(obj, asset_id, kind, role, component)
 
 
+def polish_surface(obj, *, subdivision=0, bevel=0.0, weighted_normals=True):
+    bpy.context.view_layer.objects.active = obj
+    obj.select_set(True)
+    try:
+        bpy.ops.object.shade_smooth()
+    finally:
+        obj.select_set(False)
+    if subdivision:
+        modifier = obj.modifiers.new("sculpted_skin_subdivision", "SUBSURF")
+        modifier.levels = subdivision
+        modifier.render_levels = subdivision
+    if bevel:
+        modifier = obj.modifiers.new("soft_retained_edge_bevel", "BEVEL")
+        modifier.width = bevel
+        modifier.segments = 4
+    if weighted_normals:
+        obj.modifiers.new("weighted_skin_normals", "WEIGHTED_NORMAL")
+    return obj
+
+
+def sculpted_arch_shell(name, x, y, base, width, depth, height, mat, target, asset_id, role):
+    verts = []
+    faces = []
+    cols = 18
+    rows = 10
+    for row in range(rows + 1):
+        v = row / rows
+        for col in range(cols + 1):
+            u = col / cols
+            px = x - width / 2 + width * u
+            arch = sin(pi * u)
+            crown = sin(pi * v)
+            py = y + depth / 2 + 0.16 * arch * crown
+            pz = base + 0.22 + height * v + 0.18 * arch * (1.0 - v)
+            verts.append((px, py, pz))
+    for row in range(rows):
+        for col in range(cols):
+            a = row * (cols + 1) + col
+            faces.append((a, a + 1, a + cols + 2, a + cols + 1))
+
+    mesh = bpy.data.meshes.new(f"{name}_mesh")
+    mesh.from_pydata(verts, [], faces)
+    mesh.update()
+    mesh.materials.append(mat)
+    obj = bpy.data.objects.new(name, mesh)
+    target.objects.link(obj)
+    mark(obj, asset_id, "building", role, "single-piece-arched-skin")
+    obj["mesh_construction"] = "continuous_curved_surface"
+    solid = obj.modifiers.new("skin_thickness", "SOLIDIFY")
+    solid.thickness = 0.12
+    solid.offset = 0
+    return polish_surface(obj, subdivision=1, bevel=0.015)
+
+
+def sculpted_floor_plate(name, x, y, base, width, depth, mat, target, asset_id, role):
+    verts = []
+    faces = []
+    cols = 10
+    rows = 8
+    for row in range(rows + 1):
+        v = row / rows
+        for col in range(cols + 1):
+            u = col / cols
+            px = x - width / 2 + width * u
+            py = y - depth / 2 + depth * v
+            edge = min(u, 1 - u, v, 1 - v)
+            pz = base + 0.07 + 0.025 * sin(pi * u) * sin(pi * v) - 0.035 * max(0, 0.18 - edge)
+            verts.append((px, py, pz))
+    for row in range(rows):
+        for col in range(cols):
+            a = row * (cols + 1) + col
+            faces.append((a, a + 1, a + cols + 2, a + cols + 1))
+    mesh = bpy.data.meshes.new(f"{name}_mesh")
+    mesh.from_pydata(verts, [], faces)
+    mesh.update()
+    mesh.materials.append(mat)
+    obj = bpy.data.objects.new(name, mesh)
+    target.objects.link(obj)
+    mark(obj, asset_id, "building", role, "single-piece-sculpted-floor")
+    obj["mesh_construction"] = "continuous_floor_skin"
+    solid = obj.modifiers.new("floor_skin_thickness", "SOLIDIFY")
+    solid.thickness = 0.08
+    solid.offset = -1
+    return polish_surface(obj, subdivision=1, bevel=0.02)
+
+
+def sculpted_side_buttress(name, x, y, base, side, mat, target, asset_id, role):
+    verts = []
+    faces = []
+    rows = 8
+    cols = 4
+    for row in range(rows + 1):
+        v = row / rows
+        for col in range(cols + 1):
+            u = col / cols
+            px = x + side * (2.35 + 0.08 * sin(pi * v))
+            py = y - 1.35 + 2.65 * u
+            pz = base + 0.22 + 2.05 * v
+            if row > rows * 0.65:
+                px -= side * 0.35 * ((v - 0.65) / 0.35)
+            verts.append((px, py, pz))
+    for row in range(rows):
+        for col in range(cols):
+            a = row * (cols + 1) + col
+            faces.append((a, a + 1, a + cols + 2, a + cols + 1))
+    mesh = bpy.data.meshes.new(f"{name}_mesh")
+    mesh.from_pydata(verts, [], faces)
+    mesh.update()
+    mesh.materials.append(mat)
+    obj = bpy.data.objects.new(name, mesh)
+    target.objects.link(obj)
+    mark(obj, asset_id, "building", role, "curved-side-buttress-skin")
+    obj["mesh_construction"] = "continuous_side_skin"
+    solid = obj.modifiers.new("buttress_skin_thickness", "SOLIDIFY")
+    solid.thickness = 0.12
+    solid.offset = 0
+    return polish_surface(obj, subdivision=1, bevel=0.018)
+
+
+def sculpted_robe(name, x, y, height, mat, target, asset_id, role):
+    verts = [
+        (x - 0.42, y + 0.07, height * 0.86),
+        (x + 0.42, y + 0.07, height * 0.86),
+        (x + 0.58, y + 0.2, height * 0.28),
+        (x + 0.36, y + 0.28, height * 0.06),
+        (x - 0.36, y + 0.28, height * 0.06),
+        (x - 0.58, y + 0.2, height * 0.28),
+        (x, y + 0.23, height * 0.45),
+    ]
+    faces = [(0, 1, 6), (1, 2, 6), (2, 3, 6), (3, 4, 6), (4, 5, 6), (5, 0, 6)]
+    mesh = bpy.data.meshes.new(f"{name}_mesh")
+    mesh.from_pydata(verts, [], faces)
+    mesh.update()
+    mesh.materials.append(mat)
+    obj = bpy.data.objects.new(name, mesh)
+    target.objects.link(obj)
+    mark(obj, asset_id, "character", role, "skinned-robe-cloth")
+    obj["mesh_construction"] = "single_cloth_skin"
+    return polish_surface(obj, subdivision=1, bevel=0.01)
+
+
+def add_species_detail(asset_id, role, label_text, x, y, height, accent_mat, target, mats):
+    lower = label_text.lower()
+    if "owl" in lower:
+        for side in (-1, 1):
+            ellipsoid(f"{asset_id}_facial_disk_{side}_mesh", (x + side * 0.12, y - 0.31, height + 0.23), (0.13, 0.018, 0.14), mats["fur_light"], target, asset_id, "character", role, "owl-facial-disk", 20, 10)
+        for side in (-1, 1):
+            for feather in range(4):
+                cone(f"{asset_id}_brow_feather_{side}_{feather}_mesh", (x + side * (0.08 + feather * 0.035), y - 0.29, height + 0.42 - feather * 0.015), 0.035, 0.004, 0.18, mats["fur"], target, asset_id, "character", role, "owl-brow-feather", 8, rotation=(0.8, side * 0.2, side * 0.5))
+    elif "fox" in lower:
+        for side in (-1, 1):
+            cone(f"{asset_id}_fox_cheek_tuft_{side}_mesh", (x + side * 0.25, y - 0.22, height + 0.1), 0.08, 0.008, 0.22, mats["fur_light"], target, asset_id, "character", role, "fox-cheek-tuft", 12, rotation=(1.2, side * 0.55, 0))
+        tail = lunar.curve(f"{asset_id}_fox_tail_sculpt_wire", [(x + 0.24, y + 0.2, 0.42), (x + 0.64, y + 0.36, 0.86), (x + 0.42, y + 0.12, 1.18)], 0.105, mats["fur"], target)
+        add_asset_metadata(tail, asset_id, "character", role, "fox-tail-volume")
+    elif "raccoon" in lower or "badger" in lower:
+        for side in (-1, 1):
+            ellipsoid(f"{asset_id}_mask_patch_{side}_mesh", (x + side * 0.1, y - 0.318, height + 0.23), (0.08, 0.012, 0.055), mats["black"], target, asset_id, "character", role, "mask-patch", 16, 8)
+        stripe = lunar.curve(f"{asset_id}_head_stripe_wire", [(x, y - 0.32, height + 0.44), (x, y - 0.335, height + 0.28), (x, y - 0.33, height + 0.11)], 0.018, mats["white"], target)
+        add_asset_metadata(stripe, asset_id, "character", role, "head-stripe")
+    elif "eagle" in lower or "hawk" in lower:
+        for side in (-1, 1):
+            wing = lunar.curve(f"{asset_id}_folded_wing_{side}_wire", [(x + side * 0.28, y + 0.02, height * 0.74), (x + side * 0.55, y + 0.12, height * 0.48), (x + side * 0.42, y + 0.18, height * 0.22)], 0.055, mats["fur"], target)
+            add_asset_metadata(wing, asset_id, "character", role, "folded-wing")
+    if role == "medical":
+        chamfer(f"{asset_id}_medic_cross_mesh", (x, y - 0.285, height * 0.56), (0.11, 0.012, 0.028), mats["red"], target, asset_id, "character", role, "medic-cross-horizontal")
+        chamfer(f"{asset_id}_medic_cross_vertical_mesh", (x, y - 0.286, height * 0.56), (0.035, 0.012, 0.09), mats["red"], target, asset_id, "character", role, "medic-cross-vertical")
+
+
 def chamfer(name, location, scale, mat, target, asset_id, kind, role, component, rotation=None):
-    source = lunar.chamfered_box_asset(f"{name}_source", (1, 1, 1), mat, target, 0.09)
-    source.hide_render = True
-    source.hide_viewport = True
-    obj = lunar.instance_asset(source, name, target, location, scale, rotation)
+    obj = lunar.chamfered_box_asset(name, (1, 1, 1), mat, target, 0.09)
+    obj.location = location
+    obj.scale = scale
+    if rotation:
+        obj.rotation_euler = rotation
+    bpy.context.view_layer.objects.active = obj
+    obj.select_set(True)
+    bpy.ops.object.transform_apply(location=False, rotation=False, scale=True)
+    obj.select_set(False)
     add_asset_metadata(obj, asset_id, kind, role, component)
     return obj
 
@@ -179,13 +352,14 @@ def label(name, text, location, mat, target, size=0.26):
 def make_building(asset_id, role, title, accent, x, y, target, mats):
     base = 0.0
     accent_mat = mats[accent]
-    # Foundation and open diorama shell
-    chamfer(f"{asset_id}_foundation_mesh", (x, y, base + 0.12), (2.6, 1.8, 0.12), mats["floor"], target, asset_id, "building", role, "foundation")
-    chamfer(f"{asset_id}_back_hull_skin", (x, y + 1.55, base + 1.15), (2.65, 0.14, 1.1), mats["shell"], target, asset_id, "building", role, "back-hull")
-    chamfer(f"{asset_id}_left_hull_skin", (x - 2.45, y, base + 1.03), (0.14, 1.55, 1.0), mats["shell"], target, asset_id, "building", role, "left-hull")
-    chamfer(f"{asset_id}_right_hull_skin", (x + 2.45, y, base + 1.03), (0.14, 1.55, 1.0), mats["shell"], target, asset_id, "building", role, "right-hull")
+    # Foundation and open diorama shell. These are single skinned meshes over
+    # arched wire controls, not stacked building blocks.
+    sculpted_floor_plate(f"{asset_id}_single_piece_floor_skin", x, y, base, 5.0, 3.45, mats["floor"], target, asset_id, role)
+    sculpted_arch_shell(f"{asset_id}_single_piece_back_hull_skin", x, y, base, 5.15, 3.15, 1.95, mats["shell"], target, asset_id, role)
+    sculpted_side_buttress(f"{asset_id}_left_continuous_buttress_skin", x, y, base, -1, mats["shell"], target, asset_id, role)
+    sculpted_side_buttress(f"{asset_id}_right_continuous_buttress_skin", x, y, base, 1, mats["shell"], target, asset_id, role)
     for dx in (-1.65, -0.55, 0.55, 1.65):
-        chamfer(f"{asset_id}_roof_layer_{dx}", (x + dx, y + 0.78, base + 2.28), (0.42, 0.7, 0.12), mats["shell"], target, asset_id, "building", role, "segmented-roof")
+        ellipsoid(f"{asset_id}_smooth_roof_fairing_{dx}", (x + dx, y + 0.78, base + 2.24), (0.45, 0.64, 0.11), mats["shell"], target, asset_id, "building", role, "smooth-roof-fairing", 24, 10)
     # Curved front shell and glow ribs
     frame_points = [(x - 2.45, y - 1.55, base + 0.18), *arc_points(x, y - 1.55, base + 1.65, 4.9, 0.62, 11), (x + 2.45, y - 1.55, base + 0.18)]
     frame = lunar.curve(f"{asset_id}_curved_wire_shell", frame_points, 0.075, mats["shell"], target)
@@ -201,7 +375,7 @@ def make_building(asset_id, role, title, accent, x, y, target, mats):
         chamfer(f"{asset_id}_back_panel_{col}", (px, y + 1.39, base + 1.16), (0.26, 0.035, 0.22), mats["glass"], target, asset_id, "building", role, "backlit-panel")
     for col in range(4):
         px = x - 1.35 + col * 0.9
-        chamfer(f"{asset_id}_floor_tile_{col}", (px, y - 0.15, base + 0.255), (0.36, 0.62, 0.018), mats["panel"], target, asset_id, "building", role, "floor-tile")
+        ellipsoid(f"{asset_id}_inset_floor_tile_{col}", (px, y - 0.15, base + 0.15), (0.38, 0.58, 0.018), mats["panel"], target, asset_id, "building", role, "inset-floor-tile", 20, 8)
     # Role-specific hero interior
     if role in {"knowledge", "archive"}:
         for shelf in range(3):
@@ -265,6 +439,7 @@ def make_character(asset_id, role, label_text, accent, x, y, target, mats, kind)
         cylinder(f"{asset_id}_leg_{side}_mesh", (x + side * body_w * 0.45, y, height * 0.13), 0.052 if leader else 0.038, height * 0.26, mats["suit"], target, asset_id, "character", role, "leg", 16)
         ellipsoid(f"{asset_id}_foot_{side}_mesh", (x + side * body_w * 0.48, y - 0.1, 0.05), (0.1, 0.16, 0.045), mats["black"], target, asset_id, "character", role, "foot", 20, 10)
     if leader:
+        sculpted_robe(f"{asset_id}_robe_cloth_skin", x, y, height, accent_mat, target, asset_id, role)
         for side in (-1, 1):
             cone(f"{asset_id}_ear_{side}_mesh", (x + side * 0.22, y, height + 0.58), 0.12, 0.02, 0.34, mats["fur"], target, asset_id, "character", role, "ear", 16, rotation=(0.18, side * 0.34, 0))
             ellipsoid(f"{asset_id}_eye_{side}_mesh", (x + side * 0.11, y - 0.285, height + 0.25), (0.045, 0.018, 0.035), mats["white"], target, asset_id, "character", role, "eye", 16, 8)
@@ -289,6 +464,7 @@ def make_character(asset_id, role, label_text, accent, x, y, target, mats, kind)
             chamfer(f"{asset_id}_wrench_head_mesh", (x + 0.5, y - 0.18, height * 0.62), (0.11, 0.025, 0.045), mats["shell"], target, asset_id, "character", role, "wrench")
         elif role == "medical":
             chamfer(f"{asset_id}_medkit_mesh", (x - 0.46, y - 0.17, height * 0.46), (0.14, 0.035, 0.1), mats["white"], target, asset_id, "character", role, "medkit")
+        add_species_detail(asset_id, role, label_text, x, y, height, accent_mat, target, mats)
     rig_points = [(x, y, 0.05), (x, y, height * 0.65), (x, y, height + 0.18)]
     spine = lunar.curve(f"{asset_id}_animation_spine_wire", rig_points, 0.014, accent_mat, target)
     arms = lunar.curve(f"{asset_id}_animation_arm_wire", [(x - body_w, y, height * 0.7), (x, y, height * 0.78), (x + body_w, y, height * 0.7)], 0.012, accent_mat, target)
@@ -318,12 +494,12 @@ def setup_camera_and_lighting(target):
     fill.data.color = (0.18, 0.42, 1.0)
     fill.data.size = 18
     lunar.move_to(fill, lighting)
-    bpy.ops.object.camera_add(location=(0, -27, 18))
+    bpy.ops.object.camera_add(location=(0, -34, 23))
     camera = bpy.context.object
     camera.name = "Hero asset review camera"
     camera.data.type = "ORTHO"
-    camera.data.ortho_scale = 27
-    camera.rotation_euler = (Vector((0, 0, 1.0)) - camera.location).to_track_quat("-Z", "Y").to_euler()
+    camera.data.ortho_scale = 36
+    camera.rotation_euler = (Vector((0, -2.0, 1.0)) - camera.location).to_track_quat("-Z", "Y").to_euler()
     bpy.context.scene.camera = camera
     lunar.move_to(camera, lighting)
     world = bpy.context.scene.world or bpy.data.worlds.new("Hero Asset World")
@@ -378,6 +554,7 @@ def main():
     scene["reference_target"] = "approved lunar city concept images"
     scene["asset_count"] = len(BUILDINGS) + len(LEADERS) + len(WORKERS) + len(CHILDREN)
     scene["hero_mesh_components"] = sum(1 for obj in bpy.data.objects if obj.get("hero_asset"))
+    scene["sculpted_surface_components"] = sum(1 for obj in bpy.data.objects if obj.get("mesh_construction"))
 
     manifest = {
         "schemaVersion": 1,
@@ -389,6 +566,7 @@ def main():
         "characterPreview": "lunar-city/hero-assets/lunar-city-hero-characters.png",
         "assetCount": scene["asset_count"],
         "heroMeshComponentCount": scene["hero_mesh_components"],
+        "sculptedSurfaceComponentCount": scene["sculpted_surface_components"],
         "buildings": [{"id": asset_id, "role": role, "title": title, "lod": ["hero", "high", "medium", "low"]} for asset_id, role, title, _accent in BUILDINGS],
         "leaders": [{"id": asset_id, "role": role, "identity": species, "animationClips": ["idle", "walk", "work", "talk", "panic", "celebrate"]} for asset_id, role, species, _accent in LEADERS],
         "workers": [{"id": asset_id, "role": role, "personality": personality, "animationClips": ["idle", "walk", "work", "carry", "repair", "celebrate"]} for asset_id, role, personality, _accent in WORKERS],
@@ -398,6 +576,7 @@ def main():
             "usesSeparateHeroAssetScene": True,
             "noRawSoulContent": True,
             "freeLocalGenerationOnly": True,
+            "usesContinuousSculptedSurfaces": scene["sculpted_surface_components"] >= len(BUILDINGS) * 4 + len(LEADERS),
         },
     }
     HERO_MANIFEST.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
@@ -410,8 +589,8 @@ def main():
     bpy.ops.render.render(write_still=True)
     camera = scene.camera
     if camera:
-        camera.location = (0, -24, 14)
-        camera.data.ortho_scale = 17
+        camera.location = (0, -28, 17)
+        camera.data.ortho_scale = 23
         camera.rotation_euler = (Vector((0, -7.8, 0.9)) - camera.location).to_track_quat("-Z", "Y").to_euler()
         scene.render.filepath = str(HERO_CHARACTER_RENDER)
         bpy.ops.render.render(write_still=True)

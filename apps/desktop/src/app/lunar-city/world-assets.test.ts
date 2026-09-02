@@ -1,4 +1,6 @@
 import { describe, expect, it } from 'vitest'
+import { readFileSync } from 'node:fs'
+import { join } from 'node:path'
 
 import { LUNAR_CITY_ASSET_MANIFEST } from './world-assets'
 
@@ -57,5 +59,31 @@ describe('Lunar City asset manifest', () => {
         expect(['2k', '4k']).toContain(slot.resolution)
       }
     }
+  })
+
+  it('tracks the generated sculpted hero asset library', () => {
+    const manifest = JSON.parse(
+      readFileSync(join(process.cwd(), 'public/lunar-city/hero-assets/hero-assets-manifest.json'), 'utf8')
+    ) as {
+      assetCount: number
+      buildings: unknown[]
+      children: unknown[]
+      heroMeshComponentCount: number
+      leaders: unknown[]
+      sculptedSurfaceComponentCount: number
+      validation: Record<string, boolean>
+      workers: unknown[]
+    }
+
+    expect(manifest.assetCount).toBe(26)
+    expect(manifest.buildings).toHaveLength(8)
+    expect(manifest.leaders).toHaveLength(8)
+    expect(manifest.workers).toHaveLength(6)
+    expect(manifest.children).toHaveLength(4)
+    expect(manifest.heroMeshComponentCount).toBeGreaterThan(600)
+    expect(manifest.sculptedSurfaceComponentCount).toBeGreaterThanOrEqual(40)
+    expect(manifest.validation.usesContinuousSculptedSurfaces).toBe(true)
+    expect(manifest.validation.freeLocalGenerationOnly).toBe(true)
+    expect(manifest.validation.noRawSoulContent).toBe(true)
   })
 })
