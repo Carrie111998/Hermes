@@ -6,6 +6,7 @@ Handler injected to avoid importing ``main``.
 
 from __future__ import annotations
 
+import argparse
 from typing import Callable
 
 
@@ -39,6 +40,20 @@ def build_doctor_parser(subparsers, *, cmd_doctor: Callable) -> None:
             "Acknowledge a security advisory by ID and exit. After ack, the "
             "advisory will no longer trigger startup banners. Run `hermes "
             "doctor` first to see active advisories and their IDs."
+        ),
+    )
+    doctor_sub = doctor_parser.add_subparsers(
+        dest="doctor_command", metavar="{deploy}"
+    )
+    doctor_sub.add_parser(
+        "deploy",
+        help="Verify every running hermes-agent process is on current code",
+        description=(
+            "List every running hermes-agent long-lived process (gateway, "
+            "serve backend, dashboard) with pid, kind, start time, HEAD-at-start "
+            "and current install HEAD. Flags STALE any process whose "
+            "HERMES_AGENT_HEAD differs from current HEAD. Exits non-zero when "
+            "any process is stale (or HEAD cannot be resolved)."
         ),
     )
     doctor_parser.set_defaults(func=cmd_doctor)

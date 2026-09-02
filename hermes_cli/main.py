@@ -5931,6 +5931,10 @@ def cmd_hooks(args):
 
 def cmd_doctor(args):
     """Check configuration and dependencies."""
+    if getattr(args, "doctor_command", None) == "deploy":
+        from hermes_cli.doctor_deploy import run_doctor_deploy
+
+        sys.exit(run_doctor_deploy(args))
     from hermes_cli.doctor import run_doctor
 
     run_doctor(args)
