@@ -1928,16 +1928,18 @@ class DockerEnvironment(BaseEnvironment):
             ]
             if egress_label != "off":
                 filters.extend(["--filter", f"label={_EGRESS_LABEL_KEY}={egress_label}"])
-                fmt = "{{.ID}}\t{{.State}}"
             else:
-                # When egress is off, we widen the probe to find any
-                # task+profile container (regardless of egress label), then
-                # post-filter in Python: reject containers whose
-                # hermes-egress label is present and not "off".  Without
-                # this, a container created with egress=on can be silently
-                # reused after the operator runs "hermes egress disable",
-                # preserving baked-in proxy env and CA mounts.
-                fmt = '{{.ID}}\t{{.State}}\t{{.Label "' + _EGRESS_LABEL_KEY + '"}}'
+                # Egress-off reuse is label-filtered too: a container
+                # created with egress=on must not be silently reused after
+                # "hermes egress disable" (it would keep baked-in proxy env
+                # and CA mounts). Every container this class creates carries
+                # an explicit hermes-egress label, so filtering on
+                # label=hermes-egress=off matches exactly the reusable set.
+                # The label FILTER (not the {{.Label "key"}} template
+                # function, which is Docker-only and makes podman ps exit
+                # 125) keeps the probe portable across runtimes (#99213).
+                filters.extend(["--filter", f"label={_EGRESS_LABEL_KEY}=off"])
+            fmt = "{{.ID}}\t{{.State}}"
             result = subprocess.run(
                 [
                     self._docker_exe, "ps", "-a",
@@ -1970,24 +1972,12 @@ class DockerEnvironment(BaseEnvironment):
         running = None
         first = None
         for ln in lines:
-            if egress_label == "off":
-                # Format: ID\tState\tEgressLabel — parse all three fields
-                # and reject containers with a non-off egress label.
-                parts = ln.split("\t", 2)
-                if len(parts) < 3:
-                    continue
-                cid, state, egress_val = parts[0], parts[1].lower(), parts[2]
-                if egress_val not in ("", "<no value>", "off"):
-                    logger.debug(
-                        "skipping container %s for egress=off reuse: "
-                        "label %s=%r", cid, _EGRESS_LABEL_KEY, egress_val,
-                    )
-                    continue
-            else:
-                parts = ln.split("\t", 1)
-                if len(parts) != 2:
-                    continue
-                cid, state = parts[0], parts[1].lower()
+            # Format: ID\tState (the egress posture is already enforced by
+            # the label filters above, so no third column to post-filter).
+            parts = ln.split("\t", 1)
+            if len(parts) != 2:
+                continue
+            cid, state = parts[0], parts[1].lower()
             if first is None:
                 first = (cid, state)
             if state == "running" and running is None:
