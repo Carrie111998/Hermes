@@ -18,7 +18,7 @@ import uuid
 from pathlib import Path
 from datetime import datetime, timedelta
 from dataclasses import dataclass, field, replace
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional, Any, Set
 
 logger = logging.getLogger(__name__)
 
@@ -3899,7 +3899,24 @@ class SessionStore:
             self._ensure_loaded_locked()
             entry = self._entries.get(session_key)
             return getattr(entry, "session_id", None) if entry else None
-    
+
+    def live_session_keys(self) -> Set[str]:
+        """Return a snapshot of every routable session key.
+
+        Public, lock-held companion to ``peek_session_id`` for callers that
+        need the whole key set rather than one lookup — e.g. the orphaned-row
+        sweep, which must know which DB rows are still owned by the in-memory
+        expiry path. Reaching into ``_entries`` directly races
+        ``_ensure_loaded_locked`` and the reset path, both of which REPLACE
+        entries wholesale, so an unlocked reader can observe a partially
+        rebuilt index and conclude a live session is orphaned.
+
+        The returned set is a copy; mutating it does not affect the store.
+        """
+        with self._lock:
+            self._ensure_loaded_locked()
+            return set(self._entries.keys())
+
     def _get_transcript_drain_lock(self):
         """Return the lock that serializes pending-queue drain boundaries."""
         drain_lock = getattr(self, "_transcript_drain_lock", None)

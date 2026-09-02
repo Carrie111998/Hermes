@@ -7707,6 +7707,60 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             ).fetchall()
         return [dict(r) for r in rows]
 
+    def list_orphaned_open_sessions(
+        self, *, older_than_seconds: float
+    ) -> List[Dict[str, Any]]:
+        """Open sessions that no in-memory entry can ever finalize.
+
+        ``_session_expiry_watcher`` walks ``session_store._entries`` — the
+        gateway routing index, keyed by ``session_key``. Two shapes of row can
+        never appear there, so the reset policy is never evaluated for them and
+        they stay open forever:
+
+        * ``session_key IS NULL`` — e.g. every ``api_server`` row. The
+          stateless ``/v1/chat/completions`` path derives a per-request session
+          id and never registers a routing key, so nothing can look it up.
+        * keys evicted from the index (``_prune_stale_sessions_locked``) or
+          belonging to a previous gateway process. A key that is never
+          revisited — a per-message thread root, a one-shot request — is not
+          reloaded, so the entry that would have carried the policy is gone.
+
+        Observed in the wild: 703 open rows on a single-user install, 551 of
+        them ``api_server`` with a NULL key, and Matrix rows idle for 69 days
+        under a 120-minute idle policy.
+
+        ``source`` and ``chat_type`` are returned so the caller can resolve the
+        row's effective reset policy (``get_reset_policy(platform,
+        session_type)``) rather than applying a flat age rule — the shipped
+        default is ``mode="none"``, so an age-only sweep would auto-reset
+        sessions on installs that configured nothing.
+
+        Deliberately narrower than the in-memory path: it only reports rows
+        idle far beyond any sane reset window (see ``_ORPHAN_SWEEP_MIN_IDLE_S``
+        in ``gateway/run.py``), and skips ``pinned``/``archived`` rows, which
+        are explicit user intent to keep. Unlike
+        ``list_never_active_keyed_sessions`` it does NOT require the row to be
+        empty — these rows have real transcripts; the caller ENDS them, it
+        never deletes them.
+        """
+        cutoff = time.time() - float(older_than_seconds)
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT s.id, s.session_key, s.source, s.chat_type,
+                       COALESCE(s.last_activity_at, s.started_at) AS last_active
+                  FROM sessions s
+                 WHERE s.ended_at IS NULL
+                   AND COALESCE(s.pinned, 0) = 0
+                   AND COALESCE(s.archived, 0) = 0
+                   AND COALESCE(s.last_activity_at, s.started_at) IS NOT NULL
+                   AND COALESCE(s.last_activity_at, s.started_at) < ?
+                 ORDER BY last_active
+                """,
+                (cutoff,),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
     def _delete_routing_entries_for_sessions(self, session_ids: Set[str]) -> int:
         """Drop ``gateway_routing`` rows pointing at any of *session_ids*.
 

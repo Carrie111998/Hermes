@@ -83,6 +83,18 @@ from hermes_cli.fallback_config import get_fallback_chain
 # (see gateway/agent_cache_pressure.py).
 _AGENT_CACHE_MAX_SIZE = 128
 _AGENT_CACHE_IDLE_TTL_SECS = 3600.0  # evict agents idle for >1h
+# Minimum idle time before the orphaned-session sweep will END a DB row that
+# the routing index can no longer reach. Deliberately far beyond any sane
+# reset window (the shipped default is 120 min idle / daily at 04:00), so the
+# sweep can only ever catch genuinely abandoned rows — never a session that is
+# merely slow. See _reconcile_orphaned_open_sessions.
+_ORPHAN_SWEEP_MIN_IDLE_S = 24 * 3600.0
+# Rows ended per watcher tick. The first sweep on a leaking install faces a
+# real backlog (703 open rows observed on a single-user box); each end_session
+# is a synchronous sqlite write, so an uncapped first pass would issue all of
+# them back-to-back. The watcher ticks every 300s, so a backlog drains over a
+# few passes instead of in one burst.
+_ORPHAN_SWEEP_MAX_PER_TICK = 50
 _PLATFORM_CONNECT_TIMEOUT_SECS_DEFAULT = 30.0
 # Telegram cold polling now proves one real getUpdates round trip before connect
 # returns. Leave enough outer budget for initialize/deleteWebhook/start_polling
@@ -15371,6 +15383,206 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             err = getattr(result, "error", "send returned success=False")
             raise RuntimeError(f"adapter.send failed: {err}")
 
+    async def _reconcile_orphaned_open_sessions(self) -> int:
+        """End open sessions the in-memory expiry path can never see.
+
+        ``_session_expiry_watcher`` iterates ``session_store._entries``, which
+        ``_ensure_loaded_locked`` builds from the ``gateway_routing`` table —
+        keyed by ``session_key``. A row that has no key, or whose key was
+        pruned or belongs to a previous gateway process, is not in that index,
+        so its reset policy is never evaluated and it stays open indefinitely.
+        Neither ``prune`` nor ``archive`` can reach it either: their selector
+        is pinned to ``ended_at IS NOT NULL`` precisely so a live session is
+        never picked, which excludes every never-closed row by construction.
+
+        Only rows idle beyond ``_ORPHAN_SWEEP_MIN_IDLE_S`` are touched — far
+        past any reset window, so a merely-slow session is never affected.
+        Anything still present in the routing index is skipped and left to the
+        in-memory path, which additionally runs the finalize hooks. Sessions
+        with live background processes are skipped via the same guard the
+        reset policy uses.
+
+        Rows are ENDED, never deleted: they hold real transcripts.
+        ``end_session`` is idempotent and first-reason-wins, so a concurrent
+        close is harmless.
+
+        Returns:
+            Number of sessions ended.
+        """
+        db = getattr(getattr(self, "_session_db", None), "_db", None)
+        lister = getattr(db, "list_orphaned_open_sessions", None)
+        if not callable(lister):
+            # Reached only if the private attribute chain moved. Warn ONCE,
+            # loudly enough to be found: a silent `return 0` here turns an
+            # upstream rename into a permanent no-op that looks like "there
+            # were no orphans" forever, and the leak this method exists to
+            # fix comes straight back with nothing in the log to say so.
+            if not getattr(self, "_orphan_sweep_unavailable_warned", False):
+                self._orphan_sweep_unavailable_warned = True
+                logger.warning(
+                    "Orphaned-session sweep disabled: could not resolve "
+                    "_session_db._db.list_orphaned_open_sessions (resolved "
+                    "db=%r). Open rows unreachable from the routing index "
+                    "will accumulate until this is repaired.",
+                    type(db).__name__ if db is not None else None,
+                )
+            return 0
+
+        # EVERYTHING below runs off-loop in one thread hop. Two reasons:
+        #   * end_session is blocking sqlite I/O; a slow disk must not stall
+        #     every other gateway task behind this sweep.
+        #   * the eligibility filter reads the SYNC session_store
+        #     (live_session_keys / _has_active_processes_safe). Async gateway
+        #     code may not touch the sync store on the loop — see
+        #     tests/gateway/test_async_session_store.py, which allows exactly
+        #     this shape: a nested sync helper, because it executes off-loop.
+        #     An earlier revision called _has_active_processes_safe directly in
+        #     the coroutine and tripped that test.
+        def _sweep() -> tuple:
+            try:
+                rows = lister(older_than_seconds=_ORPHAN_SWEEP_MIN_IDLE_S)
+            except Exception as exc:
+                logger.debug("Orphaned-session listing failed: %s", exc)
+                return 0, 0
+            if not rows:
+                return 0, 0
+
+            # Snapshot the routing index through the store's public, lock-held
+            # accessor. Reading `_entries` unlocked races the rebuild paths,
+            # which replace the dict wholesale — a reader can catch it
+            # half-built and mistake a live session for an orphan. Fall back to
+            # the private dict only for older stores / test doubles predating
+            # the accessor.
+            store = self.session_store
+            keys_fn = getattr(store, "live_session_keys", None)
+            if callable(keys_fn):
+                live_keys = keys_fn()
+            else:
+                live_keys = set(getattr(store, "_entries", {}) or {})
+
+            eligible = []
+            for row in rows:
+                key = row.get("session_key")
+                # Still routable: the in-memory path owns it (and runs the
+                # finalize hooks this sweep deliberately does not).
+                if key and key in live_keys:
+                    continue
+                # Would this row's OWN reset policy ever have ended it? The
+                # shipped default is mode="none" (never auto-reset), so
+                # skipping this check does not merely miss an edge case — it
+                # overrides the DEFAULT for every install that never
+                # configured session_reset.
+                if not self._orphan_sweep_policy_permits_end(row):
+                    continue
+                if key:
+                    try:
+                        if store._has_active_processes_safe(
+                            key, context="orphan-sweep"
+                        ):
+                            continue
+                    except Exception:
+                        continue
+                eligible.append(row["id"])
+                # Bound the work per tick. The first sweep on a leaking
+                # install has a real backlog (703 rows were observed on a
+                # single-user box); ending them all in one pass would run that
+                # many synchronous DB writes back-to-back. The watcher ticks
+                # every 300s, so a backlog drains steadily instead.
+                if len(eligible) >= _ORPHAN_SWEEP_MAX_PER_TICK:
+                    break
+
+            done = 0
+            for session_id in eligible:
+                try:
+                    db.end_session(session_id, "orphaned_expiry")
+                    done += 1
+                except Exception as exc:
+                    logger.debug(
+                        "Could not end orphaned session %s: %s", session_id, exc
+                    )
+            return done, len(eligible)
+
+        closed, considered = await asyncio.to_thread(_sweep)
+        if considered >= _ORPHAN_SWEEP_MAX_PER_TICK:
+            logger.info(
+                "Orphaned-session sweep hit the per-tick cap (%d); more rows "
+                "remain and will be picked up on the next pass.",
+                _ORPHAN_SWEEP_MAX_PER_TICK,
+            )
+        return closed
+
+    def _orphan_sweep_policy_permits_end(self, row: dict) -> bool:
+        """True only if this row's effective reset policy would have ended it.
+
+        The sweep exists because these rows never reach the in-memory expiry
+        path, so their policy is never evaluated. Ending them without
+        consulting that policy substitutes a flat 24h rule for the user's
+        configuration — and since ``SessionResetPolicy.mode`` defaults to
+        ``"none"`` ("never auto-reset", made the default in July 2026 because
+        the old behaviour "surprised users who expected their conversations to
+        persist"), the unconditional version would auto-reset sessions on
+        installs that opted into nothing at all.
+
+        Fails CLOSED: any row whose policy cannot be resolved with confidence
+        is left open. Keeping a stale row costs disk; ending a session the
+        user asked to keep forever destroys their context.
+        """
+        config = getattr(self.session_store, "config", None)
+        resolver = getattr(config, "get_reset_policy", None)
+        if not callable(resolver):
+            return False
+
+        # `chat_type` is the session_type the live path passes (see the
+        # notify branch in _session_expiry_watcher, which resolves it as
+        # `getattr(source, 'chat_type', 'dm')`), so a bare DB row can be
+        # resolved exactly the same way the in-memory path would.
+        session_type = row.get("chat_type")
+        if not session_type and getattr(config, "reset_by_type", None):
+            # Per-type policies are configured but this row predates the
+            # column or never recorded one. Any answer would be a guess, and
+            # the guess could end a row the user pinned to "none".
+            return False
+
+        source = row.get("source")
+        platform = None
+        if source:
+            try:
+                platform = Platform(source)
+            except Exception:
+                # A source the enum cannot construct: reset_by_platform cannot
+                # be checked, so an override pinning it to "none" cannot be
+                # ruled out.
+                return False
+        try:
+            policy = resolver(platform=platform, session_type=session_type)
+        except Exception:
+            return False
+
+        mode = (getattr(policy, "mode", "none") or "none").lower()
+        if mode == "none":
+            return False
+        if mode == "daily":
+            # Only rows already idle past _ORPHAN_SWEEP_MIN_IDLE_S (24h) reach
+            # here, so at least one daily boundary has certainly passed.
+            return True
+        if mode in ("idle", "both"):
+            try:
+                idle_limit = float(getattr(policy, "idle_minutes", 1440)) * 60.0
+            except (TypeError, ValueError):
+                return False
+            last_active = row.get("last_active")
+            if last_active is None:
+                return False
+            try:
+                idle_for = time.time() - float(last_active)
+            except (TypeError, ValueError):
+                return False
+            # "both" also has a daily trigger, but the idle test is the
+            # stricter of the two at >24h idle, so it alone is sufficient.
+            return idle_for >= idle_limit
+        # Unrecognised mode from a newer config: fail closed.
+        return False
+
     async def _session_expiry_watcher(self, interval: int = 300):
         """Background task that finalizes expired sessions.
 
@@ -15505,6 +15717,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         logger.info(
                             "Session expiry done: %d finalized", _done,
                         )
+
+                # Close DB rows that no in-memory entry can ever reach.
+                # The loop above walks session_store._entries — the routing
+                # index, keyed by session_key — so a row with a NULL key, or
+                # one whose key was evicted or belongs to a previous gateway
+                # process, is never evaluated and stays open forever. See
+                # _reconcile_orphaned_open_sessions.
+                try:
+                    _orphans_closed = await self._reconcile_orphaned_open_sessions()
+                    if _orphans_closed:
+                        logger.info(
+                            "Session expiry: closed %d orphaned open session(s) "
+                            "unreachable from the routing index",
+                            _orphans_closed,
+                        )
+                except Exception as _e:
+                    logger.debug("Orphaned-session reconcile failed: %s", _e)
 
                 # Sweep agents that have been idle beyond the TTL regardless
                 # of session reset policy.  This catches sessions with very
