@@ -20,7 +20,7 @@ from __future__ import annotations
 import json
 import logging
 import re
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from agent.memory_provider import MemoryProvider
 from tools.registry import tool_error
@@ -242,14 +242,75 @@ class HolographicMemoryProvider(MemoryProvider):
             return
         self._auto_extract_facts(messages)
 
-    def on_memory_write(self, action: str, target: str, content: str) -> None:
-        """Mirror built-in memory writes as facts."""
-        if action == "add" and self._store and content:
-            try:
+    def on_memory_write(
+        self,
+        action: str,
+        target: str,
+        content: str,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Mirror built-in memory writes as facts.
+
+        ``add`` inserts a new fact.  ``replace`` / ``remove`` locate the
+        existing fact via the manager-provided ``old_text`` substring
+        (metadata) and update / delete it; without ``old_text`` they are no-ops
+        — replacing an unlocatable fact would create a duplicate instead of
+        updating it, which is worse than skipping.
+        """
+        if not self._store:
+            return
+        metadata = metadata or {}
+        try:
+            if action == "add":
+                if not content:
+                    return
                 category = "user_pref" if target == "user" else "general"
                 self._store.add_fact(content, category=category)
-            except Exception as e:
-                logger.debug("Holographic memory_write mirror failed: %s", e)
+                return
+
+            old_text = metadata.get("old_text")
+            if not isinstance(old_text, str) or not old_text.strip():
+                # No anchor for a replace/remove — cannot locate the fact.
+                return
+
+            if action == "replace":
+                if not content:
+                    return
+                self._mirror_replace(content, old_text, target)
+            elif action == "remove":
+                self._mirror_remove(old_text, target)
+        except Exception as e:
+            logger.debug("Holographic memory_write mirror failed: %s", e)
+
+    def _mirror_replace(self, content: str, old_text: str, target: str) -> None:
+        """Update the best-matching fact for ``old_text`` with new content."""
+        facts = self._store.search_facts(old_text, limit=5)
+        if not facts:
+            return
+        # Prefer an exact substring hit over an FTS token hit.
+        hit = next(
+            (f for f in facts if old_text.strip().lower() in f.get("content", "").lower()),
+            None,
+        )
+        if hit is None:
+            hit = facts[0]
+        category = "user_pref" if target == "user" else None
+        self._store.update_fact(
+            hit["fact_id"], content=content, category=category
+        )
+
+    def _mirror_remove(self, old_text: str, target: str) -> None:
+        """Delete the best-matching fact for ``old_text``."""
+        facts = self._store.search_facts(old_text, limit=5)
+        if not facts:
+            return
+        hit = next(
+            (f for f in facts if old_text.strip().lower() in f.get("content", "").lower()),
+            None,
+        )
+        if hit is None:
+            hit = facts[0]
+        self._store.remove_fact(hit["fact_id"])
 
     def shutdown(self) -> None:
         # Release the shared SQLite connection deterministically on the
