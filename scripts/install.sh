@@ -1085,7 +1085,7 @@ install_node_line() {
         prefer_gz=true
         log_info "xz not found — preferring .tar.gz tarballs (GNU tar needs xz for .tar.xz)"
     fi
-    local tarball_name
+    local tarball_name=""
     if [ "$prefer_gz" = true ]; then
         tarball_name=$(curl -fsSL "$index_url" \
             | grep -oE "node-v${node_line}\.[0-9]+\.[0-9]+-${node_os}-${node_arch}\.tar\.gz" \
