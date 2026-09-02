@@ -1219,6 +1219,19 @@ def build_session_key(
     return ":".join(str(part) for part in key_parts)
 
 
+def build_telegram_topic_session_key(chat_id: object, thread_id: object = None) -> str:
+    """Build the stable, platform-facing Telegram topic identity key.
+
+    The SessionStore continues to use its profile-aware internal namespace
+    from :func:`build_session_key`; this compact key is used by Telegram task
+    routing/audit records and makes the topic boundary explicit. Missing
+    ``message_thread_id`` maps to the general lane.
+    """
+    chat = str(chat_id or "")
+    thread = str(thread_id or "general")
+    return f"telegram:{chat}:{thread}"
+
+
 class _SessionFlight:
     def __init__(self) -> None:
         self.event = threading.Event()

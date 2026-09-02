@@ -870,6 +870,9 @@ class TelegramAdapter(BasePlatformAdapter):
         # Slash-confirm button state: confirm_id → session_key (for /reload-mcp
         # and any other slash-confirm prompts; see GatewayRunner._request_slash_confirm).
         self._slash_confirm_state: Dict[str, str] = {}
+        # Task-router approval button state: task_id → session_key (HIGH/CRITICAL
+        # risk-routed tasks paused pending approval; see gateway/task_router.py).
+        self._task_approval_state: Dict[str, str] = {}
         # Clarify button state: clarify_id → session_key (for the clarify tool's
         # multiple-choice prompts; see GatewayRunner clarify_callback wiring).
         self._clarify_state: Dict[str, str] = {}
@@ -6620,6 +6623,68 @@ class TelegramAdapter(BasePlatformAdapter):
             logger.warning("[%s] send_slash_confirm failed: %s", self.name, _redact_telegram_error_text(e))
             return SendResult(success=False, error=_redact_telegram_error_text(e))
 
+    async def send_task_approval(
+        self, chat_id: str, task_id: str, request_text: str, risk: str,
+        session_key: str, environment: str = "local", reason: str = "",
+        proposed_agent: str = "claude-sonnet-5 via anthropic",
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """Render an Approve/Reject prompt for a HIGH/CRITICAL risk-routed task.
+
+        Sent by the gateway's task risk router (gateway/task_router.py) before
+        a HIGH/CRITICAL task is allowed to run. The buttons call
+        ``TaskApprovalRegistry.approve``/``.reject`` via ``_handle_callback_query``
+        — same idempotent pop-then-resolve shape as ``send_exec_approval``.
+        """
+        if not self._bot:
+            return SendResult(success=False, error="Not connected")
+
+        try:
+            preview = self.format_message(
+                f"⚠️ *APPROVAL REQUIRED*\n\n"
+                f"*Task:* {self._truncate_preview(request_text, 1200)}\n"
+                f"*Risk:* {risk.upper()}\n"
+                f"*Reason:* {reason or 'policy-gated operation'}\n"
+                f"*Proposed agent:* {proposed_agent}\n"
+                f"*Affected environment:* {environment}\n\n"
+                f"*Actions:* Approve / Reject / Revise"
+            )
+
+            keyboard = InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton("✅ Approve", callback_data=f"tr:approve:{task_id}"),
+                    InlineKeyboardButton("❌ Reject", callback_data=f"tr:reject:{task_id}"),
+                    InlineKeyboardButton("✏️ Revise", callback_data=f"tr:revise:{task_id}"),
+                ],
+            ])
+
+            thread_id = self._metadata_thread_id(metadata)
+            kwargs: Dict[str, Any] = {
+                "chat_id": normalize_telegram_chat_id(chat_id),
+                "text": preview,
+                "parse_mode": ParseMode.MARKDOWN_V2,
+                "reply_markup": keyboard,
+                **self._link_preview_kwargs(),
+            }
+            reply_to_id = self._reply_to_message_id_for_send(None, metadata, reply_to_mode=self._reply_to_mode)
+            kwargs["reply_to_message_id"] = reply_to_id
+            kwargs.update(
+                self._thread_kwargs_for_send(
+                    chat_id,
+                    thread_id,
+                    metadata,
+                    reply_to_message_id=reply_to_id,
+                    reply_to_mode=self._reply_to_mode
+                )
+            )
+
+            msg = await self._send_message_with_thread_fallback(**kwargs)
+            self._task_approval_state[task_id] = session_key
+            return SendResult(success=True, message_id=str(msg.message_id))
+        except Exception as e:
+            logger.warning("[%s] send_task_approval failed: %s", self.name, _redact_telegram_error_text(e))
+            return SendResult(success=False, error=_redact_telegram_error_text(e))
+
     async def send_clarify(
         self,
         chat_id: str,
@@ -7675,6 +7740,101 @@ class TelegramAdapter(BasePlatformAdapter):
                         await self._send_message_with_thread_fallback(**send_kwargs)
                 except Exception as exc:
                     logger.error("[%s] slash-confirm callback failed: %s", self.name, exc, exc_info=True)
+            return
+
+        # --- Task-router approval callbacks (tr:choice:task_id) ---
+        # HIGH/CRITICAL risk-routed tasks (gateway/task_router.py) pause
+        # before running and wait for one of these two buttons.
+        if data.startswith("tr:"):
+            parts = data.split(":", 2)
+            if len(parts) == 3:
+                choice = parts[1]  # approve, reject
+                task_id = parts[2]
+
+                # Only authorized users may decide a paused task.
+                caller_id = str(getattr(query.from_user, "id", ""))
+                if not self._is_callback_user_authorized(
+                    caller_id,
+                    chat_id=query_chat_id,
+                    chat_type=str(query_chat_type) if query_chat_type is not None else None,
+                    thread_id=str(query_thread_id) if query_thread_id is not None else None,
+                    user_name=query_user_name,
+                ):
+                    await query.answer(text="⛔ You are not authorized to decide this task.")
+                    return
+
+                # First idempotency layer: pop the per-adapter marker so a
+                # second tap on the SAME button (before the registry round
+                # trip even starts) is rejected immediately.
+                if task_id not in self._task_approval_state:
+                    await query.answer(text="This task approval has already been resolved.")
+                    return
+                self._task_approval_state.pop(task_id, None)
+
+                user_display = getattr(query.from_user, "first_name", "User")
+                decided_by = f"telegram:{caller_id}:{user_display}"
+
+                from gateway.task_router import get_task_registry
+                registry = get_task_registry()
+                # Second, authoritative idempotency layer: the registry's
+                # approve/reject only succeed out of PENDING and are
+                # lock-guarded, so a race between two taps (or a replayed
+                # callback) can resolve the task at most once either way.
+                if choice == "approve":
+                    route = registry.approve(task_id, decided_by)
+                elif choice in {"reject", "revise"}:
+                    route = registry.reject(task_id, decided_by)
+                else:
+                    route = None
+
+                if route is None:
+                    label = "⌛ Already resolved"
+                    edit_text = (
+                        f"{label} — this task was already approved, rejected, "
+                        f"or is no longer pending."
+                    )
+                elif choice == "approve":
+                    label = "✅ Approved"
+                    edit_text = (
+                        f"{label} by {user_display} — running with "
+                        f"{route.agent.provider}/{route.agent.model}."
+                    )
+                elif choice == "revise":
+                    label = "✏️ Revision requested"
+                    edit_text = (
+                        f"{label} by {user_display}. This request will not run; "
+                        "send a new task with the requested changes."
+                    )
+                else:
+                    label = "❌ Rejected"
+                    edit_text = f"{label} by {user_display}. This task will not run."
+
+                await query.answer(text=label)
+                try:
+                    await query.edit_message_text(
+                        text=self.format_message(edit_text),
+                        parse_mode=ParseMode.MARKDOWN_V2,
+                        reply_markup=None,
+                    )
+                except Exception:
+                    pass
+
+                if route is not None and choice == "approve":
+                    # Hand off to the gateway to actually run the now-approved
+                    # task. Reached via the bound _handle_message method the
+                    # runner registered as our message handler — same
+                    # indirection _is_callback_user_authorized already uses
+                    # to reach back into the runner without a hard import.
+                    runner = getattr(getattr(self, "_message_handler", None), "__self__", None)
+                    resume_fn = getattr(runner, "_resume_approved_telegram_task", None)
+                    if callable(resume_fn):
+                        try:
+                            await resume_fn(task_id)
+                        except Exception:
+                            logger.error(
+                                "[%s] Failed to resume approved task %s",
+                                self.name, task_id, exc_info=True,
+                            )
             return
 
         # --- Clarify callbacks (cl:clarify_id:idx | cl:clarify_id:other) ---

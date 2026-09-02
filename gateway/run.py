@@ -21102,6 +21102,209 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 pass
         return source
 
+    # ------------------------------------------------------------------
+    # Telegram task risk router (gateway/task_router.py)
+    #
+    # Classifies each inbound Telegram task's risk and either (a) routes
+    # LOW/MEDIUM straight to gpt-5.6-luna via a one-turn model override, or
+    # (b) for HIGH/CRITICAL, pauses the turn and sends a Telegram
+    # approve/reject prompt — the agent never runs until an authorized
+    # approver approves it. Scoped to Telegram only; every other platform's
+    # message flow, and Telegram's own slash-command/shell-approval paths,
+    # are untouched.
+    # ------------------------------------------------------------------
+
+    async def _route_telegram_task_risk(
+        self, *, source, session_key: str, message_text: str, event,
+    ):
+        """Return ``(paused, task_id)``.
+
+        ``paused=True`` means the caller MUST return without calling
+        ``_run_agent`` — a HIGH/CRITICAL task is awaiting approval (or a
+        duplicate delivery landed on one still pending) and the approval
+        prompt has already been sent. ``task_id`` is set when the caller
+        should call ``_mark_task_route_executed`` once the turn finishes so
+        the audit trail records completion; it is ``None`` when there is
+        nothing to track (non-Telegram platforms, internal/system events,
+        blank text).
+        """
+        if source.platform != Platform.TELEGRAM:
+            return False, None
+
+        from gateway.task_router import get_task_registry
+        from gateway.session import build_telegram_topic_session_key
+
+        registry = get_task_registry()
+        event_metadata = getattr(event, "metadata", None) or {}
+        resume_task_id = event_metadata.get("task_router_resume_task_id")
+
+        if resume_task_id:
+            # Re-entry after approval: _resume_approved_telegram_task already
+            # consumed the task for execution; just apply its agent override
+            # for this turn and proceed.
+            route = registry.get(resume_task_id)
+            if route is None:
+                return False, None
+            await self._apply_task_route_model_override(session_key, route.agent)
+            return False, resume_task_id
+
+        if getattr(event, "internal", False):
+            return False, None
+        if not message_text or not message_text.strip():
+            return False, None
+
+        from gateway.task_router import (
+            approval_reason,
+            classify_and_select,
+            infer_environment,
+            requires_approval,
+        )
+
+        risk, agent = classify_and_select(message_text)
+        message_id = getattr(event, "message_id", None)
+        dedupe_key = f"{session_key}:{message_id}" if message_id else None
+
+        route = registry.create_or_get(
+            dedupe_key=dedupe_key,
+            session_key=build_telegram_topic_session_key(
+                source.chat_id, getattr(source, "thread_id", None)
+            ),
+            chat_id=str(source.chat_id or ""),
+            thread_id=str(getattr(source, "thread_id", None) or ""),
+            user_id=str(source.user_id or ""),
+            request_text=message_text,
+            risk=risk,
+            agent=agent,
+        )
+
+        if requires_approval(route.risk):
+            if registry.claim_prompt(route.task_id) is not None:
+                try:
+                    adapter = self._adapter_for_source(source)
+                    send_fn = getattr(adapter, "send_task_approval", None)
+                    if callable(send_fn):
+                        await send_fn(
+                            chat_id=str(source.chat_id or ""),
+                            task_id=route.task_id,
+                            request_text=message_text,
+                            risk=risk.value,
+                            session_key=session_key,
+                            environment=infer_environment(message_text),
+                            reason=approval_reason(route.risk),
+                            proposed_agent=f"{route.agent.model} via {route.agent.provider}",
+                            metadata={
+                                "thread_id": str(getattr(source, "thread_id", None) or "")
+                            },
+                        )
+                    else:
+                        logger.warning(
+                            "task_router: adapter for %s has no send_task_approval; "
+                            "task %s left pending with no prompt sent",
+                            source.platform, route.task_id,
+                        )
+                except Exception:
+                    registry.release_prompt_claim(route.task_id)
+                    logger.error(
+                        "task_router: failed to send approval prompt for task %s",
+                        route.task_id, exc_info=True,
+                    )
+            # Whether we just sent the prompt or a duplicate delivery hit an
+            # already-pending task, the turn must not proceed to _run_agent.
+            return True, None
+
+        # LOW/MEDIUM: auto-approved by the registry at creation time. Consume
+        # it for execution now — the single-use execution gate. A redelivered
+        # duplicate resolves to the same task_id via dedupe above but cannot
+        # be consumed a second time.
+        consumed = registry.consume_for_execution(route.task_id)
+        if consumed is None:
+            return True, None
+        await self._apply_task_route_model_override(session_key, consumed.agent)
+        return False, consumed.task_id
+
+    async def _apply_task_route_model_override(self, session_key: str, agent) -> None:
+        """Apply a task-router agent selection as a one-turn session override.
+
+        Reuses the exact ``/model --once`` mechanism (snapshot now, restore
+        in the existing per-turn ``finally`` via
+        ``_restore_pending_one_turn_model_override``) so the switch never
+        outlives this one turn and never touches the user's own persisted
+        model choice.
+        """
+        try:
+            runtime_kwargs = await asyncio.to_thread(
+                _resolve_runtime_agent_kwargs_for_provider, agent.provider
+            )
+        except Exception:
+            logger.warning(
+                "task_router: failed to resolve credentials for provider=%s; "
+                "running the turn without a model override",
+                agent.provider, exc_info=True,
+            )
+            return
+        restore_snapshot = self._snapshot_session_model_override(session_key)
+        self._session_model_overrides[session_key] = {
+            "model": agent.model,
+            "provider": runtime_kwargs.get("provider") or agent.provider,
+            "api_key": runtime_kwargs.get("api_key"),
+            "base_url": runtime_kwargs.get("base_url"),
+            "api_mode": runtime_kwargs.get("api_mode"),
+        }
+        self._pending_one_turn_model_restores[session_key] = restore_snapshot
+        self._evict_cached_agent(session_key)
+
+    def _mark_task_route_executed(self, task_id: str, agent_result) -> None:
+        try:
+            from gateway.task_router import get_task_registry
+            success = bool(agent_result.get("success")) if isinstance(agent_result, dict) else True
+            get_task_registry().mark_executed(task_id, success=success)
+        except Exception:
+            logger.debug("task_router: failed to mark task %s executed", task_id, exc_info=True)
+
+    async def _resume_approved_telegram_task(self, task_id: str) -> None:
+        """Re-dispatch a HIGH/CRITICAL task after it clears Telegram approval.
+
+        Called by the adapter's ``tr:approve:`` callback handler once
+        ``TaskApprovalRegistry.approve`` has atomically verified the task was
+        pending and transitioned it to approved. Consumes it for execution
+        here (APPROVED -> EXECUTING, single-use) and re-injects it as an
+        inbound message so it gets the SAME session/transcript/delivery
+        handling as any other Telegram turn — just routed to
+        claude-sonnet-5 instead of re-classified.
+        """
+        from gateway.task_router import get_task_registry
+
+        registry = get_task_registry()
+        route = registry.consume_for_execution(task_id)
+        if route is None:
+            logger.warning(
+                "task_router: resume requested for task %s but it was not "
+                "APPROVED (already consumed, rejected, or unknown)", task_id,
+            )
+            return
+
+        chat_type = "dm" if not str(route.chat_id).startswith("-") else "group"
+        event = MessageEvent(
+            text=route.request_text,
+            source=SessionSource(
+                platform=Platform.TELEGRAM,
+                chat_id=route.chat_id,
+                user_id=route.user_id,
+                chat_type=chat_type,
+                thread_id=route.thread_id or None,
+            ),
+            message_id=f"task-router-resume-{route.task_id}",
+            metadata={"task_router_resume_task_id": route.task_id},
+        )
+        try:
+            await self._handle_message(event)
+        except Exception:
+            logger.error(
+                "task_router: approved task %s failed during resumed execution",
+                task_id, exc_info=True,
+            )
+            registry.mark_executed(task_id, success=False)
+
     async def _handle_message_with_agent(self, event, source, _quick_key: str, run_generation: int):
         """Inner handler that runs under the _running_agents sentinel guard."""
         _msg_start_time = time.time()
@@ -23037,6 +23240,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             run_generation,
         )
 
+        # Telegram task risk router: classify + gate BEFORE the agent runs.
+        # LOW/MEDIUM proceed immediately (routed to gpt-5.6-luna below).
+        # HIGH/CRITICAL pause here — the approval prompt has already been
+        # sent — and this turn returns without ever calling _run_agent.
+        _task_route_paused, _task_route_id = await self._route_telegram_task_risk(
+            source=source, session_key=session_key, message_text=message_text,
+            event=event,
+        )
+        if _task_route_paused:
+            return None
+
         try:
             # Emit agent:start hook
             hook_ctx = {
@@ -23076,6 +23290,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 message_type=event.message_type,
             )
             _turn_seconds = time.monotonic() - _turn_started_monotonic
+            if _task_route_id:
+                self._mark_task_route_executed(_task_route_id, agent_result)
 
             # Stop persistent typing indicator now that the agent is done.
             # Slack AI status is scoped to a thread/workspace, so preserve the
