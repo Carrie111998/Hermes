@@ -48,7 +48,7 @@ def _diff_ansi() -> dict[str, str]:
     if _diff_colors_cached is not None:
         return _diff_colors_cached
 
-    # Defaults that work on dark terminals
+    # Defaults that work on dark terminals (white fg on dark tinted bg)
     dim = "\033[38;2;150;150;150m"
     file_c = "\033[38;2;180;160;255m"
     hunk = "\033[38;2;120;120;140m"
@@ -70,16 +70,53 @@ def _diff_ansi() -> dict[str, str]:
         dim = _hex_fg("banner_dim", (150, 150, 150))
         file_c = _hex_fg("session_label", (180, 160, 255))
         hunk = _hex_fg("session_border", (120, 120, 140))
-        # minus/plus use background colors — derive from ui_error/ui_ok
-        err_h = skin.get_color("ui_error", "#ef5350")
-        ok_h = skin.get_color("ui_ok", "#4caf50")
-        if err_h and len(err_h) == 7:
-            er, eg, eb = int(err_h[1:3], 16), int(err_h[3:5], 16), int(err_h[5:7], 16)
-            # Use a dark tinted version as background
-            minus = f"\033[38;2;255;255;255;48;2;{max(er//2,20)};{max(eg//4,10)};{max(eb//4,10)}m"
-        if ok_h and len(ok_h) == 7:
-            or_, og, ob = int(ok_h[1:3], 16), int(ok_h[3:5], 16), int(ok_h[5:7], 16)
-            plus = f"\033[38;2;255;255;255;48;2;{max(or_//4,10)};{max(og//2,20)};{max(ob//4,10)}m"
+
+        # Added/removed lines. When the skin defines dedicated diff colors
+        # (diff_added/diff_removed backgrounds + diff_*_word foregrounds —
+        # the same keys the TUI uses), use them so diffs render in the skin's
+        # intended low-saturation light green / light red. Otherwise fall back
+        # to a dark tinted background derived from ui_error / ui_ok — exactly
+        # how diff colors were themed before the dedicated keys existed — so a
+        # skin that customized ui_error/ui_ok keeps its diff tinting.
+        def _diff_line(bg_key, word_key, src_key, src_fallback, r_div, g_div, b_div):
+            bg_h = skin.get_color(bg_key, "")
+            word_h = skin.get_color(word_key, "")
+            if (
+                bg_h and word_h
+                and len(bg_h) == 7 and bg_h[0] == "#"
+                and len(word_h) == 7 and word_h[0] == "#"
+            ):
+                bg_r = int(bg_h[1:3], 16)
+                bg_g = int(bg_h[3:5], 16)
+                bg_b = int(bg_h[5:7], 16)
+                fg_r = int(word_h[1:3], 16)
+                fg_g = int(word_h[3:5], 16)
+                fg_b = int(word_h[5:7], 16)
+                return f"\033[38;2;{fg_r};{fg_g};{fg_b};48;2;{bg_r};{bg_g};{bg_b}m"
+            # Backward-compatible fallback: derive a dark tint from the skin's
+            # ui_error / ui_ok, exactly as diff colors were derived before the
+            # dedicated diff_* keys existed. The accent channel (the one
+            # halved) clamps to a floor of 20, the others to 10 — matching the
+            # previous ui_error/ui_ok derivation so skins that customized them
+            # keep their exact diff tinting.
+            src = skin.get_color(src_key, src_fallback)
+            if src and len(src) == 7 and src[0] == "#":
+                sr = int(src[1:3], 16)
+                sg = int(src[3:5], 16)
+                sb = int(src[5:7], 16)
+                min_r = 20 if r_div == 2 else 10
+                min_g = 20 if g_div == 2 else 10
+                min_b = 20 if b_div == 2 else 10
+                return (
+                    f"\033[38;2;255;255;255;48;2;"
+                    f"{max(sr // r_div, min_r)};{max(sg // g_div, min_g)};{max(sb // b_div, min_b)}m"
+                )
+            return "\033[38;2;255;255;255;48;2;20;20;20m"
+
+        # Removed lines: red tint from ui_error; Added lines: green tint from
+        # ui_ok. Divisors reproduce the previous ui_error/ui_ok derivation.
+        minus = _diff_line("diff_removed", "diff_removed_word", "ui_error", "#ef5350", 2, 4, 4)
+        plus = _diff_line("diff_added", "diff_added_word", "ui_ok", "#4caf50", 4, 2, 4)
     except Exception:
         pass
 
