@@ -242,7 +242,11 @@ honcho = ["honcho-ai==2.2.0"]
 # can't break fresh installs.
 supermemory = ["supermemory==3.50.0"]
 mem0 = ["mem0ai==2.0.10"]
-audit = ["guardclaw==0.8.2"]
+# Image resize recovery for the vision tools. Pillow is now a CORE dependency
+# (see the main `dependencies` list above) since the byte/pixel shrink paths are on
+# the default vision-embed path and the mid-session lazy install deadlocked the
+# CLI under prompt_toolkit (#40490). This extra is kept as a no-op back-compat
+# alias so existing requests for the `vision` extra resolve.
 vision = []
 # Kept as a no-op back-compat alias — `ptyprocess` and `pywinpty` are now
 # in the main `dependencies` list (with the same platform markers), so
