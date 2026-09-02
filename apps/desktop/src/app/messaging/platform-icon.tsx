@@ -69,7 +69,9 @@ function MatrixIcon(props: React.SVGProps<SVGSVGElement>) {
 function WeComIcon(props: React.SVGProps<SVGSVGElement>) {
   return (
     <svg fill="currentColor" viewBox="0 0 24 24" {...props}>
-      <g transform="translate(2 2) scale(0.4)">
+      {/* Optical-only adjustment: keep the official paths intact while using the
+          24px chip more evenly. */}
+      <g transform="translate(0.9 0.9) scale(0.46)">
         <path
           d="M36.75,37.19s-.09-.02-.14-.03c-.05,0-.09-.01-.14-.02-1.37-.26-2.68-.91-3.74-1.97-.08-.08-.15-.15-.22-.23h0c-.22-.22-.57-.22-.78,0-.2,.2-.22,.52-.04,.74,.01,.01,.02,.03,.04,.04,.02,.02,.05,.04,.08,.06,.05,.05,.11,.1,.16,.15,1.04,1.04,1.69,2.31,1.95,3.65,0,.08,.01,.15,.02,.22,.01,.08,.03,.16,.05,.24,.1,.38,.3,.73,.6,1.03,.9,.9,2.37,.9,3.27,0,.9-.9,.9-2.37,0-3.27-.32-.32-.71-.52-1.12-.62"
           fill="currentColor"
