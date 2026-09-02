@@ -105,13 +105,28 @@ def _chain_ending_at(boots: List[float], ts: float, gap: float) -> List[float]:
     older belongs to a previous, already-resolved episode.  A chain broken at
     the head (nothing recent enough) yields an empty list, which is how a
     healthy gateway forgets an old loop.
+
+    Future entries (``t > ts``, from a clock rollback or restored state file)
+    are included when they lie within ``gap`` of ``ts``, but they do not
+    advance ``prev``: a subsequent link is measured against ``ts`` rather than
+    against the nearest future boot.  This is deliberate and matches the
+    breaker's coarse purpose — adjacency is only ever asserted against the
+    reference time, never against a future entry, so a burst of recent
+    forward entries cannot inflate a chain past ``gap``.
     """
     chain: List[float] = []
     prev = ts
     for t in sorted(boots, reverse=True):
         if t > ts:
-            # Clock moved backwards (NTP step, restored state file). Treat the
-            # future entry as adjacent rather than dropping the whole chain.
+            # Clock moved backwards (NTP step, restored state file). Treat a
+            # *recent* future entry as adjacent rather than dropping the whole
+            # chain — but bound it by ``gap`` like any other link. Without a
+            # bound here, an arbitrarily old entry (weeks back) chains in
+            # after one large backward step and trips the breaker on
+            # unrelated history, turning the documented fail-open contract
+            # into fail-closed.
+            if t - ts > gap:
+                continue
             chain.append(t)
             continue
         if prev - t > gap:

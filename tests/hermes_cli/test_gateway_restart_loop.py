@@ -1825,6 +1825,20 @@ class TestRestartLoopGuard:
             assert rlg.check_and_record(0, 60, now=ts) is False
         assert rlg.is_restart_loop_tripped(0, 60, now=1451.0) is False
 
+    def test_clock_rollback_does_not_self_prune_valid_chain(self):
+        """PR #93427: 'break' on distant future entries would exit the loop
+        before reaching valid earlier boots, silently losing the chain.
+        The fix must use 'continue' to skip only the distant entry."""
+        import gateway.restart_loop_guard as rlg
+
+        # Distant future boot (940s ahead) + two recent boots within gap.
+        # Sorted reverse iteration sees [2000, 1100, 1050]:
+        #   - With 'break': 2000 is 940s > 300 → break → chain=[] (LOST!)
+        #   - With 'continue': 2000 skipped, then 1100/1050 chained → chain=[1050,1100]
+        assert rlg._chain_ending_at(
+            [2000.0, 1100.0, 1050.0], 1060.0, 300.0
+        ) == [1050.0, 1100.0]
+
 class TestTerminalToolGatewayLifecycleGuardRemote:
     """Remote-backend and two-session cwd regression coverage."""
 
