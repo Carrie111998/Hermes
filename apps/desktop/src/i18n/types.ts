@@ -2942,6 +2942,10 @@ export interface Translations {
       preparingAudio: string
       stopReading: string
       readAloud: string
+      linkPreviewLoad: string
+      linkPreviewLoading: string
+      linkPreviewUnavailable: string
+      linkPreviewPrivate: string
       editMessage: string
       expandMessage: string
       scrollToBottom: string
