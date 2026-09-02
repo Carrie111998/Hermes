@@ -139,7 +139,7 @@ async def test_stream_events_reuses_connection_and_closes_after_disconnect(
         "run_id": None,
         "kind": "updated",
         "payload": '{"status": "running"}',
-        "created_at": 1234,
+        "created_at": 1234,  # stored SQL seconds; stream serializes to ms (#94025)
     }
     conn = _TrackingConnection(rows_by_poll=[[], [event_row]])
     connect_threads: list[int] = []
@@ -177,7 +177,7 @@ async def test_stream_events_reuses_connection_and_closes_after_disconnect(
             "run_id": None,
             "kind": "updated",
             "payload": {"status": "running"},
-            "created_at": 1234,
+            "created_at": 1234000,  # #94025: serialized to the host timeAgo ms contract
         }],
         "cursor": 7,
     }]

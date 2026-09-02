@@ -156,12 +156,24 @@ BOARD_COLUMNS: list[str] = [
 _CARD_SUMMARY_PREVIEW_CHARS = 200
 
 
+def _epoch_ms(ts) -> Any:
+    """Convert a stored Unix-seconds timestamp to the milliseconds contract
+    the drawer's host ``timeAgo`` (``apps/desktop/src/lib/time.ts``:
+    ``formatAgo(fromMs, nowMs=Date.now())``) expects. Idempotent: values
+    already in milliseconds (>= 1e12) pass through unchanged."""
+    if ts is None:
+        return None
+    ts = int(ts)
+    return ts * 1000 if ts < 10**12 else ts
+
+
 def _task_dict(
     task: kanban_db.Task,
     *,
     latest_summary: Optional[str] = None,
 ) -> dict[str, Any]:
     d = asdict(task)
+    d["created_at"] = _epoch_ms(d["created_at"])
     # Add derived age metrics so the UI can colour stale cards without
     # computing deltas client-side.
     try:
@@ -183,7 +195,7 @@ def _event_dict(event: kanban_db.Event) -> dict[str, Any]:
         "task_id": event.task_id,
         "kind": event.kind,
         "payload": event.payload,
-        "created_at": event.created_at,
+        "created_at": _epoch_ms(event.created_at),
         "run_id": event.run_id,
     }
 
@@ -194,7 +206,7 @@ def _comment_dict(c: kanban_db.Comment) -> dict[str, Any]:
         "task_id": c.task_id,
         "author": c.author,
         "body": c.body,
-        "created_at": c.created_at,
+        "created_at": _epoch_ms(c.created_at),
     }
 
 
@@ -209,7 +221,7 @@ def _attachment_dict(a: kanban_db.Attachment) -> dict[str, Any]:
         "size": a.size,
         "uploaded_by": a.uploaded_by,
         "stored_path": a.stored_path,
-        "created_at": a.created_at,
+        "created_at": _epoch_ms(a.created_at),
     }
 
 
@@ -3039,7 +3051,7 @@ async def stream_events(ws: WebSocket):
                     "run_id": r["run_id"],
                     "kind": r["kind"],
                     "payload": payload,
-                    "created_at": r["created_at"],
+                    "created_at": _epoch_ms(r["created_at"]),
                 })
                 new_cursor = r["id"]
             return new_cursor, out
