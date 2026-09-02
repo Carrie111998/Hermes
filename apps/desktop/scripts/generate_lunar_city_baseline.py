@@ -157,18 +157,34 @@ def building(asset_id, role, location, accent, buildings, mats):
     return shell
 
 
-def character(name, location, leader, characters, mats):
+def character(name, location, leader, characters, mats, role=None, personality=None, kind=None, accent=None):
     x, y, z = location
-    body = cylinder(f"{name}_body", (x, y, z + 0.55), 0.34 if not leader else 0.48, 0.9 if not leader else 1.2, mats["character"], characters)
+    child = kind == "child"
+    radius = 0.25 if child else (0.34 if not leader else 0.48)
+    height = 0.65 if child else (0.9 if not leader else 1.2)
+    body = cylinder(f"{name}_body", (x, y, z + height / 2), radius, height, mats[accent or "character"], characters)
     head = bpy.data.objects.new(f"{name}_head", bpy.data.meshes.new(f"{name}_head_mesh"))
-    bpy.ops.mesh.primitive_ico_sphere_add(subdivisions=2, radius=0.43 if not leader else 0.58, location=(x, y, z + 1.35))
+    bpy.ops.mesh.primitive_ico_sphere_add(
+        subdivisions=2,
+        radius=0.32 if child else (0.43 if not leader else 0.58),
+        location=(x, y, z + height + (0.35 if child else 0.45)),
+    )
     head = bpy.context.object
     head.name = f"{name}_head"
     head.data.materials.append(mats["helmet"])
     move_to(head, characters)
-    visor = cube(f"{name}_visor", (x, y - 0.39, z + 1.35), (0.2, 0.04, 0.11), mats["glass"], characters, 0.05)
-    body["role"] = "leader" if leader else "worker"
-    body["personality"] = "bold" if leader else "curious"
+    visor = cube(
+        f"{name}_visor",
+        (x, y - (0.3 if child else 0.39), z + height + (0.35 if child else 0.45)),
+        (0.15 if child else 0.2, 0.04, 0.08 if child else 0.11),
+        mats[accent or "glass"],
+        characters,
+        0.05,
+    )
+    body["role"] = role or ("leader" if leader else "worker")
+    body["personality"] = personality or ("bold" if leader else "curious")
+    body["kind"] = kind or ("leader" if leader else "worker")
+    body["asset_family"] = "hermes-profile-variant"
     add_animation_library(body, name, leader)
 
 
@@ -270,6 +286,67 @@ def main():
     for index, location in enumerate(((-1, -2, 0.4), (1, -2, 0.4), (2, 0, 0.4), (-2, 0, 0.4))):
         character(f"worker-prototype-{index}", location, False, characters, mats)
     cube("dispatcher-cube", (0, 4, 0.5), (0.55, 0.55, 0.55), mats["glass"], characters, 0.18)
+
+    asset_library = collection("Character Asset Library")
+    asset_library["source"] = "sanitized Hermes role and personality classes"
+    asset_library.hide_render = True
+    asset_library["render_policy"] = "viewport_asset_library_only"
+    leader_variants = [
+        ("knowledge", "curious", "violet"),
+        ("research", "curious", "cyan"),
+        ("creative", "social", "green"),
+        ("governance", "methodical", "violet"),
+        ("engineering", "bold", "cyan"),
+        ("medical", "protective", "amber"),
+        ("review", "methodical", "violet"),
+        ("archive", "cautious", "violet"),
+    ]
+    for index, (role, personality, accent) in enumerate(leader_variants):
+        character(
+            f"leader-{role}",
+            (-12 + (index % 4) * 4, 27 - (index // 4) * 5, 0.0),
+            True,
+            asset_library,
+            mats,
+            role=role,
+            personality=personality,
+            kind="leader",
+            accent=accent,
+        )
+
+    worker_variants = [
+        ("audit", "methodical", "violet"),
+        ("operations", "protective", "cyan"),
+        ("release", "bold", "amber"),
+        ("research", "curious", "cyan"),
+        ("review", "methodical", "violet"),
+        ("support", "social", "green"),
+    ]
+    for index, (role, personality, accent) in enumerate(worker_variants):
+        character(
+            f"worker-{role}",
+            (6 + (index % 3) * 3, 27 - (index // 3) * 5, 0.0),
+            False,
+            asset_library,
+            mats,
+            role=role,
+            personality=personality,
+            kind="worker",
+            accent=accent,
+        )
+
+    for index, personality in enumerate(("curious", "social", "bold", "cautious")):
+        character(
+            f"child-{personality}",
+            (16 + index * 2, 27, 0.0),
+            False,
+            asset_library,
+            mats,
+            role="child",
+            personality=personality,
+            kind="child",
+            accent="glass",
+        )
 
     bpy.ops.object.light_add(type="AREA", location=(0, 0, 28))
     key = bpy.context.object
