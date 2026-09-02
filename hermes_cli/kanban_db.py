@@ -2698,9 +2698,51 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     # is cheap thanks to ``IF NOT EXISTS`` and stays correct on fresh DBs
     # (where the columns already exist from SCHEMA_SQL).
     conn.execute("CREATE INDEX IF NOT EXISTS idx_tasks_tenant ON tasks(tenant)")
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_tasks_idempotency ON tasks(idempotency_key)"
-    )
+
+    # ``idx_tasks_idempotency`` migration: PLAIN -> UNIQUE (#64).
+    #
+    # The index was historically PLAIN, which let concurrent same-key
+    # creates (and archived-row re-admissions) insert duplicate rows the
+    # create-path guard could not see. UNIQUE makes the database itself
+    # enforce one row per idempotency key.
+    #
+    # DEPENDENCY: duplicate keys must be purged before this ships. On the
+    # deployment where the corruption was observed, 7 idempotency keys
+    # existed in duplicate (retry-storm re-admissions across archived
+    # rows); an operational cleanup (the "F2" purge script in the
+    # operator's hermes-scripts repo, review t_0345734c) removed them
+    # BEFORE this migration landed. Without that purge, CREATE UNIQUE
+    # INDEX fails with IntegrityError. Rather than bricking the board, the
+    # error is caught, the PLAIN index is kept, and a loud remediation
+    # warning is logged. The swap is retried on every init (the shape
+    # check below re-inspects the existing index), so once the duplicates
+    # are purged the next connect() converts to UNIQUE.
+    _existing_idem_idx = conn.execute(
+        "SELECT sql FROM sqlite_master "
+        "WHERE type = 'index' AND name = 'idx_tasks_idempotency'"
+    ).fetchone()
+    if (
+        _existing_idem_idx is None
+        or "UNIQUE" not in (_existing_idem_idx["sql"] or "").upper()
+    ):
+        conn.execute("DROP INDEX IF EXISTS idx_tasks_idempotency")
+        try:
+            conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_tasks_idempotency "
+                "ON tasks(idempotency_key)"
+            )
+        except sqlite3.IntegrityError as exc:
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_tasks_idempotency "
+                "ON tasks(idempotency_key)"
+            )
+            _log.warning(
+                "idx_tasks_idempotency: duplicate idempotency_key values "
+                "present (%s); kept the non-unique index so the board keeps "
+                "opening. Purge the duplicate rows (keep one row per key) "
+                "and re-run init to enforce uniqueness.",
+                exc,
+            )
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_tasks_session_id ON tasks(session_id)"
     )
