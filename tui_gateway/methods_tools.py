@@ -1206,7 +1206,7 @@ def _(rid, params: dict) -> dict:
     # /skills has an interactive hub for terminal clients.  slash.exec is a
     # non-interactive transport, so enforce the registry's desktop review
     # slice here too instead of trusting every frontend to apply the metadata.
-    if _cmd_base == "skills":
+    if _cmd_base == "skills" and params.get("surface") == "desktop":
         from hermes_cli.commands import resolve_command
         from hermes_cli.write_approval_commands import handle_pending_subcommand
         from hermes_constants import (

@@ -362,7 +362,10 @@ describe('usePromptActions /title', () => {
 
     await handle!.submitText('/skills pending')
 
-    expect(requestGateway).toHaveBeenCalledWith('slash.exec', expect.objectContaining({ command: 'skills pending' }))
+    expect(requestGateway).toHaveBeenCalledWith(
+      'slash.exec',
+      expect.objectContaining({ command: 'skills pending', surface: 'desktop' })
+    )
   })
 
   it('surfaces a rename error without touching the sidebar store', async () => {
@@ -605,7 +608,11 @@ describe('usePromptActions slash session targeting', () => {
     expect(calls.map(c => c.method)).toEqual(['session.resume', 'slash.exec'])
     expect(calls[0]?.params).toMatchObject({ session_id: STORED_SESSION_ID })
     // The command lands on the recovered runtime that owns the goal.
-    expect(calls[1]?.params).toEqual({ command: 'goal status', session_id: RECOVERED_SESSION_ID })
+    expect(calls[1]?.params).toEqual({
+      command: 'goal status',
+      session_id: RECOVERED_SESSION_ID,
+      surface: 'desktop'
+    })
   })
 
   it('does not fork the chat when the routed session cannot be rebound', async () => {
@@ -1392,7 +1399,8 @@ describe('usePromptActions slash.exec dispatch payloads', () => {
 
     expect(requestGateway).toHaveBeenCalledWith('slash.exec', {
       command: 'approvals off',
-      session_id: focusedSessionId
+      session_id: focusedSessionId,
+      surface: 'desktop'
     })
     expect(persistedModes.get(focusedProfile)).toBe('off')
     expect(persistedModes.has('default')).toBe(false)
@@ -1431,7 +1439,8 @@ describe('usePromptActions slash.exec dispatch payloads', () => {
     expect(calls.map(c => c.method)).toEqual(['slash.exec', 'prompt.submit'])
     expect(calls[0]?.params).toEqual({
       command: 'goal write the implementation plan',
-      session_id: RUNTIME_SESSION_ID
+      session_id: RUNTIME_SESSION_ID,
+      surface: 'desktop'
     })
     expect(calls[1]?.params).toEqual({
       session_id: RUNTIME_SESSION_ID,
@@ -1880,7 +1889,8 @@ describe('usePromptActions slash.exec dispatch payloads', () => {
     expect(calls.map(c => c.method)).toEqual(['slash.exec', 'prompt.submit'])
     expect(calls[0]?.params).toEqual({
       command: 'goal Write a Python script\nthat prints Hello World',
-      session_id: RUNTIME_SESSION_ID
+      session_id: RUNTIME_SESSION_ID,
+      surface: 'desktop'
     })
 
     const renderedText = states

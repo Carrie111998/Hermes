@@ -112,6 +112,20 @@ class TestCommandRegistry:
         assert goal is not None
         assert goal.argument_mode == "mixed"
 
+    def test_desktop_meta_preserves_an_explicit_empty_subcommand_scope(self):
+        command = CommandDef(
+            "demo",
+            "Demo",
+            "Session",
+            desktop_subcommands=(),
+        )
+
+        assert command_desktop_meta(command) == {
+            "argument_mode": None,
+            "desktop": None,
+            "desktop_subcommands": [],
+        }
+
     def test_argument_mode_infers_text_from_any_args_hint(self):
         assert infer_argument_mode(CommandDef("demo", "Demo", "Session", args_hint="<prompt>")) == "text"
         assert infer_argument_mode(CommandDef("ask", "Ask", "Session", args_hint="<query>")) == "text"

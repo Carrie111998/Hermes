@@ -692,7 +692,11 @@ def test_slash_exec_refuses_non_review_skills_subcommands_before_worker(monkeypa
             {
                 "id": "skills-install",
                 "method": "slash.exec",
-                "params": {"command": "skills install example", "session_id": "sid"},
+                "params": {
+                    "command": "skills install example",
+                    "session_id": "sid",
+                    "surface": "desktop",
+                },
             }
         )
     finally:
@@ -701,6 +705,27 @@ def test_slash_exec_refuses_non_review_skills_subcommands_before_worker(monkeypa
     assert response is not None
     assert response["error"]["code"] == 4018
     assert "review subcommands" in response["error"]["message"]
+
+
+def test_slash_exec_keeps_tui_skills_commands_on_the_worker_path():
+    worker = Mock()
+    worker.run.return_value = "audit complete"
+    server._sessions["sid"] = _session(slash_worker=worker)
+
+    try:
+        response = server.handle_request(
+            {
+                "id": "skills-audit",
+                "method": "slash.exec",
+                "params": {"command": "skills audit", "session_id": "sid"},
+            }
+        )
+    finally:
+        server._sessions.pop("sid", None)
+
+    assert response is not None
+    assert response["result"]["output"] == "audit complete"
+    worker.run.assert_called_once_with("skills audit")
 
 
 def test_slash_exec_runs_skills_pending_without_worker(tmp_path, monkeypatch):
@@ -719,7 +744,11 @@ def test_slash_exec_runs_skills_pending_without_worker(tmp_path, monkeypatch):
             {
                 "id": "skills-pending",
                 "method": "slash.exec",
-                "params": {"command": "skills pending", "session_id": "sid"},
+                "params": {
+                    "command": "skills pending",
+                    "session_id": "sid",
+                    "surface": "desktop",
+                },
             }
         )
     finally:
@@ -748,7 +777,11 @@ def test_slash_exec_skills_approval_persists_to_session_profile(tmp_path, monkey
             {
                 "id": "skills-approval",
                 "method": "slash.exec",
-                "params": {"command": "skills approval on", "session_id": "sid"},
+                "params": {
+                    "command": "skills approval on",
+                    "session_id": "sid",
+                    "surface": "desktop",
+                },
             }
         )
     finally:

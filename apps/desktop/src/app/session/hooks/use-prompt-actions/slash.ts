@@ -394,7 +394,8 @@ export function useSlashCommand(deps: SlashCommandDeps) {
         try {
           const result = await requestGateway<unknown>('slash.exec', {
             session_id: sessionId,
-            command: command.replace(/^\/+/, '')
+            command: command.replace(/^\/+/, ''),
+            surface: 'desktop'
           })
 
           const dispatch = parseCommandDispatch(result)

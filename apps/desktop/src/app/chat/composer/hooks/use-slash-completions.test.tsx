@@ -228,6 +228,20 @@ describe('useSlashCompletions', () => {
     expect(commandsOf(await completions(api, 'skills pen'))).toEqual(['/skills pending'])
   })
 
+  it('keeps non-scoped command rows intact when replace_from is omitted', async () => {
+    const request = vi.fn().mockImplementation((method: string) =>
+      Promise.resolve(
+        method === 'commands.catalog'
+          ? CATALOG
+          : { items: [{ text: '/save', display: '/save', kind: 'command' }] }
+      )
+    )
+
+    const api = harness({ request } as unknown as HermesGateway)
+
+    expect(commandsOf(await completions(api, 'save json report'))).toEqual(['/save'])
+  })
+
   it('filters blocked subcommands from replace_from even without trailing space', async () => {
     const request = vi.fn().mockImplementation((method: string) =>
       Promise.resolve(
