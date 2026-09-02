@@ -749,6 +749,14 @@ class MemoryStore:
         }
         if message:
             resp["message"] = message
+        if limit > 0 and current / limit >= 0.9:
+            resp["warning"] = (
+                f"Memory is nearing capacity ({pct}% — {current:,}/{limit:,} chars)."
+            )
+            resp["recommendation"] = (
+                "Consider using replace/remove to consolidate stale, redundant, or "
+                "lower-value entries before adding more memory."
+            )
         resp["note"] = "Write saved. This update is complete — do not repeat it."
         return resp
 
@@ -1388,7 +1396,6 @@ registry.register(
     emoji="🧠",
     dynamic_schema_overrides=_build_memory_schema_overrides,
 )
-
 
 
 
