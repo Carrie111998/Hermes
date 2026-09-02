@@ -844,11 +844,25 @@ def _telegram_command_menu_config() -> dict[str, Any]:
     else:
         priority = []
 
+    # Master opt-out for the automatic command-menu registration (#96025).
+    # set_my_commands overwrites whatever the user customized via BotFather
+    # on every gateway restart; ``enabled: false`` keeps Hermes from touching
+    # the menu at all so manual (e.g. localized) customizations survive.
+    enabled = menu_cfg.get("enabled", True)
+    if not isinstance(enabled, bool):
+        enabled = str(enabled).strip().lower() not in {"false", "0", "no", "off"}
+
     return {
+        "enabled": enabled,
         "max_commands": max_commands,
         "priority_mode": priority_mode,
         "priority": priority,
     }
+
+
+def telegram_menu_enabled() -> bool:
+    """True unless ``platforms.telegram.extra.command_menu.enabled`` is false."""
+    return bool(_telegram_command_menu_config()["enabled"])
 
 
 def telegram_menu_max_commands() -> int:

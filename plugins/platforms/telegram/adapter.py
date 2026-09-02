@@ -4239,8 +4239,22 @@ class TelegramAdapter(BasePlatformAdapter):
                     BotCommandScopeAllGroupChats,
                     BotCommandScopeDefault,
                 )
-                from hermes_cli.commands import telegram_menu_commands, telegram_menu_max_commands
+                from hermes_cli.commands import (
+                    telegram_menu_commands,
+                    telegram_menu_enabled,
+                    telegram_menu_max_commands,
+                )
                 if not self._bot:
+                    return
+                # command_menu.enabled: false opts out entirely — the
+                # automatic registration overwrites BotFather customizations
+                # (e.g. localized descriptions) on every restart (#96025).
+                if not telegram_menu_enabled():
+                    logger.info(
+                        "[%s] Telegram command menu disabled via config; "
+                        "keeping existing (BotFather) commands",
+                        self.name,
+                    )
                     return
                 # Telegram allows up to 100 commands but has an undocumented
                 # payload size limit (~4KB total).  Hermes defaults to 60 to
@@ -9948,7 +9962,16 @@ class TelegramAdapter(BasePlatformAdapter):
                 if chat_id in self._forum_command_registered:
                     return
                 from telegram import BotCommand, BotCommandScopeChat
-                from hermes_cli.commands import telegram_menu_commands, telegram_menu_max_commands
+                from hermes_cli.commands import (
+                    telegram_menu_commands,
+                    telegram_menu_enabled,
+                    telegram_menu_max_commands,
+                )
+                if not telegram_menu_enabled():
+                    # Same opt-out as the startup registration: never
+                    # overwrite menu customizations the user owns (#96025).
+                    self._forum_command_registered.add(chat_id)
+                    return
                 menu_commands, _ = telegram_menu_commands(max_commands=telegram_menu_max_commands())
                 bot_commands = [BotCommand(name, desc) for name, desc in menu_commands]
                 await self._bot.set_my_commands(bot_commands, scope=BotCommandScopeChat(chat_id=chat_id))
