@@ -9,12 +9,21 @@ import { cn } from '@/lib/utils'
 interface ExpandableBlockProps {
   children: ReactNode
   className?: string
+  onScrollbarSizeChange?: (size: ScrollbarSize) => void
 }
 
-export function ExpandableBlock({ children, className }: ExpandableBlockProps) {
+export interface ScrollbarSize {
+  inline: number
+}
+
+const NO_SCROLLBAR = { inline: 0 } satisfies ScrollbarSize
+
+export function ExpandableBlock({ children, className, onScrollbarSizeChange }: ExpandableBlockProps) {
   const innerRef = useRef<HTMLDivElement>(null)
+  const scrollbarSizeRef = useRef<ScrollbarSize>(NO_SCROLLBAR)
   const [expanded, setExpanded] = useState(false)
   const [overflowing, setOverflowing] = useState(false)
+  const [scrollbarSize, setScrollbarSize] = useState<ScrollbarSize>(NO_SCROLLBAR)
 
   // Measure inside ResizeObserver timing only (layout is clean there). A
   // synchronous mount-time scrollHeight read forces a reflow per instance,
@@ -24,8 +33,23 @@ export function ExpandableBlock({ children, className }: ExpandableBlockProps) {
 
     if (el) {
       setOverflowing(el.scrollHeight > 121)
+
+      // Overlay scrollbars consume no layout space (0); classic Linux/Windows
+      // bars do. Preserve the platform scrollbar exactly as rendered and move
+      // controls only by the gutter it actually occupies.
+      const next = {
+        inline: Math.max(0, el.offsetWidth - el.clientWidth)
+      }
+
+      const previous = scrollbarSizeRef.current
+
+      if (next.inline !== previous.inline) {
+        scrollbarSizeRef.current = next
+        setScrollbarSize(next)
+        onScrollbarSizeChange?.(next)
+      }
     }
-  }, [])
+  }, [onScrollbarSizeChange])
 
   useResizeObserver(measure, innerRef)
 
@@ -33,8 +57,9 @@ export function ExpandableBlock({ children, className }: ExpandableBlockProps) {
     <div className="relative">
       <div
         className={cn(
-          // `scrollbar-overlay` opts out of the app-wide classic thin gutters so
-          // this scroller keeps platform overlay bars (no always-on track).
+          // Keep platform overlay bars (no always-on authored track). The
+          // measured gutter below handles platforms that render these as
+          // classic scrollbars instead.
           'scrollbar-overlay overflow-y-auto overflow-x-auto',
           expanded ? 'max-h-[40dvh]' : 'max-h-[7.5rem]',
           className
@@ -56,6 +81,7 @@ export function ExpandableBlock({ children, className }: ExpandableBlockProps) {
             aria-label={expanded ? 'Collapse' : 'Expand'}
             className="pointer-events-auto flex h-7 w-9 cursor-pointer items-end justify-center pb-1 text-muted-foreground/70 transition-colors hover:text-foreground"
             onClick={() => setExpanded(v => !v)}
+            style={{ marginRight: scrollbarSize.inline }}
             type="button"
           >
             <ChevronDown className={cn('size-3.5 transition-transform', expanded && 'rotate-180')} />

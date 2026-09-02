@@ -1,11 +1,11 @@
 'use client'
 
 import type { SyntaxHighlighterProps } from '@assistant-ui/react-streamdown'
-import { type ComponentProps, type FC, lazy, Suspense, useMemo } from 'react'
+import { type ComponentProps, type FC, lazy, Suspense, useMemo, useState } from 'react'
 import type ShikiHighlighter from 'react-shiki'
 
 import { CodeCard, CodeCardBody } from '@/components/chat/code-card'
-import { ExpandableBlock } from '@/components/chat/expandable-block'
+import { ExpandableBlock, type ScrollbarSize } from '@/components/chat/expandable-block'
 import { CopyButton } from '@/components/ui/copy-button'
 import { useI18n } from '@/i18n'
 import { isLikelyProseCodeBlock } from '@/lib/markdown-code'
@@ -130,6 +130,7 @@ export const SyntaxHighlighter: FC<HermesSyntaxHighlighterProps> = ({
   defer = false
 }) => {
   const { t } = useI18n()
+  const [scrollbarSize, setScrollbarSize] = useState<ScrollbarSize>({ inline: 0 })
   const trimmed = (code ?? '').replace(/^\n+/, '').trimEnd()
 
   // Streaming may hand us empty/incomplete fences — render nothing rather
@@ -146,16 +147,18 @@ export const SyntaxHighlighter: FC<HermesSyntaxHighlighterProps> = ({
 
   return (
     <CodeCard data-streaming={defer ? 'true' : undefined}>
-      <CopyButton
-        appearance="inline"
-        className="absolute right-1.5 top-1.5 z-10 h-5 gap-0 rounded-md px-1 opacity-0 transition-opacity group-hover/code:opacity-100 focus-visible:opacity-100"
-        iconClassName="size-2.5"
-        label={t.assistant.tool.copyCode}
-        showLabel={false}
-        text={trimmed}
-      />
+      <div className="absolute top-1.5 z-10" style={{ right: `calc(0.375rem + ${scrollbarSize.inline}px)` }}>
+        <CopyButton
+          appearance="inline"
+          className="h-5 gap-0 rounded-md px-1 opacity-0 transition-opacity group-hover/code:opacity-100 focus-visible:opacity-100"
+          iconClassName="size-2.5"
+          label={t.assistant.tool.copyCode}
+          showLabel={false}
+          text={trimmed}
+        />
+      </div>
       <CodeCardBody className="[&_pre]:px-3 [&_pre]:py-2.5">
-        <ExpandableBlock>
+        <ExpandableBlock onScrollbarSizeChange={setScrollbarSize}>
           <Pre className="aui-shiki m-0 overflow-hidden bg-transparent p-0">
             {plain ? (
               <PlainCode code={trimmed} />

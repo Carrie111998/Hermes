@@ -11,6 +11,9 @@ class TestResizeObserver {
 
   observe(target: Element) {
     Object.defineProperty(target, 'scrollHeight', { configurable: true, value: 400 })
+    Object.defineProperty(target, 'offsetWidth', { configurable: true, value: 200 })
+    Object.defineProperty(target, 'clientWidth', { configurable: true, value: 185 })
+
     this.callback([{ target } as ResizeObserverEntry], this as unknown as ResizeObserver)
   }
 
@@ -24,11 +27,12 @@ afterEach(() => {
 })
 
 describe('ExpandableBlock', () => {
-  it('lets horizontal scroll through and keeps the last line selectable', () => {
+  it('keeps scroll interactions free and offsets controls by the vertical gutter', () => {
     vi.stubGlobal('ResizeObserver', TestResizeObserver)
+    const onScrollbarSizeChange = vi.fn()
 
     const { container } = render(
-      <ExpandableBlock>
+      <ExpandableBlock onScrollbarSizeChange={onScrollbarSizeChange}>
         <pre data-testid="content">{'const x = 1\n'.repeat(20)}</pre>
       </ExpandableBlock>
     )
@@ -37,8 +41,8 @@ describe('ExpandableBlock', () => {
     const toggle = screen.getByRole('button', { name: /expand|collapse/i })
     const fade = toggle.parentElement!
 
-    // Inner container allows horizontal scroll so wide code gets a scrollbar:
-    // platform overlay (`scrollbar-overlay`), not the always-on classic gutter.
+    // Preserve the native overlay treatment. On platforms where Chromium uses
+    // a classic gutter instead, measurement—not restyling—moves the controls.
     expect(inner.className).toContain('overflow-x-auto')
     expect(inner.className).toContain('scrollbar-overlay')
 
@@ -49,9 +53,13 @@ describe('ExpandableBlock', () => {
     expect(fade.className).toContain('inset-x-0')
 
     // Only the compact toggle is clickable, and it is pinned to the right edge
-    // rather than spanning the full width (the old bug).
+    // rather than spanning the full width (the old bug). Its measured margins
+    // match the native scrollbar gutters, so overlay bars stay unchanged while
+    // classic Linux/Windows bars get their exact hit area back.
     expect(toggle.className).toContain('pointer-events-auto')
     expect(toggle.className).toContain('w-9')
+    expect(toggle.style.marginRight).toBe('15px')
+    expect(onScrollbarSizeChange).toHaveBeenLastCalledWith({ inline: 15 })
     expect(toggle.className).not.toContain('inset-x-0')
   })
 
