@@ -7184,6 +7184,33 @@ def run_job(
                 )
             except (Exception, KeyboardInterrupt) as e:
                 logger.debug("Job '%s': failed to end session: %s", job_id, e)
+            # Fire on_session_finalize for this cron run.
+            #
+            # end_session() above closes the DB row; it does NOT notify plugin
+            # lifecycle hooks. gateway/run.py finalizes on shutdown and expiry,
+            # tui_gateway in _finalize_session — run_job had no equivalent, so
+            # every cron run emitted a start with no matching end. Measured
+            # 2026-08-29 against a plugin that posts session boundaries: 51/51
+            # cron sessions opened and never closed.
+            #
+            # Uses _final_cron_session_id, not _cron_session_id: compression can
+            # rotate the live agent onto a continuation mid-run, and the raw id
+            # captured before AIAgent started would name a session the hook
+            # cannot resolve. Ordered before close() so a hook may still read
+            # session state, and wrapped so a misbehaving plugin cannot skip the
+            # SQLite teardown below (fd leak — #10200).
+            try:
+                from hermes_cli import lifecycle
+
+                lifecycle.finalize_session(
+                    session_id=_final_cron_session_id,
+                    platform="cron",
+                    reason="cron_complete",
+                )
+            except (Exception, KeyboardInterrupt) as e:
+                logger.debug(
+                    "Job '%s': session finalize hooks failed: %s", job_id, e
+                )
             try:
                 from hermes_state import release_or_close
                 release_or_close(_session_db)
