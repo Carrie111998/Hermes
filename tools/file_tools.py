@@ -2195,6 +2195,38 @@ def _mark_verification_stale(
         logger.debug("verification stale marker failed", exc_info=True)
 
 
+_CONSUCONSTRUCT_VAULT_ROOT = Path(r"D:\OneDrive\Desktop\My Brain\ConsuConstruct").resolve()
+
+
+def _check_consuconstruct_vault_markdown_write(filepath: str, task_id: str = "default") -> str | None:
+    """Reject Hermes direct writes to David's canonical Obsidian vault Markdown.
+
+    Brain MCP `vault_note_write` / `obsidian_write` is the only sanctioned write
+    path for `.md` in this vault because it enforces planning_complete, reason,
+    canon frontmatter/CONTEXT, and an audit event in Postgres.
+    """
+    try:
+        resolved = Path(_resolve_path_for_task(filepath, task_id)).resolve()
+    except Exception:
+        try:
+            resolved = Path(_expand_tilde(filepath)).resolve()
+        except Exception:
+            return None
+    if resolved.suffix.lower() not in {".md", ".markdown"}:
+        return None
+    try:
+        resolved.relative_to(_CONSUCONSTRUCT_VAULT_ROOT)
+    except ValueError:
+        return None
+    return (
+        "Refusing direct Hermes write to ConsuConstruct vault Markdown. "
+        "Rules 49/52 require Brain MCP `vault_note_write`/`obsidian_write` so "
+        "the note is written only after investigation/planning is complete and "
+        "leaves an audit record (planning_complete=True, reason, sha256). "
+        f"Rejected path: {resolved}"
+    )
+
+
 def _check_binary_document_write(filepath: str, task_id: str = "default") -> str | None:
     """Reject text-tool writes that would corrupt a binary document.
 
@@ -2259,6 +2291,9 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
     protected_err = _check_protected_instruction_write([path], task_id)
     if protected_err:
         return tool_error(protected_err)
+    vault_md_err = _check_consuconstruct_vault_markdown_write(path, task_id)
+    if vault_md_err:
+        return tool_error(vault_md_err)
     approval_err = _check_approval_required_write([path], task_id)
     if approval_err:
         return tool_error(approval_err)
@@ -2404,6 +2439,9 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
         binary_doc_err = _check_binary_document_write(_p, task_id)
         if binary_doc_err:
             return tool_error(binary_doc_err)
+        vault_md_err = _check_consuconstruct_vault_markdown_write(_p, task_id)
+        if vault_md_err:
+            return tool_error(vault_md_err)
     # One approval prompt for the whole patch: a single protected file gates
     # the ENTIRE patch (deny applies nothing — see the helper's docstring).
     protected_err = _check_protected_instruction_write(_paths_to_check, task_id)
