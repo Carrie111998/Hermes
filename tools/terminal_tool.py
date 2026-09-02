@@ -382,11 +382,13 @@ def _docker_has_host_access(config: Dict[str, Any]) -> bool:
 
 
 def _check_all_guards(command: str, env_type: str,
-                      has_host_access: bool = False) -> dict:
+                      has_host_access: bool = False,
+                      approval_context: dict | None = None) -> dict:
     """Delegate to consolidated guard (tirith + dangerous cmd) with CLI callback."""
     return _check_all_guards_impl(command, env_type,
                                   approval_callback=_get_approval_callback(),
-                                  has_host_access=has_host_access)
+                                  has_host_access=has_host_access,
+                                  approval_context=approval_context)
 
 
 # Allowlist: characters that can legitimately appear in directory paths.
@@ -2855,6 +2857,9 @@ def terminal_tool(
     pty: bool = False,
     notify_on_complete: bool = False,
     watch_patterns: Optional[List[str]] = None,
+    approval_purpose: Optional[str] = None,
+    approval_effect: Optional[str] = None,
+    approval_risk: Optional[str] = None,
     _host_local: bool = False,
 ) -> str:
     """
@@ -2871,6 +2876,9 @@ def terminal_tool(
         pty: If True, use pseudo-terminal for interactive CLI tools (local backend only)
         notify_on_complete: If True and background=True, you'll be notified exactly once when the process exits. The right choice for almost every long task. MUTUALLY EXCLUSIVE with watch_patterns.
         watch_patterns: List of strings to watch for in background output. HARD rate limit: 1 notification per 15s per process. After 3 strike windows in a row — or after a small lifetime cap of delivered matches, however cleanly spaced — watch_patterns is disabled and the session is auto-promoted to notify_on_complete. Use ONLY for rare, one-shot mid-process signals on long-lived processes (server readiness, migration-done markers). NEVER use in loops/batch jobs — error patterns there will hit the strike limit and get disabled. MUTUALLY EXCLUSIVE with notify_on_complete — set one, not both.
+        approval_purpose: Optional explanation of why this command is needed, shown to the user if approval is required.
+        approval_effect: Optional explanation of what this command changes, shown to the user if approval is required.
+        approval_risk: Optional explanation of risks, shown to the user if approval is required.
 
     Returns:
         str: JSON string with output, exit_code, and error fields
@@ -3276,9 +3284,15 @@ def terminal_tool(
         # the approval-wait (see clear_current_thread_interrupt).
         _approved_run = bool(force)
         if not force:
+            approval_context = {
+                "purpose": approval_purpose,
+                "effect": approval_effect,
+                "risk": approval_risk,
+            }
             approval = _check_all_guards(
                 command, env_type,
                 has_host_access=_docker_has_host_access(config),
+                approval_context=approval_context,
             )
             if not approval["approved"]:
                 # Check if this is an approval_required (gateway ask mode)
@@ -4180,6 +4194,18 @@ TERMINAL_SCHEMA = {
                     {"type": "boolean"},
                     {"type": "array", "items": {"type": "string"}}
                 ]
+            },
+            "approval_purpose": {
+                "type": "string",
+                "description": "If this command triggers approval, explain its purpose to the user. Do not include secrets, tokens, passwords, or credentials."
+            },
+            "approval_effect": {
+                "type": "string",
+                "description": "If this command triggers approval, explain what it will change or affect. Do not include secrets, tokens, passwords, or credentials."
+            },
+            "approval_risk": {
+                "type": "string",
+                "description": "If this command triggers approval, explain risks the user should consider. Do not include secrets, tokens, passwords, or credentials."
             }
             # Legacy aliases (unadvertised, still accepted): notify_on_complete
             # (bool) and watch_patterns (list). notify=true|[...] maps onto
@@ -4246,6 +4272,9 @@ def _handle_terminal(args, **kw):
         pty=args.get("pty", False),
         notify_on_complete=notify_on_complete,
         watch_patterns=watch_patterns,
+        approval_purpose=args.get("approval_purpose"),
+        approval_effect=args.get("approval_effect"),
+        approval_risk=args.get("approval_risk"),
     )
 
 

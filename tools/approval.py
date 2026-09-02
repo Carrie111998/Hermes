@@ -3234,6 +3234,11 @@ def prompt_dangerous_approval(command: str, description: str,
             allow_session=True, smart_denied=False) -> str. Legacy callback
             signatures remain supported while both keywords hold their
             defaults.
+        description: The full user-facing description. When model-supplied
+            Purpose/Effect/Risk context exists, the caller passes the
+            enhanced description that already embeds it (labelled as
+            unverified) — this is the single representation of that
+            context on the CLI surface.
 
     Returns: 'once', 'session', 'always', 'deny', or 'timeout'.
         'timeout' means the prompt expired without a user response — the
@@ -4727,9 +4732,150 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
     return {"resolved": resolved, "choice": choice, "reason": entry.reason}
 
 
+def _clean_approval_context(approval_context: dict | None) -> dict:
+    """Normalize optional model-supplied approval context."""
+    if not isinstance(approval_context, dict):
+        return {}
+    allowed = {
+        "purpose": "purpose",
+        "effect": "effect",
+        "risk": "risk",
+        "approval_purpose": "purpose",
+        "approval_effect": "effect",
+        "approval_risk": "risk",
+    }
+    cleaned = {}
+    for src, dst in allowed.items():
+        value = approval_context.get(src)
+        if isinstance(value, str):
+            value = value.strip()
+            if value:
+                cleaned[dst] = value[:1000]
+    return cleaned
+
+
+def _approval_context_or_fallback(approval_context: dict | None) -> dict:
+    """Return normalized model-supplied approval context, if provided."""
+    return _clean_approval_context(approval_context)
+
+
+_FORGE_RE = re.compile(r'^[/!](approve|deny)|^(⚠|⚠️)', re.IGNORECASE)
+
+
+def _sanitize_explanation(explanation: dict | None) -> dict:
+    """Sanitize model-supplied approval context before it reaches any user surface.
+
+    Applies in order: credential redaction, newline normalisation,
+    control-character stripping (LF preserved for line-based forge
+    detection), forged-command-line removal, per-field and total length
+    caps.  Returns an empty dict when the input is empty or invalid.
+    """
+    if not isinstance(explanation, dict) or not explanation:
+        return {}
+    from agent.redact import redact_sensitive_text
+
+    cleaned: dict[str, str] = {}
+    total = 0
+    for key in ("purpose", "effect", "risk"):
+        value = str(explanation.get(key, "")).strip()
+        if not value:
+            continue
+        value = redact_sensitive_text(value, force=True)
+        # Normalize endings first and keep LF so line-based forge
+        # detection still sees "/approve" on its own line. Stripping CR/LF
+        # before the split would glue "normal text\\n/approve session"
+        # into one non-matching line.
+        value = value.replace("\r\n", "\n").replace("\r", "\n")
+        # U+2028/U+2029 (LINE/PARAGRAPH SEPARATOR) and NEL render as line
+        # breaks on several chat clients but would not be split below —
+        # normalize them to LF so a forged command after one still lands at
+        # the start of a detectable line.
+        value = re.sub(r"[\u2028\u2029\x85]", "\n", value)
+        # Strip C0 (except LF), DEL, and C1 controls.
+        value = re.sub(r"[\x00-\x09\x0b-\x1f\x7f-\x9f]", "", value)
+        # Strip Unicode format characters (category Cf): zero-width and
+        # bidi controls (U+200B, U+202E, U+2066…) are invisible or reorder
+        # rendering, so a ZWSP-prefixed "/approve" would dodge the
+        # line-anchored forge regex below while displaying as a clean
+        # "/approve" line.
+        value = "".join(
+            ch for ch in value if unicodedata.category(ch) != "Cf"
+        )
+        # Drop lines that try to forge approve/deny commands or approval
+        # headings so a model cannot hijack the approval-instruction
+        # surface. Match past leading whitespace — an indented "/approve"
+        # still reads as an instruction line.
+        safe_lines = [
+            ln for ln in value.split("\n") if not _FORGE_RE.match(ln.lstrip())
+        ]
+        value = "\n".join(safe_lines)
+        if len(value) > 1000:
+            value = value[:1000]
+        if total + len(value) > 3000:
+            value = value[:max(0, 3000 - total)]
+        if value:
+            cleaned[key] = value
+            total += len(value)
+    return cleaned
+
+
+# Hard ceiling for the combined approval description. The sanitised model
+# context is capped at 3000 chars, but the system risk description joined in
+# front of it is unbounded (one clause per warning), and platform surfaces
+# have hard limits the description shares with the command preview and
+# instructions (Discord embeds 4096, Telegram messages 4096). Clamp once
+# here so every surface receives a bounded description.
+_MAX_ENHANCED_DESC = 3500
+_ENHANCED_DESC_TRUNC = "\n… [context truncated]"
+
+
+def _build_enhanced_description_with_context(
+    system_desc: str,
+    explanation: dict | None,
+) -> str:
+    """Combine the system-level risk description with sanitised model-supplied
+    purpose/effect/risk context into a single description string suitable for
+    every approval surface (gateway button, text fallback, CLI prompt).
+
+    Raises ``ValueError`` when the result would be empty — callers MUST
+    refuse to deliver an insufficient approval prompt (fail-closed).
+    """
+    parts = [system_desc.strip()]
+
+    if isinstance(explanation, dict) and explanation:
+        ctx = []
+        for key, label in (
+            ("purpose", "Purpose"),
+            ("effect", "Effect"),
+            ("risk", "Risk"),
+        ):
+            val = str(explanation.get(key, "")).strip()
+            if val:
+                ctx.append(f"{label}: {val}")
+        if ctx:
+            parts.append("")
+            parts.append("—— Model-provided context (unverified) ——")
+            parts.extend(ctx)
+            parts.append("—— End unverified context ——")
+
+    result = "\n".join(parts)
+    if len(result) > _MAX_ENHANCED_DESC:
+        result = (
+            result[: _MAX_ENHANCED_DESC - len(_ENHANCED_DESC_TRUNC)]
+            + _ENHANCED_DESC_TRUNC
+        )
+    if not result or not result.strip():
+        raise ValueError(
+            "Approval description is empty — refusing to deliver "
+            "an insufficient approval prompt."
+        )
+    return result
+
+
 def check_all_command_guards(command: str, env_type: str,
                              approval_callback=None,
-                             has_host_access: bool = False) -> dict:
+                             has_host_access: bool = False,
+                             approval_context: dict | None = None) -> dict:
     """Run all pre-exec security checks and return a single approval decision.
 
     Gathers findings from tirith and dangerous-command detection, then
@@ -4740,6 +4886,9 @@ def check_all_command_guards(command: str, env_type: str,
     ``has_host_access`` is True when a Docker sandbox bind-mounts host paths;
     such a session is no longer isolated, so it goes through the normal flow
     instead of the container fast-path.
+
+    ``approval_context`` is optional model-supplied context explaining why the
+    command is being run. It is only surfaced when approval is required.
     """
     # Skip isolated container backends for both checks. Docker stops skipping
     # once host paths are bind-mounted into the sandbox.
@@ -5119,6 +5268,14 @@ def check_all_command_guards(command: str, env_type: str,
 
     # Combine descriptions for a single approval prompt
     combined_desc = "; ".join(desc for _, desc, _ in warnings)
+    approval_explanation = _approval_context_or_fallback(approval_context)
+    # Approval output is a secret-egress boundary: sanitise model-supplied
+    # context and build a single enhanced description that every surface
+    # (gateway button, text fallback, CLI prompt) consumes directly.
+    approval_explanation = _sanitize_explanation(approval_explanation)
+    enhanced_desc = _build_enhanced_description_with_context(
+        combined_desc, approval_explanation,
+    )
     primary_key = warnings[0][0]
     all_keys = [key for key, _, _ in warnings]
     # "Always" is offered when at least one warning is a dangerous-pattern
@@ -5221,7 +5378,8 @@ def check_all_command_guards(command: str, env_type: str,
                 "command": redact_sensitive_text(command),
                 "pattern_key": primary_key,
                 "pattern_keys": all_keys,
-                "description": redact_sensitive_text(combined_desc),
+                "description": redact_sensitive_text(enhanced_desc),
+                "explanation": approval_explanation,
                 # Smart DENY overrides are one-operation decisions, so the UI
                 # must not offer a permanent scope.  Otherwise offer Always
                 # whenever any dangerous-pattern warning can actually be
@@ -5243,7 +5401,7 @@ def check_all_command_guards(command: str, env_type: str,
                     "approved": False,
                     "message": "BLOCKED: Failed to send approval request to user. Do NOT retry.",
                     "pattern_key": primary_key,
-                    "description": combined_desc,
+                    "description": enhanced_desc,
                     "outcome": "notify_failed",
                     "user_consent": False,
                 }
@@ -5284,7 +5442,7 @@ def check_all_command_guards(command: str, env_type: str,
                         f"irreversible action.{timeout_addendum}{breaker_addendum}"
                     ),
                     "pattern_key": primary_key,
-                    "description": combined_desc,
+                    "description": enhanced_desc,
                     "outcome": outcome,
                     "user_consent": False,
                     "deny_reason": deny_reason,
@@ -5306,7 +5464,7 @@ def check_all_command_guards(command: str, env_type: str,
             # smart-DENY owner override) resets the consecutive-denial tally.
             _reset_denials(session_key)
             return {"approved": True, "message": None,
-                    "user_approved": True, "description": combined_desc}
+                    "user_approved": True, "description": enhanced_desc}
 
         # Fallback: no gateway callback registered (e.g. cron, batch).
         # Interactive CLI with a Dangerous Command callback should still
@@ -5323,12 +5481,13 @@ def check_all_command_guards(command: str, env_type: str,
             # the allowlist keys off pattern_key, so redaction is display-only.
             from agent.redact import redact_sensitive_text
             _disp_command = redact_sensitive_text(command)
-            _disp_combined_desc = redact_sensitive_text(combined_desc)
+            _disp_combined_desc = redact_sensitive_text(enhanced_desc)
             pending_data = {
                 "command": _disp_command,
                 "pattern_key": primary_key,
                 "pattern_keys": all_keys,
                 "description": _disp_combined_desc,
+                "explanation": approval_explanation,
             }
             if smart_denied_for_owner:
                 pending_data.update(smart_denied=True, allow_permanent=False)
@@ -5357,7 +5516,7 @@ def check_all_command_guards(command: str, env_type: str,
     _fire_approval_hook(
         "pre_approval_request",
         command=command,
-        description=combined_desc,
+        description=enhanced_desc,
         pattern_key=primary_key,
         pattern_keys=list(all_keys),
         session_key=session_key,
@@ -5365,7 +5524,7 @@ def check_all_command_guards(command: str, env_type: str,
     )
     choice = prompt_dangerous_approval(
         command,
-        combined_desc,
+        enhanced_desc,
         allow_permanent=has_permanent_capable and not smart_denied_for_owner,
         smart_denied=smart_denied_for_owner,
         approval_callback=approval_callback,
@@ -5373,7 +5532,7 @@ def check_all_command_guards(command: str, env_type: str,
     _fire_approval_hook(
         "post_approval_response",
         command=command,
-        description=combined_desc,
+        description=enhanced_desc,
         pattern_key=primary_key,
         pattern_keys=list(all_keys),
         session_key=session_key,
