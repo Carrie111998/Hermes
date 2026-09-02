@@ -15,6 +15,7 @@ from plugins.platforms.teams.stored_ref import (
     activity_post_url,
     classify_stored_ref,
     group_inbound_addresses_bot,
+    group_inbound_should_reply,
     load_stored_refs,
     persist_inbound_ref,
     send_from_stored_ref,
@@ -44,12 +45,12 @@ def test_classify_accepts_personal_matching_bot():
 
 
 def test_classify_rejects_group_without_inbound_addresser():
-    with pytest.raises(StoredRefError, match="mention this bot or reply"):
+    with pytest.raises(StoredRefError, match="mention, reply-to-own, or unmentioned"):
         classify_stored_ref(_throwaway(kind="groupChat"), expected_bot_app_id=BOT)
 
 
-def test_classify_rejects_group_with_sender_but_no_bot_address():
-    with pytest.raises(StoredRefError, match="mention this bot or reply"):
+def test_classify_rejects_group_with_sender_but_no_heard_via():
+    with pytest.raises(StoredRefError, match="mention, reply-to-own, or unmentioned"):
         classify_stored_ref(
             _throwaway(kind="groupChat", addressed_by="29:customer-roster"),
             expected_bot_app_id=BOT,
@@ -73,6 +74,17 @@ def test_classify_accepts_group_after_reply_to_own():
             kind="groupChat",
             addressed_by="29:customer-roster",
             addressed_via="reply_to_own",
+        ),
+        expected_bot_app_id=BOT,
+    )
+
+
+def test_classify_accepts_heard_unmentioned_group():
+    classify_stored_ref(
+        _throwaway(
+            kind="groupChat",
+            addressed_by="29:customer-roster",
+            addressed_via="unmentioned",
         ),
         expected_bot_app_id=BOT,
     )
@@ -332,22 +344,23 @@ def test_group_inbound_ambient_does_not_address_bot():
     )
 
 
-def test_persist_rejects_unmentioned_group(tmp_path: Path):
-    with pytest.raises(StoredRefError, match="mention this bot or reply"):
-        persist_inbound_ref(
-            tmp_path,
-            conversation_id="19:group-throwaway",
-            conversation_type="groupChat",
-            service_url="https://smba.trafficmanager.net/teams/",
-            tenant_id="00000000-0000-0000-0000-000000000002",
-            bot_app_id=BOT,
-            user_id="29:customer-roster",
-            inbound_activity_id="activity-ambient",
-        )
-    assert list(tmp_path.glob("*.json")) == []
+def test_persist_hears_unmentioned_group(tmp_path: Path):
+    dest = persist_inbound_ref(
+        tmp_path,
+        conversation_id="19:group-throwaway",
+        conversation_type="groupChat",
+        service_url="https://smba.trafficmanager.net/teams/",
+        tenant_id="00000000-0000-0000-0000-000000000002",
+        bot_app_id=BOT,
+        user_id="29:customer-roster",
+        inbound_activity_id="activity-ambient",
+    )
+    data = json.loads(dest.read_text(encoding="utf-8"))
+    assert data["addressed_via"] == "unmentioned"
+    assert data["last_inbound_activity_id"] == "activity-ambient"
 
 
-def test_adapter_does_not_persist_unmentioned_group(tmp_path: Path, monkeypatch):
+def test_adapter_hears_unmentioned_group(tmp_path: Path, monkeypatch):
     from plugins.platforms.teams.adapter import TeamsAdapter
 
     adapter = object.__new__(TeamsAdapter)
@@ -371,8 +384,96 @@ def test_adapter_does_not_persist_unmentioned_group(tmp_path: Path, monkeypatch)
     class _From:
         aad_object_id = "00000000-0000-0000-0000-000000000001"
         id = "29:customer-roster"
-        name = "Customer"
+        name = "Peer"
 
     adapter._persist_inbound_stored_ref(_Activity(), _Conv(), _From())
-    assert list(tmp_path.glob("*.json")) == []
-    assert adapter._stored_refs == {}
+    files = list(tmp_path.glob("*.json"))
+    assert len(files) == 1
+    data = json.loads(files[0].read_text(encoding="utf-8"))
+    assert data["addressed_via"] == "unmentioned"
+    assert data["conversation_id"] == "19:group-throwaway"
+    assert adapter._stored_refs["19:group-throwaway"]["addressed_via"] == "unmentioned"
+
+
+def test_mentioned_group_should_reply():
+    assert group_inbound_should_reply("mention") is True
+
+
+def test_replied_to_group_should_reply():
+    assert group_inbound_should_reply("reply_to_own") is True
+
+
+def test_unmentioned_group_default_silent():
+    assert group_inbound_should_reply("unmentioned") is False
+    assert group_inbound_should_reply(None) is False
+
+
+def test_unmentioned_group_spoken_when_decided():
+    assert group_inbound_should_reply("unmentioned", decide_speak=lambda: True) is True
+
+
+def test_unmentioned_silent_does_not_post():
+    async def poster(url, headers, body):
+        raise AssertionError("must not POST when unmentioned default silent")
+
+    async def run():
+        return await send_from_stored_ref(
+            _group_ref(addressed_via="unmentioned"),
+            "STORED-REF-OWN-SEND",
+            poster=poster,
+            expected_bot_app_id=BOT,
+            token="not-a-secret-for-test",
+            reply_to="activity-inbound-1",
+        )
+
+    result = asyncio.run(run())
+    assert result.get("success") is not True
+    assert result.get("silent") is True
+    assert "silent" in result["error"]
+
+
+def test_unmentioned_spoken_posts_reply():
+    posted = {}
+
+    async def poster(url, headers, body):
+        posted["body"] = body
+        return 201, {"id": "activity-unmentioned-spoken"}
+
+    async def run():
+        return await send_from_stored_ref(
+            _group_ref(addressed_via="unmentioned"),
+            "STORED-REF-OWN-SEND",
+            poster=poster,
+            expected_bot_app_id=BOT,
+            token="not-a-secret-for-test",
+            reply_to="activity-inbound-1",
+            decide_speak=lambda: True,
+        )
+
+    result = asyncio.run(run())
+    assert result["success"] is True
+    assert result["message_id"] == "activity-unmentioned-spoken"
+    assert posted["body"]["replyToId"] == "activity-inbound-1"
+
+
+def test_unmentioned_decide_speak_exception_is_silent():
+    async def poster(url, headers, body):
+        raise AssertionError("must not POST when decide_speak fails closed")
+
+    def boom():
+        raise RuntimeError("classifier failed")
+
+    async def run():
+        return await send_from_stored_ref(
+            _group_ref(addressed_via="unmentioned"),
+            "STORED-REF-OWN-SEND",
+            poster=poster,
+            expected_bot_app_id=BOT,
+            token="not-a-secret-for-test",
+            reply_to="activity-inbound-1",
+            decide_speak=boom,
+        )
+
+    result = asyncio.run(run())
+    assert result.get("success") is not True
+    assert result.get("silent") is True

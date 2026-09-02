@@ -826,7 +826,8 @@ class TeamsAdapter(BasePlatformAdapter):
         # send after restart — in-memory conv refs do not survive (#1218).
         self._stored_refs: Dict[str, Dict[str, Any]] = {}
         # Activity ids this bot sent, keyed by conversation id. Group inbound
-        # is addressed only via @mention or reply-to-one-of-these.
+        # is heard always; a send replies on @mention or reply-to-own, and
+        # unmentioned lines default silent.
         self._own_activity_ids: Dict[str, set[str]] = {}
 
     async def connect(self, *, is_reconnect: bool = False) -> bool:
@@ -973,12 +974,7 @@ class TeamsAdapter(BasePlatformAdapter):
                 entities=getattr(activity, "entities", None),
                 reply_to_id=reply_to,
                 own_activity_ids=self._own_activity_ids.get(str(conv_id)),
-            )
-            if not addressed_via:
-                logger.info(
-                    "[teams] stored-ref persist skipped: group inbound did not address this bot"
-                )
-                return
+            ) or "unmentioned"
 
         try:
             persist_inbound_ref(

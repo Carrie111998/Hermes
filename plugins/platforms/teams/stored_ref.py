@@ -26,6 +26,7 @@ _REQUIRED = ("kind", "bot_app_id", "service_url", "conversation_id", "tenant_id"
 _CONV_ID_RE = re.compile(r"^[A-Za-z0-9:@\-_.]+$")
 _STEM_RE = re.compile(r"[^A-Za-z0-9._-]+")
 _GROUP_ADDRESSED_VIA = frozenset({"mention", "reply_to_own"})
+_GROUP_HEARD_VIA = frozenset({"mention", "reply_to_own", "unmentioned"})
 
 
 class StoredRefError(ValueError):
@@ -43,7 +44,8 @@ def group_inbound_addresses_bot(
 
     A group message addresses the bot only when it @mentions the bot app
     id (``28:{bot_app_id}``) or replies to one of this bot's own
-    activity ids. Any other group message must not unlock a send.
+    activity ids. Unmentioned lines are still heard; they do not count
+    as an address.
     """
     bot = str(bot_app_id or "").strip()
     if not bot:
@@ -71,6 +73,27 @@ def group_inbound_addresses_bot(
     return None
 
 
+def group_inbound_should_reply(
+    addressed_via: Optional[str] = None,
+    *,
+    decide_speak: Optional[Callable[[], bool]] = None,
+) -> bool:
+    """Whether a delivered group inbound should produce a send.
+
+    Mention or reply-to-own always replies. Unmentioned lines default
+    silent; ``decide_speak`` may opt in (fail closed on exception).
+    """
+    via = str(addressed_via or "").strip()
+    if via in _GROUP_ADDRESSED_VIA:
+        return True
+    if decide_speak is None:
+        return False
+    try:
+        return bool(decide_speak())
+    except Exception:
+        return False
+
+
 def classify_stored_ref(
     ref: Mapping[str, Any],
     *,
@@ -82,9 +105,9 @@ def classify_stored_ref(
     kind = str(ref.get("kind") or "").strip()
     if kind in ("group", "groupChat"):
         via = str(ref.get("addressed_via") or "").strip()
-        if via not in _GROUP_ADDRESSED_VIA:
+        if via not in _GROUP_HEARD_VIA:
             raise StoredRefError(
-                "group inbound must mention this bot or reply to this bot"
+                "group inbound must record mention, reply-to-own, or unmentioned"
             )
         if not str(ref.get("addressed_by") or "").strip():
             raise StoredRefError("group ref requires inbound addresser")
@@ -165,10 +188,10 @@ def persist_inbound_ref(
     if user_id:
         ref["user_id"] = user_id
     if kind == "groupChat":
-        via = str(addressed_via or "").strip()
-        if via not in _GROUP_ADDRESSED_VIA:
+        via = str(addressed_via or "").strip() or "unmentioned"
+        if via not in _GROUP_HEARD_VIA:
             raise StoredRefError(
-                "group inbound must mention this bot or reply to this bot"
+                "group inbound must record mention, reply-to-own, or unmentioned"
             )
         addresser = user_id or aad_object_id
         if not addresser:
@@ -206,6 +229,7 @@ async def send_from_stored_ref(
     expected_bot_app_id: Optional[str] = None,
     token: str,
     reply_to: Optional[str] = None,
+    decide_speak: Optional[Callable[[], bool]] = None,
 ) -> Dict[str, Any]:
     if not text or not str(text).strip():
         return {"error": "stored-ref send: empty text"}
@@ -228,6 +252,12 @@ async def send_from_stored_ref(
     if kind in ("group", "groupChat"):
         if not thread_id:
             return {"error": "stored-ref send: group send is never a first post"}
+        via = str(ref.get("addressed_via") or "").strip()
+        if not group_inbound_should_reply(via, decide_speak=decide_speak):
+            return {
+                "silent": True,
+                "error": "stored-ref send: unmentioned group inbound is silent by default",
+            }
         body["replyToId"] = thread_id
     headers = {
         "Authorization": f"Bearer {token}",
