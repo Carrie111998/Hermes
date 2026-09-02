@@ -1128,6 +1128,14 @@ class DiscordAdapter(BasePlatformAdapter):
         # Voice channel state (per-guild)
         self._voice_clients: Dict[int, Any] = {}  # guild_id -> VoiceClient
         self._voice_locks: Dict[int, asyncio.Lock] = {}  # guild_id -> serialize join/leave
+        # Where the bot MEANT to be in voice: guild_id -> channel_id, set on a
+        # successful join and cleared only by a deliberate leave. A resume or
+        # reconnect that drops the voice connection also drops the guild from
+        # _voice_clients, so intent is the only record that lets the restore
+        # path put the bot back (see _restore_voice_after_reconnect).
+        self._voice_channel_intents: Dict[int, int] = {}
+        self._voice_restore_task: Optional[asyncio.Task] = None
+        self._saw_ready = False
         # Text batching: merge rapid successive messages (Telegram-style)
         self._text_batch_delay_seconds = env_float("HERMES_DISCORD_TEXT_BATCH_DELAY_SECONDS", 0.6)
         self._text_batch_split_delay_seconds = env_float("HERMES_DISCORD_TEXT_BATCH_SPLIT_DELAY_SECONDS", 2.0)
@@ -1443,6 +1451,30 @@ class DiscordAdapter(BasePlatformAdapter):
                 )
                 if adapter_self._missed_message_backfill_enabled():
                     adapter_self._ensure_missed_message_backfill_task()
+                if adapter_self._saw_ready:
+                    # A repeat on_ready is a FULL reconnect: a fresh session
+                    # in which Discord has dropped any voice connection the
+                    # old session held. on_resumed never fires on this path,
+                    # so this is the only hook that can restore voice here.
+                    logger.info(
+                        "[%s] Reconnected (repeat on_ready); scheduling voice restore",
+                        adapter_self.name,
+                    )
+                    adapter_self._schedule_voice_restore()
+                adapter_self._saw_ready = True
+
+            @self._client.event
+            async def on_resumed():
+                # A RESUMED session can break voice two distinct ways, both
+                # behind an all-green adapter: re-keyed UDP state underneath
+                # a live VoiceReceiver (the bot goes deaf), or a dropped
+                # voice connection (the bot is out of the channel entirely).
+                # Restore both after a short settle delay.
+                logger.info(
+                    "[%s] Gateway RESUMED; scheduling voice restore",
+                    adapter_self.name,
+                )
+                adapter_self._schedule_voice_restore()
 
             @self._client.event
             async def on_message(message: DiscordMessage):
@@ -4629,14 +4661,17 @@ class DiscordAdapter(BasePlatformAdapter):
             existing = self._voice_clients.get(guild_id)
             if existing and existing.is_connected():
                 if existing.channel.id == channel.id:
+                    self._voice_channel_intents[guild_id] = channel.id
                     self._reset_voice_timeout(guild_id)
                     return True
                 await existing.move_to(channel)
+                self._voice_channel_intents[guild_id] = channel.id
                 self._reset_voice_timeout(guild_id)
                 return True
 
             vc = await channel.connect()
             self._voice_clients[guild_id] = vc
+            self._voice_channel_intents[guild_id] = channel.id
             self._reset_voice_timeout(guild_id)
 
             # Store text-channel binding for automatic/programmatic joins
@@ -4668,9 +4703,125 @@ class DiscordAdapter(BasePlatformAdapter):
 
             return True
 
+    def _schedule_voice_restore(self) -> None:
+        """Schedule the post-reconnect voice restore.
+
+        The task reference is retained so the event loop cannot
+        garbage-collect it mid-flight; a restore already running is left
+        to finish rather than stacked.
+        """
+        if self._voice_restore_task is not None and not self._voice_restore_task.done():
+            return
+        self._voice_restore_task = asyncio.create_task(
+            self._restore_voice_after_reconnect()
+        )
+
+    async def _restore_voice_after_reconnect(
+        self, settle_seconds: float = 5.0
+    ) -> None:
+        """Restore voice after a gateway RESUME or a full reconnect.
+
+        Two distinct failures hide behind an all-green adapter:
+
+        * A RESUMED session can re-establish voice UDP state — secret key,
+          ssrc, socket reader — underneath a running ``VoiceReceiver``.
+          The receiver captured those once at ``start()``, so it goes
+          silently deaf: SPEAKING events still arrive, no audio reaches
+          STT. ``stop()`` + ``start()`` re-captures everything from the
+          live connection; audio buffered across the resume is
+          deliberately dropped — packets decrypted with a stale key are
+          garbage.
+        * A resume or reconnect can drop the voice connection outright.
+          The guild then vanishes from ``_voice_clients``, so any sweep
+          over connected clients is a silent no-op and the bot stays out
+          of the channel until a restart. The recorded intent
+          (``_voice_channel_intents``) is what lets this path rejoin.
+
+        Observed in production: a network blip closed the gateway socket,
+        text resumed within a minute, and the bot sat outside its voice
+        channel for 2.5 days while every health signal stayed green.
+        """
+        await asyncio.sleep(settle_seconds)
+        for guild_id, channel_id in list(self._voice_channel_intents.items()):
+            vc = self._voice_clients.get(guild_id)
+            if vc is not None and vc.is_connected():
+                self._rewire_voice_receiver(guild_id)
+                continue
+            await self._rejoin_intended_voice_channel(guild_id, channel_id)
+
+    def _rewire_voice_receiver(self, guild_id: int) -> None:
+        """Restart one guild's receiver so it re-captures live UDP state."""
+        receiver = self._voice_receivers.get(guild_id)
+        if receiver is None:
+            return
+        try:
+            receiver.stop()
+            receiver.start()
+            logger.info(
+                "Voice restore: receiver rewired for guild %d", guild_id
+            )
+        except Exception:
+            logger.exception(
+                "Voice restore: receiver rewire failed for guild %d", guild_id
+            )
+
+    async def _rejoin_intended_voice_channel(
+        self, guild_id: int, channel_id: int
+    ) -> None:
+        """Rejoin a voice channel the bot intended to be in but dropped."""
+        try:
+            channel = None
+            if self._client is not None:
+                channel = self._client.get_channel(channel_id)
+                if channel is None:
+                    channel = await self._client.fetch_channel(channel_id)
+            if channel is None:
+                logger.warning(
+                    "Voice restore: intended channel %d in guild %d not "
+                    "found; keeping the intent for the next reconnect",
+                    channel_id,
+                    guild_id,
+                )
+                return
+            # Capture the routing state a deliberate leave clears, then tear
+            # down whatever half-dead state the drop left behind — a stale
+            # receiver, its listen task, the mixer — through the one path
+            # that knows how, and rejoin cleanly. join_voice_channel
+            # re-records the intent on success.
+            text_channel_id = self._voice_text_channels.get(guild_id)
+            source = self._voice_sources.get(guild_id)
+            await self.leave_voice_channel(guild_id)
+            joined = await self.join_voice_channel(
+                channel, text_channel_id=text_channel_id, source=source
+            )
+            if joined:
+                logger.info(
+                    "Voice restore: rejoined channel %d in guild %d after "
+                    "reconnect",
+                    channel_id,
+                    guild_id,
+                )
+            else:
+                self._voice_channel_intents[guild_id] = channel_id
+                logger.warning(
+                    "Voice restore: rejoin of channel %d in guild %d "
+                    "failed; will retry on the next reconnect",
+                    channel_id,
+                    guild_id,
+                )
+        except Exception:
+            self._voice_channel_intents[guild_id] = channel_id
+            logger.exception(
+                "Voice restore: rejoin failed for guild %d", guild_id
+            )
+
     async def leave_voice_channel(self, guild_id: int) -> None:
         """Disconnect from the voice channel in a guild."""
         async with self._voice_locks.setdefault(guild_id, asyncio.Lock()):
+            # A deliberate leave clears the intent; a dropped connection
+            # never comes through here, which is exactly the distinction
+            # the reconnect restore path relies on.
+            self._voice_channel_intents.pop(guild_id, None)
             # Stop voice receiver first
             receiver = self._voice_receivers.pop(guild_id, None)
             pending_inputs = []

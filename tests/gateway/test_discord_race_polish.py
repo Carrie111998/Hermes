@@ -19,6 +19,7 @@ def _make_adapter():
     adapter._allowed_user_ids = set()
     adapter._allowed_role_ids = set()
     adapter._voice_clients = {}
+    adapter._voice_channel_intents = {}
     adapter._voice_locks = {}
     adapter._voice_receivers = {}
     adapter._voice_listen_tasks = {}
