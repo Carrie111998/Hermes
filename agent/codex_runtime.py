@@ -350,7 +350,8 @@ def _record_codex_app_server_compaction(
 # callbacks the standard runtime fires:
 #   - tool_progress_callback("tool.started"|"tool.completed", name, ...)
 #   - _fire_stream_delta(text) for streaming agentMessage chunks
-#   - _emit_interim_assistant_message({...}) for completed agentMessages
+#   - _emit_interim_assistant_message({...}) for completed commentary
+#     agentMessages
 # ---------------------------------------------------------------------------
 
 # Codex item types that map to a Hermes tool_call in the projector (and
@@ -509,9 +510,10 @@ def make_codex_app_server_event_bridge(agent) -> Callable[[dict], None]:
       * ``item/agentMessage/delta`` → ``_fire_stream_delta(text)`` so chat
         adapters can render the assistant's reply as it streams.
       * ``item/reasoning/delta`` → ``_fire_reasoning_delta(text)``
-      * ``item/completed`` for ``agentMessage`` →
+      * ``item/completed`` for commentary ``agentMessage`` items →
         ``_emit_interim_assistant_message({"role": "assistant",
-        "content": text})``. The gateway's ``already_streamed`` check
+        "content": text})``. Final-answer items stay on the gateway's
+        normal final-response path. The gateway's ``already_streamed`` check
         dedupes against any text the stream-delta callback already
         rendered for the same message.
 
@@ -634,6 +636,11 @@ def make_codex_app_server_event_bridge(agent) -> Callable[[dict], None]:
 
     def _fire_agent_message_completed(item: dict) -> None:
         text = item.get("text") or ""
+        # Only explicitly classified commentary belongs on the interim path.
+        # Final or unclassified messages stay on the gateway's normal final-
+        # response path; emitting them here can post the response twice.
+        if item.get("phase") != "commentary":
+            return
         if not isinstance(text, str) or not text.strip():
             return
         # display.show_commentary=false — mid-turn narration stays off the

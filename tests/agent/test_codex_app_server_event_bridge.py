@@ -250,19 +250,43 @@ class TestToolProgressDispatch:
 
 
 class TestAgentMessageInterimDispatch:
-    def test_completed_agent_message_emits_interim(self):
+    def test_completed_commentary_message_emits_interim(self):
         agent = _make_stub_agent()
         bridge = make_codex_app_server_event_bridge(agent)
         bridge(_item_completed({
             "type": "agentMessage",
             "id": "am-1",
             "text": "I'll check the config first.",
+            "phase": "commentary",
         }))
         agent._emit_interim_assistant_message.assert_called_once_with(
             {"role": "assistant", "content": "I'll check the config first."}
         )
 
+    def test_completed_final_answer_is_not_emitted_as_interim(self):
+        agent = _make_stub_agent()
+        bridge = make_codex_app_server_event_bridge(agent)
+        bridge(_item_completed({
+            "type": "agentMessage",
+            "id": "am-final",
+            "text": "Test received.",
+            "phase": "final_answer",
+        }))
+        agent._emit_interim_assistant_message.assert_not_called()
 
+    @pytest.mark.parametrize("phase", [None, "unknown"])
+    def test_completed_message_without_commentary_phase_is_not_interim(self, phase):
+        agent = _make_stub_agent()
+        bridge = make_codex_app_server_event_bridge(agent)
+        item = {
+            "type": "agentMessage",
+            "id": "am-unclassified",
+            "text": "Test received.",
+        }
+        if phase is not None:
+            item["phase"] = phase
+        bridge(_item_completed(item))
+        agent._emit_interim_assistant_message.assert_not_called()
 
     def test_show_commentary_off_suppresses_interim(self):
         """display.show_commentary=false silences agentMessage interim
@@ -273,6 +297,7 @@ class TestAgentMessageInterimDispatch:
         bridge = make_codex_app_server_event_bridge(agent)
         bridge(_item_completed({
             "type": "agentMessage", "id": "am-5", "text": "I'll check config.",
+            "phase": "commentary",
         }))
         agent._emit_interim_assistant_message.assert_not_called()
         # Tool progress is unaffected by the commentary toggle.
