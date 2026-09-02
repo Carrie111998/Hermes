@@ -40,3 +40,18 @@ def test_scan_is_bounded_and_never_raises(tmp_path):
     for i in range(15):
         (tmp_path / f"doc{i}.pdf").write_bytes(b"%PDF")
     assert len(_unsearched_documents(str(tmp_path))) == 10  # capped
+
+
+def test_hint_respects_file_glob(tmp_path):
+    """A search narrowed to source files must not point at excluded documents."""
+    (tmp_path / "notes.py").write_text("nothing relevant here")
+    (tmp_path / "tickets.pdf").write_bytes(b"%PDF-1.4 binary")
+
+    scoped = json.loads(search_tool(pattern="OATH", target="content",
+                                    path=str(tmp_path), file_glob="*.py"))
+    assert "_documents_not_searched" not in scoped
+
+    # A glob that selects documents is exactly when the blind spot bites.
+    on_docs = json.loads(search_tool(pattern="OATH", target="content",
+                                     path=str(tmp_path), file_glob="*.pdf"))
+    assert "tickets.pdf" in on_docs["_documents_not_searched"]

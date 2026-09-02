@@ -2563,8 +2563,16 @@ _SEARCH_SCAN_CAP = 2000
 _SEARCH_HINT_MAX_FILES = 10
 
 
-def _unsearched_documents(root: str) -> list[str]:
-    """Extractable documents under ``root`` that a content search cannot see."""
+def _unsearched_documents(root: str, file_glob: str = None) -> list[str]:
+    """Extractable documents under ``root`` that a content search cannot see.
+
+    ``file_glob`` is honoured so a search the caller already narrowed away from
+    documents (``*.py``) is not told to go read the PDFs it deliberately
+    excluded. A glob that *does* select documents (``*.pdf``) still reports —
+    that is the case where the blind spot bites hardest.
+    """
+    import fnmatch
+
     from tools.read_extract import ANYDOC_EXTENSIONS, EXTRACTABLE_EXTENSIONS
 
     exts = EXTRACTABLE_EXTENSIONS | ANYDOC_EXTENSIONS
@@ -2577,10 +2585,13 @@ def _unsearched_documents(root: str) -> list[str]:
                 seen += 1
                 if seen > _SEARCH_SCAN_CAP:
                     return found
-                if os.path.splitext(name)[1].lower() in exts:
-                    found.append(os.path.join(dirpath, name))
-                    if len(found) >= _SEARCH_HINT_MAX_FILES:
-                        return found
+                if os.path.splitext(name)[1].lower() not in exts:
+                    continue
+                if file_glob and not fnmatch.fnmatch(name, file_glob):
+                    continue
+                found.append(os.path.join(dirpath, name))
+                if len(found) >= _SEARCH_HINT_MAX_FILES:
+                    return found
     except OSError:
         pass
     return found
@@ -2686,7 +2697,7 @@ def search_tool(pattern: str, target: str = "content", path: str = ".",
             and not result_dict.get("error")
             and not result_dict.get("matches")
         ):
-            docs = _unsearched_documents(resolved_search_path)
+            docs = _unsearched_documents(resolved_search_path, file_glob)
             if docs:
                 result_dict["_documents_not_searched"] = (
                     "Content search does not read inside PDFs or Office documents. "
