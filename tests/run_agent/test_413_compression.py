@@ -1363,9 +1363,12 @@ class TestToolResultPreflightCompression:
 
         with (
             patch("run_agent.handle_function_call", return_value="tool result"),
+            # v0.21 replaces the whole-request rough estimate with the prior
+            # real provider usage plus the newly appended tool-result delta.
+            # Model the large delta at that calculation boundary.
             patch(
-                "agent.conversation_loop.estimate_messages_tokens_rough",
-                side_effect=[1_000, 150_000, 1_000],
+                "agent.model_metadata.estimate_messages_tokens_rough",
+                return_value=150_000,
             ),
             patch.object(agent, "_compress_context") as mock_compress,
             patch.object(agent, "_persist_session"),
