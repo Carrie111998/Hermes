@@ -4,7 +4,7 @@ These exercise the parsers with real command output shapes instead of
 patching the detectors themselves, so a change in what macOS / xdg report is
 caught here rather than in a user's browser session.
 """
-from unittest.mock import patch
+from unittest.mock import mock_open, patch
 
 import pytest
 
@@ -87,6 +87,37 @@ class TestDetectDefaultDarwin:
     def test_firefox_default_fails_closed(self):
         with self._run_with(_ls_dump(_handler("https", "org.mozilla.firefox"))):
             assert bc._detect_default_darwin() is None
+
+    def test_velja_routes_to_chrome_when_installed(self):
+        """Velja (a link router) as https handler resolves to its Chromium
+        target. Chrome is installed on this host, so expect 'chrome'."""
+        dump = _ls_dump(_handler("https", "com.sindresorhus.velja"))
+        with self._run_with(dump):
+            assert bc._detect_default_darwin() == "chrome"
+
+    def test_velja_fails_closed_when_no_chromium_installed(self):
+        """If no Chromium app exists, Velja's https handler must not guess."""
+        dump = _ls_dump(_handler("https", "com.sindresorhus.velja"))
+        velja_app_paths = {
+            "com.google.chrome": "/Applications/Google Chrome.app",
+            "org.chromium.chromium": "/Applications/Chromium.app",
+            "com.brave.browser": "/Applications/Brave Browser.app",
+            "com.microsoft.edgemac": "/Applications/Microsoft Edge.app",
+        }
+        with self._run_with(dump), \
+             patch.object(bc.os.path, "isdir", side_effect=lambda p: False):
+            assert bc._detect_default_darwin() is None
+
+    def test_velja_prefers_its_configured_browser(self):
+        """Velja's stored default browser wins over the installed-app fallback."""
+        import io as _io
+        import plistlib as _pl
+        dump = _ls_dump(_handler("https", "com.sindresorhus.velja"))
+        prefs_bytes = _pl.dumps({"defaultBrowser": "com.brave.browser"})
+        with self._run_with(dump), \
+             patch.object(bc.os.path, "expanduser", return_value="/fake/prefs.plist"), \
+             patch("builtins.open", side_effect=lambda *a, **k: _io.BytesIO(prefs_bytes)):
+            assert bc._detect_default_darwin() == "brave"
 
     def test_reader_failure_fails_closed(self):
         with patch.object(bc.subprocess, "run", side_effect=OSError("no defaults")):

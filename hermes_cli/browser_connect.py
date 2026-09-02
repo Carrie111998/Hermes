@@ -6,6 +6,7 @@ import logging
 import ntpath
 import os
 import platform
+import plistlib
 import posixpath
 import re
 import shlex
@@ -428,6 +429,17 @@ def _launchservices_https_handler(dump: str) -> str | None:
 
 
 def _detect_default_darwin() -> str | None:
+    """Return the canonical key of the default Chromium browser, or None.
+
+    macOS: reads the https URL handler from LaunchServices. A non-Chromium
+    default (Safari, Firefox, Arc, …) returns None so the caller fails closed.
+    Exception: the Sindre Sorhus link-handler apps (Velja / Velja Pro,
+    com.sindresorhus.velja) route http(s) to the user's *chosen* browser —
+    Chrome is a registered capability. Detect the browser Velja routes to
+    (default: whichever Chromium is installed, Chrome preferred) and return
+    that, so real-profile browsing works for users whose default handler is
+    a link router rather than a browser.
+    """
     try:
         out = subprocess.run(
             list(_LS_HANDLERS_READER),
@@ -443,6 +455,8 @@ def _detect_default_darwin() -> str | None:
     if not bundle:
         return None
     b = bundle.lower()
+    if b == "com.sindresorhus.velja":
+        return _velja_chromium_default()
     # Channels first (exact): a Beta/Dev/Canary bundle must fail closed.
     if b in _DARWIN_CHANNEL_BUNDLES:
         return UNSUPPORTED_CHANNEL
@@ -452,6 +466,50 @@ def _detect_default_darwin() -> str | None:
     # A non-Chromium https handler (Safari, Firefox, Arc, …) or an unknown
     # channel bundle: fail closed. No "first installed Chromium wins" fallback
     # — that would drive a browser the user never made their default.
+    return None
+
+
+def _velja_chromium_default() -> str | None:
+    """Resolve the Chromium browser Velja routes to, or None if none installed.
+
+    Velja (com.sindresorhus.velja) is a link handler that can route links to
+    a chosen browser by bundle id. Prefer its configured default browser;
+    fall back to any installed Chromium-family browser (Chrome first).
+    Never guess a browser the user does not have.
+    """
+    # 1) Velja's own setting: "Default browser" — store-backed; read via its
+    #    preferences if present.
+    prefs = os.path.expanduser(
+        "~/Library/Preferences/com.sindresorhus.velja.plist"
+    )
+    try:
+        with open(prefs, "rb") as fh:
+            p = plistlib.load(fh)
+        for key in (
+            "defaultBrowser", "DefaultBrowser", "browser",
+            "selectedBrowser", "preferredBrowser",
+        ):
+            val = p.get(key)
+            if val is None:
+                continue
+            val_str = str(val)
+            for frag, browser in _DARWIN_BUNDLE_MAP:
+                if frag in val_str:
+                    return browser
+    except Exception:
+        pass
+    # 2) Fall back to any installed Chromium browser, Chrome preferred.
+    #    _DARWIN_APPS is a tuple of binaries in Chrome→Edge order; test the
+    #    .app bundle (not the binary) and pair with the bundle-map keys.
+    app_paths = {
+        "com.google.chrome": "/Applications/Google Chrome.app",
+        "org.chromium.chromium": "/Applications/Chromium.app",
+        "com.brave.browser": "/Applications/Brave Browser.app",
+        "com.microsoft.edgemac": "/Applications/Microsoft Edge.app",
+    }
+    for frag, _browser in _DARWIN_BUNDLE_MAP:
+        if os.path.isdir(app_paths[frag]):
+            return dict(_DARWIN_BUNDLE_MAP)[frag]
     return None
 
 
