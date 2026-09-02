@@ -595,6 +595,12 @@ def test_restart_indexes_terminal_task_after_policy_compaction(tmp_path: Path):
         status="settled",
         execution_generation=0,
     )
+    assert driver.prune_published_terminal_tasks(
+        db,
+        room_id="room-1",
+        clock=time.time,
+        retain=0,
+    ) == 1
 
 
 def test_policy_checkpoint_bounds_replay_after_completed_room_history(

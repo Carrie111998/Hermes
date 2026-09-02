@@ -609,7 +609,10 @@ class HostedRoomPolicyCheckpoint:
         status: str,
         execution_generation: int,
     ) -> bool:
-        """Return whether one exact driver outcome is already in the room log."""
+        """Return whether one exact driver outcome is already in the room log.
+
+        Repair the bounded publication index when an older runtime skipped it.
+        """
 
         kind = f"turn.{status}"
         generation = execution_generation if status == "deferred" else 0
@@ -629,28 +632,43 @@ class HostedRoomPolicyCheckpoint:
                        )""",
                     (room_id, task_id),
                 ).fetchone()
-            if row is None:
-                if status == "deferred":
-                    row = conn.execute(
-                        """SELECT 1 FROM hosted_room_events
-                           WHERE room_id=? AND kind=?
-                             AND json_extract(payload_json, '$.task_id')=?
-                             AND COALESCE(CAST(json_extract(
-                                 payload_json, '$.execution_generation'
-                             ) AS INTEGER), 0)=?
-                           LIMIT 1""",
-                        (room_id, kind, task_id, generation),
-                    ).fetchone()
-                else:
-                    row = conn.execute(
-                        """SELECT 1 FROM hosted_room_events
-                           WHERE room_id=? AND kind IN (
-                               'turn.settled', 'turn.failed', 'turn.cancelled'
-                           ) AND json_extract(payload_json, '$.task_id')=?
-                           LIMIT 1""",
-                        (room_id, task_id),
-                    ).fetchone()
-        return row is not None
+            if row is not None:
+                return True
+            if status == "deferred":
+                publication = conn.execute(
+                    """SELECT kind, seq FROM hosted_room_events
+                       WHERE room_id=? AND kind=?
+                         AND json_extract(payload_json, '$.task_id')=?
+                         AND COALESCE(CAST(json_extract(
+                             payload_json, '$.execution_generation'
+                         ) AS INTEGER), 0)=?
+                       ORDER BY seq LIMIT 1""",
+                    (room_id, kind, task_id, generation),
+                ).fetchone()
+            else:
+                publication = conn.execute(
+                    """SELECT kind, seq FROM hosted_room_events
+                       WHERE room_id=? AND kind IN (
+                           'turn.settled', 'turn.failed', 'turn.cancelled'
+                       ) AND json_extract(payload_json, '$.task_id')=?
+                       ORDER BY seq LIMIT 1""",
+                    (room_id, task_id),
+                ).fetchone()
+            if publication is None:
+                return False
+            conn.execute(
+                """INSERT OR IGNORE INTO hosted_room_policy_publications (
+                       room_id, task_id, kind, execution_generation, seq
+                   ) VALUES (?, ?, ?, ?, ?)""",
+                (
+                    room_id,
+                    task_id,
+                    str(publication["kind"]),
+                    generation,
+                    int(publication["seq"]),
+                ),
+            )
+            return True
 
     def events_for_task(
         self,
