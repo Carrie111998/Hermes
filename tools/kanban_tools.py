@@ -1578,6 +1578,16 @@ def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:
             delivery_metadata["thread_id"] = thread_id
         if chat_type:
             delivery_metadata["chat_type"] = chat_type
+        scope_id = get_session_env("HERMES_SESSION_SCOPE_ID", "") or ""
+        if scope_id:
+            delivery_metadata["scope_id"] = scope_id
+            # Discord routes name this platform-neutral scope a guild.
+            delivery_metadata["guild_id"] = scope_id
+        parent_chat_id = (
+            get_session_env("HERMES_SESSION_PARENT_CHAT_ID", "") or ""
+        )
+        if parent_chat_id:
+            delivery_metadata["parent_chat_id"] = parent_chat_id
         if (
             platform.lower() == "telegram"
             and thread_id
