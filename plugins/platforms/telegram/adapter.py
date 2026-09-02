@@ -6403,7 +6403,53 @@ class TelegramAdapter(BasePlatformAdapter):
 
         return SendResult(success=False, error="draft_rejected")
 
-    async def _send_message_with_thread_fallback(self, **kwargs):
+    # Control sends (approval/clarify prompts) block an agent that waits up
+    # to the approval timeout (120s), so unlike streaming edits — which bail
+    # after 5s and fall back — they are worth holding through a flood
+    # cooldown.  Telegram's RetryAfter hint during a busy stream is commonly
+    # 15–80s in a normal chat — but a heavily-streamed DM accumulates
+    # penalties of 100–265s (observed 2026-08-20). The cap must match the
+    # prompt's own wait window: exec approvals time out at 120s so waiting
+    # longer than ~90s is pointless, while a clarify waits on the human for
+    # hours and should sleep out even a multi-minute penalty.
+    _CONTROL_FLOOD_RETRY_CAP = 90.0
+    _CLARIFY_FLOOD_RETRY_CAP = 600.0
+
+    async def _send_message_with_thread_fallback(
+        self, _flood_retry_cap: float = None, **kwargs
+    ):
+        """Send a control-style Telegram message with flood-control retry.
+
+        Flood control: if the send fails with RetryAfter and the hinted wait
+        fits under the cap (default ``_CONTROL_FLOOD_RETRY_CAP``; callers
+        with longer wait windows pass ``_flood_retry_cap``), sleep it out
+        and retry — up to twice, staying under the cap in total. Without
+        this, an approval/clarify prompt raised mid-stream (exactly when
+        flood control bites, because the agent has been spamming progress
+        edits) is silently lost and the approval times out as "user did not
+        consent" even though the user never saw it.
+        """
+        cap = self._CONTROL_FLOOD_RETRY_CAP if _flood_retry_cap is None else _flood_retry_cap
+        slept = 0.0
+        for attempt in range(3):
+            try:
+                return await self._send_control_message(**kwargs)
+            except Exception as e:
+                retry_after = getattr(e, "retry_after", None)
+                if retry_after is None and "retry after" not in str(e).lower():
+                    raise
+                wait = float(retry_after or 3.0)
+                if attempt == 2 or slept + wait > cap:
+                    raise
+                logger.warning(
+                    "[%s] Flood control on control send; retrying in %.1fs "
+                    "(attempt %d, cap %.0fs)",
+                    self.name, wait, attempt + 1, cap,
+                )
+                await asyncio.sleep(wait + 0.5)
+                slept += wait + 0.5
+
+    async def _send_control_message(self, **kwargs):
         """Send a Telegram message, retrying once without message_thread_id
         if Telegram returns 'Message thread not found'.
 
@@ -6695,7 +6741,9 @@ class TelegramAdapter(BasePlatformAdapter):
                 )
             )
 
-            msg = await self._send_message_with_thread_fallback(**kwargs)
+            msg = await self._send_message_with_thread_fallback(
+                _flood_retry_cap=self._CLARIFY_FLOOD_RETRY_CAP, **kwargs
+            )
             self._clarify_state[clarify_id] = session_key
             return SendResult(success=True, message_id=str(msg.message_id))
         except Exception as e:
