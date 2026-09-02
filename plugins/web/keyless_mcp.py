@@ -28,6 +28,7 @@ from __future__ import annotations
 import json
 import logging
 import uuid
+from collections.abc import Mapping
 from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
@@ -729,32 +730,90 @@ def search_with_failover(name: str, query: str, limit: int = 5) -> Dict[str, Any
 
 
 def extract_with_failover(name: str, urls: List[str]) -> List[Dict[str, Any]]:
-    """Keyless extract across the vendor ring, failing over per-batch.
+    """Keyless extract across the vendor ring with per-URL throttle rescue.
 
-    Advances to the next ring vendor only when EVERY url in a batch comes
-    back with a rate-limit-shaped error — partial failures are page
-    problems, not throttling, and return as-is.
+    Successful and non-throttle rows are final. Only rows with a
+    rate-limit-shaped error advance to the next vendor. Results are merged
+    back to exactly one row per input URL in the caller's original order.
     """
     order = _ring_order(name)
     if not order:
         return [
-            {"url": u, "title": "", "content": "",
-             "error": "All keyless web providers are pinned to paid tiers."}
+            {
+                "url": u,
+                "title": "",
+                "content": "",
+                "error": "All keyless web providers are pinned to paid tiers.",
+            }
             for u in urls
         ]
-    last: List[Dict[str, Any]] = []
+    if not urls:
+        return []
+
+    pending = list(range(len(urls)))
+    merged: List[Optional[Dict[str, Any]]] = []
+    for _ in urls:
+        merged.append(None)
     for i, vendor in enumerate(order):
-        results = _KEYLESS_EXTRACTORS[vendor](list(urls))
-        errors = [r.get("error", "") for r in results]
-        all_throttled = bool(results) and all(
-            e and _is_rate_limitish(e) for e in errors
-        )
-        if not all_throttled:
-            return results
-        last = results
-        nxt = order[i + 1] if i + 1 < len(order) else None
+        if not pending:
+            break
+        requested_urls = [urls[index] for index in pending]
+        results = _KEYLESS_EXTRACTORS[vendor](requested_urls)
+        rows_by_url: Dict[str, List[Dict[str, Any]]] = {}
+        for row in results:
+            if not isinstance(row, dict):
+                continue
+            result_url = str(row.get("url") or "")
+            if result_url in requested_urls:
+                rows_by_url.setdefault(result_url, []).append(row)
+        row_offsets: Dict[str, int] = {}
+        retry: List[int] = []
+        for input_index in pending:
+            url = urls[input_index]
+            offset = row_offsets.get(url, 0)
+            candidates = rows_by_url.get(url, [])
+            row = candidates[offset] if offset < len(candidates) else None
+            row_offsets[url] = offset + 1
+            if row is None:
+                row = {
+                    "url": url,
+                    "title": "",
+                    "content": "",
+                    "error": f"Keyless {vendor} extract returned no result",
+                }
+            elif vendor != name:
+                row = dict(row)
+                raw_metadata = row.get("metadata")
+                metadata = (
+                    dict(raw_metadata) if isinstance(raw_metadata, Mapping) else {}
+                )
+                metadata.setdefault("sourceURL", url)
+                metadata["served_by"] = vendor
+                row["metadata"] = metadata
+            merged[input_index] = row
+            error = str(row.get("error") or "")
+            if error and _is_rate_limitish(error) and i + 1 < len(order):
+                retry.append(input_index)
+
+        nxt = order[i + 1] if retry and i + 1 < len(order) else None
         if nxt:
             logger.info(
-                "keyless %s extract throttled; failing over to %s", vendor, nxt
+                "keyless %s extract throttled for %d/%d URL(s); failing over to %s",
+                vendor,
+                len(retry),
+                len(pending),
+                nxt,
             )
-    return last
+        pending = retry
+
+    return [
+        row
+        if row is not None
+        else {
+            "url": urls[index],
+            "title": "",
+            "content": "",
+            "error": "Keyless extract returned no result",
+        }
+        for index, row in enumerate(merged)
+    ]

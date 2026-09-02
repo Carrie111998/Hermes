@@ -526,29 +526,252 @@ class TestKeylessFailover:
         self._pin(monkeypatch, "exa")
         throttled = [
             {"url": "https://a", "title": "", "content": "", "error": "rate limit hit"},
-            {"url": "https://b", "title": "", "content": "", "error": "429 too many requests"},
+            {
+                "url": "https://b",
+                "title": "",
+                "content": "",
+                "error": "429 too many requests",
+            },
         ]
         good = [
             {"url": "https://a", "title": "A", "content": "x"},
             {"url": "https://b", "title": "B", "content": "y"},
         ]
-        monkeypatch.setitem(keyless_mcp._KEYLESS_EXTRACTORS, "exa", lambda urls: throttled)
-        monkeypatch.setitem(keyless_mcp._KEYLESS_EXTRACTORS, "parallel", lambda urls: good)
-        out = keyless_mcp.extract_with_failover("exa", ["https://a", "https://b"])
-        assert out == good
-
-    def test_extract_partial_failure_stays_on_primary(self, monkeypatch):
-        self._pin(monkeypatch, "exa")
-        partial = [
-            {"url": "https://a", "title": "A", "content": "x"},
-            {"url": "https://b", "title": "", "content": "", "error": "rate limit"},
-        ]
-        called = []
-        monkeypatch.setitem(keyless_mcp._KEYLESS_EXTRACTORS, "exa", lambda urls: partial)
         monkeypatch.setitem(
-            keyless_mcp._KEYLESS_EXTRACTORS, "parallel",
-            lambda urls: called.append(1) or [],
+            keyless_mcp._KEYLESS_EXTRACTORS, "exa", lambda urls: throttled
+        )
+        monkeypatch.setitem(
+            keyless_mcp._KEYLESS_EXTRACTORS, "parallel", lambda urls: good
         )
         out = keyless_mcp.extract_with_failover("exa", ["https://a", "https://b"])
-        assert out == partial
-        assert not called
+        assert [row["content"] for row in out] == ["x", "y"]
+        assert all(row["metadata"]["served_by"] == "parallel" for row in out)
+        assert [row["metadata"]["sourceURL"] for row in out] == [
+            "https://a",
+            "https://b",
+        ]
+
+    def test_extract_retries_only_throttled_rows_and_restores_input_order(
+        self, monkeypatch
+    ):
+        self._pin(monkeypatch, "exa")
+        urls = [
+            "https://www.anthropic.com/engineering/building-effective-agents",
+            "https://www.anthropic.com/engineering/effective-context-engineering-for-ai-agents",
+            "https://www.anthropic.com/engineering/multi-agent-research-system",
+            "https://www.anthropic.com/engineering/demystifying-evals-for-ai-agents",
+            "https://developers.openai.com/api/docs/guides/agent-evals.md",
+        ]
+        primary = [
+            {
+                "url": urls[0],
+                "title": "A",
+                "content": "primary-a",
+                "metadata": {"sourceURL": urls[0], "trace": "keep-a"},
+            },
+            {
+                "url": urls[1],
+                "title": "",
+                "content": "",
+                "error": "HTTP 429 rate limit",
+            },
+            {
+                "url": urls[2],
+                "title": "C",
+                "content": "primary-c",
+                "metadata": {"sourceURL": urls[2], "trace": "keep-c"},
+            },
+            {"url": urls[3], "title": "", "content": "", "error": "too many requests"},
+            {
+                "url": urls[4],
+                "title": "E",
+                "content": "primary-e",
+                "metadata": {"sourceURL": urls[4], "trace": "keep-e"},
+            },
+        ]
+        rescue_calls = []
+
+        def rescue(requested):
+            rescue_calls.append(list(requested))
+            # Deliberately reversed: the merge must restore original input order.
+            return [
+                {
+                    "url": urls[3],
+                    "title": "D",
+                    "content": "rescued-d",
+                    "metadata": {"sourceURL": urls[3], "trace": "keep-d"},
+                },
+                {
+                    "url": urls[1],
+                    "title": "B",
+                    "content": "rescued-b",
+                    "metadata": {"sourceURL": urls[1], "trace": "keep-b"},
+                },
+            ]
+
+        monkeypatch.setitem(
+            keyless_mcp._KEYLESS_EXTRACTORS, "exa", lambda requested: primary
+        )
+        monkeypatch.setitem(keyless_mcp._KEYLESS_EXTRACTORS, "parallel", rescue)
+
+        out = keyless_mcp.extract_with_failover("exa", urls)
+
+        assert rescue_calls == [[urls[1], urls[3]]]
+        assert [row["url"] for row in out] == urls
+        assert [row.get("content") for row in out] == [
+            "primary-a",
+            "rescued-b",
+            "primary-c",
+            "rescued-d",
+            "primary-e",
+        ]
+        assert out[0]["metadata"] == {"sourceURL": urls[0], "trace": "keep-a"}
+        assert out[1]["metadata"] == {
+            "sourceURL": urls[1],
+            "trace": "keep-b",
+            "served_by": "parallel",
+        }
+
+    def test_extract_saved_case_b_rescues_only_its_two_throttled_rows(
+        self, monkeypatch
+    ):
+        self._pin(monkeypatch, "exa")
+        urls = [
+            "https://developers.openai.com/api/docs/guides/trace-grading.md",
+            "https://developers.openai.com/api/docs/guides/evaluation-best-practices.md",
+            "https://cloud.google.com/blog/products/ai-machine-learning/a-devs-guide-to-production-ready-ai-agents/",
+            "https://docs.cloud.google.com/gemini-enterprise-agent-platform/scale/memory-bank",
+            "https://developers.openai.com/api/docs/guides/agent-builder-safety",
+        ]
+        primary = [
+            {"url": urls[0], "title": "A", "content": "primary-a"},
+            {"url": urls[1], "title": "B", "content": "primary-b"},
+            {"url": urls[2], "title": "", "content": "", "error": "HTTP 429"},
+            {"url": urls[3], "title": "D", "content": "primary-d"},
+            {
+                "url": urls[4],
+                "title": "",
+                "content": "",
+                "error": "free MCP rate limit",
+            },
+        ]
+        calls = []
+
+        def rescue(requested):
+            calls.append(list(requested))
+            return [
+                {"url": url, "title": "rescued", "content": f"rescued-{i}"}
+                for i, url in enumerate(requested)
+            ]
+
+        monkeypatch.setitem(
+            keyless_mcp._KEYLESS_EXTRACTORS, "exa", lambda requested: primary
+        )
+        monkeypatch.setitem(keyless_mcp._KEYLESS_EXTRACTORS, "parallel", rescue)
+
+        out = keyless_mcp.extract_with_failover("exa", urls)
+
+        assert calls == [[urls[2], urls[4]]]
+        assert [row["url"] for row in out] == urls
+        assert sum(not row.get("error") for row in out) == 5
+        assert out[0]["content"] == "primary-a"
+        assert out[2]["metadata"]["served_by"] == "parallel"
+        assert out[4]["metadata"]["sourceURL"] == urls[4]
+
+    def test_extract_never_retries_non_throttle_errors(self, monkeypatch):
+        self._pin(monkeypatch, "exa")
+        urls = ["https://ok", "https://not-found", "https://throttled"]
+        primary = [
+            {"url": urls[0], "title": "OK", "content": "primary"},
+            {"url": urls[1], "title": "", "content": "", "error": "HTTP 404"},
+            {"url": urls[2], "title": "", "content": "", "error": "HTTP 429"},
+        ]
+        rescue_calls = []
+        later_calls = []
+
+        def rescue(requested):
+            rescue_calls.append(list(requested))
+            return [
+                {
+                    "url": urls[2],
+                    "title": "",
+                    "content": "",
+                    "error": "HTTP 403 blocked",
+                }
+            ]
+
+        monkeypatch.setitem(
+            keyless_mcp._KEYLESS_EXTRACTORS, "exa", lambda requested: primary
+        )
+        monkeypatch.setitem(keyless_mcp._KEYLESS_EXTRACTORS, "parallel", rescue)
+        monkeypatch.setitem(
+            keyless_mcp._KEYLESS_EXTRACTORS,
+            "tavily",
+            lambda requested: later_calls.append(list(requested)) or [],
+        )
+
+        out = keyless_mcp.extract_with_failover("exa", urls)
+
+        assert rescue_calls == [[urls[2]]]
+        assert later_calls == []
+        assert out[1]["error"] == "HTTP 404"
+        assert out[2]["error"] == "HTTP 403 blocked"
+        assert out[2]["metadata"]["served_by"] == "parallel"
+
+    def test_extract_tracks_duplicate_url_occurrences_independently(self, monkeypatch):
+        self._pin(monkeypatch, "exa")
+        url = "https://duplicate"
+        primary = [
+            {"url": url, "title": "first", "content": "primary-success"},
+            {"url": url, "title": "", "content": "", "error": "HTTP 429"},
+        ]
+        rescue_calls = []
+
+        def rescue(requested):
+            rescue_calls.append(list(requested))
+            return [{"url": url, "title": "second", "content": "rescued-success"}]
+
+        monkeypatch.setitem(
+            keyless_mcp._KEYLESS_EXTRACTORS, "exa", lambda requested: primary
+        )
+        monkeypatch.setitem(keyless_mcp._KEYLESS_EXTRACTORS, "parallel", rescue)
+
+        out = keyless_mcp.extract_with_failover("exa", [url, url])
+
+        assert rescue_calls == [[url]]
+        assert [row["content"] for row in out] == [
+            "primary-success",
+            "rescued-success",
+        ]
+        assert out[0] is not out[1]
+        assert out[1]["metadata"] == {
+            "sourceURL": url,
+            "served_by": "parallel",
+        }
+
+    def test_extract_normalizes_malformed_rescue_metadata(self, monkeypatch):
+        self._pin(monkeypatch, "exa")
+        url = "https://malformed-metadata"
+        primary = [{"url": url, "title": "", "content": "", "error": "HTTP 429"}]
+        rescued = [
+            {
+                "url": url,
+                "title": "rescued",
+                "content": "ok",
+                "metadata": "broken",
+            }
+        ]
+        monkeypatch.setitem(
+            keyless_mcp._KEYLESS_EXTRACTORS, "exa", lambda requested: primary
+        )
+        monkeypatch.setitem(
+            keyless_mcp._KEYLESS_EXTRACTORS, "parallel", lambda requested: rescued
+        )
+
+        out = keyless_mcp.extract_with_failover("exa", [url])
+
+        assert out[0]["content"] == "ok"
+        assert out[0]["metadata"] == {
+            "sourceURL": url,
+            "served_by": "parallel",
+        }
