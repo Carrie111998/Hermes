@@ -472,6 +472,7 @@ declare global {
         desktop: boolean
         agentName?: string | null
         desktopName?: string | null
+        desktopSourceSubdir?: '.' | 'desktop' | null
         warnings?: string[]
         insecure?: boolean
         error?: string
