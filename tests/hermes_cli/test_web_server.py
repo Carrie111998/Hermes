@@ -1200,6 +1200,90 @@ class TestWebServerEndpoints:
         assert resp.status_code == 200
         assert resp.json()["session_id"] == "cyc-b"
 
+    def test_latest_descendant_skips_reset_branch_and_delegate_children(self):
+        """A dashboard resume of the session the user clicked must never be
+        hijacked onto a descendant that starts a NEW user-visible
+        conversation: /new-reset children (marker + legacy same-key
+        heuristic, #84284), /branch forks, and delegate subagents. Only
+        compression continuations may redirect the walk (same guard set as
+        resolve_resume_session_id)."""
+        from hermes_state import SessionDB
+
+        db = SessionDB()
+        try:
+            db.create_session(
+                session_id="ln-a", source="telegram",
+                session_key="agent:main:telegram:dm:1", chat_id="1",
+            )
+            # modern /new-reset child (durable _reset_from marker)
+            db.create_session(
+                session_id="ln-b", source="telegram",
+                parent_session_id="ln-a", session_key="agent:main:telegram:dm:1",
+                chat_id="1", model_config={"_reset_from": "ln-a"},
+            )
+            # /branch fork
+            db.create_session(
+                session_id="ln-c", source="tui",
+                parent_session_id="ln-a", model_config={"_branched_from": "ln-a"},
+            )
+            # delegate subagent (worker child)
+            db.create_session(
+                session_id="ln-d", source="subagent",
+                parent_session_id="ln-a", model_config={"_delegate_from": "ln-a"},
+            )
+            # legacy pre-marker reset child: same routing key, parent ended at
+            # a reset boundary (session_reset / session_switch / idle / daily)
+            db.create_session(
+                session_id="ln-e", source="telegram",
+                parent_session_id="ln-a", session_key="agent:main:telegram:dm:1",
+                chat_id="1",
+            )
+            db._conn.execute(
+                "UPDATE sessions SET end_reason='session_reset',"
+                " ended_at=started_at + 1 WHERE id='ln-a'"
+            )
+            db._conn.commit()
+        finally:
+            db.close()
+
+        resp = self.client.get("/api/sessions/ln-a/latest-descendant")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["session_id"] == "ln-a"
+        assert body["changed"] is False
+        assert body["path"] == ["ln-a"]
+
+    def test_latest_descendant_follows_compression_continuation(self):
+        """Auto-compression forks the continuation as a child of a parent
+        ended with end_reason='compression'; the dashboard refresh must keep
+        following that chain (that is what latest-descendant exists for)."""
+        from hermes_state import SessionDB
+
+        db = SessionDB()
+        try:
+            db.create_session(
+                session_id="cc-a", source="telegram",
+                session_key="agent:main:telegram:dm:2", chat_id="1",
+            )
+            db.create_session(
+                session_id="cc-b", source="telegram",
+                parent_session_id="cc-a", session_key="agent:main:telegram:dm:2",
+                chat_id="1",
+            )
+            db._conn.execute(
+                "UPDATE sessions SET end_reason='compression',"
+                " ended_at=started_at + 1 WHERE id='cc-a'"
+            )
+            db._conn.commit()
+        finally:
+            db.close()
+
+        resp = self.client.get("/api/sessions/cc-a/latest-descendant")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["session_id"] == "cc-b"
+        assert body["changed"] is True
+
 
 
 

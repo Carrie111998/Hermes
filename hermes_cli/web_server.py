@@ -12424,6 +12424,15 @@ def _session_latest_descendant(session_id: str, db):
 
     /model may create child sessions. Dashboard refresh should continue the
     newest child instead of reopening the old parent.
+
+    Only compression continuations (and model-rotation children) are
+    followed. Children that start a NEW user-visible conversation — /branch
+    forks, /new-reset / idle-daily boundary children, delegate subagents and
+    tool workers — must never hijack a resume of the session the user
+    actually clicked. This mirrors the guard set used by
+    ``SessionDB.resolve_resume_session_id`` / ``get_compression_tip``
+    (#84284 family; the missing reset guard here made the dashboard rewrite
+    ``?resume=<parent>`` onto the empty post-/new session).
     """
     def row_get(row, key, index):
         if isinstance(row, dict):
@@ -12440,6 +12449,11 @@ def _session_latest_descendant(session_id: str, db):
     if not sid or not db.get_session(sid):
         return None, []
 
+    # Reuse the canonical child-classification predicates from
+    # hermes_state_common so this walk cannot drift from the guard sets used
+    # by resolve_resume_session_id / get_compression_tip.
+    from hermes_state_common import _BRANCH_CHILD_SQL, _RESET_CHILD_SQL
+
     conn = (
         getattr(db, "conn", None)
         or getattr(db, "_conn", None)
@@ -12450,15 +12464,19 @@ def _session_latest_descendant(session_id: str, db):
     rows = []
     if conn is not None:
         raw_rows = conn.execute(
-            """
-            WITH RECURSIVE descendants(id, parent_session_id, started_at) AS (
-                SELECT id, parent_session_id, started_at FROM sessions WHERE id = ?
+            f"""
+            WITH RECURSIVE descendants(id, parent_session_id, started_at, model_config) AS (
+                SELECT id, parent_session_id, started_at, model_config FROM sessions WHERE id = ?
                 UNION
-                SELECT s.id, s.parent_session_id, s.started_at
+                SELECT s.id, s.parent_session_id, s.started_at, s.model_config
                 FROM sessions s
                 JOIN descendants d ON s.parent_session_id = d.id
+                WHERE NOT ({_BRANCH_CHILD_SQL.format(a='s')})
+                  AND NOT ({_RESET_CHILD_SQL.format(a='s')})
+                  AND json_extract(COALESCE(s.model_config, '{{}}'), '$._delegate_from') IS NULL
+                  AND COALESCE(s.source, '') != 'tool'
             )
-            SELECT id, parent_session_id, started_at FROM descendants
+            SELECT id, parent_session_id, started_at, model_config FROM descendants
             """,
             (sid,),
         ).fetchall()
@@ -12467,9 +12485,47 @@ def _session_latest_descendant(session_id: str, db):
                 "id": row_get(row, "id", 0),
                 "parent_session_id": row_get(row, "parent_session_id", 1),
                 "started_at": row_get(row, "started_at", 2),
+                "model_config": row_get(row, "model_config", 3),
             })
     else:
         rows = db.list_sessions_rich(limit=10000, offset=0, compact_rows=True)
+
+    # Same exclusion set as the SQL branch above, applied to the
+    # compact-rows fallback. Filter on BOTH the source label AND the durable
+    # markers: the source column can be polluted by the parent session's
+    # HERMES_SESSION_SOURCE ContextVar leaking into a delegation worker
+    # thread (mislabeling the child as tui/desktop), so source alone is not a
+    # reliable signal. The legacy reset heuristic recovers pre-marker rows:
+    # same exact non-empty routing key as a parent that ended at a reset
+    # boundary (session_reset / session_switch / idle / daily / ...).
+    from hermes_state_common import _RESET_END_REASONS
+
+    _parents = {r.get("id"): r for r in rows}
+
+    def _is_continuation_skip(row):
+        if row_get(row, "source", 3) == "subagent":
+            return True
+        try:
+            cfg = row_get(row, "model_config", 3) or "{}"
+            if isinstance(cfg, str):
+                cfg = json.loads(cfg)
+        except Exception:
+            cfg = {}
+        if cfg.get("_delegate_from") or cfg.get("_branched_from") or cfg.get("_reset_from"):
+            return True
+        if (row_get(row, "source", 3) or "") == "tool":
+            return True
+        parent = _parents.get(row.get("parent_session_id"))
+        if (
+            parent
+            and (parent.get("end_reason") or "") in _RESET_END_REASONS
+            and row.get("session_key")
+            and row.get("session_key") == parent.get("session_key")
+        ):
+            return True
+        return False
+
+    rows = [r for r in rows if not _is_continuation_skip(r)]
 
     children = {}
     for row in rows:
