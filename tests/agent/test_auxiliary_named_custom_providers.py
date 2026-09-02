@@ -110,6 +110,28 @@ class TestResolveProviderClientNamedCustom:
         assert model == "my-model"
         assert "beans.local" in str(client.base_url)
 
+    def test_explicit_api_key_overrides_named_provider_credentials(self, tmp_path):
+        _write_config(tmp_path, {
+            "model": {"default": "test-model"},
+            "custom_providers": [
+                {
+                    "name": "beans",
+                    "base_url": "http://beans.local/v1",
+                    "api_key": "provider-key",
+                    "key_cmd": "printf command-key",
+                },
+            ],
+        })
+        from agent.auxiliary_client import resolve_provider_client
+
+        client, _ = resolve_provider_client(
+            "beans",
+            "my-model",
+            explicit_api_key="task-key",
+        )
+
+        assert client.api_key == "task-key"
+
 
     def test_named_custom_no_api_key_uses_fallback(self, tmp_path):
         _write_config(tmp_path, {
@@ -236,6 +258,35 @@ class TestVisionPathApiMode:
         mock_gcc.assert_called_once()
         _, kwargs = mock_gcc.call_args
         assert kwargs.get("api_mode") == "chat_completions"
+
+    def test_named_provider_passes_task_api_key(self, tmp_path):
+        _write_config(tmp_path, {
+            "model": {"default": "test-model"},
+            "auxiliary": {
+                "vision": {
+                    "provider": "beans",
+                    "model": "vision-model",
+                    "api_key": "task-key",
+                },
+            },
+            "custom_providers": [
+                {
+                    "name": "beans",
+                    "base_url": "http://beans.local/v1",
+                },
+            ],
+        })
+        with patch("agent.auxiliary_client._get_cached_client") as mock_gcc:
+            mock_gcc.return_value = (MagicMock(), "vision-model")
+            from agent.auxiliary_client import resolve_vision_provider_client
+
+            provider, client, model = resolve_vision_provider_client()
+
+        assert provider == "beans"
+        assert client is not None
+        assert model == "vision-model"
+        _, kwargs = mock_gcc.call_args
+        assert kwargs.get("api_key") == "task-key"
 
 
 class TestProvidersDictApiModeAnthropicMessages:

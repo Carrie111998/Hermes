@@ -7144,7 +7144,8 @@ def resolve_provider_client(
             custom_entry = _get_named_custom_provider(provider)
         if custom_entry:
             custom_base = (custom_entry.get("base_url") or "").strip()
-            custom_key = (custom_entry.get("api_key") or "").strip()
+            explicit_custom_key = (explicit_api_key or "").strip()
+            custom_key = explicit_custom_key or (custom_entry.get("api_key") or "").strip()
             custom_key_env = (custom_entry.get("key_env") or custom_entry.get("api_key_env") or "").strip()
             if not custom_key and custom_key_env:
                 custom_key = _scoped_key_env(custom_key_env)
@@ -7154,7 +7155,7 @@ def resolve_provider_client(
             # agent turn works while every auxiliary call (title generation,
             # compression, vision, embedding) 401s on the placeholder below.
             custom_key_cmd = str(custom_entry.get("key_cmd", "") or "").strip()
-            if custom_key_cmd:
+            if custom_key_cmd and not explicit_custom_key:
                 from agent.command_token_source import build_command_token_provider
                 custom_key = build_command_token_provider(
                     custom_key_cmd, custom_entry.get("name") or provider
@@ -8040,6 +8041,7 @@ def resolve_vision_provider_client(
                 return _finalize(requested, client, final_model)
         # Fallback: try without explicit base_url (old behavior)
         client, final_model = _get_cached_client(requested, resolved_model, async_mode,
+                                                 api_key=resolved_api_key,
                                                  api_mode=resolved_api_mode,
                                                  main_runtime=runtime,
                                                  is_vision=True)
@@ -8048,6 +8050,7 @@ def resolve_vision_provider_client(
         return requested, client, final_model
 
     client, final_model = _get_cached_client(requested, resolved_model, async_mode,
+                                             api_key=resolved_api_key,
                                              api_mode=resolved_api_mode,
                                              main_runtime=runtime,
                                              is_vision=True)
