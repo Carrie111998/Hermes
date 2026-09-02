@@ -445,7 +445,7 @@ export function useSlashCommand(deps: SlashCommandDeps) {
           // the real error, so don't bury it under the routing noise.
           const dispatchMessage = err instanceof Error ? err.message : String(err)
 
-          if (slashExecError && /not a quick\/plugin\/skill command/i.test(dispatchMessage)) {
+          if (slashExecError && /not a quick\/plugin\/(?:bundle\/)?skill command/i.test(dispatchMessage)) {
             const original = slashExecError instanceof Error ? slashExecError.message : String(slashExecError)
             renderSlashOutput(`error: /${name} failed: ${original}`)
 

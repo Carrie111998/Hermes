@@ -242,17 +242,31 @@ describe('useSlashCompletions', () => {
     expect(commandsOf(await completions(api, 'save json report'))).toEqual(['/save'])
   })
 
+  it('uses a backend replace_from offset verbatim', async () => {
+    const request = vi.fn().mockImplementation((method: string) =>
+      Promise.resolve(
+        method === 'commands.catalog'
+          ? CATALOG
+          : { items: [{ text: 'report', display: 'report', kind: 'command' }], replace_from: 7 }
+      )
+    )
+
+    const api = harness({ request } as unknown as HermesGateway)
+
+    expect(commandsOf(await completions(api, 'save json'))).toEqual(['/save jreport'])
+  })
+
   it('filters blocked subcommands from replace_from even without trailing space', async () => {
     const request = vi.fn().mockImplementation((method: string) =>
       Promise.resolve(
         method === 'commands.catalog'
           ? CATALOG
-          : { items: [{ text: 'install' }, { text: 'pending' }], replace_from: 9 }
+          : { items: [{ text: 'install' }, { text: 'pending' }], replace_from: 8 }
       )
     )
 
     const api = harness({ request } as unknown as HermesGateway)
-    const items = await completions(api, 'skills')
+    const items = await completions(api, 'skills pen')
 
     expect(commandsOf(items)).toEqual(['/skills pending'])
   })

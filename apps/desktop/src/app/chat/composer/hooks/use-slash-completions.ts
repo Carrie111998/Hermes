@@ -202,7 +202,7 @@ export function useSlashCompletions(options: {
 
         // Arg-completion items (replace_from > 1) carry just the arg stub —
         // e.g. complete.slash returns `{text: "alice"}` for `/personality alic`
-        // with replace_from = 14. Rewrite those entries so the popover inserts
+        // with replace_from = 13. Rewrite those entries so the popover inserts
         // the full `/personality alice` token instead of stranding `/alice`.
         const replaceFromRaw = result.replace_from
         const hasReplaceFrom = typeof replaceFromRaw === 'number'
@@ -213,7 +213,8 @@ export function useSlashCompletions(options: {
         const replaceFrom = hasReplaceFrom ? replaceFromRaw : inferredReplaceFrom
         const isArgCompletion = hasReplaceFrom ? replaceFrom > 1 : inferredArgCompletion
         const rawPrefix = isArgCompletion ? text.slice(0, replaceFrom) : ''
-        const prefix = rawPrefix && !/\s$/.test(rawPrefix) ? `${rawPrefix} ` : rawPrefix
+        const prefix =
+          !hasReplaceFrom && rawPrefix && !/\s$/.test(rawPrefix) ? `${rawPrefix} ` : rawPrefix
 
         // Commands narrowed by `desktop_subcommands` (e.g. /skills exposes
         // only its review slice here) must not suggest the subcommands the

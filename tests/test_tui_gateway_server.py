@@ -717,7 +717,11 @@ def test_slash_exec_keeps_tui_skills_commands_on_the_worker_path():
             {
                 "id": "skills-audit",
                 "method": "slash.exec",
-                "params": {"command": "skills audit", "session_id": "sid"},
+                "params": {
+                    "command": "skills audit",
+                    "session_id": "sid",
+                    "surface": "tui",
+                },
             }
         )
     finally:
@@ -726,6 +730,30 @@ def test_slash_exec_keeps_tui_skills_commands_on_the_worker_path():
     assert response is not None
     assert response["result"]["output"] == "audit complete"
     worker.run.assert_called_once_with("skills audit")
+
+
+def test_slash_exec_refuses_unlabeled_non_review_skills_subcommands(monkeypatch):
+    class _ExplodingWorker:
+        def __init__(self, *args, **kwargs):
+            raise AssertionError("slash worker should not run for an unlabeled caller")
+
+    server._sessions["sid"] = _session()
+    monkeypatch.setattr(server, "_SlashWorker", _ExplodingWorker)
+
+    try:
+        response = server.handle_request(
+            {
+                "id": "skills-install",
+                "method": "slash.exec",
+                "params": {"command": "skills install example", "session_id": "sid"},
+            }
+        )
+    finally:
+        server._sessions.pop("sid", None)
+
+    assert response is not None
+    assert response["error"]["code"] == 4018
+    assert "review subcommands" in response["error"]["message"]
 
 
 def test_slash_exec_runs_skills_pending_without_worker(tmp_path, monkeypatch):
