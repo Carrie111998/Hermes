@@ -11632,6 +11632,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             "api_key": self.api_key,
             "base_url": self.base_url,
             "api_mode": self.api_mode,
+            "reasoning_config": copy.deepcopy(
+                getattr(self, "reasoning_config", None)
+            ),
             "agent_primary_runtime": copy.deepcopy(
                 getattr(agent, "_primary_runtime", None)
             ) if agent is not None else None,
@@ -11650,6 +11653,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             "api_key",
             "base_url",
             "api_mode",
+            "reasoning_config",
         ):
             if key in snapshot:
                 setattr(self, key, snapshot.get(key))
@@ -11837,6 +11841,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 )
                 return
 
+        HermesCLI._sync_reasoning_config_after_model_switch(self, result.new_model)
+
         from hermes_cli.model_switch import format_model_for_display
         _display_old = format_model_for_display(old_model)
         _display_new = format_model_for_display(result.new_model)
@@ -11905,6 +11911,29 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         # actually runs — otherwise a later resume would restore the stale
         # creation-time model over the user's new global choice.
         HermesCLI._persist_model_switch_to_session(self, result)
+
+    def _sync_reasoning_config_after_model_switch(self, model: str) -> None:
+        """Keep CLI reasoning state aligned with the switched model.
+
+        ``AIAgent.switch_model`` re-resolves per-model overrides, but the next
+        turn may rebuild that agent when the route signature changes. The new
+        agent is initialized from ``self.reasoning_config``, so leaving the
+        CLI-level value stale silently restores the previous model's effort.
+        """
+        if self.agent is not None:
+            resolved = getattr(self.agent, "reasoning_config", None)
+        else:
+            try:
+                from hermes_cli.config import load_config_readonly
+                from hermes_constants import resolve_reasoning_config
+
+                resolved = resolve_reasoning_config(load_config_readonly(), model)
+            except Exception as exc:
+                logger.debug(
+                    "model switch reasoning override resolution failed: %s", exc
+                )
+                return
+        self.reasoning_config = dict(resolved) if isinstance(resolved, dict) else None
 
     def _handle_model_picker_selection(self, persist_global: bool = False) -> None:
         state = self._model_picker_state
@@ -12226,6 +12255,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     f"staying on {old_model}."
                 )
                 return
+
+        HermesCLI._sync_reasoning_config_after_model_switch(self, result.new_model)
 
         # Store a note to prepend to the next user message so the model
         # knows a switch occurred (avoids injecting system messages mid-history
