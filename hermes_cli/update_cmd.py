@@ -83,6 +83,18 @@ _STALE_PURGE_PROTECTED = frozenset(
         "hermes_cli.main",
         "hermes_cli.update_cmd",
         "hermes_cli.hermes_logging",
+        # (#98436) The in-flight update receipt is a module-level singleton
+        # (_current) in hermes_cli.update_receipt — the module holds live
+        # state the executing update depends on, so its cache entry must
+        # survive. Purging it strands the receipt in an orphaned module
+        # object: the next `from hermes_cli.update_receipt import ...`
+        # (cmd_update's command-boundary safety net) rebuilds a FRESH
+        # module with ``_current is None``, the finalize hits its
+        # documented no-op, and the run that did the real work — the
+        # Windows hand-off child, whose pending fleet-restart catch-up
+        # purges here (_run_pending_fleet_restart) — silently writes NO
+        # receipt.
+        "hermes_cli.update_receipt",
     }
 )
 
