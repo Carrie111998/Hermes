@@ -59,10 +59,11 @@ NOISY_STATUS_MESSAGES = [
     ),
 ]
 
-# Messages that must NEVER be swallowed by the compression-noise filter:
+# Messages that must remain outside the general compression-noise regex:
 # deliberate carve-outs from routine-compression silence — manual /compress
-# feedback (manual_compression_feedback.py headlines) and abort/failure
-# notices that require user action.
+# feedback and abort/failure notices remain visible on every chat surface;
+# the blocked-overflow template remains visible in DMs/raw surfaces and has a
+# separate destination-aware multi-user exception below.
 VISIBLE_COMPRESSION_MESSAGES = [
     "Compressed: 30 → 12 messages",
     "Compression aborted: 30 messages preserved",
@@ -90,11 +91,10 @@ VISIBLE_COMPRESSION_MESSAGES = [
         "the lock check failed — try again shortly."
     ),
     # Blocked-overflow warning (#62625/#62708): the context is over the
-    # compression threshold but compression is blocked (summary-LLM cooldown
-    # or the anti-thrash breaker). FAILURE-CLASS — must reach chat users so
-    # they can /new or /compress before the session dies at the hard token
-    # limit. Formatted from the SAME template the emit site uses, so a
-    # rewording that drifts into the noise regex fails here.
+    # compression threshold but compression is blocked. It remains outside the
+    # general noise regex so DMs/raw surfaces retain actionable feedback; the
+    # destination-aware filter below suppresses exact instances in multi-user
+    # chats. Formatted from the SAME template the emit site uses.
     CONTEXT_OVERFLOW_BLOCKED_WARNING_TEMPLATE.format(
         tokens=85_000, threshold=72_000, reason="cooldown:30"
     ),
