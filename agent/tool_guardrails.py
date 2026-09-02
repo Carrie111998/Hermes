@@ -240,6 +240,13 @@ class ToolCallGuardrailConfig:
 # pathological, so the defaults are deliberately low.
 _DEFAULT_MAX_WEB_SEARCHES_PER_TURN = 50
 _DEFAULT_MAX_SUBAGENTS_PER_TURN = 50
+# vision_analyze's cost lives in the PAYLOAD, not the response: each call
+# embeds the image into primary-model context, where it rides in history and
+# is re-sent on every subsequent API call. The no-progress detector keys on
+# result identity and can never see that, so payload-cost tools get a plain
+# per-turn call-count ceiling instead. (Observed incident: 295 vision calls
+# in one session against 4 distinct images.)
+_DEFAULT_MAX_VISION_CALLS_PER_TURN = 50
 
 
 @dataclass(frozen=True)
@@ -262,6 +269,7 @@ class LoopCapConfig:
 
     max_web_searches: int = _DEFAULT_MAX_WEB_SEARCHES_PER_TURN
     max_subagents: int = _DEFAULT_MAX_SUBAGENTS_PER_TURN
+    max_vision_calls: int = _DEFAULT_MAX_VISION_CALLS_PER_TURN
 
     @classmethod
     def from_mapping(cls, data: Mapping[str, Any] | None) -> "LoopCapConfig":
@@ -275,6 +283,9 @@ class LoopCapConfig:
             ),
             max_subagents=_non_negative_int(
                 data.get("max_subagents"), defaults.max_subagents
+            ),
+            max_vision_calls=_non_negative_int(
+                data.get("max_vision_calls"), defaults.max_vision_calls
             ),
         )
 
@@ -449,6 +460,7 @@ class ToolCallGuardrailController:
         # single agent loop rather than accumulating across the session.
         self._turn_web_search_count = 0
         self._turn_subagent_count = 0
+        self._turn_vision_count = 0
 
     @property
     def halt_decision(self) -> ToolGuardrailDecision | None:
@@ -827,6 +839,28 @@ class ToolCallGuardrailController:
                 self._halt_decision = decision
                 return decision
             self._turn_web_search_count += 1
+            return None
+
+        if tool_name == "vision_analyze":
+            cap = caps.max_vision_calls
+            if cap and self._turn_vision_count >= cap:
+                decision = ToolGuardrailDecision(
+                    action="block",
+                    code="loop_vision_cap",
+                    message=(
+                        f"Blocked vision_analyze: this turn has already made {cap} "
+                        "vision calls, the per-turn limit. Every analyzed image is "
+                        "embedded in context and re-sent on each subsequent API "
+                        "call, so re-analysis loops compound cost. Answer from "
+                        "the images already loaded instead of loading more."
+                    ),
+                    tool_name=tool_name,
+                    count=self._turn_vision_count,
+                    signature=signature,
+                )
+                self._halt_decision = decision
+                return decision
+            self._turn_vision_count += 1
             return None
 
         if tool_name == "delegate_task":

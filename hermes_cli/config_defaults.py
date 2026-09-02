@@ -854,6 +854,7 @@ DEFAULT_CONFIG = {
         "loop_caps": {
             "max_web_searches": 50,   # max web_search calls per turn (0 = unlimited)
             "max_subagents": 50,      # max subagents spawned per turn (0 = unlimited)
+            "max_vision_calls": 50,   # max vision_analyze calls per turn (0 = unlimited); vision payloads ride in history, so runaway re-analysis compounds cost
         },
     },
 
