@@ -1465,10 +1465,15 @@ def _(rid, params: dict) -> dict:
         if not title:
             return _err(rid, 4021, "title required")
         try:
-            if db.set_session_title(key, title):
+            from hermes_state import SessionDB
+
+            sanitized = SessionDB.sanitize_title(title)
+            if not sanitized:
+                return _err(rid, 4021, "title required")
+            if db.set_session_title(key, sanitized):
                 session["pending_title"] = None
                 _emit_session_info_for_session(params.get("session_id", ""), session)
-                return _ok(rid, {"pending": False, "title": title})
+                return _ok(rid, {"pending": False, "title": sanitized})
             # rowcount == 0 can mean "same value" as well as "missing row".
             existing_row = db.get_session(key)
             if existing_row:
@@ -1478,7 +1483,7 @@ def _(rid, params: dict) -> dict:
                     rid,
                     {
                         "pending": False,
-                        "title": (existing_row.get("title") or title),
+                        "title": (existing_row.get("title") or sanitized),
                     },
                 )
             # No row yet (the DB write is deferred to the first prompt so empty
@@ -1493,15 +1498,15 @@ def _(rid, params: dict) -> dict:
             # a /title'd-but-never-used draft still doesn't clutter the list.
             _ensure_session_db_row(session)
             with _session_db(session) as scoped_db:
-                if scoped_db is not None and scoped_db.set_session_title(key, title):
+                if scoped_db is not None and scoped_db.set_session_title(key, sanitized):
                     session["pending_title"] = None
                     _emit_session_info_for_session(params.get("session_id", ""), session)
-                    return _ok(rid, {"pending": False, "title": title})
+                    return _ok(rid, {"pending": False, "title": sanitized})
             # Row creation didn't take (DB unavailable, or a concurrent writer) —
             # fall back to queuing so the post-turn apply block can still recover.
-            session["pending_title"] = title
+            session["pending_title"] = sanitized
             _emit_session_info_for_session(params.get("session_id", ""), session)
-            return _ok(rid, {"pending": True, "title": title})
+            return _ok(rid, {"pending": True, "title": sanitized})
         except ValueError as e:
             return _err(rid, 4022, str(e))
         except Exception as e:
