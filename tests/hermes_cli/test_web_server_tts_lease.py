@@ -152,6 +152,55 @@ def test_acquire_resolves_provider_inside_target_profile(client, isolated_profil
     assert seen["provider"] == "kittentts"
 
 
+def test_cross_profile_same_lease_name_does_not_collapse(client, isolated_profiles, monkeypatch):
+    """Two different profiles toggling speech output with the SAME bare
+    lease name (e.g. "tui:voice-tts") must be tracked as two distinct
+    holders under gateway.multiplex_profiles — releasing one profile's
+    lease must never unload the local TTS model another profile is still
+    speaking through mid-conversation."""
+    from tools import tts_tool
+
+    monkeypatch.setattr(
+        tts_tool, "warm_tts_provider",
+        lambda cfg=None, provider=None: {"action": "noop", "warmed": False, "provider": "piper"},
+    )
+    tts_tool._piper_voice_cache["voice"] = object()
+
+    default_acquire = client.post(
+        "/api/audio/tts-lease", json={"lease": "tui:voice-tts", "active": True},
+    ).json()
+    assert default_acquire["leases"] == 1
+
+    worker_acquire = client.post(
+        "/api/audio/tts-lease?profile=worker_beta",
+        json={"lease": "tui:voice-tts", "active": True},
+    ).json()
+    assert worker_acquire["leases"] == 2, (
+        "two distinct profiles holding the same bare lease name must count "
+        "as two holders, not collapse into one"
+    )
+
+    default_release = client.post(
+        "/api/audio/tts-lease", json={"lease": "tui:voice-tts", "active": False},
+    ).json()
+    assert default_release["leases"] == 1, (
+        "worker_beta still holds its own lease — must not look like the "
+        "last holder released"
+    )
+    assert default_release["released"] == 0
+    assert len(tts_tool._piper_voice_cache) == 1, (
+        "worker_beta's resident model must survive the default profile's release"
+    )
+
+    worker_release = client.post(
+        "/api/audio/tts-lease?profile=worker_beta",
+        json={"lease": "tui:voice-tts", "active": False},
+    ).json()
+    assert worker_release["leases"] == 0
+    assert worker_release["released"] == 1
+    assert tts_tool._piper_voice_cache == {}
+
+
 def test_unknown_profile_404(client):
     resp = client.post("/api/audio/tts-lease?profile=ghost", json={"lease": "desktop:read-aloud", "active": True})
     assert resp.status_code == 404

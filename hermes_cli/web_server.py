@@ -5688,10 +5688,10 @@ async def tts_lease(payload: TTSLeaseRequest, profile: Optional[str] = None):
     def _apply():
         from tools.tts_tool import acquire_tts_lease, release_tts_lease
 
-        if payload.active:
-            with _config_profile_scope(profile):
+        with _config_profile_scope(profile):
+            if payload.active:
                 return acquire_tts_lease(lease)
-        return release_tts_lease(lease)
+            return release_tts_lease(lease)
 
     try:
         result = await asyncio.get_running_loop().run_in_executor(None, _apply)
