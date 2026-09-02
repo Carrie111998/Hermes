@@ -102,6 +102,19 @@ def test_auto_mount_host_cwd_adds_volume(monkeypatch, tmp_path):
     assert f"{project_dir}:/workspace" in run_args_str
 
 
+@pytest.mark.parametrize(
+    ("volume", "expected"),
+    [
+        ("/host/project:/workspace", True),
+        ("/host/project:/workspace:ro", True),
+        ("/host/project:/workspace/projects", False),
+        ("/host/project:/workspace-cache", False),
+    ],
+)
+def test_workspace_volume_detection_requires_exact_container_target(volume, expected):
+    assert docker_env._volume_targets_workspace(volume) is expected
+
+
 def test_non_persistent_cleanup_removes_container(monkeypatch):
     """When persist_across_processes=false, cleanup() must docker stop AND
     docker rm so containers don't leak across hermes processes.

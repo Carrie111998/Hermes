@@ -666,6 +666,17 @@ def _extra_args_egress_collisions(
     return sorted(set(collisions))
 
 
+def _volume_targets_workspace(volume: str) -> bool:
+    """Return whether a Docker ``-v`` spec targets exactly ``/workspace``.
+
+    A prefix check would also match nested paths such as
+    ``/workspace/projects`` and unrelated paths such as ``/workspace-cache``.
+    The target is followed by either Docker's optional mount-mode separator or
+    the end of the volume specification.
+    """
+    return re.search(r":/workspace(?::|$)", volume) is not None
+
+
 def _build_security_args(run_as_host_user: bool, run_exec: bool = False) -> list[str]:
     """Return the security/cap/tmpfs args tailored to the privilege mode.
 
@@ -995,7 +1006,7 @@ class DockerEnvironment(BaseEnvironment):
                 continue
             if ":" in vol:
                 volume_args.extend(["-v", vol])
-                if ":/workspace" in vol:
+                if _volume_targets_workspace(vol):
                     workspace_explicitly_mounted = True
             else:
                 logger.warning("Docker volume '%s' missing colon, skipping", vol)
