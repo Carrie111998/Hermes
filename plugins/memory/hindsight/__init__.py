@@ -89,6 +89,8 @@ _HINDSIGHT_GLYPH = "👁️"
 # overwrites prior turns server-side, so we keep the per-process
 # unique document_id fallback for older APIs.
 _MIN_VERSION_FOR_UPDATE_MODE_APPEND = "0.5.0"
+_MIN_HINDSIGHT_COPILOT_VERSION = "0.9.2"
+_HINDSIGHT_COPILOT_PROVIDER = "github-copilot"
 _VALID_BUDGETS = {"low", "mid", "high"}
 _PROVIDER_DEFAULT_MODELS = {
     "openai": "gpt-4o-mini",
@@ -96,11 +98,55 @@ _PROVIDER_DEFAULT_MODELS = {
     "gemini": "gemini-3.6-flash",
     "groq": "openai/gpt-oss-120b",
     "openrouter": "qwen/qwen3.5-9b",
+    "copilot": "gpt-5.6-terra",
     "minimax": "MiniMax-M2.7",
     "ollama": "gemma3:12b",
     "lmstudio": "local-model",
     "openai_compatible": "your-model-name",
 }
+
+
+def _map_embedded_llm_provider(provider: str) -> str:
+    """Map Hermes provider names to Hindsight embedded provider identifiers."""
+    provider = str(provider or "").strip()
+    if provider == "copilot":
+        return _HINDSIGHT_COPILOT_PROVIDER
+    if provider in {"openai_compatible", "openrouter"}:
+        return "openai"
+    return provider
+
+
+def _prepare_embedded_copilot_auth() -> str:
+    """Expose Hermes' raw GitHub credential to Hindsight's native Copilot SDK."""
+    from hermes_cli.copilot_auth import resolve_copilot_token
+
+    try:
+        token, source = resolve_copilot_token()
+    except ValueError as exc:
+        raise RuntimeError(f"GitHub Copilot authentication is invalid: {exc}") from exc
+
+    if token:
+        # hindsight-embed inherits the parent process environment when it starts
+        # its daemon. Do not exchange this token for an OpenAI-style API token;
+        # Hindsight's github-copilot provider owns that SDK/auth lifecycle.
+        os.environ.setdefault("COPILOT_GITHUB_TOKEN", token)
+    return str(source or "")
+
+
+def _ensure_hindsight_copilot_runtime_version() -> None:
+    """Fail clearly when an installed Hindsight predates native Copilot support."""
+    from importlib.metadata import PackageNotFoundError, version as pkg_version
+
+    try:
+        installed = pkg_version("hindsight-all")
+    except PackageNotFoundError:
+        return
+    if not _meets_minimum_version(installed, _MIN_HINDSIGHT_COPILOT_VERSION):
+        raise RuntimeError(
+            "GitHub Copilot for Hindsight local_embedded requires "
+            f"hindsight-all>={_MIN_HINDSIGHT_COPILOT_VERSION}; found {installed}. "
+            "Run 'hermes memory setup' again to upgrade the embedded runtime."
+        )
 
 
 def _parse_int_setting(value: Any, default: int) -> int:
@@ -601,17 +647,17 @@ def _build_embedded_profile_env(config: dict[str, Any], *, llm_api_key: str | No
     current_model = config.get("llm_model", "")
     current_base_url = config.get("llm_base_url") or os.environ.get("HINDSIGHT_API_LLM_BASE_URL", "")
 
-    # The embedded daemon expects OpenAI wire format for these providers.
-    daemon_provider = "openai" if current_provider in {"openai_compatible", "openrouter"} else current_provider
+    daemon_provider = _map_embedded_llm_provider(current_provider)
 
     env_values = {
         "HINDSIGHT_API_LLM_PROVIDER": str(daemon_provider),
-        "HINDSIGHT_API_LLM_API_KEY": str(current_key or ""),
         "HINDSIGHT_API_LLM_MODEL": str(current_model),
         "HINDSIGHT_API_LOG_LEVEL": "info",
     }
-    if current_base_url:
-        env_values["HINDSIGHT_API_LLM_BASE_URL"] = str(current_base_url)
+    if daemon_provider != _HINDSIGHT_COPILOT_PROVIDER:
+        env_values["HINDSIGHT_API_LLM_API_KEY"] = str(current_key or "")
+        if current_base_url:
+            env_values["HINDSIGHT_API_LLM_BASE_URL"] = str(current_base_url)
 
     idle_timeout = (
         config.get("idle_timeout")
@@ -1011,6 +1057,9 @@ class HindsightMemoryProvider(MemoryProvider):
                 return
             llm_provider = providers_list[llm_idx]
             provider_config["llm_provider"] = llm_provider
+            if llm_provider == "copilot":
+                # Native github-copilot support landed in Hindsight 0.9.2.
+                deps_to_install = [f"hindsight-all>={_MIN_HINDSIGHT_COPILOT_VERSION}"]
 
         print("\n  Checking dependencies...")
         # Environment-aware install: sealed hosted venvs redirect to the durable
@@ -1057,7 +1106,12 @@ class HindsightMemoryProvider(MemoryProvider):
                 env_writes["HINDSIGHT_API_KEY"] = api_key
 
         else:  # local_embedded
-            if llm_provider == "openai_compatible":
+            if llm_provider == "copilot":
+                provider_config.pop("llm_base_url", None)
+                auth_source = _prepare_embedded_copilot_auth()
+                if auth_source:
+                    print(f"  ✓ GitHub Copilot authentication: {auth_source}")
+            elif llm_provider == "openai_compatible":
                 existing_base_url = provider_config.get("llm_base_url", "")
                 prompt = "  LLM endpoint URL (e.g. http://192.168.1.10:8080/v1)"
                 if existing_base_url:
@@ -1074,21 +1128,22 @@ class HindsightMemoryProvider(MemoryProvider):
             val = input(f"  LLM model [{current_model}]: ").strip()
             provider_config["llm_model"] = val or current_model
 
-            sys.stdout.write("  LLM API key: ")
-            sys.stdout.flush()
-            llm_key = masked_secret_prompt("") if sys.stdin.isatty() else sys.stdin.readline().strip()
-            if llm_key:
-                env_writes["HINDSIGHT_LLM_API_KEY"] = llm_key
-            else:
-                env_path = Path(hermes_home) / ".env"
-                existing_llm_key = ""
-                if env_path.exists():
-                    # utf-8-sig: a Notepad BOM must not hide the first key.
-                    for line in env_path.read_text(encoding="utf-8-sig").splitlines():
-                        if line.startswith("HINDSIGHT_LLM_API_KEY="):
-                            existing_llm_key = line.split("=", 1)[1]
-                            break
-                env_writes["HINDSIGHT_LLM_API_KEY"] = existing_llm_key
+            if llm_provider != "copilot":
+                sys.stdout.write("  LLM API key: ")
+                sys.stdout.flush()
+                llm_key = masked_secret_prompt("") if sys.stdin.isatty() else sys.stdin.readline().strip()
+                if llm_key:
+                    env_writes["HINDSIGHT_LLM_API_KEY"] = llm_key
+                else:
+                    env_path = Path(hermes_home) / ".env"
+                    existing_llm_key = ""
+                    if env_path.exists():
+                        # utf-8-sig: a Notepad BOM must not hide the first key.
+                        for line in env_path.read_text(encoding="utf-8-sig").splitlines():
+                            if line.startswith("HINDSIGHT_LLM_API_KEY="):
+                                existing_llm_key = line.split("=", 1)[1]
+                                break
+                    env_writes["HINDSIGHT_LLM_API_KEY"] = existing_llm_key
 
         # Step 4: Save everything
         provider_config.setdefault("bank_id", "hermes")
@@ -1193,9 +1248,9 @@ class HindsightMemoryProvider(MemoryProvider):
             {"key": "api_url", "description": "Hindsight API URL", "default": _DEFAULT_LOCAL_URL, "when": {"mode": "local_external"}},
             {"key": "api_key", "description": "API key (optional)", "secret": True, "env_var": "HINDSIGHT_API_KEY", "when": {"mode": "local_external"}},
             # Local embedded mode
-            {"key": "llm_provider", "description": "LLM provider", "default": "openai", "choices": ["openai", "anthropic", "gemini", "groq", "openrouter", "minimax", "ollama", "lmstudio", "openai_compatible"], "when": {"mode": "local_embedded"}},
+            {"key": "llm_provider", "description": "LLM provider", "default": "openai", "choices": ["openai", "anthropic", "gemini", "groq", "openrouter", "minimax", "copilot", "ollama", "lmstudio", "openai_compatible"], "when": {"mode": "local_embedded"}},
             {"key": "llm_base_url", "description": "Endpoint URL (e.g. http://192.168.1.10:8080/v1)", "default": "", "when": {"mode": "local_embedded", "llm_provider": "openai_compatible"}},
-            {"key": "llm_api_key", "description": "LLM API key (optional for openai_compatible)", "secret": True, "env_var": "HINDSIGHT_LLM_API_KEY", "when": {"mode": "local_embedded"}},
+            {"key": "llm_api_key", "description": "LLM API key (not used for Copilot; optional for openai_compatible)", "secret": True, "env_var": "HINDSIGHT_LLM_API_KEY", "when": {"mode": "local_embedded"}},
             {"key": "llm_model", "description": "LLM model", "default": "gpt-4o-mini", "default_from": {"field": "llm_provider", "map": _PROVIDER_DEFAULT_MODELS}, "when": {"mode": "local_embedded"}},
             {"key": "bank_id", "description": "Memory bank name (static fallback when bank_id_template is unset)", "default": "hermes"},
             {"key": "bank_id_template", "description": "Optional template to derive bank_id dynamically. Placeholders: {profile}, {workspace}, {platform}, {user}, {session}. Example: hermes-{profile}", "default": ""},
@@ -1249,19 +1304,27 @@ class HindsightMemoryProvider(MemoryProvider):
                     raise ImportError(str(_e))
                 from hindsight import HindsightEmbedded
                 HindsightEmbedded.__del__ = lambda self: None
-                llm_provider = self._config.get("llm_provider", "")
-                if llm_provider in {"openai_compatible", "openrouter"}:
-                    llm_provider = "openai"
+                llm_provider = _map_embedded_llm_provider(
+                    self._config.get("llm_provider", "")
+                )
+                if llm_provider == _HINDSIGHT_COPILOT_PROVIDER:
+                    _ensure_hindsight_copilot_runtime_version()
+                    _prepare_embedded_copilot_auth()
                 logger.debug("Creating HindsightEmbedded client (profile=%s, provider=%s)",
                              self._config.get("profile", "hermes"), llm_provider)
                 kwargs = dict(
                     profile=self._config.get("profile", "hermes"),
                     llm_provider=llm_provider,
-                    llm_api_key=self._config.get("llmApiKey") or self._config.get("llm_api_key") or get_secret("HINDSIGHT_LLM_API_KEY", ""),
                     llm_model=self._config.get("llm_model", ""),
                 )
-                if self._llm_base_url:
-                    kwargs["llm_base_url"] = self._llm_base_url
+                if llm_provider != _HINDSIGHT_COPILOT_PROVIDER:
+                    kwargs["llm_api_key"] = (
+                        self._config.get("llmApiKey")
+                        or self._config.get("llm_api_key")
+                        or get_secret("HINDSIGHT_LLM_API_KEY", "")
+                    )
+                    if self._llm_base_url:
+                        kwargs["llm_base_url"] = self._llm_base_url
                 idle_timeout = _parse_int_setting(
                     self._config.get("idle_timeout")
                     if self._config.get("idle_timeout") is not None
