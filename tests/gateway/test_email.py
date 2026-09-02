@@ -1121,6 +1121,118 @@ class TestSenderAuthentication(unittest.TestCase):
         )
         self.assertFalse(ok, reason)
 
+    def test_originating_auth_pass_aligned_authenticates(self):
+        """The authenticated-submission path (Rspamd's authentication-results
+        routine / the MTA) stamps ``ORIGINATING; auth=pass`` on messages that
+        arrived via authenticated SMTP. An ``smtp.auth`` account aligned with
+        the From: domain authenticates the sender even when SPF/DKIM/DMARC
+        verdicts are absent (self-hosted submission)."""
+        ok, reason = self._verify(
+            "andreas@eglimail.net",
+            ["ORIGINATING; auth=pass smtp.auth=andreas@eglimail.net "
+             "smtp.mailfrom=andreas@eglimail.net"],
+        )
+        self.assertTrue(ok, reason)
+
+    def test_originating_subdomain_aligned_authenticates(self):
+        """Relaxed alignment (same bar as the SPF path): an account on a
+        subdomain of the From: domain authenticates."""
+        ok, reason = self._verify(
+            "andreas@eglimail.net",
+            ["ORIGINATING; auth=pass smtp.auth=andreas@mail.eglimail.net "
+             "smtp.mailfrom=andreas@mail.eglimail.net"],
+        )
+        self.assertTrue(ok, reason)
+
+    def test_originating_misaligned_rejected(self):
+        """An attacker authenticated to their own account must not inherit
+        someone else's From: domain."""
+        ok, reason = self._verify(
+            "admin@example.com",
+            ["ORIGINATING; auth=pass smtp.auth=attacker@evil.com "
+             "smtp.mailfrom=attacker@evil.com"],
+        )
+        self.assertFalse(ok, reason)
+
+    def test_originating_auth_fail_rejected(self):
+        """A failed SMTP AUTH verdict never authenticates, regardless of
+        which account is recorded."""
+        ok, reason = self._verify(
+            "admin@example.com",
+            ["ORIGINATING; auth=fail smtp.auth=admin@example.com "
+             "smtp.mailfrom=admin@example.com"],
+        )
+        self.assertFalse(ok, reason)
+
+    def test_originating_quoted_auth_verdict_authenticates(self):
+        """RFC 7489 allows quoted result values: a fully quoted verdict
+        ``auth="pass"`` carries the same meaning as the unquoted form."""
+        ok, reason = self._verify(
+            "andreas@eglimail.net",
+            ['ORIGINATING; auth="pass" smtp.auth=andreas@eglimail.net '
+             "smtp.mailfrom=andreas@eglimail.net"],
+        )
+        self.assertTrue(ok, reason)
+
+    def test_originating_quoted_value_cut_by_split_rejected(self):
+        """A quoted verdict containing whitespace (``auth="pass with
+        caveat"``) is cut into a fragment by the whitespace tokenization; the
+        fragment ``"pass`` must stay malformed and fail closed rather than
+        normalize to ``pass``."""
+        ok, reason = self._verify(
+            "admin@example.com",
+            ['ORIGINATING; auth="pass with caveat" smtp.auth=admin@example.com '
+             "smtp.mailfrom=admin@example.com"],
+        )
+        self.assertFalse(ok, reason)
+
+    def test_originating_username_only_rejected(self):
+        """A bare username in ``smtp.auth`` (e.g. a submission stack that
+        logs only the local part, Dovecot ``auth_username_format=%n``)
+        carries no domain, so alignment cannot be
+        verified — fail closed."""
+        ok, reason = self._verify(
+            "admin@example.com",
+            ["ORIGINATING; auth=pass smtp.auth=admin "
+             "smtp.mailfrom=admin@example.com"],
+        )
+        self.assertFalse(ok, reason)
+
+    def test_originating_forged_header_below_trusted_rejected(self):
+        """An attacker can inject a forged ORIGINATING header into their own
+        message, but the submission stack prepends its real stamp above it
+        (or moves the attacker's ARF to Original-AR), so the trusted header
+        carries the attacker's own account and the forged aligned one is
+        ignored — with and without authserv-id pinning."""
+        headers = [
+            # The submission stack's real stamp — the account that actually
+            # logged in
+            "ORIGINATING; auth=pass smtp.auth=attacker@evil.com "
+            "smtp.mailfrom=attacker@evil.com",
+            # Forged by the attacker, claims the victim's aligned account
+            "ORIGINATING; auth=pass smtp.auth=admin@example.com "
+            "smtp.mailfrom=admin@example.com",
+        ]
+        for pin in ("", "ORIGINATING"):
+            ok, reason = self._verify("admin@example.com", headers, authserv_id=pin)
+            self.assertFalse(ok, reason)
+
+    def test_originating_below_other_arf_with_pin_authenticates(self):
+        """When another ARF (e.g. an upstream Rspamd pass) sorts above the
+        ORIGINATING submission stamp, pinning
+        ``authserv_id=ORIGINATING`` selects the submission stamp instead of
+        the topmost one."""
+        ok, reason = self._verify(
+            "andreas@eglimail.net",
+            [
+                "rspamd.example.net; spf=none dkim=none dmarc=none",
+                "ORIGINATING; auth=pass smtp.auth=andreas@eglimail.net "
+                "smtp.mailfrom=andreas@eglimail.net",
+            ],
+            authserv_id="ORIGINATING",
+        )
+        self.assertTrue(ok, reason)
+
 
 if __name__ == "__main__":
     unittest.main()

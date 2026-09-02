@@ -416,11 +416,50 @@ _AUTH_METHOD_RE = re.compile(
     r"\b(dmarc|dkim|spf)\s*=\s*([a-z]+)", re.IGNORECASE
 )
 # Match a property value like ``header.from=example.com`` or
-# ``smtp.mailfrom=user@example.com``.
+# ``smtp.mailfrom=user@example.com``. ``smtp.auth`` is the authenticated
+# SMTP account from the submission path (see ``_originating_auth_verdict``).
 _AUTH_PROP_RE = re.compile(
-    r"\b(header\.from|header\.d|smtp\.mailfrom|smtp\.from|envelope-from)\s*=\s*([^\s;]+)",
+    r"\b(header\.from|header\.d|smtp\.mailfrom|smtp\.from|smtp\.auth|envelope-from)\s*=\s*([^\s;]+)",
     re.IGNORECASE,
 )
+
+
+def _originating_auth_verdict(trusted: str) -> str:
+    """Return the standalone ``auth=`` verdict from an ORIGINATING
+    Authentication-Results header, or "" when absent.
+
+    The authenticated-submission path stamps an ``ORIGINATING``
+    Authentication-Results header when a message arrives via authenticated
+    local SMTP (25) — e.g. Rspamd's ``authentication-results`` routine
+    (whose authserv-id is the MTA-provided ``MTA-Name``/``MTA-Tag``) or an
+    MTA that stamps it directly::
+
+        Authentication-Results: ORIGINATING; auth=pass
+            smtp.auth=user@example.com smtp.mailfrom=user@example.com
+
+    The standalone ``auth`` token is the SMTP AUTH verdict (``pass`` /
+    ``fail`` / ``none``). The result part (after the first ``;``) is
+    tokenized and the key compared exactly — a bare ``auth=`` regex would
+    also match inside ``smtp.auth=`` (a dot is not a word boundary). Returns
+    "" when the authserv-id is not ORIGINATING or no standalone ``auth=``
+    token is present.
+    """
+    serv, sep, result = trusted.partition(";")
+    if not sep or serv.strip().lower() != "originating":
+        return ""
+    for token in result.split():
+        key, eq, value = token.partition("=")
+        if eq and key.lower() == "auth":
+            value = value.strip()
+            # RFC 7489 allows quoted result values. Strip surrounding quotes
+            # only when the token is fully quoted — a fragment like
+            # ``"pass`` from a quoted value that the whitespace split cut
+            # mid-string must stay malformed (fail closed), never normalize
+            # to ``pass``.
+            if len(value) >= 2 and value[0] == '"' and value[-1] == '"':
+                value = value[1:-1]
+            return value.lower()
+    return ""
 
 
 def _verify_sender_authentication(
@@ -443,7 +482,9 @@ def _verify_sender_authentication(
     Returns ``(authenticated, reason)``. ``authenticated`` is True when:
       * a DMARC pass is recorded for the From domain, OR
       * an SPF pass aligned with the From domain, OR
-      * a DKIM pass aligned (``header.d``) with the From domain.
+      * a DKIM pass aligned (``header.d``) with the From domain, OR
+      * an ``ORIGINATING`` ``auth=pass`` stamp (authenticated SMTP
+        submission) whose ``smtp.auth`` account aligns with the From domain.
 
     When no ``Authentication-Results`` header is present at all, we return
     ``(False, "no Authentication-Results header")`` — fail-closed. Operators
@@ -499,6 +540,22 @@ def _verify_sender_authentication(
         dkim_domain = props.get("header.d", "") or _domain_of(props.get("header.from", ""))
         if _domains_aligned(dkim_domain, from_domain):
             return True, "dkim=pass aligned"
+
+    # 4) Authenticated submission path: an ORIGINATING header with
+    #    auth=pass proves the message entered through a real authenticated
+    #    SMTP session — the stamp is generated from the submission stack's
+    #    own SMTP AUTH state (Rspamd's authentication-results routine or the
+    #    MTA), so any ORIGINATING copy an attacker injects into their own
+    #    message sorts below the stack's prepend (or is moved to
+    #    Original-AR) and is never the trusted header. ``smtp.auth`` is the
+    #    account that logged in; like the SPF path above, its domain must
+    #    align (relaxed) with the From domain. Covers self-hosted submission
+    #    setups where locally submitted mail has no SPF/DKIM/DMARC verdicts
+    #    (or a misaligned DMARC) to lean on.
+    if _originating_auth_verdict(trusted) == "pass":
+        auth_user_domain = _domain_of(props.get("smtp.auth", ""))
+        if _domains_aligned(auth_user_domain, from_domain):
+            return True, "originating auth=pass aligned"
 
     return False, f"authentication failed ({trusted[:120]})"
 
