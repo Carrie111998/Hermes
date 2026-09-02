@@ -8,7 +8,9 @@ integration (install on join, play routing, ack) is tested with the standard
 """
 
 import os
+import struct
 import sys
+import time
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -27,6 +29,155 @@ if _DISCORD_DIR not in sys.path:
     sys.path.insert(0, _DISCORD_DIR)
 
 import voice_mixer as vm  # noqa: E402
+
+
+def _build_rtp_packet(ssrc, seq=1):
+    header = struct.pack(">BBHII", 0x80, 0x78, seq, 960 * seq, ssrc)
+    return header + (b"\x00" * 20) + b"\x00\x00\x00\x01"
+
+
+def _make_receiver(
+    *,
+    allowed_user_ids=None,
+    speech_start_callback=None,
+    speech_start_allowed=None,
+):
+    from plugins.platforms.discord.adapter import VoiceReceiver
+
+    vc = MagicMock()
+    vc._connection.secret_key = [0] * 32
+    vc._connection.dave_session = None
+    vc._connection.ssrc = 9999
+    vc._connection.add_socket_listener = MagicMock()
+    vc._connection.remove_socket_listener = MagicMock()
+    vc._connection.hook = None
+    receiver = VoiceReceiver(
+        vc,
+        allowed_user_ids=allowed_user_ids,
+        speech_start_callback=speech_start_callback,
+        speech_start_allowed=speech_start_allowed,
+    )
+    receiver.start()
+    return receiver
+
+
+def _send_decoded_packet(receiver, ssrc, *, pcm=b"\x00" * 3840, seq=1):
+    pytest.importorskip("nacl")
+    decoder = receiver._decoders.setdefault(ssrc, MagicMock())
+    decoder.decode.return_value = pcm
+    with patch("nacl.secret.Aead") as aead:
+        aead.return_value.decrypt.return_value = b"\xf8\xff\xfe"
+        receiver._on_packet(_build_rtp_packet(ssrc, seq))
+
+
+class TestVoiceReceiverSpeechStart:
+    def test_authorized_mapped_user_only(self):
+        callback = MagicMock()
+        receiver = _make_receiver(
+            allowed_user_ids={"42"},
+            speech_start_callback=callback,
+        )
+        receiver.map_ssrc(100, 42)
+        receiver.map_ssrc(200, 7)
+
+        _send_decoded_packet(receiver, 100)
+        _send_decoded_packet(receiver, 200)
+        _send_decoded_packet(receiver, 300)
+
+        callback.assert_called_once_with(42)
+
+    @pytest.mark.parametrize(
+        ("allowed_user_ids", "canonical_result", "expected_calls"),
+        [(set(), False, 0), ({"7"}, True, 1)],
+    )
+    def test_canonical_authorization_overrides_raw_user_ids(
+        self,
+        allowed_user_ids,
+        canonical_result,
+        expected_calls,
+    ):
+        callback = MagicMock()
+        allowed = MagicMock(return_value=canonical_result)
+        receiver = _make_receiver(
+            allowed_user_ids=allowed_user_ids,
+            speech_start_callback=callback,
+            speech_start_allowed=allowed,
+        )
+        receiver.map_ssrc(100, 42)
+
+        _send_decoded_packet(receiver, 100)
+
+        allowed.assert_called_once_with(42)
+        assert callback.call_count == expected_calls
+
+    @pytest.mark.parametrize(
+        "reset_path",
+        ["silence_emit", "silence_discard", "flush", "stop"],
+    )
+    def test_fires_once_per_utterance_and_resets(self, reset_path):
+        callback = MagicMock()
+        receiver = _make_receiver(
+            allowed_user_ids={"42"},
+            speech_start_callback=callback,
+        )
+        receiver.map_ssrc(100, 42)
+        pcm = b"\x00" * (96000 if reset_path == "silence_emit" else 3840)
+
+        _send_decoded_packet(receiver, 100, pcm=pcm, seq=1)
+        _send_decoded_packet(receiver, 100, pcm=pcm, seq=2)
+        callback.assert_called_once_with(42)
+
+        if reset_path.startswith("silence_"):
+            receiver._last_packet_time[100] = time.monotonic() - 4.0
+            receiver.check_silence()
+        elif reset_path == "flush":
+            receiver.flush_pending()
+        else:
+            receiver.stop()
+            receiver.start()
+            receiver.map_ssrc(100, 42)
+
+        _send_decoded_packet(receiver, 100, pcm=pcm, seq=3)
+        assert callback.call_count == 2
+        assert all(args == (42,) for args, _kwargs in callback.call_args_list)
+
+    def test_authorization_runs_outside_receiver_lock(self):
+        callback = MagicMock()
+        lock_was_available = []
+        receiver = None
+
+        def allowed(_user_id):
+            acquired = receiver._lock.acquire(blocking=False)
+            lock_was_available.append(acquired)
+            if acquired:
+                receiver._lock.release()
+            return True
+
+        receiver = _make_receiver(
+            allowed_user_ids={"42"},
+            speech_start_callback=callback,
+            speech_start_allowed=allowed,
+        )
+        receiver.map_ssrc(100, 42)
+
+        _send_decoded_packet(receiver, 100)
+
+        assert lock_was_available == [True]
+        callback.assert_called_once_with(42)
+
+    def test_callback_exception_does_not_escape_socket_reader(self):
+        callback = MagicMock(side_effect=RuntimeError("boom"))
+        receiver = _make_receiver(
+            allowed_user_ids={"42"},
+            speech_start_callback=callback,
+        )
+        receiver.map_ssrc(100, 42)
+
+        _send_decoded_packet(receiver, 100, seq=1)
+        _send_decoded_packet(receiver, 100, seq=2)
+
+        callback.assert_called_once_with(42)
+        assert len(receiver._buffers[100]) == 7680
 
 
 # =====================================================================
@@ -105,6 +256,116 @@ class TestVoiceMixerActive:
         assert bare.voice_mixer_active(111) is False
 
 
+class TestVoiceBargeIn:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("enabled", [True, False])
+    async def test_receiver_callback_is_wired_only_when_enabled(self, enabled):
+        from plugins.platforms.discord import adapter as discord_adapter
+        from gateway.config import PlatformConfig
+
+        with patch("hermes_cli.config.read_raw_config", return_value={
+            "voice": {"barge_in": enabled},
+        }):
+            adapter = discord_adapter.DiscordAdapter(
+                PlatformConfig(enabled=True, token="fake-token")
+            )
+        adapter._client = MagicMock()
+        adapter._allowed_user_ids = {"42"}
+        adapter._reset_voice_timeout = MagicMock()
+        channel = MagicMock()
+        channel.guild.id = 111
+        channel.connect = AsyncMock(return_value=MagicMock())
+
+        def discard_listen_loop(coro):
+            coro.close()
+            return MagicMock()
+
+        with patch.object(discord_adapter, "DISCORD_AVAILABLE", True), \
+                patch.object(discord_adapter, "VoiceReceiver") as receiver_cls, \
+                patch.object(
+                    discord_adapter.asyncio,
+                    "ensure_future",
+                    side_effect=discard_listen_loop,
+                ):
+            await adapter.join_voice_channel(channel)
+
+        callback = receiver_cls.call_args.kwargs.get("speech_start_callback")
+        allowed = receiver_cls.call_args.kwargs.get("speech_start_allowed")
+        assert callable(callback) is enabled
+        assert callable(allowed) is enabled
+        if enabled:
+            guild = adapter._client.get_guild.return_value
+            adapter._is_allowed_user = MagicMock(return_value=False)
+            assert allowed(42) is False
+            adapter._is_allowed_user.assert_called_once_with(
+                "42", guild=guild, is_dm=False
+            )
+
+    def test_active_mixer_speech_is_interrupted_before_legacy_playback(self):
+        adapter = _make_adapter()
+        mixer = MagicMock()
+        mixer.speech_active = True
+        adapter._voice_mixers[111] = mixer
+        vc = MagicMock()
+        vc.is_playing.return_value = True
+        adapter._voice_clients[111] = vc
+
+        adapter._on_voice_speech_start(111, 42)
+
+        mixer.stop_speech.assert_called_once_with()
+        vc.stop.assert_not_called()
+
+    def test_active_legacy_playback_is_interrupted_without_mixer_speech(self):
+        adapter = _make_adapter()
+        vc = MagicMock()
+        vc.is_playing.return_value = True
+        adapter._voice_clients[111] = vc
+
+        adapter._on_voice_speech_start(111, 42)
+
+        vc.stop.assert_called_once_with()
+
+    @pytest.mark.parametrize("with_idle_mixer", [False, True])
+    def test_noop_without_active_speech(self, with_idle_mixer):
+        adapter = _make_adapter()
+        vc = MagicMock()
+        vc.is_playing.return_value = False
+        adapter._voice_clients[111] = vc
+        if with_idle_mixer:
+            mixer = MagicMock()
+            mixer.speech_active = False
+            adapter._voice_mixers[111] = mixer
+
+        adapter._on_voice_speech_start(111, 42)
+
+        vc.stop.assert_not_called()
+        if with_idle_mixer:
+            mixer.stop_speech.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_legacy_playback_keeps_capture_live_when_enabled(self):
+        adapter = _make_adapter()
+        adapter._voice_barge_in_enabled = True
+        adapter._playback_timeout_for_audio = AsyncMock(return_value=30.0)
+        adapter._cancel_voice_timeout = MagicMock()
+        adapter._reset_voice_timeout = MagicMock()
+        receiver = MagicMock()
+        adapter._voice_receivers[111] = receiver
+        vc = MagicMock()
+        vc.is_connected.return_value = True
+        vc.is_playing.return_value = False
+        vc.play.side_effect = lambda _source, after: after(None)
+        adapter._voice_clients[111] = vc
+
+        with patch("plugins.platforms.discord.adapter.discord") as discord_mock:
+            discord_mock.FFmpegPCMAudio.return_value = MagicMock()
+            discord_mock.PCMVolumeTransformer.return_value = MagicMock()
+            assert await adapter.play_in_voice_channel(111, "/tmp/speech.mp3") is True
+
+        receiver.pause.assert_not_called()
+        receiver.resume.assert_not_called()
+
+
 class TestPlayInVoiceChannelMixerPath:
     @pytest.mark.asyncio
     async def test_routes_through_mixer_when_present(self):
@@ -161,5 +422,3 @@ class TestPlayAckInVoice:
         adapter = _make_adapter({"ack_enabled": False})
         adapter._voice_mixers[111] = MagicMock()
         assert await adapter.play_ack_in_voice(111) is False
-
-
