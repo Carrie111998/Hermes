@@ -1033,7 +1033,48 @@ for _alias, _canonical in {
     _OFFICIAL_DOCS_PRICING[("google", _alias)] = _OFFICIAL_DOCS_PRICING[
         ("google", _canonical)
     ]
-del _alias, _canonical
+
+
+del _alias
+
+
+_OFFICIAL_DOCS_PRICING[("x-ai", "grok-4.5")] = PricingEntry(
+    input_cost_per_million=_ZERO,
+    output_cost_per_million=_ZERO,
+    cache_read_cost_per_million=_ZERO,
+    cache_write_cost_per_million=_ZERO,
+    source="true_zero_no_spend",
+    pricing_version="x-ai-beta-free",
+)
+
+_OFFICIAL_DOCS_PRICING[("nvidia", "nemotron-3-ultra-550b-a55b")] = PricingEntry(
+    input_cost_per_million=_ZERO,
+    output_cost_per_million=_ZERO,
+    cache_read_cost_per_million=_ZERO,
+    cache_write_cost_per_million=_ZERO,
+    source="true_zero_no_spend",
+    pricing_version="nvidia-nim-free",
+)
+
+_OFFICIAL_DOCS_PRICING[("anthropic", "claude-opus-5")] = PricingEntry(
+    input_cost_per_million=Decimal("5.00"),
+    output_cost_per_million=Decimal("25.00"),
+    cache_read_cost_per_million=Decimal("0.50"),
+    cache_write_cost_per_million=Decimal("6.25"),
+    source="official_docs_snapshot",
+    source_url="https://platform.claude.com/docs/en/about-claude/pricing",
+    pricing_version="anthropic-pricing-2026-07",
+)
+
+_OFFICIAL_DOCS_PRICING[("anthropic", "claude-opus-5-fast")] = PricingEntry(
+    input_cost_per_million=Decimal("10.00"),
+    output_cost_per_million=Decimal("50.00"),
+    cache_read_cost_per_million=Decimal("1.00"),
+    cache_write_cost_per_million=Decimal("12.50"),
+    source="official_docs_snapshot",
+    source_url="https://platform.claude.com/docs/en/about-claude/pricing",
+    pricing_version="anthropic-pricing-2026-07",
+)
 
 
 def _to_decimal(value: Any) -> Optional[Decimal]:
@@ -1287,7 +1328,70 @@ def get_pricing_entry(
         )
         if entry:
             return entry
+    # --- NEW: normalize bare model IDs before official docs lookup ----
+    normalized = _try_normalize_model_id(model_name)
+    if normalized:
+        norm_provider, norm_model = normalized
+        entry = _lookup_official_docs_pricing(BillingRoute(provider=norm_provider, model=norm_model, base_url=""))
+        if entry:
+            return entry
     return _lookup_official_docs_pricing(route)
+def _try_normalize_model_id(model_name: str) -> Optional[tuple[str, str]]:
+    """Try to resolve a bare model ID to (provider, bare_model) by checking known prefixes.
+
+    Returns (provider, model) if the model name matches a known provider prefix,
+    otherwise returns None.  This lets callers normalize before lookup so that
+    bare IDs like ``gpt-5.6-sol`` resolve to ``(openai, gpt-5.6-sol)``.
+    """
+    # Known provider prefixes and their canonical model names
+    prefix_map = [
+        ("openai", {"gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna",
+                    "gpt-4o", "gpt-4o-mini", "gpt-4.1", "gpt-4.1-mini",
+                    "gpt-4.1-nano", "o3", "o3-mini",
+                    "gpt-5.6-sol-pro", "gpt-5.6-terra-pro",
+                    "gpt-5.6-luna-pro"}),
+        ("anthropic", {"claude-opus-5", "claude-opus-5-fast",
+                       "claude-opus-4-8", "claude-opus-4-8-fast",
+                       "claude-sonnet-5", "claude-sonnet-4-6",
+                       "claude-sonnet-4-6-20250414", "claude-opus-4-7",
+                       "claude-opus-4-7-20250507", "claude-opus-4-5",
+                       "claude-sonnet-4-5", "claude-haiku-4-5",
+                       "claude-opus-4-20250514", "claude-sonnet-4-20250514",
+                       "claude-3-5-sonnet-20241022", "claude-3-5-haiku-20241022",
+                       "claude-3-opus-20240229", "claude-3-haiku-20240307",
+                       "claude-3-5-sonnet-20240620"}),
+        ("google", {"gemini-3.6-flash", "gemini-3.5-flash",
+                    "gemini-3.5-flash-lite", "gemini-3.1-pro",
+                    "gemini-3.1-flash-lite", "gemini-3.1-pro-preview",
+                    "gemini-3-flash-preview", "gemini-2.5-pro",
+                    "gemini-2.5-flash", "gemini-2.0-flash",
+                    "gemini-1.5-flash", "gemini-1.5-pro"}),
+        ("bedrock", {"anthropic.claude-opus-5", "anthropic.claude-opus-4-8",
+                     "anthropic.claude-opus-4-7", "anthropic.claude-sonnet-5",
+                     "anthropic.claude-sonnet-4-6", "anthropic.claude-sonnet-4-5",
+                     "anthropic.claude-haiku-4-5", "amazon.nova-pro",
+                     "amazon.nova-lite", "amazon.nova-micro"}),
+        ("fireworks", {"kimi-k2p6", "kimi-k2p7-code", "glm-5p2", "glm-5p1",
+                       "kimi-k2p6-fast", "kimi-k2p6-turbo", "kimi-k2p7-code-fast",
+                       "glm-5p2-fast", "glm-5p1-fast", "minimax-m3",
+                       "minimax-m2p7", "gpt-oss-120b", "gpt-oss-20b",
+                       }),
+        ("nvidia", {"nemotron-3-ultra-550b-a55b", "nemotron-3-ultra-550b",
+                    "nemotron", "neva-3-ultra-550b-a55b"}),
+        ("x-ai", {"grok-4.5"}),
+    ]
+    model_lower = model_name.lower().strip()
+    for provider, known_models in prefix_map:
+        if model_lower in known_models:
+            return (provider, model_lower)
+    # Also try rsplit for fireworks-style "accounts/fireworks/models/<name>"
+    if model_lower.startswith("accounts/fireworks/models/"):
+        bare = model_lower[len("accounts/fireworks/models/"):]
+        return ("fireworks", bare)
+    return None
+
+
+
 
 
 def normalize_usage(
