@@ -212,6 +212,12 @@ HERMES_OVERLAYS: Dict[str, HermesOverlay] = {
         base_url_override="https://api.gmi-serving.com/v1",
         base_url_env_var="GMI_BASE_URL",
     ),
+    "synthetic": HermesOverlay(
+        transport="openai_chat",
+        extra_env_vars=("SYNTHETIC_API_KEY",),
+        base_url_override="https://api.synthetic.new/openai/v1",
+        base_url_env_var="SYNTHETIC_BASE_URL",
+    ),
     "fireworks": HermesOverlay(
         transport="openai_chat",
         extra_env_vars=("FIREWORKS_API_KEY",),
@@ -406,6 +412,10 @@ ALIASES: Dict[str, str] = {
     "gmi-cloud": "gmi",
     "gmicloud": "gmi",
 
+    # synthetic
+    "synthetic-new": "synthetic",
+    "syntheticnew": "synthetic",
+
     # fireworks
     "fireworks-ai": "fireworks",
     "fw": "fireworks",
@@ -448,6 +458,7 @@ _LABEL_OVERRIDES: Dict[str, str] = {
     "stepfun": "StepFun Step Plan",
     "xiaomi": "Xiaomi MiMo",
     "gmi": "GMI Cloud",
+    "synthetic": "Synthetic",
     "upstage": "Upstage Solar",
     "actual": "Actual Computer",
     "tencent-tokenhub": "Tencent TokenHub",

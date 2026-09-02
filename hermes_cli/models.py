@@ -806,6 +806,15 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
         "deepseek/deepseek-r1-0528",
         "qwen/qwen3-235b-a22b-fp8",
     ],
+    # Synthetic: syn: aliases are the entire curated list (never 404 on
+    # upstream model rotation); pinned hf: IDs are deliberately omitted —
+    # the live /openai/v1/models catalog adds them at picker time.
+    "synthetic": [
+        "syn:large:text",
+        "syn:small:text",
+        "syn:large:vision",
+        "syn:small:vision",
+    ],
 }
 
 # Vercel AI Gateway: derive the bare-model-id catalog from the curated
@@ -1339,6 +1348,7 @@ CANONICAL_PROVIDERS: list[ProviderEntry] = [
     ProviderEntry("ollama-cloud",   "Ollama Cloud",             "Ollama Cloud (Cloud-hosted open models, ollama.com)"),
     ProviderEntry("arcee",          "Arcee AI",                 "Arcee AI (Trinity models, direct API)"),
     ProviderEntry("gmi",            "GMI Cloud",                "GMI Cloud (Multi-model direct API)"),
+    ProviderEntry("synthetic",      "Synthetic",                "Synthetic (OpenAI-compatible API, syn: aliases route to latest models)"),
     ProviderEntry("kilocode",       "Kilo Code",                "Kilo Code (Kilo Gateway API)"),
     ProviderEntry("opencode-zen",   "OpenCode Zen",             "OpenCode Zen (Curated models, pay-as-you-go)"),
     ProviderEntry("opencode-go",    "OpenCode Go",              "OpenCode Go (Open models subscription)"),
@@ -1545,6 +1555,8 @@ _PROVIDER_ALIASES = {
     "huggingface-hub": "huggingface",
     "novita-ai": "novita",
     "novitaai": "novita",
+    "synthetic-new": "synthetic",
+    "syntheticnew": "synthetic",
     "mimo": "xiaomi",
     "xiaomi-mimo": "xiaomi",
     "tencent": "tencent-tokenhub",

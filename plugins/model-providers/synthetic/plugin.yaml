@@ -1,0 +1,5 @@
+name: synthetic-provider
+kind: model-provider
+version: 1.0.0
+description: "Synthetic - OpenAI-compatible API with syn: model aliases"
+author: Hermes Agent

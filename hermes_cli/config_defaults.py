@@ -4310,6 +4310,22 @@ OPTIONAL_ENV_VARS = {
         "category": "provider",
         "advanced": True,
     },
+    "SYNTHETIC_API_KEY": {
+        "description": "Synthetic API key (synthetic.new)",
+        "prompt": "Synthetic API key",
+        "url": "https://synthetic.new/",
+        "password": True,
+        "category": "provider",
+        "advanced": True,
+    },
+    "SYNTHETIC_BASE_URL": {
+        "description": "Synthetic base URL override",
+        "prompt": "Synthetic base URL (leave empty for default)",
+        "url": None,
+        "password": False,
+        "category": "provider",
+        "advanced": True,
+    },
     "ACTUAL_API_KEY": {
         "description": "Actual Computer inference key (ac_...)",
         "prompt": "Actual Computer inference key",
