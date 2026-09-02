@@ -14558,6 +14558,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         self._start_loop_heartbeat_task()
 
+        # Re-arm heartbeat watches persisted as active before this restart
+        # (#98298) — must run after adapters/routing are up so the poller
+        # can deliver, and before the startup hook so restored watches are
+        # visible to it.
+        await self._restore_heartbeat_watches()
+
         # Emit gateway:startup hook
         hook_count = len(self.hooks.loaded_hooks)
         if hook_count:
@@ -24232,8 +24238,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         The registry maps ``quick_key`` → ``(source, session_id)`` so the
         poller can rebuild a MessageEvent and enqueue via the adapter FIFO.
         In-memory by design: heartbeat STATE survives restarts in SessionDB,
-        but firing resumes when the user touches /heartbeat again in the new
-        gateway process (documented; durable schedules belong to cron).
+        and ``_restore_heartbeat_watches`` re-arms active watches from the
+        routing index on gateway startup (durable schedules belong to cron).
         """
         watch = getattr(self, "_heartbeat_watch", None)
         if watch is None:
@@ -24241,6 +24247,45 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             self._heartbeat_watch = watch
         watch[quick_key] = (source, session_id)
         self._start_heartbeat_poller()
+
+    async def _restore_heartbeat_watches(self) -> None:
+        """Re-arm watches for persisted active heartbeats on gateway startup.
+
+        Heartbeat state survives restarts in SessionDB ``state_meta``, but
+        the in-memory watch registry does not: after a restart an active
+        heartbeat was orphaned — ``/heartbeat status`` kept reporting
+        "active, next in ~Ns" while nothing could ever fire it (#98298).
+        Rebuild watches from the session routing index, whose entries carry
+        the origin source the poller needs to rebuild its delivery event.
+        Paused/cleared heartbeats are left alone; durable schedules still
+        belong to ``hermes cron``.
+        """
+        try:
+            from hermes_cli.heartbeat import load_heartbeat
+
+            entries = await self.async_session_store.list_sessions()
+        except Exception:
+            logger.debug("heartbeat restore: session list unavailable", exc_info=True)
+            return
+        restored = 0
+        for entry in entries:
+            sid = getattr(entry, "session_id", None)
+            origin = getattr(entry, "origin", None)
+            if not sid or origin is None:
+                continue
+            try:
+                state = load_heartbeat(sid)
+            except Exception:
+                state = None
+            if state is None or state.status != "active" or not state.prompt:
+                continue
+            self._register_heartbeat_watch(entry.session_key, origin, sid)
+            restored += 1
+        if restored:
+            logger.info(
+                "Heartbeat: re-armed %d active heartbeat(s) from persisted state",
+                restored,
+            )
 
     def _unregister_heartbeat_watch(self, quick_key: str) -> None:
         watch = getattr(self, "_heartbeat_watch", None)
