@@ -3760,9 +3760,17 @@ def _apply_pending_fleet_restart_catchup() -> None:
     print()
     _warn_pending_fleet_restart()
     print("→ Running the pending fleet restart...")
+    # Clear the marker *before* restarting (#98010): when the updater runs
+    # inside a gateway-owned process tree (agent tool call, webhook, cron),
+    # the restart below SIGTERMs this very process, so a clear placed after
+    # the restart is unreachable and the marker — and the warning/restart
+    # cycle — survives forever. Clearing early loses no safety net: an
+    # incomplete restart restores the marker below, and a stale runtime in
+    # the latest update receipt still re-triggers this catch-up.
+    _clear_fleet_restart_pending_marker()
     if _run_pending_fleet_restart():
-        _clear_fleet_restart_pending_marker()
         return
+    _write_fleet_restart_pending_marker()
     print("  ⚠ Fleet restart incomplete. Recover with: hermes gateway restart")
     sys.exit(1)
 

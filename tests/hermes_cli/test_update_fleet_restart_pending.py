@@ -518,3 +518,47 @@ def test_startup_warn_silent_when_nothing_pending(capsys):
     captured = capsys.readouterr()
     assert captured.err == ""
     assert captured.out == ""
+
+
+# ---------------------------------------------------------------------------
+# Catch-up marker lifetime around the restart itself (#98010)
+# ---------------------------------------------------------------------------
+
+
+def test_catchup_clears_marker_before_restart_begins(monkeypatch):
+    """The marker must already be gone once the restart runs.
+
+    ``hermes update`` invoked from inside a gateway-owned process tree is
+    SIGTERMed by its own fleet restart, so clearing the marker after
+    ``_run_pending_fleet_restart`` returns never executes on that path —
+    the marker survived forever and every later update re-ran the restart
+    (#98010).
+    """
+    update_cmd._write_fleet_restart_pending_marker(expected_sha="def456")
+    marker = update_cmd._fleet_restart_pending_marker_path()
+    assert marker.is_file()
+
+    def _restart():
+        # Simulates the self-kill window: by the time the restart executes,
+        # the marker must already have been cleared.
+        assert not marker.exists()
+        return True
+
+    monkeypatch.setattr(update_cmd, "_run_pending_fleet_restart", _restart)
+    update_cmd._apply_pending_fleet_restart_catchup()
+    assert not marker.exists()
+
+
+def test_catchup_restores_marker_when_restart_incomplete(monkeypatch):
+    update_cmd._write_fleet_restart_pending_marker(expected_sha="def456")
+    marker = update_cmd._fleet_restart_pending_marker_path()
+    assert marker.is_file()
+
+    monkeypatch.setattr(update_cmd, "_run_pending_fleet_restart", lambda: False)
+
+    with pytest.raises(SystemExit) as excinfo:
+        update_cmd._apply_pending_fleet_restart_catchup()
+
+    assert excinfo.value.code == 1
+    assert marker.is_file(), "incomplete restart must leave the marker pending"
+    update_cmd._clear_fleet_restart_pending_marker()
