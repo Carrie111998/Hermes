@@ -383,6 +383,36 @@ async def test_unlisted_group_is_dropped_without_authorization(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_group_is_dropped_when_group_allowlist_is_unset(monkeypatch):
+    monkeypatch.delenv("SIMPLEX_GROUP_ALLOWED", raising=False)
+    adapter = _adapter()
+    adapter.handle_message = AsyncMock()
+
+    await adapter._handle_chat_item(_group_item(12, 7, "no group policy"))
+
+    assert adapter.group_allow_from == set()
+    assert adapter._pending_text_batch_tasks == {}
+    adapter.handle_message.assert_not_awaited()
+
+
+def test_group_authorization_grant_is_not_persisted():
+    from gateway.session import SessionSource
+
+    source = _adapter().build_source(
+        chat_id="group:12",
+        chat_type="group",
+        user_id="99",
+        role_authorized=True,
+    )
+
+    serialized = source.to_dict()
+    restored = SessionSource.from_dict(serialized)
+
+    assert "role_authorized" not in serialized
+    assert restored.role_authorized is False
+
+
+@pytest.mark.asyncio
 async def test_allowed_group_file_keeps_intake_authorization(monkeypatch):
     monkeypatch.setenv("SIMPLEX_GROUP_ALLOWED", "12")
     adapter = _adapter()
