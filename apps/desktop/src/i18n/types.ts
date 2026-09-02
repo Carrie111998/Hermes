@@ -1228,6 +1228,7 @@ export interface Translations {
   skills: {
     tabSkills: string
     tabToolsets: string
+    tabChannels: string
     configuringProfile: string
     tabMcp: string
     all: string
@@ -1278,6 +1279,26 @@ export interface Translations {
     skillArchivedMessage: string
     officialCatalog: string
     officialPill: string
+    channels: {
+      search: string
+      loadFailed: string
+      description: string
+      customBoundary: string
+      inheritedDefaults: string
+      toolsets: string
+      toggleToolset: (label: string) => string
+      highImpact: string
+      required: string
+      mcpAccess: string
+      mcpAll: string
+      mcpNone: string
+      mcpSelected: string
+      noMcp: string
+      save: string
+      savedTitle: string
+      savedMessage: (channel: string) => string
+      saveFailed: (channel: string) => string
+    }
     hub: {
       searchPlaceholder: string
       search: string
