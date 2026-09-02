@@ -291,6 +291,14 @@ class PatchResult:
         return result
 
 
+@dataclass(frozen=True)
+class ResolvedMutationTarget:
+    """A user-facing path paired with its captured backend mutation identity."""
+
+    display_path: str
+    backend_path: str
+
+
 @dataclass
 class SearchMatch:
     """A single search match."""
@@ -597,7 +605,12 @@ class FileOperations(ABC):
 
     @abstractmethod
     def patch_v4a(self, patch_content: str) -> PatchResult:
-        """Apply a V4A format patch."""
+        """Apply a V4A format patch.
+
+        Keep the historical one-argument interface stable. Backends that can
+        consume tool-layer identities may also implement
+        ``patch_v4a_resolved(patch_content, resolved_targets)``.
+        """
         ...
 
     @abstractmethod
@@ -921,6 +934,48 @@ def _maybe_warn_line_oriented_newline_pattern(result: SearchResult, pattern: str
         "lines, or escape as `\\\\n` when searching for a literal backslash+n."
     )
     return result
+
+
+class _ResolvedTargetFileOperations:
+    """Use captured backend identities while keeping V4A display paths."""
+
+    def __init__(
+        self,
+        delegate: "ShellFileOperations",
+        resolved_targets: Dict[str, ResolvedMutationTarget],
+    ):
+        self._delegate = delegate
+        self._resolved_targets = resolved_targets
+
+    def _path(self, display_path: str) -> str:
+        target = self._resolved_targets.get(display_path)
+        if target is None:
+            raise ValueError("No captured resolved identity for a V4A target")
+        return target.backend_path
+
+    def read_file_raw(self, path: str):
+        return self._delegate.read_file_raw(self._path(path))
+
+    def write_file(
+        self,
+        path: str,
+        content: str,
+        pre_content: Optional[str] = None,
+    ):
+        return self._delegate.write_file(
+            self._path(path),
+            content,
+            pre_content=pre_content,
+        )
+
+    def delete_file(self, path: str):
+        return self._delegate.delete_file(self._path(path))
+
+    def move_file(self, src: str, dst: str):
+        return self._delegate.move_file(self._path(src), self._path(dst))
+
+    def _check_lint(self, path: str, content: Optional[str] = None):
+        return self._delegate._check_lint(self._path(path), content)
 
 
 class ShellFileOperations(FileOperations):
@@ -1386,6 +1441,35 @@ class ShellFileOperations(FileOperations):
             f"if [ -f {arg} ]; then wc -c < {arg} 2>/dev/null; "
             f"elif [ -e {arg} ]; then echo {NOT_REGULAR_SENTINEL}; "
             f"else exit 1; fi"
+        )
+
+    def is_regular_file(self, path: str) -> bool:
+        """Return whether *path* is an existing regular backend file.
+
+        The stat runs inside the selected local/SSH/container backend. Callers
+        must not apply host ``Path.is_file()`` to a backend path. A missing or
+        non-regular path returns ``False``; transport/protocol failures raise so
+        safety callers can fail closed instead of treating an outage as absent.
+        """
+        arg = self._escape_shell_arg(path)
+        result = self._exec(
+            f"if [ -f {arg} ]; then echo regular; "
+            f"elif [ -e {arg} ]; then echo non_regular; "
+            "else echo missing; fi"
+        )
+        if result.exit_code != 0:
+            raise OSError(
+                f"backend regular-file probe failed for {path!r}: "
+                f"{result.stdout.strip()}"
+            )
+        output = _strip_terminal_fence_leaks(result.stdout).strip()
+        if output == "regular":
+            return True
+        if output in {"missing", "non_regular"}:
+            return False
+        raise OSError(
+            f"backend regular-file probe returned an unknown result for "
+            f"{path!r}: {output!r}"
         )
 
     @staticmethod
@@ -2381,8 +2465,17 @@ class ShellFileOperations(FileOperations):
         )
     
     def patch_v4a(self, patch_content: str) -> PatchResult:
+        """Apply V4A through the historical one-argument interface."""
+
+        return self.patch_v4a_resolved(patch_content, resolved_targets=None)
+
+    def patch_v4a_resolved(
+        self,
+        patch_content: str,
+        resolved_targets: Optional[Dict[str, ResolvedMutationTarget]],
+    ) -> PatchResult:
         """
-        Apply a V4A format patch.
+        Apply a V4A patch using captured backend identities when provided.
         
         V4A format:
             *** Begin Patch
@@ -2405,9 +2498,22 @@ class ShellFileOperations(FileOperations):
         operations, parse_error = parse_v4a_patch(patch_content)
         if parse_error:
             return PatchResult(error=f"Failed to parse patch: {parse_error}")
-        
+
+        file_ops = self
+        if resolved_targets is not None:
+            operation_paths = []
+            for operation in operations:
+                operation_paths.append(operation.file_path)
+                if operation.new_path is not None:
+                    operation_paths.append(operation.new_path)
+            if any(path not in resolved_targets for path in operation_paths):
+                return PatchResult(
+                    error="No captured resolved identity for a V4A target"
+                )
+            file_ops = _ResolvedTargetFileOperations(self, resolved_targets)
+
         # Apply operations
-        result = apply_v4a_operations(operations, self)
+        result = apply_v4a_operations(operations, file_ops)
         return result
     
     def _check_lint(self, path: str, content: Optional[str] = None) -> LintResult:
