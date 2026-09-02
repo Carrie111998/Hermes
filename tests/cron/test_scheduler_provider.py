@@ -786,3 +786,61 @@ def test_multiplex_missing_secondary_does_not_fall_back_to_shared(tmp_path):
     assert default_ad is shared
     assert sec_ad is not shared
     assert not sec_ad
+
+
+def test_multiplex_per_home_defer_keeps_secondary_on_its_own_adapters(tmp_path):
+    """Absorb contract: per-home defer and secondary adapter isolation must
+    both hold in the same cycle. The deferred default must not tick; the
+    connected secondary must tick with its own adapters, never the shared set.
+    """
+    from cron.scheduler_provider import InProcessCronScheduler
+    from hermes_constants import get_hermes_home_override
+
+    p_default = tmp_path / "default"
+    p_sec = tmp_path / "home-ops"
+    for d in (p_default, p_sec):
+        (d / "cron").mkdir(parents=True)
+    profile_homes = [("default", p_default), ("home-ops", p_sec)]
+    shared = {"kind": "shared"}
+    sec = {"kind": "secondary"}
+    captured: list = []
+
+    def _capturing_tick(*args, **kwargs):
+        captured.append((get_hermes_home_override(), kwargs.get("adapters")))
+        return 0
+
+    def _defer_default(home):
+        return str(home) != str(p_default)
+
+    stop = threading.Event()
+    prov = InProcessCronScheduler()
+    with patch("cron.scheduler.tick", side_effect=_capturing_tick), \
+         patch("cron.jobs.record_ticker_heartbeat", lambda **kw: None):
+        t = threading.Thread(
+            target=prov.start,
+            args=(stop,),
+            kwargs={
+                "interval": 0,
+                "profile_homes": profile_homes,
+                "adapters": shared,
+                "profile_adapters": {"home-ops": sec},
+                "default_profile": "default",
+                "per_home_can_dispatch": _defer_default,
+            },
+            daemon=True,
+        )
+        t.start()
+        deadline = time.monotonic() + 10
+        while len(captured) < 1 and time.monotonic() < deadline:
+            time.sleep(0.005)
+        stop.set()
+        t.join(timeout=5)
+
+    assert not t.is_alive()
+    homes = [home for home, _adapters in captured]
+    assert str(p_default) not in homes
+    assert str(p_sec) in homes
+    sec_adapters = [adapters for home, adapters in captured if home == str(p_sec)]
+    assert sec_adapters
+    assert sec_adapters[0] is sec
+    assert sec_adapters[0] is not shared
