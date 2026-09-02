@@ -1017,7 +1017,22 @@ def _rewrite_compound_background(command: str) -> str:
         suffix = result[amp_pos + 1 :]
         # `{` needs a trailing space in bash; the closing `}` needs to be
         # preceded by `;` or `&` — we're providing `&` from the backgrounding.
-        result = prefix + "{ " + middle + "& }" + suffix
+        # The closing `}` must be terminated with `;` when a next command
+        # follows (e.g. `A && { B & } echo …`), otherwise bash fails with
+        # `syntax error near 'echo'` (#100870). Only add the separator when
+        # trailing content exists and isn't already a separator.
+        if suffix.strip():
+            stripped = suffix.lstrip()
+            # Newline terminates the brace group, no extra `;` needed.
+            leading_ws = suffix[: len(suffix) - len(stripped)] if stripped else suffix
+            if "\n" in leading_ws:
+                result = prefix + "{ " + middle + "& }" + suffix
+            elif stripped and stripped[0] not in ";|&":
+                result = prefix + "{ " + middle + "& }; " + stripped
+            else:
+                result = prefix + "{ " + middle + "& }" + suffix
+        else:
+            result = prefix + "{ " + middle + "& }" + suffix
 
     return result
 
