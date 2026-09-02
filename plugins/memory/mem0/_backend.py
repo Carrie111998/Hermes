@@ -229,6 +229,9 @@ class OSSBackend(Mem0Backend):
             "embedder": _provider_block("embedder"),
             "version": "v1.1",
         }
+# Pass custom_instructions if present in oss_config (set via mem0.json "oss.custom_instructions")
+        if oss_config.get("custom_instructions"):
+            config["custom_instructions"] = oss_config["custom_instructions"]
         if str(config["llm"].get("provider") or "").strip().lower() == "openai":
             # mem0 validates LlmConfig.provider before its factory lookup, so
             # first build the supported OpenAI config and only then swap the
