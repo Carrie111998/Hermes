@@ -226,6 +226,13 @@ def build_top_level_parser():
             "the most recent session (workspace-scoped, like -c with no name)"
         ),
     )
+    _inherited_flag(
+        parser,
+        "--no-streaming",
+        action="store_true",
+        default=False,
+        help="Disable streaming output; wait for the full response before displaying (CLI only)",
+    )
     parser.add_argument(
         "--no-restore-cwd",
         action="store_true",
@@ -542,6 +549,13 @@ def build_top_level_parser():
             "Also configurable as agent.run_budget_seconds in config.yaml. "
             "Intended for one-shot/eval invocations with a hard ceiling."
         ),
+    )
+    _inherited_flag(
+        chat_parser,
+        "--no-streaming",
+        action="store_true",
+        default=argparse.SUPPRESS,
+        help="Disable streaming output; wait for the full response before displaying (CLI only)",
     )
     _inherited_flag(
         chat_parser,
