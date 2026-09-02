@@ -53,7 +53,31 @@ logger = logging.getLogger(__name__)
 
 
 def _is_orphaned(original_ppid, getppid=os.getppid) -> bool:
-    """Return whether this worker no longer has its original POSIX parent."""
+    """Return whether this worker no longer has its original parent."""
+    if sys.platform == "win32":
+        # On Windows os.getppid() does not reliably return the spawning
+        # parent's PID — the PEB value can differ from the actual creator
+        # PID. Actively probe whether the parent PID is still alive.
+        try:
+            import ctypes
+            from ctypes import wintypes
+            _kernel32 = ctypes.windll.kernel32
+            _PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+            _STILL_ACTIVE = 259
+            handle = _kernel32.OpenProcess(
+                _PROCESS_QUERY_LIMITED_INFORMATION, False, original_ppid
+            )
+            if not handle:
+                return True
+            try:
+                code = wintypes.DWORD()
+                _kernel32.GetExitCodeProcess(handle, ctypes.byref(code))
+                return code.value != _STILL_ACTIVE
+            finally:
+                _kernel32.CloseHandle(handle)
+        except Exception as exc:  # keep worker alive; log for observability
+            logger.debug("Windows orphan check failed for ppid %s: %s: %s", original_ppid, type(exc).__name__, exc)
+            return False
     return getppid() != original_ppid
 
 
