@@ -145,6 +145,15 @@ def test_decompose_fanout_false_invalid_llm_assignee_uses_default(kanban_home):
     assert task.assignee == "fallback"
 
 
+def test_decomposer_prompt_requires_named_specialist_before_null_fallback():
+    prompt = " ".join(decomp._SYSTEM_PROMPT.split())
+    assert "Every child MUST have a non-null assignee" in prompt
+    assert "EXACT profile name from the roster" in prompt
+    assert "implementation, testing, review, and planning tasks use their matching specialist profiles" in prompt
+    assert "or null for default" not in prompt
+    assert "default_assignee" not in decomp._USER_TEMPLATE
+
+
 def test_decompose_returns_false_when_task_not_triage(kanban_home):
     with kb.connect() as conn:
         tid = kb.create_task(conn, title="x")  # ready, not triage
