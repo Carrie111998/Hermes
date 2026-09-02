@@ -295,6 +295,23 @@ class TestSearchHandler:
         assert "matches" in result
         mock_ops.search.assert_called_once()
 
+    @patch("tools.file_tools._get_file_ops")
+    def test_search_rejects_invalid_match_content_limit(self, mock_get):
+        from tools.file_tools import search_tool
+
+        result = json.loads(search_tool(pattern="TODO", max_content_chars=0))
+
+        assert "max_content_chars must be an integer" in result["error"]
+        mock_get.assert_not_called()
+
+    @patch("tools.file_tools.search_tool")
+    def test_registry_handler_forwards_match_content_limit(self, mock_search):
+        from tools.file_tools import _handle_search_files
+
+        _handle_search_files({"pattern": "TODO", "max_content_chars": 1200})
+
+        assert mock_search.call_args.kwargs["max_content_chars"] == 1200
+
 
     @patch("tools.file_tools._get_file_ops")
     def test_search_exception_returns_error(self, mock_get):
@@ -424,6 +441,31 @@ class TestSearchHints:
         raw = search_tool(pattern="foo", offset=50, limit=50)
         assert "[Hint:" in raw
         assert "offset=100" in raw
+
+    @patch("tools.file_tools._get_file_ops")
+    def test_match_content_truncation_hint_explains_retry(self, mock_get):
+        from tools.file_operations import SearchMatch, SearchResult
+
+        match = SearchMatch(
+            path="notes.md",
+            line_number=1,
+            content="A" * 500,
+        )
+        mock_ops = MagicMock()
+        mock_ops.search.return_value = SearchResult(
+            matches=[match], total_count=1, content_truncated=True
+        )
+        mock_get.return_value = mock_ops
+
+        from tools.file_tools import search_tool
+        raw = search_tool(pattern="TARGET_AFTER_LIMIT")
+
+        result_json, hint = raw.split("\n\n", 1)
+        result = json.loads(result_json)
+        assert result["content_truncated"] is True
+        assert "max_content_chars=500" in hint
+        assert "Increase max_content_chars to retrieve more" in hint
+        assert "You can reduce limit or narrow the search" in hint
 
 
 # ---------------------------------------------------------------------------

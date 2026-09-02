@@ -18,6 +18,7 @@ from tools.binary_extensions import (
     is_pdf_path,
 )
 from tools.file_operations import (
+    DEFAULT_SEARCH_CONTENT_CHARS,
     ShellFileOperations,
     normalize_read_pagination,
     normalize_search_pagination,
@@ -2554,10 +2555,18 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
 def search_tool(pattern: str, target: str = "content", path: str = ".",
                 file_glob: str = None, limit: int = 50, offset: int = 0,
                 output_mode: str = "content", context: int = 0,
+                max_content_chars: int = DEFAULT_SEARCH_CONTENT_CHARS,
                 task_id: str = "default") -> str:
     """Search for content or files."""
     try:
         offset, limit = normalize_search_pagination(offset, limit)
+        if (not isinstance(max_content_chars, int)
+                or isinstance(max_content_chars, bool)
+                or max_content_chars < 1):
+            return tool_error(
+                "max_content_chars must be an integer greater than or equal to 1. "
+                "Choose the number of characters to return per matching or context line."
+            )
 
         # Track searches to detect *consecutive* repeated search loops.
         # Include pagination args so users can page through truncated
@@ -2570,6 +2579,7 @@ def search_tool(pattern: str, target: str = "content", path: str = ".",
             file_glob or "",
             limit,
             offset,
+            max_content_chars,
         )
         with _read_tracker_lock:
             task_data = _read_tracker.setdefault(task_id, {
@@ -2615,7 +2625,8 @@ def search_tool(pattern: str, target: str = "content", path: str = ".",
         file_ops = _get_file_ops(task_id)
         result = file_ops.search(
             pattern=pattern, path=path, target=target, file_glob=file_glob,
-            limit=limit, offset=offset, output_mode=output_mode, context=context
+            limit=limit, offset=offset, output_mode=output_mode, context=context,
+            max_content_chars=max_content_chars,
         )
         omitted = _filter_read_blocked_search_results(result, task_id)
         if hasattr(result, 'matches'):
@@ -2650,6 +2661,13 @@ def search_tool(pattern: str, target: str = "content", path: str = ".",
         if result_dict.get("truncated"):
             next_offset = offset + limit
             result_json += f"\n\n[Hint: Results truncated. Use offset={next_offset} to see more, or narrow with a more specific pattern or file_glob.]"
+        if result_dict.get("content_truncated"):
+            result_json += (
+                f"\n\n[Hint: Matching line content was truncated at "
+                f"max_content_chars={max_content_chars}. Increase "
+                "max_content_chars to retrieve more. You can reduce limit or "
+                "narrow the search to keep the response smaller.]"
+            )
         return result_json
     except Exception as e:
         return tool_error(str(e))
@@ -2818,7 +2836,8 @@ SEARCH_FILES_SCHEMA = {
             "limit": {"type": "integer", "description": "Maximum number of results to return (default: 50)", "default": 50},
             "offset": {"type": "integer", "description": "Skip first N results for pagination (default: 0)", "default": 0},
             "output_mode": {"type": "string", "enum": ["content", "files_only", "count"], "description": "Output format for grep mode: 'content' shows matching lines with line numbers, 'files_only' lists file paths, 'count' shows match counts per file", "default": "content"},
-            "context": {"type": "integer", "description": "Number of context lines before and after each match (grep mode only)", "default": 0}
+            "context": {"type": "integer", "description": "Number of context lines before and after each match (grep mode only)", "default": 0},
+            "max_content_chars": {"type": "integer", "description": f"Maximum characters returned per matching or context line (content mode, default {DEFAULT_SEARCH_CONTENT_CHARS}). Results with clipped lines set content_truncated=true.", "default": DEFAULT_SEARCH_CONTENT_CHARS, "minimum": 1}
         },
         "required": ["pattern"]
     }
@@ -2876,7 +2895,8 @@ def _handle_search_files(args, **kw):
     return search_tool(
         pattern=args.get("pattern", ""), target=target, path=args.get("path", "."),
         file_glob=args.get("file_glob"), limit=args.get("limit", 50), offset=args.get("offset", 0),
-        output_mode=args.get("output_mode", "content"), context=args.get("context", 0), task_id=tid)
+        output_mode=args.get("output_mode", "content"), context=args.get("context", 0),
+        max_content_chars=args.get("max_content_chars", DEFAULT_SEARCH_CONTENT_CHARS), task_id=tid)
 
 
 def _read_file_schema_overrides():
