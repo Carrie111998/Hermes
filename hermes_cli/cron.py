@@ -795,6 +795,9 @@ def cron_create(args):
         repeat=getattr(args, "repeat", None),
         skill=getattr(args, "skill", None),
         skills=_normalize_skills(getattr(args, "skill", None), getattr(args, "skills", None)),
+        enabled_toolsets=_normalize_skills(
+            None, getattr(args, "enabled_toolsets", None)
+        ),
         script=getattr(args, "script", None),
         workdir=getattr(args, "workdir", None),
         model=getattr(args, "model", None),
@@ -871,6 +874,9 @@ def cron_edit(args):
         failure_deliver=getattr(args, "failure_deliver", None),
         repeat=getattr(args, "repeat", None),
         skills=final_skills,
+        enabled_toolsets=_normalize_skills(
+            None, getattr(args, "enabled_toolsets", None)
+        ),
         script=getattr(args, "script", None),
         workdir=getattr(args, "workdir", None),
         model=getattr(args, "model", None),
