@@ -112,6 +112,55 @@ def test_fetch_from_api_keeps_supported_in_api_false_models(monkeypatch):
     assert "gpt-5-internal" not in models
 
 
+def test_catalog_requests_use_ungated_client_version(monkeypatch):
+    """Both Codex catalog request sites must send the ungated ``0.0.0``
+    sentinel, never a made-up client version.
+
+    The endpoint interprets ``client_version`` as a Codex CLI compatibility
+    version and hides models whose ``minimal_client_version`` is newer, so a
+    hardcoded fake version (the old ``1.0.0``) silently couples model
+    visibility to a version scheme Hermes doesn't follow. ``0.0.0`` is the
+    backend's ungated sentinel returning the full account catalog
+    (clean-room port of zed-industries/zed#62729).
+    """
+    import sys
+    from hermes_cli import codex_models
+    from agent import model_metadata
+
+    seen_urls = []
+
+    class _FakeResp:
+        status_code = 200
+
+        def json(self):
+            return {"models": []}
+
+    class _FakeHttpx:
+        @staticmethod
+        def get(url, headers=None, timeout=None):
+            seen_urls.append(url)
+            return _FakeResp()
+
+    monkeypatch.setitem(sys.modules, "httpx", _FakeHttpx)
+    codex_models._fetch_models_from_api(access_token="tok")
+
+    class _FakeRequests:
+        @staticmethod
+        def get(url, headers=None, timeout=None, verify=None):
+            seen_urls.append(url)
+            return _FakeResp()
+
+    monkeypatch.setattr(model_metadata, "requests", _FakeRequests)
+    monkeypatch.setattr(model_metadata, "_ensure_requests", lambda: None)
+    monkeypatch.setattr(model_metadata, "_codex_oauth_context_cache", {})
+    model_metadata._fetch_codex_oauth_context_lengths_with_source("tok")
+
+    assert len(seen_urls) == 2
+    for url in seen_urls:
+        assert "client_version=0.0.0" in url, url
+        assert "1.0.0" not in url, url
+
+
 
 
 

@@ -12,6 +12,17 @@ import os
 
 logger = logging.getLogger(__name__)
 
+# The Codex models endpoint treats ``client_version`` as a Codex CLI
+# compatibility version and hides any model whose ``minimal_client_version``
+# is newer than the value we send. Hermes is not the Codex CLI, so any real
+# version number we pick couples model visibility to an unrelated version
+# scheme (a hardcoded "1.0.0" silently drops future models gated behind a
+# higher minimal version). The backend accepts the exact sentinel "0.0.0" as
+# an ungated request that returns the account's complete catalog; other
+# out-of-sequence values (e.g. "0.0.1") return an empty catalog, and omitting
+# the parameter is an HTTP 400.
+CODEX_UNGATED_CLIENT_VERSION = "0.0.0"
+
 DEFAULT_CODEX_MODELS: List[str] = [
     # GPT-5.6 series (Sol/Terra/Luna). The public API exposes "-pro"
     # variants, but the ChatGPT Codex OAuth backend rejects them with HTTP 400,
@@ -160,7 +171,8 @@ def _fetch_models_from_api(access_token: str) -> List[str]:
         if acct_id:
             headers["ChatGPT-Account-Id"] = acct_id
         resp = httpx.get(
-            "https://chatgpt.com/backend-api/codex/models?client_version=1.0.0",
+            "https://chatgpt.com/backend-api/codex/models"
+            f"?client_version={CODEX_UNGATED_CLIENT_VERSION}",
             headers=headers,
             timeout=10,
         )

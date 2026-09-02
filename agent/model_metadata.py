@@ -2847,8 +2847,15 @@ def _fetch_codex_oauth_context_lengths_with_source(
 
     try:
         _ensure_requests()
+        try:
+            # Single source of truth for the ungated sentinel; see the
+            # comment on CODEX_UNGATED_CLIENT_VERSION for why "0.0.0".
+            from hermes_cli.codex_models import CODEX_UNGATED_CLIENT_VERSION
+        except Exception:
+            CODEX_UNGATED_CLIENT_VERSION = "0.0.0"
         resp = requests.get(
-            "https://chatgpt.com/backend-api/codex/models?client_version=1.0.0",
+            "https://chatgpt.com/backend-api/codex/models"
+            f"?client_version={CODEX_UNGATED_CLIENT_VERSION}",
             headers=headers,
             timeout=(5, 10),
             verify=_resolve_requests_verify(),
