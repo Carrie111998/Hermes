@@ -53,6 +53,23 @@ WAKE_TURN_TIMEOUT_SECONDS = 600.0
 # max_concurrent_runs cap via HTTP 429, which is worth waiting out.
 _RETRY_DELAYS_SECONDS = (2.0, 5.0, 10.0)
 
+# Serialize wake self-posts per session. A client-side 600s timeout abandons
+# the HTTP request while the server-side turn keeps running; a naive retry
+# then re-posts onto the same session (which has no per-session lock),
+# producing concurrent turns that race last-writer-wins and drop results.
+# Holding a per-session lock across the whole retry loop makes a retry wait
+# for its abandoned predecessor instead of racing it (#100689).
+_wake_session_locks: dict[str, asyncio.Lock] = {}
+
+
+def _session_wake_lock(session_id: str) -> asyncio.Lock:
+    """Get (or create) the per-session lock serializing wake self-posts."""
+    lock = _wake_session_locks.get(session_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        _wake_session_locks[session_id] = lock
+    return lock
+
 
 def adapter_supports_push(adapter: Any) -> bool:
     """Whether this adapter can push a message to the user after a turn ends.
@@ -223,49 +240,50 @@ async def _self_post_chat_completion(
 
     last_err: Optional[BaseException] = None
     attempts = 1 + len(_RETRY_DELAYS_SECONDS)
-    for attempt in range(attempts):
-        if attempt:
-            await asyncio.sleep(_RETRY_DELAYS_SECONDS[attempt - 1])
-        try:
-            timeout = aiohttp.ClientTimeout(total=WAKE_TURN_TIMEOUT_SECONDS)
-            async with aiohttp.ClientSession(timeout=timeout) as http:
-                async with http.post(url, json=payload, headers=headers) as resp:
-                    if resp.status == 429:
-                        # Global concurrency cap (max_concurrent_runs) —
-                        # transient; back off and retry.
-                        last_err = RuntimeError(
-                            f"wake self-post got HTTP 429 (concurrency cap) "
-                            f"for session {session_id}"
+    async with _session_wake_lock(session_id):
+        for attempt in range(attempts):
+            if attempt:
+                await asyncio.sleep(_RETRY_DELAYS_SECONDS[attempt - 1])
+            try:
+                timeout = aiohttp.ClientTimeout(total=WAKE_TURN_TIMEOUT_SECONDS)
+                async with aiohttp.ClientSession(timeout=timeout) as http:
+                    async with http.post(url, json=payload, headers=headers) as resp:
+                        if resp.status == 429:
+                            # Global concurrency cap (max_concurrent_runs) —
+                            # transient; back off and retry.
+                            last_err = RuntimeError(
+                                f"wake self-post got HTTP 429 (concurrency cap) "
+                                f"for session {session_id}"
+                            )
+                            logger.warning(
+                                "%s; attempt %d/%d", last_err, attempt + 1, attempts
+                            )
+                            continue
+                        if resp.status >= 400:
+                            body = (await resp.text())[:300]
+                            # Non-transient (auth/validation) — fail immediately.
+                            raise RuntimeError(
+                                f"wake self-post failed for session {session_id}: "
+                                f"HTTP {resp.status}: {body}"
+                            )
+                        await resp.read()
+                        logger.info(
+                            "wake self-post delivered for session %s (attempt %d)",
+                            session_id,
+                            attempt + 1,
                         )
-                        logger.warning(
-                            "%s; attempt %d/%d", last_err, attempt + 1, attempts
-                        )
-                        continue
-                    if resp.status >= 400:
-                        body = (await resp.text())[:300]
-                        # Non-transient (auth/validation) — fail immediately.
-                        raise RuntimeError(
-                            f"wake self-post failed for session {session_id}: "
-                            f"HTTP {resp.status}: {body}"
-                        )
-                    await resp.read()
-                    logger.info(
-                        "wake self-post delivered for session %s (attempt %d)",
-                        session_id,
-                        attempt + 1,
-                    )
-                    return
-        except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as exc:
-            last_err = exc
-            logger.warning(
-                "wake self-post transient failure for session %s "
-                "(attempt %d/%d): %s",
-                session_id,
-                attempt + 1,
-                attempts,
-                exc,
-            )
-            continue
+                        return
+            except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as exc:
+                last_err = exc
+                logger.warning(
+                    "wake self-post transient failure for session %s "
+                    "(attempt %d/%d): %s",
+                    session_id,
+                    attempt + 1,
+                    attempts,
+                    exc,
+                )
+                continue
     raise RuntimeError(
         f"wake self-post gave up for session {session_id} after "
         f"{attempts} attempts: {last_err}"
