@@ -843,6 +843,77 @@ def test_single_task_no_banner_when_clean():
     assert "TRUNCATED" not in text
 
 
+def test_batch_status_partial_when_some_children_fail():
+    """A background batch's own aggregate status must distinguish a mixed
+    outcome from a clean one. Before this fix, `_worker()` reported
+    'completed' whenever ANY child succeeded, masking partial failure in a
+    listing like the CLI's /agents command (each child's own per-task status
+    was already correct in the completion message itself — this pins the
+    separate batch-level aggregate field)."""
+    results = [
+        {
+            "task_index": 0, "status": "completed", "summary": "ok",
+            "api_calls": 1, "duration_seconds": 0.1,
+        },
+        {
+            "task_index": 1, "status": "failed", "summary": None,
+            "error": "boom", "api_calls": 1, "duration_seconds": 0.1,
+        },
+    ]
+
+    def runner():
+        return {"results": results, "total_duration_seconds": 0.2}
+
+    out = ad.dispatch_async_delegation_batch(
+        goals=["task a", "task b"], context=None, toolsets=None,
+        role="leaf", model="m", session_key="sess", runner=runner,
+    )
+    assert out["status"] == "dispatched"
+
+    evt = _drain_for(out["delegation_id"])
+    assert evt is not None
+    assert evt["is_batch"] is True
+    assert evt["status"] == "partial", (
+        f"expected 'partial' for a mixed-outcome batch, got {evt['status']!r}"
+    )
+
+
+def test_batch_status_completed_when_all_children_succeed():
+    results = [
+        {"task_index": 0, "status": "completed", "summary": "ok"},
+        {"task_index": 1, "status": "success", "summary": "ok too"},
+    ]
+
+    def runner():
+        return {"results": results, "total_duration_seconds": 0.2}
+
+    out = ad.dispatch_async_delegation_batch(
+        goals=["task a", "task b"], context=None, toolsets=None,
+        role="leaf", model="m", session_key="sess", runner=runner,
+    )
+    evt = _drain_for(out["delegation_id"])
+    assert evt is not None
+    assert evt["status"] == "completed"
+
+
+def test_batch_status_error_when_all_children_fail():
+    results = [
+        {"task_index": 0, "status": "failed", "error": "boom1"},
+        {"task_index": 1, "status": "error", "error": "boom2"},
+    ]
+
+    def runner():
+        return {"results": results, "total_duration_seconds": 0.2}
+
+    out = ad.dispatch_async_delegation_batch(
+        goals=["task a", "task b"], context=None, toolsets=None,
+        role="leaf", model="m", session_key="sess", runner=runner,
+    )
+    evt = _drain_for(out["delegation_id"])
+    assert evt is not None
+    assert evt["status"] == "error"
+
+
 def test_batch_truncation_banner_marks_only_truncated_task():
     """In a batch, only the task that hit max_iterations gets the TRUNCATED
     marker; a clean sibling keeps the normal check icon."""
