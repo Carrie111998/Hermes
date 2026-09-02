@@ -3128,11 +3128,20 @@ class GatewayStreamConsumer:
         # This was reported on Telegram, Matrix, and other clients where the
         # ▉ block character renders as a visible white box ("tofu").
         # Existing messages (edits) are unaffected — only first sends gated.
+        # A segment-break finalize carries the same risk and must be gated
+        # too: its text never contains the cursor (the cursor is only
+        # appended to mid-stream frames), so the cursor-membership test
+        # alone let a 1-2 token preamble land as its own durable message at
+        # every tool boundary, firing on_new_message and resetting the
+        # tool-progress anchor — fragmenting accumulated progress into one
+        # bubble per tool (#99026).  Turn finals are exempt: a complete
+        # answer below the threshold must still be delivered.
         _MIN_NEW_MSG_CHARS = 4
+        _preamble_finalize = finalize and not is_turn_final
         if (self._message_id is None
-                and self.cfg.cursor
-                and self.cfg.cursor in text
-                and len(_visible_stripped) < _MIN_NEW_MSG_CHARS):
+                and len(_visible_stripped) < _MIN_NEW_MSG_CHARS
+                and (_preamble_finalize
+                     or (self.cfg.cursor and self.cfg.cursor in text))):
             return True  # too short for a standalone message — accumulate more
 
         # Native streaming transport (e.g. WeCom): every frame — first send,
