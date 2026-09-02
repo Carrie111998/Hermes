@@ -31,7 +31,8 @@ import os
 import sys
 from contextlib import contextmanager
 from typing import Any, Dict, Iterator, Optional
-from urllib.parse import quote
+from pathlib import Path
+from urllib.parse import quote, urlparse
 
 # httpx is imported lazily — only the ``_write_summary_via_incoming_webhook``
 # code path actually constructs an ``AsyncClient``. Top-level import here
@@ -821,6 +822,9 @@ class TeamsAdapter(BasePlatformAdapter):
         # Maps chat_id → ConversationReference captured from incoming messages.
         # Used to send cards with the correct conversation type (personal/group/channel).
         self._conv_refs: Dict[str, Any] = {}
+        # Disk-backed slim refs (teams/conversation_refs/*.json) for proactive
+        # send after restart — in-memory conv refs do not survive (#1218).
+        self._stored_refs: Dict[str, Dict[str, Any]] = {}
 
     async def connect(self, *, is_reconnect: bool = False) -> bool:
         # Defensive re-check: create_adapter() already ran the installer
@@ -900,6 +904,7 @@ class TeamsAdapter(BasePlatformAdapter):
             await site.start()
 
             self._running = True
+            self._load_stored_refs()
             self._mark_connected()
             logger.info(
                 "[teams] Webhook server listening on %s:%d%s",
@@ -926,6 +931,62 @@ class TeamsAdapter(BasePlatformAdapter):
         self._app = None
         self._mark_disconnected()
         logger.info("[teams] Disconnected")
+
+    def _stored_ref_dir(self) -> Path:
+        from hermes_constants import get_hermes_home
+
+        return Path(get_hermes_home()) / "teams" / "conversation_refs"
+
+    def _load_stored_refs(self) -> None:
+        from plugins.platforms.teams.stored_ref import load_stored_refs
+
+        self._stored_refs = load_stored_refs(self._stored_ref_dir())
+        if self._stored_refs:
+            logger.info("[teams] loaded %d stored conversation ref(s)", len(self._stored_refs))
+
+    def _persist_inbound_stored_ref(self, activity: Any, conv: Any, from_account: Any) -> None:
+        if not self._client_id:
+            return
+        conv_type = getattr(conv, "conversation_type", None) or ""
+        if conv_type != "personal":
+            return
+        conv_id = getattr(conv, "id", None)
+        service_url = getattr(activity, "service_url", None) or ""
+        if not conv_id or not service_url:
+            return
+        from plugins.platforms.teams.stored_ref import StoredRefError, persist_inbound_ref
+
+        try:
+            persist_inbound_ref(
+                self._stored_ref_dir(),
+                conversation_id=str(conv_id),
+                conversation_type="personal",
+                service_url=str(service_url),
+                tenant_id=str(getattr(conv, "tenant_id", None) or self._tenant_id or ""),
+                bot_app_id=self._client_id,
+                aad_object_id=getattr(from_account, "aad_object_id", None),
+                user_id=getattr(from_account, "id", None),
+                person=getattr(from_account, "name", None),
+            )
+            self._load_stored_refs()
+        except StoredRefError as exc:
+            logger.info("[teams] stored-ref persist skipped: %s", exc)
+        except OSError as exc:
+            logger.warning("[teams] stored-ref persist failed: %s", exc)
+
+    async def _post_stored_activity(self, url: str, headers: Any, body: Dict[str, Any]):
+        parsed = urlparse(url)
+        if parsed.scheme != "https" or parsed.hostname not in _ALLOWED_TEAMS_SERVICE_HOSTS:
+            return 0, {"error": "stored-ref send: service host is not allowlisted"}
+        import httpx
+
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            resp = await client.post(url, headers=dict(headers), json=body)
+            try:
+                payload = resp.json()
+            except Exception:
+                payload = {}
+            return resp.status_code, payload
 
     async def _get_botframework_token(self) -> str:
         """Acquire a Bot Framework bearer token via client credentials.
@@ -1055,6 +1116,7 @@ class TeamsAdapter(BasePlatformAdapter):
         from_account = activity.from_
         user_id = getattr(from_account, "aad_object_id", None) or getattr(from_account, "id", "")
         user_name = getattr(from_account, "name", None) or ""
+        self._persist_inbound_stored_ref(activity, conv, from_account)
 
         source = self.build_source(
             chat_id=conv.id,
@@ -1362,6 +1424,32 @@ class TeamsAdapter(BasePlatformAdapter):
 
         formatted = self.format_message(content)
         chunks = self.truncate_message(formatted)
+        stored = self._stored_refs.get(chat_id)
+        if stored:
+            from plugins.platforms.teams.stored_ref import send_from_stored_ref
+
+            try:
+                token = await self._get_botframework_token()
+            except Exception as e:
+                return SendResult(success=False, error=str(e), retryable=True)
+            last_message_id = None
+            for chunk in chunks:
+                result = await send_from_stored_ref(
+                    stored,
+                    chunk,
+                    poster=self._post_stored_activity,
+                    expected_bot_app_id=self._client_id,
+                    token=token,
+                )
+                if not result.get("success"):
+                    return SendResult(
+                        success=False,
+                        error=str(result.get("error") or "stored-ref send failed"),
+                        retryable=True,
+                    )
+                last_message_id = result.get("message_id")
+            return SendResult(success=True, message_id=last_message_id)
+
         last_message_id = None
 
         for chunk in chunks:
