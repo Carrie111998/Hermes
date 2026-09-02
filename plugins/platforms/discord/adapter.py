@@ -474,6 +474,7 @@ _GATE_ENV_KEYS = (
     "DISCORD_ALLOWED_CHANNELS",
     "DISCORD_IGNORED_CHANNELS",
     "DISCORD_NO_THREAD_CHANNELS",
+    "DISCORD_AUTO_THREAD_CHANNELS",
     "DISCORD_FREE_RESPONSE_CHANNELS",
     "DISCORD_MISSED_MESSAGE_BACKFILL_CHANNELS",
     "DISCORD_ALLOW_ALL_USERS",
@@ -481,6 +482,35 @@ _GATE_ENV_KEYS = (
     "GATEWAY_ALLOW_ALL_USERS",
     "GATEWAY_ALLOWED_USERS",
 )
+
+
+def _should_skip_auto_thread(
+    channel_keys: set,
+    no_thread_channels: set,
+    auto_thread_channels: set,
+    is_free_channel: bool,
+) -> bool:
+    """Should this channel message stay flat instead of opening a thread?
+
+    Precedence, highest first:
+
+    1. ``no_thread_channels`` — the explicit "never thread here" list. Always
+       wins; an ``auto_thread_channels`` entry cannot override it.
+    2. ``auto_thread_channels`` — opts a free-response channel back INTO
+       threading. "No @mention needed" and "keep topics in threads" are
+       independent wishes, and a project channel can want both.
+    3. ``is_free_channel`` — free-response channels stay flat by default,
+       which is the historical behaviour for a casual no-mention channel.
+
+    Pure so the precedence is testable without a Discord message fixture.
+    """
+    if channel_keys & no_thread_channels:
+        return True
+
+    if channel_keys & auto_thread_channels:
+        return False
+
+    return is_free_channel
 
 
 def _scoped_gate_env(name: str, default: str = "") -> str:
@@ -6755,6 +6785,21 @@ class DiscordAdapter(BasePlatformAdapter):
         """This adapter's DISCORD_NO_THREAD_CHANNELS list (per-profile)."""
         return self._gate_csv_set(self._gate_raw("no_thread_channels", "DISCORD_NO_THREAD_CHANNELS"))
 
+    def _get_auto_thread_channels(self) -> set:
+        """This adapter's DISCORD_AUTO_THREAD_CHANNELS list (per-profile).
+
+        Free-response channels skip auto-threading by default, on the
+        assumption that a no-mention channel is a casual one that reads better
+        as a flat conversation. That is a sensible default but not a universal
+        one: a project channel can legitimately want BOTH — no @mention to
+        start a turn, and a thread per topic so long-running work stays
+        separable. Listing a channel here restores auto-threading for it
+        without giving up its free-response exemption.
+
+        Empty (the default) preserves the previous behaviour exactly.
+        """
+        return self._gate_csv_set(self._gate_raw("auto_thread_channels", "DISCORD_AUTO_THREAD_CHANNELS"))
+
     def _get_allowed_users(self) -> set:
         """This adapter's DISCORD_ALLOWED_USERS entries (per-profile, cleaned)."""
         raw = self._gate_raw("allow_from", "DISCORD_ALLOWED_USERS")
@@ -8188,6 +8233,7 @@ class DiscordAdapter(BasePlatformAdapter):
         #   discord.allowed_channels: If set, bot ONLY responds in these channels (whitelist)
         #   discord.no_thread_channels: Channel IDs where bot responds directly without creating thread
         #   discord.auto_thread: Auto-create thread on @mention in channels (default: true)
+        #   discord.auto_thread_channels: Free-response channel IDs that should still auto-thread
 
         thread_id = None
         parent_channel_id = None
@@ -8271,10 +8317,14 @@ class DiscordAdapter(BasePlatformAdapter):
         # @mention in a text channel so each conversation is isolated (like Slack).
         # Messages already inside threads or DMs are unaffected.
         # no_thread_channels: channels where bot responds directly without thread.
+        # auto_thread_channels: free-response channels that DO want threading.
         auto_threaded_channel = None
         if not is_thread and not isinstance(message.channel, discord.DMChannel):
             no_thread_channels = self._get_no_thread_channels()
-            skip_thread = bool(channel_keys & no_thread_channels) or is_free_channel
+            auto_thread_channels = self._get_auto_thread_channels()
+            skip_thread = _should_skip_auto_thread(
+                channel_keys, no_thread_channels, auto_thread_channels, is_free_channel
+            )
             auto_thread = os.getenv("DISCORD_AUTO_THREAD", "true").lower() in {"true", "1", "yes"}
             is_reply_message = getattr(message, "type", None) == discord.MessageType.reply
             if auto_thread and not skip_thread and not is_voice_linked_channel and not is_reply_message:
@@ -10579,6 +10629,14 @@ def _apply_yaml_config(yaml_cfg: dict, discord_cfg: dict) -> dict | None:
         seeded_extra["no_thread_channels"] = str(ntc)
         if not _skip_env_bridge and not os.getenv("DISCORD_NO_THREAD_CHANNELS"):
             os.environ["DISCORD_NO_THREAD_CHANNELS"] = str(ntc)
+    # auto_thread_channels: free-response channels that still want auto-threading
+    atc = discord_cfg.get("auto_thread_channels")
+    if atc is not None:
+        if isinstance(atc, list):
+            atc = ",".join(str(v) for v in atc)
+        seeded_extra["auto_thread_channels"] = str(atc)
+        if not _skip_env_bridge and not os.getenv("DISCORD_AUTO_THREAD_CHANNELS"):
+            os.environ["DISCORD_AUTO_THREAD_CHANNELS"] = str(atc)
     # history_backfill: recover missed channel messages for shared sessions
     # when require_mention is active.  Fetches messages between bot turns
     # and prepends them to the user message for context.
