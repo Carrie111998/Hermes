@@ -2603,6 +2603,128 @@ def _apply_summary_budget(results: List[Dict[str, Any]], parent_agent) -> None:
         )
 
 
+# Per-task image-attachment ceiling. Mirrors the spirit of Roomote's
+# bounded attachment forwarding (RooCodeInc/Roomote#1796: 20 attachments /
+# 200k chars per handoff) scaled down for a single-goal turn — 8 images is
+# plenty for screenshots/mocks and keeps the child's first request small.
+_MAX_TASK_IMAGES = 8
+
+
+def _normalize_task_images(task: dict, i: int) -> tuple:
+    """Validate and normalize a task's optional ``images`` list.
+
+    Returns (cleaned_list_or_None, error_string_or_None). A bare string is
+    tolerated (wrapped into a one-entry list) because small models routinely
+    emit scalars where arrays are expected.
+    """
+    raw = task.get("images")
+    if raw is None:
+        return None, None
+    if isinstance(raw, str):
+        raw = [raw]
+    if not isinstance(raw, list):
+        return None, (
+            f"Task {i} 'images' must be an array of local file paths or "
+            "http(s) URLs."
+        )
+    cleaned: List[str] = []
+    for item in raw:
+        if not isinstance(item, str) or not item.strip():
+            return None, (
+                f"Task {i} 'images' entries must be non-empty strings "
+                "(local file paths or http(s) URLs)."
+            )
+        cleaned.append(item.strip())
+    if len(cleaned) > _MAX_TASK_IMAGES:
+        return None, (
+            f"Task {i} has {len(cleaned)} images; the per-task limit is "
+            f"{_MAX_TASK_IMAGES}. Trim to the images the child actually "
+            "needs to see."
+        )
+    return (cleaned or None), None
+
+
+def _build_child_goal_message(goal: str, images: List[str], child) -> Any:
+    """Compose the child's first user message when images are forwarded.
+
+    Port of RooCodeInc/Roomote#1796/#1767 (Fast → coding-task attachment
+    forwarding) adapted to Hermes' delegation boundary: the parent names
+    images on a task and the child sees them on its goal turn.
+
+    Routing reuses the same policy as inbound gateway images
+    (``agent.image_routing``):
+
+      * child model supports vision → OpenAI-style multimodal content list
+        (text + ``image_url`` parts; local files embedded as data URLs,
+        remote URLs passed through) via ``build_native_content_parts``.
+      * otherwise → plain-text goal with ``[Image attached at: …]`` hint
+        lines so the child can run ``vision_analyze`` itself.
+
+    Best-effort by contract: ANY failure returns the text-only goal so image
+    plumbing can never break a spawn.
+    """
+    try:
+        urls = [s for s in images if s.startswith(("http://", "https://"))]
+        paths = [s for s in images if not s.startswith(("http://", "https://"))]
+
+        from agent.image_routing import (
+            build_native_content_parts,
+            decide_image_input_mode,
+        )
+
+        cfg = None
+        try:
+            from hermes_cli.config import load_config_readonly
+
+            cfg = load_config_readonly()
+        except Exception:
+            cfg = None
+
+        mode = decide_image_input_mode(
+            str(getattr(child, "provider", "") or ""),
+            str(getattr(child, "model", "") or ""),
+            cfg,
+        )
+        if mode == "native":
+            parts, skipped = build_native_content_parts(goal, paths, urls)
+            if skipped:
+                logger.info(
+                    "delegate_task: skipped %d unreadable image(s) for "
+                    "subagent: %s",
+                    len(skipped),
+                    ", ".join(skipped[:3]),
+                )
+            if any(p.get("type") == "image_url" for p in parts):
+                return parts
+            return goal
+
+        # Text mode (non-vision child model / explicit aux-vision override):
+        # give the child string handles it can feed to vision_analyze.
+        hint_lines: List[str] = []
+        for p in paths:
+            if os.path.isfile(p):
+                hint_lines.append(f"[Image attached at: {p}]")
+            else:
+                logger.info(
+                    "delegate_task: image path not found, not forwarded: %s", p
+                )
+        hint_lines.extend(f"[Image attached: {u}]" for u in urls)
+        if hint_lines:
+            return (
+                goal
+                + "\n\n"
+                + "\n".join(hint_lines)
+                + "\nUse vision_analyze to inspect these images."
+            )
+        return goal
+    except Exception:
+        logger.debug(
+            "delegate_task: image forwarding failed; sending text-only goal",
+            exc_info=True,
+        )
+        return goal
+
+
 def _run_single_child(
     task_index: int,
     goal: str,
@@ -2989,13 +3111,23 @@ def _run_single_child(
             except Exception as e:
                 logger.debug("Child text relay failed: %s", e)
 
+        # Forward any per-task images on the goal turn (Roomote#1796 port).
+        # Resolved here — after the worktree note is appended to `goal` — so
+        # multimodal goals carry the full final text in their text part.
+        _task_images = list(getattr(child, "_delegate_images", None) or [])
+        _child_user_message: Any = (
+            _build_child_goal_message(goal, _task_images, child)
+            if _task_images
+            else goal
+        )
+
         def _run_with_thread_capture():
             _worker_thread_holder["t"] = threading.current_thread()
             from agent.delegation_context import delegated_child_context
 
             with delegated_child_context(str(getattr(child, "session_id", "") or "")):
                 return child.run_conversation(
-                    user_message=goal,
+                    user_message=_child_user_message,
                     task_id=child_task_id,
                     stream_callback=_relay_child_text,
                 )
@@ -3919,6 +4051,7 @@ def delegate_task(
     role: Optional[str] = None,
     background: Optional[bool] = None,
     output_schema: Optional[Dict[str, Any]] = None,
+    images: Optional[List[str]] = None,
     action: Optional[str] = None,
     subagent_id: Optional[str] = None,
     message: Optional[str] = None,
@@ -4059,6 +4192,8 @@ def delegate_task(
         single_task: Dict[str, Any] = {"goal": goal, "context": context, "role": top_role}
         if output_schema is not None:
             single_task["output_schema"] = output_schema
+        if images is not None:
+            single_task["images"] = images
         task_list = [single_task]
     else:
         return tool_error(
@@ -4105,6 +4240,18 @@ def delegate_task(
         if schema_err:
             return tool_error(f"Task {i} output_schema invalid: {schema_err}")
         task_schemas.append(coerced_schema)
+
+    # Validate optional per-task images up front (Roomote#1796 port) so a
+    # malformed list fails the whole call loudly before any child spawns.
+    task_images: List[Optional[List[str]]] = []
+    for i, task in enumerate(task_list):
+        raw_images = task.get("images")
+        if raw_images is None and len(task_list) == 1 and images is not None:
+            task = {**task, "images": images}
+        cleaned_images, images_err = _normalize_task_images(task, i)
+        if images_err:
+            return tool_error(images_err)
+        task_images.append(cleaned_images)
 
     overall_start = time.monotonic()
     results = []
@@ -4212,6 +4359,15 @@ def delegate_task(
                 child._delegate_output_schema = _task_schema
             except Exception:
                 logger.debug("Could not attach output schema to child %d", i)
+        # Attach validated per-task images for the goal-turn forwarding in
+        # _run_single_child (Roomote#1796 port). Absent (None) on image-less
+        # tasks — the child then takes the historical text-only path.
+        _t_images = task_images[i] if i < len(task_images) else None
+        if _t_images:
+            try:
+                setattr(child, "_delegate_images", _t_images)
+            except Exception:
+                logger.debug("Could not attach images to child %d", i)
         # Tee the child's progress events into its live transcript log.
         # wrap_progress_callback preserves the inner callback contract
         # (including the _flush attribute) and never lets writer failures
@@ -5262,6 +5418,20 @@ DELEGATE_TASK_SCHEMA = {
                                 "fields you will read."
                             ),
                         },
+                        "images": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": (
+                                "Optional images this child must SEE (max 8): "
+                                "local file paths or http(s) URLs — e.g. a "
+                                "screenshot the user sent, a design mock, a "
+                                "chart. Vision-capable children receive the "
+                                "pixels on their first turn; non-vision "
+                                "children get path hints for vision_analyze. "
+                                "Text files do NOT belong here — put paths in "
+                                "'context' instead."
+                            ),
+                        },
                     },
                     "required": ["goal"],
                 },
@@ -5366,6 +5536,7 @@ registry.register(
         role=args.get("role"),
         background=_model_background_value(args, kw.get("parent_agent")),
         output_schema=args.get("output_schema"),
+        images=args.get("images"),
         action=args.get("action"),
         subagent_id=args.get("subagent_id"),
         message=args.get("message"),
