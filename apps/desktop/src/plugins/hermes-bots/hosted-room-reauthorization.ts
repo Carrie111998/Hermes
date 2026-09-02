@@ -47,15 +47,34 @@ async function routes() {
   return (Array.isArray(value) ? value : []) as ProfileRoute[]
 }
 
-function matchingLocalMember(members: GroupMember[], serverMember: Record<string, unknown>) {
+function matchingLocalMember(
+  members: GroupMember[],
+  serverMember: Record<string, unknown>,
+  capabilities: Record<string, { authorityId?: null | string }>
+) {
   const profile = String(serverMember.profile || serverMember.member_id || '')
   const handle = String(serverMember.handle || '')
-
-  return members.find(
+  const target = record(serverMember.target)
+  const targetAuthority = String(target?.installation_id || target?.peer_id || '')
+  const candidates = members.filter(
     member =>
       String(member.targetProfile || member.name || '') === profile &&
       (!handle || String(member.handle || member.name || '') === handle)
   )
+
+  if (targetAuthority) {
+    const exact = candidates.find(member => {
+      const connectionId = String(member.route?.connectionId || member.connectionId || '')
+
+      return connectionId && capabilities[connectionId]?.authorityId === targetAuthority
+    })
+
+    if (exact) {
+      return exact
+    }
+  }
+
+  return candidates.length === 1 ? candidates[0] : null
 }
 
 async function reconnectPeer(group: string, memberId: string, lifecycle: number) {
@@ -96,7 +115,9 @@ async function reconnectPeer(group: string, memberId: string, lifecycle: number)
     .find(member => String(member?.member_id || '') === memberId)
   const target = record(serverMember?.target)
   const targetAuthority = String(target?.installation_id || target?.peer_id || '')
-  const localMember = serverMember ? matchingLocalMember(room.members || [], serverMember) : null
+  const localMember = serverMember
+    ? matchingLocalMember(room.members || [], serverMember, $hostedRoomCapabilities.get())
+    : null
   const peerConnectionId = String(localMember?.route?.connectionId || localMember?.connectionId || '')
   const profile = String(serverMember?.profile || serverMember?.member_id || 'default')
   const currentPeerRoute = (Array.isArray(driver?.peer_routes) ? driver.peer_routes : [])

@@ -70,10 +70,20 @@ beforeEach(() => {
 })
 
 describe('hosted Group Chat peer reauthorization', () => {
-  it('issues a fresh peer grant and registers it on the existing authority', async () => {
+  it('issues a fresh peer grant through the source-qualified gateway', async () => {
     const { $groupChats } = await import('./group-chat')
     const { reconnectHostedGroupChatPeer } = await import('./hosted-room-reauthorization')
 
+    mocks.capabilities.value = {
+      ...mocks.capabilities.value,
+      decoy: { authorityId: 'install:decoy' },
+      peer: { authorityId: 'install:peer' }
+    }
+    mocks.host.profileRoutes = async () => [
+      { connectionId: 'home', mode: 'remote', profile: 'default', targetProfile: 'default' },
+      { connectionId: 'decoy', mode: 'remote', profile: 'builder', targetProfile: 'builder' },
+      { connectionId: 'peer', mode: 'remote', profile: 'builder', targetProfile: 'builder' }
+    ]
     $groupChats.set({
       Release: {
         continuityMode: 'distributed',
@@ -82,6 +92,19 @@ describe('hosted Group Chat peer reauthorization', () => {
         hostedEpoch: 1,
         log: [],
         members: [
+          {
+            connectionId: 'decoy',
+            handle: 'builder',
+            name: 'builder',
+            route: {
+              connectionId: 'decoy',
+              mode: 'remote',
+              profile: 'builder',
+              targetProfile: 'builder'
+            },
+            sourceScoped: true,
+            targetProfile: 'builder'
+          },
           {
             connectionId: 'peer',
             handle: 'builder',
@@ -203,6 +226,168 @@ describe('hosted Group Chat peer reauthorization', () => {
     expect(mocks.invalidate).toHaveBeenCalledWith('room-1')
     expect(mocks.addCleanup).toHaveBeenCalledTimes(2)
     expect(mocks.releaseCleanup).toHaveBeenCalledOnce()
+  })
+
+  it('fails closed when duplicate members have no matching cached authority', async () => {
+    const { $groupChats } = await import('./group-chat')
+    const { reconnectHostedGroupChatPeer } = await import('./hosted-room-reauthorization')
+
+    mocks.host.profileRoutes = async () => [
+      { connectionId: 'home', mode: 'remote', profile: 'default', targetProfile: 'default' },
+      { connectionId: 'peer-a', mode: 'remote', profile: 'builder', targetProfile: 'builder' },
+      { connectionId: 'peer-b', mode: 'remote', profile: 'builder', targetProfile: 'builder' }
+    ]
+    $groupChats.set({
+      Release: {
+        continuityMode: 'distributed',
+        hosted: 'install:home',
+        hostedConnectionId: 'home',
+        hostedEpoch: 1,
+        log: [],
+        members: ['peer-a', 'peer-b'].map(connectionId => ({
+          connectionId,
+          handle: 'builder',
+          name: 'builder',
+          route: { connectionId, mode: 'remote' as const, profile: 'builder', targetProfile: 'builder' },
+          sourceScoped: true,
+          targetProfile: 'builder'
+        })),
+        roomId: 'room-1',
+        watermarks: {}
+      }
+    })
+    mocks.requestHosted.mockImplementation(async (_route, method) => {
+      if (method === 'groups.state') {
+        return {
+          driver_status: {
+            peer_routes: [
+              {
+                grant_sha256: EXPECTED_GRANT_SHA256,
+                member_id: 'member-builder',
+                status: 'needs_reauthorization'
+              }
+            ]
+          },
+          room: {
+            authority_epoch: 1,
+            authority_gateway_id: 'install:home',
+            members: [
+              {
+                handle: 'builder',
+                member_id: 'member-builder',
+                profile: 'builder',
+                target: { installation_id: 'install:peer-b', kind: 'peer' }
+              }
+            ]
+          }
+        }
+      }
+
+      throw new Error(`unexpected hosted method: ${method}`)
+    })
+
+    await expect(reconnectHostedGroupChatPeer('Release', 'member-builder')).rejects.toThrow(
+      'Reconnect the Bot gateway in Sessions'
+    )
+    expect(mocks.requestForBot).not.toHaveBeenCalled()
+    expect(mocks.requestHosted).not.toHaveBeenCalledWith(expect.anything(), 'groups.capabilities', expect.anything())
+    expect(mocks.requestHosted).not.toHaveBeenCalledWith(expect.anything(), 'groups.peer.register', expect.anything())
+    expect(mocks.addCleanup).not.toHaveBeenCalled()
+    expect(mocks.refresh).not.toHaveBeenCalled()
+  })
+
+  it('fails closed when a cached authority points at the wrong live gateway', async () => {
+    const { $groupChats } = await import('./group-chat')
+    const { reconnectHostedGroupChatPeer } = await import('./hosted-room-reauthorization')
+
+    mocks.capabilities.value = {
+      ...mocks.capabilities.value,
+      'peer-a': { authorityId: 'install:peer-b' },
+      'peer-b': { authorityId: 'install:other' }
+    }
+    mocks.host.profileRoutes = async () => [
+      { connectionId: 'home', mode: 'remote', profile: 'default', targetProfile: 'default' },
+      { connectionId: 'peer-a', mode: 'remote', profile: 'builder', targetProfile: 'builder' },
+      { connectionId: 'peer-b', mode: 'remote', profile: 'builder', targetProfile: 'builder' }
+    ]
+    $groupChats.set({
+      Release: {
+        continuityMode: 'distributed',
+        hosted: 'install:home',
+        hostedConnectionId: 'home',
+        hostedEpoch: 1,
+        log: [],
+        members: ['peer-a', 'peer-b'].map(connectionId => ({
+          connectionId,
+          handle: 'builder',
+          name: 'builder',
+          route: { connectionId, mode: 'remote' as const, profile: 'builder', targetProfile: 'builder' },
+          sourceScoped: true,
+          targetProfile: 'builder'
+        })),
+        roomId: 'room-1',
+        watermarks: {}
+      }
+    })
+    mocks.requestHosted.mockImplementation(async (_route, method) => {
+      if (method === 'groups.state') {
+        return {
+          driver_status: {
+            peer_routes: [
+              {
+                grant_sha256: EXPECTED_GRANT_SHA256,
+                member_id: 'member-builder',
+                status: 'needs_reauthorization'
+              }
+            ]
+          },
+          room: {
+            authority_epoch: 1,
+            authority_gateway_id: 'install:home',
+            members: [
+              {
+                handle: 'builder',
+                member_id: 'member-builder',
+                profile: 'builder',
+                target: { installation_id: 'install:peer-b', kind: 'peer' }
+              }
+            ]
+          }
+        }
+      }
+
+      if (method === 'groups.capabilities') {
+        return {
+          authority_gateway_id: 'install:peer-a',
+          methods: ['groups.peer.revoke_exact'],
+          driver: true,
+          persistent_process: true,
+          room_link: {
+            enabled: true,
+            endpoint: { available: true, url: 'https://peer-a.example.test:19445' },
+            catalog: {
+              attachments: true,
+              catalog_digest: 'digest:peer-a',
+              installation_id: 'install:peer-a',
+              link_modes: ['direct'],
+              persistent_process: true,
+              protocol_versions: [2],
+              text: true
+            }
+          }
+        }
+      }
+
+      throw new Error(`unexpected hosted method: ${method}`)
+    })
+
+    await expect(reconnectHostedGroupChatPeer('Release', 'member-builder')).rejects.toThrow(
+      'cannot reconnect to this Group Chat yet'
+    )
+    expect(mocks.requestForBot).not.toHaveBeenCalled()
+    expect(mocks.requestHosted).not.toHaveBeenCalledWith(expect.anything(), 'groups.peer.register', expect.anything())
+    expect(mocks.addCleanup).not.toHaveBeenCalled()
+    expect(mocks.refresh).not.toHaveBeenCalled()
   })
 
   it('revokes the fresh peer grant when home registration fails', async () => {
