@@ -5918,7 +5918,14 @@ class GatewaySlashCommandsMixin:
                 db = get_shared_session_db()
                 try:
                     engine = InsightsEngine(db)
-                    report = engine.generate(days=days, source=source)
+                    report = engine.generate(
+                        days=days,
+                        source=source,
+                        heaviest_user_id=event.source.user_id,
+                        heaviest_source=(
+                            event.source.platform.value if event.source.platform else None
+                        ),
+                    )
                     result = engine.format_gateway(report)
                     return result
                 finally:

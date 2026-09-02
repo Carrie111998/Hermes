@@ -542,6 +542,20 @@ class TestTerminalFormatting:
         assert "Activity Patterns" in text
         assert "Notable Sessions" in text
 
+    def test_terminal_format_lists_heaviest_sessions(self, populated_db):
+        populated_db._conn.execute(
+            "UPDATE sessions SET title = ? WHERE id = ?", ("Largest job", "s3")
+        )
+        populated_db._conn.commit()
+
+        text = InsightsEngine(populated_db).format_terminal(
+            InsightsEngine(populated_db).generate(days=30)
+        )
+
+        assert "Heaviest Sessions" in text
+        assert "Largest job" in text
+        assert "140,000 tokens" in text
+
 
 
 
@@ -586,6 +600,60 @@ class TestGatewayFormatting:
         text = engine.format_gateway(report)
 
         assert "cache" not in text.lower()
+
+    def test_gateway_format_lists_three_heaviest_sessions_with_titles(self, populated_db):
+        """Telegram insights must identify the sessions that consumed most tokens."""
+        populated_db._conn.execute(
+            "UPDATE sessions SET title = ? WHERE id = ?",
+            ("Largest job", "s3"),
+        )
+        populated_db._conn.execute(
+            "UPDATE sessions SET title = ? WHERE id = ?",
+            ("Second largest", "s1"),
+        )
+        populated_db._conn.commit()
+
+        text = InsightsEngine(populated_db).format_gateway(
+            InsightsEngine(populated_db).generate(days=30)
+        )
+
+        assert "**🔥 Heaviest sessions:**" in text
+        assert "Largest job — 140,000 tokens" in text
+        assert "Second largest — 65,000 tokens" in text
+
+    def test_heaviest_session_titles_can_be_scoped_to_the_requesting_user(self, populated_db):
+        """Gateway callers must not reveal another user's session title."""
+        populated_db._conn.execute(
+            "UPDATE sessions SET title = ? WHERE id = ?", ("Private large job", "s3")
+        )
+        populated_db._conn.execute(
+            "UPDATE sessions SET title = ? WHERE id = ?", ("Own work", "s4")
+        )
+        populated_db._conn.commit()
+
+        report = InsightsEngine(populated_db).generate(days=30, heaviest_user_id="user2")
+
+        assert report["heaviest_sessions"] == [{"title": "Own work", "tokens": 15000}]
+
+    def test_heaviest_session_titles_are_scoped_by_platform_and_user(self, populated_db):
+        """Platform-local user IDs must not expose titles across gateways."""
+        populated_db.create_session(
+            session_id="s_cross", source="discord", model="gpt-4o", user_id="user1"
+        )
+        populated_db.update_token_counts("s_cross", input_tokens=900000, output_tokens=100000)
+        populated_db._conn.execute(
+            "UPDATE sessions SET title = ? WHERE id = ?", ("Discord private work", "s_cross")
+        )
+        populated_db._conn.execute(
+            "UPDATE sessions SET title = ? WHERE id = ?", ("Telegram own work", "s2")
+        )
+        populated_db._conn.commit()
+
+        report = InsightsEngine(populated_db).generate(
+            days=30, heaviest_user_id="user1", heaviest_source="telegram"
+        )
+
+        assert report["heaviest_sessions"] == [{"title": "Telegram own work", "tokens": 28000}]
 
 
 

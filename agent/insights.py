@@ -137,13 +137,23 @@ class InsightsEngine:
             ):
                 setattr(self, _attr, getattr(self, _attr).replace(_strip, ""))
 
-    def generate(self, days: int = 30, source: str = None) -> Dict[str, Any]:
+    def generate(
+        self,
+        days: int = 30,
+        source: str = None,
+        heaviest_user_id: str = None,
+        heaviest_source: str = None,
+    ) -> Dict[str, Any]:
         """
         Generate a complete insights report.
 
         Args:
             days: Number of days to look back (default: 30)
             source: Optional filter by source platform
+            heaviest_user_id: Optional owner filter for named heaviest sessions.
+                Gateway callers use this to avoid exposing another user's title.
+            heaviest_source: Authenticated platform paired with
+                ``heaviest_user_id`` because platform user IDs are not global.
 
         Returns:
             Dict with all computed insights
@@ -183,6 +193,7 @@ class InsightsEngine:
                 },
                 "activity": {},
                 "top_sessions": [],
+                "heaviest_sessions": [],
             }
 
         # Compute insights
@@ -193,6 +204,12 @@ class InsightsEngine:
         skills = self._compute_skill_breakdown(skill_usage)
         activity = self._compute_activity_patterns(sessions)
         top_sessions = self._compute_top_sessions(sessions)
+        heaviest_input = sessions
+        if heaviest_user_id is not None:
+            heaviest_input = [s for s in heaviest_input if s.get("user_id") == heaviest_user_id]
+        if heaviest_source is not None:
+            heaviest_input = [s for s in heaviest_input if s.get("source") == heaviest_source]
+        heaviest_sessions = self._compute_heaviest_sessions(heaviest_input)
 
         return {
             "days": days,
@@ -206,6 +223,7 @@ class InsightsEngine:
             "skills": skills,
             "activity": activity,
             "top_sessions": top_sessions,
+            "heaviest_sessions": heaviest_sessions,
         }
 
     def get_usage_breakdown(self, days: int = 30, source: str = None) -> Dict[str, Any]:
@@ -228,7 +246,7 @@ class InsightsEngine:
     # =========================================================================
 
     # Columns we actually need (skip system_prompt, model_config blobs)
-    _SESSION_COLS = ("id, source, model, started_at, ended_at, "
+    _SESSION_COLS = ("id, title, source, user_id, model, started_at, ended_at, "
                      "message_count, tool_call_count, input_tokens, output_tokens, "
                      "cache_read_tokens, cache_write_tokens, billing_provider, "
                      "billing_base_url, billing_mode, estimated_cost_usd, "
@@ -963,6 +981,28 @@ class InsightsEngine:
 
         return top
 
+    @staticmethod
+    def _compute_heaviest_sessions(sessions: List[Dict]) -> List[Dict]:
+        """Return the three sessions with the largest input/output token totals.
+
+        Cache reads are intentionally excluded: they are useful throughput data,
+        but do not consistently map to provider quota consumption. The result is
+        therefore a transparent answer to "which sessions consumed the most".
+        """
+        ranked = sorted(
+            sessions,
+            key=lambda s: (s.get("input_tokens") or 0) + (s.get("output_tokens") or 0),
+            reverse=True,
+        )
+        result = []
+        for session in ranked[:3]:
+            tokens = (session.get("input_tokens") or 0) + (session.get("output_tokens") or 0)
+            if tokens <= 0:
+                continue
+            title = (session.get("title") or "").strip() or session["id"][:16]
+            result.append({"title": title, "tokens": tokens})
+        return result
+
     # =========================================================================
     # Formatting
     # =========================================================================
@@ -1120,6 +1160,15 @@ class InsightsEngine:
                 lines.append(f"  Best streak: {act['max_streak']} consecutive days")
             lines.append("")
 
+        # Three sessions with the most input/output tokens. Cache throughput is
+        # deliberately excluded because it does not consistently map to quota.
+        if report.get("heaviest_sessions"):
+            lines.append("  🔥 Heaviest Sessions")
+            lines.append("  " + "─" * 56)
+            for session in report["heaviest_sessions"]:
+                lines.append(f"  {session['title'][:36]:<36} {session['tokens']:>12,} tokens")
+            lines.append("")
+
         # Notable sessions
         if report.get("top_sessions"):
             lines.append("  🏆 Notable Sessions")
@@ -1162,6 +1211,14 @@ class InsightsEngine:
             cost_parts.append(f"{unknown} unknown")
         if cost_parts:
             lines.append(f"**Cost:** {' | '.join(cost_parts)}")
+            lines.append("")
+
+        # Sessions that consumed the most input/output tokens. This is distinct
+        # from cache throughput and from a provider's opaque subscription quota.
+        if report.get("heaviest_sessions"):
+            lines.append("**🔥 Heaviest sessions:**")
+            for session in report["heaviest_sessions"]:
+                lines.append(f"  {session['title'][:48]} — {session['tokens']:,} tokens")
             lines.append("")
 
         # Models (top 5)
