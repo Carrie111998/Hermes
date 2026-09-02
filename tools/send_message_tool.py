@@ -1080,6 +1080,7 @@ async def _send_via_adapter(
                 thread_id=thread_id,
                 media_files=media_files,
                 force_document=force_document,
+                metadata=args.get("metadata") if isinstance(args, dict) else None,
             )
         except asyncio.CancelledError:
             raise

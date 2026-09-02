@@ -3612,6 +3612,9 @@ def _deliver_result(
                     "direct_messages_topic_id": str(thread_id),
                     "job_id": job["id"],
                     "notify": notify_delivery,
+                    # Cron job name, surfaced to the email adapter to derive a
+                    # meaningful subject (#98649).
+                    "job_name": job.get("name", job["id"]),
                 }
                 # Media metadata mirrors the text routing so attachments land in
                 # the same DM topic instead of the General lane (#22773).
@@ -3629,7 +3632,13 @@ def _deliver_result(
                 # anchor, so the metadata key bypasses that check and lets the
                 # adapter route via a plain message_thread_id.
                 route_thread_id = str(thread_id) if thread_id is not None else None
-                route_metadata = {"job_id": job["id"], "notify": notify_delivery}
+                route_metadata = {
+                    "job_id": job["id"],
+                    "notify": notify_delivery,
+                    # Cron job name, surfaced to the email adapter to derive a
+                    # meaningful subject (#98649).
+                    "job_name": job.get("name", job["id"]),
+                }
                 if route_thread_id:
                     route_metadata["thread_id"] = route_thread_id
                 media_metadata = {"notify": notify_delivery}
@@ -4012,7 +4021,19 @@ def _deliver_result(
                 delivery_errors.extend(target_errors)
                 continue
             # Standalone path: run the async send in a fresh event loop (safe from any thread)
-            coro = _send_to_platform(platform, pconfig, chat_id, cleaned_delivery_content, thread_id=thread_id, media_files=media_files)
+            job_name = job.get("name", job.get("id", "cron job"))
+            coro = _send_to_platform(
+                platform,
+                pconfig,
+                chat_id,
+                cleaned_delivery_content,
+                thread_id=thread_id,
+                media_files=media_files,
+                # Pass the cron job name as task metadata so the email adapter can
+                # derive a meaningful subject (e.g. "Hermes Agent: <job_name>")
+                # instead of the generic default (#98649).
+                args={"metadata": {"job_name": job_name}},
+            )
             try:
                 result = asyncio.run(coro)
             except RuntimeError as run_err:
