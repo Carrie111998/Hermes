@@ -59,7 +59,12 @@ let sha = ''
 let dirty = ''
 try {
   sha = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: repoRoot, encoding: 'utf-8' }).trim()
-  dirty = execFileSync('git', ['status', '--porcelain', '--untracked-files=no'],
+  // Default porcelain view: untracked SOURCE/CONFIG files count as dirt
+  // (they influence the build while the manifest would attest a clean HEAD —
+  // the v5 review's __provenance_untracked_probe__ reproduction). Ignored
+  // build output (target/, node_modules/) is already excluded by git's
+  // ignore rules, so --untracked-files=no is unnecessary AND too broad.
+  dirty = execFileSync('git', ['status', '--porcelain'],
     { cwd: repoRoot, encoding: 'utf-8' }).trim()
 } catch {
   console.error('[build-manifest] git unavailable — no manifest written; release gate will refuse (correct: provenance unknown)')
@@ -70,9 +75,10 @@ if (dirty) {
   const lines = dirty.split('\n').slice(0, 5).join('\n  ')
   console.error(
     '[build-manifest] REFUSING to write the manifest: the working tree is dirty.\n' +
-    '  A manifest over uncommitted source would attest a clean HEAD while\n' +
-    '  packaging different bytes. Commit or stash first, then rerun\n' +
-    '  `npm run tauri:build`. Dirty entries:\n  ' + lines
+    '  A manifest over uncommitted or untracked source would attest a clean\n' +
+    '  HEAD while packaging different bytes. Commit or stash (including new\n' +
+    '  files) first, then rerun `npm run tauri:build`.\n' +
+    '  Dirty entries:\n  ' + lines
   )
   process.exit(1)
 }

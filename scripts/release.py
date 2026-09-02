@@ -2679,6 +2679,14 @@ def main():
     # Contradictory transitions were previously accepted silently. Reject
     # them up front so the documented lifecycle is the ONLY one that runs.
     parser_errors: list[str] = []
+    if args.prepare_only and not args.bump:
+        # v5 review: `--prepare-only` without `--bump` reported a successful
+        # preparation while committing NOTHING (the bump commit is the entire
+        # mutation contract of phase 1). Enforce the pairing.
+        parser_errors.append(
+            "--prepare-only requires --bump: phase 1's entire job is "
+            "committing the version bump. Use --bump minor --prepare-only."
+        )
     if args.prepare_only and args.no_bump and not args.bump:
         parser_errors.append(
             "--prepare-only --no-bump prepares nothing: no bump to commit "
@@ -2764,6 +2772,23 @@ def main():
         print(f"  {'Preparing' if args.prepare_only else 'Publishing'} release...")
         print(f"{'='*60}")
 
+        # ── Clean-tree PRE-FLIGHT before ANY mutation (#100600 v5) ──────
+        # The bump commit below runs `git add <version files> && git commit`,
+        # which absorbs ANY unrelated STAGED change into the version commit.
+        # The post-commit witness cannot detect that (the tree looks clean
+        # after the absorbed change rode along), so prove cleanliness BEFORE
+        # update_version_files() writes a single byte.
+        _preflight = git_result("status", "--porcelain")
+        if _preflight.returncode == 0 and _preflight.stdout.strip():
+            print("  X REFUSING to start: the working tree is not clean.")
+            print("    A staged change would be absorbed into the version-bump")
+            print("    commit (plain `git commit -m` commits the whole index).")
+            print("    Commit, stash, or reset first. Dirty entries:")
+            for line in _preflight.stdout.strip().splitlines()[:5]:
+                print(f"        {line}")
+            sys.exit(1)
+        print("  ✓ Pre-flight: working tree clean")
+
         # Update version files
         if args.bump and not args.no_bump:
             update_version_files(new_version, calver_date)
@@ -2793,9 +2818,9 @@ def main():
             # Post-prepare cleanliness witness: the build hook refuses on a
             # dirty tree, so prove the prepare left the tree clean — or fail
             # loudly HERE rather than at the macOS build host hours later.
-            status_result = git_result("status", "--porcelain", "--untracked-files=no")
+            status_result = git_result("status", "--porcelain")
             if status_result.returncode == 0 and status_result.stdout.strip():
-                print("  ✗ Version-bump commit left the tree dirty — the build "
+                print("  X Version-bump commit left the tree dirty - the build "
                       "hook will refuse to write a manifest. Dirty entries:")
                 for line in status_result.stdout.strip().splitlines()[:5]:
                     print(f"      {line}")
@@ -2902,7 +2927,7 @@ def main():
         if push_result.returncode == 0:
             print("  ✓ Pushed to origin")
         else:
-            print(f"  ✗ REFUSING to continue: push failed: {push_result.stderr.strip()}")
+            print(f"  X REFUSING to continue: push failed: {push_result.stderr.strip()}")
             print("    A release without the pushed tag would let `gh release")
             print("    create` auto-tag the default branch instead of this HEAD.")
             print("    Fix access and rerun phase 2:")

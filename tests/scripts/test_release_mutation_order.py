@@ -269,6 +269,75 @@ class TestFlagMatrixValidation:
             "by the flag matrix (exit 2)"
         )
 
+    def test_prepare_only_without_bump_rejected(self, tmp_path, monkeypatch):
+        """v5 review: '--prepare-only' without '--bump' previously reported a
+        successful preparation while committing NOTHING. Pin exit(2) for the
+        exact command the reviewer ran: --prepare-only --date <d>."""
+        monkeypatch.chdir(tmp_path)
+        with (
+            patch.object(sys, "argv", ["release.py", "--prepare-only", "--date", "2026.9.2"]),
+            patch.object(release, "next_available_tag", lambda b: (b, b[1:])),
+            patch.object(release, "get_current_version", lambda: "0.20.0"),
+            patch.object(release, "get_last_tag", lambda: "v2026.8.31"),
+            patch.object(release, "get_commits", lambda since_tag=None: [
+                {"sha": "abc", "author_name": "T", "author_email": "t@x",
+                 "subject": "s", "body": "", "github_author": "t"}]),
+        ):
+            with pytest.raises(SystemExit) as e:
+                release.main()
+        assert e.value.code == 2, (
+            "--prepare-only without --bump reports a successful no-op "
+            "preparation (#100600 v5 review) — must be exit(2)"
+        )
+
+
+class TestCleanTreePreFlight:
+    """A dirty tree must block the release BEFORE any mutation (#100600 v5)."""
+
+    def test_staged_change_blocks_before_bump_commit(self, tmp_path, monkeypatch):
+        """The reviewer's staged-change absorption: an unrelated staged file
+        must abort with exit(1) BEFORE update_version_files() runs —
+        proving the pre-flight, not just the post-commit witness."""
+        monkeypatch.chdir(tmp_path)
+
+        gitlog = _GitCallLog()
+        # rev-parse succeeds; status shows a staged change
+        def _dirty_status(*args, cwd=None):
+            call = list(args)
+            gitlog.calls.append(call)
+            m = MagicMock()
+            if args[0] == "rev-parse":
+                m.returncode = 0; m.stdout = gitlog.head_sha; m.stderr = ""
+            elif args[0] == "status" and "--porcelain" in call:
+                m.returncode = 0
+                m.stdout = "M  some/unrelated/file.py\n"
+                m.stderr = ""
+            else:
+                m.returncode = 0; m.stdout = ""; m.stderr = ""
+            return m
+
+        with (
+            patch.object(sys, "argv",
+                         ["release.py", "--bump", "minor", "--prepare-only", "--date", "2026.9.2"]),
+            patch.object(release, "git_result", _dirty_status),
+            patch.object(release, "next_available_tag", lambda b: (b, b[1:])),
+            patch.object(release, "get_current_version", lambda: "0.20.0"),
+            patch.object(release, "get_last_tag", lambda: "v2026.8.31"),
+            patch.object(release, "get_commits", lambda since_tag=None: [
+                {"sha": "abc", "author_name": "T", "author_email": "t@x",
+                 "subject": "s", "body": "", "github_author": "t"}]),
+            patch.object(release, "generate_changelog", lambda *a, **k: "c"),
+        ):
+            with pytest.raises(SystemExit) as e:
+                release.main()
+
+        assert e.value.code == 1, "dirty tree must abort the release"
+        assert not gitlog.ran("commit"), (
+            "a staged change must NEVER be absorbed into the bump commit — "
+            "the pre-flight must run before any mutation"
+        )
+        assert not gitlog.ran("add"), "no staging may happen on a dirty tree"
+
 
 class TestPushFailureAborts:
     """Push failure must abort BEFORE gh release create (#100600 v4)."""
