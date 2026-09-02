@@ -12,6 +12,7 @@ import os
 import re
 import shlex
 import threading
+from bisect import bisect_left
 from urllib.parse import unquote_plus
 
 # Basenames treated as ``.env`` files by _command_reads_env_file. Imported
@@ -530,6 +531,18 @@ _CONTROL_CHARS_RE = re.compile(
     r"[\x00-\x1f\x7f\u200b-\u200f\u2028-\u202f\u2060\ufeff]"
 )
 
+# Complete CSI (ECMA-48 control sequence introducer) sequences, e.g. the ANSI
+# color codes ``\x1b[32m`` / ``\x1b[0m``. A vendor-prefixed token wrapped in
+# color codes (``\x1b[32msk-…\x1b[0m``) leaks ENTIRELY if only the bare ESC
+# byte is stripped: ``[32m`` stays glued to the token head and the literal
+# ``m`` defeats ``_PREFIX_RE``'s ``(?<![A-Za-z0-9_-])`` lookbehind in both the
+# shadow copy and the original (issue #81012). Stripping the complete SEQUENCE
+# instead of the bare byte restores alignment so the split-join pass fires.
+# Mirrors the CSI branch of tools/ansi_strip.py's _ANSI_ESCAPE_RE, including
+# the 8-bit C1 form (``\x9b``) — a ``\x9b31m``-wrapped token glues its ``m``
+# exactly like the 7-bit shape, so both introducers must strip as a unit.
+_ANSI_CSI_SEQ_RE = re.compile(r"(?:\x1b\[|\x9b)[\x30-\x3f]*[\x20-\x2f]*[\x40-\x7e]")
+
 # Union of every _PREFIX_PATTERNS body class — a control-stripped match may
 # only span original chars that are token-body or control chars (see
 # _mask_control_split_tokens). ``=`` is deliberately excluded: a KEY=value
@@ -545,55 +558,150 @@ _PREFIX_RE = re.compile(
 
 
 def _mask_control_split_tokens(text: str, mask_fn) -> str:
-    """Mask tokens whose body is split by control/zero-width characters.
+    """Mask tokens whose body is split across control/zero-width characters.
 
-    A credential like ``sk-abc\\x1bdef456…`` or ``ghp_abc\\n123def…`` has its
+    A credential like ``sk-abc\\x1bdef456…`` or ``ghp_abc\\n123…`` has its
     token body interrupted, so the contiguous _PREFIX_RE cannot match it and
-    the secret leaks verbatim (issue #77484). Strategy: build a copy with all
-    control chars removed (the token is contiguous again, matching even when
-    each fragment alone is too short), match on that, then mask the
-    corresponding span in the *original* — but only when the original span
-    contains solely token-body and control chars (a match that crosses into a
-    different line's unrelated text, e.g. ``EXA_API_KEY=*** is rejected).
+    the secret leaks raw (issue #77484). Strategy: build a shadow copy with
+    all control chars — and complete ANSI CSI sequences — removed (the token
+    is contiguous again, matching even when each fragment alone is too
+    short), match on that, then mask the corresponding span in the *original*
+    — but only when the span contains only token-body and stripped bytes (a
+    new match that crosses into a different line's unrelated text, e.g.
+    ``EXA_API_KEY=*** is rejected).
     """
-    stripped = _CONTROL_CHARS_RE.sub("", text)
-    if stripped == text:
+    # Fast path: no control bytes and no 8-bit CSI introducer? Nothing to join.
+    if _CONTROL_CHARS_RE.search(text) is None and "\x9b" not in text:
         return text
-    orig_idx = [i for i, c in enumerate(text) if not _CONTROL_CHARS_RE.match(c)]
+
+    cleaned, keep, orig_idx = _strip_shadow(text)
+    if cleaned == text:
+        return text
     out = list(text)
     matches = []
-    for m in _PREFIX_RE.finditer(stripped):
+    n = len(text)
+    for m in _PREFIX_RE.finditer(cleaned):
         body = m.group(1)
-        start_orig = orig_idx[m.start(1)]
-        end_orig = orig_idx[m.end(1) - 1] + 1
-        # If a fragment inside the span already matches _PREFIX_RE on its
-        # own AND the span crosses a LINE boundary (\n / \r), do NOT join.
-        # A complete token at end-of-line followed by a word line
-        # (``ghp_<token>\nbutton [ref=e3]``) joins into one stripped-copy
-        # match and the mask eats ``button``. Line structure is legitimate;
-        # the self-matching fragment is handled by the ordinary prefix pass
-        # (any remainder past the newline is left unmasked — accepted
-        # residual to preserve line structure).
-        # For NON-newline controls (ESC, ZWSP, ...) the join proceeds even
-        # when a fragment self-matches: those bytes never legitimately sit
-        # between a token and adjacent prose, and skipping there let the
-        # non-matching remainder of a split token leak
-        # (``sk-<head>\x1b<tail>`` masked only the head).
+        body_start = m.start(1)
+        body_end = m.end(1)
+        start_orig = orig_idx[body_start]
+        end_orig = orig_idx[body_end - 1] + 1
         span = text[start_orig:end_orig]
-        if ("\n" in span or "\r" in span) and _PREFIX_RE.search(span):
-            continue
-        # Reject matches whose original span crosses a non-token char
-        # (e.g. ``sk_abc…\nTAVILY_API_KEY=…`` — the ``=`` is not part of a
-        # token body, so the regex matched across unrelated lines). Also
-        # reject when the match runs into a ``KEY=`` name: a real token value
-        # is followed by a newline/space/end, not ``=``.
-        if (all(c in _TOKEN_BODY_CHARS or _CONTROL_CHARS_RE.match(c)
-                for c in span)
-                and (end_orig >= len(text) or text[end_orig] != "=")):
+        if "\n" in span or "\r" in span:
+            # The join spans a LINE boundary. Crossing it may pull adjacent
+            # text into the mask (``ghp_<token>\nbutton [ref=e3]``) — only
+            # safe when NO fragment of the span already matches _PREFIX_RE
+            # by itself (a complete token at a line boundary, or a short head
+            # split across a newline). If a fragment self-matches, restrict
+            # the join to the first line segment so an escaped drop on the
+            # SAME line (``sk-<head>\x1b<mid>\n…``) still gets masked
+            # (issue #81012) while later text is left untouched.
+            if _PREFIX_RE.search(span):
+                cuts = []
+                if "\n" in span:
+                    cuts.append(span.index("\n"))
+                if "\r" in span:
+                    cuts.append(span.index("\r"))
+                if cuts:
+                    cutoff = min(cuts)
+                    end_orig = start_orig + cutoff
+                    span = text[start_orig:end_orig]
+                    # Clip the body to the shadow chars that fall inside the
+                    # clipped range so the replacement mask stays in line.
+                    clips = bisect_left(orig_idx, end_orig)
+                    body = body[:clips - body_start]
+                    if not body:
+                        continue
+        # Live chars must be token-body chars. One combination is refused:
+        # an ORPHAN ESC (a bare \x1b that began no CSI) appearing BEFORE any
+        # complete CSI sequence in the span. That order marks mangled or
+        # truncated terminal output — the live text between the dangling
+        # escape and the next formed sequence is continuation-of-prose, not
+        # provably token material
+        # (``sk-aaaaa\x1bNOT_TOKEN_TEXT\x1b[31mbbbbbbbbbb`` erased
+        # NOT_TOKEN_TEXT; review finding on #81012). Once a formed sequence
+        # has been seen, a later bare ESC reads as an ordinary in-token
+        # split like any other control, so the mirrored layout
+        # (``sk-aaaaa\x1b[31mbbbbb\x1bcccccccccc``) stays fully masked and no
+        # splitter combination can flip a candidate to raw emission: every
+        # non-refused candidate is replaced wholesale.
+        orphan_precedes_csi = False
+        seen_csi = False
+        clean_join = True
+        for k, c in enumerate(span):
+            kd = keep[start_orig + k]
+            if kd == 2:
+                seen_csi = True
+            elif kd:
+                if c == "\x1b" and not seen_csi:
+                    orphan_precedes_csi = True
+            elif c not in _TOKEN_BODY_CHARS:
+                clean_join = False
+                break
+        if (clean_join
+                and not (orphan_precedes_csi and seen_csi)
+                and (end_orig >= n or text[end_orig] != "=")):
             matches.append((start_orig, end_orig, mask_fn(body)))
     for start_orig, end_orig, replacement in reversed(matches):
         out[start_orig:end_orig] = list(replacement)
     return "".join(out)
+
+
+def _strip_shadow(text: str):
+    """Build the shadow copy used to find control/CSI-split tokens.
+
+    Returns ``(cleaned, keep, orig_idx)``:
+
+    - ``cleaned`` is a copy of ``text`` with every complete ANSI CSI
+      sequence and every bare control/zero-width char removed.
+    - ``keep[i]`` classifies ``text[i]``: 0 = live char kept in the shadow,
+      1 = bare control char (stripped individually), 2 = byte belonging to a
+      complete ANSI CSI sequence (stripped as a unit). Any truthy value means
+      strippable noise, preserving the historical contract; the KIND
+      distinction lets the join pass refuse candidates whose ORPHAN ESC
+      precedes a formed CSI sequence (see the gate in
+      _mask_control_split_tokens).
+    - ``orig_idx`` maps each shadow index back to its index in ``text``.
+
+    Stripping complete CSI sequences — not just the bare ``\\x1b`` byte — is
+    what closes issue #81012: deleting only the ESC from ``\\x1b[32msk-…``
+    leaves ``[32m`` glued to the token head, the literal ``m`` defeats
+    ``_PREFIX_RE``'s ``(?<![A-Za-z0-9_-])`` lookbehind, and the secret leaks
+    verbatim in both the shadow and the original. Removing the whole
+    ``\\x1b[32m`` sequence realigns the token in the shadow so the join pass
+    can fire, and the ``keep`` back-map still validates that the masked orig
+    span contains no live non-token characters.
+    """
+    out_chars = []
+    keep = bytearray(len(text))
+    orig_idx = []
+    # .match, NOT .search: at an ESC that does NOT begin a CSI sequence,
+    # search(text, i) jumps ahead to a LATER CSI and marks everything from
+    # this ESC through that sequence as strippable noise — blessing arbitrary
+    # live bytes between the two regions and letting the greedy join delete
+    # them (``sk-aaaaa\x1bNOT_TOKEN_TEXT\x1b[31mbbbbbbbbbb`` erased
+    # NOT_TOKEN_TEXT). With .match a sequence is stripped only when it starts
+    # AT this ESC; otherwise the bare-control path strips just the ESC byte.
+    rem = _ANSI_CSI_SEQ_RE.match
+    i = 0
+    ctrl = _CONTROL_CHARS_RE.match
+    while i < len(text):
+        if text[i] == "\x1b" or text[i] == "\x9b":
+            m = rem(text, i)
+            if m:
+                for j in range(i, m.end()):
+                    keep[j] = 2
+                i = m.end()
+                continue
+        c = text[i]
+        if ctrl(c):
+            keep[i] = 1
+            i += 1
+            continue
+        out_chars.append(c)
+        orig_idx.append(i)
+        i += 1
+    return "".join(out_chars), bytes(keep), orig_idx
 
 
 # Display-mask strip for mask_secret: EVERY control char incl. \n/\t, C1,

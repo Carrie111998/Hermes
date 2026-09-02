@@ -214,17 +214,6 @@ class TestControlCharSplitTokens:
         assert "button" in result
         assert "ref=e3" in result
 
-    def test_selfmatching_head_esc_split_tail_masked(self):
-        # A split where the HEAD fragment alone already matches _PREFIX_RE
-        # (>= 10 body chars) but the tail doesn't: the join must still run
-        # for non-newline controls, or the tail leaks in cleartext. Only
-        # LINE-crossing spans skip the join (see the annotation test).
-        head = "sk-" + "a" * 15
-        tail = "b" * 25
-        result = redact_sensitive_text(head + "\x1b" + tail, force=True)
-        assert tail not in result
-        assert "a" * 12 not in result
-
     def test_env_dump_lines_not_joined(self):
         # Control-stripping must not join unrelated env lines into one match
         env_dump = (
@@ -236,6 +225,123 @@ class TestControlCharSplitTokens:
         result = redact_sensitive_text(env_dump, force=True)
         assert "SHELL=/bin/bash" in result
         assert "HOME=/home/user" in result
+
+    def test_selfmatching_head_esc_split_tail_masked(self):
+        # A split where the HEAD fragment alone already matches _PREFIX_RE
+        # (>= 10 body chars) but the tail doesn't: the join must still run
+        # for non-newline controls, or the tail leaks in cleartext. Only
+        # LINE-crossing spans skip the join (see the annotation test).
+        head = "sk-" + "a" * 15
+        tail = "b" * 25
+        result = redact_sensitive_text(head + "\x1b" + tail, force=True)
+        assert tail not in result
+        assert "a" * 12 not in result
+
+    def test_ansi_wrapped_token_not_glued_head(self):
+        # Issue #81012: a vendor-prefixed token wrapped in ANSI color codes
+        # (``\x1b[32msk-…\x1b[0m``). Stripping only the ESC byte glued ``[32m``
+        # to the token head and the literal ``m`` defeated _PREFIX_RE's
+        # lookbehind — the whole secret leaked. The complete CSI sequence must
+        # be stripped from the shadow so the token stays aligned.
+        body = "a" * 25
+        text = f"\x1b[32msk-{body}\x1b[0m"
+        result = redact_sensitive_text(text, force=True)
+        assert body not in result
+        assert "sk-" + body not in result
+        # The ANSI codes themselves must survive (terminal color, not noise)
+        assert "\x1b[32m" in result and "\x1b[0m" in result
+
+    def test_ansi_wrapped_token_private_params(self):
+        # CSI with private-mode / extra params (cursor shapes, 256-color
+        # prefixes) must strip just the same.
+        body = "b" * 25
+        text = f"\x1b[38;5;200msk_{body}\x1b[?25h"
+        result = redact_sensitive_text(text, force=True)
+        assert body not in result
+        assert f"sk_{body}" not in result
+
+    def test_ansi_wrapped_zero_width_split_also_masked(self):
+        # ANSI reset gluing is fixed, and a control-split body wrapped in
+        # codes still masks through the raw shadow.
+        body = "ghp_" + "c" * 12 + "\u200b" + "c" * 13
+        text = f"\x1b[31m{body}\x1b[0m"
+        result = redact_sensitive_text(text, force=True)
+        assert "c" * 12 not in result
+        assert "ghp_" + "c" * 12 not in result
+
+    def test_newline_esc_split_remainder_masked(self):
+        # Issue #81012, second gap: a span carrying BOTH a newline and an
+        # ESC split (``sk-<head>\x1b<mid>\n<tail>``) used to skip the join
+        # (line-boundary guard from #80987) and leak every byte after the
+        # self-matching head. The join must now run per line segment, keeping
+        # the escaped MIDDLE masked while leaving the next line untouched.
+        head = "sk-" + "a" * 15
+        mid_tail = "b" * 25
+        text = f"{head}\x1b{mid_tail}\nbutton [ref=e3]"
+        result = redact_sensitive_text(text, force=True)
+        assert mid_tail not in result
+        assert "button" in result
+        assert "ref=e3" in result
+
+    def test_ansi_glued_head_and_tail_both_masked(self):
+        # SGR colors can also split a token from the MIDDLE
+        # (``sk-ab\x1b[31mc…``) — both fragments must be covered, not just the
+        # bare-ESC shadow.
+        a = "a" * 12
+        b = "b" * 12
+        text = f"sk-{a}\x1b[31m{b}"
+        result = redact_sensitive_text(text, force=True)
+        assert a not in result
+        assert b not in result
+
+    def test_non_csi_esc_before_later_csi_live_text_survives(self):
+        # Review finding on #81012: at an ESC that does NOT begin a CSI
+        # sequence, the shadow builder must strip a CSI only when it starts
+        # AT that ESC. Jumping ahead to a LATER CSI marked the live text
+        # between the two regions as strippable noise, blessed it through
+        # the span validation, and the greedy join deleted it.
+        text = "sk-" + "a" * 5 + "\x1bNOT_TOKEN_TEXT\x1b[31m" + "b" * 10
+        result = redact_sensitive_text(text, force=True)
+        assert "NOT_TOKEN_TEXT" in result
+
+    def test_mixed_csi_and_bare_control_split_masked(self):
+        # Follow-up review finding on #81012: one complete CSI sequence PLUS
+        # one bare/zero-width split inside the SAME credential must still
+        # mask — mixing supported control encodings is not evidence of
+        # unrelated prose. Only an orphan ESC coexisting with a formed CSI
+        # (mangled/truncated terminal output) refuses the join.
+        for sep, tail_ch in (("\u200b", "c"), ("\x00", "d")):
+            text = "sk-" + "a" * 5 + "\x1b[31m" + "b" * 5 + sep + tail_ch * 10
+            result = redact_sensitive_text(text, force=True)
+            assert result != text
+            assert "a" * 5 not in result
+            assert "b" * 5 not in result
+            assert tail_ch * 10 not in result
+
+    def test_orphan_esc_after_csi_still_masks(self):
+        # Follow-up review finding on #81012: adding a trailing orphan ESC to
+        # a mixed-encoding credential must NOT walk it through unmasked. An
+        # orphan ESC only refuses the join when it PRECEDES every complete
+        # CSI in the span; once a formed sequence has been seen, a later bare
+        # ESC is an ordinary in-token split.
+        text = "sk-" + "a" * 5 + "\x1b[31m" + "b" * 5 + "\x1b" + "c" * 10
+        result = redact_sensitive_text(text, force=True)
+        assert result != text
+        assert "a" * 5 not in result
+        assert "b" * 5 not in result
+        assert "c" * 10 not in result
+
+    def test_8bit_csi_wrapped_token_masked(self):
+        # Follow-up review finding on #81012: the ECMA-48 8-bit CSI form
+        # (\x9b … m — recognized by tools/ansi_strip.py) bypassed the shadow
+        # entirely because _CONTROL_CHARS_RE excludes C1 bytes. The glued
+        # terminator defeats the prefix lookbehind exactly like the 7-bit
+        # shape, so both introducers must strip as a unit.
+        body = "a" * 25
+        text = "\x9b31m" + f"sk-{body}" + "\x9b0m"
+        result = redact_sensitive_text(text, force=True)
+        assert body not in result
+        assert f"sk-{body}" not in result
 
 
 class TestEnvLookupPreserved:
