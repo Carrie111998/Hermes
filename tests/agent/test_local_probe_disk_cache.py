@@ -87,15 +87,45 @@ class TestDetectLocalServerTypeDiskL2:
 
 class TestOllamaNumCtxDiskL2:
     def test_disk_hit_skips_api_show(self):
+        """A fresh disk hit skips the /api/show POST. The live /api/ps cap
+        still runs: served context is runtime state a 300s disk entry must
+        never freeze (see query_ollama_num_ctx)."""
         _clear_in_proc()
         MM._local_probe_disk_put("server_type", "http://127.0.0.1:11434", "ollama")
         MM._local_probe_disk_put(
             "ollama_num_ctx", "http://127.0.0.1:11434|llama3", 131072
         )
-        with patch("httpx.Client") as mock_client:
+        ps_resp = MagicMock(status_code=200)
+        ps_resp.json.return_value = {"models": []}
+        client = MagicMock()
+        client.get.return_value = ps_resp
+        client.__enter__ = lambda s: client
+        client.__exit__ = lambda s, *a: False
+        with patch("httpx.Client", return_value=client):
             ctx = MM.query_ollama_num_ctx("llama3", "http://127.0.0.1:11434/v1")
         assert ctx == 131072
-        mock_client.assert_not_called()
+        client.post.assert_not_called()
+
+    def test_disk_hit_still_capped_by_served_ctx(self):
+        """A server restarted at a smaller OLLAMA_CONTEXT_LENGTH wins over a
+        fresh disk entry — the cap is applied after the disk read."""
+        _clear_in_proc()
+        MM._local_probe_disk_put("server_type", "http://127.0.0.1:11434", "ollama")
+        MM._local_probe_disk_put(
+            "ollama_num_ctx", "http://127.0.0.1:11434|llama3", 131072
+        )
+        ps_resp = MagicMock(status_code=200)
+        ps_resp.json.return_value = {
+            "models": [{"name": "llama3", "context_length": 32768}]
+        }
+        client = MagicMock()
+        client.get.return_value = ps_resp
+        client.__enter__ = lambda s: client
+        client.__exit__ = lambda s, *a: False
+        with patch("httpx.Client", return_value=client):
+            ctx = MM.query_ollama_num_ctx("llama3", "http://127.0.0.1:11434/v1")
+        assert ctx == 32768
+        client.post.assert_not_called()
 
     def test_successful_show_persists(self):
         _clear_in_proc()

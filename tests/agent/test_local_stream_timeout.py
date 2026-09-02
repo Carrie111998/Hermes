@@ -77,10 +77,26 @@ class TestIsLocalEndpoint:
 
 
     @pytest.mark.parametrize("url", [
+        "http://ollama-box.local:11434/v1",
+        "http://ollama-box.local:11434",
+        "https://nas.local:8443",
+        "http://MY-MAC.LOCAL:11434",
+    ])
+    def test_mdns_local_hostnames(self, url):
+        """RFC 6762 reserves `.local` for mDNS — resolvable only on the LAN.
+
+        Regression: these returned False, which skipped the cached-context
+        reconciliation in get_model_context_length() and let a stale
+        GGUF-maximum cache entry outlive any /api/ps correction.
+        """
+        assert is_local_endpoint(url) is True
+
+    @pytest.mark.parametrize("url", [
         "https://api.openai.com",
         "https://openrouter.ai/api",
         "https://api.anthropic.com",
         "https://evil.docker.internal.example.com",
+        "https://evil.local.example.com",
     ])
     def test_remote_endpoints(self, url):
         assert is_local_endpoint(url) is False

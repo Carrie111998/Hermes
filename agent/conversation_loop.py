@@ -609,6 +609,83 @@ def _image_error_max_dimension(error: Exception) -> Optional[int]:
     return None
 
 
+def _reconcile_ollama_runtime_ctx(agent: Any) -> Optional[int]:
+    """Re-read Ollama's served context now that the model is certainly loaded.
+
+    ``agent._ollama_num_ctx`` is resolved once, in agent_init, and never
+    refreshed. At a cold start ``/api/ps`` lists nothing, so the probe falls
+    back to the GGUF training maximum and the agent keeps that number for the
+    whole session -- even though the first request then loads the model at the
+    server's (possibly much smaller) ``OLLAMA_CONTEXT_LENGTH`` window.
+
+    Called from the finish_reason="length" path, where the model is loaded by
+    definition because it just produced a response. Lowers only; a raised or
+    equal value is ignored.
+
+    Returns the corrected value when it changed, else None.
+    """
+    base_url = getattr(agent, "base_url", "") or ""
+    model = getattr(agent, "model", "") or ""
+    if not base_url or not model:
+        return None
+    believed = getattr(agent, "_ollama_num_ctx", None)
+    if not isinstance(believed, int) or believed <= 0:
+        return None
+
+    try:
+        from agent.model_metadata import (
+            _auth_headers,
+            _localhost_to_ipv4,
+            _query_ollama_served_ctx,
+        )
+
+        server_url = _localhost_to_ipv4(base_url.rstrip("/"))
+        if server_url.endswith("/v1"):
+            server_url = server_url[:-3]
+        api_key = agent.api_key if isinstance(getattr(agent, "api_key", None), str) else ""
+        served = _query_ollama_served_ctx(model, server_url, _auth_headers(api_key))
+    except Exception:
+        return None
+
+    if not served or served >= believed:
+        return None
+
+    logger.warning(
+        "Ollama runtime context corrected after load: %d -> %d "
+        "(model=%s base_url=%s). The startup probe saw an unloaded model and "
+        "fell back to the advertised maximum.",
+        believed, served, model, base_url,
+    )
+    agent._ollama_num_ctx = served
+
+    # Mirror the init-time clamp in agent_init: the compressor was sized from
+    # the same stale value, so without this the compaction trigger can sit
+    # above the real served window and never fire — Ollama truncates the
+    # prompt before compression is ever scheduled.
+    compressor = getattr(agent, "context_compressor", None)
+    cc_window = getattr(compressor, "context_length", 0) or 0
+    if compressor is not None and cc_window and served < cc_window:
+        try:
+            compressor.update_model(
+                model=model,
+                context_length=served,
+                base_url=base_url,
+                api_key=getattr(agent, "api_key", ""),
+                provider=getattr(agent, "provider", ""),
+                api_mode=getattr(agent, "api_mode", ""),
+            )
+            logger.info(
+                "Compressor window clamped to reconciled Ollama context: %d -> %d",
+                cc_window, served,
+            )
+        except Exception:
+            logger.debug(
+                "Compressor re-clamp after Ollama context reconciliation failed",
+                exc_info=True,
+            )
+    return served
+
+
 def _ollama_context_limit_error(agent: Any, request_tokens: int) -> Optional[str]:
     """Return a user-facing error when Ollama is loaded with too little context."""
     if not getattr(agent, "tools", None):
@@ -4118,6 +4195,40 @@ def run_conversation(
                             f"(finish_reason='length') - model hit max output tokens",
                             force=True,
                         )
+
+                    # Against Ollama, finish_reason="length" on the FIRST token is
+                    # usually not an output cap at all -- it is the prompt already
+                    # filling the served context window. The startup probe cannot
+                    # see that when the model was cold (see
+                    # _reconcile_ollama_runtime_ctx), so re-read it here: the model
+                    # is loaded by definition now, having just responded.
+                    #
+                    # Without this the continuation retries below APPEND a "continue"
+                    # message and re-send, making the prompt longer each round, and
+                    # the turn dies with "Response remained truncated after 4
+                    # continuation attempts" -- which names the wrong cause entirely.
+                    _corrected_ctx = _reconcile_ollama_runtime_ctx(agent)
+                    if _corrected_ctx is not None:
+                        _ctx_error = _ollama_context_limit_error(
+                            agent, request_pressure_tokens
+                        )
+                        if _ctx_error:
+                            messages.append(
+                                {"role": "assistant", "content": _ctx_error}
+                            )
+                            agent._emit_status(
+                                "❌ Ollama runtime context is too small for Hermes tool use"
+                            )
+                            agent._cleanup_task_resources(effective_task_id)
+                            agent._persist_session(messages, conversation_history)
+                            return {
+                                "final_response": _ctx_error,
+                                "messages": messages,
+                                "api_calls": api_call_count,
+                                "completed": False,
+                                "turn_exit_reason": "ollama_runtime_context_too_small",
+                                "error": "ollama runtime context too small",
+                            }
 
                     # Normalize the truncated response to a single OpenAI-style
                     # message shape so text-continuation and tool-call retry
