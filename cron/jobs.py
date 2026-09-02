@@ -2970,7 +2970,7 @@ def rearm_oneshot(job_id: str, run_at: Any) -> Optional[Dict[str, Any]]:
                 raise ValueError("Cannot re-arm one-shot over a live run claim.")
             if _claim_is_live(job.get("fire_claim"), now, 300):
                 raise ValueError("Cannot re-arm one-shot over a live fire claim.")
-            if job.get("schedule", {}).get("kind") != "once":
+            if (job.get("schedule") or {}).get("kind") != "once":
                 raise ValueError(
                     "Cannot re-arm recurring jobs: re-arm is one-shot-only; "
                     "use plain resume or cron run."
@@ -3490,7 +3490,7 @@ def heartbeat_run_claim(job_id: str, *, expected_owner: str) -> bool:
         for job in jobs:
             if job.get("id") != job_id:
                 continue
-            if job.get("schedule", {}).get("kind") != "once":
+            if (job.get("schedule") or {}).get("kind") != "once":
                 return False
             claim = job.get("run_claim")
             if not isinstance(claim, dict) or claim.get("by") != expected_owner:
@@ -3519,7 +3519,7 @@ def clear_run_claim(job_id: str) -> bool:
         for job in jobs:
             if job.get("id") != job_id:
                 continue
-            if job.get("schedule", {}).get("kind") != "once":
+            if (job.get("schedule") or {}).get("kind") != "once":
                 return False
             if job.get("run_claim") is not None:
                 job["run_claim"] = None
