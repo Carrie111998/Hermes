@@ -12674,7 +12674,7 @@ _BUILTIN_SUBCOMMANDS = frozenset(
         "computer-use",
         "config", "console", "cron", "curator", "dashboard", "serve", "debug", "doctor",
         "dump", "egress", "fallback", "gateway", "hooks", "import", "import-agent", "insights",
-        "gui", "desktop", "kanban", "login", "logout", "logs", "lsp", "mcp", "memory", "migrate", "moa",
+        "gui", "desktop", "install", "kanban", "login", "logout", "logs", "lsp", "mcp", "memory", "migrate", "moa",
         "journey", "memory-graph", "learning",
         "model", "monitoring", "pairing", "pause", "peer", "pets", "plugins", "portal", "profile",
         "project", "proxy",
@@ -13805,6 +13805,28 @@ def main():
         return 0
 
     egress_parser.set_defaults(func=_dispatch_egress)
+
+    # =========================================================================
+    # install command — SSH-layer file/image bridge client (shellctl)
+    # =========================================================================
+    install_parser = subparsers.add_parser(
+        "install",
+        help="Install optional Hermes companions (e.g. the SSH "
+             "file/image bridge)",
+        description=(
+            "Install optional Hermes companion tools. `hermes install "
+            "shellctl` sets up the SSH-layer bridge so a remote TUI "
+            "can move images, PDFs, and any file between the Hermes "
+            "host and your local machine over your existing SSH "
+            "connection."
+        ),
+    )
+    from hermes_cli.install_cmd import (
+        install_command,
+        register_cli as _install_register,
+    )
+    _install_register(install_parser)
+    install_parser.set_defaults(func=install_command)
 
     # =========================================================================
     # migrate command

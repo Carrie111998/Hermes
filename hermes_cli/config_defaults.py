@@ -410,6 +410,13 @@ DEFAULT_CONFIG = {
         },
     },
 
+    "shellctl": {
+        # Optional path on the SSH client machine. When set, the generated
+        # daemon command restricts /pull to this directory tree. Empty keeps
+        # intentional arbitrary-path pulls for backwards compatibility.
+        "allowed_root": "",
+    },
+
     "terminal": {
         "backend": "local",
         "modal_mode": "auto",

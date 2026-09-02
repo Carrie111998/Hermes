@@ -1,0 +1,865 @@
+#!/usr/bin/env python3
+"""hermes-shellctl - CLIENT half of the Hermes SSH file/image bridge.
+
+Runs on YOUR machine (Mac / Linux / WSL / PuTTY host) - the box you
+SSH FROM. It is a tiny HTTP server (Python 3 stdlib only, zero
+dependencies) that the Hermes host (the box you SSH INTO, running the
+TUI + dashboard) reaches back through a reverse SSH forward
+(RemoteForward). That lets the remote Hermes:
+
+  - PULL a local file from this machine  (image / pdf / any file ->
+    attach in the TUI)
+  - PUSH a file to this machine and open it  (agent-produced image /
+    artifact)
+  - read this machine's CLIPBOARD image or file  (paste)
+
+Design: stdlib only, no sudo, no ControlMaster dependency,
+localhost-bound + token-gated.
+
+Run:  hermes-shellctl daemon --port 8765 --token-file <path>
+
+The token is a bearer credential for every endpoint. A caller with the token
+and listener access can pull any file readable by this process unless
+``--allowed-root`` is set, read clipboard content, and push files into the
+download directory. The audio extension also lets that caller play audio and
+activate the local microphone remotely. Token possession permits remote
+microphone activation, and compromise of the Hermes host permits eavesdropping
+while the daemon and SSH reverse forward are running. The SSH reverse forward
+intentionally gives the remote Hermes host listener access, so a compromised
+host is inside this trust boundary.
+"""
+from __future__ import annotations
+
+import argparse
+import hmac
+import json
+import os
+import platform
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import parse_qs, urlparse
+
+SHELLCTL_VERSION = "0.2.0"
+_IS_MAC = platform.system() == "Darwin"
+
+_TOKEN = ""
+_DOWNLOAD_DIR = os.path.expanduser("~/Downloads")
+_ALLOWED_ROOT = ""
+_MAX_BYTES = 64 * 1024 * 1024  # 64 MB cap per transfer
+_MAX_AUDIO_BYTES = 64 * 1024 * 1024
+_MAX_OPEN_CAPTURE_SECS = 300
+_MAX_CONFIGURED_CAPTURE_SECS = 3600
+_AUDIO_EXTENSIONS = frozenset({"aac", "aiff", "flac", "m4a", "mp3", "ogg", "opus", "wav"})
+_OPEN_CAPTURE = {
+    "out_wav": None, "active": False, "process": None, "watchdog": None,
+}
+_CAPTURE_LOCK = threading.Lock()
+
+
+class _BodyTooLarge(ValueError):
+    pass
+
+
+class _MalformedBody(ValueError):
+    pass
+
+
+def _which(*cands: str):
+    for c in cands:
+        p = shutil.which(c)
+        if p:
+            return p
+    return None
+
+
+def _open_file(path: str):
+    opener = "open" if _IS_MAC else _which("xdg-open", "gio")
+    if not opener:
+        return False, "no opener (install xdg-utils on Linux)"
+    try:
+        subprocess.Popen(
+            [opener, path],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        return True, "opened"
+    except Exception as e:  # noqa: BLE001
+        return False, str(e)
+
+
+_MIME_BY_EXT = {
+    ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+    ".gif": "image/gif", ".webp": "image/webp", ".bmp": "image/bmp",
+    ".tiff": "image/tiff", ".tif": "image/tiff", ".heic": "image/heic",
+    ".heif": "image/heif", ".svg": "image/svg+xml",
+    ".pdf": "application/pdf",
+}
+
+
+def _guess_ctype(name):
+    import mimetypes
+
+    ext = os.path.splitext(name or "")[1].lower()
+    if ext in _MIME_BY_EXT:
+        return _MIME_BY_EXT[ext]
+    return (
+        mimetypes.guess_type(name or "")[0]
+        or "application/octet-stream"
+    )
+
+
+def _macos_clipboard_file_paths():
+    """Return POSIX paths of files currently on the macOS clipboard.
+
+    When you Cmd+C a file in Finder (or copy a file from most apps),
+    the pasteboard carries a ``public.file-url`` reference to the
+    ORIGINAL file on disk, not a re-rendered bitmap. Reading those
+    bytes straight off disk is byte-perfect and works for ANY type
+    (pdf, zip, high-res image), which is exactly the as-is transfer
+    the user wants. AppleScript's ``the clipboard as class furl``
+    returns the file URL(s); a list when several files are copied. We
+    ask for a newline-joined POSIX path list.
+    """
+    script = (
+        'set out to ""\n'
+        'try\n'
+        '  set theFiles to (the clipboard as \xc2\xabclass furl\xc2\xbb)\n'
+        '  if class of theFiles is not list then '
+        'set theFiles to {theFiles}\n'
+        '  repeat with f in theFiles\n'
+        '    set out to out & POSIX path of f & linefeed\n'
+        '  end repeat\n'
+        'end try\n'
+        'return out'
+    )
+    try:
+        r = subprocess.run(
+            ["osascript", "-e", script],
+            capture_output=True,
+            timeout=10,
+        )
+        if r.returncode != 0:
+            return []
+        raw = (r.stdout or b"").decode("utf-8", "replace")
+        return [
+            p
+            for p in (line.strip() for line in raw.splitlines())
+            if p
+        ]
+    except Exception:  # noqa: BLE001
+        return []
+
+
+def _clipboard_grab():
+    """Grab clipboard contents losslessly.
+
+    Returns (data, filename, ctype, msg). Priority, highest fidelity
+    first:
+      1. A FILE on the clipboard (Finder copy / file URL) -> read the
+         ORIGINAL bytes off disk, keep the real name + extension.
+         Byte-perfect, any type.
+      2. Raw image data on the clipboard (screenshot, copy from
+         Preview) with no backing file -> extract as PNG (lossless
+         container; the only representation the OS actually holds for
+         a screenshot, so it is as-is).
+    """
+    if _IS_MAC:
+        # 1. Real file(s) on the clipboard -> transfer the original
+        # bytes as-is.
+        for path in _macos_clipboard_file_paths():
+            try:
+                if os.path.isfile(path):
+                    sz = os.path.getsize(path)
+                    if sz > _MAX_BYTES:
+                        return (
+                            None, None, None,
+                            "clipboard file too large (%d bytes)" % sz,
+                        )
+                    with open(path, "rb") as f:
+                        data = f.read()
+                    name = os.path.basename(path) or "clipboard-file"
+                    return data, name, _guess_ctype(name), "ok"
+            except Exception:  # noqa: BLE001
+                continue  # fall through to the bitmap path
+
+        # 2. No backing file: raw image bitmap (screenshot etc).
+        pp = _which("pngpaste")
+        tmp = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
+        tmp.close()
+        try:
+            if pp:
+                r = subprocess.run(
+                    [pp, tmp.name], capture_output=True, timeout=10
+                )
+                if r.returncode != 0:
+                    return None, None, None, "no image on clipboard"
+            else:
+                script = (
+                    'set p to (POSIX file "%s")\n'
+                    'set d to the clipboard as '
+                    '\xc2\xabclass PNGf\xc2\xbb\n'
+                    'set fh to open for access p with write '
+                    'permission\n'
+                    'write d to fh\nclose access fh'
+                ) % tmp.name
+                r = subprocess.run(
+                    ["osascript", "-e", script],
+                    capture_output=True,
+                    timeout=10,
+                )
+                if r.returncode != 0:
+                    return (
+                        None, None, None,
+                        "no image on clipboard (or osascript denied)",
+                    )
+            with open(tmp.name, "rb") as f:
+                data = f.read()
+            if not data:
+                return None, None, None, "clipboard image empty"
+            return (
+                data, "clip-%d.png" % int(time.time()),
+                "image/png", "ok",
+            )
+        except Exception as e:  # noqa: BLE001
+            return None, None, None, str(e)
+        finally:
+            try:
+                os.unlink(tmp.name)
+            except OSError:
+                pass
+    else:
+        # Linux/WSL. 1. File(s) copied in a file manager land on the
+        # clipboard as text/uri-list; read the original bytes off disk
+        # (byte-perfect, any type).
+        xc = _which("xclip")
+        if xc:
+            try:
+                r = subprocess.run(
+                    [
+                        xc, "-selection", "clipboard",
+                        "-t", "text/uri-list", "-o",
+                    ],
+                    capture_output=True,
+                    timeout=10,
+                )
+                if r.returncode == 0 and r.stdout:
+                    for line in r.stdout.decode(
+                        "utf-8", "replace"
+                    ).splitlines():
+                        line = line.strip()
+                        if line.startswith("file://"):
+                            from urllib.parse import (
+                                unquote,
+                                urlparse as _up,
+                            )
+                            p = unquote(_up(line).path)
+                            if os.path.isfile(p):
+                                sz = os.path.getsize(p)
+                                if sz > _MAX_BYTES:
+                                    return (
+                                        None, None, None,
+                                        "clipboard file too large "
+                                        "(%d bytes)" % sz,
+                                    )
+                                with open(p, "rb") as f:
+                                    data = f.read()
+                                name = (
+                                    os.path.basename(p)
+                                    or "clipboard-file"
+                                )
+                                return (
+                                    data, name,
+                                    _guess_ctype(name), "ok",
+                                )
+            except Exception:  # noqa: BLE001
+                pass
+            # 2. Raw image bitmap on the clipboard.
+            try:
+                r = subprocess.run(
+                    [
+                        xc, "-selection", "clipboard",
+                        "-t", "image/png", "-o",
+                    ],
+                    capture_output=True,
+                    timeout=10,
+                )
+                if r.returncode == 0 and r.stdout:
+                    return (
+                        r.stdout, "clip-%d.png" % int(time.time()),
+                        "image/png", "ok",
+                    )
+            except Exception as e:  # noqa: BLE001
+                return None, None, None, str(e)
+            return None, None, None, "no image on clipboard"
+        return None, None, None, "install xclip for clipboard images"
+
+
+def _play_audio(path):
+    if _IS_MAC:
+        player = _which("afplay")
+        args = [player, path] if player else None
+    else:
+        player = _which("paplay", "aplay", "ffplay", "mpv")
+        if player and player.endswith("ffplay"):
+            args = [player, "-nodisp", "-autoexit", "-loglevel", "quiet", path]
+        else:
+            args = [player, path] if player else None
+    if not args:
+        return False, "no audio player found"
+    try:
+        subprocess.run(
+            args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            timeout=600,
+        )
+        return True, "played"
+    except Exception as exc:  # noqa: BLE001
+        return False, str(exc)
+
+
+def _find_micrec():
+    candidates = [
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "micrec"),
+        os.path.expanduser("~/.hermes/shellctl/micrec"),
+    ]
+    for candidate in candidates:
+        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+    return None
+
+
+def _record_mic(seconds):
+    seconds = max(1, min(seconds, 120))
+    tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+    tmp.close()
+    try:
+        if _IS_MAC:
+            recorder = _find_micrec()
+            if recorder:
+                args = [recorder, tmp.name, str(seconds)]
+            else:
+                recorder = _which("rec", "sox")
+                if recorder:
+                    args = [recorder, "-q", "-d", tmp.name, "trim", "0", str(seconds)]
+                else:
+                    ffmpeg = _which("ffmpeg")
+                    if not ffmpeg:
+                        return None, "no recorder (install sox or ffmpeg)"
+                    args = [
+                        ffmpeg, "-y", "-f", "avfoundation", "-i", ":default",
+                        "-t", str(seconds), "-loglevel", "quiet", tmp.name,
+                    ]
+        else:
+            recorder = _which("arecord")
+            if recorder:
+                args = [
+                    recorder, "-q", "-d", str(seconds), "-f", "cd", tmp.name,
+                ]
+            else:
+                ffmpeg = _which("ffmpeg")
+                if not ffmpeg:
+                    return None, "no recorder (install alsa-utils or ffmpeg)"
+                args = [
+                    ffmpeg, "-y", "-f", "pulse", "-i", "default", "-t",
+                    str(seconds), "-loglevel", "quiet", tmp.name,
+                ]
+        subprocess.run(
+            args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            timeout=seconds + 15,
+        )
+        return _read_audio_file(tmp.name)
+    except Exception as exc:  # noqa: BLE001
+        return None, str(exc)
+    finally:
+        try:
+            os.unlink(tmp.name)
+        except OSError:
+            pass
+
+
+def _read_audio_file(path):
+    """Read a captured WAV without allowing an unbounded allocation."""
+    size = os.path.getsize(path)
+    if size > _MAX_AUDIO_BYTES:
+        return None, "capture exceeds %d byte limit" % _MAX_AUDIO_BYTES
+    with open(path, "rb") as stream:
+        data = stream.read(_MAX_AUDIO_BYTES + 1)
+    if len(data) > _MAX_AUDIO_BYTES:
+        return None, "capture exceeds %d byte limit" % _MAX_AUDIO_BYTES
+    if not data:
+        return None, "capture produced no audio"
+    return data, "ok"
+
+
+def _claim_open_capture(expected_process=None):
+    """Atomically detach one capture so only one caller can clean it up."""
+    with _CAPTURE_LOCK:
+        if not _OPEN_CAPTURE["active"]:
+            return None
+        if (
+            expected_process is not None
+            and _OPEN_CAPTURE["process"] is not expected_process
+        ):
+            return None
+        claimed = dict(_OPEN_CAPTURE)
+        _OPEN_CAPTURE.update({
+            "active": False, "out_wav": None, "process": None,
+            "watchdog": None,
+        })
+    watchdog = claimed.get("watchdog")
+    if watchdog is not None:
+        watchdog.cancel()
+    return claimed
+
+
+def _terminate_process(process):
+    """Terminate a recorder and escalate to kill if it does not exit."""
+    try:
+        process.terminate()
+        process.wait(timeout=10)
+    except Exception:  # noqa: BLE001
+        try:
+            process.kill()
+            process.wait(timeout=5)
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def _discard_open_capture(expected_process=None):
+    """Stop and remove a capture without returning its audio."""
+    claimed = _claim_open_capture(expected_process)
+    if claimed is None:
+        return False
+    _terminate_process(claimed["process"])
+    try:
+        os.unlink(claimed["out_wav"])
+    except OSError:
+        pass
+    return True
+
+
+def _record_start_open():
+    """Start one bounded open capture while holding the state lock."""
+    with _CAPTURE_LOCK:
+        if _OPEN_CAPTURE["active"]:
+            return False, "capture already active", None
+        tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+        tmp.close()
+        if _IS_MAC:
+            recorder = _which("rec", "sox")
+            if recorder:
+                args = [recorder, "-q", "-d", tmp.name]
+            else:
+                recorder = _which("ffmpeg")
+                args = (
+                    [
+                        recorder, "-y", "-f", "avfoundation", "-i",
+                        ":default", "-loglevel", "quiet", tmp.name,
+                    ]
+                    if recorder else None
+                )
+        else:
+            recorder = _which("arecord")
+            if recorder:
+                args = [recorder, "-q", "-f", "cd", tmp.name]
+            else:
+                recorder = _which("ffmpeg")
+                args = (
+                    [
+                        recorder, "-y", "-f", "pulse", "-i", "default",
+                        "-loglevel", "quiet", tmp.name,
+                    ]
+                    if recorder else None
+                )
+        if not args:
+            os.unlink(tmp.name)
+            return False, "no recorder available", None
+        try:
+            process = subprocess.Popen(
+                args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+            )
+        except Exception as exc:  # noqa: BLE001
+            os.unlink(tmp.name)
+            return False, str(exc), None
+        watchdog = threading.Timer(
+            _MAX_OPEN_CAPTURE_SECS, _discard_open_capture, args=(process,)
+        )
+        watchdog.daemon = True
+        _OPEN_CAPTURE.update({
+            "active": True, "out_wav": tmp.name, "process": process,
+            "watchdog": watchdog,
+        })
+    watchdog.start()
+    return True, "recording", process
+
+
+def _record_stop_open():
+    """Claim and stop the active capture without racing another request."""
+    claimed = _claim_open_capture()
+    if claimed is None:
+        return None, "no open capture"
+    process = claimed["process"]
+    out_wav = claimed["out_wav"]
+    try:
+        _terminate_process(process)
+        return _read_audio_file(out_wav)
+    except Exception as exc:  # noqa: BLE001
+        return None, str(exc)
+    finally:
+        try:
+            os.unlink(out_wav)
+        except OSError:
+            pass
+
+
+def _capabilities():
+    return {
+        "open": bool(
+            "open" if _IS_MAC else _which("xdg-open", "gio")
+        ),
+        "clipboard": bool(
+            _which("pngpaste") or _IS_MAC or _which("xclip")
+        ),
+        "play": bool(_which("afplay", "paplay", "aplay", "ffplay", "mpv")),
+        "record": bool(
+            _find_micrec() or _which("rec", "sox", "arecord", "ffmpeg")
+        ),
+    }
+
+
+class _Handler(BaseHTTPRequestHandler):
+    server_version = "hermes-shellctl/" + SHELLCTL_VERSION
+
+    def log_message(self, *a):
+        pass
+
+    def _auth_ok(self):
+        tok = self.headers.get("X-Shellctl-Token", "")
+        return bool(_TOKEN) and hmac.compare_digest(tok, _TOKEN)
+
+    def _send(
+        self,
+        code,
+        payload=None,
+        raw=None,
+        ctype="application/json",
+        extra_headers=None,
+    ):
+        body = (
+            raw if raw is not None
+            else json.dumps(payload or {}).encode()
+        )
+        try:
+            self.send_response(code)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(body)))
+            for k, v in (extra_headers or {}).items():
+                self.send_header(k, str(v))
+            self.end_headers()
+            self.wfile.write(body)
+            return True
+        except (BrokenPipeError, ConnectionResetError):
+            return False
+
+    def _read_body(self):
+        raw_length = self.headers.get("Content-Length")
+        if raw_length is None:
+            raise _MalformedBody("missing Content-Length")
+        try:
+            n = int(raw_length)
+        except (TypeError, ValueError) as exc:
+            raise _MalformedBody("invalid Content-Length") from exc
+        if n < 0:
+            raise _MalformedBody("negative Content-Length")
+        if n > _MAX_BYTES:
+            raise _BodyTooLarge("request body too large")
+        data = self.rfile.read(n) if n else b""
+        if len(data) != n:
+            raise _MalformedBody("incomplete request body")
+        return data
+
+    @staticmethod
+    def _pull_path_allowed(path):
+        if not _ALLOWED_ROOT:
+            return True
+        try:
+            return os.path.commonpath(
+                (os.path.realpath(path), _ALLOWED_ROOT)
+            ) == _ALLOWED_ROOT
+        except (OSError, ValueError):
+            return False
+
+    def do_GET(self):
+        u = urlparse(self.path)
+        if not self._auth_ok():
+            return self._send(401, {"error": "unauthorized"})
+        if u.path == "/ping":
+            return self._send(200, {
+                "ok": True,
+                "version": SHELLCTL_VERSION,
+                "os": platform.system(),
+                "caps": _capabilities(),
+            })
+        q = parse_qs(u.query)
+        if u.path == "/pull":
+            path = os.path.expanduser((q.get("path") or [""])[0])
+            if path and not self._pull_path_allowed(path):
+                return self._send(403, {"error": "path outside allowed root"})
+            if not path or not os.path.isfile(path):
+                return self._send(
+                    404, {"error": "file not found: " + path}
+                )
+            sz = os.path.getsize(path)
+            if sz > _MAX_BYTES:
+                return self._send(
+                    413, {"error": "file too large (%d bytes)" % sz}
+                )
+            with open(path, "rb") as f:
+                return self._send(
+                    200,
+                    raw=f.read(),
+                    ctype="application/octet-stream",
+                )
+        if u.path == "/clipboard":
+            data, name, ctype, msg = _clipboard_grab()
+            if data is None:
+                return self._send(404, {"error": msg})
+            # Carry the real filename + content-type so the remote
+            # side saves the bytes verbatim with the correct extension
+            # (image, pdf, anything), instead of assuming .png. Legacy
+            # remotes that ignore these headers still get the raw
+            # bytes unchanged.
+            extra = {
+                "X-Clipboard-Filename": name or "clipboard-file",
+                "X-Clipboard-Kind": (
+                    "image"
+                    if (ctype or "").startswith("image/")
+                    else "file"
+                ),
+            }
+            return self._send(
+                200,
+                raw=data,
+                ctype=ctype or "application/octet-stream",
+                extra_headers=extra,
+            )
+        return self._send(404, {"error": "no such endpoint"})
+
+    def do_POST(self):
+        u = urlparse(self.path)
+        if not self._auth_ok():
+            return self._send(401, {"error": "unauthorized"})
+        q = parse_qs(u.query, keep_blank_values=True)
+        if u.path == "/play":
+            try:
+                data = self._read_body()
+            except _BodyTooLarge:
+                return self._send(413, {"error": "request body too large"})
+            except _MalformedBody as exc:
+                return self._send(400, {"error": str(exc)})
+            if not data:
+                return self._send(400, {"error": "empty body"})
+            extension = (q.get("fmt") or ["mp3"])[0].lower().lstrip(".")
+            if extension not in _AUDIO_EXTENSIONS:
+                return self._send(400, {"error": "unsupported audio format"})
+            tmp = tempfile.NamedTemporaryFile(
+                suffix="." + extension, delete=False
+            )
+            try:
+                tmp.write(data)
+                tmp.close()
+                ok, msg = _play_audio(tmp.name)
+                return self._send(
+                    200 if ok else 500, {"ok": ok, "msg": msg}
+                )
+            finally:
+                try:
+                    os.unlink(tmp.name)
+                except OSError:
+                    pass
+        if u.path == "/record":
+            raw_seconds = (q.get("secs") or ["8"])[0]
+            try:
+                seconds = int(raw_seconds)
+            except (TypeError, ValueError):
+                return self._send(400, {"error": "secs must be an integer"})
+            if not 1 <= seconds <= 120:
+                return self._send(400, {"error": "secs must be between 1 and 120"})
+            data, msg = _record_mic(seconds)
+            if data is None:
+                code = 413 if "byte limit" in msg else 500
+                return self._send(code, {"error": msg})
+            return self._send(200, raw=data, ctype="audio/wav")
+        if u.path == "/record-start":
+            ok, msg, process = _record_start_open()
+            if not ok:
+                return self._send(409, {"error": msg})
+            sent = self._send(200, {"ok": True, "status": msg})
+            if not sent:
+                _discard_open_capture(process)
+            return sent
+        if u.path == "/record-stop":
+            data, msg = _record_stop_open()
+            if data is None:
+                code = 413 if "byte limit" in msg else 409
+                return self._send(code, {"error": msg})
+            return self._send(200, raw=data, ctype="audio/wav")
+        if u.path == "/push":
+            name = (
+                os.path.basename(
+                    (q.get("name") or ["hermes-file"])[0]
+                )
+                or "hermes-file"
+            )
+            try:
+                data = self._read_body()
+            except _BodyTooLarge:
+                return self._send(413, {"error": "request body too large"})
+            except _MalformedBody as exc:
+                return self._send(400, {"error": str(exc)})
+            if not data:
+                return self._send(400, {"error": "empty body"})
+            os.makedirs(_DOWNLOAD_DIR, exist_ok=True)
+            try:
+                dest = _write_deduplicated(_DOWNLOAD_DIR, name, data)
+            except OSError as exc:
+                return self._send(500, {"error": str(exc)})
+            opened = (q.get("open") or ["1"])[0] not in (
+                "0", "false", "no"
+            )
+            if opened:
+                _open_file(dest)
+            return self._send(200, {
+                "ok": True,
+                "path": dest,
+                "opened": opened,
+                "bytes": len(data),
+            })
+        return self._send(404, {"error": "no such endpoint"})
+
+
+def _write_deduplicated(directory, name, data):
+    """Write data without replacing an existing destination."""
+    stem, ext = os.path.splitext(name)
+    for suffix in range(10000):
+        candidate = name if suffix == 0 else "%s-%d%s" % (stem, suffix, ext)
+        dest = os.path.join(directory, candidate)
+        try:
+            with open(dest, "xb") as f:
+                f.write(data)
+            return dest
+        except FileExistsError:
+            continue
+    raise OSError("could not allocate a unique destination filename")
+
+
+def _read_token_file(path):
+    if not path:
+        return ""
+    try:
+        with open(os.path.expanduser(path), encoding="utf-8") as f:
+            return f.read().strip()
+    except OSError as exc:
+        print("FATAL: cannot read token file: %s" % exc, file=sys.stderr)
+        return ""
+
+
+def cmd_daemon(args):
+    global _TOKEN, _DOWNLOAD_DIR, _ALLOWED_ROOT, _MAX_OPEN_CAPTURE_SECS
+    _TOKEN = args.token or _read_token_file(args.token_file) or os.environ.get(
+        "HERMES_SHELLCTL_TOKEN", ""
+    )
+    if not _TOKEN:
+        print(
+            "FATAL: no token (pass --token or set "
+            "HERMES_SHELLCTL_TOKEN)",
+            file=sys.stderr,
+        )
+        return 2
+    if args.download_dir:
+        _DOWNLOAD_DIR = os.path.expanduser(args.download_dir)
+    if args.allowed_root:
+        root = os.path.realpath(os.path.expanduser(args.allowed_root))
+        if not os.path.isdir(root):
+            print(
+                "FATAL: allowed root is not a directory: %s" % root,
+                file=sys.stderr,
+            )
+            return 2
+        _ALLOWED_ROOT = root
+    if not 1 <= args.max_open_capture_secs <= _MAX_CONFIGURED_CAPTURE_SECS:
+        print(
+            "FATAL: max open capture seconds must be between 1 and %d"
+            % _MAX_CONFIGURED_CAPTURE_SECS,
+            file=sys.stderr,
+        )
+        return 2
+    _MAX_OPEN_CAPTURE_SECS = args.max_open_capture_secs
+    srv = ThreadingHTTPServer((args.host, args.port), _Handler)
+    old_signal_handlers = {}
+
+    def stop_daemon(signum, frame):
+        raise KeyboardInterrupt
+
+    if threading.current_thread() is threading.main_thread():
+        for signum in (signal.SIGTERM, getattr(signal, "SIGHUP", None)):
+            if signum is not None:
+                old_signal_handlers[signum] = signal.signal(signum, stop_daemon)
+    print(
+        "hermes-shellctl %s listening on %s:%d (%s, caps=%s)" % (
+            SHELLCTL_VERSION,
+            args.host,
+            args.port,
+            platform.system(),
+            _capabilities(),
+        ),
+        flush=True,
+    )
+    try:
+        srv.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        _discard_open_capture()
+        srv.server_close()
+        for signum, handler in old_signal_handlers.items():
+            signal.signal(signum, handler)
+    return 0
+
+
+def main(argv=None):
+    p = argparse.ArgumentParser(
+        prog="hermes-shellctl", description=__doc__
+    )
+    sub = p.add_subparsers(dest="cmd", required=True)
+    d = sub.add_parser("daemon", help="run the bridge listener")
+    d.add_argument("--host", default="127.0.0.1")
+    d.add_argument("--port", type=int, default=8765)
+    d.add_argument("--token", default="")
+    d.add_argument("--token-file", default="")
+    d.add_argument("--download-dir", default="")
+    d.add_argument(
+        "--max-open-capture-secs",
+        type=int,
+        default=_MAX_OPEN_CAPTURE_SECS,
+        help="stop an unclosed microphone capture after this many seconds",
+    )
+    d.add_argument(
+        "--allowed-root",
+        default="",
+        help="optionally restrict /pull to this directory tree",
+    )
+    d.set_defaults(func=cmd_daemon)
+    v = sub.add_parser("version", help="print version")
+    v.set_defaults(func=lambda a: (print(SHELLCTL_VERSION), 0)[1])
+    args = p.parse_args(argv)
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
