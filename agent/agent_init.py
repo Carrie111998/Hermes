@@ -2107,6 +2107,26 @@ def init_agent(
         except Exception:
             pass
 
+    # Process-level memory watchdog (agent.memory_watchdog config section).
+    # Samples own RSS on a daemon thread and (a) logs + dumps all thread
+    # stacks when a warn threshold is crossed, (b) exits the process with a
+    # distinctive code before the kernel OOM killer has to fire when a hard
+    # threshold is configured. One thread per process — idempotent across
+    # the per-request AIAgent instances that serve/gateway create.
+    try:
+        from agent.memory_watchdog import (
+            resolve_settings as _resolve_memory_watchdog_settings,
+            start_memory_watchdog,
+        )
+
+        start_memory_watchdog(
+            _resolve_memory_watchdog_settings(
+                _agent_section.get("memory_watchdog")
+            )
+        )
+    except Exception:
+        logger.debug("memory watchdog start failed", exc_info=True)
+
     # Bot Mode teammate protocol section (tools/bot_mode_probe.py) — pure
     # filesystem reads, no warm needed. Silent on non-Bot-Mode installs.
     agent._bot_mode_protocol = bool(_agent_section.get("bot_mode_protocol", True))

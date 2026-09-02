@@ -1116,6 +1116,24 @@ When a budget is set, two things happen:
 
 The budget is per `run_conversation` turn (it resets on each user message) and the feature is completely dormant when unset — no clock reads, no injection, no timeout changes.
 
+## Memory Watchdog
+
+The agent process samples its own RSS on a daemon thread and can act **before** the kernel OOM killer has to. Two independent thresholds, both off by default (the feature is a silent no-op unless you set a threshold):
+
+```yaml
+agent:
+  memory_watchdog:
+    enabled: true           # default — sampling only runs when a threshold is set
+    interval_s: 30          # sample cadence in seconds (default 30, minimum 5)
+    warn_threshold_kib: 0   # RSS in KiB that triggers a warn + thread-stack dump; 0 = off
+    hard_threshold_kib: 0   # RSS in KiB that triggers a contained exit; 0 = off
+```
+
+- **`warn_threshold_kib`** — when crossed, Hermes logs a warning and dumps every thread's stack to `~/.hermes/logs/agent-memory-watchdog.log`. This is the forensic tool: if a backend ever starts ballooning, you get the exact code path as a stack trace instead of a kernel OOM table. Fires once per growth episode (re-arms after RSS falls back below 90% of the threshold).
+- **`hard_threshold_kib`** — when crossed, the same dump is written and the process exits with a distinctive code (`42`) so a supervisor (`systemd`, the desktop, the gateway) restarts it cleanly instead of the kernel OOM-killing the machine into a freeze. Opt-in: set it only where you want containment (e.g. `MemoryMax`-style deployment).
+
+The watchdog is GIL-resilient — the sample/dump/exit path uses only `/proc` reads, `faulthandler` and `os._exit`, so it fires even when the main loop is wedged. It runs once per process (not per conversation): gateway and `hermes serve` create a fresh agent per request, and the watchdog thread is shared.
+
 ## Verify-on-Stop (coding verification)
 
 When enabled, Hermes refuses to accept a final answer on a turn where the agent edited code in a workspace but produced no fresh verification evidence (a passing test run, build, lint, etc.) — it injects a synthetic follow-up asking the agent to verify or explain why it can't. Doc/markdown/skill-only edits never trigger it, and the loop is bounded so it can never trap the agent.
