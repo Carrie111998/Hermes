@@ -3166,6 +3166,32 @@ def _canonical_assignee(assignee: Optional[str]) -> Optional[str]:
     return normalize_profile_name(assignee)
 
 
+_MOJIBAKE_MARKERS = re.compile(r"Ã.|Â.|â[\x80-\xbf]|ð[\x80-\xbf]")
+
+
+def _repair_utf8_mojibake(value: Optional[str]) -> Optional[str]:
+    """Repair one accidental UTF-8-as-Latin-1/CP1252 decode, conservatively.
+
+    Agent/tool boundaries occasionally hand the Kanban DB text such as
+    ``demandÃ©`` or ``schemaâ\x86\x94migrations``. SQLite then stores those
+    Unicode code points faithfully, so the corruption survives every later
+    surface. Only accept a round-trip candidate when it is valid UTF-8 and
+    strictly reduces the characteristic marker count; legitimate text such as
+    ``Âge`` or ``SÃO`` therefore remains unchanged.
+    """
+    if value is None or not _MOJIBAKE_MARKERS.search(value):
+        return value
+    before = len(_MOJIBAKE_MARKERS.findall(value))
+    for source_encoding in ("latin-1", "cp1252"):
+        try:
+            candidate = value.encode(source_encoding).decode("utf-8")
+        except (UnicodeEncodeError, UnicodeDecodeError):
+            continue
+        if len(_MOJIBAKE_MARKERS.findall(candidate)) < before:
+            return candidate
+    return value
+
+
 def create_task(
     conn: sqlite3.Connection,
     *,
@@ -3234,6 +3260,8 @@ def create_task(
     board can supply the repo and branch convention. Its literal worktree is
     never reused; the new task still gets its own task-id-keyed path.
     """
+    title = _repair_utf8_mojibake(title) or ""
+    body = _repair_utf8_mojibake(body)
     model_override = (model_override or "").strip() or None
     provider_override = (provider_override or "").strip() or None
     reasoning_effort = normalize_reasoning_effort(reasoning_effort)
@@ -3993,6 +4021,7 @@ def parent_results(conn: sqlite3.Connection, task_id: str) -> list[tuple[str, Op
 def add_comment(
     conn: sqlite3.Connection, task_id: str, author: str, body: str
 ) -> int:
+    body = _repair_utf8_mojibake(body) or ""
     if not body or not body.strip():
         raise ValueError("comment body is required")
     if not author or not author.strip():
@@ -5403,6 +5432,8 @@ def complete_task(
     ``suspected_hallucinated_references`` event. This pass is advisory
     and never blocks.
     """
+    result = _repair_utf8_mojibake(result)
+    summary = _repair_utf8_mojibake(summary)
     now = int(time.time())
     # Fail before validating cards or staging artifacts; re-check inside the
     # final write transaction below to close the parent-reopen race.
@@ -6289,6 +6320,7 @@ def block_task(
     Returns True on any successful transition (to ``blocked``, ``todo``, or
     ``triage``), False when the task wasn't in a blockable state.
     """
+    reason = _repair_utf8_mojibake(reason)
     if kind is not None and kind not in VALID_BLOCK_KINDS:
         raise ValueError(
             f"block kind must be one of {sorted(VALID_BLOCK_KINDS)} or None"
