@@ -225,6 +225,25 @@ describe('useProjectTree', () => {
     expect(readDir).toHaveBeenLastCalledWith('/b')
   })
 
+  it('self-heals after resetProjectTreeState by force-reloading the root', async () => {
+    readDir.mockResolvedValue(ok([{ name: 'README.md', path: '/p/README.md', isDirectory: false }]))
+
+    const { result } = renderHook(() => useProjectTree('/p'))
+
+    await waitFor(() => expect(result.current.data.length).toBe(1))
+    expect(readDir).toHaveBeenCalledTimes(1)
+
+    // A reset clears tree state and bumps the root-request id, which drops any
+    // in-flight readDir result. A mounted tree must re-read its root instead of
+    // stranding on the empty/loading state.
+    await act(async () => {
+      resetProjectTreeState()
+    })
+
+    await waitFor(() => expect(readDir).toHaveBeenCalledTimes(2))
+    await waitFor(() => expect(result.current.data.map(n => n.name)).toEqual(['README.md']))
+  })
+
   it('falls back to the sanitized workspace dir when the session cwd is gone', async () => {
     const sanitizeWorkspaceCwd = vi.fn(async () => ({ cwd: '/home/me/projects', sanitized: true }))
     readDir.mockImplementation(async path => {
