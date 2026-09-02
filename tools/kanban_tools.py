@@ -212,6 +212,66 @@ def _enforce_worker_task_ownership(tid: str) -> Optional[str]:
     return None
 
 
+# Profiles whose kanban_complete summaries MUST carry an explicit
+# loop-closure trace.  Fleet Loop Digest 2026-08-31 Week 1 found 0/15
+# audited done cards with the trace despite the LOOP-CLOSURE LAW text
+# shipping in every SOUL.md / system prompt — awareness alone does not
+# enforce behaviour, so the completion path hard-gates it.  Card
+# t_31b252aa.  Only the orchestrator profile is scoped for now; extend
+# this set as the weekly Fleet Loop Optimizer audit (Mon 09:00) widens
+# enforcement.
+_LOOP_TRACE_REQUIRED_PROFILES = frozenset({"default"})
+
+# A summary passes when it contains the explicit nothing-new escape
+# hatch or all four trace verbs (the audit regex the weekly optimizer
+# runs is kept intentionally looser — this gate enforces the strict
+# form at write time so audits stay clean).
+_LOOP_TRACE_NOTHING_NEW = "loop-closure: nothing new"
+_LOOP_TRACE_VERBS = ("attempted", "failed", "verified", "do-differently")
+
+
+def _active_profile() -> str:
+    """Best-effort acting-profile name (env first, config fallback)."""
+    name = (os.environ.get("HERMES_PROFILE") or "").strip()
+    if name:
+        return name
+    try:
+        from hermes_cli.profiles import get_active_profile_name
+        return get_active_profile_name() or "default"
+    except Exception:
+        return "default"
+
+
+def _missing_loop_trace(summary: Optional[str]) -> Optional[str]:
+    """Return a rejection message when a required trace is absent.
+
+    Applies only to profiles listed in ``_LOOP_TRACE_REQUIRED_PROFILES``
+    (the orchestrator).  The check is purely textual on the summary +
+    legacy result field, runs BEFORE any DB mutation, and returns a
+    retryable tool_error — the task stays in-flight so the worker can
+    simply re-call kanban_complete with the trace appended.
+    """
+    if _active_profile() not in _LOOP_TRACE_REQUIRED_PROFILES:
+        return None
+    text = str(summary or "")
+    if _LOOP_TRACE_NOTHING_NEW in text.lower():
+        return None
+    lowered = text.lower()
+    missing = [v for v in _LOOP_TRACE_VERBS if v not in lowered]
+    if missing:
+        return (
+            "kanban_complete blocked by LOOP-CLOSURE LAW gate: summary "
+            f"lacks the execution trace (missing: {', '.join(missing)}). "
+            "Append 2-3 lines to the summary in the form "
+            "'attempted: ... / failed: ... / verified: ... / "
+            "do-differently: ...', or state 'loop-closure: nothing new' "
+            "if the run genuinely produced no lesson. Task is still "
+            "in-flight — retry kanban_complete with the same handoff "
+            "plus the trace."
+        )
+    return None
+
+
 def _connect(board: Optional[str] = None):
     """Import + connect lazily so the module imports cleanly in non-kanban
     contexts (e.g. test rigs that import every tool module).
@@ -743,6 +803,12 @@ def _handle_complete(args: dict, **kw) -> str:
         return tool_error(
             "provide at least one of: summary (preferred), result"
         )
+    # LOOP-CLOSURE LAW gate (card t_31b252aa): scoped to the
+    # orchestrator profile — reject trace-less completion summaries
+    # BEFORE any DB mutation so the worker can retry cheaply.
+    loop_trace_err = _missing_loop_trace(summary or result)
+    if loop_trace_err:
+        return tool_error(loop_trace_err)
     if metadata is not None and not isinstance(metadata, dict):
         return tool_error(
             f"metadata must be an object/dict, got {type(metadata).__name__}"
@@ -1798,7 +1864,13 @@ KANBAN_COMPLETE_SCHEMA = {
         "in ``artifacts`` — the gateway notifier will upload them as "
         "native attachments to the human who subscribed to the task, "
         "so the deliverable lands in their chat alongside the summary "
-        "instead of being a path they have to fetch by hand."
+        "instead of being a path they have to fetch by hand. "
+        "LOOP-CLOSURE LAW: the summary MUST end with a 2-3 line "
+        "execution trace — 'attempted: ... / failed: ... / verified: "
+        "... / do-differently: ...' — or the explicit line "
+        "'loop-closure: nothing new' when the run genuinely taught "
+        "nothing. Trace-less completions are rejected (enforced for "
+        "the orchestrator profile)."
     ),
     "parameters": {
         "type": "object",

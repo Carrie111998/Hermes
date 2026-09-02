@@ -692,6 +692,11 @@ def test_orchestrator_complete_any_task_allowed(monkeypatch, tmp_path):
     """Orchestrator profiles (no HERMES_KANBAN_TASK) can still complete
     any task via explicit task_id. The check only applies to workers."""
     monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    # Generic orchestrator profile — NOT "default": that profile carries
+    # the loop-closure trace completion gate (t_31b252aa) which would
+    # reject this trace-less summary and mask the ownership behaviour
+    # under test here.
+    monkeypatch.setenv("HERMES_PROFILE", "test-orchestrator")
     home = tmp_path / ".hermes"
     home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))

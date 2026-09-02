@@ -18,12 +18,13 @@ from typing import Any, Optional
 _jitter_counter = 0
 _jitter_lock = threading.Lock()
 
-# Z.AI Coding Plan's GLM-5.2 endpoint often returns HTTP 429 code 1305
-# ("The service may be temporarily overloaded...") for otherwise valid
-# Hermes requests. Short retries tend to hammer the same overloaded window;
-# after a few normal retries, progressively widen the wait window. Keep the
-# cap interactive-friendly: a simple TUI message should fail visibly in minutes,
-# not sit silent for 20+ minutes.
+# Z.AI Coding Plan's GLM-5 endpoints return transient HTTP 429s in two shapes:
+# code 1305 ("The service may be temporarily overloaded...") and code 1302
+# ("Rate limit reached for requests" — account/request-rate window, observed
+# 2026-08-31 sustaining ~2 minutes). Short retries tend to hammer the same
+# window; after a few normal retries, progressively widen the wait window.
+# Keep the cap interactive-friendly: a simple TUI message should fail visibly
+# in minutes, not sit silent for 20+ minutes.
 _ZAI_CODING_OVERLOAD_LONG_BACKOFF = (30.0, 60.0, 90.0, 120.0)
 
 # Number of initial short retries before the adaptive long-backoff tier kicks
@@ -140,23 +141,31 @@ def _error_text(error: Any) -> str:
 
 
 def is_zai_coding_overload_error(*, base_url: str | None, model: str | None, error: Any) -> bool:
-    """Return True for Z.AI Coding Plan transient overload 429s.
+    """Return True for transient Z.AI Coding Plan 429s worth of adaptive backoff.
 
-    The coding-plan endpoint reports overload as HTTP 429 with body code 1305
-    and message "The service may be temporarily overloaded...". Treat only
-    that narrow shape specially so ordinary quota/billing 429s still fail fast
-    through the existing classifier.
+    Two production shapes qualify (both on the Coding Plan endpoint, GLM-5
+    family models, HTTP 429):
+    - code 1305 "The service may be temporarily overloaded..." (capacity), and
+    - code 1302 "Rate limit reached for requests" (account/request-rate limit).
+
+    The 1302 shape observed 2026-08-31 (~22:57) exhausted the default 3-attempt
+    budget in ~10s while the limit window lasted ~2 minutes, killing kanban
+    workers on their first LLM call (glm-5.3-flash). Ordinary quota/billing
+    429s on other providers/models still fail fast through the classifier.
     """
     base = (base_url or "").lower()
     model_name = (model or "").lower()
     status = getattr(error, "status_code", None)
     text = _error_text(error)
-    return (
-        status == 429
-        and "api.z.ai/api/coding/paas/v4" in base
-        and "glm-5.2" in model_name
-        and ("1305" in text or "temporarily overloaded" in text)
-    )
+    if status != 429:
+        return False
+    if "api.z.ai/api/coding/paas/v4" not in base:
+        return False
+    if "glm-5" not in model_name:
+        return False
+    if "1305" in text or "temporarily overloaded" in text:
+        return True
+    return "1302" in text or "rate limit reached" in text
 
 
 def adaptive_rate_limit_backoff(

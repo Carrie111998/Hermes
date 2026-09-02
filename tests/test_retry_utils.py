@@ -169,6 +169,80 @@ def test_zai_overload_ceiling_makes_long_tier_reachable(monkeypatch):
     assert long_waits == [30.0, 60.0, 90.0, 120.0]
 
 
+def _zai_rate_limit_error():
+    """The other transient Z.AI Coding Plan 429: code 1302 'Rate limit reached
+    for requests'. Observed in production 2026-08-31 (~22:57-22:59) killing
+    kanban workers on glm-5.3-flash that exhausted the old 3-attempt budget in
+    ~10s while the limit window lasted ~2 minutes (see crashed sessions
+    20260831_225716_bfbdb9 / 20260831_225816_374804)."""
+    return SimpleNamespace(
+        status_code=429,
+        message="Error code: 429 - {'error': {'code': '1302', 'message': 'Rate limit reached for requests'}}",
+        body={
+            "error": {
+                "code": "1302",
+                "message": "Rate limit reached for requests",
+            }
+        },
+    )
+
+
+def test_zai_coding_rate_limit_1302_gets_adaptive_backoff():
+    """Regression (2026-08-31 worker crashes): code-1302 429s on glm-5.3-flash
+    must match the Z.AI Coding adaptive policy so the retry loop extends its
+    ceiling and survives the ~2min account-wide limit window instead of exiting
+    at ~10s. Previously only glm-5.2 + code 1305 matched."""
+    assert is_zai_coding_overload_error(
+        base_url="https://api.z.ai/api/coding/paas/v4",
+        model="glm-5.3-flash",
+        error=_zai_rate_limit_error(),
+    ) is True
+
+
+def test_zai_coding_rate_limit_1302_long_tier_reachable(monkeypatch):
+    """With the widened matcher, the 1302 error walks the same extended ceiling
+    and reaches the long-backoff tier within it."""
+    monkeypatch.setattr(retry_utils, "jittered_backoff", lambda *a, **kw: kw["base_delay"])
+    from agent.retry_utils import zai_coding_overload_retry_ceiling
+
+    err = _zai_rate_limit_error()
+    ceiling = zai_coding_overload_retry_ceiling()
+
+    long_waits = []
+    for attempt in range(1, ceiling):
+        _wait, policy = adaptive_rate_limit_backoff(
+            attempt,
+            base_url="https://api.z.ai/api/coding/paas/v4",
+            model="glm-5.3-flash",
+            error=err,
+            default_wait=1.0,
+        )
+        if policy == "zai_coding_overload_long":
+            long_waits.append(_wait)
+
+    assert long_waits == [30.0, 60.0, 90.0, 120.0]
+
+
+def test_zai_coding_matcher_still_scoped_to_coding_endpoint_and_429():
+    """Widening must not leak: non-coding z.ai endpoints, non-429 errors, and
+    non-GLM-5 models stay outside the adaptive policy (they keep the ordinary
+    short retry path)."""
+    err = _zai_rate_limit_error()
+    # Wrong endpoint (public PAAS API, not the Coding Plan).
+    assert is_zai_coding_overload_error(
+        base_url="https://api.z.ai/api/paas/v4", model="glm-5.3-flash", error=err
+    ) is False
+    # Not a 429.
+    err_500 = SimpleNamespace(status_code=500, body=err.body)
+    assert is_zai_coding_overload_error(
+        base_url="https://api.z.ai/api/coding/paas/v4", model="glm-5.3-flash", error=err_500
+    ) is False
+    # Older GLM-4 family stays on the ordinary path.
+    assert is_zai_coding_overload_error(
+        base_url="https://api.z.ai/api/coding/paas/v4", model="glm-4.5-flash", error=err
+    ) is False
+
+
 # ---------------------------------------------------------------------------
 # parse_retry_after_seconds — shared Retry-After parser
 # ---------------------------------------------------------------------------
