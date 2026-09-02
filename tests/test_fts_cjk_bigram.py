@@ -235,6 +235,65 @@ def test_fresh_db_index_counts_exclude_tool_rows(db):
     assert idx == non_tool
 
 
+def test_optimize_storage_converges_over_concurrent_tokenizerless_open(
+    cjk_so, tmp_path, monkeypatch
+):
+    """#100204: a tokenizer-less process opening the DB mid-backfill
+    self-heals — it drops the freshly installed cjk triggers and re-stales
+    the breadcrumb, throwing the in-flight rebuild away. optimize-storage
+    must converge within the same invocation (one reset+backfill retry)
+    instead of reporting success over a discarded index."""
+    monkeypatch.setenv("HERMES_FTS5_CJK_SO", str(cjk_so))
+    db_path = tmp_path / "state.db"
+    d = SessionDB(db_path=db_path)
+    d.create_session(session_id="s1", source="cli", model="m")
+    d.append_message("s1", role="user", content="웅기가 프로필을 요청했다 일본 우선순위")
+    d.close()
+
+    # Historical stale state, exactly as it arises in production: a
+    # tokenizer-less open drops the triggers and leaves the breadcrumb
+    # (the self-heal branch of _ensure_fts_cjk_schema).
+    monkeypatch.setenv("HERMES_FTS5_CJK_SO", "/nonexistent/libfts5_cjk.so")
+    SessionDB(db_path=db_path).close()
+
+    monkeypatch.setenv("HERMES_FTS5_CJK_SO", str(cjk_so))
+    d = SessionDB(db_path=db_path)
+    try:
+        assert d.get_meta("fts_cjk_stale") == "1"
+
+        raced = {"done": False}
+
+        def _resident_open(info):
+            # A resident tokenizer-less process opens the DB inside the
+            # first backfill pass (progress_cb fires between chunks).
+            if info.get("phase") == "backfill" and not raced["done"]:
+                raced["done"] = True
+                monkeypatch.setenv(
+                    "HERMES_FTS5_CJK_SO", "/nonexistent/libfts5_cjk.so"
+                )
+                SessionDB(db_path=db_path).close()
+                monkeypatch.setenv("HERMES_FTS5_CJK_SO", str(cjk_so))
+
+        result = d.optimize_fts_storage(progress_cb=_resident_open)
+        assert result["ok"]
+        assert "cjk_stale" not in result
+        assert d.get_meta("fts_cjk_stale") is None
+        assert d._fts_cjk_available
+    finally:
+        d.close()
+
+    # Reopen: the rebuild held and the cjk index is served again — the
+    # reset→rebuild→re-stale loop is broken.
+    d2 = SessionDB(db_path=db_path)
+    try:
+        assert d2.get_meta("fts_cjk_stale") is None
+        assert d2._fts_cjk_available
+        assert d2._describe_search_path("일본") == "fts_cjk"
+        assert d2.search_messages("일본", limit=10)
+    finally:
+        d2.close()
+
+
 def test_integrity_after_lifecycle(db):
     db.append_message("s1", role="user", content="무결성 검사")
     with db._lock:
