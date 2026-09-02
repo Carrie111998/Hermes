@@ -44,6 +44,18 @@ describe('resolvePtyKeyboardShortcut', () => {
       resolvePtyKeyboardShortcut(key({ ctrlKey: true, key: 'Delete' }), false, false),
     ).toBe('delete-word-forward')
   })
+
+  it('swallows bare Ctrl+L on non-macOS so browser address-bar focus cannot type into chat', () => {
+    expect(
+      resolvePtyKeyboardShortcut(key({ ctrlKey: true, key: 'l' }), false, false),
+    ).toBe('browser-address-bar')
+  })
+
+  it('swallows bare Cmd+L on macOS so browser address-bar focus cannot type into chat', () => {
+    expect(
+      resolvePtyKeyboardShortcut(key({ metaKey: true, key: 'l' }), true, false),
+    ).toBe('browser-address-bar')
+  })
 })
 
 describe('sendPtyShortcutSequence', () => {

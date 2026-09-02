@@ -66,6 +66,7 @@ import {
   resolvePtyKeyboardShortcut,
   sendPtyShortcutSequence,
 } from "@/lib/pty-keyboard-shortcuts";
+import { shouldIgnoreSyntheticStartupInput } from "@/lib/pty-startup-input";
 import {
   isViewportPinnedToBottom,
   parseResumeControlMessage,
@@ -87,6 +88,7 @@ import { useProfileScope } from "@/contexts/useProfileScope";
 // ``rotate`` mints a new token — used when the user explicitly starts a fresh
 // session so the old keep-alive PTY is NOT reattached (the registry reaps it).
 const PTY_ATTACH_TOKEN_KEY = "hermes.pty.token.chat";
+const PTY_RELOAD_SHORTCUT_SUPPRESSION_KEY = "hermes.pty.reload-shortcut-suppression";
 function ptyAttachToken(rotate = false): string {
   let t = "";
   if (!rotate) {
@@ -107,6 +109,38 @@ function ptyAttachToken(rotate = false): string {
     }
   }
   return t;
+}
+
+function persistReloadShortcutSuppression(key: string, until: number) {
+  try {
+    window.sessionStorage.setItem(
+      PTY_RELOAD_SHORTCUT_SUPPRESSION_KEY,
+      JSON.stringify({ key, until }),
+    );
+  } catch {
+    /* storage unavailable */
+  }
+}
+
+function consumeReloadShortcutSuppression():
+  | { key: string; until: number }
+  | null {
+  try {
+    const raw = window.sessionStorage.getItem(PTY_RELOAD_SHORTCUT_SUPPRESSION_KEY);
+    if (!raw) return null;
+    window.sessionStorage.removeItem(PTY_RELOAD_SHORTCUT_SUPPRESSION_KEY);
+    const parsed = JSON.parse(raw) as { key?: unknown; until?: unknown };
+    if (
+      typeof parsed.key === "string" &&
+      typeof parsed.until === "number" &&
+      Number.isFinite(parsed.until)
+    ) {
+      return { key: parsed.key.toLowerCase(), until: parsed.until };
+    }
+  } catch {
+    /* ignore malformed or unavailable storage */
+  }
+  return null;
 }
 
 // Channel id ties this chat tab's PTY child (publisher) to its sidebar
@@ -231,6 +265,11 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
   const connectingTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const ptyInputLineRef = useRef("");
   const mobileReplacementInputUntilRef = useRef(0);
+  const startupInputWindowUntilRef = useRef(0);
+  const lastKeyboardEventAtRef = useRef(0);
+  const lastCompositionEventAtRef = useRef(0);
+  const suppressedPrintableRef = useRef<{ key: string; until: number } | null>(null);
+  const pageSuspendingRef = useRef(false);
   const [ptyState, setPtyState] =
     useState<PtyConnectionState>("connecting");
   const ptyStateRef = useRef<PtyConnectionState>("connecting");
@@ -678,11 +717,38 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
       ev.stopPropagation();
       uploadAndAttachImages(files);
     };
+    const markPageSuspending = () => {
+      pageSuspendingRef.current = true;
+    };
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === "hidden") {
+        pageSuspendingRef.current = true;
+      }
+    };
+    pageSuspendingRef.current = false;
     host.addEventListener("paste", handleBrowserPaste, { capture: true });
     host.addEventListener("dragover", handleBrowserDragOver, { capture: true });
     host.addEventListener("drop", handleBrowserDrop, { capture: true });
+    window.addEventListener("beforeunload", markPageSuspending, true);
+    window.addEventListener("pagehide", markPageSuspending, true);
+    document.addEventListener("visibilitychange", handleVisibilityChange, true);
 
     term.attachCustomKeyEventHandler((ev) => {
+      const suppressedPrintable = suppressedPrintableRef.current;
+      if (
+        suppressedPrintable &&
+        Date.now() <= suppressedPrintable.until &&
+        !ev.ctrlKey &&
+        !ev.altKey &&
+        !ev.metaKey &&
+        ev.key.toLowerCase() === suppressedPrintable.key
+      ) {
+        ev.preventDefault();
+        return false;
+      }
+      if (suppressedPrintable && Date.now() > suppressedPrintable.until) {
+        suppressedPrintableRef.current = null;
+      }
       if (ev.type !== "keydown") return true;
 
       // Copy: Cmd+C on macOS, Ctrl+C or Ctrl+Shift+C elsewhere. Copy only
@@ -742,6 +808,17 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
       if (shortcut === "delete-word-forward") {
         ev.preventDefault();
         sendPtyShortcutSequence(wsRef.current, ptyStateRef.current, "\x1bd");
+        return false;
+      }
+
+      if (shortcut === "browser-address-bar") {
+        const suppression = {
+          key: ev.key.toLowerCase(),
+          until: Date.now() + 4000,
+        };
+        suppressedPrintableRef.current = suppression;
+        persistReloadShortcutSuppression(suppression.key, suppression.until);
+        ev.preventDefault();
         return false;
       }
 
@@ -822,6 +899,8 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
       sendComposedText(data);
     });
     term.open(host);
+    startupInputWindowUntilRef.current = Date.now() + 500;
+    suppressedPrintableRef.current = consumeReloadShortcutSuppression();
 
     // IME composition guard (fixes #52111).
     //
@@ -841,18 +920,38 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
     // sits in the *capture* phase on the terminal host so it fires before
     // the event bubbles up to the React root.
     const _imeCompositionGuard = (e: KeyboardEvent) => {
+      lastKeyboardEventAtRef.current = Date.now();
       if (e.keyCode === 229 || e.key === "Process") {
         e.stopPropagation();
       }
     };
     host.addEventListener("keydown", _imeCompositionGuard, true);
+    const markKeyboardActivity = () => {
+      lastKeyboardEventAtRef.current = Date.now();
+    };
+    host.addEventListener("keypress", markKeyboardActivity, true);
 
     const textarea = term.textarea;
     if (textarea) {
+      const clearTransientTextareaValue = () => {
+        textarea.value = "";
+      };
+      const isRestoredStartupTextareaInput = () =>
+        Date.now() <= startupInputWindowUntilRef.current &&
+        Date.now() - lastKeyboardEventAtRef.current > 250 &&
+        Date.now() - lastCompositionEventAtRef.current > 250 &&
+        /^[ -~]+$/.test(textarea.value);
+
       textarea.setAttribute("autocomplete", "off");
       textarea.setAttribute("autocorrect", "off");
       textarea.setAttribute("autocapitalize", "off");
       textarea.setAttribute("spellcheck", "false");
+      textarea.setAttribute("data-form-type", "other");
+      textarea.setAttribute("data-lpignore", "true");
+      textarea.setAttribute("data-1p-ignore", "true");
+      clearTransientTextareaValue();
+      window.setTimeout(clearTransientTextareaValue, 0);
+      requestAnimationFrame(clearTransientTextareaValue);
 
       const isMobileLike =
         typeof navigator !== "undefined" &&
@@ -869,15 +968,30 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
           mobileReplacementInputUntilRef.current = Date.now() + MOBILE_REPLACEMENT_WINDOW_MS;
         }
       };
+      const markCompositionStart = () => {
+        lastCompositionEventAtRef.current = Date.now();
+        compositionForwarder.onCompositionStart();
+      };
       const markCompositionEnd = (ev: CompositionEvent) => {
+        lastCompositionEventAtRef.current = Date.now();
         mobileReplacementInputUntilRef.current = Date.now() + MOBILE_REPLACEMENT_WINDOW_MS;
         compositionForwarder.onCompositionEnd(ev.data);
       };
+      const blockRestoredTextareaInput = (ev: Event) => {
+        if (!isRestoredStartupTextareaInput()) return;
+        clearTransientTextareaValue();
+        ev.preventDefault();
+        ev.stopImmediatePropagation();
+      };
 
+      textarea.addEventListener("input", blockRestoredTextareaInput, true);
       textarea.addEventListener("beforeinput", markReplacementInput, true);
+      textarea.addEventListener("compositionstart", markCompositionStart, true);
       textarea.addEventListener("compositionend", markCompositionEnd, true);
       mobileInputCleanup = () => {
+        textarea.removeEventListener("input", blockRestoredTextareaInput, true);
         textarea.removeEventListener("beforeinput", markReplacementInput, true);
+        textarea.removeEventListener("compositionstart", markCompositionStart, true);
         textarea.removeEventListener("compositionend", markCompositionEnd, true);
       };
     }
@@ -1458,6 +1572,20 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
           }
           return;
         }
+        if (
+          shouldIgnoreSyntheticStartupInput({
+            data,
+            now: Date.now(),
+            startupWindowUntil: startupInputWindowUntilRef.current,
+            lastKeyboardEventAt: lastKeyboardEventAtRef.current,
+            lastCompositionEventAt: lastCompositionEventAtRef.current,
+          })
+        ) {
+          return;
+        }
+        if (pageSuspendingRef.current && data.length === 1 && /^[ -~]$/.test(data)) {
+          return;
+        }
 
         const normalized = normalizePtyMobileInput(
           data,
@@ -1509,9 +1637,14 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
       onScrollDisposable?.dispose();
       mobileInputCleanup?.();
       compositionForwarder.dispose();
+      host.removeEventListener("keydown", _imeCompositionGuard, true);
+      host.removeEventListener("keypress", markKeyboardActivity, true);
       host.removeEventListener("paste", handleBrowserPaste, true);
       host.removeEventListener("dragover", handleBrowserDragOver, true);
       host.removeEventListener("drop", handleBrowserDrop, true);
+      window.removeEventListener("beforeunload", markPageSuspending, true);
+      window.removeEventListener("pagehide", markPageSuspending, true);
+      document.removeEventListener("visibilitychange", handleVisibilityChange, true);
       if (metricsDebounce) clearTimeout(metricsDebounce);
       window.removeEventListener("resize", scheduleSyncTerminalMetrics);
       keyboardInsetSyncRef.current = null;

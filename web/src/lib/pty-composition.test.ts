@@ -10,6 +10,7 @@ describe("createPtyCompositionForwarder", () => {
     const send = vi.fn();
     const forwarder = createPtyCompositionForwarder(send);
 
+    forwarder.onCompositionStart();
     forwarder.onCompositionEnd("ä");
     vi.runAllTimers();
 
@@ -21,6 +22,7 @@ describe("createPtyCompositionForwarder", () => {
     const send = vi.fn();
     const forwarder = createPtyCompositionForwarder(send);
 
+    forwarder.onCompositionStart();
     forwarder.onCompositionEnd("ä");
     forwarder.noteTerminalData("äx");
     vi.runAllTimers();
@@ -33,6 +35,7 @@ describe("createPtyCompositionForwarder", () => {
     const send = vi.fn();
     const forwarder = createPtyCompositionForwarder(send);
 
+    forwarder.onCompositionStart();
     forwarder.onCompositionEnd("ä");
     forwarder.noteTerminalData("x");
     vi.advanceTimersByTime(15);
@@ -47,6 +50,7 @@ describe("createPtyCompositionForwarder", () => {
     const send = vi.fn();
     const forwarder = createPtyCompositionForwarder(send);
 
+    forwarder.onCompositionStart();
     forwarder.onCompositionEnd("ab");
     forwarder.noteTerminalData("x");
     forwarder.noteTerminalData("a");
@@ -61,6 +65,7 @@ describe("createPtyCompositionForwarder", () => {
     const send = vi.fn();
     const forwarder = createPtyCompositionForwarder(send);
 
+    forwarder.onCompositionStart();
     forwarder.onCompositionEnd("ab");
     forwarder.noteTerminalData("a");
     forwarder.noteTerminalData("b");
@@ -74,6 +79,7 @@ describe("createPtyCompositionForwarder", () => {
     const send = vi.fn();
     const forwarder = createPtyCompositionForwarder(send);
 
+    forwarder.onCompositionStart();
     forwarder.onCompositionEnd("ab");
     forwarder.noteTerminalData("a");
     forwarder.noteTerminalData("\x1b[<0;10;10M");
@@ -88,8 +94,10 @@ describe("createPtyCompositionForwarder", () => {
     const send = vi.fn();
     const forwarder = createPtyCompositionForwarder(send);
 
+    forwarder.onCompositionStart();
     forwarder.onCompositionEnd("ä");
     vi.runAllTimers();
+    forwarder.onCompositionStart();
     forwarder.onCompositionEnd("ö");
     vi.runAllTimers();
 
@@ -102,7 +110,9 @@ describe("createPtyCompositionForwarder", () => {
     const send = vi.fn();
     const forwarder = createPtyCompositionForwarder(send);
 
+    forwarder.onCompositionStart();
     forwarder.onCompositionEnd("a");
+    forwarder.onCompositionStart();
     forwarder.onCompositionEnd("ä");
     vi.runAllTimers();
 
@@ -115,6 +125,7 @@ describe("createPtyCompositionForwarder", () => {
     const send = vi.fn();
     const forwarder = createPtyCompositionForwarder(send);
 
+    forwarder.onCompositionStart();
     forwarder.onCompositionEnd("ä");
     forwarder.dispose();
     vi.runAllTimers();
@@ -127,7 +138,19 @@ describe("createPtyCompositionForwarder", () => {
     const send = vi.fn();
     const forwarder = createPtyCompositionForwarder(send);
 
+    forwarder.onCompositionStart();
     forwarder.onCompositionEnd("");
+    vi.runAllTimers();
+
+    expect(send).not.toHaveBeenCalled();
+  });
+
+  it("ignores a compositionend that was not preceded by compositionstart", () => {
+    vi.useFakeTimers();
+    const send = vi.fn();
+    const forwarder = createPtyCompositionForwarder(send);
+
+    forwarder.onCompositionEnd("l");
     vi.runAllTimers();
 
     expect(send).not.toHaveBeenCalled();
