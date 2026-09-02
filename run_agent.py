@@ -1865,10 +1865,18 @@ class AIAgent:
         if stripped.endswith('^'):
             return True
         last = stripped[-1]
+        # An emoji may carry a trailing variation selector (U+FE0E/U+FE0F);
+        # judge the base character so "✅️" is treated like "✅".
+        if ord(last) in (0xFE0E, 0xFE0F) and len(stripped) >= 2:
+            last = stripped[-2]
         if last in '.!?:)"\']}。！？：）】」』》^':
             return True
-        # Emoji ranges (Misc Symbols, Dingbats, Emoticons, Supplemental, etc.)
-        if ord(last) >= 0x1F300:
+        # Emoji ranges (Misc Symbols, Dingbats, Emoticons, Supplemental, etc.).
+        # The >= U+1F300 check alone misses the Miscellaneous Symbols and
+        # Dingbats blocks (U+2600–U+27BF), which include very common terminal
+        # emoji such as ✅ ✔ ☑ ❤ (#98255).
+        code = ord(last)
+        if code >= 0x1F300 or 0x2600 <= code <= 0x27BF:
             return True
         return False
 
