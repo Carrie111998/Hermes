@@ -20667,6 +20667,28 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     f"{message_text}"
                 )
 
+        # LINE: a media message's binary is fetched from the LINE content API
+        # by message id, and a skill that keeps inbound files has no other way
+        # to name the file it was just sent. Injected per-turn for the same
+        # reason as Discord above — the id changes every turn, so it must stay
+        # out of the cached system prompt — and only when the message actually
+        # carries media, so ordinary text turns keep a byte-stable prefix and
+        # go on hitting the prompt cache. LINE is a plugin platform with no
+        # Platform enum member (Platform._missing_() creates it), so the
+        # comparison goes through .value rather than Platform.LINE.
+        if (
+            source is not None
+            and getattr(getattr(source, "platform", None), "value", None) == "line"
+            and getattr(event, "message_id", None)
+            and getattr(event, "media_urls", None)
+        ):
+            message_text = (
+                f"[Triggering message id: `{event.message_id}` — use as "
+                f"`message_id` to fetch this message's media from the LINE "
+                f"content API.]\n\n"
+                f"{message_text}"
+            )
+
         if getattr(event, "reply_to_text", None) and event.reply_to_message_id:
             # Always inject the reply-to pointer — even when the quoted text
             # already appears in history. The prefix isn't deduplication, it's
