@@ -1636,13 +1636,48 @@ class DiscordAdapter(BasePlatformAdapter):
                 parent_id = self._get_parent_channel_id(message.channel)
                 if parent_id:
                     msg_channel_ids.add(parent_id)
+            sender_id = str(getattr(message.author, "id", ""))
             if not self._is_allowed_user(
-                str(message.author.id),
+                sender_id,
                 message.author,
                 guild=msg_guild,
                 is_dm=is_dm,
                 channel_ids=msg_channel_ids,
             ):
+                # Observable receipt for every ordinary-message refusal
+                # (#91919): with a configured allowlist the drop was fully
+                # silent (the fail-closed warning only covers the
+                # no-allowlist case), so a user's message could vanish with
+                # no operator-visible trace. Structured IDs only — never
+                # message content or secrets. Deduplicated events cannot
+                # reach here twice (the dedup check runs before admission).
+                # ``getattr`` guards everywhere: this is the refusal path
+                # for unknown senders, where odd author objects (webhooks,
+                # partial members, deleted users) are most likely — an
+                # AttributeError here would turn a clean drop into a crash.
+                guild_id = str(getattr(msg_guild, "id", "")) if msg_guild else ""
+                channel_id = (
+                    "-" if is_dm else str(getattr(message.channel, "id", ""))
+                )
+                has_allowlist = bool(
+                    getattr(self, "_allowed_user_ids", None)
+                    or getattr(self, "_allowed_role_ids", None)
+                )
+                reason = (
+                    "sender_not_in_allowlist"
+                    if has_allowlist
+                    else "fail_closed_no_allowlist"
+                )
+                logger.warning(
+                    "[%s] Discord message refused: sender_id=%s %s channel_id=%s "
+                    "message_id=%s reason=%s",
+                    self.name,
+                    sender_id,
+                    f"guild_id={guild_id}" if guild_id else "dm",
+                    channel_id,
+                    getattr(message, "id", ""),
+                    reason,
+                )
                 self._warn_if_fail_closed_default()
                 return False, False
             role_authorized = bool(getattr(self, "_allowed_role_ids", set()))
