@@ -1199,18 +1199,35 @@ def run_doctor(args):
     memories_dir = hermes_home / "memories"
     if memories_dir.exists():
         check_ok(f"{_DHH}/memories/ directory exists")
-        memory_file = memories_dir / "MEMORY.md"
-        user_file = memories_dir / "USER.md"
-        if memory_file.exists():
-            size = len(memory_file.read_text(encoding="utf-8").strip())
-            check_ok(f"MEMORY.md exists ({size} chars)")
+        # Determine active memory provider. When an external provider (Mnemosyne,
+        # Honcho, Mem0, etc.) is active, the on-disk MEMORY.md/USER.md files are
+        # NOT the canonical store — reporting their existence/size is misleading
+        # (#100668). Skip those checks when an external provider is configured.
+        _active_mem_provider = ""
+        try:
+            import yaml as _yaml
+            _mem_cfg_path = hermes_home / "config.yaml"
+            if _mem_cfg_path.exists():
+                with open(_mem_cfg_path, encoding="utf-8") as _f:
+                    _mem_cfg = _yaml.safe_load(_f) or {}
+                _active_mem_provider = (_mem_cfg.get("memory") or {}).get("provider", "")
+        except Exception:
+            pass
+        if not _active_mem_provider:
+            memory_file = memories_dir / "MEMORY.md"
+            user_file = memories_dir / "USER.md"
+            if memory_file.exists():
+                size = len(memory_file.read_text(encoding="utf-8").strip())
+                check_ok(f"MEMORY.md exists ({size} chars)")
+            else:
+                check_info("MEMORY.md not created yet (will be created when the agent first writes a memory)")
+            if user_file.exists():
+                size = len(user_file.read_text(encoding="utf-8").strip())
+                check_ok(f"USER.md exists ({size} chars)")
+            else:
+                check_info("USER.md not created yet (will be created when the agent first writes a memory)")
         else:
-            check_info("MEMORY.md not created yet (will be created when the agent first writes a memory)")
-        if user_file.exists():
-            size = len(user_file.read_text(encoding="utf-8").strip())
-            check_ok(f"USER.md exists ({size} chars)")
-        else:
-            check_info("USER.md not created yet (will be created when the agent first writes a memory)")
+            check_info(f"Memory files skipped (active provider: {_active_mem_provider})")
     else:
         check_warn(f"{_DHH}/memories/ not found", "(will be created on first use)")
         if should_fix:
