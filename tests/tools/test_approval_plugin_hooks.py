@@ -256,7 +256,11 @@ class TestSmartModeFiresHooks:
             result = guard(value, "local")
 
         assert result["approved"] is True
-        assert force_values == [True, True]
+        # Two calls from the smart-approval observer payload, plus one more
+        # from the approval-audit-log hook (_log_approval_event), which also
+        # redacts with force=True since this is a non-trivial (smart-approved)
+        # decision. All three must ignore the user's redact_secrets: false.
+        assert force_values == [True, True, True]
 
     @pytest.mark.parametrize("guard,value", [
         (check_all_command_guards, "rm -rf /tmp/smart-hook-crash"),
