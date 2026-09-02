@@ -35,6 +35,7 @@ import atexit
 import importlib
 import json
 import logging
+import math
 import os
 import queue
 import sys
@@ -72,8 +73,8 @@ class _RecallResult:
 _DEFAULT_API_URL = "https://api.hindsight.vectorize.io"
 _DEFAULT_LOCAL_URL = "http://localhost:8888"
 # Keep in sync with tools/lazy_deps.py ("memory.hindsight") and plugin.yaml.
-_MIN_CLIENT_VERSION = "0.6.1"
-_DEFAULT_TIMEOUT = 120  # seconds — cloud API can take 30-40s per request
+_MIN_CLIENT_VERSION = "0.8.5"
+_DEFAULT_TIMEOUT = 120  # seconds — cloud API can take 30-40s per request. Override per-profile via timeout key in ~/.hermes/hindsight/config.json
 _DEFAULT_IDLE_TIMEOUT = 300  # seconds — Hindsight embedded daemon default
 # ``metadata.source`` stamped on retained memories — OPT-IN, empty by default.
 # AGENTS.md forbids shipping third-party attribution tags on-by-default until a
@@ -463,6 +464,55 @@ def _load_config() -> dict:
     }
 
 
+def _load_thread_routing() -> dict:
+    """Load the optional thread-scoped recall routing table.
+
+    Same resolution/fail-open discipline as _load_config(): a missing file is a
+    silent no-op (empty table); a malformed file or a bad entry is logged and
+    that entry (or the whole table) is skipped — this must never raise and
+    must never block plugin initialize(). Path is profile-scoped via
+    get_hermes_home(), same as config.json, so multi-profile setups don't
+    collide (Planner review t_a1317d5c, S3).
+
+    Format: {"<platform>:<thread_id>": {"extra_tags": [...], "domain": "...",
+    "vault_path": "..."}}. Only "extra_tags" is consumed by this plugin today;
+    "domain"/"vault_path" are inert here, reserved for future use — a SOUL-level
+    bootstrap-recipe mechanism sharing this table was considered and declined
+    2026-07-24 (Planner consult t_32e5ae5d); these fields stay for whatever else
+    ends up wanting per-thread domain/path metadata.
+    """
+    from pathlib import Path
+
+    routing_path = get_hermes_home() / "hindsight" / "thread_routing.json"
+    if not routing_path.exists():
+        return {}
+    try:
+        raw = json.loads(routing_path.read_text(encoding="utf-8"))
+    except Exception as e:
+        logger.warning("thread_routing.json is malformed, ignoring (fail-open to global recall config): %s", e)
+        return {}
+    if not isinstance(raw, dict):
+        logger.warning("thread_routing.json root is not an object, ignoring: %r", type(raw))
+        return {}
+
+    validated: dict = {}
+    for key, entry in raw.items():
+        try:
+            if not isinstance(key, str) or not isinstance(entry, dict):
+                raise ValueError("entry must be a string key -> object")
+            if entry.get("dormant"):
+                continue  # skip dormant entries — archived threads fall back to global recall config
+            extra_tags = entry.get("extra_tags", [])
+            if extra_tags is None:
+                extra_tags = []
+            if not isinstance(extra_tags, list) or not all(isinstance(t, str) for t in extra_tags):
+                raise ValueError("extra_tags must be a list of strings")
+            validated[key] = {"extra_tags": extra_tags}
+        except Exception as e:
+            logger.warning("thread_routing.json entry %r is invalid, skipping: %s", key, e)
+    return validated
+
+
 def _normalize_retain_tags(value: Any) -> List[str]:
     """Normalize tag config/tool values to a deduplicated list of strings."""
     if value is None:
@@ -548,6 +598,64 @@ def _normalize_observation_scopes(value: Any) -> Any:
         return scopes or None
 
     return None
+
+
+_VALID_MIN_SCORE_KEYS = frozenset({"semantic", "keyword", "reranker", "final"})
+
+
+def _normalize_min_scores(value: Any) -> Optional[Dict[str, float]]:
+    """Validate and normalize a ``recall_min_scores`` config value.
+
+    Returns a ``{stage: floor}`` dict ready to pass as ``min_scores`` to
+    ``client.arecall()``, or ``None`` if the config is unset / entirely invalid
+    (fail-open: no relevance floor applied).
+
+    Only the four known stage keys are accepted (0.8.5 client raises
+    ``ValueError`` on unknown keys).  Non-numeric values are dropped with a
+    ``logger.warning``.
+    """
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        logger.warning("recall_min_scores: expected dict, got %s — ignoring", type(value).__name__)
+        return None
+
+    result: Dict[str, float] = {}
+    for key, raw in value.items():
+        key_str = str(key)
+        if key_str not in _VALID_MIN_SCORE_KEYS:
+            logger.warning(
+                "recall_min_scores: unknown key %r (must be one of %s) — dropping",
+                key_str,
+                ", ".join(sorted(_VALID_MIN_SCORE_KEYS)),
+            )
+            continue
+        try:
+            v = float(raw)
+        except (TypeError, ValueError):
+            logger.warning(
+                "recall_min_scores: key %r has non-numeric value %r — dropping",
+                key_str,
+                raw,
+            )
+            continue
+        if not math.isfinite(v):
+            logger.warning(
+                "recall_min_scores: key %r has non-finite value %r — dropping",
+                key_str,
+                raw,
+            )
+            continue
+        # Range-clamp bounded stages (keyword uses BM25 which is unbounded ≥0).
+        if key_str in {"semantic", "reranker", "final"} and not (0.0 <= v <= 1.0):
+            logger.warning(
+                "recall_min_scores: %r value %s outside [0,1] — clamping",
+                key_str, v,
+            )
+            v = max(0.0, min(1.0, v))
+        result[key_str] = v
+
+    return result or None
 
 
 def _utc_timestamp() -> str:
@@ -878,6 +986,12 @@ class HindsightMemoryProvider(MemoryProvider):
         self._recall_types: list[str] = ["observation"]
         self._recall_prompt_preamble = ""
         self._recall_max_input_chars = 800
+
+        # v0.8.4+ recall parameters (prefer_observations, min_scores).
+        # Constructor defaults so any pre-initialize read never raises
+        # AttributeError. Actual values are set in initialize().
+        self._prefer_observations = False
+        self._recall_min_scores: dict | None = None
 
         # Bank
         self._bank_mission = ""
@@ -1224,6 +1338,8 @@ class HindsightMemoryProvider(MemoryProvider):
             {"key": "retain_context", "description": "Context label for retained memories", "default": "conversation between Hermes Agent and the User"},
             {"key": "recall_max_tokens", "description": "Maximum tokens for recall results", "default": 4096},
             {"key": "recall_max_input_chars", "description": "Maximum input query length for auto-recall", "default": 800},
+            {"key": "recall_min_scores", "description": "Relevance score floors applied to RECALL ONLY (not reflect — server-side limitation). Dict mapping stage name to minimum score, e.g. {\"reranker\": 0.01}. Valid stages: semantic, keyword, reranker, final.", "default": {}},
+            {"key": "prefer_observations", "description": "When recalling observation+raw facts together, drop raw facts superseded by consolidated observations. Requires Hindsight >= 0.8.4. Has no effect when recall_types is observation-only (the default).", "default": False},
             {"key": "recall_prompt_preamble", "description": "Custom preamble for recalled memories in context"},
             {"key": "timeout", "description": "API request timeout in seconds", "default": _DEFAULT_TIMEOUT},
             {"key": "idle_timeout", "description": "Embedded daemon idle timeout in seconds (0 disables auto-shutdown)", "default": _DEFAULT_IDLE_TIMEOUT, "when": {"mode": "local_embedded"}},
@@ -1704,6 +1820,31 @@ class HindsightMemoryProvider(MemoryProvider):
         )
         self._recall_tags = self._config.get("recall_tags") or None
         self._recall_tags_match = self._config.get("recall_tags_match", "any")
+
+        # Thread-scoped recall override (Step 2, Planner review t_a1317d5c).
+        # Must run AFTER the config-based assignment above, not before —
+        # placing this near where self._thread_id is first set (~line 1250)
+        # would be silently clobbered by the config read here (Planner B2).
+        # Fail-open by construction: an unmatched key, missing file, or
+        # malformed table all leave self._recall_tags/_recall_tags_match at
+        # whatever config.json already specified — zero behavior change for
+        # any thread not explicitly routed.
+        if self._platform and self._thread_id:
+            _routing_key = f"{self._platform}:{self._thread_id}"
+            _routing_table = _load_thread_routing()
+            _routing_entry = _routing_table.get(_routing_key)
+            if _routing_entry is not None:
+                _channel_tag = f"channel:{self._platform}:{self._thread_id}"
+                _override_tags = [_channel_tag] + list(_routing_entry.get("extra_tags", []))
+                self._recall_tags = _override_tags
+                # any_strict, not any (Planner S1) — "any" would also admit
+                # untagged facts, silently weakening the existing config.
+                self._recall_tags_match = "any_strict"
+                logger.info(
+                    "Hindsight thread-routing override active: key=%s recall_tags=%s recall_tags_match=%s",
+                    _routing_key, self._recall_tags, self._recall_tags_match,
+                )
+
         self._retain_source = str(
             self._config.get("retain_source") or os.environ.get("HINDSIGHT_RETAIN_SOURCE", _DEFAULT_RETAIN_SOURCE)
         ).strip()
@@ -1744,6 +1885,46 @@ class HindsightMemoryProvider(MemoryProvider):
         # when a turn is dispatched to the writer. Same off switch rationale.
         self._retain_indicator = bool(self._config.get("retain_indicator", True))
         self._recall_max_input_chars = int(self._config.get("recall_max_input_chars", 800))
+
+        # Min-scores relevance floor (RECALL ONLY — server ReflectRequest has
+        # no min_scores field, so this does NOT apply to reflect paths).
+        self._recall_min_scores = _normalize_min_scores(
+            self._config.get("recall_min_scores")
+        )
+
+        # prefer_observations: pass through to arecall when configured. When
+        # recall_types is observation-only (the default), this flag has no
+        # effect — it only matters when at least one raw type (world/experience)
+        # is also included alongside observation. See runbook C3 decision.
+        self._prefer_observations = bool(
+            self._config.get("prefer_observations", False)
+        )
+
+        # Version guard (C4): if an installed hindsight-client < 0.8.4 would
+        # not accept these params, drop them gracefully (log warning, recall
+        # still proceeds) rather than raising TypeError.
+        if self._prefer_observations or self._recall_min_scores is not None:
+            try:
+                from importlib.metadata import version as _v
+                _installed_client = _v("hindsight-client")
+                if _meets_minimum_version(_installed_client, "0.8.4") is False:
+                    logger.warning(
+                        "v0.8.4 recall params (prefer_observations / min_scores) "
+                        "require hindsight-client >= 0.8.4 (installed: %s). "
+                        "Params disabled — recall will proceed without them.",
+                        _installed_client,
+                    )
+                    self._prefer_observations = False
+                    self._recall_min_scores = None
+            except Exception:
+                logger.warning(
+                    "Could not determine hindsight-client version; disabling "
+                    "prefer_observations / min_scores params defensively — "
+                    "recall will proceed without them.",
+                )
+                self._prefer_observations = False
+                self._recall_min_scores = None
+
         self._retain_async = self._config.get("retain_async", True)
         self._prefetch_waits_for_retain = self._config.get("prefetch_waits_for_retain", True)
         self._prefetch_retain_drain_timeout = float(
@@ -1763,10 +1944,11 @@ class HindsightMemoryProvider(MemoryProvider):
                          self._bank_id_template, self._agent_identity, self._agent_workspace,
                          self._platform, self._user_id, self._bank_id)
         logger.debug("Hindsight config: auto_retain=%s, auto_recall=%s, retain_every_n=%d, "
-                     "retain_async=%s, retain_context=%s, recall_max_tokens=%d, recall_max_input_chars=%d, tags=%s, recall_tags=%s",
+                     "retain_async=%s, retain_context=%s, recall_max_tokens=%d, recall_max_input_chars=%d, "
+                     "tags=%s, recall_tags=%s, recall_min_scores=%s",
                      self._auto_retain, self._auto_recall, self._retain_every_n_turns,
                      self._retain_async, self._retain_context, self._recall_max_tokens, self._recall_max_input_chars,
-                     self._tags, self._recall_tags)
+                     self._tags, self._recall_tags, self._recall_min_scores)
 
         # For local mode, start the embedded daemon in the background so it
         # doesn't block the chat. Redirect stdout/stderr to a log file to
@@ -1900,6 +2082,10 @@ class HindsightMemoryProvider(MemoryProvider):
                 recall_kwargs["tags_match"] = self._recall_tags_match
             if self._recall_types:
                 recall_kwargs["types"] = self._recall_types
+            if self._prefer_observations:
+                recall_kwargs["prefer_observations"] = self._prefer_observations
+            if self._recall_min_scores is not None:
+                recall_kwargs["min_scores"] = self._recall_min_scores
             logger.debug("Recall: calling recall (bank=%s, query_len=%d, budget=%s)",
                          self._bank_id, len(query), self._budget)
             resp = self._run_hindsight_operation(lambda client: client.arecall(**recall_kwargs))
@@ -1991,6 +2177,8 @@ class HindsightMemoryProvider(MemoryProvider):
                 with self._prefetch_lock:
                     self._prefetch_result = recalled.text
                     self._prefetch_count = recalled.count
+
+
 
         self._prefetch_thread = threading.Thread(target=_run, daemon=True, name="hindsight-prefetch")
         self._prefetch_thread.start()
@@ -2129,6 +2317,8 @@ class HindsightMemoryProvider(MemoryProvider):
             lineage_tags.append(f"session:{self._session_id}")
         if self._parent_session_id:
             lineage_tags.append(f"parent:{self._parent_session_id}")
+        if self._platform and self._thread_id:
+            lineage_tags.append(f"channel:{self._platform}:{self._thread_id}")
 
         # Snapshot the state needed for the retain. The writer may run after
         # _session_turns / _turn_index are mutated by a later sync_turn().
@@ -2225,8 +2415,11 @@ class HindsightMemoryProvider(MemoryProvider):
                 logger.debug("Tool hindsight_retain: success")
                 return json.dumps({"result": "Memory stored successfully."})
             except Exception as e:
+                msg = f"Failed to store memory: {type(e).__name__}: {e}"
+                if isinstance(e, TimeoutError):
+                    msg += " The server may have completed the operation despite the client timeout. Do not blindly retry — verify the fact was stored via recall before retrying to avoid duplicates. See hindsight-retain-timeout-workaround.md for REST fallback."
                 logger.warning("hindsight_retain failed: %s", e, exc_info=True)
-                return tool_error(f"Failed to store memory: {e}")
+                return tool_error(msg)
 
         elif tool_name == "hindsight_recall":
             query = args.get("query", "")
@@ -2242,6 +2435,13 @@ class HindsightMemoryProvider(MemoryProvider):
                     recall_kwargs["tags_match"] = self._recall_tags_match
                 if self._recall_types:
                     recall_kwargs["types"] = self._recall_types
+                # prefer_observations: wired but inert unless recall_types
+                # includes at least one raw type (world/experience) alongside
+                # observation (dormant-by-design, runbook C3).
+                if self._prefer_observations:
+                    recall_kwargs["prefer_observations"] = self._prefer_observations
+                if self._recall_min_scores is not None:
+                    recall_kwargs["min_scores"] = self._recall_min_scores
                 logger.debug("Tool hindsight_recall: bank=%s, query_len=%d, budget=%s",
                              self._bank_id, len(query), self._budget)
                 resp = self._run_hindsight_operation(lambda client: client.arecall(**recall_kwargs))
@@ -2249,11 +2449,24 @@ class HindsightMemoryProvider(MemoryProvider):
                 logger.debug("Tool hindsight_recall: %d results", num_results)
                 if not resp.results:
                     return json.dumps({"result": "No relevant memories found."})
-                lines = [f"{i}. {r.text}" for i, r in enumerate(resp.results, 1)]
+                lines = []
+                for i, r in enumerate(resp.results, 1):
+                    prov_bits = []
+                    r_context = getattr(r, "context", None)
+                    r_tags = getattr(r, "tags", None)
+                    r_type = getattr(r, "type", None)
+                    if r_type:
+                        prov_bits.append(str(r_type))
+                    if r_context:
+                        prov_bits.append(str(r_context))
+                    if r_tags:
+                        prov_bits.append("tags=" + ",".join(r_tags))
+                    prov = f" [{'; '.join(prov_bits)}]" if prov_bits else ""
+                    lines.append(f"{i}. {r.text}{prov}")
                 return json.dumps({"result": "\n".join(lines)})
             except Exception as e:
                 logger.warning("hindsight_recall failed: %s", e, exc_info=True)
-                return tool_error(f"Failed to search memory: {e}")
+                return tool_error(f"Failed to search memory: {type(e).__name__}: {e}")
 
         elif tool_name == "hindsight_reflect":
             query = args.get("query", "")
@@ -2262,16 +2475,18 @@ class HindsightMemoryProvider(MemoryProvider):
             try:
                 logger.debug("Tool hindsight_reflect: bank=%s, query_len=%d, budget=%s",
                              self._bank_id, len(query), self._budget)
+                _reflect_tool_kwargs: dict = {"bank_id": self._bank_id, "query": query, "budget": self._budget}
+                if self._recall_tags:
+                    _reflect_tool_kwargs["tags"] = self._recall_tags
+                    _reflect_tool_kwargs["tags_match"] = self._recall_tags_match
                 resp = self._run_hindsight_operation(
-                    lambda client: client.areflect(
-                        bank_id=self._bank_id, query=query, budget=self._budget
-                    )
+                    lambda client: client.areflect(**_reflect_tool_kwargs)
                 )
                 logger.debug("Tool hindsight_reflect: response_len=%d", len(resp.text or ""))
                 return json.dumps({"result": resp.text or "No relevant memories found."})
             except Exception as e:
                 logger.warning("hindsight_reflect failed: %s", e, exc_info=True)
-                return tool_error(f"Failed to reflect: {e}")
+                return tool_error(f"Failed to reflect: {type(e).__name__}: {e}")
 
         return tool_error(f"Unknown tool: {tool_name}")
 
@@ -2335,6 +2550,8 @@ class HindsightMemoryProvider(MemoryProvider):
                 old_lineage_tags.append(f"session:{old_session_id}")
             if old_parent_session_id:
                 old_lineage_tags.append(f"parent:{old_parent_session_id}")
+            if self._platform and self._thread_id:
+                old_lineage_tags.append(f"channel:{self._platform}:{self._thread_id}")
             old_content = "[" + ",".join(old_turns) + "]"
             # Resolve doc_id + update_mode against the OLD session BEFORE
             # we rotate _session_id, so the flush lands in the old
