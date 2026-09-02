@@ -1,0 +1,189 @@
+#!/usr/bin/env python3
+"""Full-git-history secret and identity scan. Stdlib only, no dependencies.
+
+Usage:
+    history_scan.py [--personal FILE] [PATH ...]
+
+Each PATH is a git repo (bare/mirror or normal) or a directory containing
+<name>.git mirror clones. With no PATH: scans the cwd if it is a repo,
+otherwise every *.git directory inside it.
+
+Scans every blob reachable from ANY ref (git rev-list --objects --all),
+binaries included, plus commit messages and annotated tag messages, and
+reports every author/committer identity in history.
+
+Personal patterns: one regex per line (blank lines and # comments ignored)
+from --personal FILE, or ~/.hermes/personal-patterns.txt if it exists.
+The current user's username and home directory path are always checked.
+"""
+import subprocess, re, sys, os, collections
+
+SECRET_PATTERNS = [
+    ("stripe-style sk_", rb"sk_[A-Za-z0-9]{16,}"),
+    ("google-api-key", rb"AIza[0-9A-Za-z_\-]{35}"),
+    ("google-oauth-secret", rb"GOCSPX-[A-Za-z0-9_\-]{20,}"),
+    ("github-token", rb"(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})"),
+    ("aws-key", rb"AKIA[0-9A-Z]{16}"),
+    ("openai-style sk-", rb"sk-[A-Za-z0-9_\-]{20,}"),
+    ("xai-key", rb"xai-[A-Za-z0-9]{20,}"),
+    ("huggingface-token", rb"hf_[A-Za-z0-9]{30,}"),
+    ("npm-token", rb"npm_[A-Za-z0-9]{36}"),
+    ("agentmail-key", rb"\bam_[A-Za-z0-9]{20,}"),
+    ("telegram-bot-token", rb"\b[0-9]{8,10}:AA[A-Za-z0-9_\-]{33}\b"),
+    ("slack-token", rb"xox[baprs]-[A-Za-z0-9\-]{10,}"),
+    ("slack-webhook", rb"hooks\.slack\.com/services/T[A-Za-z0-9/]+"),
+    ("sendgrid-key", rb"SG\.[A-Za-z0-9_\-]{20,}\.[A-Za-z0-9_\-]{20,}"),
+    ("private-key-block", rb"-----BEGIN [A-Z ]*PRIVATE KEY"),
+    ("jwt", rb"eyJ[A-Za-z0-9_\-]{15,}\.eyJ[A-Za-z0-9_\-]{15,}"),
+    ("bearer-literal", rb"[Bb]earer\s+[A-Za-z0-9_\-\.=]{20,}"),
+    ("generic-assignment", rb"(?i)(api[_\-]?key|apikey|api_secret|client_secret|access_token|auth_token|passwd|password)[\"']?\s*[:=]\s*[\"'][^\"'\s]{8,}[\"']"),
+    # bare .env-style lines: API_KEY=value with no quotes
+    ("env-assignment", rb"(?m)^(?:export[ \t]+)?[A-Z][A-Z0-9_]*(?:KEY|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIALS?)[A-Z0-9_]*[ \t]*=[ \t]*[^\s\"'#$][^\s\"']{7,}"),
+    ("solana-keypair-json", rb"\[(?:\s*\d{1,3}\s*,){63}\s*\d{1,3}\s*\]"),
+]
+EMAIL = re.compile(rb"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}")
+EMAIL_NOISE = re.compile(rb"(?i)(example\.com|users\.noreply\.github\.com|@2x|sentry|schema|\.png|\.jpg|@[0-9]+\.[0-9]+|node_modules|@babel|@types|@keyframes|@media)")
+
+def load_personal_patterns(argv):
+    """Return ([(label, compiled_bytes_pattern)], remaining_argv)."""
+    path = None
+    if "--personal" in argv:
+        i = argv.index("--personal")
+        try:
+            path = argv[i + 1]
+        except IndexError:
+            sys.exit("--personal needs a file argument")
+        argv = argv[:i] + argv[i + 2:]
+    else:
+        default = os.path.join(
+            os.environ.get("HERMES_HOME", os.path.expanduser("~/.hermes")),
+            "personal-patterns.txt")
+        if os.path.isfile(default):
+            path = default
+
+    pats = []
+    home = os.path.expanduser("~")
+    if home and home not in ("/", "\\"):
+        pats.append(("home-path", re.compile(re.escape(home.encode()))))
+        user = os.path.basename(home.rstrip("/\\"))
+        if len(user) >= 3:
+            pats.append(("username", re.compile(rb"(?i)\b" + re.escape(user.encode()) + rb"\b")))
+    if path:
+        with open(path, "rb") as f:
+            for n, line in enumerate(f, 1):
+                line = line.strip()
+                if not line or line.startswith(b"#"):
+                    continue
+                try:
+                    pats.append((f"personal:{n}", re.compile(line)))
+                except re.error as e:
+                    print(f"!! bad personal pattern line {n}: {e}", file=sys.stderr)
+    return pats, argv
+
+def resolve_repos(paths):
+    paths = paths or ["."]
+    repos = []
+    for p in paths:
+        p = os.path.abspath(p)
+        if subprocess.run(["git", "-C", p, "rev-parse", "--git-dir"],
+                          capture_output=True).returncode == 0:
+            repos.append(p)
+        elif os.path.isdir(p):
+            sub = [os.path.join(p, d) for d in sorted(os.listdir(p)) if d.endswith(".git")]
+            if not sub:
+                print(f"!! {p}: not a repo and holds no *.git dirs", file=sys.stderr)
+            repos.extend(sub)
+        else:
+            print(f"!! {p}: no such directory", file=sys.stderr)
+    return repos
+
+def git(repo, *args, binary=False):
+    r = subprocess.run(["git", "-C", repo] + list(args), capture_output=True)
+    return r.stdout if binary else r.stdout.decode(errors="replace")
+
+def main():
+    personal, argv = load_personal_patterns(sys.argv[1:])
+    all_patterns = SECRET_PATTERNS + [(n, p.pattern) for n, p in personal]
+
+    def scan_bytes(data, hits, where):
+        for name, pat in all_patterns:
+            for m in re.finditer(pat, data):
+                frag = m.group(0)[:70]
+                hits[(name, where)].add(frag.decode(errors="replace"))
+
+    exit_hits = 0
+    for repo in resolve_repos(argv):
+        print("#" * 70)
+        print("## REPO:", repo)
+        ids = git(repo, "log", "--all", "--format=%an <%ae> | %cn <%ce>")
+        counts = collections.Counter(ids.strip().splitlines())
+        print("-- commit identities:")
+        for k, v in counts.most_common():
+            print(f"   {v:4d}x {k}")
+
+        hits = collections.defaultdict(set)
+        email_hits = collections.defaultdict(set)
+
+        msgs = git(repo, "log", "--all", "--format=%H%x00%B%x00", binary=True)
+        for chunk in msgs.split(b"\x00\x00"):
+            parts = chunk.strip(b"\n\x00").split(b"\x00", 1)
+            if len(parts) == 2:
+                scan_bytes(parts[1], hits, f"commit-msg {parts[0][:10].decode()}")
+        tags = git(repo, "tag", "-l", "--format=%(objectname) %(contents)", binary=True)
+        if tags.strip():
+            scan_bytes(tags, hits, "tag-messages")
+
+        out = git(repo, "rev-list", "--objects", "--all")
+        blobs = {}
+        for line in out.splitlines():
+            parts = line.split(" ", 1)
+            if len(parts) == 2 and parts[1]:
+                blobs.setdefault(parts[0], parts[1])
+        types = {}
+        p = subprocess.run(["git", "-C", repo, "cat-file", "--batch-check"],
+                           input="\n".join(blobs.keys()).encode(), capture_output=True)
+        for line in p.stdout.decode().splitlines():
+            parts = line.split()
+            if len(parts) >= 3 and parts[1] == "blob":
+                types[parts[0]] = int(parts[2])
+
+        nbin = 0
+        for sha, path in blobs.items():
+            if sha not in types:
+                continue
+            if types[sha] > 20_000_000:
+                print(f"   !! skipped huge blob {path} ({types[sha]}b)")
+                continue
+            data = git(repo, "cat-file", "blob", sha, binary=True)
+            is_bin = b"\x00" in data[:8192]
+            if is_bin:
+                nbin += 1
+            scan_bytes(data, hits, path)
+            if not is_bin:
+                for m in EMAIL.finditer(data):
+                    e = m.group(0)
+                    if not EMAIL_NOISE.search(e):
+                        email_hits[e.decode(errors="replace")].add(path)
+
+        print(f"-- scanned {len(types)} blobs ({nbin} binary) + commit/tag messages")
+        if hits:
+            print("-- pattern hits:")
+            for (name, where), frags in sorted(hits.items()):
+                for f in sorted(frags)[:6]:
+                    print(f"   [{name}] {where}: {f}")
+        else:
+            print("-- pattern hits: none")
+        if email_hits:
+            print("-- emails found in content:")
+            for e, paths in sorted(email_hits.items()):
+                print(f"   {e}  ({', '.join(sorted(paths)[:4])})")
+        n = sum(len(v) for v in hits.values())
+        exit_hits += n
+        print(f"RESULT: {n} pattern hit(s), {len(email_hits)} distinct content email(s)")
+        print()
+    # Nonzero exit when anything hit, so callers can gate on it. Hits still
+    # need human judgment (placeholders are fine) — this is a flag, not a verdict.
+    sys.exit(1 if exit_hits else 0)
+
+if __name__ == "__main__":
+    main()
