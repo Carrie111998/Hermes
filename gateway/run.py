@@ -2320,6 +2320,13 @@ def _profile_runtime_scope(profile_home: "Path"):
     ``.env`` here does NOT mutate ``os.environ`` — ``build_profile_secret_scope``
     returns an isolated dict — which is what keeps subprocesses (MCP, kanban)
     from inheriting cross-profile secrets.
+
+    Scope-only: this never resolves external secret sources (1Password,
+    Bitwarden, ...). Those fetches block, and this scope runs synchronously on
+    the inbound path, so a cold profile must be hydrated beforehand — via
+    ``_prehydrate_profile_secret_sources`` at secondary startup, or the
+    process-global dotenv path for the active profile. The scope only reads
+    the already-recorded per-home snapshot.
     """
     from hermes_constants import set_hermes_home_override, reset_hermes_home_override
     from agent.secret_scope import (
@@ -2327,16 +2334,26 @@ def _profile_runtime_scope(profile_home: "Path"):
         set_secret_scope,
         reset_secret_scope,
     )
-    from hermes_cli.env_loader import hydrate_profile_secret_sources
 
     home_token = set_hermes_home_override(str(profile_home))
-    hydrate_profile_secret_sources(Path(profile_home))
     secret_token = set_secret_scope(build_profile_secret_scope(Path(profile_home)))
     try:
         yield
     finally:
         reset_secret_scope(secret_token)
         reset_hermes_home_override(home_token)
+
+
+async def _prehydrate_profile_secret_sources(profile_home: "Path") -> None:
+    """Resolve one profile's external secret sources off the event loop.
+
+    ``hydrate_profile_secret_sources`` can block on a network/CLI backend, so
+    it runs in a worker thread. Must complete before the profile first enters
+    ``_profile_runtime_scope``, which is scope-only and never hydrates.
+    """
+    from hermes_cli.env_loader import hydrate_profile_secret_sources
+
+    await asyncio.to_thread(hydrate_profile_secret_sources, Path(profile_home))
 
 
 def load_gateway_config_for_runner() -> "GatewayConfig":
@@ -16160,9 +16177,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     claimed[retry_claim] = active
 
         profile_homes = _multiplex_profile_homes(self.config)
-        for profile_name, profile_home in profile_homes:
-            if profile_name == active:
-                continue  # handled by the primary startup loop
+        # The active profile is handled by the primary startup loop.
+        secondary = [(n, h) for n, h in profile_homes if n != active]
+        # Hydrate every secondary's external secret sources off-loop BEFORE any
+        # profile enters _profile_runtime_scope: the scope is synchronous and
+        # scope-only, so a cold source must be resolved here, never on the
+        # first inbound turn. Sequential on purpose — one blocking fetch at a
+        # time keeps backend rate limits and lock contention predictable.
+        for _profile_name, profile_home in secondary:
+            await _prehydrate_profile_secret_sources(profile_home)
+
+        for profile_name, profile_home in secondary:
             try:
                 connected += await self._start_one_profile_adapters(
                     profile_name, profile_home, claimed
