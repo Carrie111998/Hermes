@@ -122,7 +122,7 @@ export default function ConfigPage() {
   const [confirmReset, setConfirmReset] = useState(false);
   const { toast, showToast } = useToast();
   const fileInputRef = useRef<HTMLInputElement>(null);
-  const { t } = useI18n();
+  const { t, locale } = useI18n();
   const { setEnd } = usePageHeader();
 
   useLayoutEffect(() => {
@@ -167,7 +167,7 @@ export default function ConfigPage() {
       .then(setConfig)
       .catch(() => {});
     api
-      .getSchema()
+      .getSchema(locale)
       .then((resp) => {
         // memory.provider has a dedicated management UI on the Plugins page
         // (provider cards + guided setup/switch flow). Hide it from the
@@ -200,7 +200,7 @@ export default function ConfigPage() {
       .getStatus()
       .then((resp) => setConfigPath((prev) => prev ?? resp.config_path))
       .catch(() => {});
-  }, []);
+  }, [locale]);
 
   // Set active category when categories load
   useEffect(() => {

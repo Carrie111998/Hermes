@@ -522,7 +522,10 @@ export const api = {
   getConfig: (profile = getManagementProfile()) =>
     fetchJSON<Record<string, unknown>>(appendProfileParam("/api/config", profile)),
   getDefaults: () => fetchJSON<Record<string, unknown>>("/api/config/defaults"),
-  getSchema: () => fetchJSON<{ fields: Record<string, unknown>; category_order: string[] }>("/api/config/schema"),
+  getSchema: (lang?: string) =>
+    fetchJSON<{ fields: Record<string, unknown>; category_order: string[] }>(
+      `/api/config/schema${lang ? `?lang=${encodeURIComponent(lang)}` : ""}`,
+    ),
   getModelInfo: (profile = getManagementProfile()) =>
     fetchJSON<ModelInfoResponse>(appendProfileParam("/api/model/info", profile)),
   getModelOptions: (
