@@ -477,6 +477,24 @@ class TestOrphanedPipeReconciliation:
         except (ProcessLookupError, PermissionError):
             pass
 
+    def test_count_running_reconciles_exited_local_process(self, registry):
+        """Status-bar counts should not stay stale after a child exits."""
+        proc = MagicMock()
+        proc.poll.return_value = 0
+        proc.stdout = None
+        s = _make_session(sid="proc_status_bar_stale")
+        s.process = proc
+        s.pid = 12345
+        registry._running[s.id] = s
+
+        with patch.object(registry, "_write_checkpoint"):
+            assert registry.count_running() == 0
+
+        assert s.exited is True
+        assert s.exit_code == 0
+        assert s.id in registry._finished
+        assert s.id not in registry._running
+
     def test_wait_returns_when_reader_blocked(self, registry):
         """wait() must also reconcile — not just poll()."""
         proc = subprocess.Popen(
