@@ -2119,6 +2119,10 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 return _message_agent_tool(
                     target=next_args.get("target", ""),
                     message=next_args.get("message", ""),
+                    # Optional structured facts; validated in the tool, and
+                    # rendered into the delivered turn as a JSON block. Absent
+                    # for every caller that does not set it.
+                    context=next_args.get("context"),
                     task_id=effective_task_id,
                     agent=agent,
                 )
