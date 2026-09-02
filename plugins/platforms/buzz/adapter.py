@@ -1964,6 +1964,19 @@ class BuzzAdapter(BasePlatformAdapter):
                                         # Clean close raced the probe — treat
                                         # it like a clean close above.
                                         break
+                                    except AttributeError:
+                                        # The transport implementation does not
+                                        # expose a ping probe (different
+                                        # websockets generation / fake in
+                                        # tests): we cannot judge liveness, so
+                                        # fall back to the pre-#101160 read-idle
+                                        # behaviour and force the reconnect
+                                        # path.
+                                        raise ConnectionError(
+                                            f"no WebSocket frame for "
+                                            f"{_WS_READ_IDLE_TIMEOUT:.0f}s; "
+                                            "assuming the connection went silent"
+                                        ) from None
                                     # Probe answered: the transport is alive and
                                     # merely quiet — skip frame processing and
                                     # keep waiting for the next application

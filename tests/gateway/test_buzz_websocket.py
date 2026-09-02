@@ -140,12 +140,16 @@ async def test_websocket_loop_reconnects_when_read_goes_silent(monkeypatch, capl
 
     Reproduces the #98097 shape: a socket stuck in CLOSE_WAIT yields no
     frame and no error, so without a read-side bound the loop would wait
-    forever while the gateway keeps reporting "connected".
+    forever while the gateway keeps reporting "connected".  Per #101160 the
+    idle bound first probes liveness with a protocol ping — a wedged
+    CLOSE_WAIT socket answers NO protocol ping either, so the probe times
+    out and the reconnect path fires exactly as before.
     """
     import logging
 
     adapter = _make_adapter()
     monkeypatch.setattr(_buzz_mod, "_WS_READ_IDLE_TIMEOUT", 0.05)
+    monkeypatch.setattr(_buzz_mod, "_WS_READ_IDLE_PROBE_TIMEOUT", 0.05)
     caplog.set_level(logging.WARNING)
 
     sockets = []
@@ -155,6 +159,12 @@ async def test_websocket_loop_reconnects_when_read_goes_silent(monkeypatch, capl
 
     def fake_connect(*args, **kwargs):
         ws = _ScriptedWebSocket(dead_anext)
+        # A wedged socket cannot complete a ping/pong round-trip either —
+        # the liveness probe must time out and still force the reconnect.
+        async def _dead_ping():
+            await asyncio.Event().wait()  # never answers the probe
+
+        ws.ping = _dead_ping
         sockets.append(ws)
         return ws
 
