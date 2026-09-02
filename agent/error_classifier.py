@@ -1599,6 +1599,31 @@ def _classify_402(error_msg: str, result_fn) -> ClassifiedError:
     )
 
 
+def _is_codex_masked_replay_rejection(
+    error_msg: str, error_code: str, provider: str
+) -> bool:
+    """True when a Codex OAuth 400 masks an encrypted-reasoning replay rejection.
+
+    The ChatGPT Codex backend masks certain failures behind a generic
+    ``400 invalid_prompt "Request blocked."`` envelope. After the
+    Harmony-token defang (#68087, salvaged via #75860) the primary trigger
+    is fixed at the source, but a rejected encrypted-reasoning replay still
+    surfaces this way, and the generic format-error bucket burns retries
+    and force-falls back although the strip-replay repair for the sibling
+    ``invalid_encrypted_content`` reason applies verbatim (#92353).
+
+    Deliberately narrow: exact error code + exact message + codex provider
+    slug, so a genuine ``invalid_prompt`` from any other route (or any
+    other provider) is untouched.
+    """
+    if (error_code or "").strip().lower() != "invalid_prompt":
+        return False
+    if "request blocked" not in (error_msg or ""):
+        return False
+    provider_slug = (provider or "").strip().lower()
+    return "codex" in provider_slug
+
+
 def _classify_400(
     error_msg: str,
     error_code: str,
@@ -1683,6 +1708,22 @@ def _classify_400(
             retryable=True,
             # The request shape was fine — never route this into compression.
             should_compress=False,
+        )
+
+    # Masked Codex replay rejection: the ChatGPT Codex OAuth backend hides
+    # encrypted-reasoning replay failures behind a generic 400
+    # ``invalid_prompt "Request blocked."`` envelope. Classify it as the
+    # sibling invalid_encrypted_content reason so the existing one-shot
+    # strip-replay-and-retry recovery applies (#92353). The repair path is
+    # self-guarding — it fires only in codex_responses mode with actual
+    # cached codex_reasoning_items and only once — so a genuinely
+    # unrelated "Request blocked." still reaches the normal retry path
+    # after the single repair attempt instead of looping.
+    if _is_codex_masked_replay_rejection(error_msg, error_code, provider):
+        return result_fn(
+            FailoverReason.invalid_encrypted_content,
+            retryable=True,
+            should_fallback=False,
         )
 
     # Request-validation errors (unsupported / unknown parameter) MUST be

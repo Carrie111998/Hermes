@@ -1580,3 +1580,57 @@ class TestServerInjectedParameterRejection:
         assert result.retryable is False
 
 
+
+
+class TestCodexMaskedReplayRejection:
+    """#92353 - the Codex OAuth backend masks encrypted-reasoning replay
+    failures behind a generic 400 ``invalid_prompt "Request blocked."``
+    envelope. It must classify as invalid_encrypted_content so the existing
+    one-shot strip-replay-and-retry recovery fires instead of burning
+    retries and force-falling back."""
+
+    MASKED_BODY = {"error": {"code": "invalid_prompt", "message": "Request blocked."}}
+
+    def test_masked_envelope_routes_to_invalid_encrypted_content(self):
+        e = MockAPIError("Request blocked.", status_code=400, body=self.MASKED_BODY)
+        result = classify_api_error(e, provider="openai-codex")
+        assert result.reason == FailoverReason.invalid_encrypted_content
+        assert result.retryable is True
+        assert result.should_fallback is False
+
+    def test_same_envelope_from_other_provider_is_untouched(self):
+        e = MockAPIError("Request blocked.", status_code=400, body=self.MASKED_BODY)
+        result = classify_api_error(e, provider="openrouter")
+        assert result.reason != FailoverReason.invalid_encrypted_content
+
+    def test_invalid_prompt_with_other_message_is_untouched(self):
+        e = MockAPIError(
+            "Missing required parameter: 'model'.",
+            status_code=400,
+            body={"error": {"code": "invalid_prompt",
+                            "message": "Missing required parameter: 'model'."}},
+        )
+        result = classify_api_error(e, provider="openai-codex")
+        assert result.reason != FailoverReason.invalid_encrypted_content
+
+    def test_request_blocked_with_other_code_is_untouched(self):
+        e = MockAPIError(
+            "Request blocked.",
+            status_code=400,
+            body={"error": {"code": "content_policy_violation",
+                            "message": "Request blocked."}},
+        )
+        result = classify_api_error(e, provider="openai-codex")
+        assert result.reason != FailoverReason.invalid_encrypted_content
+
+    def test_cybersecurity_refusal_still_wins(self):
+        """#18028 refusal phrasing must not be swept into the replay repair."""
+        e = MockAPIError(
+            "Request blocked. flagged for possible cybersecurity risk",
+            status_code=400,
+            body={"error": {"code": "invalid_prompt",
+                            "message": "Request blocked. flagged for possible "
+                                       "cybersecurity risk"}},
+        )
+        result = classify_api_error(e, provider="openai-codex")
+        assert result.reason != FailoverReason.invalid_encrypted_content
