@@ -2520,7 +2520,9 @@ def switch_model(
         base_url = normalize_opencode_base_url(target_provider, api_mode, base_url)
 
     # --- Get capabilities (legacy) ---
-    capabilities = get_model_capabilities(target_provider, new_model, allow_network=True)
+    capabilities = get_model_capabilities(
+        target_provider, new_model, base_url=base_url, allow_network=True
+    )
     from agent.native_compaction import resolve_native_compaction_capabilities
     runtime_capabilities = resolve_native_compaction_capabilities(
         model=new_model,
@@ -2530,7 +2532,9 @@ def switch_model(
     )
 
     # --- Get full model info from models.dev ---
-    model_info = get_model_info(target_provider, new_model, allow_network=True)
+    model_info = get_model_info(
+        target_provider, new_model, base_url=base_url, allow_network=True
+    )
 
     # --- Collect warnings ---
     warnings: list[str] = []
