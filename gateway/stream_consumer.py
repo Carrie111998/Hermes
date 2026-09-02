@@ -512,6 +512,7 @@ class GatewayStreamConsumer:
             meta["expect_edits"] = True
         if final:
             meta["notify"] = True
+            meta["final"] = True
         return meta or None
 
     @property
