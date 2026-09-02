@@ -8,6 +8,7 @@ Exposes an HTTP server with endpoints:
 - DELETE /v1/responses/{response_id} — Delete a stored response
 - GET  /v1/models                  — lists hermes-agent and any configured model_routes aliases
 - GET  /v1/capabilities            — machine-readable API capabilities for external UIs
+- GET  /api/projects               — list projects and discovered repos with session counts
 - GET  /api/sessions               — list client-visible Hermes sessions
 - POST /api/sessions               — create an empty Hermes session
 - GET/PATCH/DELETE /api/sessions/{session_id} — read/update/delete a session
@@ -2234,6 +2235,7 @@ class APIServerAdapter(BasePlatformAdapter):
             ("GET", "/v1/artifacts/download/{artifact_id}", self._handle_artifact_download),
             ("GET", "/v1/skills", self._handle_skills),
             ("GET", "/v1/toolsets", self._handle_toolsets),
+            ("GET", "/api/projects", self._handle_list_projects),
             ("GET", "/api/sessions", self._handle_list_sessions),
             ("POST", "/api/sessions", self._handle_create_session),
             ("GET", "/api/sessions/{session_id}", self._handle_get_session),
@@ -3470,6 +3472,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "run_approval_response": True,
                 "tool_progress_events": True,
                 "approval_events": True,
+                "project_resources": True,
                 "session_resources": True,
                 "model_options": True,
                 "session_chat": True,
@@ -3527,6 +3530,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "run_stop": {"method": "POST", "path": "/v1/runs/{run_id}/stop"},
                 "skills": {"method": "GET", "path": "/v1/skills"},
                 "toolsets": {"method": "GET", "path": "/v1/toolsets"},
+                "projects": {"method": "GET", "path": "/api/projects"},
                 "sessions": {"method": "GET", "path": "/api/sessions"},
                 "session_create": {"method": "POST", "path": "/api/sessions"},
                 "session": {"method": "GET", "path": "/api/sessions/{session_id}"},
@@ -4280,7 +4284,148 @@ class APIServerAdapter(BasePlatformAdapter):
         return min(parsed, maximum)
 
     @staticmethod
-    def _session_response(session: Dict[str, Any]) -> Dict[str, Any]:
+    def _workspace_path_segments(path: Any) -> tuple[str, ...]:
+        """Return cross-platform path segments suitable for identity checks.
+
+        A remote profile can contain Windows paths even when a control-plane
+        client is running on POSIX. Preserve POSIX case sensitivity while
+        treating drive-letter, UNC, and backslash-rooted paths as Windows.
+        """
+        value = str(path or "").strip().rstrip("/\\")
+        if not value:
+            return ()
+        segments = tuple(part for part in re.split(r"[/\\]+", value) if part)
+        is_windows = bool(re.match(r"^[A-Za-z]:[/\\]", value)) or value.startswith(
+            ("\\", "//")
+        )
+        return tuple(part.casefold() for part in segments) if is_windows else segments
+
+    @classmethod
+    def _load_project_snapshot(
+        cls,
+        project_db_path: Path,
+        sessions: List[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        """Read the project catalog and associate/count ``sessions``.
+
+        The path is captured on aiohttp's profile-scoped request task before
+        this function is offloaded, rather than making correctness depend on
+        runtime-scope propagation into an executor. A missing DB is a valid
+        empty state and must stay read-only: probing this API does not create
+        projects.db.
+        """
+        empty = {
+            "projects": [],
+            "discovered_repos": [],
+            "active_id": None,
+            "session_projects": [None for _ in sessions],
+        }
+        if not project_db_path.is_file():
+            return empty
+
+        from hermes_cli import projects_db as pdb
+
+        with pdb.connect_closing(project_db_path) as conn:
+            projects = pdb.list_projects(conn)
+            discovered = pdb.list_discovered_repos(conn)
+            active_id = pdb.get_active_id(conn)
+
+        project_matches: List[tuple[tuple[str, ...], Dict[str, Any]]] = []
+        project_rows: List[Dict[str, Any]] = []
+        project_counts: Dict[str, int] = {}
+        for project in projects:
+            row = project.to_dict()
+            project_rows.append(row)
+            project_counts[project.id] = 0
+            for folder in project.folders:
+                parts = cls._workspace_path_segments(folder.path)
+                if parts:
+                    project_matches.append((parts, row))
+        project_matches.sort(key=lambda item: len(item[0]), reverse=True)
+
+        discovered_rows = [dict(repo) for repo in discovered]
+        discovered_counts = [0 for _ in discovered_rows]
+        discovered_matches = sorted(
+            (
+                (parts, index)
+                for index, repo in enumerate(discovered_rows)
+                if (parts := cls._workspace_path_segments(repo.get("root")))
+            ),
+            key=lambda item: len(item[0]),
+            reverse=True,
+        )
+
+        session_projects: List[Optional[Dict[str, Any]]] = []
+        for session in sessions:
+            # Explicit Project membership follows the desktop contract: check
+            # both the selected cwd and the persisted common git root, and let
+            # the most-specific declared project folder win.
+            candidates = [session.get("cwd"), session.get("git_repo_root")]
+            candidate_parts = [
+                cls._workspace_path_segments(candidate)
+                for candidate in candidates
+                if str(candidate or "").strip()
+            ]
+            project_row = next(
+                (
+                    row
+                    for folder_parts, row in project_matches
+                    if any(
+                        parts[: len(folder_parts)] == folder_parts
+                        for parts in candidate_parts
+                    )
+                ),
+                None,
+            )
+            session_projects.append(project_row)
+            if project_row is not None:
+                project_counts[project_row["id"]] += 1
+
+            # A discovered repo is an auto-workspace. Assign each session to
+            # at most one cache row (the deepest matching root), preventing a
+            # nested repo from inflating all of its ancestors' counts.
+            discovered_index = next(
+                (
+                    index
+                    for root_parts, index in discovered_matches
+                    if any(
+                        parts[: len(root_parts)] == root_parts
+                        for parts in candidate_parts
+                    )
+                ),
+                None,
+            )
+            if discovered_index is not None:
+                discovered_counts[discovered_index] += 1
+
+        for row in project_rows:
+            row["session_count"] = project_counts[row["id"]]
+        for index, row in enumerate(discovered_rows):
+            row["session_count"] = discovered_counts[index]
+
+        visible_ids = {row["id"] for row in project_rows}
+        return {
+            "projects": project_rows,
+            "discovered_repos": discovered_rows,
+            "active_id": active_id if active_id in visible_ids else None,
+            "session_projects": session_projects,
+        }
+
+    async def _project_snapshot_for_sessions(
+        self, sessions: List[Dict[str, Any]]
+    ) -> Dict[str, Any]:
+        """Capture the active profile path, then read it off-loop."""
+        from hermes_cli import projects_db as pdb
+
+        project_db_path = pdb.projects_db_path()
+        return await asyncio.to_thread(
+            self._load_project_snapshot, project_db_path, sessions
+        )
+
+    @staticmethod
+    def _session_response(
+        session: Dict[str, Any], project: Optional[Dict[str, Any]] = None
+    ) -> Dict[str, Any]:
         """Return a stable, client-safe session representation."""
         safe_keys = (
             "id", "source", "user_id", "model", "title", "started_at", "ended_at",
@@ -4288,7 +4433,8 @@ class APIServerAdapter(BasePlatformAdapter):
             "output_tokens", "cache_read_tokens", "cache_write_tokens",
             "reasoning_tokens", "estimated_cost_usd", "actual_cost_usd",
             "api_call_count", "parent_session_id", "last_active", "preview",
-            "_lineage_root_id", "pinned", "archived", "hidden",
+            "_lineage_root_id", "pinned", "archived", "hidden", "cwd",
+            "git_repo_root",
         )
         payload = {key: session.get(key) for key in safe_keys if key in session}
         # SQLite stores these as 0/1; clients reconcile against a real boolean.
@@ -4299,7 +4445,28 @@ class APIServerAdapter(BasePlatformAdapter):
         # callers only need to know whether those snapshots exist.
         payload["has_system_prompt"] = bool(session.get("system_prompt"))
         payload["has_model_config"] = bool(session.get("model_config"))
+        payload["project_id"] = project.get("id") if project else None
+        payload["project_slug"] = project.get("slug") if project else None
         return payload
+
+    async def _session_responses(
+        self, sessions: List[Dict[str, Any]]
+    ) -> List[Dict[str, Any]]:
+        """Serialize sessions with best-effort Project associations."""
+        try:
+            snapshot = await self._project_snapshot_for_sessions(sessions)
+            projects = snapshot["session_projects"]
+        except Exception:
+            logger.warning(
+                "[%s] Failed to resolve session Project associations",
+                self.name,
+                exc_info=True,
+            )
+            projects = [None for _ in sessions]
+        return [
+            self._session_response(session, project)
+            for session, project in zip(sessions, projects)
+        ]
 
     @staticmethod
     def _message_response(message: Dict[str, Any]) -> Dict[str, Any]:
@@ -4342,6 +4509,51 @@ class APIServerAdapter(BasePlatformAdapter):
         except Exception as exc:
             logger.warning("Failed to load session history for %s: %s", session_id, exc)
             return []
+
+    async def _handle_list_projects(self, request: "web.Request") -> "web.Response":
+        """GET /api/projects — list read-only workspace metadata and counts."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        db = await self._ensure_session_db_async()
+        if db is None:
+            return web.json_response(
+                _openai_error(
+                    "Session database unavailable", code="session_db_unavailable"
+                ),
+                status=503,
+            )
+
+        try:
+            # Counts follow the same visibility contract as GET /api/sessions:
+            # active, non-hidden, client-visible conversations only. LIMIT -1
+            # is SQLite's unbounded form, so counts do not depend on a page.
+            sessions = await asyncio.to_thread(
+                db.list_sessions_rich,
+                limit=-1,
+                include_children=False,
+                order_by_last_active=False,
+                compact_rows=True,
+            )
+            snapshot = await self._project_snapshot_for_sessions(sessions)
+        except Exception:
+            logger.exception("[%s] GET /api/projects failed", self.name)
+            return web.json_response(
+                _openai_error(
+                    "Failed to list projects", code="project_list_failed"
+                ),
+                status=500,
+            )
+
+        return web.json_response(
+            {
+                "object": "list",
+                "data": snapshot["projects"],
+                "discovered_repos": snapshot["discovered_repos"],
+                "active_id": snapshot["active_id"],
+            }
+        )
 
     async def _handle_list_sessions(self, request: "web.Request") -> "web.Response":
         """GET /api/sessions — list persisted Hermes sessions."""
@@ -4411,9 +4623,10 @@ class APIServerAdapter(BasePlatformAdapter):
         # Back-filled pins arrive PAST the limit, so counting them would report
         # another page that doesn't exist. Only the recency window decides.
         windowed = sum(1 for s in sessions if not s.get("pinned"))
+        session_payloads = await self._session_responses(sessions)
         return web.json_response({
             "object": "list",
-            "data": [self._session_response(s) for s in sessions],
+            "data": session_payloads,
             "limit": limit,
             "offset": offset,
             "has_more": windowed >= limit,
@@ -4548,7 +4761,8 @@ class APIServerAdapter(BasePlatformAdapter):
         session, err = await self._get_existing_session_or_404(request.match_info["session_id"])
         if err:
             return err
-        return web.json_response({"object": "hermes.session", "session": self._session_response(session)})
+        payload = (await self._session_responses([session]))[0]
+        return web.json_response({"object": "hermes.session", "session": payload})
 
     async def _handle_patch_session(self, request: "web.Request") -> "web.Response":
         """PATCH /api/sessions/{session_id} — update client-safe session metadata."""
