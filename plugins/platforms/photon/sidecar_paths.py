@@ -45,15 +45,32 @@ logger = logging.getLogger(__name__)
 
 SOURCE_SIDECAR_DIR = Path(__file__).parent / "sidecar"
 
-# The files that define the sidecar. Mirrored into the writable runtime dir
-# when the install tree is read-only. node_modules is deliberately absent —
-# it is either baked (managed image) or installed by npm in the mirror.
-_MIRROR_FILES = (
-    "index.mjs",
-    "package.json",
-    "package-lock.json",
-    "patch-spectrum-mixed-attachments.mjs",
-)
+# Suffixes that make up the mirrored sidecar payload: the ES modules the
+# entrypoint (transitively) imports plus the npm manifests ``npm ci`` needs.
+# node_modules is deliberately absent — it is either baked (managed image)
+# or installed by npm in the mirror.
+_MIRROR_SUFFIXES = frozenset({".mjs", ".json"})
+
+
+def _mirror_files(source: Path) -> tuple:
+    """Derive the mirror set from the source tree, not a hardcoded list.
+
+    A hardcoded list missed ``send-format.mjs``/``stream-staleness.mjs``
+    once ``index.mjs`` started importing them: on read-only installs the
+    mirrored sidecar crash-looped with ERR_MODULE_NOT_FOUND, and after a
+    hand-repair the unlisted files were never refreshed on later resolves,
+    silently skewing versions (#100031). Scanning the tree means a newly
+    added sidecar module is mirrored without anyone remembering to update
+    this module. Raises OSError on an unreadable source; the caller's
+    mirror path already treats that as "fall back to the source dir".
+    """
+    return tuple(
+        sorted(
+            entry.name
+            for entry in source.iterdir()
+            if entry.is_file() and entry.suffix in _MIRROR_SUFFIXES
+        )
+    )
 
 
 def dir_writable(path: Path) -> bool:
@@ -122,7 +139,7 @@ def resolve_sidecar_dir(source_dir: Optional[Path] = None) -> Path:
     mirror = get_hermes_home() / "photon" / "sidecar"
     try:
         mirror.mkdir(parents=True, exist_ok=True)
-        for name in _MIRROR_FILES:
+        for name in _mirror_files(source):
             src = source / name
             if not src.exists():
                 continue
