@@ -112,6 +112,27 @@ class TestConfigYamlRouting:
         assert "not a recognized config key" not in capsys.readouterr().out
         assert "script_timeout_seconds: 600" in _read_config(_isolated_hermes_home)
 
+    def test_global_reasoning_effort_is_recognized(self, _isolated_hermes_home, capsys):
+        """The global reasoning setting must not be mistaken for its override sibling."""
+        set_config_value("agent.reasoning_effort", "high")
+
+        output = capsys.readouterr().out
+        assert "not a recognized config key" not in output
+        assert "Did you mean: agent.reasoning_overrides" not in output
+        assert "reasoning_effort: high" in _read_config(_isolated_hermes_home)
+
+    @pytest.mark.parametrize("value", ["off", "no"])
+    def test_global_reasoning_effort_cli_disable_aliases(
+        self, _isolated_hermes_home, value
+    ):
+        """String-preserving config writes must keep disable aliases effective."""
+        set_config_value("agent.reasoning_effort", value)
+
+        from hermes_cli.config import load_config
+        from hermes_constants import resolve_reasoning_config
+
+        assert resolve_reasoning_config(load_config()) == {"enabled": False}
+
     def test_memory_nudge_interval_is_recognized(self, _isolated_hermes_home, capsys):
         """The documented background-memory review interval is runtime config."""
         set_config_value("memory.nudge_interval", "0")
@@ -547,6 +568,7 @@ class TestValidateConfigKey:
         "platforms.discord.enabled",
         "gateway.platforms.my_platform.extra.token",
         "approvals.mode",
+        "agent.reasoning_effort",
     ])
     def test_known_keys_pass(self, key):
         from hermes_cli.config import _validate_config_key
