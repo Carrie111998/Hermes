@@ -229,14 +229,15 @@ def _safe_result_filename(tool_use_id: str) -> str:
 
 
 def generate_preview(content: str, max_chars: int = DEFAULT_PREVIEW_SIZE_CHARS) -> tuple[str, bool]:
-    """Truncate at last newline within max_chars. Returns (preview, has_more)."""
+    """Return a bounded head/tail preview and whether content was omitted."""
+    if max_chars <= 0:
+        return "", bool(content)
     if len(content) <= max_chars:
         return content, False
-    truncated = content[:max_chars]
-    last_nl = truncated.rfind("\n")
-    if last_nl > max_chars // 2:
-        truncated = truncated[:last_nl + 1]
-    return truncated, True
+    head_chars = (max_chars + 1) // 2
+    tail_chars = max_chars // 2
+    tail = content[-tail_chars:] if tail_chars else ""
+    return content[:head_chars] + tail, True
 
 
 def _heredoc_marker(content: str) -> str:
@@ -287,7 +288,7 @@ def _build_persisted_message(
         "process it with execute_code — do NOT re-request the same data from the "
         "remote API; the full result is already on disk.\n\n"
     )
-    msg += f"Preview (first {len(preview)} chars):\n"
+    msg += f"Preview (head/tail, {len(preview)} chars):\n"
     msg += preview
     if has_more:
         msg += "\n..."

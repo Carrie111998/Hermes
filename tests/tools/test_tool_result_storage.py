@@ -42,6 +42,29 @@ class TestGeneratePreview:
         assert preview == text
         assert has_more is False
 
+    def test_oversized_content_retains_tail_signal(self):
+        text = "HEAD-SIGNAL\n" + ("middle\n" * 100) + "TAIL-SIGNAL"
+
+        preview, has_more = generate_preview(text, max_chars=80)
+
+        assert preview.startswith("HEAD-SIGNAL")
+        assert preview.endswith("TAIL-SIGNAL")
+        assert len(preview) <= 80
+        assert has_more is True
+
+    def test_one_character_budget_stays_bounded(self):
+        preview, has_more = generate_preview("oversized", max_chars=1)
+
+        assert preview == "o"
+        assert has_more is True
+
+    @pytest.mark.parametrize("max_chars", [0, -1])
+    def test_non_positive_budget_returns_empty_preview(self, max_chars):
+        preview, has_more = generate_preview("oversized", max_chars=max_chars)
+
+        assert preview == ""
+        assert has_more is True
+
 
 # ── _heredoc_marker ───────────────────────────────────────────────────
 
@@ -155,6 +178,7 @@ class TestBuildPersistedMessage:
         assert "/tmp/hermes-results/test123.txt" in msg
         assert "read_file" in msg
         assert "first 100 chars..." in msg
+        assert "Preview (head/tail, 18 chars):" in msg
         assert "..." in msg  # has_more indicator
 
 
