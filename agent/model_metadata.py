@@ -3466,6 +3466,17 @@ def get_model_context_length(
         ctx = _resolve_endpoint_context_length(model, base_url, api_key=api_key)
         if ctx is not None:
             return ctx
+    if effective_provider == "vulpy" and base_url:
+        # Vulpy-branded OpenAI-compatible gateways (e.g. gateway.vulpy.io)
+        # advertise authoritative per-model context windows via /v1/models
+        # (max_input_tokens field) when their underlying LiteLLM version
+        # supports it.  Probe the live endpoint so clients automatically
+        # pick up the correct window without needing a hardcoded override.
+        ctx = _resolve_endpoint_context_length(model, base_url, api_key=api_key)
+        if ctx is not None:
+            if not _skip_persistent_context_cache(base_url, provider):
+                save_context_length(model, base_url, ctx)
+            return ctx
     # 5e. Ollama native /api/show probe — runs for providers whose base_url
     # is NOT a known non-Ollama provider.  Ollama-compatible servers expose
     # this endpoint regardless of hostname (local Ollama, Ollama Cloud,
