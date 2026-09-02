@@ -19736,7 +19736,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             _init_notes = event.get_command_args().strip()
             try:
-                _init_prompt = build_init_prompt_for_cwd(extra=_init_notes)
+                # Resolve the SESSION's active directory (its terminal cwd
+                # record, then the configured/pinned cwd) — not the gateway
+                # process's launch dir, which is the home directory on the
+                # desktop app and would scan/update the wrong AGENTS.md.
+                _init_prompt = build_init_prompt_for_cwd(
+                    extra=_init_notes,
+                    session_key=self._session_key_for_source(source),
+                )
             except Exception:
                 return "Could not start /init — please try again."
             _ack = (

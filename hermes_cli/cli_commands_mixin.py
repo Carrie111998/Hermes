@@ -2285,7 +2285,9 @@ class CLICommandsMixin:
         parts = cmd.strip().split(None, 1)
         extra = parts[1].strip() if len(parts) > 1 else ""
 
-        msg = build_init_prompt_for_cwd(extra=extra)
+        # session_key="" targets the single-session CLI's "default" cwd record
+        # (tracks `cd` / workspace switches); falls back to the process cwd.
+        msg = build_init_prompt_for_cwd(extra=extra, session_key="")
         if "UPDATE the existing AGENTS.md" in msg:
             print("\n⚡ Updating AGENTS.md from a project scan...")
         else:

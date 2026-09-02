@@ -636,9 +636,35 @@ def _(rid, params: dict) -> dict:
         # submit it as a normal agent turn (same pattern as /learn). The live
         # agent scans the project with its own read-only tools and writes or
         # merge-updates AGENTS.md via write_file. Works on any backend.
+        #
+        # Resolve the session's ACTIVE directory, not the process cwd: on the
+        # desktop app the process launches from the home directory, so a bare
+        # os.getcwd() fallback scanned/updated the HOME's AGENTS.md instead
+        # of the project the session is attached to. The terminal cwd record
+        # (seeded when the workspace attaches, updated after every `cd`) is
+        # the live source; the session's attached workspace is the fallback.
         from hermes_cli.init_command import build_init_prompt_for_cwd
 
-        return _ok(rid, {"type": "send", "message": build_init_prompt_for_cwd(extra=arg)})
+        _init_skey = session.get("session_key") if session else None
+        try:
+            from tools.terminal_tool import get_session_cwd
+
+            _init_cwd = get_session_cwd(_init_skey) if _init_skey else None
+        except Exception:
+            _init_cwd = None
+        if not _init_cwd and session:
+            _init_cwd = _session_cwd(session)
+        return _ok(
+            rid,
+            {
+                "type": "send",
+                "message": build_init_prompt_for_cwd(
+                    extra=arg,
+                    cwd=_init_cwd,
+                    session_key=_init_skey,
+                ),
+            },
+        )
     if name == "moa":
         # /moa is one-shot sugar only: run a single prompt through the default
         # MoA preset, then restore the prior model. To *switch* to a MoA preset
