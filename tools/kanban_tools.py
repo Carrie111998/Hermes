@@ -255,22 +255,38 @@ def _goal_mode_handoff_rejection(task, evidence: str) -> Optional[str]:
     """Return a rejection reason when a goal-mode terminal handoff is premature."""
     if not task or not task.goal_mode or not _goal_judge_available():
         return None
-    verdict = "done"
-    reason = ""
+    verdict = "continue"
+    reason = "goal judge failed without a classified transport error"
+    parse_failed = True
+    transport_failed = False
     try:
-        verdict, reason, _, _, _ = judge_goal(
+        verdict, reason, parse_failed, _, transport_failed = judge_goal(
             goal=f"{task.title}\n\n{task.body or ''}".strip(),
             last_response=evidence.strip(),
         )
+        if (
+            verdict not in {"done", "continue", "wait", "skipped"}
+            or not isinstance(reason, str)
+            or not isinstance(parse_failed, bool)
+            or not isinstance(transport_failed, bool)
+        ):
+            raise ValueError("invalid goal judge return contract")
     except Exception as judge_exc:
-        # Keep the existing fail-open semantics: an unavailable/broken
-        # auxiliary judge must not permanently wedge goal-mode work.
+        # Provider/network failures are classified by judge_goal via
+        # transport_failed=True. Unclassified exceptions and malformed return
+        # contracts are implementation failures, so they must not bypass the
+        # goal-mode acceptance gate.
         logger.warning(
-            "goal judge check failed, allowing lifecycle handoff: %s",
+            "goal judge check failed, rejecting lifecycle handoff: %s",
             judge_exc,
             exc_info=True,
         )
-    return reason if verdict != "done" else None
+        return f"judge error: {type(judge_exc).__name__}"
+    if transport_failed is True:
+        return None
+    if parse_failed or verdict != "done":
+        return reason or "goal judge response could not be validated"
+    return None
 
 
 # ---------------------------------------------------------------------------
