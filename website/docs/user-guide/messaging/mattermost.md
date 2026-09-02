@@ -252,6 +252,20 @@ Behavior:
 
 See also: [admin/user slash command split](../../reference/slash-commands.md#permissions-and-adminuser-split).
 
+## Passive channel observation
+
+Hermes can retain allowed channel discussion as context while staying silent until mentioned:
+
+```yaml
+mattermost:
+  require_mention: true
+  allowed_channels:
+    - "xyz987uvw654rst321opq098nml"
+  observe_unmentioned_channel_messages: true
+```
+
+The option defaults to `false`. It only observes explicitly allowed channels while mention gating is enabled. The sender must pass the existing user allowlist; bot, webhook, system, command, DM, free-response, and out-of-scope posts are not observed. Observed text is shared within its channel or existing thread and is supplied as context, not as a pending request, on a later mention.
+
 ## Troubleshooting
 
 ### Bot is not responding to messages
