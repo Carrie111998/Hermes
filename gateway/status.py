@@ -541,7 +541,7 @@ def _gateway_command_subcommand(command: str | None) -> str | None:
     has_gateway_entry = (
         "hermes_cli.main" in joined
         or "hermes_cli/main.py" in joined
-        or any(t.rsplit("/", 1)[-1] in ("hermes", "hermes.exe") for t in tokens)
+        or any(t.rsplit("/", 1)[-1] in ("hermes", "hermes.exe", "hermes.upstream") for t in tokens)
     )
     if not has_gateway_entry:
         return None
