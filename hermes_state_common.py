@@ -11,9 +11,11 @@ import errno
 import json
 import logging
 import os
+import random
+import sqlite3
 import sys
 import time
-from typing import Any
+from typing import Any, Iterator
 
 from agent.skill_commands import (
     SKILL_EXCERPT_JOINT,
@@ -1299,3 +1301,139 @@ def fts_rebuild_admission(db_path, *, timeout_seconds=None):
             pass
         finally:
             handle.close()
+
+# ---------------------------------------------------------------------------
+# Shared helper-writer BEGIN IMMEDIATE primitive
+# ---------------------------------------------------------------------------
+#
+# ``state_db_begin_immediate`` is the BEGIN IMMEDIATE discipline wired into
+# ``tools.async_delegation._transaction`` and
+# ``gateway.delivery_ledger._transaction``.  The contract it implements
+# mirrors what ``SessionDB._execute_write`` has long used for the main
+# session DB writer: acquire the WAL write lock at BEGIN time so contention
+# surfaces immediately rather than mid-batch, and ride out a brief hold by
+# a sibling writer with bounded jitter retry.
+#
+# Why a shared primitive: the helper ledgers (async-delegation,
+# delivery-obligations, cron execution-ledger) historically used plain
+# ``sqlite3`` transactions (``with conn:``), which let the lock upgrade
+# lazily — meaning a competing writer's hold could land mid-batch as
+# ``OperationalError("database is locked")``.  Two of them already had
+# deterministic-close fixes for the FD-leak (#69567 / PR #69594); this
+# primitive adds the same retry discipline ``SessionDB._execute_write``
+# has, without bringing SessionDB-only behavior (FTS shadow repair,
+# compression lock, write counters) into the helpers.
+#
+
+# Routine-write budget.  Mirrors ``SessionDB._WRITE_PATIENCE_S`` so a
+# helper that starts a transaction while the SessionDB writer holds the
+# lock rides out the same maintenance window, but stays SHORT ENOUGH that
+# a wedged sibling (older pre-bounded-merge install mid-FTS-optimize)
+# doesn't stall a delivery ack indefinitely.  Helpers are NOT
+# transcript-critical — a failed async-delegation / delivery-ledger write
+# is recoverable on the next process restart (the row stays durable until
+# the sweep / restore path claims it again), so the routine patience is
+# the right knob.
+_STATE_DB_WRITE_PATIENCE_S = 20.0
+
+# Jitter schedule — matches ``SessionDB._WRITE_RETRY_*`` so contending
+# helpers and the SessionDB writer don't synchronize their backoff into
+# a deterministic convoy.  Fast reclaim on millisecond contention,
+# backing off once the hold crosses ``_STATE_DB_WRITE_RETRY_SLOW_AFTER_S``.
+_STATE_DB_WRITE_RETRY_MIN_S = 0.020
+_STATE_DB_WRITE_RETRY_MAX_S = 0.150
+_STATE_DB_WRITE_RETRY_SLOW_AFTER_S = 2.0
+_STATE_DB_WRITE_RETRY_SLOW_MIN_S = 0.250
+_STATE_DB_WRITE_RETRY_SLOW_MAX_S = 1.000
+
+
+def _is_retryable_lock_error(exc: BaseException) -> bool:
+    """True for the SQLite lock/busy conditions this primitive retries on.
+
+    Message-scoped on purpose: the class hierarchy differs across SQLite
+    builds (3.53.1 surfaces ``"database is locked"`` as ``OperationalError``,
+    but the same condition can land as a sibling error class on older
+    builds, and the ``"no more rows available"`` transient surfaces as
+    ``InterfaceError`` on some builds — see ``SessionDB._execute_write``).
+    Class checks would silently miss the alternate surface and defeat
+    the retry.  Everything else propagates untouched.
+    """
+    if not isinstance(exc, sqlite3.Error):
+        return False
+    msg = str(exc).lower()
+    if "locked" in msg or "busy" in msg:
+        return True
+    if "no more rows available" in msg:
+        return True
+    return False
+
+
+@contextlib.contextmanager
+def state_db_begin_immediate(conn: sqlite3.Connection) -> Iterator[sqlite3.Connection]:
+    """``BEGIN IMMEDIATE`` with bounded retry; commit/rollback on exit.
+
+    The body between ``__enter__`` and ``__exit__`` is NOT re-run on
+    retry (Python's ``with`` semantics don't allow re-invoking the
+    block); only the BEGIN itself is retried, so this primitive is
+    safe for bodies that have side effects beyond the SQLite write
+    (e.g. acquiring locks, publishing events).
+
+    The helper keeps deterministic connection close (the caller owns
+    that lifecycle).  Mid-body contention rides on SQLite's own
+    ``timeout=10`` busy handler; only the BEGIN itself gets the
+    application-level jitter retry so a sustained write-lock hold by a
+    sibling writer doesn't surface as a mid-turn ``OperationalError``.
+
+    Contract:
+
+    * ``BEGIN IMMEDIATE`` runs first; on ``OperationalError("locked"|"busy")``
+      or the ``"no more rows available"`` transient, retry with the
+      same fast-then-slow jitter schedule as ``SessionDB._execute_write``.
+    * Body runs un-retried (the connection's own ``timeout=10`` covers it).
+    * Body success → ``COMMIT``; body exception → ``ROLLBACK``; the body
+      exception propagates.
+    * ``OperationalError`` at BEGIN exhausts patience → rolled back,
+      re-raised untouched.
+    * Non-lock ``sqlite3.Error`` from the body (integrity violation,
+      schema mismatch, etc.) and arbitrary application ``Exception``
+      propagate untouched after rollback — they are NOT contention
+      problems and must not be masked by retry.
+    """
+    deadline = time.monotonic() + _STATE_DB_WRITE_PATIENCE_S
+    while True:
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            break
+        except sqlite3.Error as exc:
+            if not _is_retryable_lock_error(exc):
+                raise
+            now = time.monotonic()
+            if now >= deadline:
+                try:
+                    conn.execute("ROLLBACK")
+                except Exception:
+                    pass
+                raise
+            elapsed_s = now - (deadline - _STATE_DB_WRITE_PATIENCE_S)
+            if elapsed_s >= _STATE_DB_WRITE_RETRY_SLOW_AFTER_S:
+                jitter = random.uniform(
+                    _STATE_DB_WRITE_RETRY_SLOW_MIN_S,
+                    _STATE_DB_WRITE_RETRY_SLOW_MAX_S,
+                )
+            else:
+                jitter = random.uniform(
+                    _STATE_DB_WRITE_RETRY_MIN_S,
+                    _STATE_DB_WRITE_RETRY_MAX_S,
+                )
+            time.sleep(min(jitter, max(deadline - now, 0.001)))
+
+    try:
+        yield conn
+    except BaseException:
+        try:
+            conn.execute("ROLLBACK")
+        except Exception:
+            pass
+        raise
+    else:
+        conn.execute("COMMIT")

@@ -104,3 +104,129 @@ def test_schema_init_failure_still_closes_connection(monkeypatch, tmp_path):
 
     assert len(opened) == 1
     assert len(closed) == 1
+
+
+def _seed_delete_mode(path):
+    """Create state.db in journal_mode=DELETE as a guest would inherit it."""
+    seed = sqlite3.connect(str(path), timeout=10, isolation_level=None)
+    try:
+        seed.execute("PRAGMA journal_mode=DELETE")
+    finally:
+        seed.close()
+
+
+def test_guest_delete_mode_preserved_and_contention_survived(monkeypatch, tmp_path):
+    """async_delegation is a GUEST of state.db: it must not change journal
+    mode (DELETE stays DELETE) and must ride out transient write contention
+    via the shared BEGIN IMMEDIATE primitive.
+
+    This is the mandatory vertical regression: seed journal_mode=DELETE
+    while the ledger initializes, run a real guest dispatch, and confirm both
+    the operation succeeds AND journal mode remains `delete`.
+    """
+    import threading
+
+    _point_ledger(monkeypatch, tmp_path)
+    path = tmp_path / "state.db"
+
+    # Let _connect() create the schema first so columns exist; then force
+    # DELETE mode explicitly (the guest ownership contract).
+    ad._connect().close()
+    _seed_delete_mode(path)
+    mode_before = str(
+        sqlite3.connect(str(path), timeout=10, isolation_level=None)
+        .execute("PRAGMA journal_mode").fetchone()[0]
+    ).lower()
+    assert mode_before == "delete", f"seed failed, mode={mode_before!r}"
+
+    # Competitor holds the write lock briefly.
+    competitor_holder = []
+    release = threading.Event()
+
+    def _hold_lock():
+        c = sqlite3.connect(str(path), timeout=10, isolation_level=None)
+        competitor_holder.append(c)
+        try:
+            c.execute("BEGIN IMMEDIATE")
+        except Exception:
+            return
+        release.wait()
+        try:
+            c.execute("COMMIT")
+        except Exception:
+            try:
+                c.execute("ROLLBACK")
+            except Exception:
+                pass
+        finally:
+            c.close()
+
+    competitor = threading.Thread(target=_hold_lock, daemon=True)
+    competitor.start()
+
+    import time as _time
+    deadline = _time.monotonic() + 2.0
+    while not competitor_holder:
+        if _time.monotonic() > deadline:
+            pytest.fail("competitor never acquired the lock")
+        _time.sleep(0.01)
+    _time.sleep(0.05)
+
+    def _release_after():
+        _time.sleep(0.25)
+        release.set()
+
+    threading.Thread(target=_release_after, daemon=True).start()
+
+    # Guest dispatch must succeed by riding out the hold.
+    ad._persist_dispatch({
+        "delegation_id": "deleg_contended",
+        "session_key": "test:sess",
+        "origin_ui_session_id": "",
+        "parent_session_id": None,
+        "dispatched_at": 1.0,
+        "origin_session_id": "",
+        "goal": "contended",
+        "context": "ctx",
+    })
+    row = ad.get_durable_delegation("deleg_contended")
+    assert row is not None, row
+    assert row["origin_session"] == "test:sess"
+
+    competitor.join(timeout=2.0)
+
+    # DELETE mode must be preserved — the guest changed nothing.
+    mode_after = str(
+        sqlite3.connect(str(path), timeout=10, isolation_level=None)
+        .execute("PRAGMA journal_mode").fetchone()[0]
+    ).lower()
+    assert mode_after == "delete", (
+        f"async_delegation guest changed journal mode to {mode_after!r}"
+    )
+
+
+def test_guest_uncontended_delete_mode_preserved(monkeypatch, tmp_path):
+    """Even without contention, a guest dispatch must leave DELETE mode intact."""
+    _point_ledger(monkeypatch, tmp_path)
+    path = tmp_path / "state.db"
+
+    ad._connect().close()
+    _seed_delete_mode(path)
+
+    ad._persist_dispatch({
+        "delegation_id": "deleg_plain",
+        "session_key": "test:plain",
+        "origin_ui_session_id": "",
+        "parent_session_id": None,
+        "dispatched_at": 1.0,
+        "origin_session_id": "",
+        "goal": "plain",
+        "context": "ctx",
+    })
+    assert ad.get_durable_delegation("deleg_plain") is not None
+
+    mode = str(
+        sqlite3.connect(str(path), timeout=10, isolation_level=None)
+        .execute("PRAGMA journal_mode").fetchone()[0]
+    ).lower()
+    assert mode == "delete", f"guest changed journal mode to {mode!r}"
