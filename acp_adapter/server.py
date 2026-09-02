@@ -1131,6 +1131,8 @@ class HermesACPAgent(acp.Agent):
         """Register ACP-provided MCP servers and refresh the agent tool surface."""
         if not mcp_servers:
             return
+        if state.closed_book:
+            raise ValueError("closed-book session cannot register MCP servers")
 
         try:
             from tools.mcp_tool import register_mcp_servers
@@ -1221,6 +1223,8 @@ class HermesACPAgent(acp.Agent):
         No-op when discovery already finished, when the join times out, when the
         registry was unchanged, or when the session was closed while waiting.
         """
+        if state.closed_book:
+            return
         try:
             from hermes_cli.mcp_startup import mcp_discovery_in_flight
         except Exception:
@@ -1594,19 +1598,31 @@ class HermesACPAgent(acp.Agent):
         mcp_servers: list | None = None,
         **kwargs: Any,
     ) -> NewSessionResponse:
-        state = self.session_manager.create_session(cwd=cwd)
+        command_adviser = kwargs.get("commandAdviser")
+        closed_book = (
+            isinstance(command_adviser, dict)
+            and command_adviser.get("mode") == "closed-book"
+        )
+        state = self.session_manager.create_session(cwd=cwd, closed_book=closed_book)
         await self._register_session_mcp_servers(state, mcp_servers)
         self._schedule_mcp_late_refresh(state)
         logger.info("New session %s (cwd=%s)", state.session_id, cwd)
         self._schedule_available_commands_update(state.session_id)
         self._schedule_usage_update(state)
+        response_meta = self._provenance_meta(
+            state.session_id, getattr(state.agent, "session_id", state.session_id)
+        )
+        if state.closed_book:
+            response_meta["commandAdviser"] = {
+                "mode": "closed-book",
+                "enabledToolsets": list(getattr(state.agent, "enabled_toolsets", [])),
+                "toolNames": sorted(getattr(state.agent, "valid_tool_names", set())),
+            }
         return NewSessionResponse(
             session_id=state.session_id,
             models=self._build_model_state(state),
             modes=self._session_modes(state),
-            field_meta=self._provenance_meta(
-                state.session_id, getattr(state.agent, "session_id", state.session_id)
-            ),
+            field_meta=response_meta,
         )
 
     async def load_session(

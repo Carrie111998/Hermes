@@ -178,6 +178,52 @@ class TestAuthenticate:
 class TestSessionOps:
 
     @pytest.mark.asyncio
+    async def test_closed_book_session_exposes_only_terminal_tools_and_rejects_mcp(self):
+        agent = SimpleNamespace(
+            model="local-model",
+            provider="lmstudio",
+            base_url="http://127.0.0.1:8000/v1",
+            enabled_toolsets=["hermes-acp"],
+            disabled_toolsets=[],
+            tools=[
+                {"function": {"name": "terminal"}},
+                {"function": {"name": "process"}},
+                {"function": {"name": "memory"}},
+                {"function": {"name": "web_search"}},
+            ],
+            valid_tool_names={"terminal", "process", "memory", "web_search"},
+        )
+        manager = SessionManager(agent_factory=lambda: agent)
+        acp_agent = HermesACPAgent(session_manager=manager)
+        router = build_agent_router(acp_agent)
+
+        response = await router(
+            "session/new",
+            {
+                "cwd": "/tmp",
+                "mcpServers": [],
+                "_meta": {"commandAdviser": {"mode": "closed-book"}},
+            },
+            False,
+        )
+        state = manager.get_session(response.session_id)
+
+        assert state is not None
+        assert state.closed_book is True
+        assert state.agent.enabled_toolsets == ["terminal"]
+        assert state.agent.skip_context_files is True
+        assert state.agent.skip_memory is True
+        assert state.agent.valid_tool_names == {"terminal", "process"}
+        assert response.field_meta["commandAdviser"] == {
+            "mode": "closed-book",
+            "enabledToolsets": ["terminal"],
+            "toolNames": ["process", "terminal"],
+        }
+
+        with pytest.raises(ValueError, match="closed-book session cannot register MCP servers"):
+            await acp_agent._register_session_mcp_servers(state, [SimpleNamespace(name="rag")])
+
+    @pytest.mark.asyncio
     async def test_new_session_returns_authenticated_cross_provider_model_state(self):
         manager = SessionManager(
             agent_factory=lambda: SimpleNamespace(
