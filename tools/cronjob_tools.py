@@ -736,10 +736,11 @@ def _validate_cron_script_path(script: Optional[str]) -> Optional[str]:
         )
 
     # Validate containment after resolution
+    from cron.jobs import _ensure_cron_dir
     from tools.path_security import validate_within_dir
 
     scripts_dir = get_hermes_home() / "scripts"
-    scripts_dir.mkdir(parents=True, exist_ok=True)
+    _ensure_cron_dir(scripts_dir)
     containment_error = validate_within_dir(scripts_dir / raw, scripts_dir)
     if containment_error:
         return (

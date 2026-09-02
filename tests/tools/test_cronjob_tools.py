@@ -688,6 +688,46 @@ class TestValidateCronBaseUrl:
         assert self._v(None, "https://x.example/v1") is not None
 
 
+class TestValidateCronScriptPathDeletedProfile:
+    """The script-path API boundary must not resurrect a deleted named
+    profile's home directory (same class as cron/jobs.py's _ensure_cron_dir
+    widening — see TestEnsureCronDirWidened in tests/cron/test_jobs.py).
+
+    A stale multiplex scheduler can still hold a HERMES_HOME override
+    pointing at a profile the user has since removed; the mkdir this
+    validator performs must fail closed instead of silently recreating the
+    deleted profile's directory tree.
+    """
+
+    @staticmethod
+    def _v(script):
+        from tools.cronjob_tools import _validate_cron_script_path
+        return _validate_cron_script_path(script)
+
+    def test_deleted_named_profile_fails_closed(self, tmp_path, monkeypatch):
+        import hermes_constants
+
+        profiles_dir = tmp_path / "profiles"
+        profiles_dir.mkdir()
+        deleted_home = profiles_dir / "deleted"
+        # deleted_home does not exist — the profile was removed.
+        monkeypatch.setattr(hermes_constants, "get_hermes_home", lambda: deleted_home)
+
+        with pytest.raises(FileNotFoundError):
+            self._v("run.sh")
+        assert not deleted_home.exists()
+
+    def test_default_home_still_creates_scripts_dir(self, tmp_path, monkeypatch):
+        import hermes_constants
+
+        default_home = tmp_path / "default_home"
+        default_home.mkdir()
+        monkeypatch.setattr(hermes_constants, "get_hermes_home", lambda: default_home)
+
+        assert self._v("run.sh") is None
+        assert (default_home / "scripts").is_dir()
+
+
 class TestGithubExemptionAbuse:
     """The GitHub auth-header exemption must not become a blanket line
     eraser or accept lookalike hosts."""
