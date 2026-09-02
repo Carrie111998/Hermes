@@ -17,6 +17,19 @@ def test_format_banner_version_label_on_upstream_main():
     assert "local" not in value
 
 
+def test_format_banner_version_label_identifies_behind_local_build():
+    from hermes_cli import banner
+
+    with patch.object(
+        banner,
+        "get_git_banner_state",
+        return_value={"upstream": "4f225435", "local": "2a598aad", "ahead": 0},
+    ):
+        value = banner.format_banner_version_label()
+
+    assert value.endswith("· upstream 4f225435 · local 2a598aad")
+
+
 def test_get_git_banner_state_reads_origin_and_head(tmp_path):
     from hermes_cli import banner
 
