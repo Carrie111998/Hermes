@@ -909,6 +909,13 @@ class TestParseTargetRef:
             ("discord", "-1001234567890:17585", "-1001234567890", "17585"),
             ("discord", "1003724596514", "1003724596514", None),
             ("discord", "  123456:789  ", "123456", "789"),
+            # Discord user targets. A bare snowflake stays a CHANNEL (above):
+            # Discord user and channel IDs are indistinguishable, so only these
+            # explicit forms may address a person.
+            ("discord", "user:123456789012345678", "user:123456789012345678", None),
+            ("discord", "<@123456789012345678>", "user:123456789012345678", None),
+            ("discord", "<@!123456789012345678>", "user:123456789012345678", None),
+            ("discord", "  user:123456789012345678  ", "user:123456789012345678", None),
             # Matrix: room id, room:thread-event, user MXID
             ("matrix", "!HLOQwxYGgFPMPJUSNR:matrix.org:$thread123:matrix.org",
              "!HLOQwxYGgFPMPJUSNR:matrix.org", "$thread123:matrix.org"),
