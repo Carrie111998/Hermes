@@ -188,8 +188,91 @@ def _file_ext_or_basename(path: str) -> str:
     return base
 
 
-def _which(*names: str) -> Optional[str]:
-    """Return the full path of the first command found on PATH."""
+# Marker-gated repo-local bin directories, probed BEFORE falling back to
+# PATH.  A local bin dir is only trusted when a sibling marker proves the
+# directory belongs to a project of that ecosystem — a stray, unmarked
+# ``node_modules/.bin`` cannot inject an executable into the resolution
+# order.  Ported/adapted from oh-my-openagent PR #7424.
+_LOCAL_BIN_RULES: Tuple[Tuple[Tuple[str, ...], Tuple[str, ...]], ...] = (
+    (
+        ("package.json", "bun.lock", "bun.lockb", "package-lock.json",
+         "yarn.lock", "pnpm-lock.yaml"),
+        (os.path.join("node_modules", ".bin"),),
+    ),
+    (
+        ("pyproject.toml", "requirements.txt", "setup.py", "setup.cfg",
+         "Pipfile", "pyrightconfig.json", "ruff.toml", ".ruff.toml"),
+        (os.path.join(".venv", "bin"), os.path.join(".venv", "Scripts"),
+         os.path.join("venv", "bin"), os.path.join("venv", "Scripts")),
+    ),
+    (
+        ("Gemfile", "Gemfile.lock"),
+        (os.path.join("vendor", "bundle", "bin"), "bin"),
+    ),
+    (
+        ("go.mod", "go.sum", "go.work"),
+        ("bin",),
+    ),
+)
+
+# Per-process cache: (root, name) -> resolved path or None.  LSP spawn
+# resolution runs on every first-touch of a language in a session; the
+# marker walk is pure filesystem probing, so memoize it.
+_LOCAL_RESOLVE_CACHE: Dict[Tuple[str, str], Optional[str]] = {}
+
+
+def _resolve_local_binary(name: str, root: str) -> Optional[str]:
+    """Resolve ``name`` from marker-gated project-local bin dirs.
+
+    Walks upward from ``root``, probing each ecosystem's bin directories
+    only when a sibling marker file authorizes them.  The walk ends at a
+    ``.git`` boundary (that directory is still probed) — tooling above a
+    repository root belongs to a different project.  ``shutil.which`` with
+    an explicit ``path=`` handles executability and Windows PATHEXT.
+    """
+    key = (root, name)
+    if key in _LOCAL_RESOLVE_CACHE:
+        return _LOCAL_RESOLVE_CACHE[key]
+    resolved: Optional[str] = None
+    current = os.path.abspath(root)
+    while True:
+        for markers, bin_dirs in _LOCAL_BIN_RULES:
+            if not any(os.path.exists(os.path.join(current, m)) for m in markers):
+                continue
+            for bin_dir in bin_dirs:
+                cand_dir = os.path.join(current, bin_dir)
+                if not os.path.isdir(cand_dir):
+                    continue
+                found = shutil.which(name, path=cand_dir)
+                if found:
+                    resolved = found
+                    break
+            if resolved:
+                break
+        if resolved or os.path.exists(os.path.join(current, ".git")):
+            break
+        parent = os.path.dirname(current)
+        if parent == current:
+            break
+        current = parent
+    _LOCAL_RESOLVE_CACHE[key] = resolved
+    return resolved
+
+
+def _which(*names: str, root: Optional[str] = None) -> Optional[str]:
+    """Return the full path of the first command found.
+
+    When ``root`` is given, marker-gated project-local bin directories
+    (``node_modules/.bin``, ``.venv/bin``, ...) are probed first, walking
+    up from ``root`` to the nearest ``.git`` boundary — so a project's own
+    pinned language server wins over a globally installed one.  PATH is
+    the fallback either way.
+    """
+    if root:
+        for n in names:
+            path = _resolve_local_binary(n, root)
+            if path:
+                return path
     for n in names:
         path = shutil.which(n)
         if path:
@@ -231,8 +314,7 @@ def _root_or_workspace(file_path: str, workspace: str, markers: Sequence[str], e
 
 def _spawn_pyright(root: str, ctx: ServerContext) -> Optional[SpawnSpec]:
     bin_path = _resolve_override(ctx, "pyright") or _which(
-        "pyright-langserver", "pyright"
-    )
+        "pyright-langserver", "pyright", root=root)
     if bin_path is None:
         from agent.lsp.install import try_install
         bin_path = try_install("pyright", ctx.install_strategy)
@@ -275,7 +357,7 @@ def _detect_python(root: str) -> Optional[str]:
 
 
 def _spawn_typescript(root: str, ctx: ServerContext) -> Optional[SpawnSpec]:
-    bin_path = _resolve_override(ctx, "typescript") or _which("typescript-language-server")
+    bin_path = _resolve_override(ctx, "typescript") or _which("typescript-language-server", root=root)
     if bin_path is None:
         from agent.lsp.install import try_install
         bin_path = try_install("typescript-language-server", ctx.install_strategy)
@@ -292,7 +374,7 @@ def _spawn_typescript(root: str, ctx: ServerContext) -> Optional[SpawnSpec]:
 
 
 def _spawn_gopls(root: str, ctx: ServerContext) -> Optional[SpawnSpec]:
-    bin_path = _resolve_override(ctx, "gopls") or _which("gopls")
+    bin_path = _resolve_override(ctx, "gopls") or _which("gopls", root=root)
     if bin_path is None:
         from agent.lsp.install import try_install
         bin_path = try_install("gopls", ctx.install_strategy)
@@ -308,7 +390,7 @@ def _spawn_gopls(root: str, ctx: ServerContext) -> Optional[SpawnSpec]:
 
 
 def _spawn_rust_analyzer(root: str, ctx: ServerContext) -> Optional[SpawnSpec]:
-    bin_path = _resolve_override(ctx, "rust-analyzer") or _which("rust-analyzer")
+    bin_path = _resolve_override(ctx, "rust-analyzer") or _which("rust-analyzer", root=root)
     if bin_path is None:
         from agent.lsp.install import try_install
         bin_path = try_install("rust-analyzer", ctx.install_strategy)
@@ -324,7 +406,7 @@ def _spawn_rust_analyzer(root: str, ctx: ServerContext) -> Optional[SpawnSpec]:
 
 
 def _spawn_clangd(root: str, ctx: ServerContext) -> Optional[SpawnSpec]:
-    bin_path = _resolve_override(ctx, "clangd") or _which("clangd")
+    bin_path = _resolve_override(ctx, "clangd") or _which("clangd", root=root)
     if bin_path is None:
         from agent.lsp.install import try_install
         bin_path = try_install("clangd", ctx.install_strategy)
@@ -343,7 +425,7 @@ _BASH_SHELLCHECK_WARNED = False
 
 
 def _spawn_bash_ls(root: str, ctx: ServerContext) -> Optional[SpawnSpec]:
-    bin_path = _resolve_override(ctx, "bash-language-server") or _which("bash-language-server")
+    bin_path = _resolve_override(ctx, "bash-language-server") or _which("bash-language-server", root=root)
     if bin_path is None:
         from agent.lsp.install import try_install
         bin_path = try_install("bash-language-server", ctx.install_strategy)
@@ -371,7 +453,7 @@ def _spawn_bash_ls(root: str, ctx: ServerContext) -> Optional[SpawnSpec]:
 
 
 def _spawn_yaml_ls(root: str, ctx: ServerContext) -> Optional[SpawnSpec]:
-    bin_path = _resolve_override(ctx, "yaml-language-server") or _which("yaml-language-server")
+    bin_path = _resolve_override(ctx, "yaml-language-server") or _which("yaml-language-server", root=root)
     if bin_path is None:
         from agent.lsp.install import try_install
         bin_path = try_install("yaml-language-server", ctx.install_strategy)
@@ -387,7 +469,7 @@ def _spawn_yaml_ls(root: str, ctx: ServerContext) -> Optional[SpawnSpec]:
 
 
 def _spawn_lua_ls(root: str, ctx: ServerContext) -> Optional[SpawnSpec]:
-    bin_path = _resolve_override(ctx, "lua-language-server") or _which("lua-language-server")
+    bin_path = _resolve_override(ctx, "lua-language-server") or _which("lua-language-server", root=root)
     if bin_path is None:
         from agent.lsp.install import try_install
         bin_path = try_install("lua-language-server", ctx.install_strategy)
@@ -403,7 +485,7 @@ def _spawn_lua_ls(root: str, ctx: ServerContext) -> Optional[SpawnSpec]:
 
 
 def _spawn_intelephense(root: str, ctx: ServerContext) -> Optional[SpawnSpec]:
-    bin_path = _resolve_override(ctx, "intelephense") or _which("intelephense")
+    bin_path = _resolve_override(ctx, "intelephense") or _which("intelephense", root=root)
     if bin_path is None:
         from agent.lsp.install import try_install
         bin_path = try_install("intelephense", ctx.install_strategy)
@@ -421,7 +503,7 @@ def _spawn_intelephense(root: str, ctx: ServerContext) -> Optional[SpawnSpec]:
 
 
 def _spawn_ocamllsp(root: str, ctx: ServerContext) -> Optional[SpawnSpec]:
-    bin_path = _resolve_override(ctx, "ocaml-lsp") or _which("ocamllsp")
+    bin_path = _resolve_override(ctx, "ocaml-lsp") or _which("ocamllsp", root=root)
     if bin_path is None:
         return None
     return SpawnSpec(
@@ -434,7 +516,7 @@ def _spawn_ocamllsp(root: str, ctx: ServerContext) -> Optional[SpawnSpec]:
 
 
 def _spawn_dockerfile_ls(root: str, ctx: ServerContext) -> Optional[SpawnSpec]:
-    bin_path = _resolve_override(ctx, "dockerfile-ls") or _which("docker-langserver")
+    bin_path = _resolve_override(ctx, "dockerfile-ls") or _which("docker-langserver", root=root)
     if bin_path is None:
         from agent.lsp.install import try_install
         bin_path = try_install("dockerfile-language-server-nodejs", ctx.install_strategy)
@@ -450,7 +532,7 @@ def _spawn_dockerfile_ls(root: str, ctx: ServerContext) -> Optional[SpawnSpec]:
 
 
 def _spawn_terraform_ls(root: str, ctx: ServerContext) -> Optional[SpawnSpec]:
-    bin_path = _resolve_override(ctx, "terraform-ls") or _which("terraform-ls")
+    bin_path = _resolve_override(ctx, "terraform-ls") or _which("terraform-ls", root=root)
     if bin_path is None:
         return None  # terraform-ls is heavy to auto-install; require user
     init = {
@@ -470,7 +552,7 @@ def _spawn_terraform_ls(root: str, ctx: ServerContext) -> Optional[SpawnSpec]:
 
 
 def _spawn_dart(root: str, ctx: ServerContext) -> Optional[SpawnSpec]:
-    bin_path = _resolve_override(ctx, "dart") or _which("dart")
+    bin_path = _resolve_override(ctx, "dart") or _which("dart", root=root)
     if bin_path is None:
         return None
     return SpawnSpec(
@@ -484,8 +566,7 @@ def _spawn_dart(root: str, ctx: ServerContext) -> Optional[SpawnSpec]:
 
 def _spawn_haskell_ls(root: str, ctx: ServerContext) -> Optional[SpawnSpec]:
     bin_path = _resolve_override(ctx, "haskell-language-server") or _which(
-        "haskell-language-server-wrapper", "haskell-language-server"
-    )
+        "haskell-language-server-wrapper", "haskell-language-server", root=root)
     if bin_path is None:
         return None
     return SpawnSpec(
@@ -498,7 +579,7 @@ def _spawn_haskell_ls(root: str, ctx: ServerContext) -> Optional[SpawnSpec]:
 
 
 def _spawn_julia(root: str, ctx: ServerContext) -> Optional[SpawnSpec]:
-    bin_path = _resolve_override(ctx, "julia") or _which("julia")
+    bin_path = _resolve_override(ctx, "julia") or _which("julia", root=root)
     if bin_path is None:
         return None
     return SpawnSpec(
@@ -517,7 +598,7 @@ def _spawn_julia(root: str, ctx: ServerContext) -> Optional[SpawnSpec]:
 
 
 def _spawn_clojure_lsp(root: str, ctx: ServerContext) -> Optional[SpawnSpec]:
-    bin_path = _resolve_override(ctx, "clojure-lsp") or _which("clojure-lsp")
+    bin_path = _resolve_override(ctx, "clojure-lsp") or _which("clojure-lsp", root=root)
     if bin_path is None:
         return None
     return SpawnSpec(
@@ -530,7 +611,7 @@ def _spawn_clojure_lsp(root: str, ctx: ServerContext) -> Optional[SpawnSpec]:
 
 
 def _spawn_nixd(root: str, ctx: ServerContext) -> Optional[SpawnSpec]:
-    bin_path = _resolve_override(ctx, "nixd") or _which("nixd")
+    bin_path = _resolve_override(ctx, "nixd") or _which("nixd", root=root)
     if bin_path is None:
         return None
     return SpawnSpec(
@@ -543,7 +624,7 @@ def _spawn_nixd(root: str, ctx: ServerContext) -> Optional[SpawnSpec]:
 
 
 def _spawn_zls(root: str, ctx: ServerContext) -> Optional[SpawnSpec]:
-    bin_path = _resolve_override(ctx, "zls") or _which("zls")
+    bin_path = _resolve_override(ctx, "zls") or _which("zls", root=root)
     if bin_path is None:
         return None
     return SpawnSpec(
@@ -556,7 +637,7 @@ def _spawn_zls(root: str, ctx: ServerContext) -> Optional[SpawnSpec]:
 
 
 def _spawn_gleam(root: str, ctx: ServerContext) -> Optional[SpawnSpec]:
-    bin_path = _resolve_override(ctx, "gleam") or _which("gleam")
+    bin_path = _resolve_override(ctx, "gleam") or _which("gleam", root=root)
     if bin_path is None:
         return None
     return SpawnSpec(
@@ -569,7 +650,7 @@ def _spawn_gleam(root: str, ctx: ServerContext) -> Optional[SpawnSpec]:
 
 
 def _spawn_elixir_ls(root: str, ctx: ServerContext) -> Optional[SpawnSpec]:
-    bin_path = _resolve_override(ctx, "elixir-ls") or _which("elixir-ls", "language_server.sh")
+    bin_path = _resolve_override(ctx, "elixir-ls") or _which("elixir-ls", "language_server.sh", root=root)
     if bin_path is None:
         return None
     return SpawnSpec(
@@ -582,7 +663,7 @@ def _spawn_elixir_ls(root: str, ctx: ServerContext) -> Optional[SpawnSpec]:
 
 
 def _spawn_prisma(root: str, ctx: ServerContext) -> Optional[SpawnSpec]:
-    bin_path = _resolve_override(ctx, "prisma") or _which("prisma")
+    bin_path = _resolve_override(ctx, "prisma") or _which("prisma", root=root)
     if bin_path is None:
         return None
     return SpawnSpec(
@@ -596,8 +677,7 @@ def _spawn_prisma(root: str, ctx: ServerContext) -> Optional[SpawnSpec]:
 
 def _spawn_kotlin_ls(root: str, ctx: ServerContext) -> Optional[SpawnSpec]:
     bin_path = _resolve_override(ctx, "kotlin-language-server") or _which(
-        "kotlin-language-server"
-    )
+        "kotlin-language-server", root=root)
     if bin_path is None:
         return None
     return SpawnSpec(
@@ -613,7 +693,7 @@ def _spawn_jdtls(root: str, ctx: ServerContext) -> Optional[SpawnSpec]:
     # jdtls has a complex install flow.  We require a manual install
     # for now and look for the wrapper script that the jdtls install
     # produces.
-    bin_path = _resolve_override(ctx, "jdtls") or _which("jdtls")
+    bin_path = _resolve_override(ctx, "jdtls") or _which("jdtls", root=root)
     if bin_path is None:
         return None
     return SpawnSpec(
@@ -627,8 +707,7 @@ def _spawn_jdtls(root: str, ctx: ServerContext) -> Optional[SpawnSpec]:
 
 def _spawn_vue(root: str, ctx: ServerContext) -> Optional[SpawnSpec]:
     bin_path = _resolve_override(ctx, "vue-language-server") or _which(
-        "vue-language-server"
-    )
+        "vue-language-server", root=root)
     if bin_path is None:
         from agent.lsp.install import try_install
         bin_path = try_install("@vue/language-server", ctx.install_strategy)
@@ -645,8 +724,7 @@ def _spawn_vue(root: str, ctx: ServerContext) -> Optional[SpawnSpec]:
 
 def _spawn_svelte(root: str, ctx: ServerContext) -> Optional[SpawnSpec]:
     bin_path = _resolve_override(ctx, "svelte-language-server") or _which(
-        "svelteserver", "svelte-language-server"
-    )
+        "svelteserver", "svelte-language-server", root=root)
     if bin_path is None:
         from agent.lsp.install import try_install
         bin_path = try_install("svelte-language-server", ctx.install_strategy)
@@ -663,8 +741,7 @@ def _spawn_svelte(root: str, ctx: ServerContext) -> Optional[SpawnSpec]:
 
 def _spawn_astro(root: str, ctx: ServerContext) -> Optional[SpawnSpec]:
     bin_path = _resolve_override(ctx, "astro-language-server") or _which(
-        "astro-ls", "astro-language-server"
-    )
+        "astro-ls", "astro-language-server", root=root)
     if bin_path is None:
         from agent.lsp.install import try_install
         bin_path = try_install("@astrojs/language-server", ctx.install_strategy)
