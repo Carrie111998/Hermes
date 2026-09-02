@@ -11,12 +11,24 @@ class FakeFitAddon {
 }
 
 class FakeWebglAddon {
-  onContextLoss() {
+  static instances: FakeWebglAddon[] = [];
+
+  contextLossHandler: (() => void) | null = null;
+  dispose = vi.fn();
+
+  constructor() {
+    FakeWebglAddon.instances.push(this);
+  }
+
+  onContextLoss(handler: () => void) {
+    this.contextLossHandler = handler;
     return { dispose() {} };
   }
 }
 
 class FakeTerminal {
+  static instances: FakeTerminal[] = [];
+
   options: Record<string, unknown>;
   rows = 24;
   cols = 80;
@@ -27,6 +39,7 @@ class FakeTerminal {
 
   constructor(options: Record<string, unknown>) {
     this.options = options;
+    FakeTerminal.instances.push(this);
   }
 
   attachCustomKeyEventHandler() {
@@ -57,23 +70,29 @@ class FakeTerminal {
     return { dispose() {} };
   }
 
-  onScroll() {
+  onScrollHandler: (() => void) | null = null;
+
+  onScroll(handler: () => void) {
+    this.onScrollHandler = handler;
     return { dispose() {} };
   }
 
+  scrollPos = { baseY: 0, viewportY: 0 };
+
   get buffer() {
-    // Minimal active-buffer surface for the resume follow-scroll pin
-    // (isViewportPinnedToBottom reads viewportY/baseY).
-    return { active: { baseY: 0, viewportY: 0 } };
+    // Minimal active-buffer surface for the resume follow-scroll pin and
+    // the stick-to-bottom re-anchor gate (isViewportPinnedToBottom reads
+    // viewportY/baseY); tests mutate scrollPos before invoking the
+    // captured onScroll handler to simulate the user scrolling up.
+    return { active: { ...this.scrollPos } };
   }
 
-  scrollToBottom() {}
+  scrollToBottom = vi.fn();
 
   open() {}
-
   paste() {}
 
-  refresh() {}
+  refresh = vi.fn();
 
   write() {}
 }
@@ -190,6 +209,8 @@ async function render(ui: ReactNode) {
 }
 
 beforeEach(() => {
+  FakeTerminal.instances = [];
+  FakeWebglAddon.instances = [];
   FakeWebSocket.instances = [];
   maybeReloadForLoopbackWsAuthFailure.mockClear();
   apiMocks.buildWsUrl.mockReset();
@@ -222,6 +243,10 @@ beforeEach(() => {
     randomUUID: () => "chat-test-id",
   });
 
+  Object.defineProperty(document, "visibilityState", {
+    configurable: true,
+    value: "visible",
+  });
   Object.defineProperty(window, "visualViewport", {
     configurable: true,
     value: { addEventListener() {}, removeEventListener() {}, width: 1280 },
@@ -255,6 +280,143 @@ afterEach(async () => {
 });
 
 describe("ChatPage", () => {
+  it("repaints with the fallback renderer immediately on WebGL context loss", async () => {
+    const { default: ChatPage } = await import("./ChatPage");
+
+    await render(
+      <MemoryRouter initialEntries={["/chat"]}>
+        <ChatPage isActive />
+      </MemoryRouter>,
+    );
+    await vi.waitFor(() => expect(FakeWebglAddon.instances).toHaveLength(1));
+    const webgl = FakeWebglAddon.instances[0];
+    const host = container.querySelector(".hermes-chat-xterm-host");
+    expect(host).not.toBeNull();
+
+    // The capture-phase listener on the terminal host must fire before the
+    // addon's own 3000ms grace timer, disposing the WebGL renderer and
+    // repainting the viewport at once.
+    await act(async () => {
+      host!.dispatchEvent(new Event("webglcontextlost"));
+    });
+
+    expect(webgl.dispose).toHaveBeenCalledTimes(1);
+    expect(FakeTerminal.instances[0].refresh).toHaveBeenCalledWith(
+      0,
+      FakeTerminal.instances[0].rows - 1,
+    );
+  });
+
+  it("restores the live terminal viewport when returning to Chat", async () => {
+    const { default: ChatPage } = await import("./ChatPage");
+    const page = (isActive: boolean) => (
+      <MemoryRouter initialEntries={["/chat"]}>
+        <ChatPage isActive={isActive} />
+      </MemoryRouter>
+    );
+
+    await render(page(true));
+    await vi.waitFor(() => expect(FakeTerminal.instances).toHaveLength(1));
+    const terminal = FakeTerminal.instances[0];
+    terminal.scrollToBottom.mockClear();
+
+    await act(async () => root.render(page(false)));
+    expect(terminal.scrollToBottom).not.toHaveBeenCalled();
+
+    await act(async () => root.render(page(true)));
+    expect(terminal.scrollToBottom).toHaveBeenCalledTimes(1);
+  });
+
+  it("restores the live terminal viewport when the browser tab becomes visible", async () => {
+    const { default: ChatPage } = await import("./ChatPage");
+
+    await render(
+      <MemoryRouter initialEntries={["/chat"]}>
+        <ChatPage isActive />
+      </MemoryRouter>,
+    );
+    await vi.waitFor(() => expect(FakeTerminal.instances).toHaveLength(1));
+    const terminal = FakeTerminal.instances[0];
+    terminal.scrollToBottom.mockClear();
+
+    Object.defineProperty(document, "visibilityState", {
+      configurable: true,
+      value: "hidden",
+    });
+    await act(async () =>
+      document.dispatchEvent(new Event("visibilitychange")),
+    );
+    expect(terminal.scrollToBottom).not.toHaveBeenCalled();
+
+    Object.defineProperty(document, "visibilityState", {
+      configurable: true,
+      value: "visible",
+    });
+    await act(async () =>
+      document.dispatchEvent(new Event("visibilitychange")),
+    );
+
+    expect(terminal.scrollToBottom).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps a mid-scrollback reader's position on Chat return", async () => {
+    const { default: ChatPage } = await import("./ChatPage");
+    const page = (isActive: boolean) => (
+      <MemoryRouter initialEntries={["/chat"]}>
+        <ChatPage isActive={isActive} />
+      </MemoryRouter>
+    );
+
+    await render(page(true));
+    await vi.waitFor(() => expect(FakeTerminal.instances).toHaveLength(1));
+    const terminal = FakeTerminal.instances[0];
+    // Simulate the user scrolling up into the backlog: the captured onScroll
+    // handler releases the stick-to-bottom pin (viewportY < baseY).
+    terminal.scrollPos = { baseY: 120, viewportY: 40 };
+    terminal.onScrollHandler?.();
+    terminal.scrollToBottom.mockClear();
+
+    await act(async () => root.render(page(false)));
+    await act(async () => root.render(page(true)));
+
+    // The WebGL retry still runs, but the viewport is NOT yanked to the tail.
+    expect(terminal.scrollToBottom).not.toHaveBeenCalled();
+  });
+
+  it("keeps a mid-scrollback reader's position when the browser tab returns", async () => {
+    const { default: ChatPage } = await import("./ChatPage");
+
+    await render(
+      <MemoryRouter initialEntries={["/chat"]}>
+        <ChatPage isActive />
+      </MemoryRouter>,
+    );
+    await vi.waitFor(() => expect(FakeTerminal.instances).toHaveLength(1));
+    const terminal = FakeTerminal.instances[0];
+    terminal.scrollPos = { baseY: 120, viewportY: 40 };
+    terminal.onScrollHandler?.();
+    terminal.scrollToBottom.mockClear();
+
+    Object.defineProperty(document, "visibilityState", {
+      configurable: true,
+      value: "hidden",
+    });
+    await act(async () =>
+      document.dispatchEvent(new Event("visibilitychange")),
+    );
+    Object.defineProperty(document, "visibilityState", {
+      configurable: true,
+      value: "visible",
+    });
+    await act(async () =>
+      document.dispatchEvent(new Event("visibilitychange")),
+    );
+
+    // The fallback repaint still happens; the re-anchor does not.
+    expect(terminal.scrollToBottom).not.toHaveBeenCalled();
+    expect(terminal.refresh).toHaveBeenCalledWith(0, terminal.rows - 1);
+  });
+
   it("treats loopback 4401 closes as stale-token reload candidates", async () => {
     const { default: ChatPage } = await import("./ChatPage");
 
