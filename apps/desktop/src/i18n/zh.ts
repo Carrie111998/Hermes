@@ -2028,6 +2028,27 @@ export const zh: Translations = {
       MATTERMOST_HOME_CHANNEL: { label: '主页频道' },
       QQ_ALLOW_ALL_USERS: { label: '允许所有 QQ 用户' },
       QQBOT_HOME_CHANNEL: { label: 'QQ 主页频道', help: 'cron 投递的默认频道或群组。' },
+      ONEBOT_WS_URL: {
+        label: 'OneBot WebSocket 地址',
+        help: '机器人接收消息的 WS 地址，例如 ws://127.0.0.1:3001。'
+      },
+      ONEBOT_HTTP_URL: {
+        label: 'OneBot HTTP 地址',
+        help: '发送消息用的 HTTP API 地址，例如 http://127.0.0.1:3000。'
+      },
+      ONEBOT_WS_MODE: { label: '连接模式', help: 'forward（主动连接）或 backward（被动监听）。' },
+      ONEBOT_WS_LISTEN: { label: '监听地址', help: '仅 backward 模式使用，例如 0.0.0.0:3001。' },
+      ONEBOT_ACCESS_TOKEN: { label: '访问令牌', help: 'OneBot 框架要求时填写。' },
+      ONEBOT_ALLOW_FROM: {
+        label: '允许的 QQ 用户 ID',
+        help: '逗号分隔。留空则拒绝所有人。'
+      },
+      ONEBOT_GROUP_ALLOW_FROM: {
+        label: '允许的群 ID',
+        help: '逗号分隔的群 ID，机器人只在这些群响应。留空拒绝所有群。'
+      },
+      ONEBOT_REQUIRE_AT: { label: '群里需要 @', help: '只在被 @ 时响应群消息。' },
+      ONEBOT_HOME_CHANNEL: { label: '主页 QQ 用户 ID', help: 'cron 输出和提醒的投递目标。' },
       QQBOT_HOME_CHANNEL_NAME: { label: 'QQ 主页频道名称' },
       SLACK_BOT_TOKEN: {
         label: 'Slack bot 令牌',

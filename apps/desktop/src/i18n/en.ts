@@ -1870,6 +1870,27 @@ export const en: Translations = {
       MATTERMOST_HOME_CHANNEL: { label: 'Home channel' },
       QQ_ALLOW_ALL_USERS: { label: 'Allow all QQ users' },
       QQBOT_HOME_CHANNEL: { label: 'QQ home channel', help: 'Default channel or group for cron delivery.' },
+      ONEBOT_WS_URL: {
+        label: 'OneBot WebSocket URL',
+        help: 'Where the bot connects for messages, e.g. ws://127.0.0.1:3001.'
+      },
+      ONEBOT_HTTP_URL: {
+        label: 'OneBot HTTP URL',
+        help: 'HTTP API base used to send messages, e.g. http://127.0.0.1:3000.'
+      },
+      ONEBOT_WS_MODE: { label: 'Connection mode', help: 'forward (bot connects out) or backward (listen).' },
+      ONEBOT_WS_LISTEN: { label: 'Listen address', help: 'Only for backward mode, e.g. 0.0.0.0:3001.' },
+      ONEBOT_ACCESS_TOKEN: { label: 'Access token', help: 'If your OneBot framework requires one.' },
+      ONEBOT_ALLOW_FROM: {
+        label: 'Allowed QQ user IDs',
+        help: 'Comma-separated. Empty denies everyone.'
+      },
+      ONEBOT_GROUP_ALLOW_FROM: {
+        label: 'Allowed group IDs',
+        help: 'Comma-separated groups where the bot responds. Empty denies all groups.'
+      },
+      ONEBOT_REQUIRE_AT: { label: 'Require @ in groups', help: 'Only respond in groups when @-mentioned.' },
+      ONEBOT_HOME_CHANNEL: { label: 'Home QQ user ID', help: 'Where cron output and reminders are delivered.' },
       QQBOT_HOME_CHANNEL_NAME: { label: 'QQ home channel name' },
       SLACK_BOT_TOKEN: {
         label: 'Slack bot token',
