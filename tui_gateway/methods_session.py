@@ -255,6 +255,30 @@ def _(rid, params: dict) -> dict:
             # their own source.
             deny = frozenset({"kanban", "tool"})
 
+            def _wire_row(session, branch_parent_roots, *, last_active=None):
+                """Project a rich row without leaking model_config markers."""
+                projected = {
+                    "id": session["id"],
+                    "title": session.get("title") or "",
+                    "preview": session.get("preview") or "",
+                    "started_at": session.get("started_at") or 0,
+                    "message_count": session.get("message_count") or 0,
+                    "source": session.get("source") or "",
+                }
+                lineage_root = session.get("_lineage_root_id")
+                if isinstance(lineage_root, str) and lineage_root:
+                    projected["_lineage_root_id"] = lineage_root
+                parent = session.get("parent_session_id")
+                if isinstance(parent, str) and parent:
+                    projected["parent_session_id"] = parent
+                branch_parent_root = branch_parent_roots.get(session["id"])
+                if branch_parent_root:
+                    projected["branch_parent_root_id"] = branch_parent_root
+                activity = session.get("last_active") if last_active is None else last_active
+                if isinstance(activity, (int, float)):
+                    projected["last_active"] = activity
+                return projected
+
             # ``title``: EXACT-title registry lookup, not a listing. The core
             # UNIQUE title index means at most one session per db carries a
             # given exact title, so callers that treat a title as an identity
@@ -291,7 +315,10 @@ def _(rid, params: dict) -> dict:
                     or row.get("archived")
                     or (row.get("source") or "").strip().lower() in deny
                 ):
-                    return _ok(rid, {"sessions": []})
+                    return _ok(
+                        rid,
+                        {"sessions": [], "total": 0, "has_more": False},
+                    )
                 try:
                     # A named-session registry lookup must resolve only a real
                     # compression continuation.  The generic resume resolver
@@ -302,58 +329,65 @@ def _(rid, params: dict) -> dict:
                 except Exception:
                     tip = row["id"]
                 tip_row = (db.get_session(tip) or row) if tip != row["id"] else row
+                normalize = getattr(db, "session_list_branch_parent_roots", None)
+                branch_parent_roots = normalize([row]) if callable(normalize) else {}
+                last_active_fn = getattr(db, "session_last_active", None)
+                last_active = last_active_fn(tip) if callable(last_active_fn) else None
+                wire_row = _wire_row(row, branch_parent_roots, last_active=last_active)
+                wire_row["resolved_id"] = tip
+                wire_row["preview"] = tip_row.get("preview") or ""
+                wire_row["message_count"] = tip_row.get("message_count") or 0
                 return _ok(
                     rid,
                     {
-                        "sessions": [
-                            {
-                                "id": row["id"],
-                                "resolved_id": tip,
-                                "title": row.get("title") or "",
-                                "preview": tip_row.get("preview") or "",
-                                "started_at": row.get("started_at") or 0,
-                                "message_count": tip_row.get("message_count") or 0,
-                                "source": row.get("source") or "",
-                            }
-                        ]
+                        "sessions": [wire_row],
+                        "total": 1,
+                        "has_more": False,
                     },
                 )
 
-            limit = int(params.get("limit", 200) or 200)
+            limit = max(1, min(int(params.get("limit", 200) or 200), 200))
+            offset = max(0, min(int(params.get("offset", 0) or 0), 1_000_000))
             # ``include_hidden``: surfaces that OWN hidden sessions (the Bots
             # pane's per-profile browser, plugin session pickers) need to list
             # them; the flag stays off for the resume picker and every other
             # global caller so `hidden` keeps meaning "not in shared lists".
             include_hidden = is_truthy_value(params.get("include_hidden", False))
-            # Over-fetch modestly so per-source filtering doesn't leave us
-            # short; the compression-tip projection in ``list_sessions_rich``
-            # can also merge rows.
-            fetch_limit = max(limit * 2, 200)
+            # Push the deny-list into SQL so LIMIT/OFFSET and total describe the
+            # same visible row set. Keep the small Python check as defense for
+            # older/custom SessionDB implementations that ignore the kwarg.
             rows = [
                 s
                 for s in db.list_sessions_rich(
                     source=None,
-                    limit=fetch_limit,
+                    exclude_sources=sorted(deny),
+                    limit=limit,
+                    offset=offset,
                     order_by_last_active=True,
                     compact_rows=True,
                     include_hidden=include_hidden,
                 )
                 if (s.get("source") or "").strip().lower() not in deny
             ][:limit]
+            normalize = getattr(db, "session_list_branch_parent_roots", None)
+            branch_parent_roots = normalize(rows) if callable(normalize) else {}
+            count = getattr(db, "session_count", None)
+            if callable(count):
+                total = count(
+                    exclude_children=True,
+                    exclude_sources=sorted(deny),
+                    include_hidden=include_hidden,
+                )
+            else:
+                # Compatibility for lightweight third-party/test SessionDB
+                # implementations. The real SessionDB always supplies count.
+                total = offset + len(rows)
             return _ok(
                 rid,
                 {
-                    "sessions": [
-                        {
-                            "id": s["id"],
-                            "title": s.get("title") or "",
-                            "preview": s.get("preview") or "",
-                            "started_at": s.get("started_at") or 0,
-                            "message_count": s.get("message_count") or 0,
-                            "source": s.get("source") or "",
-                        }
-                        for s in rows
-                    ]
+                    "sessions": [_wire_row(s, branch_parent_roots) for s in rows],
+                    "total": total,
+                    "has_more": offset + len(rows) < total,
                 },
             )
         except Exception as e:

@@ -11841,8 +11841,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     JOIN sessions child ON child.parent_session_id = parent.id
                     WHERE parent.id = ?
                       AND parent.end_reason = 'compression'
-                      AND json_extract(COALESCE(child.model_config, '{{}}'), '$._branched_from') IS NULL
-                      AND json_extract(COALESCE(child.model_config, '{{}}'), '$._delegate_from') IS NULL
+                      AND COALESCE(json_extract(COALESCE(child.model_config, '{{}}'), '$._branched_from'), '')
+                          != child.parent_session_id
+                      AND COALESCE(json_extract(COALESCE(child.model_config, '{{}}'), '$._delegate_from'), '')
+                          != child.parent_session_id
                       AND COALESCE(child.source, '') != 'tool'
                     ORDER BY
                       CASE
@@ -11874,6 +11876,153 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         id when no continuation exists."""
         chain = self.get_compression_chain(session_id)
         return chain[-1] if chain else session_id
+
+    def session_list_branch_parent_roots(
+        self,
+        sessions: List[Dict[str, Any]],
+        *,
+        max_rows: int = 200,
+        max_hops: int = 100,
+    ) -> Dict[str, str]:
+        """Return normalized visible-parent roots for listable branch rows.
+
+        ``parent_session_id`` records the exact segment that was live when a
+        branch was created. If that conversation compresses again, the exact
+        segment becomes an intermediate hidden row. Session-list consumers
+        need the compression root instead so the branch remains attached to
+        the one projected parent row.
+
+        The walk deliberately follows only compression edges, using the same
+        explicit-fork discriminator as :meth:`get_compression_lineage`. It is
+        batch-loaded and hard-bounded before traversal: at most ``max_rows``
+        seeds and ``max_hops`` ancestor frontiers are inspected. Missing,
+        malformed, cyclic, or over-depth ancestry simply omits the normalized
+        field; callers keep every admitted session row.
+        """
+        admitted = list(sessions[: max(0, min(int(max_rows), 200))])
+        hop_limit = max(1, min(int(max_hops), 100))
+        if not admitted:
+            return {}
+
+        def _config(row: Dict[str, Any]) -> Dict[str, Any]:
+            raw = row.get("model_config")
+            if not raw:
+                return {}
+            try:
+                parsed = json.loads(raw) if isinstance(raw, str) else raw
+            except (TypeError, json.JSONDecodeError):
+                return {}
+            return parsed if isinstance(parsed, dict) else {}
+
+        # Do not seed this cache from projected list rows. A projected row uses
+        # the compression tip's ``id`` but intentionally retains the root's
+        # ``parent_session_id``/model_config; treating that synthetic shape as
+        # the real tip would stop an ancestor walk one segment too early.
+        cache: Dict[str, Dict[str, Any]] = {}
+        frontier = {
+            str(row["parent_session_id"])
+            for row in admitted
+            if isinstance(row.get("parent_session_id"), str)
+            and row.get("parent_session_id")
+        }
+        with self._read_ctx() as conn:
+            for _ in range(hop_limit + 1):
+                missing = sorted(sid for sid in frontier if sid not in cache)
+                if missing:
+                    placeholders = ",".join("?" for _ in missing)
+                    rows = conn.execute(
+                        "SELECT id, parent_session_id, source, model_config, "
+                        "started_at, ended_at, end_reason FROM sessions "
+                        f"WHERE id IN ({placeholders})",
+                        missing,
+                    ).fetchall()
+                    for row in rows:
+                        cache[str(row["id"])] = dict(row)
+                frontier = {
+                    str(cache[sid]["parent_session_id"])
+                    for sid in frontier
+                    if sid in cache
+                    and isinstance(cache[sid].get("parent_session_id"), str)
+                    and cache[sid].get("parent_session_id")
+                    and str(cache[sid]["parent_session_id"]) not in cache
+                }
+                if not frontier:
+                    break
+
+        def _branch_origin(row: Dict[str, Any]) -> Optional[str]:
+            parent_id = row.get("parent_session_id")
+            if not isinstance(parent_id, str) or not parent_id:
+                return None
+            cfg = _config(row)
+            if "_branched_from" in cfg:
+                marker = cfg.get("_branched_from")
+                # Current writers bind the marker to the exact direct parent.
+                # A mismatched marker is corrupt evidence, not authority.
+                return parent_id if marker == parent_id else None
+
+            # Legacy branch rows predate the marker. Mirror
+            # _BRANCH_CHILD_SQL's end-reason/timestamp fallback exactly.
+            parent = cache.get(parent_id)
+            if not parent or parent.get("end_reason") != "branched":
+                return None
+            child_started = row.get("started_at")
+            parent_ended = parent.get("ended_at")
+            if child_started is None or parent_ended is None:
+                return None
+            try:
+                return parent_id if child_started >= parent_ended else None
+            except TypeError:
+                return None
+
+        def _compression_root(origin: str) -> Optional[str]:
+            current = origin
+            seen: set[str] = set()
+            for _ in range(hop_limit):
+                if not current or current in seen:
+                    return None
+                seen.add(current)
+                child = cache.get(current)
+                if child is None:
+                    return None
+                parent_id = child.get("parent_session_id")
+                if not isinstance(parent_id, str) or not parent_id:
+                    return current
+                # A branch/delegate/tool root starts its own conversation; do
+                # not cross that edge while normalizing its compression root.
+                if self._is_explicit_fork_child_row(child):
+                    return current
+                parent = cache.get(parent_id)
+                if parent is None:
+                    return None
+                if parent.get("end_reason") != "compression":
+                    return current
+                current = parent_id
+            return None
+
+        normalized: Dict[str, str] = {}
+        for row in admitted:
+            visible_id = row.get("id")
+            if not isinstance(visible_id, str) or not visible_id:
+                continue
+            origin = _branch_origin(row)
+            root = _compression_root(origin) if origin else None
+            if root:
+                normalized[visible_id] = root
+        return normalized
+
+    def session_last_active(self, session_id: str) -> Optional[float]:
+        """Return the list-order activity timestamp for one exact session row."""
+        if not session_id:
+            return None
+        with self._read_ctx() as conn:
+            row = conn.execute(
+                f"SELECT {_sql_session_last_active('s')} AS last_active "
+                "FROM sessions s WHERE s.id = ?",
+                (session_id,),
+            ).fetchone()
+        if row is None or row["last_active"] is None:
+            return None
+        return float(row["last_active"])
 
     # Columns excluded from compact_rows projections: only the payload-heavy
     # blob no list consumer renders. Everything else — including gateway
@@ -12024,8 +12173,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             params.append(session_key)
         if exclude_sources:
             placeholders = ",".join("?" for _ in exclude_sources)
-            where_clauses.append(f"s.source NOT IN ({placeholders})")
-            params.extend(exclude_sources)
+            where_clauses.append(
+                f"LOWER(COALESCE(s.source, '')) NOT IN ({placeholders})"
+            )
+            params.extend(str(value).lower() for value in exclude_sources)
         if cwd_prefix:
             clause, clause_params = _cwd_prefix_clause(cwd_prefix)
             where_clauses.append(clause)
@@ -12134,8 +12285,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     JOIN sessions parent ON parent.id = c.cur_id
                     JOIN sessions child ON child.parent_session_id = c.cur_id
                     WHERE parent.end_reason = 'compression'
-                      AND json_extract(COALESCE(child.model_config, '{{}}'), '$._branched_from') IS NULL
-                      AND json_extract(COALESCE(child.model_config, '{{}}'), '$._delegate_from') IS NULL
+                      AND COALESCE(json_extract(COALESCE(child.model_config, '{{}}'), '$._branched_from'), '')
+                          != child.parent_session_id
+                      AND COALESCE(json_extract(COALESCE(child.model_config, '{{}}'), '$._delegate_from'), '')
+                          != child.parent_session_id
                       AND COALESCE(child.source, '') != 'tool'
                 ),
                 chain_max AS (
@@ -14846,6 +14999,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         archived_only: bool = False,
         exclude_children: bool = False,
         exclude_sources: List[str] = None,
+        include_hidden: Optional[bool] = None,
     ) -> int:
         """Count sessions, optionally filtered by source.
 
@@ -14860,6 +15014,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         (e.g. ``["cron"]`` so the recents "load more" total matches a
         cron-excluded ``list_sessions_rich`` page and doesn't keep "load more"
         stuck on for buried scheduler sessions).
+
+        ``include_hidden`` is tri-state for compatibility: ``None`` preserves
+        the historical all-row count, while an explicit false mirrors a normal
+        list and true admits hidden rows.
         """
         where_clauses = []
         params = []
@@ -14877,8 +15035,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             params.extend(include_sources)
         if exclude_sources:
             placeholders = ",".join("?" for _ in exclude_sources)
-            where_clauses.append(f"s.source NOT IN ({placeholders})")
-            params.extend(exclude_sources)
+            where_clauses.append(
+                f"LOWER(COALESCE(s.source, '')) NOT IN ({placeholders})"
+            )
+            params.extend(str(value).lower() for value in exclude_sources)
         if cwd_prefix:
             clause, clause_params = _cwd_prefix_clause(cwd_prefix)
             where_clauses.append(clause)
@@ -14890,6 +15050,11 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             where_clauses.append("s.archived = 1")
         elif not include_archived:
             where_clauses.append("s.archived = 0")
+        # ``None`` preserves the historical count contract for callers that do
+        # not pair this with a visibility-scoped listing. session.list passes
+        # an explicit boolean so its total describes the exact same row set.
+        if include_hidden is False:
+            where_clauses.append("s.hidden = 0")
 
         where_sql = f" WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
 
