@@ -209,6 +209,11 @@ def _browser_controller_ws_sender(ws, loop, *, wait_timeout: float = 10.0):
     own deadline/cancel path decide; a real send exception still propagates.
     """
 
+    # Strong refs to on-loop fire-and-forget frame pushes: the loop keeps
+    # tasks only weakly, so an unreferenced send can be GC-reaped and the
+    # frame silently dropped.
+    _spawned_sends: set = set()
+
     def send(frame: dict) -> None:
         if ws.closed:
             raise ConnectionError("browser-control websocket is closed")
@@ -217,7 +222,10 @@ def _browser_controller_ws_sender(ws, loop, *, wait_timeout: float = 10.0):
         except RuntimeError:
             on_loop = False
         if on_loop:
-            loop.create_task(ws.send_json(frame))
+            task = loop.create_task(ws.send_json(frame))
+            _spawned_sends.add(task)
+            if hasattr(task, "add_done_callback"):
+                task.add_done_callback(_spawned_sends.discard)
             return
         future = asyncio.run_coroutine_threadsafe(ws.send_json(frame), loop)
         try:

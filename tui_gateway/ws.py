@@ -143,6 +143,10 @@ class WSTransport:
         self.auth_identity = auth_identity
         self._closed = False
         self._last_inbound_at = time.monotonic()
+        # Strong refs to fire-and-forget flush tasks: the loop keeps only
+        # weak references, so an unreferenced batch send can be GC-reaped
+        # before the tokens reach the wire.
+        self._spawned_tasks: set = set()
         # Token-coalescing buffer (CF-2). Streamed token frames land here and a
         # short timer flushes the batch. The lock guards the buffer + the
         # "armed" flag against the worker threads that call write(); the timer
@@ -213,7 +217,10 @@ class WSTransport:
             self._pending_tokens = []
             if on_loop:
                 # Fire-and-forget — don't block the loop waiting on itself.
-                self._loop.create_task(self._safe_send_many(batch))
+                task = self._loop.create_task(self._safe_send_many(batch))
+                self._spawned_tasks.add(task)
+                if hasattr(task, "add_done_callback"):
+                    task.add_done_callback(self._spawned_tasks.discard)
                 return True
             fut = safe_schedule_threadsafe(
                 self._safe_send_many(batch), self._loop
@@ -268,7 +275,10 @@ class WSTransport:
                 return
             batch = self._pending_tokens
             self._pending_tokens = []
-            self._loop.create_task(self._safe_send_many(batch))
+            task = self._loop.create_task(self._safe_send_many(batch))
+            self._spawned_tasks.add(task)
+            if hasattr(task, "add_done_callback"):
+                task.add_done_callback(self._spawned_tasks.discard)
 
     async def write_async(self, obj: dict) -> bool:
         """Send from the owning event loop. Awaits until the frame is on the wire."""

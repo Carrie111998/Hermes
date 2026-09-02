@@ -1654,7 +1654,15 @@ class SlackAdapter(BasePlatformAdapter):
             loop = asyncio.get_running_loop()
         except RuntimeError:
             return
-        loop.create_task(self._restart_socket_mode("socket task exited"))
+        # Track the task: the loop keeps only weak references, so an
+        # unreferenced reconnect can be GC-reaped and Slack would stay
+        # disconnected until process restart.
+        restart_task = loop.create_task(
+            self._restart_socket_mode("socket task exited")
+        )
+        self._background_tasks.add(restart_task)
+        if hasattr(restart_task, "add_done_callback"):
+            restart_task.add_done_callback(self._background_tasks.discard)
 
     def _describe_slack_api_error(
         self, response: Any, *, file_obj: Optional[Dict[str, Any]] = None
