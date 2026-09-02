@@ -250,11 +250,11 @@ class TestBotModeGatewayPromptRestore:
         assert agent._session_title_hint is None
 
     @pytest.mark.parametrize(
-        ("profile_managed", "platform"),
+        ("roster_profile", "platform"),
         ((False, "discord"), (True, "cli"), (True, "not-a-platform")),
     )
     def test_stale_prompt_does_not_migrate_denied_session(
-        self, tmp_path, monkeypatch, profile_managed, platform
+        self, tmp_path, monkeypatch, roster_profile, platform
     ):
         from agent import conversation_loop
         from tools import bot_mode_probe
@@ -264,10 +264,12 @@ class TestBotModeGatewayPromptRestore:
         agent = self._gateway_agent(tmp_path, stored)
         agent.platform = platform
         agent._session_db.get_session_title.return_value = "Ordinary chat"
-        if not profile_managed:
-            (tmp_path / ".hermes" / "profiles" / "yuki" / "profile.yaml").unlink()
-            # Keep the install managed via a different profile while the
-            # current routed profile remains unmanaged.
+        if not roster_profile:
+            # Keep the install managed via another profile while tombstoning
+            # the current routed profile out of profiles.list.
+            tombstone = tmp_path / ".hermes" / "profiles" / ".deleted" / "yuki"
+            tombstone.parent.mkdir(parents=True)
+            tombstone.write_text("deleted\n", encoding="utf-8")
             other = tmp_path / ".hermes" / "profiles" / "researcher"
             other.mkdir(parents=True)
             (other / "profile.yaml").write_text(

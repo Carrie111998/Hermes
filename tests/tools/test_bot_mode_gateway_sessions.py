@@ -7,17 +7,17 @@ living on Discord cannot route work to teammates at all and asks the user to
 relay messages by hand.
 
 The gate stays closed for:
-- unmanaged profiles (no ``ui_meta['hermes-bots']`` anywhere AND the current
-  profile not managed) on any session shape,
-- self-owned sessions (CLI, TUI, desktop, cron, kanban, subagent, webhook,
-  api_server, ...) even on managed installs.
+- profiles on installs that are not participating in Bot Mode,
+- paths that are not real members of a participating install's profile roster,
+- self-owned and machine/API sessions (CLI, cron, A2A, Home Assistant, ...).
 
-Fleet contract (rsi/JJ audit): EVERY Bot-Mode-managed local profile on this
-install gets the tool in a gateway session; unmanaged sessions never do.
+Fleet contract (rsi/JJ audit): EVERY local profile in a Bot-Mode-participating
+install is a Bot Mode roster member, even when only some profiles have custom
+``ui_meta['hermes-bots']`` presentation metadata. Unmanaged installs and
+non-human session sources never receive the tool.
 """
 
 import json
-import textwrap
 from pathlib import Path
 
 import pytest
@@ -33,49 +33,63 @@ def _fresh_probe_cache():
     bot_mode_probe._reset_cache_for_tests()
 
 
-# The exact audited install roster (13 profiles incl. default).
+# The exact audited install roster (13 profiles incl. default). Only five have
+# custom Bot Mode presentation metadata in the installed topology; Bot Mode's
+# roster itself is every profile returned by profiles.list.
 AUDITED_PROFILES = (
     "default", "buggy", "coder", "jade", "jade-ops", "product", "qa",
     "research", "reviewer", "rsi", "x", "yuki", "yuki-ops",
 )
+AUDITED_PROFILES_WITH_BOT_META = ("jade", "jade-ops", "rsi", "yuki", "yuki-ops")
 
-# Every built-in messaging-gateway session class. The expected set is derived
-# from the production Platform enum and the shared self-owned exclusion set,
-# so adding a new adapter exercises it automatically instead of requiring a
-# catalog snapshot update.
+# Explicit security classification: only adapters carrying human-authored
+# conversations qualify. Machine/API/event sources fail closed even though they
+# are valid Platform values.
+BUILTIN_MESSAGING_SOURCES = (
+    "telegram", "discord", "whatsapp", "whatsapp_cloud", "slack", "signal",
+    "mattermost", "matrix", "email", "sms", "dingtalk", "feishu", "wecom",
+    "wecom_callback", "weixin", "bluebubbles", "qqbot", "yuanbao",
+)
+BUILTIN_DENIED_SOURCES = (
+    "local", "homeassistant", "api_server", "webhook", "msgraph_webhook",
+    "relay",
+)
+BUNDLED_MESSAGING_SOURCES = (
+    "buzz", "dingtalk", "discord", "email", "feishu", "google_chat", "irc",
+    "line", "matrix", "mattermost", "photon", "simplex", "slack", "sms",
+    "teams", "telegram", "wecom", "whatsapp",
+)
+BUNDLED_DENIED_SOURCES = ("a2a", "homeassistant", "ntfy", "raft")
 SELF_OWNED_SOURCES = (
     "", "cli", "tui", "desktop", "cron", "kanban", "subagent", "test",
     "webhook", "api_server", "msgraph_webhook", "local", "acp", "webui",
 )
-GATEWAY_SOURCES = tuple(
-    platform.value
-    for platform in Platform
-    if platform.value not in SELF_OWNED_SOURCES
-)
 
 
-def _make_hermes_home(tmp_path: Path, managed_profiles=AUDITED_PROFILES) -> Path:
-    """A hermes root whose selected profiles carry Bot Mode ui_meta."""
+def _make_hermes_home(
+    tmp_path: Path,
+    managed_profiles=AUDITED_PROFILES_WITH_BOT_META,
+    installed_profiles=AUDITED_PROFILES,
+) -> Path:
+    """Mirror a Bot Mode install: full roster, sparse presentation metadata."""
     home = tmp_path / ".hermes"
     home.mkdir()
-    for name in managed_profiles:
-        if name == "default":
-            # The desktop writes the default profile's ui_meta at the root.
-            (home / "profile.yaml").write_text(
-                "ui_meta:\n  hermes-bots:\n    shape: local\n", encoding="utf-8"
-            )
-            continue
+    managed = set(managed_profiles)
+    installed = set(installed_profiles)
+    if "default" in managed:
+        (home / "profile.yaml").write_text(
+            "ui_meta:\n  hermes-bots:\n    shape: local\n", encoding="utf-8"
+        )
+    for name in sorted(installed - {"default"}):
         d = home / "profiles" / name
         d.mkdir(parents=True, exist_ok=True)
+        metadata = (
+            "\nui_meta:\n  hermes-bots:\n    shape: cloud\n"
+            if name in managed
+            else "\n"
+        )
         (d / "profile.yaml").write_text(
-            textwrap.dedent(
-                """\
-                description: teammate for tests
-                ui_meta:
-                  hermes-bots:
-                    shape: cloud
-                """
-            ),
+            "description: teammate for tests\n" + metadata,
             encoding="utf-8",
         )
     return home
@@ -139,13 +153,75 @@ def test_canonical_bot_chat_kind_unchanged(tmp_path):
     assert state["session_kind"] == "bot_chat"
 
 
+def test_installed_profile_without_own_bot_metadata_is_roster_managed(tmp_path):
+    """Installed topology: coder is a Bot Mode bot without presentation ui_meta."""
+    home = _make_hermes_home(tmp_path)
+    coder_home = home / "profiles" / "coder"
+    assert "hermes-bots" not in (coder_home / "profile.yaml").read_text()
+
+    gateway = _FakeAgent(coder_home, title="Group: 1", platform="discord")
+    canonical = _FakeAgent(
+        coder_home, title="Bot Chat", platform="cli", session_id="coder-bot-chat"
+    )
+    assert bot_mode_probe.bot_mode_session_state(gateway)["session_kind"] == "gateway"
+    assert bot_mode_probe.bot_mode_session_state(canonical)["session_kind"] == "bot_chat"
+
+
+def test_roster_profile_does_not_require_presentation_metadata_file(tmp_path):
+    """profiles.list includes valid profile directories without profile.yaml."""
+    home = _make_hermes_home(
+        tmp_path, managed_profiles=("yuki",), installed_profiles=("yuki",)
+    )
+    bare = home / "profiles" / "bare"
+    bare.mkdir()
+    agent = _FakeAgent(bare, title="Group: 1", platform="discord", session_id="bare")
+    assert bot_mode_probe.bot_mode_session_state(agent)["session_kind"] == "gateway"
+
+
+def test_deleted_and_invalid_profile_directories_are_not_roster_members(tmp_path):
+    home = _make_hermes_home(tmp_path, managed_profiles=("yuki",))
+    deleted = home / "profiles" / "coder"
+    tombstone = home / "profiles" / ".deleted" / "coder"
+    tombstone.parent.mkdir(exist_ok=True)
+    tombstone.write_text("deleted\n")
+    invalid = home / "profiles" / "INVALID!"
+    invalid.mkdir()
+
+    for profile_home, sid in ((deleted, "deleted"), (invalid, "invalid")):
+        agent = _FakeAgent(
+            profile_home, title="Group: 1", platform="discord", session_id=sid
+        )
+        assert bot_mode_probe.bot_mode_session_state(agent)["session_kind"] is None
+
+
+def test_symlinked_profile_cannot_escape_install_containment(tmp_path):
+    home = _make_hermes_home(
+        tmp_path, managed_profiles=("yuki",), installed_profiles=("yuki",)
+    )
+    external = tmp_path / "external-managed-home"
+    external.mkdir()
+    (external / "profile.yaml").write_text(
+        "ui_meta:\n  hermes-bots:\n    shape: external\n"
+    )
+    escaped = home / "profiles" / "escaped"
+    escaped.symlink_to(external, target_is_directory=True)
+
+    agent = _FakeAgent(
+        escaped, title="Group: 1", platform="discord", session_id="escaped"
+    )
+    assert bot_mode_probe.bot_mode_session_state(agent)["session_kind"] is None
+
+
 def test_multiplex_context_override_beats_shared_launch_db(tmp_path):
     """The routed profile ContextVar, not shared gateway state.db, owns auth."""
     from hermes_constants import reset_hermes_home_override, set_hermes_home_override
 
-    # Managed launch/default profile must not bless an unmanaged routed Yuki.
-    home = _make_hermes_home(tmp_path, managed_profiles=("default",))
-    yuki_home = home / "profiles" / "yuki"
+    # Managed launch/default profile must not bless a routed path that is not
+    # a real member of the install's profile roster.
+    home = _make_hermes_home(
+        tmp_path, managed_profiles=("default",), installed_profiles=("default",)
+    )
+    yuki_home = home / "profiles" / "INVALID!"
     yuki_home.mkdir(parents=True)
     shared_agent = _FakeAgent(home, title="Group: 1", platform="discord")
     token = set_hermes_home_override(yuki_home)
@@ -177,8 +253,8 @@ def test_multiplex_cache_isolated_by_routed_profile_home(tmp_path):
 
     home = _make_hermes_home(tmp_path, managed_profiles=("yuki",))
     yuki_home = home / "profiles" / "yuki"
-    ordinary_home = home / "profiles" / "ordinary"
-    ordinary_home.mkdir(parents=True)
+    unlisted_home = home / "profiles" / "INVALID!"
+    unlisted_home.mkdir(parents=True)
 
     managed = _FakeAgent(home, title="Group: 1", platform="discord")
     token = set_hermes_home_override(yuki_home)
@@ -187,11 +263,11 @@ def test_multiplex_cache_isolated_by_routed_profile_home(tmp_path):
     finally:
         reset_hermes_home_override(token)
 
-    # Same launch DB and persisted session ID, different routed profile home.
-    ordinary = _FakeAgent(home, title="Group: 1", platform="discord")
-    token = set_hermes_home_override(ordinary_home)
+    # Same launch DB and persisted session ID, different unlisted routed home.
+    unlisted = _FakeAgent(home, title="Group: 1", platform="discord")
+    token = set_hermes_home_override(unlisted_home)
     try:
-        assert bot_mode_probe.bot_mode_session_state(ordinary)["session_kind"] is None
+        assert bot_mode_probe.bot_mode_session_state(unlisted)["session_kind"] is None
     finally:
         reset_hermes_home_override(token)
 
@@ -207,29 +283,29 @@ def test_unmanaged_profile_gateway_session_not_routed(tmp_path):
     assert state["session_kind"] is None
 
 
-def test_unmanaged_profile_on_managed_install_not_routed(tmp_path):
-    """A managed teammate elsewhere must not bless an ordinary profile's chat."""
+def test_unlisted_profile_path_on_managed_install_not_routed(tmp_path):
+    """A managed install must not bless a path absent from profiles.list."""
     home = _make_hermes_home(tmp_path, managed_profiles=("yuki",))
     managed = _FakeAgent(
         home / "profiles" / "yuki", title="Group: 1", platform="discord"
     )
     assert bot_mode_probe.bot_mode_session_state(managed)["session_kind"] == "gateway"
 
-    ordinary_home = home / "profiles" / "ordinary"
-    ordinary_home.mkdir(parents=True)
-    agent = _FakeAgent(ordinary_home, title="Group: 1", platform="discord")
+    unlisted_home = home / "profiles" / "INVALID!"
+    unlisted_home.mkdir(parents=True)
+    agent = _FakeAgent(unlisted_home, title="Group: 1", platform="discord")
     state = bot_mode_probe.bot_mode_session_state(agent)
     assert state["managed"] is True
     assert state["session_kind"] is None
     assert bot_mode_dm.ensure_message_agent_tool(agent) is False
 
 
-def test_unmanaged_profile_canonical_bot_chat_not_routed(tmp_path):
-    """Install-wide management cannot bless an unmanaged sibling's Bot Chat."""
+def test_unlisted_profile_path_canonical_bot_chat_not_routed(tmp_path):
+    """Install-wide management cannot bless an unlisted path's Bot Chat."""
     home = _make_hermes_home(tmp_path, managed_profiles=("yuki",))
-    unmanaged_home = home / "profiles" / "ordinary"
-    unmanaged_home.mkdir(parents=True)
-    agent = _FakeAgent(unmanaged_home, title="Bot Chat", platform="cli")
+    unlisted_home = home / "profiles" / "INVALID!"
+    unlisted_home.mkdir(parents=True)
+    agent = _FakeAgent(unlisted_home, title="Bot Chat", platform="cli")
 
     assert bot_mode_probe.bot_mode_session_state(agent) == {
         "managed": True,
@@ -260,13 +336,23 @@ def test_self_owned_sessions_never_route_on_managed_install(tmp_path, platform):
     assert state["session_kind"] is None
 
 
-@pytest.mark.parametrize("platform", GATEWAY_SOURCES)
-def test_structural_gateway_platforms_route(tmp_path, platform):
-    """Any messaging-gateway platform qualifies — not just Discord."""
+@pytest.mark.parametrize("platform", BUILTIN_MESSAGING_SOURCES)
+def test_explicit_builtin_messaging_platforms_route(tmp_path, platform):
     home = _make_hermes_home(tmp_path, managed_profiles=("yuki",))
     yuki_home = home / "profiles" / "yuki"
     agent = _FakeAgent(yuki_home, title="chat with JJ", platform=platform)
+    assert bot_mode_probe.is_messaging_gateway_session(agent) is True
     assert bot_mode_probe.bot_mode_session_state(agent)["session_kind"] == "gateway"
+
+
+@pytest.mark.parametrize("platform", BUILTIN_DENIED_SOURCES)
+def test_builtin_machine_and_api_platforms_are_denied(tmp_path, platform):
+    home = _make_hermes_home(tmp_path, managed_profiles=("yuki",))
+    agent = _FakeAgent(
+        home / "profiles" / "yuki", title="external task", platform=platform
+    )
+    assert bot_mode_probe.is_messaging_gateway_session(agent) is False
+    assert bot_mode_probe.bot_mode_session_state(agent)["session_kind"] is None
 
 
 def test_session_gate_is_frozen_after_first_resolution(tmp_path):
@@ -355,15 +441,34 @@ def test_bot_chat_injection_still_works(tmp_path):
     assert bot_mode_dm.ensure_message_agent_tool(agent) is True
 
 
-def test_bundled_plugin_platform_routes(tmp_path):
-    """Registered plugin adapters qualify structurally without an allowlist."""
+@pytest.mark.parametrize("platform", BUNDLED_MESSAGING_SOURCES)
+def test_bundled_human_messaging_platform_routes(tmp_path, platform):
     home = _make_hermes_home(tmp_path, managed_profiles=("yuki",))
     agent = _FakeAgent(
-        home / "profiles" / "yuki", title="IRC: #bots", platform="irc"
+        home / "profiles" / "yuki", title="chat with JJ", platform=platform
     )
     assert bot_mode_probe.is_messaging_gateway_session(agent) is True
     assert bot_mode_probe.bot_mode_session_state(agent)["session_kind"] == "gateway"
     assert bot_mode_dm.ensure_message_agent_tool(agent) is True
+
+
+@pytest.mark.parametrize("platform", BUNDLED_DENIED_SOURCES)
+def test_bundled_machine_or_agent_platform_is_denied(tmp_path, platform):
+    """A2A/automation tasks must not gain Bot Mode teammate capabilities."""
+    home = _make_hermes_home(tmp_path, managed_profiles=("yuki",))
+    agent = _FakeAgent(
+        home / "profiles" / "yuki", title="external task", platform=platform
+    )
+    assert Platform(platform).value == platform  # valid bundled adapter
+    assert bot_mode_probe.is_messaging_gateway_session(agent) is False
+    assert bot_mode_probe.bot_mode_session_state(agent)["session_kind"] is None
+    assert bot_mode_dm.ensure_message_agent_tool(agent) is False
+
+
+def test_every_bundled_adapter_has_explicit_security_classification():
+    """A new bundled adapter fails closed until this boundary is reviewed."""
+    classified = set(BUNDLED_MESSAGING_SOURCES) | set(BUNDLED_DENIED_SOURCES)
+    assert Platform._scan_bundled_plugin_platforms() == classified
 
 
 def test_arbitrary_source_fails_closed(tmp_path):
@@ -448,12 +553,14 @@ def test_protocol_section_wording_covers_gateway_chats(tmp_path):
 
 
 @pytest.mark.parametrize("profile", AUDITED_PROFILES)
-def test_fleet_gateway_matrix_every_managed_profile(tmp_path, profile):
-    """Post-fix acceptance: EVERY audited managed profile gets message_agent
-    in a Discord session, canonical Bot Chat still works, and the default
-    profile's own Discord chat routes too. Unmanaged profiles stay denied."""
+def test_fleet_gateway_matrix_every_roster_profile(tmp_path, profile):
+    """Exact installed topology: all 13 roster profiles route, while only the
+    five customized profiles carry ``hermes-bots`` presentation metadata."""
     home = _make_hermes_home(tmp_path)
     profile_home = home if profile == "default" else home / "profiles" / profile
+    if profile != "default":
+        raw = (profile_home / "profile.yaml").read_text()
+        assert ("hermes-bots" in raw) is (profile in AUDITED_PROFILES_WITH_BOT_META)
 
     # gateway session: routed
     gw = _FakeAgent(profile_home, title="Group: 1", platform="discord")

@@ -168,6 +168,32 @@ def test_unknown_target_lists_roster(tmp_path):
     assert set(result["teammates"]) == {"researcher", "coder"}
 
 
+def test_local_target_roster_excludes_deleted_invalid_and_symlinked_dirs(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(
+        bot_mode_dm,
+        "_spawn_delivery",
+        lambda *args, **kwargs: pytest.fail("unlisted target reached delivery"),
+    )
+    home = _managed_home(tmp_path, teammates=("researcher", "dead"))
+    tombstone = home / "profiles" / ".deleted" / "dead"
+    tombstone.parent.mkdir()
+    tombstone.write_text("deleted\n", encoding="utf-8")
+    (home / "profiles" / "INVALID!").mkdir()
+    external = tmp_path / "external-profile"
+    external.mkdir()
+    (home / "profiles" / "escaped").symlink_to(external, target_is_directory=True)
+    agent = _FakeAgent(home, title="Bot Chat")
+
+    for target in ("dead", "INVALID!", "escaped"):
+        result = json.loads(
+            bot_mode_dm.message_agent_tool(target=target, message="hi", agent=agent)
+        )
+        assert "error" in result
+        assert set(result["teammates"]) == {"researcher"}
+
+
 def test_cannot_message_self(tmp_path):
     home = _managed_home(tmp_path)
     agent = _FakeAgent(home, title="Bot Chat")  # default profile

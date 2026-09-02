@@ -3,8 +3,8 @@
 A structured, Bot-Mode-session-only tool that lets a Bot Mode agent message a
 teammate agent (another Hermes profile on this install, or an agent on a
 registered peer gateway) WITHOUT hand-assembling shell commands. Routed Bot
-Mode sessions are the canonical "Bot Chat" and messaging-gateway chats whose
-own profile is Bot-Mode-managed.
+Mode sessions are the canonical "Bot Chat" and classified human messaging
+chats routed to real profiles in a Bot-Mode-participating install.
 
 Why this exists (Aug 2026): the Bot Mode teammate protocol taught agents to
 DM each other via a prompt-injected ``hermes -p <bot> chat ...`` shellout.
@@ -19,11 +19,11 @@ blocks the sender's turn).
 
 Containment contract (MUST hold — reviewers check all three):
 - The tool schema is injected ONLY into a routed Bot Mode session: either a
-  canonical "Bot Chat" on a Bot-Mode-managed install, or a messaging-gateway
-  chat whose OWN profile is Bot-Mode-managed. The shared gate excludes CLI,
-  TUI, desktop, cron, kanban, subagent, webhook/API, and arbitrary sources.
-  It is NOT registered in the global tool registry and is NOT part of any
-  toolset.
+  canonical "Bot Chat" or a classified human messaging chat, both bound to a
+  real roster profile in a Bot-Mode-participating install. The shared gate
+  excludes CLI, TUI, desktop, cron, kanban, subagent, webhook/API, agent-task,
+  automation, and arbitrary sources. It is NOT registered in the global tool
+  registry and is NOT part of any toolset.
 - Dispatch uses the same shared gate again at execution time (defense in
   depth): a forged call from a session that shouldn't have the tool returns
   a structured error instead of delivering.
@@ -133,9 +133,9 @@ def ensure_message_agent_tool(agent: Any) -> bool:
 
     Called once per turn from the conversation loop. Idempotent and
     deterministic for the life of a session: the gate (:func:`bot_mode_probe.
-    bot_mode_session_state` — canonical Bot Chat on a managed install, or a
-    messaging-gateway chat of a MANAGED profile) is stable from the
-    session's first turn, so the tool list is byte-identical across turns —
+    bot_mode_session_state` — canonical Bot Chat or classified human
+    messaging chat on a real roster profile) is stable from the session's
+    first turn, so the tool list is byte-identical across turns —
     prompt-cache safe. Every other session fails the gate on every turn and
     never sees the schema. Never raises.
     """
@@ -183,17 +183,13 @@ def _self_profile_name(home: Path) -> str:
 
 
 def _local_roster(root: Path) -> list[str]:
-    """Profile names on this install: default + every named profile."""
-    names = ["default"]
+    """Live local profile names, sharing the prompt/auth roster contract."""
     try:
-        profiles = root / "profiles"
-        if profiles.is_dir():
-            for child in sorted(profiles.iterdir()):
-                if child.is_dir():
-                    names.append(child.name)
+        from tools.bot_mode_probe import _roster as _probe_roster
+
+        return [name for name, _profile_dir in _probe_roster(root)]
     except Exception:
-        pass
-    return names
+        return []
 
 
 def _peers(root: Path) -> list[str]:

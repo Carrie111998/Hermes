@@ -4,13 +4,15 @@ When the desktop's Bot Mode manages this install, routed Bot Mode sessions
 receive a short "Messaging other agents" section so the bot can receive
 teammate DMs, reply with attribution, and hand off @mentions. Routed means:
 
-- the canonical "Bot Chat" on a Bot-Mode-managed install, or
-- a messaging-gateway chat (Discord, Telegram, Slack, ...) whose OWN profile
-  carries ``ui_meta['hermes-bots']``.
+- the canonical "Bot Chat" for any profile in a Bot-Mode-participating
+  install, or
+- a classified human messaging chat (Discord, Telegram, Slack, ...) routed to
+  one of that install's real profiles.
 
-Regular self-owned sessions (CLI, TUI, cron, subagents, ...) and gateway
-chats of unmanaged profiles never carry the section; the desktop's composer
-middleware owns the @mention send path there.
+Regular self-owned sessions (CLI, TUI, cron, subagents, ...), machine/API
+adapters, paths outside the install's profile roster, and every session on an
+unmanaged install never carry the section; the desktop's composer middleware
+owns the @mention send path there.
 
 The shared :func:`bot_mode_session_state` gate is used by the prompt,
 schema-injection, and dispatch paths so defense in depth cannot drift.
@@ -34,10 +36,12 @@ Toggle via ``agent.bot_mode_protocol`` in config.yaml (default True).
 from __future__ import annotations
 
 import os
+import re
 import threading
 from pathlib import Path
 
 _PROTOCOL_HEADING = "## Messaging other agents"
+_PROFILE_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 
 # The canonical per-bot conversation title — the only session shape that
 # receives the protocol section. Must match the desktop plugin's
@@ -84,16 +88,52 @@ def _is_bot_managed(profile_dir: Path) -> bool:
         return False
 
 
+def _absolute_without_symlink_resolution(path: Path) -> Path:
+    """Absolute lexical path, preserving ``profiles/<name>`` containment."""
+    return Path(os.path.abspath(os.fspath(path.expanduser())))
+
+
+def _is_roster_profile_dir(root: Path, candidate: Path) -> bool:
+    """Match the lightweight profile-directory contract used by profiles.list.
+
+    Invalid/tombstoned names and symlinks fail closed. Resolving only after the
+    lexical parent check prevents ``profiles/<name>`` links from escaping the
+    install and being reclassified as another install's default profile.
+    """
+    try:
+        root = _absolute_without_symlink_resolution(root)
+        candidate = _absolute_without_symlink_resolution(candidate)
+        if candidate == root:
+            return root.is_dir()
+        profiles = root / "profiles"
+        if (
+            candidate.parent != profiles
+            or not _PROFILE_ID_RE.fullmatch(candidate.name)
+            or candidate.is_symlink()
+            or profiles.is_symlink()
+            or not candidate.is_dir()
+            or (profiles / ".deleted" / candidate.name).exists()
+        ):
+            return False
+        profiles_real = profiles.resolve(strict=True)
+        return candidate.resolve(strict=True) == profiles_real / candidate.name
+    except (OSError, RuntimeError):
+        return False
+
+
 def _roster(root: Path) -> list[tuple[str, Path]]:
-    """(name, dir) for the default profile + every named profile."""
-    entries: list[tuple[str, Path]] = [("default", root)]
+    """The same valid default + named profile directories as profiles.list."""
+    root = _absolute_without_symlink_resolution(root)
+    entries: list[tuple[str, Path]] = []
+    if _is_roster_profile_dir(root, root):
+        entries.append(("default", root))
     try:
         profiles = root / "profiles"
-        if profiles.is_dir():
+        if profiles.is_dir() and not profiles.is_symlink():
             for child in sorted(profiles.iterdir()):
-                if child.is_dir():
+                if child.name != "default" and _is_roster_profile_dir(root, child):
                     entries.append((child.name, child))
-    except Exception:
+    except OSError:
         pass
     return entries
 
@@ -116,56 +156,56 @@ def is_bot_mode_managed(home: str | os.PathLike | None = None) -> bool:
         return False
 
 
-def is_profile_bot_managed(home: str | os.PathLike | None = None) -> bool:
-    """True when the CURRENT profile itself is Bot-Mode-managed.
+def is_bot_mode_roster_profile(home: str | os.PathLike | None = None) -> bool:
+    """True when ``home`` is a real profile in a participating install's roster.
 
-    Used by the messaging-gateway arm of the routing gate: a gateway chat
-    may only route teammates when the profile behind it opted into Bot
-    Mode (``ui_meta['hermes-bots']``). Never raises.
+    Bot Mode's roster is ``profiles.list``: every installed profile is a bot,
+    while ``ui_meta['hermes-bots']`` is optional presentation data written only
+    after customization. Named profiles must be valid, live immediate
+    ``profiles/`` children; the install root is the implicit default profile.
+    Never raises.
     """
     try:
-        resolved = Path(
-            str(home) if home else (os.getenv("HERMES_HOME") or os.path.expanduser("~/.hermes"))
+        candidate = _absolute_without_symlink_resolution(
+            Path(
+                str(home)
+                if home
+                else (os.getenv("HERMES_HOME") or os.path.expanduser("~/.hermes"))
+            )
         )
-        return _is_bot_managed(resolved)
+        root = _hermes_root(candidate)
+        return _is_roster_profile_dir(root, candidate)
     except Exception:
         return False
 
 
 # ── messaging-gateway session gate ───────────────────────────────────────────
 #
-# Session sources that belong to a local surface (this process or one it
-# spawned): never messaging-gateway chats. Mirrors the TUI backend's
-# ``_NON_GATEWAY_SOURCES`` (tui_gateway/server.py). Any OTHER source that
-# resolves to a gateway ``Platform`` — built-in enum member or registered
-# plugin platform via ``Platform._missing_`` — is a messaging-gateway chat
-# (Discord, Telegram, Slack, IRC, ...), so new platforms are covered
-# structurally instead of by a hardcoded allowlist.
-
-_SELF_OWNED_SESSION_SOURCES = frozenset({
-    "", "cli", "tui", "desktop", "cron", "kanban", "subagent", "test",
-    "local", "acp", "webhook", "api_server", "msgraph_webhook", "webui",
+# Only sources whose inbound unit is a human-authored conversation may expose
+# cross-profile teammate routing. This is deliberately an allowlist: Platform
+# also contains API endpoints, automation event streams, and agent-to-agent task
+# protocols. A newly registered adapter therefore fails closed until its trust
+# model is reviewed here.
+_MESSAGING_GATEWAY_SESSION_SOURCES = frozenset({
+    # Built-in adapters.
+    "telegram", "discord", "whatsapp", "whatsapp_cloud", "slack", "signal",
+    "mattermost", "matrix", "email", "sms", "dingtalk", "feishu", "wecom",
+    "wecom_callback", "weixin", "bluebubbles", "qqbot", "yuanbao",
+    # Bundled plugin adapters carrying human chats/messages.
+    "buzz", "google_chat", "irc", "line", "photon", "simplex", "teams",
 })
 
 
 def is_messaging_gateway_session(agent: object) -> bool:
-    """True when ``agent`` serves a messaging-gateway chat.
+    """True only for classified human messaging-gateway conversations.
 
-    Reads the agent's ``platform`` source (set by every spawner: "cli",
-    "discord", "telegram", ..., "cron", "subagent"). Structural, not an
-    allowlist: unknown-but-registered platform plugins qualify, arbitrary
-    junk strings and self-owned surfaces fail closed to False. Stable for
-    a session's lifetime, so gates keyed on it are prompt-cache safe.
-    Never raises.
+    Machine/API surfaces (including A2A, Home Assistant, Raft, webhooks, and
+    arbitrary future plugins) fail closed even when they are valid registered
+    ``Platform`` values. Stable for a session's lifetime; never raises.
     """
     try:
         source = str(getattr(agent, "platform", "") or "").strip().lower()
-        if source in _SELF_OWNED_SESSION_SOURCES:
-            return False
-        from gateway.config import Platform
-
-        Platform(source)  # raises ValueError for non-platform strings
-        return True
+        return source in _MESSAGING_GATEWAY_SESSION_SOURCES
     except Exception:
         return False
 
@@ -218,13 +258,12 @@ def bot_mode_session_state(
     Returns ``{"managed": bool, "session_kind": str | None}`` where
     ``session_kind`` is:
 
-    - ``"bot_chat"``  — the canonical "Bot Chat" of a Bot-Mode-managed
-      current profile (the existing bot-profile contract),
-    - ``"gateway"``   — a messaging-gateway chat (Discord, Telegram, ...)
-      whose OWN profile is Bot-Mode-managed: the bot can route teammates
-      from its chats, not only from its Bot Chat,
-    - ``None``        — gated: unmanaged installs/profiles, self-owned
-      ordinary sessions (CLI, TUI, cron, subagents, ...), arbitrary sources.
+    - ``"bot_chat"``  — the canonical "Bot Chat" of a real profile in a
+      Bot-Mode-participating install,
+    - ``"gateway"``   — a classified human messaging chat routed to a real
+      profile in that install,
+    - ``None``        — gated: unmanaged installs, paths outside the profile
+      roster, self-owned sessions, machine/API adapters, arbitrary sources.
 
     The answer is frozen by profile home + persisted session identity for the
     process lifetime. That survives agent-object recreation while keeping the
@@ -239,7 +278,11 @@ def bot_mode_session_state(
                 return cached
 
         protocol_enabled = bool(getattr(agent, "_bot_mode_protocol", True))
-        resolved = str(Path(home if home else _agent_home(agent)).expanduser().resolve())
+        resolved = str(
+            _absolute_without_symlink_resolution(
+                Path(home if home else _agent_home(agent))
+            )
+        )
         title = _session_title(agent)
         session_id = str(getattr(agent, "session_id", "") or "")
 
@@ -260,14 +303,12 @@ def bot_mode_session_state(
             state = {"managed": False, "session_kind": None}
         else:
             managed = is_bot_mode_managed(resolved)
-            profile_managed = is_profile_bot_managed(resolved)
+            roster_profile = is_bot_mode_roster_profile(resolved)
             if not managed:
                 state = {"managed": False, "session_kind": None}
-            elif profile_managed and title == BOT_CHAT_TITLE:
+            elif roster_profile and title == BOT_CHAT_TITLE:
                 state = {"managed": True, "session_kind": "bot_chat"}
-            # Gateway chats route only for a MANAGED CURRENT profile — an
-            # unrelated profile's group chat on a managed install stays gated.
-            elif profile_managed and is_messaging_gateway_session(agent):
+            elif roster_profile and is_messaging_gateway_session(agent):
                 state = {"managed": True, "session_kind": "gateway"}
             else:
                 state = {"managed": True, "session_kind": None}
