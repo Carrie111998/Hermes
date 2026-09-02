@@ -387,6 +387,34 @@ Use these in the Discord text channel where the bot is present:
 You must be in a voice channel before running `/voice join`. The bot joins the same VC you're in.
 :::
 
+### Auto-Join
+
+By default the bot only joins a voice channel when you run `/voice join`. If you'd rather have it join automatically the moment an allowed user enters a voice channel, opt in via `discord.voice` in `config.yaml`:
+
+```yaml
+discord:
+  voice:
+    auto_join_on_user_join: true       # default: false — opt-in only
+    auto_join_users: []                # optional IDs/usernames; scalar also accepted
+    auto_join_voice_channels: []       # optional channel IDs/names; empty = any
+    auto_join_text_channel_id: ""      # text/session anchor for transcripts and replies
+```
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `auto_join_on_user_join` | `false` | When `true`, the bot calls the same join logic as `/voice join` as soon as a qualifying user enters a voice channel it isn't already in. |
+| `auto_join_users` | `[]` | Optional Discord user ID or username, or a list of them. Empty means any user who already passes `DISCORD_ALLOWED_USERS` / `DISCORD_ALLOWED_ROLES` can trigger auto-join. Non-empty restricts triggering to those users (they must still pass the existing allowlist). |
+| `auto_join_voice_channels` | `[]` | Optional voice channel ID or name, or a list of them. Empty allows any voice channel. Assigning channels per profile prevents every profile from following the same user into the same VC. |
+| `auto_join_text_channel_id` | `""` | Required text channel used as the session anchor for auto-joined transcripts and replies. Hermes falls back to `DISCORD_HOME_CHANNEL`, then the first `DISCORD_FREE_RESPONSE_CHANNELS` entry. If no valid anchor resolves, Hermes does not join the VC. |
+
+Notes:
+
+- The bot **never** auto-joins in response to another bot joining a voice channel.
+- Auto-join reuses the exact `join_voice_channel()` path (and its per-guild lock) used by `/voice join` — it does not open a second connection or bypass any existing voice permission checks.
+- The bot follows a qualifying user both on their initial join and when they switch into a configured destination channel.
+- If the bot is already connected to the destination channel, nothing happens (no-op).
+- This is purely additive: `/voice join` and `/voice leave` keep working exactly as before, whether or not auto-join is enabled.
+
 ### How It Works
 
 When the bot joins a voice channel, it:
