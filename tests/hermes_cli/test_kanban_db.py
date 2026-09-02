@@ -861,6 +861,78 @@ class TestSharedBoardPaths:
             assert key not in env
 
 
+def _spawn_command_for_task(monkeypatch, tmp_path, task, config):
+    """Capture the dispatcher command without starting a worker process."""
+    home = tmp_path / ".hermes"
+    home.mkdir(exist_ok=True)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr("hermes_cli.config.load_config_readonly", lambda: config)
+    captured = {}
+
+    class _FakePopen:
+        def __init__(self, cmd, **kwargs):
+            captured["cmd"] = cmd
+            self.pid = 4242
+
+    monkeypatch.setattr("subprocess.Popen", _FakePopen)
+    kb._default_spawn(task, str(tmp_path / "workspace"))
+    return captured["cmd"]
+
+
+def test_dispatcher_spawn_uses_configured_default_worker_route(
+    kanban_home, monkeypatch, tmp_path
+):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="default route", assignee="coder")
+        task = kb.get_task(conn, task_id)
+
+    cmd = _spawn_command_for_task(
+        monkeypatch,
+        tmp_path,
+        task,
+        {"kanban": {"default_model": "gpt-5.6-luna", "default_provider": "openai-codex"}},
+    )
+    assert cmd[cmd.index("-m") : cmd.index("--toolsets")] == [
+        "-m", "gpt-5.6-luna", "--provider", "openai-codex",
+    ]
+
+
+def test_dispatcher_spawn_task_override_beats_configured_default_route(
+    kanban_home, monkeypatch, tmp_path
+):
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="explicit route",
+            assignee="coder",
+            model_override="task-model",
+            provider_override="task-provider",
+        )
+        task = kb.get_task(conn, task_id)
+
+    cmd = _spawn_command_for_task(
+        monkeypatch,
+        tmp_path,
+        task,
+        {"kanban": {"default_model": "gpt-5.6-luna", "default_provider": "openai-codex"}},
+    )
+    assert cmd[cmd.index("-m") : cmd.index("--toolsets")] == [
+        "-m", "task-model", "--provider", "task-provider",
+    ]
+
+
+def test_dispatcher_spawn_without_configured_route_keeps_profile_defaults(
+    kanban_home, monkeypatch, tmp_path
+):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="profile route", assignee="coder")
+        task = kb.get_task(conn, task_id)
+
+    cmd = _spawn_command_for_task(monkeypatch, tmp_path, task, {"kanban": {}})
+    assert "-m" not in cmd
+    assert "--provider" not in cmd
+
+
 # ---------------------------------------------------------------------------
 # latest_summary / latest_summaries — surface task_runs.summary handoffs
 # ---------------------------------------------------------------------------
