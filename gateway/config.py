@@ -973,6 +973,14 @@ class GatewayConfig:
     thread_sessions_per_user: bool = False  # When False (default), threads are shared across all participants
     max_concurrent_sessions: Optional[int] = None  # Positive int caps simultaneous active chat sessions
 
+    # Worker threads in the gateway-owned executor that runs synchronous agent
+    # turns (#38909 introduced the dedicated pool; its size was left hardcoded).
+    # Every messaging turn occupies one worker for its full duration — including
+    # model streaming and HITL approval waits — so on high-traffic installs the
+    # pool, not the CPU, is what bounds turn concurrency. Invalid or
+    # non-positive values fall back to the default.
+    agent_executor_workers: int = 10
+
     # Multi-profile multiplexing (opt-in; default off preserves one-gateway-per-profile).
     # When True, the default profile's gateway serves inbound messages for every
     # profile on the host: profiles are stamped into session keys and (in later
@@ -1152,6 +1160,7 @@ class GatewayConfig:
             "group_sessions_per_user": self.group_sessions_per_user,
             "thread_sessions_per_user": self.thread_sessions_per_user,
             "max_concurrent_sessions": self.max_concurrent_sessions,
+            "agent_executor_workers": self.agent_executor_workers,
             "multiplex_profiles": self.multiplex_profiles,
             "multiplex_profile_allowlist": self.multiplex_profile_allowlist,
             "room_link_url": self.room_link_url,
@@ -1304,6 +1313,16 @@ class GatewayConfig:
             max_concurrent_raw,
             max_concurrent_key,
         )
+        if "agent_executor_workers" in data:
+            executor_workers_raw = data.get("agent_executor_workers")
+            executor_workers_key = "agent_executor_workers"
+        else:
+            executor_workers_raw = nested_gateway.get("agent_executor_workers")
+            executor_workers_key = "gateway.agent_executor_workers"
+        agent_executor_workers = _coerce_optional_positive_int(
+            executor_workers_raw,
+            executor_workers_key,
+        ) or 10
         unauthorized_dm_behavior = _normalize_unauthorized_dm_behavior(
             data.get("unauthorized_dm_behavior"),
             "pair",
@@ -1345,6 +1364,7 @@ class GatewayConfig:
             loop_watchdog_probe_timeout_s=loop_watchdog_probe_timeout_s,
             loop_watchdog_max_strikes=loop_watchdog_max_strikes,
             max_concurrent_sessions=max_concurrent_sessions,
+            agent_executor_workers=agent_executor_workers,
             unauthorized_dm_behavior=unauthorized_dm_behavior,
             streaming=StreamingConfig.from_dict(data.get("streaming", {})),
             session_store_max_age_days=session_store_max_age_days,
