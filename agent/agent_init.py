@@ -533,6 +533,50 @@ def _refuse_checkpoint_required_on_codex_app_server(
         )
 
 
+def _clone_plugin_context_engine(candidate: Any) -> Any:
+    """Return a per-agent copy of a process-wide plugin context engine.
+
+    Prefers an explicit ``clone_for_agent()`` hook so engines that own
+    unpickleable runtime state (SQLite connections, locks, clients) can
+    construct a fresh instance (#99640). Falls back to ``copy.deepcopy``
+    for engines that do not implement the hook.
+
+    A distinct instance is required so a child agent's ``update_model()``
+    cannot mutate the parent's compressor (#42449). Raises on failure so
+    the caller can fall back to the built-in compressor.
+    """
+    import copy
+
+    clone_fn = getattr(candidate, "clone_for_agent", None)
+    if callable(clone_fn):
+        return clone_fn()
+    return copy.deepcopy(candidate)
+
+
+def _try_clone_plugin_context_engine(
+    candidate: Any, engine_name: str
+) -> tuple[Any | None, bool]:
+    """Clone a plugin context-engine singleton for one agent.
+
+    Returns ``(clone, False)`` on success. On failure logs a warning and
+    returns ``(None, True)`` so the caller can fall back to the built-in
+    compressor without mislabelling the engine as "not found".
+    """
+    try:
+        return _clone_plugin_context_engine(candidate), False
+    except Exception as copy_err:
+        _ra().logger.warning(
+            "Context engine '%s' could not be safely cloned for this "
+            "agent (%s) — falling back to built-in compressor. Plugin "
+            "engines that hold uncopyable state (locks, DB connections) "
+            "should implement clone_for_agent() to construct a fresh "
+            "per-agent runtime.",
+            engine_name,
+            copy_err,
+        )
+        return None, True
+
+
 def init_agent(
     agent,
     base_url: str = None,
@@ -2754,26 +2798,16 @@ def init_agent(
             except Exception:
                 _candidate = None
             if _candidate is not None and _candidate.name == _engine_name:
-                # Deep-copy the shared plugin singleton so a child agent's
+                # Clone the shared plugin singleton so a child agent's
                 # update_model() can't mutate the parent's compressor (#42449).
-                # Copy can fail for engines holding uncopyable state (locks, DB
-                # connections, clients); in that case fall back to the built-in
-                # compressor with an ACCURATE message rather than silently
-                # mislabelling it "not found".
-                import copy
-                try:
-                    _selected_engine = copy.deepcopy(_candidate)
-                except Exception as _copy_err:
-                    _copy_failed = True
-                    _ra().logger.warning(
-                        "Context engine '%s' could not be safely copied for this "
-                        "agent (%s) — falling back to built-in compressor. Plugin "
-                        "engines that hold uncopyable state (locks, DB connections) "
-                        "should implement __deepcopy__ to copy only mutable budget "
-                        "state.",
-                        _engine_name, _copy_err,
-                    )
-                    _selected_engine = None
+                # Prefer clone_for_agent() when engines hold uncopyable state
+                # (locks, DB connections, clients); otherwise deepcopy.
+                # Failure falls back to the built-in compressor with an
+                # ACCURATE message rather than silently mislabelling it
+                # "not found" (#99640).
+                _selected_engine, _copy_failed = _try_clone_plugin_context_engine(
+                    _candidate, _engine_name
+                )
 
         if _selected_engine is None and not _copy_failed:
             _ra().logger.warning(

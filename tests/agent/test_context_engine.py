@@ -233,115 +233,204 @@ class TestPluginContextEngineDeepCopy:
 
 
 
-class TestInitAgentDoesNotMutatePluginSingleton:
-    """Regression coverage for #42449: a child agent's init must not mutate the
-    shared plugin context-engine singleton via update_model().
+class TestClonePluginContextEngine:
+    """Per-agent clone of the process-wide plugin context engine.
 
-    Note: ``test_child_init_does_not_corrupt_parent_singleton`` replicates the
-    init_agent selection-block *pattern* (it cannot cheaply spin up a full
-    init_agent), so it documents/verifies the deepcopy approach but does NOT by
-    itself guard a production revert. The real revert guard is
-    ``test_agent_init_source_deepcopies_singleton_not_aliases`` (source-pin),
-    and ``test_unpicklable_engine_falls_back_gracefully`` covers the
-    copy-failure path.
+    #99640: prefer ``clone_for_agent()`` when present, else deepcopy.
+    #42449: the clone must be distinct so ``update_model()`` cannot leak
+    back into the registered singleton.
     """
 
-    def test_child_init_does_not_corrupt_parent_singleton(self, monkeypatch):
-        import hermes_cli.plugins as plugins_mod
-        from hermes_cli.plugins import PluginManager
+    def test_clone_for_agent_used_when_engine_is_unpickleable(self, monkeypatch):
+        """Unpickleable state plus ``clone_for_agent()`` uses the hook, not deepcopy."""
+        import copy as copy_mod
+        import sqlite3
 
-        # Register a "parent" engine as the global plugin singleton, sized for
-        # a 1M-context model (DeepSeek-style), threshold 20% => 200K.
+        from agent.agent_init import _try_clone_plugin_context_engine
+
+        class _UnpickleableClonableEngine(StubEngine):
+            def __init__(self, context_length=1_000_000, threshold_pct=0.20):
+                super().__init__(
+                    context_length=context_length, threshold_pct=threshold_pct
+                )
+                self._conn = sqlite3.connect(":memory:")
+                self.clone_calls = 0
+
+            def clone_for_agent(self):
+                self.clone_calls += 1
+                clone = type(self)(
+                    context_length=self.context_length,
+                    threshold_pct=0.20,
+                )
+                clone.threshold_tokens = self.threshold_tokens
+                return clone
+
+        engine = _UnpickleableClonableEngine()
+        clone = None
+        try:
+            with pytest.raises(TypeError):
+                copy_mod.deepcopy(engine)
+
+            engine_deepcopy_calls = []
+            real_deepcopy = copy_mod.deepcopy
+
+            def _spy(obj, *args, **kwargs):
+                if obj is engine:
+                    engine_deepcopy_calls.append(obj)
+                return real_deepcopy(obj, *args, **kwargs)
+
+            monkeypatch.setattr(copy_mod, "deepcopy", _spy)
+
+            clone, failed = _try_clone_plugin_context_engine(engine, "stub")
+
+            assert failed is False
+            assert clone is not engine
+            assert engine.clone_calls == 1
+            assert engine_deepcopy_calls == []
+            assert clone.context_length == engine.context_length
+
+            clone.update_model(
+                model="MiniMax-M2", context_length=204800, provider="minimax"
+            )
+            assert engine.context_length == 1_000_000
+            assert clone.context_length == 204800
+        finally:
+            engine._conn.close()
+            clone_conn = getattr(clone, "_conn", None) if clone is not None else None
+            if clone_conn is not None:
+                clone_conn.close()
+
+    def test_deepcopy_used_when_clone_for_agent_absent(self, monkeypatch):
+        """Engines without the hook are deep-copied; child mutation stays isolated."""
+        import copy as copy_mod
+
+        import hermes_cli.plugins as plugins_mod
+        from agent.agent_init import _try_clone_plugin_context_engine
+        from hermes_cli.plugins import PluginManager, get_plugin_context_engine
+
         singleton = StubEngine(context_length=1_000_000, threshold_pct=0.20)
+        assert not callable(getattr(singleton, "clone_for_agent", None))
+
+        engine_deepcopy_calls = []
+        real_deepcopy = copy_mod.deepcopy
+
+        def _spy(obj, *args, **kwargs):
+            if obj is singleton:
+                engine_deepcopy_calls.append(obj)
+            return real_deepcopy(obj, *args, **kwargs)
+
+        monkeypatch.setattr(copy_mod, "deepcopy", _spy)
+
         old_mgr = plugins_mod._plugin_manager
         try:
             mgr = PluginManager()
             mgr._context_engine = singleton
             plugins_mod._plugin_manager = mgr
 
-            # Replicate init_agent's fallback selection-block pattern: fetch the
-            # singleton, deepcopy it, then mutate the copy via update_model with
-            # a SMALLER child context (MiniMax-style 204800).
-            import copy
-            from hermes_cli.plugins import get_plugin_context_engine
+            candidate = get_plugin_context_engine()
+            assert candidate is singleton
 
-            _candidate = get_plugin_context_engine()
-            assert _candidate is singleton
-            _selected_engine = copy.deepcopy(_candidate)
-            _selected_engine.update_model(
-                model="MiniMax-M2", context_length=204800, provider="minimax",
-            )
+            clone, failed = _try_clone_plugin_context_engine(candidate, "stub")
 
-            # The child's smaller context must NOT leak back into the parent
-            # singleton (the #42449 corruption).
-            assert singleton.context_length == 1_000_000, (
-                "parent singleton context_length was corrupted by child init"
+            assert failed is False
+            assert engine_deepcopy_calls == [singleton]
+            assert clone is not singleton
+
+            clone.update_model(
+                model="MiniMax-M2", context_length=204800, provider="minimax"
             )
+            assert singleton.context_length == 1_000_000
             assert singleton.threshold_tokens == 200_000
-            # And the child's own engine reflects the child model.
-            assert _selected_engine.context_length == 204800
-            assert _selected_engine is not singleton
+            assert clone.context_length == 204800
         finally:
             plugins_mod._plugin_manager = old_mgr
 
-    def test_unpicklable_engine_falls_back_gracefully(self, monkeypatch):
-        """Copy-failure path: an engine holding uncopyable state (a lock — the
-        plugin docs prescribe locks/DB connections for stateful engines) makes
-        copy.deepcopy raise. init_agent must NOT silently drop it with a
-        misleading 'not found'; it falls back to the built-in compressor and
-        logs an accurate copy-failure warning. Regression for the deepcopy-
-        copy-failure path."""
-        import threading
+    def test_unpickleable_engine_without_hook_falls_back(self, monkeypatch):
+        """Copy failure without ``clone_for_agent()`` falls back and warns."""
+        import copy as copy_mod
+        import sqlite3
+        from unittest.mock import MagicMock
+
+        from agent.agent_init import _try_clone_plugin_context_engine
 
         class _UncopyableEngine(StubEngine):
             def __init__(self):
                 super().__init__(context_length=1_000_000, threshold_pct=0.20)
-                self._lock = threading.RLock()  # RLock can't be deepcopied
+                self._conn = sqlite3.connect(":memory:")
 
         engine = _UncopyableEngine()
-        # Sanity: the engine genuinely defeats deepcopy.
-        import copy
-        with pytest.raises(Exception):
-            copy.deepcopy(engine)
-
-        # Replicate the init_agent fallback block's copy-failure handling.
-        selected = None
-        copy_failed = False
+        mock_logger = MagicMock()
+        monkeypatch.setattr(
+            "agent.agent_init._ra", lambda: MagicMock(logger=mock_logger)
+        )
         try:
-            selected = copy.deepcopy(engine)
-        except Exception:
-            copy_failed = True
-            selected = None
+            with pytest.raises(TypeError):
+                copy_mod.deepcopy(engine)
 
-        assert copy_failed is True
-        assert selected is None
-        # The original engine is untouched (no partial mutation).
-        assert engine.context_length == 1_000_000
+            clone, failed = _try_clone_plugin_context_engine(engine, "stub")
 
-    def test_agent_init_source_deepcopies_singleton_not_aliases(self):
-        """Source-pin guarding the production fix in agent/agent_init.py:
-        the plugin-singleton fallback MUST deepcopy the candidate, not alias
-        it (`_selected_engine = _candidate`). Full init_agent is too heavy to
-        drive here, so this pins the exact line so a future revert to direct
-        assignment fails CI. Regression for #42449."""
+            assert failed is True
+            assert clone is None
+            assert engine.context_length == 1_000_000
+            mock_logger.warning.assert_called_once()
+            warning = mock_logger.warning.call_args[0][0]
+            assert "could not be safely cloned" in warning
+            assert "falling back to built-in compressor" in warning
+        finally:
+            engine._conn.close()
+
+    def test_clone_for_agent_error_falls_back(self, monkeypatch):
+        """A raising ``clone_for_agent()`` falls back; deepcopy is not a second try."""
+        import copy as copy_mod
+        from unittest.mock import MagicMock
+
+        from agent.agent_init import _try_clone_plugin_context_engine
+
+        class _BrokenCloneEngine(StubEngine):
+            def clone_for_agent(self):
+                raise RuntimeError("clone exploded")
+
+        engine = _BrokenCloneEngine()
+        engine_deepcopy_calls = []
+        real_deepcopy = copy_mod.deepcopy
+
+        def _spy(obj, *args, **kwargs):
+            if obj is engine:
+                engine_deepcopy_calls.append(obj)
+            return real_deepcopy(obj, *args, **kwargs)
+
+        monkeypatch.setattr(copy_mod, "deepcopy", _spy)
+        mock_logger = MagicMock()
+        monkeypatch.setattr(
+            "agent.agent_init._ra", lambda: MagicMock(logger=mock_logger)
+        )
+
+        clone, failed = _try_clone_plugin_context_engine(engine, "stub")
+
+        assert failed is True
+        assert clone is None
+        assert engine_deepcopy_calls == []
+        mock_logger.warning.assert_called_once()
+
+    def test_agent_init_source_routes_plugin_singleton_through_clone_helper(self):
+        """Source-pin for #42449: production init must clone the plugin
+        singleton, not alias it. Full init_agent is too heavy to drive
+        here, so this pins the call site. The helper tests above do not
+        catch `_selected_engine = _candidate`."""
         import inspect
         import re
+
         import agent.agent_init as _ai
 
         src = inspect.getsource(_ai)
-        # The candidate fetched from the plugin singleton must be deep-copied
-        # before becoming _selected_engine (which is later mutated by
-        # update_model). A bare `_selected_engine = _candidate` is the bug.
         assert re.search(
-            r"_selected_engine\s*=\s*(copy|_copy)\.deepcopy\(\s*_candidate\s*\)",
+            r"_try_clone_plugin_context_engine\s*\(\s*_candidate",
             src,
         ), (
-            "agent_init must deepcopy the plugin context-engine singleton "
-            "(`_selected_engine = copy.deepcopy(_candidate)`) — a bare "
-            "`_selected_engine = _candidate` re-introduces #42449 (child "
-            "update_model corrupts the parent's shared singleton)."
+            "agent_init must clone the plugin context-engine singleton via "
+            "`_try_clone_plugin_context_engine(_candidate, …)` — a bare "
+            "`_selected_engine = _candidate` re-introduces #42449."
         )
-        # And the bug-shape alias must NOT be present on that path.
         assert not re.search(
             r"_selected_engine\s*=\s*_candidate\b", src
         ), "found the #42449 bug-shape alias `_selected_engine = _candidate`"
