@@ -36,6 +36,7 @@ COLORS = ("red", "green", "blue", "yellow", "orange", "purple", "white", "black"
 # A trend, channel edge, or wedge is one polyline. Cap vertices so a model
 # cannot dump a sampled path that paints over the whole chart.
 MAX_POLYLINE_POINTS = 24
+MAX_STEP = 12
 
 # Required numeric fields per shape kind. `label` additionally needs `text`,
 # and `polyline` needs `points` — both checked separately.
@@ -79,6 +80,10 @@ def _validate_shape(index: int, shape) -> Optional[str]:
     if dashed is not None and not isinstance(dashed, bool):
         return f"shapes[{index}].dashed must be a boolean."
 
+    step_problem = _validate_step(index, shape.get("step"))
+    if step_problem:
+        return step_problem
+
     color = shape.get("color")
     if color is not None and color not in COLORS:
         return f"shapes[{index}].color must be one of: {', '.join(COLORS)}."
@@ -99,6 +104,18 @@ def _validate_polyline_points(index: int, points) -> Optional[str]:
             return f"shapes[{index}].points[{i}] must be an object."
         if not _is_number(point.get("x")) or not _is_number(point.get("y")):
             return f"shapes[{index}].points[{i}] needs numeric 'x' and 'y'."
+    return None
+
+
+def _validate_step(index: int, value) -> Optional[str]:
+    """A walkthrough badge. None is fine; anything else must be 1–MAX_STEP."""
+    if value is None:
+        return None
+    if isinstance(value, bool) or not _is_number(value):
+        return f"shapes[{index}].step must be an integer 1–{MAX_STEP}."
+    number = int(value)
+    if number != value or not (1 <= number <= MAX_STEP):
+        return f"shapes[{index}].step must be an integer 1–{MAX_STEP}."
     return None
 
 
@@ -203,6 +220,14 @@ _SHAPE_SCHEMA = {
                 "of a channel."
             ),
         },
+        "step": {
+            "type": "integer",
+            "description": (
+                f"Optional walkthrough number 1–{MAX_STEP}, drawn as a badge "
+                "on the mark. Use on a how-to: step 1 on the menu, step 2 on "
+                "the button, step 3 on the panel. Omit for a single glance."
+            ),
+        },
         "points": {
             "type": "array",
             "items": {
@@ -235,7 +260,8 @@ ANNOTATE_SCREEN_SCHEMA = {
         "polylines, text labels — directly on the user's SCREEN, over the "
         "app they are working in, via a transparent click-through overlay "
         "the Hermes desktop app owns. Use it to point instead of describing: "
-        "the chess piece to move, the button to click, or a chart/diagram "
+        "the chess piece to move, the button to click, a numbered how-to on "
+        "the live UI (Photoshop, a DAW, a settings panel), or a chart/diagram "
         "read (trendline, channel, support/resistance, up vs down) drawn on "
         "the candles rather than narrated. Workflow: look at the target "
         "first (a screenshot of the window or screen), then pass that "
@@ -243,14 +269,14 @@ ANNOTATE_SCREEN_SCHEMA = {
         "shape's coordinates in that same image-pixel space — the desktop "
         "maps them onto the live window, handling display scaling for you. "
         "`target` names the app to anchor to (the window's app name, e.g. "
-        "'Chess' or 'Chrome'); omit it to anchor to the window directly "
+        "'Photoshop' or 'Chrome'); omit it to anchor to the window directly "
         "behind the Hermes window, or pass 'screen' when your coordinates "
         "cover the whole display. Marks never intercept clicks, a new draw "
         "replaces the previous one, and everything fades out after "
-        "ttl_seconds (default 30, a glance) — for chart or diagram analysis "
-        "pass ~180 so the user can read it; action='clear' removes them "
-        "sooner. Keep it to a few decisive shapes; a polyline plus two "
-        "labels says more than eight boxes."
+        "ttl_seconds (default 30, a glance) — for a walkthrough or a chart "
+        "read pass ~180 so the user can follow it; action='clear' removes "
+        "them sooner. Keep it to a few decisive shapes; numbered steps on "
+        "the real buttons say more than a paragraph of menu paths."
     ),
     "parameters": {
         "type": "object",
@@ -285,8 +311,8 @@ ANNOTATE_SCREEN_SCHEMA = {
                 "type": "number",
                 "description": (
                     "Seconds before the marks fade on their own. Default 30 "
-                    "(a glance: chess move, which button). For chart or "
-                    "diagram analysis the user will sit with, pass ~180. "
+                    "(a glance: chess move, which button). For a walkthrough "
+                    "or a chart the user will sit with, pass ~180. "
                     "Clamped to 3–900."
                 ),
             },

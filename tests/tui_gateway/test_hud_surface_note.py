@@ -88,6 +88,20 @@ class TestNoteContents:
         assert "computer_use" not in note
         assert "chart" in note
         assert "180" in note
+        assert "how to" in note
+        assert "step=" in note
+
+    def test_teach_without_computer_use_does_not_name_that_tool(self):
+        """The note only names tools this agent has — see hud_surface_note."""
+        note = hud_surface_note({"read_window_below", "annotate_screen"})
+
+        assert "computer_use" not in note
+
+    def test_teach_with_computer_use_leaves_the_mouse_to_the_user(self):
+        note = hud_surface_note({"read_window_below", "annotate_screen", "computer_use"})
+
+        assert "leave the mouse" in note
+        assert "computer_use" in note
 
     def test_chart_offer_needs_the_annotation_tool(self):
         note = hud_surface_note({"read_window_below"})

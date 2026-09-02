@@ -855,14 +855,22 @@ def hud_surface_note(valid_tool_names: "set[str] | None" = None) -> str:
                 "browser_navigate."
             )
     if "annotate_screen" in names:
-        sentences.append(
-            "When they ask where something is, what to do next, or to read a "
-            "chart or diagram in that app, annotate_screen draws the answer "
-            "onto their screen — a circle on the piece, a polyline along a "
-            "trend, a label on a level — which lands better than prose. "
-            "Chart and diagram marks should stay up long enough to read "
-            "(ttl_seconds around 180)."
+        teach = (
+            "When they ask where something is, what to do next, how to do "
+            "something in that app, or to read a chart or diagram, "
+            "annotate_screen draws the answer onto their screen — numbered "
+            "steps on the real buttons and menus (step=1, 2, 3), a circle "
+            "on the piece, a polyline along a trend — which lands better "
+            "than prose. Walkthroughs and chart reads should stay up long "
+            "enough to follow (ttl_seconds around 180)."
         )
+        if "computer_use" in names:
+            teach += (
+                " If they asked to be taught or shown how, mark the controls "
+                "and leave the mouse to them; do not computer_use the clicks "
+                "unless they asked you to do the work for them."
+            )
+        sentences.append(teach)
     if "subtitle_overlay" in names:
         sentences.append(
             "When they ask to translate the subtitles of what they are "

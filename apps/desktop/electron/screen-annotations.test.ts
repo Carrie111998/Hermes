@@ -6,12 +6,14 @@ import {
   ANNOTATION_TTL_DEFAULT_S,
   ANNOTATION_TTL_MAX_S,
   ANNOTATION_TTL_MIN_S,
+  annotationShapeBounds,
   clampAnnotationTtlSeconds,
   isScreenTarget,
   mapAnnotationShapes,
   offsetAnnotationShapes,
   overlayBoundsForShapes,
-  resolveAnnotationWindow
+  resolveAnnotationWindow,
+  STEP_BADGE_RADIUS
 } from './screen-annotations'
 import type { EnumeratedWindow } from './window-below'
 
@@ -353,4 +355,48 @@ test('offsetAnnotationShapes shifts polyline vertices', () => {
       ]
     }
   ])
+})
+
+test('a walkthrough step rides through mapping; junk steps are dropped', () => {
+  const target = { x: 0, y: 0, width: 200, height: 200 }
+  const frame = { width: 200, height: 200 }
+
+  const { shapes, skipped } = mapAnnotationShapes(
+    [
+      { kind: 'circle', step: 1, x: 40, y: 40 },
+      { kind: 'rect', height: 20, step: 2, width: 30, x: 10, y: 10 },
+      { kind: 'circle', step: 0, x: 40, y: 40 },
+      { kind: 'circle', step: 13, x: 40, y: 40 },
+      { kind: 'circle', step: 1.5, x: 40, y: 40 }
+    ],
+    frame,
+    target,
+    DISPLAY
+  )
+
+  assert.equal(skipped, 0)
+  assert.equal((shapes[0] as { step?: number }).step, 1)
+  assert.equal((shapes[1] as { step?: number }).step, 2)
+  assert.equal((shapes[2] as { step?: number }).step, undefined)
+  assert.equal((shapes[3] as { step?: number }).step, undefined)
+  assert.equal((shapes[4] as { step?: number }).step, undefined)
+})
+
+test('a stepped mark pads its bounds so the badge is not clipped', () => {
+  const plain = annotationShapeBounds({ color: 'red', kind: 'circle', radius: 20, x: 50, y: 50 })
+
+  const numbered = annotationShapeBounds({
+    color: 'red',
+    kind: 'circle',
+    radius: 20,
+    step: 3,
+    x: 50,
+    y: 50
+  })
+
+  assert.ok(plain)
+  assert.ok(numbered)
+  assert.ok(numbered.width > plain.width)
+  assert.ok(numbered.height > plain.height)
+  assert.equal(numbered.width - plain.width, STEP_BADGE_RADIUS * 2)
 })

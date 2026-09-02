@@ -59,6 +59,12 @@ def test_draw_validates_its_shapes():
         shapes=[{"kind": "polyline", "points": [{"x": i, "y": i} for i in range(sa.MAX_POLYLINE_POINTS + 1)]}]
     )["error"]
     assert "dashed must be a boolean" in _draw(shapes=[{**CIRCLE, "dashed": 1}])["error"]
+    assert "step must be an integer" in _draw(shapes=[{**CIRCLE, "step": 0}])["error"]
+    assert "step must be an integer" in _draw(shapes=[{**CIRCLE, "step": 13}])["error"]
+    assert "step must be an integer" in _draw(shapes=[{**CIRCLE, "step": 1.5}])["error"]
+    assert "step must be an integer" in _draw(shapes=[{**CIRCLE, "step": True}])["error"]
+    assert "error" not in _draw(shapes=[{**CIRCLE, "step": 1}])
+    assert "error" not in _draw(shapes=[{**CIRCLE, "step": 12}])
     assert "color must be one of" in _draw(shapes=[{**CIRCLE, "color": "chartreuse"}])["error"]
 
 
@@ -126,6 +132,26 @@ def test_polyline_payload_keeps_points_and_dashed():
 
     assert seen["shapes"] == [path]
     assert seen["ttl_seconds"] == 180
+
+
+def test_step_payload_rides_through_on_the_shape():
+    seen = {}
+    mark = {**CIRCLE, "step": 2, "label": "Layer mask"}
+
+    def cb(payload):
+        seen.update(payload)
+        return json.dumps({"success": True})
+
+    sa.annotate_screen_tool(
+        action="draw",
+        frame_width=1024,
+        frame_height=768,
+        shapes=[mark],
+        ttl_seconds=180,
+        callback=cb,
+    )
+
+    assert seen["shapes"][0]["step"] == 2
 
 
 def test_clear_payload_omits_the_draw_fields():

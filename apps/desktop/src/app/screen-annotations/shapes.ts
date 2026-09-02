@@ -16,6 +16,8 @@ export interface ScreenAnnotationShapeBase {
   /** Skip the entrance/pulse animation — for shapes that replace each other
    *  rapidly (live subtitles), where pulsing text is unreadable. */
   steady?: boolean
+  /** Walkthrough number drawn as a badge on the mark (1–12). */
+  step?: number
 }
 
 export interface ScreenAnnotationCircle extends ScreenAnnotationShapeBase {

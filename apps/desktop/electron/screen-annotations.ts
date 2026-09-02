@@ -53,11 +53,30 @@ export type MappedAnnotationShape =
       fromY: number
       label?: string
       steady?: boolean
+      step?: number
       toX: number
       toY: number
     }
-  | { color: AnnotationColor; kind: 'circle'; label?: string; radius: number; steady?: boolean; x: number; y: number }
-  | { color: AnnotationColor; fontSize?: number; kind: 'label'; steady?: boolean; text: string; x: number; y: number }
+  | {
+      color: AnnotationColor
+      kind: 'circle'
+      label?: string
+      radius: number
+      steady?: boolean
+      step?: number
+      x: number
+      y: number
+    }
+  | {
+      color: AnnotationColor
+      fontSize?: number
+      kind: 'label'
+      steady?: boolean
+      step?: number
+      text: string
+      x: number
+      y: number
+    }
   | {
       color: AnnotationColor
       dashed?: boolean
@@ -65,6 +84,7 @@ export type MappedAnnotationShape =
       label?: string
       points: AnnotationPoint[]
       steady?: boolean
+      step?: number
     }
   | {
       color: AnnotationColor
@@ -73,6 +93,7 @@ export type MappedAnnotationShape =
       kind: 'rect'
       label?: string
       steady?: boolean
+      step?: number
       width: number
       x: number
       y: number
@@ -85,6 +106,9 @@ export type MappedAnnotationShape =
 export const ANNOTATION_TTL_DEFAULT_S = 30
 export const ANNOTATION_TTL_MIN_S = 3
 export const ANNOTATION_TTL_MAX_S = 900
+
+/** Room for the numbered walkthrough badge sitting outside a mark. */
+export const STEP_BADGE_RADIUS = 16
 
 export function clampAnnotationTtlSeconds(raw: unknown): number {
   const value = typeof raw === 'number' && Number.isFinite(raw) ? raw : ANNOTATION_TTL_DEFAULT_S
@@ -113,30 +137,26 @@ export function clampChannelHoldSeconds(raw: unknown): number {
 /** Axis-aligned box of one overlay-local shape. Labels get a generous
  *  width guess so a tight overlay window does not clip the last glyph. */
 export function annotationShapeBounds(shape: MappedAnnotationShape): AnnotationBounds | null {
-  if (shape.kind === 'rect') {
-    return { height: shape.height, width: shape.width, x: shape.x, y: shape.y }
-  }
+  let box: AnnotationBounds | null = null
 
-  if (shape.kind === 'circle') {
-    return {
+  if (shape.kind === 'rect') {
+    box = { height: shape.height, width: shape.width, x: shape.x, y: shape.y }
+  } else if (shape.kind === 'circle') {
+    box = {
       height: shape.radius * 2,
       width: shape.radius * 2,
       x: shape.x - shape.radius,
       y: shape.y - shape.radius
     }
-  }
-
-  if (shape.kind === 'label') {
+  } else if (shape.kind === 'label') {
     const size = shape.fontSize && shape.fontSize > 0 ? shape.fontSize : 15
     const lines = shape.text.split('\n').filter(line => line.trim().length > 0)
     const longest = lines.reduce((max, line) => Math.max(max, line.length), 0)
     const width = Math.max(size, longest * size * 0.65)
     const height = size * (1 + 1.3 * Math.max(0, lines.length - 1))
 
-    return { height, width, x: shape.x - width / 2, y: shape.y - size }
-  }
-
-  if (shape.kind === 'polyline') {
+    box = { height, width, x: shape.x - width / 2, y: shape.y - size }
+  } else if (shape.kind === 'polyline') {
     if (shape.points.length === 0) {
       return null
     }
@@ -153,23 +173,36 @@ export function annotationShapeBounds(shape: MappedAnnotationShape): AnnotationB
       bottom = Math.max(bottom, point.y)
     }
 
-    return {
+    box = {
       height: Math.max(1, bottom - top),
       width: Math.max(1, right - left),
       x: left,
       y: top
     }
+  } else {
+    const x = Math.min(shape.fromX, shape.toX)
+    const y = Math.min(shape.fromY, shape.toY)
+
+    box = {
+      height: Math.max(1, Math.abs(shape.toY - shape.fromY)),
+      width: Math.max(1, Math.abs(shape.toX - shape.fromX)),
+      x,
+      y
+    }
   }
 
-  const x = Math.min(shape.fromX, shape.toX)
-  const y = Math.min(shape.fromY, shape.toY)
+  if (box && shape.step) {
+    const pad = STEP_BADGE_RADIUS * 2
 
-  return {
-    height: Math.max(1, Math.abs(shape.toY - shape.fromY)),
-    width: Math.max(1, Math.abs(shape.toX - shape.fromX)),
-    x,
-    y
+    box = {
+      height: box.height + pad,
+      width: box.width + pad,
+      x: box.x - pad,
+      y: box.y - pad
+    }
   }
+
+  return box
 }
 
 export function unionAnnotationBounds(shapes: MappedAnnotationShape[]): AnnotationBounds | null {
@@ -331,6 +364,7 @@ interface RawShape {
   label?: unknown
   points?: unknown
   radius?: unknown
+  step?: unknown
   text?: unknown
   to_x?: unknown
   to_y?: unknown
@@ -357,6 +391,20 @@ const asCaption = (value: unknown): string | undefined => {
 }
 
 const asDashed = (value: unknown): true | undefined => (value === true ? true : undefined)
+
+const MAX_STEP = 12
+
+const asStep = (value: unknown): number | undefined => {
+  if (typeof value !== 'number' || !Number.isInteger(value) || value < 1 || value > MAX_STEP) {
+    return undefined
+  }
+
+  return value
+}
+
+function withStep<T extends object>(mapped: T, step: number | undefined): T {
+  return step === undefined ? mapped : { ...mapped, step }
+}
 
 // Visibility floors, in DIP. A sub-pixel circle or rect is a draw that
 // happened but cannot be seen — worse than an error.
@@ -405,6 +453,7 @@ export function mapAnnotationShapes(
     const shape = (raw ?? {}) as RawShape
     const color = asColor(shape.color)
     const label = asCaption(shape.label)
+    const step = asStep(shape.step)
 
     if (shape.kind === 'circle') {
       const x = asNumber(shape.x)
@@ -418,17 +467,22 @@ export function mapAnnotationShapes(
 
       const radius = asNumber(shape.radius)
 
-      shapes.push({
-        color,
-        kind: 'circle',
-        label,
-        radius:
-          radius === null
-            ? DEFAULT_CIRCLE_RADIUS
-            : Math.max(MIN_CIRCLE_RADIUS, Math.round(radius * Math.min(scaleX, scaleY))),
-        x: localX(x),
-        y: localY(y)
-      })
+      shapes.push(
+        withStep(
+          {
+            color,
+            kind: 'circle',
+            label,
+            radius:
+              radius === null
+                ? DEFAULT_CIRCLE_RADIUS
+                : Math.max(MIN_CIRCLE_RADIUS, Math.round(radius * Math.min(scaleX, scaleY))),
+            x: localX(x),
+            y: localY(y)
+          },
+          step
+        )
+      )
 
       continue
     }
@@ -445,15 +499,20 @@ export function mapAnnotationShapes(
         continue
       }
 
-      shapes.push({
-        color,
-        height: Math.max(MIN_RECT_SIZE, Math.round(height * scaleY)),
-        kind: 'rect',
-        label,
-        width: Math.max(MIN_RECT_SIZE, Math.round(width * scaleX)),
-        x: localX(x),
-        y: localY(y)
-      })
+      shapes.push(
+        withStep(
+          {
+            color,
+            height: Math.max(MIN_RECT_SIZE, Math.round(height * scaleY)),
+            kind: 'rect',
+            label,
+            width: Math.max(MIN_RECT_SIZE, Math.round(width * scaleX)),
+            x: localX(x),
+            y: localY(y)
+          },
+          step
+        )
+      )
 
       continue
     }
@@ -472,16 +531,21 @@ export function mapAnnotationShapes(
 
       const dashed = asDashed(shape.dashed)
 
-      shapes.push({
-        color,
-        ...(dashed ? { dashed } : {}),
-        fromX: localX(fromX),
-        fromY: localY(fromY),
-        kind: shape.kind,
-        label,
-        toX: localX(toX),
-        toY: localY(toY)
-      })
+      shapes.push(
+        withStep(
+          {
+            color,
+            ...(dashed ? { dashed } : {}),
+            fromX: localX(fromX),
+            fromY: localY(fromY),
+            kind: shape.kind,
+            label,
+            toX: localX(toX),
+            toY: localY(toY)
+          },
+          step
+        )
+      )
 
       continue
     }
@@ -513,13 +577,18 @@ export function mapAnnotationShapes(
 
       const dashed = asDashed(shape.dashed)
 
-      shapes.push({
-        color,
-        ...(dashed ? { dashed } : {}),
-        kind: 'polyline',
-        label,
-        points
-      })
+      shapes.push(
+        withStep(
+          {
+            color,
+            ...(dashed ? { dashed } : {}),
+            kind: 'polyline',
+            label,
+            points
+          },
+          step
+        )
+      )
 
       continue
     }
@@ -536,7 +605,11 @@ export function mapAnnotationShapes(
       }
 
       const rawFontSize = asNumber(shape.font_size)
-      const mapped: MappedAnnotationShape = { color, kind: 'label', text, x: localX(x), y: localY(y) }
+
+      const mapped: MappedAnnotationShape = withStep(
+        { color, kind: 'label', text, x: localX(x), y: localY(y) },
+        step
+      )
 
       if (rawFontSize !== null && rawFontSize > 0) {
         mapped.fontSize = Math.min(

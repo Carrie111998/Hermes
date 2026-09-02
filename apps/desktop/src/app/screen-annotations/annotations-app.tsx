@@ -17,6 +17,7 @@ const ARROW_HEAD_LENGTH = 16
 const LABEL_FONT_SIZE = 15
 const LABEL_OFFSET = 10
 const DASH_ARRAY = '10 8'
+const STEP_BADGE_R = 13
 
 const hexFor = (color: ScreenAnnotationColor): string => SCREEN_ANNOTATION_HEX[color] ?? SCREEN_ANNOTATION_HEX.red
 
@@ -70,6 +71,54 @@ function Caption({
         </tspan>
       ))}
     </text>
+  )
+}
+
+function stepInk(color: ScreenAnnotationColor): string {
+  return color === 'yellow' || color === 'white' ? '#111111' : '#FFFFFF'
+}
+
+function stepAnchor(shape: ScreenAnnotationShape): { x: number; y: number } {
+  if (shape.kind === 'circle') {
+    return { x: shape.x - shape.radius, y: shape.y - shape.radius }
+  }
+
+  if (shape.kind === 'rect') {
+    return { x: shape.x, y: shape.y }
+  }
+
+  if (shape.kind === 'arrow' || shape.kind === 'line') {
+    return { x: shape.toX, y: shape.toY }
+  }
+
+  if (shape.kind === 'polyline') {
+    return shape.points[0] ?? { x: 0, y: 0 }
+  }
+
+  return { x: shape.x, y: shape.y }
+}
+
+function StepBadge({ color, step, x, y }: { color: ScreenAnnotationColor; step?: number; x: number; y: number }) {
+  if (step == null || step < 1) {
+    return null
+  }
+
+  return (
+    <g>
+      <circle cx={x} cy={y} fill={haloFor(color)} r={STEP_BADGE_R + 2} />
+      <circle cx={x} cy={y} fill={hexFor(color)} r={STEP_BADGE_R} />
+      <text
+        fill={stepInk(color)}
+        fontFamily="system-ui, -apple-system, sans-serif"
+        fontSize={14}
+        fontWeight={800}
+        textAnchor="middle"
+        x={x}
+        y={y + 5}
+      >
+        {step}
+      </text>
+    </g>
   )
 }
 
@@ -318,11 +367,16 @@ export function ScreenAnnotationsApp() {
           width: '100vw'
         }}
       >
-        {shapes.map((shape, index) => (
-          <g className={shape.steady ? undefined : 'hermes-annotation'} key={index}>
-            <Shape shape={shape} />
-          </g>
-        ))}
+        {shapes.map((shape, index) => {
+          const badge = stepAnchor(shape)
+
+          return (
+            <g className={shape.steady ? undefined : 'hermes-annotation'} key={index}>
+              <Shape shape={shape} />
+              <StepBadge color={shape.color} step={shape.step} x={badge.x} y={badge.y} />
+            </g>
+          )
+        })}
       </svg>
     </>
   )
