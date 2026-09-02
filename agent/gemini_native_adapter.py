@@ -30,6 +30,7 @@ import httpx
 
 from agent.bounded_response import read_streaming_error_body
 from agent.gemini_schema import sanitize_gemini_tool_parameters
+from agent.media_routing import normalize_audio_mime
 
 logger = logging.getLogger(__name__)
 
@@ -265,6 +266,13 @@ def _coerce_content_to_text(content: Any) -> str:
 
 
 def _extract_multimodal_parts(content: Any) -> List[Dict[str, Any]]:
+    """Translate inline OpenAI-style content into Gemini native parts.
+
+    Gateway attachments reach this adapter from local/cache files encoded as
+    ``data:`` URIs. Arbitrary remote HTTP(S) media is intentionally not fetched
+    here (which would create an SSRF boundary) or mislabeled as a Gemini Files
+    API URI; those references remain represented by their accompanying text.
+    """
     if not isinstance(content, list):
         text = _coerce_content_to_text(content)
         return [{"text": text}] if text else []
@@ -281,9 +289,21 @@ def _extract_multimodal_parts(content: Any) -> List[Dict[str, Any]]:
             text = item.get("text")
             if isinstance(text, str) and text:
                 parts.append({"text": text})
-        elif ptype == "image_url":
-            url = ((item.get("image_url") or {}).get("url") or "")
+        elif ptype in {"image_url", "video_url", "file"}:
+            url = ""
+            if ptype == "image_url":
+                url = (item.get("image_url") or {}).get("url") or ""
+            elif ptype == "video_url":
+                url = (item.get("video_url") or {}).get("url") or ""
+            elif ptype == "file":
+                url = (item.get("file") or {}).get("file_data") or ""
             if not isinstance(url, str) or not url.startswith("data:"):
+                if isinstance(url, str) and url:
+                    logger.debug(
+                        "Gemini native adapter omitted non-inline %s content; "
+                        "only data URIs are accepted on this path",
+                        ptype,
+                    )
                 continue
             try:
                 header, encoded = url.split(",", 1)
@@ -296,6 +316,21 @@ def _extract_multimodal_parts(content: Any) -> List[Dict[str, Any]]:
                     "inlineData": {
                         "mimeType": mime,
                         "data": base64.b64encode(raw).decode("ascii"),
+                    }
+                }
+            )
+        elif ptype == "input_audio":
+            audio_info = item.get("input_audio") or {}
+            encoded = audio_info.get("data")
+            fmt = str(audio_info.get("format") or "").strip().lower()
+            if not isinstance(encoded, str) or not encoded.strip():
+                continue
+            mime = normalize_audio_mime(fmt)
+            parts.append(
+                {
+                    "inlineData": {
+                        "mimeType": mime,
+                        "data": encoded.strip(),
                     }
                 }
             )

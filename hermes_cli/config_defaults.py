@@ -3354,6 +3354,12 @@ DEFAULT_CONFIG = {
             "enabled": False,
         },
 
+        # Inbound voice-note routing: "auto" uses the active model's declared
+        # audio capability, "native" prefers inline audio, and "stt" always
+        # transcribes first. Native payload-construction failures fall back to
+        # the configured STT path so an attachment is never silently dropped.
+        "audio_mode": "auto",
+
         # Maximum bytes for an inbound image / audio / video payload the
         # gateway will buffer into memory and cache to disk. Inbound media is
         # read fully into RAM before being written, so an unbounded upload

@@ -5804,6 +5804,90 @@ class TurnRunner:
                     ctx._cleanup_msg_ids.append(str(mid))
             _fut.add_done_callback(_track_status_id)
 
+    @staticmethod
+    def _prepend_message_text(message: Any, prefix: str) -> Any:
+        """Prepend text without discarding native multimodal content parts."""
+        prefix = str(prefix or "").strip()
+        if not prefix:
+            return message
+
+        if isinstance(message, list):
+            updated = list(message)
+            for index, part in enumerate(updated):
+                if not isinstance(part, dict) or part.get("type") != "text":
+                    continue
+                existing = part.get("text")
+                existing_text = existing if isinstance(existing, str) else ""
+                updated[index] = {
+                    **part,
+                    "text": (
+                        f"{prefix}\n\n{existing_text}"
+                        if existing_text
+                        else prefix
+                    ),
+                }
+                return updated
+            return [{"type": "text", "text": prefix}, *updated]
+
+        if isinstance(message, str) and message:
+            return f"{prefix}\n\n{message}"
+        return prefix
+
+    @staticmethod
+    def _native_audio_fallback_note(audio_paths: List[str]) -> str:
+        """Return a non-empty last-resort note when the STT bridge fails."""
+        try:
+            from tools.credential_files import to_agent_visible_cache_path
+        except Exception:
+            def to_agent_visible_cache_path(path: str) -> str:
+                return path
+
+        notes: List[str] = []
+        seen: set[str] = set()
+        for path in audio_paths:
+            raw_path = str(path or "")
+            if not raw_path or raw_path in seen:
+                continue
+            seen.add(raw_path)
+            agent_path = to_agent_visible_cache_path(os.path.abspath(raw_path))
+            notes.append(
+                "[voice message could not be transcribed automatically; "
+                f"the audio is available at: {agent_path}]"
+            )
+        return "\n\n".join(notes) or (
+            "[voice message could not be processed natively or transcribed "
+            "automatically]"
+        )
+
+    def _transcribe_native_audio_fallback_sync(
+        self,
+        audio_paths: List[str],
+    ) -> str:
+        """Bridge rejected native audio back to the gateway's async STT path."""
+        if not audio_paths:
+            return self._native_audio_fallback_note([])
+
+        ctx = self._ctx
+        fallback_future = safe_schedule_threadsafe(
+            self._runner._transcribe_native_audio_fallback(
+                audio_paths,
+                source=ctx.source,
+                reply_to_message_id=ctx.event_message_id,
+            ),
+            ctx._loop_for_step,
+            logger=logger,
+            log_message="Native audio STT fallback scheduling error",
+            log_level=logging.WARNING,
+        )
+        if fallback_future is not None:
+            try:
+                fallback_text = fallback_future.result()
+                if isinstance(fallback_text, str) and fallback_text.strip():
+                    return fallback_text.strip()
+            except Exception as exc:
+                logger.warning("Native audio STT fallback failed: %s", exc)
+        return self._native_audio_fallback_note(audio_paths)
+
     def run_sync(self):
         ctx = self._ctx
         # Historical note: as a nested closure this body declared
@@ -6934,36 +7018,170 @@ class TurnRunner:
         _approval_session_token = set_current_session_key(_approval_session_key)
         register_gateway_notify(_approval_session_key, _approval_notify_sync)
         try:
-            # If _prepare_inbound_message_text buffered image paths for native
+            # If _prepare_inbound_message_text buffered media for native
             # attachment, wrap the user turn as an OpenAI-style multimodal
             # content list. Consume-and-clear so subsequent turns on the same
-            # runner instance don't re-attach stale images.
+            # runner instance don't re-attach stale media.
             _native_imgs = self._runner._consume_pending_native_image_paths(ctx.session_key)
-            if _native_imgs:
+            _native_audio = self._runner._consume_pending_native_audio_attachments(
+                ctx.session_key
+            )
+            _run_message: Any = ctx.message
+            _native_audio_survived = False
+            _failed_native_audio_paths: List[str] = []
+            _native_audio_marker = "[Voice message attached natively]"
+
+            def _build_native_image_message() -> Optional[List[Dict[str, Any]]]:
+                """Build the established image-only path after mixed-media failure."""
+                if not _native_imgs:
+                    return None
                 try:
                     from agent.image_routing import build_native_content_parts
-                    _parts, _skipped = build_native_content_parts(
+
+                    _image_parts, _image_skipped = build_native_content_parts(
                         ctx.message,
                         _native_imgs,
                     )
-                    if _skipped:
+                    if _image_skipped:
                         logger.warning(
                             "Native image attachment: skipped %d unreadable path(s): %s",
-                            len(_skipped), _skipped,
+                            len(_image_skipped),
+                            _image_skipped,
                         )
-                    if any(p.get("type") == "image_url" for p in _parts):
-                        _run_message: Any = _parts
-                    else:
-                        # All images failed to read — fall back to plain text.
-                        _run_message = ctx.message
+                    if any(p.get("type") == "image_url" for p in _image_parts):
+                        return _image_parts
                 except Exception as _img_exc:
                     logger.warning(
                         "Native image attachment failed, falling back to text: %s",
                         _img_exc,
                     )
-                    _run_message = ctx.message
-            else:
-                _run_message = ctx.message
+                return None
+
+            if _native_audio:
+                _native_audio_paths = [
+                    (
+                        str(item.get("path") or "")
+                        if isinstance(item, dict)
+                        else str(item or "")
+                    )
+                    for item in _native_audio
+                    if isinstance(item, (dict, str, Path))
+                ]
+                try:
+                    from agent.media_routing import build_native_media_content_parts
+
+                    _media_attachments = [
+                        {"path": path, "mime_type": "", "modality": "image"}
+                        for path in _native_imgs
+                    ]
+                    _media_attachments.extend(_native_audio)
+                    _target_provider = getattr(agent, "provider", "") or ""
+                    _parts, _skipped = build_native_media_content_parts(
+                        ctx.message,
+                        _media_attachments,
+                        target_provider=_target_provider,
+                    )
+                    if _skipped:
+                        logger.warning(
+                            "Native media attachment: skipped %d attachment(s): %s",
+                            len(_skipped), _skipped,
+                        )
+                    _skipped_paths = {str(path) for path in _skipped}
+                    _failed_native_audio_paths = [
+                        path
+                        for path in _native_audio_paths
+                        if path and path in _skipped_paths
+                    ]
+                    _native_audio_survived = any(
+                        p.get("type") == "input_audio" for p in _parts
+                    )
+                    # A builder that returns neither an audio part nor an
+                    # explicit skipped path must still fail closed to STT. It
+                    # must never turn a media-only voice event into an empty
+                    # user message.
+                    if (
+                        not _native_audio_survived
+                        and not _failed_native_audio_paths
+                    ):
+                        _failed_native_audio_paths = [
+                            path for path in _native_audio_paths if path
+                        ]
+                    if any(
+                        p.get("type") in {"image_url", "file", "input_audio", "video_url"}
+                        for p in _parts
+                    ):
+                        _run_message = _parts
+                    else:
+                        _run_message = _build_native_image_message() or ctx.message
+                except Exception as _media_exc:
+                    logger.warning(
+                        "Native media attachment failed, falling back to text: %s",
+                        _media_exc,
+                    )
+                    _failed_native_audio_paths = [
+                        path for path in _native_audio_paths if path
+                    ]
+                    _run_message = _build_native_image_message() or ctx.message
+            elif _native_imgs:
+                _run_message = _build_native_image_message() or ctx.message
+
+            if _failed_native_audio_paths or (
+                _native_audio and not _native_audio_survived
+            ):
+                # Native routing is only a lossless optimization. If payload
+                # construction rejects an attachment (unreadable, oversized,
+                # unsupported container/transcode, or an unexpected builder
+                # error), reuse the established STT path for exactly those
+                # files. Successful native audio and images remain attached.
+                _audio_fallback_text = self._transcribe_native_audio_fallback_sync(
+                    _failed_native_audio_paths
+                )
+                _run_message = self._prepend_message_text(
+                    _run_message,
+                    _audio_fallback_text,
+                )
+
+                # Preserve an existing clean-persistence override. When any
+                # audio still travels natively, force a compact text override
+                # so Base64 never enters SQLite; include both the fallback
+                # transcript and a marker for the surviving native clip(s).
+                if (
+                    _persist_user_message_override is not None
+                    or _native_audio_survived
+                ):
+                    _persist_base = (
+                        _persist_user_message_override
+                        if _persist_user_message_override is not None
+                        else ctx.message
+                    )
+                    if _native_audio_survived:
+                        _persist_base = self._prepend_message_text(
+                            _persist_base,
+                            _native_audio_marker,
+                        )
+                    _persist_user_message_override = self._prepend_message_text(
+                        _persist_base,
+                        _audio_fallback_text,
+                    )
+
+            # Persist a compact marker instead of embedding Base64 audio in
+            # the session database/history. Do not stamp a voice marker when
+            # audio failed and only images/text survived.
+            if (
+                _native_audio_survived
+                and _persist_user_message_override is None
+            ):
+                _persist_user_message_override = (
+                    ctx.message.strip()
+                    if isinstance(ctx.message, str) and ctx.message.strip()
+                    else _native_audio_marker
+                )
+            elif (
+                _native_audio_survived
+                and isinstance(_persist_user_message_override, str)
+                and not _persist_user_message_override.strip()
+            ):
+                _persist_user_message_override = _native_audio_marker
 
             _api_run_message = _wrap_current_message_with_observed_context(
                 _run_message,
@@ -7382,6 +7600,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     _pending_messages = legacy_dict_property("_pending_messages")
     _pending_native_image_paths_by_session = legacy_dict_property(
         "_pending_native_image_paths_by_session"
+    )
+    _pending_native_audio_attachments_by_session = legacy_dict_property(
+        "_pending_native_audio_attachments_by_session"
     )
     _session_ephemeral_pin = legacy_dict_property("_session_ephemeral_pin")
     _session_vc_last = legacy_dict_property("_session_vc_last")
@@ -19951,12 +20172,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         preprocessing pipeline so sender attribution, image enrichment, STT,
         document notes, reply context, and @ references all behave the same.
 
-        Side effect: buffers per-session native image paths when the active
-        model supports native vision AND the user has images attached. The
-        caller consumes and clears that session-scoped buffer at the
-        ``run_conversation`` site to build a multimodal user turn. When the
-        list is empty, the ``_enrich_message_with_vision`` text path has
-        already run and images are represented in-text.
+        Side effect: buffers per-session native image paths and voice
+        attachments when the active model supports those modalities. The
+        caller consumes and clears those session-scoped buffers at the
+        ``run_conversation`` site to build a multimodal user turn. Images on
+        the text path are already represented by vision enrichment; native
+        audio rejected during final payload construction falls back to STT.
         """
         history = history or []
         _pending_stt_prepared = hasattr(event, "_gateway_pending_stt_text")
@@ -19974,6 +20195,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Reset only this session's per-call buffer; other sessions may be
         # concurrently preparing multimodal turns on the same runner.
         self._consume_pending_native_image_paths(session_key)
+        self._consume_pending_native_audio_attachments(session_key)
 
         _is_shared_multi_user = is_shared_multi_user_session(
             source,
@@ -20015,6 +20237,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if event.media_urls:
             image_paths = []
             audio_paths = []
+            audio_attachments: List[Dict[str, str]] = []
             for i, path in enumerate(event.media_urls):
                 mtype = event.media_types[i] if i < len(event.media_types) else ""
                 # Classify images per-attachment: trust this attachment's own
@@ -20027,11 +20250,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # MessageType.AUDIO = audio file attachment (e.g. .mp3, .m4a) — never STT.
                 # Mixed DOCUMENT events also preserve audio as a file path instead of
                 # dropping it or treating it as a voice note.
+                # MessageType.VOICE is routed natively when the effective model
+                # accepts audio; otherwise it falls back to configured STT.
                 if _event_media_is_audio(event, i):
                     if event.message_type in {MessageType.AUDIO, MessageType.DOCUMENT}:
                         audio_file_paths.append(path)
                     elif not _pending_stt_prepared and _event_media_is_stt_input(event, i):
                         audio_paths.append(path)
+                        audio_attachments.append({
+                            "path": path,
+                            "mime_type": mtype,
+                            "modality": "audio",
+                        })
                 if mtype.startswith("video/") or (not mtype and event.message_type == MessageType.VIDEO):
                     video_paths.append(path)
 
@@ -20088,29 +20318,35 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         )
 
             if audio_paths:
-                message_text, _successful_transcripts = await self._enrich_message_with_transcription(
-                    message_text,
-                    audio_paths,
+                _audio_mode = await asyncio.to_thread(
+                    self._decide_audio_input_mode,
+                    source=source,
+                    session_key=session_key,
                 )
-                # Echo each successful transcript back to the user immediately
-                # when configured. Lets users verify STT quality in real-time,
-                # while allowing quiet STT for users who only want the agent to
-                # receive the transcription.
-                if _successful_transcripts and self._should_echo_stt_transcripts():
-                    _echo_adapter = self._adapter_for_source(source)
-                    _echo_meta = self._thread_metadata_for_source(source, self._reply_anchor_for_event(event))
-                    if _echo_adapter:
-                        for _tx in _successful_transcripts:
-                            try:
-                                await _echo_adapter.send(
-                                    source.chat_id,
-                                    f'🎙️ "{_tx}"',
-                                    metadata=_echo_meta,
-                                )
-                            except Exception as _echo_exc:
-                                logger.debug(
-                                    "Transcript echo failed (non-fatal): %s", _echo_exc,
-                                )
+                if _audio_mode == "native":
+                    self._session_state(
+                        session_key
+                    ).persistent.native_audio_attachments = [
+                        dict(item) for item in audio_attachments
+                    ]
+                    logger.info(
+                        "Audio routing: native. %d voice attachment(s) will be sent inline.",
+                        len(audio_attachments),
+                    )
+                else:
+                    message_text, _successful_transcripts = await self._enrich_message_with_transcription(
+                        message_text,
+                        audio_paths,
+                    )
+                    # Echo each successful transcript back to the user immediately
+                    # when configured. Lets users verify STT quality in real-time,
+                    # while allowing quiet STT for users who only want the agent to
+                    # receive the transcription.
+                    await self._echo_stt_transcripts(
+                        source,
+                        _successful_transcripts,
+                        reply_to_message_id=self._reply_anchor_for_event(event),
+                    )
                 # NOTE: Previously, when transcription failed (e.g. no STT
                 # provider configured), the gateway also emitted a hardcoded
                 # English notice via `_stt_adapter.send()`. That bypassed the
@@ -20399,6 +20635,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         paths = list(state.persistent.native_image_paths)
         state.persistent.native_image_paths = []
         return paths
+
+    def _consume_pending_native_audio_attachments(
+        self,
+        session_key: str,
+    ) -> List[Dict[str, str]]:
+        """Consume this session's one-shot native audio attachment buffer."""
+        state = self._peek_session_state(session_key)
+        if state is None or not state.persistent.native_audio_attachments:
+            return []
+        attachments = [dict(item) for item in state.persistent.native_audio_attachments]
+        state.persistent.native_audio_attachments = []
+        return attachments
 
     def _cache_session_source(self, session_key: str, source) -> None:
         if not session_key or source is None:
@@ -27058,6 +27306,136 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             logger.debug("image_routing: decision failed, falling back to text — %s", exc)
             return "text"
 
+    def _decide_audio_input_mode(
+        self,
+        *,
+        source: Optional[SessionSource] = None,
+        session_key: Optional[str] = None,
+        user_config: Optional[dict] = None,
+        provider: Optional[str] = None,
+        model: Optional[str] = None,
+    ) -> str:
+        """Return ``native`` when this turn's model accepts audio, else ``stt``.
+
+        The decision follows the same session-aware runtime resolution used by
+        image routing, including per-chat and ``/model`` overrides. Unknown
+        capability data is treated conservatively and falls back to STT.
+        """
+        try:
+            from agent.auxiliary_client import _read_main_model, _read_main_provider
+            from agent.media_routing import supported_input_modalities
+            from hermes_cli.config import load_config
+
+            cfg = user_config if isinstance(user_config, dict) else load_config()
+            # Explicit user preference override (gateway.audio_mode; the
+            # top-level audio_mode form remains accepted for compatibility).
+            # Inspect raw key presence rather than the DEFAULT_CONFIG-merged
+            # dict: its gateway.audio_mode="auto" default must not mask a
+            # legacy top-level value or a gateway.json-backed runtime value.
+            preference_cfg = (
+                user_config
+                if isinstance(user_config, dict)
+                else _load_gateway_config()
+            )
+            raw_gateway_pref = preference_cfg.get("gateway")
+            nested_gateway_pref = (
+                raw_gateway_pref if isinstance(raw_gateway_pref, dict) else {}
+            )
+            if "audio_mode" in preference_cfg:
+                user_pref = preference_cfg.get("audio_mode")
+            elif "audio_mode" in nested_gateway_pref:
+                user_pref = nested_gateway_pref.get("audio_mode")
+            else:
+                user_pref = getattr(
+                    getattr(self, "config", None),
+                    "audio_mode",
+                    "auto",
+                )
+            if isinstance(user_pref, str):
+                _pref_norm = user_pref.strip().lower()
+                if _pref_norm == "stt":
+                    logger.info("Audio routing decision: mode=stt (user config override)")
+                    return "stt"
+                if _pref_norm == "native":
+                    logger.info("Audio routing decision: mode=native (user config override)")
+                    return "native"
+                if _pref_norm not in {"", "auto"}:
+                    logger.warning(
+                        "Ignoring invalid gateway.audio_mode=%r "
+                        "(expected auto, native, or stt)",
+                        user_pref,
+                    )
+
+            resolved_provider = (provider or "").strip()
+            resolved_model = (model or "").strip()
+
+            needs_session_runtime = not resolved_provider or not resolved_model
+            if needs_session_runtime and (source is not None or session_key):
+                try:
+                    turn_model, runtime_kwargs = self._resolve_session_agent_runtime(
+                        source=source,
+                        session_key=session_key,
+                        user_config=cfg,
+                    )
+                    if not resolved_model and isinstance(turn_model, str):
+                        resolved_model = turn_model.strip()
+                    runtime_provider = (
+                        runtime_kwargs.get("provider")
+                        if isinstance(runtime_kwargs, dict)
+                        else None
+                    )
+                    if not resolved_provider and isinstance(runtime_provider, str):
+                        resolved_provider = runtime_provider.strip()
+                except Exception as exc:
+                    logger.debug(
+                        "audio_routing: session runtime resolution failed, "
+                        "falling back to process runtime — %s",
+                        exc,
+                    )
+
+            if not resolved_provider:
+                resolved_provider = _read_main_provider()
+            if not resolved_model:
+                resolved_model = _read_main_model()
+
+            # Force STT for Meta / Muse Spark: api.meta.ai rejects
+            # ``input_audio`` (400: messages[N].content[2] did not match any
+            # supported type) for Telegram Ogg Opus voice notes even though
+            # models.dev advertises audio. Groq STT handles ogg correctly.
+            _prov_norm = (resolved_provider or "").strip().lower()
+            _model_norm = (resolved_model or "").strip().lower()
+            if _prov_norm in ("meta", "meta-ai"):
+                logger.info(
+                    "Audio routing decision: mode=stt (forced for meta) provider=%s model=%s",
+                    resolved_provider or "unknown",
+                    resolved_model or "unknown",
+                )
+                return "stt"
+            if "muse-spark" in _model_norm or "muse_spark" in _model_norm:
+                logger.info(
+                    "Audio routing decision: mode=stt (forced for muse-spark) provider=%s model=%s",
+                    resolved_provider or "unknown",
+                    resolved_model or "unknown",
+                )
+                return "stt"
+
+            modalities = supported_input_modalities(
+                resolved_provider,
+                resolved_model,
+            )
+            mode = "native" if "audio" in modalities else "stt"
+            logger.info(
+                "Audio routing decision: mode=%s provider=%s model=%s modalities=%s",
+                mode,
+                resolved_provider or "unknown",
+                resolved_model or "unknown",
+                sorted(modalities),
+            )
+            return mode
+        except Exception as exc:
+            logger.debug("audio_routing: decision failed, falling back to STT — %s", exc)
+            return "stt"
+
     async def _enrich_message_with_vision(
         self,
         user_text: str,
@@ -27128,6 +27506,53 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 return f"{prefix}\n\n{user_text}"
             return prefix
         return user_text
+
+    async def _echo_stt_transcripts(
+        self,
+        source: SessionSource,
+        transcripts: List[str],
+        *,
+        reply_to_message_id: Optional[str] = None,
+        log_context: str = "Transcript",
+    ) -> None:
+        """Echo fresh STT transcripts for a single inbound processing pass."""
+        if not transcripts or not self._should_echo_stt_transcripts():
+            return
+        adapter = self._adapter_for_source(source)
+        if adapter is None:
+            return
+        metadata = self._thread_metadata_for_source(
+            source,
+            reply_to_message_id,
+        )
+        for transcript in transcripts:
+            try:
+                await adapter.send(
+                    source.chat_id,
+                    f'🎙️ "{transcript}"',
+                    metadata=metadata,
+                )
+            except Exception as exc:
+                logger.debug("%s echo failed (non-fatal): %s", log_context, exc)
+
+    async def _transcribe_native_audio_fallback(
+        self,
+        audio_paths: List[str],
+        *,
+        source: SessionSource,
+        reply_to_message_id: Optional[str] = None,
+    ) -> str:
+        """Transcribe native attachments rejected during payload construction."""
+        fallback_text, successful_transcripts = (
+            await self._enrich_message_with_transcription("", audio_paths)
+        )
+        await self._echo_stt_transcripts(
+            source,
+            successful_transcripts,
+            reply_to_message_id=reply_to_message_id,
+            log_context="Native audio STT fallback",
+        )
+        return fallback_text
 
     async def _enrich_message_with_transcription(
         self,

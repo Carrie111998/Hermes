@@ -209,6 +209,22 @@ class TestStreamingConfig:
 
 class TestGatewayConfigRoundtrip:
 
+    @pytest.mark.parametrize(
+        ("raw", "expected"),
+        [
+            ("AUTO", "auto"),
+            (" native ", "native"),
+            ("stt", "stt"),
+            ("unsupported", "auto"),
+            (False, "auto"),
+        ],
+    )
+    def test_audio_mode_is_normalized_and_roundtrips(self, raw, expected):
+        config = GatewayConfig.from_dict({"audio_mode": raw})
+
+        assert config.audio_mode == expected
+        assert GatewayConfig.from_dict(config.to_dict()).audio_mode == expected
+
     def test_systemd_watchdog_from_dict_disables_invalid_values(self):
         invalid_values = [
             None,
@@ -489,6 +505,20 @@ class TestLoadGatewayConfig:
         config = load_gateway_config()
 
         assert config.stt_enabled is False
+
+    def test_audio_mode_from_nested_gateway_section(self, tmp_path, monkeypatch):
+        """The documented gateway.audio_mode path must reach runtime config."""
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        (hermes_home / "config.yaml").write_text(
+            "gateway:\n  audio_mode: native\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+        config = load_gateway_config()
+
+        assert config.audio_mode == "native"
 
 
     @staticmethod

@@ -2113,6 +2113,26 @@ Direct OpenAI API requests and custom proxy endpoints are unchanged.
 
 ## Speech-to-Text (STT)
 
+Inbound voice notes use the active session model's declared input modalities by
+default. An audio-capable model receives the voice note directly, preserving
+prosody and other non-text information; other models use STT. Configure the
+routing policy separately from the STT provider:
+
+```yaml
+gateway:
+  audio_mode: auto             # "auto" (default) | "native" | "stt"
+```
+
+- `auto` uses native audio only when the active model advertises audio input.
+- `native` prefers inline native audio regardless of capability metadata.
+- `stt` always transcribes voice notes before invoking the model.
+
+If native payload construction cannot safely read, encode, or transcode an
+attachment, Hermes falls back to STT for that attachment. Other valid audio or
+image attachments in the same message remain native. Regular audio-file
+attachments are still exposed as files; this routing policy applies to voice
+notes.
+
 ```yaml
 stt:
   enabled: true                # Auto-transcribe inbound voice messages (default: true)
