@@ -252,7 +252,31 @@ class TestSignalStreamingPatch:
 
     def test_signal_does_not_support_editing(self, monkeypatch):
         """SignalAdapter.SUPPORTS_MESSAGE_EDITING must be False."""
-        monkeypatch.setenv("SIGNAL_GROUP_ALLOWED_USERS", "")
+        monkeypatch.setenv("SIGNAL_ALLOWED_GROUPS", "")
         from gateway.platforms.signal import SignalAdapter
         assert SignalAdapter.SUPPORTS_MESSAGE_EDITING is False
 
+    @pytest.mark.asyncio
+    async def test_send_returns_no_message_id(self, monkeypatch):
+        """send() returns message_id=None so stream consumer uses no-edit path."""
+        monkeypatch.setenv("SIGNAL_ALLOWED_GROUPS", "")
+        from gateway.platforms.signal import SignalAdapter
+
+        config = PlatformConfig(enabled=True)
+        config.extra = {
+            "http_url": "http://localhost:8080",
+            "account": "+15551234567",
+        }
+        adapter = SignalAdapter(config)
+
+        # Mock the RPC call
+        async def mock_rpc(method, params, rpc_id=None):
+            return {"timestamp": 1234567890}
+
+        adapter._rpc = mock_rpc
+
+        result = await adapter.send(
+            chat_id="+15559876543",
+            content="Hello",
+        )
+        assert result.message_id is None
