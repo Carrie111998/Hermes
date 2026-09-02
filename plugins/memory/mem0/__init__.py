@@ -114,6 +114,10 @@ def _load_config() -> dict:
 # Tool schemas
 # ---------------------------------------------------------------------------
 
+# Shared by SEARCH_SCHEMA["description"] and system_prompt_block() so the
+# retry cap can't drift out of sync between the two guidance surfaces.
+SEARCH_RETRY_CAP = 2
+
 SEARCH_SCHEMA = {
     "name": "mem0_search",
     "description": (
@@ -121,8 +125,11 @@ SEARCH_SCHEMA = {
         "relevance. Use this before answering any question that may depend on "
         "what you know about the user (preferences, facts, history, people, "
         "projects, past decisions). For multi-part or multi-hop questions, "
-        "call it several times — vary the wording and run follow-up searches "
-        "on what earlier results reveal; one search is rarely enough."
+        "run a few searches with different wording/angles and follow-up "
+        "searches on what earlier results reveal. If results stay "
+        f"low-relevance or unrelated after {SEARCH_RETRY_CAP} attempts, stop and answer from "
+        "other sources instead. Always stop immediately if the user says to "
+        "skip or stop searching memory."
     ),
     "parameters": {
         "type": "object",
@@ -403,10 +410,12 @@ class Mem0MemoryProvider(MemoryProvider):
             "on prior context (the user's preferences, facts, history, people, "
             "projects, or earlier decisions) — do not rely on the chat window "
             "alone, and do not assume you have no memory.\n"
-            "For multi-part or multi-hop questions, run several searches with "
+            "For multi-part or multi-hop questions, run a few searches with "
             "different wording/angles and follow-up searches on what the first "
-            "results surface; one search is rarely enough. Keep searching until "
-            "you have every fact the question needs before you answer.\n"
+            "results surface. If results stay low-relevance or unrelated to the "
+            f"question after {SEARCH_RETRY_CAP} attempts, stop searching and answer from other "
+            "sources (web, domain knowledge) instead. Always stop immediately "
+            "if the user says to skip or stop searching memory.\n"
             "Tools: mem0_search to find memories, mem0_add to store facts, "
             f"mem0_update and mem0_delete to manage by ID.{rerank_note}"
         )

@@ -260,6 +260,35 @@ class TestMem0V3Config:
         assert "mem0_profile" not in block
         assert "mem0_conclude" not in block
 
+    def test_system_prompt_has_search_circuit_breaker(self):
+        # Regression for #93485: the old wording ("Keep searching until you
+        # have every fact") gave the agent no exit condition, so low-relevance
+        # results (e.g. semantic false positives) triggered unbounded
+        # mem0_search retries even after the user said to stop.
+        provider = Mem0MemoryProvider()
+        provider._user_id = "test"
+        block = provider.system_prompt_block()
+        assert "keep searching until" not in block.lower()
+        assert "after 2 attempts" in block
+        assert "Always stop immediately if the user says to skip or stop searching memory" in block
+
+    def test_search_schema_has_search_circuit_breaker(self):
+        # Regression for #93485 follow-up: SEARCH_SCHEMA["description"] is
+        # sent to the model on every turn mem0_search is offered, independent
+        # of whether system_prompt_block() is in context. It used to say
+        # "call it several times... one search is rarely enough" with no cap
+        # — the same unbounded-retry guidance the bug report blamed — so
+        # fixing only system_prompt_block left contradictory instructions in
+        # the same prompt payload. Assert the tool schema itself carries the
+        # cap/stop-on-request wording, not just the system prompt text.
+        provider = Mem0MemoryProvider()
+        schemas = provider.get_tool_schemas()
+        search_schema = next(s for s in schemas if s["name"] == "mem0_search")
+        description = search_schema["description"].lower()
+        assert "one search is rarely enough" not in description
+        assert "after 2 attempts" in description
+        assert "always stop immediately if the user says to skip or stop searching memory" in description
+
 
 class TestMem0ModeSwitch:
 
