@@ -2538,7 +2538,19 @@ def _parent_summary_char_budget(parent_agent, n_summaries: int) -> Optional[int]
         if not isinstance(context_length, int) or context_length <= 0:
             return None
 
-        used_tokens = getattr(parent_agent, "session_prompt_tokens", 0)
+        # Measure CURRENT context usage, not the session-lifetime
+        # accumulator. session_prompt_tokens is a lifetime total
+        # (agent_init = 0, then += per API call, never reset), so on a long
+        # session the headroom below is permanently negative and every batch
+        # summary collapses to the minimum-char floor even when the live
+        # context is small. Prefer the compressor's latest real prompt size;
+        # fall back to the post-compression-boundary measurement, and only
+        # then to the accumulator.
+        used_tokens = getattr(compressor, "last_prompt_tokens", 0) or 0
+        if not isinstance(used_tokens, (int, float)) or used_tokens <= 0:
+            used_tokens = getattr(compressor, "last_real_prompt_tokens", 0) or 0
+        if not isinstance(used_tokens, (int, float)) or used_tokens <= 0:
+            used_tokens = getattr(parent_agent, "session_prompt_tokens", 0)
         if not isinstance(used_tokens, (int, float)) or used_tokens < 0:
             used_tokens = 0
 
