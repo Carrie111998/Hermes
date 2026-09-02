@@ -1328,6 +1328,42 @@ class TestSanitizeError:
         result = _sanitize_error("normal error message")
         assert result == "normal error message"
 
+    def test_strips_unnamed_query_capability(self):
+        from tools.mcp_tool import _sanitize_error
+
+        capability = "q7ZP3mN8vK2xR9tW4cY6bH1jF5sL0dG7"
+        result = _sanitize_error(
+            f"request failed: https://mcp.example.invalid/cb?{capability}"
+        )
+
+        assert capability not in result
+        assert "https://mcp.example.invalid/cb?<redacted>" in result
+
+    def test_strips_opaque_userinfo_capability(self):
+        from tools.mcp_tool import _sanitize_error
+
+        capability = "u7Qm3Zx9Vp2Ks8Rw5Cd1"
+        result = _sanitize_error(
+            f"request failed: https://{capability}@mcp.example.invalid/cb"
+        )
+
+        assert capability not in result
+        assert "https://<redacted>@mcp.example.invalid/cb" in result
+
+    def test_strips_short_user_password_while_preserving_url_structure(self):
+        from tools.mcp_tool import _sanitize_error
+
+        result = _sanitize_error(
+            "request failed: https://bob:pw@mcp.example.invalid:8443/cb/status"
+        )
+
+        assert "bob" not in result
+        assert "pw" not in result
+        assert result == (
+            "request failed: "
+            "https://<redacted>@mcp.example.invalid:8443/cb/status"
+        )
+
 # ---------------------------------------------------------------------------
 # HTTP config
 # ---------------------------------------------------------------------------

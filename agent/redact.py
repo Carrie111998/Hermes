@@ -8,11 +8,13 @@ the first 6 and last 4 characters for debuggability.
 """
 
 import logging
+import math
 import os
 import re
 import shlex
 import threading
-from urllib.parse import unquote_plus
+from collections import Counter
+from urllib.parse import unquote, unquote_plus, urlsplit, urlunsplit
 
 # Basenames treated as ``.env`` files by _command_reads_env_file. Imported
 # from agent/file_safety (the read-block list) so the two defenses can't
@@ -1072,6 +1074,195 @@ def redact_sensitive_text(
     return text
 
 
+_DIAGNOSTIC_URL_RE = re.compile(r"https?://[^\s<>\"']+", re.IGNORECASE)
+_URL_TRAILING_PUNCTUATION = ".,;:!?)}"
+_URL_COMPONENT_SEPARATOR_RE = re.compile(r"([:/?#\[\]@!$&'()*+,;=])")
+_PERCENT_ESCAPE_RE = re.compile(r"%[0-9A-Fa-f]{2}")
+_PERCENT_RESERVED_ESCAPE_RE = re.compile(
+    r"%(?:2[fF]|3[aA-fF]|4[0aA]|5[bBdD])"
+)
+_URL_ATOM_RUN_RE = re.compile(r"[A-Za-z0-9_-]+")
+_URL_REG_NAME_RE = re.compile(r"(?:[A-Za-z0-9._~-]|%[0-9A-Fa-f]{2})+")
+_UUID_URL_COMPONENT_RE = re.compile(
+    r"[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}",
+    re.IGNORECASE,
+)
+
+
+def _is_opaque_url_atom(value: str) -> bool:
+    """Return whether a decoded URL atom looks like an unlabelled capability."""
+    if _UUID_URL_COMPONENT_RE.fullmatch(value):
+        return True
+    if len(value) < 16 or not re.fullmatch(r"[A-Za-z0-9_-]+", value):
+        return False
+    classes = sum(
+        (
+            any(c.islower() for c in value),
+            any(c.isupper() for c in value),
+            any(c.isdigit() for c in value),
+        )
+    )
+    counts = Counter(value)
+    entropy = -sum(
+        (n / len(value)) * math.log2(n / len(value))
+        for n in counts.values()
+    )
+    if value.isdigit():
+        return len(value) >= 24 and entropy >= 3.0
+    if len(value) < 24:
+        return classes >= 2 and entropy >= 3.5
+    return entropy >= (3.5 if classes >= 2 else 4.0)
+
+
+def _is_opaque_url_path_segment(segment: str) -> bool:
+    """Return whether a URL component looks like an unlabelled capability.
+
+    Keep this deliberately conservative: long filenames and human-readable
+    slugs survive, while a long URL-safe component with high character entropy
+    and no word structure is treated as a bearer capability. Classification
+    uses exactly one decoded view and never renders it. A still-encoded escape
+    after that pass is ambiguous double encoding, so diagnostics fail closed.
+    """
+    decoded = unquote(segment)
+    if _PERCENT_ESCAPE_RE.search(decoded):
+        return True
+    candidates = [
+        candidate.group(0)
+        for part in _URL_COMPONENT_SEPARATOR_RE.split(decoded)
+        if part and not _URL_COMPONENT_SEPARATOR_RE.fullmatch(part)
+        for candidate in _URL_ATOM_RUN_RE.finditer(part)
+    ]
+    for candidate in candidates:
+        if _UUID_URL_COMPONENT_RE.fullmatch(candidate):
+            return True
+        # Source context is stronger than morphology. For arbitrary URLs,
+        # preserve human-readable hyphenated slugs unless one individual
+        # segment is independently token-shaped; never classify the joined
+        # phrase by whole-slug entropy.
+        atoms = candidate.split("-") if "-" in candidate else (candidate,)
+        if any(_is_opaque_url_atom(atom) for atom in atoms):
+            return True
+
+    # Percent-encoded reserved separators can split one opaque capability into
+    # several short atoms. Classify that single decoded view as a unit, but do
+    # not apply this join to ordinary unencoded word slugs.
+    return (
+        bool(candidates)
+        and bool(_PERCENT_RESERVED_ESCAPE_RE.search(segment))
+        and _is_opaque_url_atom("".join(candidates))
+    )
+
+
+def project_diagnostic_url_component(component: str) -> str:
+    """Project one untrusted URL-like component for diagnostic display."""
+    return "<redacted>" if _is_opaque_url_path_segment(component) else component
+
+
+def project_configured_mcp_url(url: str) -> str:
+    """Project a known configured remote MCP endpoint deterministically.
+
+    For configured endpoints, source context is the secrecy boundary: any
+    userinfo, non-root path, query, or fragment is sensitive regardless of its
+    morphology. Only transport and authority are retained.
+    """
+    try:
+        parts = urlsplit(url)
+        if parts.scheme.lower() not in {"http", "https"} or parts.hostname is None:
+            raise ValueError("invalid configured MCP URL")
+        _port = parts.port
+        hostinfo = parts.netloc.rpartition("@")[2]
+        root = urlunsplit((parts.scheme, hostinfo, "/", "", ""))
+        if (
+            "@" in parts.netloc
+            or parts.path not in {"", "/"}
+            or parts.query
+            or parts.fragment
+        ):
+            return f"{root}<redacted>"
+        return root
+    except (TypeError, ValueError):
+        scheme, separator, _remainder = str(url).partition("://")
+        return f"{scheme}{separator}<redacted>" if separator else "<redacted>"
+
+
+def _project_diagnostic_url_structure(value: str) -> str:
+    """Project opaque tokens while preserving URL component separators."""
+    return "".join(
+        part
+        if _URL_COMPONENT_SEPARATOR_RE.fullmatch(part)
+        else project_diagnostic_url_component(part)
+        for part in _URL_COMPONENT_SEPARATOR_RE.split(value)
+    )
+
+
+def project_diagnostic_urls(text: str) -> str:
+    """Hide opaque URL capabilities while retaining useful URL context."""
+    if not text or "://" not in text:
+        return text
+
+    def _project(match: re.Match) -> str:
+        raw = match.group(0)
+        url = raw.rstrip(_URL_TRAILING_PUNCTUATION)
+        trailing = raw[len(url):]
+        try:
+            parts = urlsplit(url)
+            if parts.hostname is None:
+                raise ValueError("diagnostic URL has no hostname")
+            _port = parts.port
+            if ":" not in parts.hostname:
+                try:
+                    ascii_hostname = parts.hostname.encode("idna").decode("ascii")
+                except UnicodeError as exc:
+                    raise ValueError("invalid diagnostic URL hostname") from exc
+                if not _URL_REG_NAME_RE.fullmatch(ascii_hostname):
+                    raise ValueError("invalid diagnostic URL hostname")
+            path = _project_diagnostic_url_structure(parts.path)
+
+            netloc = parts.netloc
+            if "@" in netloc:
+                _userinfo, separator, hostinfo = netloc.rpartition("@")
+                netloc = f"<redacted>{separator}{hostinfo}"
+
+            query = _project_diagnostic_url_structure(parts.query)
+            fragment = _project_diagnostic_url_structure(parts.fragment)
+            projected = urlunsplit((parts.scheme, netloc, path, query, fragment))
+            return projected + trailing
+        except (TypeError, ValueError):
+            scheme, separator, _remainder = url.partition("://")
+            return f"{scheme}{separator}<redacted>{trailing}"
+
+    return _DIAGNOSTIC_URL_RE.sub(_project, text)
+
+
+def redact_diagnostic_text(
+    text: str,
+    *,
+    force: bool = False,
+    redact_secrets: bool = True,
+    configured_urls: tuple[str, ...] = (),
+) -> str:
+    """Central safe projection for logs, exceptions, and CLI diagnostics.
+
+    Callers with an existing credential masker may set ``redact_secrets=False``
+    while still applying the shared capability projection.
+    """
+    redacted = text
+    for configured_url in configured_urls:
+        if configured_url:
+            redacted = redacted.replace(
+                configured_url,
+                project_configured_mcp_url(configured_url),
+            )
+    redacted = project_diagnostic_urls(redacted)
+    if redact_secrets:
+        redacted = redact_sensitive_text(
+            redacted,
+            force=force,
+            redact_url_credentials=True,
+        )
+    return redacted
+
+
 # Commands whose stdout is an environment-variable dump (KEY=value lines),
 # NOT source code. For these, terminal-output redaction must run the
 # ENV-assignment pass (code_file=False) so opaque tokens with no recognized
@@ -1487,4 +1678,4 @@ class RedactingFormatter(logging.Formatter):
 
     def format(self, record: logging.LogRecord) -> str:
         original = super().format(record)
-        return redact_sensitive_text(original)
+        return redact_diagnostic_text(original)

@@ -31,6 +31,7 @@ import threading
 import time
 from typing import Dict, Any, List, Optional, Tuple
 
+from agent.redact import redact_diagnostic_text
 from tools.registry import (
     CHECK_FN_CACHE_BYPASS,
     check_fn_cache_scope,
@@ -844,6 +845,7 @@ def _sanitize_tool_error(error_msg: str) -> str:
     sanitized = _TOOL_ERROR_FENCE_OPEN_RE.sub("", sanitized)
     sanitized = _TOOL_ERROR_FENCE_CLOSE_RE.sub("", sanitized)
     sanitized = _TOOL_ERROR_CDATA_RE.sub("", sanitized)
+    sanitized = redact_diagnostic_text(sanitized, force=True)
     if len(sanitized) > _TOOL_ERROR_MAX_LEN:
         sanitized = sanitized[:_TOOL_ERROR_MAX_LEN - 3] + "..."
     return f"[TOOL_ERROR] {sanitized}"

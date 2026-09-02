@@ -144,6 +144,7 @@ _NOISY_LOGGERS = (
     "openai",
     "openai._base_client",
     "httpx",
+    "httpx2",
     "httpcore",
     "asyncio",
     "hpack",
