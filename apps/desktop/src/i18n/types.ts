@@ -447,6 +447,11 @@ export interface Translations {
       sessionDensityCompact: string
       sessionDensityComfortable: string
       sessionDensityDetailed: string
+      contentWidthTitle: string
+      contentWidthDesc: string
+      contentWidthNarrow: string
+      contentWidthComfortable: string
+      contentWidthWide: string
       tabStripTitle: string
       tabStripDesc: string
       tabStripAuto: string
