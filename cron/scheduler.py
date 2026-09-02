@@ -10,6 +10,7 @@ runs at a time if multiple processes overlap.
 
 import asyncio
 import atexit
+import base64
 import concurrent.futures
 import contextlib
 import contextvars
@@ -4282,6 +4283,7 @@ def _run_job_script(
     cancel_event: Optional[_CancelEventLike] = None,
     preserve_stdout: bool = False,
     expected_sha256: Optional[str] = None,
+    script_snapshot: Optional[bytes] = None,
 ) -> tuple[bool, str]:
     """Execute a cron job's data-collection script and capture its output.
 
@@ -4360,11 +4362,15 @@ def _run_job_script(
             f"({scripts_dir_resolved}): {script_path!r}"
         )
 
-    if not path.exists():
-        return False, f"Script not found: {path}"
-    if not path.is_file():
-        return False, f"Script path is not a file: {path}"
-    if expected_sha256 is not None:
+    if script_snapshot is None:
+        if not path.exists():
+            return False, f"Script not found: {path}"
+        if not path.is_file():
+            return False, f"Script path is not a file: {path}"
+    if expected_sha256 is not None and script_snapshot is not None:
+        if hashlib.sha256(script_snapshot).hexdigest() != expected_sha256:
+            return False, f"Script snapshot identity mismatch: {path}"
+    elif expected_sha256 is not None:
         try:
             with path.open("rb") as script_file:
                 if os.fstat(script_file.fileno()).st_size > 1024 * 1024:
@@ -4385,6 +4391,7 @@ def _run_job_script(
     # shebang: the scripts dir is trusted, but keeping the interpreter
     # choice explicit here keeps the allowed surface small and auditable.
     suffix = path.suffix.lower()
+    snapshot_input: Optional[str] = None
     if suffix in {".sh", ".bash"}:
         # Resolve bash dynamically so Windows (Git Bash) and Linux/macOS
         # all work.  On native Windows without Git for Windows installed
@@ -4400,17 +4407,44 @@ def _run_job_script(
                 "On Windows, install Git for Windows (which ships Git Bash) "
                 "or rewrite the script as Python (.py)."
         )
-        argv = [_bash, str(path)]
+        if script_snapshot is None:
+            argv = [_bash, str(path)]
+            snapshot_input = None
+        else:
+            try:
+                snapshot_input = script_snapshot.decode("utf-8")
+            except UnicodeDecodeError:
+                return False, f"Shell script snapshot is not valid UTF-8: {path}"
+            argv = [_bash, "-s", "--", str(path)]
         env_overlay: dict[str, str] = {}
     else:
         python_exe, env_overlay = _windows_cron_python_invocation(sys.executable)
-        if env_overlay:
+        if script_snapshot is not None:
+            bootstrap = "import base64,os,sys;"
+            if env_overlay:
+                site_packages = (
+                    Path(env_overlay["VIRTUAL_ENV"]) / "Lib" / "site-packages"
+                )
+                bootstrap += f"import site;site.addsitedir({str(site_packages)!r});"
+            bootstrap += (
+                "script=sys.argv[1];"
+                "sys.argv=[script]+sys.argv[2:];"
+                "sys.path.insert(0,os.path.dirname(os.path.abspath(script)));"
+                "source=base64.b64decode(sys.stdin.buffer.read());"
+                "namespace={'__name__':'__main__','__file__':script,"
+                "'__package__':None,'__cached__':None};"
+                "exec(compile(source,script,'exec'),namespace)"
+            )
+            argv = [python_exe, "-c", bootstrap, str(path)]
+            snapshot_input = base64.b64encode(script_snapshot).decode("ascii")
+        elif env_overlay:
             # Overlay mode (Windows uv venv): PYTHONPATH alone cannot make
             # editable installs importable — .pth processing needs
             # site.addsitedir() (see _windows_cron_bootstrap_argv).
             argv = _windows_cron_bootstrap_argv(python_exe, env_overlay, str(path))
         else:
             argv = [python_exe, str(path)]
+            snapshot_input = None
 
     try:
         from tools.environments.local import build_subprocess_env
@@ -4432,6 +4466,7 @@ def _run_job_script(
         _script_cwd = workdir or str(path.parent)
         proc = subprocess.Popen(
             argv,
+            stdin=subprocess.PIPE if snapshot_input is not None else None,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
@@ -4440,6 +4475,7 @@ def _run_job_script(
             **popen_kwargs,
         )
         deadline = time.monotonic() + script_timeout
+        snapshot_input_pending = snapshot_input is not None
         while True:
             if cancel_event is not None and cancel_event.is_set():
                 # Same bug class as the timeout site below: a cancelled fire
@@ -4462,7 +4498,16 @@ def _run_job_script(
                 _drain_script_pipes(proc)
                 return False, f"Script timed out after {script_timeout}s: {path}"
             try:
-                stdout_raw, stderr_raw = proc.communicate(timeout=min(0.1, remaining))
+                if snapshot_input_pending:
+                    snapshot_input_pending = False
+                    stdout_raw, stderr_raw = proc.communicate(
+                        input=snapshot_input,
+                        timeout=min(0.1, remaining),
+                    )
+                else:
+                    stdout_raw, stderr_raw = proc.communicate(
+                        timeout=min(0.1, remaining)
+                    )
                 break
             except subprocess.TimeoutExpired:
                 continue
@@ -4503,6 +4548,7 @@ def _run_job_script_with_claim_heartbeat(
     cancel_event: Optional[_CancelEventLike] = None,
     preserve_stdout: bool = False,
     expected_sha256: Optional[str] = None,
+    script_snapshot: Optional[bytes] = None,
 ) -> tuple[bool, str]:
     """Run a cron script while keeping its owned one-shot claim fresh.
 
@@ -4530,6 +4576,7 @@ def _run_job_script_with_claim_heartbeat(
             cancel_event=cancel_event,
             preserve_stdout=preserve_stdout,
             expected_sha256=expected_sha256,
+            script_snapshot=script_snapshot,
         )
 
     job_id = str(job.get("id") or "")
@@ -4567,6 +4614,7 @@ def _run_job_script_with_claim_heartbeat(
             cancel_event=cancel_event,
             preserve_stdout=preserve_stdout,
             expected_sha256=expected_sha256,
+            script_snapshot=script_snapshot,
         )
 
     try:
@@ -4576,6 +4624,7 @@ def _run_job_script_with_claim_heartbeat(
             cancel_event=cancel_event,
             preserve_stdout=preserve_stdout,
             expected_sha256=expected_sha256,
+            script_snapshot=script_snapshot,
         )
     finally:
         stop.set()
@@ -4612,46 +4661,16 @@ def _run_delivery_script_snapshot(
     workdir: Optional[str],
     cancel_event: Optional[_CancelEventLike],
 ) -> tuple[bool, str]:
-    """Execute immutable validated delivery-script bytes from a private copy."""
-    import tempfile
-
-    original_path = Path(identity[0])
-    snapshot_path: Optional[Path] = None
-    try:
-        fd, raw_snapshot_path = tempfile.mkstemp(
-            prefix=f".{original_path.stem}-delivery-",
-            suffix=original_path.suffix,
-            dir=original_path.parent,
-        )
-        snapshot_path = Path(raw_snapshot_path)
-        with os.fdopen(fd, "wb") as snapshot_file:
-            snapshot_file.write(identity[2])
-            snapshot_file.flush()
-            os.fsync(snapshot_file.fileno())
-        try:
-            snapshot_path.chmod(0o500)
-        except OSError:
-            pass
-        return _run_job_script_with_claim_heartbeat(
-            job,
-            str(snapshot_path),
-            workdir=workdir,
-            cancel_event=cancel_event,
-            preserve_stdout=True,
-            expected_sha256=identity[1],
-        )
-    except OSError as exc:
-        return False, f"Delivery script snapshot failed: {exc}"
-    finally:
-        if snapshot_path is not None:
-            try:
-                snapshot_path.unlink(missing_ok=True)
-            except OSError:
-                logger.warning(
-                    "Could not remove delivery script snapshot %s",
-                    snapshot_path,
-                    exc_info=True,
-                )
+    """Execute immutable validated delivery-script bytes without reopening its path."""
+    return _run_job_script_with_claim_heartbeat(
+        job,
+        identity[0],
+        workdir=workdir,
+        cancel_event=cancel_event,
+        preserve_stdout=True,
+        expected_sha256=identity[1],
+        script_snapshot=identity[2],
+    )
 
 
 def _parse_wake_gate(script_output: str) -> bool:
@@ -5669,20 +5688,24 @@ def run_job(
 
     delivery_script_identity = None
     if raw_delivery_source == "script":
-        from cron.lifecycle_guard import check_gateway_lifecycle
-
-        try:
-            check_gateway_lifecycle(
-                str(job.get("prompt") or ""), str(job["delivery_script"])
-            )
-        except Exception as exc:
-            error = f"Post-run delivery script blocked by lifecycle guard: {exc}"
-            return False, f"# Cron Job: {job_name}\n\nError: {error}\n", "", error
         delivery_script_identity = _delivery_script_identity(
             str(job["delivery_script"])
         )
         if delivery_script_identity is None:
             error = "Post-run delivery script is missing or unreadable."
+            return False, f"# Cron Job: {job_name}\n\nError: {error}\n", "", error
+        from cron.lifecycle_guard import check_gateway_lifecycle_bytes
+
+        try:
+            delivery_path = Path(delivery_script_identity[0])
+            check_gateway_lifecycle_bytes(
+                str(job.get("prompt") or ""),
+                delivery_script_identity[2],
+                script_suffix=delivery_path.suffix,
+                script_dir=str(delivery_path.parent),
+            )
+        except Exception as exc:
+            error = f"Post-run delivery script blocked by lifecycle guard: {exc}"
             return False, f"# Cron Job: {job_name}\n\nError: {error}\n", "", error
 
     # Fail closed on a corrupt config.yaml before any agent-driven work
@@ -7283,7 +7306,11 @@ def _run_with_fire_claim_heartbeat(job: dict, run) -> bool:
     stop = threading.Event()
     lost_ownership = threading.Event()
     side_effect_fence_active = threading.Event()
+    side_effect_fence_coordination = threading.Lock()
     lost_ownership._hermes_side_effect_fence_active = side_effect_fence_active
+    side_effect_fence_active._hermes_coordination_lock = (
+        side_effect_fence_coordination
+    )
     heartbeat_context = contextvars.copy_context()
 
     def _finish_unstarted(error: str) -> None:
@@ -7323,10 +7350,14 @@ def _run_with_fire_claim_heartbeat(job: dict, run) -> bool:
     def _heartbeat_loop() -> None:
         last_confirmed = time.monotonic()
         while not stop.wait(_RUN_CLAIM_HEARTBEAT_SECONDS):
-            if side_effect_fence_active.is_set():
-                continue
             try:
-                if not heartbeat_fire_claim(job_id, expected_owner=owner):
+                with side_effect_fence_coordination:
+                    if side_effect_fence_active.is_set():
+                        continue
+                    owns_fire_claim = heartbeat_fire_claim(
+                        job_id, expected_owner=owner
+                    )
+                if not owns_fire_claim:
                     lost_ownership.set()
                     logger.warning(
                         "Job '%s': fire claim ownership lost; interrupting stale run",
@@ -7562,7 +7593,13 @@ def _run_one_job_body(
             script_cancel_event: Optional[_CancelEventLike],
         ) -> tuple[bool, str]:
             if fire_claim_fence_active is not None:
-                fire_claim_fence_active.set()
+                coordination_lock = getattr(
+                    fire_claim_fence_active,
+                    "_hermes_coordination_lock",
+                    contextlib.nullcontext(),
+                )
+                with coordination_lock:
+                    fire_claim_fence_active.set()
             try:
                 with _side_effect_fence() as owns_script:
                     if not owns_script:
@@ -7586,7 +7623,8 @@ def _run_one_job_body(
                     return result
             finally:
                 if fire_claim_fence_active is not None:
-                    fire_claim_fence_active.clear()
+                    with coordination_lock:
+                        fire_claim_fence_active.clear()
 
         try:
             _run_kwargs = {

@@ -211,6 +211,27 @@ class TestRunJobScript:
         assert "changed before execution" in output
         assert "replacement report" not in output
 
+    def test_delivery_snapshot_lifecycle_scan_uses_exact_bytes(self, cron_env):
+        from cron.lifecycle_guard import (
+            GatewayLifecycleBlocked,
+            check_gateway_lifecycle_bytes,
+        )
+
+        with pytest.raises(GatewayLifecycleBlocked):
+            check_gateway_lifecycle_bytes(
+                "Analyze",
+                b"import os\nos.system('hermes gateway restart')\n",
+                script_suffix=".py",
+                script_dir=str(cron_env / "scripts"),
+            )
+
+        check_gateway_lifecycle_bytes(
+            "Analyze",
+            b"print('safe report')\n",
+            script_suffix=".py",
+            script_dir=str(cron_env / "scripts"),
+        )
+
     @pytest.mark.parametrize("invalid_source", ["Script", "script ", "model"])
     def test_noncanonical_runtime_delivery_source_fails_closed(
         self, cron_env, invalid_source
