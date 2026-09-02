@@ -12109,9 +12109,17 @@ def latest_summary(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
     for ties or unfinished rows). Returns None if no run has a summary.
     """
     row = conn.execute(
-        "SELECT summary FROM task_runs "
-        "WHERE task_id = ? AND summary IS NOT NULL AND summary != '' "
-        "ORDER BY COALESCE(ended_at, started_at) DESC, id DESC LIMIT 1",
+        "SELECT summary FROM task_runs AS t "
+        "WHERE t.task_id = ? AND t.summary IS NOT NULL AND t.summary != '' "
+        # Suppress an older run's summary while a newer run is still active
+        # (unfinished, no summary of its own yet). The task's current state is
+        # that newer run, so surfacing the old summary as "latest" makes a
+        # RUNNING task read as still blocked/complete (#98204).
+        "AND NOT EXISTS ("
+        " SELECT 1 FROM task_runs AS newer "
+        " WHERE newer.task_id = t.task_id AND newer.id > t.id "
+        " AND newer.ended_at IS NULL) "
+        "ORDER BY COALESCE(t.ended_at, t.started_at) DESC, t.id DESC LIMIT 1",
         (task_id,),
     ).fetchone()
     return row["summary"] if row else None
@@ -12138,14 +12146,21 @@ def latest_summaries(
     rows = conn.execute(
         f"""
         SELECT task_id, summary FROM (
-            SELECT task_id, summary,
+            SELECT t.task_id AS task_id, t.summary AS summary,
                    ROW_NUMBER() OVER (
-                       PARTITION BY task_id
-                       ORDER BY COALESCE(ended_at, started_at) DESC, id DESC
+                       PARTITION BY t.task_id
+                       ORDER BY COALESCE(t.ended_at, t.started_at) DESC, t.id DESC
                    ) AS rn
-              FROM task_runs
-             WHERE task_id IN ({placeholders})
-               AND summary IS NOT NULL AND summary != ''
+              FROM task_runs AS t
+             WHERE t.task_id IN ({placeholders})
+               AND t.summary IS NOT NULL AND t.summary != ''
+               -- Same suppression as latest_summary(): drop a stale summary
+               -- while a newer run is still active (#98204).
+               AND NOT EXISTS (
+                   SELECT 1 FROM task_runs AS newer
+                   WHERE newer.task_id = t.task_id AND newer.id > t.id
+                     AND newer.ended_at IS NULL
+               )
         ) WHERE rn = 1
         """,
         ids,
