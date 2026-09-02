@@ -83,3 +83,88 @@ def test_build_welcome_banner_non_moa_unchanged(tmp_path, monkeypatch):
     out = console.export_text()
     assert "claude-opus-4.8" in out
     assert "MoA:" not in out
+
+
+def test_explicit_empty_toolsets_do_not_advertise_tools_or_skills(
+    tmp_path, monkeypatch
+):
+    """An explicit empty capability surface must render as empty."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    (tmp_path / ".hermes").mkdir()
+    unavailable = [{"id": "web", "name": "web", "tools": ["web_search"]}]
+
+    with (
+        patch.object(
+            model_tools,
+            "check_tool_availability",
+            return_value=([], unavailable),
+        ),
+        patch.object(
+            banner,
+            "get_available_skills",
+            return_value={"research": ["grounded-citations"]},
+        ),
+        patch.object(banner, "get_update_result", return_value=None),
+        patch.object(tools.mcp_tool, "get_mcp_status", return_value=[]),
+    ):
+        console = Console(record=True, force_terminal=False, color_system=None, width=160)
+        banner.build_welcome_banner(
+            console=console,
+            model="test-model",
+            cwd="/tmp/project",
+            tools=[],
+            enabled_toolsets=[],
+        )
+
+    out = console.export_text()
+    assert "web_search" not in out
+    assert "grounded-citations" not in out
+    assert "Skills toolset disabled" in out
+
+
+def test_unrestricted_toolsets_keep_global_unavailable_tools(tmp_path, monkeypatch):
+    """Omitting the selector keeps the unrestricted availability display."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    (tmp_path / ".hermes").mkdir()
+    unavailable = [{"id": "web", "name": "web", "tools": ["web_search"]}]
+
+    with (
+        patch.object(
+            model_tools,
+            "check_tool_availability",
+            return_value=([], unavailable),
+        ),
+        patch.object(banner, "get_available_skills", return_value={}),
+        patch.object(banner, "get_update_result", return_value=None),
+        patch.object(tools.mcp_tool, "get_mcp_status", return_value=[]),
+    ):
+        console = Console(record=True, force_terminal=False, color_system=None, width=160)
+        banner.build_welcome_banner(
+            console=console,
+            model="test-model",
+            cwd="/tmp/project",
+            tools=[],
+            enabled_toolsets=None,
+        )
+
+    assert "web_search" in console.export_text()
+
+
+def test_banner_snapshot_distinguishes_unrestricted_from_explicit_empty(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    (tmp_path / ".hermes").mkdir()
+    availability = {
+        "unavailable_toolsets": [],
+        "lazy_tools": [],
+        "disabled_tools": [],
+    }
+
+    with (
+        patch.object(banner, "banner_snapshot_fingerprint", return_value="current"),
+        patch.object(banner, "get_available_skills", return_value={}),
+    ):
+        banner.save_banner_snapshot([], None, availability, {})
+        assert banner.load_banner_snapshot(None) is not None
+        assert banner.load_banner_snapshot([]) is None

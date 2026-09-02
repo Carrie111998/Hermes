@@ -21934,15 +21934,15 @@ def main(
     # Parse toolsets - handle both string and tuple/list inputs
     # Default to hermes-cli toolset which includes cronjob management tools
     toolsets_list = None
-    if toolsets:
+    if toolsets is not None:
         if isinstance(toolsets, str):
-            toolsets_list = [t.strip() for t in toolsets.split(",")]
+            toolsets_list = [t.strip() for t in toolsets.split(",") if t.strip()]
         elif isinstance(toolsets, (list, tuple)):
             # Fire may pass multiple --toolsets as a tuple
             toolsets_list = []
             for t in toolsets:
                 if isinstance(t, str):
-                    toolsets_list.extend([x.strip() for x in t.split(",")])
+                    toolsets_list.extend(x.strip() for x in t.split(",") if x.strip())
                 else:
                     toolsets_list.append(str(t))
     else:
