@@ -126,12 +126,14 @@ def test_scrub_respects_force_flag_regardless_of_config(worker_env, monkeypatch)
 # Negative test — legacy result field is also scrubbed
 # ---------------------------------------------------------------------------
 
-def test_kanban_complete_result_field_scrubbed(worker_env):
+def test_kanban_complete_result_field_scrubbed(monkeypatch, worker_env):
     """Legacy result field must be scrubbed just like summary."""
     from tools import kanban_tools as kt
     from hermes_cli import kanban_db as kb
     secret = "sk-" + "D" * 48
-    kt._handle_complete({"result": f"finished with key={secret}"})
+    monkeypatch.setenv("HERMES_PROFILE", "reviewer")
+    result = json.loads(kt._handle_complete({"result": f"finished with key={secret}"}))
+    assert result["ok"] is True
     conn = kb.connect()
     try:
         run = kb.latest_run(conn, worker_env)
