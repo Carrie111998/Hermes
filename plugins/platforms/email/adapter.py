@@ -246,6 +246,18 @@ def _is_read_only_email(extra: Any) -> bool:
     )
 
 
+def _is_draft_only_email(extra: Any) -> bool:
+    """Return whether config.yaml routes every outbound email to the durable
+    draft store instead of SMTP (``platforms.email.extra.draft_only``).
+
+    Draft mode is the stronger policy: it implies read-only (nothing reaches
+    SMTP without an explicit owner approval) and is what the P1 approval
+    surface is built on."""
+    return isinstance(extra, dict) and is_truthy_value(
+        extra.get("draft_only"), default=False
+    )
+
+
 _CHARSET_ALIASES = {
     # Aliases seen in the wild that Python's codec registry doesn't know.
     # "unknown-8bit" / "x-unknown" are RFC 1428 placeholders some MTAs (QQ
@@ -586,6 +598,27 @@ class EmailAdapter(BasePlatformAdapter):
         # unchanged unless explicitly enabled).
         self._read_only = _is_read_only_email(extra)
 
+        # Draft-only / approval mode — configured via config.yaml:
+        #   platforms:
+        #     email:
+        #       extra:
+        #         draft_only: true
+        # When enabled every outbound email lands in the durable
+        # ``outbound_drafts`` store as a ``pending`` draft instead of reaching
+        # SMTP.  An explicit owner approval (Desktop/RPC only) is the only way
+        # a draft is ever transmitted, and each approved draft is sent at most
+        # once.  Draft mode implies read-only: nothing reaches SMTP without
+        # approval.  Default OFF (behaviour unchanged unless explicitly
+        # enabled).  The store file defaults to the canonical Hermes-home
+        # path; ``extra.draft_store`` overrides it.
+        self._draft_only = _is_draft_only_email(extra)
+        self._draft_store_path = str(extra.get("draft_store") or "").strip()
+        self._outbound_store = None
+        try:
+            self._draft_ttl_hours = int(extra.get("draft_ttl_hours") or 72)
+        except (TypeError, ValueError):
+            self._draft_ttl_hours = 72
+
         # Require the sender's From: domain to be authenticated (SPF/DKIM/DMARC)
         # before trusting it for authorization. The From: header is
         # attacker-controlled and unauthenticated by IMAP, so an allowlist keyed
@@ -630,8 +663,18 @@ class EmailAdapter(BasePlatformAdapter):
         logger.info("[Email] Adapter initialized for %s", self._address)
 
     def _outbound_is_suppressed(self) -> bool:
-        """Return the outbound policy, including lightweight test adapters."""
-        return bool(getattr(self, "_read_only", False))
+        """Return the outbound policy, including lightweight test adapters.
+
+        Draft-only mode suppresses direct SMTP just like read-only mode; the
+        difference is *what* the suppressed send does (queue a draft vs. drop
+        silently), decided by the caller via :meth:`_draft_only`."""
+        return bool(
+            getattr(self, "_draft_only", False) or getattr(self, "_read_only", False)
+        )
+
+    def _draft_only_enabled(self) -> bool:
+        """True when outbound email should be queued as drafts, not sent."""
+        return bool(getattr(self, "_draft_only", False))
 
     def _trim_seen_uids(self) -> None:
         """Keep only the most recent UIDs to prevent unbounded memory growth.
@@ -1188,6 +1231,136 @@ class EmailAdapter(BasePlatformAdapter):
         )
         return SendResult(success=True, message_id="read-only-suppressed")
 
+    def _draft_store(self):
+        """Resolve the durable outbound-draft store (lazy, shared by path)."""
+        store = getattr(self, "_outbound_store", None)
+        if store is None:
+            from gateway.outbound_drafts import get_or_create_store
+
+            store = get_or_create_store(self._draft_store_path or None)
+            self._outbound_store = store
+        return store
+
+    def _session_meta(self, metadata):
+        """Extract session/generation/idempotency fields from send metadata."""
+        meta = metadata if isinstance(metadata, dict) else {}
+        session_id = meta.get("session_id") or meta.get("task_id") or ""
+        session_key = meta.get("session_key") or session_id or ""
+        turn_generation = meta.get("turn_generation") or ""
+        idempotency_key = meta.get("idempotency_key") or f"draft-{uuid.uuid4().hex}"
+        return session_id, session_key, turn_generation, idempotency_key
+
+    def _notify_draft_created(self, draft) -> None:
+        """Best-effort surface events so the Desktop approval pane renders."""
+        try:
+            from tui_gateway.methods_email_drafts import _emit_event
+
+            payload = draft.to_dict()
+            _emit_event("email.draft.created", payload)
+            _emit_event("email.draft.requires_approval", payload)
+        except Exception:
+            pass
+
+    def _stage_outbound_draft(
+        self,
+        target: str,
+        body: str,
+        *,
+        subject: Optional[str] = None,
+        in_reply_to: Optional[str] = None,
+        references: Optional[str] = None,
+        attachment_manifest: Optional[List[Any]] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        kind: str = "message",
+    ) -> SendResult:
+        """Queue an outbound email as a pending draft (draft-only mode).
+
+        The stop fence is checked first: a racing callback from a stopped
+        generation must not create a new draft or reach SMTP.
+        """
+        from gateway.outbound_drafts import session_stopped
+
+        session_id, session_key, turn_generation, idem = self._session_meta(metadata)
+        if session_id and session_stopped(session_id, turn_generation):
+            logger.info(
+                "[Email] draft suppressed (session stopped) session=%s gen=%s",
+                session_id,
+                turn_generation,
+            )
+            return SendResult(success=True, message_id="draft-suppressed")
+        if session_key and session_key != session_id and session_stopped(
+            session_key, turn_generation
+        ):
+            logger.info(
+                "[Email] draft suppressed (session stopped) key=%s gen=%s",
+                session_key,
+                turn_generation,
+            )
+            return SendResult(success=True, message_id="draft-suppressed")
+
+        ctx = self._thread_context.get(target, {})
+        resolved_subject = subject or ctx.get("subject", "Hermes Agent")
+        if not resolved_subject.startswith("Re:"):
+            resolved_subject = f"Re: {resolved_subject}"
+        original_msg_id = in_reply_to or ctx.get("message_id")
+
+        try:
+            store = self._draft_store()
+            draft = store.create_draft(
+                profile="",
+                session_key=session_key,
+                session_id=session_id,
+                turn_generation=turn_generation,
+                platform="email",
+                recipient=target,
+                subject=resolved_subject,
+                in_reply_to=original_msg_id or "",
+                references=references or original_msg_id or "",
+                body=body or "",
+                attachment_manifest=attachment_manifest or [],
+                idempotency_key=idem,
+                ttl_hours=self._draft_ttl_hours,
+            )
+        except Exception as e:
+            logger.error("[Email] draft creation failed: %s", e)
+            return SendResult(success=False, error=str(e))
+
+        self._notify_draft_created(draft)
+        return SendResult(success=True, message_id=f"draft:{draft.draft_id}")
+
+    def _draft_from_mime(
+        self,
+        msg: MIMEMultipart,
+        *,
+        recipient: str,
+        subject: str,
+        kind: str = "message",
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> str:
+        """Boundary defense: a direct SMTP call in draft mode queues a draft."""
+        body = ""
+        manifest: List[Any] = []
+        for part in msg.walk():
+            ctype = part.get_content_type()
+            if ctype == "text/plain" and not body:
+                try:
+                    body = part.get_payload(decode=True).decode("utf-8", "replace")
+                except Exception:
+                    body = ""
+            elif part.get_filename():
+                manifest.append({"path": part.get_filename(), "name": part.get_filename()})
+        result = self._stage_outbound_draft(
+            recipient,
+            body,
+            subject=subject,
+            in_reply_to=str(msg.get("In-Reply-To") or ""),
+            references=str(msg.get("References") or ""),
+            attachment_manifest=manifest,
+            metadata=metadata,
+            kind=kind,
+        )
+        return result.message_id or "draft-suppressed"
+
     def _send_via_smtp(
         self,
         msg: MIMEMultipart,
@@ -1206,6 +1379,10 @@ class EmailAdapter(BasePlatformAdapter):
         ``_standalone_send``.
         """
         if self._outbound_is_suppressed():
+            if self._draft_only_enabled():
+                return self._draft_from_mime(
+                    msg, recipient=recipient, subject=subject, kind=kind, metadata=metadata
+                )
             return self._read_only_suppress(
                 recipient, kind, subject=subject, metadata=metadata
             ).message_id or "read-only-suppressed"
@@ -1230,6 +1407,8 @@ class EmailAdapter(BasePlatformAdapter):
     ) -> SendResult:
         """Send an email reply to the given address."""
         if self._outbound_is_suppressed():
+            if self._draft_only_enabled():
+                return self._stage_outbound_draft(chat_id, content, metadata=metadata)
             return self._read_only_suppress(chat_id, metadata=metadata)
         try:
             loop = asyncio.get_running_loop()
@@ -1323,6 +1502,23 @@ class EmailAdapter(BasePlatformAdapter):
         attachments fine, subject to SMTP message size limits.
         """
         if self._outbound_is_suppressed():
+            if self._draft_only_enabled():
+                from urllib.parse import unquote as _unquote
+
+                draft_paths = []
+                for image_url, _alt in images:
+                    if image_url.startswith("file://"):
+                        draft_paths.append(_unquote(image_url[7:]))
+                self._stage_outbound_draft(
+                    chat_id,
+                    "",
+                    attachment_manifest=[
+                        {"path": p, "name": Path(p).name} for p in draft_paths
+                    ],
+                    metadata=metadata,
+                    kind="image batch",
+                )
+                return
             self._read_only_suppress(chat_id, "image batch", metadata=metadata)
             return
         if not images:
@@ -1427,6 +1623,16 @@ class EmailAdapter(BasePlatformAdapter):
         """Send a file as an email attachment."""
         metadata = kwargs.get("metadata")
         if self._outbound_is_suppressed():
+            if self._draft_only_enabled():
+                return self._stage_outbound_draft(
+                    chat_id,
+                    caption or "",
+                    attachment_manifest=[
+                        {"path": file_path, "name": file_name or Path(file_path).name}
+                    ],
+                    metadata=metadata,
+                    kind="document",
+                )
             return self._read_only_suppress(chat_id, "document", metadata=metadata)
         try:
             loop = asyncio.get_running_loop()
@@ -1524,6 +1730,33 @@ async def _standalone_send(
     """Out-of-process Email delivery via SMTP (one-shot). Implements the
     standalone_sender_fn contract; replaces the legacy _send_email helper."""
     extra = getattr(pconfig, "extra", {}) or {}
+    if _is_draft_only_email(extra):
+        # Shared cron/report boundary: queue a pending draft instead of SMTP.
+        from gateway.outbound_drafts import get_or_create_store
+
+        store = get_or_create_store(str(extra.get("draft_store") or "") or None)
+        try:
+            draft = store.create_draft(
+                profile="",
+                session_key="",
+                session_id="",
+                turn_generation="",
+                platform="email",
+                recipient=chat_id,
+                subject="Hermes Agent",
+                body=message or "",
+                attachment_manifest=[],
+                idempotency_key=f"cron-{uuid.uuid4().hex}",
+                ttl_hours=72,
+            )
+        except Exception as e:
+            return {"error": f"Email draft creation failed: {e}"}
+        return {
+            "success": True,
+            "platform": "email",
+            "chat_id": chat_id,
+            "message_id": f"draft:{draft.draft_id}",
+        }
     if _is_read_only_email(extra):
         # This is the shared cron/report transport boundary. Check before
         # resolving credentials or creating an SMTP object so no Email route
