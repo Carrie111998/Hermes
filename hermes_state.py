@@ -13222,7 +13222,6 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         transcript mutation then share one write transaction, so a second
         process cannot archive or replace a turn that is still being produced.
         """
-
         active_clause = " AND active = 1" if active_only else ""
 
         def _do(conn):
