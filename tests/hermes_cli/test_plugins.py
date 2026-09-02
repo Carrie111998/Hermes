@@ -809,6 +809,47 @@ class TestPluginHooks:
         assert results[0] == {"action": "skip", "reason": "test"}
 
 
+    def test_pre_gateway_dispatch_e2e_delivers_agent_busy_and_session_key(
+        self, tmp_path, monkeypatch
+    ):
+        """Real plugin loading (not a monkeypatched invoke_hook) must deliver
+        the additive agent_busy / session_key kwargs to a registered callback.
+
+        This exercises the full discover_and_load -> invoke_hook -> callback
+        chain (regression guard against mock-only tests hiding wiring bugs).
+        """
+        plugins_dir = tmp_path / "hermes_test" / "plugins"
+        _make_plugin_dir(
+            plugins_dir,
+            "busy_probe_plugin",
+            register_body=(
+                "def _busy_probe(**kwargs):\n"
+                "        return {\"action\": \"allow\", "
+                "\"agent_busy\": kwargs.get(\"agent_busy\"), "
+                "\"session_key\": kwargs.get(\"session_key\")}\n"
+                "    ctx.register_hook(\"pre_gateway_dispatch\", _busy_probe)"
+            ),
+        )
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes_test"))
+
+        mgr = PluginManager()
+        mgr.discover_and_load()
+
+        results = mgr.invoke_hook(
+            "pre_gateway_dispatch",
+            event=object(),
+            gateway=object(),
+            session_store=object(),
+            session_key="telegram:dm:123",
+            agent_busy=True,
+        )
+        assert len(results) == 1
+        assert results[0]["action"] == "allow"
+        # The additive kwargs reached the real callback through the loaded plugin.
+        assert results[0]["agent_busy"] is True
+        assert results[0]["session_key"] == "telegram:dm:123"
+
+
 
 
 
