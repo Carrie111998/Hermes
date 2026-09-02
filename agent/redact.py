@@ -1486,5 +1486,11 @@ class RedactingFormatter(logging.Formatter):
         super().__init__(fmt, datefmt, style, **kwargs)
 
     def format(self, record: logging.LogRecord) -> str:
+        # Records created manually by libraries, deserialised from another
+        # process, or retained across an in-place runtime update can bypass
+        # hermes_logging's record factory, leaving %(session_tag)s undefined
+        # and turning every log write into a logging error. The formatter is
+        # the final boundary before interpolation, so default it here.
+        record.__dict__.setdefault("session_tag", "")
         original = super().format(record)
         return redact_sensitive_text(original)

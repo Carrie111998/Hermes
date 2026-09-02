@@ -369,6 +369,26 @@ class TestRedactingFormatter:
         assert "abc123def456" not in result
         assert "sk-pro" in result
 
+    def test_record_without_session_tag_still_formats(self):
+        # Records that bypass hermes_logging's record factory (library-created,
+        # deserialised, or retained across an in-place update) would crash the
+        # %(session_tag)s format with ValueError on every log write.
+        formatter = RedactingFormatter(
+            "%(asctime)s %(levelname)s%(session_tag)s %(name)s: %(message)s"
+        )
+        record = logging.LogRecord(
+            name="test",
+            level=logging.INFO,
+            pathname="",
+            lineno=0,
+            msg="factory-bypassing record",
+            args=(),
+            exc_info=None,
+        )
+        assert "session_tag" not in record.__dict__
+        result = formatter.format(record)
+        assert "factory-bypassing record" in result
+
 
 class TestPrintenvSimulation:
     """Simulate what happens when the agent runs `env` or `printenv`."""
