@@ -692,15 +692,33 @@ def _check_sensitive_path(filepath: str, task_id: str = "default") -> str | None
     except (OSError, ValueError):
         resolved = filepath
     normalized = os.path.normpath(_expand_tilde(filepath))
+
     _err = (
         f"Refusing to write to sensitive system path: {filepath}\n"
         "Use the terminal tool with sudo if you need to modify system files."
     )
+    posix_resolved = resolved.replace("\\", "/")
+    posix_normalized = normalized.replace("\\", "/")
+    posix_raw = filepath.replace("\\", "/")
+
     for prefix in _SENSITIVE_PATH_PREFIXES:
-        if resolved.startswith(prefix) or normalized.startswith(prefix):
+        if (
+            posix_resolved.startswith(prefix)
+            or posix_normalized.startswith(prefix)
+            or posix_raw.startswith(prefix)
+            or resolved.startswith(prefix)
+            or normalized.startswith(prefix)
+        ):
             return _err
-    if resolved in _SENSITIVE_EXACT_PATHS or normalized in _SENSITIVE_EXACT_PATHS:
+    if (
+        posix_resolved in _SENSITIVE_EXACT_PATHS
+        or posix_normalized in _SENSITIVE_EXACT_PATHS
+        or posix_raw in _SENSITIVE_EXACT_PATHS
+        or resolved in _SENSITIVE_EXACT_PATHS
+        or normalized in _SENSITIVE_EXACT_PATHS
+    ):
         return _err
+
     # Prevent agents from modifying the Hermes config file directly.
     # approvals.mode and other security settings live here; a malicious or
     # prompt-injected agent could silently disable exec approval by writing to
@@ -712,6 +730,16 @@ def _check_sensitive_path(filepath: str, task_id: str = "default") -> str | None
             "Agent cannot modify security-sensitive configuration. "
             "Edit ~/.hermes/config.yaml directly or use 'hermes config' instead."
         )
+
+    try:
+        from agent.file_safety import get_write_denied_error
+        for probe in (resolved, normalized, filepath):
+            denial_err = get_write_denied_error(probe)
+            if denial_err:
+                return denial_err
+    except Exception:
+        pass
+
     return None
 
 
