@@ -5370,6 +5370,7 @@ def complete_task(
     created_cards: Optional[Iterable[str]] = None,
     expected_run_id: Optional[int] = None,
     fire_lifecycle_hook: bool = True,
+    signal_fn=None,
 ) -> bool:
     """Transition ``running|ready|blocked|review -> done`` and record ``result``.
 
@@ -5396,6 +5397,12 @@ def complete_task(
     ``completion_blocked_hallucination`` event is emitted so the rejected
     attempt is auditable. When all ids verify, they are recorded on the
     ``completed`` event payload.
+
+    A ``running`` task's worker is reaped before the transition (see
+    :func:`_reap_forgotten_worker`) so completing a card never leaves an
+    unsupervised child behind with no pid on the board. A worker completing
+    its own card is left alone; ``signal_fn`` is a test hook mirroring
+    :func:`reclaim_task`.
 
     After a successful completion, ``summary`` and ``result`` are scanned
     for prose references like ``t_deadbeefcafe`` that do not resolve.
@@ -5439,6 +5446,8 @@ def complete_task(
     metadata = _merge_completion_prose_artifacts(
         conn, task_id, metadata, summary=summary, result=result,
     )
+    # Outside the write txn: termination polls the pid with time.sleep.
+    worker_reap = _reap_forgotten_worker(conn, task_id, signal_fn=signal_fn)
     with write_txn(conn):
         # Parent completion is a hard invariant even for direct human review
         # approval. A parent may have been reopened after this task entered
@@ -5539,6 +5548,8 @@ def complete_task(
             "result_len": len(result) if result else 0,
             "summary": ev_summary or None,
         }
+        if worker_reap:
+            completed_payload["worker_reap"] = worker_reap
         if verified_cards:
             completed_payload["verified_cards"] = verified_cards
         # Carry artifact paths in the event payload so the gateway
@@ -6261,6 +6272,7 @@ def block_task(
     reason: Optional[str] = None,
     kind: Optional[str] = None,
     expected_run_id: Optional[int] = None,
+    signal_fn=None,
 ) -> bool:
     """Transition ``running``/``ready`` → ``blocked`` (or route elsewhere).
 
@@ -6286,6 +6298,12 @@ def block_task(
       can use it to signal "this might clear on its own"; it still participates
       in the loop breaker so a forever-flaky task eventually escalates.
 
+    A ``running`` task's worker is reaped before the transition (see
+    :func:`_reap_forgotten_worker`) so blocking a card never leaves an
+    unsupervised child behind with no pid on the board. A worker blocking
+    its own card is left alone; ``signal_fn`` is a test hook mirroring
+    :func:`reclaim_task`.
+
     Returns True on any successful transition (to ``blocked``, ``todo``, or
     ``triage``), False when the task wasn't in a blockable state.
     """
@@ -6294,6 +6312,8 @@ def block_task(
             f"block kind must be one of {sorted(VALID_BLOCK_KINDS)} or None"
         )
     recurrences = 0
+    # Outside the write txn: termination polls the pid with time.sleep.
+    worker_reap = _reap_forgotten_worker(conn, task_id, signal_fn=signal_fn)
     with write_txn(conn):
         cur_row = conn.execute(
             "SELECT status, block_kind, block_recurrences FROM tasks WHERE id = ?",
@@ -6350,6 +6370,7 @@ def block_task(
                     "reason": reason,
                     "kind": kind,
                     "source_status": source_status,
+                    **({"worker_reap": worker_reap} if worker_reap else {}),
                 },
                 run_id=run_id,
             )
@@ -6410,6 +6431,7 @@ def block_task(
                     "recurrences": recurrences,
                     "limit": BLOCK_RECURRENCE_LIMIT,
                     "source_status": source_status,
+                    **({"worker_reap": worker_reap} if worker_reap else {}),
                 },
                 run_id=run_id,
             )
@@ -6467,6 +6489,7 @@ def block_task(
                     "kind": kind,
                     "recurrences": recurrences,
                     "source_status": source_status,
+                    **({"worker_reap": worker_reap} if worker_reap else {}),
                 },
                 run_id=run_id,
             )
@@ -8321,6 +8344,72 @@ def _terminate_reclaimed_worker(
 
     info["terminated"] = not _pid_alive(pid)
     return info
+
+
+def _pid_is_self_or_ancestor(pid: int) -> bool:
+    """True when ``pid`` is this process or one of its ancestors.
+
+    A worker reports its own outcome: ``kanban_complete`` / ``kanban_block``
+    run inside the very process the board recorded as ``worker_pid`` (or a
+    child of it). Signalling that pid would kill the worker mid-report, so
+    the reap in :func:`_reap_forgotten_worker` skips it. Falls back to the
+    direct parent when ``psutil`` cannot walk the tree.
+    """
+    if pid <= 0:
+        return False
+    if pid == os.getpid():
+        return True
+    try:
+        import psutil
+
+        for parent in psutil.Process(os.getpid()).parents():
+            if parent.pid == pid:
+                return True
+        return False
+    except Exception:
+        try:
+            return pid == os.getppid()
+        except Exception:
+            return False
+
+
+def _reap_forgotten_worker(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    signal_fn=None,
+) -> dict[str, Any]:
+    """Terminate the worker a ``done``/``blocked`` transition is about to drop.
+
+    ``complete_task`` and ``block_task`` NULL ``worker_pid`` in the same
+    UPDATE that moves the task out of ``running``. That used to be the end
+    of it: the child kept executing with full credentials, and the board no
+    longer held the pid, so ``reclaim``/``block``/``complete`` had nothing
+    left to signal (#90073). Reap it here, with the same host-local,
+    best-effort, SIGTERM-then-SIGKILL semantics the reclaim path already
+    uses.
+
+    Two cases are deliberately left alone:
+
+    * a task that is not ``running`` (a manual ``complete`` on a ``ready`` /
+      ``blocked`` / ``review`` card has no worker in flight), and
+    * a pid that is this process or one of its ancestors, which is the
+      normal shape of a worker reporting its own completion.
+
+    Returns the termination info dict (empty when nothing was reaped) for
+    the caller to attach to its event payload. Must be called BEFORE the
+    caller's write transaction: termination polls with ``time.sleep``.
+    """
+    row = conn.execute(
+        "SELECT status, claim_lock, worker_pid FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    if not row or row["status"] != "running" or not row["worker_pid"]:
+        return {}
+    pid = int(row["worker_pid"])
+    if _pid_is_self_or_ancestor(pid):
+        return {"prev_pid": pid, "self_reported": True}
+    return _terminate_reclaimed_worker(pid, row["claim_lock"], signal_fn=signal_fn)
 
 
 def _worker_survived_termination(termination: dict) -> bool:
