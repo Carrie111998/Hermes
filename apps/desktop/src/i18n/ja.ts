@@ -756,6 +756,7 @@ export const ja = defineLocale({
       none: 'なし',
       noneParen: '(なし)',
       builtinOnly: '内蔵のみ',
+      detected: '検出済み',
       notSet: '未設定',
       commaSeparated: 'カンマ区切りの値',
       searchPlaceholder: '検索…',

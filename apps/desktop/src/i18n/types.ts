@@ -593,6 +593,7 @@ export interface Translations {
       none: string
       noneParen: string
       builtinOnly: string
+      detected: string
       notSet: string
       commaSeparated: string
       searchPlaceholder: string
