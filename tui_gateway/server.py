@@ -12297,6 +12297,8 @@ def _notification_event_dedup_key(evt: dict) -> tuple:
     """
     evt_type = evt.get("type", "completion")
     evt_sid = evt.get("session_id", "")
+    if evt.get("event_id"):
+        return (evt_type, evt.get("event_id"))
     if evt_type == "watch_match":
         return (
             evt_sid,
@@ -12701,6 +12703,8 @@ def _notification_poller_loop(
         _evt_sid = evt.get("session_id", "")
         if evt.get("type") == "completion" and process_registry.is_completion_consumed(_evt_sid):
             continue
+        if not process_registry.is_notification_actionable(evt):
+            continue
 
         text = format_process_notification(evt)
         if not text:
@@ -12750,6 +12754,7 @@ def _notification_poller_loop(
             else:
                 _run_prompt_submit(rid, sid, session, text)
             complete_event_delivery(evt, _claim)
+            process_registry.mark_notification_delivered(evt)
         except Exception as exc:
             release_event_delivery(evt, _claim)
             print(
@@ -12792,6 +12797,8 @@ def _notification_poller_loop(
         _evt_sid = evt.get("session_id", "")
         if evt.get("type") == "completion" and process_registry.is_completion_consumed(_evt_sid):
             continue
+        if not process_registry.is_notification_actionable(evt):
+            continue
         text = format_process_notification(evt)
         if not text:
             continue
@@ -12828,6 +12835,7 @@ def _notification_poller_loop(
             else:
                 _run_prompt_submit(rid, sid, session, text)
             complete_event_delivery(evt, _claim)
+            process_registry.mark_notification_delivered(evt)
         except Exception as exc:
             release_event_delivery(evt, _claim)
             print(
@@ -14225,6 +14233,7 @@ def _run_prompt_submit(
                     _emit("message.start", sid)
                     _run_prompt_submit(rid, sid, session, synth)
                     complete_event_delivery(_evt, _claim)
+                    process_registry.mark_notification_delivered(_evt)
                 except Exception as _n_exc:
                     release_event_delivery(_evt, _claim)
                     print(
