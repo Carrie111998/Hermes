@@ -56,6 +56,56 @@ def kanban_home(tmp_path, monkeypatch):
 # ---------------------------------------------------------------------------
 
 
+def test_concurrent_idempotent_creates_return_one_task(kanban_home):
+    workers = 8
+    barrier = threading.Barrier(workers)
+    task_ids: list[str] = []
+    errors: list[BaseException] = []
+    result_lock = threading.Lock()
+
+    def create() -> None:
+        conn = kb.connect()
+        try:
+            barrier.wait()
+            task_id = kb.create_task(
+                conn,
+                title="one logical task",
+                idempotency_key="maos-todo:concurrent",
+            )
+            with result_lock:
+                task_ids.append(task_id)
+        except BaseException as exc:
+            with result_lock:
+                errors.append(exc)
+        finally:
+            conn.close()
+
+    threads = [threading.Thread(target=create) for _ in range(workers)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=10)
+
+    assert not any(thread.is_alive() for thread in threads)
+    assert errors == []
+    assert len(task_ids) == workers
+    assert len(set(task_ids)) == 1
+
+    conn = kb.connect()
+    try:
+        rows = conn.execute(
+            "SELECT id FROM tasks WHERE idempotency_key = ?",
+            ("maos-todo:concurrent",),
+        ).fetchall()
+        events = conn.execute(
+            "SELECT id FROM task_events WHERE task_id = ? AND kind = 'created'",
+            (task_ids[0],),
+        ).fetchall()
+    finally:
+        conn.close()
+    assert len(rows) == 1
+    assert len(events) == 1
+
 
 # ---------------------------------------------------------------------------
 # Spawn-failure circuit breaker

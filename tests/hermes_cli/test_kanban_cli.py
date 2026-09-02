@@ -5,6 +5,8 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import subprocess
+import sys
 import threading
 from pathlib import Path
 
@@ -114,6 +116,74 @@ def test_board_override_is_isolated_per_concurrent_call(kanban_home, monkeypatch
 
     assert alpha_titles == ["alpha-task"]
     assert beta_titles == ["beta-task"]
+
+
+def test_concurrent_cli_creates_return_one_task(kanban_home, tmp_path):
+    root = Path(__file__).resolve().parents[2]
+    start = tmp_path / "start"
+    helper = tmp_path / "concurrent_create.py"
+    helper.write_text(
+        "import os, sys, time\n"
+        "from pathlib import Path\n"
+        "start = Path(os.environ['HERMES_TEST_START'])\n"
+        "while not start.exists():\n"
+        "    time.sleep(0.005)\n"
+        "sys.argv = ['hermes', 'kanban', 'create', 'one logical CLI task', "
+        "'--idempotency-key', 'maos-todo:concurrent-cli', '--json']\n"
+        "from hermes_cli.main import main\n"
+        "raise SystemExit(main())\n",
+        encoding="utf-8",
+    )
+    env = dict(os.environ)
+    env.update({
+        "HERMES_HOME": str(kanban_home),
+        "HERMES_KANBAN_HOME": str(kanban_home),
+        "HERMES_TEST_START": str(start),
+        "PYTHONPATH": str(root) + os.pathsep + env.get("PYTHONPATH", ""),
+    })
+    for name in (
+        "HERMES_DELEGATED_CHILD_CONTEXT",
+        "HERMES_KANBAN_BOARD",
+        "HERMES_KANBAN_DB",
+        "HERMES_KANBAN_WORKSPACES_ROOT",
+    ):
+        env.pop(name, None)
+
+    processes = [
+        subprocess.Popen(
+            [sys.executable, str(helper)],
+            cwd=root,
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        for _ in range(4)
+    ]
+    start.write_text("go", encoding="utf-8")
+    try:
+        completed = [process.communicate(timeout=60) for process in processes]
+    finally:
+        for process in processes:
+            if process.poll() is None:
+                process.kill()
+                process.communicate()
+
+    assert all(process.returncode == 0 for process in processes), completed
+    task_ids = [json.loads(stdout)["id"] for stdout, _stderr in completed]
+    assert len(set(task_ids)) == 1
+
+    with kb.connect_closing() as conn:
+        rows = conn.execute(
+            "SELECT id FROM tasks WHERE idempotency_key = ?",
+            ("maos-todo:concurrent-cli",),
+        ).fetchall()
+        events = conn.execute(
+            "SELECT id FROM task_events WHERE task_id = ? AND kind = 'created'",
+            (task_ids[0],),
+        ).fetchall()
+    assert len(rows) == 1
+    assert len(events) == 1
 
 
 # ---------------------------------------------------------------------------
