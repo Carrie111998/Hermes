@@ -5814,6 +5814,14 @@ def _validate_config_key(key: str) -> tuple[bool, Optional[str]]:
             # Accept it (set_config_value's coercion will replace the
             # leaf with a dict, matching pre-existing behavior).
             return True, None
+        if not node:
+            # An empty mapping in DEFAULT_CONFIG declares the container but
+            # cannot enumerate its runtime-owned children. Treat it as open,
+            # just like the named open-dict roots above. This covers nested
+            # shapes such as auxiliary.<task>.extra_body.* and
+            # terminal.docker_env.* without weakening validation in populated
+            # schema mappings.
+            return True, None
         if seg not in node:
             # Suggest the closest sibling at this depth.
             sibling_suggestion = _suggest_closest_key(seg, set(node.keys()))
