@@ -2509,6 +2509,33 @@ def _fs_default_cwd() -> str:
     return str(Path.cwd())
 
 
+def _fs_default_cwd_for_home(profile_home: Path) -> str:
+    """``_fs_default_cwd`` for a non-launch profile's own config.yaml.
+
+    Reads ``terminal.cwd`` from ``profile_home/config.yaml`` (with ${VAR}
+    expansion, mirroring the gateway's ``_profile_configured_cwd`` read-side
+    pipeline) instead of the process-active profile's config. Falls back to
+    the launch default when the profile sets no usable value.
+    """
+    try:
+        from hermes_cli.config import _expand_env_vars, read_user_config_raw
+        from hermes_cli.managed_scope import apply_managed_overlay
+
+        data = apply_managed_overlay(read_user_config_raw(profile_home / "config.yaml"))
+        expanded = _expand_env_vars(data)
+        if isinstance(expanded, dict):
+            data = expanded
+        terminal = data.get("terminal") if isinstance(data, dict) else None
+        raw = str((terminal or {}).get("cwd") or "").strip()
+        if raw and raw not in {".", "auto", "cwd"}:
+            candidate = Path(raw).expanduser().resolve(strict=False)
+            if candidate.is_dir():
+                return str(candidate)
+    except Exception:
+        _log.debug("profile default-cwd read failed for %s", profile_home, exc_info=True)
+    return _fs_default_cwd()
+
+
 def _fs_git_branch(cwd: str) -> str:
     try:
         run_kwargs: Dict[str, Any] = {
@@ -3303,8 +3330,21 @@ async def fs_git_root(path: str):
 
 
 @app.get("/api/fs/default-cwd")
-async def fs_default_cwd():
-    cwd = _fs_default_cwd()
+async def fs_default_cwd(profile: str = ""):
+    """Default workspace for a fresh chat.
+
+    With ``profile``, resolves the default from THAT profile's own
+    ``terminal.cwd`` config instead of the launch profile's. In app-global
+    remote mode one backend serves every profile, so a new chat under a
+    non-launch profile must seed its workspace from that profile's config —
+    the same rule the gateway applies to ``session.create`` fallbacks
+    (``_profile_configured_cwd``, issue #40334).
+    """
+    if (profile or "").strip():
+        profile_home = _resolve_profile_dir(profile.strip())
+        cwd = _fs_default_cwd_for_home(profile_home)
+    else:
+        cwd = _fs_default_cwd()
     return {"cwd": cwd, "branch": _fs_git_branch(cwd)}
 
 

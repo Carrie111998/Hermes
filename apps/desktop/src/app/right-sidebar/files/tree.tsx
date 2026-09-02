@@ -7,6 +7,7 @@ import { TreeSkeleton } from '@/components/chat/skeletons'
 import { Codicon } from '@/components/ui/codicon'
 import { markRightPanePerf } from '@/debug/right-pane-events'
 import { useResizeObserver } from '@/hooks/use-resize-observer'
+import { isUnderPath } from '@/lib/path-compare'
 import { cn } from '@/lib/utils'
 import { type RepoChangeKind, repoChangeKindForPath } from '@/store/coding-status'
 import { $renamingPath, beginInlineRename } from '@/store/file-actions'
@@ -61,7 +62,14 @@ export function ProjectTree({
 
   const containerRef = useRef<HTMLDivElement | null>(null)
   const treeRef = useRef<TreeApi<TreeNode> | null>(null)
+  const workspaceCwdRef = useRef(cwd)
+  const workspaceGenerationRef = useRef(0)
   const [size, setSize] = useState({ height: 0, width: 0 })
+
+  if (workspaceCwdRef.current !== cwd) {
+    workspaceCwdRef.current = cwd
+    workspaceGenerationRef.current += 1
+  }
 
   const syncTreeSize = useCallback((entries: readonly ResizeObserverEntry[]) => {
     const el = containerRef.current
@@ -107,6 +115,21 @@ export function ProjectTree({
     async (absPath: string) => {
       const root = cwd.replace(/[\\/]+$/, '')
       const target = absPath.replace(/[\\/]+$/, '')
+      const requestGeneration = workspaceGenerationRef.current
+
+      const isCurrentRequest = () =>
+        requestGeneration === workspaceGenerationRef.current &&
+        isUnderPath(workspaceCwdRef.current.replace(/[\\/]+$/, ''), target)
+
+      // A reveal request can outlive a session/profile transition. Never allow
+      // a request for the previous workspace to select a path outside the tree
+      // currently mounted; the old implementation fell through to select()
+      // against the new tree, which made stale reveals look like no-ops and
+      // could leave the wrong workspace visually active.
+      if (!isCurrentRequest()) {
+        return
+      }
+
       const rel = target.startsWith(root) ? target.slice(root.length).replace(/^[\\/]+/, '') : ''
       const segments = rel.split(/[\\/]/).filter(Boolean)
 
@@ -118,11 +141,27 @@ export function ProjectTree({
 
         if (node?.data?.isDirectory && node.data.children === undefined) {
           await onLoadChildren(acc)
+
+          if (!isCurrentRequest()) {
+            return
+          }
+        }
+
+        if (!isCurrentRequest()) {
+          return
         }
 
         onNodeOpenChange(acc, true)
         treeRef.current?.open(acc)
         await new Promise(resolve => requestAnimationFrame(() => resolve(undefined)))
+
+        if (!isCurrentRequest()) {
+          return
+        }
+      }
+
+      if (!isCurrentRequest()) {
+        return
       }
 
       treeRef.current?.select(target)

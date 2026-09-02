@@ -1,9 +1,20 @@
-import { beforeEach, describe, expect, it } from 'vitest'
+import { beforeEach, describe, expect, it, vi } from 'vitest'
 
+import * as treeStore from '@/components/pane-shell/tree/store'
 import type { HermesConnection } from '@/global'
 import { readKey } from '@/lib/storage'
 
-import { $pinnedSessionIds, $sidebarSessionOrderIds, $sidebarSessionOrderManual, pinSession } from './layout'
+import {
+  $fileBrowserOpen,
+  $pinnedSessionIds,
+  $revealInTreeRequest,
+  $sidebarSessionOrderIds,
+  $sidebarSessionOrderManual,
+  FILES_PANE_ID,
+  pinSession,
+  revealFileInTree,
+  setFileBrowserOpen
+} from './layout'
 import { getRememberedSessionId, setConnection, setRememberedSessionId } from './session'
 
 // Two Desktop windows share one renderer origin (and therefore one
@@ -146,6 +157,21 @@ describe('connection-scoped sidebar lists (#77318)', () => {
 
     setConnection(remoteA)
     expect($sidebarSessionOrderIds.get()).toEqual(['r1'])
+  })
+
+  it('reveals the files tab when publishing a footer reveal intent', () => {
+    const reveal = vi.spyOn(treeStore, 'revealTreePane').mockImplementation(() => undefined)
+
+    setFileBrowserOpen(false)
+    revealFileInTree('/home/tom/workspaces/lex')
+
+    expect($fileBrowserOpen.get()).toBe(true)
+    expect(reveal).toHaveBeenCalledWith(FILES_PANE_ID)
+    expect($revealInTreeRequest.get()).toBe('/home/tom/workspaces/lex')
+
+    reveal.mockRestore()
+    $revealInTreeRequest.set(null)
+    setFileBrowserOpen(false)
   })
 
   it('scopes remembered session navigation per connection, not just per profile', () => {

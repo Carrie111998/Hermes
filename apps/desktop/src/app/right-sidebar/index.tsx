@@ -142,9 +142,10 @@ function FilesystemTab({
   const r = t.rightSidebar
 
   // No working directory (a bare/detached chat) → no tree, just a terse hint.
-  // Switching workspace is a project/worktree action, never a raw folder picker.
+  // A named Project is optional; the selected session's working directory is the
+  // filesystem root whenever it has one.
   if (!hasWorkspace) {
-    return <PaneEmptyState label={r.noProjectOpen} />
+    return <PaneEmptyState label={r.noWorkspaceOpen} />
   }
 
   return (
@@ -242,7 +243,7 @@ function FileTreeBody({
   const showSkeleton = useDelayedTrue(loading && data.length === 0)
 
   if (!cwd) {
-    return <EmptyState body={r.noProjectBody} title={r.noProjectTitle} />
+    return <EmptyState body={r.noWorkspaceBody} title={r.noWorkspaceTitle} />
   }
 
   if (error) {

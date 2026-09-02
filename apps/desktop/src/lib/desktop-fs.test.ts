@@ -39,8 +39,10 @@ const api = vi.fn(async ({ path }: { path: string }) => {
     return { root: '/remote' }
   }
 
-  if (path === '/api/fs/default-cwd') {
-    return { cwd: '/backend/project', branch: 'main' }
+  if (path === '/api/fs/default-cwd' || path.startsWith('/api/fs/default-cwd?')) {
+    const profile = new URL(path, 'https://x').searchParams.get('profile') || ''
+
+    return { cwd: profile ? `/backend/${profile}` : '/backend/project', branch: 'main' }
   }
 
   if (path.startsWith('/api/git/file-diff?')) {
@@ -111,6 +113,7 @@ describe('desktop filesystem facade', () => {
     expect(api).toHaveBeenCalledWith({ path: '/api/fs/read-data-url?path=%2Fhome%2Fuser%2Fproject%2Fa%20b.txt' })
     expect(api).toHaveBeenCalledWith({ path: '/api/fs/git-root?path=%2Fhome%2Fuser%2Fproject' })
     expect(api).toHaveBeenCalledWith({ path: '/api/fs/default-cwd' })
+    expect(api).toHaveBeenCalledTimes(5)
     expect(readDir).not.toHaveBeenCalled()
     expect(readFileText).not.toHaveBeenCalled()
     expect(readFileDataUrl).not.toHaveBeenCalled()
@@ -144,7 +147,28 @@ describe('desktop filesystem facade', () => {
     await desktopDefaultCwd()
 
     expect(api).toHaveBeenCalledWith({ path: '/api/fs/list?path=%2Fsrv%2Fproject', profile: 'remote-docker' })
-    expect(api).toHaveBeenCalledWith({ path: '/api/fs/default-cwd', profile: 'remote-docker' })
+    expect(api).toHaveBeenCalledWith({ path: '/api/fs/default-cwd?profile=remote-docker', profile: 'remote-docker' })
+  })
+
+  it('seeds the default workspace from the active profile so a non-launch profile opens in its own folder', async () => {
+    $connection.set({ mode: 'remote', profile: 'lex' } as never)
+
+    const result = await desktopDefaultCwd()
+
+    expect(api).toHaveBeenCalledWith({ path: '/api/fs/default-cwd?profile=lex', profile: 'lex' })
+    expect(result).toEqual({ cwd: '/backend/lex', branch: 'main' })
+  })
+
+  it('encodes profile names with special characters in the default-cwd query', async () => {
+    $connection.set({ mode: 'remote', profile: 'my agent/2' } as never)
+
+    const result = await desktopDefaultCwd()
+
+    expect(api).toHaveBeenCalledWith({
+      path: `/api/fs/default-cwd?profile=${encodeURIComponent('my agent/2')}`,
+      profile: 'my agent/2'
+    })
+    expect(result).toEqual({ cwd: '/backend/my agent/2', branch: 'main' })
   })
 
   it('pins SSH filesystem reads to the active registry connection', async () => {

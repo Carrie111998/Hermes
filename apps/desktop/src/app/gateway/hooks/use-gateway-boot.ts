@@ -62,7 +62,7 @@ import {
   forgetSessionOwnerHintsForConnection,
   setConnection,
   setCurrentBranch,
-  setCurrentCwd,
+  setCurrentCwdTransient,
   setSessionsLoading
 } from '@/store/session'
 import {
@@ -551,16 +551,19 @@ export function useGatewayBoot({
     // Seed the working dir from the backend default on a fresh view (nothing
     // open yet). Shared by boot + soft switch.
     async function seedDefaultCwd(shouldPublish: () => boolean = () => true) {
-      await ensureDefaultWorkspaceCwd(shouldPublish)
+      const remoteDefault = await desktopDefaultCwd().catch(() => null)
+      await ensureDefaultWorkspaceCwd(shouldPublish, remoteDefault?.cwd ?? null)
 
       if (!shouldPublish()) {
         return
       }
 
-      const remoteDefault = await desktopDefaultCwd().catch(() => null)
-
       if (shouldPublish() && remoteDefault?.cwd && !$activeSessionId.get() && !$currentCwd.get()) {
-        setCurrentCwd(remoteDefault.cwd)
+        // Transient seed: the backend default is derived per-profile config,
+        // not a user choice. Persisting it (setCurrentCwd) promoted whatever
+        // folder the app launched in into the remembered workspace, and every
+        // later new chat inherited it (#80213-class stickiness).
+        setCurrentCwdTransient(remoteDefault.cwd)
         setCurrentBranch(remoteDefault.branch || '')
       }
     }
@@ -1009,7 +1012,8 @@ export function useGatewayBoot({
         // arrives. Non-fatal: the remembered cwd is a fine fallback and the
         // post-connect pass retries the sync.
         try {
-          await ensureDefaultWorkspaceCwd()
+          const profileDefault = await desktopDefaultCwd().catch(() => null)
+          await ensureDefaultWorkspaceCwd(() => !cancelled, profileDefault?.cwd ?? null)
         } catch (err) {
           console.warn('Failed to seed default workspace cwd pre-connect', err)
         }

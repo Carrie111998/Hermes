@@ -290,8 +290,18 @@ export async function syncConfiguredDefaultProjectDir(shouldPublish: () => boole
 
 /** Align the renderer workspace with the main-process default (home dir when
  *  packaged, optional Settings override). Clears stale install-dir paths that
- *  PR #37586's localStorage stickiness can preserve across the #37536 fix. */
-export async function ensureDefaultWorkspaceCwd(shouldPublish: () => boolean = () => true): Promise<void> {
+ *  PR #37586's localStorage stickiness can preserve across the #37536 fix.
+ *
+ *  `remoteDefault` (optional): the ACTIVE profile's backend-side workspace for
+ *  remote connections, fetched by the caller to avoid an import cycle. When
+ *  the profile declares its own ``terminal.cwd``, a fresh view opens THERE —
+ *  the profile's workspace — instead of the last remembered path. Seeded
+ *  transiently; never persisted.
+ */
+export async function ensureDefaultWorkspaceCwd(
+  shouldPublish: () => boolean = () => true,
+  remoteDefault?: string | null
+): Promise<void> {
   const sanitize = window.hermesDesktop?.sanitizeWorkspaceCwd
 
   if (!sanitize || !shouldPublish()) {
@@ -318,7 +328,7 @@ export async function ensureDefaultWorkspaceCwd(shouldPublish: () => boolean = (
   const remembered = getRememberedWorkspaceCwd()
 
   if ($connection.get()?.mode === 'remote') {
-    seedLiveCwd(remembered)
+    seedLiveCwd(remoteDefault ?? remembered)
 
     return
   }

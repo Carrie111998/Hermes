@@ -548,7 +548,13 @@ export function setFileBrowserOpen(open: boolean) {
 export const $revealInTreeRequest = atom<null | string>(null)
 
 export function revealFileInTree(path: string): void {
+  // Opening the pane is not enough when the files tab shares a right-column
+  // group with Preview or Review: the boolean can already be true while the
+  // tree is behind a sibling tab. Reveal the tree as well so this intent has
+  // one deterministic result from every caller (footer, context menu, and
+  // keyboard actions).
   setFileBrowserOpen(true)
+  revealTreePane(FILES_PANE_ID)
   $revealInTreeRequest.set(path)
 }
 

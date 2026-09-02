@@ -2697,9 +2697,9 @@ export interface Translations {
     collapseAll: string
     previewUnavailable: string
     couldNotPreview: (path: string) => string
-    noProjectTitle: string
-    noProjectBody: string
-    noProjectOpen: string
+    noWorkspaceTitle: string
+    noWorkspaceBody: string
+    noWorkspaceOpen: string
     noDiffs: string
     unreadableTitle: string
     unreadableBody: (error: string) => string
