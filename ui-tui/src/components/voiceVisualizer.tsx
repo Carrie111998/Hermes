@@ -1,6 +1,6 @@
 import { Box, Text } from '@hermes/ink'
-import { renderTuiOrb } from 'thinking-orbs/tui'
 import { useEffect, useMemo, useState } from 'react'
+import { renderTuiOrb } from 'thinking-orbs/tui'
 
 import type { RealtimeVoicePhase, RealtimeVoiceTranscript } from '../domain/realtimeVoice.js'
 import type { Theme } from '../theme.js'

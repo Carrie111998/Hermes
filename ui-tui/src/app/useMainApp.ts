@@ -1,4 +1,4 @@
-import { spawn, type ChildProcess } from 'node:child_process'
+import { type ChildProcess, spawn } from 'node:child_process'
 import { resolve } from 'node:path'
 
 import {
@@ -26,12 +26,12 @@ import {
   MAX_REALTIME_VOICE_FRAME_CHARS,
   parseRealtimeVoiceEvent,
   parseRealtimeVoicePhase,
+  type RealtimeVoicePhase,
+  type RealtimeVoiceTranscript,
   registerRealtimeVoiceProcess,
   stopRegisteredRealtimeVoiceProcess,
-  writeRealtimeVoiceControl,
   unregisterRealtimeVoiceProcess,
-  type RealtimeVoicePhase,
-  type RealtimeVoiceTranscript
+  writeRealtimeVoiceControl
 } from '../domain/realtimeVoice.js'
 import { sessionScopedModelArg } from '../domain/slash.js'
 import { type GatewayClient } from '../gatewayClient.js'
