@@ -3637,6 +3637,64 @@ def _get_smart_policy() -> str:
     return policy.strip()
 
 
+# Dangerous-pattern descriptions that smart approval must NEVER auto-approve
+# — they always fall through to the human approval prompt, even when
+# approvals.mode=smart.
+#
+# The smart-approval guardian LLM evaluates commands against a generic risk
+# rubric (recursive deletes, fork bombs, disk wipes).  Gateway-lifecycle
+# commands look harmless under that rubric, but they are agent
+# self-termination: stopping/restarting the gateway kills every running
+# agent mid-work, and ``hermes gateway stop`` additionally runs ``launchctl
+# bootout``, which UNLOADS the launchd job — so KeepAlive never respawns it
+# and a single auto-approved command leaves the gateway down until a human
+# runs ``hermes gateway start``.  A guardian APPROVE must not be able to
+# authorize that; only a human can.  Detection is unaffected — this set only
+# removes these keys from the guardian's jurisdiction.
+SMART_APPROVAL_HUMAN_ONLY_DESCRIPTIONS = frozenset({
+    "stop/restart hermes gateway (kills running agents)",
+    "stop/restart hermes launchd service (kills running agents)",
+    _GATEWAY_LIFECYCLE_SPLICE_DESCRIPTION,
+    "hermes update (restarts gateway, kills running agents)",
+    "kill hermes/gateway process (self-termination)",
+})
+
+
+def _smart_approval_human_only(pattern_keys) -> bool:
+    """True when any flagged pattern key is outside guardian jurisdiction.
+
+    When True, Phase 2.5 skips the auxiliary-LLM assessment entirely and the
+    warning proceeds straight to the human approval prompt (see
+    SMART_APPROVAL_HUMAN_ONLY_DESCRIPTIONS for why).
+    """
+    return any(
+        key in SMART_APPROVAL_HUMAN_ONLY_DESCRIPTIONS for key in pattern_keys
+    )
+
+
+def _script_has_gateway_lifecycle(code: str) -> bool:
+    """True when an execute_code script embeds a gateway-lifecycle command.
+
+    Delegates to ``cron.lifecycle_guard.contains_gateway_lifecycle_command``
+    — the same token-aware detector (shlex tokenization, quote/escape
+    splicing, argv-list punctuation, referenced-script recursion) used for
+    the in-gateway hard block and the splice-variant approval pattern.
+
+    Fail-CLOSED on detector errors: an exception here must route the script
+    to the human prompt (return True), never back to the guardian LLM —
+    failing open would reintroduce exactly the auto-approved
+    self-termination this exemption exists to prevent.  The cost of a false
+    positive is one extra human approval prompt; the cost of a false
+    negative is the gateway outage class.
+    """
+    try:
+        from cron.lifecycle_guard import contains_gateway_lifecycle_command
+
+        return contains_gateway_lifecycle_command(code)
+    except Exception:
+        return True
+
+
 def _smart_approve(command: str, description: str) -> str:
     """Use the auxiliary LLM to assess risk and decide approval.
 
@@ -5074,8 +5132,15 @@ def check_all_command_guards(command: str, env_type: str,
     # When approvals.mode=smart, ask the aux LLM before prompting the user.
     # Inspired by OpenAI Codex's Smart Approvals guardian subagent
     # (openai/codex#13860).
+    #
+    # Exception: warnings whose pattern key is outside guardian jurisdiction
+    # (gateway-lifecycle / agent self-termination) skip the LLM entirely and
+    # proceed straight to the human prompt — a guardian APPROVE must not be
+    # able to stop or restart the agent's own gateway.
     smart_denied_for_owner = False
-    if approval_mode == "smart":
+    if approval_mode == "smart" and not _smart_approval_human_only(
+        [key for key, _, _ in warnings]
+    ):
         combined_desc_for_llm = "; ".join(desc for _, desc, _ in warnings)
         observer_payload = _prepare_smart_approval_observer(
             command=command,
@@ -5577,8 +5642,16 @@ def check_execute_code_guard(code: str, env_type: str,
     # Smart mode: ask the aux LLM about the whole script. An APPROVE here only
     # suppresses the redundant whole-script prompt; the per-call terminal()
     # guards (restored by context propagation) still run independently.
+    #
+    # Exception: a script that EMBEDS a gateway-lifecycle command
+    # (subprocess.run(["launchctl", "bootout", ...]), os.system("hermes
+    # gateway stop"), ...) is outside guardian jurisdiction — the guardian
+    # sees only the benign-looking shell string and would auto-approve the
+    # agent's own self-termination. Such scripts go straight to the human
+    # prompt, same as their terminal() counterparts (see
+    # SMART_APPROVAL_HUMAN_ONLY_DESCRIPTIONS).
     smart_denied_for_owner = False
-    if approval_mode == "smart":
+    if approval_mode == "smart" and not _script_has_gateway_lifecycle(code):
         observer_payload = _prepare_smart_approval_observer(
             command=command,
             description=description,
