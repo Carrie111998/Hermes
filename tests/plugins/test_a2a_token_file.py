@@ -47,8 +47,9 @@ def test_1221_bearer_token_file_rejects_short_material(tmp_path: Path) -> None:
         _auth_header({"type": "bearer", "token_file": str(token_file)})
 
 
-@pytest.mark.skipif(not hasattr(os, "O_NOFOLLOW"), reason="O_NOFOLLOW unavailable")
 def test_1221_bearer_token_file_rejects_symlink(tmp_path: Path) -> None:
+    if not hasattr(os, "O_NOFOLLOW"):
+        pytest.skip("O_NOFOLLOW unavailable")
     target = tmp_path / "target.token"
     target.write_text("peer-secret-value-0123456789abcdef", encoding="utf-8")
     target.chmod(0o600)
@@ -56,3 +57,22 @@ def test_1221_bearer_token_file_rejects_symlink(tmp_path: Path) -> None:
     link.symlink_to(target)
     with pytest.raises(ValueError, match="unreadable"):
         _auth_header({"type": "bearer", "token_file": str(link)})
+
+
+def test_1221_bearer_token_file_fails_closed_without_no_follow(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    token_file = tmp_path / "peer.token"
+    token_file.write_text("peer-secret-value-0123456789abcdef", encoding="utf-8")
+    token_file.chmod(0o600)
+    monkeypatch.delattr(os, "O_NOFOLLOW", raising=False)
+    with pytest.raises(ValueError, match="secure no-follow"):
+        _auth_header({"type": "bearer", "token_file": str(token_file)})
+
+
+def test_1221_bearer_token_file_rejects_unread_trailing_content(tmp_path: Path) -> None:
+    token_file = tmp_path / "oversized.token"
+    token_file.write_text("x" * 4096 + "\nextra", encoding="utf-8")
+    token_file.chmod(0o600)
+    with pytest.raises(ValueError, match="at most 4096 bytes"):
+        _auth_header({"type": "bearer", "token_file": str(token_file)})

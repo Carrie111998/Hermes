@@ -82,14 +82,19 @@ def _auth_header(auth: dict) -> dict:
         path = Path(token_file).expanduser()
         descriptor: int | None = None
         try:
-            flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+            no_follow = getattr(os, "O_NOFOLLOW", None)
+            if no_follow is None:
+                raise ValueError("bearer token_file secure no-follow open is unavailable")
+            flags = os.O_RDONLY | no_follow
             descriptor = os.open(path, flags)
             file_stat = os.fstat(descriptor)
             if not stat.S_ISREG(file_stat.st_mode) or file_stat.st_mode & 0o077:
                 raise ValueError("bearer token_file must be a regular file with mode 0600")
+            if file_stat.st_size > 4098:
+                raise ValueError("bearer token_file must contain at most 4096 bytes")
             with os.fdopen(descriptor, "r", encoding="utf-8") as handle:
                 descriptor = None
-                token = handle.read(4097).strip()
+                token = handle.read().strip()
         except ValueError:
             raise
         except (OSError, UnicodeError) as exc:
@@ -98,8 +103,12 @@ def _auth_header(auth: dict) -> dict:
             if descriptor is not None:
                 os.close(descriptor)
         token_bytes = token.encode("utf-8")
-        if len(token_bytes) < 32 or len(token_bytes) > 4096 or any(char.isspace() for char in token):
+        if len(token_bytes) < 32:
             raise ValueError("bearer token_file must contain one bearer value of at least 32 bytes")
+        if len(token_bytes) > 4096:
+            raise ValueError("bearer token_file must contain at most 4096 bytes")
+        if any(char.isspace() for char in token):
+            raise ValueError("bearer token_file must contain one bearer value")
         return {"Authorization": f"Bearer {token}"}
     if inline:
         return {"Authorization": f"Bearer {inline}"}
