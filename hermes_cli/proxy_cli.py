@@ -870,8 +870,9 @@ def _load_env_file_into_environ() -> int:
     keys plainly exist — a confusing first-run papercut.
 
     Only fills names that aren't already set in the process env (an exported
-    value always wins), and only for known bearer-provider names so we don't
-    slurp unrelated secrets into the process. Returns the count of names added.
+    value always wins), and only for known provider credential names and aliases
+    so we don't slurp unrelated secrets into the process. Returns the count of
+    names added.
     """
     try:
         from hermes_cli.config import load_env
@@ -882,8 +883,7 @@ def _load_env_file_into_environ() -> int:
     except Exception:  # noqa: BLE001 — best-effort convenience, never fatal
         return 0
     added = 0
-    known = set(ip._BEARER_PROVIDERS) | set(ip._NON_BEARER_PROVIDERS)
-    for name in known:
+    for name in ip.known_credential_env_names():
         if name in os.environ and os.environ[name].strip():
             continue
         val = (file_env.get(name) or "").strip()

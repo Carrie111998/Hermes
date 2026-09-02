@@ -200,6 +200,29 @@ def test_cmd_restart_propagates_start_failure(hermes_home, monkeypatch):
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.parametrize(
+    ("env_name", "expected_mapping"),
+    [
+        ("ANTHROPIC_API_KEY", "ANTHROPIC_API_KEY"),
+        ("GOOGLE_API_KEY", "GEMINI_API_KEY"),
+    ],
+)
+def test_load_env_file_backfills_header_auth_provider_keys(
+    hermes_home, monkeypatch, env_name, expected_mapping,
+):
+    """Env setup must cover header-auth providers and their aliases."""
+
+    monkeypatch.delenv(env_name, raising=False)
+    monkeypatch.setattr(
+        "hermes_cli.config.load_env",
+        lambda: {env_name: "test-provider-key"},
+    )
+
+    assert proxy_cli._load_env_file_into_environ() == 1
+    mappings = ip.discover_provider_mappings()
+    assert [mapping.real_env_name for mapping in mappings] == [expected_mapping]
+
+
 
 
 
