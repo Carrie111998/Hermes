@@ -1798,6 +1798,29 @@ def switch_model(
         if pdef is None and explicit_provider.strip().lower() == "custom":
             pdef = _bare_custom_provider_def(current_base_url)
         if pdef is None:
+            # explicit_provider may be a `model_aliases:` name rather than a
+            # real provider — the interactive picker surfaces alias rows with
+            # their alias name as the "provider" slug (#92763). Resolve the
+            # alias's own provider/base_url so selecting that row switches
+            # instead of erroring with "Unknown provider". The alias's model
+            # name is picked back up as `resolved_alias` a few lines down via
+            # resolve_alias()'s model-id reverse lookup, which also applies
+            # the alias's exact base_url/credentials further below.
+            _ensure_direct_aliases()
+            _direct_alias = DIRECT_ALIASES.get(explicit_provider.strip().lower())
+            if _direct_alias is not None:
+                pdef = resolve_provider_full(
+                    _direct_alias.provider,
+                    user_providers,
+                    custom_providers,
+                )
+                if pdef is None and _direct_alias.provider.strip().lower() == "custom":
+                    pdef = _bare_custom_provider_def(
+                        _direct_alias.base_url or current_base_url
+                    )
+                if pdef is not None and not new_model:
+                    new_model = _direct_alias.model
+        if pdef is None:
             _switch_err = (
                 f"Unknown provider '{explicit_provider}'. "
                 f"Check 'hermes model' for available providers, or define it "
@@ -4414,5 +4437,48 @@ def list_picker_providers(
         if not has_models and not is_custom_endpoint:
             continue
         filtered.append(p)
+
+    # Surface ``model_aliases:`` entries that have no matching provider row.
+    # A dict-based alias pointing at a custom endpoint (e.g. a local
+    # llama.cpp/Ollama server) resolves correctly via the typed
+    # ``/model <alias>`` command, but was otherwise invisible here because
+    # this function only enumerates providers, never DIRECT_ALIASES / the
+    # ``model_aliases:`` config section. Add a minimal row per unshadowed
+    # alias so it is discoverable and selectable (#92763).
+    _picker_slugs = {str(p.get("slug", "")).strip().lower() for p in filtered}
+    try:
+        from hermes_cli.config import load_config
+        alias_cfg = load_config().get("model_aliases")
+    except Exception:
+        alias_cfg = None
+    if isinstance(alias_cfg, dict):
+        for alias_name, alias_entry in alias_cfg.items():
+            slug = str(alias_name).strip()
+            if not slug or slug.lower() in _picker_slugs or not isinstance(alias_entry, dict):
+                continue
+            model = str(alias_entry.get("model", "")).strip()
+            if not model:
+                continue
+            base_url = str(alias_entry.get("base_url", "")).strip()
+            is_current = (
+                bool(current_model)
+                and model == current_model
+                and (
+                    not base_url
+                    or base_url.strip().rstrip("/").lower()
+                    == str(current_base_url or "").strip().rstrip("/").lower()
+                )
+            )
+            filtered.append({
+                "slug": slug,
+                "name": slug,
+                "is_current": is_current,
+                "is_user_defined": True,
+                "models": [model],
+                "total_models": 1,
+                "source": "user-config",
+                "api_url": base_url,
+            })
+            _picker_slugs.add(slug.lower())
 
     return filtered

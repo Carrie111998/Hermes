@@ -133,6 +133,123 @@ def test_current_custom_endpoint_passthrough_marks_current_row(monkeypatch):
     assert row["models"] == ["glm-5.1", "qwen3"]
 
 
+def test_model_alias_with_no_provider_row_gets_a_picker_row(monkeypatch):
+    """A ``model_aliases:`` entry not also registered under ``providers:``
+    must still surface in the interactive picker (#92763).
+
+    Before the fix, ``list_picker_providers`` only enumerated providers, so a
+    local endpoint configured purely via ``model_aliases:`` (e.g. a
+    llama.cpp/Ollama server) was reachable via typed ``/model local`` but
+    never appeared as a selectable row.
+    """
+    monkeypatch.setattr(model_switch, "list_authenticated_providers", lambda **kw: [])
+    monkeypatch.setattr("hermes_cli.models.fetch_openrouter_models",
+                        lambda *a, **kw: [])
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda: {
+            "model_aliases": {
+                "local": {
+                    "model": "qwen3-30b-a3b",
+                    "provider": "custom",
+                    "base_url": "http://localhost:8080/v1",
+                },
+            },
+        },
+    )
+
+    result = model_switch.list_picker_providers()
+
+    alias_rows = [p for p in result if p.get("slug") == "local"]
+    assert len(alias_rows) == 1
+    row = alias_rows[0]
+    assert row["is_user_defined"] is True
+    assert row["models"] == ["qwen3-30b-a3b"]
+
+
+def test_model_alias_shadowed_by_provider_row_is_not_duplicated(monkeypatch):
+    """An alias sharing a slug with an existing provider row must not double up."""
+    monkeypatch.setattr(
+        model_switch, "list_authenticated_providers",
+        lambda **kw: [_make_provider("local", models=["already-here"],
+                                      is_user_defined=True, api_url="http://x")],
+    )
+    monkeypatch.setattr("hermes_cli.models.fetch_openrouter_models",
+                        lambda *a, **kw: [])
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda: {
+            "model_aliases": {
+                "local": {
+                    "model": "qwen3-30b-a3b",
+                    "provider": "custom",
+                    "base_url": "http://localhost:8080/v1",
+                },
+            },
+        },
+    )
+
+    result = model_switch.list_picker_providers()
+
+    matching = [p for p in result if p.get("slug") == "local"]
+    assert len(matching) == 1
+    assert matching[0]["models"] == ["already-here"]
+
+
+def test_model_alias_picker_row_selection_switches_model(monkeypatch):
+    """Selecting the alias row end-to-end must switch the model, not error (#92763).
+
+    Telegram/Discord treat a picker row's ``slug`` as a provider identifier:
+    they call back into ``switch_model(raw_input=<row's model>,
+    explicit_provider=<row's slug>)``. For an alias-only row that slug is the
+    alias *name* (e.g. "local"), not a registered provider, so this exercises
+    the actual selection callback rather than just the row's shape in the
+    picker list.
+    """
+    alias_cfg = {
+        "model_aliases": {
+            "local": {
+                "model": "qwen3-30b-a3b",
+                "provider": "custom",
+                "base_url": "http://localhost:8080/v1",
+            },
+        },
+    }
+    monkeypatch.setattr(model_switch, "list_authenticated_providers", lambda **kw: [])
+    monkeypatch.setattr("hermes_cli.models.fetch_openrouter_models",
+                        lambda *a, **kw: [])
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda: alias_cfg)
+    monkeypatch.setattr(
+        "hermes_cli.models.validate_requested_model",
+        lambda *a, **k: {
+            "accepted": True, "persist": True, "recognized": True, "message": None,
+        },
+    )
+    model_switch.DIRECT_ALIASES.clear()
+
+    rows = model_switch.list_picker_providers()
+    row = next(p for p in rows if p.get("slug") == "local")
+
+    # Mirrors plugins/platforms/{telegram,discord}/adapter.py's picker
+    # callback: model_id comes from the clicked row's models[idx], and
+    # provider_slug from the row's own slug.
+    model_id = row["models"][0]
+    provider_slug = row["slug"]
+
+    result = model_switch.switch_model(
+        raw_input=model_id,
+        current_provider="openrouter",
+        current_model="",
+        explicit_provider=provider_slug,
+        user_providers=None,
+        custom_providers=None,
+    )
+
+    assert result.success, result.error_message
+    assert result.new_model == "qwen3-30b-a3b"
+    assert result.target_provider == "custom"
+    assert result.base_url == "http://localhost:8080/v1"
+
 
 # ---------------------------------------------------------------------------
 # list_authenticated_providers: alias/canonical de-dup for Kimi (#49439)
