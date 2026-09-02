@@ -6917,6 +6917,13 @@ def _tui_compression_config_signature(cfg: dict | None) -> tuple:
     messaging stay on the same key set. Adds ``idle_compact_after_seconds``
     and ``tail_mode``, which affect live TUI sessions but are not in the
     gateway tuple today.
+
+    The auxiliary compression ROUTE is part of this signature even though it
+    lives under ``auxiliary.``: the compaction trigger is clamped to the
+    auxiliary model's context window
+    (``check_compression_model_feasibility``), so switching that model is a
+    threshold change. Adopting it here re-derives the live compressor in
+    place — no agent rebuild, so the prompt-cache prefix survives.
     """
     from gateway.run import GatewayRunner
 
@@ -6929,6 +6936,17 @@ def _tui_compression_config_signature(cfg: dict | None) -> tuple:
     compression = cfg.get("compression") if isinstance(cfg, dict) and isinstance(cfg.get("compression"), dict) else {}
     for extra in ("idle_compact_after_seconds", "tail_mode"):
         picked[f"compression.{extra}"] = compression.get(extra)
+    auxiliary = cfg.get("auxiliary") if isinstance(cfg, dict) else None
+    aux_compression = (
+        auxiliary.get("compression") if isinstance(auxiliary, dict) else None
+    )
+    if not isinstance(aux_compression, dict):
+        aux_compression = {}
+    # Only the route keys: these decide which window the trigger is clamped
+    # to. timeout / reasoning_effort / extra_body are read per call by
+    # auxiliary_client and must NOT churn the signature.
+    for route_key in ("provider", "model", "base_url"):
+        picked[f"auxiliary.compression.{route_key}"] = aux_compression.get(route_key)
     return tuple(sorted(picked.items()))
 
 
@@ -7211,9 +7229,34 @@ def _apply_live_compression_config(agent: Any, cfg: dict | None) -> None:
         if cap and current:
             cc.threshold_tokens = min(int(current), int(cap))
 
+    # The trigger just re-derived above is the CONFIGURED one. Re-run the
+    # auxiliary-window feasibility check so it is re-clamped when the current
+    # compression model still cannot ingest that much, and left alone when it
+    # can. Without this the adoption above could raise the trigger above a
+    # small aux model's window — reintroducing the very failure the clamp
+    # exists to prevent — and a stale clamp could never be lifted.
+    try:
+        from agent.conversation_compression import (
+            check_compression_model_feasibility,
+        )
+
+        check_compression_model_feasibility(agent)
+    except ValueError:
+        # A hard rejection (aux below the minimum context) is fatal at session
+        # START, but this is a live config edit on a running session: keep the
+        # session alive with the trigger we just derived and let the next
+        # compaction surface the failure.
+        logger.warning(
+            "Live compression config adopted, but the auxiliary compression "
+            "model is below the minimum context window."
+        )
+    except Exception as exc:
+        logger.debug("Auxiliary feasibility re-check skipped: %s", exc)
+
 
 def _sync_agent_compression_with_config(sid: str, session: dict) -> None:
-    """Adopt compression.* / model.context_length edits at turn start.
+    """Adopt compression.* / auxiliary.compression.* / model.context_length
+    edits at turn start.
 
     Messaging gateways already rebuild a cached agent when these keys change.
     Desktop/TUI only synced the model; the live compressor kept the threshold

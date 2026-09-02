@@ -2528,6 +2528,61 @@ class _CompressionLockLeaseRefresher:
                 break
 
 
+def _restore_configured_compression_threshold(agent: Any) -> bool:
+    """Undo a previous auxiliary-window clamp, re-deriving from config.
+
+    Returns True when a clamp was active and has been lifted. The configured
+    trigger is recomputed through the compressor's own math (per-model
+    override → small-window floor → output reservation → absolute cap) rather
+    than restored from a snapshot, so a ``compression.threshold`` edit made
+    while the clamp was active is honoured on the way back up.
+
+    A no-op unless :func:`check_compression_model_feasibility` previously
+    clamped this compressor, so sessions that never hit a small auxiliary
+    model keep whatever threshold their host set.
+    """
+    compressor = getattr(agent, "context_compressor", None)
+    if compressor is None or not getattr(compressor, "_aux_window_clamped", False):
+        return False
+
+    from agent.context_compressor import ContextCompressor as _CC
+    from agent.context_compressor import resolve_model_threshold
+
+    compressor._aux_window_clamped = False
+    main_ctx = getattr(compressor, "context_length", 0)
+    if not main_ctx or not isinstance(compressor, _CC):
+        # External engines own their own compaction policy (#44439) and may
+        # not expose the built-in derivation; leave their trigger alone.
+        return False
+
+    base_pct = resolve_model_threshold(
+        getattr(agent, "model", "") or "",
+        getattr(compressor, "model_thresholds", None) or {},
+        getattr(compressor, "_config_threshold_percent", compressor.threshold_percent),
+    )
+    compressor.threshold_percent = _CC._effective_threshold_percent(main_ctx, base_pct)
+    compressor.threshold_tokens = _CC._compute_threshold_tokens(
+        main_ctx, compressor.threshold_percent, getattr(compressor, "max_tokens", None),
+    )
+    # The absolute cap (``compression.threshold_tokens``) is a first-class
+    # config value, not a one-time patch — re-apply it exactly as
+    # ``update_model()`` does so restoring can never exceed it.
+    apply_cap = getattr(compressor, "_apply_threshold_tokens_cap", None)
+    if callable(apply_cap):
+        apply_cap()
+    # ``tail_token_budget`` is derived from the trigger, so it moves with it.
+    # Reset to None and let the mode-aware property recompute (lean mode uses
+    # a window-relative budget, not 0.20x the trigger).
+    compressor._tail_token_budget = None
+    _ = compressor.tail_token_budget
+    logger.info(
+        "Auxiliary compression window no longer constrains the trigger — "
+        "restored session threshold to %d tokens.",
+        compressor.threshold_tokens,
+    )
+    return True
+
+
 def check_compression_model_feasibility(agent: Any) -> None:
     """Warn at session start if the auxiliary compression model's context
     window is smaller than the main model's compression threshold.
@@ -2640,6 +2695,16 @@ def check_compression_model_feasibility(agent: Any) -> None:
                 f"detected value if it is wrong."
             )
 
+        # Restore first, then re-clamp. This function runs at agent
+        # construction AND whenever the live compression config is re-adopted
+        # (``auxiliary.compression.*`` is live-editable), so it must be
+        # idempotent in BOTH directions. Clamping alone made it a one-way
+        # ratchet: a session that once had a small auxiliary model stayed
+        # pinned to that lowered trigger for the rest of its life, even after
+        # the operator pointed compression at a full-window model again — it
+        # kept compacting ~1.6x more often than configured with no way back
+        # short of restarting the session.
+        _restore_configured_compression_threshold(agent)
         threshold = agent.context_compressor.threshold_tokens
         if aux_context < threshold:
             # Auto-correct: lower the live session threshold so
@@ -2667,14 +2732,19 @@ def check_compression_model_feasibility(agent: Any) -> None:
                 agent.context_compressor.tail_token_budget = int(
                     new_threshold * summary_target_ratio
                 )
-            # Keep threshold_percent in sync so future main-model
-            # context_length changes (update_model) re-derive from a
-            # sensible number rather than the original too-high value.
+            # Record the clamp so a later re-run can undo it. The configured
+            # trigger is re-derived from ``_config_threshold_percent`` rather
+            # than snapshotted, so a config edit between two runs is honoured.
+            #
+            # NOTE: ``threshold_percent`` is deliberately NOT overwritten with
+            # ``new_threshold / main_ctx``. That ratio bypasses
+            # ``_effective_threshold_percent``'s sub-512K floor (a 128K aux on
+            # a 272K main writes 0.47, below the 0.75 floor), and every
+            # re-derivation path already reads the pristine
+            # ``_config_threshold_percent`` instead. Writing it only made the
+            # clamp unrecoverable.
+            agent.context_compressor._aux_window_clamped = True
             main_ctx = agent.context_compressor.context_length
-            if main_ctx:
-                agent.context_compressor.threshold_percent = (
-                    new_threshold / main_ctx
-                )
             safe_pct = int((aux_context / main_ctx) * 100) if main_ctx else 50
             # The "lower the threshold" suggestion must survive the built-in
             # trigger recomputation (#67422): _effective_threshold_percent()
