@@ -2195,7 +2195,9 @@ def _count_status_active_sessions() -> int:
 
     db = _open_session_db_for_profile(None, read_only=True)
     try:
-        sessions = db.list_sessions_rich(limit=50, compact_rows=True)
+        sessions = db.list_sessions_rich(
+            limit=50, compact_rows=True, include_children=True
+        )
         now = time.time()
         return sum(
             1 for s in sessions
