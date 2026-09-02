@@ -4247,6 +4247,7 @@ _SECURITY_COMMENT = """
 #   tirith_enabled: true
 #   tirith_path: "tirith"
 #   tirith_timeout: 5
+#   tirith_scan_timeout: 120
 #   tirith_fail_open: true
 """
 
