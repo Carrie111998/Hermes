@@ -1799,7 +1799,11 @@ function McpAvatar({
         />
       }
     >
-      {!brand && source ? <Favicon fallback={monogramFor(name)} url={source} /> : undefined}
+      {!brand && source ? (
+        <span className="grid size-[76%] place-items-center">
+          <Favicon fallback={monogramFor(name)} url={source} />
+        </span>
+      ) : undefined}
     </AvatarChip>
   )
 }

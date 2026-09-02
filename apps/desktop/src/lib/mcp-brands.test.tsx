@@ -3,7 +3,7 @@ import { afterEach, describe, expect, it } from 'vitest'
 
 import { AvatarChip } from '@/components/ui/avatar-chip'
 
-import { brandFor, faviconSourceFor } from './mcp-brands'
+import { brandFor, brandGlyphStyle, faviconSourceFor } from './mcp-brands'
 
 afterEach(cleanup)
 
@@ -105,6 +105,19 @@ describe('MCP catalog brand glyphs', () => {
     expect(brand).toBeNull()
     expect(container.querySelector('svg')).toBeNull()
     expect(container.textContent).toBe(name.charAt(0).toUpperCase())
+  })
+
+  it('keeps dense marks optically lighter without changing their SVG source', () => {
+    const dense = brandFor('circleci')
+    const regular = brandFor('linear')
+
+    expect(dense?.glyphScale).toBe(0.88)
+    expect(regular?.glyphScale).toBeUndefined()
+    expect(brandGlyphStyle(dense!)).toEqual({ transform: 'scale(0.88)' })
+    expect(brandGlyphStyle(regular!)).toEqual({ color: '#5E6AD2' })
+
+    const { container } = render(<AvatarChip brand={dense} name="circleci" />)
+    expect(container.querySelector('svg')?.getAttribute('style')).toContain('transform: scale(0.88)')
   })
 
   it('still returns no brand for an unknown MCP server', () => {

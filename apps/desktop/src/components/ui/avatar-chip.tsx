@@ -21,6 +21,10 @@ export interface AvatarChipBrand {
    *  the surrounding text color instead of vanishing into the theme. */
   monochrome?: boolean
   monogram?: string
+  /** Optional optical correction for dense marks whose path fills most of
+   *  the source viewBox. Kept as a transform so the source geometry stays
+   *  untouched; callers without a correction keep the shared 58% size. */
+  glyphScale?: number
 }
 
 interface AvatarChipProps extends Omit<ComponentPropsWithoutRef<'span'>, 'children'> {
@@ -64,7 +68,16 @@ export const AvatarChip = forwardRef<HTMLSpanElement, AvatarChipProps>(function 
       }
       {...rest}
     >
-      {children ?? (Icon ? <Icon aria-hidden className={GLYPH_CLASS} /> : (brand?.monogram ?? monogramFor(name)))}
+      {children ??
+        (Icon ? (
+          <Icon
+            aria-hidden
+            className={GLYPH_CLASS}
+            style={brand?.glyphScale ? { transform: `scale(${brand.glyphScale})` } : undefined}
+          />
+        ) : (
+          (brand?.monogram ?? monogramFor(name))
+        ))}
       {overlay}
     </span>
   )

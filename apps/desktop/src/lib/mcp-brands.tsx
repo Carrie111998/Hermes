@@ -35,8 +35,8 @@ import {
   SiMiro,
   SiMixpanel,
   SiN8n,
-  SiNetlify,
   SiNeon,
+  SiNetlify,
   SiNotion,
   SiPaypal,
   SiPostgresql,
@@ -67,57 +67,60 @@ export interface McpBrand {
    *  `currentColor` so it follows the theme instead of vanishing on dark. The
    *  `color` stays for tint backgrounds (the avatar chip), never the glyph. */
   monochrome?: boolean
+  /** Optical correction for dense marks in the shared 24px AvatarChip. This
+   *  scales only the rendered wrapper; the source SVG remains unchanged. */
+  glyphScale?: number
 }
 
 export const MCP_BRAND_ICONS: Record<string, McpBrand> = {
   airtable: { Icon: SiAirtable, color: '#18BFFF' },
-  algolia: { Icon: SiAlgolia, color: '#003DFF' },
+  algolia: { Icon: SiAlgolia, color: '#003DFF', glyphScale: 0.9 },
   alltrails: { Icon: SiAlltrails, color: '#142800' },
   asana: { Icon: SiAsana, color: '#F06A6A' },
   atlassian: { Icon: SiAtlassian, color: '#0052CC' },
-  betterstack: { Icon: SiBetterstack, color: '#000000', monochrome: true },
+  betterstack: { Icon: SiBetterstack, color: '#000000', monochrome: true, glyphScale: 0.88 },
   buildkite: { Icon: SiBuildkite, color: '#14CC80' },
-  calendly: { Icon: SiCalendly, color: '#006BFF' },
-  circleci: { Icon: SiCircleci, color: '#343434', monochrome: true },
-  clickup: { Icon: SiClickup, color: '#7B68EE' },
+  calendly: { Icon: SiCalendly, color: '#006BFF', glyphScale: 0.9 },
+  circleci: { Icon: SiCircleci, color: '#343434', monochrome: true, glyphScale: 0.88 },
+  clickup: { Icon: SiClickup, color: '#7B68EE', glyphScale: 0.9 },
   cloudflare: { Icon: SiCloudflare, color: '#F38020' },
   cloudinary: { Icon: SiCloudinary, color: '#3448C5' },
-  datadog: { Icon: SiDatadog, color: '#632CA6' },
+  datadog: { Icon: SiDatadog, color: '#632CA6', glyphScale: 0.9 },
   dropbox: { Icon: SiDropbox, color: '#0061FF' },
   figma: { Icon: SiFigma, color: '#F24E1E' },
   github: { Icon: SiGithub, color: '#181717', monochrome: true },
-  gitlab: { Icon: SiGitlab, color: '#FC6D26' },
-  grafana: { Icon: SiGrafana, color: '#F46800' },
-  hugging_face: { Icon: SiHuggingface, color: '#FFD21E' },
-  huggingface: { Icon: SiHuggingface, color: '#FFD21E' },
+  gitlab: { Icon: SiGitlab, color: '#FC6D26', glyphScale: 0.9 },
+  grafana: { Icon: SiGrafana, color: '#F46800', glyphScale: 0.88 },
+  hugging_face: { Icon: SiHuggingface, color: '#FFD21E', glyphScale: 0.9 },
+  huggingface: { Icon: SiHuggingface, color: '#FFD21E', glyphScale: 0.9 },
   indeed: { Icon: SiIndeed, color: '#003A9B' },
-  intercom: { Icon: SiIntercom, color: '#6AFDEF' },
+  intercom: { Icon: SiIntercom, color: '#6AFDEF', glyphScale: 0.9 },
   linear: { Icon: SiLinear, color: '#5E6AD2' },
-  miro: { Icon: SiMiro, color: '#050038', monochrome: true },
+  miro: { Icon: SiMiro, color: '#050038', monochrome: true, glyphScale: 0.86 },
   mixpanel: { Icon: SiMixpanel, color: '#7856FF' },
   n8n: { Icon: SiN8n, color: '#EA4B71' },
   netlify: { Icon: SiNetlify, color: '#00C7B7' },
-  neon: { Icon: SiNeon, color: '#34D399' },
-  notion: { Icon: SiNotion, color: '#000000', monochrome: true },
+  neon: { Icon: SiNeon, color: '#34D399', glyphScale: 0.9 },
+  notion: { Icon: SiNotion, color: '#000000', monochrome: true, glyphScale: 0.88 },
   paypal: { Icon: SiPaypal, color: '#003087' },
   postgres: { Icon: SiPostgresql, color: '#4169E1' },
   postgresql: { Icon: SiPostgresql, color: '#4169E1' },
-  postman: { Icon: SiPostman, color: '#FF6C37' },
-  'prisma-postgres': { Icon: SiPrisma, color: '#2D3748', monochrome: true },
-  railway: { Icon: SiRailway, color: '#0B0D0E', monochrome: true },
+  postman: { Icon: SiPostman, color: '#FF6C37', glyphScale: 0.88 },
+  'prisma-postgres': { Icon: SiPrisma, color: '#2D3748', monochrome: true, glyphScale: 0.9 },
+  railway: { Icon: SiRailway, color: '#0B0D0E', monochrome: true, glyphScale: 0.88 },
   robinhood: { Icon: SiRobinhood, color: '#CCFF00' },
-  sentry: { Icon: SiSentry, color: '#362D59' },
-  square: { Icon: SiSquare, color: '#3E4348', monochrome: true },
+  sentry: { Icon: SiSentry, color: '#362D59', glyphScale: 0.9 },
+  square: { Icon: SiSquare, color: '#3E4348', monochrome: true, glyphScale: 0.86 },
   strava: { Icon: SiStrava, color: '#FC4C02' },
   stripe: { Icon: SiStripe, color: '#635BFF' },
   supabase: { Icon: SiSupabase, color: '#3FCF8E' },
-  todoist: { Icon: SiTodoist, color: '#E44332' },
+  todoist: { Icon: SiTodoist, color: '#E44332', glyphScale: 0.88 },
   trivago: { Icon: SiTrivago, color: '#E32851' },
-  'unreal-engine': { Icon: SiUnrealengine, color: '#0E1128', monochrome: true },
-  vercel: { Icon: SiVercel, color: '#000000', monochrome: true },
-  webflow: { Icon: SiWebflow, color: '#146EF5' },
-  'wordpress-com': { Icon: SiWordpress, color: '#21759B' },
-  wolfram: { Icon: SiWolfram, color: '#DD1100' },
+  'unreal-engine': { Icon: SiUnrealengine, color: '#0E1128', monochrome: true, glyphScale: 0.9 },
+  vercel: { Icon: SiVercel, color: '#000000', monochrome: true, glyphScale: 0.86 },
+  webflow: { Icon: SiWebflow, color: '#146EF5', glyphScale: 0.9 },
+  'wordpress-com': { Icon: SiWordpress, color: '#21759B', glyphScale: 0.9 },
+  wolfram: { Icon: SiWolfram, color: '#DD1100', glyphScale: 0.9 },
   zapier: { Icon: SiZapier, color: '#FF4A00' }
 }
 
@@ -135,8 +138,11 @@ export const faviconSourceFor = (name: string, source?: null | string): null | s
 
 /** Inline-glyph color for a brand: monochrome marks inherit the surrounding
  *  text color; branded marks use the brand color. */
-export const brandGlyphStyle = (brand: McpBrand): { color: string } | undefined =>
-  brand.monochrome ? undefined : { color: brand.color }
+export const brandGlyphStyle = (brand: McpBrand): { color?: string; transform?: string } | undefined => {
+  const style = brand.monochrome ? {} : { color: brand.color }
+
+  return brand.glyphScale ? { ...style, transform: `scale(${brand.glyphScale})` } : brand.monochrome ? undefined : style
+}
 
 /** The same brand under every spelling a connector arrives with: catalog slug
  *  (`unreal-engine`), registry id (`unreal_engine`), display name (`Unreal
