@@ -48,9 +48,16 @@ from typing import List, Optional, Tuple
 
 # Hard cap on text scanned with regexes.  Context/tool-result strings can be
 # arbitrarily large, and the scanners are advisory guards rather than archival
-# search; bounding input keeps worst-case runtime predictable while preserving
-# detections near the beginning of injected content.
+# search; bounding input keeps worst-case runtime predictable.  The whole input
+# is still scanned — just in chunks of this size — so a payload past the cap
+# (which the renderer may still emit as a tail) cannot escape detection.
 MAX_SCAN_CHARS = 65_536
+
+# Overlap kept between adjacent scan chunks.  The widest pattern match is the
+# ``[^\n]{0,2048}`` / ``[^>]{0,2048}`` spans in the exfil / config-mod patterns,
+# so an overlap comfortably larger than 2048 guarantees a pattern straddling a
+# chunk boundary is still seen whole by the next chunk.
+_CHUNK_OVERLAP = 4096
 
 # Bounded filler used between key attack words.  Earlier patterns used
 # ``(?:\w+\s+)*`` which is ambiguous and can backtrack heavily on adversarial
@@ -231,8 +238,6 @@ def scan_for_threats(content: str, scope: str = "context") -> List[str]:
 
     findings: List[str] = []
 
-    content = content[:MAX_SCAN_CHARS]
-
     # Invisible unicode — single pass through the content set, not 17
     # ``in`` lookups.  Run this on the RAW content before NFKC normalisation,
     # since normalisation can strip some of these codepoints.
@@ -241,21 +246,53 @@ def scan_for_threats(content: str, scope: str = "context") -> List[str]:
     for ch in invisible_hits:
         findings.append(f"invisible_unicode_U+{ord(ch):04X}")
 
-    # Normalise to NFKC so full-width / compatibility Unicode variants
-    # (e.g. ｃａｔ → cat, Ａ → A) are folded to their ASCII counterparts before
-    # the regex engine sees them.  This prevents homograph substitution from
-    # bypassing keyword checks (e.g. ``ｃａｔ ~/.hermes/.env``).  NOTE: this
-    # does NOT defend against cross-script confusables (Cyrillic ``а`` U+0430),
-    # which NFKC leaves untouched — that needs a TR#39 confusable database.
-    normalised = unicodedata.normalize("NFKC", content)
-
-    # Threat patterns
+    # Threat patterns.  Scan the COMPLETE input in bounded chunks with overlap
+    # so a payload past ``MAX_SCAN_CHARS`` (which the renderer may still emit as
+    # a tail) is not silently skipped.  Findings are deduplicated — a pattern
+    # can legitimately fire in more than one overlapping chunk.
+    #
+    # Cost model: this loop is O(len(content)) in the input — deliberately,
+    # because the tail is now scanned rather than dropped.  `scan_for_threats`
+    # runs on the hot path (every tool result / context string), so a multi-MB
+    # input costs proportionally per call.  The old single-pass HEAD-only scan
+    # was O(MAX_SCAN_CHARS) regardless of size; that bounded-runtime guarantee
+    # no longer holds and should not be re-asserted.
+    #
+    # Overlap semantics: `_CHUNK_OVERLAP` (4096) is sized so any single pattern
+    # match straddling a seam — the widest spans are the ``[^\n]{0,2048}`` /
+    # ``[^>]{0,2048}`` exfil and config-mod patterns (see the `_CHUNK_OVERLAP`
+    # comment above) — is seen whole by the following chunk.  This is a
+    # guarantee about *span width*,
+    # not boundary equivalence with a single-pass scan: a ``\\b``-anchored keyword
+    # can still fire (or miss) purely because a chunk begins/ends mid-text at a
+    # word boundary.  NFKC is likewise applied per chunk, so a multi-codepoint
+    # composition that spans a seam (e.g. a Hangul jamo pair) may normalize
+    # differently than in whole-string normalization — low risk in practice, but
+    # the overlap only mitigates, not eliminates, this boundary effect.
     patterns = _COMPILED.get(scope)
     if patterns is None:
         raise ValueError(f"scan_for_threats: unknown scope {scope!r}")
-    for compiled, pid in patterns:
-        if compiled.search(normalised):
-            findings.append(pid)
+
+    found_ids: set[str] = set()
+    step = max(1, MAX_SCAN_CHARS - _CHUNK_OVERLAP)
+
+    for start in range(0, len(content), step):
+        # Normalise to NFKC so full-width / compatibility Unicode variants
+        # (e.g. ｃａｔ → cat, Ａ → A) are folded to their ASCII counterparts
+        # before the regex engine sees them.  This prevents homograph
+        # substitution from bypassing keyword checks (e.g. ``ｃａｔ
+        # ~/.hermes/.env``).  NOTE: this does NOT defend against cross-script
+        # confusables (Cyrillic ``а`` U+0430), which NFKC leaves untouched —
+        # that needs a TR#39 confusable database.
+        chunk = content[start:start + MAX_SCAN_CHARS]
+        normalised = unicodedata.normalize("NFKC", chunk)
+
+        for compiled, pid in patterns:
+            if pid in found_ids:
+                continue
+            if compiled.search(normalised):
+                found_ids.add(pid)
+                findings.append(pid)
 
     return findings
 
