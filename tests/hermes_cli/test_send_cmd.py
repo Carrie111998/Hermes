@@ -64,6 +64,61 @@ def fake_tool(monkeypatch):
 # ---------------------------------------------------------------------------
 
 
+def test_send_prefers_running_gateway_control_socket(
+    fake_tool, capsys, monkeypatch, tmp_path
+):
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    calls = []
+
+    def _query(home, verb, *, payload=None, timeout=None):
+        calls.append((home, verb, payload, timeout))
+        return {
+            "success": True,
+            "platform": "matrix",
+            "chat_id": "!room:test",
+            "message_id": "$encrypted",
+        }
+
+    monkeypatch.setattr("gateway.control_socket.query_gateway_control", _query)
+
+    args = _parse(["--json", "--to", "matrix:!room:test", "hello"])
+    with pytest.raises(SystemExit) as exc:
+        send_cmd.cmd_send(args)
+
+    assert exc.value.code == 0
+    assert fake_tool.calls == []
+    assert calls == [
+        (
+            tmp_path,
+            "send-message",
+            {"target": "matrix:!room:test", "message": "hello"},
+            40.0,
+        )
+    ]
+    assert json.loads(capsys.readouterr().out)["message_id"] == "$encrypted"
+
+
+def test_send_falls_back_when_gateway_has_no_send_verb(
+    fake_tool, capsys, monkeypatch, tmp_path
+):
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(
+        "gateway.control_socket.query_gateway_control",
+        lambda *args, **kwargs: None,
+    )
+
+    args = _parse(["--json", "--to", "telegram:123", "hello"])
+    with pytest.raises(SystemExit) as exc:
+        send_cmd.cmd_send(args)
+
+    assert exc.value.code == 0
+    assert fake_tool.calls == [
+        {"action": "send", "target": "telegram:123", "message": "hello"}
+    ]
+    assert json.loads(capsys.readouterr().out)["message_id"] == "m123"
+
 
 
 

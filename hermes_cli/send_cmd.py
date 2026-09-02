@@ -371,6 +371,29 @@ def cmd_send(args: argparse.Namespace) -> None:
     if subject:
         message = f"{subject}\n\n{message.lstrip()}"
 
+    # Prefer the running gateway's live adapter. Stateful platforms such as
+    # encrypted Matrix must never construct a second crypto machine in this
+    # CLI process, and a raw Client-Server API request would be plaintext.
+    try:
+        from gateway.control_socket import query_gateway_control
+        from hermes_constants import get_hermes_home
+
+        live_result = query_gateway_control(
+            get_hermes_home(),
+            "send-message",
+            payload={"target": target, "message": message},
+            timeout=40.0,
+        )
+    except Exception:
+        live_result = None
+    if live_result is not None:
+        exit_code = _emit_result(
+            json.dumps(live_result),
+            json_mode=getattr(args, "json", False),
+            quiet=getattr(args, "quiet", False),
+        )
+        sys.exit(exit_code)
+
     # Import lazily so `hermes send --help` stays fast and does not pull in
     # the full tool registry / gateway config stack.
     from tools.send_message_tool import send_message_tool
