@@ -11500,7 +11500,8 @@ async function ensureRegistryBackend(connectionId, profile, managedUpdateCorrela
     token: null,
     connectionPromise: null,
     lastActiveAt: Date.now(),
-    remoteBaseUrl: null
+    remoteBaseUrl: null,
+    ownsRemoteServe: source.kind === 'ssh'
   }
 
   entry.connectionPromise = connectRegistryBackend(
@@ -11540,6 +11541,7 @@ async function connectRegistryBackend(
   const profileKey = String(profile ?? '').trim() || 'default'
 
   if (source.kind === 'ssh') {
+    poolEntry.ownsRemoteServe = true
     // The composite key doubles as the ssh scope so each (connection, profile)
     // pair owns its own tunnel + remote dashboard; the profile that re-homes
     // the REMOTE process is the entry's remoteProfile or the requested one —
@@ -11634,7 +11636,8 @@ async function ensureManagedSshBackendAtKey(source, profile, key, correlationId,
     token: null,
     connectionPromise: null,
     lastActiveAt: Date.now(),
-    remoteBaseUrl: null
+    remoteBaseUrl: null,
+    ownsRemoteServe: source.kind === 'ssh'
   }
 
   entry.connectionPromise = connectRegistryBackend(
@@ -12163,7 +12166,7 @@ function startPoolIdleReaper() {
     for (const [profile, entry] of [...backendPool.entries()]) {
       if (now - (entry.lastActiveAt || 0) > POOL_IDLE_MS) {
         rememberLog(`Reaping idle profile backend "${profile}" (idle > ${Math.round(POOL_IDLE_MS / 1000)}s)`)
-        stopPoolBackend(profile)
+        stopPoolBackendReclaiming(profile)
       }
     }
 
@@ -12206,6 +12209,10 @@ async function spawnPoolBackend(profile, entry, opts: { forceLocal?: boolean; po
     // Recorded on the entry so revalidation can probe this descriptor without
     // awaiting connectionPromise, which may still be pending for a sibling.
     entry.remoteBaseUrl = remote.baseUrl
+
+    if (remote.remoteKind === 'ssh') {
+      entry.ownsRemoteServe = true
+    }
 
     return {
       ...remote,
@@ -12403,11 +12410,19 @@ async function spawnPoolBackend(profile, entry, opts: { forceLocal?: boolean; po
 const poolStopper = createPoolStopper({
   pool: backendPool,
   stopChild: child => stopBackendChild(child),
+  stopOwnedRemote: async key => {
+    await sshBootstrapCoordinator.cancelAndWait(key)
+    await teardownSshConnection(key)
+  },
   waitForExit: child => waitForBackendExit(child)
 })
 
 function stopPoolBackend(profile) {
   return poolStopper.stop(profile)
+}
+
+function stopPoolBackendReclaiming(profile) {
+  return poolStopper.stopAndReclaim(profile)
 }
 
 async function teardownPoolBackendAndWait(profile) {
