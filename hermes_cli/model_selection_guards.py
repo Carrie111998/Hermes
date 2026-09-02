@@ -30,11 +30,52 @@ from agent.models_dev import ModelInfo
 class SelectionWarning:
     """A selection-time warning a surface must confirm before applying."""
 
-    kind: str  # "cost" | "data_policy" | future guard kinds
+    kind: str  # "cost" | "data_policy" | "context_cache" | future guard kinds
     title: str
     model: str
     provider: str
     message: str
+
+
+@dataclass(frozen=True)
+class SelectionContext:
+    """Live-session facts a surface can thread into the guard registry.
+
+    Guards that only need the target model (cost, data-policy) ignore this.
+    Guards about the *switch itself* (context-cache) need to know how much
+    conversation is at stake and what model the session is currently on.
+    Surfaces without a live agent (setup wizard, dashboard scope assignment)
+    simply omit it — session-dependent guards then stay silent.
+    """
+
+    context_tokens: Optional[int] = None
+    current_model: Optional[str] = None
+
+
+def selection_context_for_agent(agent: object) -> Optional[SelectionContext]:
+    """Build a :class:`SelectionContext` from a live ``AIAgent``.
+
+    Uses the compressor's measured ``last_prompt_tokens`` (what the provider
+    actually billed on the latest turn) and falls back to the session prompt
+    counter. Returns ``None`` when no live size is known — the context-cache
+    guard then stays silent rather than guessing.
+    """
+    if agent is None:
+        return None
+    tokens = 0
+    try:
+        cc = getattr(agent, "context_compressor", None)
+        tokens = int(getattr(cc, "last_prompt_tokens", 0) or 0) if cc else 0
+        if tokens <= 0:
+            tokens = int(getattr(agent, "session_prompt_tokens", 0) or 0)
+    except Exception:
+        tokens = 0
+    if tokens <= 0:
+        return None
+    return SelectionContext(
+        context_tokens=tokens,
+        current_model=(getattr(agent, "model", "") or "") or None,
+    )
 
 
 def _cost_guard(
@@ -43,6 +84,7 @@ def _cost_guard(
     base_url: Optional[str],
     api_key: Optional[str],
     model_info: Optional[ModelInfo],
+    ctx: Optional[SelectionContext] = None,
 ) -> Optional[SelectionWarning]:
     from hermes_cli.model_cost_guard import expensive_model_warning
 
@@ -72,6 +114,7 @@ def _data_policy_guard(
     base_url: Optional[str],
     api_key: Optional[str],
     model_info: Optional[ModelInfo],
+    ctx: Optional[SelectionContext] = None,
 ) -> Optional[SelectionWarning]:
     from hermes_cli.model_data_policy_guard import data_training_warning
 
@@ -91,11 +134,83 @@ def _data_policy_guard(
     )
 
 
+# Default context-token threshold above which a mid-session model switch asks
+# for confirmation (the next call after a switch re-reads the whole context
+# uncached — providers key prompt caches per model). Mirrors deepagents'
+# `warnings.model_switch_token_threshold` (langchain-ai/deepagents#5829).
+DEFAULT_CONTEXT_CACHE_SWITCH_THRESHOLD = 100_000
+
+
+def _context_cache_threshold() -> int:
+    """Resolve the confirm threshold from config.yaml (0 disables)."""
+    try:
+        from hermes_cli.config import load_config
+
+        cfg = load_config() or {}
+        model_cfg = cfg.get("model", {})
+        if isinstance(model_cfg, dict):
+            raw = model_cfg.get("switch_context_confirm_tokens")
+            if raw is not None:
+                return max(0, int(raw))
+    except Exception:
+        pass
+    return DEFAULT_CONTEXT_CACHE_SWITCH_THRESHOLD
+
+
+def _context_cache_guard(
+    model_name: str,
+    provider: Optional[str],
+    base_url: Optional[str],
+    api_key: Optional[str],
+    model_info: Optional[ModelInfo],
+    ctx: Optional[SelectionContext] = None,
+) -> Optional[SelectionWarning]:
+    """Confirm mid-session switches that abandon a large cached context.
+
+    Providers key prompt caches per model, so the first call after a switch
+    re-reads the entire conversation at full input price. On a large session
+    that is real money and easy to trigger by accident from a picker. Fires
+    only when the surface supplied live-session facts (``ctx``) showing the
+    active context exceeds the configured threshold; sessions below it, empty
+    sessions, and no-op re-selects of the current model stay silent.
+    """
+    if ctx is None or not ctx.context_tokens:
+        return None
+    target = (model_name or "").strip()
+    current = (ctx.current_model or "").strip()
+    if not target or (current and target == current):
+        return None  # same-model re-select keeps the cache warm
+    threshold = _context_cache_threshold()
+    if threshold <= 0 or int(ctx.context_tokens) < threshold:
+        return None
+    tokens = int(ctx.context_tokens)
+    lines = [
+        "!!! LARGE CONTEXT MODEL SWITCH !!!",
+        "",
+        f"This session holds ~{tokens:,} tokens of context.",
+        f"Switching to {target} makes the next reply re-read all of it "
+        "uncached (providers key prompt caches per model) — a one-time "
+        "full-price input cost.",
+        "",
+        "Threshold: model.switch_context_confirm_tokens "
+        f"(currently {threshold:,}; 0 disables this check).",
+        "Confirm only if you intend to switch now.",
+    ]
+    return SelectionWarning(
+        kind="context_cache",
+        title="Large Context Switch Warning",
+        model=target,
+        provider=(provider or "").strip(),
+        message="\n".join(lines),
+    )
+
+
 # Registry, evaluated in order. Add new guard classes here — never at the
 # individual surfaces.
 _GUARDS = (
     _cost_guard,
     _data_policy_guard,
+    _context_cache_guard,
 )
 
 
@@ -107,6 +222,7 @@ def selection_warnings(
     api_key: Optional[str] = None,
     model_info: Optional[ModelInfo] = None,
     include_kinds: Optional[Iterable[str]] = None,
+    selection_context: Optional[SelectionContext] = None,
 ) -> List[SelectionWarning]:
     """Run every registered selection guard and return the warnings that fired.
 
@@ -124,7 +240,16 @@ def selection_warnings(
     results: List[SelectionWarning] = []
     for guard in _GUARDS:
         try:
-            warning = guard(model_name, provider, base_url, api_key, model_info)
+            warning = guard(
+                model_name, provider, base_url, api_key, model_info,
+                selection_context,
+            )
+        except TypeError:
+            # Back-compat: externally patched 5-arg guards (tests, plugins).
+            try:
+                warning = guard(model_name, provider, base_url, api_key, model_info)
+            except Exception:
+                continue
         except Exception:
             continue
         if warning is None:
@@ -152,6 +277,7 @@ def combined_selection_warning(
     base_url: Optional[str] = None,
     api_key: Optional[str] = None,
     model_info: Optional[ModelInfo] = None,
+    selection_context: Optional[SelectionContext] = None,
 ) -> Optional[SelectionWarning]:
     """Drop-in replacement for ``expensive_model_warning`` call sites.
 
@@ -167,6 +293,7 @@ def combined_selection_warning(
         base_url=base_url,
         api_key=api_key,
         model_info=model_info,
+        selection_context=selection_context,
     )
     if not warnings:
         return None

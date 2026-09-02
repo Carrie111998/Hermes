@@ -11575,7 +11575,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         if not getattr(result, "success", False):
             return True
         try:
-            from hermes_cli.model_selection_guards import combined_selection_warning
+            from hermes_cli.model_selection_guards import (
+                combined_selection_warning,
+                selection_context_for_agent,
+            )
 
             warning = combined_selection_warning(
                 result.new_model,
@@ -11583,6 +11586,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 base_url=result.base_url or self.base_url or "",
                 api_key=result.api_key or self.api_key or "",
                 model_info=result.model_info,
+                selection_context=selection_context_for_agent(
+                    getattr(self, "agent", None)
+                ),
             )
         except Exception:
             warning = None

@@ -2496,7 +2496,19 @@ class GatewaySlashCommandsMixin:
         # cache miss, so run it off the event loop.
         _cost_warning = None
         try:
-            from hermes_cli.model_selection_guards import combined_selection_warning
+            from hermes_cli.model_selection_guards import (
+                combined_selection_warning,
+                selection_context_for_agent,
+            )
+
+            _guard_agent = None
+            _g_lock = getattr(self, "_agent_cache_lock", None)
+            _g_cache = getattr(self, "_agent_cache", None)
+            if _g_lock is not None and _g_cache is not None:
+                with _g_lock:
+                    _g_entry = _g_cache.get(session_key)
+                    if _g_entry and _g_entry[0] is not None:
+                        _guard_agent = _g_entry[0]
 
             _cost_warning = await asyncio.to_thread(
                 combined_selection_warning,
@@ -2505,6 +2517,7 @@ class GatewaySlashCommandsMixin:
                 base_url=result.base_url or current_base_url or "",
                 api_key=result.api_key or current_api_key or "",
                 model_info=result.model_info,
+                selection_context=selection_context_for_agent(_guard_agent),
             )
         except Exception:
             _cost_warning = None

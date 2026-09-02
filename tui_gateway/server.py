@@ -6671,7 +6671,10 @@ def _apply_model_switch(
 
     if not confirm_expensive_model:
         try:
-            from hermes_cli.model_selection_guards import combined_selection_warning
+            from hermes_cli.model_selection_guards import (
+                combined_selection_warning,
+                selection_context_for_agent,
+            )
 
             warning = combined_selection_warning(
                 result.new_model,
@@ -6679,6 +6682,7 @@ def _apply_model_switch(
                 base_url=result.base_url or current_base_url,
                 api_key=result.api_key or current_api_key,
                 model_info=result.model_info,
+                selection_context=selection_context_for_agent(agent),
             )
         except Exception:
             warning = None
