@@ -16180,7 +16180,12 @@ def _rank_slash_completions(
     else:
         skills.sort(key=lambda item: (-usage(name_of(item)), name_of(item)))
 
-    return commands[:_SLASH_COMPLETION_LIMIT] + skills[:_SLASH_COMPLETION_LIMIT]
+    # Commands come from the bounded, curated registry (~150 entries), not
+    # from user-installed skills, which is what the cap exists to bound (see
+    # the 230-skill case above). Truncating the command block hid /goal,
+    # /loop and /queue from a bare `/` purely by registry position.
+    ranked_commands = commands if browsing else commands[:_SLASH_COMPLETION_LIMIT]
+    return ranked_commands + skills[:_SLASH_COMPLETION_LIMIT]
 
 
 def _cli_exec_blocked(argv: list[str]) -> str | None:
