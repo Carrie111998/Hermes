@@ -998,9 +998,9 @@ class BaseEnvironment(ABC):
 
     @staticmethod
     def _embed_stdin_heredoc(command: str, stdin_data: str) -> str:
-        """Append stdin_data as a shell heredoc to the command string."""
+        """Redirect stdin_data to the complete command with a shell heredoc."""
         delimiter = f"HERMES_STDIN_{uuid.uuid4().hex[:12]}"
-        return f"{command} << '{delimiter}'\n{stdin_data}\n{delimiter}"
+        return f"{{\n{command}\n}} << '{delimiter}'\n{stdin_data}\n{delimiter}"
 
     # ------------------------------------------------------------------
     # Process lifecycle

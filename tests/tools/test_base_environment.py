@@ -333,7 +333,7 @@ class TestEmbedStdinHeredoc:
     def test_heredoc_format(self):
         result = BaseEnvironment._embed_stdin_heredoc("cat", "hello world")
 
-        assert result.startswith("cat << '")
+        assert result.startswith("{\ncat\n} << '")
         assert "hello world" in result
         assert "HERMES_STDIN_" in result
 
@@ -345,6 +345,31 @@ class TestEmbedStdinHeredoc:
         d1 = r1.split("'")[1]
         d2 = r2.split("'")[1]
         assert d1 != d2  # UUID-based, should be unique
+
+    def test_compound_command_receives_stdin_as_a_group(self):
+        import shutil
+        import subprocess
+
+        import pytest
+
+        bash = shutil.which("bash")
+        if bash is None:
+            pytest.skip("bash required")
+
+        command = BaseEnvironment._embed_stdin_heredoc(
+            'IFS= read -r first; IFS= read -r second; '
+            'printf \'<%s|%s>\' "$first" "$second"',
+            "alpha\nbeta",
+        )
+
+        result = subprocess.run(
+            [bash, "-c", command],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+
+        assert result.stdout == "<alpha|beta>"
 
 
 class TestInitSessionFailure:
