@@ -12,7 +12,9 @@ unpaid. Only the local proxy can settle those 402s, so this profile's
 The proxy ignores the bearer value (payment replaces the key), but Hermes'
 API-key resolver refuses to run a provider with an empty credential, so
 ``OPENZOO_API_KEY`` must be set to any non-empty value — ``sk-openzoo`` is
-the documented placeholder.
+the documented placeholder. The value only ever travels to the loopback
+proxy (or, for a public tunnel, as the tunnel's own printed bearer over the
+tunnel's TLS); it is never forwarded to the upstream gateway.
 
 Model discovery: ``GET /v1/models`` is free and returns OpenRouter-shaped
 rows. Rows carrying a ``kind`` field (``image`` / ``video``) are media
@@ -91,14 +93,16 @@ openzoo = OpenZooProfile(
     # The gateway's own router; the cheapest sensible default for side tasks.
     default_aux_model="openzoo/auto",
     # Offline floor for the picker; the live /v1/models catalog is
-    # authoritative and is merged in when the proxy is reachable.
+    # authoritative and is merged in when the proxy is reachable. Every id
+    # below is verified against openzoo@0.50.84's published catalog — the
+    # proxy uses bare ids, not vendor-prefixed OpenRouter slugs.
     fallback_models=(
         "openzoo/auto",
-        "anthropic/claude-sonnet-5",
-        "anthropic/claude-fable-5.1",
-        "x-ai/grok-4.6",
-        "deepseek/deepseek-v4-pro",
-        "nvidia/nemotron-3.5-lightning",
+        "claude-sonnet-5",
+        "claude-fable-5",
+        "grok-4",
+        "deepseek-reasoner",
+        "gemini-2.5-pro",
     ),
 )
 
