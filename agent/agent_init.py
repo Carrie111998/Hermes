@@ -1020,7 +1020,6 @@ def init_agent(
     # it to summarise.  No intermediate pressure warnings — they caused
     # models to "give up" prematurely on complex tasks (#7915).
     agent._budget_exhausted_injected = False
-    agent._budget_grace_call = False
 
     # Optional wall-clock run budget (seconds per run_conversation turn).
     # Explicit constructor arg wins; else resolved from config.yaml
