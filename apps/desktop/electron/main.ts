@@ -30,6 +30,8 @@ import {
   systemPreferences
 } from 'electron'
 
+import { stripMarkdownPathWrappers } from '@hermes/shared/markdown-path'
+
 import { classifyActiveRuntime } from './active-runtime-state'
 import { destroyKeepaliveAgents, downloadAgentFor, jsonAgentFor, withRetry } from './api-transport'
 import { appIconCandidates, resolveAppIcon } from './app-icon'
@@ -1690,6 +1692,16 @@ function openExternalUrl(rawUrl) {
   // file association. If the OS can't open it (`error` is a non-empty
   // string), fall back to revealing the file in the system file manager.
   if (parsed.protocol === 'file:') {
+    // Markdown emphasis wrappers (`**`, `__`) and `@url:` directive prefixes
+    // leak from chat labels into link targets (issue #95713) — Windows then
+    // refuses to open '...xyz.pdf**'. Strip them from the URL path before
+    // resolving; the resolver's own safety checks still run afterwards.
+    try {
+      parsed.pathname = stripMarkdownPathWrappers(parsed.pathname)
+    } catch {
+      // Unparseable path — fall through and let the resolver report it.
+    }
+
     let localPath
 
     try {
