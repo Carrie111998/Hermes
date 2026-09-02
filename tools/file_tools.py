@@ -1421,6 +1421,7 @@ def _get_file_ops(task_id: str = "default") -> ShellFileOperations:
         _resolve_task_host_cwd,
         _is_unusable_container_cwd,
         _CONTAINER_BACKENDS,
+        _resolve_task_image,
     )
     import time
 
@@ -1484,17 +1485,7 @@ def _get_file_ops(task_id: str = "default") -> ShellFileOperations:
             config = _get_env_config()
             env_type = config["env_type"]
             overrides = resolve_task_overrides(raw_task_id)
-
-            if env_type == "docker":
-                image = overrides.get("docker_image") or config["docker_image"]
-            elif env_type == "singularity":
-                image = overrides.get("singularity_image") or config["singularity_image"]
-            elif env_type == "modal":
-                image = overrides.get("modal_image") or config["modal_image"]
-            elif env_type == "daytona":
-                image = overrides.get("daytona_image") or config["daytona_image"]
-            else:
-                image = ""
+            image = _resolve_task_image(env_type, overrides, config)
 
             try:
                 from tools.terminal_tool import get_session_cwd

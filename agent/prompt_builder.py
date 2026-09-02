@@ -1205,6 +1205,21 @@ def _probe_remote_backend(env_type: str) -> str | None:
     if cached is not None:
         return cached or None
 
+    # A plugin backend can opt out of the live probe (probe_at_prompt_build =
+    # False) when creating an environment is expensive or billable — a prompt
+    # build must never spin up a paid sandbox. The caller then uses the
+    # provider's static env_description fallback. Fail-soft: built-in and
+    # unknown names keep probing.
+    try:
+        from agent.terminal_env_registry import provider_flag
+
+        probe_allowed = provider_flag(env_type, "probe_at_prompt_build", True)
+    except Exception:
+        probe_allowed = True
+    if not probe_allowed:
+        _BACKEND_PROBE_CACHE[cache_key] = ""
+        return None
+
     try:
         # Import locally: tools/ imports are heavy and only relevant when a
         # non-local backend is actually configured.

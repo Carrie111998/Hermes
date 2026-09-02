@@ -21,8 +21,11 @@ A registered backend automatically participates in every core surface:
 | Dashboard terminal-backend picker (probe status) | `probe()` |
 | `hermes status` / `hermes doctor` | `doctor_checks()` |
 | System-prompt environment hints | `is_remote`, `env_description` |
+| System-prompt live backend probe opt-out | `probe_at_prompt_build` |
 | Dangerous-command approval skipping | `skip_container_guards` |
 | Container path/cwd handling | `is_container` |
+| Default working directory inside the backend | `default_cwd` |
+| Guest-home exemption from host-path cwd sanitizing | `guest_home_root` |
 | Synced cache-file path translation | `cache_path_base` |
 | Secret stripping from spawned subprocesses | `strip_env_keys` |
 | Per-session sandbox isolation (`container_persistent: false`) | `session_isolated_when_nonpersistent` |
@@ -107,7 +110,8 @@ hermes config set terminal.backend acmebox
   never shadow in-tree backends.
 - **`create_environment` must accept `**kwargs`** and ignore unknown keys —
   the forward-compat contract that lets the factory signature evolve without
-  breaking older plugins.
+  breaking older plugins. An empty `image` string means no image is
+  configured — treat `""` as unset and use your backend's own default.
 - **`is_available()` / `probe()` must be cheap.** No network calls — they run
   during requirement checks and UI paints.
 - **Fail-soft everywhere.** A provider attribute that raises is treated as
@@ -129,6 +133,25 @@ interface as `tools.environments.base.BaseEnvironment`:
 
 Subclassing `BaseEnvironment` is recommended (you inherit the shared file-sync
 and background-process plumbing) but not required.
+
+## Cwd semantics
+
+The core sanitizes working directories before they reach your backend: a
+host-looking path (`/Users/...`, `/home/...`, `C:\...`) or a relative path
+cannot exist inside a container sandbox, so it is replaced with the backend's
+default cwd instead of failing the environment start.
+
+- Declare `default_cwd` when your sandbox does not start in `/root` (e.g. a
+  guest-user home). It seeds new environments and is the sanitizers' fallback
+  target.
+- Declare `guest_home_root` when the guest home lives under a host-looking
+  prefix (e.g. `/home/agent`). Its subtree is then accepted as a valid
+  in-sandbox cwd — including the agent's recorded `cd` state between
+  commands — instead of being discarded as a host path. The root must be an
+  absolute path other than `/`; empty, relative, and `/` roots are ignored.
+- Set `probe_at_prompt_build = False` when creating an environment is
+  expensive or billable: the system-prompt builder then skips the live
+  OS/$HOME/cwd probe and describes the backend with your `env_description`.
 
 ## Session isolation semantics
 

@@ -874,6 +874,7 @@ def _get_or_create_env(task_id: str):
         _get_env_config, _last_activity, _start_cleanup_thread,
         _creation_locks, _creation_locks_lock, _task_env_overrides,
         _resolve_container_task_id, _resolve_task_host_cwd,
+        _resolve_task_image,
     )
 
     effective_task_id = _resolve_container_task_id(task_id)
@@ -899,17 +900,7 @@ def _get_or_create_env(task_id: str):
         config = _get_env_config()
         env_type = config["env_type"]
         overrides = _task_env_overrides.get(effective_task_id, {})
-
-        if env_type == "docker":
-            image = overrides.get("docker_image") or config["docker_image"]
-        elif env_type == "singularity":
-            image = overrides.get("singularity_image") or config["singularity_image"]
-        elif env_type == "modal":
-            image = overrides.get("modal_image") or config["modal_image"]
-        elif env_type == "daytona":
-            image = overrides.get("daytona_image") or config["daytona_image"]
-        else:
-            image = ""
+        image = _resolve_task_image(env_type, overrides, config)
 
         cwd = overrides.get("cwd") or config["cwd"]
 

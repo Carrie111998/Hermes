@@ -35,6 +35,21 @@ recur for plugin backends:
   own filesystem rooted away from the host: container resource config is
   passed through, host-looking cwds are sanitized, and file tools use
   container path resolution.
+* ``guest_home_root`` — the backend's guest-home directory (e.g.
+  ``"/home/agent"``), or ``None``. Its subtree is accepted as a legitimate
+  in-sandbox cwd by the host-path sanitizers even though it matches the
+  host-path heuristics (``/home/...`` looks like a host path). Must be an
+  absolute path other than ``"/"`` — a bare ``"/"`` would exempt every
+  absolute path from the guard, so empty, relative, and ``"/"`` roots are
+  ignored (no exemption).
+* ``default_cwd`` — default working directory inside the backend, or
+  ``None`` to use the container default (``"/root"``).
+* ``probe_at_prompt_build`` — whether the prompt builder may create a live
+  environment to probe the backend's OS/$HOME/cwd at system-prompt build
+  time. Set ``False`` when creating an environment is expensive or
+  billable; the prompt then falls back to ``env_description``. The prompt
+  builder caches the declaration per process — this is a static
+  declaration, not a runtime toggle.
 * ``skip_container_guards`` — the sandbox is isolated enough that
   dangerous-command approval prompts are skipped (a wiped filesystem is
   disposable). Defaults to ``is_container``. Backends that can mount host
@@ -104,6 +119,9 @@ class TerminalEnvironmentProvider(abc.ABC):
     is_remote: bool = True
     is_container: bool = True
     session_isolated_when_nonpersistent: bool = False
+    guest_home_root: Optional[str] = None
+    default_cwd: Optional[str] = None
+    probe_at_prompt_build: bool = True
 
     @property
     def skip_container_guards(self) -> bool:
@@ -213,6 +231,8 @@ class TerminalEnvironmentProvider(abc.ABC):
             timeout: Default per-command timeout in seconds.
             task_id: Task identifier for environment reuse/persistence keying.
             image: Configured container image name (may be irrelevant).
+                An empty string means no image is configured — treat ``""``
+                as unset and use the backend's own default.
             container_config: Resource config dict (``container_cpu``,
                 ``container_memory``, ``container_disk``,
                 ``container_persistent``) when :attr:`is_container` is True.
