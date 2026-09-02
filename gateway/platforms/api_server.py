@@ -2461,8 +2461,20 @@ class APIServerAdapter(BasePlatformAdapter):
         per-profile cache. Deliberately does NOT write into ``self._session_db``
         — that stays reserved for an explicit test/manual override, so the first
         profile served can't pin every later request to its DB.
+
+        #100896: handles are acquired through the shared per-path registry
+        (``get_shared_session_db``), NOT raw ``SessionDB()`` constructions.
+        Each raw construction holds its OWN writer connection on the same
+        WAL file — the reporter's "5 live SessionDB handles on state.db in
+        this process" precursor fired 7 minutes before corruption #4, and
+        the registry's own routing rule says long-lived in-process callers
+        share ONE writer connection per resolved path. The per-profile key
+        still works: ``acquire()`` keys by the RESOLVED path, so each
+        profile's ``home / state.db`` gets its own single shared instance —
+        same instance the gateway's other long-lived surfaces use, so the
+        whole process now holds one handle per path instead of N.
         """
-        from hermes_state import SessionDB
+        from hermes_state import get_shared_session_db
 
         key = str(home)
         with self._session_db_cache_lock:
@@ -2470,24 +2482,33 @@ class APIServerAdapter(BasePlatformAdapter):
                 return None
             db = self._session_dbs.get(key)
             if db is None:
-                db = SessionDB(db_path=home / "state.db")
+                db = get_shared_session_db(home / "state.db")
                 self._session_dbs[key] = db
             return db
 
     def _close_cached_session_dbs(self) -> None:
-        """Close SessionDB handles owned by this adapter's profile cache."""
+        """Release SessionDB handles held by this adapter's profile cache.
+
+        #100896: registry-acquired handles are RELEASED (refcount drop),
+        not closed outright — another long-lived surface (gateway runner,
+        cron) may still hold a reference to the same shared instance, and
+        closing the underlying connection out from under it is exactly the
+        multi-handle writer churn this cache is being converted away from.
+        """
         with self._session_db_cache_lock:
             self._session_db_cache_closed = True
             cached = list(self._session_dbs.values())
             self._session_dbs.clear()
         shared_db = getattr(self, "_session_db", None)
+        from hermes_state import release_shared_session_db
+
         for db in cached:
             if db is shared_db:
                 continue
             try:
-                db.close()
+                release_shared_session_db(db)
             except Exception:
-                logger.debug("Failed to close API-server SessionDB", exc_info=True)
+                logger.debug("Failed to release API-server SessionDB", exc_info=True)
 
     def _ensure_session_db(self):
         """Lazily initialise and return the SessionDB for the active profile home.
