@@ -27763,8 +27763,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     # earlier wording ("The user sent a voice message~ Here's
                     # what they said: ...") read as a meta-instruction and made
                     # the LLM volunteer commentary about voice mode rather than
-                    # reply to the content.
-                    enriched_parts.append(f'"{transcript}"')
+                    # reply to the content. A terse bracketed suffix carries
+                    # the provenance the other two branches already emit —
+                    # original audio location and duration — so the agent can
+                    # tell a voice note from typed text and still reach the
+                    # media for verification, analysis, or filing (#93982).
+                    from tools.credential_files import to_agent_visible_cache_path
+
+                    _agent_path = to_agent_visible_cache_path(os.path.abspath(path))
+                    _duration_str = await _probe_audio_duration(os.path.abspath(path))
+                    if _duration_str:
+                        _voice_note = f"voice note, {_duration_str}, audio: {_agent_path}"
+                    else:
+                        _voice_note = f"voice note, audio: {_agent_path}"
+                    enriched_parts.append(f'"{transcript}"\n[{_voice_note}]')
                 else:
                     error = result.get("error", "unknown error")
                     # All failure branches: a single, minimal, neutral marker.
