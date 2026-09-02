@@ -1967,10 +1967,6 @@ class BuzzAdapter(BasePlatformAdapter):
                                     # A clean close racing the liveness probe is
                                     # normal relay lifecycle, not a failure.
                                     break
-                                except asyncio.TimeoutError:
-                                    raise ConnectionError(
-                                        "WebSocket liveness probe timed out"
-                                    ) from None
                                 try:
                                     message = json.loads(raw)
                                 except (ValueError, TypeError):
