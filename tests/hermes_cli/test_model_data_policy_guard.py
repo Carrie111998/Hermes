@@ -18,6 +18,24 @@ def test_fires_on_meta_contributor():
     assert "dev.meta.ai/docs/pricing-rate-limits" in w.message
 
 
+def test_fires_on_meta_contributor_1_3_with_correct_model_name():
+    # Regression: the predicate matched 1.3 via suffix but the message named
+    # 1.2. The warning must name the triggering model and its standard variant.
+    w = data_training_warning("muse-spark-1.3-contributor", provider="meta-ai")
+    assert isinstance(w, DataTrainingWarning)
+    assert w.model == "muse-spark-1.3-contributor"
+    assert "muse-spark-1.3-contributor" in w.message
+    assert "muse-spark-1.3." in w.message  # points to the no-training alternative
+    assert "muse-spark-1.2" not in w.message  # must not name the older version
+    # 1.3 standard pricing verified via OpenRouter — comparison present, but
+    # cached figures (verified for 1.2 only) must not leak into the 1.3 message.
+    assert "$0.10" in w.message and "$0.20" in w.message
+    assert "$1.25" in w.message and "$4.25" in w.message
+    assert "$0.002" not in w.message and "$0.15" not in w.message
+    assert "train" in w.message.lower()
+    assert "dev.meta.ai/docs/pricing-rate-limits" in w.message
+
+
 def test_silent_on_non_contributor_muse():
     assert data_training_warning("muse-spark-1.2", provider="meta-ai") is None
     assert data_training_warning("muse-spark-1.1", provider="meta-ai") is None
