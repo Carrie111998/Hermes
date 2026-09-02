@@ -18407,6 +18407,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             "yolo": self._handle_yolo_command,
             "verbose": self._handle_verbose_command,
             "footer": self._handle_footer_command,
+            "title": self._handle_title_command,
             "help": self._handle_help_command,
             "commands": self._handle_commands_command,
             "profile": self._handle_profile_command,
