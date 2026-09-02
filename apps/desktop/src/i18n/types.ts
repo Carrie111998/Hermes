@@ -2209,6 +2209,18 @@ export interface Translations {
     pasteImage: string
     url: string
     promptSnippets: string
+    rewritePrompt: string
+    rewritingPrompt: string
+    rewriteBasic: string
+    rewriteBasicDesc: string
+    rewriteBrief: string
+    rewriteBriefDesc: string
+    rewriteDetailed: string
+    rewriteDetailedDesc: string
+    rewriteEnhance: string
+    rewriteEnhanceDesc: string
+    rewriteFailed: string
+    rewriteDraftChanged: string
     tipPre: string
     tipPost: string
     snippetsTitle: string

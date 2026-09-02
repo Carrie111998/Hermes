@@ -65,6 +65,7 @@ import { useSlashCompletions } from './hooks/use-slash-completions'
 import { useSessionStatusPresence } from './hooks/use-status-presence'
 import { ActionBadges } from './micro-actions'
 import { chipTypedPathOnSpace, pathifyRefs } from './path-refs'
+import { PromptRewriteMenu } from './prompt-rewrite-menu'
 import { QueuePanel } from './queue-panel'
 import {
   beginComposerComposition,
@@ -1006,6 +1007,28 @@ export function ChatBar({
     />
   )
 
+  const getLiveDraft = () =>
+    sanitizeComposerInput(editorRef.current ? composerPlainText(editorRef.current) : draftRef.current)
+
+  const rewriteMenu = minimal ? null : (
+    <PromptRewriteMenu
+      cwd={cwd}
+      disabled={inputDisabled || !hasText}
+      gateway={gateway}
+      getDraft={getLiveDraft}
+      key={sessionId || 'draft'}
+      onRewrite={text => {
+        // Model output replaces the draft programmatically, outside Chromium's
+        // editing pipeline. Bank the exact pre-rewrite text so Cmd/Ctrl+Z
+        // restores it as one step through the composer's own undo stack.
+        recordUndoPoint()
+        loadIntoComposer(text, scope.attachments.$attachments.get())
+        focusInput()
+      }}
+      sessionId={sessionId}
+    />
+  )
+
   const controls = (
     <ComposerControls
       autoSpeak={autoSpeak}
@@ -1030,6 +1053,7 @@ export function ChatBar({
       onDictate={dictate}
       onQueue={queueDraft}
       onToggleAutoSpeak={handleToggleAutoSpeak}
+      rewriteControl={rewriteMenu}
       state={state}
       voiceStatus={voiceStatus}
     />

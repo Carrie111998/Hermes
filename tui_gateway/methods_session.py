@@ -1640,12 +1640,36 @@ def _(rid, params: dict) -> dict:
             temperature = float(temperature)
         except (TypeError, ValueError):
             temperature = None
+    try:
+        # Caller-specific generation budget, bounded so a lost provider request
+        # cannot strand a gateway worker indefinitely. Existing callers that do
+        # not opt in retain the historical 60-second one-shot deadline.
+        timeout = min(300.0, max(5.0, float(params.get("timeout") or 60.0)))
+    except (TypeError, ValueError):
+        timeout = 60.0
 
     if not template and not str(instructions).strip() and not str(user_input).strip():
         return _err(rid, 4030, "llm.oneshot requires a template or instructions/input")
 
-    # Optional: inherit the live session's model (no error if absent).
-    session = _sessions.get(params.get("session_id") or "")
+    # Optional: inherit the live session's model (no error if absent). A newly
+    # opened Desktop/Bot composer can expose its draft before the deferred
+    # agent build settles. Wait for that exact session instead of silently
+    # falling through to the auxiliary model — callers pass session_id because
+    # the profile/bot's configured model is part of the request contract.
+    session_id = str(params.get("session_id") or "").strip()
+    session = _sessions.get(session_id)
+    generation_timeout = timeout
+    if session and session.get("agent") is None:
+        deadline = time.monotonic() + timeout
+        _start_agent_build(session_id, session)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return _err(rid, 5032, "agent initialization timed out")
+        if init_err := _wait_agent(session, rid, timeout=remaining):
+            return init_err
+        generation_timeout = deadline - time.monotonic()
+        if generation_timeout <= 0:
+            return _err(rid, 5030, "one-shot generation timed out before provider request")
     main_runtime = _main_runtime_from_agent(session.get("agent")) if session else None
 
     try:
@@ -1659,6 +1683,7 @@ def _(rid, params: dict) -> dict:
             task=task,
             max_tokens=max_tokens,
             temperature=temperature if temperature is not None else 0.3,
+            timeout=generation_timeout,
             main_runtime=main_runtime,
         )
     except KeyError as e:

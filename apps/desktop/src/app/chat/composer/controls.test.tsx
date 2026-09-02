@@ -8,7 +8,7 @@ import { applyWakeStartResult, applyWakeStatus, resetWakeWordState } from '@/sto
 
 import { ComposerControls } from './controls'
 
-vi.mock('./model-pill', () => ({ ModelPill: () => null }))
+vi.mock('./model-pill', () => ({ ModelPill: () => <button data-testid="model-picker">Model picker</button> }))
 
 const state: ChatBarState = {
   model: { canSwitch: false, model: '', provider: '' },
@@ -128,6 +128,22 @@ describe('narrow tiles', () => {
     renderControls({ busy: true, busyAction: 'stop', foldVoice: true, hasComposerPayload: false, minimal: true })
 
     expect(screen.getByLabelText('Stop')).toBeTruthy()
+  })
+})
+
+describe('control order', () => {
+  it('places the rewrite control directly after the model picker and before the microphone', () => {
+    renderControls({ rewriteControl: <button data-testid="rewrite-control">Rewrite</button> })
+
+    const row = screen.getByTestId('model-picker').parentElement
+    const controls = Array.from(row?.children ?? [])
+
+    expect(controls.indexOf(screen.getByTestId('rewrite-control'))).toBe(
+      controls.indexOf(screen.getByTestId('model-picker')) + 1
+    )
+    expect(controls.indexOf(screen.getByTestId('rewrite-control'))).toBeLessThan(
+      controls.indexOf(screen.getByLabelText('Voice dictation'))
+    )
   })
 })
 
