@@ -4640,6 +4640,19 @@ def claim_task(
     now = int(time.time())
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
+    try:
+        from hermes_cli.lifecycle import invoke_hook
+        hook_results = invoke_hook(
+            "pre_kanban_task_claim",
+            conn=conn,
+            task_id=task_id,
+            claimer=lock,
+        )
+        for hr in hook_results:
+            if isinstance(hr, dict) and hr.get("allow") is False:
+                return None
+    except Exception as exc:
+        _log.debug("pre_kanban_task_claim hook error: %s", exc)
     with write_txn(conn):
         # Structural invariant: never transition ready -> running while any
         # parent is not yet 'done'. This is the single enforcement point
@@ -5435,6 +5448,32 @@ def complete_task(
             raise HallucinatedCardsError(phantom_cards, task_id)
     else:
         verified_cards = []
+
+    if fire_lifecycle_hook:
+        try:
+            from hermes_cli.lifecycle import invoke_hook
+            hook_results = invoke_hook(
+                "pre_kanban_task_complete",
+                conn=conn,
+                task_id=task_id,
+                result=result,
+                summary=summary,
+                metadata=metadata,
+                created_cards=created_cards,
+            )
+            for hr in hook_results:
+                if isinstance(hr, dict) and hr.get("allow") is False:
+                    reason = hr.get("reason", "completion rejected by pre_kanban_task_complete hook")
+                    with write_txn(conn):
+                        _append_event(
+                            conn, task_id, "completion_blocked_policy",
+                            {"reason": reason},
+                        )
+                    raise PermissionError(reason)
+        except (HallucinatedCardsError, PermissionError):
+            raise
+        except Exception as exc:
+            _log.debug("pre_kanban_task_complete hook error: %s", exc)
 
     metadata = _merge_completion_prose_artifacts(
         conn, task_id, metadata, summary=summary, result=result,
