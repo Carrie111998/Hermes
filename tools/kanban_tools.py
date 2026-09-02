@@ -34,6 +34,7 @@ import os
 from typing import Any, Optional
 
 from agent.redact import redact_sensitive_text
+from hermes_constants import VALID_REASONING_EFFORTS
 from hermes_cli.goals import judge_goal
 from tools.registry import registry, tool_error
 from hermes_cli.config import cfg_get, load_config
@@ -493,6 +494,7 @@ def _task_summary_dict(kb, conn, task) -> dict[str, Any]:
     parents = kb.parent_ids(conn, task.id)
     children = kb.child_ids(conn, task.id)
     return {
+        "reasoning_effort": task.reasoning_effort,
         "id": task.id,
         "title": task.title,
         "assignee": task.assignee,
@@ -543,6 +545,7 @@ def _handle_show(args: dict, **kw) -> str:
 
             def _task_dict(t):
                 return {
+                    "reasoning_effort": t.reasoning_effort,
                     "id": t.id, "title": t.title, "body": t.body,
                     "assignee": t.assignee, "status": t.status,
                     "tenant": t.tenant, "priority": t.priority,
@@ -1431,6 +1434,7 @@ def _handle_create(args: dict, **kw) -> str:
     goal_max_turns = args.get("goal_max_turns")
     model_override = args.get("model")
     provider_override = args.get("provider")
+    reasoning_effort = args.get("reasoning_effort")
     if provider_override and not model_override:
         return tool_error("'provider' requires 'model' to be set as well")
     if isinstance(parents, str):
@@ -1474,6 +1478,7 @@ def _handle_create(args: dict, **kw) -> str:
                 skills=skills,
                 model_override=model_override,
                 provider_override=provider_override,
+                reasoning_effort=reasoning_effort,
                 goal_mode=goal_mode,
                 goal_max_turns=(
                     int(goal_max_turns) if goal_max_turns is not None else None
@@ -2321,6 +2326,15 @@ KANBAN_CREATE_SCHEMA = {
                     "provider — a model name alone is resolved against "
                     "the profile's provider and will fail if it belongs "
                     "to a different one. Requires 'model'."
+                ),
+            },
+            "reasoning_effort": {
+                "type": "string",
+                "enum": ["none", *VALID_REASONING_EFFORTS],
+                "description": (
+                    "Pin the dispatched worker reasoning depth for this task. "
+                    "Values are case-insensitive in the handler; omit to "
+                    "inherit the assignee profile."
                 ),
             },
             "board": _board_schema_prop(),
