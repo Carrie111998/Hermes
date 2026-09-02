@@ -5910,8 +5910,11 @@ def run_conversation(
                 # and transport errors (connection failure / timeout / provider
                 # overloaded).  Rate limits and billing: switch immediately —
                 # the primary provider won't recover within the retry window.
-                # Transport errors: allow 1 retry first (transient hiccups
-                # recover), then fall back if the provider is truly unreachable.
+                # Transport errors: gated by agent._transport_fallback_threshold
+                # (default 2) — 1 = fall back on the first transport failure,
+                # N = require N consecutive failures, 0 = disabled (never
+                # switch models on transport errors; rate-limit/billing
+                # fallback above still applies).
                 is_rate_limited = classified.reason in {
                     FailoverReason.rate_limit,
                     FailoverReason.billing,
@@ -5948,9 +5951,14 @@ def run_conversation(
                 )
                 if _is_zai_coding_overload:
                     max_retries = max(max_retries, zai_coding_overload_retry_ceiling())
+                _tft = getattr(agent, "_transport_fallback_threshold", 2)
                 _should_fallback = (
                     (is_rate_limited and _wrapped_output_cap_budget is None)
-                    or (_is_transport_failure and retry_count >= 2)
+                    or (
+                        _is_transport_failure
+                        and _tft > 0  # 0 = disabled: never fall back on transport errors
+                        and retry_count >= _tft
+                    )
                 )
                 if _should_fallback and agent._fallback_index < len(agent._fallback_chain):
                     # Don't eagerly fallback if credential pool rotation may
@@ -6947,17 +6955,25 @@ def run_conversation(
                         agent._fallback_index = 0
                         agent._fallback_activated = False
                         continue
-                    # Try fallback before giving up entirely
-                    if agent._has_pending_fallback():
-                        agent._buffer_status(f"⚠️ Max retries ({max_retries}) exhausted — trying fallback...")
-                    if agent._try_activate_fallback():
-                        active_system_prompt = _sync_failover_system_message(
-                            agent, api_messages, active_system_prompt)
-                        retry_count = 0
-                        compression_attempts = 0
-                        _retry.primary_recovery_attempted = False
-                        _retry.restart_with_rebuilt_messages = True
-                        break
+                    # Try fallback before giving up entirely — except when
+                    # transport-failure fallback is disabled (threshold 0):
+                    # the retry window above is the only grace transport
+                    # errors get, and after it exhausts the turn fails
+                    # without switching models. Rate-limit/billing failover
+                    # is untouched (it is gated by is_rate_limited, not
+                    # this threshold).
+                    _fallback_allowed = _tft > 0 or not _is_transport_failure
+                    if _fallback_allowed:
+                        if agent._has_pending_fallback():
+                            agent._buffer_status(f"⚠️ Max retries ({max_retries}) exhausted — trying fallback...")
+                        if agent._try_activate_fallback():
+                            active_system_prompt = _sync_failover_system_message(
+                                agent, api_messages, active_system_prompt)
+                            retry_count = 0
+                            compression_attempts = 0
+                            _retry.primary_recovery_attempted = False
+                            _retry.restart_with_rebuilt_messages = True
+                            break
                     # Terminal — flush buffered retry/fallback trace.
                     agent._flush_status_buffer()
                     _final_summary = agent._summarize_api_error(api_error)
