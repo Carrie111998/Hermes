@@ -156,6 +156,18 @@ def cancel_background_review_for_live_turn(agent: Any) -> None:
     the bounded deadline, a warning is logged and the live turn proceeds
     anyway. The review is non-critical self-improvement work and must never
     block a user-facing turn (#84423).
+
+    A non-acknowledging review also force-supersedes its own run slot here,
+    under the same identity check ``finish_background_review_run`` uses for
+    itself. Without this, a review wedged inside a single tool call (e.g. an
+    MCP server that accepts a connection but never replies) leaves
+    ``agent._background_review_run`` claimed until that call's own timeout
+    unwinds it — up to several minutes — silently blocking every background
+    review attempt in between with no error or log anywhere else. The
+    wedged thread's own eventual ``finish_background_review_run(agent, run)``
+    call becomes a no-op against a run it no longer owns (mirrors the ABA-safe
+    check that function already performs), so this is safe to do
+    unconditionally on timeout.
     """
     lock = getattr(agent, "_background_review_lock", None)
     if lock is not None:
@@ -185,6 +197,12 @@ def cancel_background_review_for_live_turn(agent: Any) -> None:
             "proceeding with foreground live turn",
             _BACKGROUND_REVIEW_CANCEL_TIMEOUT_SECONDS,
         )
+        if lock is not None:
+            with lock:
+                if getattr(agent, "_background_review_run", None) is run:
+                    agent._background_review_run = None
+        elif getattr(agent, "_background_review_run", None) is run:
+            agent._background_review_run = None
 
 
 # ---------------------------------------------------------------------------

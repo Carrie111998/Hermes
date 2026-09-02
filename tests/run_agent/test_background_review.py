@@ -694,6 +694,98 @@ def test_live_turn_proceeds_when_review_acknowledgement_times_out(monkeypatch):
     assert agent.session_id == "test-session"
 
 
+def test_cancel_timeout_supersedes_run_so_a_second_review_can_start(monkeypatch):
+    """A review wedged inside a single tool call must not permanently block
+    every later review attempt.
+
+    Regression for: prepare_background_review_run() refuses to start a new
+    review while agent._background_review_run.request_done is unset, and
+    that Event is only ever set by the review thread's own eventual
+    finish_background_review_run() call. Before this fix,
+    cancel_background_review_for_live_turn() logged a warning on timeout and
+    returned without releasing the slot, so a review stuck mid-tool-call
+    (e.g. an MCP server that accepts a connection but never replies) starved
+    every subsequent review attempt for as long as that tool call's own
+    timeout took to unwind it — silently, with no error or log anywhere else.
+    """
+    import agent.background_review as background_review_module
+
+    review_entered = threading.Event()
+    allow_review_return = threading.Event()
+
+    class WedgedReviewAgent(FakeReviewAgent):
+        def run_conversation(self, **kwargs):
+            review_entered.set()
+            allow_review_return.wait(10.0)
+
+        def interrupt(self, message=None):
+            # Simulates a tool call that doesn't honor the interrupt
+            # promptly — run_conversation() stays blocked regardless.
+            pass
+
+    monkeypatch.setattr(run_agent_module, "AIAgent", WedgedReviewAgent)
+    CapturingThread.targets = []
+    monkeypatch.setattr(run_agent_module.threading, "Thread", CapturingThread)
+    monkeypatch.setattr(
+        background_review_module,
+        "_BACKGROUND_REVIEW_CANCEL_TIMEOUT_SECONDS",
+        0.01,
+        raising=False,
+    )
+
+    agent = _bare_agent()
+    AIAgent._spawn_background_review(
+        agent, messages_snapshot=[{"role": "user", "content": "hello"}], review_memory=True,
+    )
+    first_run = agent._background_review_run
+    assert first_run is not None
+
+    monkeypatch.setattr(run_agent_module.threading, "Thread", _REAL_THREAD)
+    worker = _REAL_THREAD(target=CapturingThread.targets[0], daemon=True)
+    worker.start()
+    assert review_entered.wait(2.0)
+
+    _install_live_turn_boundary(monkeypatch, lambda: None)
+    _install_relay_recorder(monkeypatch, first_run)
+
+    live_result = {}
+    live = _REAL_THREAD(
+        target=_run_wrapped_live_turn_to_boundary, args=(agent, live_result), daemon=True,
+    )
+    live.start()
+    live.join(timeout=5.0)
+    assert live_result == {"boundary_reached": True}
+
+    # The first review is still wedged inside run_conversation() — nothing
+    # has unblocked it yet.
+    assert worker.is_alive()
+    assert not first_run.request_done.is_set()
+
+    # A second post-turn trigger (exactly what fires after any live turn)
+    # must now be able to start, because the timeout above force-superseded
+    # the stale slot instead of leaving it claimed.
+    assert agent._background_review_run is not first_run
+    CapturingThread.targets = []
+    monkeypatch.setattr(run_agent_module.threading, "Thread", CapturingThread)
+    AIAgent._spawn_background_review(
+        agent, messages_snapshot=[{"role": "user", "content": "second trigger"}], review_memory=True,
+    )
+    assert len(CapturingThread.targets) == 1, (
+        "second background review was silently dropped while the first was "
+        "still wedged — the slot was not force-released on cancel timeout"
+    )
+
+    # Cleanup: unblock the wedged first review so its thread doesn't leak
+    # past the test. Its own eventual finish_background_review_run() call
+    # must be a no-op against the slot (ABA-safe), never touching the
+    # second run that has since taken over.
+    second_run = agent._background_review_run
+    allow_review_return.set()
+    worker.join(timeout=3.0)
+    assert not worker.is_alive()
+    assert agent._background_review_run is second_run
+
+
 def test_live_turn_interrupts_legacy_review_but_keeps_foreground_priority(monkeypatch):
     """Legacy stubs are interrupted without turning review into a user blocker."""
     interrupts = []
