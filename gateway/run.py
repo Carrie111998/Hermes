@@ -31906,7 +31906,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 from gateway.streaming_tts_consumer import StreamingTTSConsumer
                 from tools.tts_tool import _load_tts_config
                 _tts_cfg = _load_tts_config()
-                _gateway_loop = self._gateway_loop or asyncio.get_event_loop()
+                _gateway_loop = self._gateway_loop or asyncio.get_running_loop()
                 _stts_consumer = StreamingTTSConsumer(
                     adapter=_stts_adapter,
                     chat_id=source.chat_id,

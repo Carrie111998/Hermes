@@ -791,7 +791,7 @@ class SimplexAdapter(BasePlatformAdapter):
         corr_id = self._make_corr_id()
         payload = json.dumps({"corrId": corr_id, "cmd": command})
 
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         fut: asyncio.Future = loop.create_future()
         self._pending_responses[corr_id] = fut
 
