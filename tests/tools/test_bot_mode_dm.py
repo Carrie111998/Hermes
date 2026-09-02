@@ -700,3 +700,116 @@ def test_dm_dir_rejects_precreated_symlink(tmp_path, monkeypatch):
 
     with pytest.raises(PermissionError, match="not a directory"):
         bot_mode_dm._dm_dir()
+
+
+# ── reply read-back: relay the message_agent payload, not trailing narration ──
+# Regression for the Bot-Mode "Track B" bug: _run_delivery captured the target
+# turn's final stdout (often a user-facing wrap-up) instead of the peer-addressed
+# message_agent reply the target actually composed. _peer_reply_after reads that
+# reply back from the target's own state.db so the right text is relayed.
+
+import sqlite3
+
+
+def _seed_target_db(path: Path, rows: list[dict]) -> None:
+    """Minimal `messages` table with the columns _peer_reply_after reads."""
+    conn = sqlite3.connect(str(path))
+    conn.execute(
+        "CREATE TABLE messages (id INTEGER PRIMARY KEY, session_id TEXT, "
+        "role TEXT, content TEXT, tool_calls TEXT, tool_name TEXT, timestamp REAL)"
+    )
+    for i, r in enumerate(rows, start=1):
+        conn.execute(
+            "INSERT INTO messages (id, session_id, role, content, tool_calls, "
+            "tool_name, timestamp) VALUES (?,?,?,?,?,?,?)",
+            (i, "sess-1", r["role"], r.get("content"), r.get("tool_calls"),
+             r.get("tool_name"), float(i)),
+        )
+    conn.commit()
+    conn.close()
+
+
+def _ma_call(target: str, message: str) -> str:
+    return json.dumps(
+        [{"function": {"name": "message_agent",
+                       "arguments": json.dumps({"target": target, "message": message})}}]
+    )
+
+
+def test_peer_reply_after_prefers_message_agent_over_trailing_narration(tmp_path):
+    db = tmp_path / "state.db"
+    reply = "Got you loud and clear, Sonny. Acknowledged, no action needed."
+    _seed_target_db(db, [
+        {"role": "user", "content": "Message from 🤖 sonny (@sonny): ping"},
+        {"role": "assistant", "content": "", "tool_calls": _ma_call("sonny", reply)},
+        {"role": "tool", "content": '{"status":"sent"}', "tool_name": "message_agent"},
+        # the trailing user-facing wrap-up the old code wrongly relayed
+        {"role": "assistant", "content": "Done — I relayed it to you. All good, Josh."},
+    ])
+    assert bot_mode_dm._peer_reply_after(db, 0, "sonny") == reply
+
+
+def test_peer_reply_after_falls_back_to_none_on_plain_text_reply(tmp_path):
+    db = tmp_path / "state.db"
+    _seed_target_db(db, [
+        {"role": "user", "content": "Message from 🤖 sonny (@sonny): ping"},
+        {"role": "assistant", "content": "Thanks, noted!"},  # no message_agent call
+    ])
+    # None => caller keeps the existing stdout-capture behaviour
+    assert bot_mode_dm._peer_reply_after(db, 0, "sonny") is None
+
+
+def test_peer_reply_after_matches_default_via_hermes_handle(tmp_path):
+    db = tmp_path / "state.db"
+    reply = "Round two ack — all clean on my end."
+    # target composed by handle "hermes"; sender profile is the default ("hermes")
+    _seed_target_db(db, [
+        {"role": "assistant", "content": "", "tool_calls": _ma_call("hermes", reply)},
+    ])
+    assert bot_mode_dm._peer_reply_after(db, 0, "hermes") == reply
+    assert bot_mode_dm._peer_reply_after(db, 0, "default") == reply
+
+
+def test_peer_reply_after_ignores_replies_to_other_agents(tmp_path):
+    db = tmp_path / "state.db"
+    _seed_target_db(db, [
+        {"role": "assistant", "content": "", "tool_calls": _ma_call("someone_else", "not for sonny")},
+    ])
+    assert bot_mode_dm._peer_reply_after(db, 0, "sonny") is None
+
+
+def test_peer_reply_after_respects_since_id_window(tmp_path):
+    db = tmp_path / "state.db"
+    _seed_target_db(db, [
+        {"role": "assistant", "content": "", "tool_calls": _ma_call("sonny", "old reply")},
+        {"role": "assistant", "content": "", "tool_calls": _ma_call("sonny", "new reply")},
+    ])
+    # only rows after id 1 are this turn's — must pick the new reply
+    assert bot_mode_dm._peer_reply_after(db, 1, "sonny") == "new reply"
+
+
+def test_db_high_water_and_missing_db(tmp_path):
+    db = tmp_path / "state.db"
+    assert bot_mode_dm._db_high_water(None) == -1
+    assert bot_mode_dm._db_high_water(tmp_path / "nope.db") == -1
+    _seed_target_db(db, [{"role": "user", "content": "hi"}])
+    assert bot_mode_dm._db_high_water(db) == 1
+
+
+def test_target_db_path_resolves_default_and_named(tmp_path, monkeypatch):
+    root = tmp_path / ".hermes"
+    (root / "profiles" / "sonny").mkdir(parents=True)
+    (root / "state.db").write_text("", encoding="utf-8")
+    (root / "profiles" / "sonny" / "state.db").write_text("", encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(root))
+    assert bot_mode_dm._target_db_path(["hermes", "-p", "default", "chat"]) == root / "state.db"
+    assert bot_mode_dm._target_db_path(["hermes", "-p", "sonny", "chat"]) == root / "profiles" / "sonny" / "state.db"
+    assert bot_mode_dm._target_db_path(["hermes", "chat"]) is None  # no -p
+
+
+def test_sender_handle_from_dm(tmp_path):
+    f = tmp_path / "dm.txt"
+    f.write_text("Message from 🤖 sonny (@sonny): hello there", encoding="utf-8")
+    assert bot_mode_dm._sender_handle_from_dm(str(f)) == "sonny"
+    f.write_text("no prefix here", encoding="utf-8")
+    assert bot_mode_dm._sender_handle_from_dm(str(f)) is None

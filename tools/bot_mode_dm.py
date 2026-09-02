@@ -562,6 +562,106 @@ def _delivery_lock(argv: list[str], *, stdin_file: bool):
     return acquire_turn_lock(_hermes_root(home), argv[2])
 
 
+def _target_db_path(argv: list[str]) -> Optional[Path]:
+    """state.db of the ``-p <profile>`` target in a query-file delivery.
+
+    Named profiles live under ``profiles/<name>/state.db``; the default
+    profile uses the root ``state.db``. Returns None if the profile can't be
+    resolved or its DB doesn't exist yet.
+    """
+    profile = None
+    for i, tok in enumerate(argv):
+        if tok == "-p" and i + 1 < len(argv):
+            profile = argv[i + 1]
+            break
+    if not profile:
+        return None
+    root = _hermes_root(
+        Path(os.getenv("HERMES_HOME") or os.path.expanduser("~/.hermes"))
+    )
+    db = root / "state.db" if profile == "default" else root / "profiles" / profile / "state.db"
+    return db if db.exists() else None
+
+
+def _sender_handle_from_dm(dm_file: str) -> Optional[str]:
+    """The '@<handle>' the inbound DM is attributed to, parsed from its
+    ``Message from 🤖 <name> (@<handle>):`` prefix — used to match the
+    target's reply back to the original sender."""
+    try:
+        head = Path(dm_file).read_text(encoding="utf-8", errors="replace")[:400]
+    except OSError:
+        return None
+    m = re.search(r"\(@([^)]+)\)\s*:", head)
+    return m.group(1).strip().lower() if m else None
+
+
+def _db_high_water(db_path: Optional[Path]) -> int:
+    """Max message id in the target DB before the turn runs (-1 if none)."""
+    if not db_path:
+        return -1
+    try:
+        import sqlite3
+
+        with sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=5) as conn:
+            row = conn.execute("SELECT MAX(id) FROM messages").fetchone()
+        return int(row[0]) if row and row[0] is not None else -1
+    except Exception:
+        return -1
+
+
+def _peer_reply_after(
+    db_path: Optional[Path], since_id: int, sender_handle: Optional[str]
+) -> Optional[str]:
+    """The target's own ``message_agent`` reply addressed back to the sender.
+
+    Scans assistant rows created after ``since_id`` (this turn's rows, since
+    the per-profile turn lock serialises deliveries) for a ``message_agent``
+    call targeting ``sender_handle`` and returns its ``message`` — the text
+    that SHOULD be relayed, not the turn's trailing (often user-facing)
+    narration that stdout captures. Returns None when the target replied in
+    plain text (no such call), so the caller falls back to stdout.
+    """
+    if not db_path or not sender_handle:
+        return None
+
+    def _norm(h: str) -> str:
+        h = h.strip().lstrip("@").lower()
+        return "hermes" if h in ("hermes", "default") else h
+
+    want = _norm(sender_handle)
+    try:
+        import sqlite3
+
+        with sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=5) as conn:
+            rows = conn.execute(
+                "SELECT tool_calls FROM messages "
+                "WHERE id > ? AND role = 'assistant' AND tool_calls IS NOT NULL "
+                "ORDER BY id DESC",
+                (since_id,),
+            ).fetchall()
+    except Exception:
+        return None
+    for (raw,) in rows:
+        try:
+            calls = json.loads(raw) if isinstance(raw, str) else raw
+        except (ValueError, TypeError):
+            continue
+        for call in calls if isinstance(calls, list) else []:
+            fn = (call or {}).get("function") or {}
+            if fn.get("name") != "message_agent":
+                continue
+            args = fn.get("arguments")
+            try:
+                parsed = json.loads(args) if isinstance(args, str) else (args or {})
+            except (ValueError, TypeError):
+                continue
+            if _norm(str(parsed.get("target") or "")) == want:
+                msg = str(parsed.get("message") or "").strip()
+                if msg:
+                    return msg
+    return None
+
+
 def _run_delivery(argv: list[str], dm_file: str, *, stdin_file: bool) -> int:
     """Run one DM transport and remove its plaintext file after consumption.
 
@@ -584,6 +684,13 @@ def _run_delivery(argv: list[str], dm_file: str, *, stdin_file: bool) -> int:
                 # after subprocess.run returns, not merely after stdin reaches EOF.
                 with open(dm_file, "r", encoding="utf-8") as stream:
                     return subprocess.run(argv, stdin=stream, check=False).returncode
+            # Capture the target DB high-water + sender handle BEFORE the turn
+            # so we can read back the target's own message_agent reply (the
+            # peer-addressed text) instead of relaying its trailing, often
+            # user-facing, narration.
+            db_path = _target_db_path(argv)
+            sender_handle = _sender_handle_from_dm(dm_file)
+            pre_id = _db_high_water(db_path) if (db_path and sender_handle) else -1
             proc = subprocess.run(
                 [*argv, "--query-file", dm_file],
                 check=False,
@@ -607,9 +714,20 @@ def _run_delivery(argv: list[str], dm_file: str, *, stdin_file: bool) -> int:
                         capture_output=True,
                         text=True,
                     )
-            # Re-emit the transport's streams: stdout is the reply text the
-            # completion notification carries back to the sending agent.
-            if proc.stdout:
+            # Prefer the target's own message_agent reply (addressed back to the
+            # sender) over the turn's trailing stdout, which is frequently a
+            # user-facing wrap-up rather than the peer reply. Fall back to
+            # stdout when the target replied in plain text (no message_agent
+            # call) or on any read-back error — never worse than before.
+            reply = (
+                _peer_reply_after(db_path, pre_id, sender_handle)
+                if proc.returncode == 0
+                else None
+            )
+            if reply is not None:
+                sys.stdout.write(reply)
+                sys.stdout.flush()
+            elif proc.stdout:
                 sys.stdout.write(proc.stdout)
                 sys.stdout.flush()
             if proc.stderr:
