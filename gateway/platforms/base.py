@@ -15,7 +15,6 @@ import re
 import socket as _socket
 import subprocess
 import sys
-import tempfile
 import threading
 import time
 import uuid
@@ -23,6 +22,7 @@ import weakref
 from abc import ABC, abstractmethod
 from urllib.parse import urlsplit
 
+from hermes_constants import get_hermes_home
 from utils import normalize_proxy_url
 
 logger = logging.getLogger(__name__)
@@ -258,13 +258,11 @@ def build_auto_tts_output_path(platform) -> str:
     from tools.tts_tool import OPUS_VOICE_PLATFORMS
 
     ext = "ogg" if _platform_name(platform) in OPUS_VOICE_PLATFORMS else "mp3"
-    audio_path = os.path.join(
-        tempfile.gettempdir(),
-        "hermes_voice",
-        f"tts_reply_{uuid.uuid4().hex[:12]}.{ext}",
+    audio_path = get_hermes_home() / "tmp" / "hermes_voice" / (
+        f"tts_reply_{uuid.uuid4().hex[:12]}.{ext}"
     )
-    os.makedirs(os.path.dirname(audio_path), exist_ok=True)
-    return audio_path
+    audio_path.parent.mkdir(parents=True, exist_ok=True)
+    return str(audio_path)
 
 
 def utf16_len(s: str) -> int:

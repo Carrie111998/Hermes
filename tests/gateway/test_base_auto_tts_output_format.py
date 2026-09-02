@@ -12,10 +12,12 @@ voice bubble). The fix passes an explicit output path from
 
 import asyncio
 import json
+from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 import pytest
 
+from agent.file_safety import is_write_denied
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import (
     BasePlatformAdapter,
@@ -79,9 +81,40 @@ def _hold_typing():
 
 
 @pytest.mark.parametrize(
+    ("platform", "suffix"),
+    [(Platform.TELEGRAM, ".ogg"), (Platform.DISCORD, ".mp3")],
+)
+def test_output_path_is_safe_hermes_temp_path(
+    platform, suffix, tmp_path, monkeypatch
+):
+    hermes_home = tmp_path / "hermes-home"
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.setenv("HERMES_WRITE_SAFE_ROOT", str(hermes_home))
+
+    path = Path(build_auto_tts_output_path(platform))
+
+    assert path.parent == hermes_home / "tmp" / "hermes_voice"
+    assert path.suffix == suffix
+    assert path.parent.is_dir()
+    assert is_write_denied(str(path)) is False
+
+
+def test_output_paths_are_uuid_unique(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    first = build_auto_tts_output_path(Platform.TELEGRAM)
+    second = build_auto_tts_output_path(Platform.TELEGRAM)
+
+    assert first != second
+
+
+@pytest.mark.parametrize(
     "platform", [Platform.DISCORD, Platform.SLACK, "irc", None]
 )
-def test_output_path_is_mp3_for_non_opus_platforms(platform):
+def test_output_path_is_mp3_for_non_opus_platforms(
+    platform, tmp_path, monkeypatch
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     path = build_auto_tts_output_path(platform)
     assert path.endswith(".mp3"), path
 
@@ -116,8 +149,22 @@ async def _run_auto_tts(adapter: _DummyAdapter, platform: Platform):
 
 
 @pytest.mark.asyncio
-async def test_base_auto_tts_skips_playback_when_tool_reports_failure():
+async def test_base_auto_tts_cleans_up_safe_output_path(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    adapter = _DummyAdapter(Platform.TELEGRAM)
+
+    requested, _ = await _run_auto_tts(adapter, Platform.TELEGRAM)
+
+    assert len(requested) == 1
+    assert not Path(requested[0]).exists()
+
+
+@pytest.mark.asyncio
+async def test_base_auto_tts_skips_playback_when_tool_reports_failure(
+    tmp_path, monkeypatch
+):
     """A success=False tool result must not deliver a stale/partial file."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     adapter = _DummyAdapter(Platform.TELEGRAM)
     adapter._keep_typing = _hold_typing()
     adapter._should_auto_tts_for_chat = lambda _chat_id: True
