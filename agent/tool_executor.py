@@ -1785,14 +1785,15 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
             if blocked:
                 effect_disposition = "none"
 
-            if not blocked:
-                function_result = agent._append_guardrail_observation(
-                    function_name,
-                    function_args,
-                    function_result,
-                    failed=is_error,
-                    tool_call_id=tool_call_id,
-                )
+            # Count blocked calls as failures so the same_tool_failure_halt
+            # guardrail can fire when a tool is structurally blocked every try.
+            function_result = agent._append_guardrail_observation(
+                function_name,
+                function_args,
+                function_result,
+                failed=is_error or blocked,
+                tool_call_id=tool_call_id,
+            )
 
             if is_error:
                 _err_text = _multimodal_text_summary(function_result)
