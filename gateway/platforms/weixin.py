@@ -1420,7 +1420,12 @@ class WeixinAdapter(BasePlatformAdapter):
                     _save_sync_buf(self._hermes_home, self._account_id, sync_buf)
 
                 for message in response.get("msgs") or []:
-                    asyncio.create_task(self._process_message_safe(message))
+                    # Track: unreferenced inbound tasks can be GC-reaped
+                    # before running, silently dropping the message.
+                    msg_task = asyncio.create_task(self._process_message_safe(message))
+                    self._background_tasks.add(msg_task)
+                    if hasattr(msg_task, "add_done_callback"):
+                        msg_task.add_done_callback(self._background_tasks.discard)
             except asyncio.CancelledError:
                 break
             except Exception as exc:
@@ -1501,7 +1506,12 @@ class WeixinAdapter(BasePlatformAdapter):
         context_token = str(message.get("context_token") or "").strip()
         if context_token:
             self._token_store.set(self._account_id, sender_id, context_token)
-        asyncio.create_task(self._maybe_fetch_typing_ticket(sender_id, context_token or None))
+        ticket_task = asyncio.create_task(
+            self._maybe_fetch_typing_ticket(sender_id, context_token or None)
+        )
+        self._background_tasks.add(ticket_task)
+        if hasattr(ticket_task, "add_done_callback"):
+            ticket_task.add_done_callback(self._background_tasks.discard)
 
         media_paths: List[str] = []
         media_types: List[str] = []

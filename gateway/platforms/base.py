@@ -4338,12 +4338,19 @@ class BasePlatformAdapter(ABC):
 
         coro = _run_delete()
         try:
-            asyncio.create_task(coro)
+            task = asyncio.create_task(coro)
         except RuntimeError:
             # No running loop (e.g. unit tests that never reach the async
             # path).  Close the coroutine cleanly so Python doesn't warn
             # about it never being awaited, then drop silently.
             coro.close()
+            return
+        # Retain a reference: the event loop keeps only WEAK references to
+        # tasks, so an unreferenced sleeping delete can be garbage-collected
+        # mid-wait and the ephemeral message silently never deleted.
+        self._background_tasks.add(task)
+        if hasattr(task, "add_done_callback"):
+            task.add_done_callback(self._background_tasks.discard)
 
     # ── Shared interactive-prompt formatting cores ─────────────────────────
     # Template attrs for ``_format_exec_approval``. Adapters override these to

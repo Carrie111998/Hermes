@@ -3124,6 +3124,9 @@ class ConnectionManager:
         self._consecutive_hb_timeouts: int = 0
         self._reconnect_attempts: int = 0
         self._reconnecting: bool = False
+        # Strong ref so the GC cannot reap the sleeping reconnect task
+        # (the event loop holds only weak references to tasks).
+        self._reconnect_task: Optional[asyncio.Task] = None
         # Debounce buffer for aggregating multi-part inbound messages
         self._inbound_buffer: Dict[str, list] = {}  # key -> [raw_data_frames, ...]
         self._inbound_timers: Dict[str, asyncio.TimerHandle] = {}  # key -> timer
@@ -3662,7 +3665,10 @@ class ConnectionManager:
     def schedule_reconnect(self) -> None:
         """Schedule a reconnect only if running and not already reconnecting."""
         if self._adapter._running and not self._reconnecting:
-            asyncio.create_task(self._reconnect_with_backoff())
+            # Retain the reference: the loop keeps only weak refs to tasks,
+            # so an unreferenced backoff-sleeping reconnect can be GC-reaped
+            # and the adapter silently never reconnects.
+            self._reconnect_task = asyncio.create_task(self._reconnect_with_backoff())
 
     async def _reconnect_with_backoff(self) -> bool:
         """Reconnect with exponential backoff (1s, 2s, 4s, … up to 60s)."""

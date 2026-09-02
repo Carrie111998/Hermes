@@ -1072,6 +1072,9 @@ class BlueBubblesAdapter(BasePlatformAdapter):
 
         # Fire-and-forget read receipt
         if self.send_read_receipts and session_chat_id:
-            asyncio.create_task(self.mark_read(session_chat_id))
+            receipt_task = asyncio.create_task(self.mark_read(session_chat_id))
+            self._background_tasks.add(receipt_task)
+            if hasattr(receipt_task, "add_done_callback"):
+                receipt_task.add_done_callback(self._background_tasks.discard)
 
         return web.Response(text="ok")

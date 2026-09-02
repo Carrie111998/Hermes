@@ -885,7 +885,13 @@ class QQAdapter(BasePlatformAdapter):
                     "GUILD_MESSAGE_CREATE",
                     "GUILD_AT_MESSAGE_CREATE",
             }:
-                asyncio.create_task(self._on_message(t, d))
+                # Track the task: the loop holds only weak refs, so an
+                # unreferenced inbound-message task can be reaped by GC
+                # before it runs and the message silently lost.
+                msg_task = asyncio.create_task(self._on_message(t, d))
+                self._background_tasks.add(msg_task)
+                if hasattr(msg_task, "add_done_callback"):
+                    msg_task.add_done_callback(self._background_tasks.discard)
             elif t == "INTERACTION_CREATE":
                 self._create_task(self._on_interaction(d))
             else:
