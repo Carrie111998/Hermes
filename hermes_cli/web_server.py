@@ -2759,9 +2759,13 @@ def _managed_file_entry(policy: ManagedFilesPolicy, target: Path) -> Dict[str, A
 
     is_dir = resolved.is_dir()
     mime_type = None if is_dir else (mimetypes.guess_type(resolved.name)[0] or "application/octet-stream")
+    # Report the entry's own path, not the resolved target: when a link and its
+    # target sit in the same directory, resolved paths would collide and the
+    # Files page keys rows by this value (#99418). `target` is already resolved
+    # for the single-entry callers (upload/mkdir), so only link entries change.
     return {
         "name": target.name or resolved.name or str(resolved),
-        "path": str(resolved),
+        "path": str(target),
         "is_directory": is_dir,
         "size": None if is_dir else st.st_size,
         "mtime": st.st_mtime,

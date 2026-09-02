@@ -375,3 +375,30 @@ def test_credential_dir_trees_blocked_on_subdir_descent(forced_files_client):
     assert [e["name"] for e in mcp_listing.json()["entries"]] == []
 
 
+def test_link_entries_report_their_own_path(forced_files_client):
+    """Regression test for #99418: a link and its target in the same directory
+    must produce two entries with distinct paths (the Files page keys rows by
+    path, so a resolved collision leaves a phantom row in every folder)."""
+    client, root = forced_files_client
+    # The server reports entries under the resolved locked root.
+    root = root.resolve()
+
+    real_dir = root / "real"
+    real_dir.mkdir(parents=True)
+    link = root / "link"
+    try:
+        link.symlink_to(real_dir, target_is_directory=True)
+    except (OSError, NotImplementedError):
+        pytest.skip("directory symlinks are not creatable on this platform")
+
+    listing = client.get("/api/files", params={"path": str(root)})
+    assert listing.status_code == 200
+    entries = {e["name"]: e for e in listing.json()["entries"]}
+    assert set(entries) >= {"real", "link"}
+    assert entries["real"]["path"] == str(real_dir)
+    assert entries["link"]["path"] == str(link)
+    assert entries["link"]["path"] != entries["real"]["path"]
+    # stat still follows the link, so the target's directory flag is preserved.
+    assert entries["link"]["is_directory"] is True
+
+
