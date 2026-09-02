@@ -159,7 +159,9 @@ class TestSmartModeFiresHooks:
         monkeypatch.delenv("HERMES_CRON_SESSION", raising=False)
         monkeypatch.setattr(approval_module, "_YOLO_MODE_FROZEN", False)
         monkeypatch.setattr(approval_module, "_get_approval_mode", lambda: "smart")
-        monkeypatch.setattr(approval_module, "_smart_approve", lambda *_: verdict)
+        monkeypatch.setattr(
+            approval_module, "_smart_approve", lambda *_args, **_kwargs: verdict
+        )
         monkeypatch.setattr(
             "tools.tirith_security.check_command_security",
             lambda _: {"action": "allow", "findings": [], "summary": ""},
@@ -217,7 +219,7 @@ class TestSmartModeFiresHooks:
         self._configure(monkeypatch, "approve")
         events = []
 
-        def decide(*_):
+        def decide(*_args, **_kwargs):
             events.append("smart_approve")
             return "approve"
 
@@ -322,7 +324,11 @@ class TestSmartModeFiresHooks:
         monkeypatch.delenv("HERMES_GATEWAY_SESSION", raising=False)
         monkeypatch.setattr(approval_module, "_YOLO_MODE_FROZEN", False)
         monkeypatch.setattr(approval_module, "_get_approval_mode", lambda: "smart")
-        monkeypatch.setattr(approval_module, "_smart_approve", lambda *_: next(verdicts))
+        monkeypatch.setattr(
+            approval_module,
+            "_smart_approve",
+            lambda *_args, **_kwargs: next(verdicts),
+        )
         monkeypatch.setattr(
             "tools.tirith_security.check_command_security",
             lambda _: {"action": "allow", "findings": [], "summary": ""},
@@ -343,3 +349,49 @@ class TestSmartModeFiresHooks:
         ]
 
 
+class TestCronSmartTerminalHooks:
+    @pytest.mark.parametrize(
+        ("review_result", "expected_choice"),
+        [
+            ("escalate", "smart_escalate"),
+            (RuntimeError("guardian crashed"), "smart_error"),
+        ],
+    )
+    def test_terminal_block_balances_pre_and_post_hooks(
+        self, isolated_session, monkeypatch, review_result, expected_choice
+    ):
+        monkeypatch.setenv("HERMES_CRON_SESSION", "1")
+        monkeypatch.delenv("HERMES_INTERACTIVE", raising=False)
+        monkeypatch.delenv("HERMES_GATEWAY_SESSION", raising=False)
+        monkeypatch.delenv("HERMES_EXEC_ASK", raising=False)
+        monkeypatch.setattr(approval_module, "_YOLO_MODE_FROZEN", False)
+        monkeypatch.setattr(approval_module, "_get_approval_mode", lambda: "manual")
+        monkeypatch.setattr(approval_module, "_get_cron_approval_mode", lambda: "smart")
+        monkeypatch.setattr(
+            "tools.tirith_security.check_command_security",
+            lambda _: {"action": "allow", "findings": [], "summary": ""},
+        )
+
+        def review(*_args, **_kwargs):
+            if isinstance(review_result, Exception):
+                raise review_result
+            return review_result
+
+        monkeypatch.setattr(approval_module, "_smart_approve", review)
+        captured = []
+        with patch(
+            "hermes_cli.plugins.invoke_hook",
+            side_effect=lambda name, **kwargs: captured.append((name, kwargs)),
+        ):
+            result = check_all_command_guards(
+                "rm -rf /tmp/cron-smart-hook", "local"
+            )
+
+        assert result["approved"] is False
+        assert result.get("approval_pending") is not True
+        assert [name for name, _ in captured] == [
+            "pre_approval_request",
+            "post_approval_response",
+        ]
+        assert captured[1][1]["choice"] == expected_choice
+        assert captured[1][1]["decided_by"] == "aux_llm"

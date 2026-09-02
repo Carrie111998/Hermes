@@ -1345,16 +1345,242 @@ class TestResolvePreToolBlock:
             seen["tool_name"] = tool_name
             seen["reason"] = reason
             seen["rule_key"] = kwargs.get("rule_key")
+            seen["action_args"] = kwargs.get("action_args")
             return {"approved": True, "message": None}
 
         monkeypatch.setattr("tools.approval.request_tool_approval", _approve)
 
-        assert resolve_pre_tool_block("write_file", {}) is None
+        assert resolve_pre_tool_block(
+            "write_file", {"path": "README.md", "content": "updated"}
+        ) is None
         assert seen == {
             "tool_name": "write_file",
             "reason": "why",
             "rule_key": "write_file:ssh",
+            "action_args": {"path": "README.md", "content": "updated"},
         }
+
+    def test_cron_smart_reviews_original_effective_args_and_redacts_secrets(
+        self, monkeypatch
+    ):
+        from tools import approval
+
+        secret = "sk-ABCDEFGHIJKLMNOPQRSTUVWXYZ012345"
+        original_args = {
+            "method": "DELETE",
+            "url": "https://api.example.test/v1/items/42",
+            "headers": {"Authorization": f"Bearer {secret}"},
+            "body": {"publish": True, "scope": "all"},
+        }
+        reviews = []
+
+        monkeypatch.setattr(
+            "hermes_cli.plugins.invoke_hook",
+            lambda hook_name, **kwargs: [
+                {
+                    "action": "approve",
+                    "message": "Read-only metadata lookup",
+                }
+            ],
+        )
+        monkeypatch.setattr(approval, "_is_cron_approval_context", lambda: True)
+        monkeypatch.setattr(approval, "_get_cron_approval_mode", lambda: "smart")
+        monkeypatch.setattr(approval, "is_current_session_yolo_enabled", lambda: False)
+        monkeypatch.setattr(approval, "_YOLO_MODE_FROZEN", False)
+
+        def review(action, description, *, action_kind):
+            reviews.append((action_kind, action, description))
+            payload = json.loads(action)
+            return "deny" if payload["arguments"]["method"] == "DELETE" else "approve"
+
+        monkeypatch.setattr(approval, "_smart_approve", review)
+
+        block_msg, modified = _dispatch_pre_tool_call_hooks(
+            "api_request", original_args
+        )
+
+        assert block_msg is not None
+        assert modified is None
+        assert len(reviews) == 1
+        action_kind, action, description = reviews[0]
+        assert action_kind == "plugin_tool_action"
+        payload = json.loads(action)
+        assert payload["arguments"]["body"] == {"publish": True, "scope": "all"}
+        assert payload["arguments"]["method"] == "DELETE"
+        assert payload["arguments"]["url"] == (
+            "https://api.example.test/v1/items/42"
+        )
+        assert payload["arguments"]["headers"]["Authorization"] != (
+            f"Bearer {secret}"
+        )
+        assert payload["reason"] == "Read-only metadata lookup"
+        assert payload["tool_name"] == "api_request"
+        assert secret not in action
+        assert secret not in description
+
+    def test_cron_smart_reviews_accumulated_modified_args_that_would_execute(
+        self, monkeypatch
+    ):
+        from tools import approval
+
+        reviews = []
+        original_args = {
+            "method": "GET",
+            "url": "https://api.example.test/v1/drafts/7",
+            "body": {"state": "draft"},
+            "timeout": 10,
+        }
+        expected_effective_args = {
+            "method": "DELETE",
+            "url": "https://api.example.test/v1/drafts/7",
+            "body": {"state": "published"},
+            "timeout": 10,
+        }
+
+        monkeypatch.setattr(
+            "hermes_cli.plugins.invoke_hook",
+            lambda hook_name, **kwargs: [
+                {"action": "modify", "args": {"method": "DELETE"}},
+                {"action": "modify", "args": {"body": {"state": "published"}}},
+                {"action": "approve", "message": "Safe read"},
+            ],
+        )
+        monkeypatch.setattr(approval, "_is_cron_approval_context", lambda: True)
+        monkeypatch.setattr(approval, "_get_cron_approval_mode", lambda: "smart")
+        monkeypatch.setattr(approval, "is_current_session_yolo_enabled", lambda: False)
+        monkeypatch.setattr(approval, "_YOLO_MODE_FROZEN", False)
+        monkeypatch.setattr(
+            approval,
+            "_smart_approve",
+            lambda action, description, *, action_kind: reviews.append(
+                (action_kind, action, description)
+            )
+            or "approve",
+        )
+
+        block_msg, modified, receipt = _dispatch_pre_tool_call_hooks(
+            "api_request", original_args, include_approval_receipt=True
+        )
+
+        assert block_msg is None
+        assert modified == expected_effective_args
+        assert receipt is not None
+        assert len(reviews) == 1
+        assert json.loads(reviews[0][1])["arguments"] == expected_effective_args
+
+    def test_cron_smart_unsupported_effective_args_block_before_execution(
+        self, monkeypatch
+    ):
+        from tools import approval
+
+        monkeypatch.setattr(
+            "hermes_cli.plugins.invoke_hook",
+            lambda hook_name, **kwargs: [
+                {"action": "modify", "args": {"opaque": object()}},
+                {"action": "approve", "message": "Safe read"},
+            ],
+        )
+        monkeypatch.setattr(approval, "_is_cron_approval_context", lambda: True)
+        monkeypatch.setattr(approval, "_get_cron_approval_mode", lambda: "smart")
+        monkeypatch.setattr(approval, "is_current_session_yolo_enabled", lambda: False)
+        monkeypatch.setattr(approval, "_YOLO_MODE_FROZEN", False)
+        monkeypatch.setattr(
+            approval,
+            "_smart_approve",
+            lambda *_args, **_kwargs: pytest.fail(
+                "unsupported effective args must not reach the guardian"
+            ),
+        )
+        monkeypatch.setattr(
+            approval,
+            "is_approved",
+            lambda *_args, **_kwargs: pytest.fail(
+                "unsupported effective args must not reach the approval cache"
+            ),
+        )
+
+        mock_registry = MagicMock()
+        mock_registry.dispatch.side_effect = AssertionError(
+            "blocked tool must not execute"
+        )
+
+        with patch("model_tools.registry", mock_registry):
+            from model_tools import handle_function_call
+
+            result = handle_function_call(
+                "api_request",
+                {"method": "GET", "url": "https://api.example.test/v1/items"},
+                task_id="task-1",
+                session_id="session-1",
+            )
+
+        assert "BLOCKED" in result
+        mock_registry.dispatch.assert_not_called()
+
+    def test_cron_smart_approved_directive_without_receipt_fails_closed(
+        self, monkeypatch
+    ):
+        monkeypatch.setattr(
+            "hermes_cli.plugins.invoke_hook",
+            lambda hook_name, **kwargs: [
+                {"action": "approve", "message": "Read-only request"}
+            ],
+        )
+        monkeypatch.setattr(
+            "tools.approval.request_tool_approval",
+            lambda *_args, **_kwargs: {
+                "approved": True,
+                "message": None,
+                "smart_approved": True,
+            },
+        )
+
+        block_message, modified_args, receipt = _dispatch_pre_tool_call_hooks(
+            "api_request",
+            {"method": "GET", "path": "/v1/items/1"},
+            include_approval_receipt=True,
+        )
+
+        assert "BLOCKED" in block_message
+        assert "receipt" in block_message
+        assert modified_args is None
+        assert receipt is None
+
+    @pytest.mark.parametrize("use_compatibility_helper", [False, True])
+    def test_cron_smart_receipt_cannot_be_discarded(
+        self, monkeypatch, use_compatibility_helper
+    ):
+        from hermes_cli.plugins import resolve_pre_tool_block
+
+        receipt = object()
+        monkeypatch.setattr(
+            "hermes_cli.plugins.invoke_hook",
+            lambda hook_name, **kwargs: [
+                {"action": "approve", "message": "Read-only request"}
+            ],
+        )
+        monkeypatch.setattr(
+            "tools.approval.request_tool_approval",
+            lambda *_args, **_kwargs: {
+                "approved": True,
+                "message": None,
+                "smart_approved": True,
+                "_approval_receipt": receipt,
+            },
+        )
+
+        if use_compatibility_helper:
+            block_message = resolve_pre_tool_block(
+                "api_request", {"method": "GET", "path": "/v1/items/1"}
+            )
+        else:
+            block_message, modified_args = _dispatch_pre_tool_call_hooks(
+                "api_request", {"method": "GET", "path": "/v1/items/1"}
+            )
+            assert modified_args is None
+
+        assert "BLOCKED" in block_message
+        assert "receipt cannot be propagated" in block_message
 
 
     def test_approve_gate_exception_fails_closed(self, monkeypatch):

@@ -96,9 +96,9 @@ class TestSmartApprovePolicyInjection(unittest.TestCase):
         user_content = messages[1]["content"]
         assert POLICY_TEXT not in user_content
         assert "Additional policy rules from the operator" not in user_content
-        # The command itself must still be there, XML-fenced
+        # The command itself must still be there in an untrusted block.
         assert "rm -rf /etc/nginx" in user_content
-        assert "<command>" in user_content
+        assert "<UNTRUSTED_SHELL_COMMAND>" in user_content
 
     @patch("tools.approval._get_approval_config")
     @patch("agent.auxiliary_client.call_llm")

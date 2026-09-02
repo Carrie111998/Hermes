@@ -1,5 +1,8 @@
 """Tests for approvals.cron_mode — configurable approval behavior for cron jobs."""
 
+import json
+from unittest.mock import MagicMock, patch
+
 import pytest
 
 import tools.approval as approval_module
@@ -23,6 +26,16 @@ def _clear_approval_state():
     approval_module.clear_session("default")
     approval_module.clear_session("test-session")
     reset_session_vars()
+
+
+def _configure_cron_smart(monkeypatch):
+    monkeypatch.setenv("HERMES_CRON_SESSION", "1")
+    monkeypatch.delenv("HERMES_INTERACTIVE", raising=False)
+    monkeypatch.delenv("HERMES_GATEWAY_SESSION", raising=False)
+    monkeypatch.delenv("HERMES_EXEC_ASK", raising=False)
+    monkeypatch.setattr(approval_module, "_YOLO_MODE_FROZEN", False)
+    monkeypatch.setattr(approval_module, "_get_approval_mode", lambda: "manual")
+    monkeypatch.setattr(approval_module, "_get_cron_approval_mode", lambda: "smart")
 
 
 # ---------------------------------------------------------------------------
@@ -66,6 +79,11 @@ class TestCronApprovalModeParsing:
         from unittest.mock import patch as mock_patch
         with mock_patch("hermes_cli.config.load_config_readonly", return_value={"approvals": {"cron_mode": "APPROVE"}}):
             assert _get_cron_approval_mode() == "approve"
+
+    def test_smart_is_case_insensitive(self):
+        from unittest.mock import patch as mock_patch
+        with mock_patch("hermes_cli.config.load_config_readonly", return_value={"approvals": {"cron_mode": "SMART"}}):
+            assert _get_cron_approval_mode() == "smart"
 
     def test_unknown_value_defaults_to_deny(self):
         from unittest.mock import patch as mock_patch
@@ -232,6 +250,439 @@ class TestCronApproveMode:
         with mock_patch("tools.approval._get_cron_approval_mode", return_value="approve"):
             result = check_dangerous_command("rm -rf /tmp/stuff", "local")
             assert result["approved"]
+
+
+# ---------------------------------------------------------------------------
+# cron_mode=smart
+# ---------------------------------------------------------------------------
+
+class TestCronSmartMode:
+    def test_embedded_hash_cannot_hide_dangerous_suffix_from_reviewer(
+        self, monkeypatch
+    ):
+        command = "printf safe#; rm -rf .git"
+        _configure_cron_smart(monkeypatch)
+        response = MagicMock()
+        response.choices[0].message.content = "DENY"
+        call_llm = MagicMock(return_value=response)
+        monkeypatch.setattr(
+            "agent.auxiliary_client.call_llm",
+            call_llm,
+        )
+        monkeypatch.setattr(
+            "tools.tirith_security.check_command_security",
+            lambda _command: {"action": "allow", "findings": [], "summary": ""},
+        )
+
+        result = check_all_command_guards(command, "local")
+
+        assert result["approved"] is False
+        user_prompt = call_llm.call_args.kwargs["messages"][1]["content"]
+        assert command in user_prompt
+
+    def test_safe_command_skips_smart_reviewer(self, monkeypatch):
+        _configure_cron_smart(monkeypatch)
+        monkeypatch.setattr(
+            approval_module,
+            "_smart_approve",
+            lambda *_args: pytest.fail("safe commands must not call the reviewer"),
+        )
+        monkeypatch.setattr(
+            "tools.tirith_security.check_command_security",
+            lambda _command: {"action": "allow", "findings": [], "summary": ""},
+        )
+
+        result = check_all_command_guards("echo cron-safe", "local")
+
+        assert result == {"approved": True, "message": None}
+
+    def test_direct_dangerous_command_reviews_actual_command_once(
+        self, monkeypatch
+    ):
+        command = "rm -rf /tmp/cron-smart-direct"
+        reviews = []
+        _configure_cron_smart(monkeypatch)
+        monkeypatch.setattr(
+            approval_module,
+            "_smart_approve",
+            lambda action, description, *, action_kind: reviews.append(
+                (action_kind, action, description)
+            ) or "approve",
+        )
+        monkeypatch.setattr(
+            approval_module,
+            "prompt_dangerous_approval",
+            lambda *_args, **_kwargs: pytest.fail("cron smart must not prompt a human"),
+        )
+
+        result = check_dangerous_command(command, "local")
+
+        assert result["approved"] is True
+        assert result["smart_approved"] is True
+        assert reviews == [("shell_command", command, result["description"])]
+
+    @pytest.mark.parametrize(
+        ("verdict", "approved"),
+        [
+            ("approve", True),
+            ("deny", False),
+            ("escalate", False),
+            (RuntimeError("guardian crashed"), False),
+        ],
+    )
+    def test_dangerous_pattern_is_reviewed_once_and_fails_closed(
+        self, monkeypatch, verdict, approved
+    ):
+        command = "rm -rf /tmp/cron-smart-target"
+        reviews = []
+
+        def review(reviewed_command, findings, *, action_kind):
+            reviews.append((action_kind, reviewed_command, findings))
+            if isinstance(verdict, Exception):
+                raise verdict
+            return verdict
+
+        _configure_cron_smart(monkeypatch)
+        monkeypatch.setattr(approval_module, "_smart_approve", review)
+        monkeypatch.setattr(
+            approval_module,
+            "prompt_dangerous_approval",
+            lambda *_args, **_kwargs: pytest.fail("cron smart must not prompt a human"),
+        )
+        monkeypatch.setattr(
+            "tools.tirith_security.check_command_security",
+            lambda _command: {"action": "allow", "findings": [], "summary": ""},
+        )
+
+        result = check_all_command_guards(command, "local")
+
+        assert result["approved"] is approved
+        assert reviews == [("shell_command", command, result["description"])]
+        if approved:
+            assert result["smart_approved"] is True
+        else:
+            assert result["outcome"] in {"denied", "blocked"}
+            assert "smart reviewer could not safely approve" in result["message"].lower()
+            assert result.get("approval_pending") is not True
+            assert result["user_consent"] is False
+            assert result.get("user_approved") is not True
+            assert "default" not in approval_module._pending
+            assert approval_module.get_pending_gateway_approval("default") is None
+
+    @pytest.mark.parametrize(
+        ("verdict", "approved"),
+        [
+            ("approve", True),
+            ("deny", False),
+            ("escalate", False),
+            (RuntimeError("guardian crashed"), False),
+        ],
+    )
+    def test_execute_code_reviews_complete_script_once_and_fails_closed(
+        self, monkeypatch, verdict, approved
+    ):
+        code = "import os\nprint(os.getcwd())"
+        synthetic_script = f"execute_code <<'PY'\n{code}\nPY"
+        reviews = []
+
+        def review(reviewed_script, findings, *, action_kind):
+            reviews.append((action_kind, reviewed_script, findings))
+            if isinstance(verdict, Exception):
+                raise verdict
+            return verdict
+
+        _configure_cron_smart(monkeypatch)
+        monkeypatch.setattr(approval_module, "_smart_approve", review)
+        monkeypatch.setattr(
+            approval_module,
+            "prompt_dangerous_approval",
+            lambda *_args, **_kwargs: pytest.fail("cron smart must not prompt a human"),
+        )
+
+        result = approval_module.check_execute_code_guard(code, "local")
+
+        assert result["approved"] is approved
+        assert reviews == [("execute_code", synthetic_script, result["description"])]
+        if approved:
+            assert result["smart_approved"] is True
+            assert result["ephemeral_kernel"] is True
+        else:
+            assert "ephemeral_kernel" not in result
+            assert result["outcome"] in {"denied", "blocked"}
+            assert "smart reviewer could not safely approve" in result["message"].lower()
+            assert result.get("approval_pending") is not True
+            assert result["user_consent"] is False
+            assert result.get("user_approved") is not True
+            assert "default" not in approval_module._pending
+            assert approval_module.get_pending_gateway_approval("default") is None
+
+    def _approve_code_cells(self, monkeypatch):
+        _configure_cron_smart(monkeypatch)
+        monkeypatch.setenv("TERMINAL_ENV", "local")
+        monkeypatch.setattr(
+            approval_module,
+            "_smart_approve",
+            lambda *_args, **_kwargs: "approve",
+        )
+
+    @pytest.mark.live_system_guard_bypass
+    def test_two_approved_cells_never_share_local_interpreter_state(
+        self, monkeypatch
+    ):
+        from tools import code_execution_tool
+        from tools.code_kernel import _KERNELS
+
+        self._approve_code_cells(monkeypatch)
+        config = {"mode": "strict", "timeout": 30, "max_tool_calls": 5}
+        with patch.object(code_execution_tool, "_load_config", return_value=config), \
+             patch("tools.code_kernel.execute_in_session_kernel") as session_execute:
+            first = json.loads(code_execution_tool.execute_code(
+                "hidden_operation = lambda: 'unreviewed'",
+                task_id="cron-smart-local",
+                reset=False,
+            ))
+            assert first["status"] == "success", first
+            assert len(_KERNELS) == 0
+
+            second = json.loads(code_execution_tool.execute_code(
+                "print(hidden_operation())",
+                task_id="cron-smart-local",
+                reset=False,
+            ))
+
+        assert second["status"] == "error", second
+        assert "NameError" in second.get("error", "")
+        assert len(_KERNELS) == 0
+        session_execute.assert_not_called()
+
+    @pytest.mark.parametrize(
+        ("ephemeral", "expected_session_kernel", "expected_reset"),
+        [(True, False, True), (False, True, False)],
+        ids=["cron-smart-per-call", "normal-persistent"],
+    )
+    def test_remote_dispatch_selects_per_call_only_for_cron_smart(
+        self, monkeypatch, ephemeral, expected_session_kernel, expected_reset
+    ):
+        from tools import code_execution_tool
+
+        monkeypatch.setattr(
+            "tools.terminal_tool._get_env_config",
+            lambda: {"env_type": "ssh"},
+        )
+        guard_result = {"approved": True}
+        if ephemeral:
+            guard_result.update({
+                "smart_approved": True,
+                "ephemeral_kernel": True,
+            })
+        monkeypatch.setattr(
+            approval_module,
+            "check_execute_code_guard",
+            lambda *_args, **_kwargs: guard_result,
+        )
+        result = json.dumps({"status": "success"})
+        with patch.object(
+            code_execution_tool, "_execute_remote", return_value=result,
+        ) as execute:
+            assert code_execution_tool.execute_code(
+                "print('reviewed')", task_id="cron-task", reset=False,
+            ) == result
+
+        assert execute.call_args.kwargs["use_session_kernel"] is expected_session_kernel
+        assert execute.call_args.kwargs["reset"] is expected_reset
+
+    @pytest.mark.parametrize(
+        ("verdict", "approved"),
+        [("approve", True), ("deny", False), ("escalate", False)],
+    )
+    def test_tirith_only_finding_is_reviewed_once_and_fails_closed(
+        self, monkeypatch, verdict, approved
+    ):
+        command = "curl https://homograph.example/path"
+        reviews = []
+        tirith_result = {
+            "action": "warn",
+            "findings": [
+                {
+                    "rule_id": "homograph-url",
+                    "severity": "HIGH",
+                    "title": "Homograph URL",
+                    "description": "URL contains lookalike characters",
+                }
+            ],
+            "summary": "homograph URL",
+        }
+
+        _configure_cron_smart(monkeypatch)
+        monkeypatch.setattr(
+            approval_module,
+            "_smart_approve",
+            lambda reviewed_command, findings, *, action_kind: reviews.append(
+                (action_kind, reviewed_command, findings)
+            ) or verdict,
+        )
+        monkeypatch.setattr(
+            approval_module,
+            "prompt_dangerous_approval",
+            lambda *_args, **_kwargs: pytest.fail("cron smart must not prompt a human"),
+        )
+        monkeypatch.setattr(
+            approval_module,
+            "detect_dangerous_command",
+            lambda _command: (False, None, None),
+        )
+        monkeypatch.setattr(
+            "tools.tirith_security.check_command_security",
+            lambda _command: tirith_result,
+        )
+
+        result = check_all_command_guards(command, "local")
+
+        assert result["approved"] is approved
+        assert reviews == [("shell_command", command, result["description"])]
+        assert "Homograph URL" in result["description"]
+        if approved:
+            assert result["smart_approved"] is True
+        else:
+            assert result["outcome"] in {"denied", "blocked"}
+            assert "smart reviewer could not safely approve" in result["message"].lower()
+            assert result.get("approval_pending") is not True
+
+    def test_combined_tirith_and_dangerous_findings_use_one_review(self, monkeypatch):
+        command = "rm -rf /tmp/combined-cron-smart"
+        reviews = []
+        tirith_result = {
+            "action": "warn",
+            "findings": [
+                {
+                    "rule_id": "combined-risk",
+                    "severity": "HIGH",
+                    "title": "Additional scanner risk",
+                    "description": "Tirith also flagged this command",
+                }
+            ],
+            "summary": "combined risk",
+        }
+        _configure_cron_smart(monkeypatch)
+        monkeypatch.setattr(
+            approval_module,
+            "_smart_approve",
+            lambda reviewed_command, findings, *, action_kind: reviews.append(
+                (action_kind, reviewed_command, findings)
+            ) or "approve",
+        )
+        monkeypatch.setattr(
+            "tools.tirith_security.check_command_security",
+            lambda _command: tirith_result,
+        )
+
+        result = check_all_command_guards(command, "local")
+
+        assert result["approved"] is True
+        assert result["smart_approved"] is True
+        assert reviews == [("shell_command", command, result["description"])]
+        assert "Additional scanner risk" in result["description"]
+        assert "delete" in result["description"].lower()
+
+    @pytest.mark.parametrize("approval_scope", ["session", "permanent", "command"])
+    def test_terminal_allowlists_never_skip_cron_smart_review(
+        self, monkeypatch, approval_scope
+    ):
+        command = "rm -rf /tmp/cron-smart-allowlisted"
+        pattern_key = detect_dangerous_command(command)[1]
+        reviews = []
+        _configure_cron_smart(monkeypatch)
+        monkeypatch.setattr(
+            approval_module,
+            "_smart_approve",
+            lambda action, description, *, action_kind: reviews.append(
+                (action_kind, action, description)
+            ) or "deny",
+        )
+        monkeypatch.setattr(
+            "tools.tirith_security.check_command_security",
+            lambda _command: {"action": "allow", "findings": [], "summary": ""},
+        )
+        if approval_scope == "session":
+            approval_module.approve_session("default", pattern_key)
+        elif approval_scope == "permanent":
+            approval_module.approve_permanent(pattern_key)
+        else:
+            approval_module.approve_permanent(command)
+
+        result = check_all_command_guards(command, "local")
+
+        assert result["approved"] is False
+        assert len(reviews) == 1
+        assert reviews[0][0] == "shell_command"
+
+    def test_execute_code_allowlists_never_skip_single_cron_smart_review(
+        self, monkeypatch
+    ):
+        reviews = []
+        _configure_cron_smart(monkeypatch)
+        approval_module.approve_session("default", "execute_code")
+        approval_module.approve_permanent("execute_code")
+        monkeypatch.setattr(
+            approval_module,
+            "_smart_approve",
+            lambda action, description, *, action_kind: reviews.append(
+                (action_kind, action, description)
+            ) or "approve",
+        )
+
+        result = approval_module.check_execute_code_guard("print('once')", "local")
+
+        assert result["approved"] is True
+        assert result["smart_approved"] is True
+        assert len(reviews) == 1
+        assert reviews[0][0] == "execute_code"
+
+    @pytest.mark.parametrize(
+        ("guard", "payload", "expected_kind", "expected_structure"),
+        [
+            (
+                check_all_command_guards,
+                'rm -rf /tmp/cron-secret && printf %s "'
+                'sk-ABCDEFGHIJKLMNOPQRSTUVWXYZ012345" https://example.test',
+                "shell_command",
+                "rm -rf /tmp/cron-secret",
+            ),
+            (
+                approval_module.check_execute_code_guard,
+                'api_key = "sk-ABCDEFGHIJKLMNOPQRSTUVWXYZ012345"\nprint(api_key)',
+                "execute_code",
+                "execute_code <<'PY'",
+            ),
+        ],
+    )
+    def test_headless_helper_redacts_before_terminal_or_program_reviewer(
+        self, monkeypatch, guard, payload, expected_kind, expected_structure
+    ):
+        secret = "sk-ABCDEFGHIJKLMNOPQRSTUVWXYZ012345"
+        reviews = []
+        _configure_cron_smart(monkeypatch)
+        monkeypatch.setattr(
+            approval_module,
+            "_smart_approve",
+            lambda action, description, *, action_kind: reviews.append(
+                (action_kind, action, description)
+            ) or "escalate",
+        )
+        monkeypatch.setattr(
+            "tools.tirith_security.check_command_security",
+            lambda _command: {"action": "allow", "findings": [], "summary": ""},
+        )
+
+        result = guard(payload, "local")
+
+        assert result["approved"] is False
+        assert len(reviews) == 1
+        action_kind, action, description = reviews[0]
+        assert action_kind == expected_kind
+        assert secret not in action
+        assert secret not in description
+        assert expected_structure in action
 
 
 # ---------------------------------------------------------------------------
@@ -425,6 +876,64 @@ class TestCronModeInteractions:
         result = check_dangerous_command("rm -rf /tmp/stuff", "local")
         assert result["approved"]
 
+    @pytest.mark.parametrize(
+        "guard,payload",
+        [
+            (check_all_command_guards, "rm -rf /tmp/cron-smart-off"),
+            (approval_module.check_execute_code_guard, "print('cron smart off')"),
+        ],
+    )
+    def test_global_approval_off_still_bypasses_cron_smart_guardian(
+        self, monkeypatch, guard, payload
+    ):
+        _configure_cron_smart(monkeypatch)
+        monkeypatch.setattr(approval_module, "_get_approval_mode", lambda: "off")
+        monkeypatch.setattr(
+            approval_module,
+            "_smart_approve",
+            lambda *_args, **_kwargs: pytest.fail(
+                "global approvals.mode=off must bypass the guardian"
+            ),
+        )
+
+        assert guard(payload, "local") == {"approved": True, "message": None}
+
+    def test_container_still_bypasses_cron_smart_guardian(self, monkeypatch):
+        _configure_cron_smart(monkeypatch)
+        monkeypatch.setattr(
+            approval_module,
+            "_smart_approve",
+            lambda *_args, **_kwargs: pytest.fail(
+                "isolated containers must bypass the guardian"
+            ),
+        )
+
+        result = check_all_command_guards("rm -rf /", "docker")
+
+        assert result == {"approved": True, "message": None}
+
+    @pytest.mark.parametrize(
+        "guard,payload",
+        [
+            (check_all_command_guards, "rm -rf /tmp/cron-smart-yolo"),
+            (approval_module.check_execute_code_guard, "print('cron smart yolo')"),
+        ],
+    )
+    def test_yolo_still_bypasses_cron_smart_guardian(
+        self, monkeypatch, guard, payload
+    ):
+        _configure_cron_smart(monkeypatch)
+        monkeypatch.setattr(approval_module, "_YOLO_MODE_FROZEN", True)
+        monkeypatch.setattr(
+            approval_module,
+            "_smart_approve",
+            lambda *_args, **_kwargs: pytest.fail(
+                "yolo must bypass the guardian"
+            ),
+        )
+
+        assert guard(payload, "local") == {"approved": True, "message": None}
+
 
 class TestCronWithGatewayOrigin:
     """Cron jobs originating from a gateway platform must NOT be treated as gateway.
@@ -478,4 +987,3 @@ class TestCronWithGatewayOrigin:
                 assert result.get("status") != "approval_required"
         finally:
             clear_session_vars(tokens)
-

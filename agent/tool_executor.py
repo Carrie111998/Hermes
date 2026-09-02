@@ -638,15 +638,16 @@ def _run_agent_tool_execution_middleware(
 
         block_message = scope_block
         block_error_type = "tool_scope_block"
+        approval_receipt = None
         if block_message is None:
             block_error_type = "plugin_block"
 
             def _resolve_pre_tool_block():
-                nonlocal final_args
+                nonlocal approval_receipt, final_args
                 try:
                     from hermes_cli.plugins import _dispatch_pre_tool_call_hooks
 
-                    block_msg, modified_args = _dispatch_pre_tool_call_hooks(
+                    hook_result = _dispatch_pre_tool_call_hooks(
                         function_name,
                         final_args,
                         task_id=effective_task_id or "",
@@ -656,7 +657,12 @@ def _run_agent_tool_execution_middleware(
                         api_request_id=getattr(agent, "_current_api_request_id", "")
                         or "",
                         middleware_trace=list(state["middleware_trace"]),
+                        include_approval_receipt=True,
                     )
+                    if len(hook_result) == 3:
+                        block_msg, modified_args, approval_receipt = hook_result
+                    else:
+                        block_msg, modified_args = hook_result
                     if modified_args is not None:
                         final_args = modified_args
                         state["args"] = modified_args
@@ -669,6 +675,21 @@ def _run_agent_tool_execution_middleware(
                 if authorization_gate is None
                 else authorization_gate.run(_resolve_pre_tool_block)
             )
+
+        if block_message is None and approval_receipt is not None:
+            from tools.approval import consume_plugin_smart_approval_receipt
+
+            receipt_error = consume_plugin_smart_approval_receipt(
+                approval_receipt,
+                function_name,
+                final_args,
+            )
+            if receipt_error is not None:
+                block_message = (
+                    "BLOCKED: Plugin tool arguments changed after smart approval "
+                    f"or the approval receipt was invalid: {receipt_error}"
+                )
+                block_error_type = "smart_approval_receipt"
 
         guardrail_decision = None
         if block_message is None:

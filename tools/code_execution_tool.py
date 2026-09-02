@@ -1213,6 +1213,7 @@ def _execute_remote(
     task_id: Optional[str],
     enabled_tools: Optional[List[str]],
     reset: bool = False,
+    use_session_kernel: bool = True,
 ) -> str:
     """Run code on the remote terminal backend.
 
@@ -1270,35 +1271,38 @@ def _execute_remote(
         # rebuilt on the run-to-completion transport (detached runner +
         # file cell protocol). Spawn failure falls OPEN to the per-call
         # path below so a degraded remote host never blocks execution.
-        try:
-            from tools.code_kernel_remote import execute_in_remote_kernel
+        # Cron-smart calls deliberately skip this branch: approval covers one
+        # complete cell, so hidden state from another cell cannot participate.
+        if use_session_kernel:
+            try:
+                from tools.code_kernel_remote import execute_in_remote_kernel
 
-            kernel_result = execute_in_remote_kernel(
-                code,
-                env=env,
-                env_type=env_type,
-                task_env_id=effective_task_id,
-                sandbox_tools=frozenset(sandbox_tools),
-                timeout=timeout,
-                max_tool_calls=max_tool_calls,
-                reset=bool(reset),
-                idle_exit=int(_cfg.get("kernel_idle_timeout", 1800)),
-            )
-        except Exception:
-            logger.warning(
-                "remote session-kernel path failed; falling back to per-call",
-                exc_info=True,
-            )
-            kernel_result = None
+                kernel_result = execute_in_remote_kernel(
+                    code,
+                    env=env,
+                    env_type=env_type,
+                    task_env_id=effective_task_id,
+                    sandbox_tools=frozenset(sandbox_tools),
+                    timeout=timeout,
+                    max_tool_calls=max_tool_calls,
+                    reset=bool(reset),
+                    idle_exit=int(_cfg.get("kernel_idle_timeout", 1800)),
+                )
+            except Exception:
+                logger.warning(
+                    "remote session-kernel path failed; falling back to per-call",
+                    exc_info=True,
+                )
+                kernel_result = None
 
-        if kernel_result is not None:
-            return _finish_remote_kernel_result(
-                kernel_result, timeout=timeout, exec_start=exec_start,
+            if kernel_result is not None:
+                return _finish_remote_kernel_result(
+                    kernel_result, timeout=timeout, exec_start=exec_start,
+                )
+            logger.info(
+                "remote session kernel unavailable on %s; using per-call path",
+                env_type,
             )
-        logger.info(
-            "remote session kernel unavailable on %s; using per-call path",
-            env_type,
-        )
 
         # Create sandbox directory on remote
         env.execute(
@@ -1611,8 +1615,21 @@ def execute_code(
         from tools.interrupt import clear_current_thread_interrupt
         clear_current_thread_interrupt()
 
+    # A cron smart review covers only the submitted cell. It cannot authorize
+    # behavior hidden in an earlier cell's interpreter state. Guard metadata
+    # therefore routes this call through the existing per-call execution path.
+    # No shared owner kernel is reset, which keeps concurrent calls isolated.
+    ephemeral_kernel = _guard.get("ephemeral_kernel") is True
+    effective_reset = bool(reset) or ephemeral_kernel
+
     if env_type != "local":
-        return _execute_remote(code, task_id, enabled_tools, reset=bool(reset))
+        return _execute_remote(
+            code,
+            task_id,
+            enabled_tools,
+            reset=effective_reset,
+            use_session_kernel=not ephemeral_kernel,
+        )
 
     # --- Local execution path (UDS) --- below this line is unchanged ---
 
@@ -1631,10 +1648,10 @@ def execute_code(
     if not sandbox_tools:
         sandbox_tools = SANDBOX_ALLOWED_TOOLS
 
-    if _get_kernel_mode() == "session":
-        # Session kernels keep one interpreter alive across calls; the guards
-        # above already ran for this cell, and the kernel path reuses the
-        # same env builder, RPC server, and output redaction as below.
+    if _get_kernel_mode() == "session" and not ephemeral_kernel:
+        # Session kernels keep one interpreter alive across normal calls. Cron
+        # smart-review calls skip this branch so each reviewed cell is the
+        # complete program that executes.
         from tools.code_kernel import execute_in_session_kernel
 
         _mode = _get_execution_mode()
@@ -1647,7 +1664,7 @@ def execute_code(
             sandbox_tools=frozenset(sandbox_tools),
             timeout=timeout,
             max_tool_calls=max_tool_calls,
-            reset=bool(reset),
+            reset=effective_reset,
             is_interrupted=_is_interrupted,
         )
 

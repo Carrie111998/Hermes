@@ -3470,17 +3470,23 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
 
     # Check plugin hooks for a block or approval directive before executing.
     block_message: Optional[str] = None
+    approval_receipt = None
     if not pre_tool_block_checked:
         try:
             from hermes_cli.plugins import _dispatch_pre_tool_call_hooks
-            block_message, modified_args = _dispatch_pre_tool_call_hooks(
+            hook_result = _dispatch_pre_tool_call_hooks(
                 function_name, function_args, task_id=effective_task_id or "",
                 session_id=getattr(agent, "session_id", "") or "",
                 tool_call_id=tool_call_id or "",
                 turn_id=getattr(agent, "_current_turn_id", "") or "",
                 api_request_id=getattr(agent, "_current_api_request_id", "") or "",
                 middleware_trace=list(_tool_middleware_trace),
+                include_approval_receipt=True,
             )
+            if len(hook_result) == 3:
+                block_message, modified_args, approval_receipt = hook_result
+            else:
+                block_message, modified_args = hook_result
             if modified_args is not None:
                 function_args = modified_args
         except Exception:
@@ -3716,9 +3722,8 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
                 enabled_toolsets=getattr(agent, "enabled_toolsets", None),
                 disabled_toolsets=getattr(agent, "disabled_toolsets", None),
                 tool_request_middleware_trace=list(_tool_middleware_trace),
+                skip_tool_execution_middleware=True,
             )
-            if skip_tool_execution_middleware:
-                dispatch_kwargs["skip_tool_execution_middleware"] = True
             return _ra().handle_function_call(
                 function_name,
                 next_args,
@@ -3726,15 +3731,39 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
                 **dispatch_kwargs,
             )
 
+    def _execute_with_receipt(next_args: dict) -> Any:
+        if approval_receipt is not None:
+            from tools.approval import consume_plugin_smart_approval_receipt
+
+            receipt_error = consume_plugin_smart_approval_receipt(
+                approval_receipt,
+                function_name,
+                next_args,
+            )
+            if receipt_error is not None:
+                return json.dumps(
+                    {
+                        "error": (
+                            "BLOCKED: Plugin tool arguments changed after smart "
+                            "approval or the approval receipt was invalid: "
+                            f"{receipt_error}"
+                        )
+                    },
+                    ensure_ascii=False,
+                )
+        return _execute(next_args)
+
     if skip_tool_execution_middleware:
-        return _execute(function_args)
+        return _execute_with_receipt(function_args)
 
     from hermes_cli.middleware import run_tool_execution_middleware
 
     return run_tool_execution_middleware(
         function_name,
         function_args,
-        lambda next_args: _execute(next_args if isinstance(next_args, dict) else function_args),
+        lambda next_args: _execute_with_receipt(
+            next_args if isinstance(next_args, dict) else function_args
+        ),
         original_args=function_args,
         task_id=effective_task_id or "",
         session_id=getattr(agent, "session_id", "") or "",
