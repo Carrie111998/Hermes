@@ -1,5 +1,6 @@
 """Gateway /loop command tests — dispatch, routing capture, mid-run guard."""
 
+import contextvars
 import logging
 import time
 from unittest.mock import AsyncMock, Mock
@@ -146,6 +147,61 @@ async def test_post_turn_loop_completion_noop_without_inflight_tick(loop_env):
     reloaded = loops.load_loop("sid-gateway-loop")
     assert reloaded.status == "active"
     assert reloaded.ticks_fired == 0
+
+
+_loop_ctx_probe: contextvars.ContextVar = contextvars.ContextVar(
+    "_loop_ctx_probe", default="unset"
+)
+
+
+@pytest.mark.asyncio
+async def test_post_turn_loop_completion_until_judge_preserves_caller_context(
+    loop_env, monkeypatch,
+):
+    """The --until judge (mgr.complete_tick -> judge_goal) must run inside the
+    caller's contextvars, not a fresh/empty executor Context.
+
+    Under gateway.multiplex_profiles the profile secret scope and HERMES_HOME
+    override are ContextVars installed per-turn by _profile_runtime_scope. A
+    bare run_in_executor hop starts with an empty Context, so get_secret()
+    inside the judge's aux-LLM call would read the wrong profile's (or the
+    default profile's raw process env) credentials instead of this session's
+    own — a cross-profile credential leak, not merely a failure.
+    """
+    from hermes_cli import goals as goals_module
+
+    seen = {}
+
+    def _fake_judge_goal(goal, last_response, **kwargs):
+        seen["value"] = _loop_ctx_probe.get()
+        return ("continue", "still working", False, None, False)
+
+    monkeypatch.setattr(goals_module, "judge_goal", _fake_judge_goal)
+
+    runner = _make_runner()
+    await GatewayRunner._handle_loop_command(
+        runner, _make_event("/loop 5m poll CI --until done"),
+    )
+
+    mgr = loops.LoopManager(session_id="sid-gateway-loop")
+    mgr.state.next_due_at = time.time() - 1
+    assert mgr.fire_tick() is not None
+
+    token = _loop_ctx_probe.set("caller-scoped-value")
+    try:
+        await GatewayRunner._post_turn_loop_completion(
+            runner,
+            session_entry=_FakeSessionEntry(),
+            source=None,
+            final_response="CI is still running, not done yet.",
+        )
+    finally:
+        _loop_ctx_probe.reset(token)
+
+    assert seen.get("value") == "caller-scoped-value", (
+        "the --until judge ran outside the caller's Context — a bare "
+        "run_in_executor hop drops profile-scoped contextvars"
+    )
 
 
 def test_streamed_already_sent_none_recovers_text_for_hooks():
