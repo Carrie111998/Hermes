@@ -396,6 +396,10 @@ _AUTH_HEADER_RE = re.compile(
     re.IGNORECASE,
 )
 
+_ENV_PLACEHOLDER_RE = re.compile(
+    r"\\?\$\{[A-Za-z_][A-Za-z0-9_.-]*\}",
+)
+
 # API-key style auth headers carrying a single opaque value (no scheme word).
 # Anthropic and many providers authenticate with ``x-api-key``; values without
 # a known vendor prefix (custom/local backends) would otherwise leak when a
@@ -983,8 +987,30 @@ def redact_sensitive_text(
     # "[Proxy-]Authorization:" case-insensitively, so "uthorization" is the
     # cheapest substring gate that covers every casing without a casefold().
     if "uthorization" in text or "UTHORIZATION" in text:
+        auth_pattern_source_spans = []
+        if code_file:
+            search_from = 0
+            while True:
+                start = text.find(_AUTH_HEADER_RE.pattern, search_from)
+                if start < 0:
+                    break
+                end = start + len(_AUTH_HEADER_RE.pattern)
+                auth_pattern_source_spans.append((start, end))
+                search_from = end
+
+        def _redact_auth_header(m):
+            credential = m.group(3)
+            if any(
+                start <= m.start() and m.end() <= end
+                for start, end in auth_pattern_source_spans
+            ):
+                return m.group(0)
+            if _ENV_PLACEHOLDER_RE.fullmatch(credential):
+                return m.group(0)
+            return m.group(1) + (m.group(2) or "") + _mask_token(credential)
+
         text = _AUTH_HEADER_RE.sub(
-            lambda m: m.group(1) + (m.group(2) or "") + _mask_token(m.group(3)),
+            _redact_auth_header,
             text,
         )
 

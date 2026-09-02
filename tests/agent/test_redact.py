@@ -4,7 +4,13 @@ import logging
 
 import pytest
 
-from agent.redact import mask_secret, redact_cdp_url, redact_sensitive_text, RedactingFormatter
+from agent.redact import (
+    _AUTH_HEADER_RE,
+    mask_secret,
+    redact_cdp_url,
+    redact_sensitive_text,
+    RedactingFormatter,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -284,6 +290,44 @@ class TestJsonFields:
 
 
 class TestAuthHeaders:
+
+    @pytest.mark.parametrize(
+        "placeholder",
+        ["${MCP_SKILLS_API_KEY}", r"\${MCP_SKILLS_API_KEY}"],
+    )
+    def test_env_placeholder_preserved(self, placeholder):
+        text = f"Authorization: Bearer {placeholder}"
+        assert redact_sensitive_text(text, force=True, file_read=True) == text
+
+    def test_auth_header_pattern_source_preserved(self):
+        text = f'r"{_AUTH_HEADER_RE.pattern}"'
+        assert redact_sensitive_text(text, force=True, code_file=True) == text
+
+    def test_auth_header_pattern_exemption_is_position_scoped(self):
+        matched_source = next(
+            _AUTH_HEADER_RE.finditer(_AUTH_HEADER_RE.pattern)
+        ).group(0)
+        text = f"{_AUTH_HEADER_RE.pattern}\ncredential={matched_source}"
+
+        result = redact_sensitive_text(text, force=True, file_read=True)
+
+        source, credential = result.split("\n", 1)
+        assert source == _AUTH_HEADER_RE.pattern
+        assert credential != f"credential={matched_source}"
+        assert matched_source not in credential
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "Authorization: Bearer opaque-provider-token-123456789",
+            "Proxy-Authorization: Basic dXNlcjpwYXNzd29yZA==",
+            r"Authorization: \s*opaquevalue123456789",
+        ],
+    )
+    def test_literal_credentials_remain_redacted(self, text):
+        result = redact_sensitive_text(text, force=True, file_read=True)
+        assert result != text
+        assert text.rsplit(" ", 1)[-1] not in result
 
 
 
