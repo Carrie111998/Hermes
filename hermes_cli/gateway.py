@@ -8564,7 +8564,9 @@ def _loopback_probe_host(host: str) -> str | None:
     return normalized if address.is_loopback else None
 
 
-def _warn_if_gateway_api_server_port_is_occupied() -> None:
+def _warn_if_gateway_api_server_port_is_occupied(
+    retry_command: str = "start",
+) -> None:
     """Warn on an occupied API port using only a short loopback probe."""
     try:
         config = load_gateway_config()
@@ -8590,7 +8592,10 @@ def _warn_if_gateway_api_server_port_is_occupied() -> None:
 
         import socket
 
-        connection = socket.create_connection((probe_host, port), timeout=0.2)
+        try:
+            connection = socket.create_connection((probe_host, port), timeout=0.2)
+        except OSError:
+            return
         try:
             connection.close()
         except OSError:
@@ -8609,12 +8614,11 @@ def _warn_if_gateway_api_server_port_is_occupied() -> None:
             profile = "default"
         profile_prefix = f"--profile {profile} "
         print_warning(
-            f"⚠ API server port is already in use: profile={profile}, "
-            f"host={host}, port={port}. Stop it with `hermes {profile_prefix}gateway stop`, "
-            f"then run `hermes {profile_prefix}gateway restart`."
+            f"API server port is already in use for profile={profile}: "
+            f"host={host}, port={port}. Another process is listening on this endpoint. "
+            f"Stop or reconfigure the process using that port, then retry "
+            f"`hermes {profile_prefix}gateway {retry_command}`."
         )
-    except (OSError, TypeError, ValueError):
-        return
     except Exception:
         logger.debug("Could not check gateway API server port occupancy", exc_info=True)
 
@@ -9039,6 +9043,7 @@ def _gateway_command_inner(args):
             if total:
                 print(f"✓ Stopped {total} gateway process(es) across all profiles")
             _wait_for_gateway_exit(timeout=10.0, force_after=5.0)
+            _warn_if_gateway_api_server_port_is_occupied(retry_command="restart")
 
             # Start the current profile's service fresh
             print("Starting gateway...")
@@ -9133,6 +9138,7 @@ def _gateway_command_inner(args):
                 print("✓ Stopped gateway for this profile")
 
             _wait_for_gateway_exit(timeout=10.0, force_after=5.0)
+            _warn_if_gateway_api_server_port_is_occupied(retry_command="restart")
 
             # Start fresh
             print("Starting gateway...")
