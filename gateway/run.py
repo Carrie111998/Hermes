@@ -2669,9 +2669,12 @@ def _profile_runtime_scope(
         try:
             yield
         finally:
+            # Every seam unwinds even when the turn raises: a leaked secret
+            # scope or HERMES_HOME override would hand the next routed turn
+            # another profile's credentials and home.
             reset_context_file_cwd(context_cwd_token)
-    reset_secret_scope(secret_token)
-    reset_hermes_home_override(home_token)
+            reset_secret_scope(secret_token)
+            reset_hermes_home_override(home_token)
 
 
 def load_gateway_config_for_runner() -> "GatewayConfig":
