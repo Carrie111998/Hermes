@@ -7,7 +7,6 @@ import logging
 from collections import OrderedDict
 from collections.abc import AsyncIterator, Awaitable, Callable
 from typing import Any
-from uuid import UUID
 
 from agent.realtime_voice import (
     HeardAudioBoundary,
@@ -45,7 +44,7 @@ class RealtimeVoiceCoordinator:
         self._dispatch_tool = dispatch_tool
         self._session: RealtimeSession | None = None
         self._current_item_id: str | None = None
-        self._current_audio_events: dict[UUID, RealtimeEvent] = {}
+        self._current_audio_event: RealtimeEvent | None = None
         self._heard_boundary: HeardAudioBoundary | None = None
         self._max_in_flight_tool_calls = max_in_flight_tool_calls
         self._max_completed_tool_calls = max_completed_tool_calls
@@ -98,7 +97,7 @@ class RealtimeVoiceCoordinator:
             or event.type is not RealtimeEventType.AUDIO
             or not event.item_id
             or event.item_id != self._current_item_id
-            or self._current_audio_events.get(event.emission_id) is not event
+            or self._current_audio_event is not event
             or audio_end_ms < 0
         ):
             return False
@@ -142,8 +141,7 @@ class RealtimeVoiceCoordinator:
                     if event.item_id != self._current_item_id:
                         self._current_item_id = event.item_id
                         self._heard_boundary = None
-                    self._current_audio_events.clear()
-                    self._current_audio_events[event.emission_id] = event
+                    self._current_audio_event = event
                 if event.type is RealtimeEventType.TOOL_CALL:
                     self._start_tool_dispatch(event, session, generation)
                 if not self._is_current_session(session, generation):
@@ -296,5 +294,5 @@ class RealtimeVoiceCoordinator:
 
     def _reset_output_state(self) -> None:
         self._current_item_id = None
-        self._current_audio_events.clear()
+        self._current_audio_event = None
         self._heard_boundary = None

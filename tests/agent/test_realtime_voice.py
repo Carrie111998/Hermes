@@ -224,7 +224,7 @@ async def test_coordinator_retains_only_latest_audio_event_identity():
     await coordinator.open(instructions="", tools=[])
     observed = [event async for event in coordinator.events()]
 
-    assert len(coordinator._current_audio_events) == 1
+    assert coordinator._current_audio_event is observed[-1]
     assert coordinator.report_audio_heard(observed[-1], audio_end_ms=100) is True
     assert coordinator.report_audio_heard(observed[-2], audio_end_ms=100) is False
 
