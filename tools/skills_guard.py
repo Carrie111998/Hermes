@@ -252,11 +252,16 @@ THREAT_PATTERNS = [
     # os.environ on the line — handles both full-line comments and inline
     # comments like `x = 1  # os.environ`. The docstring pre-filter in
     # scan_file() skips lines inside triple-quoted strings entirely.
-    # ANY `.get("<name>")` form is exempt here — non-secret names are plain
-    # config reads, and secret-shaped names are scored (medium) by the
-    # dedicated python_environ_get_secret pattern below; without the blanket
-    # exemption the high severity here would swamp that intended medium.
-    (r'^[^#\n]*os\.environ\b(?!\s*\.get\s*\()',
+    # `.get("<literal-name>")` forms are exempt here — non-secret literal
+    # names are plain config reads, and secret-shaped literal names are
+    # scored (medium) by the dedicated python_environ_get_secret pattern
+    # below, so without this exemption the high severity here would swamp
+    # that intended medium. The exemption requires a literal string
+    # immediately inside the parens (`["\']`); `.get(some_var)` with a
+    # *dynamic* key is NOT exempt — a variable key can point at any name at
+    # runtime (e.g. a loop harvesting every entry in a list of secret names),
+    # so it keeps scoring high here same as bare os.environ access.
+    (r'^[^#\n]*os\.environ\b(?!\s*\.get\s*\(\s*["\'])',
      "python_os_environ", "high", "exfiltration",
      "accesses os.environ outside comments/docstrings (potential env dump)"),
     (r'os\.environ\s*\.get\s*\(\s*["\'][^"\']*(?:KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL)',
@@ -727,6 +732,13 @@ def _compute_docstring_lines(lines: list) -> set:
     or similar edge cases -- but it catches the common skill-content patterns
     (docstrings, multiline comments containing prose samples) that trigger
     false-positive ``python_os_environ`` matches.
+
+    Callers must scope use of this result to ``_DOCSTRING_EXEMPT_PATTERN_IDS``
+    (currently just ``python_os_environ``) rather than skipping every threat
+    pattern inside a docstring — most patterns here (destructive commands,
+    exfiltration sinks, reverse shells, ...) are exactly the kind of payload
+    an attacker would wrap in a triple-quoted string specifically to evade
+    detection, so a blanket skip would defeat the scanner for those.
     """
     doc_lines: set = set()
     in_docstring = False
@@ -744,6 +756,15 @@ def _compute_docstring_lines(lines: list) -> set:
         if was_in or in_docstring or (has_marker and not was_in and not in_docstring):
             doc_lines.add(i + 1)
     return doc_lines
+
+
+# Pattern IDs allowed to skip lines inside triple-quoted strings. Only
+# python_os_environ was ever designed around docstring/prose false positives
+# (see its comment above and _compute_docstring_lines' docstring) — every
+# other pattern must keep firing inside a docstring, since wrapping a real
+# payload (rm -rf, curl|sh, a reverse shell, ...) in a triple-quoted string
+# is itself a plausible detection-evasion technique, not a false positive.
+_DOCSTRING_EXEMPT_PATTERN_IDS = frozenset({"python_os_environ"})
 
 
 # ---------------------------------------------------------------------------
@@ -786,7 +807,7 @@ def scan_file(file_path: Path, rel_path: str = "") -> List[Finding]:
         for i, line in enumerate(lines, start=1):
             if (pid, i) in seen:
                 continue
-            if i in docstring_lines:
+            if pid in _DOCSTRING_EXEMPT_PATTERN_IDS and i in docstring_lines:
                 continue
             if pattern.search(line):
                 seen.add((pid, i))
