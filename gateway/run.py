@@ -1171,9 +1171,42 @@ def _clarify_send_then_wait(fut, *, clarify_id: str, session_key: str, clarify_m
     timeout = clarify_mod.get_clarify_timeout()
     response = clarify_mod.wait_for_response(clarify_id, timeout=float(timeout))
     if response is None or response == "":
-        # Timeout or session-boundary cancellation
+        # Timeout or session-boundary cancellation. Count it toward the
+        # consecutive-timeout breaker (#96050): a clarify loop where the user
+        # never answers traps every follow-up text as the next prompt's
+        # intercept response.
+        _record_clarify_timeout(session_key)
         return f"[user did not respond within {int(timeout / 60)}m]"
+    _reset_clarify_timeout_streak(session_key)
     return response
+
+
+# Consecutive clarify-timeout breaker (#96050). When a session's clarifies
+# keep timing out, each NEW prompt still arms the text intercept — so the
+# user's imperative follow-ups ("stop", "restart") are consumed as clarify
+# answers and never reach the agent as real turns, and the model re-clarifies
+# in a loop (live report: ~4 hours of 10-minute clarify→timeout cycles).
+# After this many consecutive timeouts, the gateway stops posting new
+# prompts for the session and tells the agent to answer as plain text; any
+# successfully answered clarify resets the streak.
+_CLARIFY_TIMEOUT_BREAKER_LIMIT = 2
+_CLARIFY_TIMEOUT_STREAKS: Dict[str, int] = {}
+
+
+def _record_clarify_timeout(session_key: str) -> None:
+    key = str(session_key or "")
+    if not key:
+        return
+    _CLARIFY_TIMEOUT_STREAKS[key] = _CLARIFY_TIMEOUT_STREAKS.get(key, 0) + 1
+
+
+def _reset_clarify_timeout_streak(session_key: str) -> None:
+    _CLARIFY_TIMEOUT_STREAKS.pop(str(session_key or ""), None)
+
+
+def _clarify_breaker_open(session_key: str) -> bool:
+    key = str(session_key or "")
+    return bool(key) and _CLARIFY_TIMEOUT_STREAKS.get(key, 0) >= _CLARIFY_TIMEOUT_BREAKER_LIMIT
 
 
 def _resolve_progress_thread_id(
@@ -6596,6 +6629,22 @@ class TurnRunner:
 
             if not ctx._status_adapter:
                 return ""
+
+            if _clarify_breaker_open(ctx.session_key or ""):
+                # Consecutive-timeout breaker (#96050): previous prompts in
+                # this session timed out unanswered, and each new prompt
+                # traps the user's follow-up text in the intercept loop.
+                # Post nothing; tell the agent to answer as plain text.
+                logger.info(
+                    "[clarify] breaker open for %s — skipping prompt, "
+                    "agent answers as text",
+                    ctx.session_key or "<unknown>",
+                )
+                return (
+                    "[clarify unavailable: earlier prompts in this session "
+                    "timed out with no answer. Do not ask again — answer "
+                    "directly as normal text using your best judgement.]"
+                )
 
             clarify_id = _uuid.uuid4().hex[:10]
             _clarify_mod.register(
