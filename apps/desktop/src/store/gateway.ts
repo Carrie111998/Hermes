@@ -133,6 +133,9 @@ interface GatewayRegistryState {
   primaryGateway: HermesGateway | null
   /** Registry source currently served by primaryGateway, when known. */
   primaryConnectionId: null | string
+  /** True after Electron explicitly published the primary descriptor, even
+   * when that descriptor deliberately has no registry connection id. */
+  primaryConnectionResolved?: boolean
   primaryProfile: string
   activeKey: string
   activationEpoch: number
@@ -154,6 +157,7 @@ function createRegistryState(): GatewayRegistryState {
     config: null,
     primaryGateway: null,
     primaryConnectionId: null,
+    primaryConnectionResolved: false,
     primaryProfile: 'default',
     activeKey: 'default',
     activationEpoch: 0,
@@ -190,6 +194,7 @@ function gatewayState(): GatewayRegistryState {
     // Existing dev-HMR containers predate whole-turn leases.
     store[STATE_KEY].turnLeases ??= new Map()
     store[STATE_KEY].turnLeaseReleaseTimers ??= new Map()
+    store[STATE_KEY].primaryConnectionResolved ??= false
 
     return store[STATE_KEY]
   }
@@ -241,6 +246,7 @@ export function setPrimaryGateway(gateway: HermesGateway | null, profile = 'defa
 
   if (g.primaryGateway !== gateway) {
     g.primaryConnectionId = null
+    g.primaryConnectionResolved = false
   }
 
   // Route identity is exact-scope, never bare-name (#93892 follow-up): when
@@ -274,6 +280,10 @@ export function setPrimaryGatewayConnectionId(connectionId: null | string | unde
   }
 
   g.primaryConnectionId = (connectionId ?? '').trim() || null
+  // Null is meaningful: Electron resolved this primary as the legacy/local
+  // route. Do not fall back to a stale descriptor from the secondary source
+  // the window just left.
+  g.primaryConnectionResolved = true
 
   if (g.activeKey === g.primaryProfile) {
     setApiRequestConnection(g.primaryConnectionId)
@@ -388,7 +398,9 @@ export function activeGateway(): HermesGateway | null {
  */
 export function activeGatewayConnectionId(): null | string {
   if (g.activeKey === g.primaryProfile) {
-    return g.primaryConnectionId ?? (g.config?.activeConnectionId?.()?.trim() || null)
+    return g.primaryConnectionResolved === true
+      ? g.primaryConnectionId
+      : (g.config?.activeConnectionId?.()?.trim() || null)
   }
 
   return g.secondaries.get(g.activeKey)?.connectionId ?? null
