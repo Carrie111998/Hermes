@@ -503,8 +503,9 @@ async def _handle_runs(
     # Accept explicit conversation_history from the request body.
     # Precedence: explicit conversation_history > previous_response_id.
     conversation_history: List[Dict[str, str]] = []
+    conversation_history_supplied = "conversation_history" in body
     raw_history = body.get("conversation_history")
-    if raw_history:
+    if conversation_history_supplied:
         if not isinstance(raw_history, list):
             return web.json_response(
                 _openai_error("'conversation_history' must be an array of message objects"),
@@ -521,7 +522,11 @@ async def _handle_runs(
             logger.debug("Both conversation_history and previous_response_id provided; using conversation_history")
 
     stored_session_id = None
-    if not conversation_history and previous_response_id:
+    if (
+        not conversation_history_supplied
+        and not conversation_history
+        and previous_response_id
+    ):
         stored = self._response_store.get(previous_response_id)
         if stored:
             conversation_history = list(stored.get("conversation_history", []))
@@ -532,7 +537,12 @@ async def _handle_runs(
     # When input is a multi-message array, extract all but the last
     # message as conversation history (the last becomes user_message).
     # Only fires when no explicit history was provided.
-    if not conversation_history and isinstance(raw_input, list) and len(raw_input) > 1:
+    if (
+        not conversation_history_supplied
+        and not conversation_history
+        and isinstance(raw_input, list)
+        and len(raw_input) > 1
+    ):
         for msg in raw_input[:-1]:
             if isinstance(msg, dict) and msg.get("role") and msg.get("content"):
                 content = msg["content"]
@@ -544,7 +554,16 @@ async def _handle_runs(
                     )
                 conversation_history.append({"role": msg["role"], "content": str(content)})
 
+    caller_history_authoritative = bool(
+        conversation_history_supplied
+        or previous_response_id
+        or (isinstance(raw_input, list) and len(raw_input) > 1)
+    )
+
     session_id = body.get("session_id") or stored_session_id
+    server_history_authoritative = bool(
+        session_id and not caller_history_authoritative
+    )
     route = self._resolve_route(body.get("model"))
     agent_overrides = _request_agent_overrides(body, virtual_model=self._model_name)
     selection_error = self._request_route_conflict_error(
@@ -598,10 +617,17 @@ async def _handle_runs(
     if limited is not None:
         return limited
 
-    if not conversation_history and session_id and not previous_response_id:
-        conversation_history = await self._conversation_history_for_session(
-            str(session_id)
+    if (
+        not conversation_history_supplied
+        and not conversation_history
+        and session_id
+        and not previous_response_id
+    ):
+        conversation_history, history_error = (
+            await self._conversation_history_for_existing_session(str(session_id))
         )
+        if history_error is not None:
+            return history_error
 
     run_id = f"run_{uuid.uuid4().hex}"
     self._run_owners[run_id] = self._run_idempotency_scope(request)
@@ -790,6 +816,9 @@ async def _handle_runs(
                 approval_token = None
                 session_tokens = []
                 room_policy_token = None
+                history_authority_missing = object()
+                previous_history_authority = history_authority_missing
+                previous_server_history_reload = history_authority_missing
                 with self._profile_scope(request_profile):
                     try:
                         # Bind approval/session identity for this API run via
@@ -831,6 +860,26 @@ async def _handle_runs(
                         # ownership so stop/cancel can reap only the
                         # background processes this run created (#76115).
                         _publish_turn_process_ownership(agent, effective_task_id)
+                        if caller_history_authoritative:
+                            previous_history_authority = agent.__dict__.get(
+                                "_preserve_caller_history_on_lease_wait",
+                                history_authority_missing,
+                            )
+                            setattr(
+                                agent,
+                                "_preserve_caller_history_on_lease_wait",
+                                True,
+                            )
+                        elif server_history_authoritative:
+                            previous_server_history_reload = agent.__dict__.get(
+                                "_reload_durable_history_after_lease",
+                                history_authority_missing,
+                            )
+                            setattr(
+                                agent,
+                                "_reload_durable_history_after_lease",
+                                True,
+                            )
                         r = agent.run_conversation(
                             user_message=user_message,
                             conversation_history=conversation_history,
@@ -843,6 +892,30 @@ async def _handle_runs(
                         # run deliberately left running (same race-window
                         # guard as gateway/run.py and _run_agent above).
                         _clear_turn_process_ownership(agent)
+                        if caller_history_authoritative:
+                            if previous_history_authority is history_authority_missing:
+                                agent.__dict__.pop(
+                                    "_preserve_caller_history_on_lease_wait",
+                                    None,
+                                )
+                            else:
+                                setattr(
+                                    agent,
+                                    "_preserve_caller_history_on_lease_wait",
+                                    previous_history_authority,
+                                )
+                        elif server_history_authoritative:
+                            if previous_server_history_reload is history_authority_missing:
+                                agent.__dict__.pop(
+                                    "_reload_durable_history_after_lease",
+                                    None,
+                                )
+                            else:
+                                setattr(
+                                    agent,
+                                    "_reload_durable_history_after_lease",
+                                    previous_server_history_reload,
+                                )
                         # /v1/runs owns its agent lifecycle, so it records
                         # the declared conversation itself rather than
                         # through _run_agent's bind_declared_conversation

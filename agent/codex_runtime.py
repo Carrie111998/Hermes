@@ -884,6 +884,26 @@ def run_codex_app_server_turn(
                     "will be missing after restart/resume",
                     getattr(agent, "session_id", None),
                 )
+                cause = getattr(agent, "_last_persistence_error_cause", None)
+                return {
+                    "final_response": "",
+                    "messages": messages,
+                    "api_calls": 1,
+                    "completed": False,
+                    "partial": True,
+                    "interrupted": False,
+                    "error": (
+                        "Codex app-server turn could not be persisted to the "
+                        "session database."
+                    ),
+                    "failed": True,
+                    "failure_reason": (
+                        "session_persistence_failed:" + (cause or "unknown")
+                    ),
+                    # The inbound user row may already be durable. Never ask a
+                    # gateway fallback to append the whole turn again.
+                    "agent_persisted": True,
+                }
 
 
     # Counter ticks for the agent-improvement loop.

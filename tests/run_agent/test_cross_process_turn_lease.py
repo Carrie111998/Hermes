@@ -127,6 +127,64 @@ def test_run_conversation_acquires_then_reloads_latest_tip(monkeypatch):
     )
 
 
+def test_contended_lease_preserves_explicit_caller_history(monkeypatch):
+    db = _DB()
+    agent = _agent_with_db(db)
+    setattr(agent, "_preserve_caller_history_on_lease_wait", True)
+
+    def acquire_with_wait(session_id, holder, **kwargs):
+        db.events.append(("acquire", session_id, holder))
+        kwargs["on_wait"](0.0)
+        return True
+
+    db.acquire_session_turn_lease = acquire_with_wait
+    observed = {}
+
+    def fake_run(_agent, _message, _system, history, *_args, **_kwargs):
+        observed["history"] = history
+        observed["session_id"] = _agent.session_id
+        return {"final_response": "ok", "messages": history, "failed": False}
+
+    monkeypatch.setattr("agent.conversation_loop.run_conversation", fake_run)
+    explicit = []
+
+    AIAgent.run_conversation(agent, "new message", conversation_history=explicit)
+
+    assert observed == {"history": explicit, "session_id": "compressed-tip"}
+    assert [event[0] for event in db.events] == ["acquire", "resolve", "release"]
+
+
+def test_server_history_reloads_after_immediate_lease_admission(monkeypatch):
+    db = _DB()
+    agent = _agent_with_db(db)
+    setattr(agent, "_reload_durable_history_after_lease", True)
+    observed = {}
+
+    def fake_run(_agent, _message, _system, history, *_args, **_kwargs):
+        observed["history"] = history
+        observed["session_id"] = _agent.session_id
+        return {"final_response": "ok", "messages": history, "failed": False}
+
+    monkeypatch.setattr("agent.conversation_loop.run_conversation", fake_run)
+
+    AIAgent.run_conversation(
+        agent,
+        "new message",
+        conversation_history=[{"role": "user", "content": "stale API preload"}],
+    )
+
+    assert observed == {
+        "history": [{"role": "user", "content": "durable latest"}],
+        "session_id": "compressed-tip",
+    }
+    assert [event[0] for event in db.events] == [
+        "acquire",
+        "resolve",
+        "reload",
+        "release",
+    ]
+
+
 def test_run_conversation_acquires_lease_when_session_probe_raises(monkeypatch):
     """A locked / non-WAL get_session must not skip the durable lease."""
     db = _DB()

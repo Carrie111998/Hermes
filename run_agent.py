@@ -9465,27 +9465,47 @@ class AIAgent:
                 durable_turn_lease = _durable_holder
                 self._active_session_turn_lease_holder = _durable_holder
                 self._active_session_turn_lease_ttl_seconds = _lease_ttl
-                if _lease_waited:
-                    self._emit_status(
-                        "Session is free; loading the latest transcript..."
+                _refresh_durable_history = bool(
+                    _lease_waited
+                    or getattr(
+                        self,
+                        "_reload_durable_history_after_lease",
+                        False,
                     )
+                )
+                if _refresh_durable_history:
+                    if getattr(
+                        self,
+                        "_preserve_caller_history_on_lease_wait",
+                        False,
+                    ):
+                        self._emit_status(
+                            "Session is free; preserving caller-provided history..."
+                        )
+                    else:
+                        self._emit_status(
+                            "Session is free; loading the latest transcript..."
+                        )
 
-                # The holder may have compressed and rotated the session while
-                # this process waited. Resolve and reload only AFTER admission;
-                # a caller-provided in-memory snapshot is necessarily stale.
-                # Skip when acquisition was immediate — no other process held
-                # the lease, so the in-memory history is current and reloading
-                # would only cause an unnecessary prompt cache miss.
-                if _lease_waited:
+                # Another holder may append or rotate after an API handler's
+                # pre-admission read, even if it releases before our first lease
+                # attempt. Resolve/reload only AFTER admission whenever the
+                # caller marks server history as canonical.
+                if _refresh_durable_history:
                     latest_session_id = _turn_db.resolve_resume_session_id(session_id)
                     if latest_session_id:
                         self.session_id = latest_session_id
                         task_context["session_id"] = latest_session_id
-                    conversation_history = _turn_db.get_messages_as_conversation(
-                        self.session_id,
-                        repair_alternation=True,
-                        include_row_ids=True,
-                    )
+                    if not getattr(
+                        self,
+                        "_preserve_caller_history_on_lease_wait",
+                        False,
+                    ):
+                        conversation_history = _turn_db.get_messages_as_conversation(
+                            self.session_id,
+                            repair_alternation=True,
+                            include_row_ids=True,
+                        )
 
                 # Long model/tool/compression turns outlive a fixed TTL. Refresh
                 # in a daemon thread; holder-qualified UPDATE and DELETE fence a
