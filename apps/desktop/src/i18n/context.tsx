@@ -92,6 +92,16 @@ export interface I18nProviderProps {
   initialLocale?: unknown
 }
 
+/** One-shot `/api/config` can miss a Windows cold-start GIL stall. Four
+ *  attempts with exponential backoff (1s, 2s, 4s) cover the 12–28s import
+ *  window without locking English for the rest of the session (#96177). */
+export const CONFIG_LOAD_MAX_ATTEMPTS = 4
+export const CONFIG_LOAD_BASE_DELAY_MS = 1_000
+
+function configLoadRetryDelayMs(attempt: number): number {
+  return CONFIG_LOAD_BASE_DELAY_MS * 2 ** attempt
+}
+
 export function I18nProvider({ children, configClient = defaultConfigClient, initialLocale }: I18nProviderProps) {
   const [locale, setLocaleState] = useState<Locale>(() => normalizeLocale(initialLocale))
   const [isLoadingConfig, setIsLoadingConfig] = useState(false)
@@ -113,31 +123,69 @@ export function I18nProvider({ children, configClient = defaultConfigClient, ini
     }
 
     let cancelled = false
+    let retryTimeoutId: ReturnType<typeof setTimeout> | undefined
+
+    const finishFailure = (error: unknown) => {
+      setConfigLoadError(toError(error))
+      setLocaleState(DEFAULT_LOCALE)
+      setIsLoadingConfig(false)
+    }
+
+    const fetchConfig = (attempt: number) => {
+      if (cancelled) {
+        return
+      }
+
+      configClient
+        .getConfig()
+        .then(config => {
+          if (cancelled) {
+            return
+          }
+
+          const language = getConfigDisplayLanguage(config)
+
+          if (language) {
+            setLocaleState(normalizeLocale(language))
+            setConfigLoadError(null)
+            setIsLoadingConfig(false)
+            return
+          }
+
+          // Gateway answered but display.language is not in the payload yet
+          // (still warming). Retry rather than snapping to English.
+          if (attempt + 1 < CONFIG_LOAD_MAX_ATTEMPTS) {
+            retryTimeoutId = setTimeout(() => fetchConfig(attempt + 1), configLoadRetryDelayMs(attempt))
+            return
+          }
+
+          setLocaleState(normalizeLocale(language))
+          setIsLoadingConfig(false)
+        })
+        .catch(error => {
+          if (cancelled) {
+            return
+          }
+
+          if (attempt + 1 < CONFIG_LOAD_MAX_ATTEMPTS) {
+            retryTimeoutId = setTimeout(() => fetchConfig(attempt + 1), configLoadRetryDelayMs(attempt))
+            return
+          }
+
+          finishFailure(error)
+        })
+    }
 
     setIsLoadingConfig(true)
     setConfigLoadError(null)
-
-    configClient
-      .getConfig()
-      .then(config => {
-        if (!cancelled) {
-          setLocaleState(normalizeLocale(getConfigDisplayLanguage(config)))
-        }
-      })
-      .catch(error => {
-        if (!cancelled) {
-          setConfigLoadError(toError(error))
-          setLocaleState(DEFAULT_LOCALE)
-        }
-      })
-      .finally(() => {
-        if (!cancelled) {
-          setIsLoadingConfig(false)
-        }
-      })
+    fetchConfig(0)
 
     return () => {
       cancelled = true
+
+      if (retryTimeoutId !== undefined) {
+        clearTimeout(retryTimeoutId)
+      }
     }
   }, [configClient, initialLocale])
 

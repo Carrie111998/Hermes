@@ -13,7 +13,7 @@ import assert from 'node:assert/strict'
 
 import { test } from 'vitest'
 
-import { probeGatewayWebSocket } from './gateway-ws-probe'
+import { DEFAULT_CONNECT_TIMEOUT_MS, DEFAULT_READY_GRACE_MS, probeGatewayWebSocket } from './gateway-ws-probe'
 
 // Minimal WebSocket double: records listeners synchronously (the probe attaches
 // them in its executor) and exposes emit() so the test can replay events.
@@ -47,6 +47,13 @@ function makeFakeWs(): { FakeWs: new (url: string) => any; instances: any[] } {
 }
 
 const FAST = { connectTimeoutMs: 1_000, readyGraceMs: 10 }
+
+test('production defaults outlast Windows cold-start GIL import stalls (#96177)', () => {
+  // Observed backend import stalls are 12–28s. The previous 10s/750ms pair
+  // failed the first probe on virtually every cold launch.
+  assert.equal(DEFAULT_CONNECT_TIMEOUT_MS, 30_000)
+  assert.equal(DEFAULT_READY_GRACE_MS, 3_000)
+})
 
 test('probe resolves ok when the socket opens and stays open', async () => {
   const { FakeWs, instances } = makeFakeWs()

@@ -25,12 +25,20 @@
  * caller passes the Node/Electron global ``WebSocket``.
  */
 
-const DEFAULT_CONNECT_TIMEOUT_MS = 10_000
+// Windows cold-start: the Python backend can hold the GIL for 12–28s while
+// importing gateway platform modules (feishu/lark, weixin, telegram) before
+// the WebSocket listener is actually ready. A 10s connect budget then
+// declares the backend dead, spawns a second one, and the UI never
+// recovers (#96177). 30s covers that stall with headroom; tests inject
+// FAST timeouts so they are not coupled to this production budget.
+const DEFAULT_CONNECT_TIMEOUT_MS = 30_000
 // After the upgrade is accepted, a gateway that rejects the credential
 // post-handshake closes the socket almost immediately. Wait a short grace
 // window: a frame (gateway.ready) or a still-open socket means success; an
 // early close means the upgrade was accepted but the session was refused.
-const DEFAULT_READY_GRACE_MS = 750
+// The same GIL stall can delay the first ready frame past 750ms, so the
+// production grace matches the longer connect budget.
+const DEFAULT_READY_GRACE_MS = 3_000
 
 /**
  * Attempt a live WebSocket connection and classify the outcome.
