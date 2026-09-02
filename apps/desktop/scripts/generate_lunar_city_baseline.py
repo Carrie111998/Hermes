@@ -26,6 +26,15 @@ def material(name, color, metallic=0.0, roughness=0.55, emission=None):
     if emission:
         node.inputs["Emission Color"].default_value = (*emission, 1.0)
         node.inputs["Emission Strength"].default_value = 3.0
+    noise = mat.node_tree.nodes.new("ShaderNodeTexNoise")
+    noise.inputs["Scale"].default_value = 7.0
+    noise.inputs["Detail"].default_value = 3.0
+    bump = mat.node_tree.nodes.new("ShaderNodeBump")
+    bump.inputs["Strength"].default_value = 0.12 if not emission else 0.04
+    bump.inputs["Distance"].default_value = 0.08
+    mat.node_tree.links.new(noise.outputs["Fac"], bump.inputs["Height"])
+    mat.node_tree.links.new(bump.outputs["Normal"], node.inputs["Normal"])
+    mat["surface_pipeline"] = "procedural_pbr_noise_bump"
     return mat
 
 
@@ -129,6 +138,22 @@ def building(asset_id, role, location, accent, buildings, mats):
         cube(f"{asset_id}_window_{dx}", (x + dx, y - 2.31, base + 0.85), (0.42, 0.05, 0.28), mats["glass"], buildings, 0.04)
     for dx in (-2.55, 2.55):
         cylinder(f"{asset_id}_vent_{dx}", (x + dx, y, base + 2.7), 0.24, 0.35, mats[accent], buildings)
+    curve(
+        f"{asset_id}_arched_entry_frame",
+        [
+            (x - 2.72, y - 2.28, base + 0.22),
+            (x - 2.72, y - 2.28, base + 2.05),
+            (x - 2.25, y - 2.28, base + 2.48),
+            (x, y - 2.28, base + 2.62),
+            (x + 2.25, y - 2.28, base + 2.48),
+            (x + 2.72, y - 2.28, base + 2.05),
+            (x + 2.72, y - 2.28, base + 0.22),
+        ],
+        0.12,
+        mats["shell"],
+        buildings,
+    )
+    shell["architecture"] = "arched_entry_frame"
     return shell
 
 
