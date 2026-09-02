@@ -96,6 +96,11 @@ def test_reasoning_value_is_not_misclassified_as_subcommand(monkeypatch):
 # ── _plugin_cli_discovery_needed ───────────────────────────────────────────
 
 
+def test_contacts_skips_plugin_discovery():
+    with patch.object(sys, "argv", ["hermes", "contacts", "list"]):
+        assert _plugin_cli_discovery_needed() is False
+
+
 # ── _BUILTIN_SUBCOMMANDS ↔ argparse registration parity ────────────────────
 
 
