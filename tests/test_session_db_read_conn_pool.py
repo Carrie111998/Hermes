@@ -171,6 +171,97 @@ def test_pooled_get_session_retries_transient_ioerr(db, monkeypatch):
     assert attempts == 2
 
 
+def test_pooled_get_session_retries_transient_fetchone_ioerr(db, monkeypatch):
+    """The retry boundary includes SQLite stepping the selected row."""
+    import hermes_state as hs
+
+    real_connect = hs._connect_tracked_db
+    attempts = 0
+
+    class FlakyCursor:
+        def __init__(self, cursor):
+            self._cursor = cursor
+
+        def fetchone(self):
+            raise sqlite3.OperationalError("disk I/O error")
+
+    class FlakyReadConnection:
+        def __init__(self, conn):
+            object.__setattr__(self, "_conn", conn)
+
+        def __getattr__(self, name):
+            return getattr(self._conn, name)
+
+        def __setattr__(self, name, value):
+            setattr(self._conn, name, value)
+
+        def execute(self, sql, parameters=()):
+            nonlocal attempts
+            cursor = self._conn.execute(sql, parameters)
+            if "FROM sessions s" in sql:
+                attempts += 1
+                if attempts == 1:
+                    return FlakyCursor(cursor)
+            return cursor
+
+    def flaky_connect(*args, **kwargs):
+        conn = real_connect(*args, **kwargs)
+        if args and isinstance(args[0], str) and "mode=ro" in args[0]:
+            return FlakyReadConnection(conn)
+        return conn
+
+    monkeypatch.setattr(hs, "_connect_tracked_db", flaky_connect)
+    monkeypatch.setattr(hs, "_READ_ONLY_IOERR_RETRY_BACKOFF_S", 0.0)
+    db._wal_active = True
+
+    assert db.get_session("s1")["id"] == "s1"
+    assert attempts == 2
+
+
+def test_pooled_get_session_persistent_fetchone_ioerr_is_bounded(db, monkeypatch):
+    """Persistent fetch-time IOERR propagates after the existing retry budget."""
+    import hermes_state as hs
+
+    real_connect = hs._connect_tracked_db
+    attempts = 0
+
+    class BrokenCursor:
+        def fetchone(self):
+            raise sqlite3.OperationalError("disk I/O error")
+
+    class BrokenReadConnection:
+        def __init__(self, conn):
+            object.__setattr__(self, "_conn", conn)
+
+        def __getattr__(self, name):
+            return getattr(self._conn, name)
+
+        def __setattr__(self, name, value):
+            setattr(self._conn, name, value)
+
+        def execute(self, sql, parameters=()):
+            nonlocal attempts
+            if "FROM sessions s" in sql:
+                attempts += 1
+                return BrokenCursor()
+            return self._conn.execute(sql, parameters)
+
+    def broken_connect(*args, **kwargs):
+        conn = real_connect(*args, **kwargs)
+        if args and isinstance(args[0], str) and "mode=ro" in args[0]:
+            return BrokenReadConnection(conn)
+        return conn
+
+    monkeypatch.setattr(hs, "_connect_tracked_db", broken_connect)
+    monkeypatch.setattr(hs, "_READ_ONLY_IOERR_RETRY_BACKOFF_S", 0.0)
+    db._wal_active = True
+
+    with pytest.raises(sqlite3.OperationalError, match="disk I/O error"):
+        db.get_session("s1")
+
+    assert attempts == hs._READ_ONLY_IOERR_RETRY_ATTEMPTS + 1
+
+
 def test_pooled_read_persistent_ioerr_exhausts_retry_budget(monkeypatch):
     """A real storage failure must still surface after bounded retries."""
     import hermes_state as hs

@@ -2148,10 +2148,10 @@ class _RetryingReadConnection:
 
     The constructor retry above covers opening a read-only connection, but a
     warm pooled connection can hit the same WAL transition later when its
-    SELECT executes (#100871). Reads through this wrapper are idempotent, so
-    replaying the statement is safe. The retry deliberately stays on the same
-    connection: close-and-reopen can cancel POSIX locks held by sibling SQLite
-    connections in this process.
+    SELECT executes or steps its result set (#100871). Reads through this
+    wrapper are idempotent, so replaying the statement is safe. The retry
+    deliberately stays on the same connection: close-and-reopen can cancel
+    POSIX locks held by sibling SQLite connections in this process.
     """
 
     def __init__(self, conn: sqlite3.Connection) -> None:
@@ -2165,6 +2165,18 @@ class _RetryingReadConnection:
         while True:
             try:
                 return self._conn.execute(sql, parameters)
+            except sqlite3.OperationalError as exc:
+                if not _is_transient_read_only_ioerr(exc, attempt=attempt):
+                    raise
+                attempt += 1
+                time.sleep(_READ_ONLY_IOERR_RETRY_BACKOFF_S)
+
+    def execute_fetchone(self, sql: str, parameters=(), /):
+        """Execute and step one row within a single bounded retry boundary."""
+        attempt = 0
+        while True:
+            try:
+                return self._conn.execute(sql, parameters).fetchone()
             except sqlite3.OperationalError as exc:
                 if not _is_transient_read_only_ioerr(exc, attempt=attempt):
                     raise
@@ -10496,15 +10508,18 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         # totals. No-op attribute check when nothing is queued.
         self.flush_token_counts()
         with self._read_ctx() as conn:
-            cursor = conn.execute(
+            sql = (
                 "SELECT s.*, "
                 "COALESCE(sp.prompt, s.system_prompt) AS _system_prompt_resolved "
                 "FROM sessions s "
                 "LEFT JOIN system_prompts sp ON sp.hash = s.system_prompt_hash "
-                "WHERE s.id = ?",
-                (session_id,),
+                "WHERE s.id = ?"
             )
-            row = cursor.fetchone()
+            parameters = (session_id,)
+            if isinstance(conn, _RetryingReadConnection):
+                row = conn.execute_fetchone(sql, parameters)
+            else:
+                row = conn.execute(sql, parameters).fetchone()
         return self._session_row_dict(row) if row else None
 
     def get_dominant_session_model_route(
