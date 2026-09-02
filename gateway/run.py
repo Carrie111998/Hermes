@@ -12769,7 +12769,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         )
         return True
 
-    def request_restart(self, *, detached: bool = False, via_service: bool = False) -> bool:
+    def request_restart(
+        self,
+        *,
+        detached: bool = False,
+        via_service: bool = False,
+        force: bool = False,
+    ) -> bool:
         if self._restart_task_started:
             return False
         self._restart_requested = True
@@ -12782,7 +12788,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self._draining = True
 
         async def _run_restart() -> None:
-            await self._await_active_work_before_restart()
+            if not force:
+                await self._await_active_work_before_restart()
+            else:
+                logger.warning(
+                    "Forced gateway restart requested — skipping active-work wait"
+                )
             # Launch the detached helper only AFTER the after-turn wait.
             # Its deadline is drain_timeout+5 and covers stop() teardown —
             # launching earlier would fire `hermes gateway restart` while
@@ -12793,7 +12804,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 except Exception as e:
                     logger.error("Failed to launch detached gateway restart helper: %s", e)
             await asyncio.sleep(0.05)
-            await self.stop(restart=True, detached_restart=detached, service_restart=via_service)
+            stop_kwargs = {"force_restart": True} if force else {}
+            await self.stop(
+                restart=True,
+                detached_restart=detached,
+                service_restart=via_service,
+                **stop_kwargs,
+            )
 
         # _run_restart is a short-lived self-terminating task (calls stop()
         # then returns).  Don't add it to _background_tasks — _stop_impl
@@ -16306,6 +16323,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         restart: bool = False,
         detached_restart: bool = False,
         service_restart: bool = False,
+        force_restart: bool = False,
     ) -> None:
         """Stop the gateway and disconnect all adapters."""
         # getattr-guard: shutdown-path tests build bare runners via
@@ -16482,7 +16500,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _phase_elapsed(),
             )
 
-            timeout = self._restart_drain_timeout
+            # /restart force deliberately bypasses the configured graceful
+            # active-work drain. The normal interrupt/resume bookkeeping below
+            # still runs, so interrupted sessions remain recoverable.
+            timeout = 0.0 if force_restart else self._restart_drain_timeout
 
             # Pre-mark sessions as resume_pending BEFORE the drain wait.
             # If the process is killed by the service manager during the
@@ -16512,11 +16533,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _cron_drain_cfg = getattr(
                 self, "_cron_drain_timeout", DEFAULT_GATEWAY_CRON_DRAIN_TIMEOUT
             )
-            _cron_timeout = resolve_cron_drain_budget(
-                timeout,
-                _cron_drain_cfg,
-                watchdog_delay=resolve_shutdown_watchdog_delay(timeout),
-                elapsed=_phase_elapsed(),
+            _cron_timeout = (
+                0.0
+                if force_restart
+                else resolve_cron_drain_budget(
+                    timeout,
+                    _cron_drain_cfg,
+                    watchdog_delay=resolve_shutdown_watchdog_delay(timeout),
+                    elapsed=_phase_elapsed(),
+                )
             )
             if _cron_at_start and _cron_timeout > timeout:
                 logger.info(

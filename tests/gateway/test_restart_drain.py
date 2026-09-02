@@ -59,6 +59,50 @@ async def test_restart_command_while_busy_requests_drain_without_interrupt(monke
     runner.request_restart.assert_called_once_with(detached=True, via_service=False)
 
 
+@pytest.mark.asyncio
+async def test_restart_force_while_busy_skips_drain_wait(monkeypatch):
+    monkeypatch.delenv("INVOCATION_ID", raising=False)
+    monkeypatch.delenv("XPC_SERVICE_NAME", raising=False)
+    monkeypatch.delenv("HERMES_S6_SUPERVISED_CHILD", raising=False)
+    monkeypatch.delenv("HERMES_GATEWAY_EXTERNAL_SUPERVISOR", raising=False)
+    monkeypatch.setattr(
+        "gateway.restart.is_container_restart_context", lambda: False
+    )
+    runner, _adapter = make_restart_runner()
+    runner.request_restart = MagicMock(return_value=True)
+    event = MessageEvent(
+        text="/restart force",
+        message_type=MessageType.TEXT,
+        source=make_restart_source(),
+        message_id="m-force",
+    )
+    runner._running_agents[build_session_key(event.source)] = MagicMock()
+
+    result = await runner._handle_message(event)
+
+    assert "Restarting" in str(result)
+    runner.request_restart.assert_called_once_with(
+        detached=True, via_service=False, force=True
+    )
+
+
+@pytest.mark.asyncio
+async def test_restart_rejects_unknown_argument():
+    runner, _adapter = make_restart_runner()
+    runner.request_restart = MagicMock(return_value=True)
+    event = MessageEvent(
+        text="/restart now",
+        message_type=MessageType.TEXT,
+        source=make_restart_source(),
+        message_id="m-invalid",
+    )
+
+    result = await runner._handle_restart_command(event)
+
+    assert result == "Usage: /restart [force]"
+    runner.request_restart.assert_not_called()
+
+
 def test_load_busy_text_mode_follows_input_mode_and_honors_legacy(tmp_path, monkeypatch):
     monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
     monkeypatch.delenv("HERMES_GATEWAY_BUSY_TEXT_MODE", raising=False)
@@ -201,6 +245,27 @@ async def test_request_restart_after_turn_timeout_zero_enters_stop_immediately()
 
     runner.stop.assert_awaited_once_with(
         restart=True, detached_restart=False, service_restart=True
+    )
+
+
+@pytest.mark.asyncio
+async def test_request_restart_force_skips_both_active_work_waits():
+    runner, _adapter = make_restart_runner()
+    runner.stop = AsyncMock()
+    runner._await_active_work_before_restart = AsyncMock()
+    runner._running_agents["agent:main:telegram:dm:1"] = MagicMock()
+
+    assert runner.request_restart(
+        detached=False, via_service=True, force=True
+    ) is True
+    await runner._restart_task
+
+    runner._await_active_work_before_restart.assert_not_awaited()
+    runner.stop.assert_awaited_once_with(
+        restart=True,
+        detached_restart=False,
+        service_restart=True,
+        force_restart=True,
     )
 
 
