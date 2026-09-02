@@ -1363,6 +1363,38 @@ def create_profile(
         except Exception:
             pass  # best-effort — don't fail profile creation over this
 
+    # Seed a minimal config.yaml for fresh (non-clone) profiles so the kanban
+    # dispatcher stays OFF by default. A profile whose config.yaml lacks an
+    # explicit ``kanban:`` section inherits DEFAULT_CONFIG's
+    # ``dispatch_in_gateway: true``, which makes its gateway try to acquire
+    # the singleton dispatcher lock (<kanban-root>/kanban/.dispatcher.lock)
+    # and race the default/factory gateway for the same board. The helper
+    # profile hit exactly this (it briefly held the factory dispatcher lock).
+    # Non-factory profiles must never hold that lock; factory dispatcher
+    # profiles opt in explicitly (``dispatch_in_gateway: true``) in their own
+    # config. Skipped when the profile already has a config (--clone /
+    # --clone-all copy it from the source, kanban section included).
+    config_path = profile_dir / "config.yaml"
+    if not config_path.exists():
+        try:
+            from hermes_cli.config_defaults import DEFAULT_CONFIG as _DEFAULT_CONFIG
+            _version = int(_DEFAULT_CONFIG.get("_config_version", 1) or 1)
+            config_path.write_text(
+                "# Kanban dispatcher ownership (single-dispatcher posture):\n"
+                "# non-factory profiles must NOT hold the kanban dispatcher lock\n"
+                "# (<kanban-root>/kanban/.dispatcher.lock). Only the default/factory\n"
+                "# gateway dispatches; flip dispatch_in_gateway to true ONLY for\n"
+                "# profiles explicitly intended to be factory dispatchers.\n"
+                f"_config_version: {_version}\n"
+                "kanban:\n"
+                "  dispatch_in_gateway: false\n"
+                "  enabled: false\n",
+                encoding="utf-8",
+            )
+            os.chmod(str(config_path), 0o644)
+        except Exception:
+            pass  # best-effort — profile creation must not fail over this
+
     # Write the opt-out marker so seed_profile_skills() and `hermes update`'s
     # all-profile sync loop both skip this profile for bundled-skill seeding.
     if no_skills:

@@ -40,6 +40,23 @@ hermes profile create mybot
 
 Creates a fresh profile with bundled skills seeded. Run `mybot setup` to configure API keys, model, and gateway tokens.
 
+A fresh profile (no `--clone`) is seeded with the kanban dispatcher **off** — its
+`config.yaml` ships with `kanban: {dispatch_in_gateway: false, enabled: false}`.
+This is the single-dispatcher posture: only the profile that is explicitly meant
+to dispatch (e.g. `default`) keeps `dispatch_in_gateway: true`. A profile without
+an explicit `kanban:` section inherits `dispatch_in_gateway: true` from the
+defaults and its gateway would race for the singleton dispatcher lock
+(`<kanban-root>/kanban/.dispatcher.lock`) — a non-factory profile must never hold
+that lock. As a code-side backstop, only profiles named in
+`kanban.dispatch_profiles` (default `["default"]`) may even attempt the lock,
+and contenders re-check it every `kanban.lock_takeover_interval` (default 30s)
+instead of giving up at boot, so a dead dispatcher-gateway is replaced within
+~a minute. See the [multi-gateway
+guide](https://github.com/NousResearch/hermes-agent/blob/main/docs/kanban/multi-gateway.md) for
+details. Cloning with `--clone` / `--clone-all` copies the source profile's
+`kanban:` section as-is — verify it after cloning so a clone of the dispatcher
+doesn't become a second dispatcher.
+
 If you plan to use this profile as a kanban worker (or want the kanban orchestrator to route work to it), pass `--description "<role>"` at create time so the orchestrator knows what it's good at:
 
 ```bash

@@ -89,6 +89,19 @@ Creates a new profile.
 
 Creating a profile does **not** make that profile directory the default project/workspace directory for terminal commands. If you want a profile to start in a specific project, set `terminal.cwd` in that profile's `config.yaml`.
 
+**Kanban dispatcher default:** a fresh profile (no `--clone`) gets a seeded
+`config.yaml` containing `kanban: {dispatch_in_gateway: false, enabled: false}`.
+This keeps every non-factory profile out of the kanban dispatcher race: only the
+gateway that is explicitly meant to dispatch (e.g. `default`) keeps
+`dispatch_in_gateway: true` and holds the singleton
+`<kanban-root>/kanban/.dispatcher.lock`. A profile whose `config.yaml` lacks a
+`kanban:` section inherits `dispatch_in_gateway: true` from the defaults — a
+helper profile's gateway would then silently become a second dispatcher, so keep
+the section explicit. Only profiles named in `kanban.dispatch_profiles`
+(default `["default"]`) may even attempt the lock; contenders re-check it every
+`kanban.lock_takeover_interval` (default 30s) instead of giving up at boot.
+Cloning copies the source's `kanban:` section as-is; check it after cloning.
+
 **Examples:**
 
 ```bash

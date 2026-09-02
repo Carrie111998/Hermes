@@ -2907,6 +2907,25 @@ DEFAULT_CONFIG = {
         # only if you run the dispatcher as a separate systemd unit or
         # don't want the gateway to spawn workers.
         "dispatch_in_gateway": True,
+        # Profiles allowed to hold the machine-global singleton dispatcher
+        # lock (<kanban-root>/kanban/.dispatcher.lock). Defaults to
+        # ["default"] — ONLY the default-profile gateway may dispatch unless
+        # a deployment explicitly opts other profiles in. A worker/helper
+        # profile that flips dispatch_in_gateway on (or inherits the default
+        # true) must NOT race the main gateway for the lock; naming it here
+        # is the explicit opt-in for a second dispatcher.
+        "dispatch_profiles": ["default"],
+        # Seconds a contender gateway waits between dispatcher-lock takeover
+        # retries. When the lock owner dies, the kernel releases the flock
+        # and the next retry acquires it, so the board recovers within
+        # roughly this interval instead of starving until a container
+        # restart.
+        "lock_takeover_interval": 30,
+        # Seconds a lock lease heartbeat may be silent before contenders
+        # treat the holder as wedged (alive pid + stale heartbeat = stuck
+        # dispatcher loop; a live flock cannot be stolen, so they warn and
+        # keep retrying).
+        "lock_lease_timeout": 120,
         # Automatically claim tasks in the first-class review column and spawn
         # the assigned profile with the bundled sdlc-review skill. Disable for
         # boards where every review is performed manually from the dashboard.
