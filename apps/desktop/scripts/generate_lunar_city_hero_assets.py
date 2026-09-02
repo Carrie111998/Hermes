@@ -718,6 +718,59 @@ def asset_quality_entries():
     return [grouped[key] for key in sorted(grouped)]
 
 
+def lod_budget_entries():
+    entries = []
+    for asset_id, role, _title, _accent in BUILDINGS:
+        entries.append(
+            {
+                "id": asset_id,
+                "kind": "building",
+                "role": role,
+                "sourceCollection": f"Hero Asset - {asset_id}",
+                "levels": {
+                    "hero": {"screenCoverage": "close", "triangleBudget": 18000, "textureResolution": "4k"},
+                    "high": {"screenCoverage": "district", "triangleBudget": 9000, "textureResolution": "2k"},
+                    "medium": {"screenCoverage": "city", "triangleBudget": 3500, "textureResolution": "2k_atlas"},
+                    "low": {"screenCoverage": "background", "triangleBudget": 900, "textureResolution": "1k_atlas"},
+                },
+                "policy": "preserve_silhouette_and_signage_first",
+            }
+        )
+    for asset_id, role, _species, _accent in LEADERS:
+        entries.append(
+            {
+                "id": asset_id,
+                "kind": "leader",
+                "role": role,
+                "sourceCollection": f"Hero Asset - {asset_id}",
+                "levels": {
+                    "hero": {"screenCoverage": "dialogue", "triangleBudget": 14000, "textureResolution": "4k"},
+                    "high": {"screenCoverage": "room", "triangleBudget": 7000, "textureResolution": "2k"},
+                    "medium": {"screenCoverage": "street", "triangleBudget": 2400, "textureResolution": "2k_atlas"},
+                    "low": {"screenCoverage": "background", "triangleBudget": 650, "textureResolution": "1k_atlas"},
+                },
+                "policy": "preserve_face_props_and_body_language_first",
+            }
+        )
+    for asset_id, role, _personality, _accent in WORKERS + CHILDREN:
+        entries.append(
+            {
+                "id": asset_id,
+                "kind": "worker" if asset_id.startswith("worker-") else "child",
+                "role": role,
+                "sourceCollection": f"Hero Asset - {asset_id}",
+                "levels": {
+                    "hero": {"screenCoverage": "selected", "triangleBudget": 8000, "textureResolution": "2k"},
+                    "high": {"screenCoverage": "room", "triangleBudget": 4200, "textureResolution": "2k"},
+                    "medium": {"screenCoverage": "street", "triangleBudget": 1600, "textureResolution": "1k_atlas"},
+                    "low": {"screenCoverage": "crowd", "triangleBudget": 420, "textureResolution": "512_atlas"},
+                },
+                "policy": "preserve_visor_accent_and_animation_silhouette_first",
+            }
+        )
+    return entries
+
+
 def main():
     HERO_DIR.mkdir(parents=True, exist_ok=True)
     reset_scene()
@@ -767,6 +820,7 @@ def main():
     scene["sculpted_character_limb_components"] = sum(1 for obj in bpy.data.objects if obj.get("mesh_construction") == "continuous_tapered_limb_skin")
     pbr_materials = sorted({mat.name for mat in bpy.data.materials if mat.get("surface_pipeline")})
     quality_entries = asset_quality_entries()
+    lod_entries = lod_budget_entries()
 
     manifest = {
         "schemaVersion": 1,
@@ -785,6 +839,7 @@ def main():
         "proceduralPbrMaterialCount": len(pbr_materials),
         "proceduralPbrMaterials": pbr_materials,
         "assetQuality": quality_entries,
+        "lods": lod_entries,
         "buildings": [
             {"id": asset_id, "role": role, "title": title, "collection": f"Hero Asset - {asset_id}", "lod": ["hero", "high", "medium", "low"]}
             for asset_id, role, title, _accent in BUILDINGS
@@ -829,6 +884,7 @@ def main():
             "usesContinuousCharacterLimbMeshes": scene["sculpted_character_limb_components"] >= (len(LEADERS) + len(WORKERS) + len(CHILDREN)) * 4,
             "usesProceduralPbrMaterials": len(pbr_materials) >= 12,
             "tracksPerAssetQuality": len(quality_entries) == len(BUILDINGS) + len(LEADERS) + len(WORKERS) + len(CHILDREN),
+            "tracksLodBudgets": len(lod_entries) == len(BUILDINGS) + len(LEADERS) + len(WORKERS) + len(CHILDREN),
         },
     }
     HERO_MANIFEST.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")

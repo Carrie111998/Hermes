@@ -667,6 +667,762 @@
       "role": "archive"
     }
   ],
+  "lods": [
+    {
+      "id": "library",
+      "kind": "building",
+      "levels": {
+        "hero": {
+          "screenCoverage": "close",
+          "textureResolution": "4k",
+          "triangleBudget": 18000
+        },
+        "high": {
+          "screenCoverage": "district",
+          "textureResolution": "2k",
+          "triangleBudget": 9000
+        },
+        "low": {
+          "screenCoverage": "background",
+          "textureResolution": "1k_atlas",
+          "triangleBudget": 900
+        },
+        "medium": {
+          "screenCoverage": "city",
+          "textureResolution": "2k_atlas",
+          "triangleBudget": 3500
+        }
+      },
+      "policy": "preserve_silhouette_and_signage_first",
+      "role": "knowledge",
+      "sourceCollection": "Hero Asset - library"
+    },
+    {
+      "id": "research-lab",
+      "kind": "building",
+      "levels": {
+        "hero": {
+          "screenCoverage": "close",
+          "textureResolution": "4k",
+          "triangleBudget": 18000
+        },
+        "high": {
+          "screenCoverage": "district",
+          "textureResolution": "2k",
+          "triangleBudget": 9000
+        },
+        "low": {
+          "screenCoverage": "background",
+          "textureResolution": "1k_atlas",
+          "triangleBudget": 900
+        },
+        "medium": {
+          "screenCoverage": "city",
+          "textureResolution": "2k_atlas",
+          "triangleBudget": 3500
+        }
+      },
+      "policy": "preserve_silhouette_and_signage_first",
+      "role": "research",
+      "sourceCollection": "Hero Asset - research-lab"
+    },
+    {
+      "id": "arts-studio",
+      "kind": "building",
+      "levels": {
+        "hero": {
+          "screenCoverage": "close",
+          "textureResolution": "4k",
+          "triangleBudget": 18000
+        },
+        "high": {
+          "screenCoverage": "district",
+          "textureResolution": "2k",
+          "triangleBudget": 9000
+        },
+        "low": {
+          "screenCoverage": "background",
+          "textureResolution": "1k_atlas",
+          "triangleBudget": 900
+        },
+        "medium": {
+          "screenCoverage": "city",
+          "textureResolution": "2k_atlas",
+          "triangleBudget": 3500
+        }
+      },
+      "policy": "preserve_silhouette_and_signage_first",
+      "role": "creative",
+      "sourceCollection": "Hero Asset - arts-studio"
+    },
+    {
+      "id": "council-hall",
+      "kind": "building",
+      "levels": {
+        "hero": {
+          "screenCoverage": "close",
+          "textureResolution": "4k",
+          "triangleBudget": 18000
+        },
+        "high": {
+          "screenCoverage": "district",
+          "textureResolution": "2k",
+          "triangleBudget": 9000
+        },
+        "low": {
+          "screenCoverage": "background",
+          "textureResolution": "1k_atlas",
+          "triangleBudget": 900
+        },
+        "medium": {
+          "screenCoverage": "city",
+          "textureResolution": "2k_atlas",
+          "triangleBudget": 3500
+        }
+      },
+      "policy": "preserve_silhouette_and_signage_first",
+      "role": "governance",
+      "sourceCollection": "Hero Asset - council-hall"
+    },
+    {
+      "id": "engineering-workshop",
+      "kind": "building",
+      "levels": {
+        "hero": {
+          "screenCoverage": "close",
+          "textureResolution": "4k",
+          "triangleBudget": 18000
+        },
+        "high": {
+          "screenCoverage": "district",
+          "textureResolution": "2k",
+          "triangleBudget": 9000
+        },
+        "low": {
+          "screenCoverage": "background",
+          "textureResolution": "1k_atlas",
+          "triangleBudget": 900
+        },
+        "medium": {
+          "screenCoverage": "city",
+          "textureResolution": "2k_atlas",
+          "triangleBudget": 3500
+        }
+      },
+      "policy": "preserve_silhouette_and_signage_first",
+      "role": "engineering",
+      "sourceCollection": "Hero Asset - engineering-workshop"
+    },
+    {
+      "id": "triage-clinic",
+      "kind": "building",
+      "levels": {
+        "hero": {
+          "screenCoverage": "close",
+          "textureResolution": "4k",
+          "triangleBudget": 18000
+        },
+        "high": {
+          "screenCoverage": "district",
+          "textureResolution": "2k",
+          "triangleBudget": 9000
+        },
+        "low": {
+          "screenCoverage": "background",
+          "textureResolution": "1k_atlas",
+          "triangleBudget": 900
+        },
+        "medium": {
+          "screenCoverage": "city",
+          "textureResolution": "2k_atlas",
+          "triangleBudget": 3500
+        }
+      },
+      "policy": "preserve_silhouette_and_signage_first",
+      "role": "medical",
+      "sourceCollection": "Hero Asset - triage-clinic"
+    },
+    {
+      "id": "review-office",
+      "kind": "building",
+      "levels": {
+        "hero": {
+          "screenCoverage": "close",
+          "textureResolution": "4k",
+          "triangleBudget": 18000
+        },
+        "high": {
+          "screenCoverage": "district",
+          "textureResolution": "2k",
+          "triangleBudget": 9000
+        },
+        "low": {
+          "screenCoverage": "background",
+          "textureResolution": "1k_atlas",
+          "triangleBudget": 900
+        },
+        "medium": {
+          "screenCoverage": "city",
+          "textureResolution": "2k_atlas",
+          "triangleBudget": 3500
+        }
+      },
+      "policy": "preserve_silhouette_and_signage_first",
+      "role": "review",
+      "sourceCollection": "Hero Asset - review-office"
+    },
+    {
+      "id": "archive",
+      "kind": "building",
+      "levels": {
+        "hero": {
+          "screenCoverage": "close",
+          "textureResolution": "4k",
+          "triangleBudget": 18000
+        },
+        "high": {
+          "screenCoverage": "district",
+          "textureResolution": "2k",
+          "triangleBudget": 9000
+        },
+        "low": {
+          "screenCoverage": "background",
+          "textureResolution": "1k_atlas",
+          "triangleBudget": 900
+        },
+        "medium": {
+          "screenCoverage": "city",
+          "textureResolution": "2k_atlas",
+          "triangleBudget": 3500
+        }
+      },
+      "policy": "preserve_silhouette_and_signage_first",
+      "role": "archive",
+      "sourceCollection": "Hero Asset - archive"
+    },
+    {
+      "id": "leader-knowledge",
+      "kind": "leader",
+      "levels": {
+        "hero": {
+          "screenCoverage": "dialogue",
+          "textureResolution": "4k",
+          "triangleBudget": 14000
+        },
+        "high": {
+          "screenCoverage": "room",
+          "textureResolution": "2k",
+          "triangleBudget": 7000
+        },
+        "low": {
+          "screenCoverage": "background",
+          "textureResolution": "1k_atlas",
+          "triangleBudget": 650
+        },
+        "medium": {
+          "screenCoverage": "street",
+          "textureResolution": "2k_atlas",
+          "triangleBudget": 2400
+        }
+      },
+      "policy": "preserve_face_props_and_body_language_first",
+      "role": "knowledge",
+      "sourceCollection": "Hero Asset - leader-knowledge"
+    },
+    {
+      "id": "leader-research",
+      "kind": "leader",
+      "levels": {
+        "hero": {
+          "screenCoverage": "dialogue",
+          "textureResolution": "4k",
+          "triangleBudget": 14000
+        },
+        "high": {
+          "screenCoverage": "room",
+          "textureResolution": "2k",
+          "triangleBudget": 7000
+        },
+        "low": {
+          "screenCoverage": "background",
+          "textureResolution": "1k_atlas",
+          "triangleBudget": 650
+        },
+        "medium": {
+          "screenCoverage": "street",
+          "textureResolution": "2k_atlas",
+          "triangleBudget": 2400
+        }
+      },
+      "policy": "preserve_face_props_and_body_language_first",
+      "role": "research",
+      "sourceCollection": "Hero Asset - leader-research"
+    },
+    {
+      "id": "leader-creative",
+      "kind": "leader",
+      "levels": {
+        "hero": {
+          "screenCoverage": "dialogue",
+          "textureResolution": "4k",
+          "triangleBudget": 14000
+        },
+        "high": {
+          "screenCoverage": "room",
+          "textureResolution": "2k",
+          "triangleBudget": 7000
+        },
+        "low": {
+          "screenCoverage": "background",
+          "textureResolution": "1k_atlas",
+          "triangleBudget": 650
+        },
+        "medium": {
+          "screenCoverage": "street",
+          "textureResolution": "2k_atlas",
+          "triangleBudget": 2400
+        }
+      },
+      "policy": "preserve_face_props_and_body_language_first",
+      "role": "creative",
+      "sourceCollection": "Hero Asset - leader-creative"
+    },
+    {
+      "id": "leader-governance",
+      "kind": "leader",
+      "levels": {
+        "hero": {
+          "screenCoverage": "dialogue",
+          "textureResolution": "4k",
+          "triangleBudget": 14000
+        },
+        "high": {
+          "screenCoverage": "room",
+          "textureResolution": "2k",
+          "triangleBudget": 7000
+        },
+        "low": {
+          "screenCoverage": "background",
+          "textureResolution": "1k_atlas",
+          "triangleBudget": 650
+        },
+        "medium": {
+          "screenCoverage": "street",
+          "textureResolution": "2k_atlas",
+          "triangleBudget": 2400
+        }
+      },
+      "policy": "preserve_face_props_and_body_language_first",
+      "role": "governance",
+      "sourceCollection": "Hero Asset - leader-governance"
+    },
+    {
+      "id": "leader-engineering",
+      "kind": "leader",
+      "levels": {
+        "hero": {
+          "screenCoverage": "dialogue",
+          "textureResolution": "4k",
+          "triangleBudget": 14000
+        },
+        "high": {
+          "screenCoverage": "room",
+          "textureResolution": "2k",
+          "triangleBudget": 7000
+        },
+        "low": {
+          "screenCoverage": "background",
+          "textureResolution": "1k_atlas",
+          "triangleBudget": 650
+        },
+        "medium": {
+          "screenCoverage": "street",
+          "textureResolution": "2k_atlas",
+          "triangleBudget": 2400
+        }
+      },
+      "policy": "preserve_face_props_and_body_language_first",
+      "role": "engineering",
+      "sourceCollection": "Hero Asset - leader-engineering"
+    },
+    {
+      "id": "leader-medical",
+      "kind": "leader",
+      "levels": {
+        "hero": {
+          "screenCoverage": "dialogue",
+          "textureResolution": "4k",
+          "triangleBudget": 14000
+        },
+        "high": {
+          "screenCoverage": "room",
+          "textureResolution": "2k",
+          "triangleBudget": 7000
+        },
+        "low": {
+          "screenCoverage": "background",
+          "textureResolution": "1k_atlas",
+          "triangleBudget": 650
+        },
+        "medium": {
+          "screenCoverage": "street",
+          "textureResolution": "2k_atlas",
+          "triangleBudget": 2400
+        }
+      },
+      "policy": "preserve_face_props_and_body_language_first",
+      "role": "medical",
+      "sourceCollection": "Hero Asset - leader-medical"
+    },
+    {
+      "id": "leader-review",
+      "kind": "leader",
+      "levels": {
+        "hero": {
+          "screenCoverage": "dialogue",
+          "textureResolution": "4k",
+          "triangleBudget": 14000
+        },
+        "high": {
+          "screenCoverage": "room",
+          "textureResolution": "2k",
+          "triangleBudget": 7000
+        },
+        "low": {
+          "screenCoverage": "background",
+          "textureResolution": "1k_atlas",
+          "triangleBudget": 650
+        },
+        "medium": {
+          "screenCoverage": "street",
+          "textureResolution": "2k_atlas",
+          "triangleBudget": 2400
+        }
+      },
+      "policy": "preserve_face_props_and_body_language_first",
+      "role": "review",
+      "sourceCollection": "Hero Asset - leader-review"
+    },
+    {
+      "id": "leader-archive",
+      "kind": "leader",
+      "levels": {
+        "hero": {
+          "screenCoverage": "dialogue",
+          "textureResolution": "4k",
+          "triangleBudget": 14000
+        },
+        "high": {
+          "screenCoverage": "room",
+          "textureResolution": "2k",
+          "triangleBudget": 7000
+        },
+        "low": {
+          "screenCoverage": "background",
+          "textureResolution": "1k_atlas",
+          "triangleBudget": 650
+        },
+        "medium": {
+          "screenCoverage": "street",
+          "textureResolution": "2k_atlas",
+          "triangleBudget": 2400
+        }
+      },
+      "policy": "preserve_face_props_and_body_language_first",
+      "role": "archive",
+      "sourceCollection": "Hero Asset - leader-archive"
+    },
+    {
+      "id": "worker-audit",
+      "kind": "worker",
+      "levels": {
+        "hero": {
+          "screenCoverage": "selected",
+          "textureResolution": "2k",
+          "triangleBudget": 8000
+        },
+        "high": {
+          "screenCoverage": "room",
+          "textureResolution": "2k",
+          "triangleBudget": 4200
+        },
+        "low": {
+          "screenCoverage": "crowd",
+          "textureResolution": "512_atlas",
+          "triangleBudget": 420
+        },
+        "medium": {
+          "screenCoverage": "street",
+          "textureResolution": "1k_atlas",
+          "triangleBudget": 1600
+        }
+      },
+      "policy": "preserve_visor_accent_and_animation_silhouette_first",
+      "role": "audit",
+      "sourceCollection": "Hero Asset - worker-audit"
+    },
+    {
+      "id": "worker-operations",
+      "kind": "worker",
+      "levels": {
+        "hero": {
+          "screenCoverage": "selected",
+          "textureResolution": "2k",
+          "triangleBudget": 8000
+        },
+        "high": {
+          "screenCoverage": "room",
+          "textureResolution": "2k",
+          "triangleBudget": 4200
+        },
+        "low": {
+          "screenCoverage": "crowd",
+          "textureResolution": "512_atlas",
+          "triangleBudget": 420
+        },
+        "medium": {
+          "screenCoverage": "street",
+          "textureResolution": "1k_atlas",
+          "triangleBudget": 1600
+        }
+      },
+      "policy": "preserve_visor_accent_and_animation_silhouette_first",
+      "role": "operations",
+      "sourceCollection": "Hero Asset - worker-operations"
+    },
+    {
+      "id": "worker-release",
+      "kind": "worker",
+      "levels": {
+        "hero": {
+          "screenCoverage": "selected",
+          "textureResolution": "2k",
+          "triangleBudget": 8000
+        },
+        "high": {
+          "screenCoverage": "room",
+          "textureResolution": "2k",
+          "triangleBudget": 4200
+        },
+        "low": {
+          "screenCoverage": "crowd",
+          "textureResolution": "512_atlas",
+          "triangleBudget": 420
+        },
+        "medium": {
+          "screenCoverage": "street",
+          "textureResolution": "1k_atlas",
+          "triangleBudget": 1600
+        }
+      },
+      "policy": "preserve_visor_accent_and_animation_silhouette_first",
+      "role": "release",
+      "sourceCollection": "Hero Asset - worker-release"
+    },
+    {
+      "id": "worker-research",
+      "kind": "worker",
+      "levels": {
+        "hero": {
+          "screenCoverage": "selected",
+          "textureResolution": "2k",
+          "triangleBudget": 8000
+        },
+        "high": {
+          "screenCoverage": "room",
+          "textureResolution": "2k",
+          "triangleBudget": 4200
+        },
+        "low": {
+          "screenCoverage": "crowd",
+          "textureResolution": "512_atlas",
+          "triangleBudget": 420
+        },
+        "medium": {
+          "screenCoverage": "street",
+          "textureResolution": "1k_atlas",
+          "triangleBudget": 1600
+        }
+      },
+      "policy": "preserve_visor_accent_and_animation_silhouette_first",
+      "role": "research",
+      "sourceCollection": "Hero Asset - worker-research"
+    },
+    {
+      "id": "worker-review",
+      "kind": "worker",
+      "levels": {
+        "hero": {
+          "screenCoverage": "selected",
+          "textureResolution": "2k",
+          "triangleBudget": 8000
+        },
+        "high": {
+          "screenCoverage": "room",
+          "textureResolution": "2k",
+          "triangleBudget": 4200
+        },
+        "low": {
+          "screenCoverage": "crowd",
+          "textureResolution": "512_atlas",
+          "triangleBudget": 420
+        },
+        "medium": {
+          "screenCoverage": "street",
+          "textureResolution": "1k_atlas",
+          "triangleBudget": 1600
+        }
+      },
+      "policy": "preserve_visor_accent_and_animation_silhouette_first",
+      "role": "review",
+      "sourceCollection": "Hero Asset - worker-review"
+    },
+    {
+      "id": "worker-support",
+      "kind": "worker",
+      "levels": {
+        "hero": {
+          "screenCoverage": "selected",
+          "textureResolution": "2k",
+          "triangleBudget": 8000
+        },
+        "high": {
+          "screenCoverage": "room",
+          "textureResolution": "2k",
+          "triangleBudget": 4200
+        },
+        "low": {
+          "screenCoverage": "crowd",
+          "textureResolution": "512_atlas",
+          "triangleBudget": 420
+        },
+        "medium": {
+          "screenCoverage": "street",
+          "textureResolution": "1k_atlas",
+          "triangleBudget": 1600
+        }
+      },
+      "policy": "preserve_visor_accent_and_animation_silhouette_first",
+      "role": "support",
+      "sourceCollection": "Hero Asset - worker-support"
+    },
+    {
+      "id": "child-curious",
+      "kind": "child",
+      "levels": {
+        "hero": {
+          "screenCoverage": "selected",
+          "textureResolution": "2k",
+          "triangleBudget": 8000
+        },
+        "high": {
+          "screenCoverage": "room",
+          "textureResolution": "2k",
+          "triangleBudget": 4200
+        },
+        "low": {
+          "screenCoverage": "crowd",
+          "textureResolution": "512_atlas",
+          "triangleBudget": 420
+        },
+        "medium": {
+          "screenCoverage": "street",
+          "textureResolution": "1k_atlas",
+          "triangleBudget": 1600
+        }
+      },
+      "policy": "preserve_visor_accent_and_animation_silhouette_first",
+      "role": "child",
+      "sourceCollection": "Hero Asset - child-curious"
+    },
+    {
+      "id": "child-social",
+      "kind": "child",
+      "levels": {
+        "hero": {
+          "screenCoverage": "selected",
+          "textureResolution": "2k",
+          "triangleBudget": 8000
+        },
+        "high": {
+          "screenCoverage": "room",
+          "textureResolution": "2k",
+          "triangleBudget": 4200
+        },
+        "low": {
+          "screenCoverage": "crowd",
+          "textureResolution": "512_atlas",
+          "triangleBudget": 420
+        },
+        "medium": {
+          "screenCoverage": "street",
+          "textureResolution": "1k_atlas",
+          "triangleBudget": 1600
+        }
+      },
+      "policy": "preserve_visor_accent_and_animation_silhouette_first",
+      "role": "child",
+      "sourceCollection": "Hero Asset - child-social"
+    },
+    {
+      "id": "child-bold",
+      "kind": "child",
+      "levels": {
+        "hero": {
+          "screenCoverage": "selected",
+          "textureResolution": "2k",
+          "triangleBudget": 8000
+        },
+        "high": {
+          "screenCoverage": "room",
+          "textureResolution": "2k",
+          "triangleBudget": 4200
+        },
+        "low": {
+          "screenCoverage": "crowd",
+          "textureResolution": "512_atlas",
+          "triangleBudget": 420
+        },
+        "medium": {
+          "screenCoverage": "street",
+          "textureResolution": "1k_atlas",
+          "triangleBudget": 1600
+        }
+      },
+      "policy": "preserve_visor_accent_and_animation_silhouette_first",
+      "role": "child",
+      "sourceCollection": "Hero Asset - child-bold"
+    },
+    {
+      "id": "child-cautious",
+      "kind": "child",
+      "levels": {
+        "hero": {
+          "screenCoverage": "selected",
+          "textureResolution": "2k",
+          "triangleBudget": 8000
+        },
+        "high": {
+          "screenCoverage": "room",
+          "textureResolution": "2k",
+          "triangleBudget": 4200
+        },
+        "low": {
+          "screenCoverage": "crowd",
+          "textureResolution": "512_atlas",
+          "triangleBudget": 420
+        },
+        "medium": {
+          "screenCoverage": "street",
+          "textureResolution": "1k_atlas",
+          "triangleBudget": 1600
+        }
+      },
+      "policy": "preserve_visor_accent_and_animation_silhouette_first",
+      "role": "child",
+      "sourceCollection": "Hero Asset - child-cautious"
+    }
+  ],
   "preview": "lunar-city/hero-assets/lunar-city-hero-assets.png",
   "proceduralPbrMaterialCount": 21,
   "proceduralPbrMaterials": [
@@ -702,6 +1458,7 @@
     "allAssetsVisibleInReviewScene": true,
     "freeLocalGenerationOnly": true,
     "noRawSoulContent": true,
+    "tracksLodBudgets": true,
     "tracksPerAssetQuality": true,
     "usesContinuousCharacterCoreMeshes": true,
     "usesContinuousCharacterLimbMeshes": true,

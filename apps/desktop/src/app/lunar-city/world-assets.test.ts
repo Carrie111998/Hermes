@@ -82,6 +82,7 @@ describe('Lunar City asset manifest', () => {
       children: Array<{ collection: string; id: string }>
       heroMeshComponentCount: number
       leaders: Array<{ collection: string; id: string }>
+      lods: Array<{ id: string; levels: Record<string, unknown>; sourceCollection: string }>
       proceduralPbrMaterialCount: number
       proceduralPbrMaterials: string[]
       sculptedCharacterCoreComponentCount: number
@@ -112,16 +113,22 @@ describe('Lunar City asset manifest', () => {
     expect(manifest.validation.freeLocalGenerationOnly).toBe(true)
     expect(manifest.validation.noRawSoulContent).toBe(true)
     expect(manifest.validation.tracksPerAssetQuality).toBe(true)
+    expect(manifest.validation.tracksLodBudgets).toBe(true)
     expect(manifest.assetQuality).toHaveLength(26)
+    expect(manifest.lods).toHaveLength(26)
     for (const asset of [...manifest.buildings, ...manifest.leaders, ...manifest.workers, ...manifest.children]) {
       expect(asset.collection).toBe(`Hero Asset - ${asset.id}`)
       const quality = manifest.assetQuality.find(entry => entry.id === asset.id)
+      const lod = manifest.lods.find(entry => entry.id === asset.id)
       expect(quality).toBeTruthy()
+      expect(lod).toBeTruthy()
       expect(quality?.collection).toBe(asset.collection)
+      expect(lod?.sourceCollection).toBe(asset.collection)
       expect(quality?.heroComponentCount).toBeGreaterThan(0)
       expect(quality?.proceduralPbrMaterialCount).toBeGreaterThan(0)
       expect(quality?.lodPolicy).toEqual(['hero', 'high', 'medium', 'low'])
       expect(quality?.retopologyTarget).toBe('quad_dominant_smart_low_poly')
+      expect(Object.keys(lod?.levels ?? {}).sort()).toEqual(['hero', 'high', 'low', 'medium'])
     }
   })
 })
