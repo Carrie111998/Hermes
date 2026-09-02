@@ -2876,6 +2876,25 @@ def _invalidate_pending_stt_cache(event: MessageEvent) -> None:
             delattr(event, attr)
 
 
+def _advance_merged_reply_anchor(existing: MessageEvent, event: MessageEvent) -> None:
+    """Point a merged pending event at the newest message in the burst.
+
+    ``merge_pending_message_event`` folds the incoming event's text/media into
+    the queued one, but the queued event keeps the *first* message's
+    ``message_id``.  That id is what ``_reply_anchor_for_event`` hands to the
+    adapters as ``reply_to``, so a three-message burst produced a reply quoting
+    message #1 while its content answered message #3 -- the wrong-quote symptom
+    in WhatsApp/Telegram group chats.
+
+    The newest message is the right anchor: it is the last thing the user
+    typed, and the merged turn answers all of it.  Events with no id of their
+    own (synthetic/proactive sends) leave the existing anchor alone rather than
+    clearing it, since dropping the anchor loses reply threading outright.
+    """
+    if event.message_id is not None:
+        existing.message_id = event.message_id
+
+
 def merge_pending_message_event(
     pending_messages: Dict[str, MessageEvent],
     session_key: str,
@@ -2918,6 +2937,7 @@ def merge_pending_message_event(
             existing.media_text_inlined.extend(incoming_inline_flags)
             if event.text:
                 existing.text = BasePlatformAdapter._merge_caption(existing.text, event.text)
+            _advance_merged_reply_anchor(existing, event)
             _invalidate_pending_stt_cache(existing)
             return
 
@@ -2938,6 +2958,7 @@ def merge_pending_message_event(
                 and event.message_type != MessageType.TEXT
             ):
                 existing.message_type = event.message_type
+            _advance_merged_reply_anchor(existing, event)
             _invalidate_pending_stt_cache(existing)
             return
 
@@ -2948,6 +2969,7 @@ def merge_pending_message_event(
         ):
             if event.text:
                 existing.text = f"{existing.text}\n{event.text}" if existing.text else event.text
+            _advance_merged_reply_anchor(existing, event)
             return
 
     pending_messages[session_key] = event
