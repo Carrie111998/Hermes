@@ -22,6 +22,7 @@ from hermes_constants import (
 )
 from typing import List, Optional
 
+from agent.runtime_cwd import REMOTE_TERMINAL_BACKENDS as _REMOTE_TERMINAL_BACKENDS
 from agent.runtime_cwd import resolve_agent_cwd
 from agent.skill_utils import (
     EXCLUDED_SKILL_DIRS,
@@ -1071,10 +1072,8 @@ WSL_ENVIRONMENT_HINT = (
 # container / remote host rather than on the machine where Hermes itself
 # runs. For these backends, host info (Windows/Linux/macOS, $HOME, cwd) is
 # misleading — the agent should only see the machine it can actually touch.
-_REMOTE_TERMINAL_BACKENDS = frozenset({
-    "docker", "singularity", "modal", "daytona", "ssh",
-    "vercel_sandbox", "managed_modal",
-})
+# Canonical set lives in agent.runtime_cwd (imported above) so this module
+# and the local-cwd resolvers can't drift apart on which backends count.
 
 
 # Per-backend fallback descriptions — used when the live probe fails.

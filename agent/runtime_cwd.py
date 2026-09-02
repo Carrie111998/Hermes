@@ -29,6 +29,33 @@ _SESSION_CWD: ContextVar = ContextVar("HERMES_SESSION_CWD", default=_UNSET)
 # resolve here.
 _PACKAGE_ROOT = Path(__file__).resolve().parent.parent
 
+# Backends whose `terminal.cwd` names a path inside a *different* filesystem
+# (a container, a sandbox, or — for ssh — a different host entirely). For
+# these, `TERMINAL_CWD` carries no meaning as a local path: it can coincide
+# with a real local directory by accident (e.g. an ssh profile's remote
+# `~/.hermes` scoped small on purpose to keep session-sync fast, which also
+# happens to exist locally as this machine's OWN Hermes root) and silently
+# redirect local-only concerns — context-file discovery, git-workspace
+# snapshots — into the wrong directory (#confused-identity-leak). Kept as the
+# single source of truth here; `agent/prompt_builder.py`'s environment-hints
+# builder imports this instead of keeping its own copy.
+REMOTE_TERMINAL_BACKENDS = frozenset({
+    "docker", "singularity", "modal", "daytona", "ssh",
+    "vercel_sandbox", "managed_modal",
+})
+
+
+def _is_remote_terminal_backend() -> bool:
+    backend = (os.environ.get("TERMINAL_ENV") or "local").strip().lower()
+    if backend in REMOTE_TERMINAL_BACKENDS:
+        return True
+    try:
+        from agent.prompt_builder import _plugin_backend_is_remote
+
+        return _plugin_backend_is_remote(backend)
+    except Exception:
+        return False
+
 
 def _is_install_tree(p: Path) -> bool:
     # True only when p IS the package root or sits inside it. Ancestors of the
@@ -64,12 +91,13 @@ def resolve_agent_cwd() -> Path:
         if p.is_dir():
             return p
         logger.warning("configured working directory does not exist: %s", override)
-    raw = os.environ.get("TERMINAL_CWD", "").strip()
-    if raw:
-        p = Path(raw).expanduser()
-        if p.is_dir():
-            return p
-        logger.warning("TERMINAL_CWD does not exist: %s", raw)
+    if not _is_remote_terminal_backend():
+        raw = os.environ.get("TERMINAL_CWD", "").strip()
+        if raw:
+            p = Path(raw).expanduser()
+            if p.is_dir():
+                return p
+            logger.warning("TERMINAL_CWD does not exist: %s", raw)
     return Path(os.getcwd())
 
 
@@ -89,6 +117,8 @@ def resolve_context_cwd() -> Path | None:
             logger.warning("configured working directory does not exist: %s", override)
         else:
             return p
+        return None
+    if _is_remote_terminal_backend():
         return None
     raw = os.environ.get("TERMINAL_CWD", "").strip()
     if raw:
