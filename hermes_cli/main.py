@@ -11419,6 +11419,11 @@ def cmd_profile(args):
                         "No bundled skills seeded (--no-skills). "
                         "Delete .no-bundled-skills in the profile to opt back in."
                     )
+                elif result and result.get("error"):
+                    print(
+                        "⚠ Skills could not be seeded ({}). "
+                        "Run `{} update` to retry.".format(result["error"], name)
+                    )
                 elif result:
                     copied = len(result.get("copied", []))
                     print(f"{copied} bundled skills synced.")

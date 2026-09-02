@@ -786,6 +786,43 @@ class TestCmdUpdateProfileSkillSync:
 
         assert default_p.path in synced_paths
 
+    @patch("shutil.which", return_value=None)
+    @patch("subprocess.run")
+    def test_failed_profile_sync_prints_reason(
+        self, mock_run, _mock_which, mock_args, capsys
+    ):
+        """#97792: a failed per-profile sync prints *why*, not a bare "sync failed".
+
+        seed_profile_skills() returns an {"error": ...} dict on failure; the
+        update loop must surface that reason instead of masking it.
+        """
+        from pathlib import Path
+
+        mock_run.side_effect = _make_run_side_effect(
+            branch="main", verify_ok=True, commit_count="1"
+        )
+
+        default_p = SimpleNamespace(name="default", path=Path("/fake/.hermes"))
+        failing_p = SimpleNamespace(name="design", path=Path("/fake/.hermes/profiles/design"))
+
+        def fake_seed(path, quiet=False):
+            if path == failing_p.path:
+                return {"error": "rc=1: ValueError: bad manifest"}
+            return {"copied": [], "updated": [], "user_modified": []}
+
+        empty_sync = {"copied": [], "updated": [], "user_modified": [], "cleaned": []}
+
+        with (
+            patch("hermes_cli.profiles.list_profiles", return_value=[default_p, failing_p]),
+            patch("hermes_cli.profiles.seed_profile_skills", side_effect=fake_seed),
+            patch("tools.skills_sync.sync_skills", return_value=empty_sync),
+        ):
+            cmd_update(mock_args)
+
+        out = capsys.readouterr().out
+        assert "design: sync failed (rc=1: ValueError: bad manifest)" in out
+        assert "design: up to date" not in out
+
 
 class TestCmdUpdateBranchFlag:
     """``hermes update --branch <name>`` targets the requested branch.

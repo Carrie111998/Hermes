@@ -261,6 +261,85 @@ class TestNoSkillsOptOut:
 
 
 # ===================================================================
+# TestSeedProfileSkillsFailureReason
+# ===================================================================
+
+class TestSeedProfileSkillsFailureReason:
+    """#97792: a failed child sync must return *why*, even under quiet=True.
+
+    Previously every failure path returned a bare None, so `hermes update`
+    printed "sync failed" with no diagnostic anywhere (stderr was captured
+    then dropped, and the reason never reached a log file either).
+    """
+
+    def test_nonzero_exit_returns_reason_with_stderr_tail(self, profile_env, monkeypatch):
+        import subprocess as _sp
+
+        profile_dir = create_profile("orchestrator", no_alias=True)
+        monkeypatch.setattr(
+            "subprocess.run",
+            lambda *a, **kw: _sp.CompletedProcess(
+                args=a, returncode=1,
+                stdout="",
+                stderr="Traceback (most recent call last):\nValueError: bad manifest",
+            ),
+        )
+        r = seed_profile_skills(profile_dir, quiet=True)
+        assert r == {"error": "rc=1: ValueError: bad manifest"}
+
+    def test_stderr_tail_is_sanitized_for_status_lines(self, profile_env, monkeypatch):
+        import subprocess as _sp
+
+        profile_dir = create_profile("orchestrator", no_alias=True)
+        monkeypatch.setattr(
+            "subprocess.run",
+            lambda *a, **kw: _sp.CompletedProcess(
+                args=a, returncode=1,
+                stdout="",
+                stderr="\x1b[31mValueError\x1b[0m: bad manifest\r\x1b[K",
+            ),
+        )
+        r = seed_profile_skills(profile_dir, quiet=True)
+        # The reason reaches user-facing lines without ANSI/control characters.
+        assert r == {"error": "rc=1: ValueError: bad manifest"}
+
+    def test_zero_exit_empty_stdout_returns_reason(self, profile_env, monkeypatch):
+        import subprocess as _sp
+
+        profile_dir = create_profile("orchestrator", no_alias=True)
+        monkeypatch.setattr(
+            "subprocess.run",
+            lambda *a, **kw: _sp.CompletedProcess(args=a, returncode=0, stdout="", stderr=""),
+        )
+        r = seed_profile_skills(profile_dir, quiet=True)
+        assert r == {"error": "rc=0: no stderr"}
+
+    def test_timeout_returns_reason(self, profile_env, monkeypatch):
+        import subprocess as _sp
+
+        profile_dir = create_profile("orchestrator", no_alias=True)
+        monkeypatch.setattr(
+            "subprocess.run",
+            lambda *a, **kw: (_ for _ in ()).throw(_sp.TimeoutExpired(cmd=a, timeout=60)),
+        )
+        r = seed_profile_skills(profile_dir, quiet=True)
+        assert r == {"error": "timed out after 60s"}
+
+    def test_malformed_stdout_returns_exception_reason(self, profile_env, monkeypatch):
+        import subprocess as _sp
+
+        profile_dir = create_profile("orchestrator", no_alias=True)
+        monkeypatch.setattr(
+            "subprocess.run",
+            lambda *a, **kw: _sp.CompletedProcess(
+                args=a, returncode=0, stdout="not json", stderr=""
+            ),
+        )
+        r = seed_profile_skills(profile_dir, quiet=True)
+        assert r.get("error", "").startswith("JSONDecodeError:")
+
+
+# ===================================================================
 # TestBackfillProfileEnvs
 # ===================================================================
 
