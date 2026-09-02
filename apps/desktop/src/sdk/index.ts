@@ -1394,6 +1394,9 @@ export const host = {
 // Every contribution surface, plugin-reachable: register keybinds, palette
 // commands, routes, themes, panes, composer extensions, and bar items with
 // the same area ids + payload types core uses.
+/** Profile-scoped Xvfb/noVNC surface used by Bot Mode's embedded desktop. */
+export { BotDesktopSurface } from '@/app/bot-desktop/bot-desktop-root'
+
 export {
   COMPOSER_AREAS,
   type ComposerAtCompletionItem,

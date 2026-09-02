@@ -3137,6 +3137,26 @@ export interface Translations {
     noClipboardImage: string
     clipboardPasteFailed: string
     dropFiles: string
+    botDesktop: {
+      title: string
+      profile: (profile: string) => string
+      runtime: string
+      wsl: string
+      docker: string
+      openStandalone: string
+      openEmbedded: string
+      start: string
+      starting: string
+      stop: string
+      refresh: string
+      revealWorkspace: string
+      running: string
+      notRunning: string
+      unavailable: string
+      viewerTitle: (profile: string) => string
+      viewerHint: string
+      startFailed: (message: string) => string
+    }
     handoff: {
       pickPlatform: string
       success: (platform: string) => string

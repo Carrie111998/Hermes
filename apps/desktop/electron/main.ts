@@ -81,6 +81,14 @@ import {
 import { decideBootstrapRepair } from './bootstrap-repair-guard'
 import { runBootstrap } from './bootstrap-runner'
 import {
+  type BotDesktopProvider,
+  botDesktopWorkspacePath,
+  buildBotDesktopWindowUrl,
+  createBotDesktopWindowRegistry,
+  normalizeBotDesktopProfile
+} from './bot-desktop-runtime'
+import { createBotDesktopWindowsRuntime } from './bot-desktop-windows-runtime'
+import {
   BROWSER_WINDOW_HEIGHT,
   BROWSER_WINDOW_MIN_HEIGHT,
   BROWSER_WINDOW_MIN_WIDTH,
@@ -799,6 +807,27 @@ function resolveHermesHome() {
 }
 
 const HERMES_HOME = resolveHermesHome()
+
+// Bot Desktop is intentionally a separate runtime from the Hermes backend.
+// On Windows, WSL or Docker owns the Linux display/browser process tree; the
+// Electron renderer only receives a loopback noVNC URL. Two provider instances
+// allow a user to switch providers without sharing a container or display.
+const botDesktopRuntimes: Record<BotDesktopProvider, ReturnType<typeof createBotDesktopWindowsRuntime>> = {
+  docker: createBotDesktopWindowsRuntime({
+    provider: 'docker',
+    workspacePathForProfile: profile => botDesktopWorkspacePath(HERMES_HOME, profile),
+    log: message => rememberLog(message)
+  }),
+  wsl: createBotDesktopWindowsRuntime({
+    provider: 'wsl',
+    workspacePathForProfile: profile => botDesktopWorkspacePath(HERMES_HOME, profile),
+    log: message => rememberLog(message)
+  })
+}
+
+const botDesktopWindows = createBotDesktopWindowRegistry()
+let botDesktopQuitTeardownDone = false
+let botDesktopQuitTeardown: Promise<void> | null = null
 
 function pathWithHermesManagedNode(...entries) {
   const managed = hermesManagedNodePathEntries(HERMES_HOME).filter(directoryExists)
@@ -13210,6 +13239,103 @@ function createBrowserWindow(tabId) {
   return browserWindows.openOrFocus(tabId, () => spawnBrowserWindow(tabId))
 }
 
+function botDesktopRuntime(provider: BotDesktopProvider) {
+  return botDesktopRuntimes[provider]
+}
+
+function botDesktopInfo(profile: string, provider?: BotDesktopProvider) {
+  if (provider) {
+    return botDesktopRuntime(provider).getInfo(profile)
+  }
+
+  const running = (['wsl', 'docker'] as const)
+    .map(candidate => botDesktopRuntime(candidate).getInfo(profile))
+    .find(info => info.running)
+
+  return running || botDesktopRuntime('wsl').getInfo(profile)
+}
+
+async function startBotDesktop(profileInput: unknown, provider: BotDesktopProvider = 'wsl') {
+  const profile = normalizeBotDesktopProfile(profileInput)
+  const workspace = botDesktopWorkspacePath(HERMES_HOME, profile)
+  fs.mkdirSync(workspace, { recursive: true })
+
+  const otherProvider: BotDesktopProvider = provider === 'wsl' ? 'docker' : 'wsl'
+  await botDesktopRuntime(otherProvider).stop(profile)
+
+  return botDesktopRuntime(provider).ensure(profile)
+}
+
+async function stopBotDesktop(profileInput: unknown) {
+  const profile = normalizeBotDesktopProfile(profileInput)
+  await Promise.all((['wsl', 'docker'] as const).map(provider => botDesktopRuntime(provider).stop(profile)))
+
+  return botDesktopInfo(profile)
+}
+
+function spawnBotDesktopWindow(profile: string) {
+  const icon = getAppIconPath()
+
+  const win = new BrowserWindow({
+    width: 1360,
+    height: 900,
+    minWidth: 960,
+    minHeight: 640,
+    title: 'Hermes',
+    titleBarStyle: 'hidden',
+    titleBarOverlay: getTitleBarOverlayOptions(),
+    trafficLightPosition: IS_MAC ? WINDOW_BUTTON_POSITION : undefined,
+    ...chatWindowSurfaceOptions(),
+    icon,
+    show: false,
+    webPreferences: chatWindowWebPreferences(PRELOAD_PATH)
+  })
+
+  translucencyBackedWindows.add(win)
+
+  if (IS_MAC) {
+    win.setWindowButtonPosition?.(WINDOW_BUTTON_POSITION)
+  }
+
+  wireWindowReveal(win)
+  streamThrottle.register(win)
+  wireCommonWindowHandlers(win, zoomWiringForWindowKind('chat'))
+  attachRendererConsoleCapture(win, 'bot-desktop-window', rememberLog)
+  installWindowRendererLifecycle(win, {
+    kind: 'bot-desktop',
+    callbacks: {
+      log: rememberLog,
+      reload: () => {
+        win.webContents.reload()
+      }
+    },
+    reloadWindowMs: RENDERER_RELOAD_WINDOW_MS,
+    reloadMax: RENDERER_RELOAD_MAX,
+    recentReloadTimesRef: rendererReloadTimesRef
+  })
+
+  win.on('closed', () => {
+    void stopBotDesktop(profile).catch(error => {
+      rememberLog(`[bot-desktop] cleanup after window close failed: ${error?.message || error}`)
+    })
+  })
+
+  loadWindowUrl(
+    win,
+    buildBotDesktopWindowUrl(profile, {
+      devServer: DEV_SERVER,
+      rendererIndexPath: DEV_SERVER ? undefined : resolveRendererIndex()
+    }),
+    'Bot Desktop window'
+  )
+
+  return win
+}
+
+function openBotDesktopWindow(profile: string) {
+  return botDesktopWindows.openOrFocus(profile, key => spawnBotDesktopWindow(key))
+}
+
 // Additional full "instance" windows — peers of the primary that render the
 // COMPLETE app (sidebar, routing, its own draft) against the shared backend, so
 // a user can run multiple GUI windows at once (⌘⇧N / the "New Window" palette
@@ -14630,6 +14756,77 @@ ipcMain.handle('hermes:window:openBrowser', async (_event, tabId) => {
   createBrowserWindow(tabId.trim())
 
   return { ok: true }
+})
+ipcMain.handle('hermes:bot-desktop:info', async (_event, payload) => {
+  try {
+    const profile = normalizeBotDesktopProfile(payload?.profile)
+    const provider = payload?.provider === 'docker' || payload?.provider === 'wsl' ? payload.provider : undefined
+
+    return botDesktopInfo(profile, provider)
+  } catch (error) {
+    return {
+      platform: 'unsupported',
+      provider: 'none',
+      supported: false,
+      running: false,
+      display: null,
+      pid: null,
+      resolution: '1280x800x24',
+      error: error instanceof Error ? error.message : String(error),
+      executionBoundary: 'none',
+      nativeBackendInherited: false
+    }
+  }
+})
+ipcMain.handle('hermes:bot-desktop:start', async (_event, payload) => {
+  try {
+    const provider: BotDesktopProvider = payload?.provider === 'docker' ? 'docker' : 'wsl'
+    const info = await startBotDesktop(payload?.profile, provider)
+
+    return { ok: info.running, error: info.error, info }
+  } catch (error) {
+    return { ok: false, error: error instanceof Error ? error.message : String(error) }
+  }
+})
+ipcMain.handle('hermes:bot-desktop:open', async (_event, payload) => {
+  try {
+    const provider: BotDesktopProvider = payload?.provider === 'docker' ? 'docker' : 'wsl'
+    const profile = normalizeBotDesktopProfile(payload?.profile)
+    const info = await startBotDesktop(profile, provider)
+
+    if (!info.running) {
+      return { ok: false, error: info.error || 'Bot Desktop did not become ready.' }
+    }
+
+    openBotDesktopWindow(profile)
+
+    return { ok: true }
+  } catch (error) {
+    return { ok: false, error: error instanceof Error ? error.message : String(error) }
+  }
+})
+ipcMain.handle('hermes:bot-desktop:stop', async (_event, payload) => {
+  try {
+    const profile = normalizeBotDesktopProfile(payload?.profile)
+    botDesktopWindows.close(profile)
+    const info = await stopBotDesktop(profile)
+
+    return { ok: true, info }
+  } catch (error) {
+    return { ok: false, error: error instanceof Error ? error.message : String(error) }
+  }
+})
+ipcMain.handle('hermes:bot-desktop:reveal-workspace', async (_event, payload) => {
+  try {
+    const profile = normalizeBotDesktopProfile(payload?.profile)
+    const workspace = botDesktopWorkspacePath(HERMES_HOME, profile)
+    fs.mkdirSync(workspace, { recursive: true })
+    const error = await shell.openPath(workspace)
+
+    return error ? { ok: false, error } : { ok: true }
+  } catch (error) {
+    return { ok: false, error: error instanceof Error ? error.message : String(error) }
+  }
 })
 
 // Hand a session to the user's OWN terminal emulator, running the TUI against
@@ -17827,6 +18024,28 @@ app.on('before-quit', event => {
         managedUpdateQuitWaitDone = true
         app.quit()
       })
+    }
+
+    return
+  }
+
+  // Bot Desktop owns WSL/Docker process trees outside the Hermes backend. Wait
+  // for both provider runtimes before allowing Electron to exit, otherwise a
+  // browser/Xvfb pair can survive an otherwise clean application shutdown.
+  if (!botDesktopQuitTeardownDone) {
+    event.preventDefault()
+
+    if (!botDesktopQuitTeardown) {
+      botDesktopQuitTeardown = Promise.allSettled([
+        botDesktopWindows.closeAll(),
+        botDesktopRuntimes.wsl.closeAll(),
+        botDesktopRuntimes.docker.closeAll()
+      ])
+        .then(() => undefined)
+        .finally(() => {
+          botDesktopQuitTeardownDone = true
+          app.quit()
+        })
     }
 
     return

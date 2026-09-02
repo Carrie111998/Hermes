@@ -3235,6 +3235,27 @@ export const ja = defineLocale({
     noClipboardImage: 'クリップボードに画像が見つかりません',
     clipboardPasteFailed: 'クリップボードからの貼り付けに失敗しました',
     dropFiles: 'ファイルをドロップ',
+    botDesktop: {
+      title: 'Bot Desktop',
+      profile: profile => `プロファイル: ${profile}`,
+      runtime: 'ランタイム',
+      wsl: 'WSL + Xvfb',
+      docker: 'Docker + Xvfb',
+      openStandalone: 'Desktopを別ウィンドウで開く',
+      openEmbedded: 'Hermesのワークスペースに埋め込む',
+      start: 'Desktopを起動',
+      starting: 'Desktopを起動中…',
+      stop: 'Desktopを停止',
+      refresh: '状態を更新',
+      revealWorkspace: 'ワークスペースを開く',
+      running: '実行中',
+      notRunning: '停止中',
+      unavailable: '利用できません',
+      viewerTitle: profile => `${profile} のBot Desktop`,
+      viewerHint:
+        'BotごとにXディスプレイ、ブラウザデータ、ワークスペースを分離します。OSプロセス境界であり、VMではありません。',
+      startFailed: message => `Bot Desktopを起動できませんでした: ${message}`
+    },
     handoff: {
       pickPlatform: '送信先を選択',
       success: platform => `${platform} に引き継ぎました。いつでもここで再開できます。`,

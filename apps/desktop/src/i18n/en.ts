@@ -3636,6 +3636,27 @@ export const en: Translations = {
     noClipboardImage: 'No image found in clipboard',
     clipboardPasteFailed: 'Clipboard paste failed',
     dropFiles: 'Drop files',
+    botDesktop: {
+      title: 'Bot Desktop',
+      profile: profile => `Profile: ${profile}`,
+      runtime: 'Runtime',
+      wsl: 'WSL + Xvfb',
+      docker: 'Docker + Xvfb',
+      openStandalone: 'Open standalone desktop',
+      openEmbedded: 'Open in Hermes workspace',
+      start: 'Start desktop',
+      starting: 'Starting desktop…',
+      stop: 'Stop desktop',
+      refresh: 'Refresh status',
+      revealWorkspace: 'Reveal workspace',
+      running: 'Running',
+      notRunning: 'Not running',
+      unavailable: 'Unavailable',
+      viewerTitle: profile => `${profile} Bot Desktop`,
+      viewerHint:
+        'Each Bot has its own X display, browser data, and workspace. This is an OS-process boundary, not a VM.',
+      startFailed: message => `Could not start Bot Desktop: ${message}`
+    },
     handoff: {
       pickPlatform: 'Choose a destination',
       success: platform => `Handed off to ${platform}. Resume here anytime.`,

@@ -34,6 +34,13 @@ contextBridge.exposeInMainWorld('hermesDesktop', {
   openSessionInTerminal: (sessionId, opts) => ipcRenderer.invoke('hermes:window:openInTerminal', sessionId, opts),
   openWindow: () => ipcRenderer.invoke('hermes:window:openInstance'),
   openBrowserWindow: tabId => ipcRenderer.invoke('hermes:window:openBrowser', tabId),
+  botDesktop: {
+    start: (profile, provider) => ipcRenderer.invoke('hermes:bot-desktop:start', { profile, provider }),
+    info: (profile, provider) => ipcRenderer.invoke('hermes:bot-desktop:info', { profile, provider }),
+    stop: profile => ipcRenderer.invoke('hermes:bot-desktop:stop', { profile }),
+    open: (profile, provider) => ipcRenderer.invoke('hermes:bot-desktop:open', { profile, provider }),
+    revealWorkspace: profile => ipcRenderer.invoke('hermes:bot-desktop:reveal-workspace', { profile })
+  },
   onBrowserPopoutClosed: callback => {
     const listener = (_event, tabId) => callback(tabId)
     ipcRenderer.on('hermes:browser-popout:closed', listener)

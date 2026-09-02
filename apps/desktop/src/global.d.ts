@@ -68,6 +68,16 @@ declare global {
       // `onBrowserPopoutClosed` so the caller can dock the tab again.
       openBrowserWindow: (tabId: string) => Promise<{ ok: boolean; error?: string }>
       onBrowserPopoutClosed: (callback: (tabId: string) => void) => () => void
+      botDesktop: {
+        start: (
+          profile: string,
+          provider?: 'docker' | 'wsl'
+        ) => Promise<{ ok: boolean; error?: string; info?: DesktopBotDesktopInfo }>
+        info: (profile: string, provider?: 'docker' | 'wsl') => Promise<DesktopBotDesktopInfo>
+        stop: (profile: string) => Promise<{ ok: boolean; error?: string; info?: DesktopBotDesktopInfo }>
+        open: (profile: string, provider?: 'docker' | 'wsl') => Promise<{ ok: boolean; error?: string }>
+        revealWorkspace: (profile: string) => Promise<{ ok: boolean; error?: string }>
+      }
       // Claim a one-shot cross-window ambient cue (turn-end sound / spoken
       // reply). Resolves true for the first window to claim a key, false for
       // peers — so N open windows don't all fire the same cue.
@@ -538,6 +548,25 @@ declare global {
       onOpenFindBarRequested: (callback: () => void) => () => void
     }
   }
+}
+
+export interface DesktopBotDesktopInfo {
+  platform: 'windows' | 'unsupported'
+  provider: 'docker' | 'wsl' | 'none'
+  supported: boolean
+  running: boolean
+  display: string | null
+  pid: number | null
+  resolution: string
+  error?: string
+  distro?: string
+  image?: string
+  containerName?: string
+  viewerUrl?: string
+  viewerPort?: number
+  vncPort?: number
+  executionBoundary: 'docker' | 'wsl' | 'none'
+  nativeBackendInherited: false
 }
 
 export interface DesktopMarketplaceSearchItem {

@@ -121,6 +121,44 @@ probe, hardening, and platform policies live in focused modules beside it. The
 renderer is under `src/`, with shared atoms in `src/store` and transport/native
 adapters in `src/lib`.
 
+### Bot Desktop (Windows)
+
+Bot Mode can open a profile-scoped Linux desktop from a Bot row's context menu.
+The Desktop keeps one viewer/runtime per profile and separates:
+
+- the X display number and VNC/noVNC ports;
+- the browser data directory under that profile's `desktop-workspace`;
+- the embedded workspace pane or standalone Electron window.
+
+On Windows the runtime boundary is either WSL2 or Docker Desktop. The Linux
+side starts Xvfb, Openbox, a Chromium-compatible browser, x11vnc, and noVNC;
+Hermes embeds the loopback viewer in its normal workspace. The default action
+uses WSL. Docker is available from the runtime selector and is useful when the
+desktop dependencies should live in an image:
+
+```powershell
+docker build -f docker/bot-desktop-xvfb.Dockerfile -t hermes-bot-desktop-xvfb:local apps/desktop
+```
+
+For WSL, install the same Linux packages in the selected distribution:
+
+```bash
+sudo apt-get update
+sudo apt-get install -y chromium curl openbox python3 websockify x11-utils x11vnc xterm xvfb
+```
+
+The boundary is intentionally described precisely: this is an isolated
+OS-process/display/browser/workspace runtime, not a VM or Windows Sandbox. The
+native Windows Hermes backend does not inherit the Linux `DISPLAY`; future
+computer-use wiring must explicitly attach a Bot's tool process to its runtime.
+The bounded smoke check exercises two distinct displays and cleanup:
+
+```powershell
+cd apps/desktop
+npm run smoke:bot-desktop-xvfb -- --provider=wsl
+npm run smoke:bot-desktop-xvfb -- --provider=docker
+```
+
 Before changing the app, read:
 
 - [`AGENTS.md`](./AGENTS.md): architecture, state ownership, resolver/fallback,
