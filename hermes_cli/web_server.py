@@ -222,13 +222,30 @@ def _process_start_marker(pid: int) -> str:
     raise OSError(f"ps could not inspect PID {pid}: {result.stderr.strip()}")
 
 
+def _normalize_parent_start_marker(marker: str) -> str:
+    """Collapse ps(1) column padding so Node trim and Python strip compare equal."""
+    prefix, separator, value = marker.partition(":")
+    if not separator:
+        return marker
+    return f"{prefix}:{' '.join(value.split())}"
+
+
 def _valid_parent_start_marker(marker: str) -> bool:
     prefix, separator, value = marker.partition(":")
     if not separator or not value or value != value.strip():
         return False
     if prefix in ("linux", "win", "winms"):
         return value.isdigit()
-    return prefix == "ps"
+    if prefix != "ps":
+        return False
+    # macOS/BSD ``ps -o lstart=`` looks like ``Sat Aug 29 15:04:31 2026``.
+    # A truncated token (``ps:Sat``) is what you get if the marker is split on
+    # spaces in the environment; treating that as a real identity makes a live
+    # Desktop look dead and the backend exits 0 right after HERMES_BACKEND_READY.
+    tokens = value.split()
+    has_year = any(token.isdigit() and len(token) == 4 for token in tokens)
+    has_time = any(":" in token for token in tokens)
+    return len(tokens) >= 4 and has_year and has_time
 
 
 def _parent_start_markers_match(actual: str, expected: str) -> bool:
@@ -240,6 +257,8 @@ def _parent_start_markers_match(actual: str, expected: str) -> bool:
     exact FILETIME and normalizes it only when the expected marker is ``winms``.
     """
     if actual == expected:
+        return True
+    if _normalize_parent_start_marker(actual) == _normalize_parent_start_marker(expected):
         return True
     if not actual.startswith("win:") or not expected.startswith("winms:"):
         return False
@@ -19539,8 +19558,8 @@ def _start_parent_death_watchdog() -> None:
     tracking.
     """
     raw_pid = os.environ.get("HERMES_PARENT_PID")
-    start_marker = os.environ.get("HERMES_PARENT_START_MARKER")
-    nonce = os.environ.get("HERMES_PARENT_NONCE")
+    start_marker = os.environ.get("HERMES_PARENT_START_MARKER") or None
+    nonce = os.environ.get("HERMES_PARENT_NONCE") or None
 
     try:
         desktop_pid = int(raw_pid or "")
@@ -19568,6 +19587,14 @@ def _start_parent_death_watchdog() -> None:
     def _loop() -> None:
         while not _is_serve_orphaned(desktop_pid, start_marker):
             time.sleep(poll)
+        try:
+            print(
+                "parent-death watchdog: owner is gone; exiting 0 "
+                f"(pid={desktop_pid} marker={start_marker!r})",
+                flush=True,
+            )
+        except Exception:
+            pass
         os._exit(0)
 
     threading.Thread(target=_loop, daemon=True, name="serve-parent-watchdog").start()
