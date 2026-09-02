@@ -124,7 +124,7 @@
     {
       "animationRigWireCount": 3,
       "collection": "Hero Asset - leader-archive",
-      "heroComponentCount": 37,
+      "heroComponentCount": 50,
       "id": "leader-archive",
       "lodPolicy": [
         "hero",
@@ -132,14 +132,14 @@
         "medium",
         "low"
       ],
-      "proceduralPbrMaterialCount": 37,
+      "proceduralPbrMaterialCount": 50,
       "retopologyTarget": "quad_dominant_smart_low_poly",
       "sculptedSurfaceCount": 7
     },
     {
       "animationRigWireCount": 3,
       "collection": "Hero Asset - leader-creative",
-      "heroComponentCount": 29,
+      "heroComponentCount": 34,
       "id": "leader-creative",
       "lodPolicy": [
         "hero",
@@ -147,14 +147,14 @@
         "medium",
         "low"
       ],
-      "proceduralPbrMaterialCount": 29,
+      "proceduralPbrMaterialCount": 34,
       "retopologyTarget": "quad_dominant_smart_low_poly",
       "sculptedSurfaceCount": 7
     },
     {
       "animationRigWireCount": 3,
       "collection": "Hero Asset - leader-engineering",
-      "heroComponentCount": 29,
+      "heroComponentCount": 34,
       "id": "leader-engineering",
       "lodPolicy": [
         "hero",
@@ -162,14 +162,14 @@
         "medium",
         "low"
       ],
-      "proceduralPbrMaterialCount": 29,
+      "proceduralPbrMaterialCount": 34,
       "retopologyTarget": "quad_dominant_smart_low_poly",
       "sculptedSurfaceCount": 7
     },
     {
       "animationRigWireCount": 3,
       "collection": "Hero Asset - leader-governance",
-      "heroComponentCount": 29,
+      "heroComponentCount": 34,
       "id": "leader-governance",
       "lodPolicy": [
         "hero",
@@ -177,14 +177,14 @@
         "medium",
         "low"
       ],
-      "proceduralPbrMaterialCount": 29,
+      "proceduralPbrMaterialCount": 34,
       "retopologyTarget": "quad_dominant_smart_low_poly",
       "sculptedSurfaceCount": 7
     },
     {
       "animationRigWireCount": 3,
       "collection": "Hero Asset - leader-knowledge",
-      "heroComponentCount": 37,
+      "heroComponentCount": 50,
       "id": "leader-knowledge",
       "lodPolicy": [
         "hero",
@@ -192,14 +192,14 @@
         "medium",
         "low"
       ],
-      "proceduralPbrMaterialCount": 37,
+      "proceduralPbrMaterialCount": 50,
       "retopologyTarget": "quad_dominant_smart_low_poly",
       "sculptedSurfaceCount": 7
     },
     {
       "animationRigWireCount": 3,
       "collection": "Hero Asset - leader-medical",
-      "heroComponentCount": 28,
+      "heroComponentCount": 32,
       "id": "leader-medical",
       "lodPolicy": [
         "hero",
@@ -207,14 +207,14 @@
         "medium",
         "low"
       ],
-      "proceduralPbrMaterialCount": 28,
+      "proceduralPbrMaterialCount": 32,
       "retopologyTarget": "quad_dominant_smart_low_poly",
       "sculptedSurfaceCount": 7
     },
     {
       "animationRigWireCount": 3,
       "collection": "Hero Asset - leader-research",
-      "heroComponentCount": 29,
+      "heroComponentCount": 34,
       "id": "leader-research",
       "lodPolicy": [
         "hero",
@@ -222,14 +222,14 @@
         "medium",
         "low"
       ],
-      "proceduralPbrMaterialCount": 29,
+      "proceduralPbrMaterialCount": 34,
       "retopologyTarget": "quad_dominant_smart_low_poly",
       "sculptedSurfaceCount": 7
     },
     {
       "animationRigWireCount": 3,
       "collection": "Hero Asset - leader-review",
-      "heroComponentCount": 28,
+      "heroComponentCount": 32,
       "id": "leader-review",
       "lodPolicy": [
         "hero",
@@ -237,7 +237,7 @@
         "medium",
         "low"
       ],
-      "proceduralPbrMaterialCount": 28,
+      "proceduralPbrMaterialCount": 32,
       "retopologyTarget": "quad_dominant_smart_low_poly",
       "sculptedSurfaceCount": 7
     },
@@ -553,7 +553,8 @@
     }
   ],
   "glb": "lunar-city/hero-assets/lunar-city-hero-assets.glb",
-  "heroMeshComponentCount": 854,
+  "heroMeshComponentCount": 908,
+  "leaderPreview": "lunar-city/hero-assets/lunar-city-hero-leaders.png",
   "leaders": [
     {
       "animationClips": [
@@ -567,7 +568,8 @@
       "collection": "Hero Asset - leader-knowledge",
       "id": "leader-knowledge",
       "identity": "owl archivist",
-      "role": "knowledge"
+      "role": "knowledge",
+      "signature": "owl archivist"
     },
     {
       "animationClips": [
@@ -581,7 +583,8 @@
       "collection": "Hero Asset - leader-research",
       "id": "leader-research",
       "identity": "fox scientist",
-      "role": "research"
+      "role": "research",
+      "signature": "fox scientist"
     },
     {
       "animationClips": [
@@ -595,7 +598,8 @@
       "collection": "Hero Asset - leader-creative",
       "id": "leader-creative",
       "identity": "raccoon artist",
-      "role": "creative"
+      "role": "creative",
+      "signature": "raccoon artist"
     },
     {
       "animationClips": [
@@ -609,7 +613,8 @@
       "collection": "Hero Asset - leader-governance",
       "id": "leader-governance",
       "identity": "eagle councillor",
-      "role": "governance"
+      "role": "governance",
+      "signature": "eagle councillor"
     },
     {
       "animationClips": [
@@ -623,7 +628,8 @@
       "collection": "Hero Asset - leader-engineering",
       "id": "leader-engineering",
       "identity": "badger engineer",
-      "role": "engineering"
+      "role": "engineering",
+      "signature": "badger engineer"
     },
     {
       "animationClips": [
@@ -637,7 +643,8 @@
       "collection": "Hero Asset - leader-medical",
       "id": "leader-medical",
       "identity": "gold medic",
-      "role": "medical"
+      "role": "medical",
+      "signature": "gold medic"
     },
     {
       "animationClips": [
@@ -651,7 +658,8 @@
       "collection": "Hero Asset - leader-review",
       "id": "leader-review",
       "identity": "hawk reviewer",
-      "role": "review"
+      "role": "review",
+      "signature": "hawk reviewer"
     },
     {
       "animationClips": [
@@ -665,7 +673,8 @@
       "collection": "Hero Asset - leader-archive",
       "id": "leader-archive",
       "identity": "owl historian",
-      "role": "archive"
+      "role": "archive",
+      "signature": "owl historian"
     }
   ],
   "lods": [
@@ -1425,20 +1434,28 @@
     }
   ],
   "preview": "lunar-city/hero-assets/lunar-city-hero-assets.png",
-  "proceduralPbrMaterialCount": 21,
+  "proceduralPbrMaterialCount": 29,
   "proceduralPbrMaterials": [
     "Hero amber identity emission",
+    "Hero archive owl violet feather PBR",
+    "Hero badger slate fur PBR",
     "Hero beak gold keratin",
     "Hero cyan glass emission",
     "Hero cyan identity emission",
     "Hero dark interior alloy",
+    "Hero eagle bronze feather PBR",
     "Hero floor graphite PBR",
+    "Hero fox amber fur PBR",
     "Hero gold trim",
+    "Hero golden medic fur PBR",
     "Hero green identity emission",
+    "Hero hawk russet feather PBR",
     "Hero ink black detail",
     "Hero inset panel alloy",
     "Hero leader fur",
     "Hero leader light muzzle",
+    "Hero owl moon feather PBR",
+    "Hero raccoon silver fur PBR",
     "Hero red alert enamel",
     "Hero review floor",
     "Hero sign text emission",
@@ -1455,6 +1472,7 @@
   "sculptedCharacterLimbComponentCount": 72,
   "sculptedSurfaceComponentCount": 158,
   "source": "local_blender_hero_asset_generation",
+  "uniqueLeaderSignatureCount": 54,
   "validation": {
     "allAssetsVisibleInReviewScene": true,
     "freeLocalGenerationOnly": true,
@@ -1466,7 +1484,8 @@
     "usesContinuousSculptedSurfaces": true,
     "usesDetailedBuildingFacades": true,
     "usesProceduralPbrMaterials": true,
-    "usesSeparateHeroAssetScene": true
+    "usesSeparateHeroAssetScene": true,
+    "usesUniqueLeaderSignatures": true
   },
   "workers": [
     {

@@ -82,13 +82,15 @@ describe('Lunar City asset manifest', () => {
       characterPreview: string
       children: Array<{ collection: string; id: string }>
       heroMeshComponentCount: number
-      leaders: Array<{ collection: string; id: string }>
+      leaderPreview: string
+      leaders: Array<{ collection: string; id: string; signature: string }>
       lods: Array<{ id: string; levels: Record<string, unknown>; sourceCollection: string }>
       proceduralPbrMaterialCount: number
       proceduralPbrMaterials: string[]
       sculptedCharacterCoreComponentCount: number
       sculptedCharacterLimbComponentCount: number
       sculptedSurfaceComponentCount: number
+      uniqueLeaderSignatureCount: number
       validation: Record<string, boolean>
       workers: Array<{ collection: string; id: string }>
     }
@@ -96,12 +98,15 @@ describe('Lunar City asset manifest', () => {
     expect(manifest.assetCount).toBe(26)
     expect(manifest.buildingPreview).toBe('lunar-city/hero-assets/lunar-city-hero-buildings.png')
     expect(manifest.characterPreview).toBe('lunar-city/hero-assets/lunar-city-hero-characters.png')
+    expect(manifest.leaderPreview).toBe('lunar-city/hero-assets/lunar-city-hero-leaders.png')
     expect(manifest.buildings).toHaveLength(8)
     expect(manifest.leaders).toHaveLength(8)
+    expect(new Set(manifest.leaders.map(leader => leader.signature)).size).toBe(8)
     expect(manifest.workers).toHaveLength(6)
     expect(manifest.children).toHaveLength(4)
     expect(manifest.heroMeshComponentCount).toBeGreaterThan(600)
     expect(manifest.buildingDetailComponentCount).toBeGreaterThanOrEqual(160)
+    expect(manifest.uniqueLeaderSignatureCount).toBeGreaterThanOrEqual(24)
     expect(manifest.sculptedSurfaceComponentCount).toBeGreaterThanOrEqual(148)
     expect(manifest.sculptedCharacterCoreComponentCount).toBeGreaterThanOrEqual(36)
     expect(manifest.sculptedCharacterLimbComponentCount).toBeGreaterThanOrEqual(72)
@@ -112,6 +117,7 @@ describe('Lunar City asset manifest', () => {
     expect(manifest.validation.usesContinuousCharacterCoreMeshes).toBe(true)
     expect(manifest.validation.usesContinuousCharacterLimbMeshes).toBe(true)
     expect(manifest.validation.usesDetailedBuildingFacades).toBe(true)
+    expect(manifest.validation.usesUniqueLeaderSignatures).toBe(true)
     expect(manifest.validation.usesProceduralPbrMaterials).toBe(true)
     expect(manifest.validation.freeLocalGenerationOnly).toBe(true)
     expect(manifest.validation.noRawSoulContent).toBe(true)

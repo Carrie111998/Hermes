@@ -37,6 +37,7 @@ HERO_GLB = HERO_DIR / "lunar-city-hero-assets.glb"
 HERO_RENDER = HERO_DIR / "lunar-city-hero-assets.png"
 HERO_BUILDING_RENDER = HERO_DIR / "lunar-city-hero-buildings.png"
 HERO_CHARACTER_RENDER = HERO_DIR / "lunar-city-hero-characters.png"
+HERO_LEADER_RENDER = HERO_DIR / "lunar-city-hero-leaders.png"
 HERO_MANIFEST = HERO_DIR / "hero-assets-manifest.json"
 
 
@@ -126,6 +127,14 @@ def create_materials():
         "beak": lunar.material("Hero beak gold keratin", (0.95, 0.55, 0.14), roughness=0.42),
         "fur": lunar.material("Hero leader fur", (0.72, 0.38, 0.15), roughness=0.5),
         "fur_light": lunar.material("Hero leader light muzzle", (0.95, 0.76, 0.48), roughness=0.58),
+        "owl_feather": lunar.material("Hero owl moon feather PBR", (0.54, 0.43, 0.31), roughness=0.62),
+        "fox_fur": lunar.material("Hero fox amber fur PBR", (0.88, 0.42, 0.14), roughness=0.54),
+        "raccoon_fur": lunar.material("Hero raccoon silver fur PBR", (0.42, 0.45, 0.46), roughness=0.58),
+        "eagle_feather": lunar.material("Hero eagle bronze feather PBR", (0.64, 0.42, 0.19), roughness=0.56),
+        "badger_fur": lunar.material("Hero badger slate fur PBR", (0.22, 0.23, 0.24), roughness=0.6),
+        "gold_fur": lunar.material("Hero golden medic fur PBR", (0.92, 0.68, 0.24), roughness=0.5),
+        "hawk_feather": lunar.material("Hero hawk russet feather PBR", (0.58, 0.31, 0.13), roughness=0.55),
+        "archive_owl": lunar.material("Hero archive owl violet feather PBR", (0.34, 0.28, 0.46), roughness=0.62),
         "helmet": lunar.material("Hero worker helmet ceramic", (0.86, 0.9, 0.94), metallic=0.42, roughness=0.2),
         "suit": lunar.material("Hero worker suit fabric alloy", (0.12, 0.15, 0.18), metallic=0.25, roughness=0.46),
         "gold": lunar.material("Hero gold trim", (0.92, 0.62, 0.17), metallic=0.68, roughness=0.24),
@@ -139,6 +148,9 @@ def create_materials():
     tune_material(mats["panel"], noise_scale=64, noise_detail=11, bump_strength=0.1, bump_distance=0.022, pipeline="2k_pbr_panel_seam_noise")
     tune_material(mats["fur"], noise_scale=52, noise_detail=12, bump_strength=0.18, bump_distance=0.03, pipeline="4k_pbr_leader_fur_directional_noise")
     tune_material(mats["fur_light"], noise_scale=48, noise_detail=10, bump_strength=0.13, bump_distance=0.024, pipeline="4k_pbr_leader_muzzle_soft_noise")
+    for key in ("owl_feather", "fox_fur", "raccoon_fur", "eagle_feather", "badger_fur", "gold_fur", "hawk_feather", "archive_owl"):
+        tune_material(mats[key], noise_scale=58, noise_detail=12, bump_strength=0.16, bump_distance=0.028, pipeline="4k_pbr_unique_leader_species_skin")
+        mats[key]["texture_resolution_target"] = "4k_hero_leader"
     tune_material(mats["helmet"], noise_scale=34, noise_detail=9, bump_strength=0.08, bump_distance=0.018, pipeline="2k_pbr_worker_helmet_ceramic_noise")
     tune_material(mats["suit"], noise_scale=44, noise_detail=11, bump_strength=0.16, bump_distance=0.028, pipeline="2k_pbr_worker_suit_fabric_alloy_noise")
     tune_material(mats["wood"], noise_scale=22, noise_detail=12, bump_strength=0.2, bump_distance=0.04, pipeline="2k_pbr_warm_wood_grain_noise")
@@ -165,6 +177,7 @@ def add_asset_metadata(obj, asset_id, kind, role, component):
     obj["asset_kind"] = kind
     obj["role"] = role
     obj["component"] = component
+    obj["asset_component"] = component
     obj["hero_asset"] = True
     obj["source_provenance"] = "handbuilt_from_approved_reference_images"
     obj["topology"] = "skinned_mesh_wireframe_controls"
@@ -513,6 +526,75 @@ def add_species_detail(asset_id, role, label_text, x, y, height, accent_mat, tar
         chamfer(f"{asset_id}_medic_cross_vertical_mesh", (x, y - 0.286, height * 0.56), (0.035, 0.012, 0.09), mats["red"], target, asset_id, "character", role, "medic-cross-vertical")
 
 
+def leader_skin_material(label_text, role, mats):
+    lower = label_text.lower()
+    if "archive" in role:
+        return mats["archive_owl"]
+    if "owl" in lower:
+        return mats["owl_feather"]
+    if "fox" in lower:
+        return mats["fox_fur"]
+    if "raccoon" in lower:
+        return mats["raccoon_fur"]
+    if "eagle" in lower:
+        return mats["eagle_feather"]
+    if "badger" in lower:
+        return mats["badger_fur"]
+    if "gold" in lower:
+        return mats["gold_fur"]
+    if "hawk" in lower:
+        return mats["hawk_feather"]
+    return mats["fur"]
+
+
+def add_unique_leader_signature(asset_id, role, label_text, x, y, height, accent_mat, target, mats):
+    lower = label_text.lower()
+    skin_mat = leader_skin_material(label_text, role, mats)
+
+    def signature_curve(name, points, bevel, mat):
+        obj = lunar.curve(name, points, bevel, mat, target)
+        add_asset_metadata(obj, asset_id, "character", role, "unique-leader-signature")
+        return obj
+
+    if "owl" in lower:
+        for side in (-1, 1):
+            ellipsoid(f"{asset_id}_large_owl_face_disk_{side}", (x + side * 0.13, y - 0.352, height + 0.27), (0.18, 0.016, 0.19), mats["fur_light"], target, asset_id, "character", role, "unique-leader-signature", 24, 12)
+            cone(f"{asset_id}_tall_owl_ear_horn_{side}", (x + side * 0.2, y - 0.03, height + 0.67), 0.08, 0.006, 0.38, skin_mat, target, asset_id, "character", role, "unique-leader-signature", 12, rotation=(0.36, side * 0.58, side * 0.2))
+        for feather in range(9):
+            dx = (feather - 4) * 0.065
+            signature_curve(f"{asset_id}_layered_owl_chest_feather_{feather}", [(x + dx, y - 0.29, height * 0.76), (x + dx * 0.84, y - 0.32, height * 0.66), (x + dx * 0.6, y - 0.3, height * 0.54)], 0.018, skin_mat)
+    elif "fox" in lower:
+        cone(f"{asset_id}_long_fox_muzzle_signature", (x, y - 0.43, height + 0.14), 0.14, 0.035, 0.46, mats["fur_light"], target, asset_id, "character", role, "unique-leader-signature", 24, rotation=(1.52, 0, 0))
+        for side in (-1, 1):
+            cone(f"{asset_id}_knife_fox_ear_{side}", (x + side * 0.26, y - 0.02, height + 0.65), 0.095, 0.004, 0.46, skin_mat, target, asset_id, "character", role, "unique-leader-signature", 14, rotation=(0.3, side * 0.64, 0))
+            signature_curve(f"{asset_id}_sweeping_fox_tail_{side}", [(x + side * 0.2, y + 0.2, 0.38), (x + side * 0.76, y + 0.3, 0.92), (x + side * 0.56, y + 0.12, 1.38)], 0.09, skin_mat)
+    elif "raccoon" in lower:
+        for side in (-1, 1):
+            ellipsoid(f"{asset_id}_bold_raccoon_eye_mask_{side}", (x + side * 0.115, y - 0.36, height + 0.26), (0.105, 0.011, 0.068), mats["black"], target, asset_id, "character", role, "unique-leader-signature", 18, 8)
+            signature_curve(f"{asset_id}_ringed_tail_band_{side}", [(x + 0.34, y + 0.2 + side * 0.018, 0.48 + side * 0.11), (x + 0.66, y + 0.26, 0.68 + side * 0.1), (x + 0.62, y + 0.17, 0.9 + side * 0.08)], 0.035, mats["black"])
+        ellipsoid(f"{asset_id}_rounded_raccoon_snout_signature", (x, y - 0.37, height + 0.1), (0.17, 0.018, 0.09), mats["fur_light"], target, asset_id, "character", role, "unique-leader-signature", 20, 10)
+    elif "eagle" in lower:
+        cone(f"{asset_id}_large_hooked_eagle_beak_signature", (x, y - 0.43, height + 0.16), 0.1, 0.006, 0.36, mats["beak"], target, asset_id, "character", role, "unique-leader-signature", 20, rotation=(1.5, 0, 0))
+        for side in (-1, 1):
+            signature_curve(f"{asset_id}_broad_eagle_wing_{side}", [(x + side * 0.24, y + 0.06, height * 0.78), (x + side * 0.72, y + 0.18, height * 0.56), (x + side * 0.58, y + 0.16, height * 0.25)], 0.07, skin_mat)
+            cone(f"{asset_id}_eagle_brow_crest_{side}", (x + side * 0.1, y - 0.35, height + 0.36), 0.05, 0.006, 0.18, mats["white"], target, asset_id, "character", role, "unique-leader-signature", 10, rotation=(1.1, side * 0.2, side * 0.7))
+    elif "badger" in lower:
+        signature_curve(f"{asset_id}_badger_white_crown_stripe", [(x, y - 0.36, height + 0.55), (x, y - 0.38, height + 0.28), (x, y - 0.36, height + 0.02)], 0.035, mats["white"])
+        for side in (-1, 1):
+            ellipsoid(f"{asset_id}_badger_black_face_band_{side}", (x + side * 0.14, y - 0.355, height + 0.24), (0.085, 0.012, 0.15), mats["black"], target, asset_id, "character", role, "unique-leader-signature", 18, 8)
+            signature_curve(f"{asset_id}_badger_stocky_shoulder_{side}", [(x + side * 0.28, y - 0.04, height * 0.74), (x + side * 0.46, y + 0.02, height * 0.58), (x + side * 0.36, y - 0.02, height * 0.42)], 0.065, skin_mat)
+    elif "gold" in lower:
+        ellipsoid(f"{asset_id}_golden_medic_soft_head_signature", (x, y - 0.015, height + 0.2), (0.28, 0.24, 0.24), skin_mat, target, asset_id, "character", role, "unique-leader-signature", 28, 14)
+        chamfer(f"{asset_id}_medic_helmet_cross_signature", (x, y - 0.36, height + 0.43), (0.13, 0.012, 0.032), mats["red"], target, asset_id, "character", role, "unique-leader-signature")
+        chamfer(f"{asset_id}_medic_helmet_cross_stem_signature", (x, y - 0.36, height + 0.43), (0.036, 0.012, 0.12), mats["red"], target, asset_id, "character", role, "unique-leader-signature")
+        signature_curve(f"{asset_id}_medic_soft_tail_signature", [(x + 0.16, y + 0.18, 0.38), (x + 0.48, y + 0.22, 0.7), (x + 0.36, y + 0.12, 1.0)], 0.07, skin_mat)
+    elif "hawk" in lower:
+        cone(f"{asset_id}_sharp_hawk_beak_signature", (x, y - 0.44, height + 0.15), 0.082, 0.004, 0.34, mats["beak"], target, asset_id, "character", role, "unique-leader-signature", 18, rotation=(1.52, 0, 0))
+        signature_curve(f"{asset_id}_hawk_swept_head_crest", [(x - 0.12, y - 0.04, height + 0.53), (x, y - 0.09, height + 0.71), (x + 0.12, y - 0.04, height + 0.53)], 0.04, skin_mat)
+        for side in (-1, 1):
+            signature_curve(f"{asset_id}_narrow_hawk_wing_{side}", [(x + side * 0.24, y + 0.04, height * 0.74), (x + side * 0.62, y + 0.13, height * 0.52), (x + side * 0.48, y + 0.15, height * 0.28)], 0.05, skin_mat)
+
+
 def add_building_surface_detail(asset_id, role, x, y, base, accent_mat, target, mats):
     for row, z in enumerate((0.48, 0.82, 1.18, 1.54, 1.9)):
         seam = lunar.curve(
@@ -657,7 +739,7 @@ def make_character(asset_id, role, label_text, accent, x, y, target, mats, kind)
     body_mat = accent_mat if leader else mats["suit"]
     sculpted_actor_body(f"{asset_id}_single_piece_body_skin", x, y, height, body_w, body_mat, target, asset_id, role, kind)
     chamfer(f"{asset_id}_belt_panel_mesh", (x, y - 0.24, height * 0.42), (body_w * 0.72, 0.025, 0.055), mats["gold"] if leader else accent_mat, target, asset_id, "character", role, "belt-panel")
-    head_mat = mats["fur"] if leader else mats["helmet"]
+    head_mat = leader_skin_material(label_text, role, mats) if leader else mats["helmet"]
     sculpted_head(f"{asset_id}_single_piece_head_skin", x, y - 0.01, height + 0.18, head_mat, target, asset_id, role, label_text, kind)
     visor = chamfer(f"{asset_id}_visor_mesh", (x, y - 0.27, height + 0.18), (0.16, 0.018, 0.07), mats["glass"], target, asset_id, "character", role, "visor")
     visor["animation_binding"] = f"{asset_id}:look"
@@ -684,6 +766,7 @@ def make_character(asset_id, role, label_text, accent, x, y, target, mats, kind)
         chamfer(f"{asset_id}_gold_collar_mesh", (x, y - 0.11, height * 0.9), (0.27, 0.028, 0.035), mats["gold"], target, asset_id, "character", role, "collar")
         tail = lunar.curve(f"{asset_id}_tail_or_robe_sweep_wire", [(x + 0.22, y + 0.12, 0.45), (x + 0.48, y + 0.2, 0.72), (x + 0.62, y + 0.12, 0.96)], 0.055, mats["fur"], target)
         add_asset_metadata(tail, asset_id, "character", role, "tail-or-robe-sweep")
+        add_unique_leader_signature(asset_id, role, label_text, x, y, height, accent_mat, target, mats)
         if role == "research":
             cone(f"{asset_id}_held_telescope_mesh", (x + 0.58, y - 0.18, height * 0.78), 0.08, 0.05, 0.56, mats["shell"], target, asset_id, "character", role, "held-telescope", 20, rotation=(1.25, 0.08, -0.76))
         elif role in {"knowledge", "archive"}:
@@ -873,7 +956,7 @@ def main():
     scene["sculpted_surface_components"] = sum(1 for obj in bpy.data.objects if obj.get("mesh_construction"))
     scene["sculpted_character_core_components"] = sum(1 for obj in bpy.data.objects if str(obj.get("mesh_construction", "")).startswith("continuous_") and obj.get("asset_kind") == "character")
     scene["sculpted_character_limb_components"] = sum(1 for obj in bpy.data.objects if obj.get("mesh_construction") == "continuous_tapered_limb_skin")
-    scene["building_detail_components"] = sum(1 for obj in bpy.data.objects if obj.get("asset_kind") == "building" and obj.get("component") in {
+    scene["building_detail_components"] = sum(1 for obj in bpy.data.objects if obj.get("asset_kind") == "building" and obj.get("asset_component") in {
         "recessed-hull-panel-seam",
         "glowing-power-conduit",
         "roof-sensor-dome",
@@ -888,6 +971,11 @@ def main():
         "medical-cross-stem",
         "review-status-chip",
     })
+    scene["unique_leader_signature_components"] = sum(
+        1
+        for obj in bpy.data.objects
+        if obj.get("asset_kind") == "character" and obj.get("asset_component") == "unique-leader-signature"
+    )
     pbr_materials = sorted({mat.name for mat in bpy.data.materials if mat.get("surface_pipeline")})
     quality_entries = asset_quality_entries()
     lod_entries = lod_budget_entries()
@@ -901,12 +989,14 @@ def main():
         "preview": "lunar-city/hero-assets/lunar-city-hero-assets.png",
         "buildingPreview": "lunar-city/hero-assets/lunar-city-hero-buildings.png",
         "characterPreview": "lunar-city/hero-assets/lunar-city-hero-characters.png",
+        "leaderPreview": "lunar-city/hero-assets/lunar-city-hero-leaders.png",
         "assetCount": scene["asset_count"],
         "heroMeshComponentCount": scene["hero_mesh_components"],
         "sculptedSurfaceComponentCount": scene["sculpted_surface_components"],
         "sculptedCharacterCoreComponentCount": scene["sculpted_character_core_components"],
         "sculptedCharacterLimbComponentCount": scene["sculpted_character_limb_components"],
         "buildingDetailComponentCount": scene["building_detail_components"],
+        "uniqueLeaderSignatureCount": scene["unique_leader_signature_components"],
         "proceduralPbrMaterialCount": len(pbr_materials),
         "proceduralPbrMaterials": pbr_materials,
         "assetQuality": quality_entries,
@@ -920,6 +1010,7 @@ def main():
                 "id": asset_id,
                 "role": role,
                 "identity": species,
+                "signature": species,
                 "collection": f"Hero Asset - {asset_id}",
                 "animationClips": ["idle", "walk", "work", "talk", "panic", "celebrate"],
             }
@@ -955,6 +1046,7 @@ def main():
             "usesContinuousCharacterLimbMeshes": scene["sculpted_character_limb_components"] >= (len(LEADERS) + len(WORKERS) + len(CHILDREN)) * 4,
             "usesProceduralPbrMaterials": len(pbr_materials) >= 12,
             "usesDetailedBuildingFacades": scene["building_detail_components"] >= len(BUILDINGS) * 20,
+            "usesUniqueLeaderSignatures": scene["unique_leader_signature_components"] >= len(LEADERS) * 3,
             "tracksPerAssetQuality": len(quality_entries) == len(BUILDINGS) + len(LEADERS) + len(WORKERS) + len(CHILDREN),
             "tracksLodBudgets": len(lod_entries) == len(BUILDINGS) + len(LEADERS) + len(WORKERS) + len(CHILDREN),
         },
@@ -982,6 +1074,21 @@ def main():
         camera.rotation_euler = (Vector((0, -7.8, 0.9)) - camera.location).to_track_quat("-Z", "Y").to_euler()
         scene.render.filepath = str(HERO_CHARACTER_RENDER)
         bpy.ops.render.render(write_still=True)
+        buildings.hide_render = False
+        buildings.hide_render = True
+        for asset_id, *_rest in WORKERS + CHILDREN:
+            collection = bpy.data.collections.get(f"Hero Asset - {asset_id}")
+            if collection:
+                collection.hide_render = True
+        camera.location = (0, -26, 16)
+        camera.data.ortho_scale = 18
+        camera.rotation_euler = (Vector((0, -4.7, 1.0)) - camera.location).to_track_quat("-Z", "Y").to_euler()
+        scene.render.filepath = str(HERO_LEADER_RENDER)
+        bpy.ops.render.render(write_still=True)
+        for asset_id, *_rest in WORKERS + CHILDREN:
+            collection = bpy.data.collections.get(f"Hero Asset - {asset_id}")
+            if collection:
+                collection.hide_render = False
         buildings.hide_render = False
 
 
