@@ -156,7 +156,7 @@ export async function runDesktopRoomCommandCycle({
         }
 
         const commands = Array.isArray((claimed as { commands?: unknown[] } | null)?.commands)
-          ? ((claimed as { commands: DesktopRoomCommand[] }).commands || [])
+          ? (claimed as { commands: DesktopRoomCommand[] }).commands || []
           : []
 
         remaining -= commands.length

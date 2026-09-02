@@ -11,7 +11,12 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from gateway import hosted_room_controls, hosted_room_driver, hosted_room_messaging, hosted_rooms
+from gateway import (
+    hosted_room_controls,
+    hosted_room_driver,
+    hosted_room_messaging,
+    hosted_rooms,
+)
 from gateway.config import GatewayConfig, HomeChannel, Platform, PlatformConfig
 from gateway.hosted_room_messaging import (
     MessagingRoomBackend,
@@ -197,12 +202,10 @@ def test_secondary_profile_only_lists_rooms_in_its_frozen_roster(tmp_path):
         "research-room",
     }
     assert [
-        room["room_id"]
-        for room in list_messaging_rooms(service, profile="ops")
+        room["room_id"] for room in list_messaging_rooms(service, profile="ops")
     ] == ["release-room"]
     assert [
-        room["room_id"]
-        for room in list_messaging_rooms(service, profile="research")
+        room["room_id"] for room in list_messaging_rooms(service, profile="research")
     ] == ["research-room"]
 
 
@@ -234,8 +237,16 @@ def _event(
         user_id=user_id,
         user_name="Display Name",
         message_id=message_id,
-        media_urls=media_urls if media_urls is not None else ["/tmp/image.png"] if media else [],
-        media_types=media_types if media_types is not None else ["image/png"] if media else [],
+        media_urls=media_urls
+        if media_urls is not None
+        else ["/tmp/image.png"]
+        if media
+        else [],
+        media_types=media_types
+        if media_types is not None
+        else ["image/png"]
+        if media
+        else [],
         source=source,
     )
 
@@ -244,9 +255,7 @@ def _runner(*, platform: Platform = Platform.SIGNAL, extra=None):
     from gateway.run import GatewayRunner
 
     runner = object.__new__(GatewayRunner)
-    effective_extra = (
-        {"allow_admin_from": ["user-1"]} if extra is None else extra
-    )
+    effective_extra = {"allow_admin_from": ["user-1"]} if extra is None else extra
     runner.config = GatewayConfig(
         platforms={
             platform: PlatformConfig(
@@ -258,7 +267,9 @@ def _runner(*, platform: Platform = Platform.SIGNAL, extra=None):
     )
     runner.adapters = {
         platform: SimpleNamespace(
-            typed_command_prefix="!" if platform in {Platform.MATRIX, Platform.SLACK} else "/"
+            typed_command_prefix="!"
+            if platform in {Platform.MATRIX, Platform.SLACK}
+            else "/"
         )
     }
     return runner
@@ -466,57 +477,68 @@ def test_participant_gateway_lists_reads_and_controls_remote_room(
     service = _FakeService(db)
 
     rooms = list_messaging_rooms(service)
-    assert [(room["name"], room["_room_mode"], room["member_count"]) for room in rooms] == [
-        ("Release planning", "remote", 2)
-    ]
-    assert "⚪ **1. Release planning** · connected · 2 Bots" in format_room_list(service)
+    assert [
+        (room["name"], room["_room_mode"], room["member_count"]) for room in rooms
+    ] == [("Release planning", "remote", 2)]
+    assert "⚪ **1. Release planning** · connected · 2 Bots" in format_room_list(
+        service
+    )
     detail = format_room_detail(service, rooms[0])
     assert "💬 **Release planning**" in detail
     assert "🟡 work queued or running" in detail
     assert "• **Reviewer:** Ready." in detail
     assert "A" * 43 not in repr(rooms)
-    assert send_to_room(
-        service,
-        rooms[0],
-        _event("/group 1 send hello", message_id="remote-send"),
-        "hello",
-    ) == "Queued in Release planning."
-    assert stop_room(
-        service,
-        rooms[0],
-        _event("/group 1 stop", message_id="remote-stop"),
-    ) == "Stop requested for Release planning. Active work will stop safely."
-    assert retry_room(
-        service,
-        rooms[0],
-        _event("/group 1 retry", message_id="remote-retry"),
-    ) == "Retry checked for Release planning (1 task)."
+    assert (
+        send_to_room(
+            service,
+            rooms[0],
+            _event("/group 1 send hello", message_id="remote-send"),
+            "hello",
+        )
+        == "Queued in Release planning."
+    )
+    assert (
+        stop_room(
+            service,
+            rooms[0],
+            _event("/group 1 stop", message_id="remote-stop"),
+        )
+        == "Stop requested for Release planning. Active work will stop safely."
+    )
+    assert (
+        retry_room(
+            service,
+            rooms[0],
+            _event("/group 1 retry", message_id="remote-retry"),
+        )
+        == "Retry checked for Release planning (1 task)."
+    )
     assert [call["action"] for call in calls] == ["send", "stop", "retry"]
     assert calls[0]["actor_display_name"] == "Display Name via Signal"
 
 
-def test_legacy_projection_uses_the_same_name_identity_as_new_desktop(tmp_path, monkeypatch):
+def test_legacy_projection_uses_the_same_name_identity_as_new_desktop(
+    tmp_path, monkeypatch
+):
     import yaml
 
     home = tmp_path / "hermes"
     home.mkdir(parents=True)
     (home / "profile.yaml").write_text(
-        yaml.safe_dump(
-            {
-                "ui_meta": {
-                    "hermes-bots-groups": {
-                        "version": 2,
-                        "rooms": {
-                            "Legacy planning": {
-                                "name": "Legacy planning",
-                                "members": [{"name": "default"}],
-                                "log": [],
-                            }
-                        },
-                    }
+        yaml.safe_dump({
+            "ui_meta": {
+                "hermes-bots-groups": {
+                    "version": 2,
+                    "rooms": {
+                        "Legacy planning": {
+                            "name": "Legacy planning",
+                            "members": [{"name": "default"}],
+                            "log": [],
+                        }
+                    },
                 }
             }
-        ),
+        }),
         encoding="utf-8",
     )
     monkeypatch.setenv("HERMES_HOME", str(home))
@@ -526,7 +548,9 @@ def test_legacy_projection_uses_the_same_name_identity_as_new_desktop(tmp_path, 
     assert room["room_id"] == "name:Legacy planning"
 
 
-def test_more_than_128_classic_rooms_list_without_disabling_controls(tmp_path, monkeypatch):
+def test_more_than_128_classic_rooms_list_without_disabling_controls(
+    tmp_path, monkeypatch
+):
     import yaml
 
     home = tmp_path / "hermes"
@@ -541,9 +565,9 @@ def test_more_than_128_classic_rooms_list_without_disabling_controls(tmp_path, m
         for index in range(260)
     }
     (home / "profile.yaml").write_text(
-        yaml.safe_dump(
-            {"ui_meta": {"hermes-bots-groups": {"version": 3, "rooms": rooms}}}
-        ),
+        yaml.safe_dump({
+            "ui_meta": {"hermes-bots-groups": {"version": 3, "rooms": rooms}}
+        }),
         encoding="utf-8",
     )
     monkeypatch.setenv("HERMES_HOME", str(home))
@@ -554,7 +578,9 @@ def test_more_than_128_classic_rooms_list_without_disabling_controls(tmp_path, m
     assert len({room["messaging_ref"] for room in listed}) == 260
 
 
-def test_malformed_projected_room_does_not_hide_healthy_group_chats(tmp_path, monkeypatch):
+def test_malformed_projected_room_does_not_hide_healthy_group_chats(
+    tmp_path, monkeypatch
+):
     import yaml
 
     home = tmp_path / "hermes"
@@ -597,14 +623,18 @@ def test_classic_room_send_and_stop_wait_for_desktop(tmp_path, monkeypatch):
         "hello",
     )
 
-    assert sent == "Saved for Desktop planning. Open or update Hermes Desktop to continue."
+    assert (
+        sent == "Saved for Desktop planning. Open or update Hermes Desktop to continue."
+    )
     commands = desktop_room_mailbox.claim_commands(
         desktop_room_mailbox.default_db_path(),
         consumer_id="desktop:test",
-        room_authorities=[{
-            "room_id": "classic-room",
-            "authority_token": "authority:test",
-        }],
+        room_authorities=[
+            {
+                "room_id": "classic-room",
+                "authority_token": "authority:test",
+            }
+        ],
     )
     assert [(item["action"], item["payload"]) for item in commands] == [
         (
@@ -630,10 +660,12 @@ def test_classic_room_send_and_stop_wait_for_desktop(tmp_path, monkeypatch):
     stop_commands = desktop_room_mailbox.claim_commands(
         desktop_room_mailbox.default_db_path(),
         consumer_id="desktop:test",
-        room_authorities=[{
-            "room_id": "classic-room",
-            "authority_token": "authority:test",
-        }],
+        room_authorities=[
+            {
+                "room_id": "classic-room",
+                "authority_token": "authority:test",
+            }
+        ],
         actions=["stop"],
     )
     assert [(item["action"], item["payload"]) for item in stop_commands] == [
@@ -647,7 +679,9 @@ def test_classic_room_send_and_stop_wait_for_desktop(tmp_path, monkeypatch):
     ]
 
 
-def test_legacy_desktop_room_control_requests_one_current_desktop_open(tmp_path, monkeypatch):
+def test_legacy_desktop_room_control_requests_one_current_desktop_open(
+    tmp_path, monkeypatch
+):
     import yaml
 
     home = tmp_path / "hermes"
@@ -688,10 +722,12 @@ def test_classic_room_detail_surfaces_failed_command_recovery(tmp_path, monkeypa
     claimed = desktop_room_mailbox.claim_commands(
         db,
         consumer_id="desktop:test",
-        room_authorities=[{
-            "room_id": "classic-room",
-            "authority_token": "authority:test",
-        }],
+        room_authorities=[
+            {
+                "room_id": "classic-room",
+                "authority_token": "authority:test",
+            }
+        ],
     )[0]
     desktop_room_mailbox.complete_command(
         db,
@@ -733,15 +769,20 @@ def test_classic_retry_requeues_all_expired_commands_and_replays_receipt(
         )
         now[0] += 1
     now[0] += desktop_room_mailbox.PENDING_TTL_SECONDS + 1
-    assert desktop_room_mailbox.claim_commands(
-        db,
-        consumer_id="desktop:test",
-        room_authorities=[{
-            "room_id": "classic-room",
-            "authority_token": "authority:test",
-        }],
-        clock=lambda: now[0],
-    ) == []
+    assert (
+        desktop_room_mailbox.claim_commands(
+            db,
+            consumer_id="desktop:test",
+            room_authorities=[
+                {
+                    "room_id": "classic-room",
+                    "authority_token": "authority:test",
+                }
+            ],
+            clock=lambda: now[0],
+        )
+        == []
+    )
 
     service = _FakeService(db)
     room = list_messaging_rooms(service)[0]
@@ -884,8 +925,7 @@ def test_room_numbers_stay_stable_and_are_not_reused_after_disband(tmp_path):
     db, first, second = _seed_rooms(tmp_path)
     service = _FakeService(db)
     initial = {
-        room["room_id"]: room["messaging_ref"]
-        for room in list_messaging_rooms(service)
+        room["room_id"]: room["messaging_ref"] for room in list_messaging_rooms(service)
     }
 
     hosted_rooms.disband_room(
@@ -1059,9 +1099,7 @@ async def test_bare_group_uses_native_picker_and_selection_refreshes_detail(
     runner._thread_metadata_for_source = lambda source, anchor=None: {}
     runner._reply_anchor_for_event = lambda event: None
 
-    result = await runner._handle_rooms_command(
-        _event("/group", platform=platform)
-    )
+    result = await runner._handle_rooms_command(_event("/group", platform=platform))
 
     assert result is None
     assert len(adapter.calls) == 1
@@ -1230,7 +1268,9 @@ async def test_native_group_picker_hides_unexpected_callback_details(
 
 
 @pytest.mark.asyncio
-async def test_group_list_pages_keep_every_stable_number_reachable(tmp_path, monkeypatch):
+async def test_group_list_pages_keep_every_stable_number_reachable(
+    tmp_path, monkeypatch
+):
     db, _, _ = _seed_rooms(tmp_path)
     for index in range(3, 11):
         hosted_rooms.create_room(
@@ -1266,9 +1306,7 @@ async def test_mutating_room_commands_require_the_stable_number(tmp_path, monkey
         "gateway.hosted_room_messaging.current_room_backend", lambda: service
     )
 
-    result = await _runner()._handle_room_command(
-        _event("/group stop Release room")
-    )
+    result = await _runner()._handle_room_command(_event("/group stop Release room"))
 
     assert result == (
         "Use `/group <number> send <message>`, `/group <number> retry`, or "
@@ -1676,13 +1714,14 @@ def test_group_detail_only_offers_actions_that_match_current_state(tmp_path):
         "running": False,
         "working": False,
         "blocked": False,
-        "peer_routes": [
-            {"member_id": "remote", "status": "needs_reauthorization"}
-        ],
+        "peer_routes": [{"member_id": "remote", "status": "needs_reauthorization"}],
     }
-    assert MessagingRoomBackend(db_path=db, service=service).status(
-        "release-room"
-    )["blocked"] is True
+    assert (
+        MessagingRoomBackend(db_path=db, service=service).status("release-room")[
+            "blocked"
+        ]
+        is True
+    )
 
     classic = {
         "room_id": "classic-room",

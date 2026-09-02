@@ -88,9 +88,7 @@ def test_home_stores_only_sha256_and_never_exposes_token(tmp_path):
     assert issued.control_token.encode() not in db.read_bytes()
 
 
-def test_home_invitation_replay_recovers_the_same_opaque_token(
-    tmp_path, monkeypatch
-):
+def test_home_invitation_replay_recovers_the_same_opaque_token(tmp_path, monkeypatch):
     db = tmp_path / "state.db"
     _create_room(db)
     monkeypatch.setattr(
@@ -112,9 +110,12 @@ def test_home_invitation_replay_recovers_the_same_opaque_token(
 
     assert replay.control_token == first.control_token
     with sqlite3.connect(db) as conn:
-        assert conn.execute(
-            "SELECT COUNT(*) FROM hosted_room_control_tokens"
-        ).fetchone()[0] == 1
+        assert (
+            conn.execute("SELECT COUNT(*) FROM hosted_room_control_tokens").fetchone()[
+                0
+            ]
+            == 1
+        )
     with pytest.raises(controls.HostedRoomControlConflictError):
         controls.issue_home_control_token(
             db,
@@ -583,7 +584,9 @@ def test_failed_retry_rotation_does_not_starve_newer_commands(tmp_path):
             now=20 + index,
         )
     first = controls.load_pending_control_retries(db, room_id="room-1", limit=8)
-    assert [item.command_id for item in first] == [f"retry-{index}" for index in range(8)]
+    assert [item.command_id for item in first] == [
+        f"retry-{index}" for index in range(8)
+    ]
     for item in first:
         assert controls.defer_control_retry(
             db,

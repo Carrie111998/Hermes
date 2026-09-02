@@ -57,23 +57,21 @@ def _display_text(value: Any, *, limit: int) -> str:
     """Keep untrusted labels readable without letting them impersonate controls."""
 
     return _text(value)[:limit].translate(
-        str.maketrans(
-            {
-                "@": "＠",
-                "\\": "＼",
-                "`": "｀",
-                "*": "＊",
-                "_": "＿",
-                "{": "｛",
-                "}": "｝",
-                "[": "［",
-                "]": "］",
-                "#": "＃",
-                "|": "｜",
-                ">": "＞",
-                "~": "～",
-            }
-        )
+        str.maketrans({
+            "@": "＠",
+            "\\": "＼",
+            "`": "｀",
+            "*": "＊",
+            "_": "＿",
+            "{": "｛",
+            "}": "｝",
+            "[": "［",
+            "]": "］",
+            "#": "＃",
+            "|": "｜",
+            ">": "＞",
+            "~": "～",
+        })
     )
 
 
@@ -185,7 +183,9 @@ def _require_observer_lease(
         return
     lease_generation = int(observation.get("observer_lease_generation") or 0)
     if lease_generation < 1:
-        raise MessagingApprovalObservationStale("approval observer lease is unavailable")
+        raise MessagingApprovalObservationStale(
+            "approval observer lease is unavailable"
+        )
     try:
         room = conn.execute(
             """SELECT authority_gateway_id, authority_epoch, disbanded_at
@@ -209,8 +209,7 @@ def _require_observer_lease(
         or room["disbanded_at"] is not None
         or str(room["authority_gateway_id"])
         != str(observation.get("authority_gateway_id") or "")
-        or int(room["authority_epoch"])
-        != int(observation.get("authority_epoch") or 0)
+        or int(room["authority_epoch"]) != int(observation.get("authority_epoch") or 0)
         or row is None
         or str(row["gateway_id"]) != str(observation.get("authority_gateway_id") or "")
         or int(row["authority_epoch"]) != int(observation.get("authority_epoch") or 0)
@@ -232,9 +231,7 @@ def normalize_pending_approval(
     approval = action.get("approval")
     if not isinstance(approval, Mapping):
         raise MessagingApprovalError("pending approval details are unavailable")
-    choices = {
-        str(choice or "").casefold() for choice in approval.get("choices") or ()
-    }
+    choices = {str(choice or "").casefold() for choice in approval.get("choices") or ()}
     if not {"once", "deny"} <= choices:
         raise MessagingApprovalError("pending approval choices are unsafe")
     generation = int(action.get("execution_generation") or 0)
@@ -269,9 +266,7 @@ def normalize_pending_approval(
             action.get("observer_generation") or "legacy",
             label="observer_generation",
         ),
-        "observer_lease_generation": int(
-            action.get("observer_lease_generation") or 0
-        ),
+        "observer_lease_generation": int(action.get("observer_lease_generation") or 0),
         "approval": {
             "description": _text(approval.get("description")),
             "command": _text(approval.get("command")),
@@ -356,9 +351,7 @@ def clear_pending_approval(
     room = _identifier(room_id, label="room_id")
     member = _identifier(member_id, label="member_id")
     request = (
-        _identifier(request_id, label="request_id")
-        if request_id is not None
-        else ""
+        _identifier(request_id, label="request_id") if request_id is not None else ""
     )
     authority_gateway = (
         _identifier(authority_gateway_id, label="authority_gateway_id")
@@ -845,7 +838,9 @@ def select_pending_approval(
         if approval_reference(action).casefold() == raw.casefold()
     ]
     if len(matches) != 1:
-        raise MessagingApprovalError("Choose the approval code shown in the Group Chat.")
+        raise MessagingApprovalError(
+            "Choose the approval code shown in the Group Chat."
+        )
     return matches[0]
 
 
@@ -971,9 +966,7 @@ def format_pending_approvals(
         description, command = _approval_display_parts(approval)
         detail = description or command or "Command"
         reference = approval_reference(action)
-        lines.append(
-            f"{index}. **{label}** · {detail} · `{reference}`"
-        )
+        lines.append(f"{index}. **{label}** · {detail} · `{reference}`")
         if command and command != detail:
             lines.append(f"   Command: {command}")
     lines.extend([
@@ -1012,10 +1005,7 @@ def approval_picker_choices(
             room,
             str(action["member_id"]),
         )
-        coordinates = "\0".join(
-            str(action[field])
-            for field in _APPROVAL_SCOPE_FIELDS
-        )
+        coordinates = "\0".join(str(action[field]) for field in _APPROVAL_SCOPE_FIELDS)
         once_token = hashlib.sha256(
             f"{index}\0once\0{coordinates}".encode()
         ).hexdigest()[:20]

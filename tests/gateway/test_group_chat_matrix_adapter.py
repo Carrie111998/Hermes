@@ -17,9 +17,11 @@ async def test_named_two_member_dm_stamps_one_to_one_proof():
     adapter._dm_rooms = {"!named_dm:ex.org": True}
     adapter._client = MagicMock()
     adapter._client.get_state_event = AsyncMock(
-        side_effect=lambda _room_id, event_type: {"name": "Alice & Bot"}
-        if event_type == "m.room.name"
-        else (_ for _ in ()).throw(Exception("no alias"))
+        side_effect=lambda _room_id, event_type: (
+            {"name": "Alice & Bot"}
+            if event_type == "m.room.name"
+            else (_ for _ in ()).throw(Exception("no alias"))
+        )
     )
     adapter._client.state_store = MagicMock()
     adapter._client.state_store.get_members = AsyncMock(

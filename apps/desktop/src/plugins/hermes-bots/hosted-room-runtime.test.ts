@@ -311,14 +311,20 @@ describe('hosted Group Chat runtime', () => {
 
   it('replays the final events of a known room before marking a remote disband', async () => {
     const events = [
-      hostedEvent(3, 'member-1', 'message.member', {
-        text: 'Finished while Desktop was closed',
-        thread_id: 'thread-1'
-      }, {
-        kind: 'member',
-        id: 'builder',
-        display_name: 'Builder'
-      }),
+      hostedEvent(
+        3,
+        'member-1',
+        'message.member',
+        {
+          text: 'Finished while Desktop was closed',
+          thread_id: 'thread-1'
+        },
+        {
+          kind: 'member',
+          id: 'builder',
+          display_name: 'Builder'
+        }
+      ),
       hostedEvent(4, 'disbanded-1', 'room.disbanded')
     ]
 
@@ -334,16 +340,18 @@ describe('hosted Group Chat runtime', () => {
 
       if (method === 'groups.list') {
         return {
-          rooms: [{
-            authority_epoch: 1,
-            authority_gateway_id: 'install:home',
-            disbanded_at: 4,
-            latest_seq: 4,
-            members: MEMBERS,
-            name: 'Release',
-            revision: 2,
-            room_id: 'room-1'
-          }]
+          rooms: [
+            {
+              authority_epoch: 1,
+              authority_gateway_id: 'install:home',
+              disbanded_at: 4,
+              latest_seq: 4,
+              members: MEMBERS,
+              name: 'Release',
+              revision: 2,
+              room_id: 'room-1'
+            }
+          ]
         }
       }
 
@@ -383,14 +391,16 @@ describe('hosted Group Chat runtime', () => {
     loaded.chat.$groupChats.set({
       Release: room({
         hostedSeq: 2,
-        log: [{
-          at: 2,
-          from: { kind: 'user', name: 'You' },
-          id: 'user-1',
-          seq: 2,
-          text: 'Start',
-          thread: 'thread-1'
-        }]
+        log: [
+          {
+            at: 2,
+            from: { kind: 'user', name: 'You' },
+            id: 'user-1',
+            seq: 2,
+            text: 'Start',
+            thread: 'thread-1'
+          }
+        ]
       })
     })
 
@@ -418,16 +428,18 @@ describe('hosted Group Chat runtime', () => {
 
         if (method === 'groups.list') {
           return {
-            rooms: [{
-              authority_epoch: 1,
-              authority_gateway_id: 'install:home',
-              disbanded_at: 4,
-              latest_seq: 4,
-              members: MEMBERS,
-              name: 'Release',
-              revision: 2,
-              room_id: 'room-1'
-            }]
+            rooms: [
+              {
+                authority_epoch: 1,
+                authority_gateway_id: 'install:home',
+                disbanded_at: 4,
+                latest_seq: 4,
+                members: MEMBERS,
+                name: 'Release',
+                revision: 2,
+                room_id: 'room-1'
+              }
+            ]
           }
         }
 
@@ -461,14 +473,16 @@ describe('hosted Group Chat runtime', () => {
       loaded.chat.$groupChats.set({
         Release: room({
           hostedSeq: 2,
-          log: [{
-            at: 2,
-            from: { kind: 'user', name: 'You' },
-            id: 'user-1',
-            seq: 2,
-            text: 'Start',
-            thread: 'thread-1'
-          }]
+          log: [
+            {
+              at: 2,
+              from: { kind: 'user', name: 'You' },
+              id: 'user-1',
+              seq: 2,
+              text: 'Start',
+              thread: 'thread-1'
+            }
+          ]
         })
       })
 
@@ -491,16 +505,18 @@ describe('hosted Group Chat runtime', () => {
 
       if (method === 'groups.list') {
         return {
-          rooms: [{
-            authority_epoch: 1,
-            authority_gateway_id: 'install:home',
-            disbanded_at: 4,
-            latest_seq: 4,
-            members: MEMBERS,
-            name: 'Release',
-            revision: 2,
-            room_id: 'room-1'
-          }]
+          rooms: [
+            {
+              authority_epoch: 1,
+              authority_gateway_id: 'install:home',
+              disbanded_at: 4,
+              latest_seq: 4,
+              members: MEMBERS,
+              name: 'Release',
+              revision: 2,
+              room_id: 'room-1'
+            }
+          ]
         }
       }
 
@@ -1099,9 +1115,10 @@ describe('hosted Group Chat runtime', () => {
       const calls = loaded.calls.filter(call => call.method === `groups.${kind}`)
 
       expect(calls).toHaveLength(2)
-      expect(
-        calls.map(call => String(call.params.event_id || call.params.cancel_id || ''))
-      ).toEqual([commandId, commandId])
+      expect(calls.map(call => String(call.params.event_id || call.params.cancel_id || ''))).toEqual([
+        commandId,
+        commandId
+      ])
       expect(accepted).toBe(1)
       expect(loaded.storage.get('hosted-room-outbox-v1')).toMatchObject({
         commands: []

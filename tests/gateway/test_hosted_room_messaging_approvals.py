@@ -59,19 +59,25 @@ def test_pending_approval_is_bounded_and_cleared_exactly(tmp_path):
         "command": "pytest -q tests/focused",
         "choices": ["once", "deny"],
     }
-    assert approvals.clear_pending_approval(
-        db,
-        room_id="room-1",
-        member_id="member-1",
-        request_id="other-request",
-    ) == 0
+    assert (
+        approvals.clear_pending_approval(
+            db,
+            room_id="room-1",
+            member_id="member-1",
+            request_id="other-request",
+        )
+        == 0
+    )
     assert len(approvals.list_pending_approvals(db, room_id="room-1")) == 1
-    assert approvals.clear_pending_approval(
-        db,
-        room_id="room-1",
-        member_id="member-1",
-        request_id="request-1",
-    ) == 1
+    assert (
+        approvals.clear_pending_approval(
+            db,
+            room_id="room-1",
+            member_id="member-1",
+            request_id="request-1",
+        )
+        == 1
+    )
 
 
 def test_existing_approval_table_migrates_observer_generation(tmp_path):
@@ -100,9 +106,10 @@ def test_existing_approval_table_migrates_observer_generation(tmp_path):
     pending = _pending(db)
 
     assert pending["observer_generation"] == "legacy"
-    assert approvals.list_pending_approvals(db, room_id="room-1")[0][
-        "observer_generation"
-    ] == "legacy"
+    assert (
+        approvals.list_pending_approvals(db, room_id="room-1")[0]["observer_generation"]
+        == "legacy"
+    )
 
 
 def test_existing_approval_table_migrates_concurrently(tmp_path):
@@ -399,10 +406,13 @@ def test_stale_pending_approvals_and_commands_expire(tmp_path, monkeypatch):
 
     assert approvals.list_pending_approvals(db, room_id="room-1") == []
     assert approvals.list_pending_approval_commands(db, room_id="room-1") == []
-    assert approvals.approval_command(
-        db,
-        command_id="approval-command-1",
-    ) is None
+    assert (
+        approvals.approval_command(
+            db,
+            command_id="approval-command-1",
+        )
+        is None
+    )
 
     approvals.persist_pending_approval(
         db,
@@ -410,10 +420,13 @@ def test_stale_pending_approvals_and_commands_expire(tmp_path, monkeypatch):
         member_id="member-2",
         action=_action(task_id="task-2", request_id="request-2"),
     )
-    assert approvals.approval_command(
-        db,
-        command_id="approval-command-1",
-    ) is None
+    assert (
+        approvals.approval_command(
+            db,
+            command_id="approval-command-1",
+        )
+        is None
+    )
 
 
 def test_pending_approval_journal_has_a_per_room_cap(tmp_path, monkeypatch):
@@ -477,14 +490,20 @@ def test_completed_receipts_do_not_consume_the_pending_cap(tmp_path, monkeypatch
             result="Approved once.",
         )
 
-    assert approvals.approval_command(
-        db,
-        command_id="approval-command-1",
-    )["state"] == "completed"
-    assert approvals.approval_command(
-        db,
-        command_id="approval-command-3",
-    )["state"] == "completed"
+    assert (
+        approvals.approval_command(
+            db,
+            command_id="approval-command-1",
+        )["state"]
+        == "completed"
+    )
+    assert (
+        approvals.approval_command(
+            db,
+            command_id="approval-command-3",
+        )["state"]
+        == "completed"
+    )
 
 
 def test_multiple_approvals_require_an_explicit_number(tmp_path):
@@ -500,14 +519,20 @@ def test_multiple_approvals_require_an_explicit_number(tmp_path):
 
     with pytest.raises(approvals.MessagingApprovalError, match="Choose"):
         approvals.select_pending_approval(pending)
-    assert approvals.select_pending_approval(
-        pending,
-        approvals.approval_reference(first),
-    )[1] == first
-    assert approvals.select_pending_approval(
-        pending,
-        approvals.approval_reference(second),
-    )[1] == second
+    assert (
+        approvals.select_pending_approval(
+            pending,
+            approvals.approval_reference(first),
+        )[1]
+        == first
+    )
+    assert (
+        approvals.select_pending_approval(
+            pending,
+            approvals.approval_reference(second),
+        )[1]
+        == second
+    )
 
 
 def test_approval_code_does_not_retarget_after_list_reordering(tmp_path):
@@ -538,10 +563,13 @@ def test_single_text_approval_also_requires_its_stable_code(tmp_path):
 
     with pytest.raises(approvals.MessagingApprovalError, match="approval code"):
         approvals.select_pending_approval([pending])
-    assert approvals.select_pending_approval(
-        [pending],
-        approvals.approval_reference(pending),
-    )[1] == pending
+    assert (
+        approvals.select_pending_approval(
+            [pending],
+            approvals.approval_reference(pending),
+        )[1]
+        == pending
+    )
 
 
 def test_desktop_hosted_approval_names_the_supported_surface(tmp_path):
@@ -611,13 +639,13 @@ def test_approval_display_neutralizes_markup_shaped_bot_and_command_text(tmp_pat
     )
     room = {
         "room_id": "room-1",
-        "members": [
-            {"member_id": "member-1", "display_name": "[Admin](url) @all"}
-        ],
+        "members": [{"member_id": "member-1", "display_name": "[Admin](url) @all"}],
     }
 
     rendered = approvals.format_pending_approvals(
-        type("Service", (), {"status": lambda *_args: {"pending_actions": [pending]}})(),
+        type(
+            "Service", (), {"status": lambda *_args: {"pending_actions": [pending]}}
+        )(),
         room,
         room_reference="1",
     )
@@ -658,7 +686,9 @@ def test_native_picker_title_keeps_the_complete_bounded_action(tmp_path):
 
     assert action in title
     rendered = approvals.format_pending_approvals(
-        type("Service", (), {"status": lambda *_args: {"pending_actions": [pending]}})(),
+        type(
+            "Service", (), {"status": lambda *_args: {"pending_actions": [pending]}}
+        )(),
         {"room_id": "room-1", "members": []},
         room_reference="1",
     )

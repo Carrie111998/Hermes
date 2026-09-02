@@ -90,9 +90,7 @@ def control_api(tmp_path, monkeypatch):
         "tui_gateway.methods_groups.get_hosted_room_service",
         lambda: service,
     )
-    adapter = APIServerAdapter(
-        PlatformConfig(enabled=True, extra={"key": "sk-secret"})
-    )
+    adapter = APIServerAdapter(PlatformConfig(enabled=True, extra={"key": "sk-secret"}))
     app = web.Application()
     for method, path, handler in api_server_room_controls._http_routes(adapter):
         app.router.add_route(method, path, handler)
@@ -170,12 +168,15 @@ async def test_read_send_stop_and_retry_are_scoped_and_replay_safe(control_api):
         )
         assert retried.status == retry_replay.status == 200
         assert service.retried == []
-        assert len(
-            hosted_room_controls.load_pending_control_retries(
-                service.db_path,
-                room_id="room-1",
+        assert (
+            len(
+                hosted_room_controls.load_pending_control_retries(
+                    service.db_path,
+                    room_id="room-1",
+                )
             )
-        ) == 1
+            == 1
+        )
 
         stopped = await client.post(
             "/v1/room-controls/room-1",

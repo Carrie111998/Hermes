@@ -16,10 +16,7 @@ class Clock:
 
 
 def authorities(*room_ids: str, token: str = "authority:one") -> list[dict]:
-    return [
-        {"room_id": room_id, "authority_token": token}
-        for room_id in room_ids
-    ]
+    return [{"room_id": room_id, "authority_token": token} for room_id in room_ids]
 
 
 def authority_commitment(token: str = "authority:one") -> str:
@@ -335,15 +332,18 @@ def test_live_claim_can_be_renewed(tmp_path):
     clock.value += 5
 
     assert renewed["lease_token"] == claimed["lease_token"]
-    assert mailbox.complete_command(
-        db,
-        consumer_id="desktop:first",
-        command_id="messaging:renew",
-        lease_token=claimed["lease_token"],
-        success=True,
-        result={"thread_id": "thread-1"},
-        clock=clock,
-    )["state"] == "completed"
+    assert (
+        mailbox.complete_command(
+            db,
+            consumer_id="desktop:first",
+            command_id="messaging:renew",
+            lease_token=claimed["lease_token"],
+            success=True,
+            result={"thread_id": "thread-1"},
+            clock=clock,
+        )["state"]
+        == "completed"
+    )
 
 
 def test_presence_expires_without_deleting_pending_work(tmp_path):
@@ -400,12 +400,15 @@ def test_authority_token_fences_a_cold_desktop_after_owner_expiry(tmp_path):
     )
     clock.value += 6
 
-    assert mailbox.claim_commands(
-        db,
-        consumer_id="desktop:cold",
-        room_authorities=authorities("room-1", token="authority:wrong"),
-        clock=clock,
-    ) == []
+    assert (
+        mailbox.claim_commands(
+            db,
+            consumer_id="desktop:cold",
+            room_authorities=authorities("room-1", token="authority:wrong"),
+            clock=clock,
+        )
+        == []
+    )
     reclaimed = mailbox.claim_commands(
         db,
         consumer_id="desktop:owner",
@@ -426,11 +429,14 @@ def test_claim_cannot_establish_room_authority(tmp_path):
         payload={"message": "hello"},
     )
 
-    assert mailbox.claim_commands(
-        db,
-        consumer_id="desktop:untrusted",
-        room_authorities=authorities("room-1", token="authority:guessed"),
-    ) == []
+    assert (
+        mailbox.claim_commands(
+            db,
+            consumer_id="desktop:untrusted",
+            room_authorities=authorities("room-1", token="authority:guessed"),
+        )
+        == []
+    )
 
     claimed = mailbox.claim_commands(
         db,
@@ -451,13 +457,18 @@ def test_projected_authority_commitment_is_idempotent_and_fenced(tmp_path):
         [{"room_id": "room-1", "authority_hash": authority_commitment()}],
     ) == ["room-1"]
 
-    assert mailbox.register_projected_authorities(
-        db,
-        [{
-            "room_id": "room-1",
-            "authority_hash": authority_commitment("authority:other"),
-        }],
-    ) == []
+    assert (
+        mailbox.register_projected_authorities(
+            db,
+            [
+                {
+                    "room_id": "room-1",
+                    "authority_hash": authority_commitment("authority:other"),
+                }
+            ],
+        )
+        == []
+    )
 
     assert mailbox.register_projected_authorities(
         db,
@@ -553,13 +564,16 @@ def test_renew_keeps_room_ownership_alive_for_long_turn(tmp_path):
         )
 
     assert mailbox.room_available(db, "room-1", clock=clock) is True
-    assert mailbox.claim_commands(
-        db,
-        consumer_id="desktop:other",
-        room_authorities=authorities("room-1"),
-        actions=["stop"],
-        clock=clock,
-    ) == []
+    assert (
+        mailbox.claim_commands(
+            db,
+            consumer_id="desktop:other",
+            room_authorities=authorities("room-1"),
+            actions=["stop"],
+            clock=clock,
+        )
+        == []
+    )
 
 
 def test_default_presence_overlaps_the_minute_desktop_backstop(tmp_path):
@@ -662,21 +676,27 @@ def test_presence_refresh_allows_secret_proven_takeover_after_expiry(tmp_path):
         presence_ttl=5,
         clock=clock,
     ) == ["room-1"]
-    assert mailbox.refresh_presence(
-        db,
-        consumer_id="desktop:second",
-        room_authorities=authorities("room-1"),
-        presence_ttl=5,
-        clock=clock,
-    ) == []
+    assert (
+        mailbox.refresh_presence(
+            db,
+            consumer_id="desktop:second",
+            room_authorities=authorities("room-1"),
+            presence_ttl=5,
+            clock=clock,
+        )
+        == []
+    )
 
     clock.value += 6
-    assert mailbox.refresh_presence(
-        db,
-        consumer_id="desktop:second",
-        room_authorities=authorities("room-1", token="authority:wrong"),
-        clock=clock,
-    ) == []
+    assert (
+        mailbox.refresh_presence(
+            db,
+            consumer_id="desktop:second",
+            room_authorities=authorities("room-1", token="authority:wrong"),
+            clock=clock,
+        )
+        == []
+    )
     assert mailbox.refresh_presence(
         db,
         consumer_id="desktop:second",
@@ -699,12 +719,15 @@ def test_pending_command_expires_instead_of_running_days_later(tmp_path):
     )
 
     clock.value += mailbox.PENDING_TTL_SECONDS + 1
-    assert mailbox.claim_commands(
-        db,
-        consumer_id="desktop:first",
-        room_authorities=authorities("room-1"),
-        clock=clock,
-    ) == []
+    assert (
+        mailbox.claim_commands(
+            db,
+            consumer_id="desktop:first",
+            room_authorities=authorities("room-1"),
+            clock=clock,
+        )
+        == []
+    )
     state = mailbox.latest_command_states(db, ["room-1"])["room-1"]
     assert state["state"] == "failed"
     assert state["result"]["code"] == "command_expired"
@@ -726,12 +749,15 @@ def test_retry_requeues_all_bounded_expired_commands_oldest_first(tmp_path):
         clock.value += 1
 
     clock.value += mailbox.PENDING_TTL_SECONDS + 1
-    assert mailbox.claim_commands(
-        db,
-        consumer_id="desktop:first",
-        room_authorities=authorities("room-1"),
-        clock=clock,
-    ) == []
+    assert (
+        mailbox.claim_commands(
+            db,
+            consumer_id="desktop:first",
+            room_authorities=authorities("room-1"),
+            clock=clock,
+        )
+        == []
+    )
 
     frozen = mailbox.retryable_command_ids(db, room_id="room-1")
     assert frozen == ("messaging:stale-0", "messaging:stale-1")

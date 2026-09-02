@@ -241,16 +241,14 @@ def _derived_control_token(
     authority_epoch: int,
     request_id: str,
 ) -> str:
-    material = "\0".join(
-        (
-            "hermes-room-control-v1",
-            room_id,
-            member_id,
-            authority_gateway_id,
-            str(authority_epoch),
-            request_id,
-        )
-    ).encode("utf-8")
+    material = "\0".join((
+        "hermes-room-control-v1",
+        room_id,
+        member_id,
+        authority_gateway_id,
+        str(authority_epoch),
+        request_id,
+    )).encode("utf-8")
     digest = hmac.new(gateway_room_grant_secret(), material, hashlib.sha256).digest()
     return base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")
 
@@ -339,47 +337,52 @@ def _schema_is_current(conn: sqlite3.Connection) -> bool:
         row[1] for row in conn.execute("PRAGMA table_info(hosted_room_peer_controls)")
     }
     commands = {
-        row[1] for row in conn.execute("PRAGMA table_info(hosted_room_control_commands)")
+        row[1]
+        for row in conn.execute("PRAGMA table_info(hosted_room_control_commands)")
     }
-    return {
-        "room_id",
-        "member_id",
-        "authority_gateway_id",
-        "authority_epoch",
-        "request_id",
-        "token_hash",
-        "status",
-        "created_at",
-        "updated_at",
-        "expires_at",
-        "revoked_at",
-    }.issubset(home) and {
-        "room_id",
-        "member_id",
-        "room_name",
-        "member_count",
-        "home_url",
-        "transport_security",
-        "authority_gateway_id",
-        "authority_epoch",
-        "control_token",
-        "status",
-        "created_at",
-        "updated_at",
-        "expires_at",
-        "revoked_at",
-        "quarantine_reason",
-    }.issubset(peer) and {
-        "command_id",
-        "room_id",
-        "member_id",
-        "action",
-        "task_ids_json",
-        "state",
-        "result_json",
-        "created_at",
-        "updated_at",
-    }.issubset(commands)
+    return (
+        {
+            "room_id",
+            "member_id",
+            "authority_gateway_id",
+            "authority_epoch",
+            "request_id",
+            "token_hash",
+            "status",
+            "created_at",
+            "updated_at",
+            "expires_at",
+            "revoked_at",
+        }.issubset(home)
+        and {
+            "room_id",
+            "member_id",
+            "room_name",
+            "member_count",
+            "home_url",
+            "transport_security",
+            "authority_gateway_id",
+            "authority_epoch",
+            "control_token",
+            "status",
+            "created_at",
+            "updated_at",
+            "expires_at",
+            "revoked_at",
+            "quarantine_reason",
+        }.issubset(peer)
+        and {
+            "command_id",
+            "room_id",
+            "member_id",
+            "action",
+            "task_ids_json",
+            "state",
+            "result_json",
+            "created_at",
+            "updated_at",
+        }.issubset(commands)
+    )
 
 
 def _migrate_schema(conn: sqlite3.Connection) -> None:
@@ -464,11 +467,11 @@ def _active_room_scope(
     if table is None:
         return False
     row = conn.execute(
-            """SELECT members_json FROM hosted_rooms
+        """SELECT members_json FROM hosted_rooms
                 WHERE room_id=? AND authority_gateway_id=?
                   AND authority_epoch=? AND disbanded_at IS NULL""",
-            (room_id, authority_gateway_id, authority_epoch),
-        ).fetchone()
+        (room_id, authority_gateway_id, authority_epoch),
+    ).fetchone()
     if row is None:
         return False
     if member_id is None:
@@ -712,9 +715,7 @@ def revoke_home_control_token_value(
 
     room_id = _identifier(room_id, label="room_id")
     member_id = _identifier(member_id, label="member_id")
-    token_hash = hashlib.sha256(
-        _control_token(control_token).encode("ascii")
-    ).digest()
+    token_hash = hashlib.sha256(_control_token(control_token).encode("ascii")).digest()
     timestamp = _timestamp(time.time() if now is None else now, label="now")
     with _transaction(db_path, immediate=True) as conn:
         rows = conn.execute(
@@ -1223,8 +1224,7 @@ def load_pending_control_retries(
                 if not isinstance(raw_task_ids, list):
                     raise HostedRoomControlError("stored retry task_ids are invalid")
                 task_ids = tuple(
-                    _identifier(value, label="task_id")
-                    for value in raw_task_ids
+                    _identifier(value, label="task_id") for value in raw_task_ids
                 )
                 if (
                     not task_ids
@@ -1234,13 +1234,9 @@ def load_pending_control_retries(
                     raise HostedRoomControlError("stored retry task_ids are invalid")
                 pending.append(
                     PendingRoomControlRetry(
-                        command_id=_identifier(
-                            row["command_id"], label="command_id"
-                        ),
+                        command_id=_identifier(row["command_id"], label="command_id"),
                         room_id=_identifier(row["room_id"], label="room_id"),
-                        member_id=_identifier(
-                            row["member_id"], label="member_id"
-                        ),
+                        member_id=_identifier(row["member_id"], label="member_id"),
                         task_ids=task_ids,
                     )
                 )

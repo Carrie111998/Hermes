@@ -60,8 +60,7 @@ async def test_dm_label_without_one_to_one_proof_cannot_control_group_chats(
     )
 
     assert result == (
-        "Group Chat controls are private. Use your authorized one-to-one "
-        "Hermes chat."
+        "Group Chat controls are private. Use your authorized one-to-one Hermes chat."
     )
 
 
@@ -70,7 +69,9 @@ async def test_dm_label_without_one_to_one_proof_cannot_control_group_chats(
     "platform",
     [Platform.WHATSAPP_CLOUD, Platform.EMAIL, Platform.SMS],
 )
-async def test_native_distinct_dm_proves_private_owner_surface(tmp_path, monkeypatch, platform):
+async def test_native_distinct_dm_proves_private_owner_surface(
+    tmp_path, monkeypatch, platform
+):
     service = _FakeService(tmp_path / "state.db")
     monkeypatch.setattr(
         "gateway.hosted_room_messaging.current_room_backend", lambda: service
@@ -102,7 +103,9 @@ async def test_edited_message_cannot_start_group_chat_work(tmp_path, monkeypatch
 
     result = await _runner()._handle_rooms_command(event)
 
-    assert result == "Edited messages can’t run Group Chat commands. Send a new message."
+    assert (
+        result == "Edited messages can’t run Group Chat commands. Send a new message."
+    )
     assert service.sent == []
 
 
@@ -280,13 +283,11 @@ def test_relay_and_session_roundtrip_preserve_bot_provenance():
     assert SessionSource.from_dict(source.to_dict()).is_bot is True
     wire_source = source.to_dict()
     wire_source["message_is_edit"] = False
-    relayed = _event_from_wire(
-        {
-            "text": "/group",
-            "message_type": "command",
-            "source": wire_source,
-        }
-    )
+    relayed = _event_from_wire({
+        "text": "/group",
+        "message_type": "command",
+        "source": wire_source,
+    })
     assert relayed.source.is_bot is True
     assert relay_provenance_is_unknown(relayed) is False
 
@@ -294,18 +295,16 @@ def test_relay_and_session_roundtrip_preserve_bot_provenance():
 def test_legacy_relay_without_author_classification_fails_closed():
     from gateway.relay.ws_transport import _event_from_wire
 
-    relayed = _event_from_wire(
-        {
-            "text": "/group",
-            "message_type": "command",
-            "source": {
-                "platform": "discord",
-                "chat_id": "chat-1",
-                "chat_type": "dm",
-                "user_id": "user-1",
-            },
-        }
-    )
+    relayed = _event_from_wire({
+        "text": "/group",
+        "message_type": "command",
+        "source": {
+            "platform": "discord",
+            "chat_id": "chat-1",
+            "chat_type": "dm",
+            "user_id": "user-1",
+        },
+    })
     assert relay_provenance_is_unknown(relayed) is True
 
 
@@ -337,13 +336,11 @@ def test_authenticated_relay_preserves_one_to_one_privacy_proof(
     }
     if verified is not None:
         source["one_to_one_verified"] = verified
-    relayed = _event_from_wire(
-        {
-            "text": "/group",
-            "message_type": "command",
-            "source": source,
-        }
-    )
+    relayed = _event_from_wire({
+        "text": "/group",
+        "message_type": "command",
+        "source": source,
+    })
 
     assert relayed.source.is_one_to_one is expected
     assert relay_provenance_is_unknown(relayed) is False
@@ -362,22 +359,22 @@ async def test_classified_relay_dm_with_explicit_admin_can_control_group_chats(
         "gateway.hosted_room_messaging.current_room_backend",
         lambda: service,
     )
-    event = _event_from_wire(
-        {
-            "text": "/group list",
-            "message_type": "command",
-            "source": {
-                "platform": "signal",
-                "chat_id": "chat-signal",
-                "chat_type": "dm",
-                "user_id": "user-1",
-                "is_bot": False,
-                "message_is_edit": False,
-            },
-        }
-    )
+    event = _event_from_wire({
+        "text": "/group list",
+        "message_type": "command",
+        "source": {
+            "platform": "signal",
+            "chat_id": "chat-signal",
+            "chat_type": "dm",
+            "user_id": "user-1",
+            "is_bot": False,
+            "message_is_edit": False,
+        },
+    })
 
-    result = await _runner(extra={"allow_admin_from": ["user-1"]})._handle_rooms_command(event)
+    result = await _runner(
+        extra={"allow_admin_from": ["user-1"]}
+    )._handle_rooms_command(event)
 
     assert result.startswith("👥 **Group Chats**")
 
@@ -422,11 +419,12 @@ async def test_even_an_admin_cannot_expose_room_history_in_a_shared_chat(
     )
     event = _event("/group list", user_id="admin", chat_type="group")
 
-    result = await _runner(extra={"group_allow_admin_from": ["admin"]})._handle_rooms_command(event)
+    result = await _runner(
+        extra={"group_allow_admin_from": ["admin"]}
+    )._handle_rooms_command(event)
 
     assert result == (
-        "Group Chat controls are private. Use your authorized one-to-one "
-        "Hermes chat."
+        "Group Chat controls are private. Use your authorized one-to-one Hermes chat."
     )
     assert "Release room" not in result
 
@@ -444,9 +442,7 @@ async def test_room_history_and_mutation_require_an_explicit_admin(
     runner._is_user_authorized_for_source = lambda _source: True
     denial = "This chat can’t control Group Chats"
     assert denial in await runner._handle_rooms_command(_event("/group"))
-    assert denial in await runner._handle_room_command(
-        _event("/group 1 send hello")
-    )
+    assert denial in await runner._handle_room_command(_event("/group 1 send hello"))
     assert service.sent == []
 
 
@@ -615,11 +611,7 @@ async def test_routed_profile_uses_transport_principals_for_owner_census(
 
     def fake_auth_env(name, default=""):
         if name == "SIGNAL_ALLOWED_USERS":
-            return (
-                "user-1,user-2"
-                if active_scope["name"] == "transport"
-                else "user-1"
-            )
+            return "user-1,user-2" if active_scope["name"] == "transport" else "user-1"
         return default
 
     monkeypatch.setattr(gateway_run, "_profile_runtime_scope", fake_profile_scope)
@@ -641,9 +633,7 @@ async def test_routed_profile_uses_transport_principals_for_owner_census(
 
 
 @pytest.mark.asyncio
-async def test_secondary_adapter_allowlist_owns_the_owner_census(
-    tmp_path, monkeypatch
-):
+async def test_secondary_adapter_allowlist_owns_the_owner_census(tmp_path, monkeypatch):
     db, _, _ = _seed_rooms(tmp_path)
     service = _FakeService(db)
     monkeypatch.setattr(
@@ -740,7 +730,9 @@ async def test_busy_dispatch_runs_room_control_without_touching_main_agent():
 
 
 @pytest.mark.asyncio
-async def test_real_service_persists_server_owned_messaging_actor(tmp_path, monkeypatch):
+async def test_real_service_persists_server_owned_messaging_actor(
+    tmp_path, monkeypatch
+):
     service = _TestHostedRoomService(tmp_path / "state.db")
     service.create_room(
         room_id="release-room",
@@ -809,16 +801,18 @@ def test_cross_process_store_wakes_owner_without_desktop_transport(tmp_path):
     service.start()
     try:
         _wait_for(
-            lambda: sum(
-                row["kind"] == "message.member"
-                for row in hosted_rooms.read_events(
-                    service.db_path,
-                    room_id="release-room",
-                    since_seq=0,
-                    limit=40,
-                )["events"]
+            lambda: (
+                sum(
+                    row["kind"] == "message.member"
+                    for row in hosted_rooms.read_events(
+                        service.db_path,
+                        room_id="release-room",
+                        since_seq=0,
+                        limit=40,
+                    )["events"]
+                )
+                == 2
             )
-            == 2
         )
     finally:
         assert service.stop(timeout=1.0)
@@ -917,9 +911,7 @@ def test_cross_process_send_is_idempotent_on_transport_redelivery(
     )
     assert first["seq"] == second["seq"] == 1
     assert second["idempotent"] is True
-    delta = hosted_rooms.read_events(
-        db, room_id=room["room_id"], since_seq=0, limit=20
-    )
+    delta = hosted_rooms.read_events(db, room_id=room["room_id"], since_seq=0, limit=20)
     assert len(delta["events"]) == 1
 
 
@@ -955,10 +947,12 @@ def test_cross_process_stop_is_acknowledged_by_owner_for_running_work(tmp_path):
         )
         assert messaging_process.stop_room("release-room", cancel_id="stop-1") == 1
         _wait_for(
-            lambda: hosted_room_driver.list_tasks(
-                service.db_path, room_id="release-room"
-            )[0]["status"]
-            == "cancelled"
+            lambda: (
+                hosted_room_driver.list_tasks(service.db_path, room_id="release-room")[
+                    0
+                ]["status"]
+                == "cancelled"
+            )
         )
     finally:
         assert service.stop(timeout=1.0)

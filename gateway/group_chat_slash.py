@@ -115,9 +115,7 @@ class GroupChatSlashCommandsMixin:
             else:
                 pairing_store_for = getattr(self, "_pairing_store_for", None)
                 pairing_store = (
-                    pairing_store_for(source)
-                    if callable(pairing_store_for)
-                    else None
+                    pairing_store_for(source) if callable(pairing_store_for) else None
                 )
             if pairing_store is not None:
                 try:
@@ -148,7 +146,6 @@ class GroupChatSlashCommandsMixin:
         with _profile_runtime_scope(Path(authorization_home)):
             return _census()
 
-
     def _can_control_group_chats(self, event: MessageEvent) -> bool:
         """Authorize a trusted DM or the exact operator of an explicit home chat."""
         from gateway.slash_access import policy_for_source
@@ -159,14 +156,19 @@ class GroupChatSlashCommandsMixin:
         # m.direct rooms can contain several people. Adapters stamp this
         # transport-local signal only when they can prove the current surface is
         # one-to-one. Unknown and older connectors fail closed.
-        platform = str(getattr(getattr(event.source, "platform", None), "value", "") or "")
+        platform = str(
+            getattr(getattr(event.source, "platform", None), "value", "") or ""
+        )
         native_distinct_dm = (
             getattr(event.source, "delivered_via_upstream_relay", False) is not True
             and platform in _NATIVE_DISTINCT_DM_PLATFORMS
             and str(getattr(event.source, "chat_type", "") or "").casefold()
             in {"dm", "direct", "private"}
         )
-        if getattr(event.source, "is_one_to_one", None) is not True and not native_distinct_dm:
+        if (
+            getattr(event.source, "is_one_to_one", None) is not True
+            and not native_distinct_dm
+        ):
             return False
         chat_type = str(getattr(event.source, "chat_type", "") or "").casefold()
         if chat_type not in {"", "dm", "direct", "private"}:
@@ -174,20 +176,18 @@ class GroupChatSlashCommandsMixin:
         policy = policy_for_source(self.config, event.source)
         return policy.enabled and policy.is_admin(event.source.user_id)
 
-
     @staticmethod
     def _group_chat_control_denial(event: MessageEvent) -> str:
         chat_type = str(getattr(event.source, "chat_type", "") or "").casefold()
-        platform = str(getattr(getattr(event.source, "platform", None), "value", "") or "")
+        platform = str(
+            getattr(getattr(event.source, "platform", None), "value", "") or ""
+        )
         proven_private = getattr(event.source, "is_one_to_one", None) is True or (
             getattr(event.source, "delivered_via_upstream_relay", False) is not True
             and platform in _NATIVE_DISTINCT_DM_PLATFORMS
             and chat_type in {"dm", "direct", "private"}
         )
-        if (
-            chat_type not in {"", "dm", "direct", "private"}
-            or not proven_private
-        ):
+        if chat_type not in {"", "dm", "direct", "private"} or not proven_private:
             return (
                 "Group Chat controls are private. Use your authorized one-to-one "
                 "Hermes chat."
@@ -196,7 +196,6 @@ class GroupChatSlashCommandsMixin:
             "This chat can’t control Group Chats. Use your authorized one-to-one "
             "Hermes chat or authorize this account in settings."
         )
-
 
     def _group_chat_rate_limit_denial(
         self,
@@ -223,7 +222,11 @@ class GroupChatSlashCommandsMixin:
             platform,
             str(getattr(source, "scope_id", None) or ""),
             str(getattr(source, "chat_id", None) or ""),
-            str(getattr(source, "user_id_alt", None) or getattr(source, "user_id", None) or ""),
+            str(
+                getattr(source, "user_id_alt", None)
+                or getattr(source, "user_id", None)
+                or ""
+            ),
             bucket_kind,
         )
         now = time.monotonic()
@@ -251,7 +254,6 @@ class GroupChatSlashCommandsMixin:
                 buckets.pop(next(iter(buckets)))
         return None
 
-
     @staticmethod
     def _group_chat_profile(event: MessageEvent) -> str:
         """Return the profile selected by the authenticated inbound route."""
@@ -262,7 +264,6 @@ class GroupChatSlashCommandsMixin:
         from hermes_cli.profiles import get_active_profile_name
 
         return str(get_active_profile_name() or "default")
-
 
     async def _handle_rooms_command(self, event: MessageEvent) -> Optional[str]:
         """List Bot Group Chats or show one chat's recent activity."""
@@ -306,7 +307,8 @@ class GroupChatSlashCommandsMixin:
                 words
                 and words[0].isdecimal()
                 and len(words) > 1
-                and words[1].casefold() in {
+                and words[1].casefold()
+                in {
                     "approve",
                     "deny",
                     "retry",
@@ -410,7 +412,9 @@ class GroupChatSlashCommandsMixin:
                         return str(exc)
                     except Exception:
                         logger.exception("Failed to apply Group Chat approval")
-                        return "Couldn’t apply that approval. Check the Group Chat again."
+                        return (
+                            "Couldn’t apply that approval. Check the Group Chat again."
+                        )
 
                 picker_sent = bool(choices) and await self._try_send_choice_picker(
                     event,
@@ -435,7 +439,9 @@ class GroupChatSlashCommandsMixin:
                 room = resolve_room(rooms, words[0])
                 if words[1].casefold() == "bot":
                     if len(words) != 3:
-                        return f"Use `{rooms_command} {words[0]} bot <number or handle>`."
+                        return (
+                            f"Use `{rooms_command} {words[0]} bot <number or handle>`."
+                        )
                     return await asyncio.to_thread(
                         format_room_bot_detail,
                         service,
@@ -543,7 +549,9 @@ class GroupChatSlashCommandsMixin:
                     except (RoomControlError, hosted_rooms.HostedRoomError) as exc:
                         return str(exc)
                     except Exception:
-                        logger.exception("Failed to open Group Chat from messaging picker")
+                        logger.exception(
+                            "Failed to open Group Chat from messaging picker"
+                        )
                         return (
                             "Couldn’t load that Group Chat. "
                             f"Run `{rooms_command}` again."
@@ -579,7 +587,9 @@ class GroupChatSlashCommandsMixin:
                 )
             list_parts = query.casefold().split()
             if not query or (list_parts and list_parts[0] == "list"):
-                if len(list_parts) > 2 or (len(list_parts) == 2 and not list_parts[1].isdecimal()):
+                if len(list_parts) > 2 or (
+                    len(list_parts) == 2 and not list_parts[1].isdecimal()
+                ):
                     return f"Use `{rooms_command} list [page]`."
                 page = int(list_parts[1]) if len(list_parts) == 2 else 1
                 return await asyncio.to_thread(
@@ -605,7 +615,6 @@ class GroupChatSlashCommandsMixin:
             logger.exception("Failed to read Bot Group Chats from messaging")
             return "Couldn’t load Group Chats. Try again in a moment."
 
-
     async def _handle_room_command(self, event: MessageEvent) -> str:
         """Send to or stop work in a Bot Group Chat."""
 
@@ -625,6 +634,7 @@ class GroupChatSlashCommandsMixin:
             messaging_event_id,
             relay_provenance_is_unknown,
         )
+
         if is_machine_authored(event):
             return "Group Chat controls are only available to people."
         if is_message_edit(event):
@@ -654,9 +664,7 @@ class GroupChatSlashCommandsMixin:
                     raise RoomControlError(
                         f"Use `{rooms_command} <room number> send <message>`."
                     )
-                raise RoomControlError(
-                    f"Use `{rooms_command} <room number> stop`."
-                )
+                raise RoomControlError(f"Use `{rooms_command} <room number> stop`.")
 
             def _mutate() -> str:
                 rooms = list_messaging_rooms(
@@ -679,7 +687,10 @@ class GroupChatSlashCommandsMixin:
                         service.db_path,
                         command_id=approval_command_id,
                     )
-                    if approval_receipt is not None and approval_receipt["state"] == "completed":
+                    if (
+                        approval_receipt is not None
+                        and approval_receipt["state"] == "completed"
+                    ):
                         return str(
                             approval_receipt.get("result_text")
                             or "Approval is no longer available."
@@ -704,10 +715,9 @@ class GroupChatSlashCommandsMixin:
                         raise RoomControlError(
                             "That approval is no longer available. Check Group Chats again."
                         )
-                if (
-                    room.get("_room_mode") == "desktop"
-                    and str(room.get("room_id") or "").startswith("name:")
-                ):
+                if room.get("_room_mode") == "desktop" and str(
+                    room.get("room_id") or ""
+                ).startswith("name:"):
                     raise RoomControlError(
                         "Open this older Group Chat once in the latest Hermes Desktop "
                         "before changing it from messaging."
