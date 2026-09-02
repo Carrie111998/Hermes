@@ -159,6 +159,45 @@ def _classify_write_denial(path: str) -> Optional[str]:
         except Exception:
             continue
 
+    # Sibling profiles: writes into ANOTHER profile's credential / control
+    # files have no legitimate in-profile use — a prompt-injected session
+    # must not overwrite a sibling's .env / config.yaml / auth.json or
+    # token stores. Sibling dirs only (never the active profile or root),
+    # so active-profile write behavior is exactly upstream's. Same shape
+    # as the #15981 dir widening, one level wider.
+    sibling_dirs = []
+    try:
+        for entry in (_hermes_root_path() / "profiles").iterdir():
+            if not entry.is_dir():
+                continue
+            real = os.path.realpath(entry)
+            if real not in hermes_dirs and real not in sibling_dirs:
+                sibling_dirs.append(real)
+    except Exception:
+        pass
+    sibling_credential_names = (
+        ".env",
+        "config.yaml",
+        "auth.json",
+        ".anthropic_oauth.json",
+        "webhook_subscriptions.json",
+        os.path.join("cache", "bws_cache.enc.json"),
+    )
+    for base_real in sibling_dirs:
+        for name in sibling_credential_names:
+            try:
+                if resolved == os.path.realpath(os.path.join(base_real, name)):
+                    return "credential"
+            except Exception:
+                continue
+        for sub in (mcp_tokens_dir_name, "pairing"):
+            try:
+                sub_real = os.path.realpath(os.path.join(base_real, sub))
+                if resolved == sub_real or resolved.startswith(sub_real + os.sep):
+                    return "credential"
+            except Exception:
+                continue
+
     for base_real in hermes_dirs:
         # Session transcripts are application-owned state.  Letting the agent's
         # generic file tools rewrite state.db or legacy JSON snapshots can
@@ -304,6 +343,22 @@ def get_read_block_error(path: str) -> Optional[str]:
                 hermes_dirs.append(real)
         except Exception:
             continue
+
+    # Sibling profiles: enumerate <root>/profiles/* so every profile's
+    # credential stores get the same read-deny as the active profile and
+    # root. Without this, a profile-mode session can read another profile's
+    # auth.json / mcp-tokens / OAuth stores (only .env was caught, via the
+    # blanket basename rule below). Same shape as the #15981 dir widening,
+    # one level wider.
+    try:
+        for entry in (_hermes_root_path().resolve() / "profiles").iterdir():
+            if not entry.is_dir():
+                continue
+            real = entry.resolve()
+            if real not in hermes_dirs:
+                hermes_dirs.append(real)
+    except Exception:
+        pass
 
     # Skills .hub: prompt-injection carriers.
     for hd in hermes_dirs:
