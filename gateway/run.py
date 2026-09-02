@@ -27732,7 +27732,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 result = await asyncio.to_thread(
                     transcribe_audio, path, None, "gateway",
                 )
-                if not result.get("success"):
+                if (
+                    not result.get("success")
+                    and getattr(self.config, "stt_local_fallback", True)
+                ):
                     fallback = await asyncio.to_thread(
                         transcribe_audio_local_fallback,
                         path,

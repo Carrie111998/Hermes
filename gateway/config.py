@@ -967,6 +967,7 @@ class GatewayConfig:
     # STT settings
     stt_enabled: bool = True  # Whether to auto-transcribe inbound voice messages
     stt_echo_transcripts: bool = True  # Whether to echo raw STT transcripts back to the user
+    stt_local_fallback: bool = True  # Whether cloud/plugin STT failures may fall back to local Whisper
 
     # Session isolation in shared chats
     group_sessions_per_user: bool = True  # Isolate group/channel sessions per participant when user IDs are available
@@ -1217,6 +1218,13 @@ class GatewayConfig:
                 if isinstance(data.get("stt"), dict)
                 else None
             )
+        stt_local_fallback = data.get("stt_local_fallback")
+        if stt_local_fallback is None:
+            stt_local_fallback = (
+                data.get("stt", {}).get("local_fallback")
+                if isinstance(data.get("stt"), dict)
+                else None
+            )
 
         group_sessions_per_user = data.get("group_sessions_per_user")
         thread_sessions_per_user = data.get("thread_sessions_per_user")
@@ -1334,6 +1342,7 @@ class GatewayConfig:
             ),
             stt_enabled=_coerce_bool(stt_enabled, True),
             stt_echo_transcripts=_coerce_bool(stt_echo_transcripts, True),
+            stt_local_fallback=_coerce_bool(stt_local_fallback, True),
             group_sessions_per_user=_coerce_bool(group_sessions_per_user, True),
             thread_sessions_per_user=_coerce_bool(thread_sessions_per_user, False),
             multiplex_profiles=_coerce_bool(multiplex_profiles, False),
