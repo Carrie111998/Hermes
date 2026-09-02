@@ -1281,3 +1281,55 @@ def test_find_profile_gateway_processes_strict_propagates_profile_listing_failur
 
     with pytest.raises(RuntimeError, match="profile listing failed"):
         gateway.find_profile_gateway_processes(strict=True)
+
+
+def test_find_windows_gateway_services_ignores_exempt_system_services(monkeypatch):
+    """Exempt Windows system services like Schedule (Task Scheduler) or BITS must
+    never be classified as Hermes gateway services (#97208)."""
+    monkeypatch.setattr(gateway.sys, "platform", "win32")
+    profile = SimpleNamespace(profile="default", pid=300, create_time=300.0)
+
+    class FakeService:
+        def __init__(self, name, pid, status="running"):
+            self._name = name
+            self._pid = pid
+            self._status = status
+
+        def name(self):
+            return self._name
+
+        def pid(self):
+            return self._pid
+
+        def status(self):
+            return self._status
+
+    class FakeProcess:
+        def __init__(self, pid):
+            self.pid = pid
+
+        def parents(self):
+            # Parent chain reaches Schedule service host (svchost.exe PID 100)
+            return [FakeProcess(200), FakeProcess(100)]
+
+        def children(self, recursive=False):
+            return [FakeProcess(200), FakeProcess(300)]
+
+        def create_time(self):
+            return float(self.pid)
+
+    fake_psutil = SimpleNamespace(
+        win_service_iter=lambda: [
+            FakeService("Schedule", 100),  # Windows Task Scheduler
+            FakeService("BITS", 150, status="start_pending"),
+        ],
+        Process=FakeProcess,
+    )
+
+    result = gateway.find_windows_gateway_services(
+        psutil_module=fake_psutil,
+        profile_processes=[profile],
+    )
+
+    assert result == []
+

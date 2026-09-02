@@ -1105,6 +1105,25 @@ def find_profile_gateway_processes(
     return processes
 
 
+_EXEMPT_WINDOWS_SYSTEM_SERVICES: frozenset[str] = frozenset({
+    "schedule",
+    "bits",
+    "winmgmt",
+    "dcomlaunch",
+    "rpcss",
+    "eventlog",
+    "plugplay",
+    "lanmanserver",
+    "lanmanworkstation",
+    "wuauserv",
+    "appidsvc",
+    "cryptsvc",
+    "wscsvc",
+    "gpsvc",
+    "trustedinstaller",
+})
+
+
 def find_windows_gateway_services(
     *,
     psutil_module=None,
@@ -1150,6 +1169,8 @@ def find_windows_gateway_services(
                 raise RuntimeError("SCM service inspection failed") from exc
             if not service_name:
                 raise RuntimeError("SCM service has an empty name")
+            if service_name.lower() in _EXEMPT_WINDOWS_SYSTEM_SERVICES:
+                continue
             if service_status == "stopped":
                 continue
             if service_status != "running":

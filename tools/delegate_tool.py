@@ -955,6 +955,21 @@ def _get_worktree_isolation() -> bool:
     return bool(cfg.get("worktree_isolation", False))
 
 
+def _get_worktree_repo_root() -> str | None:
+    """Read optional delegation.worktree_repo_root from config (str | None).
+
+    When set, this directory is used as the git repository anchor for worktree
+    isolation instead of relying solely on the parent session's recorded
+    terminal cwd (#97209).
+    """
+    cfg = _load_config()
+    val = cfg.get("worktree_repo_root")
+    if isinstance(val, str) and val.strip():
+        return val.strip()
+    return None
+
+
+
 _LEGACY_MAX_ASYNC_WARNED = False
 
 
@@ -2938,16 +2953,27 @@ def _run_single_child(
                         _parent_cwd = _gsc(parent_task_id)
                     except Exception:
                         pass
+                    _explicit_root = _get_worktree_repo_root()
+                    _anchor = (
+                        _explicit_root
+                        or _parent_cwd
+                        or _resolve_workspace_hint(parent_agent)
+                    )
                     _worktree_info = subagent_worktree.create_subagent_worktree(
-                        _parent_cwd or _resolve_workspace_hint(parent_agent),
+                        _anchor,
                         subagent_id=_subagent_id,
                     )
+                    if _worktree_info is None:
+                        logger.warning(
+                            "Worktree isolation requested but could not create worktree for anchor %r (not a git repo or creation failed). Falling back to shared workspace.",
+                            _anchor,
+                        )
                 else:
-                    logger.debug(
-                        "worktree isolation skipped: non-local terminal backend"
+                    logger.warning(
+                        "Worktree isolation requested but terminal backend is non-local. Falling back to shared workspace."
                     )
             except Exception as e:
-                logger.debug("worktree isolation setup failed: %s", e)
+                logger.warning("Worktree isolation setup failed (%s). Falling back to shared workspace.", e)
             if _worktree_info is not None:
                 try:
                     from tools.terminal_tool import record_session_cwd as _rsc
