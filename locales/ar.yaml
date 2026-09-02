@@ -68,6 +68,8 @@ gateway:
     usage_switch_model:     "`/model <name>` — تبديل النموذج"
     usage_switch_provider:  "`/model <name> --provider <slug>` — تبديل المزوّد"
     usage_persist:          "`/model <name> --global` — حفظ دائم"
+    usage_clear:            "`/model --clear` — إزالة تجاوز الجلسة (استخدام config.yaml / CLI)"
+    cleared:                "أُزيل تجاوز النموذج لهذه الجلسة. الرسائل التالية تستخدم config.yaml / CLI (`{model}` على {provider})."
 
   agents:
     header:                "🤖 **الوكلاء والمهام النشطة**"

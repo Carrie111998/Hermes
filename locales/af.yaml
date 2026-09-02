@@ -45,6 +45,8 @@ gateway:
     usage_switch_model:     "`/model <name>` — verander model"
     usage_switch_provider:  "`/model <name> --provider <slug>` — verander verskaffer"
     usage_persist:          "`/model <name> --global` — stoor permanent"
+    usage_clear:            "`/model --clear` — laat vaar sessie-oorskrywing (gebruik config.yaml / CLI)"
+    cleared:                "Hierdie sessie se model-oorskrywing is verwyder. Volgende boodskappe gebruik config.yaml / CLI (`{model}` op {provider})."
 
   agents:
     header:                "🤖 **Aktiewe Agente & Take**"

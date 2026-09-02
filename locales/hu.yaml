@@ -45,6 +45,8 @@ gateway:
     usage_switch_model:     "`/model <name>` — modell váltása"
     usage_switch_provider:  "`/model <name> --provider <slug>` — szolgáltató váltása"
     usage_persist:          "`/model <name> --global` — megőrzés"
+    usage_clear:            "`/model --clear` — munkamenet-felülírás törlése (config.yaml / CLI)"
+    cleared:                "A munkamenet modellfelülírása törölve. A következő üzenetek a config.yaml / CLI beállítást használják (`{model}`, {provider})."
 
   agents:
     header:                "🤖 **Aktív ügynökök és feladatok**"

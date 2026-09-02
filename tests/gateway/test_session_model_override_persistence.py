@@ -141,6 +141,29 @@ def test_runner_rehydrates_override_after_restart(store_factory):
     assert route["runtime"]["capabilities"] == {"openai_native_compaction": True}
 
 
+def test_cleared_override_lets_config_default_apply_after_restart(store_factory):
+    store = store_factory()
+    entry = store.get_or_create_session(_make_source())
+    session_key = entry.session_key
+    store.set_model_override(session_key, OVERRIDE)
+    store.set_model_override(session_key, None)
+    assert store.get_model_override(session_key) is None
+
+    runner = _make_runner(store_factory())
+    runner._rehydrate_session_model_override(session_key)
+    assert session_key not in runner._session_model_overrides
+
+    with patch(
+        "gateway.run._resolve_runtime_agent_kwargs",
+        return_value={"provider": "openai", "api_key": "x"},
+    ):
+        model, _runtime = runner._resolve_session_agent_runtime(
+            session_key=session_key,
+            user_config={"model": {"default": "global-model"}},
+        )
+    assert model == "global-model"
+
+
 def test_sanitize_model_override():
     assert sanitize_model_override(None) is None
     assert sanitize_model_override({}) is None

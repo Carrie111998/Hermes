@@ -45,6 +45,8 @@ gateway:
     usage_switch_model:     "`/model <name>` — モデルを切り替え"
     usage_switch_provider:  "`/model <name> --provider <slug>` — プロバイダーを切り替え"
     usage_persist:          "`/model <name> --global` — 永続化"
+    usage_clear:            "`/model --clear` — セッション上書きを解除（config.yaml / CLI を使用）"
+    cleared:                "このセッションのモデル上書きを解除しました。以降のメッセージは config.yaml / CLI を使います（`{model}` / {provider}）。"
 
   agents:
     header:                "🤖 **アクティブなエージェントとタスク**"

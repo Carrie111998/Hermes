@@ -12,6 +12,9 @@ Real imports throughout (AGENTS.md: no mocks for resolution chains).
 import pytest
 
 from hermes_cli.model_switch import (
+    MODEL_SWITCH_ERR_CLEAR_WITH_GLOBAL,
+    MODEL_SWITCH_ERR_CLEAR_WITH_ONCE,
+    MODEL_SWITCH_ERR_CLEAR_WITH_TARGET,
     MODEL_SWITCH_ERR_ONCE_REQUIRES_TARGET,
     MODEL_SWITCH_ERR_ONCE_WITH_GLOBAL,
     MODEL_SWITCH_ERROR_TEXT,
@@ -49,6 +52,42 @@ def test_once_with_global_conflict():
         == "/model --once cannot be combined with --global"
     )
     assert "/model --once cannot be combined with --global" in req.error_messages()
+
+
+def test_clear_flag_and_unassign_tokens():
+    for raw in ("--clear", "default", "-", "clear", "reset", "DEFAULT"):
+        req = parse_model_switch_args(raw)
+        assert req.is_clear is True, raw
+        assert req.scope == "clear"
+        assert req.target == ""
+        assert req.errors == ()
+
+    parsed = parse_model_flags_detailed("—clear")
+    assert parsed.is_clear is True
+    assert parse_model_switch_args("—clear").is_clear is True
+
+
+def test_clear_conflicts():
+    assert MODEL_SWITCH_ERR_CLEAR_WITH_GLOBAL in parse_model_switch_args(
+        "--clear --global"
+    ).errors
+    assert MODEL_SWITCH_ERR_CLEAR_WITH_ONCE in parse_model_switch_args(
+        "--clear --once"
+    ).errors
+    assert MODEL_SWITCH_ERR_CLEAR_WITH_TARGET in parse_model_switch_args(
+        "sonnet --clear"
+    ).errors
+    assert MODEL_SWITCH_ERR_CLEAR_WITH_TARGET in parse_model_switch_args(
+        "--clear --provider anthropic"
+    ).errors
+
+
+def test_default_with_provider_is_not_clear():
+    req = parse_model_switch_args("default --provider ollama")
+    assert req.is_clear is False
+    assert req.target == "default"
+    assert req.explicit_provider == "ollama"
+    assert req.errors == ()
 
 
 

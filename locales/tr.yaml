@@ -45,6 +45,8 @@ gateway:
     usage_switch_model:     "`/model <name>` — modeli değiştir"
     usage_switch_provider:  "`/model <name> --provider <slug>` — sağlayıcıyı değiştir"
     usage_persist:          "`/model <name> --global` — kalıcı kaydet"
+    usage_clear:            "`/model --clear` — oturum geçersiz kılmayı kaldır (config.yaml / CLI kullan)"
+    cleared:                "Bu oturumun model geçersiz kılması kaldırıldı. Sonraki iletiler config.yaml / CLI kullanır (`{model}` / {provider})."
 
   agents:
     header:                "🤖 **Aktif Ajanlar ve Görevler**"

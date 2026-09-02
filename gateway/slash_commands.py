@@ -1759,6 +1759,8 @@ class GatewaySlashCommandsMixin:
           /model <name> --global              — switch and persist to config.yaml
           /model <name> --provider <provider> — switch provider + model
           /model --provider <provider>        — switch to provider, auto-detect model
+          /model --clear                      — drop this session's override (config.yaml / CLI win)
+          /model default  |  /model -         — same as --clear
         """
         from gateway.run import _hermes_home, _load_gateway_config
         from hermes_cli.model_switch import (
@@ -1777,8 +1779,8 @@ class GatewaySlashCommandsMixin:
                 self, "_resolve_profile_home_for_source"
             )(source)
 
-        # Parse --provider, --global, --session, --once, and --refresh flags
-        # via the shared single-owner parser (hermes_cli.model_switch).
+        # Parse --provider, --global, --session, --once, --clear, and --refresh
+        # flags via the shared single-owner parser (hermes_cli.model_switch).
         request = parse_model_switch_args(raw_args)
         model_input = request.target
         explicit_provider = request.explicit_provider
@@ -1786,6 +1788,7 @@ class GatewaySlashCommandsMixin:
         force_refresh = request.force_refresh
         is_session = request.is_session
         one_turn = request.is_once
+        is_clear = request.is_clear
         if request.errors:
             # Gateway decoration: "❌ " prefix over the canonical error copy.
             return f"❌ {request.error_messages()[0]}"
@@ -1844,11 +1847,23 @@ class GatewaySlashCommandsMixin:
         restore_snapshot = (
             self._snapshot_session_model_override(session_key) if one_turn else None
         )
+        config_model = current_model
+        config_provider = current_provider
         if override:
             current_model = override.get("model", current_model)
             current_provider = override.get("provider", current_provider)
             current_base_url = override.get("base_url", current_base_url)
             current_api_key = override.get("api_key", current_api_key)
+
+        if is_clear:
+            # Drop the session override only.  --global remains the yaml-write
+            # path; this is the exit so yaml/CLI win again without a /new.
+            return await self._clear_session_model_override(
+                source=source,
+                session_key=session_key,
+                config_model=config_model,
+                config_provider=config_provider,
+            )
 
         # No args: show interactive picker (Telegram/Discord) or text list
         if not model_input and not explicit_provider:
@@ -2204,6 +2219,7 @@ class GatewaySlashCommandsMixin:
             lines.append(t("gateway.model.usage_switch_model"))
             lines.append(t("gateway.model.usage_switch_provider"))
             lines.append(t("gateway.model.usage_persist"))
+            lines.append(t("gateway.model.usage_clear"))
             return "\n".join(lines)
 
         # Perform the switch
@@ -2534,6 +2550,72 @@ class GatewaySlashCommandsMixin:
             )
 
         return await _finish_switch()
+
+    async def _clear_session_model_override(
+        self,
+        *,
+        source,
+        session_key: str,
+        config_model: str,
+        config_provider: str,
+    ) -> str:
+        """Drop the persisted /model override so yaml/CLI win again.
+
+        Pops the in-memory map, writes ``set_model_override(..., None)`` so
+        hydrate cannot resurrect the pick, and clears ``sessions.model`` /
+        ``model_config`` model+provider if those columns were written by
+        the original switch.  Does not write config.yaml.
+        """
+        self._session_model_overrides.pop(session_key, None)
+        restores = getattr(self, "_pending_one_turn_model_restores", None)
+        if restores is not None:
+            try:
+                restores.pop(session_key, None)
+            except Exception:
+                pass
+        notes = getattr(self, "_pending_model_notes", None)
+        if isinstance(notes, dict):
+            notes.pop(session_key, None)
+        try:
+            self._last_resolved_model.pop(session_key, None)
+        except Exception:
+            pass
+
+        store = getattr(self, "async_session_store", None)
+        if store is not None:
+            try:
+                await store.set_model_override(session_key, None)
+            except Exception:
+                logger.debug(
+                    "Failed to clear persisted session model override",
+                    exc_info=True,
+                )
+
+        _sess_db = getattr(self, "_session_db", None)
+        if _sess_db is not None and store is not None:
+            try:
+                _sess_entry = await store.get_or_create_session(source)
+                updater = getattr(_sess_db, "update_session_model", None)
+                if callable(updater):
+                    await updater(_sess_entry.session_id, "")
+                patcher = getattr(_sess_db, "patch_session_model_config", None)
+                if callable(patcher):
+                    await patcher(
+                        _sess_entry.session_id,
+                        {"model": None, "provider": None},
+                    )
+            except Exception:
+                logger.debug(
+                    "Failed to clear sessions.model after /model --clear",
+                    exc_info=True,
+                )
+
+        self._evict_cached_agent(session_key)
+        return t(
+            "gateway.model.cleared",
+            model=config_model or "configured default",
+            provider=config_provider or "default",
+        )
 
     async def _handle_codex_runtime_command(self, event: MessageEvent) -> str:
         """Handle /codex-runtime command in the gateway.

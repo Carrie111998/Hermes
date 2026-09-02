@@ -45,6 +45,8 @@ gateway:
     usage_switch_model:     "`/model <name>` — змінити модель"
     usage_switch_provider:  "`/model <name> --provider <slug>` — змінити провайдера"
     usage_persist:          "`/model <name> --global` — зберегти назавжди"
+    usage_clear:            "`/model --clear` — скинути перевизначення сесії (config.yaml / CLI)"
+    cleared:                "Перевизначення моделі цієї сесії скинуто. Наступні повідомлення використовують config.yaml / CLI (`{model}` на {provider})."
 
   agents:
     header:                "🤖 **Активні агенти та завдання**"

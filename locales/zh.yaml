@@ -45,6 +45,8 @@ gateway:
     usage_switch_model:     "`/model <name>` — 切换模型"
     usage_switch_provider:  "`/model <name> --provider <slug>` — 切换提供方"
     usage_persist:          "`/model <name> --global` — 永久保存"
+    usage_clear:            "`/model --clear` — 清除会话覆盖（改用 config.yaml / CLI）"
+    cleared:                "已清除本会话的模型覆盖。之后的消息使用 config.yaml / CLI（`{model}`，{provider}）。"
 
   agents:
     header:                "🤖 **活跃代理与任务**"

@@ -45,6 +45,8 @@ gateway:
     usage_switch_model:     "`/model <name>` — changer de modèle"
     usage_switch_provider:  "`/model <name> --provider <slug>` — changer de fournisseur"
     usage_persist:          "`/model <name> --global` — conserver"
+    usage_clear:            "`/model --clear` — retirer le forçage de session (revenir à config.yaml / CLI)"
+    cleared:                "Forçage de modèle de cette session retiré. Les messages suivants utilisent config.yaml / CLI (`{model}` sur {provider})."
 
   agents:
     header:                "🤖 **Agents et tâches actifs**"

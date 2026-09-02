@@ -12003,6 +12003,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
           /model <name> --global              — switch and persist to config.yaml
           /model <name> --provider <provider> — switch provider + model
           /model --provider <provider>        — switch to provider, auto-detect model
+          /model --clear                      — drop a messaging-session override
 
         Persistence defaults to off (``model.persist_switch_by_default`` in
         config.yaml, default False — switches are session-scoped). Use
@@ -12031,6 +12032,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         if request.errors:
             # CLI decoration: "  ✗ " prefix over the canonical error copy.
             _cprint(f"  ✗ {request.error_messages()[0]}")
+            return
+        if request.is_clear:
+            _cprint("  /model --clear drops a messaging-session override so config.yaml / CLI win again.")
+            _cprint("  In the CLI, switch with /model <name> or persist with --global.")
             return
         # Resolve the effective persistence once: --global forces persist,
         # --session/--once force session-scope, otherwise defer to
@@ -12096,6 +12101,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 _cprint("  /model <name> --once                 switch for the next turn only")
                 _cprint("  /model <name> --session              switch for this session only")
                 _cprint("  /model --provider <slug>             switch provider")
+                _cprint("  /model --clear                       drop a messaging-session override")
                 _cprint("  /model --refresh                     re-fetch live model lists")
                 return
 

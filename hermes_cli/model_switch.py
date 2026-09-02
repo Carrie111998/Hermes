@@ -913,9 +913,20 @@ class ModelFlagParseResult:
     force_refresh: bool = False
     is_session: bool = False
     is_once: bool = False
+    is_clear: bool = False
 # ---------------------------------------------------------------------------
 # Flag parsing
 # ---------------------------------------------------------------------------
+
+# Unassign-style targets accepted as "/model --clear" aliases when they are
+# the entire model token and ``--provider`` is absent.  A real model named
+# "default" remains reachable as ``/model default --provider <slug>``.
+MODEL_SWITCH_CLEAR_TARGETS = frozenset({"-", "default", "clear", "reset"})
+
+
+def _target_is_clear_token(target: str) -> bool:
+    return str(target or "").strip().lower() in MODEL_SWITCH_CLEAR_TARGETS
+
 
 def parse_model_flags_detailed(raw_args: str) -> ModelFlagParseResult:
     """Parse flags from /model command args.
@@ -929,12 +940,17 @@ def parse_model_flags_detailed(raw_args: str) -> ModelFlagParseResult:
     :func:`resolve_persist_behavior` so the config-gated default
     (``model.persist_switch_by_default``) is applied in one place.
 
+    ``--clear`` drops a session ``/model`` override so config.yaml / CLI
+    win again.  Surfaces interpret ``is_clear``; this function only
+    tokenizes the flag.
+
     Examples::
 
         "sonnet"                         -> ("sonnet", "", False, False, False)
         "sonnet --global"                -> ("sonnet", "", True, False, False)
         "sonnet --session"               -> ("sonnet", "", False, False, True)
         "sonnet --once"                  -> is_once=True
+        "--clear"                        -> is_clear=True
         "sonnet --provider anthropic"    -> ("sonnet", "anthropic", False, False, False)
         "--provider my-ollama"           -> ("", "my-ollama", False, False, False)
         "--refresh"                      -> ("", "", False, True, False)
@@ -945,11 +961,16 @@ def parse_model_flags_detailed(raw_args: str) -> ModelFlagParseResult:
     force_refresh = False
     is_session = False
     is_once = False
+    is_clear = False
 
     # Normalize Unicode dashes (Telegram/iOS auto-converts -- to em/en dash)
     # A single Unicode dash before a flag keyword becomes "--"
     import re as _re
-    raw_args = _re.sub(r'[\u2012\u2013\u2014\u2015](provider|global|session|refresh|once)', r'--\1', raw_args)
+    raw_args = _re.sub(
+        r'[\u2012\u2013\u2014\u2015](provider|global|session|refresh|once|clear)',
+        r'--\1',
+        raw_args,
+    )
 
     # Keep this hand-rolled because model IDs may contain colons/slashes and
     # the historical parser did not require shell quoting.
@@ -969,6 +990,9 @@ def parse_model_flags_detailed(raw_args: str) -> ModelFlagParseResult:
         elif parts[i] == "--once":
             is_once = True
             i += 1
+        elif parts[i] == "--clear":
+            is_clear = True
+            i += 1
         elif parts[i] == "--provider" and i + 1 < len(parts):
             explicit_provider = parts[i + 1]
             i += 2
@@ -984,6 +1008,7 @@ def parse_model_flags_detailed(raw_args: str) -> ModelFlagParseResult:
         force_refresh=force_refresh,
         is_session=is_session,
         is_once=is_once,
+        is_clear=is_clear,
     )
 
 
@@ -1075,6 +1100,9 @@ def resolve_persist_behavior(
 # Error codes emitted by parse_model_switch_args().
 MODEL_SWITCH_ERR_ONCE_WITH_GLOBAL = "once_with_global"
 MODEL_SWITCH_ERR_ONCE_REQUIRES_TARGET = "once_requires_target"
+MODEL_SWITCH_ERR_CLEAR_WITH_GLOBAL = "clear_with_global"
+MODEL_SWITCH_ERR_CLEAR_WITH_ONCE = "clear_with_once"
+MODEL_SWITCH_ERR_CLEAR_WITH_TARGET = "clear_with_target"
 
 # Canonical (surface-neutral) error copy.  Surfaces prepend their own
 # decoration ("  ✗ " in the CLI, "❌ " in the gateway) but MUST NOT change
@@ -1082,6 +1110,9 @@ MODEL_SWITCH_ERR_ONCE_REQUIRES_TARGET = "once_requires_target"
 MODEL_SWITCH_ERROR_TEXT = {
     MODEL_SWITCH_ERR_ONCE_WITH_GLOBAL: "/model --once cannot be combined with --global",
     MODEL_SWITCH_ERR_ONCE_REQUIRES_TARGET: "/model --once requires a model or provider.",
+    MODEL_SWITCH_ERR_CLEAR_WITH_GLOBAL: "/model --clear cannot be combined with --global",
+    MODEL_SWITCH_ERR_CLEAR_WITH_ONCE: "/model --clear cannot be combined with --once",
+    MODEL_SWITCH_ERR_CLEAR_WITH_TARGET: "/model --clear cannot be combined with a model name or --provider",
 }
 
 
@@ -1090,9 +1121,9 @@ class ModelSwitchRequest:
     """A fully parsed /model command request.
 
     ``scope`` is the *requested* persistence scope derived purely from the
-    flags: ``"once"`` | ``"session"`` | ``"global"`` | ``"default"`` (no
-    explicit scope flag; the effective decision then belongs to
-    :func:`resolve_persist_behavior`, which also reads config).
+    flags: ``"once"`` | ``"session"`` | ``"global"`` | ``"clear"`` |
+    ``"default"`` (no explicit scope flag; the effective decision then
+    belongs to :func:`resolve_persist_behavior`, which also reads config).
 
     ``errors`` carries error *codes* (see ``MODEL_SWITCH_ERR_*``); surfaces
     render them via :data:`MODEL_SWITCH_ERROR_TEXT` plus their own prefix.
@@ -1105,6 +1136,7 @@ class ModelSwitchRequest:
     is_session: bool = False
     is_once: bool = False
     force_refresh: bool = False
+    is_clear: bool = False
     scope: str = "default"
     errors: tuple = ()
 
@@ -1123,6 +1155,7 @@ class ModelSwitchRequest:
             force_refresh=self.force_refresh,
             is_session=self.is_session,
             is_once=self.is_once,
+            is_clear=self.is_clear,
         )
 
     def error_messages(self) -> list:
@@ -1142,22 +1175,51 @@ def parse_model_switch_args(raw: str) -> ModelSwitchRequest:
     * ``--once`` + ``--global``  → ``MODEL_SWITCH_ERR_ONCE_WITH_GLOBAL``
     * ``--once`` with no model and no ``--provider``
       → ``MODEL_SWITCH_ERR_ONCE_REQUIRES_TARGET``
+    * ``--clear`` + ``--global``  → ``MODEL_SWITCH_ERR_CLEAR_WITH_GLOBAL``
+    * ``--clear`` + ``--once``    → ``MODEL_SWITCH_ERR_CLEAR_WITH_ONCE``
+    * ``--clear`` with a model name or ``--provider``
+      → ``MODEL_SWITCH_ERR_CLEAR_WITH_TARGET``
 
     Model targets pass through untouched: bare names (``sonnet``),
     aggregator slugs (``vendor/model``), and colon forms (``vendor:model``)
     are all resolved later by :func:`switch_model` (aggregator-aware — bare
-    names resolve WITHIN the current aggregator first).
+    names resolve WITHIN the current aggregator first).  Bare unassign
+    tokens (``-``, ``default``, ``clear``, ``reset``) are treated as
+    ``--clear`` when ``--provider`` is absent.
     """
     raw = str(raw or "")
     parsed = parse_model_flags_detailed(raw)
 
+    token_clear = (
+        _target_is_clear_token(parsed.model_input) and not parsed.explicit_provider
+    )
+    is_clear = parsed.is_clear or token_clear
+    target = "" if is_clear else parsed.model_input
+
     errors: list = []
     if parsed.is_once and parsed.is_global:
         errors.append(MODEL_SWITCH_ERR_ONCE_WITH_GLOBAL)
-    if parsed.is_once and not parsed.model_input and not parsed.explicit_provider:
+    if (
+        parsed.is_once
+        and not target
+        and not parsed.explicit_provider
+        and not is_clear
+    ):
         errors.append(MODEL_SWITCH_ERR_ONCE_REQUIRES_TARGET)
+    if is_clear:
+        if parsed.is_global:
+            errors.append(MODEL_SWITCH_ERR_CLEAR_WITH_GLOBAL)
+        if parsed.is_once:
+            errors.append(MODEL_SWITCH_ERR_CLEAR_WITH_ONCE)
+        leftover = parsed.model_input if parsed.is_clear else ""
+        if leftover and not _target_is_clear_token(leftover):
+            errors.append(MODEL_SWITCH_ERR_CLEAR_WITH_TARGET)
+        if parsed.is_clear and parsed.explicit_provider:
+            errors.append(MODEL_SWITCH_ERR_CLEAR_WITH_TARGET)
 
-    if parsed.is_once:
+    if is_clear:
+        scope = "clear"
+    elif parsed.is_once:
         scope = "once"
     elif parsed.is_session:
         scope = "session"
@@ -1168,12 +1230,13 @@ def parse_model_switch_args(raw: str) -> ModelSwitchRequest:
 
     return ModelSwitchRequest(
         raw=raw,
-        target=parsed.model_input,
-        explicit_provider=parsed.explicit_provider,
+        target=target,
+        explicit_provider="" if is_clear else parsed.explicit_provider,
         is_global=parsed.is_global,
         is_session=parsed.is_session,
         is_once=parsed.is_once,
         force_refresh=parsed.force_refresh,
+        is_clear=is_clear,
         scope=scope,
         errors=tuple(errors),
     )

@@ -45,6 +45,8 @@ gateway:
     usage_switch_model:     "`/model <name>` — 切換模型"
     usage_switch_provider:  "`/model <name> --provider <slug>` — 切換提供方"
     usage_persist:          "`/model <name> --global` — 永久儲存"
+    usage_clear:            "`/model --clear` — 清除工作階段覆寫（改用 config.yaml / CLI）"
+    cleared:                "已清除本工作階段的模型覆寫。之後的訊息使用 config.yaml / CLI（`{model}`，{provider}）。"
 
   agents:
     header:                "🤖 **作用中的代理與任務**"

@@ -45,6 +45,8 @@ gateway:
     usage_switch_model:     "`/model <name>` — mudar de modelo"
     usage_switch_provider:  "`/model <name> --provider <slug>` — mudar de fornecedor"
     usage_persist:          "`/model <name> --global` — guardar permanentemente"
+    usage_clear:            "`/model --clear` — remover o override da sessão (usar config.yaml / CLI)"
+    cleared:                "Override de modelo desta sessão removido. As próximas mensagens usam config.yaml / CLI (`{model}` em {provider})."
 
   agents:
     header:                "🤖 **Agentes e tarefas ativos**"

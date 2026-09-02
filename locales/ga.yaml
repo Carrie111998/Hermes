@@ -49,6 +49,8 @@ gateway:
     usage_switch_model:     "`/model <name>` — athraigh an tsamhail"
     usage_switch_provider:  "`/model <name> --provider <slug>` — athraigh an soláthraí"
     usage_persist:          "`/model <name> --global` — coinnigh"
+    usage_clear:            "`/model --clear` — bain sárú an tseisiúin (úsáid config.yaml / CLI)"
+    cleared:                "Baineadh sárú samhla an tseisiúin seo. Úsáideann an chéad teachtaireacht eile config.yaml / CLI (`{model}` ar {provider})."
 
   agents:
     header:                "🤖 **Gníomhairí & Tascanna Gníomhacha**"

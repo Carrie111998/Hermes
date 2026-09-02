@@ -52,8 +52,8 @@ def build_relay_command_manifest() -> List[Dict[str, Any]]:
         {"name": "reset", "description": "Reset your Hermes session"},
         {
             "name": "model",
-            "description": "Show or change the model",
-            "options": [_opt("name", "Model name. Leave empty to see current.")],
+            "description": "Show or change the model; --clear restores config.yaml",
+            "options": [_opt("name", "Model name, or --clear to use config.yaml again. Empty shows current.")],
         },
         {
             "name": "reasoning",

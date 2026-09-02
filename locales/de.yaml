@@ -45,6 +45,8 @@ gateway:
     usage_switch_model:     "`/model <name>` — Modell wechseln"
     usage_switch_provider:  "`/model <name> --provider <slug>` — Anbieter wechseln"
     usage_persist:          "`/model <name> --global` — dauerhaft speichern"
+    usage_clear:            "`/model --clear` — Sitzungsüberschreibung entfernen (config.yaml / CLI nutzen)"
+    cleared:                "Sitzungsüberschreibung entfernt. Nächste Nachrichten nutzen config.yaml / CLI (`{model}` auf {provider})."
 
   agents:
     header:                "🤖 **Aktive Agenten & Aufgaben**"

@@ -5914,8 +5914,8 @@ class DiscordAdapter(BasePlatformAdapter):
         async def slash_reset(interaction: discord.Interaction):
             await self._run_simple_slash(interaction, "/reset", "Session reset~")
 
-        @tree.command(name="model", description="Show or change the model")
-        @discord.app_commands.describe(name="Model name (e.g. anthropic/claude-sonnet-4). Leave empty to see current.")
+        @tree.command(name="model", description="Show or change the model; --clear restores config.yaml")
+        @discord.app_commands.describe(name="Model name, or --clear to use config.yaml again. Empty shows current.")
         async def slash_model(interaction: discord.Interaction, name: str = ""):
             await self._run_simple_slash(interaction, f"/model {name}".strip())
 
@@ -7916,7 +7916,8 @@ class DiscordAdapter(BasePlatformAdapter):
                 description=(
                     f"Current model: `{current_model or 'unknown'}`\n"
                     f"Provider: {provider_label}\n\n"
-                    f"Select a provider:"
+                    f"Select a provider:\n\n"
+                    f"Use `/model --clear` to drop this session's override."
                 ),
                 color=discord.Color.blue(),
             )
@@ -9593,7 +9594,8 @@ def _define_discord_view_classes() -> None:
                     description=(
                         f"Current model: `{self.current_model or 'unknown'}`\n"
                         f"Provider: {provider_label}\n\n"
-                        f"Select a provider:"
+                        f"Select a provider:\n\n"
+                        f"Use `/model --clear` to drop this session's override."
                     ),
                     color=discord.Color.blue(),
                 ),
