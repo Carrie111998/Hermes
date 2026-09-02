@@ -1948,8 +1948,18 @@ class BuzzAdapter(BasePlatformAdapter):
                                     # returns a distinct async generator that
                                     # does not expose ``ping()`` (#101160).
                                     try:
+                                        # websockets 15.x ping() is TWO-stage:
+                                        # ``await ping()`` only SENDS the ping
+                                        # and returns a pong waiter; awaiting
+                                        # that waiter is what actually waits
+                                        # for the matching pong.  Bounding only
+                                        # the first stage would treat an
+                                        # unanswered ping as proof of liveness,
+                                        # so the probe must await BOTH stages
+                                        # (#101258 pre-merge review).
+                                        pong_waiter = await websocket.ping()
                                         await asyncio.wait_for(
-                                            websocket.ping(),
+                                            pong_waiter,
                                             timeout=_WS_READ_IDLE_PROBE_TIMEOUT,
                                         )
                                     except asyncio.TimeoutError:

@@ -161,8 +161,11 @@ async def test_websocket_loop_reconnects_when_read_goes_silent(monkeypatch, capl
         ws = _ScriptedWebSocket(dead_anext)
         # A wedged socket cannot complete a ping/pong round-trip either —
         # the liveness probe must time out and still force the reconnect.
+        # websockets 15.x two-stage contract: ``await ping()`` SENDS the ping
+        # and returns a pong waiter; on a wedged socket the waiter never
+        # resolves, so the probe's second await times out.
         async def _dead_ping():
-            await asyncio.Event().wait()  # never answers the probe
+            return asyncio.get_running_loop().create_future()
 
         ws.ping = _dead_ping
         sockets.append(ws)

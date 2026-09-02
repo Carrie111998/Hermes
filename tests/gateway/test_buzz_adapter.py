@@ -3915,21 +3915,33 @@ class _FakeWS:
 class TestWebsocketReadIdleLiveness:
     """#101160: idle watchdog must probe liveness, not assume death."""
 
-    def _harness(self, adapter, frames, monkeypatch, *, ping_sleeper=None,
+    def _harness(self, adapter, frames, monkeypatch, *, dead_ping=False,
                  connect_calls_before_stop=1):
         """Stub the transport and drive ``_websocket_loop`` until the fake
         ``connect`` raises CancelledError (terminating the reconnect loop).
 
         Returns ``(connect_calls, ws)`` so tests can assert on the fake
-        connection's ``ping`` probe count."""
+        connection's ``ping`` probe count.
+
+        The fake ``ping`` mirrors the real websockets 15.x TWO-stage
+        contract: ``await ping()`` only SENDS the ping and returns a pong
+        waiter, and only awaiting that waiter waits for the pong.  A live
+        transport resolves the waiter promptly; a wedged one (CLOSE_WAIT)
+        returns a waiter that never resolves.
+        """
         connect_calls = {"n": 0}
 
-        if ping_sleeper is not None:
-            async def _ping(*_a, **_k):
-                await asyncio.sleep(ping_sleeper)
-            ping = AsyncMock(side_effect=_ping)
-        else:
-            ping = AsyncMock()
+        async def _live_ping(*_a, **_k):
+            waiter = asyncio.get_running_loop().create_future()
+            waiter.set_result(0.01)  # pong arrives — latency in seconds
+            return waiter
+
+        async def _dead_ping(*_a, **_k):
+            # Sending succeeds (first await returns promptly) but the pong
+            # waiter never resolves — a wedged socket answers no pong.
+            return asyncio.get_running_loop().create_future()
+
+        ping = AsyncMock(side_effect=_dead_ping if dead_ping else _live_ping)
         ws = _FakeWS(frames, ping=ping)
 
         # websockets 15.x ``connect()`` is a synchronous factory returning the
@@ -3985,7 +3997,7 @@ class TestWebsocketReadIdleLiveness:
         caplog.set_level(logging.WARNING)
         adapter = _make_adapter()
         frames = _ScriptedFrameSource(["idle"])
-        connects, ws = self._harness(adapter, frames, monkeypatch, ping_sleeper=60.0)
+        connects, ws = self._harness(adapter, frames, monkeypatch, dead_ping=True)
 
         with pytest.raises(asyncio.CancelledError):
             await adapter._websocket_loop()
