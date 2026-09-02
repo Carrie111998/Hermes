@@ -596,6 +596,42 @@ describe('the drain loop wires drain → deliver → reply', () => {
     stopBotRelay()
   })
 
+  it('synthesizes a credential-free route for a registered SSH target whose seed is absent', async () => {
+    hostMock.connections = vi.fn(async () => [{ id: 'a', kind: 'local' }, { id: 'b', kind: 'ssh' }])
+    hostMock.profileRoutes = vi.fn(async () => [route('a'), route('c')])
+
+    const calls = respondWith(call => {
+      if (call.method === 'bot_relay.outbox.drain') {
+        return { envelopes: call.connectionId === 'a' ? [envelope] : [] }
+      }
+
+      if (call.method === 'bot_relay.deliver') {
+        return { reply: 'lazy dial complete' }
+      }
+
+      return {}
+    })
+
+    const { startBotRelay, stopBotRelay } = await loadRelay()
+
+    startBotRelay()
+    await vi.advanceTimersByTimeAsync(0)
+    calls.length = 0
+    await pushAndSettle()
+
+    expect(hostMock.warmAgent).toHaveBeenCalledWith('b', 'ops')
+    expect(calls.find(call => call.method === 'bot_relay.deliver')).toMatchObject({
+      connectionId: 'b',
+      params: { message: 'status?', profile: 'ops' }
+    })
+    expect(calls.find(call => call.method === 'bot_relay.reply')?.params).toMatchObject({
+      id: 'env-1',
+      reply: 'lazy dial complete'
+    })
+
+    stopBotRelay()
+  })
+
   it('forwards the gateway’s typed failure reason to both the reply and the badge', async () => {
     // #93091: bot_relay.deliver classifies the failed turn and ships the code
     // in `data.reason`; a classified code beats re-parsing free text.

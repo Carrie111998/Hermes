@@ -225,6 +225,42 @@ async function waitForRelayConnection(
     host.warmAgent(connectionId, profile)
   }
 
+  // A remembered SSH roster can momentarily suppress its undialed seed route
+  // even though the connection still exists in the authoritative registry.
+  // Build the same credential-free descriptor Electron would return so the
+  // request path itself can complete the lazy dial. Registry membership is
+  // re-read first; arbitrary/stale ids are never synthesized.
+  if (typeof host.connections === 'function') {
+    try {
+      const registered = await host.connections()
+
+      const source = (Array.isArray(registered) ? registered : []).find(
+        connection => String(connection?.id || '') === connectionId
+      )
+
+      if (source) {
+        const kind = String(source.kind || '')
+
+        const targetProfile =
+          kind === 'ssh' && typeof source.remoteProfile === 'string' && source.remoteProfile.trim()
+            ? source.remoteProfile.trim()
+            : profile
+
+        return {
+          id: connectionId,
+          route: {
+            connectionId,
+            mode: kind === 'local' ? 'local' : 'remote',
+            profile,
+            targetProfile
+          }
+        }
+      }
+    } catch {
+      // Fall through to bounded route inventory polling.
+    }
+  }
+
   while (!relay.disposed && Date.now() < deadline) {
     await new Promise<void>(resolve => setTimeout(resolve, RELAY_ROUTE_RECONNECT_POLL_MS))
 
