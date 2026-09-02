@@ -104,7 +104,12 @@ from agent.trajectory import has_incomplete_scratchpad
 # Bind before the turn starts so a source-tree swap cannot load a skewed
 # finalizer at turn end.
 from agent.turn_finalizer import finalize_turn
-from agent.usage_pricing import estimate_usage_cost, normalize_usage
+from agent.usage_pricing import (
+    estimate_usage_cost,
+    normalize_usage,
+    usage_reports_cache_metrics,
+    usage_reports_full_prompt_metrics,
+)
 from agent import empty_response_guard as _empty_guard
 from hermes_constants import PARTIAL_STREAM_STUB_ID
 from hermes_logging import set_session_context
@@ -4777,6 +4782,46 @@ def run_conversation(
                     agent.session_completion_tokens += completion_tokens
                     agent.session_total_tokens += total_tokens
                     agent.session_api_calls += 1
+                    # Some adapters synthesize a truthy all-zero usage object
+                    # when upstream omitted usage. A real non-empty model
+                    # request cannot have zero prompt tokens, so count only a
+                    # positive canonical prompt as a usable provider report.
+                    latest_prompt_tokens = aggregator_usage.prompt_tokens
+                    if latest_prompt_tokens > 0:
+                        agent.session_usage_report_calls = (
+                            getattr(agent, "session_usage_report_calls", 0) + 1
+                        )
+                        agent.session_last_prompt_tokens = latest_prompt_tokens
+                        if usage_reports_full_prompt_metrics(
+                            response.usage,
+                            provider=agent.provider,
+                            api_mode=agent.api_mode,
+                            model=agent.model,
+                            base_url=agent.base_url,
+                        ):
+                            agent.session_context_usage_report_calls = (
+                                getattr(
+                                    agent,
+                                    "session_context_usage_report_calls",
+                                    0,
+                                )
+                                + 1
+                            )
+                        if usage_reports_cache_metrics(
+                            response.usage,
+                            provider=agent.provider,
+                            api_mode=agent.api_mode,
+                            model=agent.model,
+                            base_url=agent.base_url,
+                        ):
+                            agent.session_cache_usage_report_calls = (
+                                getattr(
+                                    agent,
+                                    "session_cache_usage_report_calls",
+                                    0,
+                                )
+                                + 1
+                            )
                     agent.session_input_tokens += canonical_usage.input_tokens
                     agent.session_output_tokens += canonical_usage.output_tokens
                     agent.session_cache_read_tokens += canonical_usage.cache_read_tokens

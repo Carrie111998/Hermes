@@ -153,8 +153,10 @@ def _record_codex_app_server_usage(agent, turn) -> dict[str, Any]:
 
     from agent.usage_pricing import CanonicalUsage, estimate_usage_cost
 
-    input_tokens = _coerce_usage_int(usage.get("inputTokens"))
+    input_total = _coerce_usage_int(usage.get("inputTokens"))
     cache_read_tokens = _coerce_usage_int(usage.get("cachedInputTokens"))
+    cache_write_tokens = _coerce_usage_int(usage.get("cacheWriteInputTokens"))
+    input_tokens = max(0, input_total - cache_read_tokens - cache_write_tokens)
     output_tokens = _coerce_usage_int(usage.get("outputTokens"))
     reasoning_tokens = _coerce_usage_int(usage.get("reasoningOutputTokens"))
     reported_total = _coerce_usage_int(usage.get("totalTokens"))
@@ -163,7 +165,7 @@ def _record_codex_app_server_usage(agent, turn) -> dict[str, Any]:
         input_tokens=input_tokens,
         output_tokens=output_tokens,
         cache_read_tokens=cache_read_tokens,
-        cache_write_tokens=0,
+        cache_write_tokens=cache_write_tokens,
         reasoning_tokens=reasoning_tokens,
         raw_usage=usage,
     )
@@ -199,6 +201,18 @@ def _record_codex_app_server_usage(agent, turn) -> dict[str, Any]:
     agent.session_cache_read_tokens += canonical_usage.cache_read_tokens
     agent.session_cache_write_tokens += canonical_usage.cache_write_tokens
     agent.session_reasoning_tokens += canonical_usage.reasoning_tokens
+    if prompt_tokens > 0:
+        agent.session_usage_report_calls = (
+            getattr(agent, "session_usage_report_calls", 0) + 1
+        )
+        agent.session_last_prompt_tokens = prompt_tokens
+        agent.session_context_usage_report_calls = (
+            getattr(agent, "session_context_usage_report_calls", 0) + 1
+        )
+        if "cachedInputTokens" in usage:
+            agent.session_cache_usage_report_calls = (
+                getattr(agent, "session_cache_usage_report_calls", 0) + 1
+            )
 
     cost_result = estimate_usage_cost(
         agent.model,

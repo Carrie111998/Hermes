@@ -12,13 +12,29 @@ Config (``~/.hermes/config.yaml``)::
         fields: [model, context_pct, cwd]   # order shown; drop any to hide
 
 Available fields:
-    model        — bare model id, vendor prefix dropped (``gpt-5.4``)
-    context_pct  — last-call context occupancy as a percent (``5%``)
-    latency      — wall-clock duration of the turn (``22s``, ``1m05s``)
-    cwd          — home-relative working dir (``~``)
+    model             — final active model, vendor prefix dropped (``gpt-5.4``)
+    context_pct       — last-call context occupancy as a percent (``5%``)
+    context_window    — last-call context used/total plus percent
+                        (``ctx(last):123.0k/1.0M (12%)``)
+    latency           — wall-clock duration of the turn (``22s``, ``1m05s``)
+    cwd               — home-relative working dir (``~``)
+    tokens_turn       — labelled non-cached turn usage
+                        (``tokens(turn,uncached):15.9k in/1.2k out``)
+    cache_hit         — provider-reported prompt cache hit ratio
+                        (``cache(turn):87%``)
+    reasoning_effort  — active model's request intent (``effort(req):max``)
 
-``latency`` is opt-in: it is NOT in the default field set, so a footer whose
-``fields`` are unset renders exactly as before.
+``latency``, ``tokens_turn``, and ``reasoning_effort`` are opt-in: they are NOT
+in the default field set, so a footer whose ``fields`` are unset renders
+exactly as before.
+
+Token fields are provider-reported accounting, not local estimates. Cached
+input is excluded from ``tokens_turn`` but still occupies ``context_window``.
+A turn whose provider reports usage for only some logical calls is labelled
+``reported,partial``; a turn with no usable report omits token fields instead
+of rendering a synthetic zero. ``reasoning_effort`` describes Hermes' request
+intent for the active model, not reasoning tokens actually consumed. Cache and
+context fields are omitted when the provider cannot prove those values.
 
 Per-platform overrides live under ``display.platforms.<platform>.runtime_footer``.
 Users can toggle the global setting with ``/footer on|off`` from both the CLI
@@ -108,6 +124,15 @@ def _format_latency(seconds: float) -> str:
     return f"{m}m{sec:02d}s"
 
 
+def _format_token_count(value: int) -> str:
+    """Render a compact, stable token count for the footer."""
+    if value >= 1_000_000:
+        return f"{value / 1_000_000:.1f}M"
+    if value >= 1_000:
+        return f"{value / 1_000:.1f}k"
+    return str(value)
+
+
 def format_runtime_footer(
     *,
     model: Optional[str],
@@ -115,6 +140,14 @@ def format_runtime_footer(
     context_length: Optional[int],
     cwd: Optional[str] = None,
     turn_seconds: Optional[float] = None,
+    tokens_in: Optional[int] = None,
+    tokens_out: Optional[int] = None,
+    cache_read_tokens: Optional[int] = None,
+    cache_write_tokens: Optional[int] = None,
+    token_usage_status: Optional[str] = None,
+    cache_usage_status: Optional[str] = None,
+    context_usage_status: Optional[str] = "reported",
+    reasoning_effort: Optional[str] = None,
     fields: Iterable[str] = _DEFAULT_FIELDS,
 ) -> str:
     """Render the footer line, or return "" if no fields have data.
@@ -129,9 +162,27 @@ def format_runtime_footer(
             if m:
                 parts.append(m)
         elif field == "context_pct":
-            if context_length and context_length > 0 and context_tokens >= 0:
+            if (
+                context_usage_status == "reported"
+                and context_length
+                and context_length > 0
+                and context_tokens >= 0
+            ):
                 pct = max(0, min(100, round((context_tokens / context_length) * 100)))
                 parts.append(f"{pct}%")
+        elif field == "context_window":
+            if (
+                context_usage_status == "reported"
+                and context_length
+                and context_length > 0
+                and context_tokens >= 0
+            ):
+                pct = max(0, min(100, round((context_tokens / context_length) * 100)))
+                parts.append(
+                    "ctx(last):"
+                    f"{_format_token_count(context_tokens)}/"
+                    f"{_format_token_count(context_length)} ({pct}%)"
+                )
         elif field == "latency":
             # Wall-clock turn duration. Skipped when the caller supplied no
             # timing (call sites that don't measure) or the value is negative.
@@ -147,6 +198,50 @@ def format_runtime_footer(
             rel = _home_relative_cwd(cwd or env_cwd)
             if rel:
                 parts.append(rel)
+        elif field == "tokens_turn":
+            reported: list[str] = []
+            if (
+                isinstance(tokens_in, int)
+                and not isinstance(tokens_in, bool)
+                and tokens_in >= 0
+            ):
+                reported.append(f"{_format_token_count(tokens_in)} in")
+            if (
+                isinstance(tokens_out, int)
+                and not isinstance(tokens_out, bool)
+                and tokens_out >= 0
+            ):
+                reported.append(f"{_format_token_count(tokens_out)} out")
+            if reported and token_usage_status in {"reported", "reported_partial"}:
+                label = (
+                    "tokens(turn,uncached,partial)"
+                    if token_usage_status == "reported_partial"
+                    else "tokens(turn,uncached)"
+                )
+                parts.append(f"{label}:{'/'.join(reported)}")
+        elif field == "cache_hit":
+            cache_buckets = (tokens_in, cache_read_tokens, cache_write_tokens)
+            if (
+                cache_usage_status in {"reported", "reported_partial"}
+                and all(
+                    isinstance(value, int)
+                    and not isinstance(value, bool)
+                    and value >= 0
+                    for value in cache_buckets
+                )
+            ):
+                prompt_tokens = sum(cache_buckets)
+                if prompt_tokens > 0:
+                    cache_pct = round((cache_read_tokens / prompt_tokens) * 100)
+                    label = (
+                        "cache(turn,partial)"
+                        if cache_usage_status == "reported_partial"
+                        else "cache(turn)"
+                    )
+                    parts.append(f"{label}:{cache_pct}%")
+        elif field == "reasoning_effort":
+            if reasoning_effort:
+                parts.append(f"effort(req):{reasoning_effort}")
         # Unknown field names are silently ignored.
 
     if not parts:
@@ -163,6 +258,14 @@ def build_footer_line(
     context_length: Optional[int],
     cwd: Optional[str] = None,
     turn_seconds: Optional[float] = None,
+    tokens_in: Optional[int] = None,
+    tokens_out: Optional[int] = None,
+    cache_read_tokens: Optional[int] = None,
+    cache_write_tokens: Optional[int] = None,
+    token_usage_status: Optional[str] = None,
+    cache_usage_status: Optional[str] = None,
+    context_usage_status: Optional[str] = "reported",
+    reasoning_effort: Optional[str] = None,
 ) -> str:
     """Top-level entry point used by gateway/run.py.
 
@@ -183,5 +286,13 @@ def build_footer_line(
         context_length=context_length,
         cwd=cwd,
         turn_seconds=turn_seconds,
+        tokens_in=tokens_in,
+        tokens_out=tokens_out,
+        cache_read_tokens=cache_read_tokens,
+        cache_write_tokens=cache_write_tokens,
+        token_usage_status=token_usage_status,
+        cache_usage_status=cache_usage_status,
+        context_usage_status=context_usage_status,
+        reasoning_effort=reasoning_effort,
         fields=cfg.get("fields") or _DEFAULT_FIELDS,
     )
