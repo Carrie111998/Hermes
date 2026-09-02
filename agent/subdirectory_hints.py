@@ -34,7 +34,9 @@ _HINT_FILENAMES = [
     ".cursorrules",
 ]
 
-# Maximum chars per hint file to prevent context bloat
+# Minimum chars per hint file. Scales up with the model's context window via
+# ``_hint_max_chars`` so a large-window model does not silently drop the
+# operational half of a long AGENTS.md.
 _MAX_HINT_CHARS = 8_000
 
 # Tool argument keys that typically contain file paths
@@ -82,8 +84,13 @@ class SubdirectoryHintTracker:
             tool_result += hints  # append to the tool result string
     """
 
-    def __init__(self, working_dir: Optional[str] = None):
+    def __init__(
+        self,
+        working_dir: Optional[str] = None,
+        context_length: Optional[int] = None,
+    ):
         self.working_dir = Path(working_dir or os.getcwd()).resolve()
+        self.context_length = context_length
         self._loaded_dirs: Set[Path] = set()
         # Content digests already injected — prevents re-sending the same file
         # reachable through symlinks, hardlinks, or duplicated copies.
@@ -91,6 +98,28 @@ class SubdirectoryHintTracker:
         # Pre-mark the working dir as loaded (startup context handles it)
         self._loaded_dirs.add(self.working_dir)
         self._seed_working_dir_digest()
+
+    def _hint_max_chars(self) -> int:
+        """Resolve the per-hint char cap for this session.
+
+        Delegates to the resolver the startup context path already uses
+        (``prompt_builder._get_context_file_max_chars``) so a hint and a
+        startup-loaded context file obey one rule: an explicit
+        ``context_file_max_chars`` wins, otherwise the cap scales with the
+        model's window. Falls back to the historical 8K floor when the window
+        is unknown or the resolver is unavailable.
+        """
+        if not isinstance(self.context_length, int) or self.context_length <= 0:
+            return _MAX_HINT_CHARS
+        try:
+            from agent.prompt_builder import _get_context_file_max_chars
+
+            return max(
+                _MAX_HINT_CHARS, _get_context_file_max_chars(self.context_length)
+            )
+        except Exception as exc:
+            logger.debug("Could not resolve dynamic hint cap: %s", exc)
+            return _MAX_HINT_CHARS
 
     def _seed_working_dir_digest(self) -> None:
         """Record the CWD context file's digest so it is never re-injected.
@@ -303,9 +332,10 @@ class SubdirectoryHintTracker:
                 self._loaded_digests.add(digest)
                 # Same security scan as startup context loading
                 content = _scan_context_content(content, filename)
-                if len(content) > _MAX_HINT_CHARS:
+                max_hint_chars = self._hint_max_chars()
+                if len(content) > max_hint_chars:
                     content = (
-                        content[:_MAX_HINT_CHARS]
+                        content[:max_hint_chars]
                         + f"\n\n[...truncated {filename}: {len(content):,} chars total]"
                     )
                 # Best-effort relative path for display
