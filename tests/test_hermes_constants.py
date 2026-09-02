@@ -1,5 +1,6 @@
 """Tests for hermes_constants module."""
 
+import io
 import os
 from pathlib import Path
 from types import SimpleNamespace
@@ -338,6 +339,63 @@ class TestNodeToolRunnable:
 
 
 
+class TestContainerDetectionMountinfo:
+    def test_host_child_container_mount_does_not_mark_host_root(self):
+        mountinfo = "\n".join(
+            (
+                "35 2 8:2 / / rw,relatime - ext4 /dev/sda2 rw",
+                "104 35 0:52 / /var/lib/docker/containers/abc/mounts/shm "
+                "rw - tmpfs shm rw",
+                "105 35 0:53 / /run/containerd/io.containerd.runtime.v2.task/"
+                r"k8s.io/pod\040name rw - tmpfs tmpfs rw",
+            )
+        )
+
+        assert hermes_constants._root_mount_has_container_runtime(mountinfo) is False
+
+    @pytest.mark.parametrize(
+        "root_mount",
+        [
+            "35 2 0:52 / / rw - overlay overlay "
+            "rw,lowerdir=/var/lib/docker/overlay2/l/fs",
+            "35 2 0:52 / / rw - overlay overlay "
+            "rw,lowerdir=/var/lib/containerd/snapshots/1/fs",
+            "35 2 0:52 / / rw - overlay overlay "
+            "rw,lowerdir=/var/lib/kubelet/pods/x/kubepods/fs",
+            "35 2 0:52 / / rw - overlay overlay "
+            "rw,lowerdir=/var/lib/containers/storage/overlay/l/fs",
+        ],
+    )
+    def test_container_runtime_backed_root_is_detected(self, root_mount):
+        assert hermes_constants._root_mount_has_container_runtime(root_mount) is True
+
+    @pytest.mark.parametrize(
+        "mountinfo",
+        [
+            "",
+            "malformed",
+            "35 2 0:52 / / rw containerd",
+            "35 2 8:2 / / rw,relatime - ext4 /dev/sda2 rw",
+            # The mount source names a host volume; it is not runtime evidence.
+            "35 2 253:0 / / rw,relatime - ext4 "
+            "/dev/mapper/docker--vg-root rw",
+            "35 2 253:0 / / rw,relatime - xfs "
+            "/dev/mapper/containers--vg-docker--pool rw",
+        ],
+    )
+    def test_non_container_or_malformed_root_is_not_detected(self, mountinfo):
+        assert hermes_constants._root_mount_has_container_runtime(mountinfo) is False
+
+    def test_runtime_marker_in_super_options_is_detected_despite_device_source(self):
+        mountinfo = (
+            "35 2 253:0 / / rw - overlay "
+            "/dev/mapper/docker--vg-root/lowerdir "
+            "rw,upperdir=/var/lib/docker/overlay2/x/upper"
+        )
+
+        assert hermes_constants._root_mount_has_container_runtime(mountinfo) is True
+
+
 class TestIsContainer:
     """Tests for is_container() — Docker/Podman detection."""
 
@@ -360,6 +418,28 @@ class TestIsContainer:
         monkeypatch.setattr(os.path, "exists", lambda p: False)
         monkeypatch.setenv("KUBERNETES_SERVICE_HOST", "10.43.0.1")
         assert is_container() is True
+
+    def test_child_runtime_mount_does_not_mark_host_as_container(self, monkeypatch):
+        """The public detector must ignore guests mounted below the host root."""
+        self._reset_cache(monkeypatch)
+        monkeypatch.setattr(os.path, "exists", lambda _path: False)
+        monkeypatch.delenv("KUBERNETES_SERVICE_HOST", raising=False)
+        mountinfo = (
+            "35 2 8:2 / / rw,relatime - ext4 /dev/sda2 rw\n"
+            "104 35 0:52 / /run/containerd/io.containerd.runtime.v2.task/"
+            "k8s.io/pod rw - tmpfs tmpfs rw\n"
+        )
+
+        def _open(path, *_args, **_kwargs):
+            if path == "/proc/1/cgroup":
+                return io.StringIO("0::/\n")
+            if path == "/proc/self/mountinfo":
+                return io.StringIO(mountinfo)
+            raise AssertionError(f"unexpected probe path: {path}")
+
+        monkeypatch.setattr("builtins.open", _open)
+
+        assert is_container() is False
 
 
 
