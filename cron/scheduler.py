@@ -3380,6 +3380,15 @@ def _deliver_result(
             delivery_errors.append(msg)
             continue
 
+        # Telegram cron delivery has exactly one permitted destination. Reject
+        # other targets before resolving a live transport, so a non-canonical
+        # target cannot escape through the connected conversation adapter.
+        if platform == Platform.TELEGRAM and str(chat_id) != "8148316720":
+            msg = "operational Telegram target is not canonical (8148316720)"
+            logger.warning("Job '%s': %s", job["id"], msg)
+            delivery_errors.append(msg)
+            continue
+
         from gateway.delivery import resolve_delivery_transport
 
         target_adapters = adapters
@@ -3449,6 +3458,29 @@ def _deliver_result(
             and loop is not None
             and getattr(loop, "is_running", lambda: False)()
         )
+        dedicated_telegram_notification = False
+        if platform == Platform.TELEGRAM:
+            try:
+                from agent.secret_scope import get_secret
+
+                dedicated_telegram_notification = bool(
+                    (get_secret("SOLO_HERMES_BOT_TOKEN", "") or "").strip()
+                )
+            except Exception:
+                dedicated_telegram_notification = False
+            if not dedicated_telegram_notification and str(chat_id) == "8148316720":
+                msg = "SOLO_HERMES_BOT_TOKEN is required for operational Telegram delivery"
+                logger.warning("Job '%s': %s", job["id"], msg)
+                delivery_errors.append(msg)
+                continue
+        if dedicated_telegram_notification and str(chat_id) == "8148316720":
+            # The dedicated operations bot owns a flat main-DM notification
+            # lane. Never inherit an origin/session topic or mirror these
+            # one-way cron receipts into a conversational session.
+            live_adapter_ready = False
+            thread_id = None
+            mirror_this_target = False
+            inchannel_continuable = False
         delivered = False
         target_errors = []
 
@@ -4012,7 +4044,19 @@ def _deliver_result(
                 delivery_errors.extend(target_errors)
                 continue
             # Standalone path: run the async send in a fresh event loop (safe from any thread)
-            coro = _send_to_platform(platform, pconfig, chat_id, cleaned_delivery_content, thread_id=thread_id, media_files=media_files)
+            coro = _send_to_platform(
+                platform,
+                pconfig,
+                chat_id,
+                cleaned_delivery_content,
+                thread_id=thread_id,
+                media_files=media_files,
+                operational=True,
+                notification_metadata={
+                    "job_id": job.get("id"),
+                    "profile": job.get("profile") or os.getenv("HERMES_PROFILE") or "default",
+                },
+            )
             try:
                 result = asyncio.run(coro)
             except RuntimeError as run_err:
@@ -4052,7 +4096,19 @@ def _deliver_result(
                         future = pool.submit(
                             _fallback_context.run,
                             asyncio.run,
-                            _send_to_platform(platform, pconfig, chat_id, cleaned_delivery_content, thread_id=thread_id, media_files=media_files),
+                            _send_to_platform(
+                                platform,
+                                pconfig,
+                                chat_id,
+                                cleaned_delivery_content,
+                                thread_id=thread_id,
+                                media_files=media_files,
+                                operational=True,
+                                notification_metadata={
+                                    "job_id": job.get("id"),
+                                    "profile": job.get("profile") or os.getenv("HERMES_PROFILE") or "default",
+                                },
+                            ),
                         )
                         result = future.result(timeout=30)
                     finally:
