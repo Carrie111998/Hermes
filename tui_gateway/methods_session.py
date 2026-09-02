@@ -624,6 +624,50 @@ def _(rid, params: dict) -> dict:
                         logger.exception(
                             "stranded-session adoption failed for %s", target
                         )
+                # Minted-but-never-persisted key rescue. session.create mints
+                # the stored key but intentionally writes no DB row until the
+                # first prompt (no "Untitled" litter). If the backend dies
+                # between create and that first prompt, the key exists
+                # client-side (pinned tile, stored id) but has no row anywhere
+                # — and after a restart the in-memory live-lazy lookup above
+                # can't find it either, so this resume used to 4007 forever
+                # ("no route to the backend holding this session"). When the
+                # target is a well-formed server-minted key, materialize the
+                # row and let the normal resume path continue with empty
+                # history. Abandoned drafts still leave no row: nothing is
+                # written until a client explicitly resumes the exact key.
+                # Fail-closed: anything not matching the minted shape (garbage,
+                # 8-hex runtime ids, titles) still 4007s, and a key claimed by
+                # ANY live session (even under a different profile) is owned —
+                # an unscoped resume must never mint a phantom row in the
+                # launch store. Lazy watch windows (subagent viewers) are
+                # excluded: they attach to live children by design, and a dead
+                # child should honestly 4007 rather than mint a phantom row.
+                if (
+                    not found
+                    and not is_truthy_value(params.get("lazy", False))
+                    and _is_server_minted_key(target)
+                    and not _any_live_session_claims_key(target)
+                ):
+                    try:
+                        db.create_session(
+                            target,
+                            source=_resolve_session_source(
+                                str(params.get("source") or "").strip() or None
+                            ),
+                            model=_resolve_model(),
+                            profile_name=Path(profile_home).name if profile_home else None,
+                        )
+                        found = db.get_session(target)
+                        logger.info(
+                            "materialized session row for minted-but-unpersisted "
+                            "key %s (resume no longer 4007s)",
+                            target,
+                        )
+                    except Exception:
+                        logger.warning(
+                            "failed to materialize session row for %s", target, exc_info=True
+                        )
                 if not found:
                     return _err(rid, 4007, "session not found")
 
