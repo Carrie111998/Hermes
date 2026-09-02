@@ -31,6 +31,7 @@ import { $wakeWord, resetWakeWordState } from '@/store/wake-word'
 import type { SessionInfo } from '@/types/hermes'
 
 import { clearSingleFlightSessionResumeState } from './single-flight-resume'
+import { SESSION_COMPRESS_TIMEOUT_MS } from './slash'
 import type { SubmitTextOptions } from './utils'
 
 import { uploadComposerAttachment, usePromptActions } from '.'
@@ -349,6 +350,69 @@ describe('usePromptActions /title', () => {
   })
 })
 
+describe('usePromptActions /stop', () => {
+  afterEach(() => {
+    cleanup()
+    vi.restoreAllMocks()
+  })
+
+  it('interrupts the target desktop turn before keeping the background-process cleanup', async () => {
+    const calls: Array<{ method: string; params?: Record<string, unknown> }> = []
+
+    const requestGateway = vi.fn(async (method: string, params?: Record<string, unknown>) => {
+      calls.push({ method, params })
+
+      if (method === 'session.interrupt') {
+        return { status: 'interrupted' } as never
+      }
+
+      if (method === 'process.stop') {
+        return { killed: 0 } as never
+      }
+
+      return {} as never
+    })
+
+    let handle: HarnessHandle | null = null
+    await actRender(
+      <Harness onReady={h => (handle = h)} refreshSessions={async () => undefined} requestGateway={requestGateway} />
+    )
+
+    await handle!.submitText('/stop', { sessionId: 'rt-target-session' })
+
+    expect(calls).toEqual([
+      { method: 'session.interrupt', params: { session_id: 'rt-target-session' } },
+      { method: 'process.stop', params: {} }
+    ])
+    expect(requestGateway).not.toHaveBeenCalledWith('slash.exec', expect.anything())
+    expect(requestGateway).not.toHaveBeenCalledWith('command.dispatch', expect.anything())
+  })
+
+  it('still stops background processes when the turn interrupt fails', async () => {
+    const requestGateway = vi.fn(async (method: string) => {
+      if (method === 'session.interrupt') {
+        throw new Error('interrupt failed')
+      }
+
+      if (method === 'process.stop') {
+        return { killed: 2 } as never
+      }
+
+      return {} as never
+    })
+
+    let handle: HarnessHandle | null = null
+    await actRender(
+      <Harness onReady={h => (handle = h)} refreshSessions={async () => undefined} requestGateway={requestGateway} />
+    )
+
+    await handle!.submitText('/stop')
+
+    expect(requestGateway).toHaveBeenCalledWith('session.interrupt', { session_id: RUNTIME_SESSION_ID })
+    expect(requestGateway).toHaveBeenCalledWith('process.stop', {})
+  })
+})
+
 // Helper: extract rendered text parts from captured updateSessionState seeds.
 function renderedSeedTexts(seeds: Record<string, unknown>[]): string[] {
   return seeds.flatMap(state => {
@@ -629,7 +693,7 @@ describe('usePromptActions /compress', () => {
     vi.restoreAllMocks()
   })
 
-  it('routes through session.compress (not slash.exec) with a 120s timeout and renders the summary', async () => {
+  it('routes through session.compress (not slash.exec) with the compute-host ceiling timeout and renders the summary', async () => {
     const seeds: Record<string, unknown>[] = []
 
     const requestGateway = vi.fn(async (method: string, _params?: Record<string, unknown>, _timeoutMs?: number) => {
@@ -665,7 +729,7 @@ describe('usePromptActions /compress', () => {
     expect(requestGateway).toHaveBeenCalledWith(
       'session.compress',
       expect.objectContaining({ session_id: RUNTIME_SESSION_ID }),
-      120_000
+      SESSION_COMPRESS_TIMEOUT_MS
     )
     expect(requestGateway).not.toHaveBeenCalledWith('slash.exec', expect.anything())
     expect(requestGateway).not.toHaveBeenCalledWith('command.dispatch', expect.anything())
@@ -799,7 +863,7 @@ describe('usePromptActions /compress', () => {
     expect(requestGateway).toHaveBeenCalledWith(
       'session.compress',
       expect.objectContaining({ focus_topic: 'the auth refactor' }),
-      120_000
+      SESSION_COMPRESS_TIMEOUT_MS
     )
   })
 
@@ -906,7 +970,9 @@ describe('usePromptActions /compress', () => {
     act(() => {
       submitted = handle!.submitTextRaw('/compress')
     })
-    await waitFor(() => expect(requestGateway).toHaveBeenCalledWith('session.compress', expect.anything(), 120_000))
+    await waitFor(() =>
+      expect(requestGateway).toHaveBeenCalledWith('session.compress', expect.anything(), SESSION_COMPRESS_TIMEOUT_MS)
+    )
 
     // Switch to session B before compression resolves.
     activeSessionIdRef.current = RUNTIME_SESSION_B
@@ -965,7 +1031,9 @@ describe('usePromptActions /compress', () => {
     act(() => {
       submitted = handle!.submitTextRaw('/compress')
     })
-    await waitFor(() => expect(requestGateway).toHaveBeenCalledWith('session.compress', expect.anything(), 120_000))
+    await waitFor(() =>
+      expect(requestGateway).toHaveBeenCalledWith('session.compress', expect.anything(), SESSION_COMPRESS_TIMEOUT_MS)
+    )
     activeSessionIdRef.current = RUNTIME_SESSION_B
     storedSessionIdRef.current = 'stored-b'
     rejectCompress(new Error('compression failed'))
@@ -1891,14 +1959,12 @@ describe('usePromptActions submit / queue drain semantics', () => {
     )
 
     expect(await handle!.submitText('continue remotely')).toBe(true)
-    expect(requestGatewayForAgent).toHaveBeenCalledWith(
-      'hermes01',
-      'default',
+    expect(ambientRequest).toHaveBeenCalledWith(
       'prompt.submit',
       { session_id: 'runtime-remote', text: 'continue remotely' },
       1_800_000
     )
-    expect(ambientRequest).not.toHaveBeenCalled()
+    expect(requestGatewayForAgent).not.toHaveBeenCalled()
   })
 
   it('clears a leftover interrupted flag on a fresh submit (so the new turn streams)', async () => {
@@ -5704,5 +5770,70 @@ describe('usePromptActions editMessage stale-target recovery (#82462)', () => {
     expect(
       (submitCalls[0]?.[1] as { truncate_before_user_ordinal?: unknown } | undefined)?.truncate_before_user_ordinal
     ).toBeUndefined()
+  })
+})
+
+describe('usePromptActions reloadFromMessage failed-submit rollback (#95745)', () => {
+  afterEach(() => {
+    cleanup()
+    clearNotifications()
+    setMessages([])
+    $busy.set(false)
+  })
+
+  it('restores the full transcript when regenerate is rejected', async () => {
+    $busy.set(false)
+
+    const seed = [
+      { id: 'u1', parts: [textPart('first')], role: 'user' as const, timestamp: 0 },
+      { id: 'a1', parts: [textPart('reply')], role: 'assistant' as const, timestamp: 1 },
+      { id: 'u2', parts: [textPart('later')], role: 'user' as const, timestamp: 2 },
+      { id: 'a2', parts: [textPart('later reply')], role: 'assistant' as const, timestamp: 3 }
+    ]
+
+    setMessages(seed as never)
+
+    let latest: Record<string, unknown> | undefined
+
+    const requestGateway = vi.fn(async (method: string) => {
+      if (method === 'prompt.submit') {
+        throw new JsonRpcGatewayError('target user message is no longer in session history', {
+          code: 4018,
+          data: {
+            ordinal: 0,
+            prefix_user_count: 1,
+            segment_ordinal: -1,
+            user_turn_count: 2
+          }
+        })
+      }
+
+      return {} as never
+    })
+
+    let handle: HarnessHandle | undefined
+
+    await actRender(
+      <Harness
+        onReady={h => {
+          handle = h
+        }}
+        onSeedState={next => {
+          latest = next
+        }}
+        refreshSessions={async () => undefined}
+        requestGateway={requestGateway}
+        seedMessages={seed}
+      />
+    )
+
+    await handle!.reloadFromMessage('u1')
+
+    const rolledBack = latest?.messages as Array<{ hidden?: boolean; id: string }> | undefined
+
+    expect(rolledBack?.map(m => m.id)).toEqual(['u1', 'a1', 'u2', 'a2'])
+    expect(rolledBack?.some(m => m.hidden)).toBe(false)
+    expect(latest?.busy).toBe(false)
+    expect(latest?.awaitingResponse).toBe(false)
   })
 })
