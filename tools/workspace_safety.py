@@ -152,7 +152,7 @@ def check_path_side_effect_allowed(
     bound_repo = _bound_repo_path()
     if bound_repo is None:
         return _blocked_message(repo_root, None)
-    if not _same_path(repo_root, bound_repo):
+    if not _same_repo(repo_root, bound_repo):
         return _blocked_message(repo_root, bound_repo)
     return None
 
@@ -196,7 +196,7 @@ def check_terminal_side_effect_allowed(
         bound_repo = _bound_repo_path()
         if bound_repo is None:
             return _blocked_message(repo_root, None)
-        if not _same_path(repo_root, bound_repo):
+        if not _same_repo(repo_root, bound_repo):
             return _blocked_message(repo_root, bound_repo)
     return None
 
@@ -255,6 +255,65 @@ def _same_path(left: Path, right: Path) -> bool:
         return left.resolve() == right.resolve()
     except OSError:
         return os.path.abspath(left) == os.path.abspath(right)
+
+
+def _gitdir_pointer(repo_root: Path) -> Optional[Path]:
+    marker = repo_root / ".git"
+    try:
+        if marker.is_dir():
+            return marker.resolve()
+        if not marker.is_file():
+            return None
+        for line in marker.read_text(encoding="utf-8").splitlines():
+            if line.lower().startswith("gitdir:"):
+                raw = Path(line.split(":", 1)[1].strip())
+                if not raw.is_absolute():
+                    raw = repo_root / raw
+                return raw.resolve()
+    except OSError:
+        return None
+    return None
+
+
+def _git_common_dir(repo_root: Path) -> Optional[Path]:
+    gitdir = _gitdir_pointer(repo_root)
+    if gitdir is None or not gitdir.is_dir():
+        return None
+    if gitdir.parent.name == "worktrees" and gitdir.parent.parent.name == ".git":
+        return gitdir.parent.parent
+    return gitdir
+
+
+def _linked_worktree_backref_ok(repo_root: Path, gitdir: Path) -> bool:
+    back = gitdir / "gitdir"
+    try:
+        if not back.is_file():
+            return False
+        pointed = Path(back.read_text(encoding="utf-8").strip())
+        if not pointed.is_absolute():
+            pointed = gitdir / pointed
+        return pointed.resolve() == (repo_root / ".git").resolve()
+    except OSError:
+        return False
+
+
+def _same_repo(left: Path, right: Path) -> bool:
+    """True when both paths are the same checkout or linked worktrees."""
+    if _same_path(left, right):
+        return True
+    left_git = _gitdir_pointer(left)
+    right_git = _gitdir_pointer(right)
+    left_common = _git_common_dir(left)
+    right_common = _git_common_dir(right)
+    if left_git is None or right_git is None or left_common is None or right_common is None:
+        return False
+    if not _same_path(left_common, right_common):
+        return False
+    if left_git.parent.name == "worktrees" and not _linked_worktree_backref_ok(left, left_git):
+        return False
+    if right_git.parent.name == "worktrees" and not _linked_worktree_backref_ok(right, right_git):
+        return False
+    return True
 
 
 def _safe_resolve(path: str | Path) -> Path:

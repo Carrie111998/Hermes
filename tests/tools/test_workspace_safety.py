@@ -35,6 +35,15 @@ def _git_repo(path: Path) -> Path:
     return path
 
 
+def _linked_worktree(main: Path, linked: Path) -> Path:
+    gitdir = main / ".git" / "worktrees" / "linked"
+    gitdir.mkdir(parents=True)
+    linked.mkdir(parents=True)
+    (linked / ".git").write_text(f"gitdir: {gitdir}\n", encoding="utf-8")
+    (gitdir / "gitdir").write_text(f"{linked / '.git'}\n", encoding="utf-8")
+    return linked
+
+
 def _gateway_session(bound_repo: str | Path | None = None):
     return set_session_vars(
         platform="matrix",
@@ -465,3 +474,49 @@ def test_quoted_git_text_is_not_an_executable(command, tmp_path):
         clear_session_vars(tokens)
 
     assert error is None
+
+
+def test_linked_worktree_write_and_git_are_allowed(tmp_path):
+    bound_repo = _git_repo(tmp_path / "bound")
+    linked = _linked_worktree(bound_repo, tmp_path / "linked")
+    tokens = _gateway_session(bound_repo)
+    try:
+        write_result = json.loads(write_file_tool(str(linked / "file.txt"), "data"))
+        error = check_terminal_side_effect_allowed("git commit -m update", linked)
+    finally:
+        clear_session_vars(tokens)
+
+    assert write_result.get("error") in (None, "")
+    assert (linked / "file.txt").read_text(encoding="utf-8") == "data"
+    assert error is None
+
+
+def test_independent_clone_is_still_blocked(tmp_path):
+    bound_repo = _git_repo(tmp_path / "bound")
+    clone = _git_repo(tmp_path / "clone")
+    tokens = _gateway_session(bound_repo)
+    try:
+        write_result = json.loads(write_file_tool(str(clone / "file.txt"), "data"))
+        error = check_terminal_side_effect_allowed("git commit -m update", clone)
+    finally:
+        clear_session_vars(tokens)
+
+    assert "outside authoritative workspace binding" in write_result["error"]
+    assert error is not None
+    assert "outside authoritative" in error
+
+
+def test_worktree_pointer_without_backref_is_blocked(tmp_path):
+    bound_repo = _git_repo(tmp_path / "bound")
+    spoof = tmp_path / "spoof"
+    spoof.mkdir()
+    gitdir = bound_repo / ".git" / "worktrees" / "spoof"
+    gitdir.mkdir(parents=True)
+    (spoof / ".git").write_text(f"gitdir: {gitdir}\n", encoding="utf-8")
+    tokens = _gateway_session(bound_repo)
+    try:
+        write_result = json.loads(write_file_tool(str(spoof / "file.txt"), "data"))
+    finally:
+        clear_session_vars(tokens)
+
+    assert "outside authoritative workspace binding" in write_result["error"]
