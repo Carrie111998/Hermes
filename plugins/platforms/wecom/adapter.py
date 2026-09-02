@@ -1497,7 +1497,25 @@ class WeComAdapter(BasePlatformAdapter):
                 "[WeCom] Flushing batch %s (%d chars, %d media)",
                 key, len(event.text or ""), len(event.media_urls or []),
             )
-            await self.handle_message(event)
+            try:
+                await self.handle_message(event)
+            except asyncio.CancelledError:
+                # The event was already popped above: without re-buffering,
+                # a cancellation mid-dispatch loses the user's message
+                # permanently. Prepend so it precedes any newer chunk.
+                existing = self._pending_text_batches.get(key)
+                if existing is not None:
+                    existing.text = (
+                        f"{event.text}\n{existing.text}"
+                        if event.text and existing.text
+                        else (existing.text or event.text)
+                    )
+                    if event.media_urls:
+                        existing.media_urls[:0] = event.media_urls
+                        existing.media_types[:0] = event.media_types
+                else:
+                    self._pending_text_batches[key] = event
+                raise
         finally:
             if self._pending_text_batch_tasks.get(key) is current_task:
                 self._pending_text_batch_tasks.pop(key, None)
