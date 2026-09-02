@@ -3,30 +3,35 @@ import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-libra
 import { MemoryRouter } from 'react-router'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
+import { I18nProvider, type Locale } from '@/i18n'
 import type { MessagingPlatformInfo } from '@/types/hermes'
 
 const getMessagingPlatforms = vi.fn()
+const getEmailAutoReplyPolicy = vi.fn()
 const updateMessagingPlatform = vi.fn()
+const updateEmailAutoReplyPolicy = vi.fn()
 const getPairing = vi.fn()
 const approvePairing = vi.fn()
 const revokePairing = vi.fn()
 const openExternalLink = vi.fn()
+const notifyError = vi.fn()
 
 vi.mock('@/hermes', () => ({
   approvePairing: (platformId: string, requestId: string, profile?: null | string) =>
     approvePairing(platformId, requestId, profile),
+  getEmailAutoReplyPolicy: (profile?: null | string) => getEmailAutoReplyPolicy(profile),
   getMessagingPlatforms: (profile?: null | string) => getMessagingPlatforms(profile),
   getPairing: (profile?: null | string) => getPairing(profile),
   getProfiles: vi.fn(async () => ({ profiles: [] })),
   revokePairing: (platformId: string, userId: string, profile?: null | string) =>
     revokePairing(platformId, userId, profile),
   setApiRequestProfile: vi.fn(),
+  updateEmailAutoReplyPolicy: (body: unknown, profile?: null | string) =>
+    updateEmailAutoReplyPolicy(body, profile),
   updateMessagingPlatform: (id: string, body: unknown, profile?: null | string) =>
     updateMessagingPlatform(id, body, profile)
 }))
 
-// Keep store/profile's side-effecting imports inert (pulled in via the shared
-// settings scope store) — same seam as store/profile.test.ts.
 vi.mock('@/store/gateway', () => ({
   $gateway: { get: () => null, subscribe: () => () => {} },
   ensureGatewayForAgent: vi.fn(async () => undefined),
@@ -42,7 +47,7 @@ vi.mock('@/lib/external-link', () => ({
 
 vi.mock('@/store/notifications', () => ({
   notify: vi.fn(),
-  notifyError: vi.fn()
+  notifyError: (error: unknown, title: string) => notifyError(error, title)
 }))
 
 vi.mock('@/store/system-actions', () => ({
@@ -65,6 +70,94 @@ function platform(patch: Partial<MessagingPlatformInfo> = {}): MessagingPlatform
 }
 
 beforeEach(() => {
+  getEmailAutoReplyPolicy.mockResolvedValue({
+    fields: [
+      {
+        advanced: false,
+        current_value: 'false',
+        default_value: 'false',
+        description: '',
+        input_type: 'boolean',
+        is_password: false,
+        is_set: false,
+        key: 'auto_reply_promotions',
+        prompt: '',
+        redacted_value: null,
+        required: false,
+        url: null
+      },
+      {
+        advanced: false,
+        current_value: '',
+        default_value: '',
+        description: '',
+        input_type: 'textarea',
+        is_password: false,
+        is_set: false,
+        key: 'no_reply_keywords',
+        prompt: '',
+        redacted_value: null,
+        required: false,
+        url: null
+      },
+      {
+        advanced: false,
+        current_value: '',
+        default_value: '',
+        description: '',
+        input_type: 'textarea',
+        is_password: false,
+        is_set: false,
+        key: 'skip_patterns',
+        prompt: '',
+        redacted_value: null,
+        required: false,
+        url: null
+      },
+      {
+        advanced: false,
+        current_value: '',
+        default_value: '',
+        description: '',
+        input_type: 'textarea',
+        is_password: false,
+        is_set: false,
+        key: 'force_reply_keywords',
+        prompt: '',
+        redacted_value: null,
+        required: false,
+        url: null
+      },
+      {
+        advanced: false,
+        current_value: 'true',
+        default_value: 'true',
+        description: '',
+        input_type: 'boolean',
+        is_password: false,
+        is_set: false,
+        key: 'require_structured_response',
+        prompt: '',
+        redacted_value: null,
+        required: false,
+        url: null
+      }
+    ],
+    policy: {
+      auto_reply_calendar: false,
+      auto_reply_newsletters: false,
+      auto_reply_promotions: false,
+      auto_reply_reports: false,
+      auto_reply_security: false,
+      auto_reply_social: false,
+      auto_reply_transactions: false,
+      force_reply_keywords: '',
+      no_reply_keywords: '',
+      skip_patterns: '',
+      require_structured_response: true
+    }
+  })
+  updateEmailAutoReplyPolicy.mockResolvedValue({ ok: true })
   updateMessagingPlatform.mockResolvedValue({ ok: true, platform: 'teams' })
   getPairing.mockResolvedValue({ approved: [], pending: [] })
 })
@@ -74,31 +167,117 @@ afterEach(() => {
   vi.clearAllMocks()
 })
 
-async function renderMessaging() {
+async function renderMessaging(locale: Locale = 'en') {
   const { MessagingView } = await import('./index')
   let result: ReturnType<typeof render>
   await act(async () => {
     result = render(
-      <MemoryRouter>
-        <MessagingView />
-      </MemoryRouter>
+      <I18nProvider configClient={null} initialLocale={locale}>
+        <MemoryRouter>
+          <MessagingView />
+        </MemoryRouter>
+      </I18nProvider>
     )
   })
 
   return result!
 }
 
-describe('MessagingView profile scope', () => {
-  it('follows the active profile instead of targeting primary when there is no override', async () => {
-    const { $settingsScopeOverride } = await import('@/store/settings-scope')
+describe('MessagingView email policy', () => {
+  it('renders the policy as a dedicated localized control surface', async () => {
+    getMessagingPlatforms.mockResolvedValue({
+      platforms: [
+        platform({
+          configured: true,
+          id: 'email',
+          name: 'Email',
+          env_vars: [
+            {
+              advanced: false,
+              current_value: 'bot@example.com',
+              description: 'Backend English description',
+              input_type: 'text',
+              is_password: false,
+              is_set: true,
+              key: 'EMAIL_ADDRESS',
+              prompt: 'Backend English mailbox prompt',
+              redacted_value: null,
+              required: true,
+              url: null
+            }
+          ]
+        })
+      ]
+    })
 
-    $settingsScopeOverride.set(null)
-    getMessagingPlatforms.mockResolvedValue({ platforms: [platform()] })
+    await renderMessaging('zh')
 
-    await renderMessaging()
+    expect(await screen.findByText('自动回复策略')).toBeTruthy()
+    expect(screen.getByText('推广与营销')).toBeTruthy()
+    expect(screen.getByText('绝不回复')).toBeTruthy()
+    expect(screen.getByText('跳过正则表达式')).toBeTruthy()
+    expect(screen.getByText('要求结构化回复判定')).toBeTruthy()
+    expect(screen.getByText('邮箱地址')).toBeTruthy()
+    expect(screen.queryByText('Backend English promotion prompt')).toBeNull()
 
-    await waitFor(() => expect(getMessagingPlatforms).toHaveBeenCalledWith(undefined))
-    expect(getPairing).toHaveBeenCalledWith(undefined)
+    fireEvent.change(screen.getByLabelText('绝不回复'), {
+      target: { value: 'invoice + overdue\nvip customer' }
+    })
+    fireEvent.click(screen.getByRole('button', { name: '保存更改' }))
+
+    await waitFor(() =>
+      expect(updateEmailAutoReplyPolicy).toHaveBeenCalledWith({
+        values: { no_reply_keywords: 'invoice + overdue;vip customer' },
+        clear: []
+      }, undefined)
+    )
+  })
+
+  it('saves skip patterns through the dedicated policy endpoint', async () => {
+    getMessagingPlatforms.mockResolvedValue({
+      platforms: [platform({ configured: true, id: 'email', name: 'Email', env_vars: [] })]
+    })
+
+    await renderMessaging('zh')
+
+    fireEvent.change(await screen.findByLabelText('跳过正则表达式'), {
+      target: { value: '^out of office$' }
+    })
+    fireEvent.click(screen.getByRole('button', { name: '保存更改' }))
+
+    await waitFor(() =>
+      expect(updateEmailAutoReplyPolicy).toHaveBeenCalledWith({
+        values: { skip_patterns: '^out of office$' },
+        clear: []
+      }, undefined)
+    )
+  })
+
+  it('rejects the same semantic keyword group on both reply lists', async () => {
+    getMessagingPlatforms.mockResolvedValue({
+      platforms: [
+        platform({
+          configured: true,
+          id: 'email',
+          name: 'Email',
+          env_vars: []
+        })
+      ]
+    })
+
+    await renderMessaging('zh')
+
+    fireEvent.change(await screen.findByLabelText('绝不回复'), {
+      target: { value: '发票 + 逾期' }
+    })
+    fireEvent.change(screen.getByLabelText('必须回复'), {
+      target: { value: '逾期 && 发票' }
+    })
+    fireEvent.click(screen.getByRole('button', { name: '保存更改' }))
+
+    expect(updateMessagingPlatform).not.toHaveBeenCalled()
+    expect(updateEmailAutoReplyPolicy).not.toHaveBeenCalled()
+    expect(notifyError).toHaveBeenCalledWith(expect.any(Error), '关键词规则冲突')
   })
 })
 
@@ -155,7 +334,7 @@ describe('MessagingView pairing', () => {
       fireEvent.click(approve)
     })
 
-    await waitFor(() => expect(approvePairing).toHaveBeenCalledWith('teams', 'a1b2c3d4e5f60718', undefined))
+    await waitFor(() => expect(approvePairing).toHaveBeenCalledWith('teams', 'a1b2c3d4e5f60718'))
   })
 
   it('restores the pending row when approval fails', async () => {

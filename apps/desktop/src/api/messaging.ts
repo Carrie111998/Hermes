@@ -1,4 +1,6 @@
 import type {
+  EmailAutoReplyPolicyResponse,
+  EmailAutoReplyPolicyUpdate,
   MessagingPlatformsResponse,
   MessagingPlatformTestResponse,
   MessagingPlatformUpdate,
@@ -16,6 +18,25 @@ export function getMessagingPlatforms(profile?: null | string): Promise<Messagin
   return hermesApi<MessagingPlatformsResponse>({
     ...profileScoped(profile),
     path: '/api/messaging/platforms'
+  })
+}
+
+export function getEmailAutoReplyPolicy(profile?: null | string): Promise<EmailAutoReplyPolicyResponse> {
+  return hermesApi<EmailAutoReplyPolicyResponse>({
+    ...profileScoped(profile),
+    path: '/api/messaging/platforms/email/auto-reply-policy'
+  })
+}
+
+export function updateEmailAutoReplyPolicy(
+  body: EmailAutoReplyPolicyUpdate,
+  profile?: null | string
+): Promise<{ ok: boolean }> {
+  return hermesApi<{ ok: boolean }>({
+    ...profileScoped(profile),
+    path: '/api/messaging/platforms/email/auto-reply-policy',
+    method: 'PUT',
+    body
   })
 }
 

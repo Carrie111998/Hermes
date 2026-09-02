@@ -4658,8 +4658,12 @@ def _env_line_defines_key(
     ) == _env_var_policy_name(key, is_windows=is_windows)
 
 
-def save_env_value(key: str, value: str):
-    """Save or update a value in ~/.hermes/.env."""
+def save_env_value(key: str, value: str, *, preserve_unicode: bool = False):
+    """Save or update a value in ~/.hermes/.env.
+
+    ``preserve_unicode`` is reserved for user-authored text settings. Secret
+    and identifier callers keep the historical ASCII guard by default.
+    """
     if is_managed():
         managed_error(f"set {key}")
         return
@@ -4678,8 +4682,10 @@ def save_env_value(key: str, value: str):
         return
     validate_env_var_name_for_write(key)
     value = value.replace("\n", "").replace("\r", "")
-    # API keys / tokens must be ASCII — strip non-ASCII with a warning.
-    value = _check_non_ascii_credential(key, value)
+    # API keys / tokens must be ASCII. User-authored text rules are UTF-8 data,
+    # not credentials, and must survive a save/read round trip unchanged.
+    if not preserve_unicode:
+        value = _check_non_ascii_credential(key, value)
     ensure_hermes_home()
     env_path = get_env_path()
 

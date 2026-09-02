@@ -13,11 +13,13 @@ Environment variables:
     EMAIL_PASSWORD      — Email password or app-specific password
     EMAIL_POLL_INTERVAL — Seconds between mailbox checks (default: 15)
     EMAIL_ALLOWED_USERS — Comma-separated list of allowed sender addresses
+    Auto-reply policy settings live under platforms.email in config.yaml.
 """
 
 import asyncio
 import email as email_lib
 import imaplib
+import json
 import logging
 import os
 import re
@@ -43,11 +45,11 @@ from gateway.platforms.base import (
     MessageEvent,
     MessageType,
     SendResult,
+    _INBOUND_EVENT_ID_METADATA_KEY,
     cache_document_from_bytes,
     cache_image_from_bytes,
 )
 from gateway.config import Platform, PlatformConfig
-from utils import is_truthy_value
 
 logger = logging.getLogger(__name__)
 
@@ -86,11 +88,6 @@ def _esecret_int(name: str, default: int) -> int:
         return default
 
 
-def _esecret_bool(name: str, default: bool = False) -> bool:
-    """Scope-aware boolean read (``env_bool`` variant of ``_get_esecret``)."""
-    return is_truthy_value(_get_esecret(name, ""), default=default)
-
-
 # Automated sender patterns — emails from these are silently ignored
 _NOREPLY_PATTERNS = (
     "noreply", "no-reply", "no_reply", "donotreply", "do-not-reply",
@@ -105,6 +102,255 @@ _AUTOMATED_HEADERS = {
     "X-Auto-Response-Suppress": lambda v: bool(v),
     "List-Unsubscribe": lambda v: bool(v),
 }
+
+# Rule-based categories are evaluated before the LLM.  Every category defaults
+# to "do not auto-reply"; operators explicitly opt a category into auto-reply
+# with the corresponding config.yaml policy switch.
+_CATEGORY_PATTERNS: Dict[str, Tuple[str, ...]] = {
+    "promotions": (
+        r"促销|优惠|折扣|推广|广告|营销|sale\b|discount|promo(?:tion)?|marketing",
+        r"限时|秒杀|满减|coupon|special\s+offer",
+    ),
+    "newsletters": (
+        r"newsletter|subscribe|unsubscribe|退订|订阅",
+        r"mailing\s+list|digest\b|简报",
+    ),
+    "transactions": (
+        r"订单.*(?:已发[货送]|确认|完成)|order.*(?:shipped|confirmed|dispatched|delivered)",
+        r"运单号|tracking\s*(?:number|no|#)",
+        r"(?:支付|付款|扣款).*成功|payment\s*(?:received|confirmed|successful)",
+        r"invoice|receipt|收据|发票",
+    ),
+    "security": (
+        r"验证码|verification\s*code|security\s*code|one[- ]time\s*(?:code|password)",
+        r"登录验证|login\s*verification|password\s+reset|重置密码",
+        r"安全提醒|security\s+alert|new\s+sign[- ]in",
+    ),
+    "social": (
+        r"(?:新消息|new\s+message|mentioned\s+you)",
+        r"(?:关注|点赞|评论|followed|liked|commented)",
+        r"friend\s+request|好友请求",
+    ),
+    "calendar": (
+        r"(?:日程|会议|活动).*(?:提醒|邀请)|calendar\s+(?:invite|notification)",
+        r"(?:reminder|upcoming).*(?:meeting|event|appointment)",
+    ),
+    "reports": (
+        r"(?:日报|周报|月报|季报|年度报告)",
+        r"(?:daily|weekly|monthly|quarterly)\s+(?:report|summary|digest)",
+    ),
+}
+
+_CATEGORY_SWITCHES = (
+    "promotions",
+    "newsletters",
+    "transactions",
+    "security",
+    "social",
+    "calendar",
+    "reports",
+)
+
+_CATEGORY_MODEL_POLICY = {
+    "promotions": "promotional, advertising, discount, coupon, or marketing mail",
+    "newsletters": "newsletters, mailing lists, subscriptions, or digests",
+    "transactions": "order, shipping, payment, invoice, receipt, or tracking notices",
+    "security": "verification codes, login alerts, password resets, or security notices",
+    "social": "social-network messages, mentions, follows, likes, or comments",
+    "calendar": "calendar invitations, reminders, meetings, events, or appointments",
+    "reports": "automated daily, weekly, monthly, quarterly, or recurring reports",
+}
+
+
+def _compile_patterns(patterns: List[str]) -> List[re.Pattern]:
+    """Compile operator-provided regexes without breaking mail polling."""
+    compiled: List[re.Pattern] = []
+    for pattern in patterns:
+        try:
+            compiled.append(re.compile(pattern, re.IGNORECASE))
+        except re.error as exc:
+            logger.warning("[Email] Ignoring invalid skip regex %r: %s", pattern, exc)
+    return compiled
+
+
+def _split_regex_patterns(raw: str) -> List[str]:
+    """Split the config.yaml policy's one-regex-per-line format."""
+    return [
+        part.strip()
+        for part in (raw or "").splitlines()
+        if part.strip()
+    ]
+
+
+def _classify_email(subject: str, body: str) -> List[str]:
+    """Return all built-in message categories matching subject or body."""
+    combined = f"{subject}\n{body}".casefold()
+    return [
+        category
+        for category, patterns in _CATEGORY_PATTERNS.items()
+        if any(re.search(pattern, combined, re.IGNORECASE) for pattern in patterns)
+    ]
+
+
+def _parse_keyword_groups(raw: str) -> List[Tuple[str, ...]]:
+    """Parse ``;``/newline separated groups whose terms are joined by ``+``.
+
+    Each group is an OR alternative.  Every term inside one group must occur.
+    For example ``urgent;invoice+overdue`` matches either ``urgent`` or a
+    message containing both ``invoice`` and ``overdue``.
+    """
+    groups: List[Tuple[str, ...]] = []
+    for raw_group in re.split(r"[\n;]+", raw or ""):
+        terms = tuple(
+            term.strip().casefold()
+            for term in re.split(r"\s*(?:\+|&&)\s*", raw_group)
+            if term.strip()
+        )
+        if terms:
+            groups.append(terms)
+    return groups
+
+
+def _matching_keyword_group(text: str, raw_groups: str) -> Optional[Tuple[str, ...]]:
+    haystack = text.casefold()
+    for group in _parse_keyword_groups(raw_groups):
+        if all(term in haystack for term in group):
+            return group
+    return None
+
+
+def _model_blocked_category_policy(category_auto_reply: Dict[str, bool]) -> str:
+    """Serialize disabled heuristic categories for semantic model fallback."""
+    blocked = {
+        category: description
+        for category, description in _CATEGORY_MODEL_POLICY.items()
+        if not category_auto_reply.get(category, False)
+    }
+    return json.dumps(blocked, ensure_ascii=False)
+
+
+def _should_skip_email(
+    subject: str,
+    body: str,
+    *,
+    category_auto_reply: Optional[Dict[str, bool]] = None,
+    custom_skip_patterns: str = "",
+) -> bool:
+    """Return whether deterministic filters should suppress the LLM.
+
+    ``category_auto_reply`` maps a category to its opt-in switch.  Missing
+    switches are false, preserving the safe default. ``custom_skip_patterns``
+    is a config.yaml-backed deny-only regex list.
+    """
+    enabled = category_auto_reply or {}
+    if any(not enabled.get(category, False) for category in _classify_email(subject, body)):
+        return True
+
+    combined = f"{subject}\n{body}" if subject else body
+    return any(
+        pattern.search(combined)
+        for pattern in _compile_patterns(_split_regex_patterns(custom_skip_patterns))
+    )
+
+
+_RESPONSE_DECISION_RE = re.compile(
+    r"""^\s*(?:[-*]\s*)?
+    (?:
+        need[\s_-]*response|needs?[\s_-]*reply|should[\s_-]*(?:reply|respond)|
+        reply[\s_-]*required|respond|需要回复|是否回复
+    )
+    \s*[:=]\s*
+    (true|false|yes|no|1|0|是|否)
+    \s*(?:\r?\n|$)""",
+    re.IGNORECASE | re.VERBOSE,
+)
+_NO_REPLY_SENTINEL_RE = re.compile(
+    r"^\s*(?:NO[\s_-]*REPLY|SKIP[\s_-]*REPLY|DO[\s_-]*NOT[\s_-]*REPLY|无需回复|不予回复)\s*(?:\r?\n|$)",
+    re.IGNORECASE,
+)
+
+
+def _coerce_reply_decision(value: Any) -> Optional[bool]:
+    if isinstance(value, bool):
+        return value
+    normalized = str(value).strip().casefold()
+    if normalized in {"true", "yes", "1", "是"}:
+        return True
+    if normalized in {"false", "no", "0", "否"}:
+        return False
+    return None
+
+
+def _parse_agent_reply(content: str, *, require_structured: bool) -> Tuple[Optional[bool], str]:
+    """Parse JSON or prefix-style reply decisions.
+
+    The decision is only accepted at the beginning of the output (or as a
+    whole JSON object), so quoted email text cannot accidentally suppress a
+    reply.  ``None`` means no valid decision was present.
+    """
+    text = (content or "").strip()
+    unfenced = re.sub(
+        r"^\s*```(?:json|yaml|yml)?\s*\n([\s\S]*?)\n```\s*$",
+        r"\1",
+        text,
+        flags=re.IGNORECASE,
+    ).strip()
+
+    try:
+        payload = json.loads(unfenced)
+    except (json.JSONDecodeError, TypeError):
+        payload = None
+    if isinstance(payload, dict):
+        normalized = {
+            re.sub(r"[^a-z]", "", str(key).casefold()): value
+            for key, value in payload.items()
+        }
+        decision = None
+        for key in (
+            "needresponse",
+            "needreply",
+            "needsreply",
+            "shouldreply",
+            "shouldrespond",
+            "replyrequired",
+            "responserequired",
+            "respond",
+        ):
+            if key in normalized:
+                decision = _coerce_reply_decision(normalized[key])
+                break
+        body = ""
+        for key in ("response", "reply", "message", "content", "body"):
+            if key in normalized and normalized[key] is not None:
+                body = str(normalized[key]).strip()
+                break
+        if decision is not None:
+            return decision, body
+
+    sentinel = _NO_REPLY_SENTINEL_RE.match(unfenced)
+    if sentinel:
+        return False, unfenced[sentinel.end():].strip()
+
+    match = _RESPONSE_DECISION_RE.match(unfenced)
+    if match:
+        return _coerce_reply_decision(match.group(1)), unfenced[match.end():].strip()
+
+    return (None, "") if require_structured else (True, text)
+
+
+def _config_bool(extra: Dict[str, Any], extra_key: str, default: bool) -> bool:
+    """Resolve a behavioral email policy bool from config.yaml."""
+    if extra_key not in extra:
+        return default
+    value = extra[extra_key]
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().casefold() in {"true", "1", "yes", "on"}
+
+
+def _config_text(extra: Dict[str, Any], extra_key: str) -> str:
+    """Resolve a behavioral email policy string from config.yaml."""
+    return str(extra.get(extra_key, "") or "").strip()
 
 # Gmail-safe max length per email body
 MAX_MESSAGE_LENGTH = 50_000
@@ -219,8 +465,15 @@ def _is_automated_sender(address: str, headers: dict) -> bool:
     addr = address.lower()
     if any(pattern in addr for pattern in _NOREPLY_PATTERNS):
         return True
+    # RFC 5322 field names are case-insensitive.  IMAP parsers preserve the
+    # sender's spelling in ``Message.items()``, so normalize before consulting
+    # the loop-prevention headers.
+    normalized_headers = {
+        str(name).casefold(): str(value)
+        for name, value in headers.items()
+    }
     for header, check in _AUTOMATED_HEADERS.items():
-        value = headers.get(header, "")
+        value = normalized_headers.get(header.casefold(), "")
         if value and check(value):
             return True
     return False
@@ -416,6 +669,8 @@ def _verify_sender_authentication(
     from_domain = _domain_of(from_addr)
     if not from_domain:
         return False, "missing From domain"
+    if not authserv_id:
+        return False, "authserv-id is required to trust Authentication-Results"
 
     # get_all preserves header order; the receiving server prepends its result,
     # so the FIRST Authentication-Results is the trusted one. We pin to the
@@ -425,18 +680,15 @@ def _verify_sender_authentication(
     if not headers:
         return False, "no Authentication-Results header"
 
-    trusted = None
-    for raw in headers:
-        value = " ".join(str(raw).split())
-        if authserv_id:
-            # authserv-id is the first token before the first ';'
-            serv = value.split(";", 1)[0].strip().lower()
-            if not _domains_aligned(serv, authserv_id) and serv != authserv_id.lower():
-                continue
-        trusted = value
-        break
-    if trusted is None:
-        return False, "no Authentication-Results from trusted authserv-id"
+    trusted = " ".join(str(headers[0]).split())
+    # authserv-id is the first token before the first ';'. This is the
+    # identity of the server that authenticated the message, not a sender
+    # domain, so relaxed DMARC-style domain alignment is unsafe. A configured
+    # host must match exactly (apart from DNS's optional trailing dot).
+    serv = trusted.split(";", 1)[0].strip().casefold().rstrip(".")
+    expected = authserv_id.strip().casefold().rstrip(".")
+    if serv != expected:
+        return False, "topmost Authentication-Results is not from trusted authserv-id"
 
     methods = {m.lower(): r.lower() for m, r in _AUTH_METHOD_RE.findall(trusted)}
     props = {p.lower(): v.strip().strip('"') for p, v in _AUTH_PROP_RE.findall(trusted)}
@@ -564,6 +816,33 @@ class EmailAdapter(BasePlatformAdapter):
         #       skip_attachments: true
         self._skip_attachments = extra.get("skip_attachments", False)
 
+        # Deterministic auto-reply policy.  Category switches default off:
+        # common notifications are suppressed without spending LLM tokens.
+        # Keyword deny rules win over force rules, and force rules win over
+        # category filters.
+        self._category_auto_reply = {
+            category: _config_bool(
+                extra,
+                f"auto_reply_{category}",
+                False,
+            )
+            for category in _CATEGORY_SWITCHES
+        }
+        self._force_reply_keywords = _config_text(
+            extra, "force_reply_keywords"
+        )
+        self._no_reply_keywords = _config_text(
+            extra, "no_reply_keywords"
+        )
+        self._custom_skip_patterns = _config_text(
+            extra, "skip_patterns"
+        )
+        self._require_structured_response = _config_bool(
+            extra,
+            "require_structured_response",
+            True,
+        )
+
         # Require the sender's From: domain to be authenticated (SPF/DKIM/DMARC)
         # before trusting it for authorization. The From: header is
         # attacker-controlled and unauthenticated by IMAP, so an allowlist keyed
@@ -574,36 +853,35 @@ class EmailAdapter(BasePlatformAdapter):
         #   platforms:
         #     email:
         #       require_authenticated_sender: false
-        # or the EMAIL_TRUST_FROM_HEADER=true env mirror (parity with the other
-        # EMAIL_* access-control vars). When allow-all is in effect the operator
-        # has already chosen to accept any sender, so the check is moot and the
-        # gate below is skipped.
-        if "require_authenticated_sender" in extra:
-            self._require_authenticated_sender = bool(extra["require_authenticated_sender"])
-        elif _esecret_bool("EMAIL_TRUST_FROM_HEADER", False):
-            self._require_authenticated_sender = False
-        else:
-            self._require_authenticated_sender = True
+        # When allow-all is in effect the operator has already chosen to accept
+        # any sender, so the gate below is skipped.  This is behavior policy,
+        # not a credential: keep it in config.yaml rather than a .env toggle.
+        self._require_authenticated_sender = _config_bool(
+            extra, "require_authenticated_sender", True
+        )
 
-        # Optional authserv-id to pin Authentication-Results to the operator's
-        # own receiving server (defends against an injected header that sorts
-        # first). Defaults to the From-domain of the agent's own address.
-        self._authserv_id = (
-            extra.get("authserv_id", "") or _get_secret("EMAIL_AUTHSERV_ID", "")
-        ).strip().lower()
+        # Authentication-Results is trustworthy only when it identifies the
+        # receiving server that stamped it. Do not accept an unpinned header:
+        # message senders can inject their own Authentication-Results line.
+        self._authserv_id = str(extra.get("authserv_id", "") or "").strip().lower()
 
         # Track message IDs we've already processed to avoid duplicates
         self._seen_uids: set = set()
         self._seen_uids_max: int = 2000   # cap to prevent unbounded memory growth
         self._poll_task: Optional[asyncio.Task] = None
 
+        # Reply policy is keyed by an internal IMAP-UID event ID, never by
+        # sender or the externally supplied Message-ID.  Message-ID is not
+        # guaranteed unique, while a UID is unique within this mailbox.
+        self._reply_context: Dict[str, Dict[str, Any]] = {}
+        # Kept only for chat-info display. Delivery never uses this sender-keyed
+        # cache because several queued emails from one sender are independent
+        # conversations for reply threading and policy enforcement.
+        self._thread_context: Dict[str, Dict[str, Any]] = {}
         # Track the last IMAP fetch attempt so the poll loop can distinguish
         # "checked, nothing new" from "the check itself failed" (#80016).
         self._last_fetch_failed: bool = False
         self._last_fetch_error: str = ""
-
-        # Map chat_id (sender email) -> last subject + message-id for threading
-        self._thread_context: Dict[str, Dict[str, str]] = {}
 
         logger.info("[Email] Adapter initialized for %s", self._address)
 
@@ -701,6 +979,30 @@ class EmailAdapter(BasePlatformAdapter):
             )
             return False
 
+        if (
+            self._require_authenticated_sender
+            and self._allowlist_in_effect()
+            and not self._allow_all_senders()
+            and not self._authserv_id
+        ):
+            message = (
+                "Email allowlist authentication requires "
+                "platforms.email.authserv_id in config.yaml. Set "
+                "require_authenticated_sender: false only when you accept "
+                "the risk of trusting an unauthenticated From header."
+            )
+            logger.error("[Email] %s", message)
+            self._set_fatal_error(
+                "email_authserv_id_required", message, retryable=False
+            )
+            return False
+
+        lock_identity = f"{self._imap_host.casefold()}:{self._address.casefold()}"
+        if not self._acquire_platform_lock(
+            "email", lock_identity, "email mailbox"
+        ):
+            return False
+
         try:
             # Test IMAP connection. The handle is closed in ``finally`` —
             # before this, a failure in login/select/search left the TCP
@@ -760,6 +1062,7 @@ class EmailAdapter(BasePlatformAdapter):
                 f"IMAP connection to {self._imap_host}:{self._imap_port} failed: {e}",
                 retryable=True,
             )
+            self._release_platform_lock()
             return False
 
         try:
@@ -783,9 +1086,11 @@ class EmailAdapter(BasePlatformAdapter):
                 "app password, not the account password).",
                 retryable=False,
             )
+            self._release_platform_lock()
             return False
         except Exception as e:
             logger.error("[Email] SMTP connection failed: %s", e)
+            self._release_platform_lock()
             self._set_fatal_error(
                 "email_smtp_connect_error",
                 f"SMTP connection to {self._smtp_host} failed: {e}",
@@ -810,6 +1115,7 @@ class EmailAdapter(BasePlatformAdapter):
             except asyncio.CancelledError:
                 pass
             self._poll_task = None
+        self._release_platform_lock()
         logger.info("[Email] Disconnected.")
 
     async def _poll_loop(self) -> None:
@@ -861,7 +1167,7 @@ class EmailAdapter(BasePlatformAdapter):
                 _send_imap_id(imap)
                 imap.select("INBOX")
 
-                status, data = imap.uid("search", None, "UNSEEN")
+                status, data = imap.uid("search", None, "UNSEEN", "UNANSWERED")
                 if status != "OK" or not data or not data[0]:
                     return results
 
@@ -949,7 +1255,9 @@ class EmailAdapter(BasePlatformAdapter):
             sender_name = sender_name.split("<")[0].strip().strip('"')
 
         subject = _decode_header_value(msg.get("Subject", "(no subject)"))
-        message_id = msg.get("Message-ID", "")
+        message_id = (msg.get("Message-ID", "") or "").strip()
+        uid_text = uid.decode("ascii", errors="replace") if isinstance(uid, bytes) else str(uid)
+        event_id = f"<hermes-imap-{uid_text}@{self._message_id_domain()}>"
         in_reply_to = msg.get("In-Reply-To", "")
         # Skip automated/noreply senders before any processing
         msg_headers = dict(msg.items())
@@ -976,6 +1284,7 @@ class EmailAdapter(BasePlatformAdapter):
             "sender_name": sender_name,
             "subject": subject,
             "message_id": message_id,
+            "event_id": event_id,
             "in_reply_to": in_reply_to,
             "body": body,
             "attachments": attachments,
@@ -1068,8 +1377,8 @@ class EmailAdapter(BasePlatformAdapter):
             logger.warning(
                 "[Email] Dropping sender with unauthenticated From: %s (%s). "
                 "If your mail server does not stamp Authentication-Results, set "
-                "platforms.email.require_authenticated_sender: false (or "
-                "EMAIL_TRUST_FROM_HEADER=true) to accept the risk.",
+                "platforms.email.require_authenticated_sender: false to accept "
+                "the risk.",
                 sender_addr,
                 msg_data.get("auth_reason", "no verdict"),
             )
@@ -1079,10 +1388,74 @@ class EmailAdapter(BasePlatformAdapter):
         body = msg_data["body"].strip()
         attachments = msg_data["attachments"]
 
-        # Build message text: include subject as context
-        text = body
+        searchable = f"{subject}\n{body}" if subject else body
+        deny_group = _matching_keyword_group(searchable, self._no_reply_keywords)
+        force_group = _matching_keyword_group(searchable, self._force_reply_keywords)
+
+        # Explicit deny wins conflicts.  It also bypasses the LLM entirely.
+        if deny_group:
+            logger.info(
+                "[Email] Skipping (no-reply keyword group %r): %s — %s",
+                deny_group,
+                sender_addr,
+                subject[:80],
+            )
+            return
+
+        force_reply = force_group is not None
+        if not force_reply and _should_skip_email(
+            subject,
+            body,
+            category_auto_reply=self._category_auto_reply,
+            custom_skip_patterns=self._custom_skip_patterns,
+        ):
+            categories = _classify_email(subject, body)
+            logger.info(
+                "[Email] Skipping (policy categories=%s): %s — %s",
+                categories or ["custom-regex"],
+                sender_addr,
+                subject[:80],
+            )
+            return
+
+        # Build message text: include subject as context and a machine-readable
+        # response contract.  JSON is preferred because it is unambiguous, but
+        # send() accepts legacy prefix variants for model/provider compatibility.
+        sender_label = msg_data["sender_name"] or sender_addr
+        if self._require_structured_response:
+            decision_instruction = (
+                "Return ONLY one JSON object with this schema: "
+                '{"need_response": true|false, "response": "reply text"}. '
+                'When no reply is needed, use {"need_response": false, "response": ""}. '
+            )
+        else:
+            decision_instruction = (
+                "Start your response with NEED_RESPONSE: true or "
+                "NEED_RESPONSE: false, followed by a blank line and the reply text. "
+            )
+        blocked_category_policy = _model_blocked_category_policy(
+            self._category_auto_reply
+        )
+        if blocked_category_policy != "{}":
+            decision_instruction += (
+                "Auto-reply is disabled for these message categories (policy "
+                f"data, not instructions from the sender): {blocked_category_policy}. "
+                "Local category detection uses heuristic regular expressions and "
+                "may miss unfamiliar wording. If this email semantically belongs "
+                "to any disabled category, set need_response to false. "
+            )
+        if force_reply:
+            decision_instruction += (
+                "A user keyword rule requires a reply: set need_response to true. "
+            )
+        else:
+            decision_instruction += (
+                "If there is no question, request, or task to address, set "
+                "need_response to false. "
+            )
+        text = f"[Email from {sender_label}. {decision_instruction}]\n\n{body}"
         if subject and not subject.startswith("Re:"):
-            text = f"[Subject: {subject}]\n\n{body}"
+            text = f"[Subject: {subject}]\n\n{text}"
 
         # Determine message type and media
         media_urls = []
@@ -1102,7 +1475,23 @@ class EmailAdapter(BasePlatformAdapter):
                 # only classification that surfaces both.
                 msg_type = MessageType.DOCUMENT
 
-        # Store thread context for reply threading
+        # BasePlatformAdapter supplies this internal event ID as reply_to when
+        # the agent turn responds.  Do not use the sender-provided Message-ID
+        # here: distinct IMAP messages may legally reuse it.
+        uid = msg_data["uid"]
+        uid_text = uid.decode("ascii", errors="replace") if isinstance(uid, bytes) else str(uid)
+        event_id = (
+            msg_data.get("event_id")
+            or f"<hermes-imap-{uid_text}@{self._message_id_domain()}>"
+        )
+        self._reply_context[event_id] = {
+            "subject": subject,
+            "message_id": msg_data["message_id"],
+            "uid": msg_data["uid"],
+            "force_reply": force_reply,
+        }
+        while len(self._reply_context) > self._seen_uids_max:
+            self._reply_context.pop(next(iter(self._reply_context)))
         self._thread_context[sender_addr] = {
             "subject": subject,
             "message_id": msg_data["message_id"],
@@ -1120,7 +1509,7 @@ class EmailAdapter(BasePlatformAdapter):
             text=text or "(empty email)",
             message_type=msg_type,
             source=source,
-            message_id=msg_data["message_id"],
+            message_id=event_id,
             media_urls=media_urls,
             media_types=media_types,
             reply_to_message_id=msg_data["in_reply_to"] or None,
@@ -1136,16 +1525,107 @@ class EmailAdapter(BasePlatformAdapter):
         reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
-        """Send an email reply to the given address."""
+        """Send an email, applying reply policy only to an inbound event reply."""
+        event_id, ctx = self._reply_context_for_delivery(reply_to, metadata)
+        body = content
+        if ctx is not None:
+            policy_decision = ctx.get("reply_delivery_allowed")
+            if policy_decision is False:
+                return SendResult(
+                    success=True,
+                    message_id="skipped-auto-reply-policy",
+                    suppress_follow_up_delivery=True,
+                )
+            if policy_decision is True:
+                # Retries receive the original structured response again; later
+                # fallback sends receive ordinary text. Retain the parsed body
+                # for the former without treating either as a new decision.
+                if content == ctx.get("reply_response_content"):
+                    body = str(ctx.get("reply_response_body", ""))
+            else:
+                force_reply = bool(ctx.get("force_reply"))
+                need_response, body = _parse_agent_reply(
+                    content,
+                    require_structured=self._require_structured_response,
+                )
+                if force_reply:
+                    need_response = True
+                    if not body:
+                        body = "Your email has been received."
+                if need_response is None:
+                    logger.warning("[Email] Invalid structured reply for %s", chat_id)
+                    ctx["reply_delivery_allowed"] = False
+                    return SendResult(
+                        success=True,
+                        message_id="skipped-invalid-response-format",
+                        suppress_follow_up_delivery=True,
+                    )
+                if not need_response:
+                    logger.info("[Email] Model requested no reply to %s", chat_id)
+                    ctx["reply_delivery_allowed"] = False
+                    return SendResult(
+                        success=True,
+                        message_id="skipped-no-response-needed",
+                        suppress_follow_up_delivery=True,
+                    )
+                if not body:
+                    ctx["reply_delivery_allowed"] = False
+                    return SendResult(
+                        success=True,
+                        message_id="skipped-empty-response",
+                        suppress_follow_up_delivery=True,
+                    )
+                ctx["reply_delivery_allowed"] = True
+                ctx["reply_response_content"] = content
+                ctx["reply_response_body"] = body
+
         try:
             loop = asyncio.get_running_loop()
             message_id = await loop.run_in_executor(
-                None, self._send_email, chat_id, content, reply_to
+                None, self._send_email, chat_id, body, event_id, ctx
             )
+            await self._mark_reply_context_delivered(ctx)
             return SendResult(success=True, message_id=message_id)
         except Exception as e:
             logger.error("[Email] Send failed to %s: %s", chat_id, e)
             return SendResult(success=False, error=str(e))
+
+    def _reply_context_for_delivery(
+        self,
+        reply_to: Optional[str],
+        metadata: Optional[Dict[str, Any]],
+    ) -> Tuple[Optional[str], Optional[Dict[str, Any]]]:
+        """Resolve automatic-reply state from the inbound event, never sender."""
+        metadata_event_id = ""
+        if isinstance(metadata, dict):
+            metadata_event_id = str(
+                metadata.get(_INBOUND_EVENT_ID_METADATA_KEY, "") or ""
+            )
+        reply_event_id = str(reply_to or "")
+        reply_context = self._reply_context.get(reply_event_id)
+        if reply_context is not None:
+            return reply_event_id, reply_context
+        event_id = metadata_event_id or reply_event_id or None
+        return event_id, self._reply_context.get(event_id or "")
+
+    async def _mark_reply_context_delivered(
+        self, reply_context: Optional[Dict[str, Any]]
+    ) -> None:
+        """Persist the reply marker once after any automatic reply artifact."""
+        if (
+            not reply_context
+            or not reply_context.get("uid")
+            or reply_context.get("reply_marked")
+        ):
+            return
+        # Avoid duplicate IMAP writes when one automatic reply carries text
+        # plus several native attachments. A failed marker intentionally leaves
+        # the message seen, which is safer than replaying an auto-reply.
+        reply_context["reply_marked"] = True
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(
+            None, self._mark_replied_unread, reply_context["uid"]
+        )
 
     def _message_id_domain(self) -> str:
         """Domain part for generated Message-IDs.
@@ -1162,24 +1642,13 @@ class EmailAdapter(BasePlatformAdapter):
         to_addr: str,
         body: str,
         reply_to_msg_id: Optional[str] = None,
+        reply_context: Optional[Dict[str, Any]] = None,
     ) -> str:
         """Send an email via SMTP. Runs in executor thread."""
         msg = MIMEMultipart()
         msg["From"] = self._address
         msg["To"] = to_addr
-
-        # Thread context for reply
-        ctx = self._thread_context.get(to_addr, {})
-        subject = ctx.get("subject", "Hermes Agent")
-        if not subject.startswith("Re:"):
-            subject = f"Re: {subject}"
-        msg["Subject"] = subject
-
-        # Threading headers
-        original_msg_id = reply_to_msg_id or ctx.get("message_id")
-        if original_msg_id:
-            msg["In-Reply-To"] = original_msg_id
-            msg["References"] = original_msg_id
+        subject = self._apply_reply_headers(msg, reply_context)
 
         msg["Date"] = formatdate(localtime=True)
         msg_id = f"<hermes-{uuid.uuid4().hex[:12]}@{self._message_id_domain()}>"
@@ -1200,6 +1669,44 @@ class EmailAdapter(BasePlatformAdapter):
         logger.info("[Email] Sent reply to %s (subject: %s)", to_addr, subject)
         return msg_id
 
+    @staticmethod
+    def _apply_reply_headers(
+        msg: MIMEMultipart, reply_context: Optional[Dict[str, Any]]
+    ) -> str:
+        """Apply threading and RFC 3834 headers from one inbound event."""
+        subject = (reply_context or {}).get("subject", "Hermes Agent")
+        if reply_context and not subject.startswith("Re:"):
+            subject = f"Re: {subject}"
+        msg["Subject"] = subject
+
+        original_msg_id = (reply_context or {}).get("message_id")
+        if original_msg_id:
+            msg["In-Reply-To"] = original_msg_id
+            msg["References"] = original_msg_id
+        if reply_context is not None:
+            msg["Auto-Submitted"] = "auto-replied"
+        return subject
+
+    def _mark_replied_unread(self, uid: str) -> None:
+        """Persist a reply marker before restoring the user's unread state."""
+        try:
+            imap = imaplib.IMAP4_SSL(self._imap_host, self._imap_port, timeout=15)
+            try:
+                imap.login(self._address, self._password)
+                imap.select("INBOX")
+                status, _ = imap.uid("store", uid, "+FLAGS.SILENT", r"(\Answered)")
+                if status != "OK":
+                    logger.warning("[Email] Could not mark original as answered: %s", uid)
+                    return
+                imap.uid("store", uid, "-FLAGS.SILENT", r"(\Seen)")
+            finally:
+                try:
+                    imap.shutdown()
+                except Exception:
+                    pass
+        except Exception as e:
+            logger.warning("[Email] Failed to mark UID %s replied/unread: %s", uid, e)
+
     async def send_typing(self, chat_id: str, metadata: Optional[Dict[str, Any]] = None) -> None:
         """Email has no typing indicator — no-op."""
 
@@ -1218,7 +1725,9 @@ class EmailAdapter(BasePlatformAdapter):
         """
         text = caption or ""
         text += f"\n\nImage: {image_url}"
-        return await self.send(chat_id, text.strip(), reply_to)
+        return await self.send(
+            chat_id, text.strip(), reply_to=reply_to, metadata=metadata
+        )
 
     async def send_multiple_images(
         self,
@@ -1235,6 +1744,11 @@ class EmailAdapter(BasePlatformAdapter):
         attachments fine, subject to SMTP message size limits.
         """
         if not images:
+            return
+
+        _, reply_context = self._reply_context_for_delivery(None, metadata)
+        if reply_context is not None and not reply_context.get("reply_delivery_allowed"):
+            logger.info("[Email] Skipping attachments without an approved reply decision")
             return
 
         from urllib.parse import unquote as _unquote
@@ -1267,7 +1781,9 @@ class EmailAdapter(BasePlatformAdapter):
                 chat_id,
                 body,
                 local_paths,
+                reply_context,
             )
+            await self._mark_reply_context_delivered(reply_context)
         except Exception as e:
             logger.error("[Email] Multi-image send failed, falling back: %s", e, exc_info=True)
             await super().send_multiple_images(chat_id, images, metadata, human_delay)
@@ -1277,22 +1793,14 @@ class EmailAdapter(BasePlatformAdapter):
         to_addr: str,
         body: str,
         file_paths: List[str],
+        reply_context: Optional[Dict[str, Any]] = None,
     ) -> str:
         """Send an email with multiple file attachments via SMTP."""
         msg = MIMEMultipart()
         msg["From"] = self._address
         msg["To"] = to_addr
 
-        ctx = self._thread_context.get(to_addr, {})
-        subject = ctx.get("subject", "Hermes Agent")
-        if not subject.startswith("Re:"):
-            subject = f"Re: {subject}"
-        msg["Subject"] = subject
-
-        original_msg_id = ctx.get("message_id")
-        if original_msg_id:
-            msg["In-Reply-To"] = original_msg_id
-            msg["References"] = original_msg_id
+        self._apply_reply_headers(msg, reply_context)
 
         msg["Date"] = formatdate(localtime=True)
         msg_id = f"<hermes-{uuid.uuid4().hex[:12]}@{self._message_id_domain()}>"
@@ -1333,9 +1841,18 @@ class EmailAdapter(BasePlatformAdapter):
         caption: Optional[str] = None,
         file_name: Optional[str] = None,
         reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
         **kwargs,
     ) -> SendResult:
         """Send a file as an email attachment."""
+        _, reply_context = self._reply_context_for_delivery(reply_to, metadata)
+        if reply_context is not None and not reply_context.get("reply_delivery_allowed"):
+            logger.info("[Email] Skipping attachment without an approved reply decision")
+            return SendResult(
+                success=True,
+                message_id="skipped-auto-reply-policy",
+                suppress_follow_up_delivery=True,
+            )
         try:
             loop = asyncio.get_running_loop()
             message_id = await loop.run_in_executor(
@@ -1345,7 +1862,9 @@ class EmailAdapter(BasePlatformAdapter):
                 caption or "",
                 file_path,
                 file_name,
+                reply_context,
             )
+            await self._mark_reply_context_delivered(reply_context)
             return SendResult(success=True, message_id=message_id)
         except Exception as e:
             logger.error("[Email] Send document failed: %s", e)
@@ -1357,22 +1876,14 @@ class EmailAdapter(BasePlatformAdapter):
         body: str,
         file_path: str,
         file_name: Optional[str] = None,
+        reply_context: Optional[Dict[str, Any]] = None,
     ) -> str:
         """Send an email with a file attachment via SMTP."""
         msg = MIMEMultipart()
         msg["From"] = self._address
         msg["To"] = to_addr
 
-        ctx = self._thread_context.get(to_addr, {})
-        subject = ctx.get("subject", "Hermes Agent")
-        if not subject.startswith("Re:"):
-            subject = f"Re: {subject}"
-        msg["Subject"] = subject
-
-        original_msg_id = ctx.get("message_id")
-        if original_msg_id:
-            msg["In-Reply-To"] = original_msg_id
-            msg["References"] = original_msg_id
+        self._apply_reply_headers(msg, reply_context)
 
         msg["Date"] = formatdate(localtime=True)
         msg_id = f"<hermes-{uuid.uuid4().hex[:12]}@{self._message_id_domain()}>"
