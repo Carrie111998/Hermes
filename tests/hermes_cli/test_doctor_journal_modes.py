@@ -419,6 +419,51 @@ class TestReportDatabaseJournalModes:
         assert "cannot rule out WAL exposure" not in out
         assert "⚠" not in out
 
+    def test_empty_database_warns_even_on_fixed_runtime(self, tmp_path, capsys):
+        """A 0-byte kanban.db/state.db is a stale placeholder, not "maybe WAL".
+
+        This must warn regardless of the WAL-reset vulnerability check —
+        an empty file is never exposed to that bug, but it is exactly the
+        stale-placeholder shape from issue #94106 that silently confuses
+        anything that expects to find data at this path.
+        """
+        (tmp_path / "kanban.db").touch()
+
+        doctor._report_database_journal_modes(tmp_path, (3, 51, 3))
+
+        out = capsys.readouterr().out
+        assert "⚠" in out
+        assert "kanban.db is empty (0 bytes)" in out
+        assert "stale placeholder" in out
+
+    def test_empty_database_warns_on_vulnerable_runtime_too(self, tmp_path, capsys):
+        (tmp_path / "state.db").touch()
+
+        doctor._report_database_journal_modes(tmp_path, VULNERABLE)
+
+        out = capsys.readouterr().out
+        assert "state.db is empty (0 bytes)" in out
+        assert "cannot rule out WAL exposure" not in out
+
+    def test_empty_database_warns_even_if_error_wording_changes(
+        self, tmp_path, capsys, monkeypatch
+    ):
+        """The warning is keyed on st_size == 0, not on matching the exact
+        "file is empty" string from `_read_journal_mode`. If that message is
+        ever reworded, this must keep warning instead of silently falling
+        back to the buried info path.
+        """
+        (tmp_path / "state.db").touch()
+        monkeypatch.setattr(
+            doctor, "_read_journal_mode", lambda path: (None, "0-byte file")
+        )
+
+        doctor._report_database_journal_modes(tmp_path, (3, 51, 3))
+
+        out = capsys.readouterr().out
+        assert "⚠" in out
+        assert "state.db is empty (0 bytes)" in out
+
     def test_report_creates_no_wal_sidecars(self, tmp_path, capsys):
         db = tmp_path / "state.db"
         _make_db(db, journal_mode="WAL")
