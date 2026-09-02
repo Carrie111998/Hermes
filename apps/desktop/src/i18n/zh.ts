@@ -1359,7 +1359,8 @@ export const zh: Translations = {
       useAction: '使用',
       activePill: '默认',
       updateTitle: '引擎有可用更新',
-      updateDetail: (next, current) => `新的 llama.cpp 构建（${next}）可以安装——当前为 ${current}。下载期间模型仍可正常使用。`,
+      updateDetail: (next, current) =>
+        `新的 llama.cpp 构建（${next}）可以安装——当前为 ${current}。下载期间模型仍可正常使用。`,
       updateAction: '更新引擎',
       updating: '正在更新引擎…',
       upToDateTitle: '引擎已是最新',
@@ -3808,10 +3809,6 @@ export const zh: Translations = {
       'composer-mentions': {
         title: '附件与命令',
         text: '输入 @ 把文件带入对话，输入 / 运行命令。'
-      },
-      'model-switch': {
-        title: '对话中随时换模型',
-        text: '模型名称就是按钮。工作性质变了就换一个。'
       },
       'local-setup': {
         title: '这台电脑可以本地运行模型',
