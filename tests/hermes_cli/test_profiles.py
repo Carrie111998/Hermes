@@ -1081,6 +1081,35 @@ class TestEdgeCases:
         assert cloned_config["model"] == "cloned"
         assert (target_dir / ".env").read_text().strip() == "SECRET=yes"
 
+    def test_cmd_profile_clone_from_next_steps_treats_as_clone(
+        self, profile_env, capsys
+    ):
+        """CLI guidance should not tell clone-from users they have no API keys."""
+        from hermes_cli import main as main_mod
+
+        source_dir = create_profile("source", no_alias=True)
+        (source_dir / ".env").write_text("SECRET=yes")
+        (source_dir / "SOUL.md").write_text("Source personality")
+
+        main_mod.cmd_profile(
+            types.SimpleNamespace(
+                profile_action="create",
+                profile_name="target",
+                clone=False,
+                clone_all=False,
+                clone_from="source",
+                no_alias=True,
+                no_skills=False,
+                description=None,
+            )
+        )
+
+        output = capsys.readouterr().out
+        assert "Cloned config, .env, SOUL.md, and skills from source." in output
+        assert "/.env for different API keys" in output
+        assert "/SOUL.md for different personality" in output
+        assert "This profile has no API keys yet" not in output
+
 
 
 class TestProfilesToServe:
@@ -1175,5 +1204,4 @@ class TestResolveProfileEnvSpelling:
         # No HERMES_HOME: the platform default root applies (existing contract).
         monkeypatch.delenv("HERMES_HOME", raising=False)
         assert Path(resolve_profile_env("default")) == _get_default_hermes_home()
-
 
