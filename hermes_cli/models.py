@@ -396,9 +396,10 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
         "nvidia/nemotron-3.5-lightning-30b-a3b",
         "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning",
         # Third-party agentic models hosted on build.nvidia.com
-        # (map to OpenRouter defaults — users get familiar picks on NIM)
-        "z-ai/glm-5.3",
-        "z-ai/glm-5.2",
+        # NOTE: z-ai/glm-5.3 and z-ai/glm-5.2 were removed - NVIDIA's live
+        # /v1/models catalog serves no z-ai models and calls 404 (verified
+        # 2026-08-28 against integrate.api.nvidia.com).
+        "moonshotai/kimi-k3",
         "moonshotai/kimi-k2.6",
         "minimaxai/minimax-m3",
     ],
