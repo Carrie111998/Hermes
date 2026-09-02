@@ -580,6 +580,84 @@ class TestMatrixBangCommandAlias:
 
 
 # ---------------------------------------------------------------------------
+# Reply quote reconstruction (rich replies without an inline fallback)
+# ---------------------------------------------------------------------------
+
+class TestMatrixReplyFetch:
+    """When a client sends a rich reply that references the original event but
+    omits the inline ``> quote`` fallback, the adapter must fetch the
+    replied-to event from the homeserver so ``reply_to_text`` is populated."""
+
+    def setup_method(self):
+        self.adapter = _make_adapter()
+        self.adapter._is_dm_room = AsyncMock(return_value=True)
+        self.adapter._get_display_name = AsyncMock(return_value="Nagger")
+        self.adapter._background_read_receipt = MagicMock()
+        self.adapter._text_batch_delay_seconds = 0
+        self.adapter._client = MagicMock()
+        self.adapter._client.get_event = AsyncMock()
+
+    @pytest.mark.asyncio
+    async def test_reply_without_fallback_fetches_quoted_text(self):
+        self.adapter._client.get_event = AsyncMock(
+            return_value=types.SimpleNamespace(
+                content={"body": "12 posts queued, target 14"},
+                sender="@nagger:example.org",
+            )
+        )
+        captured = None
+
+        async def capture(msg_event):
+            nonlocal captured
+            captured = msg_event
+
+        self.adapter.handle_message = capture
+        await self.adapter._handle_text_message(
+            room_id="!room:example.org",
+            sender="@alice:example.org",
+            event_id="$matrix-reply-fetch-test",
+            event_ts=0.0,
+            source_content={"msgtype": "m.text", "body": "Is this right?"},
+            relates_to={"m.in_reply_to": {"event_id": "$parent-event"}},
+        )
+
+        assert captured is not None
+        assert captured.text == "Is this right?"
+        assert captured.reply_to_text == "12 posts queued, target 14"
+        assert captured.reply_to_author_id == "@nagger:example.org"
+        assert captured.reply_to_author_name == "Nagger"
+        self.adapter._client.get_event.assert_awaited_once_with(
+            "!room:example.org", "$parent-event"
+        )
+
+    @pytest.mark.asyncio
+    async def test_reply_fetch_failure_degrades_to_empty_quote(self):
+        self.adapter._client.get_event = AsyncMock(
+            side_effect=Exception("homeserver unreachable")
+        )
+        captured = None
+
+        async def capture(msg_event):
+            nonlocal captured
+            captured = msg_event
+
+        self.adapter.handle_message = capture
+        await self.adapter._handle_text_message(
+            room_id="!room:example.org",
+            sender="@alice:example.org",
+            event_id="$matrix-reply-fetch-fail",
+            event_ts=0.0,
+            source_content={"msgtype": "m.text", "body": "Is this right?"},
+            relates_to={"m.in_reply_to": {"event_id": "$parent-event"}},
+        )
+
+        assert captured is not None
+        assert captured.text == "Is this right?"
+        assert captured.reply_to_text is None
+        assert captured.reply_to_author_id is None
+
+
+# ---------------------------------------------------------------------------
 # Thread detection
 # ---------------------------------------------------------------------------
 
