@@ -13428,6 +13428,20 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                         "commit; refusing to publish a stale compaction"
                     )
 
+            if self._active_messages_match_compacted(
+                conn, session_id, compacted_messages
+            ):
+                # A second compression path in the same cycle (preflight +
+                # tool-loop tail) can republish the identical summary.
+                # archive-then-insert would duplicate the row as compacted=1
+                # and session_search would return both (#97321).
+                count_row = conn.execute(
+                    "SELECT COUNT(*) AS n FROM messages "
+                    "WHERE session_id = ? AND active = 1",
+                    (session_id,),
+                ).fetchone()
+                return int(count_row["n"] if count_row is not None else 0)
+
             patched_model_config = None
             if model_config_patch is not None:
                 # on_missing="raise": a prune/compaction must not commit
@@ -13557,6 +13571,27 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             return inserted
 
         return self._execute_write(_do)
+
+    def _active_messages_match_compacted(
+        self,
+        conn,
+        session_id: str,
+        compacted_messages: List[Dict[str, Any]],
+    ) -> bool:
+        """True when the live transcript is already *compacted_messages*."""
+        rows = conn.execute(
+            "SELECT role, content FROM messages "
+            "WHERE session_id = ? AND active = 1 ORDER BY id",
+            (session_id,),
+        ).fetchall()
+        if len(rows) != len(compacted_messages):
+            return False
+        for row, msg in zip(rows, compacted_messages):
+            if (row["role"] or "") != (msg.get("role") or ""):
+                return False
+            if row["content"] != self._encode_content(msg.get("content")):
+                return False
+        return True
 
     def _message_column_names(self, conn) -> List[str]:
         """Column names of the messages table, cached per-connection era."""

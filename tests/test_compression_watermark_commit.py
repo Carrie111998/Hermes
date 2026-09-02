@@ -41,6 +41,31 @@ SUMMARY = [
 
 
 class TestWatermarkCommit:
+    def test_identical_second_compact_does_not_duplicate_summary(
+        self, db: SessionDB
+    ) -> None:
+        """Preflight + tool-loop must not insert the same summary twice (#97321)."""
+        _seed(db)
+        db.archive_and_compact("sess1", SUMMARY)
+        live_after_first = db.get_messages("sess1")
+        first_ids = [row["id"] for row in live_after_first]
+        assert [row["content"] for row in live_after_first] == [
+            SUMMARY[0]["content"],
+            SUMMARY[1]["content"],
+        ]
+
+        count = db.archive_and_compact("sess1", SUMMARY)
+        live = db.get_messages("sess1")
+        assert [row["id"] for row in live] == first_ids
+        assert count == 2
+        compacted = db.get_messages("sess1", include_compacted=True)
+        summaries = [
+            row
+            for row in compacted
+            if row.get("content") == SUMMARY[0]["content"]
+        ]
+        assert len(summaries) == 1
+
     def test_concurrent_tail_survives_compaction(self, db: SessionDB) -> None:
         _seed(db)
         watermark = db.get_active_message_watermark("sess1")
