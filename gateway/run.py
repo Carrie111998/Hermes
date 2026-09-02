@@ -10819,6 +10819,25 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """
         if running_agent is None or running_agent is _AGENT_PENDING_SENTINEL:
             return False
+        # ``_active_children`` is intentionally a short-lived registry: each
+        # child removes itself before ``delegate_task`` returns to the parent
+        # tool executor. During that teardown window the parent is still
+        # inside delegate_task, but the list can already be empty. Treat the
+        # parent tool marker as authoritative for the full tool-call lifetime
+        # so a conversational follow-up cannot slip through as an interrupt.
+        current_tool = getattr(running_agent, "_current_tool", None)
+        if not isinstance(current_tool, str):
+            try:
+                summary = running_agent.get_activity_summary()
+            except Exception:
+                summary = None
+            if isinstance(summary, dict):
+                current_tool = summary.get("current_tool")
+        if isinstance(current_tool, str):
+            active_tools = {part.strip() for part in current_tool.split(",")}
+            if "delegate_task" in active_tools:
+                return True
+
         children = getattr(running_agent, "_active_children", None)
         # AIAgent always initialises this as a concrete list (see
         # agent/agent_init.py). Reject anything that isn't a real
