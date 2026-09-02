@@ -1653,6 +1653,8 @@ export interface Translations {
     enabledRestarting: string
     all: string
     deliverOnly: string
+    statusEnabled: string
+    statusDisabled: string
     createdTitle: string
     createdSecretHint: string
     webhookUrl: string
