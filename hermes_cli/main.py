@@ -454,6 +454,7 @@ if _try_ultrafast_version():
     raise SystemExit(0)
 
 import argparse
+import contextlib
 import hashlib
 import json
 import re
@@ -2434,6 +2435,63 @@ def _iter_tui_build_inputs(root: Path):
                 yield path
 
 
+@contextlib.contextmanager
+def _tui_build_lock(root: Path):
+    """Serialize concurrent ``npm run build`` invocations on ``dist/entry.js``.
+
+    Every non-dev launch runs the esbuild bundle step (``should_build`` is
+    ``True`` by default). When several Hermes panes start at once — an
+    AgentGrid grid, a tmux layout, or the dashboard Chat tab racing a terminal
+    launch — each one shells out to its own esbuild against the SAME output
+    path. The bundle write itself is now atomic (see ui-tui/scripts/build.mjs),
+    so a reader can no longer observe a truncated module, but N redundant
+    bundlers still burn CPU and fight over dist/.
+
+    An exclusive advisory lock collapses that to one real build: the first
+    holder bundles, the rest block briefly and then re-check freshness, at
+    which point ``_tui_need_rebuild`` reports the bundle is already current and
+    they skip straight to launch.
+
+    Best-effort by design — a lock that cannot be taken must never keep the TUI
+    from starting. Windows has no ``fcntl``; there we simply proceed unlocked,
+    which is still correct because the rename in build.mjs is atomic there too.
+    """
+    try:
+        import fcntl
+    except ImportError:  # Windows — atomic rename still protects readers.
+        yield
+        return
+
+    lock_path = root / "dist" / ".build.lock"
+    lock_fd = None
+    try:
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        lock_fd = open(lock_path, "w", encoding="utf-8")
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+    except OSError:
+        # Read-only install dir, exotic filesystem without flock, fd
+        # exhaustion — none of these are worth failing a launch over.
+        if lock_fd is not None:
+            try:
+                lock_fd.close()
+            except OSError:
+                pass
+            lock_fd = None
+
+    try:
+        yield
+    finally:
+        if lock_fd is not None:
+            try:
+                fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            except OSError:
+                pass
+            try:
+                lock_fd.close()
+            except OSError:
+                pass
+
+
 def _tui_need_rebuild(root: Path) -> bool:
     """True when ``dist/entry.js`` is missing or older than TUI inputs.
 
@@ -2792,15 +2850,52 @@ def _make_tui_argv(tui_dir: Path, tui_dev: bool) -> tuple[list[str], Path]:
 
     if should_build:
         npm = _node_bin("npm")
-        result = subprocess.run(
-            [npm, "run", "build"],
-            cwd=str(tui_dir),
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            env=_npm_lifecycle_env(),
-        )
+        entry_path = tui_dir / "dist" / "entry.js"
+
+        def _entry_stamp() -> Optional[tuple]:
+            try:
+                st = entry_path.stat()
+            except OSError:
+                return None
+            return (st.st_mtime, st.st_size)
+
+        # Sampled BEFORE we queue on the lock, so we can tell afterwards
+        # whether a peer published a new bundle while we were blocked.
+        stamp_before = _entry_stamp()
+
+        with _tui_build_lock(tui_dir):
+            # Concurrent-launch fast path (AgentGrid grid, tmux layout,
+            # dashboard Chat racing a terminal). Several panes each want to
+            # bundle the same sources into the same file. The first one
+            # through the lock does the real work; a waiter that observes the
+            # bundle changed *while it was blocked* knows a peer just rebuilt
+            # from the same tree, so repeating ~4s of esbuild would only
+            # reproduce a byte-identical result.
+            #
+            # Deliberately narrow: this skips only on evidence of a peer build
+            # during our wait. A lone launch still rebuilds unconditionally,
+            # preserving the historical "always rebuild" guarantee for the
+            # single-process case (an mtime-only check would silently skip
+            # rebuilds for any build input not covered by
+            # _TUI_BUILD_INPUT_FILES/_DIRS).
+            stamp_after = _entry_stamp()
+            peer_rebuilt = (
+                stamp_before is not None
+                and stamp_after is not None
+                and stamp_after != stamp_before
+            )
+            if peer_rebuilt and not _tui_need_rebuild(tui_dir):
+                return [_node_bin("node"), "--expose-gc", str(entry_path)], tui_dir
+
+            result = subprocess.run(
+                [npm, "run", "build"],
+                cwd=str(tui_dir),
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                env=_npm_lifecycle_env(),
+            )
         if result.returncode != 0:
             combined = f"{result.stdout or ''}{result.stderr or ''}".strip()
             preview = "\n".join(combined.splitlines()[-30:])
