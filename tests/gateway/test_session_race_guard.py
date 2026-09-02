@@ -109,7 +109,7 @@ async def test_claim_records_every_batched_message_id_for_edit_correlation():
     event = _make_event()
     event.message_id = "msg_1"
     event.metadata = {
-        "simplex_batch_items": [
+        "correlated_message_items": [
             {"message_id": "msg_1", "text": "first"},
             {"message_id": "msg_2", "text": "second"},
         ]
@@ -187,7 +187,7 @@ def test_merge_pending_message_event_preserves_transport_sidecars():
         message_type=MessageType.TEXT,
         source=source,
         metadata={
-            "simplex_batch_items": [{"message_id": "1", "text": "first"}]
+            "correlated_message_items": [{"message_id": "1", "text": "first"}]
         },
     )
     second = MessageEvent(
@@ -195,7 +195,7 @@ def test_merge_pending_message_event_preserves_transport_sidecars():
         message_type=MessageType.TEXT,
         source=source,
         metadata={
-            "simplex_batch_items": [{"message_id": "2", "text": "second"}]
+            "correlated_message_items": [{"message_id": "2", "text": "second"}]
         },
     )
     cleanup_one = lambda: None
@@ -207,7 +207,7 @@ def test_merge_pending_message_event_preserves_transport_sidecars():
     merge_pending_message_event(pending, "session", second, merge_text=True)
 
     merged = pending["session"]
-    assert merged.metadata["simplex_batch_items"] == [
+    assert merged.metadata["correlated_message_items"] == [
         {"message_id": "1", "text": "first"},
         {"message_id": "2", "text": "second"},
     ]

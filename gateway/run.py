@@ -3031,6 +3031,8 @@ from gateway.session_state import (
     legacy_lease_token_property,
 )
 from gateway.authz_mixin import GatewayAuthorizationMixin
+from gateway.edit_supersede import GatewayEditSupersedeMixin
+from gateway.event_sidecars import correlated_event_message_ids
 from gateway.kanban_watchers import GatewayKanbanWatchersMixin
 from gateway.slash_commands import GatewaySlashCommandsMixin
 from gateway.turn_context import TurnContext
@@ -7320,7 +7322,12 @@ class TurnRunner:
 _SESSION_DB_UNPINNED = object()
 
 
-class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, GatewaySlashCommandsMixin):
+class GatewayRunner(
+    GatewayAuthorizationMixin,
+    GatewayEditSupersedeMixin,
+    GatewayKanbanWatchersMixin,
+    GatewaySlashCommandsMixin,
+):
     """
     Main gateway controller.
 
@@ -7339,6 +7346,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         DEFAULT_GATEWAY_SIGNAL_INTERRUPT_GRACE_TIMEOUT
     )
     _exit_code: Optional[int] = None
+    _agent_pending_sentinel = _AGENT_PENDING_SENTINEL
     _draining: bool = False
     _external_drain_active: bool = False
     _restart_requested: bool = False
@@ -9868,178 +9876,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     kept.append(queued_event)
             _q_state.conversation.queued_events = kept
         return removed
-
-    def _replace_queued_message(
-        self,
-        session_key: str,
-        adapter: Any,
-        message_id: str,
-        new_text: str,
-    ) -> bool:
-        """Replace the text of the first queued event matching ``message_id``.
-
-        Searches the primary pending slot first, then the overflow FIFO.
-        Mutates the matching event's ``.text`` in place and preserves all
-        other fields and FIFO order.  Returns True if a match was replaced,
-        False if no match was found in either queue level.
-
-        Modeled on ``_clear_goal_pending_continuations`` (same two-level
-        search pattern).
-        """
-        def _replace_event(event: Any) -> bool:
-            metadata = getattr(event, "metadata", None) or {}
-            components = metadata.get("simplex_batch_items", [])
-            if isinstance(components, list):
-                for component in components:
-                    if not isinstance(component, dict):
-                        continue
-                    if str(component.get("message_id")) != str(message_id):
-                        continue
-                    component["text"] = new_text
-                    event.text = "\n".join(
-                        str(item.get("text", ""))
-                        for item in components
-                        if isinstance(item, dict)
-                    )
-                    return True
-            if getattr(event, "message_id", None) == message_id:
-                event.text = new_text
-                return True
-            return False
-
-        # BasePlatformAdapter owns a short queue-mode debounce buffer in
-        # addition to the runner's pending slot and overflow FIFO.  Search it
-        # first so an edit cannot miss the exact message merely because its
-        # debounce timer has not fired yet.
-        replace_debounced = getattr(adapter, "replace_text_debounce_message", None)
-        if callable(replace_debounced) and replace_debounced(
-            session_key, message_id, new_text
-        ):
-            return True
-
-        # Primary slot
-        pending_slot = getattr(adapter, "_pending_messages", None) if adapter is not None else None
-        if isinstance(pending_slot, dict):
-            pending_event = pending_slot.get(session_key)
-            if pending_event is not None and _replace_event(pending_event):
-                return True
-
-        # Overflow FIFO
-        _q_state = self._peek_session_state(session_key)
-        overflow = _q_state.conversation.queued_events if _q_state else []
-        for ev in overflow:
-            if _replace_event(ev):
-                return True
-
-        return False
-
-    def _handle_edit_supersede(
-        self,
-        event: "MessageEvent",
-        session_key: str,
-        adapter: Any,
-    ) -> bool:
-        """Correlate an inbound edit with queued or in-flight messages.
-
-        Called from the synchronous edit-supersede block in
-        ``_handle_message`` (#35535).  Returns True if the event was handled
-        (queue-replaced, in-flight redirected/steered, or silently dropped);
-        the caller should return ``None`` to skip normal dispatch.  Returns
-        False for non-edit events that should continue through normal
-        processing.
-
-        Design intent (per issue #35535 design review):
-          * Queue match -> replace text in-place, silent (no ack).
-          * In-flight match (active_message_id) -> redirect/steer with
-            framing text.  Neither primitive cancels in-flight tools — this
-            is the best available approach without transcript mutation.
-          * No match (uncorrelated edit) -> silently dropped.  An isolated
-            out-of-context correction would confuse the model.
-
-        SYNCHRONOUS: no await between queued-replace, in-flight check, and
-        decision.  All operations are in-memory attribute writes.
-        """
-        _is_edit = bool(event.metadata.get("is_edit", False) if event.metadata else False)
-        _msg_id = event.message_id
-        if not _is_edit or not _msg_id:
-            return False  # not an edit — continue normal dispatch
-
-        # 1. Try queued supersede
-        if self._replace_queued_message(session_key, adapter, _msg_id, event.text or ""):
-            logger.info(
-                "Edit supersede — replaced queued message_id=%s for session %s",
-                _msg_id, session_key,
-            )
-            return True
-
-        # 2. Try in-flight redirect / steer
-        _q_state = self._peek_session_state(session_key)
-        if _q_state and (
-            _q_state.turn.active_message_id == _msg_id
-            or _msg_id in _q_state.turn.active_message_ids
-        ):
-            running_agent = _q_state.turn.agent
-            if running_agent is _AGENT_PENDING_SENTINEL:
-                logger.info(
-                    "Edit supersede — active turn is still initializing for "
-                    "message_id=%s in session %s; dropping the edit rather "
-                    "than misrouting it as a new turn",
-                    _msg_id,
-                    session_key,
-                )
-                return True
-            if running_agent is not None and running_agent is not _AGENT_PENDING_SENTINEL:
-                _framing = f'[User edited their earlier message. Corrected message: "{event.text}"]'
-                _handled = False
-                # Prefer redirect() over steer() — redirect delivers as
-                # user-side input next model iteration, steer appends to
-                # last tool result.  Neither cancels in-flight tools.
-                if (
-                    getattr(running_agent, "_supports_active_turn_redirect", False) is True
-                    and hasattr(running_agent, "redirect")
-                ):
-                    try:
-                        _handled = bool(running_agent.redirect(_framing))
-                    except Exception as exc:
-                        logger.warning(
-                            "Edit supersede — redirect failed for session %s: %s",
-                            session_key, exc,
-                        )
-                if not _handled and hasattr(running_agent, "steer"):
-                    try:
-                        _handled = bool(running_agent.steer(_framing))
-                    except Exception as exc:
-                        logger.warning(
-                            "Edit supersede — steer failed for session %s: %s",
-                            session_key, exc,
-                        )
-                if _handled:
-                    logger.info(
-                        "Edit supersede — redirected/steered in-flight turn "
-                        "message_id=%s for session %s",
-                        _msg_id, session_key,
-                    )
-                    return True
-                # Fallback: queue the edit as a normal pending event
-                logger.warning(
-                    "Edit supersede — redirect/steer unavailable for session %s, "
-                    "queueing edit as normal pending event",
-                    session_key,
-                )
-                self._queue_or_replace_pending_event(session_key, event)
-                return True
-
-        # 3. Uncoupled edit (#35535 deliberate policy): no queued match,
-        #    no in-flight match.  An isolated out-of-context correction
-        #    would confuse the model — drop it silently.
-        logger.info(
-            "Edit supersede — uncorrelated edit dropped "
-            "(platform=%s, chat=%s, message_id=%s)",
-            getattr(getattr(event.source, "platform", None), "value", "?"),
-            getattr(event.source, "chat_id", "?"),
-            _msg_id,
-        )
-        return True
 
     def _goal_still_active_for_session(self, session_id: str) -> bool:
         """Best-effort fresh DB check before running a queued continuation."""
@@ -20036,14 +19872,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         _claim_state.turn.agent = _AGENT_PENDING_SENTINEL
         _claim_state.turn.started_ts = time.time()
         _claim_state.turn.active_message_id = event.message_id or None
-        _component_ids = {
-            str(component.get("message_id"))
-            for component in (event.metadata or {}).get("simplex_batch_items", [])
-            if isinstance(component, dict) and component.get("message_id") is not None
-        }
-        if event.message_id is not None:
-            _component_ids.add(str(event.message_id))
-        _claim_state.turn.active_message_ids = _component_ids
+        _claim_state.turn.active_message_ids = correlated_event_message_ids(event)
         self._persist_active_agents()
         _run_generation = self._begin_session_run_generation(_quick_key)
 

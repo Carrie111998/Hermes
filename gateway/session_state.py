@@ -78,7 +78,7 @@ class TurnState:
     active_message_id: Optional[str] = None
     # Every correlated component ID represented by the active event.  A
     # transport may batch several user messages into one turn while retaining
-    # their independent edit identities (SimpleX ``simplex_batch_items``).
+    # their independent edit identities through generic event sidecars.
     active_message_ids: set[str] = field(default_factory=set)
 
     def clear(self) -> None:

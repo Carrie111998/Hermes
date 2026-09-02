@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from gateway.event_sidecars import CORRELATED_MESSAGE_ITEMS_KEY
+
 
 def prepend_cancelled_batch(cancelled: Any, newer: Any | None) -> Any:
     """Restore a cancelled in-flight event ahead of any newly queued event.
@@ -28,8 +30,8 @@ def prepend_cancelled_batch(cancelled: Any, newer: Any | None) -> Any:
 
     cancelled.metadata = dict(cancelled.metadata or {})
     newer_metadata = dict(newer.metadata or {})
-    cancelled_items = cancelled.metadata.setdefault("simplex_batch_items", [])
-    newer_items = newer_metadata.get("simplex_batch_items", [])
+    cancelled_items = cancelled.metadata.setdefault(CORRELATED_MESSAGE_ITEMS_KEY, [])
+    newer_items = newer_metadata.get(CORRELATED_MESSAGE_ITEMS_KEY, [])
     if isinstance(cancelled_items, list) and isinstance(newer_items, list):
         cancelled_items.extend(newer_items)
     return cancelled

@@ -72,6 +72,11 @@ from gateway.platforms.base import (
     MessageType,
     SendResult,
 )
+from gateway.event_sidecars import (
+    CORRELATED_MESSAGE_ITEMS_KEY,
+    add_post_turn_cleanup_callback,
+    replace_correlated_event_text,
+)
 from plugins.platforms.simplex.approvals import SimplexApprovalMixin
 from plugins.platforms.simplex.batching import prepend_cancelled_batch
 from plugins.platforms.simplex.config import (
@@ -1241,14 +1246,9 @@ class SimplexAdapter(
             # flight. Re-arm it at completion so a long-running transfer does
             # not shorten the consuming turn's cleanup window.
             self._schedule_owned_media_cleanup(owned_media_path, reset=True)
-            setattr(
+            add_post_turn_cleanup_callback(
                 msg_event,
-                "_post_turn_cleanup_callbacks",
-                [
-                    lambda path=owned_media_path: self._cleanup_owned_media_path(
-                        path
-                    )
-                ],
+                lambda path=owned_media_path: self._cleanup_owned_media_path(path),
             )
 
         logger.debug(
@@ -1298,7 +1298,7 @@ class SimplexAdapter(
         existing = self._pending_text_batches.get(key)
         event.metadata = dict(event.metadata or {})
         event.metadata.setdefault(
-            "simplex_batch_items",
+            CORRELATED_MESSAGE_ITEMS_KEY,
             [{"message_id": event.message_id, "text": event.text or ""}],
         )
         if existing is None:
@@ -1309,8 +1309,8 @@ class SimplexAdapter(
                     f"{existing.text}\n{event.text}" if existing.text else event.text
                 )
             existing.metadata = dict(existing.metadata or {})
-            existing.metadata.setdefault("simplex_batch_items", []).extend(
-                event.metadata["simplex_batch_items"]
+            existing.metadata.setdefault(CORRELATED_MESSAGE_ITEMS_KEY, []).extend(
+                event.metadata[CORRELATED_MESSAGE_ITEMS_KEY]
             )
             if event.media_urls:
                 existing.media_urls.extend(event.media_urls)
@@ -1342,20 +1342,11 @@ class SimplexAdapter(
         pending = self._pending_text_batches.get(key)
         if pending is None or not event.message_id:
             return False
-        items = (pending.metadata or {}).get("simplex_batch_items", [])
-        if not isinstance(items, list):
-            return False
-        for item in items:
-            if not isinstance(item, dict):
-                continue
-            if str(item.get("message_id")) != str(event.message_id):
-                continue
-            item["text"] = event.text or ""
-            pending.text = "\n".join(
-                str(component.get("text", ""))
-                for component in items
-                if isinstance(component, dict)
-            )
+        if replace_correlated_event_text(
+            pending,
+            event.message_id,
+            event.text or "",
+        ):
             logger.info(
                 "SimpleX: superseded batched message item_id=%s",
                 event.message_id,

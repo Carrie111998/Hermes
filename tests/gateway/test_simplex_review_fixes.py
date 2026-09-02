@@ -78,10 +78,10 @@ async def test_new_text_does_not_cancel_an_inflight_dispatch():
     await asyncio.gather(*list(adapter._pending_text_batch_tasks.values()))
 
     assert [event.text for event in dispatched] == ["first", "second"]
-    assert dispatched[0].metadata["simplex_batch_items"] == [
+    assert dispatched[0].metadata["correlated_message_items"] == [
         {"message_id": "1", "text": "first"},
     ]
-    assert dispatched[1].metadata["simplex_batch_items"] == [
+    assert dispatched[1].metadata["correlated_message_items"] == [
         {"message_id": "2", "text": "second"},
     ]
 
@@ -113,7 +113,7 @@ async def test_cancelled_inflight_dispatch_retries_when_adapter_is_running():
     await asyncio.gather(*list(adapter._pending_text_batch_tasks.values()))
 
     assert [event.text for event in dispatched] == ["first"]
-    assert dispatched[0].metadata["simplex_batch_items"] == [
+    assert dispatched[0].metadata["correlated_message_items"] == [
         {"message_id": "1", "text": "first"},
     ]
 

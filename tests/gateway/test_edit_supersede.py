@@ -203,7 +203,7 @@ class TestReplaceQueuedMessage:
         sk = "test_session"
         batched = _make_event(text="first\nsecond", message_id="msg_1")
         batched.metadata = {
-            "simplex_batch_items": [
+            "correlated_message_items": [
                 {"message_id": "msg_1", "text": "first"},
                 {"message_id": "msg_2", "text": "second"},
             ]
@@ -239,7 +239,7 @@ class TestReplaceQueuedMessage:
         sk = "test_session"
         batched = _make_event(text="first\nsecond", message_id="msg_1")
         batched.metadata = {
-            "simplex_batch_items": [
+            "correlated_message_items": [
                 {"message_id": "msg_1", "text": "first"},
                 {"message_id": "msg_2", "text": "second"},
             ]

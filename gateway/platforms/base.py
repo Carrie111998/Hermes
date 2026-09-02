@@ -24,6 +24,12 @@ from abc import ABC, abstractmethod
 from urllib.parse import urlsplit
 
 from utils import normalize_proxy_url
+from gateway.event_sidecars import (
+    merge_correlated_message_items,
+    merge_event_sidecars,
+    replace_correlated_event_text,
+    run_post_turn_cleanup_callbacks,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -2871,34 +2877,6 @@ def merge_pending_message_event(
     """
     existing = pending_messages.get(session_key)
     if existing:
-        def _merge_event_sidecars() -> None:
-            """Preserve transport-owned correlation and cleanup state."""
-            existing_metadata = dict(getattr(existing, "metadata", None) or {})
-            incoming_metadata = dict(getattr(event, "metadata", None) or {})
-            existing_components = existing_metadata.get("simplex_batch_items")
-            incoming_components = incoming_metadata.get("simplex_batch_items")
-            if isinstance(incoming_components, list):
-                if not isinstance(existing_components, list):
-                    existing_components = []
-                existing_metadata["simplex_batch_items"] = [
-                    *existing_components,
-                    *incoming_components,
-                ]
-                existing.metadata = existing_metadata
-
-            incoming_cleanup = list(
-                getattr(event, "_post_turn_cleanup_callbacks", []) or []
-            )
-            if incoming_cleanup:
-                existing_cleanup = list(
-                    getattr(existing, "_post_turn_cleanup_callbacks", []) or []
-                )
-                setattr(
-                    existing,
-                    "_post_turn_cleanup_callbacks",
-                    [*existing_cleanup, *incoming_cleanup],
-                )
-
         existing_is_photo = getattr(existing, "message_type", None) == MessageType.PHOTO
         incoming_is_photo = event.message_type == MessageType.PHOTO
         existing_has_media = bool(existing.media_urls)
@@ -2916,7 +2894,7 @@ def merge_pending_message_event(
             existing.media_text_inlined = existing_inline_flags
 
         if existing_is_photo and incoming_is_photo:
-            _merge_event_sidecars()
+            merge_event_sidecars(existing, event)
             existing.media_urls.extend(event.media_urls)
             existing.media_types.extend(event.media_types)
             existing.media_text_inlined.extend(incoming_inline_flags)
@@ -2926,7 +2904,7 @@ def merge_pending_message_event(
             return
 
         if existing_has_media or incoming_has_media:
-            _merge_event_sidecars()
+            merge_event_sidecars(existing, event)
             if incoming_has_media:
                 existing.media_urls.extend(event.media_urls)
                 existing.media_types.extend(event.media_types)
@@ -2951,7 +2929,7 @@ def merge_pending_message_event(
             and getattr(existing, "message_type", None) == MessageType.TEXT
             and event.message_type == MessageType.TEXT
         ):
-            _merge_event_sidecars()
+            merge_event_sidecars(existing, event)
             if event.text:
                 existing.text = f"{existing.text}\n{event.text}" if existing.text else event.text
             return
@@ -5920,26 +5898,7 @@ class BasePlatformAdapter(ABC):
         state = self._text_debounce_store().get(session_key)
         if state is None:
             return False
-        event = state.event
-        metadata = getattr(event, "metadata", None) or {}
-        components = metadata.get("simplex_batch_items", [])
-        if isinstance(components, list):
-            for component in components:
-                if not isinstance(component, dict):
-                    continue
-                if str(component.get("message_id")) != str(message_id):
-                    continue
-                component["text"] = new_text
-                event.text = "\n".join(
-                    str(item.get("text", ""))
-                    for item in components
-                    if isinstance(item, dict)
-                )
-                return True
-        if str(getattr(event, "message_id", "")) == str(message_id):
-            event.text = new_text
-            return True
-        return False
+        return replace_correlated_event_text(state.event, message_id, new_text)
 
     def _is_queue_text_debounce_candidate(self, event: MessageEvent) -> bool:
         """Return True for normal text eligible for queue-mode debounce."""
@@ -6026,18 +5985,7 @@ class BasePlatformAdapter(ABC):
                     if state.event.text
                     else event.text
                 )
-            state_metadata = dict(getattr(state.event, "metadata", None) or {})
-            event_metadata = dict(getattr(event, "metadata", None) or {})
-            state_components = state_metadata.get("simplex_batch_items")
-            event_components = event_metadata.get("simplex_batch_items")
-            if isinstance(event_components, list):
-                if not isinstance(state_components, list):
-                    state_components = []
-                state_metadata["simplex_batch_items"] = [
-                    *state_components,
-                    *event_components,
-                ]
-                state.event.metadata = state_metadata
+            merge_correlated_message_items(state.event, event)
             latest_message_id = getattr(event, "message_id", None)
             latest_anchor = latest_message_id or getattr(event, "reply_to_message_id", None)
             if latest_message_id is not None:
@@ -7285,24 +7233,12 @@ class BasePlatformAdapter(ABC):
             # artifacts they created (for example a received-file target).
             # Run them only after the turn has consumed the event, and keep
             # failures isolated from session cleanup and the pending drain.
-            for _cleanup_cb in list(
-                getattr(event, "_post_turn_cleanup_callbacks", []) or []
-            ):
-                if not callable(_cleanup_cb):
-                    continue
-                try:
-                    _cleanup_result = _cleanup_cb()
-                    if inspect.isawaitable(_cleanup_result):
-                        await asyncio.wait_for(
-                            _cleanup_result,
-                            timeout=_POST_DELIVERY_CALLBACK_TIMEOUT_SECONDS,
-                        )
-                except (asyncio.TimeoutError, Exception):
-                    logger.debug(
-                        "[%s] Post-turn artifact cleanup failed",
-                        self.name,
-                        exc_info=True,
-                    )
+            await run_post_turn_cleanup_callbacks(
+                event,
+                timeout=_POST_DELIVERY_CALLBACK_TIMEOUT_SECONDS,
+                logger=logger,
+                platform_name=self.name,
+            )
             # Some adapters keep platform-level typing tasks.  If callback
             # work or a late refresh recreated one, make one final bounded stop
             # before releasing the session guard.
