@@ -1965,6 +1965,7 @@ SUPPORTED_DOCUMENT_TYPES = {
     ".log": "text/plain",
     ".json": "application/json",
     ".xml": "application/xml",
+    ".svg": "image/svg+xml",
     ".yaml": "application/yaml",
     ".yml": "application/yaml",
     ".toml": "application/toml",
@@ -1996,7 +1997,7 @@ SUPPORTED_DOCUMENT_TYPES = {
 
 _TEXT_INJECT_EXTENSIONS = {
     ".txt", ".md", ".markdown", ".csv", ".tsv", ".log",
-    ".json", ".jsonl", ".ndjson", ".xml", ".yaml", ".yml", ".toml",
+    ".json", ".jsonl", ".ndjson", ".xml", ".svg", ".yaml", ".yml", ".toml",
     ".ini", ".cfg", ".conf", ".env", ".properties",
     ".html", ".htm", ".css", ".scss", ".sass", ".less",
     ".py", ".pyi", ".js", ".mjs", ".cjs", ".ts", ".tsx", ".jsx",
@@ -2409,7 +2410,7 @@ def cache_media_bytes(
     display = re.sub(r"[^\w.\- ]", "_", filename) if filename else (ext.lstrip(".") or "file")
 
     is_image = (
-        mime.startswith("image/")
+        (mime.startswith("image/") and mime != "image/svg+xml")
         or ext in SUPPORTED_IMAGE_DOCUMENT_TYPES
         or default_kind == "image"
     )

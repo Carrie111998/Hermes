@@ -10430,7 +10430,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 # Telegram may deliver screenshots/photos as documents. If the
                 # payload is actually an image, route it through the image cache
                 # and batching path instead of rejecting it as a document.
-                if ext in _TELEGRAM_IMAGE_EXTENSIONS or doc_mime.startswith("image/"):
+                if (ext in _TELEGRAM_IMAGE_EXTENSIONS or doc_mime.startswith("image/")) and doc_mime != "image/svg+xml":
                     file_obj = await doc.get_file()
                     image_bytes = await file_obj.download_as_bytearray()
                     image_ext = ext if ext in _TELEGRAM_IMAGE_EXTENSIONS else _TELEGRAM_IMAGE_MIME_TO_EXT.get(doc_mime, ".jpg")
