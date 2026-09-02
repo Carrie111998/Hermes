@@ -80,7 +80,7 @@ def read_or_create_install_id(root: Path | None = None) -> Optional[str]:
     root = get_default_hermes_root() if root is None else root
     path = root / _INSTALL_ID_FILENAME
     try:
-        existing = path.read_text(encoding="utf-8").strip().lower()
+        existing = path.read_text(encoding="utf-8-sig").strip().lower()
         if _INSTALL_ID_RE.fullmatch(existing):
             return existing
     except FileNotFoundError:
@@ -99,7 +99,7 @@ def read_or_create_install_id(root: Path | None = None) -> Optional[str]:
         # retain the file lock as the cross-process publication fence.
         with _INSTALL_ID_PUBLICATION_LOCK, _install_id_file_lock(root):
             try:
-                existing = path.read_text(encoding="utf-8").strip().lower()
+                existing = path.read_text(encoding="utf-8-sig").strip().lower()
                 if _INSTALL_ID_RE.fullmatch(existing):
                     return existing
             except FileNotFoundError:
@@ -121,7 +121,7 @@ def read_or_create_install_id(root: Path | None = None) -> Optional[str]:
                     os.unlink(tmp_name)
                 raise
 
-            committed = path.read_text(encoding="utf-8").strip().lower()
+            committed = path.read_text(encoding="utf-8-sig").strip().lower()
             return committed if _INSTALL_ID_RE.fullmatch(committed) else None
     except OSError:
         return None

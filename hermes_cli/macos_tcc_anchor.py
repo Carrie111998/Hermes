@@ -50,7 +50,7 @@ import tempfile
 from pathlib import Path
 
 from hermes_constants import venv_python_path
-from hermes_cli.managed_uv import _RUNTIME_DIR_NAME
+from hermes_cli.runtime_repair import _RUNTIME_DIR_NAME
 from utils import atomic_write_text
 
 logger = logging.getLogger(__name__)
@@ -58,7 +58,7 @@ logger = logging.getLogger(__name__)
 _MARKER_NAME = ".tcc-anchor-source"
 
 _STORE_COMMON_MARKERS = ("cpython-", "-macos-")
-# The runtime-store marker is derived from managed_uv so a rename of the
+# The runtime-store marker is derived from runtime_repair so a rename of the
 # repair-generation directory cannot silently stop the anchor from matching.
 _STORE_ROOT_MARKERS = ("/uv/python/", f"/{_RUNTIME_DIR_NAME}/python/")
 
@@ -147,7 +147,7 @@ def _interpreter_source(venv_dir: Path) -> str | None:
         return None
     home = ""
     try:
-        for line in cfg.read_text(encoding="utf-8").splitlines():
+        for line in cfg.read_text(encoding="utf-8-sig").splitlines():
             if line.lower().startswith("home"):
                 _, _, home = line.partition("=")
                 home = home.strip()
@@ -334,7 +334,7 @@ def _install_anchor(venv_dir: Path, source_file: Path) -> None:
         shutil.copy2(source_file, tmp_path)
         os.chmod(tmp_path, source_file.stat().st_mode | 0o111)
         try:
-            from hermes_cli.managed_uv import _macos_sign_managed_python
+            from hermes_cli.runtime_repair import _macos_sign_managed_python
 
             _macos_sign_managed_python(tmp_path)
         except Exception:  # pragma: no cover - never block the anchor
@@ -390,7 +390,7 @@ def ensure_tcc_anchor(project_root: Path | None = None) -> Path | None:
     if not venv_py.is_symlink():
         marker = _anchor_marker(venv_py.parent)
         try:
-            if marker.is_file() and marker.read_text(encoding="utf-8").strip() == (
+            if marker.is_file() and marker.read_text(encoding="utf-8-sig").strip() == (
                 _marker_value(source_file)
             ):
                 _provision_libpython(venv_dir, source_file, refresh=False)
@@ -436,7 +436,7 @@ def tcc_anchor_state(project_root: Path | None = None) -> tuple[str, str]:
         source_file = _interpreter_file(source)
         expected = _marker_value(source_file) if source_file is not None else source
         try:
-            if marker.is_file() and marker.read_text(encoding="utf-8").strip() == expected:
+            if marker.is_file() and marker.read_text(encoding="utf-8-sig").strip() == expected:
                 return "active", str(venv_py)
         except OSError:
             pass

@@ -275,6 +275,12 @@ contextBridge.exposeInMainWorld('hermesDesktop', {
   setDisableF12: blocked => ipcRenderer.send('hermes:devtools:disable-f12', blocked),
   setPreviewShortcutActive: active => ipcRenderer.send('hermes:previewShortcutActive', Boolean(active)),
   openExternal: url => ipcRenderer.invoke('hermes:openExternal', url),
+  onExternalOpenFailed: callback => {
+    const listener = (_event, payload) => callback(payload)
+    ipcRenderer.on('hermes:external-open-failed', listener)
+
+    return () => ipcRenderer.removeListener('hermes:external-open-failed', listener)
+  },
   mcpOauth: {
     // One-shot loopback listener for MCP OAuth against remote backends: bind
     // on this machine, hand redirectUri to mcp.servers.oauth.start, then wait
@@ -315,6 +321,7 @@ contextBridge.exposeInMainWorld('hermesDesktop', {
   // Fire-and-forget: persists a renderer error-boundary catch (with component
   // stack) to desktop.log so crashes survive the window (#79428).
   reportRendererError: report => ipcRenderer.send('hermes:logs:renderer-error', report),
+  logLine: line => ipcRenderer.send('hermes:logs:renderer-line', line),
   readDir: dirPath => ipcRenderer.invoke('hermes:fs:readDir', dirPath),
   gitRoot: startPath => ipcRenderer.invoke('hermes:fs:gitRoot', startPath),
   revealPath: targetPath => ipcRenderer.invoke('hermes:fs:reveal', targetPath),

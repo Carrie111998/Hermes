@@ -70,17 +70,11 @@ _PROVIDER_ENV_HINTS = (
     "TOKENPLAN_API_KEY",
 )
 
-
-from hermes_constants import is_termux as _is_termux
-
-
 def _python_install_cmd() -> str:
-    return "python -m pip install" if _is_termux() else "uv pip install"
+    return "uv pip install"
 
 
 def _system_package_install_cmd(pkg: str) -> str:
-    if _is_termux():
-        return f"pkg install {pkg}"
     if sys.platform == "darwin":
         return f"brew install {pkg}"
     return f"sudo apt install {pkg}"
@@ -240,26 +234,6 @@ def _safe_which(cmd: str) -> str | None:
         return shutil.which(cmd)
     except Exception:
         return None
-
-
-def _termux_browser_setup_steps(node_installed: bool) -> list[str]:
-    steps: list[str] = []
-    step = 1
-    if not node_installed:
-        steps.append(f"{step}) pkg install nodejs")
-        step += 1
-    steps.append(f"{step}) npm install -g agent-browser")
-    steps.append(f"{step + 1}) agent-browser install")
-    return steps
-
-
-def _termux_install_all_fallback_notes() -> list[str]:
-    return [
-        "Termux install profile: use .[termux-all] for broad compatibility (installer default on Termux).",
-        "Matrix E2EE extra is excluded on Termux (python-olm currently fails to build).",
-        "Local faster-whisper extra is excluded on Termux (ctranslate2/av build path unavailable).",
-        "STT fallback: use Groq Whisper (set GROQ_API_KEY) or OpenAI Whisper (set VOICE_TOOLS_OPENAI_KEY).",
-    ]
 
 
 def _has_provider_env_config(content: str) -> bool:
@@ -707,7 +681,7 @@ def _read_pyproject_version() -> str | None:
     """
     pyproject = PROJECT_ROOT / "pyproject.toml"
     try:
-        text = pyproject.read_text(encoding="utf-8")
+        text = pyproject.read_text(encoding="utf-8-sig")
     except OSError:
         return None
     in_project = False
@@ -1233,6 +1207,34 @@ def check_macos_full_disk_access() -> None:
     )
 
 
+def _pm_venv_active() -> bool:
+    """Whether pm provisioned a runtime venv for this install.
+
+    Resolved from pm's own records (facts.json + store layout), never from
+    interpreter state: under no-boot-through-venv ``sys.prefix`` always
+    equals ``sys.base_prefix`` and ``VIRTUAL_ENV`` is unset in bundled
+    installs. A bundled install keeps its relocatable venv beside the
+    manifest; a dev install syncs the project venv (``venv``/``.venv``).
+    Falls back to the legacy ``sys.prefix`` probe when pm records nothing
+    here (pre-pm checkouts) or pm itself cannot be read.
+    """
+    try:
+        from pm import paths
+        from pm.lock import Facts
+
+        if Facts(paths.facts_path()).get("venv"):
+            store = paths.store_root()
+            bundled = store.parent / "venv"
+            if (store.parent / "manifest.json").is_file():
+                return bundled.is_dir()
+            from hermes_constants import project_venv_dir
+
+            return project_venv_dir(paths.repo_root()) is not None
+    except Exception:
+        pass
+    return sys.prefix != sys.base_prefix
+
+
 def run_doctor(args):
     """Run diagnostic checks."""
     should_fix = getattr(args, 'fix', False)
@@ -1396,8 +1398,12 @@ def run_doctor(args):
         _report_database_journal_modes()
     except Exception as e:
         check_warn(f"SQLite version probe failed: {e}")
-    # Check if in virtual environment
-    in_venv = sys.prefix != sys.base_prefix
+    # Check whether pm provisioned a runtime venv for this install.
+    # Under no-boot-through-venv the gateway runs the store python
+    # (sys.prefix == sys.base_prefix always, VIRTUAL_ENV unset in bundled
+    # installs), so prefix sniffing cannot distinguish; pm's facts are the
+    # authority. Falls back to the legacy probe when pm has no venv here.
+    in_venv = _pm_venv_active()
     if in_venv:
         check_ok("Virtual environment active")
     else:
@@ -1465,7 +1471,7 @@ def run_doctor(args):
         # latin-1 for Windows Notepad/cp1252 files that are not valid UTF-8 —
         # matches hermes_cli.env_loader._load_dotenv_with_fallback.
         try:
-            content = env_path.read_text(encoding="utf-8")
+            content = env_path.read_text(encoding="utf-8-sig")
         except UnicodeDecodeError:
             content = env_path.read_text(encoding="latin-1")
         if _has_provider_env_config(content):
@@ -1996,7 +2002,7 @@ def run_doctor(args):
     # Check for SOUL.md persona file
     soul_path = hermes_home / "SOUL.md"
     if soul_path.exists():
-        content = soul_path.read_text(encoding="utf-8").strip()
+        content = soul_path.read_text(encoding="utf-8-sig").strip()
         # Check if it's just the template comments (no real content)
         lines = [l for l in content.splitlines() if l.strip() and not l.strip().startswith(("<!--", "-->", "#"))]
         if lines:
@@ -2023,12 +2029,12 @@ def run_doctor(args):
         memory_file = memories_dir / "MEMORY.md"
         user_file = memories_dir / "USER.md"
         if memory_file.exists():
-            size = len(memory_file.read_text(encoding="utf-8").strip())
+            size = len(memory_file.read_text(encoding="utf-8-sig").strip())
             check_ok(f"MEMORY.md exists ({size} chars)")
         else:
             check_info("MEMORY.md not created yet (will be created when the agent first writes a memory)")
         if user_file.exists():
-            size = len(user_file.read_text(encoding="utf-8").strip())
+            size = len(user_file.read_text(encoding="utf-8-sig").strip())
             check_ok(f"USER.md exists ({size} chars)")
         else:
             check_info("USER.md not created yet (will be created when the agent first writes a memory)")
@@ -2209,14 +2215,8 @@ def run_doctor(args):
                 break
 
         # Determine the expected command link directory (mirrors install.sh logic)
-        _prefix = os.environ.get("PREFIX", "")
-        _is_termux_env = bool(os.environ.get("TERMUX_VERSION")) or "com.termux/files/usr" in _prefix
-        if _is_termux_env and _prefix:
-            _cmd_link_dir = Path(_prefix) / "bin"
-            _cmd_link_display = "$PREFIX/bin"
-        else:
-            _cmd_link_dir = Path.home() / ".local" / "bin"
-            _cmd_link_display = "~/.local/bin"
+        _cmd_link_dir = Path.home() / ".local" / "bin"
+        _cmd_link_display = "~/.local/bin"
         _cmd_link = _cmd_link_dir / "hermes"
 
         if _venv_bin is None:
@@ -2329,8 +2329,6 @@ def run_doctor(args):
             )
     elif _safe_which("docker"):
         check_ok("docker", "(optional)")
-    elif _is_termux():
-        check_info("Docker backend is not available inside Termux (expected on Android)")
     elif running_in_container:
         pass  # already explained above
     else:
@@ -2525,12 +2523,6 @@ def run_doctor(args):
                 "agent-browser found but not runnable",
                 f"(broken symlink at {_resolved_ab}? run: npx agent-browser --version)",
             )
-        elif _is_termux():
-            check_info("agent-browser is not installed (expected in the tested Termux path)")
-            check_info("Install it manually later with: npm install -g agent-browser && agent-browser install")
-            check_info("Termux browser setup:")
-            for step in _termux_browser_setup_steps(node_installed=True):
-                check_info(step)
         else:
             check_warn("agent-browser not installed", "(requires npm/npx on PATH)")
 
@@ -2538,9 +2530,8 @@ def run_doctor(args):
         # agent-browser is found but no Playwright-managed Chromium is on disk
         # (tools/browser_tool.py::check_browser_requirements filters them out
         # before the agent ever sees them).  Reuse the exact predicate it uses
-        # so the two checks cannot diverge.  Skip on Termux (not a tested
-        # path).
-        if agent_browser_ok and not _is_termux():
+        # so the two checks cannot diverge.
+        if agent_browser_ok:
             try:
                 # Lazy import: browser_tool is a ~150KB module we don't want
                 # to eagerly load in every `hermes doctor` invocation.
@@ -2583,12 +2574,6 @@ def run_doctor(args):
                                 f"Install with: cd {PROJECT_ROOT} && "
                                 "npx playwright install --with-deps chromium"
                             )
-    elif _is_termux():
-        check_info("Node.js not found (browser tools are optional in the tested Termux path)")
-        check_info("Install Node.js on Termux with: pkg install nodejs")
-        check_info("Termux browser setup:")
-        for step in _termux_browser_setup_steps(node_installed=False):
-            check_info(step)
     else:
         check_warn("Node.js not found", "(optional, needed for browser tools)")
 
@@ -2720,11 +2705,6 @@ def run_doctor(args):
                     )
             except Exception:
                 pass
-
-    if _is_termux():
-        check_info("Termux compatibility fallbacks:")
-        for note in _termux_install_all_fallback_notes():
-            check_info(note)
 
     _section("API Connectivity")
     # Refactor: every connectivity probe below is HTTP-bound and fully
@@ -3209,7 +3189,7 @@ def run_doctor(args):
         if lock_file.exists():
             try:
                 import json
-                lock_data = json.loads(lock_file.read_text(encoding="utf-8"))
+                lock_data = json.loads(lock_file.read_text(encoding="utf-8-sig"))
                 count = len(lock_data.get("installed", {}))
                 check_ok(f"Lock file OK ({count} hub-installed skill(s))")
             except Exception:
@@ -3375,7 +3355,7 @@ def run_doctor(args):
                     if not wrapper.is_file():
                         continue
                     try:
-                        content = wrapper.read_text(encoding="utf-8")
+                        content = wrapper.read_text(encoding="utf-8-sig")
                         if "hermes -p" in content:
                             _m = _re.search(r"hermes -p (\S+)", content)
                             if _m and not profile_exists(_m.group(1)):

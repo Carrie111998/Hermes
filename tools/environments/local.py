@@ -557,7 +557,7 @@ def _is_terminal_first_party_env(name: str) -> bool:
 # system/venv Pythons — to the Hermes venv's stdlib, which crashes with
 # version-mismatch errors before a child script even imports a package
 # (#75018). Hermes itself treats PYTHONHOME as contamination in its own
-# child processes (managed_uv.py, sqlite_runtime.py), so stripping it from
+# child processes (sqlite_runtime.py), so stripping it from
 # subprocess envs is consistent. Users who need PYTHONHOME for a specific
 # child can set it explicitly in the command.
 #
@@ -831,7 +831,9 @@ _ALWAYS_STRIP_KEYS: frozenset[str] = frozenset({
 })
 
 
-def hermes_subprocess_env(*, inherit_credentials: bool = False) -> dict[str, str]:
+def hermes_subprocess_env(
+    *, inherit_credentials: bool = False, base_env: dict[str, str] | None = None
+) -> dict[str, str]:
     """Build a sanitized environment dict for a spawned subprocess.
 
     Centralized helper for the **non-terminal** spawn surface (browser,
@@ -862,8 +864,12 @@ def hermes_subprocess_env(*, inherit_credentials: bool = False) -> dict[str, str
     needs ``BROWSERBASE_API_KEY`` / ``FIRECRAWL_API_KEY``) should call with
     ``inherit_credentials=False`` and copy just those keys back from
     ``os.environ`` into the returned dict.
+
+    ``base_env`` swaps the starting environment (default ``os.environ``) —
+    for callers that already hold a curated env (pm's sanitized uv env) and
+    want the strip policy applied on top of it.
     """
-    env = os.environ.copy()
+    env = dict(base_env) if base_env is not None else os.environ.copy()
 
     # Tier 1 — always strip.
     for key in _ALWAYS_STRIP_KEYS:
@@ -980,213 +986,18 @@ def build_subprocess_env(
 
 
 def _find_bash() -> str:
-    """Find bash for command execution."""
-    if not _IS_WINDOWS:
-        return (
-            shutil.which("bash")
-            or ("/usr/bin/bash" if os.path.isfile("/usr/bin/bash") else None)
-            or ("/bin/bash" if os.path.isfile("/bin/bash") else None)
-            or os.environ.get("SHELL")
-            or "/bin/sh"
-        )
+    """Resolve the shell Hermes runs commands with. Owned by pm (the store
+    is the authority on bundled bash); this is a thin wrapper over
+    pm.shell() for callers that need a bash binary."""
+    import pm.shell
 
-    candidates: list[str] = []
-
-    custom = os.environ.get("HERMES_GIT_BASH_PATH")
-    if custom and os.path.isfile(custom):
-        candidates.append(custom)
-
-    # Prefer our own portable Git install — a broken or partially-uninstalled
-    # system Git (or a stale HERMES_GIT_BASH_PATH pointing at one) must not
-    # brick the terminal.  install.ps1 drops PortableGit here when needed.
-    #
-    # Layouts (both checked so upgrades between MinGit and PortableGit
-    # installs work transparently):
-    #   PortableGit: %LOCALAPPDATA%\hermes\git\bin\bash.exe   (primary)
-    #   MinGit:      %LOCALAPPDATA%\hermes\git\usr\bin\bash.exe (legacy/32-bit fallback)
-    _local_appdata = os.environ.get("LOCALAPPDATA", "")
-    _hermes_portable_git = os.path.join(_local_appdata, "hermes", "git") if _local_appdata else ""
-    if _hermes_portable_git:
-        for candidate in (
-            os.path.join(_hermes_portable_git, "bin", "bash.exe"),        # PortableGit (primary)
-            os.path.join(_hermes_portable_git, "usr", "bin", "bash.exe"), # MinGit fallback
-        ):
-            if os.path.isfile(candidate) and candidate not in candidates:
-                candidates.append(candidate)
-
-    # Check known Git for Windows install locations before PATH lookup.
-    # On machines with both WSL and Git for Windows, shutil.which("bash")
-    # may return WSL's bash (which doesn't understand Windows paths and
-    # will fail silently).  Explicit Git-for-Windows paths avoid that.
-    for candidate in (
-        os.path.join(os.environ.get("ProgramFiles", r"C:\Program Files"), "Git", "bin", "bash.exe"),
-        os.path.join(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"), "Git", "bin", "bash.exe"),
-        os.path.join(_local_appdata, "Programs", "Git", "bin", "bash.exe") if _local_appdata else "",
-    ):
-        if candidate and os.path.isfile(candidate) and candidate not in candidates:
-            candidates.append(candidate)
-
-    found = shutil.which("bash")
-    if found and found not in candidates:
-        candidates.append(found)
-
-    # Prefer the first candidate that can actually start.  A stale
-    # HERMES_GIT_BASH_PATH pointing at a broken Git-for-Windows install
-    # (``Directory \\drivers\\etc does not exist``) must not win over a
-    # healthy portable Git under %LOCALAPPDATA%\\hermes\\git.
-    for candidate in candidates:
-        if _bash_starts(candidate):
-            if candidate != custom and custom and os.path.isfile(custom):
-                logger.warning(
-                    "HERMES_GIT_BASH_PATH=%s fails to start; using %s instead",
-                    custom,
-                    candidate,
-                )
-            return candidate
-
-    if candidates:
-        probe_details = "\n".join(
-            detail
-            for candidate in candidates
-            if (detail := _bash_probe_details_cache.get(candidate))
-        )
-        if _mandatory_aslr_enabled() is True or _looks_like_msys_spawn_failure(
-            probe_details
-        ):
-            raise RuntimeError(_git_bash_aslr_help(candidates[0], probe_details))
-
-        # Last resort for failures unrelated to the known MSYS/ASLR class:
-        # return the first path so the caller still sees the real bash error
-        # instead of the less useful "not found" message.
-        return candidates[0]
-
+    bash = pm.shell.bash()
+    if bash:
+        return bash
     raise RuntimeError(
-        "Git Bash not found. Hermes Agent requires Git for Windows on Windows.\n"
-        "Install it from: https://git-scm.com/download/win\n"
-        "Or set HERMES_GIT_BASH_PATH to your bash.exe location."
+        "No shell found. Hermes needs bash (Git for Windows on Windows). "
+        "Run `hermes pm install` or reinstall the bundle."
     )
-
-
-_bash_starts_cache: dict[str, bool] = {}
-_bash_probe_details_cache: dict[str, str] = {}
-_mandatory_aslr_enabled_cache: "bool | None" = None
-
-_BASH_EXTERNAL_PROGRAM_PROBE = "/usr/bin/true; /usr/bin/cat --version >/dev/null"
-
-
-def _looks_like_msys_spawn_failure(details: str) -> bool:
-    """Match Git-for-Windows child-launch failures associated with ASLR."""
-    lowered = details.lower()
-    return any(
-        marker in lowered
-        for marker in (
-            "dofork:",
-            "child_copy:",
-            "0xc0000142",
-            "0xc0000005",
-        )
-    )
-
-
-def _mandatory_aslr_enabled() -> "bool | None":
-    """Return Windows' system-wide ForceRelocateImages state when available."""
-    global _mandatory_aslr_enabled_cache
-    if _mandatory_aslr_enabled_cache is not None:
-        return _mandatory_aslr_enabled_cache
-
-    try:
-        powershell = shutil.which("powershell.exe") or "powershell.exe"
-        result = subprocess.run(
-            [
-                powershell,
-                "-NoProfile",
-                "-NonInteractive",
-                "-Command",
-                "(Get-ProcessMitigation -System).Aslr.ForceRelocateImages.ToString()",
-            ],
-            capture_output=True,
-            text=True, encoding="utf-8", errors="replace",
-            timeout=10,
-            creationflags=windows_hide_flags(),
-        )
-        if result.returncode != 0:
-            return None
-        value = (result.stdout or "").strip().upper()
-        if value == "ON":
-            _mandatory_aslr_enabled_cache = True
-            return True
-        if value in {"OFF", "NOTSET"}:
-            _mandatory_aslr_enabled_cache = False
-            return False
-    except Exception as exc:
-        logger.debug("Could not query Windows Mandatory ASLR state: %s", exc)
-    return None
-
-
-def _git_root_from_bash(bash: str) -> str:
-    """Resolve Git's root from either <root>/bin or <root>/usr/bin bash."""
-    bin_dir = ntpath.dirname(ntpath.normpath(bash))
-    if ntpath.basename(bin_dir).lower() != "bin":
-        return ntpath.dirname(bin_dir)
-    parent = ntpath.dirname(bin_dir)
-    if ntpath.basename(parent).lower() == "usr":
-        return ntpath.dirname(parent)
-    return parent
-
-
-def _git_bash_aslr_help(bash: str, details: str = "") -> str:
-    """Build the targeted per-program Mandatory-ASLR remediation."""
-    git_root = _git_root_from_bash(bash)
-    escaped_root = git_root.replace("'", "''")
-    detail_line = f"\nGit Bash probe output: {details[:500]}" if details else ""
-    return (
-        f"Git Bash at {bash} cannot launch required MSYS child processes while "
-        "Windows Mandatory ASLR (ForceRelocateImages) is enabled, or its output "
-        f"matches that Git-for-Windows failure class.{detail_line}\n"
-        "Reinstalling Git will not change the Windows mitigation policy. Open "
-        "PowerShell as Administrator and run:\n"
-        f"$gitRoot = '{escaped_root}'\n"
-        'Get-Item "$gitRoot\\bin\\bash.exe", "$gitRoot\\usr\\bin\\*.exe" '
-        "-ErrorAction SilentlyContinue | ForEach-Object { "
-        "Set-ProcessMitigation -Name $_.FullName -Disable ForceRelocateImages }\n"
-        "Then restart Hermes. If the override is blocked or later re-applied, "
-        "ask your Windows administrator to allow this per-program exception."
-    )
-
-
-def _bash_starts(bash: str) -> bool:
-    """True if *bash* can launch external MSYS programs.
-
-    Uses ``--noprofile --norc`` so a broken login post-install
-    (``Directory \\drivers\\etc``) does not falsely condemn an otherwise
-    usable bash. The external ``true`` and ``cat`` calls are intentional:
-    a builtin-only ``exit 0`` probe misses Git-for-Windows fork/spawn failures
-    under system-wide Mandatory ASLR. Cached per path for the process lifetime.
-    """
-    cached = _bash_starts_cache.get(bash)
-    if cached is not None:
-        return cached
-
-    try:
-        result = subprocess.run(
-            [bash, "--noprofile", "--norc", "-c", _BASH_EXTERNAL_PROGRAM_PROBE],
-            capture_output=True,
-            text=True, encoding="utf-8", errors="replace",
-            timeout=15,
-            creationflags=windows_hide_flags() if _IS_WINDOWS else 0,
-        )
-        ok = result.returncode == 0
-        if not ok:
-            combined = f"{result.stdout or ''}{result.stderr or ''}"
-            _bash_probe_details_cache[bash] = combined.strip()[:2000]
-            logger.debug("bash probe failed for %s: %s", bash, combined.strip()[:200])
-    except Exception as exc:
-        _bash_probe_details_cache[bash] = str(exc)[:2000]
-        logger.debug("bash probe error for %s: %s", bash, exc)
-        ok = False
-
-    _bash_starts_cache[bash] = ok
-    return ok
 
 
 _git_bash_bin_dirs_cache: "list[str] | None" = None
@@ -1408,7 +1219,7 @@ def _managed_runtime_path_entries() -> list[str]:
     itself, so on a machine where Hermes provisioned its own toolchain a
     command the agent runs resolves a system copy instead — or nothing at all:
 
-    - ``$HERMES_HOME/node`` (+ ``/bin``) — installed to satisfy the desktop and
+    - the pm store's node/npm entries — installed to satisfy the desktop and
       browser toolchain. ``tools/browser_tool.py`` already does this for its own
       subprocesses; the agent's shell deserves the same.
     - ``$HERMES_HOME/bin`` — the managed ``uv``. ``install.sh`` writes it there
@@ -1416,13 +1227,16 @@ def _managed_runtime_path_entries() -> list[str]:
       uv is the managed one looks uv-less to both the agent and the model.
 
     Resolved per call rather than cached in a module constant because
-    ``get_hermes_home()`` is profile-scoped and a managed tree can appear
-    mid-process (``heal_hermes_managed_node``, a first browser install).
+    ``get_hermes_home()`` is profile-scoped and a managed runtime can appear
+    mid-process (a lazy pm install, a first browser install).
     """
     try:
-        from hermes_constants import get_hermes_home, iter_hermes_node_dirs
+        import pm
+        from hermes_constants import get_hermes_home
 
-        candidates = [*iter_hermes_node_dirs(), get_hermes_home() / "bin"]
+        env = pm.env_for("npm", base_env={"PATH": ""})
+        managed = [Path(d) for d in env.get("PATH", "").split(os.pathsep) if d]
+        candidates = [*managed, get_hermes_home() / "bin"]
         return [str(d) for d in candidates if d.is_dir()]
     except Exception:
         return []
@@ -1707,28 +1521,62 @@ _in_venv: bool = (
 _hermes_site_packages: list[Path] | None = None
 
 
-def _validated_runtime_venv(env: dict) -> Path | None:
-    """Return a producer-owned runtime venv identified by VIRTUAL_ENV.
+def _pm_runtime_venv_dir() -> Path | None:
+    """The venv pm provisioned for this install, resolved from pm's own
+    records (facts.json + store layout) — never from interpreter state or
+    the ambient environment.
 
-    A user may carry an unrelated VIRTUAL_ENV, so the variable alone is not
-    provenance.  The legacy Windows base-Python gateway producer uses the exact
-    ``<Hermes repo>/venv`` layout and a real venv marker; require both before
-    accepting its separate runtime venv.
+    Under no-boot-through-venv the gateway runs the store python with the
+    venv's site-packages on PYTHONPATH, so ``VIRTUAL_ENV`` is unset in
+    bundled installs and a user-carried value is unproven provenance
+    anyway. pm is the authority: a bundled install keeps its relocatable
+    venv beside the manifest (a sibling of the store), a dev install syncs
+    the project venv (``venv``/``.venv`` — the same layout
+    ``pm.packages.Venv.venv_dir`` materializes). The venv fact must exist:
+    pm only vouches for what it provisioned.
     """
-    value = env.get("VIRTUAL_ENV")
-    if not value:
-        return None
-
-    candidate = Path(value)
-    if not any(_same_path(candidate, repo_root / "venv") for repo_root in _hermes_repo_root_aliases):
-        return None
-
     try:
-        if not (candidate / "pyvenv.cfg").is_file():
-            return None
-    except OSError:
+        from pm import paths
+        from pm.lock import Facts
+    except Exception:
         return None
+    try:
+        if not Facts(paths.facts_path()).get("venv"):
+            return None
+    except Exception:
+        return None
+    store = paths.store_root()
+    bundled = store.parent / "venv"
+    if (store.parent / "manifest.json").is_file():
+        return bundled if bundled.is_dir() else None
+    try:
+        from hermes_constants import project_venv_dir
+    except ImportError:
+        return None
+    return project_venv_dir(paths.repo_root())
 
+
+def _runtime_venv_site_packages(venv: Path) -> Path:
+    """The site-packages dir of *venv* under pm's venv layout (uv-created:
+    ``Lib/site-packages`` on Windows, ``lib/pythonX.Y/site-packages``
+    otherwise)."""
+    if _IS_WINDOWS:
+        return venv / "Lib" / "site-packages"
+    pyver = f"python{sys.version_info[0]}.{sys.version_info[1]}"
+    return venv / "lib" / pyver / "site-packages"
+
+
+def _validated_runtime_venv(env: dict) -> Path | None:
+    """Return the pm-provisioned runtime venv, when pm owns one here.
+
+    The *env* parameter is retained for call-site compatibility; provenance
+    now comes from pm's facts/store (see ``_pm_runtime_venv_dir``), not from
+    a validated ``VIRTUAL_ENV`` — an inherited value could always name an
+    unrelated venv, and under no-boot-through-venv it is simply unset.
+    """
+    candidate = _pm_runtime_venv_dir()
+    if candidate is None or not candidate.is_dir():
+        return None
     return candidate
 
 
@@ -1738,8 +1586,11 @@ def _get_hermes_site_packages(env: dict) -> list[Path]:
     Uses ``site.getsitepackages()`` when available for robustness (it respects
     ``.pth`` rewrites and platform conventions), with a manual fallback that
     constructs the canonical path from ``sys.prefix`` for POSIX and Windows.
-    A validated Windows base-interpreter launch contributes its separate
-    ``VIRTUAL_ENV/Lib/site-packages`` directory as an additional exact entry.
+    The pm-provisioned runtime venv (facts/store resolution — see
+    ``_validated_runtime_venv``) contributes its site-packages as an
+    additional exact entry; under no-boot-through-venv the running
+    interpreter is the store python and this is how its real site-packages
+    are identified.
     """
     global _hermes_site_packages
     if _hermes_site_packages is not None:
@@ -1769,7 +1620,7 @@ def _get_hermes_site_packages(env: dict) -> list[Path]:
 
     runtime_venv = _validated_runtime_venv(env)
     if runtime_venv is not None:
-        runtime_site_packages = runtime_venv / "Lib" / "site-packages"
+        runtime_site_packages = _runtime_venv_site_packages(runtime_venv)
         if not any(_same_path(runtime_site_packages, existing) for existing in result):
             result.append(runtime_site_packages)
 
@@ -2011,7 +1862,7 @@ class LocalEnvironment(BaseEnvironment):
     def get_temp_dir(self) -> str:
         """Return a shell-safe writable temp dir for local execution.
 
-        Termux does not provide /tmp by default, but exposes a POSIX TMPDIR.
+        Some Unix hosts do not provide /tmp but do export a POSIX TMPDIR.
         Prefer POSIX-style env vars when available, keep using /tmp on regular
         Unix systems, and only fall back to tempfile.gettempdir() when it also
         resolves to a POSIX path.

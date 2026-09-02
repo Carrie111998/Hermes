@@ -157,7 +157,7 @@ def _read_spent_rotation_sidecar(source_path: Optional[Path]) -> set:
         return set()
     try:
         raw = json.loads(
-            _spent_rotation_sidecar_path(source_path).read_text(encoding="utf-8")
+            _spent_rotation_sidecar_path(source_path).read_text(encoding="utf-8-sig")
         )
     except (OSError, ValueError):
         return set()
@@ -341,7 +341,7 @@ def _read_claude_code_credentials_from_file() -> Optional[Dict[str, Any]]:
     if not cred_path.exists():
         return None
     try:
-        data = json.loads(cred_path.read_text(encoding="utf-8"))
+        data = json.loads(cred_path.read_text(encoding="utf-8-sig"))
     except (json.JSONDecodeError, OSError, IOError) as e:
         logger.debug("Failed to read ~/.claude/.credentials.json: %s", e)
         return None
@@ -625,7 +625,7 @@ def _write_claude_code_credentials(
         # Read existing file to preserve other fields
         existing = {}
         if cred_path.exists():
-            existing = json.loads(cred_path.read_text(encoding="utf-8"))
+            existing = json.loads(cred_path.read_text(encoding="utf-8-sig"))
 
         oauth_data: Dict[str, Any] = {
             "accessToken": access_token,
@@ -1065,7 +1065,7 @@ def read_hermes_oauth_credentials() -> Optional[Dict[str, Any]]:
     oauth_file = _get_hermes_oauth_file()
     if oauth_file.exists():
         try:
-            data = json.loads(oauth_file.read_text(encoding="utf-8"))
+            data = json.loads(oauth_file.read_text(encoding="utf-8-sig"))
             if data.get("accessToken"):
                 return data
         except (json.JSONDecodeError, OSError, IOError) as e:

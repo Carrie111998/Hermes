@@ -204,11 +204,8 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 # Standard PATH entries for environments with minimal PATH (e.g. systemd services).
-# Includes Android/Termux and macOS Homebrew locations needed for agent-browser,
-# npx, node, and Android's glibc runner (grun).
+# Includes macOS Homebrew locations needed for agent-browser, npx, and node.
 _SANE_PATH_DIRS = (
-    "/data/data/com.termux/files/usr/bin",
-    "/data/data/com.termux/files/usr/sbin",
     "/opt/homebrew/bin",
     "/opt/homebrew/sbin",
     "/usr/local/sbin",
@@ -403,7 +400,7 @@ def _needs_chromium_sandbox_bypass() -> bool:
         return True
     userns_restrict = "/proc/sys/kernel/apparmor_restrict_unprivileged_userns"
     try:
-        with open(userns_restrict, encoding="utf-8") as f:
+        with open(userns_restrict, encoding="utf-8-sig") as f:
             if f.read().strip() == "1":
                 return True
     except OSError:
@@ -430,7 +427,7 @@ def _read_command_output_files(stdout_path: str, stderr_path: str) -> tuple[str,
     stdout = stderr = ""
     for path, slot in ((stdout_path, "stdout"), (stderr_path, "stderr")):
         try:
-            with open(path, "r", encoding="utf-8") as f:
+            with open(path, "r", encoding="utf-8-sig") as f:
                 text = f.read().strip()
         except OSError:
             continue
@@ -952,12 +949,7 @@ def _resolve_cloud_provider_uncached() -> Optional[CloudBrowserProvider]:
     return _cached_cloud_provider
 
 
-from hermes_constants import is_termux as _is_termux_environment
-
-
 def _browser_install_hint() -> str:
-    if _is_termux_environment():
-        return "npm install -g agent-browser && agent-browser install"
     return "npm install -g agent-browser && agent-browser install --with-deps"
 
 
@@ -977,17 +969,6 @@ AGENT_BROWSER_NPX_SPEC = "agent-browser@^0.26.0"
 
 def _is_npx_agent_browser_sentinel(browser_cmd: str) -> bool:
     return browser_cmd.strip() == NPX_AGENT_BROWSER_SENTINEL
-
-
-def _requires_real_termux_browser_install(browser_cmd: str) -> bool:
-    return _is_termux_environment() and _is_local_mode() and _is_npx_agent_browser_sentinel(browser_cmd)
-
-
-def _termux_browser_install_error() -> str:
-    return (
-        "Local browser automation on Termux cannot rely on the bare npx fallback. "
-        f"Install agent-browser explicitly first: {_browser_install_hint()}"
-    )
 
 
 def _is_local_mode() -> bool:
@@ -1342,7 +1323,7 @@ def _run_chrome_fallback_command(
     # uses, not a bare shutil.which("npx") — Hermes-managed-Node-only setups
     # resolve npx only through the extended fallback path, and a bare lookup
     # would let a broken system npx shadow a healthy managed one. If npx isn't
-    # found at all (Termux, bare container), fall back to the bare name and
+    # found at all (bare container), fall back to the bare name and
     # let Popen raise with a readable "FileNotFoundError: 'npx'" rather than
     # WinError 193.
     if _is_npx_agent_browser_sentinel(browser_cmd):
@@ -1430,7 +1411,7 @@ def _run_chrome_fallback_command(
             proc.wait()
             return {"success": False, "error": f"Chrome fallback '{cmd}' timed out"}
         try:
-            with open(stdout_path, "r", encoding="utf-8") as f:
+            with open(stdout_path, "r", encoding="utf-8-sig") as f:
                 stdout = f.read().strip()
             if stdout:
                 return json.loads(stdout.split("\n")[-1])
@@ -1611,7 +1592,7 @@ def _cdp_on_data_dir(http_cdp: str, data_dir: str) -> bool:
     if not m:
         return False
     try:
-        with open(os.path.join(data_dir, "DevToolsActivePort"), encoding="utf-8") as fh:
+        with open(os.path.join(data_dir, "DevToolsActivePort"), encoding="utf-8-sig") as fh:
             port_line = fh.readline().strip()
         return port_line == m.group(1)
     except OSError:
@@ -1832,7 +1813,7 @@ def _real_profile_cdp() -> tuple:
         port = None
         while _time.monotonic() < deadline:
             try:
-                with open(port_file, encoding="utf-8") as fh:
+                with open(port_file, encoding="utf-8-sig") as fh:
                     line = fh.readline().strip()
                 if line.isdigit():
                     port = int(line)
@@ -1896,7 +1877,7 @@ def _real_profile_cdp() -> tuple:
         # Chrome wrote is the authoritative endpoint of the logged-in browser;
         # if the daemon disagrees, trust ours.
         try:
-            with open(port_file, encoding="utf-8") as fh:
+            with open(port_file, encoding="utf-8-sig") as fh:
                 our_port = fh.readline().strip()
             m = re.search(r":(\d+)", cdp or "")
             if m and m.group(1) != our_port:
@@ -2602,7 +2583,7 @@ def _reap_orphaned_browser_sessions():
         owner_alive: Optional[bool] = None  # None = owner_pid missing/unreadable
         if os.path.isfile(owner_pid_file):
             try:
-                owner_pid = int(Path(owner_pid_file).read_text(encoding="utf-8").strip())
+                owner_pid = int(Path(owner_pid_file).read_text(encoding="utf-8-sig").strip())
                 # ``os.kill(pid, 0)`` is NOT a no-op on Windows (bpo-14484).
                 # Use the cross-platform existence check.
                 from gateway.status import _pid_exists
@@ -2658,7 +2639,7 @@ def _reap_orphaned_browser_sessions():
             continue
 
         try:
-            daemon_pid = int(Path(pid_file).read_text(encoding="utf-8").strip())
+            daemon_pid = int(Path(pid_file).read_text(encoding="utf-8-sig").strip())
         except (ValueError, OSError):
             shutil.rmtree(socket_dir, ignore_errors=True)
             continue
@@ -3206,9 +3187,8 @@ def _resolve_npx_bin() -> Optional[str]:
 
     Checking bare PATH first would let a broken or unrelated system npx
     shadow a healthy Hermes-managed one with no recovery — every candidate
-    is therefore validated with ``node_tool_runnable`` (the same check
-    ``find_hermes_node_executable`` uses to self-heal a managed Node tree)
-    before being trusted, falling through to the next candidate otherwise.
+    is therefore validated with ``node_tool_runnable`` before being trusted,
+    falling through to the next candidate otherwise.
     """
     extended_path = _merge_browser_path("")
     if extended_path:
@@ -3269,7 +3249,7 @@ def _find_agent_browser(*, validate: bool = True) -> str:
         return which_result
 
     # Build an extended search PATH including Hermes-managed Node, macOS
-    # versioned Homebrew installs, and fallback system dirs like Termux.
+    # versioned Homebrew installs, and fallback system dirs.
     extended_path = _merge_browser_path("")
     if extended_path:
         which_result = shutil.which("agent-browser", path=extended_path)
@@ -3553,7 +3533,7 @@ def _discard_timed_out_browser_session(
         pid_file = os.path.join(task_socket_dir, f"{session_name}.pid")
         if os.path.isfile(pid_file):
             try:
-                daemon_pid = int(Path(pid_file).read_text(encoding="utf-8").strip())
+                daemon_pid = int(Path(pid_file).read_text(encoding="utf-8-sig").strip())
                 if not _verify_reapable_browser_daemon(daemon_pid, task_socket_dir, session_name):
                     return
                 # Tree-kill (#68139 / #85125 4c): the daemon spawns Chromium
@@ -3573,7 +3553,7 @@ def _read_browser_daemon_pid(task_socket_dir: str, session_name: str) -> Optiona
     """Read the agent-browser daemon PID for a session (best-effort)."""
     pid_file = os.path.join(task_socket_dir, f"{session_name}.pid")
     try:
-        return int(Path(pid_file).read_text(encoding="utf-8").strip())
+        return int(Path(pid_file).read_text(encoding="utf-8-sig").strip())
     except (OSError, ValueError):
         return None
 
@@ -3734,11 +3714,6 @@ def _run_browser_command(
     except FileNotFoundError as e:
         logger.warning("agent-browser CLI not found: %s", e)
         return {"success": False, "error": str(e)}
-
-    if _requires_real_termux_browser_install(browser_cmd):
-        error = _termux_browser_install_error()
-        logger.warning("browser command blocked on Termux: %s", error)
-        return {"success": False, "error": error}
 
     # Local mode with no Chromium on disk: fail fast with an actionable
     # message instead of hanging for _command_timeout seconds per call.
@@ -3925,9 +3900,9 @@ def _run_browser_command(
             }
             # Fall through to fallback check below
         else:
-            with open(stdout_path, "r", encoding="utf-8") as f:
+            with open(stdout_path, "r", encoding="utf-8-sig") as f:
                 stdout = f.read()
-            with open(stderr_path, "r", encoding="utf-8") as f:
+            with open(stderr_path, "r", encoding="utf-8-sig") as f:
                 stderr = f.read()
             returncode = proc.returncode
 
@@ -5929,7 +5904,7 @@ def _cleanup_single_browser_session(task_id: str) -> None:
                 if os.path.isfile(pid_file):
                     try:
                         from tools.process_registry import ProcessRegistry
-                        daemon_pid = int(Path(pid_file).read_text(encoding="utf-8").strip())
+                        daemon_pid = int(Path(pid_file).read_text(encoding="utf-8-sig").strip())
                         # The .pid file lives in a world-writable temp dir and
                         # PIDs recycle: verify this really is our daemon for
                         # this session before tree-killing, and pin the
@@ -6043,17 +6018,18 @@ def _chromium_installed() -> bool:
 
     1. ``AGENT_BROWSER_EXECUTABLE_PATH`` env var — the official way to point
        agent-browser at a pre-installed Chrome/Chromium.
-    2. System Chrome/Chromium in PATH (``google-chrome``, ``chromium``,
-       ``chromium-browser``, ``chrome``).
-    3. Playwright's browser cache (current logic) — directories containing
-       ``chromium-*`` or ``chromium_headless_shell-*``.
+    2. The pinned browser store (Playwright's browser cache) — directories
+       containing ``chromium-*`` or ``chromium_headless_shell-*``.
 
-    agent-browser (0.26+) downloads Playwright's chromium / headless-shell
-    builds into ``PLAYWRIGHT_BROWSERS_PATH`` and won't start without at least
-    one of the three above being present.  Without a browser binary the CLI
-    hangs on first use until the command timeout fires (often ~30s).  Guarding
-    the tool behind this check prevents advertising a capability that will
-    fail at runtime.
+    There is deliberately NO system-Chrome fallback rung: a pinned store
+    build is hash/version-pinned and re-provisioned by pm, while a system
+    Chrome varies per machine and breaks the pinning contract (gap plan
+    decision D3). agent-browser (0.26+) downloads Playwright's chromium /
+    headless-shell builds into ``PLAYWRIGHT_BROWSERS_PATH`` and won't start
+    without at least one of the two above being present.  Without a browser
+    binary the CLI hangs on first use until the command timeout fires
+    (often ~30s).  Guarding the tool behind this check prevents advertising
+    a capability that will fail at runtime.
     """
     global _cached_chromium_installed
     if _cached_chromium_installed is not None:
@@ -6066,18 +6042,7 @@ def _chromium_installed() -> bool:
             _cached_chromium_installed = True
             return True
 
-    # 2. System Chrome/Chromium in PATH (common names)
-    system_chrome = (
-        shutil.which("google-chrome")
-        or shutil.which("chromium")
-        or shutil.which("chromium-browser")
-        or shutil.which("chrome")
-    )
-    if system_chrome:
-        _cached_chromium_installed = True
-        return True
-
-    # 3. Playwright browser cache (legacy — chromium-* / chromium_headless_shell-* dirs)
+    # 2. Pinned browser store (chromium-* / chromium_headless_shell-* dirs)
     for root in _chromium_search_roots():
         if not root or not os.path.isdir(root):
             continue
@@ -6127,7 +6092,7 @@ def _maybe_autoinstall_chromium() -> bool:
     if _running_in_docker():
         return False
 
-    from tools.lazy_deps import _allow_lazy_installs
+    from pm.ensure import lazy_installs_allowed as _allow_lazy_installs
     if not _allow_lazy_installs():
         return False
 
@@ -6176,7 +6141,7 @@ def _running_in_docker() -> bool:
     if os.path.exists("/.dockerenv"):
         return True
     try:
-        with open("/proc/1/cgroup", "rt", encoding="utf-8") as fp:
+        with open("/proc/1/cgroup", "rt", encoding="utf-8-sig") as fp:
             return "docker" in fp.read()
     except OSError:
         return False
@@ -6223,13 +6188,6 @@ def check_browser_requirements() -> bool:
     try:
         browser_cmd = _find_agent_browser(validate=False)
     except FileNotFoundError:
-        return False
-
-    # On Termux, the bare npx fallback is too fragile to treat as a satisfied
-    # local browser dependency. Require a real install (global or local) so the
-    # browser tool is not advertised as available when it will likely fail on
-    # first use.
-    if _requires_real_termux_browser_install(browser_cmd):
         return False
 
     # In cloud mode, also require provider credentials. Cloud browsers
@@ -6292,10 +6250,7 @@ if __name__ == "__main__":
         print("❌ Missing requirements:")
         try:
             browser_cmd = _find_agent_browser()
-            if _requires_real_termux_browser_install(browser_cmd):
-                print("   - bare npx fallback found (insufficient on Termux local mode)")
-                print(f"     Install: {_browser_install_hint()}")
-            elif _cp is None and not _chromium_installed():
+            if _cp is None and not _chromium_installed():
                 print("   - Chromium browser binary not found")
                 searched = ", ".join(_chromium_search_roots()) or "(no candidate paths)"
                 print(f"     Searched: {searched}")
