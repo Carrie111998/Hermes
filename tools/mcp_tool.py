@@ -5115,6 +5115,16 @@ _SESSION_EXPIRED_MARKERS: tuple = (
 _EXC_TRAVERSAL_MAX_NODES = 10_000
 
 
+# Stale-session wordings that interpolate an opaque session id between the
+# stable words — a contiguous _SESSION_EXPIRED_MARKERS entry cannot match
+# them. Observed provider behaviors, not spec'd strings:
+#   BrowserOS neo:      "BrowserOS neo session <uuid> is no longer live"
+#   other MCP servers:  "mcp session <uuid> is not registered"
+_STALE_SESSION_WITH_ID_RE = re.compile(
+    r"session \S+ (?:is no longer live|is not registered)"
+)
+
+
 def _is_session_expired_error(exc: BaseException) -> bool:
     """Return True if ``exc`` looks like an MCP transport session expiry.
 
@@ -5179,6 +5189,14 @@ def _is_session_expired_error(exc: BaseException) -> bool:
         # false positives on unrelated server errors.
         msg = str(current).lower()
         if msg and any(marker in msg for marker in _SESSION_EXPIRED_MARKERS):
+            transport_error_found = True
+        # Some MCP servers interpolate an opaque session id between the
+        # stable words (see _STALE_SESSION_WITH_ID_RE above), so a single
+        # contiguous marker cannot match their stale-session errors.
+        # Requiring the id between the words keeps unrelated errors that
+        # merely mention a session elsewhere from being misread as
+        # transport expiry.
+        if msg and _STALE_SESSION_WITH_ID_RE.search(msg):
             transport_error_found = True
 
         stack.extend(getattr(current, "exceptions", ()))
