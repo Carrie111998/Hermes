@@ -440,6 +440,9 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
     - allow_from: List of sender IDs allowed in DMs (when dm_policy="allowlist")
     - group_policy: "open" | "allowlist" | "disabled" | "pairing" — which groups are processed (default: "pairing")
     - group_allow_from: List of group JIDs allowed (when group_policy="allowlist")
+    - contact_toolsets: Map of contact ID -> toolset list, restricting what runs
+      that contact triggers may use (overrides ``platform_toolsets.whatsapp``
+      for that contact only). Keys accept phone / JID / LID forms.
     - send_read_receipts: Mark accepted inbound WhatsApp messages as read
 
     Behavior (gating, mention parsing, markdown conversion, chunking) is
