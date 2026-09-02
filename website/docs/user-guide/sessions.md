@@ -352,7 +352,7 @@ What's the weather in Las Vegas?                    3d ago        tele   2025030
 
 Plus `--only user-prompts` for a prompts-only view (jsonl or md).
 
-All formats share the same selection knobs: `--session-id` for one session, or the full `prune`/`archive` filter set for bulk — `--older-than` / `--newer-than` / `--before` / `--after` (durations like `5h`/`2d`/`1w`, bare days, or ISO timestamps), `--source`, `--title`, `--model`, `--provider`, `--cwd`, `--min/--max-messages`, `--min/--max-tokens`, `--min/--max-cost`, `--min/--max-tool-calls`, `--user`, `--chat-id`, `--chat-type`, `--branch`, `--end-reason`. `--dry-run` previews the match set without writing. `--redact` scrubs secrets (API keys, tokens, credentials) from exported content on any format — recommended for anything you plan to share. Note: bulk filters match *ended* sessions; unfiltered `export` dumps everything, including active ones.
+All formats share the same selection knobs: `--session-id` for one session, or the full `prune`/`archive` filter set for bulk — `--older-than` / `--newer-than` / `--before` / `--after` (durations like `5h`/`2d`/`1w`, bare days, or ISO timestamps), `--source`, `--title`, `--model`, `--provider`, `--cwd`, `--min/--max-messages`, `--min/--max-tokens`, `--min/--max-cost`, `--min/--max-tool-calls`, `--user`, `--chat-id`, `--chat-type`, `--branch`, `--end-reason`. `--dry-run` previews the match set without writing. `--redact` scrubs secrets (API keys, tokens, credentials) from exported content on any format — recommended for anything you plan to share. Note: export is non-destructive, so unlike `prune`/`archive` the bulk filters also match active, archived, and pinned sessions; unfiltered `export` likewise dumps everything.
 
 #### JSONL (default)
 
@@ -426,10 +426,10 @@ hermes sessions export --format md --session-id 20250305_091523_a1b2c3d4
 # Export a compression lineage as one logical document
 hermes sessions export --format md --session-id 20250305_091523_a1b2c3d4 --lineage logical
 
-# Preview ended sessions older than 90 days without writing files
+# Preview sessions older than 90 days without writing files
 hermes sessions export --format md --older-than 90 --dry-run
 
-# Export ended Telegram sessions older than 2 weeks to QMD files
+# Export Telegram sessions older than 2 weeks to QMD files
 hermes sessions export --format qmd --older-than 2w --source telegram
 
 # Export long Claude sessions, secrets redacted

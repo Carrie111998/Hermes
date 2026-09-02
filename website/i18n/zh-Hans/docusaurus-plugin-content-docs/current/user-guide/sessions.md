@@ -282,7 +282,7 @@ What's the weather in Las Vegas?                    3d ago        tele   2025030
 
 另有 `--only user-prompts` 只导出你的 prompt（jsonl 或 md）。
 
-所有格式共享同一套选择方式：`--session-id` 导出单个 session，或使用与 `prune` / `archive` 相同的完整过滤器进行批量导出 — `--older-than` / `--newer-than` / `--before` / `--after`（时长如 `5h`/`2d`/`1w`、纯数字天数或 ISO 时间戳）、`--source`、`--title`、`--model`、`--provider`、`--cwd`、`--min/--max-messages`、`--min/--max-tokens`、`--min/--max-cost`、`--min/--max-tool-calls`、`--user`、`--chat-id`、`--chat-type`、`--branch`、`--end-reason`。`--dry-run` 可预览匹配集而不写入。`--redact` 在任意格式下从导出内容中清除密钥（API key、token、凭据）— 任何打算分享的导出都建议加上。注意：带过滤器的批量导出只匹配*已结束*的 session；不带过滤器的 `export` 会导出所有 session（包括活跃的）。
+所有格式共享同一套选择方式：`--session-id` 导出单个 session，或使用与 `prune` / `archive` 相同的完整过滤器进行批量导出 — `--older-than` / `--newer-than` / `--before` / `--after`（时长如 `5h`/`2d`/`1w`、纯数字天数或 ISO 时间戳）、`--source`、`--title`、`--model`、`--provider`、`--cwd`、`--min/--max-messages`、`--min/--max-tokens`、`--min/--max-cost`、`--min/--max-tool-calls`、`--user`、`--chat-id`、`--chat-type`、`--branch`、`--end-reason`。`--dry-run` 可预览匹配集而不写入。`--redact` 在任意格式下从导出内容中清除密钥（API key、token、凭据）— 任何打算分享的导出都建议加上。注意：导出是非破坏性的，因此与 `prune` / `archive` 不同，带过滤器的批量导出同样会匹配活跃、已归档和已置顶（pinned）的 session；不带过滤器的 `export` 也会导出所有 session。
 
 #### JSONL（默认）
 
@@ -356,10 +356,10 @@ hermes sessions export --format md --session-id 20250305_091523_a1b2c3d4
 # 将压缩链（compression lineage）导出为一个逻辑文档
 hermes sessions export --format md --session-id 20250305_091523_a1b2c3d4 --lineage logical
 
-# 预览 90 天前已结束的 session，不写入文件
+# 预览 90 天前的 session，不写入文件
 hermes sessions export --format md --older-than 90 --dry-run
 
-# 将 2 周前已结束的 Telegram session 导出为 QMD 文件
+# 将 2 周前的 Telegram session 导出为 QMD 文件
 hermes sessions export --format qmd --older-than 2w --source telegram
 
 # 导出长的 Claude session，并脱敏

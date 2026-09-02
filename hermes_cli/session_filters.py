@@ -1,8 +1,8 @@
-"""Shared time/filter parsing for `hermes sessions prune` / `archive`.
+"""Shared time/filter parsing for `hermes sessions prune` / `archive` / `export`.
 
 Turns user-friendly CLI values into the epoch bounds and filter kwargs
 consumed by ``SessionDB.prune_sessions`` / ``archive_sessions`` /
-``list_prune_candidates``.
+``list_prune_candidates`` / ``list_export_candidates``.
 
 Two value shapes are accepted anywhere a point in time is expected:
 
