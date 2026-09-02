@@ -1,5 +1,7 @@
 """Regression tests for #86570: gateway provider error connection messaging."""
 
+from unittest.mock import patch
+
 import pytest
 
 from gateway.run import (
@@ -10,6 +12,37 @@ from gateway.run import (
 
 
 class TestGatewayConnectionErrorReply:
+    @pytest.mark.parametrize(
+        ("text", "category"),
+        [
+            ("provider authentication failed", "authentication"),
+            ("request was rejected", "policy"),
+            ("rate limited after 3 retries", "rate_limit"),
+            ("connection refused", "connection"),
+            ("HTTP 500 internal server error", "generic"),
+        ],
+    )
+    def test_configured_category_reply_overrides_builtin(self, text, category):
+        configured = f"custom {category} reply"
+        with patch(
+            "gateway.run._load_gateway_config",
+            return_value={
+                "gateway": {"provider_error_replies": {category: configured}}
+            },
+        ):
+            assert _gateway_provider_error_reply(text) == configured
+
+    def test_empty_configured_reply_falls_back_to_builtin(self):
+        with patch(
+            "gateway.run._load_gateway_config",
+            return_value={
+                "gateway": {"provider_error_replies": {"rate_limit": ""}}
+            },
+        ):
+            assert "rate-limiting" in _gateway_provider_error_reply(
+                "rate limited after 3 retries"
+            ).lower()
+
     def test_connection_error_strings_produce_specific_reply(self):
         samples = [
             "openai.APIConnectionError",

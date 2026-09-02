@@ -63,6 +63,26 @@ Settings are resolved in this order (highest priority first):
 Secrets (API keys, bot tokens, passwords) go in `.env`. Everything else (model, terminal backend, compression settings, memory limits, toolsets) goes in `config.yaml`. When both are set, `config.yaml` wins for non-secret settings.
 :::
 
+### Gateway provider-error replies
+
+Messaging surfaces replace raw provider failures with short, safe replies. To
+match those replies to your product voice, override any category in
+`config.yaml`:
+
+```yaml
+gateway:
+  provider_error_replies:
+    authentication: "I can't sign in to the model service right now."
+    policy: "I couldn't complete that request. Try rephrasing it."
+    rate_limit: "I'm receiving too many requests. Please try again shortly."
+    connection: "I can't reach the model service right now."
+    generic: "Something went wrong while contacting the model service."
+```
+
+All categories are optional. Missing or empty values use the built-in reply.
+Templates do not interpolate the raw provider body, so credentials and provider
+diagnostics stay out of user-facing chat.
+
 :::tip Org deployments
 An administrator can pin specific config and secret values that a standard user
 cannot override, via a system-level managed directory. See

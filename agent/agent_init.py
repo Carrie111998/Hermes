@@ -1057,6 +1057,9 @@ def init_agent(
     # Rate limit tracking — updated from x-ratelimit-* response headers
     # after each API call.  Accessed by /usage slash command.
     agent._rate_limit_state: Optional["RateLimitState"] = None
+    # Structured metadata from the latest failed API attempt in the current
+    # turn. Reset before every turn so cached agents cannot leak old failures.
+    agent._last_api_error_context: Optional[Dict[str, Any]] = None
 
     # Credits tracking (dev-only, L0 usage-aware-credits) — updated from
     # x-nous-credits-* response headers after each API call.  Session-start
