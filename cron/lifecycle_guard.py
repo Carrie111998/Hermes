@@ -46,7 +46,7 @@ import re
 import shlex
 import stat
 from pathlib import Path
-from typing import Callable, Iterator, Optional
+from typing import Callable, Iterator, Optional, Sequence
 
 logger = logging.getLogger(__name__)
 
@@ -842,6 +842,73 @@ def _iter_referenced_shell_scripts(
             yield from _references_at(segment, peeled, cwd)
 
 
+# A shell's ``-c`` may arrive bundled with other short options (``bash -lc``,
+# ``sh -ec``, ``bash -euc``), and the command string is the first non-option
+# OPERAND rather than whichever token happens to follow the ``-c``: real bash
+# runs the payload for ``bash -c -l 'cmd'`` too. ``-o``/``-O`` swallow the next
+# token even inside a bundle, so ``bash -euo pipefail -c 'cmd'`` must not read
+# ``pipefail`` as the command. tools/approval.py's ``_bash_exec_payload`` parses
+# bundles the same way; the guard cannot import it, because approval.py defers
+# TO this module as the non-bypassable block.
+_SHELL_SHORT_OPTION_LETTERS = frozenset("ilrsDcabefhkmnptuvxBCEHPTOo")
+_SHELL_OPTIONS_WITH_ARG = frozenset({"-O", "+O", "-o", "+o", "--rcfile", "--init-file"})
+
+
+def _shell_command_string(arguments: Sequence[str]) -> Optional[str]:
+    """Return the command string a shell's ``-c`` owns, or None.
+
+    Scans options the way a shell does rather than matching ``-c`` exactly:
+    the flag counts wherever it appears among the short-option letters, and
+    the payload is the first operand after option parsing finishes.
+    """
+    saw_command_flag = False
+    index = 0
+    while index < len(arguments):
+        token = arguments[index]
+        if token == "--":
+            index += 1
+            break
+        if not token.startswith(("-", "+")):
+            break
+        if token == "--command":
+            saw_command_flag = True
+            index += 1
+            continue
+        if token in _SHELL_OPTIONS_WITH_ARG:
+            index += 2
+            continue
+        if token.startswith("--"):
+            index += 1
+            continue
+        letters = token[1:]
+        # Restrict to the documented alphabet so an unknown control such as
+        # ``-Wc`` is not read as a bundle carrying ``c``.
+        if not set(letters) <= _SHELL_SHORT_OPTION_LETTERS:
+            index += 1
+            continue
+        # ``c`` anywhere in the bundle counts. The shells disagree about a
+        # bundle such as ``-oc``: ksh runs the next token, zsh and bash reject
+        # it. Counting it means scanning a payload that some shells never run,
+        # which costs nothing; not counting it means missing one that ksh does.
+        if "c" in letters:
+            saw_command_flag = True
+        # ``-o``/``-O`` take a value, and it is attached when anything follows
+        # the letter inside the same token. ``zsh -opipefail`` and
+        # ``ksh -opipefail`` are one token; only ``-euo pipefail`` spends the
+        # next one. Consuming a token that was never the option's value used to
+        # swallow the ``-c`` that followed it, which is how the payload of
+        # ``zsh -opipefail -c '...'`` went unscanned while zsh ran it.
+        consumes_next_token = False
+        for position, letter in enumerate(letters):
+            if letter in ("o", "O"):
+                consumes_next_token = position == len(letters) - 1
+                break
+        index += 1 + int(consumes_next_token)
+    if not saw_command_flag or index >= len(arguments):
+        return None
+    return arguments[index]
+
+
 def _iter_shell_command_payloads(command: str) -> Iterator[str]:
     """Yield code passed through ``sh|bash|... -c`` for recursive scanning."""
     for segment in _iter_command_segments(command):
@@ -859,11 +926,9 @@ def _iter_shell_command_payloads(command: str) -> Iterator[str]:
             continue
         if _executable_name(segment[index]) not in _SHELL_EXECUTABLES:
             continue
-        arguments = segment[index + 1 :]
-        for arg_index, argument in enumerate(arguments[:-1]):
-            if argument in {"-c", "--command"}:
-                yield arguments[arg_index + 1]
-                break
+        payload = _shell_command_string(segment[index + 1 :])
+        if payload is not None:
+            yield payload
 
 
 def _resolve_script_directory(script_path: str) -> Optional[str]:

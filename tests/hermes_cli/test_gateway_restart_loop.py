@@ -1646,6 +1646,129 @@ class TestTransparentWrapperPrefixes:
         assert self._scan(f"sudo bash {clean}", cwd=str(tmp_path)) is False
 
 
+class TestShellShortOptionBundles:
+    """A shell's `-c` is a short option, so it bundles: `bash -lc`, `sh -ec`,
+    `bash -euc`. Matching the token exactly found only the unbundled spelling,
+    so the payload walk never recursed and a script referenced from inside a
+    bundled payload was never read.
+
+    The direct scan and the token-level referenced-script walk cover a payload
+    that is a bare script path, which is why the gap needs a payload of more
+    than one token to show: `bash -lc 'cd /tmp && ./deploy.sh'` reaches the
+    outer walk as a single opaque token."""
+
+    def _scan(self, command, cwd=None):
+        from cron.lifecycle_guard import (
+            contains_gateway_lifecycle_command_or_referenced_script,
+        )
+
+        return contains_gateway_lifecycle_command_or_referenced_script(
+            command, cwd=cwd
+        )
+
+    @pytest.fixture
+    def helper(self, tmp_path):
+        script = tmp_path / "deploy.sh"
+        script.write_text("#!/bin/sh\nhermes gateway stop\n", encoding="utf-8")
+        return script
+
+    @pytest.mark.parametrize("shell", ["bash", "sh", "zsh", "dash", "/bin/bash"])
+    @pytest.mark.parametrize("flags", [
+        "-c", "-lc", "-ec", "-xc", "-lxc", "-ic", "-sc", "-euc",
+        "--command", "-c -l", "-l -c", "-euo pipefail -c",
+    ])
+    def test_bundled_command_flag_still_scans_the_payload(
+        self, tmp_path, helper, shell, flags,
+    ):
+        command = f"{shell} {flags} 'cd /tmp && {helper}'"
+        assert self._scan(command, cwd=str(tmp_path)) is True
+
+    @pytest.mark.parametrize("prefix", ["sudo", "env", "nohup", "timeout 60"])
+    def test_a_wrapper_in_front_does_not_reopen_it(self, tmp_path, helper, prefix):
+        command = f"{prefix} bash -lc 'cd /tmp && {helper}'"
+        assert self._scan(command, cwd=str(tmp_path)) is True
+
+    def test_option_argument_is_not_mistaken_for_the_payload(self):
+        """`-o`/`-O` take a value. It is the next token only when the letter
+        ends the bundle; see the attached-value case below. Reading the value
+        as the command string would scan `pipefail` and miss the real payload."""
+        from cron.lifecycle_guard import _shell_command_string
+
+        assert _shell_command_string(["-euo", "pipefail", "-c", "PAYLOAD"]) == "PAYLOAD"
+        assert _shell_command_string(["-O", "extglob", "-c", "PAYLOAD"]) == "PAYLOAD"
+        assert _shell_command_string(["--rcfile", "f", "-c", "PAYLOAD"]) == "PAYLOAD"
+
+    def test_the_payload_is_the_first_operand_not_the_next_token(self):
+        """Real bash runs the payload for `bash -c -l 'cmd'` — `-l` is parsed
+        as an option and the command string is the first operand after it."""
+        from cron.lifecycle_guard import _shell_command_string
+
+        assert _shell_command_string(["-c", "-l", "PAYLOAD"]) == "PAYLOAD"
+        assert _shell_command_string(["-c", "--", "PAYLOAD"]) == "PAYLOAD"
+
+    def test_an_unknown_control_is_not_read_as_a_bundle(self):
+        """`-Wc` is not a bash short-option bundle. Treating any token
+        containing `c` as `-c` would invent payloads out of unrelated flags."""
+        from cron.lifecycle_guard import _shell_command_string
+
+        assert _shell_command_string(["-Wc", "PAYLOAD"]) is None
+        assert _shell_command_string(["-l", "script.sh"]) is None
+        assert _shell_command_string([]) is None
+
+    # -- attached option values -------------------------------------------
+    #
+    # `-o`/`-O` take a value, and zsh, ksh and mksh accept it attached inside
+    # the same token: `zsh -opipefail -c '...'` runs the payload. Charging that
+    # option a following token spent the `-c`, so the command flag was never
+    # seen and the payload went unscanned on a shell that runs it. Measured
+    # against the real binaries rather than the option grammar: before this,
+    # `zsh -opipefail`, `ksh -opipefail`, `ksh -oc` and `zsh -Opipefail` all
+    # executed the payload with the guard blind to it.
+
+    @pytest.mark.parametrize("shell", ["bash", "sh", "zsh", "dash", "/bin/bash"])
+    @pytest.mark.parametrize("flags", [
+        "-opipefail -c", "-Opipefail -c", "-opipefail -euc",
+        "-oemacs -c", "-oc", "-oec", "+oposix -c",
+    ])
+    def test_an_attached_option_value_does_not_eat_the_command_flag(
+        self, tmp_path, helper, shell, flags,
+    ):
+        command = f"{shell} {flags} 'cd /tmp && {helper}'"
+        assert self._scan(command, cwd=str(tmp_path)) is True
+
+    def test_the_option_value_is_attached_only_when_letters_follow_it(self):
+        """The two spellings cost different numbers of tokens.
+
+        `-euo pipefail` spends the next one; `-opipefail` is self-contained and
+        spends none. Charging both the same token is what dropped the `-c`."""
+        from cron.lifecycle_guard import _shell_command_string
+
+        assert _shell_command_string(["-opipefail", "-c", "PAYLOAD"]) == "PAYLOAD"
+        assert _shell_command_string(["-Opipefail", "-c", "PAYLOAD"]) == "PAYLOAD"
+        assert _shell_command_string(["-euo", "pipefail", "-c", "PAYLOAD"]) == "PAYLOAD"
+        assert _shell_command_string(["-eo", "pipefail", "-c", "PAYLOAD"]) == "PAYLOAD"
+        # `c` inside the bundle counts even when an attached value follows.
+        assert _shell_command_string(["-oc", "PAYLOAD"]) == "PAYLOAD"
+
+    def test_an_attached_payload_is_not_a_command_string_on_any_shell(self):
+        """`bash -c'payload'` reaches the shell as the single token
+        `-cpayload`, and no shell reads it as a command string: bash answers
+        `- : invalid option`, dash and busybox `Illegal option -h`, zsh, ksh
+        and mksh reject it too. Nothing runs, so there is nothing to scan, and
+        inventing a payload here would only add false positives."""
+        from cron.lifecycle_guard import _shell_command_string
+
+        assert _shell_command_string(["-cecho hi"]) is None
+        assert _shell_command_string(["-xcecho hi"]) is None
+
+    def test_a_clean_bundled_payload_is_still_allowed(self, tmp_path):
+        """The widening must not turn every `bash -lc` into a block."""
+        clean = tmp_path / "ok.sh"
+        clean.write_text("#!/bin/sh\necho hi\n", encoding="utf-8")
+        assert self._scan(f"bash -lc 'cd /tmp && {clean}'", cwd=str(tmp_path)) is False
+        assert self._scan("bash -lc 'ls -la && echo done'", cwd=str(tmp_path)) is False
+
+
 class TestRelativePathDoesNotDisableDataExemption:
     """A leading dot disables the data-sink exemption because sqlite3 spells
     its escapes as dot-commands (`.shell`). `.`, `./x` and `../x` are plain
