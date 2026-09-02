@@ -6,12 +6,14 @@
  * Pure, dependency-injected gate that parks local backend spawns while an
  * in-app update is running (#73822, #50238).
  *
- * Two independent signals mean "an update owns the venv right now":
+ * Three independent signals mean "an update owns the venv right now":
  *
  *  - the on-disk marker (`HERMES_HOME/.hermes-update-in-progress`), written
  *    by the updater — and by the desktop itself just before hand-off — and
  *  - the in-process `updateInFlight` flag, true for the whole
- *    `applyUpdates()` critical section.
+ *    `applyUpdates()` critical section, and
+ *  - the successful detached hand-off state, which remains true while this
+ *    Desktop is waiting to quit after the wrapper has handed control away.
  *
  * The marker alone is NOT enough (#73822): `applyUpdates` kills its own
  * backend early (`releaseBackendLock`) but only writes the marker AFTER the
@@ -25,13 +27,15 @@
  * waiter could slip through mid-update.
  */
 
-export type UpdateGateReason = 'marker' | 'update-in-flight' | null
+export type UpdateGateReason = 'marker' | 'update-in-flight' | 'handoff' | null
 
 export interface UpdateGateDeps {
   /** True when a live on-disk update marker exists (see update-marker.ts). */
   hasLiveMarker: () => boolean
   /** True while this process is inside applyUpdates()' critical section. */
   isUpdateInFlight: () => boolean
+  /** True after a detached updater hand-off is viable and this Desktop will quit. */
+  isHandoffActive: () => boolean
 }
 
 /** Why the gate is closed right now, or null when it is open. */
@@ -42,6 +46,10 @@ export function updateGateReason(deps: UpdateGateDeps): UpdateGateReason {
 
   if (deps.isUpdateInFlight()) {
     return 'update-in-flight'
+  }
+
+  if (deps.isHandoffActive()) {
+    return 'handoff'
   }
 
   return null
