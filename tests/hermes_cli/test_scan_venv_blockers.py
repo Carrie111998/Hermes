@@ -461,7 +461,7 @@ def test_updater_owned_backend_ledger_failure_blocks(monkeypatch, capsys):
 
 
 def test_main_gateway_with_long_managed_runtime_path_is_exempt(monkeypatch, capsys):
-    """Regression: the detector must hand the FULL cmdline to the exemption.
+    r"""Regression: the detector must hand the FULL cmdline to the exemption.
 
     Gateways launched via the managed-runtime interpreter carry a >120-char
     exe path (`.hermes-runtime\python\generation-...\cpython-3.11-...`).
