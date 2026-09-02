@@ -105,8 +105,8 @@ export const TimelineTimestamp: FC<{
 /** Timestamp for the current assistant-ui message lifecycle. */
 export const MessageTimelineTimestamp: FC<{
   className?: string
-  suppressIfDuplicatePart?: boolean
-}> = ({ className, suppressIfDuplicatePart = false }) => {
+  suppressIfPartClock?: boolean
+}> = ({ className, suppressIfPartClock = false }) => {
   const timestamp = useAuiState(s => {
     const value = (s.message.metadata?.custom as { timelineTimestamp?: unknown } | undefined)?.timelineTimestamp
 
@@ -119,24 +119,12 @@ export const MessageTimelineTimestamp: FC<{
     return validUnixSeconds(value) ? value : undefined
   })
 
-  const duplicatePart = useAuiState(s => {
-    const custom = (s.message.metadata?.custom ?? {}) as {
-      timelineCompletedAt?: unknown
-      timelineTimestamp?: unknown
-    }
+  // Every prose part renders the assistant's landing clock itself. Suppress the
+  // aggregate clock by rendered role rather than raw timestamps: live prose
+  // starts on the first text delta, which is normally later than the message.
+  const hasPartClock = useAuiState(s => s.message.parts.some(part => part.type === 'text'))
 
-    const solePart =
-      s.message.parts.length === 1 ? (s.message.parts[0] as { completedAt?: unknown; timestamp?: unknown }) : null
-
-    return (
-      Boolean(solePart) &&
-      solePart?.timestamp === custom.timelineTimestamp &&
-      (solePart?.completedAt === custom.timelineCompletedAt ||
-        (!validUnixSeconds(solePart?.completedAt) && !validUnixSeconds(custom.timelineCompletedAt)))
-    )
-  })
-
-  if (suppressIfDuplicatePart && duplicatePart) {
+  if (suppressIfPartClock && hasPartClock) {
     return null
   }
 

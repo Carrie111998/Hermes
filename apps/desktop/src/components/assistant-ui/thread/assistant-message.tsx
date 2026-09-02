@@ -261,7 +261,7 @@ const AssistantMessageBody: FC<AssistantMessageProps & { collapsedNotice?: null 
               </ErrorPrimitive.Root>
             </MessagePrimitive.Error>
           </div>
-          <MessageTimelineTimestamp className="px-(--message-text-indent) pt-0.5" suppressIfDuplicatePart />
+          <MessageTimelineTimestamp className="px-(--message-text-indent) pt-0.5" suppressIfPartClock />
           {hasVisibleText && !isInterim && (
             <AssistantFooter
               durationS={turnDurationS}

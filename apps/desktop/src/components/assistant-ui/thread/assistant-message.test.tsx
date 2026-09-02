@@ -156,15 +156,15 @@ describe('message timeline timestamps', () => {
     expect(stamps).toContain(formatClockTimestamp(landedAt))
   })
 
-  it('suppresses an aggregate assistant stamp that exactly duplicates its sole part', async () => {
+  it('shows one assistant clock when its prose part starts after the message', async () => {
     const startedAt = createdAt.getTime() / 1000
-    // Cross a minute boundary so the assistant's landing clock is textually
-    // distinct from the user bubble's send clock and the two can be counted.
+    // Live prose starts on the first text delta, after the message lifecycle.
+    const partStartedAt = startedAt + 0.125
     const landedAt = startedAt + 130
 
     const assistant = {
       ...assistantMessage(),
-      content: [{ completedAt: landedAt, text: 'done', timestamp: startedAt, type: 'text' }],
+      content: [{ completedAt: landedAt, text: 'done', timestamp: partStartedAt, type: 'text' }],
       metadata: {
         ...assistantMessage().metadata,
         custom: { timelineCompletedAt: landedAt, timelineTimestamp: startedAt }
@@ -179,11 +179,36 @@ describe('message timeline timestamps', () => {
       node.textContent?.trim()
     )
 
-    // Aggregate and sole part now render identically, so exactly one survives
-    // on the assistant bubble — plus the user bubble's own send clock.
     expect(formatClockTimestamp(landedAt)).not.toBe(formatClockTimestamp(startedAt))
     expect(stamps.filter(stamp => stamp === formatClockTimestamp(landedAt))).toHaveLength(1)
     expect(stamps.filter(stamp => stamp === formatClockTimestamp(startedAt))).toHaveLength(1)
     expect(stamps).not.toContain(formatTimelineRange(startedAt, landedAt))
+  })
+
+  it('shows one assistant clock when reasoning precedes prose', async () => {
+    const startedAt = createdAt.getTime() / 1000
+    const landedAt = startedAt + 130
+
+    const assistant = {
+      ...assistantMessage(),
+      content: [
+        { completedAt: startedAt + 0.1, text: 'thinking', timestamp: startedAt + 0.05, type: 'reasoning' },
+        { completedAt: landedAt, text: 'done', timestamp: startedAt + 0.125, type: 'text' }
+      ],
+      metadata: {
+        ...assistantMessage().metadata,
+        custom: { timelineCompletedAt: landedAt, timelineTimestamp: startedAt }
+      }
+    } as unknown as ThreadMessage
+
+    const { container } = render(<Harness assistant={assistant} />)
+    await screen.findByText('done')
+
+    const stamps = Array.from(container.querySelectorAll('[data-slot="timeline-timestamp"]')).map(node =>
+      node.textContent?.trim()
+    )
+
+    expect(stamps.filter(stamp => stamp === formatClockTimestamp(landedAt))).toHaveLength(1)
+    expect(stamps).toContain(formatTimelineRange(startedAt + 0.05, startedAt + 0.1))
   })
 })
