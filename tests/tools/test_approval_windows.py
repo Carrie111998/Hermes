@@ -24,6 +24,15 @@ class TestWindowsDestructiveTier:
         # PowerShell destructive delete, bare form (no powershell prefix)
         r"Remove-Item -Recurse -Force C:\Users\me\project",
         r"Remove-Item C:\data -Force",
+        r"ri -Recurse -Force C:\data",
+        r"rm C:\data -Force",
+        r"del C:\data -Recurse",
+        r"erase C:\data -Force",
+        r"rd C:\data -Recurse",
+        r"rmdir C:\data -Force",
+        r"ri C:\data -r",
+        r"del C:\data -rec",
+        r"rmdir C:\data -fo",
         # cmd builtins with destructive switches
         r"del /s /q C:\Users\me\docs",
         r"rd /s /q C:\data",
@@ -36,6 +45,13 @@ class TestWindowsDestructiveTier:
         # force process kills
         "taskkill /F /IM chrome.exe",
         "Stop-Process -Force -Name explorer",
+        "Stop-Process -F -Name explorer",
+        "Stop-Process -Fo -Name explorer",
+        "Stop-Pro -Fo -Name explorer",
+        "kill -F -Name explorer",
+        "kill -Fo -Name explorer",
+        "spps -F -Name explorer",
+        "spps -Fo -Name explorer",
         # disk/volume destruction
         "Format-Volume -DriveLetter D",
         "Clear-Disk -Number 0 -RemoveData",
@@ -54,6 +70,9 @@ class TestWindowsDestructiveTier:
         r"Remove-ItemProperty -Path HKLM:\X -Name Y -Force",
         # service stop/delete
         "Stop-Service -Force spooler",
+        "Stop-Service -F spooler",
+        "Stop-Service -Fo spooler",
+        "Stop-Serv -Fo spooler",
         "sc stop wuauserv",
         "sc.exe delete myservice",
     ])
@@ -64,6 +83,8 @@ class TestWindowsDestructiveTier:
         # graceful / read-only Windows usage must NOT prompt
         "taskkill /IM notepad.exe",          # graceful kill, no /F
         "Stop-Process -Name notepad",         # no -Force
+        "kill -Name notepad",                 # alias, no -Force
+        "spps -Name notepad -WhatIf",
         "reg query HKLM\\SOFTWARE",           # read-only
         "icacls C:\\file.txt",                # inspect ACLs
         "sc query wuauserv",                  # read-only
@@ -71,6 +92,10 @@ class TestWindowsDestructiveTier:
         "vssadmin list shadows",
         "del file.txt",                       # plain delete, no /s /q
         "Remove-Item file.txt",               # no -Recurse/-Force
+        "ri file.txt",                        # aliases without destructive flags
+        "del file.txt -WhatIf",
+        "rmdir build -WhatIf",
+        "ri file.txt -f",                     # -f is not a valid Force abbreviation
         # prose containing keywords
         "echo Remove-Item is a PowerShell cmdlet",
         "git commit -m 'document taskkill usage'",
@@ -78,6 +103,25 @@ class TestWindowsDestructiveTier:
         "git status",
     ])
     def test_benign_windows_commands_not_flagged(self, cmd):
+        assert not _is_dangerous(cmd), f"should NOT be flagged: {cmd}"
+
+
+class TestPowerShellStructuralForms:
+    @pytest.mark.parametrize("cmd", [
+        "Remove-Item C:\\data `\n  -Force",
+        "$params = @{Path='C:\\data'; Force=$true}; Remove-Item @params",
+        "$command = 'Remove-Item'; & $command C:\\data -Force",
+    ])
+    def test_ambiguous_or_destructive_structural_forms_are_flagged(self, cmd):
+        assert _is_dangerous(cmd), f"should be flagged: {cmd}"
+
+    @pytest.mark.parametrize("cmd", [
+        'Write-Output "Remove-Item C:\\data `\n  -Force"',
+        "$params = @{Path='C:\\data'}; Get-Item @params",
+        "Write-Output '& $command is dynamic invocation syntax'",
+        "& { Get-Date }",
+    ])
+    def test_benign_structural_forms_are_not_flagged(self, cmd):
         assert not _is_dangerous(cmd), f"should NOT be flagged: {cmd}"
 
 

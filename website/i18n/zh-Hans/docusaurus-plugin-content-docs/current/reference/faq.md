@@ -349,6 +349,27 @@ custom_providers:
 
 ### 终端问题
 
+#### 如何在原生 Windows 终端中使用 PowerShell 7？
+
+如果 Hermes 已经通过 local terminal backend 原生运行在 Windows 上，可以在
+`~/.hermes/config.yaml` 中选择 PowerShell 7：
+
+```yaml
+terminal:
+  shell: pwsh
+```
+
+修改后需要重启 Hermes。Hermes 会从 PATH 或 PowerShell 7 的标准安装位置解析并
+验证 PowerShell Core 7+ 的 `pwsh.exe`。如果找不到可运行的 PowerShell 7，终端会
+返回明确错误，不会静默回退到 Windows PowerShell 5.1、Bash 或 `cmd.exe`。
+
+当前增量只支持同步前台命令。选择 `pwsh` 后，后台执行、PTY 会话和完成通知都会
+直接失败；WSL、远程和容器终端 backend 继续使用原有 Bash 契约。
+
+每次前台调用都会启动新的 PowerShell 进程，但工作目录和进程环境变量会在调用
+之间保留。函数、别名、模块、作业、PowerShell drive 和其他 runspace 状态不会
+持久化。
+
 #### 命令被标记为危险而阻止
 
 **原因：** Hermes 检测到潜在的破坏性命令（例如 `rm -rf`、`DROP TABLE`）。这是一项安全功能。
