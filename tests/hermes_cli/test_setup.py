@@ -122,6 +122,112 @@ def test_select_provider_and_model_warns_if_named_custom_provider_disappears(
     assert "selected saved custom provider is no longer available" in out
 
 
+def test_select_provider_and_model_reopens_picker_after_nous_login_failure(
+    tmp_path, monkeypatch, capsys
+):
+    """A blocked Portal must not strand onboarding on the Nous choice."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    _clear_provider_env(monkeypatch)
+    save_config({"model": {}})
+
+    selections = iter(("Nous", "OpenRouter"))
+
+    def pick_provider(labels, default=0, title="Select provider:"):
+        del default, title
+        selected = next(selections)
+        return next(i for i, label in enumerate(labels) if selected in label)
+
+    openrouter_calls = []
+    monkeypatch.setattr("hermes_cli.main._prompt_provider_choice", pick_provider)
+    monkeypatch.setattr("hermes_cli.main._model_flow_nous", lambda *a, **k: False)
+    monkeypatch.setattr(
+        "hermes_cli.main._model_flow_openrouter",
+        lambda *a, **k: openrouter_calls.append(True),
+    )
+
+    from hermes_cli.main import select_provider_and_model
+
+    select_provider_and_model()
+
+    assert openrouter_calls == [True]
+    output = capsys.readouterr().out
+    assert "choose another provider" in output
+    assert "Portal access is not required" in output
+
+
+def test_model_flow_nous_signals_recoverable_login_failure(monkeypatch):
+    monkeypatch.setattr(
+        "hermes_cli.auth.get_provider_auth_state", lambda provider: None
+    )
+
+    def fail_login(*args, **kwargs):
+        raise SystemExit(1)
+
+    monkeypatch.setattr("hermes_cli.auth._login_nous", fail_login)
+
+    from hermes_cli.main import _model_flow_nous
+
+    assert _model_flow_nous({}, current_model="") is False
+
+
+def test_model_flow_nous_signals_recoverable_expired_session_relogin_failure(
+    monkeypatch,
+):
+    from hermes_cli.auth import AuthError
+
+    monkeypatch.setattr(
+        "hermes_cli.auth.get_provider_auth_state",
+        lambda provider: {"access_token": "expired"},
+    )
+
+    def expired_credentials(*args, **kwargs):
+        raise AuthError(
+            "Stored credentials expired.",
+            provider="nous",
+            relogin_required=True,
+        )
+
+    def fail_relogin(*args, **kwargs):
+        raise SystemExit(1)
+
+    monkeypatch.setattr(
+        "hermes_cli.auth.resolve_nous_runtime_credentials", expired_credentials
+    )
+    monkeypatch.setattr("hermes_cli.auth._login_nous", fail_relogin)
+
+    from hermes_cli.main import _model_flow_nous
+
+    assert _model_flow_nous({}, current_model="") is False
+
+
+def test_model_flow_nous_preserves_expired_session_relogin_cancellation(monkeypatch):
+    from hermes_cli.auth import AuthError
+
+    monkeypatch.setattr(
+        "hermes_cli.auth.get_provider_auth_state",
+        lambda provider: {"access_token": "expired"},
+    )
+
+    def expired_credentials(*args, **kwargs):
+        raise AuthError(
+            "Stored credentials expired.",
+            provider="nous",
+            relogin_required=True,
+        )
+
+    def cancel_relogin(*args, **kwargs):
+        raise SystemExit(130)
+
+    monkeypatch.setattr(
+        "hermes_cli.auth.resolve_nous_runtime_credentials", expired_credentials
+    )
+    monkeypatch.setattr("hermes_cli.auth._login_nous", cancel_relogin)
+
+    from hermes_cli.main import _model_flow_nous
+
+    assert _model_flow_nous({}, current_model="") is None
+
+
 
 
 

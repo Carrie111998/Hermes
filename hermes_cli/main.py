@@ -4188,39 +4188,57 @@ def select_provider_and_model(args=None):
     ordered.append(("aux-config", "Configure auxiliary models...", []))
     ordered.append(("cancel", "Leave unchanged", []))
 
-    provider_idx = _prompt_provider_choice(
-        [label for _, label, _ in ordered],
-        default=default_idx,
-    )
-    if provider_idx is None or ordered[provider_idx][0] == "cancel":
+    def _select_provider() -> str | None:
+        provider_idx = _prompt_provider_choice(
+            [label for _, label, _ in ordered],
+            default=default_idx,
+        )
+        if provider_idx is None or ordered[provider_idx][0] == "cancel":
+            return None
+
+        selected_key = ordered[provider_idx][0]
+        selected_members = ordered[provider_idx][2]
+
+        # Group row → drill into a member sub-picker. Default to the active member
+        # if the active provider lives in this group. The descriptive text lives on
+        # the group row itself, so member rows show only their short label here.
+        if selected_members:
+            member_default = 0
+            if active in selected_members:
+                member_default = selected_members.index(active)
+            member_labels = [provider_labels.get(m, m) for m in selected_members]
+            group_label = ordered[provider_idx][1].split(" ▸", 1)[0]
+            member_idx = _prompt_provider_choice(
+                member_labels,
+                default=member_default,
+                title=f"Select {group_label} provider:",
+            )
+            if member_idx is None:
+                return None
+            return selected_members[member_idx]
+        return selected_key
+
+    selected_provider = _select_provider()
+    if selected_provider is None:
         print("No change.")
         return
 
-    selected_key = ordered[provider_idx][0]
-    selected_members = ordered[provider_idx][2]
-
-    # Group row → drill into a member sub-picker. Default to the active member
-    # if the active provider lives in this group. The descriptive text lives on
-    # the group row itself, so member rows show only their short label here.
-    if selected_members:
-        member_default = 0
-        if active in selected_members:
-            member_default = selected_members.index(active)
-        member_labels = [
-            provider_labels.get(m, m) for m in selected_members
-        ]
-        group_label = ordered[provider_idx][1].split(" ▸", 1)[0]
-        member_idx = _prompt_provider_choice(
-            member_labels,
-            default=member_default,
-            title=f"Select {group_label} provider:",
+    # A Portal outage must not terminate first-run setup. Keep this recovery at
+    # the provider-picker boundary so the user can immediately choose any BYOK
+    # or local provider without restarting Hermes.
+    while selected_provider == "nous":
+        if _model_flow_nous(config, current_model, args=args) is not False:
+            break
+        print()
+        print(
+            "Nous Portal login failed. You can choose another provider; "
+            "Portal access is not required for OpenRouter, Anthropic, or local/custom endpoints."
         )
-        if member_idx is None:
+        print()
+        selected_provider = _select_provider()
+        if selected_provider is None:
             print("No change.")
             return
-        selected_provider = selected_members[member_idx]
-    else:
-        selected_provider = selected_key
 
     if selected_provider == "aux-config":
         _aux_config_menu()
@@ -4234,7 +4252,7 @@ def select_provider_and_model(args=None):
     elif selected_provider == "ai-gateway":
         _model_flow_ai_gateway(config, current_model)
     elif selected_provider == "nous":
-        _model_flow_nous(config, current_model, args=args)
+        pass  # handled above so Portal failures can reopen the provider picker
     elif selected_provider == "openai-codex":
         _model_flow_openai_codex(config, current_model)
     elif selected_provider == "xai-oauth":
