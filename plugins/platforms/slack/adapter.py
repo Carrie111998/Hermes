@@ -1121,6 +1121,11 @@ class SlackAdapter(BasePlatformAdapter):
 
     MAX_MESSAGE_LENGTH = 39000  # Slack API allows 40,000 chars; leave margin
     supports_code_blocks = True  # Slack mrkdwn renders fenced code blocks
+    # Native chat.startStream/appendStream/stopStream IS the final message.
+    # Telegram-shaped drafts clear and a later send() posts history; Slack
+    # must not do that or users see the streamed reply plus a duplicate
+    # chat.postMessage. Keep one stream per turn across tool boundaries.
+    draft_stream_is_message = True
     # Slack's typing indicator is a text status line (assistant.threads
     # .setStatus), so the gateway feeds it live per-tool phrases.
     supports_status_text = True
