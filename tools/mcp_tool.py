@@ -3806,7 +3806,10 @@ class MCPServerTask:
             )
 
         url = config["url"]
-        headers = dict(config.get("headers") or {})
+        # Headers are kept raw in the stored config (see _load_mcp_config /
+        # #97107) so a rotated ${ENV} token is re-resolved on every
+        # (re)connect rather than frozen at config-load.
+        headers = _resolve_headers_with_env(config)
         # Portable Agent Plugins v1 packages set strict_redirect_headers:
         # configured headers are visible package data and MUST NOT be
         # forwarded to a different origin through a redirect (spec §7.2.1).
@@ -4211,7 +4214,9 @@ class MCPServerTask:
             # would incorrectly block the OAuth flow before it can run.
             if config.get("transport") != "sse" and not config.get("skip_preflight") and not self._ready.is_set() and self._auth_type != "oauth":
                 try:
-                    _probe_headers = dict(config.get("headers") or {})
+                    # Re-resolve ${ENV} in headers for this probe too, so the
+                    # preflight uses the current token (see #97107).
+                    _probe_headers = _resolve_headers_with_env(config)
                     await self._preflight_content_type(
                         config["url"],
                         headers=_probe_headers,
@@ -6022,6 +6027,22 @@ def _interrupted_call_result() -> str:
 # Config loading
 # ---------------------------------------------------------------------------
 
+def _resolve_headers_with_env(config: dict) -> dict:
+    """Resolve a server's `headers` block, re-expanding ``${ENV}`` refs.
+
+    MCP config headers are stored RAW (see _load_mcp_config / #97107) so a
+    rotated static token (``Authorization: Bearer ${API_TOKEN}``) is re-read
+    from the environment at every (re)connect instead of being frozen at
+    config-load. Non-string values pass through unchanged.
+    """
+    headers: Dict[str, Any] = {}
+    for key, value in (config.get("headers") or {}).items():
+        headers[key] = (
+            _interpolate_env_vars(value) if isinstance(value, str) else value
+        )
+    return headers
+
+
 def _interpolate_env_vars(value):
     """Recursively resolve ``${VAR}`` placeholders.
 
@@ -6161,8 +6182,17 @@ def _load_mcp_config() -> Dict[str, dict]:
             pass
         safe_servers: Dict[str, dict] = {}
         for name, cfg in _filter_suspicious_mcp_servers(servers).items():
+            # Interpolate env refs for the whole config EXCEPT the `headers`
+            # block. HTTP MCP server headers commonly carry static tokens
+            # (`Authorization: Bearer ${API_TOKEN}`); expanding them here
+            # freezes the value for the life of the server task, so a rotated
+            # token is never picked up on reconnect (see #97107). Keep headers
+            # raw so _run_http re-resolves them at each (re)connect.
             interpolated = _interpolate_env_vars(cfg)
-            if isinstance(interpolated, dict):
+            if isinstance(interpolated, dict) and isinstance(cfg, dict):
+                raw_headers = cfg.get("headers")
+                if raw_headers is not None:
+                    interpolated["headers"] = raw_headers
                 _warn_hidden_whitespace(name, interpolated)
                 safe_servers[name] = interpolated
         try:
