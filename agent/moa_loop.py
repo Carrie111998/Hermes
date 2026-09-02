@@ -54,6 +54,31 @@ _MOA_PHONE_RE = re.compile(
 )
 
 
+# OpenAI/Groq chat-message contract. MoA auxiliary paths bypass the transport
+# sanitizer, so message dicts sent to the wire must be reduced to exactly these
+# keys (Groq 400s on _db_persisted, timestamp, reasoning, or any unknown field).
+# Allowlist beats denylist: survives future internal-field leaks.
+_MOA_SAFE_MSG_KEYS = frozenset(
+    {"role", "content", "name", "tool_calls", "tool_call_id", "refusal"}
+)
+
+
+def _aggregator_is_tool_incapable(model: Any) -> bool:
+    """True when the aggregator model cannot accept tool_calls / `tools=`.
+
+    Groq's compound models (groq/compound, groq/compound-mini) reject tool
+    schemas with HTTP 400 'tool calling is not supported'. The aggregator is the
+    acting model in MoA, so when this is True we fold the transcript's tool
+    calls/results to text (via _reference_messages) and drop `tools=` entirely.
+
+    EXTENSION POINT: when a provider capability table (models_dev.py
+    supports_tools) is wired in, this should also consult it for any model with
+    supports_tools=False — not just the groq/compound* class. Until then the
+    prefix check is the proven, minimal signal.
+    """
+    return str(model or "").startswith("groq/compound")
+
+
 def _redact_reference_text(text: Any) -> Any:
     """Redact secrets + PII from one advisor/reference text surface.
 
@@ -291,6 +316,10 @@ def _slot_label(slot: dict[str, Any]) -> str:
 
 def _slot_reasoning_config(slot: dict[str, Any]) -> dict[str, Any] | None:
     """Translate optional per-MoA-slot reasoning_effort into runtime config."""
+    # Groq compound models reject reasoning params (400 'think unsupported');
+    # let them reason natively instead of failing the whole fan-out.
+    if str(slot.get("model") or "").startswith("groq/compound"):
+        return None
     effort = slot.get("reasoning_effort")
     try:
         from hermes_constants import parse_reasoning_effort
@@ -316,6 +345,8 @@ def _aggregator_reasoning_config(aggregator: dict[str, Any]) -> dict[str, Any] |
     advisor fan-out would silently multiply cost. Their depth is slot-or-
     provider-default only.
     """
+    if str(aggregator.get("model") or "").startswith("groq/compound"):
+        return None
     cfg = _slot_reasoning_config(aggregator)
     if cfg is not None:
         return cfg
@@ -1747,7 +1778,15 @@ class MoAChatCompletions:
         history.
         """
         guidance = prepared.get("guidance")
-        agg_messages = [dict(message) for message in messages]
+        # Strip Hermes-internal '_'-prefixed fields (e.g. _db_persisted) that
+        # the chat_completions transport sanitizer would drop, but MoA
+        # auxiliary paths bypass it (see chat_completions.py:330-332). Without
+        # this, Groq rejects the request: HTTP 400 'messages.N': property
+        # '_db_persisted' is unsupported. Mirrors the transport stripper.
+        agg_messages = [
+            {k: v for k, v in message.items() if k in _MOA_SAFE_MSG_KEYS}
+            for message in messages
+        ]
         if guidance:
             _attach_reference_guidance(agg_messages, str(guidance))
         return {**prepared, "messages": agg_messages}
@@ -1765,6 +1804,11 @@ class MoAChatCompletions:
         max_tokens: Any = agg_kwargs.get("max_tokens")
         tools: Any = agg_kwargs.get("tools")
         extra_body: Any = agg_kwargs.get("extra_body")
+        # groq/compound (+ compound-mini) cannot accept tool schemas at all —
+        # sending `tools=` yields HTTP 400 'tool calling is not supported'.
+        # The MoA aggregator reasons over the text-folded transcript instead.
+        if _aggregator_is_tool_incapable(aggregator.get("model")):
+            tools = None
         agg_runtime = _slot_runtime(aggregator)
         try:
             from agent.agent_runtime_helpers import (
@@ -2246,7 +2290,25 @@ class MoAChatCompletions:
                 )
 
         guidance: str | None = None
-        agg_messages = [dict(m) for m in messages]
+        # Strip Hermes-internal '_'-prefixed fields (e.g. _db_persisted) so the
+        # aggregator request matches the provider schema. MoA auxiliary paths
+        # bypass the chat_completions transport sanitizer (chat_completions.py:
+        # 330-332), so the leak reaches Groq as HTTP 400 'property _db_persisted
+        # is unsupported'. Mirrors that sanitizer's '_'-prefix strip.
+        # Build the aggregator's view of the conversation. _reference_messages
+        # folds tool_calls / tool results into plain text and drops the
+        # system prompt, producing a tool-free user/assistant transcript. Some
+        # MoA aggregators (e.g. groq/compound, groq/compound-mini) cannot
+        # accept tool_calling messages and 400 on them — for those, route
+        # through the text-folded view so they still act over the full dialogue.
+        _agg_model = str(aggregator.get("model") or "")
+        if _aggregator_is_tool_incapable(_agg_model):
+            agg_messages = _reference_messages(messages)
+        else:
+            agg_messages = [
+                {k: v for k, v in m.items() if k in _MOA_SAFE_MSG_KEYS}
+                for m in messages
+            ]
         successful_outputs = _successful_references(reference_outputs)
         failed_labels = _failed_reference_labels(reference_outputs)
         joined = ""
