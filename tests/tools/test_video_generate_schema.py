@@ -229,7 +229,19 @@ class TestDynamicParamGating(unittest.TestCase):
             model_meta={"modalities": ["image"]},
         )
         self.assertIn("image_url", schema["parameters"]["properties"])
+        self.assertEqual(
+            schema["parameters"]["required"], ["prompt", "image_url"]
+        )
         self.assertIn("image-to-video only", schema["description"])
+
+    def test_dual_modality_model_keeps_image_url_optional(self):
+        schema = self._schema_with({
+            "modalities": ["text", "image"], "max_reference_images": 0,
+            "supports_audio": False, "supports_negative_prompt": False,
+            "supports_seed": False, "supports_upscale": False,
+        })
+        self.assertIn("image_url", schema["parameters"]["properties"])
+        self.assertEqual(schema["parameters"]["required"], ["prompt"])
 
     def test_no_provider_serves_prompt_only(self):
         with patch.object(vt, "_resolve_active_provider", return_value=None):
