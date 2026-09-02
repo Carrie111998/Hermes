@@ -64,7 +64,8 @@ import { useComposerMicroActions } from './hooks/use-micro-actions'
 import { useSlashCompletions } from './hooks/use-slash-completions'
 import { useSessionStatusPresence } from './hooks/use-status-presence'
 import { ActionBadges } from './micro-actions'
-import { chipTypedPathOnSpace, pathifyRefs } from './path-refs'
+import { preparePastedText } from './paste-to-focus'
+import { chipTypedPathOnSpace } from './path-refs'
 import { QueuePanel } from './queue-panel'
 import {
   beginComposerComposition,
@@ -84,7 +85,7 @@ import { ComposerTriggerPopover } from './trigger-popover'
 import type { ChatBarProps } from './types'
 import { isRedoShortcut, isUndoShortcut } from './undo-history'
 import { UrlDialog } from './url-dialog'
-import { chipTypedUrlOnSpace, linkifyUrls } from './url-refs'
+import { chipTypedUrlOnSpace } from './url-refs'
 import { VoiceActivity, VoicePlaybackActivity } from './voice-activity'
 
 export function ChatBar({
@@ -559,7 +560,7 @@ export function ChatBar({
     const scope = openDirectiveScope(event.currentTarget)
 
     recordUndoPoint()
-    insertComposerContentsAtCaret(event.currentTarget, pathifyRefs(linkifyUrls(pastedText)), scope)
+    insertComposerContentsAtCaret(event.currentTarget, preparePastedText(pastedText), scope)
     scheduleFlushEditorToDraft(event.currentTarget)
   }
 
