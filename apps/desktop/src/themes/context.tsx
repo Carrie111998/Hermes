@@ -68,16 +68,25 @@ const normalizeMode = (value: string | null): ThemeMode =>
 // it *is* the legacy global slot, so it reads/writes the global directly. Named
 // profiles get their own entry and fall back to that global until assigned, so
 // unassigned profiles and pre-per-profile installs stay on the global value.
-const profilePref = <T extends string>(record: string, legacy: string, normalize: (v: string | null) => T) => ({
-  resolve: (profile: string): T => normalize(storedStringRecord(record)[profile] ?? storedString(legacy)),
-  assign: (profile: string, value: T): void => {
-    if (profile === 'default') {
-      persistString(legacy, value)
-    } else {
-      persistStringRecord(record, { ...storedStringRecord(record), [profile]: value })
+const profilePref = <T extends string>(record: string, legacy: string, normalize: (v: string | null) => T) => {
+  const readRaw = (profile: string): string | null =>
+    storedStringRecord(record)[profile] ?? storedString(legacy)
+
+  return {
+    // The stored value with no normalization. Callers that need to re-resolve it
+    // later — e.g. once a backend theme arrives after connect — read this and
+    // normalize on their own schedule instead of at boot.
+    raw: readRaw,
+    resolve: (profile: string): T => normalize(readRaw(profile)),
+    assign: (profile: string, value: T): void => {
+      if (profile === 'default') {
+        persistString(legacy, value)
+      } else {
+        persistStringRecord(record, { ...storedStringRecord(record), [profile]: value })
+      }
     }
   }
-})
+}
 
 export const skinPref = profilePref(PROFILE_SKINS_KEY, SKIN_KEY, normalizeSkin)
 export const modePref = profilePref(PROFILE_MODES_KEY, MODE_KEY, normalizeMode)
@@ -386,8 +395,22 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
     [userThemes, backendThemes, registryVersion]
   )
 
-  const [themeName, setThemeNameState] = useState(() =>
-    typeof window === 'undefined' ? DEFAULT_SKIN_NAME : skinPref.resolve(readBootProfileKey())
+  // The skin preference is kept raw on purpose. A custom skin (amber, cybergreen,
+  // …) only becomes resolvable once the gateway registers it as a backend theme
+  // — which happens after connect, i.e. after this first paint. Resolving it at
+  // boot would quietly downgrade the stored name to the default and never look
+  // at it again. `themeName` re-resolves the raw name against the live registry,
+  // so a late-arriving backend skin upgrades default → the stored skin.
+  const [skinName, setSkinNameState] = useState<string | null>(() =>
+    typeof window === 'undefined' ? null : skinPref.raw(readBootProfileKey())
+  )
+
+  const themeName = useMemo(
+    () => normalizeSkin(skinName),
+    // normalizeSkin calls resolveTheme, which reads the same user/backend/
+    // contributed registries that `listAllThemes` documents below.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [skinName, userThemes, backendThemes, registryVersion]
   )
 
   const [mode, setModeState] = useState<ThemeMode>(() =>
@@ -398,7 +421,7 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
   // remember it for the next boot's first paint.
   useEffect(() => {
     rememberActiveProfileKey(profileKey)
-    setThemeNameState(skinPref.resolve(profileKey))
+    setSkinNameState(skinPref.raw(profileKey))
     setModeState(modePref.resolve(profileKey))
   }, [profileKey])
 
@@ -414,7 +437,7 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
 
       const live = normalizeProfileKey($activeGatewayProfile.get())
 
-      setThemeNameState(skinPref.resolve(live))
+      setSkinNameState(skinPref.raw(live))
       setModeState(modePref.resolve(live))
     }
 
@@ -467,10 +490,11 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
   const liveProfile = () => normalizeProfileKey($activeGatewayProfile.get())
 
   const setTheme = useCallback((name: string) => {
-    const next = normalizeSkin(name)
+    // Store the name as given; normalization happens in the `themeName` memo so
+    // the persisted preference keeps the user's actual choice, not a downgrade.
     setPreview(null)
-    setThemeNameState(next)
-    skinPref.assign(liveProfile(), next)
+    setSkinNameState(name)
+    skinPref.assign(liveProfile(), name)
   }, [])
 
   const setMode = useCallback((next: ThemeMode) => {
