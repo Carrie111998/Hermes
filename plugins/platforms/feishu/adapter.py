@@ -95,6 +95,7 @@ CreateImageRequest = None  # type: ignore[assignment]
 CreateImageRequestBody = None  # type: ignore[assignment]
 CreateMessageRequest = None  # type: ignore[assignment]
 CreateMessageRequestBody = None  # type: ignore[assignment]
+DeleteMessageRequest = None  # type: ignore[assignment]
 GetChatRequest = None  # type: ignore[assignment]
 GetMessageRequest = None  # type: ignore[assignment]
 GetMessageResourceRequest = None  # type: ignore[assignment]
@@ -315,19 +316,6 @@ _MENTION_PLACEHOLDER_RE = re.compile(r"@_user_\d+")
 _MENTION_BOUNDARY_CHARS = frozenset(" \t\n\r.,;:!?、，。；：！？()[]{}<>\"'`")
 _TRAILING_TERMINAL_PUNCT = frozenset(" \t\n\r.!?。！？")
 _WHITESPACE_RE = re.compile(r"\s+")
-_SUPPORTED_CARD_TEXT_KEYS = (
-    "title",
-    "text",
-    "content",
-    "label",
-    "value",
-    "name",
-    "summary",
-    "subtitle",
-    "description",
-    "placeholder",
-    "hint",
-)
 _SKIP_TEXT_KEYS = {
     "tag",
     "type",
@@ -986,11 +974,18 @@ def _normalize_interactive_message(message_type: str, payload: Dict[str, Any]) -
     body_lines = _collect_card_lines(card_payload)
     actions = _collect_action_labels(card_payload)
 
+    # Button/select labels are collected both as body lines (buttons are
+    # rich-block tags) and by _collect_action_labels — collapsing the exact
+    # duplicates here stops the same label from appearing twice in the card
+    # text rendered to the agent (e.g. "View Logs" as a line and again in
+    # "Actions: View Logs, Retry").
+    action_set = set(actions)
+
     lines: List[str] = []
     if title:
         lines.append(title)
     for line in body_lines:
-        if line != title:
+        if line != title and line not in action_set:
             lines.append(line)
     if actions:
         lines.append(f"Actions: {', '.join(actions)}")
@@ -1098,14 +1093,12 @@ def _collect_text_segments(value: Any, *, in_rich_block: bool) -> List[str]:
         "date_picker",
     }
 
+    # A single recursive walk collects every leaf string exactly once: the
+    # walk descends into all values (including those under `text`/`content`
+    # style keys), and the string branch emits the text when the enclosing
+    # node is a rich block. Collecting keys directly here too would
+    # double-report the same string.
     segments: List[str] = []
-    for key in _SUPPORTED_CARD_TEXT_KEYS:
-        item = value.get(key)
-        if isinstance(item, str) and next_in_rich_block:
-            normalized = _normalize_feishu_text(item)
-            if normalized:
-                segments.append(normalized)
-
     for key, item in value.items():
         if key in _SKIP_TEXT_KEYS:
             continue
@@ -1486,6 +1479,7 @@ def _load_lark_oapi() -> bool:
                 CreateFileRequest, CreateFileRequestBody,
                 CreateImageRequest, CreateImageRequestBody,
                 CreateMessageRequest, CreateMessageRequestBody,
+                DeleteMessageRequest,
                 GetChatRequest, GetMessageRequest, GetMessageResourceRequest,
                 P2ImMessageMessageReadV1,
                 ReplyMessageRequest, ReplyMessageRequestBody,
@@ -1511,6 +1505,7 @@ def _load_lark_oapi() -> bool:
             "CreateImageRequestBody": CreateImageRequestBody,
             "CreateMessageRequest": CreateMessageRequest,
             "CreateMessageRequestBody": CreateMessageRequestBody,
+            "DeleteMessageRequest": DeleteMessageRequest,
             "GetChatRequest": GetChatRequest,
             "GetMessageRequest": GetMessageRequest,
             "GetMessageResourceRequest": GetMessageResourceRequest,
@@ -2155,6 +2150,42 @@ class FeishuAdapter(BasePlatformAdapter):
         except Exception as exc:
             logger.error("[Feishu] Failed to edit message %s: %s", message_id, exc, exc_info=True)
             return SendResult(success=False, error=str(exc))
+
+    async def delete_message(
+        self,
+        chat_id: str,
+        message_id: str,
+    ) -> bool:
+        """Delete a previously sent Feishu message (recall).
+
+        Used by the stream consumer's fresh-final / fallback cleanup paths to
+        remove a stale streaming preview message once the completed reply has
+        been delivered as a new message — without this, a failed final edit
+        leaves the truncated ``▉``-suffixed preview on screen next to the
+        complete answer (duplicate content).
+
+        ``chat_id`` is required by the base adapter contract and callers pass
+        it positionally, but Feishu's recall API addresses a message purely by
+        ``message_id`` (``DELETE /im/v1/messages/{message_id}``) — it does not
+        scope deletion to a chat, so ``chat_id`` is intentionally unused.
+        """
+        if not self._client:
+            return False
+        if not message_id or message_id == "__no_edit__":
+            return False
+        try:
+            request = self._build_delete_message_request(message_id)
+            response = await self._run_blocking(self._client.im.v1.message.delete, request)
+            if not self._response_succeeded(response):
+                code = getattr(response, "code", "unknown")
+                msg = getattr(response, "msg", "message delete failed")
+                logger.warning("[Feishu] Failed to delete message %s: [%s] %s", message_id, code, msg)
+                return False
+            logger.debug("[Feishu] Deleted message %s", message_id)
+            return True
+        except Exception as exc:
+            logger.warning("[Feishu] Failed to delete message %s: %s", message_id, exc)
+            return False
 
     # Template attrs for the shared _format_exec_approval core. The card
     # header carries the title, so the text core starts at the code fence.
@@ -5253,6 +5284,12 @@ class FeishuAdapter(BasePlatformAdapter):
     def _build_get_message_request(message_id: str) -> Any:
         if GetMessageRequest is not None:
             return GetMessageRequest.builder().message_id(message_id).build()
+        return SimpleNamespace(message_id=message_id)
+
+    @staticmethod
+    def _build_delete_message_request(message_id: str) -> Any:
+        if DeleteMessageRequest is not None:
+            return DeleteMessageRequest.builder().message_id(message_id).build()
         return SimpleNamespace(message_id=message_id)
 
     @staticmethod

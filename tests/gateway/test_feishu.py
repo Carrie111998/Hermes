@@ -94,10 +94,59 @@ class TestFeishuMessageNormalization(unittest.TestCase):
         )
 
         self.assertEqual(normalized.relation_kind, "interactive")
+        # Button labels are action labels, not body text — they must appear
+        # once (in the Actions summary), not twice (also as body lines).
         self.assertEqual(
             normalized.text_content,
-            "Build Failed\nService: payments-api\nBranch: main\nView Logs\nRetry\nActions: View Logs, Retry",
+            "Build Failed\nService: payments-api\nBranch: main\nActions: View Logs, Retry",
         )
+
+    def test_collect_text_segments_collects_each_leaf_once(self):
+        """Every card string is collected exactly once.
+
+        Regression for the double-collection bug where the direct
+        _SUPPORTED_CARD_TEXT_KEYS scan and the recursive value walk both
+        emitted the same string.
+        """
+        from plugins.platforms.feishu.adapter import _collect_text_segments
+
+        payload = {
+            "header": {"title": {"tag": "plain_text", "content": "Build Failed"}},
+            "elements": [
+                {"tag": "div", "text": {"tag": "lark_md", "content": "Service: payments-api"}},
+                {"tag": "note", "elements": [{"tag": "plain_text", "content": "note here"}]},
+                {
+                    "tag": "action",
+                    "actions": [
+                        {"tag": "button", "text": {"tag": "plain_text", "content": "Retry"}},
+                    ],
+                },
+            ],
+        }
+        segments = _collect_text_segments(payload, in_rich_block=False)
+        self.assertEqual(
+            segments,
+            ["Build Failed", "Service: payments-api", "note here", "Retry"],
+        )
+        # No string may appear more than once in the raw output.
+        self.assertEqual(len(segments), len(set(segments)))
+
+    def test_collect_text_segments_keeps_non_duplicate_repeated_text(self):
+        """Two *distinct* card elements with the same text are both preserved.
+
+        Only the accidental double-collection of a single element is removed;
+        genuinely repeated card content still shows up (once per element).
+        """
+        from plugins.platforms.feishu.adapter import _collect_text_segments
+
+        payload = {
+            "elements": [
+                {"tag": "div", "text": {"tag": "plain_text", "content": "Retry"}},
+                {"tag": "div", "text": {"tag": "plain_text", "content": "Retry"}},
+            ],
+        }
+        segments = _collect_text_segments(payload, in_rich_block=False)
+        self.assertEqual(segments, ["Retry", "Retry"])
 
 
 class TestFeishuAdapterMessaging(unittest.TestCase):
@@ -284,6 +333,156 @@ class TestFeishuAdapterMessaging(unittest.TestCase):
             captured["calls"][1].request_body.content,
             json.dumps({"text": "可以用 粗体 和 斜体。"}, ensure_ascii=False),
         )
+
+    def test_delete_message_recalls_sent_message(self):
+        from gateway.config import PlatformConfig
+        from plugins.platforms.feishu.adapter import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        captured = {"calls": []}
+
+        class _MessageAPI:
+            def delete(self, request):
+                captured["calls"].append(request)
+                return SimpleNamespace(success=lambda: True, code=0, msg="success")
+
+        adapter._client = SimpleNamespace(
+            im=SimpleNamespace(
+                v1=SimpleNamespace(
+                    message=_MessageAPI(),
+                )
+            )
+        )
+
+        async def _direct(func, *args, **kwargs):
+            return func(*args, **kwargs)
+
+        # delete_message routes through _run_blocking (adapter SDK executor),
+        # not asyncio.to_thread — patch the real dispatch point and keep the
+        # SDK round-trip intact without spinning up a worker pool.
+        adapter._run_blocking = _direct
+        ok = asyncio.run(
+            adapter.delete_message(
+                chat_id="oc_chat",
+                message_id="om_stale_preview",
+            )
+        )
+
+        self.assertTrue(ok)
+        self.assertEqual(captured["calls"][0].message_id, "om_stale_preview")
+
+    def test_delete_message_failure_returns_false(self):
+        from gateway.config import PlatformConfig
+        from plugins.platforms.feishu.adapter import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        captured = {"calls": []}
+
+        class _MessageAPI:
+            def delete(self, request):
+                captured["calls"].append(request)
+                return SimpleNamespace(success=lambda: False, code=230004, msg="bot cannot delete")
+
+        adapter._client = SimpleNamespace(
+            im=SimpleNamespace(
+                v1=SimpleNamespace(
+                    message=_MessageAPI(),
+                )
+            )
+        )
+
+        async def _direct(func, *args, **kwargs):
+            return func(*args, **kwargs)
+
+        adapter._run_blocking = _direct
+        ok = asyncio.run(
+            adapter.delete_message(
+                chat_id="oc_chat",
+                message_id="om_stale_preview",
+            )
+        )
+
+        self.assertFalse(ok)
+        self.assertEqual(captured["calls"][0].message_id, "om_stale_preview")
+
+    def test_delete_message_validates_message_id_before_sdk_call(self):
+        from gateway.config import PlatformConfig
+        from plugins.platforms.feishu.adapter import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        captured = {"calls": []}
+
+        class _MessageAPI:
+            def delete(self, request):
+                captured["calls"].append(request)
+                return SimpleNamespace(success=lambda: True, code=0, msg="success")
+
+        adapter._client = SimpleNamespace(
+            im=SimpleNamespace(
+                v1=SimpleNamespace(
+                    message=_MessageAPI(),
+                )
+            )
+        )
+
+        # Sentinel/empty ids must short-circuit before any SDK call — the
+        # stream consumer passes these during degraded fallback states.
+        for bad_id in ("", "__no_edit__"):
+            captured["calls"].clear()
+            ok = asyncio.run(
+                adapter.delete_message(
+                    chat_id="oc_chat",
+                    message_id=bad_id,
+                )
+            )
+            self.assertFalse(ok)
+            self.assertEqual(captured["calls"], [])
+
+    def test_delete_message_without_client_returns_false(self):
+        from gateway.config import PlatformConfig
+        from plugins.platforms.feishu.adapter import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        self.assertIsNone(adapter._client)
+        ok = asyncio.run(
+            adapter.delete_message(
+                chat_id="oc_chat",
+                message_id="om_stale_preview",
+            )
+        )
+        self.assertFalse(ok)
+
+    def test_delete_message_survives_sdk_exception(self):
+        from gateway.config import PlatformConfig
+        from plugins.platforms.feishu.adapter import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+
+        class _MessageAPI:
+            def delete(self, _request):
+                raise RuntimeError("network down")
+
+        adapter._client = SimpleNamespace(
+            im=SimpleNamespace(
+                v1=SimpleNamespace(
+                    message=_MessageAPI(),
+                )
+            )
+        )
+
+        async def _direct(func, *args, **kwargs):
+            return func(*args, **kwargs)
+
+        adapter._run_blocking = _direct
+        ok = asyncio.run(
+            adapter.delete_message(
+                chat_id="oc_chat",
+                message_id="om_stale_preview",
+            )
+        )
+        # Deletion is best-effort for the stream consumer — an SDK failure
+        # must surface as False, never raise.
+        self.assertFalse(ok)
 
 
 class TestAdapterModule(unittest.TestCase):
