@@ -2300,6 +2300,27 @@ def get_document_cache_dir() -> Path:
     return d
 
 
+_MAX_CACHE_FILENAME_BYTES = 255
+
+
+def _truncate_filename_part(value: str, max_bytes: int) -> str:
+    """Truncate text at a UTF-8 boundary without splitting a percent escape."""
+    if len(value.encode("utf-8")) <= max_bytes:
+        return value
+    truncated = value.encode("utf-8")[:max_bytes].decode("utf-8", errors="ignore")
+    return re.sub(r"%(?:[0-9A-Fa-f])?$", "", truncated)
+
+
+def _fit_cache_filename(prefix: str, filename: str) -> str:
+    """Fit a prefixed filename within the common filesystem component limit."""
+    name_budget = _MAX_CACHE_FILENAME_BYTES - len(prefix.encode("utf-8"))
+    stem, suffix = os.path.splitext(filename)
+    suffix_bytes = len(suffix.encode("utf-8"))
+    if suffix and suffix_bytes < name_budget:
+        return _truncate_filename_part(stem, name_budget - suffix_bytes) + suffix
+    return _truncate_filename_part(filename, name_budget)
+
+
 def cache_document_from_bytes(data: bytes, filename: str) -> str:
     """
     Save raw document bytes to the cache and return the absolute file path.
@@ -2323,7 +2344,8 @@ def cache_document_from_bytes(data: bytes, filename: str) -> str:
     safe_name = safe_name.replace("\x00", "").strip()
     if not safe_name or safe_name in {".", ".."}:
         safe_name = "document"
-    cached_name = f"doc_{uuid.uuid4().hex[:12]}_{safe_name}"
+    prefix = f"doc_{uuid.uuid4().hex[:12]}_"
+    cached_name = prefix + _fit_cache_filename(prefix, safe_name)
     filepath = cache_dir / cached_name
     # Final safety check: ensure path stays inside cache dir
     if not filepath.resolve().is_relative_to(cache_dir.resolve()):
