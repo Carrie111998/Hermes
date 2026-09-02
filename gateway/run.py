@@ -3021,6 +3021,7 @@ from gateway.platforms.base import (
     MessageType,
     _prefix_within_utf16_limit,
     _reply_anchor_for_event,
+    _signal_quote_author_for_source,
     build_auto_tts_output_path,
     merge_pending_message_event,
     utf16_len,
@@ -18039,6 +18040,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     text=steer_text,
                     message_type=MessageType.TEXT,
                     source=event.source,
+                    raw_message=event.raw_message,
                     message_id=event.message_id,
                     channel_prompt=event.channel_prompt,
                     channel_context=event.channel_context,
@@ -18062,6 +18064,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 text=steer_text,
                 message_type=MessageType.TEXT,
                 source=event.source,
+                raw_message=event.raw_message,
                 message_id=event.message_id,
                 channel_prompt=event.channel_prompt,
                 channel_context=event.channel_context,
@@ -25958,12 +25961,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         reply_to_message_id: Optional[str] = None,
     ) -> Optional[Dict[str, Any]]:
         """Build the metadata dict platforms need for thread-aware replies."""
+        reply_anchor = reply_to_message_id or getattr(source, "message_id", None)
         metadata = self._thread_metadata_for_target(
             getattr(source, "platform", None),
             getattr(source, "chat_id", None),
             getattr(source, "thread_id", None),
             chat_type=getattr(source, "chat_type", None),
-            reply_to_message_id=reply_to_message_id or getattr(source, "message_id", None),
+            reply_to_message_id=reply_anchor,
         )
         if getattr(source, "platform", None) == Platform.SLACK:
             # Per-turn egress identity (R3-5, connector PR gateway-gateway#210).
@@ -25987,6 +25991,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     metadata.setdefault("scope_id", str(team_id))
                 if user_id:
                     metadata.setdefault("user_id", str(user_id))
+        signal_quote_author = _signal_quote_author_for_source(source, reply_anchor)
+        if signal_quote_author is not None:
+            metadata = dict(metadata or {})
+            metadata["signal_quote_timestamp"] = str(reply_anchor)
+            metadata["signal_quote_author"] = signal_quote_author
         return metadata
 
     def _thread_metadata_for_target(
