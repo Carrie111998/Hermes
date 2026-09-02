@@ -1196,6 +1196,16 @@ def _lookup_official_docs_pricing(route: BillingRoute) -> Optional[PricingEntry]
             entry = _OFFICIAL_DOCS_PRICING.get((route.provider, normalized))
             if entry:
                 return entry
+        # Dated snapshot ids (claude-haiku-4-5-20251001) are the API-returned
+        # spelling of the same model as their undated family entry and bill
+        # identically, so an exact miss falls back to the family id (#101145).
+        # This is a resolution fallback, not a rate guess: an unknown family
+        # id still falls through to None below.
+        family = re.sub(r"-\d{8}$", "", normalized)
+        if family != normalized:
+            entry = _OFFICIAL_DOCS_PRICING.get((route.provider, family))
+            if entry:
+                return entry
     # Bedrock cross-region inference profiles carry a region prefix
     # (us./global./eu./...) that the bare pricing keys don't have.
     if route.provider == "bedrock":

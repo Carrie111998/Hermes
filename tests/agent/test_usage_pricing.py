@@ -1,3 +1,4 @@
+import re
 from types import SimpleNamespace
 
 from agent.usage_pricing import (
@@ -8,6 +9,7 @@ from agent.usage_pricing import (
     normalize_usage,
     resolve_billing_route,
 )
+from agent.usage_pricing import _OFFICIAL_DOCS_PRICING
 from decimal import Decimal
 
 
@@ -867,3 +869,52 @@ def test_flat_entries_unaffected_by_tier_machinery():
     )
     # 250k * $0.25/M + 10k * $1.50/M
     assert result.amount_usd == Decimal("0.0775")
+
+
+def test_dated_anthropic_snapshot_resolves_to_family_entry():
+    """Regression test: a dated snapshot id is the same model as its undated
+    family entry and bills identically, so it must resolve to the family's
+    rates. Before this fix, sessions pinned to a dated snapshot (the form the
+    API returns and persists) silently booked $0.00 as unknown cost (#101145).
+    """
+    entry = get_pricing_entry("claude-haiku-4-5-20251001", provider="anthropic")
+    family = get_pricing_entry("claude-haiku-4-5", provider="anthropic")
+
+    assert entry is not None
+    assert family is not None
+    assert entry.input_cost_per_million == family.input_cost_per_million
+    assert entry.output_cost_per_million == family.output_cost_per_million
+
+
+def test_dotted_and_dated_anthropic_id_resolves():
+    """Dot-notation and a dated suffix compose: claude-opus-4.5-20251001 must
+    normalize to claude-opus-4-5-20251001 and then strip to the family id."""
+    entry = get_pricing_entry("claude-opus-4.5-20251001", provider="anthropic")
+
+    assert entry is not None
+    assert entry.input_cost_per_million == Decimal("5.00")
+
+
+def test_dated_strip_does_not_invent_rates_for_unknown_families():
+    """The dated fallback is a resolution, not a guess: when the family id is
+    not in the table, the lookup must still return None so callers report the
+    cost as unknown instead of silently booking $0.00 from a wrong card."""
+    assert get_pricing_entry("claude-opus-9-20251001", provider="anthropic") is None
+
+
+def test_every_undated_anthropic_entry_resolves_with_dated_suffix():
+    """Every undated Anthropic family entry must keep pricing when the caller
+    pins a dated snapshot of it, so the two spellings cannot drift apart as
+    entries are added to the table."""
+    dated_suffix = "-20251001"
+    undated = [
+        model
+        for provider, model in _OFFICIAL_DOCS_PRICING
+        if provider == "anthropic" and not re.search(r"-\d{8}$", model)
+    ]
+    assert undated  # sanity: the table still has undated family entries
+
+    for model in undated:
+        entry = get_pricing_entry(model + dated_suffix, provider="anthropic")
+        assert entry is not None, f"{model}{dated_suffix} prices as unknown"
+        assert entry is _OFFICIAL_DOCS_PRICING[("anthropic", model)]
