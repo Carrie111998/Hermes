@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { $activeGatewayProfile } from '@/store/profile'
-import { $sessions } from '@/store/session'
+import { $connection, $sessions } from '@/store/session'
 import type { SessionInfo } from '@/types/hermes'
 
 import { $hudActive, $hudSession, openHud, resetHudLayout, toggleHud } from './hud'
@@ -31,6 +31,7 @@ beforeEach(() => {
   $hudActive.set(false)
   $hudSession.set(null)
   $sessions.set([])
+  $connection.set(null)
   $activeGatewayProfile.set('default')
 })
 
@@ -60,6 +61,14 @@ describe('openHud profile targeting (#82285)', () => {
     expect(open).toHaveBeenCalledWith({ sessionId: 'abc', profile: 'work' })
   })
 
+  it('carries the session owner connection when the target row is connection-tagged', () => {
+    $sessions.set([session({ id: 'abc', profile: 'default', connection_id: 'alia-linux' })])
+
+    openHud('abc')
+
+    expect(open).toHaveBeenCalledWith({ sessionId: 'abc', profile: 'default', connectionId: 'alia-linux' })
+  })
+
   it('falls back to the active gateway profile for an unstamped session', () => {
     $sessions.set([session({ id: 'abc', profile: '' })])
     $activeGatewayProfile.set('work')
@@ -75,6 +84,14 @@ describe('openHud profile targeting (#82285)', () => {
     openHud()
 
     expect(open).toHaveBeenCalledWith({ sessionId: null, profile: 'research' })
+  })
+
+  it('carries the active connection when opening without a session', () => {
+    $connection.set({ mode: 'remote', connectionId: 'alia-linux' } as never)
+
+    openHud()
+
+    expect(open).toHaveBeenCalledWith({ sessionId: null, profile: 'default', connectionId: 'alia-linux' })
   })
 
   it('normalizes to default for single-profile users', () => {

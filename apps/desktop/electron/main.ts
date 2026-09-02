@@ -13434,7 +13434,12 @@ let hudSessionId = null
 // string). A renderer adopts its backend once at boot, so a retarget onto a
 // session from a DIFFERENT profile cannot be a same-window `goto` — the HUD
 // must be respawned against the new profile's backend (see openHudWindow).
-let hudProfile = null
+let hudProfile: null | string = null
+
+// The registry connection the live HUD renderer booted against. Profile names
+// repeat across gateways (`default` exists on every source), so the profile
+// alone cannot identify the backend (#hud-route).
+let hudConnectionId: null | string = null
 
 // A wide, short bar parked near the bottom of the active display — the shape
 // of a game chat frame, and where one belongs. Defaults only: once the user
@@ -13692,15 +13697,15 @@ function hudBounds() {
   return defaultHudBounds(area)
 }
 
-function hudUrl(sessionId, profile) {
-  // The profile rides the query string next to `win=hud` (BEFORE the '#', so
-  // HashRouter never sees it). The HUD renderer's gateway boot reads it and
-  // adopts that backend instead of the primary — without it, a HUD opened on a
-  // non-primary profile's conversation resolves the session id against the
-  // wrong backend and falls back to the default profile's last session.
+function hudUrl(sessionId: null | string, profile: null | string, connectionId: null | string) {
+  // The profile and registry connection ride the query string next to `win=hud`
+  // (BEFORE the '#', so HashRouter never sees them). Both are required for a
+  // multi-gateway install: every source can expose a `default` profile, so a
+  // profile-only handoff still falls back to the primary local gateway.
   return buildHudWindowUrl(sessionId, {
     devServer: DEV_SERVER,
     profile,
+    connectionId,
     rendererIndexPath: DEV_SERVER ? undefined : resolveRendererIndex()
   })
 }
@@ -13719,7 +13724,7 @@ function broadcastHudState(open) {
   }
 }
 
-function spawnHudWindow(sessionId, profile) {
+function spawnHudWindow(sessionId: null | string, profile: null | string, connectionId: null | string) {
   const win = new BrowserWindow({
     ...hudBounds(),
     minWidth: 380,
@@ -13826,7 +13831,7 @@ function spawnHudWindow(sessionId, profile) {
   // Log-only lifecycle (#81290): the HUD is a compact auxiliary surface the
   // user can re-toggle; a dead renderer should be diagnosable, not resurrected.
   installWindowRendererLifecycle(win, { kind: 'hud', callbacks: { log: rememberLog } })
-  loadWindowUrl(win, hudUrl(sessionId, profile), 'HUD')
+  loadWindowUrl(win, hudUrl(sessionId, profile, connectionId), 'HUD')
 
   return win
 }
@@ -13844,15 +13849,16 @@ function restoreMainWindowFromHud() {
   }
 }
 
-function openHudWindow(sessionId, profile) {
+function openHudWindow(sessionId: null | string, profile: null | string, connectionId: null | string) {
   const profileKey = typeof profile === 'string' && profile.trim() ? profile.trim() : null
+  const connectionKey = typeof connectionId === 'string' && connectionId.trim() ? connectionId.trim() : null
 
   if (hudWindow && !hudWindow.isDestroyed()) {
     // Pointed at another PROFILE: the live renderer is bound to the old
     // profile's backend, and a renderer adopts its backend exactly once at
     // boot — an in-place goto would resolve the id against the wrong backend
     // (the #82285 fallback). Respawn against the right one.
-    if (profileKey && hudProfile !== profileKey) {
+    if ((profileKey && hudProfile !== profileKey) || (connectionKey && hudConnectionId !== connectionKey)) {
       const win = hudWindow
       hudWindow = null
       win.removeAllListeners('closed')
@@ -13860,7 +13866,8 @@ function openHudWindow(sessionId, profile) {
 
       hudSessionId = sessionId || null
       hudProfile = profileKey
-      hudWindow = spawnHudWindow(sessionId, profileKey)
+      hudConnectionId = connectionKey
+      hudWindow = spawnHudWindow(sessionId, profileKey, connectionKey)
       broadcastHudState(true)
       registerHudSnapShortcut()
 
@@ -13886,7 +13893,8 @@ function openHudWindow(sessionId, profile) {
   hudRestoreMainWindow = Boolean(mainWindow && !mainWindow.isDestroyed() && mainWindow.isVisible())
   hudSessionId = sessionId || null
   hudProfile = profileKey
-  hudWindow = spawnHudWindow(sessionId, profileKey)
+  hudConnectionId = connectionKey
+  hudWindow = spawnHudWindow(sessionId, profileKey, connectionKey)
   broadcastHudState(true)
   registerHudSnapShortcut()
 
