@@ -1273,3 +1273,47 @@ def test_gui_password_store_bridge_is_linux_only(tmp_path, monkeypatch):
     mock_detect.assert_not_called()
     launch_env = mock_run.call_args_list[1].kwargs["env"]
     assert "HERMES_DESKTOP_PASSWORD_STORE" not in launch_env
+
+
+@pytest.mark.linux_only
+def test_sandbox_fixup_uses_noninteractive_sudo(tmp_path, monkeypatch):
+    """Autostart has no TTY; interactive sudo conversation-failed and killed launch."""
+    exe = tmp_path / "linux-unpacked" / "hermes"
+    exe.parent.mkdir(parents=True)
+    exe.write_text("", encoding="utf-8")
+    (exe.parent / "chrome-sandbox").write_text("", encoding="utf-8")
+
+    calls: list[list[str]] = []
+
+    def fake_run(cmd, check=False, **kw):
+        calls.append(list(cmd))
+        return subprocess.CompletedProcess(cmd, 1)
+
+    monkeypatch.setattr(cli_main.shutil, "which", lambda n: "/usr/bin/sudo" if n == "sudo" else None)
+    monkeypatch.setattr(cli_main.subprocess, "run", fake_run)
+
+    assert cli_main._desktop_linux_sandbox_fixup(exe) is False
+    assert calls
+    assert all(c[:2] == ["/usr/bin/sudo", "-n"] for c in calls)
+
+
+@pytest.mark.linux_only
+def test_gui_falls_back_to_no_sandbox_when_fixup_fails_without_apparmor(tmp_path, monkeypatch):
+    """Arch has no apparmor userns sysctl; sudo-fail must still launch --no-sandbox."""
+    root = _make_desktop_tree(tmp_path)
+    monkeypatch.setattr(cli_main, "PROJECT_ROOT", root)
+    packaged_exe = _make_packaged_executable(root, monkeypatch)
+
+    launch_ok = subprocess.CompletedProcess([str(packaged_exe), "--no-sandbox"], 0)
+
+    with patch("hermes_cli.main._desktop_build_needed", return_value=False), \
+         patch("hermes_cli.main._resolve_node_runtime_npm", return_value="/usr/bin/npm"), \
+         patch("hermes_cli.main._desktop_linux_sandbox_fixup", return_value=False), \
+         patch("hermes_cli.main._desktop_linux_needs_no_sandbox", return_value=False), \
+         patch("hermes_cli.linux_desktop_entry.install_desktop_entry", return_value=None), \
+         patch("hermes_cli.main.subprocess.run", return_value=launch_ok) as mock_run, \
+         pytest.raises(SystemExit) as exc:
+        cli_main.cmd_gui(_ns())
+
+    assert exc.value.code == 0
+    assert mock_run.call_args.args[0] == [str(packaged_exe), "--no-sandbox"]

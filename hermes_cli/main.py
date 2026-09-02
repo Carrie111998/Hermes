@@ -8249,8 +8249,13 @@ def _desktop_linux_sandbox_fixup(packaged_executable: Path) -> bool:
         print("✗ Hermes Desktop requires sudo to configure Electron's Linux sandbox helper.")
         return False
 
-    print("→ Configuring Electron Linux sandbox helper (sudo required)...")
-    for command in ([sudo, "chown", "root:root", str(sandbox)], [sudo, "chmod", "4755", str(sandbox)]):
+    # ``-n``: Hyprland/uwsm autostart has no TTY. Interactive sudo hangs or
+    # ``conversation failed`` and used to hard-exit the launcher (~3s).
+    print("→ Configuring Electron Linux sandbox helper (passwordless sudo)...")
+    for command in (
+        [sudo, "-n", "chown", "root:root", str(sandbox)],
+        [sudo, "-n", "chmod", "4755", str(sandbox)],
+    ):
         if subprocess.run(command, check=False).returncode != 0:
             print(f"✗ Failed to configure Electron's Linux sandbox helper: {sandbox}")
             return False
@@ -8672,8 +8677,11 @@ def cmd_gui(args: argparse.Namespace):
 
     launch_command = [str(packaged_executable)]
     if not _desktop_linux_sandbox_fixup(packaged_executable):
-        if _desktop_linux_needs_no_sandbox() and _desktop_linux_sandbox_helper_is_regular_file(packaged_executable):
-            print("⚠ Falling back to --no-sandbox because this Linux host restricts unprivileged user namespaces and the Electron sandbox helper could not be configured.")
+        # Arch/Omarchy have no apparmor_restrict_unprivileged_userns sysctl, so
+        # ``_desktop_linux_needs_no_sandbox()`` is False — but sudo still failed
+        # (no TTY at session start). Launch anyway if the helper file exists.
+        if _desktop_linux_sandbox_helper_is_regular_file(packaged_executable):
+            print("⚠ Falling back to --no-sandbox because Electron's Linux sandbox helper could not be configured.")
             launch_command.append("--no-sandbox")
         else:
             sys.exit(1)
