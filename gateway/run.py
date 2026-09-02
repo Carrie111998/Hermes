@@ -20113,7 +20113,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 env=sanitized_env,
                             )
                             stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=30)
-                            output = (stdout or stderr).decode().strip()
+                            output = (stdout or stderr).decode(errors="replace").strip()
                             # Redact any remaining sensitive patterns in output
                             if output:
                                 from agent.redact import redact_sensitive_text
