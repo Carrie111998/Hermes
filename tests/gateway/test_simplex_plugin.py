@@ -162,6 +162,20 @@ async def test_send_dm():
     assert result.success is True
 
 
+@pytest.mark.asyncio
+async def test_send_fails_when_websocket_is_disconnected():
+    """A disconnected daemon must not turn a dropped message into success (#98949)."""
+    from gateway.config import PlatformConfig
+
+    adapter = SimplexAdapter(PlatformConfig(enabled=True, extra={"ws_url": "ws://localhost:5225"}))
+
+    result = await adapter.send("contact-42", "Hello, SimpleX!")
+
+    assert result.success is False
+    assert result.error == "SimpleX WebSocket not connected"
+    assert not adapter._pending_corr_ids
+
+
 
 @pytest.mark.asyncio
 async def test_send_group():
@@ -386,5 +400,4 @@ def _make_file_chat_item(file_path: str, file_name: str) -> dict:
             },
         },
     }
-
 

@@ -831,6 +831,9 @@ class SimplexAdapter(BasePlatformAdapter):
             content = re.sub(r"MEDIA:\S+", "", content).strip()
 
         if content:
+            if not self._ws:
+                logger.warning("SimpleX: send() called but WebSocket not connected — message dropped")
+                return SendResult(success=False, error="SimpleX WebSocket not connected")
             corr_id = self._make_corr_id()
             # Structured form: addresses by ID, and json.dumps escapes
             # newlines + special chars correctly.  The bare @id text
