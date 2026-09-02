@@ -822,6 +822,15 @@ dashboard:
       issuer: https://auth.example.com/application/o/hermes/   # required
       client_id: hermes-dashboard                              # required
       scopes: "openid profile email"                           # optional (this is the default)
+      # Optional provider-specific authorize parameters. Required keys such as
+      # redirect_uri, state, and PKCE parameters cannot be overridden.
+      authorization_params:
+        access_type: offline
+        prompt: consent
+      # Optional fail-closed identity policy. Every listed address must appear
+      # in a verified email claim in the ID token.
+      allowed_emails:
+        - operator@example.com
 ```
 
 **Environment variables** — operator overrides (env wins over `config.yaml` when set non-empty; an empty value is treated as unset):
@@ -833,6 +842,13 @@ dashboard:
 | `HERMES_DASHBOARD_OIDC_SCOPES` | `dashboard.oauth.self_hosted.scopes` | Defaults to `openid profile email` |
 
 In your IDP, register a **public** application/client with the authorization-code + PKCE (S256) grant and add the dashboard's callback as an allowed redirect URI. The callback is `<dashboard public URL>/auth/callback` (see [Public URL override](#public-url-override) for how the dashboard derives its public URL behind a proxy).
+
+`authorization_params` is useful for providers whose durable-session switch is
+not expressed as a standard scope. For example, Google requires
+`access_type: offline` to issue a refresh token and may require
+`prompt: consent` when consent was previously granted. `allowed_emails` limits
+dashboard access after cryptographic ID-token verification; an unverified or
+unlisted address is rejected server-side.
 
 #### What it verifies
 

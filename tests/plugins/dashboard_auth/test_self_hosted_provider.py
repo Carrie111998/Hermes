@@ -133,6 +133,8 @@ def _make_provider(
     scopes: str | None = None,
     client_secret: str | None = None,
     auth_methods: Any = "__unset__",
+    authorization_params: Dict[str, str] | None = None,
+    allowed_emails: list[str] | None = None,
 ):
     """Construct a provider with discovery + JWKS stubbed (no network).
 
@@ -146,6 +148,10 @@ def _make_provider(
         kwargs["scopes"] = scopes
     if client_secret is not None:
         kwargs["client_secret"] = client_secret
+    if authorization_params is not None:
+        kwargs["authorization_params"] = authorization_params
+    if allowed_emails is not None:
+        kwargs["allowed_emails"] = allowed_emails
     p = oidc_plugin.SelfHostedOIDCProvider(**kwargs)
     # Pre-seed discovery so nothing hits the network.
     disco = dict(_DISCOVERY_DOC)
@@ -311,6 +317,29 @@ class TestStartLogin:
         assert "state" in params
         assert "code_challenge" in params
 
+    def test_additional_authorization_params_support_offline_sessions(
+        self, rsa_keypair
+    ):
+        provider = _make_provider(
+            rsa_keypair,
+            authorization_params={"access_type": "offline", "prompt": "consent"},
+        )
+        result = provider.start_login(
+            redirect_uri="https://hermes.example/auth/callback"
+        )
+        params = dict(
+            urllib.parse.parse_qsl(urllib.parse.urlparse(result.redirect_url).query)
+        )
+        assert params["access_type"] == "offline"
+        assert params["prompt"] == "consent"
+
+    def test_additional_authorization_params_cannot_override_pkce(self, rsa_keypair):
+        with pytest.raises(ValueError, match="reserved parameter"):
+            _make_provider(
+                rsa_keypair,
+                authorization_params={"redirect_uri": "https://evil.example/callback"},
+            )
+
 
     def test_state_in_cookie_matches_url(self, provider):
         result = provider.start_login(
@@ -361,6 +390,47 @@ class TestCompleteLogin:
         # The verified ID token is stored in the access_token slot.
         assert session.access_token == id_token
         assert session.refresh_token == "rt_initial"
+
+    def test_email_allowlist_accepts_verified_address_case_insensitively(
+        self, rsa_keypair
+    ):
+        provider = _make_provider(rsa_keypair, allowed_emails=["ALICE@example.com"])
+        id_token = _mint_id_token(rsa_keypair, extra_claims={"email_verified": True})
+        mock_resp = _mock_post(200, {"id_token": id_token, "refresh_token": "rt"})
+        with patch(
+            "plugins.dashboard_auth.self_hosted.httpx.post", return_value=mock_resp
+        ):
+            session = provider.complete_login(
+                code="abc",
+                state="s",
+                code_verifier="vfy",
+                redirect_uri="https://hermes.example/auth/callback",
+            )
+        assert session.email == "alice@example.com"
+
+    @pytest.mark.parametrize(
+        ("email", "verified", "message"),
+        [
+            ("mallory@example.com", True, "not allowed"),
+            ("alice@example.com", False, "not verified"),
+            ("alice@example.com", None, "not verified"),
+        ],
+    )
+    def test_email_allowlist_fails_closed(self, rsa_keypair, email, verified, message):
+        provider = _make_provider(rsa_keypair, allowed_emails=["alice@example.com"])
+        extra = {} if verified is None else {"email_verified": verified}
+        id_token = _mint_id_token(rsa_keypair, email=email, extra_claims=extra)
+        mock_resp = _mock_post(200, {"id_token": id_token, "refresh_token": "rt"})
+        with patch(
+            "plugins.dashboard_auth.self_hosted.httpx.post", return_value=mock_resp
+        ):
+            with pytest.raises(ProviderError, match=message):
+                provider.complete_login(
+                    code="abc",
+                    state="s",
+                    code_verifier="vfy",
+                    redirect_uri="https://hermes.example/auth/callback",
+                )
 
     def test_tolerates_missing_refresh_token(self, provider, rsa_keypair):
         id_token = _mint_id_token(rsa_keypair)
@@ -652,6 +722,53 @@ class TestPluginRegister:
         assert registered._scopes == "openid profile email"
         assert oidc_plugin.LAST_SKIP_REASON == ""
 
+    def test_registers_behavioral_policy_from_config(self, patch_config):
+        patch_config(
+            {
+                "self_hosted": {
+                    "issuer": _ISSUER,
+                    "client_id": _CLIENT_ID,
+                    "authorization_params": {
+                        "access_type": "offline",
+                        "prompt": "consent",
+                    },
+                    "allowed_emails": ["alice@example.com"],
+                }
+            }
+        )
+        ctx = MagicMock()
+        oidc_plugin.register(ctx)
+        registered = ctx.register_dashboard_auth_provider.call_args.args[0]
+        assert registered._authorization_params == {
+            "access_type": "offline",
+            "prompt": "consent",
+        }
+        assert registered._allowed_emails == {"alice@example.com"}
+
+    @pytest.mark.parametrize(
+        ("field", "value", "message"),
+        [
+            ("authorization_params", "access_type=offline", "must be a mapping"),
+            ("allowed_emails", "alice@example.com", "must be a list"),
+        ],
+    )
+    def test_invalid_behavioral_policy_fails_closed(
+        self, patch_config, field, value, message
+    ):
+        patch_config(
+            {
+                "self_hosted": {
+                    "issuer": _ISSUER,
+                    "client_id": _CLIENT_ID,
+                    field: value,
+                }
+            }
+        )
+        ctx = MagicMock()
+        oidc_plugin.register(ctx)
+        ctx.register_dashboard_auth_provider.assert_not_called()
+        assert message in oidc_plugin.LAST_SKIP_REASON
+
 
     def test_env_overrides_config(self, patch_config, monkeypatch):
         patch_config(
@@ -726,4 +843,3 @@ class TestPluginRegister:
         oidc_plugin.register(ctx)
         registered = ctx.register_dashboard_auth_provider.call_args.args[0]
         assert registered._client_secret == "cfg-secret"
-
