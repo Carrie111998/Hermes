@@ -136,6 +136,78 @@ def test_api_calendar_list_uses_events_list(api_module):
     assert params["calendarId"] == "primary"
 
 
+def test_maton_gmail_probe_uses_gateway_without_local_oauth(api_module, monkeypatch, capsys):
+    monkeypatch.setenv("MATON_API_KEY", "maton.test")
+    captured = {}
+
+    class FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return None
+
+        def read(self):
+            return b'{"messages": [{"id": "message-1"}]}'
+
+    def fake_urlopen(request, timeout):
+        captured["request"] = request
+        captured["timeout"] = timeout
+        return FakeResponse()
+
+    api_module._ensure_authenticated = MagicMock()
+    monkeypatch.setattr(api_module.urllib.request, "urlopen", fake_urlopen)
+
+    api_module.gmail_probe(api_module.argparse.Namespace())
+
+    request = captured["request"]
+    assert request.full_url == (
+        "https://gateway.maton.ai/google-mail/gmail/v1/users/me/messages?maxResults=1"
+    )
+    assert request.get_header("Authorization") == "Bearer maton.test"
+    assert captured["timeout"] == 30
+    api_module._ensure_authenticated.assert_not_called()
+    assert json.loads(capsys.readouterr().out) == {
+        "status": "ok",
+        "auth": "maton",
+        "messageCount": 1,
+    }
+
+
+def test_gmail_probe_falls_back_to_local_oauth(api_module, monkeypatch, capsys):
+    monkeypatch.delenv("MATON_API_KEY", raising=False)
+    api_module._gws_binary = lambda: None
+    execute = MagicMock(return_value={"messages": []})
+    list_request = MagicMock(execute=execute)
+    messages = MagicMock()
+    messages.list.return_value = list_request
+    users = MagicMock()
+    users.messages.return_value = messages
+    service = MagicMock()
+    service.users.return_value = users
+    api_module.build_service = MagicMock(return_value=service)
+
+    api_module.gmail_probe(api_module.argparse.Namespace())
+
+    api_module.build_service.assert_called_once_with("gmail", "v1")
+    messages.list.assert_called_once_with(userId="me", maxResults=1)
+    assert json.loads(capsys.readouterr().out) == {
+        "status": "ok",
+        "auth": "local_oauth",
+        "messageCount": 0,
+    }
+
+
+def test_maton_path_refuses_customer_facing_send(api_module, monkeypatch, capsys):
+    monkeypatch.setenv("MATON_API_KEY", "maton.test")
+
+    with pytest.raises(SystemExit) as exc:
+        api_module.gmail_send(api_module.argparse.Namespace())
+
+    assert exc.value.code == 1
+    assert "approved gated workflow" in capsys.readouterr().err
+
+
 
 
 
