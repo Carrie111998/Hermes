@@ -8507,6 +8507,24 @@ _AUX_DIRECT_API_BASE_URLS: Dict[str, str] = {
 }
 
 
+def _normalize_optional_string(value: object) -> Optional[str]:
+    """Normalize an optional auxiliary-task config string.
+
+    YAML ``null`` and empty / whitespace-only / null-ish values all mean
+    "unset": return None. Otherwise return the stripped string.
+
+    A previous version used ``str(value or "").strip() or None``, which
+    stringified the YAML ``null`` literal into the string "None" and sent
+    that to the provider as a model ID / base URL / API key (#100835).
+    """
+    if value is None:
+        return None
+    s = str(value).strip()
+    if not s or s.lower() in {"none", "null"}:
+        return None
+    return s
+
+
 def _resolve_task_provider_model(
     task: str = None,
     provider: str = None,
@@ -8535,18 +8553,18 @@ def _resolve_task_provider_model(
 
     if task:
         task_config = _get_auxiliary_task_config(task)
-        cfg_provider = str(task_config.get("provider", "")).strip() or None
-        cfg_model = str(task_config.get("model", "")).strip() or None
-        cfg_base_url = str(task_config.get("base_url", "")).strip() or None
-        cfg_api_key = str(task_config.get("api_key", "")).strip() or None
+        cfg_provider = _normalize_optional_string(task_config.get("provider"))
+        cfg_model = _normalize_optional_string(task_config.get("model"))
+        cfg_base_url = _normalize_optional_string(task_config.get("base_url"))
+        cfg_api_key = _normalize_optional_string(task_config.get("api_key"))
         # Resolve key_env → env var when api_key is not set directly
         if not cfg_api_key:
-            cfg_key_env = str(
-                task_config.get("key_env") or task_config.get("api_key_env") or ""
-            ).strip()
+            cfg_key_env = _normalize_optional_string(
+                task_config.get("key_env") or task_config.get("api_key_env")
+            ) or ""
             if cfg_key_env:
                 cfg_api_key = _scoped_key_env(cfg_key_env) or None
-        cfg_api_mode = str(task_config.get("api_mode", "")).strip() or None
+        cfg_api_mode = _normalize_optional_string(task_config.get("api_mode"))
 
     # 'auto' is a sentinel meaning "inherit from main runtime / auto-detect", not
     # a literal model id. Without this, a config of `auxiliary.<task>.model: auto`
