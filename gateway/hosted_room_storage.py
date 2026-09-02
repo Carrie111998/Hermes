@@ -792,15 +792,16 @@ def begin_room_link_retirement(
 ) -> dict[str, Any]:
     """Fence new route writes before remote revocation and room disband."""
 
+    limits = _public_api()
     room_id = _validate_identifier(
         room_id,
         label="room_id",
-        max_chars=MAX_ROOM_ID_CHARS,
+        max_chars=limits.MAX_ROOM_ID_CHARS,
     )
     authority_gateway_id = _validate_identifier(
         authority_gateway_id,
         label="authority_gateway_id",
-        max_chars=MAX_ACTOR_ID_CHARS,
+        max_chars=limits.MAX_ACTOR_ID_CHARS,
     )
     if (
         isinstance(authority_epoch, bool)
@@ -872,15 +873,16 @@ def complete_room_link_retirement(
 ) -> None:
     """Allow route deletion only after every remote grant was revoked."""
 
+    limits = _public_api()
     room_id = _validate_identifier(
         room_id,
         label="room_id",
-        max_chars=MAX_ROOM_ID_CHARS,
+        max_chars=limits.MAX_ROOM_ID_CHARS,
     )
     authority_gateway_id = _validate_identifier(
         authority_gateway_id,
         label="authority_gateway_id",
-        max_chars=MAX_ACTOR_ID_CHARS,
+        max_chars=limits.MAX_ACTOR_ID_CHARS,
     )
     if (
         isinstance(authority_epoch, bool)
@@ -1204,13 +1206,16 @@ def restore_peer_room_reservations(
 ) -> None:
     """Restore one failed reservation attempt without clobbering a later writer."""
 
+    limits = _public_api()
     room_id = _validate_identifier(
-        claims.get("room_id"), label="room_id", max_chars=MAX_ROOM_ID_CHARS
+        claims.get("room_id"),
+        label="room_id",
+        max_chars=limits.MAX_ROOM_ID_CHARS,
     )
     target_profile = _validate_identifier(
         claims.get("target_profile"),
         label="target_profile",
-        max_chars=MAX_ACTOR_ID_CHARS,
+        max_chars=limits.MAX_ACTOR_ID_CHARS,
     )
     rows = snapshot.get("rows")
     expected_rows = snapshot.get("expected_rows")
