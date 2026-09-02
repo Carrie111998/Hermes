@@ -13369,20 +13369,105 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 {"thread_id": row["thread_id"]} if row.get("thread_id") else None
             )
 
+            # Split explicit MEDIA: directives out of the recovered final so
+            # crash recovery honors the same attachment contract as live
+            # delivery (extract → filter → send text → dispatch media by
+            # type). Without this, recovery sent the raw "MEDIA:/path" line as
+            # text and marked the obligation delivered without ever uploading
+            # the attachment (#99846).
             try:
-                result = await adapter.send(
-                    chat_id=row["chat_id"],
-                    content=content,
-                    metadata=metadata,
+                media_files, content = adapter.extract_media(content)
+                media_files = BasePlatformAdapter.filter_media_delivery_paths(
+                    media_files
                 )
-            except Exception as send_err:
+            except Exception:
+                # Fail closed: if extraction raises we cannot split the text
+                # from the MEDIA directives, and sending the raw content would
+                # reintroduce #99846 (literal "MEDIA:/path" delivered as text).
+                # Skip the send entirely and keep the obligation retryable.
                 logger.warning(
-                    "obligation %s: redelivery send raised: %s",
-                    row["obligation_id"], send_err,
+                    "obligation %s: media extraction failed; keeping retryable",
+                    row["obligation_id"], exc_info=True,
                 )
-                result = None
+                try:
+                    await asyncio.to_thread(
+                        mark_failed, row["obligation_id"], "media extraction failed",
+                    )
+                except Exception:
+                    logger.debug(
+                        "delivery ledger update failed", exc_info=True,
+                    )
+                continue
+
+            text_ok = True
+            result = None
+            if content and content.strip():
+                try:
+                    result = await adapter.send(
+                        chat_id=row["chat_id"],
+                        content=content,
+                        metadata=metadata,
+                    )
+                except Exception as send_err:
+                    logger.warning(
+                        "obligation %s: redelivery send raised: %s",
+                        row["obligation_id"], send_err,
+                    )
+                    result = None
+                text_ok = result is not None and getattr(result, "success", False)
+
+            # Dispatch attachments through the platform media methods, routing
+            # by type like the live paths (background task / post-stream):
+            # voice clips as voice bubbles, then videos, images, documents.
+            from gateway.platforms.base import (
+                should_send_media_as_audio as _should_send_audio,
+            )
+
+            _IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
+            _VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".3gp"}
+            media_ok = True
+            # One failed upload does not stop the remaining files, but the
+            # obligation stays retryable — so a later retry re-sends files
+            # that already uploaded successfully on this attempt.
+            for media_path, is_voice in media_files or []:
+                ext = os.path.splitext(str(media_path))[1].lower()
+                try:
+                    if _should_send_audio(platform, ext, is_voice=is_voice):
+                        await adapter.send_voice(
+                            chat_id=row["chat_id"],
+                            audio_path=media_path,
+                            metadata=metadata,
+                        )
+                    elif ext in _VIDEO_EXTS:
+                        await adapter.send_video(
+                            chat_id=row["chat_id"],
+                            video_path=media_path,
+                            metadata=metadata,
+                        )
+                    elif ext in _IMAGE_EXTS:
+                        await adapter.send_image_file(
+                            chat_id=row["chat_id"],
+                            image_path=media_path,
+                            metadata=metadata,
+                        )
+                    else:
+                        await adapter.send_document(
+                            chat_id=row["chat_id"],
+                            file_path=media_path,
+                            metadata=metadata,
+                        )
+                except Exception as media_err:
+                    media_ok = False
+                    logger.warning(
+                        "obligation %s: redelivery media send failed for %s: %s",
+                        row["obligation_id"], media_path, media_err,
+                    )
+
             try:
-                if result is not None and getattr(result, "success", False):
+                # Delivered only when every required send succeeded — a
+                # partial text/media failure stays retryable rather than
+                # falsely acknowledging complete delivery (#99846).
+                if text_ok and media_ok:
                     await asyncio.to_thread(mark_delivered, row["obligation_id"])
                     redelivered += 1
                     logger.info(
