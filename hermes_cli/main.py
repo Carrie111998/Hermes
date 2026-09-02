@@ -462,6 +462,7 @@ import shutil
 import stat
 import subprocess
 import tempfile
+import secrets
 from pathlib import Path
 from typing import Optional
 
@@ -500,6 +501,7 @@ from hermes_cli.subcommands.console import build_console_parser
 from hermes_cli.subcommands.update import build_update_parser
 from hermes_cli.subcommands.uninstall import build_uninstall_parser
 from hermes_cli.subcommands.dashboard import build_dashboard_parser
+from hermes_cli.subcommands.desktop_web import build_desktop_web_parser
 from hermes_cli.subcommands.gui import build_gui_parser
 from hermes_cli.subcommands.logs import build_logs_parser
 from hermes_cli.subcommands.prompt_size import build_prompt_size_parser
@@ -8404,6 +8406,11 @@ def cmd_gui(args: argparse.Namespace):
     if not (desktop_dir / "package.json").exists():
         print(f"Desktop GUI source not found at: {desktop_dir}")
         sys.exit(1)
+    
+    desktop_web_dir = PROJECT_ROOT / "apps" / "desktop" / "web"
+    if not (desktop_web_dir / "package.json").exists():
+        print(f"Desktop WEB source not found at: {desktop_web_dir}")
+        sys.exit(1)
 
     try:
         from hermes_logging import setup_logging as _setup_logging_gui
@@ -8686,6 +8693,7 @@ def cmd_gui(args: argparse.Namespace):
     print(f"→ Launching packaged Hermes Desktop: {' '.join(launch_command)}")
     launch_result = subprocess.run(launch_command, cwd=desktop_dir, env=env, check=False)
     sys.exit(launch_result.returncode)
+
 
 
 # Dashboard process-hygiene helpers live in hermes_cli/dashboard_procs.py
@@ -11978,6 +11986,133 @@ def _maybe_setup_dashboard_auth_interactively(args) -> None:
     print()
 
 
+def _maybe_setup_desktop_web_auth_interactively(args) -> None:
+    """Offer Dashboard-style first-run password setup for Desktop Web.
+
+    Desktop Web has its own host-level gate because its backend is a private,
+    launcher-owned child and must not borrow Dashboard sessions.  Keep the
+    first-run experience familiar, though: when a public authority or a
+    non-loopback bind means the gate will engage, an interactive operator can
+    configure the bundled username/password provider before the Node host
+    starts.  Non-TTY launches deliberately fall through to the Node host's
+    fail-closed response.
+    """
+    host = getattr(args, "host", "127.0.0.1") or "127.0.0.1"
+    loopback_hosts = {"localhost", "127.0.0.1", "::1"}
+
+    try:
+        from urllib.parse import urlparse
+
+        from hermes_cli.config import load_config, save_config
+
+        config = load_config()
+        desktop_web = config.get("desktop_web")
+        if not isinstance(desktop_web, dict):
+            desktop_web = {}
+        basic_auth = desktop_web.get("basic_auth")
+        if not isinstance(basic_auth, dict):
+            basic_auth = {}
+
+        configured_public_url = (
+            os.environ.get("HERMES_DESKTOP_WEB_PUBLIC_URL", "").strip()
+            or str(desktop_web.get("public_url", "") or "").strip()
+        )
+        public_hostname = ""
+        if configured_public_url:
+            parsed = urlparse(configured_public_url)
+            if parsed.scheme in {"http", "https"}:
+                public_hostname = (parsed.hostname or "").lower()
+
+        auth_required = host.strip("[]").lower() not in loopback_hosts
+        auth_required = auth_required or (
+            public_hostname and public_hostname not in loopback_hosts
+        )
+        if not auth_required:
+            return
+
+        env_username = os.environ.get("HERMES_DESKTOP_WEB_BASIC_AUTH_USERNAME", "").strip()
+        env_password = os.environ.get("HERMES_DESKTOP_WEB_BASIC_AUTH_PASSWORD", "").strip()
+        env_hash = os.environ.get("HERMES_DESKTOP_WEB_BASIC_AUTH_PASSWORD_HASH", "").strip()
+        username = env_username or str(basic_auth.get("username", "") or "").strip()
+        has_password = bool(
+            env_password
+            or env_hash
+            or str(basic_auth.get("password_hash", "") or "").strip()
+            or str(basic_auth.get("password", "") or "").strip()
+        )
+        if username and has_password:
+            return
+    except Exception:
+        # Do not make startup less safe when config discovery fails.  The Node
+        # host remains the final fail-closed authority.
+        return
+
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        return
+
+    print()
+    print(f"⚠ Desktop Web authentication is required for this configuration ({host}).")
+    print(
+        "  A public URL or non-loopback bind requires a username and password."
+    )
+    print()
+    print("  Configure Desktop Web username/password now?")
+    print("    [1] Username & password (recommended)")
+    print("    [2] Cancel")
+    print()
+
+    try:
+        choice = input("  Choice [1]: ").strip() or "1"
+    except (EOFError, KeyboardInterrupt):
+        print("\n  Cancelled.")
+        sys.exit(1)
+    if choice != "1":
+        print("  Cancelled.")
+        sys.exit(1)
+
+    import getpass
+
+    print()
+    try:
+        username = line_input("  Username [admin]: ").strip() or "admin"
+        password = getpass.getpass("  Password: ")
+        confirm = getpass.getpass("  Confirm password: ")
+    except (EOFError, KeyboardInterrupt):
+        print("\n  Cancelled.")
+        sys.exit(1)
+
+    if not password:
+        print("  ✗ Empty password — aborting.")
+        sys.exit(1)
+    if password != confirm:
+        print("  ✗ Passwords don't match — aborting.")
+        sys.exit(1)
+
+    try:
+        from plugins.dashboard_auth.basic import hash_password
+
+        password_hash = hash_password(password)
+        basic_auth["username"] = username
+        basic_auth["password_hash"] = password_hash
+        # Never persist plaintext, even though the server supports it as a
+        # compatibility fallback for manually managed configurations.
+        basic_auth["password"] = ""
+        if not str(basic_auth.get("secret", "") or "").strip():
+            basic_auth["secret"] = secrets.token_urlsafe(32)
+        desktop_web["basic_auth"] = basic_auth
+        config["desktop_web"] = desktop_web
+        save_config(config)
+    except Exception as exc:
+        print(f"  ✗ Failed to configure Desktop Web authentication: {exc}")
+        sys.exit(1)
+
+    print()
+    print(f"  ✓ Username/password auth configured (user: {username}).")
+    print("    Saved to config.yaml under desktop_web.basic_auth.")
+    print("    Start Desktop Web again if this process was not launched interactively.")
+    print()
+
+
 def _read_ssh_session_token_file(path: str) -> str:
     """Read and unlink a Desktop SSH token from its private runtime directory."""
     if sys.platform == "win32":
@@ -12080,6 +12215,241 @@ def _is_electron_packaged_web_dist(path: str) -> bool:
     # Both app.asar and app.asar.unpacked contain this marker; normalize
     # separators so Windows paths match too.
     return "app.asar" in path.replace("\\", "/")
+
+
+def _desktop_web_processes() -> list[tuple[int, str]]:
+    """Return processes launched through the canonical desktop-web command."""
+    try:
+        import psutil
+    except Exception:
+        return []
+
+    current = os.getpid()
+    candidates = {}
+    for process in psutil.process_iter(["pid", "ppid", "cmdline"]):
+        try:
+            argv = process.info.get("cmdline") or []
+            candidates[process.info["pid"]] = (process.info.get("ppid"), argv, process)
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            continue
+
+    roots = set()
+    for pid, (_ppid, argv, _process) in candidates.items():
+        if pid == current:
+            continue
+        is_launcher = "-m" in argv and "hermes_cli.main" in argv and "desktop-web" in argv
+        is_server = any(str(item).endswith("apps/desktop/web/server.mjs") for item in argv) and "--desktop-web" in argv
+        if is_launcher or is_server:
+            roots.add(pid)
+
+    owned = set(roots)
+    changed = True
+    while changed:
+        changed = False
+        for pid, (ppid, _argv, _process) in candidates.items():
+            if ppid in owned and pid not in owned:
+                owned.add(pid)
+                changed = True
+
+    return [(pid, " ".join(candidates[pid][1])) for pid in sorted(owned)]
+
+
+def _stop_desktop_web_processes() -> bool:
+    processes = _desktop_web_processes()
+    if not processes:
+        print("No hermes desktop-web processes running.")
+        return True
+
+    import signal
+    import time
+
+    for pid, _command in processes:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline and _desktop_web_processes():
+        time.sleep(0.1)
+
+    remaining = _desktop_web_processes()
+    for pid, _command in remaining:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    return not _desktop_web_processes()
+
+
+def cmd_desktop_web(args):
+    """Build and serve the standalone Desktop Web host."""
+    web_dir = PROJECT_ROOT / "apps" / "desktop" / "web"
+    dist_dir = web_dir / "dist"
+    if not (web_dir / "package.json").exists():
+        print(f"Desktop Web source not found at: {web_dir}", file=sys.stderr)
+        return 1
+
+    if args.status:
+        processes = _desktop_web_processes()
+        if not processes:
+            print("No hermes desktop-web processes running.")
+        else:
+            for pid, command in processes:
+                print(f"{pid}: {command}")
+        return 0
+
+    if args.stop:
+        return 0 if _stop_desktop_web_processes() else 1
+
+    if args.port < 0 or args.port > 65535:
+        print("desktop-web port must be between 0 and 65535", file=sys.stderr)
+        return 2
+
+    env = os.environ.copy()
+    env["HERMES_DESKTOP_WEB"] = "1"
+
+    if args.skip_build:
+        if not (dist_dir / "index.html").exists():
+            print(f"✗ --skip-build was passed but no web dist found at: {dist_dir}", file=sys.stderr)
+            print("  Run: npm run build --workspace apps/desktop/web", file=sys.stderr)
+            return 1
+        print(f"→ Skipping Desktop Web build; using {dist_dir}")
+    else:
+        npm = _resolve_node_runtime_npm()
+        if not npm:
+            print("Desktop Web requires Node.js/npm, but npm was not found on PATH.", file=sys.stderr)
+            return 1
+        from hermes_constants import with_hermes_node_path
+        npm_env = _npm_lifecycle_env(with_hermes_node_path(env))
+        print("→ Installing Desktop Web workspace dependencies...")
+        install = subprocess.run(
+            [npm, "install", "--workspace", "apps/desktop/web"],
+            cwd=PROJECT_ROOT,
+            env=npm_env,
+            check=False,
+        )
+        if install.returncode != 0:
+            print("✗ Desktop Web dependency install failed", file=sys.stderr)
+            return install.returncode or 1
+        print("→ Building Desktop Web renderer...")
+        build = subprocess.run(
+            [npm, "run", "build", "--workspace", "apps/desktop/web"],
+            cwd=PROJECT_ROOT,
+            env=npm_env,
+            check=False,
+        )
+        if build.returncode != 0 or not (dist_dir / "index.html").exists():
+            print("✗ Desktop Web build failed or produced no dist/index.html", file=sys.stderr)
+            return build.returncode or 1
+
+    # Match Dashboard's first-run behavior: interactive operators can create
+    # the independent Desktop Web gate before the host starts. Background and
+    # service launches remain fail-closed in server.mjs when it is unconfigured.
+    _maybe_setup_desktop_web_auth_interactively(args)
+
+    node = shutil.which("node")
+    if not node:
+        print("Desktop Web requires Node.js, but node was not found on PATH.", file=sys.stderr)
+        return 1
+
+    import selectors
+    import time
+
+    backend_env = os.environ.copy()
+    backend_env.pop("HERMES_DESKTOP_WEB", None)
+    backend_env.pop("HERMES_DESKTOP_WEB_PUBLIC_URL", None)
+    backend_env.pop("HERMES_WEB_DIST", None)
+    backend_env["HERMES_DESKTOP_WEB_CHILD"] = "1"
+    # Keep the native Desktop backend contract: this credential is generated
+    # for this child only and is never exposed to the browser-facing renderer.
+    backend_token = secrets.token_hex(32)
+    backend_env["HERMES_DASHBOARD_SESSION_TOKEN"] = backend_token
+    backend_command = [
+        sys.executable, "-m", "hermes_cli.main", "serve",
+        "--host", "127.0.0.1", "--port", "0", "--no-open", "--isolated",
+    ]
+    print("→ Starting dedicated Hermes backend child...")
+    backend = subprocess.Popen(
+        backend_command,
+        cwd=PROJECT_ROOT,
+        env=backend_env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+    )
+
+    backend_port = None
+    backend_deadline = time.monotonic() + 90
+    backend_selector = selectors.DefaultSelector()
+    assert backend.stdout is not None
+    backend_selector.register(backend.stdout, selectors.EVENT_READ)
+    try:
+        while time.monotonic() < backend_deadline:
+            if backend.poll() is not None:
+                break
+            for key, _events in backend_selector.select(timeout=0.25):
+                line = backend.stdout.readline()
+                if not line:
+                    continue
+                print(f"[backend] {line.rstrip()}")
+                match = re.search(r"HERMES_BACKEND_READY port=(\d+)", line)
+                if match:
+                    backend_port = int(match.group(1))
+                    break
+            if backend_port is not None:
+                break
+        if backend_port is None:
+            print("✗ Dedicated Hermes backend did not become ready.", file=sys.stderr)
+            return 1
+
+        command = [
+            node,
+            str(web_dir / "server.mjs"),
+            "--desktop-web",
+            "--host", args.host,
+            "--port", str(args.port),
+            "--backend-url", f"http://127.0.0.1:{backend_port}",
+        ]
+        web_env = env.copy()
+        # The Node host needs the token to authenticate only its owned backend
+        # proxy. It remains process-local and is never included in page data.
+        web_env["HERMES_DESKTOP_WEB_BACKEND_TOKEN"] = backend_token
+        print(f"→ Starting standalone Desktop Web on {args.host}:{args.port}")
+        web = subprocess.Popen(command, cwd=web_dir, env=web_env)
+        try:
+            if not args.no_open:
+                deadline = time.monotonic() + 15
+                while time.monotonic() < deadline and web.poll() is None:
+                    if _dashboard_listening(args.host, args.port):
+                        try:
+                            import webbrowser
+                            webbrowser.open(f"http://{args.host}:{args.port}")
+                        except Exception:
+                            pass
+                        break
+                    time.sleep(0.1)
+            return web.wait()
+        except KeyboardInterrupt:
+            web.terminate()
+            return web.wait()
+        finally:
+            if web.poll() is None:
+                web.terminate()
+                try:
+                    web.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    web.kill()
+    finally:
+        backend_selector.close()
+        if backend.poll() is None:
+            backend.terminate()
+            try:
+                backend.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                backend.kill()
+                backend.wait()
 
 
 def cmd_dashboard(args):
@@ -14808,6 +15178,7 @@ def main():
         cmd_dashboard=cmd_dashboard,
         cmd_dashboard_register=cmd_dashboard_register,
     )
+    build_desktop_web_parser(subparsers, cmd_desktop_web=cmd_desktop_web)
 
 
     # =========================================================================
