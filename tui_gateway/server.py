@@ -15338,6 +15338,18 @@ def _(rid, params: dict) -> dict:
                     sid_key, session, new_prompt, pname
                 )
             else:
+                if key == "skin":
+                    from hermes_cli.skin_engine import list_skins
+
+                    requested_skin = str(value or "").strip().lower()
+                    available_skins = {skin["name"] for skin in list_skins()}
+                    if not requested_skin or requested_skin not in available_skins:
+                        return _err(
+                            rid,
+                            4002,
+                            f"unknown skin: {requested_skin or '(empty)'}",
+                        )
+                    value = requested_skin
                 _write_config_key(f"display.{key}", value)
                 nv = value
                 if key == "skin":

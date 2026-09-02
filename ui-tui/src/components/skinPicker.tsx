@@ -1,8 +1,12 @@
 import { Box, Text, useInput, useStdout } from '@hermes/ink'
 import type { SkinBranding } from '@hermes/shared/skin'
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 
-import { applySkinPreview } from '../app/createGatewayEventHandler.js'
+import {
+  applySkinPreview,
+  getPersistedSkinRevision,
+  restorePersistedSkin
+} from '../app/createGatewayEventHandler.js'
 import type { GatewayClient } from '../gatewayClient.js'
 import type { GatewaySkin } from '../gatewayTypes.js'
 import { rpcErrorMessage } from '../lib/rpc.js'
@@ -48,6 +52,7 @@ export function SkinPicker({ gw, maxWidth, onClose, t }: SkinPickerProps) {
   const [busy, setBusy] = useState(false)
   const [err, setErr] = useState('')
   const [loading, setLoading] = useState(true)
+  const previewGeneration = useRef(0)
 
   const { stdout } = useStdout()
   const preferredWidth = Math.max(MIN_WIDTH, Math.min(MAX_WIDTH, (stdout?.columns ?? 80) - 6))
@@ -82,29 +87,34 @@ export function SkinPicker({ gw, maxWidth, onClose, t }: SkinPickerProps) {
       return
     }
 
-    let current = true
-    const timer = setTimeout(() => {
-      const preview =
-        selected.name === options.active
-          ? Promise.resolve(options.active_skin)
-          : gw.request<GatewaySkin>('skin.preview', { name: selected.name })
+    const generation = ++previewGeneration.current
+    const persistedRevision = getPersistedSkinRevision()
 
-      preview
-        .then(skin => current && applySkinPreview(skin))
-        .catch((error: unknown) => current && setErr(rpcErrorMessage(error)))
+    const timer = setTimeout(() => {
+      gw.request<GatewaySkin>('skin.preview', { name: selected.name })
+        .then(
+          skin =>
+            generation === previewGeneration.current &&
+            persistedRevision === getPersistedSkinRevision() &&
+            applySkinPreview(skin)
+        )
+        .catch(
+          (error: unknown) =>
+            generation === previewGeneration.current &&
+            persistedRevision === getPersistedSkinRevision() &&
+            setErr(rpcErrorMessage(error))
+        )
     }, SKIN_PREVIEW_DEBOUNCE_MS)
 
     return () => {
-      current = false
+      previewGeneration.current += 1
       clearTimeout(timer)
     }
   }, [gw, options, selected])
 
   const cancel = () => {
-    if (options?.active_skin) {
-      applySkinPreview(options.active_skin)
-    }
-
+    previewGeneration.current += 1
+    restorePersistedSkin(options?.active_skin)
     onClose()
   }
 
@@ -117,6 +127,7 @@ export function SkinPicker({ gw, maxWidth, onClose, t }: SkinPickerProps) {
           throw new Error('skin selection was not saved')
         }
 
+        previewGeneration.current += 1
         onClose()
       })
       .catch((error: unknown) => {
@@ -130,7 +141,7 @@ export function SkinPicker({ gw, maxWidth, onClose, t }: SkinPickerProps) {
       return
     }
 
-    if (key.escape) {
+    if (key.escape || (key.ctrl && (input.toLowerCase() === 'c' || input === '\u0003'))) {
       return cancel()
     }
 

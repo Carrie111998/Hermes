@@ -52,6 +52,40 @@ def test_skin_preview_rejects_unknown_names(tmp_path, monkeypatch):
     assert response["error"]["code"] == 4002
 
 
+def test_skin_preview_rejects_traversal_names_from_user_skin_metadata(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(server, "_hermes_home", tmp_path)
+    skins_dir = tmp_path / "skins"
+    skins_dir.mkdir()
+    (skins_dir / "decoy.yaml").write_text(
+        yaml.safe_dump({"name": "../outside", "description": "unsafe metadata"}),
+        encoding="utf-8",
+    )
+    (tmp_path / "outside.yaml").write_text(
+        yaml.safe_dump({"name": "outside", "branding": {"agent_name": "Leaked Agent"}}),
+        encoding="utf-8",
+    )
+
+    response = server._methods["skin.preview"]("skin-preview", {"name": "../outside"})
+
+    assert response["error"]["code"] == 4002
+    assert "result" not in response
+
+
+def test_config_set_rejects_skin_names_outside_discovered_options(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(server, "_hermes_home", tmp_path)
+    (tmp_path / "config.yaml").write_text("display:\n  skin: default\n", encoding="utf-8")
+
+    response = server._methods["config.set"](
+        "skin-set",
+        {"key": "skin", "value": "../outside"},
+    )
+
+    assert response["error"]["code"] == 4002
+    assert "skin: default" in (tmp_path / "config.yaml").read_text(encoding="utf-8")
+
+
 def test_skin_options_rejects_an_empty_active_skin_payload(monkeypatch):
     handler = server._methods["skin.options"]
     monkeypatch.setitem(handler.__globals__, "resolve_skin", lambda _name=None: {})
