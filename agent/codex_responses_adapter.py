@@ -1581,6 +1581,7 @@ def _normalize_codex_response(
 
     content_parts: List[str] = []
     reasoning_parts: List[str] = []
+    commentary_parts: List[str] = []
     reasoning_items_raw: List[Dict[str, Any]] = []
     message_items_raw: List[Dict[str, Any]] = []
     tool_calls: List[Any] = []
@@ -1636,11 +1637,13 @@ def _normalize_codex_response(
             item_phase = getattr(item, "phase", None)
             normalized_phase = None
             is_commentary_phase = False
+            is_analysis_phase = False
             if isinstance(item_phase, str):
                 normalized_phase = item_phase.strip().lower()
                 if normalized_phase in {"commentary", "analysis"}:
                     saw_commentary_phase = True
                     is_commentary_phase = True
+                    is_analysis_phase = normalized_phase == "analysis"
                 elif normalized_phase in {"final_answer", "final"}:
                     saw_final_answer_phase = True
             message_text = _extract_responses_message_text(item)
@@ -1649,12 +1652,17 @@ def _normalize_codex_response(
                 # preamble/progress narration, never the turn's final answer
                 # (Codex CLI excludes it from last-message extraction; issues
                 # #24933 / #41293).  Keep it out of assistant content so it
-                # can't be concatenated into — or leak as — the final response,
-                # but surface it through the reasoning channel so the CLI/
-                # gateway display it like thinking text.  The exact message
-                # item is still preserved below for replay/cache continuity.
-                if is_commentary_phase:
+                # can't be concatenated into — or leak as — the final response.
+                # ``analysis`` is provider scratchpad and always goes to the
+                # reasoning channel.  ``commentary`` is held aside instead:
+                # once the output items are known it is promoted to content on
+                # a tool-call turn (see below), and otherwise falls back to
+                # reasoning.  The exact message item is still preserved below
+                # for replay/cache continuity.
+                if is_analysis_phase:
                     reasoning_parts.append(message_text)
+                elif is_commentary_phase:
+                    commentary_parts.append(message_text)
                 else:
                     content_parts.append(message_text)
                 raw_message_item: Dict[str, Any] = {
@@ -1767,7 +1775,46 @@ def _normalize_codex_response(
                 function=SimpleNamespace(name=fn_name, arguments=arguments),
             ))
 
+    # ── Commentary promotion on tool-call turns ──────────────────
+    # Chat-completions providers deliver narration and a tool call in ONE
+    # assistant message, so a skill can report to the user and checkpoint in
+    # the same turn. The Responses API splits that into a ``commentary``
+    # message item plus a ``function_call`` item; routing commentary to the
+    # reasoning channel made that narration render as thinking text and
+    # vanish from persisted ``content`` — silently dropping user-facing
+    # reports on any surface that rebuilds history from the database.
+    #
+    # When the turn carries tool calls it cannot be the final answer, so the
+    # leak this guarded against is impossible: promote commentary to content
+    # and restore chat-completions parity. Replay is unaffected — history
+    # resends ``codex_message_items`` verbatim and skips ``content`` whenever
+    # those items exist, so the text is never sent twice.
+    #
+    # Two shapes keep the old routing. With no tool calls, commentary is an
+    # unfinished turn feeding the incomplete-continuation path. With a
+    # ``final_answer`` item present, content already holds the real answer and
+    # merging narration into it is the leak the original guard was written
+    # for — the interim callback still surfaces commentary in both cases.
+    #
+    # Commentary is merged after the content join rather than spliced into
+    # ``content_parts``, because the two are distinct output message items.
+    # A single "\n" is only a soft break in Markdown, so a report ending in a
+    # list or a paragraph would absorb the text that follows it; promoted
+    # narration is separated from the rest of the turn's content — and from a
+    # second commentary item — by a blank line instead.
+    promoted_commentary = ""
+    if commentary_parts:
+        if tool_calls and not saw_final_answer_phase:
+            promoted_commentary = "\n\n".join([p for p in commentary_parts if p])
+        else:
+            reasoning_parts.extend(commentary_parts)
+
     final_text = "\n".join([p for p in content_parts if p]).strip()
+    if promoted_commentary:
+        final_text = (
+            f"{promoted_commentary}\n\n{final_text}" if final_text
+            else promoted_commentary
+        ).strip()
     if (
         not final_text
         and hasattr(response, "output_text")
