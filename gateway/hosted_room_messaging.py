@@ -354,17 +354,21 @@ def _frozen_desktop_recipients(room: Mapping[str, Any]) -> list[dict[str, Any]]:
     return recipients
 
 
-def _latest_projected_thread(room: Mapping[str, Any]) -> str:
+def _latest_projected_stop_target(room: Mapping[str, Any]) -> tuple[str, str]:
     raw_log = room.get("log")
     if not isinstance(raw_log, list):
-        return ""
+        return "", ""
     for entry in reversed(raw_log):
         if not isinstance(entry, Mapping):
             continue
+        actor = entry.get("from")
+        if not isinstance(actor, Mapping) or actor.get("kind") != "user":
+            continue
         thread = str(entry.get("thread") or "").strip()
         if thread:
-            return thread[:128]
-    return ""
+            message_id = str(entry.get("eventId") or entry.get("id") or "").strip()
+            return thread[:128], message_id[:160]
+    return "", ""
 
 
 class RoomControlError(ValueError):
@@ -784,98 +788,27 @@ def _retry_receipt_plan(
     task_ids: list[str],
 ) -> tuple[list[str], str | None]:
     """Freeze one transport delivery to one bounded retry decision."""
+    from gateway.hosted_room_messaging_retries import (
+        MessagingRetryReceiptError,
+        retry_receipt_plan,
+    )
 
-    db_path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(db_path, timeout=10)
-    conn.row_factory = sqlite3.Row
     try:
-        from hermes_state import apply_wal_with_fallback
-
-        apply_wal_with_fallback(conn, db_label="state.db (Group Chat retry receipts)")
-        conn.execute("BEGIN IMMEDIATE")
-        conn.execute(
-            """CREATE TABLE IF NOT EXISTS hosted_room_messaging_retries (
-                   command_id TEXT PRIMARY KEY,
-                   room_id TEXT NOT NULL,
-                   actor_json TEXT NOT NULL,
-                   task_ids_json TEXT NOT NULL,
-                   state TEXT NOT NULL,
-                   result_text TEXT,
-                   created_at REAL NOT NULL,
-                   updated_at REAL NOT NULL
-               )"""
+        return retry_receipt_plan(
+            db_path,
+            command_id=command_id,
+            room_id=room_id,
+            actor=actor,
+            task_ids=task_ids,
         )
-        encoded_actor = json.dumps(
-            dict(actor), ensure_ascii=True, sort_keys=True, separators=(",", ":")
-        )
-        existing = conn.execute(
-            "SELECT * FROM hosted_room_messaging_retries WHERE command_id = ?",
-            (command_id,),
-        ).fetchone()
-        if existing is not None:
-            if (
-                str(existing["room_id"]) != room_id
-                or str(existing["actor_json"]) != encoded_actor
-            ):
-                raise RoomControlError(
-                    "This retry delivery was already used for different Group Chat work."
-                )
-            frozen = [
-                str(item)
-                for item in json.loads(str(existing["task_ids_json"]))
-                if str(item)
-            ]
-            result = (
-                str(existing["result_text"])
-                if existing["state"] == "completed" and existing["result_text"]
-                else None
-            )
-            conn.commit()
-            return frozen, result
-        if not task_ids:
-            raise RoomControlError("This Group Chat has no failed work to retry.")
-        now = time.time()
-        conn.execute(
-            """INSERT INTO hosted_room_messaging_retries (
-                   command_id, room_id, actor_json, task_ids_json, state,
-                   result_text, created_at, updated_at
-               ) VALUES (?, ?, ?, ?, 'pending', NULL, ?, ?)""",
-            (
-                command_id,
-                room_id,
-                encoded_actor,
-                json.dumps(task_ids, ensure_ascii=True, separators=(",", ":")),
-                now,
-                now,
-            ),
-        )
-        conn.commit()
-        return task_ids, None
-    except Exception:
-        conn.rollback()
-        raise
-    finally:
-        conn.close()
+    except MessagingRetryReceiptError as exc:
+        raise RoomControlError(str(exc)) from exc
 
 
 def _complete_retry_receipt(db_path: Path, *, command_id: str, result: str) -> None:
-    conn = sqlite3.connect(db_path, timeout=10)
-    try:
-        conn.execute("BEGIN IMMEDIATE")
-        changed = conn.execute(
-            """UPDATE hosted_room_messaging_retries
-                  SET state='completed', result_text=?, updated_at=?
-                WHERE command_id=? AND state='pending'""",
-            (result, time.time(), command_id),
-        )
-        if changed.rowcount not in {0, 1}:
-            raise RuntimeError("Group Chat retry receipt changed more than once")
-        conn.commit()
-    except Exception:
-        conn.rollback()
-        raise
-    finally:
-        conn.close()
+    from gateway.hosted_room_messaging_retries import complete_retry_receipt
+
+    complete_retry_receipt(db_path, command_id=command_id, result=result)
 
 
 @dataclass(frozen=True)
@@ -993,15 +926,18 @@ class MessagingRoomBackend:
             raise hosted_rooms.AuthorityConflictError(
                 "This Group Chat moved to another connected device. Open it there and try again."
             )
-        hosted_rooms.request_room_stop(
+        stop_event = hosted_rooms.request_room_stop(
             self.db_path,
             room_id=room_id,
             cancel_id=cancel_id,
             expected_gateway_id=local_gateway_id,
             expected_epoch=int(room["authority_epoch"]),
         )
+        stop_seq = int(stop_event["seq"])
         requested = 0
         for task in driver.list_tasks(self.db_path, room_id=room_id):
+            if int(task["payload"]["source_event_seq"]) >= stop_seq:
+                continue
             for _attempt in range(3):
                 current = driver.get_task(self.db_path, task["identity"])
                 status = str(current.get("status") or "")
@@ -1128,9 +1064,7 @@ def parse_room_command(args: str, *, command_root: str = "/group") -> RoomComman
     action = entity_first[1].casefold()
     remainder = entity_first[2].strip() if len(entity_first) == 3 else ""
     if action == "send":
-        message = remainder.removeprefix("--").strip()
-        if len(message) >= 2 and message[0] == message[-1] and message[0] in {'"', "'"}:
-            message = message[1:-1].strip()
+        message = remainder
         if not message:
             raise RoomControlError(f"Use `{command_root} <number> send <message>`.")
         return RoomCommand("send", room_query, message)
@@ -1370,6 +1304,7 @@ def format_room_detail(
     room: Mapping[str, Any],
     *,
     room_command: str = "/group",
+    show_approvals: bool = False,
 ) -> str:
     """Render status plus the latest visible room messages."""
 
@@ -1494,14 +1429,15 @@ def format_room_detail(
         lines.extend(["", "No messages yet."])
     from gateway.hosted_room_messaging_approvals import format_pending_approvals
 
-    approval_section = format_pending_approvals(
-        service,
-        room,
-        room_reference=str(room_reference(room)),
-        room_command=room_command,
-    )
-    if approval_section:
-        lines.extend(["", approval_section])
+    if show_approvals:
+        approval_section = format_pending_approvals(
+            service,
+            room,
+            room_reference=str(room_reference(room)),
+            room_command=room_command,
+        )
+        if approval_section:
+            lines.extend(["", approval_section])
     failed_commands = int(room.get("desktop_failed_commands") or 0)
     show_retry, show_stop = _room_action_flags(
         service,
@@ -1631,6 +1567,9 @@ def messaging_event_id(event: Any) -> str:
         str(value or "")
         for value in (
             platform,
+            getattr(source, "profile", None) or "default",
+            messaging_transport_profile(event),
+            getattr(source, "scope_id", None) or getattr(source, "guild_id", None),
             getattr(source, "chat_id", None),
             getattr(source, "thread_id", None),
             getattr(source, "user_id_alt", None)
@@ -1640,6 +1579,21 @@ def messaging_event_id(event: Any) -> str:
         )
     )
     return f"messaging:{hashlib.sha256(material.encode()).hexdigest()}"
+
+
+def messaging_transport_profile(event: Any) -> str:
+    """Return the locally trusted profile that owns the receiving adapter."""
+
+    source = getattr(event, "source", None)
+    adapter_ref = getattr(source, "_transport_adapter_ref", None)
+    try:
+        adapter = adapter_ref() if callable(adapter_ref) else adapter_ref
+    except Exception:
+        adapter = None
+    if adapter is not None:
+        owner = str(getattr(adapter, "_owner_profile", None) or "").strip()
+        return owner or "default"
+    return str(getattr(source, "profile", None) or "default")
 
 
 def ensure_text_only(event: Any) -> None:
@@ -1803,7 +1757,11 @@ def stop_room(service: Any, room: Mapping[str, Any], event: Any) -> str:
             and current.get("state") in {"claimed", "pending"}
             else ""
         )
-        target_thread_id = _latest_projected_thread(room)
+        target_thread_id, target_message_id = _latest_projected_stop_target(room)
+        if not target_command_id and not target_message_id:
+            raise RoomControlError(
+                "Open this Group Chat in Hermes Desktop to Stop it safely."
+            )
         enqueue_command(
             default_db_path(),
             command_id=cancel_id,
@@ -1817,6 +1775,11 @@ def stop_room(service: Any, room: Mapping[str, Any], event: Any) -> str:
                     else {}
                 ),
                 **({"target_thread_id": target_thread_id} if target_thread_id else {}),
+                **(
+                    {"target_message_id": target_message_id}
+                    if not target_command_id and target_message_id
+                    else {}
+                ),
             },
         )
         if room.get("desktop_available"):
@@ -1871,6 +1834,7 @@ def retry_room(service: Any, room: Mapping[str, Any], event: Any) -> str:
         return f"Retry queued for {name} ({retried} {suffix})."
     if room.get("_room_mode") == "desktop":
         from gateway.desktop_room_mailbox import (
+            DesktopRoomMailboxError,
             default_db_path,
             retry_failed_commands,
             retryable_command_ids,
@@ -1888,10 +1852,15 @@ def retry_room(service: Any, room: Mapping[str, Any], event: Any) -> str:
         except RoomControlError as exc:
             if str(exc) != "This Group Chat has no failed work to retry.":
                 raise
-            target_ids = retryable_command_ids(
-                mailbox_db,
-                room_id=room_id,
-            )
+            try:
+                target_ids = retryable_command_ids(
+                    mailbox_db,
+                    room_id=room_id,
+                )
+            except DesktopRoomMailboxError as mailbox_error:
+                raise RoomControlError(
+                    "This Group Chat has no failed work to retry."
+                ) from mailbox_error
             frozen, completed = _retry_receipt_plan(
                 receipt_db,
                 command_id=command_id,

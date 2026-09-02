@@ -850,9 +850,15 @@ def submit_room_approval(
     *,
     command_id: str,
     choice: str,
+    installation_owner_authorized: bool,
     selection: str = "",
     expected_request_id: str = "",
 ) -> tuple[int, dict[str, Any], dict[str, Any]]:
+    if installation_owner_authorized is not True:
+        raise MessagingApprovalError(
+            "Approve or deny Bot commands from the installation owner’s "
+            "authorized one-to-one Hermes chat."
+        )
     if room.get("_room_mode") == "desktop":
         raise MessagingApprovalError(
             "This Group Chat runs in Desktop. Approve or deny the command there."

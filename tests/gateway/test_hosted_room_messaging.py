@@ -704,6 +704,37 @@ def test_legacy_desktop_room_control_requests_one_current_desktop_open(
         )
 
 
+def test_classic_stop_targets_the_latest_user_message_not_only_its_thread(
+    tmp_path, monkeypatch
+):
+    from gateway import desktop_room_mailbox
+
+    home = tmp_path / "hermes"
+    _seed_classic_projection(home)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    service = _FakeService(tmp_path / "state.db")
+    room = list_messaging_rooms(service)[0]
+
+    stop_room(
+        service,
+        room,
+        _event("/group 1 stop", message_id="stop-message-fence"),
+    )
+    claimed = desktop_room_mailbox.claim_commands(
+        desktop_room_mailbox.default_db_path(),
+        consumer_id="desktop:test",
+        room_authorities=[
+            {"room_id": "classic-room", "authority_token": "authority:test"}
+        ],
+        actions=["stop"],
+    )
+
+    assert claimed[0]["payload"] == {
+        "target_message_id": "message-1",
+        "target_thread_id": "thread-1",
+    }
+
+
 def test_classic_room_detail_surfaces_failed_command_recovery(tmp_path, monkeypatch):
     from gateway import desktop_room_mailbox
 
@@ -797,8 +828,10 @@ def test_classic_retry_requeues_all_expired_commands_and_replays_receipt(
 @pytest.mark.parametrize(
     ("raw", "expected"),
     [
-        ('1 send "hi there"', ("send", "1", "hi there")),
-        ("1 send -- quoted style", ("send", "1", "quoted style")),
+        ('1 send "hi there"', ("send", "1", '"hi there"')),
+        ('1 send "a" and "b"', ("send", "1", '"a" and "b"')),
+        ("1 send --literal-prefix", ("send", "1", "--literal-prefix")),
+        ("1 send -- quoted style", ("send", "1", "-- quoted style")),
         ("1 stop", ("stop", "1", "")),
         ("1 retry", ("retry", "1", "")),
         ("1 approve", ("approve", "1", "")),
@@ -809,6 +842,28 @@ def test_classic_retry_requeues_all_expired_commands_and_replays_receipt(
 def test_parse_room_command_keeps_names_and_message_content(raw, expected):
     parsed = parse_room_command(raw)
     assert (parsed.action, parsed.room_query, parsed.message) == expected
+
+
+def test_empty_classic_retry_keeps_actionable_user_error(tmp_path, monkeypatch):
+    from gateway.desktop_room_mailbox import DesktopRoomMailboxError
+
+    service = _FakeService(tmp_path / "state.db")
+    room = {
+        "room_id": "classic-room",
+        "name": "Desktop planning",
+        "_room_mode": "desktop",
+    }
+
+    def no_retryable_commands(*_args, **_kwargs):
+        raise DesktopRoomMailboxError("no failed Group Chat command needs retry")
+
+    monkeypatch.setattr(
+        "gateway.desktop_room_mailbox.retryable_command_ids",
+        no_retryable_commands,
+    )
+
+    with pytest.raises(RoomControlError, match="no failed work to retry"):
+        retry_room(service, room, _event("/group 1 retry", message_id="empty-retry"))
 
 
 @pytest.mark.parametrize("raw", ["", "send room", "send -- hello", "stop"])
@@ -1762,6 +1817,7 @@ def test_group_detail_surfaces_exact_pending_approval_commands(tmp_path):
     detail = format_room_detail(
         MessagingRoomBackend(db_path=db),
         release,
+        show_approvals=True,
     )
 
     assert "⚠️ **Approval needed**" in detail

@@ -586,6 +586,7 @@ def test_desktop_hosted_approval_names_the_supported_surface(tmp_path):
             {"room_id": "classic-room", "_room_mode": "desktop"},
             command_id="approval-command-1",
             choice="once",
+            installation_owner_authorized=True,
         )
 
     with pytest.raises(
@@ -597,6 +598,25 @@ def test_desktop_hosted_approval_names_the_supported_surface(tmp_path):
             {"room_id": "remote-room", "_room_mode": "remote"},
             command_id="approval-command-2",
             choice="once",
+            installation_owner_authorized=True,
+        )
+
+
+def test_secondary_profile_cannot_submit_room_approval(tmp_path):
+    class Backend:
+        db_path = tmp_path / "state.db"
+        service = None
+
+    with pytest.raises(
+        approvals.MessagingApprovalError,
+        match="installation owner",
+    ):
+        approvals.submit_room_approval(
+            Backend(),
+            {"room_id": "room-1"},
+            command_id="approval-command-secondary",
+            choice="once",
+            installation_owner_authorized=False,
         )
 
 

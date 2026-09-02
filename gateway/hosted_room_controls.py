@@ -37,6 +37,7 @@ MAX_LOAD_LINKS = MAX_PEER_LINKS
 MAX_ROOM_NAME_CHARS = 200
 MAX_ROOM_MEMBERS = 64
 MAX_CONTROL_COMMANDS = 4096
+CONTROL_COMMAND_RETENTION_SECONDS = 30 * 24 * 60 * 60
 ROOM_LIFETIME_EXPIRES_AT = 253_402_300_799.0
 _JOURNAL_MODE_LOCK_RETRIES = 5
 
@@ -326,6 +327,10 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
             created_at REAL NOT NULL,
             updated_at REAL NOT NULL
         )"""
+    )
+    conn.execute(
+        """CREATE INDEX IF NOT EXISTS idx_hosted_room_control_commands_retention
+           ON hosted_room_control_commands(state, updated_at, command_id)"""
     )
 
 
@@ -1173,13 +1178,37 @@ def begin_control_retry(
                 result=result,
                 idempotent=True,
             )
+        conn.execute(
+            """DELETE FROM hosted_room_control_commands
+                 WHERE command_id IN (
+                     SELECT command_id FROM hosted_room_control_commands
+                      WHERE state='completed' AND updated_at<?
+                      ORDER BY updated_at, command_id
+                      LIMIT ?
+                 )""",
+            (timestamp - CONTROL_COMMAND_RETENTION_SECONDS, MAX_CONTROL_COMMANDS),
+        )
         count = conn.execute(
             "SELECT COUNT(*) FROM hosted_room_control_commands"
         ).fetchone()[0]
         if int(count) >= MAX_CONTROL_COMMANDS:
+            conn.execute(
+                """DELETE FROM hosted_room_control_commands
+                     WHERE command_id IN (
+                         SELECT command_id FROM hosted_room_control_commands
+                          WHERE state='completed'
+                          ORDER BY updated_at, command_id
+                          LIMIT ?
+                     )""",
+                (int(count) - MAX_CONTROL_COMMANDS + 1,),
+            )
+            count = conn.execute(
+                "SELECT COUNT(*) FROM hosted_room_control_commands"
+            ).fetchone()[0]
+        if int(count) >= MAX_CONTROL_COMMANDS:
             raise HostedRoomControlError("stored control command limit reached")
         if not frozen:
-            raise HostedRoomControlError("retry task_ids must contain 1-8 tasks")
+            raise HostedRoomControlError("This Group Chat has no failed work to retry.")
         conn.execute(
             """INSERT INTO hosted_room_control_commands (
                    command_id, room_id, member_id, action, task_ids_json,

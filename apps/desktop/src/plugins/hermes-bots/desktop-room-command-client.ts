@@ -13,6 +13,7 @@ export interface DesktopRoomDescriptor {
 
 export interface DesktopRoomCommand {
   action?: string
+  attempts?: number
   command_id?: string
   lease_token?: string
   payload?: Record<string, unknown>

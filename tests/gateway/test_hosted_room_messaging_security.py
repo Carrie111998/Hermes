@@ -65,6 +65,24 @@ async def test_dm_label_without_one_to_one_proof_cannot_control_group_chats(
 
 
 @pytest.mark.asyncio
+async def test_unknown_chat_type_fails_closed_even_with_private_transport_proof(
+    tmp_path, monkeypatch
+):
+    service = _FakeService(tmp_path / "state.db")
+    monkeypatch.setattr(
+        "gateway.hosted_room_messaging.current_room_backend", lambda: service
+    )
+
+    result = await _runner()._handle_rooms_command(
+        _event("/group", chat_type="", is_one_to_one=True)
+    )
+
+    assert result == (
+        "Group Chat controls are private. Use your authorized one-to-one Hermes chat."
+    )
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "platform",
     [Platform.WHATSAPP_CLOUD, Platform.EMAIL, Platform.SMS],
@@ -137,6 +155,33 @@ async def test_mutating_group_chat_commands_have_a_per_sender_rate_limit(
     assert len(service.sent) == 2
 
 
+@pytest.mark.asyncio
+async def test_rate_limits_are_isolated_by_receiving_adapter_profile(
+    tmp_path, monkeypatch
+):
+    db, _, _ = _seed_rooms(tmp_path)
+    service = _FakeService(db)
+    runner = _runner()
+    monkeypatch.setattr(
+        "gateway.hosted_room_messaging.current_room_backend", lambda: service
+    )
+    monkeypatch.setattr("gateway.group_chat_slash._GROUP_CHAT_MUTATION_RATE_LIMIT", 1)
+    secondary = _event("/group 1 send from secondary", message_id="rate-secondary")
+    secondary.source.profile = "default"
+    secondary.source._transport_adapter_ref = lambda: SimpleNamespace(
+        _owner_profile="ops"
+    )
+    primary = _event("/group 1 send from primary", message_id="rate-primary")
+    primary.source._transport_adapter_ref = lambda: SimpleNamespace(_owner_profile=None)
+
+    first = await runner._handle_rooms_command(secondary)
+    second = await runner._handle_rooms_command(primary)
+
+    assert first.startswith("Queued in")
+    assert second.startswith("Queued in")
+    assert len(service.sent) == 2
+
+
 @pytest.mark.parametrize(
     "raw_message",
     [
@@ -169,6 +214,133 @@ def test_signal_group_idempotency_includes_sender_identity():
         event.source.message_id = None
         event.raw_message = {"timestamp_ms": 1770000000000}
     assert messaging_event_id(first) != messaging_event_id(second)
+
+
+def test_messaging_idempotency_includes_profile_and_workspace_scope():
+    default = _event("/group 1 send hello", platform=Platform.TELEGRAM)
+    secondary = _event("/group 1 send hello", platform=Platform.TELEGRAM)
+    secondary.source.profile = "ops"
+    assert messaging_event_id(default) != messaging_event_id(secondary)
+
+    first_workspace = _event("/group 1 send hello", platform=Platform.SLACK)
+    second_workspace = _event("/group 1 send hello", platform=Platform.SLACK)
+    first_workspace.source.scope_id = "workspace-a"
+    second_workspace.source.scope_id = "workspace-b"
+    assert messaging_event_id(first_workspace) != messaging_event_id(second_workspace)
+
+
+def test_messaging_idempotency_includes_receiving_adapter_profile():
+    default = _event("/group 1 send hello", platform=Platform.TELEGRAM)
+    secondary = _event("/group 1 send hello", platform=Platform.TELEGRAM)
+    default.source.profile = secondary.source.profile = "default"
+    default.source._transport_adapter_ref = lambda: SimpleNamespace(_owner_profile=None)
+    secondary.source._transport_adapter_ref = lambda: SimpleNamespace(
+        _owner_profile="ops"
+    )
+
+    assert messaging_event_id(default) != messaging_event_id(secondary)
+
+
+def test_secondary_profile_adapter_supplies_the_typed_command_prefix():
+    runner = _runner(platform=Platform.SLACK)
+    runner.adapters = {}
+    runner._profile_adapters = {
+        "ops": {Platform.SLACK: SimpleNamespace(typed_command_prefix="!")}
+    }
+    source = _event("!group", platform=Platform.SLACK).source
+    source.profile = "ops"
+
+    assert runner._typed_command_prefix_for(source) == "!"
+
+
+@pytest.mark.parametrize("platform", [Platform.SLACK, Platform.MATRIX])
+def test_relayed_platform_keeps_its_usable_typed_command_prefix(platform):
+    runner = _runner(platform=platform)
+    source = _event("!group", platform=platform).source
+    source.delivered_via_upstream_relay = True
+
+    assert runner._typed_command_prefix_for(source) == "!"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "command",
+    ["/group 1 approvals", "/group 1 approve ABCDEF"],
+)
+async def test_secondary_profile_cannot_view_or_apply_group_chat_approvals(
+    tmp_path, monkeypatch, command
+):
+    db, _, _ = _seed_rooms(tmp_path)
+    service = _FakeService(db)
+    monkeypatch.setattr(
+        "gateway.hosted_room_messaging.current_room_backend", lambda: service
+    )
+    event = _event(command)
+    event.source.profile = "ops"
+
+    result = await _runner()._handle_rooms_command(event)
+
+    assert "installation owner" in result
+
+
+@pytest.mark.asyncio
+async def test_secondary_adapter_routed_to_default_cannot_apply_approval(
+    tmp_path, monkeypatch
+):
+    db, _, _ = _seed_rooms(tmp_path)
+    service = _FakeService(db)
+    monkeypatch.setattr(
+        "gateway.hosted_room_messaging.current_room_backend", lambda: service
+    )
+    event = _event("/group 1 approve ABCDEF")
+    event.source.profile = "default"
+    event.source._transport_adapter_ref = lambda: SimpleNamespace(_owner_profile="ops")
+
+    result = await _runner()._handle_rooms_command(event)
+
+    assert "installation owner" in result
+
+
+@pytest.mark.asyncio
+async def test_secondary_profile_room_detail_hides_approval_command_and_code(
+    tmp_path, monkeypatch
+):
+    db, _, _ = _seed_rooms(tmp_path)
+    service = _FakeService(db)
+    service.room_status = {
+        "running": True,
+        "working": False,
+        "blocked": True,
+        "pending_actions": [
+            {
+                "kind": "approval",
+                "authority_gateway_id": "install:test-gateway",
+                "authority_epoch": 1,
+                "member_id": "ops",
+                "task_id": "task-secret",
+                "execution_generation": 1,
+                "request_id": "request-secret",
+                "approval": {
+                    "description": "Read a private deployment key",
+                    "command": "cat /private/deployment-key",
+                    "choices": ["once", "deny"],
+                },
+            }
+        ],
+    }
+    monkeypatch.setattr(
+        "gateway.hosted_room_messaging.current_room_backend", lambda: service
+    )
+    secondary = _event("/group 1")
+    secondary.source.profile = "ops"
+
+    hidden = await _runner()._handle_rooms_command(secondary)
+    visible = await _runner()._handle_rooms_command(_event("/group 1"))
+
+    assert "deployment-key" not in hidden
+    assert "Approval needed" not in hidden
+    assert "deployment-key" in visible
+    assert "Approval needed" in visible
 
 
 @pytest.mark.asyncio
@@ -211,6 +383,25 @@ async def test_entity_first_group_send_is_dispatched(tmp_path, monkeypatch):
 
     assert result == "Queued in Release room. Check: `/group 1`."
     assert service.sent[-1]["payload"]["text"] == "hello from Signal"
+
+
+@pytest.mark.asyncio
+async def test_group_send_preserves_unicode_dashes_in_message_text(
+    tmp_path, monkeypatch
+):
+    db, _, _ = _seed_rooms(tmp_path)
+    service = _FakeService(db)
+    monkeypatch.setattr(
+        "gateway.hosted_room_messaging.current_room_backend", lambda: service
+    )
+    message = "Ship—today; validate range 1–3"
+
+    result = await _runner()._handle_rooms_command(
+        _event(f"/group 1 send {message}", message_id="unicode-dash-send")
+    )
+
+    assert result.startswith("Queued in Release room")
+    assert service.sent[-1]["payload"]["text"] == message
 
 
 @pytest.mark.asyncio

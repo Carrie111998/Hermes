@@ -379,7 +379,7 @@ describe('classic Group Chat command runtime', () => {
       {
         action: 'stop',
         command_id: 'messaging:stop-earlier',
-        payload: { target_thread_id: 'thread-old' },
+        payload: { target_message_id: 'old-message', target_thread_id: 'thread-old' },
         room_id: 'room-1'
       },
       descriptors,
@@ -414,5 +414,127 @@ describe('classic Group Chat command runtime', () => {
     await vi.advanceTimersByTimeAsync(250)
     await abandonedExpectation
     expect(groupRounds.cancelGroupThreadForLeaseLoss).toHaveBeenCalledWith('Planning', members)
+  })
+
+  it('does not re-drive terminal Stops or stop newer same-thread work', async () => {
+    const loaded = await loadRuntime()
+    const stored = new Map<string, unknown>()
+    const members = [{ connectionId: 'gateway-a', name: 'online' }]
+
+    loaded.data.$lastRoster.set(members)
+    loaded.chat.$groupChats.set({
+      Planning: {
+        log: [
+          {
+            at: 2,
+            from: { kind: 'user', name: 'You' },
+            id: 'new-message',
+            text: 'Newer work in the same thread',
+            thread: 'thread-1'
+          }
+        ],
+        members,
+        roomId: 'room-1',
+        sessions: {},
+        watermarks: {}
+      }
+    })
+    await loaded.runtime.startDesktopRoomCommandRuntime(scriptedStorage(stored).storage)
+    const descriptors = [{ authorityToken: 'authority:test', name: 'Planning', roomId: 'room-1' }]
+    const context = {
+      consumerId: 'desktop:test',
+      request: vi.fn(async () => ({})),
+      route: {
+        connectionId: 'gateway-a',
+        mode: 'remote' as const,
+        profile: 'default',
+        targetProfile: 'default'
+      },
+      signal: null
+    }
+
+    const terminal = await loaded.runtime.executeDesktopRoomCommand(
+      {
+        action: 'stop',
+        command_id: 'messaging:stop-terminal',
+        payload: { target_command_id: 'messaging:send-complete' },
+        room_id: 'room-1',
+        target_command_state: 'completed'
+      },
+      descriptors,
+      context
+    )
+    const stale = await loaded.runtime.executeDesktopRoomCommand(
+      {
+        action: 'stop',
+        command_id: 'messaging:stop-stale',
+        payload: { target_message_id: 'old-message', target_thread_id: 'thread-1' },
+        room_id: 'room-1'
+      },
+      descriptors,
+      context
+    )
+
+    expect(terminal).toEqual({ room_name: 'Planning', stale: true, stopped: false })
+    expect(stale).toEqual({ room_name: 'Planning', stale: true, stopped: false })
+    expect(groupRounds.stopGroupThread).not.toHaveBeenCalled()
+    loaded.runtime.stopDesktopRoomCommandRuntime()
+  })
+
+  it('bounds repeated classic room execution after the final mailbox claim', async () => {
+    const loaded = await loadRuntime()
+    const stored = new Map<string, unknown>()
+    const members = [{ connectionId: 'gateway-a', name: 'online' }]
+
+    loaded.data.$lastRoster.set(members)
+    loaded.chat.$groupChats.set({
+      Planning: {
+        log: [],
+        members,
+        roomId: 'room-1',
+        sessions: {},
+        watermarks: {}
+      }
+    })
+    groupRounds.sendToGroupChat.mockImplementation(() => {
+      const room = loaded.chat.$groupChats.get().Planning
+      loaded.chat.$groupChats.set({ Planning: { ...room, running: false } })
+
+      return 'thread-rejected'
+    })
+    await loaded.runtime.startDesktopRoomCommandRuntime(scriptedStorage(stored).storage)
+
+    const execution = loaded.runtime.executeDesktopRoomCommand(
+      {
+        action: 'send',
+        attempts: 2,
+        command_id: 'messaging:send-rejected',
+        payload: { message: 'Review the plan', recipients: members },
+        room_id: 'room-1'
+      },
+      [{ authorityToken: 'authority:test', name: 'Planning', roomId: 'room-1' }],
+      {
+        consumerId: 'desktop:test',
+        request: vi.fn(async () => ({})),
+        route: {
+          connectionId: 'gateway-a',
+          mode: 'remote',
+          profile: 'default',
+          targetProfile: 'default'
+        },
+        signal: null
+      }
+    )
+    const outcome = execution.then(
+      () => null,
+      error => error as Error & { retryable?: boolean }
+    )
+
+    await vi.advanceTimersByTimeAsync(250)
+    const error = await outcome
+    expect(error?.message).toContain('after repeated attempts')
+    expect(error?.retryable).not.toBe(true)
+    expect(groupRounds.sendToGroupChat).toHaveBeenCalledTimes(2)
+    loaded.runtime.stopDesktopRoomCommandRuntime()
   })
 })

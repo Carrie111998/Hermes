@@ -132,7 +132,7 @@ class GatewaySlashCommandsMixin(
 
     async_session_store: AsyncSessionStore
 
-    def _typed_command_prefix_for(self, platform) -> str:
+    def _typed_command_prefix_for(self, source_or_platform) -> str:
         """Return the prefix users can always type to reach Hermes commands.
 
         Reads the adapter's ``typed_command_prefix`` capability flag
@@ -142,7 +142,27 @@ class GatewaySlashCommandsMixin(
         Instruction text built for those platforms must show the prefix
         that actually works when typed.
         """
-        adapter = self.adapters.get(platform) if getattr(self, "adapters", None) else None
+        source = (
+            source_or_platform
+            if getattr(source_or_platform, "platform", None) is not None
+            else None
+        )
+        platform = source.platform if source is not None else source_or_platform
+        if (
+            source is not None
+            and getattr(source, "delivered_via_upstream_relay", False) is True
+            and platform in {Platform.SLACK, Platform.MATRIX}
+        ):
+            return "!"
+        adapter = (
+            self._adapter_for_source(source)
+            if source is not None
+            else (
+                self.adapters.get(platform)
+                if getattr(self, "adapters", None)
+                else None
+            )
+        )
         return getattr(adapter, "typed_command_prefix", "/") if adapter is not None else "/"
 
     async def _handle_reset_command(self, event: MessageEvent) -> Union[str, EphemeralReply]:
@@ -2531,7 +2551,7 @@ class GatewaySlashCommandsMixin(
                 # an explicit decision).
                 return await _finish_switch()
 
-            _p = self._typed_command_prefix_for(event.source.platform)
+            _p = self._typed_command_prefix_for(event.source)
             return await self._request_slash_confirm(
                 event=event,
                 command="model",
