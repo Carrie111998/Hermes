@@ -1438,6 +1438,16 @@ class BaseEnvironment(ABC):
         """
         pass
 
+    def _after_execute(self) -> None:
+        """Hook called after each command execution.
+
+        Remote backends override this to pull agent-generated files
+        back from the sandbox to the host so the gateway can attach
+        them mid-turn (e.g. ``MEDIA:~/.hermes/cache/images/foo.png``).
+        Bind-mount and local backends don't need it.
+        """
+        pass
+
     # ------------------------------------------------------------------
     # Unified execute()
     # ------------------------------------------------------------------
@@ -1578,6 +1588,7 @@ class BaseEnvironment(ABC):
         else:
             result = bounded.value
         self._update_cwd(result)
+        self._after_execute()
 
         return result
 
