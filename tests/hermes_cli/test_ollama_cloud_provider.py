@@ -146,11 +146,11 @@ class TestOllamaCloudModelPicker:
         assert ollama is None, "ollama-cloud should not appear without OLLAMA_API_KEY"
 
 
-# ── Merged Model Discovery ──
+# ── Resolved Model Discovery ──
 
-class TestOllamaCloudMergedDiscovery:
-    def test_merges_live_and_models_dev(self, tmp_path, monkeypatch):
-        """Live API models appear first, models.dev additions fill gaps."""
+class TestOllamaCloudResolvedDiscovery:
+    def test_live_api_is_authoritative_over_models_dev(self, tmp_path, monkeypatch):
+        """Models absent from the live API must not reappear from models.dev."""
         from hermes_cli.models import fetch_ollama_cloud_models
 
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
@@ -166,15 +166,57 @@ class TestOllamaCloudMergedDiscovery:
             }
         }
         with patch("hermes_cli.models.fetch_api_models", return_value=["qwen3.5:397b", "glm-5"]), \
-             patch("agent.models_dev.fetch_models_dev", return_value=mock_mdev):
+             patch("agent.models_dev.fetch_models_dev", return_value=mock_mdev) as fetch_mdev:
             result = fetch_ollama_cloud_models(force_refresh=True)
 
-        # Live models first, then models.dev additions (deduped)
-        assert result[0] == "qwen3.5:397b"  # from live API
-        assert result[1] == "glm-5"          # from live API (also in models.dev)
-        assert "kimi-k2.5" in result         # from models.dev only
-        assert "nemotron-3-super" in result  # from models.dev only
-        assert result.count("glm-5") == 1    # no duplicates
+        assert result == ["qwen3.5:397b", "glm-5"]
+        fetch_mdev.assert_not_called()
+
+    def test_empty_live_catalog_replaces_stale_fallbacks(self, tmp_path, monkeypatch):
+        """A successful empty live response remains authoritative in the cache."""
+        from hermes_cli.models import fetch_ollama_cloud_models
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.setenv("OLLAMA_API_KEY", "test-key")
+        mock_mdev = {
+            "ollama-cloud": {
+                "models": {"retired-model": {"tool_call": True}}
+            }
+        }
+
+        with patch("hermes_cli.models.fetch_api_models", return_value=[]), \
+             patch("agent.models_dev.fetch_models_dev", return_value=mock_mdev) as fetch_mdev:
+            refreshed = fetch_ollama_cloud_models(force_refresh=True)
+            cached = fetch_ollama_cloud_models()
+
+        assert refreshed == []
+        assert cached == []
+        fetch_mdev.assert_not_called()
+
+    def test_picker_cache_does_not_resurrect_retired_generic_row(self, tmp_path, monkeypatch):
+        """The picker must preserve an authoritative empty cloud catalog."""
+        import hermes_cli.models as models
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.setenv("OLLAMA_API_KEY", "test-key")
+        models._save_provider_models_cache({
+            "ollama-cloud": {
+                "fp": models._credential_fingerprint("ollama-cloud"),
+                "at": 0,
+                "models": ["retired-model"],
+            }
+        })
+
+        with patch("hermes_cli.models.fetch_api_models", return_value=[]), \
+             patch("providers.get_provider_profile") as generic_profile:
+            refreshed = models.cached_provider_model_ids(
+                "ollama-cloud", force_refresh=True
+            )
+            cached = models.cached_provider_model_ids("ollama-cloud")
+
+        assert refreshed == []
+        assert cached == []
+        generic_profile.assert_not_called()
 
     def test_falls_back_to_models_dev_without_api_key(self, tmp_path, monkeypatch):
         """Without API key, only models.dev results are returned."""
