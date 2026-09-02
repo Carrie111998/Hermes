@@ -162,8 +162,8 @@ class TestFastModeRouting(unittest.TestCase):
             base_url="https://openrouter.ai/api/v1",
             provider="openrouter",
             api_mode="chat_completions",
-            acp_command=None,
-            acp_args=[],
+            acp_command="copilot",
+            acp_args=["--token=do-not-leak", "/private/operator/path"],
             _credential_pool=None,
             service_tier="priority",
         )
@@ -194,6 +194,216 @@ class TestFastModeRouting(unittest.TestCase):
 
         assert route["runtime"]["provider"] == "openrouter"
         assert route.get("request_overrides") is None
+
+    def test_turn_route_middleware_receives_redacted_route_and_switches_provider(self):
+        cli_mod = _import_cli()
+        stub = SimpleNamespace(
+            model="old-model",
+            api_key="redacted-fixture",
+            base_url="https://api.anthropic.com",
+            provider="anthropic",
+            requested_provider="anthropic",
+            api_mode="chat_completions",
+            acp_command=None,
+            acp_args=[],
+            _credential_pool=None,
+            service_tier=None,
+            agent=None,
+            session_id="session-1",
+        )
+        observed = {}
+
+        def fake_apply(route, **context):
+            observed["route"] = route
+            observed["context"] = context
+            return SimpleNamespace(
+                changed=True,
+                payload={**route, "model": "gpt-5.4", "provider": "openai"},
+                trace=[{"source": "test"}],
+            )
+
+        with patch("hermes_cli.middleware.apply_turn_route_middleware", fake_apply), patch(
+            "hermes_cli.runtime_provider.resolve_runtime_provider",
+            return_value={
+                "provider": "openai",
+                "api_key": "selected-key",
+                "base_url": "https://api.openai.com/v1",
+                "api_mode": "chat_completions",
+            },
+        ):
+            route = cli_mod.HermesCLI._resolve_turn_agent_config(stub, "route this")
+
+        assert "api_key" not in observed["route"]
+        assert "api_key" not in observed["route"]["runtime"]
+        assert "command" not in observed["route"]["runtime"]
+        assert "args" not in observed["route"]["runtime"]
+        assert "do-not-leak" not in repr(observed["route"])
+        assert observed["context"]["session_id"] == "session-1"
+        assert observed["context"]["session_key"] == "session-1"
+        assert route["model"] == "gpt-5.4"
+        assert route["runtime"]["provider"] == "openai"
+        assert route["runtime"]["api_key"] == "selected-key"
+        assert route["middleware_trace"] == [{"source": "test"}]
+        assert stub.model == "old-model"
+        assert stub.provider == "anthropic"
+        assert stub.api_key == "redacted-fixture"
+
+    def test_turn_route_selection_is_ephemeral_across_two_turns(self):
+        cli_mod = _import_cli()
+        stub = SimpleNamespace(
+            model="primary-a",
+            api_key="primary-key",
+            base_url="https://primary.example/v1",
+            provider="primary",
+            requested_provider="primary",
+            api_mode="chat_completions",
+            acp_command="primary-client",
+            acp_args=["--profile", "primary"],
+            _credential_pool=None,
+            service_tier=None,
+            agent=None,
+            session_id="session-1",
+        )
+        calls = []
+
+        def fake_apply(route, **context):
+            calls.append(route)
+            if len(calls) == 1:
+                return SimpleNamespace(
+                    changed=True,
+                    payload={**route, "model": "dynamic-b", "provider": "secondary"},
+                    trace=[{"source": "test"}],
+                )
+            return SimpleNamespace(changed=False, payload=route, trace=[])
+
+        with patch("hermes_cli.middleware.apply_turn_route_middleware", fake_apply), patch(
+            "hermes_cli.runtime_provider.resolve_runtime_provider",
+            return_value={
+                "provider": "secondary",
+                "api_key": "secondary-key",
+                "base_url": "https://secondary.example/v1",
+                "api_mode": "chat_completions",
+            },
+        ):
+            first = cli_mod.HermesCLI._resolve_turn_agent_config(stub, "turn one")
+            second = cli_mod.HermesCLI._resolve_turn_agent_config(stub, "turn two")
+
+        assert first["model"] == "dynamic-b"
+        assert first["runtime"]["api_key"] == "secondary-key"
+        assert second["model"] == "primary-a"
+        assert second["runtime"]["provider"] == "primary"
+        assert second["runtime"]["api_key"] == "primary-key"
+        assert calls[1]["model"] == "primary-a"
+        assert calls[1]["provider"] == "primary"
+
+    def test_turn_route_resolves_requested_custom_alias_and_keeps_api_mode_host_owned(self):
+        cli_mod = _import_cli()
+        stub = SimpleNamespace(
+            model="primary",
+            api_key="alpha-key",
+            base_url="https://alpha.example/v1",
+            provider="custom",
+            requested_provider="custom:alpha",
+            api_mode="chat_completions",
+            acp_command=None,
+            acp_args=[],
+            _credential_pool=None,
+            service_tier=None,
+            agent=None,
+            session_id="session-alias",
+        )
+        observed = {}
+
+        def fake_apply(route, **_context):
+            return SimpleNamespace(
+                changed=True,
+                payload={
+                    **route,
+                    "model": "target",
+                    "provider": "custom",
+                    "requested_provider": "custom:beta",
+                    "runtime": {**route["runtime"], "requested_provider": "custom:beta", "api_mode": "invalid"},
+                },
+                trace=[],
+            )
+
+        def fake_resolve(*, requested):
+            observed["requested"] = requested
+            return {
+                "provider": "custom",
+                "requested_provider": requested,
+                "api_key": "beta-key",
+                "base_url": "https://beta.example/v1",
+                "api_mode": "responses",
+            }
+
+        with patch("hermes_cli.middleware.apply_turn_route_middleware", fake_apply), patch(
+            "hermes_cli.runtime_provider.resolve_runtime_provider", fake_resolve
+        ):
+            route = cli_mod.HermesCLI._resolve_turn_agent_config(stub, "route this")
+
+        assert observed["requested"] == "custom:beta"
+        assert route["runtime"]["provider"] == "custom"
+        assert route["runtime"]["requested_provider"] == "custom:beta"
+        assert route["runtime"]["api_key"] == "beta-key"
+        assert route["runtime"]["api_mode"] == "responses"
+
+    def test_turn_route_same_requested_identity_preserves_host_runtime(self):
+        cli_mod = _import_cli()
+        stub = SimpleNamespace(
+            model="primary", api_key="alpha-key", base_url="https://alpha.example/v1",
+            provider="custom", requested_provider="custom:alpha", api_mode="chat_completions",
+            acp_command=None, acp_args=[], _credential_pool=None, service_tier=None,
+            agent=None, session_id="session-alias",
+        )
+
+        def fake_apply(route, **_context):
+            return SimpleNamespace(
+                changed=True,
+                payload={**route, "model": "target", "provider": "custom",
+                         "requested_provider": "custom:alpha",
+                         "runtime": {**route["runtime"], "api_mode": "invalid"}},
+                trace=[],
+            )
+
+        with patch("hermes_cli.middleware.apply_turn_route_middleware", fake_apply), patch(
+            "hermes_cli.runtime_provider.resolve_runtime_provider"
+        ) as resolve:
+            route = cli_mod.HermesCLI._resolve_turn_agent_config(stub, "route this")
+
+        resolve.assert_not_called()
+        assert route["runtime"]["api_key"] == "alpha-key"
+        assert route["runtime"]["api_mode"] == "chat_completions"
+
+    def test_turn_route_middleware_timeout_fails_open_to_primary(self):
+        cli_mod = _import_cli()
+        stub = SimpleNamespace(
+            model="primary-a",
+            api_key="primary-key",
+            base_url="https://primary.example/v1",
+            provider="primary",
+            requested_provider="primary",
+            api_mode="chat_completions",
+            acp_command=None,
+            acp_args=[],
+            _credential_pool=None,
+            service_tier=None,
+            agent=None,
+            session_id="session-timeout",
+        )
+
+        with patch(
+            "hermes_cli.middleware.apply_turn_route_middleware",
+            side_effect=TimeoutError("turn-route timeout"),
+        ):
+            route = cli_mod.HermesCLI._resolve_turn_agent_config(stub, "route this")
+
+        assert route["model"] == "primary-a"
+        assert route["runtime"]["provider"] == "primary"
+        assert route["runtime"]["api_key"] == "primary-key"
+        assert stub.model == "primary-a"
+        assert stub.provider == "primary"
+        assert stub.api_key == "primary-key"
 
 
 class TestAnthropicFastMode(unittest.TestCase):

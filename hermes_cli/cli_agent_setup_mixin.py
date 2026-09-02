@@ -352,7 +352,102 @@ class CLIAgentSetupMixin:
             ),
         }
 
+        # Run behavior-changing turn middleware only for an external user
+        # turn. The public payload contains no credentials; provider clients
+        # are resolved or refreshed by Hermes after a plugin has returned its selection. Background
+        # helpers and internal continuations opt out via ``_skip_turn_routing``.
+        if not getattr(self, "_skip_turn_routing", False):
+            try:
+                from hermes_cli.middleware import (
+                    apply_turn_route_middleware,
+                    public_turn_route,
+                )
+
+                public_route = public_turn_route(route["model"], runtime)
+                result = apply_turn_route_middleware(
+                    public_route,
+                    user_message=user_message,
+                    session_id=getattr(self, "session_id", None),
+                    session_key=getattr(self, "session_id", None),
+                    source="cli",
+                    is_user_turn=True,
+                    is_first_turn=self.agent is None,
+                    internal=False,
+                    tool_continuation=False,
+                )
+                if result.changed and isinstance(result.payload, dict):
+                    selected_model = result.payload.get("model")
+                    selected_public_runtime = (
+                        result.payload.get("runtime")
+                        if isinstance(result.payload.get("runtime"), dict)
+                        else {}
+                    )
+                    # requested_provider is the resolver selector. The
+                    # canonical provider is host-derived and may be shared by
+                    # custom aliases.
+                    current_requested_provider = runtime.get("requested_provider") or runtime.get("provider")
+                    current_canonical_provider = runtime.get("provider")
+                    top_requested_provider = result.payload.get("requested_provider")
+                    nested_requested_provider = selected_public_runtime.get("requested_provider")
+                    if nested_requested_provider and nested_requested_provider != current_requested_provider:
+                        requested_provider = nested_requested_provider
+                    else:
+                        requested_provider = top_requested_provider or nested_requested_provider
+                    canonical_provider = (
+                        result.payload.get("provider")
+                        or selected_public_runtime.get("provider")
+                    )
+                    if requested_provider and requested_provider != current_requested_provider:
+                        selected_provider = requested_provider
+                    elif canonical_provider and canonical_provider != current_canonical_provider:
+                        selected_provider = canonical_provider
+                    else:
+                        selected_provider = requested_provider or canonical_provider or current_requested_provider
+                    if isinstance(selected_model, str) and selected_model.strip() and isinstance(selected_provider, str) and selected_provider.strip():
+                        selected_provider = selected_provider.strip()
+                        selected_model = selected_model.strip()
+                        current_provider = current_requested_provider
+                        if selected_provider != current_provider:
+                            from hermes_cli.runtime_provider import resolve_runtime_provider
+
+                            resolved = resolve_runtime_provider(requested=selected_provider)
+                            runtime = {
+                                "api_key": resolved.get("api_key"),
+                                "base_url": resolved.get("base_url"),
+                                "provider": resolved.get("provider", selected_provider),
+                                "requested_provider": selected_provider,
+                                "api_mode": resolved.get("api_mode", self.api_mode),
+                                "command": resolved.get("command"),
+                                "args": list(resolved.get("args") or []),
+                                "credential_pool": resolved.get("credential_pool"),
+                            }
+                        # api_mode is host-derived; middleware runtime hints
+                        # never change the transport without resolver
+                        # realization.
+                        runtime["requested_provider"] = selected_provider
+                        route["model"] = selected_model
+                        route["runtime"] = runtime
+                        route["middleware_trace"] = result.trace
+                        # Keep the selection ephemeral to this turn.  The
+                        # configured CLI route remains the fallback for the
+                        # next turn if middleware is disabled or fails.
+            except Exception as exc:
+                # Routing is advisory and must never strand the user's turn;
+                # Hermes continues with its configured route on plugin errors.
+                from cli import logger
+
+                logger.warning("Turn-route middleware failed open: %s", exc)
+
         service_tier = getattr(self, "service_tier", None)
+        route["signature"] = (
+            route["model"],
+            route["runtime"].get("provider"),
+            route["runtime"].get("requested_provider"),
+            route["runtime"].get("base_url"),
+            route["runtime"].get("api_mode"),
+            route["runtime"].get("command"),
+            tuple(route["runtime"].get("args") or []),
+        )
         if not service_tier:
             route["request_overrides"] = None
             return route

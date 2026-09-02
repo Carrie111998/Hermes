@@ -19,6 +19,7 @@ from hermes_cli.plugins import (
     PluginManifest,
     _dispatch_pre_tool_call_hooks,
     get_plugin_command_handler,
+    invoke_plugin_command,
     get_plugin_commands,
     get_pre_tool_call_block_message,
     get_pre_verify_continue_message,
@@ -30,6 +31,7 @@ from hermes_cli.relay_plugin_cutover import RELAY_PLUGINS_CONFIG_ENV
 from hermes_cli.middleware import (
     VALID_MIDDLEWARE,
     apply_llm_request_middleware,
+    apply_turn_route_middleware,
     apply_tool_request_middleware,
     run_tool_execution_middleware,
 )
@@ -328,6 +330,40 @@ class TestPluginDiscovery:
             {"args": {"path": "README.md", "mw": True}}
         ]
         assert mgr.has_middleware("llm_request") is True
+
+
+    def test_turn_route_middleware_rewrites_once_and_preserves_original(self, monkeypatch):
+        manager = types.SimpleNamespace(
+        _middleware={
+            "turn_route": [
+                lambda **kwargs: {
+                    "route": {**kwargs["route"], "model": "gpt-5.4", "provider": "openai"},
+                    "source": "test",
+                }
+            ]
+        }
+        )
+        monkeypatch.setattr("hermes_cli.plugins.get_plugin_manager", lambda: manager)
+        monkeypatch.setattr("hermes_cli.plugins.has_middleware", lambda kind: bool(manager._middleware.get(kind)))
+        monkeypatch.setattr("hermes_cli.plugins.invoke_middleware", lambda kind, **kwargs: [manager._middleware[kind][0](**kwargs)])
+        route = {"model": "old", "provider": "anthropic"}
+        result = apply_turn_route_middleware(route, user_message="plan", session_id="s1")
+        assert result.changed is True
+        assert result.payload["model"] == "gpt-5.4"
+        assert result.original_payload == route
+        assert result.trace == [{"source": "test"}]
+
+
+    def test_plugin_command_context_keeps_legacy_handlers_compatible(self):
+        seen = []
+
+        def handler(raw_args, *, session_id=None):
+            seen.append((raw_args, session_id))
+            return "ok"
+
+        assert invoke_plugin_command(handler, "x", session_id="s1") == "ok"
+        assert seen == [("x", "s1")]
+        assert invoke_plugin_command(lambda raw: raw.upper(), "x", session_id="ignored") == "X"
 
 
     def test_middleware_helpers_skip_no_listener_work(self, monkeypatch):
