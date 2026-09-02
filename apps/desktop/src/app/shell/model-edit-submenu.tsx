@@ -10,6 +10,7 @@ import {
 } from '@/components/ui/dropdown-menu'
 import { Switch } from '@/components/ui/switch'
 import { useI18n } from '@/i18n'
+import { useEffect } from 'react'
 import { isThinkingEnabled, REASONING_EFFORTS, resolveReasoningEffort } from '@/lib/reasoning-effort'
 
 // Hermes' real reasoning levels live in lib/reasoning-effort; `none` is owned
@@ -86,6 +87,10 @@ interface ModelEditSubmenuProps {
   provider: string
   /** Whether this model supports reasoning effort. */
   reasoning: boolean
+  /** Optional user-declared effort levels this model accepts. When set, the
+   *  effort radio is restricted to these; absent means no restriction known
+   *  (show the full ladder). */
+  supportedEfforts?: string[]
 }
 
 export function ModelEditSubmenu(props: ModelEditSubmenuProps) {
@@ -109,7 +114,8 @@ function ModelEditSubmenuBody({
   isActive,
   onSelectModel,
   onSetOptions,
-  reasoning
+  reasoning,
+  supportedEfforts
 }: ModelEditSubmenuProps) {
   const { t } = useI18n()
   const copy = t.shell.modelOptions
@@ -117,6 +123,34 @@ function ModelEditSubmenuBody({
   const effortValue = resolveReasoningEffort(effort, defaultEffort)
   const thinkingOn = isThinkingEnabled(effort, defaultEffort)
   const showThinkingToggle = reasoning && canDisableReasoning !== false
+
+  // Restrict the effort radio to the levels this model declares it accepts.
+  // `supportedEfforts` is a lower-cased wire vocabulary; intersect with the
+  // UI ladder to keep canonical ordering and drop anything unknown. We
+  // normalize to lowercase at the boundary (review #3) so a producer that
+  // sends `["High"]` doesn't silently empty the radio for that model.
+  const effortOptions = supportedEfforts?.length
+    ? REASONING_EFFORTS.filter(level => supportedEfforts.map(v => v.toLowerCase()).includes(level))
+    : [...REASONING_EFFORTS]
+
+  // If the persisted/current effort is not in the restricted set (e.g. the
+  // user set `medium` before the model declared `supported_efforts:
+  // [high, max]`), the radio would render with a value matching nothing and
+  // the stale invalid effort would still be sent upstream (review #1).
+  // Clamp to the nearest allowed level and report the correction once so the
+  // owning surface's store converges. `''` (thinking off) is not a level — it
+  // passes through untouched and keeps the radio clear.
+  const restricted = Boolean(supportedEfforts?.length)
+  const clampedEffort =
+    restricted && effortValue !== '' && !effortOptions.includes(effortValue)
+      ? (effortOptions[0] ?? effortValue)
+      : effortValue
+
+  useEffect(() => {
+    if (clampedEffort !== effortValue) {
+      onSetOptions({ effort: clampedEffort })
+    }
+  }, [clampedEffort, effortValue, onSetOptions])
 
   const setFast = (enabled: boolean) => {
     if (fastControl.kind === 'variant') {
@@ -166,8 +200,8 @@ function ModelEditSubmenuBody({
         <>
           <DropdownMenuSeparator className="mx-0" />
           <DropdownMenuLabel className={dropdownMenuSectionLabel}>{copy.effort}</DropdownMenuLabel>
-          <DropdownMenuRadioGroup onValueChange={value => onSetOptions({ effort: value })} value={effortValue}>
-            {REASONING_EFFORTS.map(value => (
+          <DropdownMenuRadioGroup onValueChange={value => onSetOptions({ effort: value })} value={clampedEffort}>
+            {effortOptions.map(value => (
               <DropdownMenuRadioItem
                 className={dropdownMenuRow}
                 key={value}

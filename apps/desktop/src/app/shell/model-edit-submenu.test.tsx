@@ -31,6 +31,7 @@ function renderSubmenu(opts: {
   onSelectModel?: (model: string) => void
   onSetOptions: (patch: { effort?: string; fast?: boolean }) => void
   reasoning: boolean
+  supportedEfforts?: string[]
 }) {
   return render(
     <DropdownMenu open>
@@ -47,6 +48,7 @@ function renderSubmenu(opts: {
             onSetOptions={opts.onSetOptions}
             provider="p1"
             reasoning={opts.reasoning}
+            supportedEfforts={opts.supportedEfforts}
           />
         </DropdownMenuSub>
       </DropdownMenuContent>
@@ -127,5 +129,98 @@ describe('ModelEditSubmenu reports edits without performing them', () => {
     fireEvent.click(screen.getByRole('switch'))
 
     expect(onSelectModel).toHaveBeenCalledWith('m1-fast')
+  })
+
+  it('supportedEfforts restricts the effort radio to declared levels', () => {
+    const onSetOptions = vi.fn()
+    renderSubmenu({
+      fastControl: { kind: 'none' },
+      onSetOptions,
+      reasoning: true,
+      supportedEfforts: ['high', 'max']
+    })
+
+    // GLM-5.2-style: only high and max are offered, medium (the default) is not.
+    const radios = screen.getAllByRole('menuitemradio') as HTMLElement[]
+    const levels = radios.map(r => r.textContent?.trim() ?? '')
+
+    expect(levels).toEqual(['High', 'Max'])
+    expect(levels).not.toContain('Medium')
+    expect(levels).not.toContain('XHigh')
+  })
+
+  it('absent supportedEfforts shows the full effort ladder', () => {
+    const onSetOptions = vi.fn()
+    renderSubmenu({
+      fastControl: { kind: 'none' },
+      onSetOptions,
+      reasoning: true
+    })
+
+    const radios = screen.getAllByRole('menuitemradio') as HTMLElement[]
+    const levels = radios.map(r => r.textContent?.trim() ?? '')
+
+    expect(levels.length).toBeGreaterThan(4)
+    expect(levels).toContain('Medium')
+    expect(levels).toContain('Max')
+    expect(levels).toContain('Minimal')
+  })
+
+  it('clamps a persisted effort excluded by the restriction (review #1)', () => {
+    // User set `medium`, then the model declared only high/max. The radio
+    // must converge onto an allowed level (not render blank) and report the
+    // correction once so the store stops sending the stale invalid effort.
+    const onSetOptions = vi.fn()
+    renderSubmenu({
+      defaultEffort: 'medium',
+      effort: 'medium',
+      fastControl: { kind: 'none' },
+      onSetOptions,
+      reasoning: true,
+      supportedEfforts: ['high', 'max']
+    })
+
+    // Radio shows High selected (the clamped level), not a blank selection.
+    const radios = screen.getAllByRole('menuitemradio') as HTMLElement[]
+    const selected = radios.filter(r => r.getAttribute('aria-checked') === 'true')
+    expect(selected.map(r => r.textContent?.trim())).toEqual(['High'])
+
+    // The correction is reported once.
+    expect(onSetOptions).toHaveBeenCalledWith({ effort: 'high' })
+  })
+
+  it('thinking off is not clamped by a restriction (review #1)', () => {
+    // effort='none' (thinking off) resolves to '' — the radio stays clear
+    // and no correction is reported.
+    const onSetOptions = vi.fn()
+    renderSubmenu({
+      defaultEffort: 'medium',
+      effort: 'none',
+      fastControl: { kind: 'none' },
+      onSetOptions,
+      reasoning: true,
+      supportedEfforts: ['high', 'max']
+    })
+
+    const radios = screen.getAllByRole('menuitemradio') as HTMLElement[]
+    expect(radios.filter(r => r.getAttribute('aria-checked') === 'true')).toHaveLength(0)
+    expect(onSetOptions).not.toHaveBeenCalled()
+  })
+
+  it('normalizes case of supportedEfforts at the boundary (review #3)', () => {
+    // A producer sending `["High"]` must not silently empty the radio.
+    const onSetOptions = vi.fn()
+    renderSubmenu({
+      defaultEffort: 'medium',
+      effort: 'max',
+      fastControl: { kind: 'none' },
+      onSetOptions,
+      reasoning: true,
+      supportedEfforts: ['High', 'MAX']
+    })
+
+    const radios = screen.getAllByRole('menuitemradio') as HTMLElement[]
+    const levels = radios.map(r => r.textContent?.trim() ?? '')
+    expect(levels).toEqual(['High', 'Max'])
   })
 })
