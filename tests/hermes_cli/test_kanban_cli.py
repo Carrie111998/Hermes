@@ -116,6 +116,80 @@ def test_board_override_is_isolated_per_concurrent_call(kanban_home, monkeypatch
     assert beta_titles == ["beta-task"]
 
 
+def _kanban_parser():
+    """Build the real kanban parser tree (same shape the CLI and slash
+    surfaces use) and return it for parse assertions."""
+    parser = argparse.ArgumentParser(prog="hermes", add_help=False)
+    sub = parser.add_subparsers(dest="command")
+    kc.build_parser(sub)
+    return parser
+
+
+def test_block_kind_parses_with_trailing_reason():
+    """Regression for #88135: `block <id> --kind <kind> <reason>` must not
+    fail with `unrecognized arguments: <reason>`.
+
+    The block subparser's `reason` positional is `nargs='*'`; argparse
+    cannot consume tokens after an option once positional consumption has
+    started, so the trailing reason was rejected as an extra argument. The
+    parser now hoists `--kind <val>` ahead of the positionals before
+    parsing, letting the trailing reason bind to the positional.
+    """
+    parser = _kanban_parser()
+
+    args = parser.parse_args(
+        ["kanban", "block", "t_1", "--kind", "needs_input", "some reason"]
+    )
+    assert args.task_id == "t_1"
+    assert args.kind == "needs_input"
+    assert args.reason == ["some reason"]
+
+    # Multi-word reason after the kind.
+    args = parser.parse_args(
+        ["kanban", "block", "t_1", "--kind", "dependency", "multi", "word", "reason"]
+    )
+    assert args.kind == "dependency"
+    assert args.reason == ["multi", "word", "reason"]
+
+    # `--kind=<val>` equals form.
+    args = parser.parse_args(["kanban", "block", "t_1", "--kind=capability", "eq form"])
+    assert args.kind == "capability"
+    assert args.reason == ["eq form"]
+
+    # Kind-only (no reason) still parses.
+    args = parser.parse_args(["kanban", "block", "t_1", "--kind", "transient"])
+    assert args.kind == "transient"
+    assert args.reason == []
+
+    # The no-kind form must keep working (backward compat).
+    args = parser.parse_args(["kanban", "block", "t_1", "some reason"])
+    assert args.kind is None
+    assert args.reason == ["some reason"]
+
+
+def test_block_kind_end_to_end_sets_kind_on_task(kanban_home):
+    """`block <id> --kind needs_input <reason>` actually persists the kind
+    on the task (not just parses), and the reason is recorded as a comment.
+    """
+    from hermes_cli import kanban_db as kb
+
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="kind test", assignee="alice")
+
+    rc = kc.kanban_command(
+        _kanban_parser().parse_args(
+            ["kanban", "block", tid, "--kind", "needs_input", "human input needed"]
+        )
+    )
+    assert rc == 0
+
+    with kb.connect() as conn:
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        assert task.status == "blocked"
+        assert task.block_kind == "needs_input"
+
+
 # ---------------------------------------------------------------------------
 # Integration with the COMMAND_REGISTRY
 # ---------------------------------------------------------------------------
