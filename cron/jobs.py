@@ -1567,8 +1567,18 @@ def compute_next_run(schedule: Dict[str, Any], last_run_at: Optional[str] = None
                 base_time = _ensure_aware(datetime.fromisoformat(last_run_at))
             except Exception:
                 base_time = now
+        # Ensure base is timezone-aware in Hermes timezone to avoid UTC/local
+        # mismatch at month boundaries (e.g. IDT UTC+3 monthly job "0 0 1 * *"
+        # resaved at Sep 1 00:00 UTC vs IDT). croniter interprets wall-clock
+        # in base's timezone, so base must be on the same clock as
+        # hermes_time.now() (#100030).
+        base_time = _ensure_aware(base_time)
         cron = croniter(expr, base_time)
         next_run = cron.get_next(datetime)
+        # croniter may return naive on some platforms/versions; ensure aware
+        # so stored next_run_at preserves the correct UTC offset for due
+        # checks across DST and timezone changes.
+        next_run = _ensure_aware(next_run)
         return next_run.isoformat()
 
     return None
@@ -2782,29 +2792,59 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
                     updated_schedule.get("display", updated.get("schedule_display")),
                 )
                 if updated.get("state") != "paused":
-                    updated_next_run = compute_next_run(updated_schedule)
-                    # Same guard as create_job: an UPDATE that sets a one-shot
-                    # to a time >ONESHOT_GRACE_SECONDS in the past would store
-                    # next_run_at=None with state="scheduled", re-creating the
-                    # ghost job that never fires (#59395). Reject it here too so
-                    # the bug can't re-enter through the update door.
+                    # Fix #100030: preserve existing next_run when resaving
+                    # jobs.json at month boundary with same cron expr. Recomputing
+                    # from now (croniter strictly after base) would jump a monthly
+                    # "0 0 1 * *" from Sep 1 to Oct 1 when resaved at Sep 1 00:00:01
+                    # in IDT, skipping the current month's execution. Preserve the
+                    # stored next_run if it still matches the expr and is still
+                    # upcoming or within catch-up grace.
+                    old_expr = job.get("schedule", {}).get("expr") if isinstance(job.get("schedule"), dict) else None
+                    new_expr = updated_schedule.get("expr") if isinstance(updated_schedule, dict) else None
+                    existing_next = job.get("next_run_at")
+                    _preserved = False
                     if (
-                        updated_next_run is None
-                        and updated_schedule.get("kind") == "once"
+                        old_expr is not None
+                        and new_expr == old_expr
+                        and existing_next
+                        and isinstance(existing_next, str)
+                        and updated_schedule.get("kind") == "cron"
                     ):
-                        run_at = updated_schedule.get("run_at") or updated_schedule
-                        logger.warning(
-                            "Rejecting one-shot cron job update '%s': run_at %s "
-                            "is outside the %ss grace window",
-                            updated.get("name", job_id),
-                            run_at,
-                            ONESHOT_GRACE_SECONDS,
-                        )
-                        raise ValueError(
-                            f"Requested one-shot time {run_at} is more than "
-                            f"{ONESHOT_GRACE_SECONDS}s in the past and cannot be scheduled."
-                        )
-                    updated["next_run_at"] = updated_next_run
+                        try:
+                            _existing_dt = _ensure_aware(datetime.fromisoformat(existing_next))
+                            if _cron_next_run_matches_expr(updated_schedule, _existing_dt):
+                                _now_dt = _hermes_now()
+                                _grace = _compute_grace_seconds(updated_schedule)
+                                _age = (_now_dt - _existing_dt).total_seconds()
+                                if _age < 0 or 0 <= _age <= _grace:
+                                    updated["next_run_at"] = existing_next
+                                    _preserved = True
+                        except Exception:
+                            pass
+                    if not _preserved:
+                        updated_next_run = compute_next_run(updated_schedule)
+                        # Same guard as create_job: an UPDATE that sets a one-shot
+                        # to a time >ONESHOT_GRACE_SECONDS in the past would store
+                        # next_run_at=None with state="scheduled", re-creating the
+                        # ghost job that never fires (#59395). Reject it here too so
+                        # the bug can't re-enter through the update door.
+                        if (
+                            updated_next_run is None
+                            and updated_schedule.get("kind") == "once"
+                        ):
+                            run_at = updated_schedule.get("run_at") or updated_schedule
+                            logger.warning(
+                                "Rejecting one-shot cron job update '%s': run_at %s "
+                                "is outside the %ss grace window",
+                                updated.get("name", job_id),
+                                run_at,
+                                ONESHOT_GRACE_SECONDS,
+                            )
+                            raise ValueError(
+                                f"Requested one-shot time {run_at} is more than "
+                                f"{ONESHOT_GRACE_SECONDS}s in the past and cannot be scheduled."
+                            )
+                        updated["next_run_at"] = updated_next_run
 
             if inference_fields_changed:
                 provider_snapshot, model_snapshot = _compute_provider_model_snapshots(
