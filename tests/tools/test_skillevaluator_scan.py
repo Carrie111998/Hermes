@@ -23,6 +23,7 @@ from tools.skillevaluator_scan import (  # noqa: E402
     _parse_report,
     format_tier1_report,
     run_tier1_scan,
+    scanner_readiness,
     tier1_advisory_enabled,
 )
 
@@ -46,6 +47,27 @@ def _finding(check, severity="high", message="msg", file="SKILL.md", line=3):
         "line_number": line,
         "suggestion": "fix it",
     }
+
+
+class TestScannerReadiness:
+    def test_disabled_does_not_probe_or_install(self):
+        with mock.patch("tools.skillevaluator_scan.tier1_advisory_enabled", return_value=False), \
+             mock.patch("tools.skillevaluator_scan.shutil.which") as which:
+            assert scanner_readiness() == {"state": "disabled", "missing": []}
+        which.assert_not_called()
+
+    def test_reports_each_missing_optional_scanner(self):
+        def which(name):
+            return "/usr/bin/skillevaluator" if name == "skillevaluator" else None
+
+        with mock.patch("tools.skillevaluator_scan.tier1_advisory_enabled", return_value=True), \
+             mock.patch("tools.skillevaluator_scan.shutil.which", side_effect=which):
+            assert scanner_readiness() == {"state": "incomplete", "missing": ["skillspector"]}
+
+    def test_ready_when_both_scanners_are_on_path(self):
+        with mock.patch("tools.skillevaluator_scan.tier1_advisory_enabled", return_value=True), \
+             mock.patch("tools.skillevaluator_scan.shutil.which", return_value="/usr/bin/scanner"):
+            assert scanner_readiness() == {"state": "ready", "missing": []}
 
 
 class TestParseReport:

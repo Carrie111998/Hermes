@@ -3239,6 +3239,31 @@ def run_doctor(args):
             issues.append("Run 'hermes setup' to configure missing API keys for full tool access")
     except Exception as e:
         check_warn("Could not check tool availability", f"({e})")
+
+    _section("Skill Security Advisory")
+    try:
+        from tools.skillevaluator_scan import scanner_readiness
+
+        readiness = scanner_readiness()
+        if readiness["state"] == "disabled":
+            check_ok("Tier 1 advisory disabled")
+        elif readiness["state"] == "ready":
+            check_ok("Tier 1 advisory ready", "(SkillEvaluator + SkillSpector)")
+        else:
+            missing = ", ".join(readiness.get("missing") or [])
+            check_warn("Tier 1 advisory incomplete", f"(missing {missing})")
+            check_info(
+                "Install the optional scanners with: "
+                "uv tool install --python 3.13 "
+                "'skillevaluator @ git+https://github.com/NVIDIA/SkillEvaluator.git@v0.1.0' "
+                "and `uv tool install 'git+https://github.com/NVIDIA/SkillSpector.git@v2.9.5'`."
+            )
+            issues.append(
+                "Tier 1 skill advisory is incomplete; install the missing "
+                "SkillEvaluator/SkillSpector scanner(s) or disable skills.tier1_advisory"
+            )
+    except Exception as e:
+        check_warn("Could not check skill advisory readiness", f"({e})")
     
     _section("Skills Hub")
     hub_dir = HERMES_HOME / "skills" / ".hub"
