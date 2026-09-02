@@ -28,14 +28,14 @@ These tests pin:
 
 from __future__ import annotations
 
-from hermes_cli.model_switch import _picker_key_cmd_token
+from agent.command_token_source import resolve_probe_token
 
 
-class TestPickerKeyCmdToken:
-    """The credential helper the picker's probe sites call."""
+class TestResolveProbeToken:
+    """The shared credential helper both probe paths call."""
 
     def test_bare_token_stdout(self):
-        assert _picker_key_cmd_token(
+        assert resolve_probe_token(
             {"key_cmd": "printf 'tok-abc'", "name": "gw"}
         ) == "tok-abc"
 
@@ -45,27 +45,27 @@ class TestPickerKeyCmdToken:
             "key_cmd": """printf '{"access_token":"tok-json","expires_in":3600}'""",
             "name": "gw",
         }
-        assert _picker_key_cmd_token(entry) == "tok-json"
+        assert resolve_probe_token(entry) == "tok-json"
 
     def test_absent_key_cmd_is_empty(self):
         """No key_cmd — the caller falls through to api_key/key_env."""
-        assert _picker_key_cmd_token({"name": "gw"}) == ""
+        assert resolve_probe_token({"name": "gw"}) == ""
 
     def test_blank_key_cmd_is_empty(self):
-        assert _picker_key_cmd_token({"key_cmd": "   ", "name": "gw"}) == ""
+        assert resolve_probe_token({"key_cmd": "   ", "name": "gw"}) == ""
 
     def test_failing_helper_degrades_to_empty(self):
         """A helper that needs an interactive sign-in (or is simply broken)
         must not take down the picker: every other provider's row still
         renders, and this one degrades to the old empty-key behaviour."""
-        assert _picker_key_cmd_token({"key_cmd": "exit 1", "name": "gw"}) == ""
+        assert resolve_probe_token({"key_cmd": "exit 1", "name": "gw"}) == ""
 
     def test_silent_helper_is_empty(self):
-        assert _picker_key_cmd_token({"key_cmd": "true", "name": "gw"}) == ""
+        assert resolve_probe_token({"key_cmd": "true", "name": "gw"}) == ""
 
     def test_multiline_output_is_rejected(self):
         """command_token_source refuses to guess which line is the token."""
-        assert _picker_key_cmd_token(
+        assert resolve_probe_token(
             {"key_cmd": "printf 'a\\nb'", "name": "gw"}
         ) == ""
 
@@ -224,19 +224,107 @@ class TestMintedTokenIsNeverPersisted:
 
 
 class TestSetupFlowHonoursKeyCmd:
-    """`hermes model`'s named-custom flow is the picker's sibling path."""
+    """`hermes model`'s named-custom flow is the picker's sibling path.
 
-    def test_setup_flow_resolves_key_cmd_for_its_probe(self, monkeypatch):
-        """The flow builds `Authorization: Bearer <api_key>` by hand, so an
-        unresolved key_cmd sends no auth header and the endpoint 401s."""
-        import hermes_cli.model_setup_flows as flows
+    It builds its own ``Authorization: Bearer <api_key>`` for the /models
+    probe, so an unresolved key_cmd sends no auth header and the endpoint
+    401s — same symptom, different call path.
 
-        assert flows._model_flow_named_custom is not None
-        src = __import__("inspect").getsource(flows._model_flow_named_custom)
-        assert "_picker_key_cmd_token" in src, (
-            "setup flow must resolve key_cmd, or its /models probe goes out "
-            "unauthenticated"
+    These drive the real ``_model_flow_named_custom`` and assert on what the
+    probe actually receives, rather than inspecting the function's source: a
+    semantics-preserving refactor should not fail the suite.
+    """
+
+    class _StopAfterProbe(Exception):
+        """Unwind once the probe has run, before the interactive menu."""
+
+    def _run_flow_capturing_probe(self, monkeypatch, entry):
+        """Invoke the flow far enough to capture the probe's credential."""
+        import hermes_cli.models as models_mod
+        from hermes_cli.model_setup_flows import _model_flow_named_custom
+
+        seen = {}
+
+        def fake_fetch(api_key, base_url, **kwargs):
+            seen["api_key"] = api_key
+            seen["base_url"] = base_url
+            # The flow would prompt interactively next; stop here.
+            raise TestSetupFlowHonoursKeyCmd._StopAfterProbe
+
+        monkeypatch.setattr(models_mod, "fetch_api_models", fake_fetch)
+        # Ollama detection issues its own probe; force the generic path.
+        monkeypatch.setattr(
+            models_mod, "should_use_ollama_native_catalog", lambda *a, **k: False
         )
-        # Persisted value is computed BEFORE the mint, so the token cannot
-        # leak into config.yaml.
-        assert src.index("config_api_key") < src.index("_picker_key_cmd_token")
+
+        try:
+            _model_flow_named_custom({}, dict(entry))
+        except TestSetupFlowHonoursKeyCmd._StopAfterProbe:
+            pass
+        except Exception:
+            # Any other failure still tells us what the probe received; the
+            # assertions below decide whether that was correct.
+            pass
+        return seen
+
+    def test_probe_receives_the_minted_token(self, monkeypatch):
+        seen = self._run_flow_capturing_probe(
+            monkeypatch,
+            {
+                "name": "gw",
+                "base_url": "https://gw.example.test/v1",
+                "key_cmd": "printf 'tok-minted'",
+                "model": "model-a",
+            },
+        )
+
+        assert seen.get("api_key") == "tok-minted", (
+            "setup flow probed with an empty key — its /models request goes "
+            "out unauthenticated and the endpoint 401s"
+        )
+
+    def test_static_api_key_still_wins(self, monkeypatch):
+        """key_cmd is a fallback: an explicit api_key is used unchanged, so
+        existing static-key configs are unaffected."""
+        seen = self._run_flow_capturing_probe(
+            monkeypatch,
+            {
+                "name": "gw",
+                "base_url": "https://gw.example.test/v1",
+                "api_key": "sk-static",
+                "key_cmd": "printf 'tok-minted'",
+                "model": "model-a",
+            },
+        )
+
+        assert seen.get("api_key") == "sk-static"
+
+    def test_minted_token_is_not_persisted(self, monkeypatch, tmp_path):
+        """The value written back to config.yaml is derived from the STATIC
+        credential. Persisting a short-lived bearer would leave a stale key
+        that also shadows the key_cmd meant to re-mint it."""
+        import hermes_cli.main as main_mod
+
+        persisted = {}
+        real = main_mod._custom_provider_api_key_config_value
+
+        def spy(provider_info, resolved_api_key=""):
+            out = real(provider_info, resolved_api_key)
+            persisted["value"] = out
+            return out
+
+        monkeypatch.setattr(main_mod, "_custom_provider_api_key_config_value", spy)
+
+        self._run_flow_capturing_probe(
+            monkeypatch,
+            {
+                "name": "gw",
+                "base_url": "https://gw.example.test/v1",
+                "key_cmd": "printf 'tok-minted'",
+                "model": "model-a",
+            },
+        )
+
+        assert persisted.get("value", "") == "", (
+            "a key_cmd-minted bearer reached the value persisted to config.yaml"
+        )

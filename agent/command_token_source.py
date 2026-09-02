@@ -188,3 +188,39 @@ def build_command_token_provider(
     if not command:
         return None
     return CommandTokenSource(command, provider_label)
+
+
+def resolve_probe_token(entry: dict) -> str:
+    """Mint a one-shot credential from a provider entry's ``key_cmd``.
+
+    For callers that need a CONCRETE token rather than the per-request
+    callable ``build_command_token_provider`` returns — the ``/models``
+    catalog probes, which build their request by hand instead of going
+    through a wire client. Both the ``/model`` picker and the ``hermes
+    model`` setup flow resolve credentials from ``api_key``/``key_env``
+    only; without this a ``key_cmd`` provider probes with an EMPTY key, an
+    authenticated endpoint answers 401, and the provider collapses to its
+    single configured default model.
+
+    Shares the ``CommandTokenSource`` cache with the request path, so this
+    is a cache read rather than a fresh sign-in.
+
+    Fail-closed: any error yields ``""``. A helper that needs an interactive
+    sign-in (or is simply broken) must not take down a whole picker — the
+    caller degrades to the pre-existing empty-key behaviour and every other
+    provider still renders.
+    """
+    if not isinstance(entry, dict):
+        return ""
+    command = str(entry.get("key_cmd", "") or "").strip()
+    if not command:
+        return ""
+    try:
+        provider = build_command_token_provider(
+            command, str(entry.get("name", "") or "custom")
+        )
+        if provider is None:
+            return ""
+        return (provider() or "").strip()
+    except Exception:
+        return ""

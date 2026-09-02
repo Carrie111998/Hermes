@@ -2684,36 +2684,14 @@ def _scoped_key_env(name: str) -> str:
 def _picker_key_cmd_token(entry: dict) -> str:
     """Mint a probe credential from a provider's ``key_cmd``, or "" if absent.
 
-    The picker resolved credentials from ``api_key``/``key_env`` only, so a
-    provider authenticated with ``key_cmd`` (short-lived SSO/OIDC bearers —
-    the request path has honoured these since command_token_source landed)
-    probed with an EMPTY key. An endpoint that requires auth answers 401, the
-    probe returns nothing, and the provider collapses to its single configured
-    ``default_model`` — indistinguishable from an endpoint that genuinely
-    serves one model.
-
-    Reuses the same CommandTokenSource cache as the request path, so this
-    costs a cache read rather than a fresh sign-in. Fail-closed: any error
-    means "no credential visible", which is exactly how the picker already
-    treats a missing key.
+    Thin wrapper over ``agent.command_token_source.resolve_probe_token``,
+    which owns the credential logic for every catalog-probe caller (this
+    picker and the ``hermes model`` setup flow). Kept as a module-local name
+    so the probe sites below read in terms of the picker.
     """
-    cmd = str(entry.get("key_cmd", "") or "").strip()
-    if not cmd:
-        return ""
-    try:
-        from agent.command_token_source import build_command_token_provider
+    from agent.command_token_source import resolve_probe_token
 
-        provider = build_command_token_provider(
-            cmd, str(entry.get("name", "") or "custom")
-        )
-        if provider is None:
-            return ""
-        return (provider() or "").strip()
-    except Exception:
-        # A helper that needs an interactive sign-in (or is simply broken)
-        # must not take down the whole picker — every other provider's row
-        # still renders.
-        return ""
+    return resolve_probe_token(entry)
 
 
 # --- Parallel prefetch for provider model catalogs -----------------------

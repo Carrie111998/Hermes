@@ -1581,9 +1581,9 @@ def _model_flow_named_custom(config, provider_info):
         # Authorization header, an authenticated endpoint 401s, and the flow
         # falls back to the single saved model. Deliberately resolved AFTER
         # config_api_key so the minted token stays in-memory for this probe.
-        from hermes_cli.model_switch import _picker_key_cmd_token
+        from agent.command_token_source import resolve_probe_token
 
-        api_key = _picker_key_cmd_token(provider_info)
+        api_key = resolve_probe_token(provider_info)
 
     # Honor ``discover_models: false`` (default True) — when discovery is
     # disabled, use the configured ``models:`` list verbatim and skip the
