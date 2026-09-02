@@ -4,11 +4,13 @@ Slow summary models must not be punished like hung ones (#see PR): when a
 forward-progress hook is installed (context compression), the primary
 auxiliary call streams and ticks the hook only for substantive payloads, so
 outer watchdogs (gateway session hygiene) can extend their deadline on
-liveness. Without a hook, behavior is byte-for-byte the old non-streaming call.
+liveness. Without a hook, behavior stays non-streaming unless the provider
+explicitly requires the streamed path.
 """
 
 import threading
 import time
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -24,6 +26,7 @@ from agent.auxiliary_client import (
     _anthropic_event_has_content,
     _aux_stream_total_ceiling,
     _codex_event_has_content,
+    _copy_request_local_streaming_client,
     _create_with_progress,
     _notify_aux_progress,
     _provider_requires_stream,
@@ -195,6 +198,26 @@ class TestCreateWithProgress:
 # ---------------------------------------------------------------------------
 
 class TestAggregateChatStream:
+    def test_request_local_copy_overrides_the_cached_http_pool(self, monkeypatch):
+        shared_pool = object()
+        request_pool = object()
+        local_client = object()
+        source = SimpleNamespace(
+            _client=shared_pool,
+            base_url="https://proxy.example/v1",
+            copy=MagicMock(return_value=local_client),
+        )
+        monkeypatch.setattr(
+            "agent.auxiliary_client._openai_http_client_kwargs",
+            lambda base_url: {"http_client": request_pool},
+        )
+
+        copied, owned = _copy_request_local_streaming_client(source)
+
+        assert copied is local_client
+        assert owned is True
+        source.copy.assert_called_once_with(http_client=request_pool)
+
     def test_tool_call_deltas_are_reassembled(self):
         tc0 = SimpleNamespace(
             index=0, id="call_1",
@@ -229,6 +252,239 @@ class TestAggregateChatStream:
 
         result = _aggregate_chat_stream(_Stream())
         assert result.choices[0].message.content == "ok"
+        assert closed == [True]
+
+    def test_no_progress_watchdog_aborts_request_client_and_times_out(self, monkeypatch):
+        release = threading.Event()
+        aborted = []
+
+        class _BlockedStream:
+            def __iter__(self):
+                release.wait(timeout=1.0)
+                return iter(())
+
+            def close(self):
+                pass
+
+        request_client = object()
+
+        def _abort(client):
+            aborted.append(client)
+            release.set()
+            return 1
+
+        monkeypatch.setattr(
+            "agent.auxiliary_client._AUX_STREAM_NO_PROGRESS_TIMEOUT_SECONDS", 0.02
+        )
+        monkeypatch.setattr(
+            "agent.agent_runtime_helpers.force_close_tcp_sockets", _abort
+        )
+
+        started = time.monotonic()
+        with pytest.raises(TimeoutError, match="no-progress timeout"):
+            _aggregate_chat_stream(
+                _BlockedStream(), request_client=request_client, total_ceiling=1.0
+            )
+
+        assert time.monotonic() - started < 0.5
+        assert aborted == [request_client]
+
+    @pytest.mark.windows_only
+    def test_no_progress_watchdog_interrupts_real_openai_socket(self, monkeypatch):
+        """The watchdog must wake the actual Windows SDK receive, not a mock."""
+        peer_release = threading.Event()
+
+        class _StalledSSE(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def do_POST(self):
+                length = int(self.headers.get("Content-Length", "0"))
+                self.rfile.read(length)
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Connection", "close")
+                self.end_headers()
+                self.wfile.flush()
+                peer_release.wait(timeout=2.0)
+
+            def log_message(self, format, *args):
+                pass
+
+        server = HTTPServer(("127.0.0.1", 0), _StalledSSE)
+        server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+        server_thread.start()
+        monkeypatch.setattr(
+            "agent.auxiliary_client._AUX_STREAM_NO_PROGRESS_TIMEOUT_SECONDS", 0.1
+        )
+
+        from openai import OpenAI
+
+        client = OpenAI(
+            api_key="test",
+            base_url=f"http://127.0.0.1:{server.server_address[1]}/v1",
+            max_retries=0,
+        )
+        result = []
+        started = time.monotonic()
+
+        def _request():
+            try:
+                with aux_progress_hook(lambda: None):
+                    _create_with_progress(
+                        client,
+                        {"model": "m1", "messages": [], "timeout": 5.0},
+                    )
+            except Exception as exc:
+                result.append(exc)
+
+        worker = threading.Thread(target=_request)
+        worker.start()
+        worker.join(timeout=1.0)
+        elapsed = time.monotonic() - started
+        peer_release.set()
+        worker.join(timeout=3.0)
+        client.close()
+        server.shutdown()
+        server.server_close()
+        server_thread.join(timeout=1.0)
+
+        assert not worker.is_alive(), "stalled SDK receive ignored the watchdog"
+        assert elapsed < 1.0
+        assert len(result) == 1
+        assert isinstance(result[0], TimeoutError)
+        assert "no-progress timeout" in str(result[0])
+
+    def test_substantive_chunks_rearm_no_progress_watchdog(self, monkeypatch):
+        monkeypatch.setattr(
+            "agent.auxiliary_client._AUX_STREAM_NO_PROGRESS_TIMEOUT_SECONDS", 0.04
+        )
+
+        class _SlowHealthyStream:
+            def __iter__(self):
+                for text in ("a", "b", "c"):
+                    time.sleep(0.025)
+                    yield _chunk(content=text)
+
+            def close(self):
+                pass
+
+        result = _aggregate_chat_stream(
+            _SlowHealthyStream(), request_client=object(), total_ceiling=1.0
+        )
+        assert result.choices[0].message.content == "abc"
+
+    def test_force_stream_without_hook_rearms_request_local_watchdog(self, monkeypatch):
+        monkeypatch.setattr(
+            "agent.auxiliary_client._AUX_STREAM_NO_PROGRESS_TIMEOUT_SECONDS", 0.04
+        )
+
+        class _SlowLocalClient(_FakeClient):
+            def _create(self, **kwargs):
+                self.calls.append(kwargs)
+
+                def _chunks():
+                    for text in ("a", "b", "c"):
+                        time.sleep(0.025)
+                        yield _chunk(content=text)
+
+                return _chunks()
+
+        cached_client = _FakeClient(stream_chunks=[])
+        local_client = _SlowLocalClient()
+        local_client.close = lambda: None
+        monkeypatch.setattr(
+            "agent.auxiliary_client._copy_request_local_streaming_client",
+            lambda client: (local_client, True),
+        )
+
+        result = _create_with_progress(
+            cached_client,
+            {"model": "m1", "messages": [], "timeout": 1.0},
+            force_stream=True,
+        )
+
+        assert cached_client.calls == []
+        assert local_client.calls[0]["stream"] is True
+        assert result.choices[0].message.content == "abc"
+
+    def test_request_local_worker_discards_chunks_after_caller_timeout(self, monkeypatch):
+        from agent.auxiliary_client import _aux_provider_response, _aux_timing_hook
+
+        peer_release = threading.Event()
+        worker_closed = threading.Event()
+        caller_returned = threading.Event()
+        late_callbacks = []
+        close_threads = []
+
+        class _LateLocalClient(_FakeClient):
+            def _create(self, **kwargs):
+                self.calls.append(kwargs)
+
+                def _chunks():
+                    peer_release.wait(timeout=1.0)
+                    yield _chunk(content="stale")
+
+                return _chunks()
+
+            def close(self):
+                close_threads.append(threading.get_ident())
+                worker_closed.set()
+
+        cached_client = _FakeClient(stream_chunks=[])
+        local_client = _LateLocalClient()
+        monkeypatch.setattr(
+            "agent.auxiliary_client._AUX_STREAM_NO_PROGRESS_TIMEOUT_SECONDS", 0.02
+        )
+        monkeypatch.setattr(
+            "agent.auxiliary_client._copy_request_local_streaming_client",
+            lambda client: (local_client, True),
+        )
+        monkeypatch.setattr(
+            "agent.agent_runtime_helpers.force_close_tcp_sockets", lambda client: 0
+        )
+
+        def _record_callback(kind):
+            if caller_returned.is_set():
+                late_callbacks.append(kind)
+
+        caller_thread = threading.get_ident()
+        with (
+            aux_progress_hook(lambda: _record_callback("progress")),
+            _aux_timing_hook(
+                _aux_provider_response, lambda: _record_callback("timing")
+            ),
+            pytest.raises(TimeoutError, match="no-progress timeout"),
+        ):
+            _create_with_progress(
+                cached_client, {"model": "m1", "messages": [], "timeout": 1.0}
+            )
+
+        caller_returned.set()
+        peer_release.set()
+        assert worker_closed.wait(timeout=1.0)
+        assert late_callbacks == []
+        assert close_threads and close_threads[0] != caller_thread
+
+    def test_stream_attempt_uses_and_closes_request_local_client(self, monkeypatch):
+        cached_client = _FakeClient(stream_chunks=[])
+        local_client = _FakeClient(
+            stream_chunks=[_chunk(content="isolated", finish_reason="stop")]
+        )
+        closed = []
+        local_client.close = lambda: closed.append(True)
+        monkeypatch.setattr(
+            "agent.auxiliary_client._copy_request_local_streaming_client",
+            lambda client: (local_client, True),
+        )
+
+        with aux_progress_hook(lambda: None):
+            result = _create_with_progress(
+                cached_client, {"model": "m1", "messages": [], "timeout": 30}
+            )
+
+        assert cached_client.calls == []
+        assert local_client.calls[0]["stream"] is True
+        assert result.choices[0].message.content == "isolated"
         assert closed == [True]
 
 
@@ -481,8 +737,8 @@ class TestContentBearingProgress:
             for _ in range(5):
                 accumulator.feed(keepalive)
                 accumulator.feed(empty_role_chunk)
-        # No substantive payload arrived: the fence must have stayed stale.
-        assert fence.seconds_since_progress() > 0.0
+        # No substantive payload arrived: the fence must not report progress.
+        assert fence.progress_observed is False
 
         with aux_progress_hook(fence.touch_progress):
             accumulator.feed(_chunk(content="token"))
