@@ -9157,12 +9157,19 @@ def _dashboard_cmdline_for_pid(pid: int) -> list[str] | None:
         return None
 
 
+_RESPAWN_LIVENESS_PROBE_SECONDS = 2.0
+
+
 def _respawn_dashboard_processes(commands: list[list[str]]) -> list[list[str]]:
     """Best-effort respawn of manually-started dashboards after ``hermes update``.
 
     Spawns each recovered argv detached (new session, output to the profile's
-    ``logs/dashboard-restart.log``).  Returns the commands that failed to
-    spawn; the caller prints the manual hint for those.
+    ``logs/dashboard-restart.log``).  A successful ``Popen`` only means the
+    spawn request was accepted, so each child is held to a liveness probe:
+    one that exits within ``_RESPAWN_LIVENESS_PROBE_SECONDS`` (e.g. the port
+    is still owned by a stale process) is reported as failed, not restarted
+    (#99518).  Returns the commands that failed to spawn or died during the
+    probe; the caller prints the manual hint for those.
 
     Callers must pre-filter via ``_filter_dashboard_respawn_candidates`` so
     Desktop ``serve|dashboard --port 0`` backends are not replayed and
@@ -9170,6 +9177,7 @@ def _respawn_dashboard_processes(commands: list[list[str]]) -> list[list[str]]:
     """
     from hermes_constants import get_hermes_home
 
+    spawned: list[tuple[list[str], subprocess.Popen]] = []
     respawned: list[list[str]] = []
     failed: list[tuple[list[str], str]] = []
     log_path = get_hermes_home() / "logs" / "dashboard-restart.log"
@@ -9185,7 +9193,7 @@ def _respawn_dashboard_processes(commands: list[list[str]]) -> list[list[str]]:
             if "dashboard" in command and "--no-open" not in command:
                 command = [*command, "--no-open"]
             with open(log_path, "ab") as log_f:
-                subprocess.Popen(
+                proc = subprocess.Popen(
                     command,
                     stdin=subprocess.DEVNULL,
                     stdout=log_f,
@@ -9193,9 +9201,20 @@ def _respawn_dashboard_processes(commands: list[list[str]]) -> list[list[str]]:
                     start_new_session=True,
                     close_fds=True,
                 )
-            respawned.append(command)
+            spawned.append((command, proc))
         except (OSError, ValueError) as exc:
             failed.append((command, str(exc)))
+
+    # Probe once after every spawn has had the same settle window — a child
+    # dying here (bind failure against a stale holder) must not print a check.
+    if spawned:
+        _time.sleep(_RESPAWN_LIVENESS_PROBE_SECONDS)
+    for command, proc in spawned:
+        exit_code = proc.poll()
+        if exit_code is None:
+            respawned.append(command)
+        else:
+            failed.append((command, f"exited with code {exit_code} during startup"))
 
     for command in respawned:
         print(f"    ✓ restarted: {shlex.join(command)}")

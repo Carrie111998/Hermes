@@ -564,7 +564,11 @@ class TestManualBackendRespawn:
             def __init__(self, cmd, **kwargs):
                 spawned.append(list(cmd))
 
-        with patch.object(live.subprocess, "Popen", _FakePopen):
+            def poll(self):
+                return None
+
+        with patch.object(live.subprocess, "Popen", _FakePopen), \
+             patch("time.sleep"):
             failed = live._respawn_dashboard_processes([
                 ["hermes", "dashboard", "--port", "8300"],
                 ["hermes", "serve", "--host", "0.0.0.0"],
@@ -584,6 +588,37 @@ class TestManualBackendRespawn:
         assert failed == [["hermes", "serve"]]
         out = capsys.readouterr().out
         assert "✗ failed to restart" in out
+
+    def test_respawn_child_dying_during_probe_is_failed(self, tmp_path, monkeypatch, capsys):
+        """A child that exits inside the liveness probe reports failure, not a check mark.
+
+        A successful spawn only means the spawn request was accepted; when the
+        port is still owned by a stale process the child dies on bind within
+        moments and must land in the failed list so the manual hint and the
+        serve_relaunch receipt step record reality (#99518).
+        """
+        live = self._live()
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+
+        class _FakePopen:
+            def __init__(self, cmd, **kwargs):
+                self.exit_code = 1 if cmd[1:2] == ["dying"] else None
+
+            def poll(self):
+                return self.exit_code
+
+        with patch.object(live.subprocess, "Popen", _FakePopen), \
+             patch("time.sleep") as probe_wait:
+            failed = live._respawn_dashboard_processes([
+                ["hermes", "dying"],
+                ["hermes", "serve"],
+            ])
+
+        assert failed == [["hermes", "dying"]]
+        probe_wait.assert_called_once()
+        out = capsys.readouterr().out
+        assert "✗ failed to restart (hermes dying): exited with code 1 during startup" in out
+        assert "✓ restarted: hermes serve" in out
 
 
 class TestFilterDashboardRespawnCandidates:
