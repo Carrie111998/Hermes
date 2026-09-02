@@ -105,6 +105,38 @@ def test_deepseek_v4_pro_pricing_entry_exists():
     assert float(entry.cache_read_cost_per_million) == 0.003625
 
 
+def test_bare_model_name_with_null_provider_infers_vendor():
+    """/insights sessions store bare names ("claude-opus-4-6") with
+    billing_provider NULL; resolve_billing_route used to route them to
+    provider="unknown" and price $0.00 (#3525 gap 1)."""
+    from agent.usage_pricing import resolve_billing_route
+
+    assert resolve_billing_route("claude-opus-4-6").provider == "anthropic"
+    assert resolve_billing_route("gpt-4o-mini").provider == "openai"
+    assert resolve_billing_route("gemini-2.5-pro").provider == "google"
+    # Unambiguous-only: private/unknown families must NOT be guessed.
+    assert resolve_billing_route("my-private-model").provider == "unknown"
+
+
+def test_dated_only_snapshot_key_prices_bare_family_name():
+    """/insights gap 2 (#3525): some snapshot keys exist only under their
+    documented dated form (claude-3-5-haiku-20241022); a session storing the
+    bare family name must still price instead of silently returning None."""
+    from agent.usage_pricing import (
+        _lookup_official_docs_pricing,
+        resolve_billing_route,
+    )
+
+    route = resolve_billing_route(
+        "claude-3-5-haiku", provider="anthropic"
+    )
+    entry = _lookup_official_docs_pricing(route)
+    assert entry is not None, "bare family name must hit the dated-only key"
+    # Reverse direction: dated session name against a bare key.
+    route2 = resolve_billing_route("claude-opus-4-6-20250414", provider="anthropic")
+    assert _lookup_official_docs_pricing(route2) is not None
+
+
 
 
 def test_deepseek_deprecated_aliases_price_as_v4_flash():

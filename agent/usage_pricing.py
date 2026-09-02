@@ -1089,6 +1089,19 @@ def resolve_billing_route(
             provider_name = inferred_provider
             model = bare_model
 
+    # Sessions often store BARE model names ("claude-opus-4-6") with
+    # billing_provider NULL (#3525). Infer the vendor from unambiguous
+    # family prefixes so /insights can price them instead of routing to
+    # provider="unknown".
+    if not provider_name:
+        lower_model = model.lower()
+        if lower_model.startswith("claude"):
+            provider_name = "anthropic"
+        elif lower_model.startswith(("gpt-", "o1", "o3", "o4-", "chatgpt")):
+            provider_name = "openai"
+        elif lower_model.startswith("gemini"):
+            provider_name = "google"
+
     if provider_name == "openai-codex":
         return BillingRoute(provider="openai-codex", model=model, base_url=base_url or "", billing_mode="subscription_included")
     if provider_name == "openrouter" or base_url_host_matches(base_url or "", "openrouter.ai"):
@@ -1204,6 +1217,24 @@ def _lookup_official_docs_pricing(route: BillingRoute) -> Optional[PricingEntry]
             entry = _OFFICIAL_DOCS_PRICING.get((route.provider, normalized))
             if entry:
                 return entry
+    # Family fallback (#3525): some snapshot keys exist only under their
+    # documented dated form ("claude-3-5-haiku-20241022") while sessions
+    # store the bare family name ("claude-3-5-haiku") — and vice versa.
+    # Compare with the trailing -YYYYMMDD stripped from BOTH sides so
+    # either spelling prices instead of silently returning $0.00.
+    def _strip_date(name: str) -> str:
+        return re.sub(r"-\d{8}$", "", name)
+
+    stripped_model = _strip_date(model)
+    if stripped_model != model:
+        entry = _OFFICIAL_DOCS_PRICING.get((route.provider, stripped_model))
+        if entry:
+            return entry
+    # Requested name is bare; a snapshot key may still exist ONLY under its
+    # dated form ("claude-3-5-haiku-20241022").
+    for (provider_key, model_key), candidate in _OFFICIAL_DOCS_PRICING.items():
+        if provider_key == route.provider and _strip_date(model_key) == stripped_model:
+            return candidate
     return None
 
 
