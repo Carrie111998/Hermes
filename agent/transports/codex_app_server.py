@@ -20,6 +20,7 @@ import json
 import os
 import queue
 import subprocess
+import sys
 import threading
 import time
 from dataclasses import dataclass, field
@@ -88,6 +89,23 @@ class CodexAppServerClient:
         # stripped while provider creds still flow, matching copilot_acp_client
         # (#29157 sibling spawn-site gap).
         spawn_env = hermes_subprocess_env(inherit_credentials=True)
+        if sys.platform == "win32":
+            # gateway._ensure_ssl_certs exports certifi's Mozilla bundle for
+            # Python clients on Windows. Rust Codex otherwise inherits that
+            # override instead of using the native Windows root store; valid
+            # chains can then fail with UnknownIssuer. Drop only the automatic
+            # certifi value. A distinct user/corporate CA bundle is preserved,
+            # and an explicit per-spawn env below can still override this.
+            try:
+                import certifi
+
+                inherited_ca = spawn_env.get("SSL_CERT_FILE")
+                if inherited_ca and os.path.normcase(os.path.abspath(inherited_ca)) == (
+                    os.path.normcase(os.path.abspath(certifi.where()))
+                ):
+                    spawn_env.pop("SSL_CERT_FILE", None)
+            except ImportError:
+                pass
         if env:
             spawn_env.update(env)
         if codex_home:
