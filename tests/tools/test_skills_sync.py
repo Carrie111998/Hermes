@@ -593,6 +593,140 @@ class TestResetBundledSkill:
         assert "GW v2" in (dest / "SKILL.md").read_text()
 
 
+    def test_reset_restore_installs_only_requested_skill_when_profile_opted_out(self, tmp_path):
+        """An explicit restore works without undoing the profile-wide opt-out."""
+        bundled = self._setup_bundled(tmp_path)
+        unrelated = bundled / "devops" / "unrelated-skill"
+        unrelated.mkdir(parents=True)
+        (unrelated / "SKILL.md").write_text(
+            "---\nname: unrelated-skill\n---\n# Must stay uninstalled\n"
+        )
+
+        hermes_home = tmp_path / "home"
+        skills_dir = hermes_home / "skills"
+        manifest_file = skills_dir / ".bundled_manifest"
+        hermes_home.mkdir()
+        marker = hermes_home / ".no-bundled-skills"
+        marker.write_text("opted out\n")
+
+        with self._patches(bundled, skills_dir, manifest_file), patch(
+            "tools.skills_sync.HERMES_HOME", hermes_home
+        ):
+            result = reset_bundled_skill("google-workspace", restore=True)
+            manifest_after = _read_manifest()
+
+        restored = skills_dir / "productivity" / "google-workspace" / "SKILL.md"
+        assert result["ok"] is True
+        assert result["action"] == "restored"
+        assert restored.exists()
+        assert "upstream" in restored.read_text()
+        assert manifest_after["google-workspace"] == _dir_hash(
+            bundled / "productivity" / "google-workspace"
+        )
+        assert marker.exists()
+        assert not (skills_dir / "devops" / "unrelated-skill").exists()
+
+    def test_opted_out_targeted_restore_preserves_copy_when_backup_move_fails(self, tmp_path):
+        """A failed pre-copy backup must not delete the existing user copy."""
+        bundled = self._setup_bundled(tmp_path)
+        hermes_home = tmp_path / "home"
+        skills_dir = hermes_home / "skills"
+        manifest_file = skills_dir / ".bundled_manifest"
+        dest = skills_dir / "productivity" / "google-workspace"
+        dest.mkdir(parents=True)
+        user_copy = dest / "SKILL.md"
+        user_copy.write_text("# user version\n")
+        manifest_file.write_text("google-workspace:STALEHASH\n")
+        marker = hermes_home / ".no-bundled-skills"
+        marker.write_text("opted out\n")
+
+        with self._patches(bundled, skills_dir, manifest_file), patch(
+            "tools.skills_sync.HERMES_HOME", hermes_home
+        ), patch(
+            "tools.skills_sync.shutil.move", side_effect=PermissionError("move denied")
+        ):
+            result = reset_bundled_skill("google-workspace", restore=True)
+
+        assert result["ok"] is False
+        assert result["action"] == "not_reset"
+        assert user_copy.read_text() == "# user version\n"
+        assert manifest_file.read_text() == "google-workspace:STALEHASH\n"
+        assert marker.exists()
+
+    def test_opted_out_targeted_restore_rolls_back_when_manifest_write_fails(self, tmp_path):
+        """A failed manifest write must roll back the targeted restore."""
+        bundled = self._setup_bundled(tmp_path)
+        hermes_home = tmp_path / "home"
+        skills_dir = hermes_home / "skills"
+        manifest_file = skills_dir / ".bundled_manifest"
+        dest = skills_dir / "productivity" / "google-workspace"
+        dest.mkdir(parents=True)
+        user_copy = dest / "SKILL.md"
+        user_copy.write_text("# user version\n")
+        manifest_file.write_text("google-workspace:STALEHASH\n")
+        marker = hermes_home / ".no-bundled-skills"
+        marker.write_text("opted out\n")
+
+        with self._patches(bundled, skills_dir, manifest_file), patch(
+            "tools.skills_sync.HERMES_HOME", hermes_home
+        ), patch(
+            "tools.skills_sync.atomic_write_text", side_effect=OSError("disk full")
+        ):
+            result = reset_bundled_skill("google-workspace", restore=True)
+
+        assert result["ok"] is False
+        assert result["action"] == "not_reset"
+        assert "manifest" in result["message"]
+        assert user_copy.read_text() == "# user version\n"
+        assert manifest_file.read_text() == "google-workspace:STALEHASH\n"
+        assert not dest.with_suffix(".reset.bak").exists()
+        assert marker.exists()
+
+    def test_opted_out_targeted_restore_remains_absent_when_manifest_write_fails(self, tmp_path):
+        """A failed first manifest write must remove the untracked restored copy."""
+        bundled = self._setup_bundled(tmp_path)
+        hermes_home = tmp_path / "home"
+        skills_dir = hermes_home / "skills"
+        manifest_file = skills_dir / ".bundled_manifest"
+        marker = hermes_home / ".no-bundled-skills"
+        hermes_home.mkdir()
+        marker.write_text("opted out\n")
+
+        with self._patches(bundled, skills_dir, manifest_file), patch(
+            "tools.skills_sync.HERMES_HOME", hermes_home
+        ), patch(
+            "tools.skills_sync.atomic_write_text", side_effect=OSError("disk full")
+        ):
+            result = reset_bundled_skill("google-workspace", restore=True)
+
+        dest = skills_dir / "productivity" / "google-workspace"
+        assert result["ok"] is False
+        assert result["action"] == "not_reset"
+        assert not dest.exists()
+        assert not manifest_file.exists()
+        assert marker.exists()
+
+    def test_opted_out_restore_reports_removed_bundled_source(self, tmp_path):
+        """Opt-out handling must preserve the normal missing-source error."""
+        bundled = self._setup_bundled(tmp_path)
+        hermes_home = tmp_path / "home"
+        skills_dir = hermes_home / "skills"
+        manifest_file = skills_dir / ".bundled_manifest"
+        skills_dir.mkdir(parents=True)
+        manifest_file.write_text("ghost-skill:OLDHASH\n")
+        marker = hermes_home / ".no-bundled-skills"
+        marker.write_text("opted out\n")
+
+        with self._patches(bundled, skills_dir, manifest_file), patch(
+            "tools.skills_sync.HERMES_HOME", hermes_home
+        ):
+            result = reset_bundled_skill("ghost-skill", restore=True)
+
+        assert result["ok"] is False
+        assert result["action"] == "bundled_missing"
+        assert manifest_file.read_text() == "ghost-skill:OLDHASH\n"
+        assert marker.exists()
+
     def test_reset_errors_when_untracked_or_removed_upstream(self, tmp_path):
         """Untracked skills and skills removed upstream both fail clearly."""
         bundled = self._setup_bundled(tmp_path)

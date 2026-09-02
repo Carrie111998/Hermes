@@ -1070,9 +1070,10 @@ def reset_bundled_skill(name: str, restore: bool = False) -> dict:
 
     Args:
         name: The skill name (matches the manifest key / skill frontmatter name).
-        restore: If True, also delete the user's copy in the skills dir and let
-                 the next sync re-copy the current bundled version. If False
-                 (default), only clear the manifest entry — the user's
+        restore: If True, also replace the user's copy with the current bundled
+                 version. Opted-out profiles receive only the requested skill;
+                 other profiles delete the copy and let sync_skills() re-copy it.
+                 If False (default), only clear the manifest entry — the user's
                  current copy is preserved but future updates work again.
 
     Returns:
@@ -1081,7 +1082,7 @@ def reset_bundled_skill(name: str, restore: bool = False) -> dict:
           - action: one of "manifest_cleared", "restored", "not_in_manifest",
                     "bundled_missing"
           - message: human-readable description
-          - synced: dict from sync_skills() if a sync was triggered, else None
+          - synced: sync-style details if a sync or targeted restore ran, else None
     """
     manifest = _read_manifest()
     bundled_dir = _get_bundled_dir()
@@ -1102,21 +1103,128 @@ def reset_bundled_skill(name: str, restore: bool = False) -> dict:
             "synced": None,
         }
 
+    if restore and not is_bundled:
+        return {
+            "ok": False,
+            "action": "bundled_missing",
+            "message": (
+                f"'{name}' has no bundled source — manifest entry preserved "
+                f"but cannot restore from bundled (skill was removed upstream)."
+            ),
+            "synced": None,
+        }
+
+    # An opted-out profile deliberately makes sync_skills() a no-op. A manual
+    # ``reset --restore`` is narrower than opting the whole profile back in, so
+    # install only the requested skill and leave the marker untouched. Use a
+    # rollback copy so a failed copy never destroys the user's prior version.
+    opted_out = (_hermes_home() / NO_BUNDLED_SKILLS_MARKER).exists()
+    if restore and opted_out:
+        dest = _compute_relative_dest(bundled_by_name[name], bundled_dir)
+        backup = dest.with_suffix(".reset.bak")
+        bundled_hash = _dir_hash(bundled_by_name[name])
+        moved_user_copy = False
+        copy_started = False
+        try:
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            if backup.exists():
+                if dest.exists():
+                    _rmtree_writable(backup)
+                else:
+                    # Recover a prior interrupted restore before replacing it.
+                    shutil.move(str(backup), str(dest))
+            if dest.exists():
+                shutil.move(str(dest), str(backup))
+                moved_user_copy = True
+            copy_started = True
+            shutil.copytree(bundled_by_name[name], dest)
+            if _dir_hash(dest) != bundled_hash:
+                raise OSError("restored copy did not match bundled source")
+        except (OSError, IOError) as e:
+            if copy_started and dest.exists():
+                try:
+                    _rmtree_writable(dest)
+                except (OSError, IOError):
+                    logger.warning(
+                        "Could not clear partial targeted restore %s", dest,
+                        exc_info=True,
+                    )
+            if moved_user_copy and backup.exists() and not dest.exists():
+                try:
+                    shutil.move(str(backup), str(dest))
+                except (OSError, IOError):
+                    logger.warning(
+                        "Could not roll back targeted restore %s", dest,
+                        exc_info=True,
+                    )
+            return {
+                "ok": False,
+                "action": "not_reset",
+                "message": (
+                    f"Could not restore '{name}' from bundled source: {e}. "
+                    "The profile remains opted out of bundled-skill seeding."
+                ),
+                "synced": None,
+            }
+
+        previous_manifest = dict(manifest)
+        manifest[name] = bundled_hash
+        _write_manifest(manifest)
+        if _read_manifest() != manifest:
+            rollback_errors = []
+            if dest.exists():
+                try:
+                    _rmtree_writable(dest)
+                except (OSError, IOError) as e:
+                    rollback_errors.append(f"could not remove restored copy: {e}")
+            if moved_user_copy and backup.exists() and not dest.exists():
+                try:
+                    shutil.move(str(backup), str(dest))
+                except (OSError, IOError) as e:
+                    rollback_errors.append(f"could not restore prior copy: {e}")
+
+            if _read_manifest() != previous_manifest:
+                _write_manifest(previous_manifest)
+                if _read_manifest() != previous_manifest:
+                    rollback_errors.append("could not restore prior manifest")
+
+            rollback_detail = ""
+            if rollback_errors:
+                rollback_detail = f" Rollback incomplete: {'; '.join(rollback_errors)}."
+            return {
+                "ok": False,
+                "action": "not_reset",
+                "message": (
+                    f"Could not restore '{name}' from bundled source because the "
+                    f"bundled manifest was not persisted.{rollback_detail} The profile "
+                    "remains opted out of bundled-skill seeding."
+                ),
+                "synced": None,
+            }
+        if backup.exists():
+            try:
+                _rmtree_writable(backup)
+            except (OSError, IOError):
+                logger.debug("Could not remove reset backup %s", backup, exc_info=True)
+        return {
+            "ok": True,
+            "action": "restored",
+            "message": (
+                f"Restored '{name}' from bundled source. The profile remains "
+                "opted out of automatic bundled-skill seeding."
+            ),
+            "synced": {
+                "copied": [name],
+                "updated": [],
+                "targeted_restore": True,
+            },
+        }
+
     # Step 1 (optional): delete the user's copy so next sync re-copies bundled.
     # Must happen BEFORE manifest deletion so that a failed rmtree does not
     # leave the skill in a manifest-less limbo state (see #34972).
     deleted_user_copy = False
     if restore:
-        if not is_bundled:
-            return {
-                "ok": False,
-                "action": "bundled_missing",
-                "message": (
-                    f"'{name}' has no bundled source — manifest entry preserved "
-                    f"but cannot restore from bundled (skill was removed upstream)."
-                ),
-                "synced": None,
-            }
         dest = _compute_relative_dest(bundled_by_name[name], bundled_dir)
         if dest.exists():
             try:
