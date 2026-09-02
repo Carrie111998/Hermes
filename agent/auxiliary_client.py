@@ -6163,6 +6163,23 @@ def _candidate_context_window(
     return None
 
 
+def _aux_free_only() -> bool:
+    """Return True when ``auxiliary.free_only`` is enabled in config.
+
+    P0.4: when free-only governance is on, every auxiliary route
+    (title generation, vision detect, approval, housekeeping, compression,
+    session search, web extract…) must run on a FREE model and must NEVER
+    route to OpenRouter via a paid SKU.  Centralized so all the resolution
+    steps in ``_resolve_auto_route`` consult one source of truth.
+    """
+    try:
+        from hermes_cli.config import cfg_get, load_config_readonly
+
+        return bool(cfg_get(load_config_readonly(), "auxiliary", "free_only", default=False))
+    except Exception:
+        return False
+
+
 def _try_configured_fallback_chain(
     task: str,
     failed_provider: str,
@@ -6496,8 +6513,25 @@ def _resolve_auto_route(
     # on aggregators (OpenRouter, Nous) who previously got routed to a
     # cheap provider-side default.  Explicit per-task overrides set via
     # config.yaml (auxiliary.<task>.provider) still win over this.
+    #
+    # P0.4 (free_only): when auxiliary.free_only is enabled, the main chat
+    # model is only eligible for auxiliary traffic if it is itself a FREE
+    # model (e.g. ends in ":free").  A paid main chat model (Claude, a paid
+    # OpenRouter SKU, etc.) must NOT be reused for side tasks — skip to the
+    # free discovery chain instead.  This closes the Step-1 paid escape
+    # hatch that the old free_only guard (which only covered _try_openrouter)
+    # left open.
+    _free_only = _aux_free_only()
     main_provider = str(runtime_provider or _read_main_provider() or "")
     main_model = str(runtime_model or _read_main_model() or "")
+    if _free_only and main_model and not _is_free_model(main_model):
+        logger.info(
+            "Auxiliary free_only: skipping paid main model %s for task %s "
+            "(free_only governance) — falling through to free discovery chain.",
+            main_model, task or "aux",
+        )
+        main_provider = ""
+        main_model = ""
 
     # Latency-critical tasks can explicitly prefer the provider's registered
     # fast model over the main chat model. Titling is the only eligible task:
@@ -6606,15 +6640,24 @@ def _resolve_auto_route(
     # main agent's top-level fallback_providers/fallback_model chain. The
     # hardcoded provider discovery chain below is only the convenience default
     # for users who have not declared a fallback policy.
-    if task:
-        fb_client, fb_model, fb_label = _try_configured_fallback_chain(
+    #
+    # P0.4 (free_only): NEVER consult the user's paid fallback chains for
+    # auxiliary traffic.  auxiliary.fallback_chain and the main-agent
+    # fallback_providers/fallback_model can point at paid Claude/OpenRouter
+    # SKUs — under free_only governance those are off-limits for side tasks,
+    # so we drop straight to the free discovery chain (Step 3).  This is
+    # independent of P0.3 (which disables conversation fallback) and must
+    # hold even if a fallback chain is configured.
+    if not _free_only:
+        if task:
+            fb_client, fb_model, fb_label = _try_configured_fallback_chain(
+                task, main_provider or "auto", reason="main provider unavailable")
+            if fb_client is not None:
+                return fb_client, fb_model, _fallback_provider_from_label(fb_label)
+        fb_client, fb_model, fb_label = _try_main_fallback_chain(
             task, main_provider or "auto", reason="main provider unavailable")
         if fb_client is not None:
-            return fb_client, fb_model, _fallback_provider_from_label(fb_label)
-    fb_client, fb_model, fb_label = _try_main_fallback_chain(
-        task, main_provider or "auto", reason="main provider unavailable")
-    if fb_client is not None:
-        return fb_client, fb_model, fb_label
+            return fb_client, fb_model, fb_label
 
     # ── Step 3: aggregator / fallback chain ──────────────────────────────
     tried = []

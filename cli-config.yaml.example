@@ -808,7 +808,7 @@ prompt_caching:
 #   # Image analysis: vision_analyze tool + browser screenshots
 #   vision:
 #     provider: "auto"
-#     model: ""              # e.g. "google/gemini-2.5-flash", "openai/gpt-4o"
+#     model: ""              # e.g. "google/gemini-3.6-flash", "openai/gpt-4o"
 #     timeout: 30            # LLM API call timeout (seconds)
 #     download_timeout: 30   # Image HTTP download timeout (seconds)
 #                            # Increase for slow connections or self-hosted image servers

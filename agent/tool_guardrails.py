@@ -239,7 +239,7 @@ class ToolCallGuardrailConfig:
 # issuing dozens of web searches or spawning dozens of subagents is already
 # pathological, so the defaults are deliberately low.
 _DEFAULT_MAX_WEB_SEARCHES_PER_TURN = 50
-_DEFAULT_MAX_SUBAGENTS_PER_TURN = 50
+_DEFAULT_MAX_SUBAGENTS_PER_TURN = 3
 
 
 @dataclass(frozen=True)

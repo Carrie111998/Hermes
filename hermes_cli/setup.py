@@ -100,7 +100,7 @@ _DEFAULT_PROVIDER_MODELS = {
     "vertex": [
         "google/gemini-3.1-pro-preview", "google/gemini-3-pro-preview",
         "google/gemini-3-flash-preview", "google/gemini-3.1-flash-lite-preview",
-        "google/gemini-2.5-pro", "google/gemini-2.5-flash",
+        "google/gemini-2.5-pro", "google/gemini-3.6-flash",
     ],
     "zai": ["glm-5.3", "glm-5.3-flash", "glm-5.2", "glm-5.1", "glm-5", "glm-4.7", "glm-4.5", "glm-4.5-flash"],
     "kimi-coding": ["kimi-k3", "kimi-k2.6", "kimi-k2.5", "kimi-k2-thinking", "kimi-k2-turbo-preview"],

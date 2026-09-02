@@ -1579,17 +1579,35 @@ def init_agent(
     from agent.agent_runtime_helpers import sync_credential_pool_entry_id
     sync_credential_pool_entry_id(agent)
     
-    # Provider fallback chain — ordered list of backup providers tried
-    # when the primary is exhausted (rate-limit, overload, connection
-    # failure).  Supports both legacy single-dict ``fallback_model`` and
-    # new list ``fallback_providers`` format.
-    if isinstance(fallback_model, list):
-        agent._fallback_chain = [
-            f for f in fallback_model
-            if isinstance(f, dict) and f.get("provider") and f.get("model")
-        ]
-    elif isinstance(fallback_model, dict) and fallback_model.get("provider") and fallback_model.get("model"):
-        agent._fallback_chain = [fallback_model]
+    # P0.3 — Conversation fallback is DISABLED.  The paid fallback chain
+    # must never fire for the main conversation agent: a retired model
+    # (e.g. Gemini 404 "no longer available") or any primary failure must
+    # surface to the user, not silently route to Claude/OpenRouter and burn
+    # paid fallback traffic.  Auxiliary tasks keep their own chain — they
+    # read it independently via auxiliary_client.get_main_agent_fallback_chain
+    # (which honours fallback_providers / fallback_model directly), so this
+    # gate does NOT affect auxiliary fallback governance.
+    #
+    # The chain is built from fallback_model (sourced ONLY from
+    # fallback_providers / fallback_model — confirmed by audit of
+    # get_fallback_chain in hermes_cli/fallback_config.py), but we force it
+    # empty here so a config change, a leftover fallback_model key, or an
+    # inherited parent chain cannot silently re-enable conversation fallback.
+    _conversation_fallback_enabled = bool(os.environ.get(
+        "HERMES_CONVERSATION_FALLBACK_ENABLED", ""
+    ).strip())
+    if _conversation_fallback_enabled:
+        # Escape hatch: only used by tests / explicit opt-in.  Honour the
+        # configured chain verbatim.
+        if isinstance(fallback_model, list):
+            agent._fallback_chain = [
+                f for f in fallback_model
+                if isinstance(f, dict) and f.get("provider") and f.get("model")
+            ]
+        elif isinstance(fallback_model, dict) and fallback_model.get("provider") and fallback_model.get("model"):
+            agent._fallback_chain = [fallback_model]
+        else:
+            agent._fallback_chain = []
     else:
         agent._fallback_chain = []
     agent._fallback_index = 0

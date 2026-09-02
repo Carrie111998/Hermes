@@ -1547,6 +1547,11 @@ def execute_code(
     Returns:
         JSON string with execution results.
     """
+    # P0 cost guard: fail fast in READ_ONLY sessions BEFORE any sandbox,
+    # model, or provider initialization. No retry, no fallback.
+    from agent.runtime_policy import enforce_read_only
+    enforce_read_only("execute_code")
+
     if not SANDBOX_AVAILABLE:
         return tool_error(
             "execute_code sandbox is unavailable in this environment. "

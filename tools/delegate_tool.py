@@ -3959,6 +3959,13 @@ def delegate_task(
     if parent_agent is None:
         return tool_error("delegate_task requires a parent agent context.")
 
+    # P0 cost guard: fail fast in READ_ONLY sessions BEFORE spawning any
+    # worker or initializing any model/provider. Control actions (list/
+    # steer/stop) are read-only bookkeeping and stay allowed.
+    from agent.runtime_policy import enforce_read_only
+
+    enforce_read_only("delegate_task")
+
     # ── Control plane: list/steer/stop run synchronously and return here.
     # They never spawn, so they bypass the pause gate, depth limit, and the
     # async dispatch machinery entirely.

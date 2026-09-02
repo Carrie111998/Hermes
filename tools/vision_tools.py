@@ -2241,7 +2241,7 @@ async def video_analyze_tool(
             analysis = (
                 f"The model does not support video analysis or the request was "
                 f"rejected. Ensure you're using a video-capable model "
-                f"(e.g. google/gemini-2.5-flash). Error: {e}"
+                f"(e.g. google/gemini-3.6-flash). Error: {e}"
             )
         elif any(hint in err_str for hint in (
             "too large", "payload", "413", "content_too_large",

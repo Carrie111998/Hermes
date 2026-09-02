@@ -1337,16 +1337,18 @@ def _classify_by_status(
                 retryable=False,
                 should_fallback=True,
             )
-        # Generic 404 with no "model not found" signal — could be a wrong
-        # endpoint path (common with local llama.cpp / Ollama / vLLM when
-        # the URL is slightly misconfigured), a proxy routing glitch, or
-        # a transient backend issue.  Classifying these as model_not_found
-        # silently falls back to a different provider and tells the model
-        # the model is missing, which is wrong and wastes a turn.  Treat
-        # as unknown so the retry loop surfaces the real error instead.
+        # Generic 404 with no "model not found" / billing / policy signal.
+        # This is the exact IC-001 trigger: a retired model (e.g. Gemini
+        # "is no longer available to new users") returns 404 with a bare
+        # message naming nothing. The model is GONE — retrying the same
+        # request 3x only burns attempts and (under conversation fallback)
+        # paid fallback traffic. Fail fast (0 retries) and let the caller
+        # fall back or surface the real error. P0.2: 404/NOT_FOUND must
+        # never retry (#ic-001).
         return result_fn(
-            FailoverReason.unknown,
-            retryable=True,
+            FailoverReason.model_not_found,
+            retryable=False,
+            should_fallback=True,
         )
 
     if status_code == 413:

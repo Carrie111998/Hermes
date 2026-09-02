@@ -2860,6 +2860,9 @@ def resolve_provider(
         pass
     normalized = _PROVIDER_ALIASES.get(normalized, normalized)
 
+    # P0 cost-leakage hotfix: default-safe provider id (Nous Portal).
+    from agent.runtime_policy import DEFAULT_SAFE_PROVIDER
+
     if normalized == "openrouter":
         return "openrouter"
     if normalized == "custom":
@@ -2875,6 +2878,16 @@ def resolve_provider(
         else:
             msg += " Check 'hermes model' for available providers, or run 'hermes doctor' to diagnose config issues."
         raise AuthError(msg, code="invalid_provider")
+
+    # P0 cost-leakage hotfix — default provider safety: on the auto path,
+    # NEVER let a billable credential (Gemini/Google AI Studio, OpenRouter,
+    # Anthropic API, ...) win by accident. Default resolution is pinned to
+    # Nous Portal ("nous"). A billable provider is used only when the user
+    # set it EXPLICITLY via config.yaml `model.provider` (handled above) or
+    # passed it as `requested`. Env keys / OAuth / pools no longer
+    # auto-select a billable provider.
+    if normalized == "auto":
+        return DEFAULT_SAFE_PROVIDER
 
     # Explicit one-off CLI creds always mean openrouter/custom
     if explicit_api_key or explicit_base_url:

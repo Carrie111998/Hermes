@@ -2897,7 +2897,7 @@ def _model_flow_api_key_provider(config, provider_id, current_model=""):
                 print()
                 print(
                     "❌ This Google API key is on the free tier "
-                    "(<= 250 requests/day for gemini-2.5-flash)."
+                    "(<= 250 requests/day for gemini-3.6-flash)."
                 )
                 print(
                     "   Hermes typically makes 3-10 API calls per user turn "

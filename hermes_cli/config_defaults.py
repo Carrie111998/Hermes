@@ -853,7 +853,7 @@ DEFAULT_CONFIG = {
         # the defaults are low. Set either to 0 to disable that cap (unlimited).
         "loop_caps": {
             "max_web_searches": 50,   # max web_search calls per turn (0 = unlimited)
-            "max_subagents": 50,      # max subagents spawned per turn (0 = unlimited)
+            "max_subagents": 3,       # max subagents spawned per turn (0 = unlimited)
         },
     },
 
@@ -876,7 +876,7 @@ DEFAULT_CONFIG = {
                                       # floored at 0.75 (raise-only) so compaction
                                       # doesn't fire with half the window still free;
                                       # set this above 0.75 to override the floor.
-        "threshold_tokens": None,     # absolute token cap — when set, compression
+        "threshold_tokens": 48000,   # absolute token cap — when set, compression
                                       # triggers at the lower of the ratio-based
                                       # threshold and this token count. Clamped to
                                       # the model's context length at apply-time.
@@ -1196,7 +1196,7 @@ DEFAULT_CONFIG = {
         "stream_only_base_urls": [],
         "vision": {
             "provider": "auto",    # auto | openrouter | nous | codex | custom
-            "model": "",           # e.g. "google/gemini-2.5-flash", "gpt-4o"
+            "model": "",           # e.g. "google/gemini-3.6-flash", "gpt-4o"
             "base_url": "",        # direct OpenAI-compatible endpoint (takes precedence over provider)
             "api_key": "",         # API key for base_url (falls back to OPENAI_API_KEY)
             "timeout": 120,        # seconds — LLM API call timeout; vision payloads need generous timeout
@@ -2165,7 +2165,7 @@ DEFAULT_CONFIG = {
         # extras" without silently stripping MCP tools the parent already has.
         # Set to false for strict intersection.
         "inherit_mcp_toolsets": True,
-        "max_iterations": 250,  # per-subagent iteration cap (each subagent gets its own budget,
+        "max_iterations": 20,  # per-subagent iteration cap (each subagent gets its own budget,
                                # independent of the parent's max_iterations)
         # Subagent summaries return to the parent's context verbatim. A batch
         # fan-out (N children) returns N summaries at once, which can exceed
