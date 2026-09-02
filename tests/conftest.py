@@ -744,6 +744,36 @@ def _kanban_write_guard(_hermetic_environment, monkeypatch):
     monkeypatch.setattr(_kdb, "connect", _guarded_connect)
 
 
+@pytest.fixture(autouse=True)
+def _legacy_kanban_assignee_registry(request, monkeypatch):
+    """Keep pre-validation Kanban tests focused on their original contracts.
+
+    Assignee validation is now a shared kernel invariant. Hundreds of older
+    tests intentionally use synthetic names without constructing profile homes
+    because profile routing is outside their subject. Preserve that isolation
+    here. Registry-boundary tests opt out with
+    ``real_kanban_profile_registry``.
+    """
+    node_path = str(getattr(request.node, "path", "")).lower()
+    if "kanban" not in node_path:
+        return
+    if request.node.get_closest_marker("real_kanban_profile_registry"):
+        return
+
+    from hermes_cli import kanban_db as kb
+
+    monkeypatch.setattr(
+        kb,
+        "validate_assignee_profile",
+        lambda assignee: kb._canonical_assignee(assignee),
+    )
+    monkeypatch.setattr(
+        kb,
+        "quarantine_unknown_assignees",
+        lambda conn, *, dry_run=False: [],
+    )
+
+
 # ── Live state.db write guard ───────────────────────────────────────────────
 # Companion to the kanban guard above, for the MAIN state database.
 # ``hermes_state._ensure_test_isolation`` (the single choke point every

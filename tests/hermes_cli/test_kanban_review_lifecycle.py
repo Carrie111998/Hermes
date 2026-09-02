@@ -28,6 +28,15 @@ import pytest
 from hermes_cli import kanban_db as kb
 
 
+@pytest.fixture(autouse=True)
+def installed_test_profiles(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        kb,
+        "list_profiles_on_disk",
+        lambda: ["default", "builder", "lead-reviewer", "reviewer", "worker"],
+    )
+
+
 @pytest.fixture
 def kanban_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     """Isolated HERMES_HOME with an empty kanban DB."""

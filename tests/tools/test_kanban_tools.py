@@ -15,6 +15,20 @@ from concurrent.futures import ThreadPoolExecutor
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def installed_test_profiles(monkeypatch):
+    from hermes_cli import kanban_db as kb
+
+    monkeypatch.setattr(
+        kb,
+        "list_profiles_on_disk",
+        lambda: [
+            "default", "factory", "orchestrator", "peer", "qa", "reviewer",
+            "test-worker", "worker", "x", "y",
+        ],
+    )
+
+
 # ---------------------------------------------------------------------------
 # Gating
 # ---------------------------------------------------------------------------

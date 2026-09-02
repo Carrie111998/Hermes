@@ -368,7 +368,10 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_create = sub.add_parser("create", help="Create a new task")
     p_create.add_argument("title", help="Task title")
     p_create.add_argument("--body", default=None, help="Optional opening post")
-    p_create.add_argument("--assignee", default=None, help="Profile name to assign")
+    p_create.add_argument(
+        "--assignee", default=None,
+        help="Installed Hermes profile name to assign (unknown names are rejected)",
+    )
     p_create.add_argument("--parent", action="append", default=[],
                           help="Parent task id (repeatable)")
     p_create.add_argument("--workspace", default="scratch",
@@ -1052,6 +1055,36 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_repair.add_argument("--json", action="store_true",
                           help="Emit the repair report as JSON")
 
+    # --- repair-assignees ---
+    p_assignee_repair = sub.add_parser(
+        "repair-assignees",
+        help="Report or explicitly repair cards assigned to missing profiles",
+        description=(
+            "Scans nonterminal cards for assignees absent from the live Hermes "
+            "profile registry. Reporting is read-only. Mutation requires an "
+            "explicit installed --profile target or --archive disposition; "
+            "Hermes never guesses a replacement profile across boards."
+        ),
+    )
+    p_assignee_repair.add_argument(
+        "--all-boards", action="store_true",
+        help="Scan every active board instead of only the selected board",
+    )
+    p_assignee_repair.add_argument(
+        "--task", action="append", default=[], dest="repair_tasks",
+        help="Limit mutation to this task id (repeatable)",
+    )
+    repair_action = p_assignee_repair.add_mutually_exclusive_group()
+    repair_action.add_argument(
+        "--profile", dest="repair_profile",
+        help="Explicit installed target; quarantined cards resume their prior lane",
+    )
+    repair_action.add_argument(
+        "--archive", action="store_true", dest="repair_archive",
+        help="Explicit terminal disposition: archive each selected invalid card",
+    )
+    p_assignee_repair.add_argument("--json", action="store_true")
+
     kanban_parser.set_defaults(_kanban_parser=kanban_parser)
     return kanban_parser
 
@@ -1189,6 +1222,7 @@ def kanban_command(args: argparse.Namespace) -> int:
             "specify":  _cmd_specify,
             "decompose":  _cmd_decompose,
             "gc":       _cmd_gc,
+            "repair-assignees": _cmd_repair_assignees,
         }
         handler = handlers.get(action)
         if not handler:
@@ -1241,6 +1275,7 @@ _DELEGATED_CHILD_DENIED_ACTIONS: frozenset[str] = frozenset({
     "dispatch",
     "daemon",
     "repair",
+    "repair-assignees",
     "heartbeat",
     "notify-subscribe",
     "notify-unsubscribe",
@@ -2810,6 +2845,10 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
                 for (tid, who, current) in res.skipped_per_profile_capped
             ],
             "auto_assigned_default": res.auto_assigned_default,
+            "unknown_assignee_quarantined": [
+                {"task_id": tid, "assignee": who, "previous_status": status}
+                for (tid, who, status) in res.unknown_assignee_quarantined
+            ],
         }, indent=2))
         return 0
     print(f"Reclaimed:    {res.reclaimed}")
@@ -2835,6 +2874,13 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             f"Auto-assigned to kanban.default_assignee={default_assignee!r}: "
             f"{', '.join(res.auto_assigned_default)}"
         )
+    if res.unknown_assignee_quarantined:
+        for tid, who, status in res.unknown_assignee_quarantined:
+            tag = " (dry-run only)" if args.dry_run else ""
+            print(
+                f"Quarantined unknown assignee: {tid} "
+                f"({who!r}, {status} -> triage){tag}"
+            )
     if res.skipped_unassigned:
         print(f"Skipped (unassigned): {', '.join(res.skipped_unassigned)}")
     if res.skipped_per_profile_capped:
@@ -3456,6 +3502,92 @@ def _cmd_repair(args: argparse.Namespace) -> int:
         file=sys.stderr,
     )
     return 1
+
+
+def _cmd_repair_assignees(args: argparse.Namespace) -> int:
+    """Report or explicitly repair unknown assignees with qualified ids."""
+    all_boards = bool(getattr(args, "all_boards", False))
+    if all_boards and getattr(args, "board", None):
+        raise ValueError("use either --board or --all-boards, not both")
+    if all_boards:
+        boards = [item["slug"] for item in kb.list_boards(include_archived=False)]
+        board_targets = [
+            (board, kb.canonical_kanban_db_path(board)) for board in boards
+        ]
+        resolved_targets = [str(path.expanduser().resolve()) for _, path in board_targets]
+        if len(resolved_targets) != len(set(resolved_targets)):
+            raise RuntimeError(
+                "refusing ambiguous --all-boards repair: multiple board slugs "
+                "resolved to the same dedicated database path"
+            )
+    else:
+        boards = [kb.get_current_board()]
+        # Preserve the normal single-board HERMES_KANBAN_DB override contract.
+        board_targets = [(boards[0], None)]
+
+    selected = set(getattr(args, "repair_tasks", None) or [])
+    target = getattr(args, "repair_profile", None)
+    archive = bool(getattr(args, "repair_archive", False))
+    action_requested = bool(target) or archive
+    report: list[dict[str, Any]] = []
+    for board, db_path in board_targets:
+        with kb.connect_closing(db_path=db_path, board=None if db_path else board) as conn:
+            report.extend(
+                {"board": board, **row, "action": "reported"}
+                for row in kb.list_unknown_assignee_tasks(conn)
+            )
+
+    available_keys = {
+        (f"{item['board']}/{item['task_id']}" if all_boards else item["task_id"])
+        for item in report
+    }
+    missing = sorted(selected - available_keys)
+    if missing:
+        raise ValueError(
+            "selected task id(s) are not nonterminal unknown-assignee cards on "
+            f"the scanned board set: {', '.join(missing)}"
+        )
+    if action_requested:
+        for item in report:
+            key = (
+                f"{item['board']}/{item['task_id']}"
+                if all_boards else item["task_id"]
+            )
+            if selected and key not in selected:
+                continue
+            db_path = (
+                kb.canonical_kanban_db_path(item["board"])
+                if all_boards else None
+            )
+            with kb.connect_closing(
+                db_path=db_path,
+                board=None if db_path else item["board"],
+            ) as conn:
+                kb.repair_unknown_assignee_task(
+                    conn,
+                    item["task_id"],
+                    target_profile=target,
+                    archive=archive,
+                )
+            item["action"] = "archived" if archive else "reassigned"
+            item["target_profile"] = target
+    if getattr(args, "json", False):
+        print(json.dumps({"boards": boards, "cards": report}, indent=2, ensure_ascii=False))
+        return 0
+    if not report:
+        print("No nonterminal cards with unknown assignees were found.")
+        return 0
+    for item in report:
+        print(
+            f"{item['board']}/{item['task_id']}  {item['status']:8s}  "
+            f"assignee={item['assignee']}  action={item['action']}"
+        )
+    if not action_requested:
+        print(
+            "Read-only report. Repair explicitly with --profile <installed-profile> "
+            "or the terminal --archive disposition."
+        )
+    return 0
 
 
 # ---------------------------------------------------------------------------

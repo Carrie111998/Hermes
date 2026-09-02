@@ -710,6 +710,22 @@ def board_exists(board: Optional[str] = None) -> bool:
     return (d / "board.json").exists() or (d / "kanban.db").exists()
 
 
+def canonical_kanban_db_path(board: Optional[str] = None) -> Path:
+    """Return the dedicated on-disk DB path for ``board``.
+
+    Unlike :func:`kanban_db_path`, this deliberately ignores the
+    single-board ``HERMES_KANBAN_DB`` process pin. Cross-board maintenance
+    must use this resolver so one worker/gateway pin cannot make several
+    board slugs silently refer to the same database.
+    """
+    slug = _normalize_board_slug(board)
+    if slug is None:
+        slug = get_current_board()
+    if slug == DEFAULT_BOARD:
+        return kanban_home() / "kanban.db"
+    return board_dir(slug) / "kanban.db"
+
+
 def kanban_db_path(board: Optional[str] = None) -> Path:
     """Return the path to the ``kanban.db`` for ``board``.
 
@@ -727,12 +743,7 @@ def kanban_db_path(board: Optional[str] = None) -> Path:
     override = os.environ.get("HERMES_KANBAN_DB", "").strip()
     if override:
         return Path(override).expanduser()
-    slug = _normalize_board_slug(board)
-    if slug is None:
-        slug = get_current_board()
-    if slug == DEFAULT_BOARD:
-        return kanban_home() / "kanban.db"
-    return board_dir(slug) / "kanban.db"
+    return canonical_kanban_db_path(board)
 
 
 def workspaces_root(board: Optional[str] = None) -> Path:
@@ -3166,6 +3177,42 @@ def _canonical_assignee(assignee: Optional[str]) -> Optional[str]:
     return normalize_profile_name(assignee)
 
 
+class UnknownKanbanAssigneeError(ValueError):
+    """Raised when a task names a profile that is not installed."""
+
+    def __init__(self, assignee: str, installed: Iterable[str]):
+        installed_names = sorted(set(installed))
+        choices = ", ".join(installed_names) if installed_names else "default"
+        super().__init__(
+            f"unknown Kanban assignee {assignee!r}: no installed Hermes profile "
+            f"has that name. Installed profiles: {choices}. Safe next actions: "
+            "choose one of those profiles; run `hermes profile list` to refresh "
+            "the live registry; create the named profile explicitly with "
+            f"`hermes profile create {assignee}`; or omit the assignee and leave "
+            "the card for explicit routing. Hermes never treats generic words "
+            "such as 'worker' or 'agent' as profile aliases."
+        )
+        self.assignee = assignee
+        self.installed = installed_names
+
+
+def validate_assignee_profile(assignee: Optional[str]) -> Optional[str]:
+    """Canonicalise *assignee* and require a live installed profile.
+
+    This is the shared Kanban kernel boundary used by every creator and
+    assignment surface (CLI, dashboard/API, tools, plugins, decomposers). An
+    unassigned card remains valid; a named owner must resolve in the live
+    profile registry at the moment of mutation.
+    """
+    canonical = _canonical_assignee(assignee)
+    if canonical is None:
+        return None
+    installed = list_profiles_on_disk()
+    if canonical not in installed:
+        raise UnknownKanbanAssigneeError(canonical, installed)
+    return canonical
+
+
 def create_task(
     conn: sqlite3.Connection,
     *,
@@ -3239,7 +3286,7 @@ def create_task(
     reasoning_effort = normalize_reasoning_effort(reasoning_effort)
     if provider_override and not model_override:
         raise ValueError("provider_override requires a model_override")
-    assignee = _canonical_assignee(assignee)
+    assignee = validate_assignee_profile(assignee)
     if not title or not title.strip():
         raise ValueError("title is required")
     if initial_status not in VALID_INITIAL_STATUSES:
@@ -3716,7 +3763,7 @@ def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) 
     Refuses to reassign a task that's currently running (claim_lock set).
     Reassign after the current run completes if needed.
     """
-    profile = _canonical_assignee(profile)
+    profile = validate_assignee_profile(profile)
     with write_txn(conn):
         row = conn.execute(
             "SELECT status, claim_lock, assignee FROM tasks WHERE id = ?", (task_id,)
@@ -6534,6 +6581,8 @@ def request_review(
 
     summary = redact_review_value(summary)
     metadata = redact_review_value(metadata)
+    if reviewer is not None:
+        reviewer = validate_assignee_profile(reviewer)
     with write_txn(conn):
         if not _parents_satisfied(conn, task_id):
             return _ret(False, "parent dependencies are not satisfied")
@@ -7224,7 +7273,7 @@ def specify_triage_task(
     """
     if title is not None and not title.strip():
         raise ValueError("title cannot be blank")
-    assignee = _canonical_assignee(assignee)
+    assignee = validate_assignee_profile(assignee)
     with write_txn(conn):
         existing = conn.execute(
             "SELECT title, body, assignee FROM tasks WHERE id = ? AND status = 'triage'",
@@ -7326,16 +7375,20 @@ def decompose_triage_task(
     if not children:
         return None
     if root_assignee is not None:
-        root_assignee = _canonical_assignee(root_assignee)
+        root_assignee = validate_assignee_profile(root_assignee)
 
     # Pre-validate the children list shape outside the txn. Cheap checks
     # that don't need DB access. Bad input aborts before we touch the DB.
+    validated_child_assignees: list[Optional[str]] = []
     for idx, child in enumerate(children):
         if not isinstance(child, dict):
             raise ValueError(f"child[{idx}] is not a dict")
         title = child.get("title")
         if not isinstance(title, str) or not title.strip():
             raise ValueError(f"child[{idx}].title is required")
+        validated_child_assignees.append(
+            validate_assignee_profile(child.get("assignee"))
+        )
         parents_idx = child.get("parents") or []
         if not isinstance(parents_idx, list):
             raise ValueError(f"child[{idx}].parents must be a list")
@@ -7405,7 +7458,7 @@ def decompose_triage_task(
             new_id = _new_task_id()
             title = child["title"].strip()
             body = child.get("body")
-            assignee = _canonical_assignee(child.get("assignee"))
+            assignee = validated_child_assignees[idx]
             # Per-child override wins; otherwise inherit the root's
             # workspace. A child that sets workspace_kind without a path
             # falls back to the root path only when kinds match (so a
@@ -8052,6 +8105,11 @@ class DispatchResult:
     operator-actionable failure. Tracked separately so health telemetry
     can distinguish "real stuck" (nothing spawned but spawnable work
     available) from "correctly idle" (nothing spawnable in the queue)."""
+    unknown_assignee_quarantined: list[tuple[str, str, str]] = field(default_factory=list)
+    """``(task_id, assignee, previous_status)`` rows moved to ``triage``
+    because their profile disappeared after creation. This is an audited,
+    human-visible dispatch-time backstop; the dispatcher never substitutes a
+    different profile."""
     skipped_per_profile_capped: list[tuple[str, str, int]] = field(default_factory=list)
     """Tasks deferred this tick because their assignee is already at
     ``kanban.max_in_progress_per_profile`` (#21582). Each entry is
@@ -9981,6 +10039,9 @@ def _dispatch_once_locked(
         result.rate_limited.extend(_crash_rate_limited)
     result.timed_out = enforce_max_runtime(conn)
     result.promoted = recompute_ready(conn, failure_limit=failure_limit)
+    result.unknown_assignee_quarantined = quarantine_unknown_assignees(
+        conn, dry_run=dry_run,
+    )
 
     # Count tasks already running so max_spawn enforces concurrency rather
     # than a per-tick spawn budget. See the docstring above for the full
@@ -11973,7 +12034,9 @@ def list_profiles_on_disk() -> list[str]:
     """Return the set of assignee/profile names discovered on disk.
 
     Includes:
-    - named profiles under ``<default-root>/profiles/<name>/config.yaml``
+    - named profiles under ``<default-root>/profiles/<name>/`` with a stock
+      profile marker (``config.yaml`` or the per-profile ``.env`` seeded by
+      current profile creation)
     - the implicit ``default`` profile when the default Hermes root exists
 
     Reads profile paths directly so this module has no import dependency on
@@ -11996,7 +12059,7 @@ def list_profiles_on_disk() -> list[str]:
             for entry in sorted(profiles_dir.iterdir()):
                 if not entry.is_dir():
                     continue
-                if (entry / "config.yaml").is_file():
+                if (entry / "config.yaml").is_file() or (entry / ".env").is_file():
                     names.add(entry.name)
         except OSError:
             pass
@@ -12037,6 +12100,157 @@ def known_assignees(conn: sqlite3.Connection) -> list[dict]:
         }
         for name in names
     ]
+
+
+def list_unknown_assignee_tasks(conn: sqlite3.Connection) -> list[dict[str, Any]]:
+    """Return nonterminal cards whose assignee is not an installed profile."""
+    installed = set(list_profiles_on_disk())
+    rows = conn.execute(
+        "SELECT id, title, assignee, status FROM tasks "
+        "WHERE status NOT IN ('done', 'archived') "
+        "AND assignee IS NOT NULL AND TRIM(assignee) != '' "
+        "ORDER BY created_at ASC, id ASC"
+    ).fetchall()
+    return [
+        {
+            "task_id": row["id"],
+            "title": row["title"],
+            "assignee": row["assignee"],
+            "status": row["status"],
+        }
+        for row in rows
+        if row["assignee"] not in installed
+    ]
+
+
+def quarantine_unknown_assignees(
+    conn: sqlite3.Connection,
+    *,
+    dry_run: bool = False,
+) -> list[tuple[str, str, str]]:
+    """Move dispatchable cards with removed profiles into audited triage.
+
+    The compare-and-swap update runs under the dispatcher's board lock and a
+    SQLite write transaction. A concurrently claimed or rerouted card is left
+    untouched. ``dry_run`` reports rows without mutating them.
+    """
+    unknown = [
+        row for row in list_unknown_assignee_tasks(conn)
+        if row["status"] in {"ready", "review"}
+    ]
+    if dry_run:
+        return [
+            (row["task_id"], row["assignee"], row["status"])
+            for row in unknown
+        ]
+    quarantined: list[tuple[str, str, str]] = []
+    if not unknown:
+        return quarantined
+    with write_txn(conn):
+        # The profile may have been re-installed after the read-only scan.
+        # Take one fresh snapshot under the transaction and reuse it for every
+        # candidate so the board lock does not cover one directory scan per row.
+        installed = set(list_profiles_on_disk())
+        for row in unknown:
+            if row["assignee"] in installed:
+                continue
+            cur = conn.execute(
+                "UPDATE tasks SET status = 'triage', block_kind = NULL, "
+                "claim_lock = NULL, claim_expires = NULL, worker_pid = NULL "
+                "WHERE id = ? AND assignee = ? AND status = ? "
+                "AND claim_lock IS NULL",
+                (row["task_id"], row["assignee"], row["status"]),
+            )
+            if cur.rowcount != 1:
+                continue
+            _append_event(
+                conn,
+                row["task_id"],
+                "unknown_assignee_quarantined",
+                {
+                    "assignee": row["assignee"],
+                    "previous_status": row["status"],
+                    "new_status": "triage",
+                    "reason": "assigned Hermes profile is not installed",
+                    "next_actions": ["reassign_explicitly", "archive_explicitly"],
+                },
+            )
+            quarantined.append(
+                (row["task_id"], row["assignee"], row["status"])
+            )
+    return quarantined
+
+
+def repair_unknown_assignee_task(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    target_profile: Optional[str] = None,
+    archive: bool = False,
+) -> bool:
+    """Explicitly reassign or archive one nonterminal unknown-assignee card."""
+    if bool(target_profile) == bool(archive):
+        raise ValueError("choose exactly one repair action: target_profile or archive")
+    row = conn.execute(
+        "SELECT id, assignee, status FROM tasks WHERE id = ?", (task_id,)
+    ).fetchone()
+    if row is None:
+        return False
+    unknown_ids = {item["task_id"] for item in list_unknown_assignee_tasks(conn)}
+    if task_id not in unknown_ids:
+        raise ValueError(
+            f"task {task_id} is terminal, unassigned, or already has an installed assignee"
+        )
+    previous_assignee = row["assignee"]
+    previous_status = row["status"]
+    if archive:
+        if not archive_task(conn, task_id):
+            return False
+        with write_txn(conn):
+            _append_event(
+                conn, task_id, "unknown_assignee_repaired",
+                {
+                    "previous_assignee": previous_assignee,
+                    "action": "archived",
+                    "previous_status": previous_status,
+                },
+            )
+        return True
+
+    target = validate_assignee_profile(target_profile)
+    if not assign_task(conn, task_id, target):
+        return False
+    restored_status = previous_status
+    if previous_status == "triage":
+        event = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id = ? "
+            "AND kind = 'unknown_assignee_quarantined' "
+            "ORDER BY id DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        try:
+            prior = json.loads(event["payload"]).get("previous_status") if event else None
+        except (TypeError, json.JSONDecodeError):
+            prior = None
+        if prior in {"ready", "review"}:
+            with write_txn(conn):
+                conn.execute(
+                    "UPDATE tasks SET status = ? WHERE id = ? AND status = 'triage'",
+                    (prior, task_id),
+                )
+            restored_status = prior
+    with write_txn(conn):
+        _append_event(
+            conn, task_id, "unknown_assignee_repaired",
+            {
+                "previous_assignee": previous_assignee,
+                "assignee": target,
+                "action": "reassigned",
+                "previous_status": previous_status,
+                "restored_status": restored_status,
+            },
+        )
+    return True
 
 
 # ---------------------------------------------------------------------------

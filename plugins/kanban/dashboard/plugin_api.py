@@ -626,29 +626,32 @@ def create_task(payload: CreateTaskBody, board: Optional[str] = Query(None)):
     board = _resolve_board(board)
     conn = _conn(board=board)
     try:
-        task_id = kanban_db.create_task(
-            conn,
-            title=payload.title,
-            body=payload.body,
-            assignee=payload.assignee,
-            created_by="dashboard",
-            workspace_kind=payload.workspace_kind,
-            workspace_path=payload.workspace_path,
-            tenant=payload.tenant,
-            priority=payload.priority,
-            parents=payload.parents,
-            triage=payload.triage,
-            idempotency_key=payload.idempotency_key,
-            max_runtime_seconds=payload.max_runtime_seconds,
-            skills=payload.skills,
-            goal_mode=payload.goal_mode,
-            goal_max_turns=payload.goal_max_turns,
-            model_override=payload.model_override,
-            provider_override=payload.provider_override,
-            reasoning_effort=payload.reasoning_effort,
-            project_id=payload.project_id,
-            board=board,
-        )
+        try:
+            task_id = kanban_db.create_task(
+                conn,
+                title=payload.title,
+                body=payload.body,
+                assignee=payload.assignee,
+                created_by="dashboard",
+                workspace_kind=payload.workspace_kind,
+                workspace_path=payload.workspace_path,
+                tenant=payload.tenant,
+                priority=payload.priority,
+                parents=payload.parents,
+                triage=payload.triage,
+                idempotency_key=payload.idempotency_key,
+                max_runtime_seconds=payload.max_runtime_seconds,
+                skills=payload.skills,
+                goal_mode=payload.goal_mode,
+                goal_max_turns=payload.goal_max_turns,
+                model_override=payload.model_override,
+                provider_override=payload.provider_override,
+                reasoning_effort=payload.reasoning_effort,
+                project_id=payload.project_id,
+                board=board,
+            )
+        except kanban_db.UnknownKanbanAssigneeError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
         task = kanban_db.get_task(conn, task_id)
         body: dict[str, Any] = {"task": _task_dict(task) if task else None}
         # Surface a dispatcher-presence warning so the UI can show a
@@ -888,7 +891,7 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
                 ok = kanban_db.assign_task(
                     conn, task_id, payload.assignee or None,
                 )
-            except RuntimeError as e:
+            except (RuntimeError, ValueError) as e:
                 raise HTTPException(status_code=409, detail=str(e))
             if not ok:
                 raise HTTPException(status_code=404, detail="task not found")
@@ -1402,7 +1405,7 @@ def bulk_update(payload: BulkTaskBody, board: Optional[str] = Query(None)):
                             )
                         if not ok:
                             entry.update(ok=False, error="assign refused")
-                    except RuntimeError as e:
+                    except (RuntimeError, ValueError) as e:
                         entry.update(ok=False, error=str(e))
                 if payload.priority is not None:
                     with kanban_db.write_txn(conn):
@@ -1864,12 +1867,15 @@ def reassign_task_endpoint(
     board = _resolve_board(board)
     conn = _conn(board=board)
     try:
-        ok = kanban_db.reassign_task(
-            conn, task_id,
-            payload.profile or None,
-            reclaim_first=bool(payload.reclaim_first),
-            reason=payload.reason,
-        )
+        try:
+            ok = kanban_db.reassign_task(
+                conn, task_id,
+                payload.profile or None,
+                reclaim_first=bool(payload.reclaim_first),
+                reason=payload.reason,
+            )
+        except kanban_db.UnknownKanbanAssigneeError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
         if not ok:
             raise HTTPException(
                 status_code=409,
