@@ -2718,6 +2718,51 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
                 _existing_cooldown,
                 time.monotonic() + _FALLBACK_EXHAUSTED_COOLDOWN_S,
             )
+        # This return was silent, which makes the two ways it fires
+        # indistinguishable in a log: an empty chain, and a chain that was
+        # walked to the end.  Operationally those are opposite problems — one
+        # is "my config never loaded", the other is "every provider I have is
+        # failing" — and from outside both look identical: rate-limit errors
+        # with no "Fallback activated" line.  Chasing 27 such errors against
+        # zero activations is what motivated this (self-hosted, 2026-08-25);
+        # the answer was not in the logs at all.
+        #
+        # Logged once per agent, not once per call.  Callers invoke this on
+        # every iteration of `while retry_count < max_retries` (conversation_
+        # loop.py:3396 and 3470 among others) and most keep retrying when it
+        # returns False, so an unconditional WARNING here turns one transient
+        # empty response into N+1 lines in errors.log.  The first occurrence
+        # carries the diagnosis; the rest are DEBUG.
+        _chain_len = len(agent._fallback_chain)
+        # Deliberately NOT "not configured": agent_init drops entries missing
+        # provider/model, so a `models:`-for-`model:` typo also lands here with
+        # an empty chain.  Naming only the config-absent case would send an
+        # operator to re-add a chain they already wrote — the same misdiagnosis
+        # this log exists to prevent.
+        _why = (
+            "fallback chain is empty (not configured, or every entry dropped "
+            "as invalid at init)" if _chain_len == 0 else "fallback chain exhausted"
+        )
+        # An empty chain is the normal state of a default install with no
+        # fallback_providers configured, so it must not write a config-sounding
+        # WARNING into errors.log on the first transient empty response. Real
+        # exhaustion — a chain that was configured and has now been walked to
+        # the end — is a genuine degradation and keeps WARNING.
+        _base_level = logging.INFO if _chain_len == 0 else logging.WARNING
+        # Cleared per episode alongside _fallback_index / _fallback_activated in
+        # restore_primary_runtime and switch_model, so a later, genuinely
+        # different incident warns again instead of being suppressed for the
+        # life of the process.
+        _already = getattr(agent, "_fallback_unavailable_logged", False)
+        logger.log(
+            logging.DEBUG if _already else _base_level,
+            "Fallback not activated: %s (index=%d, chain_len=%d, reason=%s)",
+            _why,
+            agent._fallback_index,
+            _chain_len,
+            getattr(reason, "name", reason),
+        )
+        agent._fallback_unavailable_logged = True
         return False
     fb = agent._fallback_chain[agent._fallback_index]
     agent._fallback_index += 1

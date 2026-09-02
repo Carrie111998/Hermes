@@ -1922,6 +1922,10 @@ def restore_primary_runtime(agent) -> bool:
         agent._fallback_activated = False
         agent._fallback_index = 0
         agent._rate_limit_backoff_count = 0  # reset exponential backoff counter
+        # Re-arm the "fallback not activated" diagnosis so a later, genuinely
+        # different decline warns again rather than being suppressed to DEBUG
+        # for the life of the process.
+        agent._fallback_unavailable_logged = False
 
         # Reset the stale-call circuit breaker (#58962): the streak measured
         # the FALLBACK provider we're leaving; the restored primary deserves
@@ -3380,6 +3384,10 @@ def switch_model(
     agent._provider_fallback_active = False
     agent._provider_fallback_route = None
     agent._fallback_index = 0
+    # switch_model reassigns _fallback_chain below, which can change the
+    # diagnosis (exhausted -> empty); re-arm so the corrected message is not
+    # suppressed by the previous episode's latch.
+    agent._fallback_unavailable_logged = False
 
     # When the user deliberately swaps primary providers (e.g. openrouter
     # → anthropic), drop any fallback entries that target the OLD primary
