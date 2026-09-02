@@ -28,7 +28,13 @@ from abc import ABC, abstractmethod
 from typing import Callable, Dict, Iterator, List, Optional
 
 from tools.tool_backend_helpers import resolve_openai_audio_api_key
-from tools.tts_tool import _get_provider, _load_tts_config, get_env_value
+from tools.tts_tool import (
+    _get_provider,
+    _load_tts_config,
+    _resolve_tts_instructions,
+    _tts_instructions_channel,
+    get_env_value,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -166,7 +172,16 @@ def _try_instantiate(name: str, tts_config: Dict) -> Optional[StreamingTTSProvid
     if cls is None or not cls.available():
         return None
     try:
-        return cls(tts_config, tts_config.get(name) or {})
+        resolved_config = dict(tts_config)
+        resolved_config["instructions"] = _resolve_tts_instructions(
+            name,
+            tts_config,
+        )
+        section = resolved_config.get(name)
+        if not isinstance(section, dict):
+            section = {}
+
+        return cls(resolved_config, section)
     except Exception as exc:  # pragma: no cover - defensive
         logger.debug("streaming provider %s init failed: %s", name, exc)
         return None
@@ -284,11 +299,18 @@ class OpenAIStreamer(StreamingTTSProvider):
         )
         model = self.section.get("model", "gpt-4o-mini-tts")
         voice = self.section.get("voice", "alloy")
+        create_kwargs = {
+            "model": model,
+            "voice": voice,
+            "input": text,
+            "response_format": "pcm",
+        }
+        instructions = _tts_instructions_channel(self.tts_config)
+        if instructions:
+            create_kwargs["instructions"] = instructions
+
         with client.audio.speech.with_streaming_response.create(
-            model=model,
-            voice=voice,
-            input=text,
-            response_format="pcm",
+            **create_kwargs
         ) as response:
             yield from _capped(response.iter_bytes(), "OpenAI streaming TTS")
 
