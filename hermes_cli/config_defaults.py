@@ -5216,6 +5216,14 @@ OPTIONAL_ENV_VARS = {
         "password": False,
         "category": "messaging",
     },
+    "WEBHOOK_HOST": {
+        "description": "Bind host for the webhook HTTP server (default: all IPv4 and IPv6 interfaces).",
+        "prompt": "Webhook bind host",
+        "url": None,
+        "password": False,
+        "category": "messaging",
+        "advanced": True,
+    },
     "WEBHOOK_PORT": {
         "description": "Port for the webhook HTTP server (default: 8644).",
         "prompt": "Webhook port",

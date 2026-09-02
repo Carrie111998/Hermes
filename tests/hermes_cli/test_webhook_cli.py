@@ -9,6 +9,8 @@ from argparse import Namespace
 from hermes_cli.webhook import (
     webhook_command,
     _get_webhook_base_url,
+    _get_webhook_config,
+    _is_webhook_enabled as _real_is_webhook_enabled,
     _load_subscriptions,
     _save_subscriptions,
     _subscriptions_path,
@@ -49,6 +51,26 @@ def test_webhook_base_url_maps_wildcard_hosts_to_localhost(monkeypatch, host):
         lambda: {"extra": {"host": host, "port": 9123}},
     )
     assert _get_webhook_base_url() == "http://localhost:9123"
+
+
+def test_cli_reads_the_gateway_effective_environment(monkeypatch):
+    monkeypatch.setenv("WEBHOOK_ENABLED", "true")
+    monkeypatch.setenv("WEBHOOK_HOST", "127.0.0.1")
+    monkeypatch.setenv("WEBHOOK_PORT", "9321")
+    monkeypatch.setenv("WEBHOOK_SECRET", "cli-secret-sentinel")
+
+    config = _get_webhook_config()
+
+    assert config["enabled"] is True
+    assert config["extra"] == {
+        "host": "127.0.0.1",
+        "port": 9321,
+        "secret_ref": "WEBHOOK_SECRET",
+    }
+    assert config["source_map"]["enabled"] == "env"
+    assert _real_is_webhook_enabled() is True
+    assert _get_webhook_base_url() == "http://127.0.0.1:9321"
+    assert "cli-secret-sentinel" not in repr(config)
 
 
 class TestSubscribe:
@@ -97,7 +119,7 @@ class TestPersistence:
     def test_corrupted_file(self):
         path = _subscriptions_path()
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text("broken{{{")
+        path.write_text("broken{{{", encoding="utf-8")
         assert _load_subscriptions() == {}
 
     @pytest.mark.skipif(os.name == "nt", reason="POSIX mode bits are platform-specific")
@@ -117,7 +139,10 @@ class TestPersistence:
         # Simulate a pre-existing 0o644 file from before this hardening landed.
         path = _subscriptions_path()
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps({"old": {"secret": "stale", "prompt": "x"}}))
+        path.write_text(
+            json.dumps({"old": {"secret": "stale", "prompt": "x"}}),
+            encoding="utf-8",
+        )
         path.chmod(0o644)
 
         _save_subscriptions({"demo": {"secret": "FRESH", "prompt": "x"}})
@@ -152,4 +177,3 @@ class TestWebhookEnabledGate:
         )
         import hermes_cli.webhook as wh_mod
         assert wh_mod._is_webhook_enabled() is False
-

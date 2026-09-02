@@ -2338,21 +2338,11 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
         if api_server_model_name:
             config.platforms[Platform.API_SERVER].extra["model_name"] = api_server_model_name
 
-    # Webhook platform
-    webhook_enabled = is_truthy_value(getenv("WEBHOOK_ENABLED", ""))
-    webhook_port = getenv("WEBHOOK_PORT")
-    webhook_secret = getenv("WEBHOOK_SECRET", "")
-    if webhook_enabled:
-        if Platform.WEBHOOK not in config.platforms:
-            config.platforms[Platform.WEBHOOK] = PlatformConfig()
-        config.platforms[Platform.WEBHOOK].enabled = True
-        if webhook_port:
-            try:
-                config.platforms[Platform.WEBHOOK].extra["port"] = int(webhook_port)
-            except ValueError:
-                pass
-        if webhook_secret:
-            config.platforms[Platform.WEBHOOK].extra["secret"] = webhook_secret
+    # Webhook platform.  The focused owner also records value-safe provenance
+    # for management projections; the gateway remains the sole merge path.
+    from gateway.webhook_config import apply_webhook_env_overrides
+
+    apply_webhook_env_overrides(config, getenv=_getenv)
 
     # Microsoft Graph webhook platform
     msgraph_webhook_enabled = is_truthy_value(getenv("MSGRAPH_WEBHOOK_ENABLED", ""))
