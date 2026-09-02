@@ -175,13 +175,25 @@ function ResolvedLink({ authoredLabel, t, url }: ResolvedLinkProps) {
   const fetched = useLinkTitle(authoredLabel ? null : url)
   const display = authoredLabel || fetched || defaultLinkLabel(url)
 
-  return (
-    <Link url={url}>
-      <Text color={t.color.accent} underline>
-        {display}
-      </Text>
-    </Link>
+  const label = (
+    <Text color={t.color.accent} underline>
+      {display}
+    </Text>
   )
+
+  // Until a page title resolves, the fallback label for a bare URL is the
+  // host/path itself (`github.com`). Wrapping URL-shaped text in OSC 8 stacks
+  // our hyperlink on the terminal's own URL autodetection, so Cmd+Click in
+  // Warp fires both and opens two tabs (#98091) — the visible text already
+  // points at the same place, so plain text keeps a single clickable layer.
+  // Labels that differ from the target (authored labels, resolved titles,
+  // host/path text that drops a query string) keep the OSC 8 href so the
+  // exact URL survives the click.
+  if (normalizeExternalUrl(display) === url) {
+    return label
+  }
+
+  return <Link url={url}>{label}</Link>
 }
 
 const renderResolvedLink = (k: number, t: Theme, rawUrl: string, label?: string) => {
