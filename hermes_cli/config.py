@@ -4307,6 +4307,36 @@ _COMMENTED_SECTIONS = """
 """
 
 
+def _optional_comment_sections(normalized: Any) -> list:
+    """Return the commented-out doc blocks that belong at the end of config.yaml.
+
+    These blocks document features that are off by default (secret redaction
+    tuning, ``fallback_model``) and are appended as ``extra_content`` by the
+    writer. They are emitted only while the corresponding section is unset, so
+    a user who configures ``fallback_model`` stops seeing the placeholder.
+
+    Shared by :func:`save_config` and :func:`set_config_value`. Before this was
+    factored out, ``set_config_value`` called ``atomic_yaml_write`` with no
+    ``extra_content``, so a single ``hermes config set`` silently deleted these
+    comment blocks from the bottom of the user's config.yaml.
+    """
+    parts: list = []
+    sec = normalized.get("security", {})
+    if not sec or (isinstance(sec, dict) and sec.get("redact_secrets") is None):
+        parts.append(_SECURITY_COMMENT)
+    fb = normalized.get("fallback_model", {})
+    fb_is_valid = False
+    if isinstance(fb, list):
+        fb_is_valid = any(
+            isinstance(e, dict) and e.get("provider") and e.get("model") for e in fb
+        )
+    elif isinstance(fb, dict):
+        fb_is_valid = bool(fb.get("provider") and fb.get("model"))
+    if not fb_is_valid:
+        parts.append(_FALLBACK_COMMENT)
+    return parts
+
+
 def save_config(
     config: Dict[str, Any],
     *,
@@ -4400,18 +4430,7 @@ def save_config(
 
         # Build optional commented-out sections for features that are off by
         # default or only relevant when explicitly configured.
-        parts = []
-        sec = normalized.get("security", {})
-        if not sec or sec.get("redact_secrets") is None:
-            parts.append(_SECURITY_COMMENT)
-        fb = normalized.get("fallback_model", {})
-        fb_is_valid = False
-        if isinstance(fb, list):
-            fb_is_valid = any(isinstance(e, dict) and e.get("provider") and e.get("model") for e in fb)
-        elif isinstance(fb, dict):
-            fb_is_valid = bool(fb.get("provider") and fb.get("model"))
-        if not fb_is_valid:
-            parts.append(_FALLBACK_COMMENT)
+        parts = _optional_comment_sections(normalized)
 
         atomic_yaml_write(
             config_path,
@@ -6159,7 +6178,19 @@ def set_config_value(key: str, value: str, force: bool = False):
     # Write only user config back (not the full merged defaults)
     ensure_hermes_home()
     from utils import atomic_yaml_write
-    atomic_yaml_write(config_path, user_config, sort_keys=False)
+    # Re-emit the trailing commented-out doc sections. atomic_yaml_write
+    # rewrites the whole document, so omitting extra_content here silently
+    # DELETED the Security / Fallback Model comment blocks from the bottom of
+    # the user's config.yaml on every `hermes config set` — the blocks are not
+    # part of the parsed mapping, so nothing else could restore them. Mirrors
+    # save_config's behavior via the shared helper.
+    _extra = _optional_comment_sections(user_config)
+    atomic_yaml_write(
+        config_path,
+        user_config,
+        sort_keys=False,
+        extra_content="".join(_extra) if _extra else None,
+    )
     
     # Keep .env in sync for keys that terminal_tool reads directly from env vars.
     # config.yaml is authoritative, but terminal_tool only reads TERMINAL_ENV etc.
