@@ -9,6 +9,7 @@ Run with:  python -m pytest tests/test_delegate.py -v
    or:     python tests/test_delegate.py
 """
 
+import hashlib
 import json
 import os
 import threading
@@ -21,8 +22,10 @@ from tools.delegate_tool import (
     DELEGATE_BLOCKED_TOOLS,
     DELEGATE_TASK_SCHEMA,
     DelegateEvent,
+    _extract_output_tail,
     _get_max_concurrent_children,
     _load_config,
+    _message_tool_trace,
     delegate_task,
     _build_child_agent,
     _build_child_progress_callback,
@@ -32,6 +35,25 @@ from tools.delegate_tool import (
     _resolve_delegation_credentials,
 )
 from hermes_state import SessionDB
+
+
+def _argument_key_evidence(*keys):
+    normalized = sorted(keys)
+    return {
+        "argument_key_count": len(normalized),
+        "argument_keys": [],
+        "argument_keys_sha256": hashlib.sha256(
+            json.dumps(
+                normalized,
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest(),
+    }
+
+
+def _target_digest(value):
+    return {"sha256": hashlib.sha256(value.encode("utf-8")).hexdigest()}
 
 
 def _make_mock_parent(depth=0):
@@ -525,6 +547,72 @@ class TestToolNamePreservation(unittest.TestCase):
 class TestDelegateObservability(unittest.TestCase):
     """Tests for enriched metadata returned by _run_single_child."""
 
+    def test_output_tail_pairs_divergent_ids_canonically(self):
+        """Output classification must retain the tool name keyed by call_id."""
+        tail = _extract_output_tail(
+            {
+                "messages": [
+                    {
+                        "role": "assistant",
+                        "tool_calls": [
+                            {
+                                "call_id": "call_process",
+                                "id": "call_process|fc_process",
+                                "function": {"name": "process", "arguments": "{}"},
+                            }
+                        ],
+                    },
+                    {
+                        "role": "tool",
+                        "tool_call_id": "call_process",
+                        "content": "[exit 2] process failed",
+                    },
+                ]
+            }
+        )
+
+        self.assertEqual(
+            tail,
+            [
+                {
+                    "tool": "process",
+                    "preview": "[exit 2] process failed",
+                    "is_error": True,
+                }
+            ],
+        )
+
+    def test_message_trace_pairs_divergent_ids_canonically(self):
+        """Fallback trace must pair a canonical result with its assistant start."""
+        trace = _message_tool_trace(
+            [
+                {
+                    "role": "assistant",
+                    "tool_calls": [
+                        {
+                            "call_id": "call_read",
+                            "id": "call_read|fc_read",
+                            "function": {
+                                "name": "read_file",
+                                "arguments": '{"path":"/frozen/a.txt"}',
+                            },
+                        }
+                    ],
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": "call_read",
+                    "name": "read_file",
+                    "content": "ok",
+                },
+            ]
+        )
+
+        self.assertEqual(len(trace), 1)
+        self.assertEqual(trace[0]["tool"], "read_file")
+        self.assertEqual(trace[0]["status"], "ok")
+        self.assertNotIn("trace_anomaly", trace[0])
+
     def test_observability_fields_present(self):
         """Completed child should return tool_trace, tokens, model, exit_reason."""
         parent = _make_mock_parent(depth=0)
@@ -566,9 +654,1845 @@ class TestDelegateObservability(unittest.TestCase):
             self.assertIn("result_bytes", entry["tool_trace"][0])
             self.assertEqual(
                 entry["tool_trace"][0]["input_summary"],
-                {"argument_keys": ["query"], "targets": {}},
+                {**_argument_key_evidence("query"), "targets": {}},
             )
             self.assertEqual(entry["tool_trace"][0]["status"], "ok")
+
+    def test_tool_trace_survives_context_compression_via_runtime_callbacks(self):
+        """Early callback events survive when the result keeps only the late tail."""
+        parent = _make_mock_parent(depth=0)
+
+        with patch("run_agent.AIAgent") as MockAgent:
+            mock_child = MagicMock()
+            mock_child.model = "claude-sonnet-4-6"
+            mock_child.session_prompt_tokens = 240000
+            mock_child.session_completion_tokens = 1200
+            mock_child.session_id = "child-compressed"
+            mock_child._session_db = MagicMock()
+
+            def run_with_compressed_messages(user_message, task_id=None, stream_callback=None):
+                start = MockAgent.call_args.kwargs.get("tool_start_callback")
+                terminal = mock_child.__dict__.get("_delegate_tool_terminal_callback")
+                early = {"path": "/frozen/corpus/a.txt", "offset": 401, "limit": 200}
+                late = {"command": "python verifier.py --phase POST"}
+                start("tc_early", "read_file", early)
+                terminal("tc_early", "read_file", early, "LINE_401|payload", None)
+                start("tc_late", "terminal", late)
+                terminal("tc_late", "terminal", late, '{"exit_code":0}', None)
+                return {
+                    "final_response": "done",
+                    "completed": True,
+                    "interrupted": False,
+                    "api_calls": 9,
+                    "messages": [
+                        {"role": "assistant", "tool_calls": [
+                            {"id": "tc_late", "function": {
+                                "name": "terminal",
+                                "arguments": '{"command":"python verifier.py --phase POST"}',
+                            }},
+                        ]},
+                        {"role": "tool", "tool_call_id": "tc_late", "content": '{"exit_code":0}'},
+                    ],
+                }
+
+            MockAgent.return_value = mock_child
+            mock_child.run_conversation.side_effect = run_with_compressed_messages
+
+            result = json.loads(delegate_task(goal="Trace every read", parent_agent=parent))
+            entry = result["results"][0]
+            trace = entry["tool_trace"]
+
+        mock_child._session_db.get_messages.assert_not_called()
+        self.assertEqual(entry["tool_trace_source"], "runtime_callbacks")
+        self.assertIs(entry["tool_trace_complete"], True)
+        self.assertEqual([item["tool"] for item in trace], ["read_file", "terminal"])
+        self.assertEqual(
+            trace[0]["input_summary"],
+            {
+                **_argument_key_evidence("limit", "offset", "path"),
+                "parameters": {"limit": 200, "offset": 401},
+                "targets": {"path": _target_digest("/frozen/corpus/a.txt")},
+            },
+        )
+        self.assertEqual([item["status"] for item in trace], ["ok", "ok"])
+
+    def test_runtime_callback_trace_retains_reused_ids_across_turns(self):
+        """Sequential turns may legitimately reuse a deterministic call ID."""
+        parent = _make_mock_parent(depth=0)
+
+        with patch("run_agent.AIAgent") as MockAgent:
+            mock_child = MagicMock()
+            mock_child.model = "claude-sonnet-4-6"
+            mock_child.session_prompt_tokens = 240000
+            mock_child.session_completion_tokens = 1200
+            mock_child.session_id = "child-runtime-trace"
+
+            def run_with_callbacks(user_message, task_id=None, stream_callback=None):
+                start = MockAgent.call_args.kwargs.get("tool_start_callback")
+                terminal = mock_child.__dict__.get("_delegate_tool_terminal_callback")
+                if callable(start) and callable(terminal):
+                    first = {"path": "/frozen/a.txt", "offset": 1, "limit": 10}
+                    second = {"path": "/frozen/b.txt", "offset": 1, "limit": 20}
+                    start("call_same", "read_file", first)
+                    terminal("call_same", "read_file", first, "A", None)
+                    start("call_same", "read_file", second)
+                    terminal("call_same", "read_file", second, "BBBB", None)
+                return {
+                    "final_response": "done",
+                    "completed": True,
+                    "interrupted": False,
+                    "api_calls": 3,
+                    "messages": [],
+                }
+
+            mock_child.run_conversation.side_effect = run_with_callbacks
+            MockAgent.return_value = mock_child
+
+            result = json.loads(delegate_task(goal="Trace repeated reads", parent_agent=parent))
+            entry = result["results"][0]
+
+        self.assertEqual(entry["tool_trace_source"], "runtime_callbacks")
+        self.assertIs(entry["tool_trace_complete"], True)
+        self.assertEqual(
+            [item["input_summary"]["targets"]["path"] for item in entry["tool_trace"]],
+            [_target_digest("/frozen/a.txt"), _target_digest("/frozen/b.txt")],
+        )
+        self.assertEqual([item["status"] for item in entry["tool_trace"]], ["ok", "ok"])
+
+    def test_runtime_callback_trace_keeps_start_order_when_completions_reverse(self):
+        """Parallel completions must not reorder the invocation ledger."""
+        parent = _make_mock_parent(depth=0)
+
+        with patch("run_agent.AIAgent") as MockAgent:
+            mock_child = MagicMock()
+            mock_child.model = "claude-sonnet-4-6"
+            mock_child.session_id = "child-reverse-completion"
+
+            def run_with_reverse_completions(user_message, task_id=None, stream_callback=None):
+                start = MockAgent.call_args.kwargs.get("tool_start_callback")
+                terminal = mock_child.__dict__.get("_delegate_tool_terminal_callback")
+                if not callable(start) or not callable(terminal):
+                    raise AssertionError("delegate trace callbacks were not installed")
+                first = {"path": "/frozen/a.txt", "offset": 1, "limit": 10}
+                second = {"path": "/frozen/b.txt", "offset": 1, "limit": 20}
+                start("call_a", "read_file", first)
+                start("call_b", "read_file", second)
+                terminal("call_b", "read_file", second, "BBBB", None)
+                terminal("call_a", "read_file", first, "A", None)
+                return {
+                    "final_response": "done",
+                    "completed": True,
+                    "interrupted": False,
+                    "api_calls": 1,
+                    "messages": [],
+                }
+
+            mock_child.run_conversation.side_effect = run_with_reverse_completions
+            MockAgent.return_value = mock_child
+
+            result = json.loads(delegate_task(goal="Trace parallel reads", parent_agent=parent))
+            trace = result["results"][0]["tool_trace"]
+
+        self.assertEqual(
+            [item["input_summary"]["targets"]["path"] for item in trace],
+            [_target_digest("/frozen/a.txt"), _target_digest("/frozen/b.txt")],
+        )
+        self.assertEqual([item["result_bytes"] for item in trace], [1, 4])
+
+    def test_production_dispatch_routes_notify_turn_and_delivery_collectors(self):
+        """Every production selector route must traverse both callbacks."""
+        from run_agent import AIAgent
+
+        def call(call_id, name, arguments):
+            return types.SimpleNamespace(
+                call_id=call_id,
+                id=f"{call_id}|fc_{call_id}",
+                function=types.SimpleNamespace(
+                    name=name,
+                    arguments=arguments,
+                ),
+            )
+
+        route_shapes = [
+            (
+                "single_sequential",
+                [
+                    call(
+                        "single-terminal",
+                        "terminal",
+                        '{"command":"true","workdir":"/tmp"}',
+                    )
+                ],
+            ),
+            (
+                "homogeneous_sequential",
+                [
+                    call(
+                        f"terminal-{index}",
+                        "terminal",
+                        '{"command":"true","workdir":"/tmp"}',
+                    )
+                    for index in range(2)
+                ],
+            ),
+            (
+                "homogeneous_concurrent",
+                [
+                    call(
+                        f"read-{index}",
+                        "read_file",
+                        f'{{"path":"/tmp/{index}"}}',
+                    )
+                    for index in range(2)
+                ],
+            ),
+            (
+                "segmented",
+                [
+                    *[
+                        call(
+                            f"segmented-read-{index}",
+                            "read_file",
+                            f'{{"path":"/tmp/segmented-{index}"}}',
+                        )
+                        for index in range(2)
+                    ],
+                    call(
+                        "segmented-terminal",
+                        "terminal",
+                        '{"command":"true","workdir":"/tmp"}',
+                    ),
+                ],
+            ),
+        ]
+
+        for route_name, tool_calls in route_shapes:
+            with self.subTest(route=route_name):
+                agent = MagicMock()
+                agent._interrupt_requested = True
+                agent._incremental_persistence_failed = False
+                agent.log_prefix = ""
+                agent.context_compressor = types.SimpleNamespace(
+                    context_length=200_000
+                )
+                agent._delegate_tool_turn_callback = MagicMock()
+                agent._delegate_tool_delivery_callback = MagicMock()
+                agent._delegate_tool_terminal_callback = MagicMock()
+                agent._execute_tool_calls_sequential = types.MethodType(
+                    AIAgent._execute_tool_calls_sequential,
+                    agent,
+                )
+                agent._execute_tool_calls_concurrent = types.MethodType(
+                    AIAgent._execute_tool_calls_concurrent,
+                    agent,
+                )
+                messages = []
+                assistant_message = types.SimpleNamespace(tool_calls=tool_calls)
+
+                with patch("agent.tool_executor.enforce_turn_budget"):
+                    AIAgent._execute_tool_calls(
+                        agent,
+                        assistant_message,
+                        messages,
+                        "production-route-observability",
+                    )
+
+                expected_identities = [
+                    (call.call_id, call.function.name) for call in tool_calls
+                ]
+                agent._delegate_tool_turn_callback.assert_called_once_with(
+                    expected_identities
+                )
+                agent._delegate_tool_delivery_callback.assert_called_once()
+                delivered, budget = (
+                    agent._delegate_tool_delivery_callback.call_args.args
+                )
+                self.assertEqual(budget, 200_000)
+                self.assertEqual(
+                    [(item[0], item[1]) for item in delivered],
+                    expected_identities,
+                )
+                self.assertEqual(len(messages), len(tool_calls))
+                self.assertEqual(
+                    agent._delegate_tool_terminal_callback.call_count,
+                    len(tool_calls),
+                )
+                self.assertEqual(
+                    [
+                        (invocation.args[0], invocation.args[1])
+                        for invocation in agent._delegate_tool_terminal_callback.call_args_list
+                    ],
+                    expected_identities,
+                )
+                self.assertEqual(
+                    [message["tool_call_id"] for message in messages],
+                    [call.call_id for call in tool_calls],
+                )
+
+    def test_concurrent_normal_success_emits_one_owned_terminal_event(self):
+        """Completed workers must feed delegate and global observers exactly once."""
+        from agent.tool_executor import execute_tool_calls_concurrent
+        from run_agent import AIAgent
+        from tools.delegate_tool import _DelegateToolTraceCollector
+
+        calls = [
+            types.SimpleNamespace(
+                id=f"normal-concurrent-{index}",
+                function=types.SimpleNamespace(
+                    name="read_file",
+                    arguments=f'{{"path":"/tmp/normal-{index}"}}',
+                ),
+            )
+            for index in range(2)
+        ]
+        collector = _DelegateToolTraceCollector()
+        agent = MagicMock()
+        agent._interrupt_requested = False
+        agent._incremental_persistence_failed = False
+        agent.log_prefix = ""
+        agent.quiet_mode = True
+        agent.tool_progress_mode = "off"
+        agent.verbose_logging = False
+        agent.context_compressor = types.SimpleNamespace(context_length=200_000)
+        agent.tool_progress_callback = None
+        agent.tool_complete_callback = None
+        agent.tool_start_callback = collector.start
+        agent._delegate_tool_turn_callback = collector.begin_turn
+        agent._delegate_tool_terminal_callback = collector.terminal
+        agent._delegate_tool_delivery_callback = collector.delivery
+        agent._checkpoint_mgr.enabled = False
+        agent._subdirectory_hints.check_tool_call.return_value = ""
+        agent._append_guardrail_observation.side_effect = (
+            lambda _name, _args, result, **_kwargs: result
+        )
+        agent._tool_result_content_for_active_model.side_effect = (
+            lambda _name, result: result
+        )
+        agent._flush_messages_to_session_db.return_value = True
+        agent._should_emit_quiet_tool_messages.return_value = False
+        agent._tool_guardrails.before_call.return_value = types.SimpleNamespace(
+            allows_execution=True
+        )
+        agent._tool_worker_threads_lock = threading.Lock()
+        agent._tool_worker_threads = set()
+        agent.valid_tool_names = []
+        agent.enabled_toolsets = None
+        agent.disabled_toolsets = None
+        agent._memory_manager = None
+        agent.session_id = ""
+        agent._current_turn_id = ""
+        agent._current_api_request_id = ""
+        agent._invoke_tool = types.MethodType(AIAgent._invoke_tool, agent)
+
+        def handle_function_call(
+            function_name,
+            function_args,
+            effective_task_id,
+            **kwargs,
+        ):
+            from model_tools import _emit_post_tool_call_hook
+
+            result = f"normal-result-{kwargs['tool_call_id']}"
+            _emit_post_tool_call_hook(
+                function_name=function_name,
+                function_args=function_args,
+                result=result,
+                task_id=effective_task_id,
+                tool_call_id=kwargs["tool_call_id"],
+            )
+            return result
+
+        messages = []
+        with (
+            patch(
+                "run_agent.handle_function_call",
+                side_effect=handle_function_call,
+            ),
+            patch("hermes_cli.lifecycle.has_hook", return_value=True),
+            patch("hermes_cli.lifecycle.invoke_hook") as invoke_hook,
+            patch("agent.tool_executor.enforce_turn_budget"),
+        ):
+            execute_tool_calls_concurrent(
+                agent,
+                types.SimpleNamespace(tool_calls=calls),
+                messages,
+                "normal-concurrent-observability",
+            )
+
+        post_tool_calls = [
+            call
+            for call in invoke_hook.call_args_list
+            if call.args and call.args[0] == "post_tool_call"
+        ]
+        self.assertEqual(len(post_tool_calls), len(calls))
+        self.assertEqual(len(messages), len(calls))
+        self.assertTrue(collector.trace_complete())
+        self.assertEqual(
+            [item["status"] for item in collector.snapshot()],
+            ["ok", "ok"],
+        )
+        self.assertTrue(collector.turns_complete())
+        self.assertTrue(collector.delivery_complete())
+
+    def test_concurrent_outer_exception_emits_explicit_error_terminal_event(self):
+        """A raised dispatch must not become an ``ok`` delegate trace entry."""
+        from agent.tool_executor import execute_tool_calls_concurrent
+        from run_agent import AIAgent
+        from tools.delegate_tool import _DelegateToolTraceCollector
+
+        tool_call = types.SimpleNamespace(
+            id="concurrent-outer-exception",
+            function=types.SimpleNamespace(
+                name="terminal",
+                arguments='{"command":"false"}',
+            ),
+        )
+        collector = _DelegateToolTraceCollector()
+        terminal_statuses = []
+        agent = MagicMock()
+        agent._interrupt_requested = False
+        agent._incremental_persistence_failed = False
+        agent.log_prefix = ""
+        agent.quiet_mode = True
+        agent.tool_progress_mode = "off"
+        agent.verbose_logging = False
+        agent.context_compressor = types.SimpleNamespace(context_length=200_000)
+        agent.tool_progress_callback = None
+        agent.tool_complete_callback = None
+        agent.tool_start_callback = collector.start
+        agent._delegate_tool_turn_callback = collector.begin_turn
+
+        def terminal_callback(call_id, name, arguments, result, status):
+            terminal_statuses.append(status)
+            collector.terminal(call_id, name, arguments, result, status)
+
+        agent._delegate_tool_terminal_callback = terminal_callback
+        agent._delegate_tool_delivery_callback = collector.delivery
+        agent._checkpoint_mgr.enabled = False
+        agent._subdirectory_hints.check_tool_call.return_value = ""
+        agent._append_guardrail_observation.side_effect = (
+            lambda _name, _args, result, **_kwargs: result
+        )
+        agent._tool_result_content_for_active_model.side_effect = (
+            lambda _name, result: result
+        )
+        agent._flush_messages_to_session_db.return_value = True
+        agent._should_emit_quiet_tool_messages.return_value = False
+        agent._tool_guardrails.before_call.return_value = types.SimpleNamespace(
+            allows_execution=True
+        )
+        agent._tool_worker_threads_lock = threading.Lock()
+        agent._tool_worker_threads = set()
+        agent.valid_tool_names = []
+        agent.enabled_toolsets = None
+        agent.disabled_toolsets = None
+        agent._memory_manager = None
+        agent.session_id = ""
+        agent._current_turn_id = ""
+        agent._current_api_request_id = ""
+        agent._invoke_tool = types.MethodType(AIAgent._invoke_tool, agent)
+
+        messages = []
+        with (
+            patch(
+                "run_agent.handle_function_call",
+                side_effect=RuntimeError("dispatch exploded"),
+            ),
+            patch("hermes_cli.lifecycle.has_hook", return_value=True),
+            patch("hermes_cli.lifecycle.invoke_hook") as invoke_hook,
+            patch("agent.tool_executor.enforce_turn_budget"),
+        ):
+            execute_tool_calls_concurrent(
+                agent,
+                types.SimpleNamespace(tool_calls=[tool_call]),
+                messages,
+                "concurrent-outer-exception-observability",
+            )
+
+        post_tool_calls = [
+            call
+            for call in invoke_hook.call_args_list
+            if call.args and call.args[0] == "post_tool_call"
+        ]
+        self.assertEqual(terminal_statuses, ["error"])
+        self.assertEqual(len(post_tool_calls), 1)
+        self.assertEqual(post_tool_calls[0].kwargs["status"], "error")
+        self.assertEqual(len(messages), 1)
+        self.assertTrue(collector.trace_complete())
+        self.assertEqual(collector.snapshot()[0]["status"], "error")
+        self.assertTrue(collector.turns_complete())
+        self.assertTrue(collector.delivery_complete())
+
+    def test_concurrent_timeout_ignores_late_worker_terminal_event(self):
+        """A timeout-owned occurrence must reject a detached worker's late result."""
+        from agent.tool_executor import execute_tool_calls_concurrent
+        from run_agent import AIAgent
+        from tools.delegate_tool import _DelegateToolTraceCollector
+
+        call = types.SimpleNamespace(
+            id="concurrent-timeout-call",
+            function=types.SimpleNamespace(
+                name="read_file",
+                arguments='{"path":"/tmp/concurrent-timeout"}',
+            ),
+        )
+        collector = _DelegateToolTraceCollector()
+        release = threading.Event()
+        tool_started = threading.Event()
+        worker_finished = threading.Event()
+        late_terminal_observed = threading.Event()
+
+        class ObservedWorkerSet(set):
+            def discard(self, value):
+                super().discard(value)
+                worker_finished.set()
+
+        agent = MagicMock()
+        agent._interrupt_requested = False
+        agent._incremental_persistence_failed = False
+        agent.log_prefix = ""
+        agent.quiet_mode = True
+        agent.tool_progress_mode = "off"
+        agent.verbose_logging = False
+        agent.context_compressor = types.SimpleNamespace(context_length=200_000)
+        agent.tool_progress_callback = None
+        agent.tool_complete_callback = None
+
+        def start_callback(*args, **kwargs):
+            collector.start(*args, **kwargs)
+            tool_started.set()
+
+        agent.tool_start_callback = start_callback
+        agent._delegate_tool_turn_callback = collector.begin_turn
+
+        def terminal_callback(call_id, name, arguments, result, status):
+            collector.terminal(call_id, name, arguments, result, status)
+            if result == "late-concurrent-result":
+                late_terminal_observed.set()
+
+        agent._delegate_tool_terminal_callback = terminal_callback
+        agent._delegate_tool_delivery_callback = collector.delivery
+        agent._checkpoint_mgr.enabled = False
+        agent._subdirectory_hints.check_tool_call.return_value = ""
+        agent._append_guardrail_observation.side_effect = (
+            lambda _name, _args, result, **_kwargs: result
+        )
+        agent._tool_result_content_for_active_model.side_effect = (
+            lambda _name, result: result
+        )
+        agent._flush_messages_to_session_db.return_value = True
+        agent._should_emit_quiet_tool_messages.return_value = False
+        agent._tool_guardrails.before_call.return_value = types.SimpleNamespace(
+            allows_execution=True
+        )
+        agent._tool_worker_threads_lock = threading.Lock()
+        agent._tool_worker_threads = ObservedWorkerSet()
+        agent.valid_tool_names = []
+        agent.enabled_toolsets = None
+        agent.disabled_toolsets = None
+        agent._memory_manager = None
+        agent.session_id = ""
+        agent._current_turn_id = ""
+        agent._current_api_request_id = ""
+        agent._invoke_tool = types.MethodType(AIAgent._invoke_tool, agent)
+
+        def handle_function_call(*_args, **_kwargs):
+            release.wait(timeout=2)
+            return "late-concurrent-result"
+
+        messages = []
+        with (
+            patch(
+                "run_agent.handle_function_call",
+                side_effect=handle_function_call,
+            ),
+            patch(
+                "agent.tool_executor._resolve_concurrent_tool_timeout",
+                return_value=0.1,
+            ),
+            patch(
+                "agent.tool_executor.time.monotonic",
+                side_effect=lambda: 1.0 if tool_started.is_set() else 0.0,
+            ),
+            patch("hermes_cli.lifecycle.has_hook", return_value=True),
+            patch("hermes_cli.lifecycle.invoke_hook") as invoke_hook,
+            patch("agent.tool_executor.enforce_turn_budget"),
+        ):
+            try:
+                execute_tool_calls_concurrent(
+                    agent,
+                    types.SimpleNamespace(tool_calls=[call]),
+                    messages,
+                    "concurrent-timeout-observability",
+                )
+                frozen_trace = collector.snapshot()
+                self.assertTrue(tool_started.is_set())
+                self.assertTrue(collector.trace_complete())
+                self.assertTrue(collector.turns_complete())
+                self.assertTrue(collector.delivery_complete())
+            finally:
+                release.set()
+            self.assertTrue(worker_finished.wait(timeout=2))
+
+        post_tool_calls = [
+            invocation
+            for invocation in invoke_hook.call_args_list
+            if invocation.args and invocation.args[0] == "post_tool_call"
+        ]
+        self.assertFalse(late_terminal_observed.is_set())
+        self.assertEqual(collector.snapshot(), frozen_trace)
+        self.assertEqual(len(post_tool_calls), 1)
+        self.assertTrue(collector.trace_complete())
+        self.assertTrue(collector.delivery_complete())
+
+    def test_post_call_interrupt_retains_cancelled_remaining_occurrences(self):
+        """Every model-emitted call must receive start and terminal evidence."""
+        from agent.tool_executor import (
+            _ManagedToolResult,
+            execute_tool_calls_sequential,
+        )
+        from tools.delegate_tool import _DelegateToolTraceCollector
+
+        calls = [
+            types.SimpleNamespace(
+                id=f"call-{index}",
+                function=types.SimpleNamespace(
+                    name="read_file",
+                    arguments=f'{{"path":"/tmp/{index}"}}',
+                ),
+            )
+            for index in range(2)
+        ]
+        collector = _DelegateToolTraceCollector()
+        agent = MagicMock()
+        agent._interrupt_requested = False
+        agent._incremental_persistence_failed = False
+        agent.context_compressor = types.SimpleNamespace(context_length=200_000)
+        agent.log_prefix = ""
+        agent.quiet_mode = True
+        agent.verbose_logging = False
+        agent.tool_progress_callback = None
+        agent.tool_complete_callback = None
+        agent.tool_start_callback = collector.start
+        agent._checkpoint_mgr.enabled = False
+        agent._subdirectory_hints.check_tool_call.return_value = ""
+        agent._append_guardrail_observation.side_effect = (
+            lambda _name, _args, result, **_kwargs: result
+        )
+        agent._tool_result_content_for_active_model.side_effect = (
+            lambda _name, result: result
+        )
+        agent._flush_messages_to_session_db.return_value = True
+        agent._should_emit_quiet_tool_messages.return_value = False
+        agent.valid_tool_names = []
+        agent.enabled_toolsets = None
+        agent.disabled_toolsets = None
+        agent.session_id = ""
+        agent._current_turn_id = ""
+        agent._current_api_request_id = ""
+        agent._delegate_tool_turn_callback = collector.begin_turn
+        agent._delegate_tool_delivery_callback = collector.delivery
+
+        def terminal_callback(call_id, name, arguments, result, status):
+            collector.terminal(call_id, name, arguments, result, status)
+            if call_id == "call-0":
+                agent._interrupt_requested = True
+
+        agent._delegate_tool_terminal_callback = terminal_callback
+
+        def middleware(_agent, **kwargs):
+            arguments = kwargs["function_args"]
+            agent.tool_start_callback(
+                kwargs["tool_call_id"],
+                kwargs["function_name"],
+                arguments,
+            )
+            return _ManagedToolResult(
+                result=kwargs["execute"](arguments),
+                args=arguments,
+                middleware_trace=[],
+                blocked=False,
+                dispatched=True,
+            )
+
+        messages = []
+        with (
+            patch(
+                "agent.tool_executor._run_sequential_tool_execution_middleware",
+                side_effect=middleware,
+            ),
+            patch("run_agent.handle_function_call", return_value="first-result"),
+            patch("agent.tool_executor.enforce_turn_budget"),
+        ):
+            execute_tool_calls_sequential(
+                agent,
+                types.SimpleNamespace(tool_calls=calls),
+                messages,
+                "interrupt-observability",
+            )
+
+        trace = collector.snapshot()
+        self.assertEqual([item["tool"] for item in trace], ["read_file", "read_file"])
+        self.assertEqual(trace[1]["status"], "error")
+        self.assertTrue(collector.turns_complete())
+
+    def test_segmented_dispatch_notifies_delegate_turn_collector(self):
+        """Each model-emitted tool batch must have one grouping callback."""
+        from agent.tool_executor import execute_tool_calls_segmented
+
+        first = types.SimpleNamespace(
+            id="call-a",
+            function=types.SimpleNamespace(name="read_file", arguments='{"path":"/a"}'),
+        )
+        second = types.SimpleNamespace(
+            id="call-b",
+            function=types.SimpleNamespace(name="read_file", arguments='{"path":"/b"}'),
+        )
+        assistant = types.SimpleNamespace(tool_calls=[first, second])
+        agent = MagicMock()
+        agent._incremental_persistence_failed = False
+        callback = MagicMock()
+        agent._delegate_tool_turn_callback = callback
+
+        with (
+            patch("agent.tool_executor.execute_tool_calls_concurrent") as execute_parallel,
+            patch("agent.tool_executor.enforce_turn_budget"),
+            patch("agent.tool_executor.get_active_env", return_value=None),
+        ):
+            execute_tool_calls_segmented(
+                agent,
+                assistant,
+                [],
+                "child-task",
+                segments=[("parallel", [first, second])],
+            )
+
+        execute_parallel.assert_called_once()
+        callback.assert_called_once_with(
+            [("call-a", "read_file"), ("call-b", "read_file")]
+        )
+
+    def test_segmented_dispatch_reports_post_budget_delivery(self):
+        """Delegate evidence must observe the exact content delivered to the model."""
+        from agent.tool_executor import execute_tool_calls_segmented
+
+        first = types.SimpleNamespace(
+            id="call-a",
+            function=types.SimpleNamespace(name="read_file", arguments='{"path":"/a"}'),
+        )
+        second = types.SimpleNamespace(
+            id="call-b",
+            function=types.SimpleNamespace(name="read_file", arguments='{"path":"/b"}'),
+        )
+        assistant = types.SimpleNamespace(tool_calls=[first, second])
+        agent = MagicMock()
+        agent._incremental_persistence_failed = False
+        agent.context_compressor = types.SimpleNamespace(context_length=200_000)
+        agent._delegate_tool_delivery_callback = MagicMock()
+
+        def execute_parallel(_agent, _message, messages, *_args, **_kwargs):
+            messages.extend(
+                [
+                    {
+                        "role": "tool",
+                        "name": "read_file",
+                        "tool_name": "read_file",
+                        "tool_call_id": "call-a",
+                        "content": "raw-a",
+                    },
+                    {
+                        "role": "tool",
+                        "name": "read_file",
+                        "tool_name": "read_file",
+                        "tool_call_id": "call-b",
+                        "content": "raw-b",
+                    },
+                ]
+            )
+
+        def enforce_budget(tool_messages, **_kwargs):
+            tool_messages[0]["content"] = "persisted-a"
+
+        messages = []
+        with (
+            patch(
+                "agent.tool_executor.execute_tool_calls_concurrent",
+                side_effect=execute_parallel,
+            ),
+            patch("agent.tool_executor.enforce_turn_budget", side_effect=enforce_budget),
+            patch("agent.tool_executor.get_active_env", return_value=None),
+        ):
+            execute_tool_calls_segmented(
+                agent,
+                assistant,
+                messages,
+                "child-task",
+                segments=[("parallel", [first, second])],
+            )
+
+        agent._delegate_tool_delivery_callback.assert_called_once_with(
+            [
+                ("call-a", "read_file", "persisted-a"),
+                ("call-b", "read_file", "raw-b"),
+            ],
+            200_000,
+        )
+
+    def test_segmented_delivery_rejects_tool_message_identity_mismatch(self):
+        """Content equality cannot hide a wrong delivered tool-message identity."""
+        from agent.tool_executor import execute_tool_calls_segmented
+        from tools.delegate_tool import _DelegateToolTraceCollector
+
+        call = types.SimpleNamespace(
+            id="expected-call",
+            function=types.SimpleNamespace(
+                name="read_file",
+                arguments='{"path":"/a"}',
+            ),
+        )
+        assistant = types.SimpleNamespace(tool_calls=[call])
+        collector = _DelegateToolTraceCollector()
+        agent = MagicMock()
+        agent._incremental_persistence_failed = False
+        agent.context_compressor = types.SimpleNamespace(context_length=200_000)
+        agent._delegate_tool_turn_callback = collector.begin_turn
+        agent._delegate_tool_delivery_callback = collector.delivery
+
+        def execute_parallel(_agent, _message, messages, *_args, **_kwargs):
+            arguments = {"path": "/a"}
+            collector.start("expected-call", "read_file", arguments)
+            collector.terminal(
+                "expected-call",
+                "read_file",
+                arguments,
+                "same-content",
+                "ok",
+            )
+            messages.append(
+                {
+                    "role": "tool",
+                    "name": "read_file",
+                    "tool_name": "read_file",
+                    "tool_call_id": "wrong-call",
+                    "content": "same-content",
+                }
+            )
+
+        with (
+            patch(
+                "agent.tool_executor.execute_tool_calls_concurrent",
+                side_effect=execute_parallel,
+            ),
+            patch("agent.tool_executor.enforce_turn_budget"),
+            patch("agent.tool_executor.get_active_env", return_value=None),
+        ):
+            execute_tool_calls_segmented(
+                agent,
+                assistant,
+                [],
+                "child-task",
+                segments=[("parallel", [call])],
+            )
+
+        self.assertFalse(collector.delivery_complete())
+
+    def _observe_structured_delivery(self, terminal_content, delivered_content):
+        from agent.tool_dispatch_helpers import make_tool_result_message
+        from agent.tool_executor import (
+            _begin_tool_execution,
+            _emit_terminal_post_tool_call,
+            _notify_delegate_tool_delivery,
+            _notify_delegate_tool_turn,
+        )
+        from tools.delegate_tool import _DelegateToolTraceCollector
+
+        call = types.SimpleNamespace(
+            id="structured-call",
+            function=types.SimpleNamespace(name="read_file", arguments="{}"),
+        )
+        arguments = {"path": "/frozen/structured"}
+        collector = _DelegateToolTraceCollector()
+        agent = MagicMock()
+        agent._delegate_tool_trace_collector = collector
+        agent._delegate_tool_turn_callback = collector.begin_turn
+        agent.tool_start_callback = collector.start
+        agent._delegate_tool_terminal_callback = collector.terminal
+        agent._delegate_tool_delivery_callback = collector.delivery
+        agent._checkpoint_mgr.enabled = False
+        agent.quiet_mode = True
+        agent.tool_progress_callback = None
+        agent._should_emit_quiet_tool_messages.return_value = False
+
+        _notify_delegate_tool_turn(agent, [call])
+        _begin_tool_execution(
+            agent,
+            function_name="read_file",
+            function_args=arguments,
+            effective_task_id="child-task",
+            tool_call_id="structured-call",
+            display_index=1,
+        )
+        _emit_terminal_post_tool_call(
+            agent,
+            function_name="read_file",
+            function_args=arguments,
+            result=terminal_content,
+            effective_task_id="child-task",
+            tool_call_id="structured-call",
+            status="ok",
+        )
+        message = make_tool_result_message(
+            "read_file",
+            delivered_content,
+            "structured-call",
+        )
+        _notify_delegate_tool_delivery(agent, [call], [message], 100)
+        return collector
+
+    def test_structured_delivery_rejects_text_projection_collision(self):
+        """Equal flattened text cannot certify different typed content blocks."""
+        terminal_content = [
+            {"type": "text", "text": "alpha"},
+            {"type": "text", "text": "beta"},
+        ]
+        delivered_content = [
+            {"type": "text", "text": "alpha\nbeta"},
+        ]
+
+        collector = self._observe_structured_delivery(
+            terminal_content,
+            delivered_content,
+        )
+        entry = collector.snapshot()[0]
+
+        self.assertEqual(entry["result_bytes"], entry["delivered_result_bytes"])
+        self.assertIs(entry["result_delivery_complete"], False)
+        self.assertFalse(collector.delivery_complete())
+
+    def test_structured_delivery_accepts_identical_typed_content(self):
+        """Identical typed content blocks retain complete delivery evidence."""
+        content = [
+            {"type": "text", "text": "alpha"},
+            {"type": "text", "text": "beta"},
+        ]
+
+        collector = self._observe_structured_delivery(content, content)
+        entry = collector.snapshot()[0]
+
+        self.assertIs(entry["result_delivery_complete"], True)
+        self.assertTrue(collector.delivery_complete())
+
+    def test_callback_exceptions_invalidate_runtime_trace_completeness(self):
+        """A callback that mutates then raises must still fail every claim closed."""
+        from agent.tool_executor import (
+            _begin_tool_execution,
+            _emit_terminal_post_tool_call,
+            _notify_delegate_tool_delivery,
+            _notify_delegate_tool_turn,
+        )
+        from tools.delegate_tool import _DelegateToolTraceCollector
+
+        call = types.SimpleNamespace(
+            id="call-1",
+            function=types.SimpleNamespace(name="read_file", arguments="{}"),
+        )
+        arguments = {"path": "/frozen/a", "offset": 1, "limit": 1}
+        message = {
+            "role": "tool",
+            "name": "read_file",
+            "tool_name": "read_file",
+            "tool_call_id": "call-1",
+            "content": "payload",
+        }
+
+        def raising_after(callback):
+            def wrapped(*args):
+                callback(*args)
+                raise RuntimeError("callback failed after mutation")
+
+            return wrapped
+
+        collector = _DelegateToolTraceCollector()
+        agent = MagicMock()
+        agent._delegate_tool_trace_collector = collector
+        agent._delegate_tool_turn_callback = raising_after(collector.begin_turn)
+        _notify_delegate_tool_turn(agent, [call])
+        collector.start("call-1", "read_file", arguments)
+        collector.terminal("call-1", "read_file", arguments, "payload", "ok")
+        collector.delivery([("call-1", "read_file", "payload")], 100)
+        self.assertFalse(collector.turns_complete())
+
+        collector = _DelegateToolTraceCollector()
+        collector.begin_turn([("call-1", "read_file")])
+        agent = MagicMock()
+        agent._delegate_tool_trace_collector = collector
+        agent.quiet_mode = True
+        agent.tool_progress_callback = None
+        agent.tool_start_callback = raising_after(collector.start)
+        agent._checkpoint_mgr.enabled = False
+        _begin_tool_execution(
+            agent,
+            function_name="read_file",
+            function_args=arguments,
+            effective_task_id="child-task",
+            tool_call_id="call-1",
+            display_index=1,
+        )
+        collector.terminal("call-1", "read_file", arguments, "payload", "ok")
+        collector.delivery([("call-1", "read_file", "payload")], 100)
+        self.assertFalse(collector.trace_complete())
+
+        collector = _DelegateToolTraceCollector()
+        collector.begin_turn([("call-1", "read_file")])
+        collector.start("call-1", "read_file", arguments)
+        agent = MagicMock()
+        agent._delegate_tool_trace_collector = collector
+        agent._delegate_tool_terminal_callback = raising_after(collector.terminal)
+        _emit_terminal_post_tool_call(
+            agent,
+            function_name="read_file",
+            function_args=arguments,
+            result="payload",
+            effective_task_id="child-task",
+            tool_call_id="call-1",
+            status="ok",
+        )
+        collector.delivery([("call-1", "read_file", "payload")], 100)
+        self.assertFalse(collector.trace_complete())
+
+        collector = _DelegateToolTraceCollector()
+        collector.begin_turn([("call-1", "read_file")])
+        collector.start("call-1", "read_file", arguments)
+        collector.terminal("call-1", "read_file", arguments, "payload", "ok")
+        agent = MagicMock()
+        agent._delegate_tool_trace_collector = collector
+        agent._delegate_tool_delivery_callback = raising_after(collector.delivery)
+        _notify_delegate_tool_delivery(agent, [call], [message], 100)
+        self.assertFalse(collector.delivery_complete())
+
+    def test_public_trace_complete_reflects_collector_invalidation(self):
+        """Runtime source provenance alone must not imply a complete ledger."""
+        parent = _make_mock_parent(depth=0)
+
+        with patch("run_agent.AIAgent") as MockAgent:
+            mock_child = MagicMock()
+            mock_child.model = "claude-sonnet-4-6"
+            mock_child.session_id = "child-invalidated-trace"
+
+            def run_invalidated(user_message, task_id=None, stream_callback=None):
+                collector = mock_child.__dict__["_delegate_tool_trace_collector"]
+                turn = mock_child.__dict__["_delegate_tool_turn_callback"]
+                start = MockAgent.call_args.kwargs["tool_start_callback"]
+                terminal = mock_child.__dict__["_delegate_tool_terminal_callback"]
+                delivery = mock_child.__dict__["_delegate_tool_delivery_callback"]
+                arguments = {"path": "/frozen/a", "offset": 1, "limit": 1}
+                turn([("call-1", "read_file")])
+                start("call-1", "read_file", arguments)
+                terminal("call-1", "read_file", arguments, "payload", "ok")
+                delivery([("call-1", "read_file", "payload")], 100)
+                collector.invalidate("terminal")
+                return {
+                    "final_response": "done",
+                    "completed": True,
+                    "interrupted": False,
+                    "api_calls": 1,
+                    "messages": [],
+                }
+
+            mock_child.run_conversation.side_effect = run_invalidated
+            MockAgent.return_value = mock_child
+            result = json.loads(
+                delegate_task(goal="Invalidated trace", parent_agent=parent)
+            )
+            entry = result["results"][0]
+
+        self.assertEqual(entry["tool_trace_source"], "runtime_callbacks")
+        self.assertIs(entry["tool_trace_complete"], False)
+
+    def test_runtime_trace_preserves_assistant_turn_grouping(self):
+        """Public trace must bind each call to its model-emitted tool turn."""
+        parent = _make_mock_parent(depth=0)
+
+        with patch("run_agent.AIAgent") as MockAgent:
+            mock_child = MagicMock()
+            mock_child.model = "claude-sonnet-4-6"
+            mock_child.session_id = "child-turn-grouping"
+
+            def run_grouped(user_message, task_id=None, stream_callback=None):
+                turn = mock_child.__dict__.get("_delegate_tool_turn_callback")
+                start = MockAgent.call_args.kwargs.get("tool_start_callback")
+                terminal = mock_child.__dict__.get("_delegate_tool_terminal_callback")
+                delivery = mock_child.__dict__.get("_delegate_tool_delivery_callback")
+                if (
+                    not callable(turn)
+                    or not callable(start)
+                    or not callable(terminal)
+                    or not callable(delivery)
+                ):
+                    raise AssertionError("delegate grouping callbacks were not installed")
+                calls = [("call-a", "read_file"), ("call-b", "read_file")]
+                turn(calls)
+                for call_id, path in (("call-a", "/frozen/a"), ("call-b", "/frozen/b")):
+                    args = {"path": path, "offset": 1, "limit": 10}
+                    start(call_id, "read_file", args)
+                    terminal(call_id, "read_file", args, "payload", None)
+                delivery(
+                    [
+                        ("call-a", "read_file", "payload"),
+                        ("call-b", "read_file", "payload"),
+                    ],
+                    120_000,
+                )
+                return {
+                    "final_response": "done",
+                    "completed": True,
+                    "interrupted": False,
+                    "api_calls": 2,
+                    "messages": [],
+                }
+
+            mock_child.run_conversation.side_effect = run_grouped
+            MockAgent.return_value = mock_child
+            result = json.loads(delegate_task(goal="Trace grouped reads", parent_agent=parent))
+            entry = result["results"][0]
+
+        self.assertIs(entry["tool_trace_turns_complete"], True)
+        self.assertIs(entry["tool_trace_delivery_complete"], True)
+        self.assertEqual(
+            [
+                (
+                    item["assistant_turn_index"],
+                    item["turn_call_index"],
+                    item["turn_call_count"],
+                )
+                for item in entry["tool_trace"]
+            ],
+            [(1, 1, 2), (1, 2, 2)],
+        )
+        self.assertEqual(
+            [
+                (
+                    item["assistant_turn_budget_chars"],
+                    item["assistant_turn_delivered_chars"],
+                )
+                for item in entry["tool_trace"]
+            ],
+            [(120_000, 14), (120_000, 14)],
+        )
+
+    def test_runtime_trace_summarizes_complete_read_file_result(self):
+        """Read evidence must prove exact delivered content without exposing it."""
+        parent = _make_mock_parent(depth=0)
+        delivered = "1|alpha\n2|beta"
+        read_result = json.dumps(
+            {
+                "content": delivered,
+                "total_lines": 2,
+                "file_size": 10,
+                "truncated": False,
+                "is_binary": False,
+                "is_image": False,
+            },
+            ensure_ascii=False,
+        )
+
+        with patch("run_agent.AIAgent") as MockAgent:
+            mock_child = MagicMock()
+            mock_child.model = "claude-sonnet-4-6"
+            mock_child.session_id = "child-read-summary"
+
+            def run_read(user_message, task_id=None, stream_callback=None):
+                turn = mock_child.__dict__["_delegate_tool_turn_callback"]
+                start = MockAgent.call_args.kwargs["tool_start_callback"]
+                terminal = mock_child.__dict__["_delegate_tool_terminal_callback"]
+                delivery = mock_child.__dict__["_delegate_tool_delivery_callback"]
+                args = {"path": "/frozen/chunk.txt", "offset": 1, "limit": 2}
+                turn([("call-read", "read_file")])
+                start("call-read", "read_file", args)
+                terminal("call-read", "read_file", args, read_result, None)
+                delivery([("call-read", "read_file", read_result)], 120_000)
+                return {
+                    "final_response": "done",
+                    "completed": True,
+                    "interrupted": False,
+                    "api_calls": 2,
+                    "messages": [],
+                }
+
+            mock_child.run_conversation.side_effect = run_read
+            MockAgent.return_value = mock_child
+            result = json.loads(delegate_task(goal="Trace exact read", parent_agent=parent))
+            entry = result["results"][0]
+            trace = entry["tool_trace"]
+
+        self.assertIs(entry["tool_trace_delivery_complete"], True)
+        self.assertIs(trace[0]["result_delivery_complete"], True)
+        self.assertEqual(trace[0]["delivered_result_bytes"], len(read_result.encode("utf-8")))
+        self.assertNotIn(delivered, json.dumps(result, ensure_ascii=False))
+        self.assertEqual(
+            trace[0]["output_summary"],
+            {
+                "content_chars": len(delivered),
+                "content_returned": True,
+                "content_sha256": hashlib.sha256(delivered.encode()).hexdigest(),
+                "file_size": 10,
+                "metadata_valid": True,
+                "total_lines": 2,
+                "truncated": False,
+            },
+        )
+
+    def test_runtime_trace_uses_utf8_bytes_and_character_budget_units(self):
+        """Byte fields count UTF-8 while the whole-turn budget remains characters."""
+        parent = _make_mock_parent(depth=0)
+        arguments = {"path": "/tmp/żółć", "offset": 1, "limit": 1}
+        payload = "zażółć"
+
+        with patch("run_agent.AIAgent") as MockAgent:
+            mock_child = MagicMock()
+            mock_child.model = "claude-sonnet-4-6"
+            mock_child.session_id = "child-unicode-accounting"
+
+            def run_unicode(user_message, task_id=None, stream_callback=None):
+                turn = mock_child.__dict__["_delegate_tool_turn_callback"]
+                start = MockAgent.call_args.kwargs["tool_start_callback"]
+                terminal = mock_child.__dict__["_delegate_tool_terminal_callback"]
+                delivery = mock_child.__dict__["_delegate_tool_delivery_callback"]
+                turn([("call-unicode", "read_file")])
+                start("call-unicode", "read_file", arguments)
+                terminal(
+                    "call-unicode",
+                    "read_file",
+                    arguments,
+                    payload,
+                    "ok",
+                )
+                delivery([("call-unicode", "read_file", payload)], 100)
+                return {
+                    "final_response": "done",
+                    "completed": True,
+                    "interrupted": False,
+                    "api_calls": 1,
+                    "messages": [],
+                }
+
+            mock_child.run_conversation.side_effect = run_unicode
+            MockAgent.return_value = mock_child
+            result = json.loads(
+                delegate_task(goal="Unicode accounting", parent_agent=parent)
+            )
+            item = result["results"][0]["tool_trace"][0]
+
+        self.assertEqual(
+            item["args_bytes"],
+            len(
+                json.dumps(
+                    arguments,
+                    ensure_ascii=False,
+                    default=str,
+                ).encode("utf-8")
+            ),
+        )
+        self.assertEqual(item["result_bytes"], len(payload.encode("utf-8")))
+        self.assertEqual(
+            item["delivered_result_bytes"],
+            len(payload.encode("utf-8")),
+        )
+        self.assertEqual(item["assistant_turn_delivered_chars"], len(payload))
+
+    def test_runtime_trace_hashes_terminal_command_and_workdir(self):
+        """Boundary identities need exact hashes without public raw text."""
+        parent = _make_mock_parent(depth=0)
+        command = "python3 -c \"print('CC011_PRE')\""
+        workdir = "/tmp/CC011_PRIVATE_WORKDIR_CANARY"
+        terminal_result = '{"output":"ok","exit_code":0}'
+
+        with patch("run_agent.AIAgent") as MockAgent:
+            mock_child = MagicMock()
+            mock_child.model = "claude-sonnet-4-6"
+            mock_child.session_id = "child-terminal-identity"
+
+            def run_terminal(user_message, task_id=None, stream_callback=None):
+                turn = mock_child.__dict__["_delegate_tool_turn_callback"]
+                start = MockAgent.call_args.kwargs["tool_start_callback"]
+                terminal = mock_child.__dict__["_delegate_tool_terminal_callback"]
+                delivery = mock_child.__dict__["_delegate_tool_delivery_callback"]
+                args = {"command": command, "workdir": workdir}
+                turn([("call-terminal", "terminal")])
+                start("call-terminal", "terminal", args)
+                terminal("call-terminal", "terminal", args, terminal_result, None)
+                delivery([("call-terminal", "terminal", terminal_result)], 120_000)
+                return {
+                    "final_response": "done",
+                    "completed": True,
+                    "interrupted": False,
+                    "api_calls": 2,
+                    "messages": [],
+                }
+
+            mock_child.run_conversation.side_effect = run_terminal
+            MockAgent.return_value = mock_child
+            result = json.loads(delegate_task(goal="Trace boundary", parent_agent=parent))
+            entry = result["results"][0]
+            trace = entry["tool_trace"]
+
+        encoded = json.dumps(result, ensure_ascii=False)
+        self.assertNotIn(command, encoded)
+        self.assertNotIn(workdir, encoded)
+        self.assertIs(entry["tool_trace_delivery_complete"], True)
+        self.assertIs(trace[0]["result_delivery_complete"], True)
+        self.assertEqual(
+            trace[0]["delivered_result_bytes"],
+            len(terminal_result.encode("utf-8")),
+        )
+        self.assertEqual(
+            trace[0]["input_summary"],
+            {
+                **_argument_key_evidence("command", "workdir"),
+                "parameters": {
+                    "command_sha256": hashlib.sha256(command.encode()).hexdigest()
+                },
+                "targets": {"workdir": _target_digest(workdir)},
+            },
+        )
+        self.assertEqual(
+            trace[0]["output_summary"],
+            {
+                "exit_code": 0,
+                "metadata_valid": True,
+                "output_chars": 2,
+                "output_sha256": hashlib.sha256(b"ok").hexdigest(),
+            },
+        )
+
+    def test_runtime_trace_marks_post_budget_replacement_incomplete(self):
+        """A persisted replacement must not count as full model delivery."""
+        parent = _make_mock_parent(depth=0)
+
+        with patch("run_agent.AIAgent") as MockAgent:
+            mock_child = MagicMock()
+            mock_child.model = "claude-sonnet-4-6"
+            mock_child.session_id = "child-delivery-proof"
+
+            def run_replaced(user_message, task_id=None, stream_callback=None):
+                turn = mock_child.__dict__["_delegate_tool_turn_callback"]
+                start = MockAgent.call_args.kwargs["tool_start_callback"]
+                terminal = mock_child.__dict__["_delegate_tool_terminal_callback"]
+                delivery = mock_child.__dict__["_delegate_tool_delivery_callback"]
+                args = {"path": "/frozen/chunk.txt", "offset": 1, "limit": 1}
+                raw = '{"content":"1|alpha","total_lines":1,"file_size":5,"truncated":false}'
+                turn([("call-read", "read_file")])
+                start("call-read", "read_file", args)
+                terminal("call-read", "read_file", args, raw, None)
+                delivery(
+                    [("call-read", "read_file", "[tool result persisted]")],
+                    120_000,
+                )
+                return {
+                    "final_response": "done",
+                    "completed": True,
+                    "interrupted": False,
+                    "api_calls": 2,
+                    "messages": [],
+                }
+
+            mock_child.run_conversation.side_effect = run_replaced
+            MockAgent.return_value = mock_child
+            result = json.loads(delegate_task(goal="Trace delivery", parent_agent=parent))
+            entry = result["results"][0]
+
+        self.assertIs(entry["tool_trace_delivery_complete"], False)
+        self.assertIs(entry["tool_trace"][0]["result_delivery_complete"], False)
+        encoded = json.dumps(entry["tool_trace"], ensure_ascii=False)
+        self.assertNotIn("1|alpha", encoded)
+        self.assertNotIn("[tool result persisted]", encoded)
+
+    def test_terminal_post_tool_call_notifies_delegate_collector(self):
+        """Every terminal outcome must reach the delegate-only trace callback."""
+        from agent.tool_executor import _emit_terminal_post_tool_call
+
+        agent = MagicMock()
+        agent.session_id = "child-terminal-callback"
+        agent._current_turn_id = "turn-1"
+        agent._current_api_request_id = "request-1"
+        callback = MagicMock()
+        agent._delegate_tool_terminal_callback = callback
+        args = {"path": "/frozen/a.txt", "offset": 1, "limit": 10}
+
+        _emit_terminal_post_tool_call(
+            agent,
+            function_name="read_file",
+            function_args=args,
+            result='{"error":"blocked"}',
+            effective_task_id="child-task",
+            tool_call_id="call-blocked",
+            status="blocked",
+            error_type="policy_block",
+        )
+
+        callback.assert_called_once_with(
+            "call-blocked",
+            "read_file",
+            args,
+            '{"error":"blocked"}',
+            "blocked",
+        )
+
+    def test_runtime_trace_is_returned_when_child_raises(self):
+        """A raised child must retain starts and expose missing completion."""
+        parent = _make_mock_parent(depth=0)
+
+        with patch("run_agent.AIAgent") as MockAgent:
+            mock_child = MagicMock()
+            mock_child.model = "claude-sonnet-4-6"
+            mock_child.session_id = "child-raised-trace"
+            mock_child.get_activity_summary.return_value = {"api_call_count": 1}
+
+            def start_then_raise(user_message, task_id=None, stream_callback=None):
+                start = MockAgent.call_args.kwargs.get("tool_start_callback")
+                if callable(start):
+                    start(
+                        "call-before-raise",
+                        "read_file",
+                        {"path": "/frozen/a.txt", "offset": 1, "limit": 10},
+                    )
+                raise RuntimeError("child failed after tool start")
+
+            mock_child.run_conversation.side_effect = start_then_raise
+            MockAgent.return_value = mock_child
+
+            result = json.loads(delegate_task(goal="Raise after start", parent_agent=parent))
+            entry = result["results"][0]
+
+        self.assertEqual(entry["status"], "error")
+        self.assertEqual(entry["tool_trace_source"], "runtime_callbacks")
+        self.assertEqual(len(entry["tool_trace"]), 1)
+        self.assertEqual(entry["tool_trace"][0]["tool"], "read_file")
+        self.assertEqual(entry["tool_trace"][0]["status"], "error")
+        self.assertEqual(
+            entry["tool_trace"][0]["trace_anomaly"],
+            "missing_tool_result",
+        )
+
+    def test_outer_delegate_exception_retains_partial_runtime_trace(self):
+        """Failures after child return must not discard callback evidence."""
+        parent = _make_mock_parent(depth=0)
+
+        with (
+            patch("run_agent.AIAgent") as MockAgent,
+            patch(
+                "tools.delegate_tool._message_tool_trace",
+                side_effect=RuntimeError("post-child projection failed"),
+            ),
+        ):
+            mock_child = MagicMock()
+            mock_child.model = "claude-sonnet-4-6"
+            mock_child.session_id = "child-outer-exception-trace"
+
+            def return_after_start(user_message, task_id=None, stream_callback=None):
+                start = MockAgent.call_args.kwargs["tool_start_callback"]
+                start(
+                    "call-before-outer-error",
+                    "read_file",
+                    {"path": "/frozen/a.txt", "offset": 1, "limit": 10},
+                )
+                return {
+                    "final_response": "done",
+                    "completed": True,
+                    "interrupted": False,
+                    "api_calls": 1,
+                    "messages": [],
+                }
+
+            mock_child.run_conversation.side_effect = return_after_start
+            MockAgent.return_value = mock_child
+            result = json.loads(
+                delegate_task(goal="Outer exception trace", parent_agent=parent)
+            )
+            entry = result["results"][0]
+
+        self.assertEqual(entry["status"], "error")
+        self.assertEqual(entry["tool_trace_source"], "runtime_callbacks")
+        self.assertIs(entry["tool_trace_complete"], False)
+        self.assertEqual(len(entry["tool_trace"]), 1)
+        self.assertEqual(
+            entry["tool_trace"][0]["trace_anomaly"],
+            "missing_tool_result",
+        )
+
+    def test_runtime_trace_is_returned_when_child_times_out(self):
+        """A timed-out child must expose every invocation started before cutoff."""
+        parent = _make_mock_parent(depth=0)
+        release = threading.Event()
+        late_terminal_observed = threading.Event()
+
+        with (
+            patch("run_agent.AIAgent") as MockAgent,
+            patch("tools.delegate_tool._get_child_timeout", return_value=0.2),
+        ):
+            mock_child = MagicMock()
+            mock_child.model = "claude-sonnet-4-6"
+            mock_child.session_id = "child-timeout-trace"
+            mock_child.get_activity_summary.return_value = {"api_call_count": 1}
+
+            def start_then_wait(user_message, task_id=None, stream_callback=None):
+                start = MockAgent.call_args.kwargs.get("tool_start_callback")
+                if not callable(start):
+                    raise AssertionError("delegate trace callback was not installed")
+                start(
+                    "call-before-timeout",
+                    "read_file",
+                    {"path": "/frozen/a.txt", "offset": 1, "limit": 10},
+                )
+                release.wait(timeout=2)
+                terminal = mock_child.__dict__["_delegate_tool_terminal_callback"]
+                terminal(
+                    "call-before-timeout",
+                    "read_file",
+                    {"path": "/frozen/a.txt", "offset": 1, "limit": 10},
+                    "late-result",
+                    "ok",
+                )
+                late_terminal_observed.set()
+                return {
+                    "final_response": "late",
+                    "completed": True,
+                    "interrupted": False,
+                    "api_calls": 1,
+                    "messages": [],
+                }
+
+            mock_child.run_conversation.side_effect = start_then_wait
+            MockAgent.return_value = mock_child
+
+            try:
+                result = json.loads(delegate_task(goal="Timeout after start", parent_agent=parent))
+            finally:
+                release.set()
+            self.assertTrue(late_terminal_observed.wait(timeout=2))
+            entry = result["results"][0]
+            live_collector = mock_child.__dict__["_delegate_tool_trace_collector"]
+            live_trace = live_collector.snapshot()
+
+        self.assertTrue(live_collector.trace_complete())
+        self.assertEqual(live_trace[0]["status"], "ok")
+        self.assertNotIn("trace_anomaly", live_trace[0])
+        self.assertEqual(entry["status"], "timeout")
+        self.assertEqual(entry["tool_trace_source"], "runtime_callbacks")
+        self.assertIs(entry["tool_trace_complete"], False)
+        self.assertEqual(len(entry["tool_trace"]), 1)
+        self.assertEqual(entry["tool_trace"][0]["tool"], "read_file")
+        self.assertEqual(entry["tool_trace"][0]["status"], "error")
+        self.assertEqual(
+            entry["tool_trace"][0]["trace_anomaly"],
+            "missing_tool_result",
+        )
+
+    def test_empty_session_lookup_does_not_claim_durable_trace(self):
+        """An empty DB lookup must not relabel a live-tail fallback as durable."""
+        parent = _make_mock_parent(depth=0)
+
+        with patch("run_agent.AIAgent") as MockAgent:
+            mock_child = MagicMock()
+            mock_child.model = "claude-sonnet-4-6"
+            mock_child.session_id = "child-empty-db"
+            mock_child._session_db = MagicMock()
+            mock_child._session_db.get_messages.return_value = []
+            mock_child.run_conversation.return_value = {
+                "final_response": "done",
+                "completed": True,
+                "interrupted": False,
+                "api_calls": 1,
+                "messages": [
+                    {"role": "assistant", "tool_calls": [
+                        {"id": "tc_tail", "function": {
+                            "name": "read_file",
+                            "arguments": '{"path":"/frozen/a.txt","offset":1,"limit":10}',
+                        }},
+                    ]},
+                    {"role": "tool", "tool_call_id": "tc_tail", "content": "ok"},
+                ],
+            }
+            MockAgent.return_value = mock_child
+
+            result = json.loads(delegate_task(goal="Trace tail only", parent_agent=parent))
+            entry = result["results"][0]
+
+        self.assertEqual(entry["tool_trace_source"], "result_messages")
+        self.assertIs(entry["tool_trace_complete"], False)
+        self.assertEqual(len(entry["tool_trace"]), 1)
+        self.assertEqual(entry["tool_trace"][0]["status"], "ok")
+
+    def test_tool_trace_url_targets_drop_paths_queries_and_scheme_less_values(self):
+        """Trace metadata must not retain credentials hidden in URL-like targets."""
+        from tools.delegate_tool import _sanitize_tool_target
+
+        self.assertEqual(
+            _sanitize_tool_target(
+                "url",
+                "https://user:password@example.com/private/token?api_key=secret#frag",
+            ),
+            "https://example.com",
+        )
+        self.assertIsNone(
+            _sanitize_tool_target("url", "example.com/private?token=secret")
+        )
+        self.assertIsNone(
+            _sanitize_tool_target("endpoint", "/private/callback?credential=secret")
+        )
+
+    def test_tool_trace_hashes_filesystem_targets_and_argument_names(self):
+        """Paths and caller-controlled key names must never enter public trace."""
+        from tools.delegate_tool import _summarize_tool_arguments
+
+        canary = "CC011_PRIVATE_CAPABILITY_CANARY"
+        arguments = {
+            canary: "value",
+            "command": "true",
+            "workdir": f"/tmp/{canary}",
+        }
+        summary = _summarize_tool_arguments(arguments, tool_name="terminal")
+        encoded = json.dumps(summary, ensure_ascii=False)
+
+        self.assertNotIn(canary, encoded)
+        self.assertEqual(summary["argument_keys"], [])
+        self.assertEqual(summary["argument_key_count"], 3)
+        self.assertEqual(
+            summary["argument_keys_sha256"],
+            hashlib.sha256(
+                json.dumps(
+                    sorted(arguments),
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            ).hexdigest(),
+        )
+        self.assertEqual(
+            summary["targets"]["workdir"],
+            {
+                "sha256": hashlib.sha256(
+                    arguments["workdir"].encode("utf-8")
+                ).hexdigest()
+            },
+        )
+
+    def test_subagent_stop_history_preserves_read_file_pagination(self):
+        """Lifecycle hooks must retain exact read pagination without raw inputs."""
+        from tools.delegate_tool import _subagent_stop_tool_call_history
+
+        history = _subagent_stop_tool_call_history([
+            {
+                "tool": "read_file",
+                "args_bytes": 64,
+                "result_bytes": 128,
+                "status": "ok",
+                "input_summary": {
+                    "argument_keys": ["limit", "offset", "path", "token"],
+                    "targets": {"path": "/frozen/chunk-01.txt"},
+                    "parameters": {"offset": 1, "limit": 200, "token": "secret"},
+                },
+            },
+        ])
+
+        self.assertEqual(
+            history[0]["tool_input"],
+            {
+                **_argument_key_evidence("limit", "offset", "path", "token"),
+                "targets": {"path": _target_digest("/frozen/chunk-01.txt")},
+                "parameters": {"offset": 1, "limit": 200},
+            },
+        )
+
+    def test_overlapping_tool_call_id_is_explicit_error(self):
+        """Concurrent reuse of one call ID is ambiguous and must fail closed."""
+        parent = _make_mock_parent(depth=0)
+
+        with patch("run_agent.AIAgent") as MockAgent:
+            mock_child = MagicMock()
+            mock_child.model = "claude-sonnet-4-6"
+            mock_child.session_id = "child-overlapping-id"
+
+            def run_with_overlap(user_message, task_id=None, stream_callback=None):
+                start = MockAgent.call_args.kwargs.get("tool_start_callback")
+                terminal = mock_child.__dict__.get("_delegate_tool_terminal_callback")
+                first = {"path": "/frozen/a.txt", "offset": 1, "limit": 10}
+                second = {"pattern": "needle", "path": "/forbidden"}
+                start("tc_reused", "read_file", first)
+                start("tc_reused", "search_files", second)
+                terminal("tc_reused", "read_file", first, "ok", None)
+                terminal("tc_reused", "search_files", second, "ok", None)
+                return {
+                    "final_response": "done",
+                    "completed": True,
+                    "interrupted": False,
+                    "api_calls": 1,
+                    "messages": [],
+                }
+
+            mock_child.run_conversation.side_effect = run_with_overlap
+            MockAgent.return_value = mock_child
+
+            result = json.loads(delegate_task(goal="Trace overlapping IDs", parent_agent=parent))
+            entry = result["results"][0]
+            trace = entry["tool_trace"]
+
+        self.assertEqual(entry["tool_trace_source"], "runtime_callbacks")
+        self.assertEqual([item["tool"] for item in trace], ["read_file", "search_files"])
+        self.assertEqual(trace[0]["status"], "ok")
+        self.assertEqual(trace[1]["status"], "error")
+        self.assertEqual(trace[1]["trace_anomaly"], "overlapping_tool_call_id")
+
+    def test_duplicate_terminal_callback_is_explicit_error(self):
+        """A second terminal callback without another start must be visible."""
+        parent = _make_mock_parent(depth=0)
+
+        with patch("run_agent.AIAgent") as MockAgent:
+            mock_child = MagicMock()
+            mock_child.model = "claude-sonnet-4-6"
+            mock_child.session_id = "child-duplicate-terminal"
+
+            def run_with_duplicate_terminal(user_message, task_id=None, stream_callback=None):
+                start = MockAgent.call_args.kwargs.get("tool_start_callback")
+                terminal = mock_child.__dict__.get("_delegate_tool_terminal_callback")
+                args = {"path": "/frozen/a.txt", "offset": 1, "limit": 10}
+                start("tc_tail", "read_file", args)
+                terminal("tc_tail", "read_file", args, "AAAA", None)
+                terminal("tc_tail", "read_file", args, "BBBB", None)
+                return {
+                    "final_response": "done",
+                    "completed": True,
+                    "interrupted": False,
+                    "api_calls": 1,
+                    "messages": [],
+                }
+
+            mock_child.run_conversation.side_effect = run_with_duplicate_terminal
+            MockAgent.return_value = mock_child
+
+            result = json.loads(delegate_task(goal="Trace duplicate terminal", parent_agent=parent))
+            trace = result["results"][0]["tool_trace"]
+
+        self.assertEqual(len(trace), 2)
+        self.assertEqual(trace[0]["status"], "ok")
+        self.assertEqual(trace[1]["status"], "error")
+        self.assertEqual(trace[1]["trace_anomaly"], "terminal_without_start")
+
+    def test_runtime_callback_trace_classifies_native_failures_as_errors(self):
+        """Native failure shapes must not become successful trace entries."""
+        parent = _make_mock_parent(depth=0)
+
+        with patch("run_agent.AIAgent") as MockAgent:
+            mock_child = MagicMock()
+            mock_child.model = "claude-sonnet-4-6"
+            mock_child.session_id = "child-native-failures"
+
+            def run_with_failures(user_message, task_id=None, stream_callback=None):
+                start = MockAgent.call_args.kwargs.get("tool_start_callback")
+                terminal = mock_child.__dict__.get("_delegate_tool_terminal_callback")
+                if not callable(start) or not callable(terminal):
+                    raise AssertionError("delegate trace callbacks were not installed")
+                cases = [
+                    ("tc_exit", "terminal", {"command": "false"}, '{"exit_code":2}', None),
+                    ("tc_false", "example", {}, '{"success":false}', None),
+                    ("tc_marker", "process", {}, "[exit 2] process failed", None),
+                    ("tc_malformed", "terminal", {}, '{"exit_code":[]}', None),
+                    (
+                        "tc_cancel",
+                        "read_file",
+                        {"path": "/frozen/a.txt", "offset": 1, "limit": 10},
+                        "[Tool execution cancelled — read_file was skipped]",
+                        "cancelled",
+                    ),
+                ]
+                for call_id, name, args, result, status in cases:
+                    start(call_id, name, args)
+                    terminal(call_id, name, args, result, status)
+                return {
+                    "final_response": "done",
+                    "completed": True,
+                    "interrupted": False,
+                    "api_calls": 1,
+                    "messages": [],
+                }
+
+            mock_child.run_conversation.side_effect = run_with_failures
+            MockAgent.return_value = mock_child
+
+            result = json.loads(delegate_task(goal="Trace failures", parent_agent=parent))
+            trace = result["results"][0]["tool_trace"]
+
+        self.assertEqual(len(trace), 5)
+        self.assertEqual([item["status"] for item in trace], ["error"] * 5)
+
+    def test_tool_trace_unmatched_result_is_explicit_error(self):
+        """An unknown result ID must not be assigned to the previous call."""
+        parent = _make_mock_parent(depth=0)
+
+        with patch("run_agent.AIAgent") as MockAgent:
+            mock_child = MagicMock()
+            mock_child.model = "claude-sonnet-4-6"
+            mock_child.session_prompt_tokens = 100
+            mock_child.session_completion_tokens = 20
+            mock_child.session_id = None
+            mock_child.run_conversation.return_value = {
+                "final_response": "done",
+                "completed": True,
+                "interrupted": False,
+                "api_calls": 1,
+                "messages": [
+                    {"role": "assistant", "tool_calls": [
+                        {"id": "tc_expected", "function": {
+                            "name": "read_file",
+                            "arguments": '{"path":"/frozen/a.txt","offset":1,"limit":10}',
+                        }},
+                    ]},
+                    {"role": "tool", "tool_call_id": "tc_unknown", "content": "unexpected"},
+                ],
+            }
+            MockAgent.return_value = mock_child
+
+            result = json.loads(delegate_task(goal="Trace unmatched result", parent_agent=parent))
+            trace = result["results"][0]["tool_trace"]
+
+        self.assertEqual(len(trace), 2)
+        self.assertEqual(trace[0]["trace_anomaly"], "missing_tool_result")
+        self.assertEqual(trace[0]["status"], "error")
+        self.assertEqual(trace[1]["trace_anomaly"], "terminal_without_start")
+        self.assertEqual(trace[1]["status"], "error")
+
+    def test_tool_trace_missing_completion_is_explicit_error(self):
+        """A start without a result must be terminally visible as incomplete."""
+        parent = _make_mock_parent(depth=0)
+
+        with patch("run_agent.AIAgent") as MockAgent:
+            mock_child = MagicMock()
+            mock_child.model = "claude-sonnet-4-6"
+            mock_child.session_prompt_tokens = 100
+            mock_child.session_completion_tokens = 20
+            mock_child.session_id = None
+            mock_child.run_conversation.return_value = {
+                "final_response": "done",
+                "completed": True,
+                "interrupted": False,
+                "api_calls": 1,
+                "messages": [
+                    {"role": "assistant", "tool_calls": [
+                        {"id": "tc_started", "function": {
+                            "name": "read_file",
+                            "arguments": '{"path":"/frozen/a.txt","offset":1,"limit":10}',
+                        }},
+                    ]},
+                ],
+            }
+            MockAgent.return_value = mock_child
+
+            result = json.loads(delegate_task(goal="Trace missing completion", parent_agent=parent))
+            trace = result["results"][0]["tool_trace"]
+
+        self.assertEqual(len(trace), 1)
+        self.assertEqual(trace[0]["status"], "error")
+        self.assertEqual(trace[0]["result_bytes"], 0)
+        self.assertEqual(trace[0]["trace_anomaly"], "missing_tool_result")
 
     def test_tool_trace_handles_list_content_blocks(self):
         """Tool-result content blocks should not crash observability metadata."""

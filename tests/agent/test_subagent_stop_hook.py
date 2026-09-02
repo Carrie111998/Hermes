@@ -11,6 +11,7 @@ Covers wire-up from tools.delegate_tool.delegate_task:
 
 from __future__ import annotations
 
+import hashlib
 import json
 import threading
 from unittest.mock import MagicMock, patch
@@ -249,19 +250,43 @@ class TestPayloadShape:
             }
             delegate_task(goal="do X", parent_agent=_make_parent())
 
+        argument_keys = ["content", "path", "token"]
+        argument_keys_sha256 = hashlib.sha256(
+            json.dumps(
+                sorted(argument_keys),
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        path_sha256 = hashlib.sha256(b"/private/report.json").hexdigest()
         assert captured[0]["tool_call_history"] == [{
             "tool_name": "write_file",
             "tool_input": {
-                "argument_keys": ["content", "path", "token"],
+                "argument_key_count": 3,
+                "argument_keys": [],
+                "argument_keys_sha256": argument_keys_sha256,
                 "targets": {
-                    "path": "/private/report.json",
-                    "url": "https://example.test:8443/upload",
+                    "path": {"sha256": path_sha256},
+                    "url": "https://example.test:8443",
                 },
             },
             "input_bytes": 128,
             "output_bytes": 32,
             "status": "ok",
         }]
+        encoded_history = json.dumps(
+            captured[0]["tool_call_history"],
+            ensure_ascii=False,
+        )
+        for private_value in (
+            "/private/report.json",
+            "user:password",
+            "/upload",
+            "token=secret",
+            "must-not-leak",
+            "secret output",
+        ):
+            assert private_value not in encoded_history
 
 
 

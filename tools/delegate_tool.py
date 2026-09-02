@@ -19,6 +19,7 @@ never the child's intermediate tool calls or reasoning.
 
 import enum
 import contextvars
+import hashlib
 import json
 import logging
 import re
@@ -36,6 +37,7 @@ from urllib.parse import urlsplit, urlunsplit
 
 from toolsets import TOOLSETS
 from agent.interrupt_compat import request_hard_interrupt
+from agent.message_sanitization import coalesce_tool_call_id
 
 # Sentinel value used by the runtime provider system for providers that are
 # not natively known (named custom providers, third-party aggregators, etc.).
@@ -666,7 +668,7 @@ def _extract_output_tail(
             continue
         if msg.get("role") == "assistant":
             for tc in msg.get("tool_calls") or []:
-                tc_id = tc.get("id")
+                tc_id = coalesce_tool_call_id(tc)
                 fn = tc.get("function") or {}
                 if tc_id:
                     pending_call_by_id[tc_id] = str(fn.get("name") or "tool")
@@ -682,8 +684,8 @@ def _extract_output_tail(
         # see markers buried inside content blocks. Crude str() here would
         # mislabel a block-wrapped "Error: ..." result as is_error=False.
         content = _stringify_tool_content(msg.get("content") or "")
-        is_error = _looks_like_error_output(content)
         tool_name = pending_call_by_id.get(msg.get("tool_call_id") or "", "tool")
+        is_error = _looks_like_error_output(content, tool_name=tool_name)
         # Preserve line structure so the overlay's wrapped scroll region can
         # show real output rather than a whitespace-collapsed blob. We still
         # cap the payload size to keep events bounded.
@@ -722,6 +724,75 @@ def _stringify_tool_content(content: Any) -> str:
     return str(content)
 
 
+def _tool_content_identity_sha256(content: Any) -> Optional[str]:
+    """Hash typed JSON-like content without collapsing it to display text.
+
+    Exact built-in types are encoded with length-delimited type tags. Container
+    cycles and custom objects fail closed: their display text may still be
+    summarized, but it cannot certify byte-for-structure delivery identity.
+    """
+    active_containers: set[int] = set()
+
+    def _frame(tag: bytes, payload: bytes) -> bytes:
+        return tag + str(len(payload)).encode("ascii") + b":" + payload
+
+    def _encode(value: Any) -> Optional[bytes]:
+        value_type = type(value)
+        if value is None:
+            return b"n0:"
+        if value_type is bool:
+            return b"b1:" + (b"1" if value else b"0")
+        if value_type is str:
+            return _frame(b"s", value.encode("utf-8"))
+        if value_type is int:
+            return _frame(b"i", str(value).encode("ascii"))
+        if value_type is float:
+            return _frame(b"f", value.hex().encode("ascii"))
+        if value_type is bytes:
+            return _frame(b"y", value)
+        if value_type not in {list, tuple, dict}:
+            return None
+
+        identity = id(value)
+        if identity in active_containers:
+            return None
+        active_containers.add(identity)
+        try:
+            if value_type in {list, tuple}:
+                encoded_items = []
+                for item in value:
+                    encoded = _encode(item)
+                    if encoded is None:
+                        return None
+                    encoded_items.append(_frame(b"e", encoded))
+                return _frame(
+                    b"l" if value_type is list else b"t",
+                    b"".join(encoded_items),
+                )
+
+            encoded_pairs = []
+            for key, item in value.items():
+                encoded_key = _encode(key)
+                encoded_value = _encode(item)
+                if encoded_key is None or encoded_value is None:
+                    return None
+                encoded_pairs.append(
+                    _frame(b"k", encoded_key) + _frame(b"v", encoded_value)
+                )
+            encoded_pairs.sort()
+            return _frame(b"d", b"".join(encoded_pairs))
+        finally:
+            active_containers.remove(identity)
+
+    try:
+        encoded_content = _encode(content)
+    except (OverflowError, RecursionError, UnicodeError, ValueError):
+        return None
+    if encoded_content is None:
+        return None
+    return hashlib.sha256(encoded_content).hexdigest()
+
+
 _TOOL_INPUT_TARGET_KEYS = frozenset({
     "cwd",
     "destination_path",
@@ -737,12 +808,22 @@ _TOOL_INPUT_TARGET_KEYS = frozenset({
     "target_path",
     "url",
     "urls",
+    "workdir",
 })
 _TOOL_INPUT_URL_KEYS = frozenset({"endpoint", "url", "urls"})
 
 
 def _sanitize_tool_target(key: str, value: Any) -> Any:
-    """Keep bounded side-effect targets while dropping URL secrets."""
+    """Keep only URL origins or irreversible filesystem-target digests."""
+    if isinstance(value, dict):
+        digest = value.get("sha256")
+        if (
+            set(value) == {"sha256"}
+            and isinstance(digest, str)
+            and re.fullmatch(r"[0-9a-f]{64}", digest)
+        ):
+            return {"sha256": digest}
+        return None
     if isinstance(value, list):
         cleaned = [
             item for item in (_sanitize_tool_target(key, item) for item in value[:16])
@@ -766,24 +847,40 @@ def _sanitize_tool_target(key: str, value: Any) -> Any:
                 host = f"[{hostname}]" if ":" in hostname else hostname
                 port = parsed.port
                 netloc = f"{host}:{port}" if port is not None else host
-                return urlunsplit((parsed.scheme, netloc, parsed.path, "", ""))
+                # A URL path can itself contain bearer material or opaque
+                # capability tokens. Trace only the origin; relative and
+                # scheme-less values have no safe authority and are dropped.
+                return urlunsplit((parsed.scheme, netloc, "", "", ""))
         except ValueError:
             return None
-    return bounded
+        return None
+    return {"sha256": hashlib.sha256(value.encode("utf-8")).hexdigest()}
 
 
-def _summarize_tool_arguments(arguments: Any) -> Dict[str, Any]:
+def _summarize_tool_arguments(
+    arguments: Any,
+    *,
+    tool_name: Optional[str] = None,
+) -> Dict[str, Any]:
     """Summarize argument names and side-effect targets without raw payloads."""
-    if not isinstance(arguments, str):
-        return {"argument_keys": [], "targets": {}}
-    try:
-        parsed = json.loads(arguments)
-    except (TypeError, ValueError):
+    if isinstance(arguments, dict):
+        parsed = arguments
+    elif isinstance(arguments, str):
+        try:
+            parsed = json.loads(arguments)
+        except (TypeError, ValueError):
+            return {"argument_keys": [], "targets": {}}
+    else:
         return {"argument_keys": [], "targets": {}}
     if not isinstance(parsed, dict):
         return {"argument_keys": [], "targets": {}}
 
-    keys = sorted(str(key)[:128] for key in parsed)[:64]
+    keys = sorted(str(key) for key in parsed)
+    key_bytes = json.dumps(
+        keys,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
     targets: Dict[str, Any] = {}
     for raw_key, value in parsed.items():
         key = str(raw_key).lower()
@@ -792,18 +889,54 @@ def _summarize_tool_arguments(arguments: Any) -> Dict[str, Any]:
         cleaned = _sanitize_tool_target(key, value)
         if cleaned is not None:
             targets[key] = cleaned
-    return {"argument_keys": keys, "targets": targets}
+    summary: Dict[str, Any] = {
+        "argument_key_count": len(keys),
+        "argument_keys": [],
+        "argument_keys_sha256": hashlib.sha256(key_bytes).hexdigest(),
+        "targets": targets,
+    }
+    if tool_name == "read_file":
+        parameters = {
+            key: parsed[key]
+            for key in ("limit", "offset")
+            if isinstance(parsed.get(key), int) and not isinstance(parsed.get(key), bool)
+        }
+        if parameters:
+            summary["parameters"] = parameters
+    elif tool_name == "terminal":
+        command = parsed.get("command")
+        if isinstance(command, str) and command:
+            summary["parameters"] = {
+                "command_sha256": hashlib.sha256(command.encode("utf-8")).hexdigest()
+            }
+    return summary
 
 
 def _sanitize_tool_input_summary(summary: Any) -> Dict[str, Any]:
     if not isinstance(summary, dict):
         return {"argument_keys": [], "targets": {}}
     keys = summary.get("argument_keys")
-    safe_keys = (
-        [str(key)[:128] for key in keys[:64]]
-        if isinstance(keys, list)
-        else []
-    )
+    declared_count = summary.get("argument_key_count")
+    declared_sha = summary.get("argument_keys_sha256")
+    if (
+        isinstance(declared_count, int)
+        and not isinstance(declared_count, bool)
+        and declared_count >= 0
+        and isinstance(declared_sha, str)
+        and re.fullmatch(r"[0-9a-f]{64}", declared_sha)
+    ):
+        key_count = declared_count
+        key_sha = declared_sha
+    else:
+        raw_keys = [str(key) for key in keys] if isinstance(keys, list) else []
+        key_count = len(raw_keys)
+        key_sha = hashlib.sha256(
+            json.dumps(
+                sorted(raw_keys),
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
     targets = summary.get("targets")
     safe_targets: Dict[str, Any] = {}
     if isinstance(targets, dict):
@@ -814,7 +947,28 @@ def _sanitize_tool_input_summary(summary: Any) -> Dict[str, Any]:
             cleaned = _sanitize_tool_target(key, value)
             if cleaned is not None:
                 safe_targets[key] = cleaned
-    return {"argument_keys": safe_keys, "targets": safe_targets}
+    result: Dict[str, Any] = {
+        "argument_key_count": key_count,
+        "argument_keys": [],
+        "argument_keys_sha256": key_sha,
+        "targets": safe_targets,
+    }
+    parameters = summary.get("parameters")
+    if isinstance(parameters, dict):
+        safe_parameters = {
+            key: parameters[key]
+            for key in ("limit", "offset")
+            if isinstance(parameters.get(key), int)
+            and not isinstance(parameters.get(key), bool)
+        }
+        command_sha256 = parameters.get("command_sha256")
+        if isinstance(command_sha256, str) and re.fullmatch(
+            r"[0-9a-f]{64}", command_sha256
+        ):
+            safe_parameters["command_sha256"] = command_sha256
+        if safe_parameters:
+            result["parameters"] = safe_parameters
+    return result
 
 
 def _subagent_stop_tool_call_history(tool_trace: Any) -> List[Dict[str, Any]]:
@@ -847,20 +1001,13 @@ def _subagent_stop_tool_call_history(tool_trace: Any) -> List[Dict[str, Any]]:
     return history
 
 
-def _looks_like_error_output(content: Any) -> bool:
-    """Conservative stderr/error detector for tool-result previews.
-
-    The old heuristic flagged any preview containing the substring "error",
-    which painted perfectly normal terminal/json output red.  We now only
-    mark output as an error when there is stronger evidence:
-      - structured JSON with an ``error`` key
-      - structured JSON with ``status`` of error/failed
-      - first line starts with a classic error marker
-    """
+def _looks_like_error_output(content: Any, *, tool_name: Optional[str] = None) -> bool:
+    """Classify native failure shapes without scanning arbitrary payload text."""
     content = _stringify_tool_content(content)
     if not content:
         return False
 
+    normalized_tool = str(tool_name or "").strip().lower()
     head = content.lstrip()
     if head.startswith("{") or head.startswith("["):
         try:
@@ -868,19 +1015,576 @@ def _looks_like_error_output(content: Any) -> bool:
             if isinstance(parsed, dict):
                 if parsed.get("error"):
                     return True
-                status = str(parsed.get("status") or "").strip().lower()
-                if status in {"error", "failed", "failure", "timeout"}:
+                if parsed.get("success") is False or parsed.get("ok") is False:
                     return True
+                status = str(parsed.get("status") or "").strip().lower()
+                if status in {
+                    "error",
+                    "failed",
+                    "failure",
+                    "timeout",
+                    "cancelled",
+                    "canceled",
+                    "blocked",
+                    "denied",
+                    "rejected",
+                }:
+                    return True
+                if normalized_tool == "terminal":
+                    exit_code = parsed.get("exit_code")
+                    if exit_code not in (None, 0, "0"):
+                        return True
         except Exception:
             pass
 
     first = content.splitlines()[0].strip().lower() if content.splitlines() else ""
-    return (
+    if (
         first.startswith("error:")
         or first.startswith("failed:")
         or first.startswith("traceback ")
         or first.startswith("exception:")
-    )
+    ):
+        return True
+    if normalized_tool in {"terminal", "process"}:
+        exit_marker = re.match(r"^\[exit\s+(-?\d+)\]", first)
+        if exit_marker and int(exit_marker.group(1)) != 0:
+            return True
+    return False
+
+
+def _summarize_tool_result(tool_name: str, content: str) -> Optional[Dict[str, Any]]:
+    """Project bounded read/terminal evidence without retaining result content."""
+    if tool_name not in {"read_file", "terminal"}:
+        return None
+    try:
+        parsed = json.loads(content)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return {"metadata_valid": False}
+    if not isinstance(parsed, dict):
+        return {"metadata_valid": False}
+    if tool_name == "terminal":
+        output = parsed.get("output")
+        exit_code = parsed.get("exit_code")
+        if (
+            not isinstance(output, str)
+            or not isinstance(exit_code, int)
+            or isinstance(exit_code, bool)
+        ):
+            return {"metadata_valid": False}
+        return {
+            "exit_code": exit_code,
+            "metadata_valid": True,
+            "output_chars": len(output),
+            "output_sha256": hashlib.sha256(output.encode("utf-8")).hexdigest(),
+        }
+    if parsed.get("dedup") is True and parsed.get("content_returned") is False:
+        return {"content_returned": False, "metadata_valid": True}
+    delivered = parsed.get("content")
+    total_lines = parsed.get("total_lines")
+    file_size = parsed.get("file_size")
+    truncated = parsed.get("truncated")
+    if (
+        not isinstance(delivered, str)
+        or not isinstance(total_lines, int)
+        or isinstance(total_lines, bool)
+        or total_lines < 0
+        or not isinstance(file_size, int)
+        or isinstance(file_size, bool)
+        or file_size < 0
+        or not isinstance(truncated, bool)
+    ):
+        return {"content_returned": False, "metadata_valid": False}
+    summary: Dict[str, Any] = {
+        "content_chars": len(delivered),
+        "content_returned": True,
+        "content_sha256": hashlib.sha256(delivered.encode("utf-8")).hexdigest(),
+        "file_size": file_size,
+        "metadata_valid": True,
+        "total_lines": total_lines,
+        "truncated": truncated,
+    }
+    next_offset = parsed.get("next_offset")
+    if isinstance(next_offset, int) and not isinstance(next_offset, bool):
+        summary["next_offset"] = next_offset
+    return summary
+
+
+class _DelegateToolTraceCollector:
+    """Thread-safe, compression-independent child tool trace collector."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._entries: List[Dict[str, Any]] = []
+        self._pending_by_id: Dict[str, List[int]] = {}
+        self._awaiting_delivery_by_id: Dict[str, List[int]] = {}
+        self._raw_result_sha_by_index: Dict[int, str] = {}
+        self._planned_turns_by_id: Dict[str, List[Dict[str, Any]]] = {}
+        self._assistant_turn_index = 0
+        self._turn_callback_seen = False
+        self._turn_observation_valid = True
+        self._delivery_callback_seen = False
+        self._delivery_observation_valid = True
+        self._trace_observation_valid = True
+
+    @staticmethod
+    def _call_id(value: Any) -> Optional[str]:
+        return value if isinstance(value, str) and value else None
+
+    @staticmethod
+    def _argument_bytes(arguments: Any) -> int:
+        if isinstance(arguments, str):
+            return len(arguments.encode("utf-8"))
+        try:
+            return len(
+                json.dumps(
+                    arguments,
+                    ensure_ascii=False,
+                    default=str,
+                ).encode("utf-8")
+            )
+        except Exception:
+            return 0
+
+    def begin_turn(self, calls: Any) -> None:
+        """Bind one model-emitted tool-call group without retaining arguments."""
+        with self._lock:
+            self._turn_callback_seen = True
+            self._assistant_turn_index += 1
+            turn_index = self._assistant_turn_index
+            if not isinstance(calls, list) or not calls:
+                self._turn_observation_valid = False
+                return
+            call_count = len(calls)
+            for call_index, item in enumerate(calls, start=1):
+                if not isinstance(item, (list, tuple)) or len(item) != 2:
+                    self._turn_observation_valid = False
+                    continue
+                call_id = self._call_id(item[0])
+                tool_name = item[1] if isinstance(item[1], str) and item[1] else None
+                if call_id is None or tool_name is None:
+                    self._turn_observation_valid = False
+                    continue
+                self._planned_turns_by_id.setdefault(call_id, []).append({
+                    "assistant_turn_index": turn_index,
+                    "turn_call_index": call_index,
+                    "turn_call_count": call_count,
+                    "planned_tool_name": tool_name[:256],
+                })
+
+    def start(self, tool_call_id: Any, tool_name: Any, arguments: Any) -> None:
+        """Record one invocation in execution-start order."""
+        try:
+            call_id = self._call_id(tool_call_id)
+            entry: Dict[str, Any] = {
+                "tool": str(tool_name or "unknown")[:256],
+                "args_bytes": self._argument_bytes(arguments),
+                "input_summary": _summarize_tool_arguments(
+                    arguments,
+                    tool_name=str(tool_name or "unknown"),
+                ),
+            }
+            with self._lock:
+                index = len(self._entries)
+                if call_id is None:
+                    self._turn_observation_valid = False
+                    entry.update({
+                        "result_bytes": 0,
+                        "status": "error",
+                        "trace_anomaly": "missing_tool_call_id",
+                    })
+                else:
+                    planned = self._planned_turns_by_id.get(call_id, [])
+                    if planned:
+                        turn = planned.pop(0)
+                        if not planned:
+                            self._planned_turns_by_id.pop(call_id, None)
+                        entry.update({
+                            "assistant_turn_index": turn["assistant_turn_index"],
+                            "turn_call_index": turn["turn_call_index"],
+                            "turn_call_count": turn["turn_call_count"],
+                        })
+                        if turn["planned_tool_name"] != entry["tool"]:
+                            self._turn_observation_valid = False
+                            entry.update({
+                                "status": "error",
+                                "trace_anomaly": "turn_tool_identity_mismatch",
+                            })
+                    else:
+                        self._turn_observation_valid = False
+                    pending = self._pending_by_id.setdefault(call_id, [])
+                    if pending:
+                        entry.update({
+                            "status": "error",
+                            "trace_anomaly": "overlapping_tool_call_id",
+                        })
+                    pending.append(index)
+                self._entries.append(entry)
+        except Exception:
+            with self._lock:
+                self._entries.append({
+                    "tool": "unknown",
+                    "args_bytes": 0,
+                    "input_summary": {"argument_keys": [], "targets": {}},
+                    "result_bytes": 0,
+                    "status": "error",
+                    "trace_anomaly": "tool_start_callback_error",
+                })
+
+    def terminal(
+        self,
+        tool_call_id: Any,
+        tool_name: Any,
+        arguments: Any,
+        result: Any,
+        status: Any = None,
+    ) -> None:
+        """Pair one terminal outcome to the oldest pending matching invocation."""
+        try:
+            call_id = self._call_id(tool_call_id)
+            content = _stringify_tool_content(result)
+            content_identity = _tool_content_identity_sha256(result)
+            normalized_status = str(status or "").strip().lower()
+            raw_name = str(tool_name or "")[:256]
+            safe_name = raw_name or "unknown"
+            output_summary = _summarize_tool_result(safe_name, content)
+            result_status = (
+                "ok"
+                if normalized_status in {"", "ok", "success", "completed"}
+                and not _looks_like_error_output(content, tool_name=safe_name)
+                else "error"
+            )
+            result_bytes = len(content.encode("utf-8"))
+            with self._lock:
+                pending = self._pending_by_id.get(call_id, []) if call_id else []
+                if not pending:
+                    planned = (
+                        self._planned_turns_by_id.get(call_id, [])
+                        if call_id is not None
+                        else []
+                    )
+                    if (
+                        normalized_status in {"cancelled", "canceled"}
+                        and planned
+                        and planned[0]["planned_tool_name"] == safe_name
+                    ):
+                        turn = planned.pop(0)
+                        if not planned and call_id is not None:
+                            self._planned_turns_by_id.pop(call_id, None)
+                        index = len(self._entries)
+                        entry = {
+                            "tool": safe_name,
+                            "args_bytes": self._argument_bytes(arguments),
+                            "input_summary": _summarize_tool_arguments(
+                                arguments,
+                                tool_name=safe_name,
+                            ),
+                            "result_bytes": result_bytes,
+                            "status": "error",
+                            "assistant_turn_index": turn["assistant_turn_index"],
+                            "turn_call_index": turn["turn_call_index"],
+                            "turn_call_count": turn["turn_call_count"],
+                        }
+                        if output_summary is not None:
+                            entry["output_summary"] = output_summary
+                        self._entries.append(entry)
+                        assert call_id is not None
+                        self._awaiting_delivery_by_id.setdefault(
+                            call_id, []
+                        ).append(index)
+                        if content_identity is not None:
+                            self._raw_result_sha_by_index[index] = content_identity
+                        return
+                    self._delivery_observation_valid = False
+                    self._entries.append({
+                        "tool": safe_name,
+                        "args_bytes": self._argument_bytes(arguments),
+                        "input_summary": _summarize_tool_arguments(
+                            arguments,
+                            tool_name=safe_name,
+                        ),
+                        "result_bytes": result_bytes,
+                        "status": "error",
+                        "trace_anomaly": "terminal_without_start",
+                        **(
+                            {"output_summary": output_summary}
+                            if output_summary is not None
+                            else {}
+                        ),
+                    })
+                    return
+                index = pending.pop(0)
+                if not pending and call_id is not None:
+                    self._pending_by_id.pop(call_id, None)
+                entry = self._entries[index]
+                entry["result_bytes"] = result_bytes
+                if call_id is not None:
+                    self._awaiting_delivery_by_id.setdefault(call_id, []).append(index)
+                    if content_identity is not None:
+                        self._raw_result_sha_by_index[index] = content_identity
+                if output_summary is not None:
+                    entry["output_summary"] = output_summary
+                if raw_name and entry.get("tool") != raw_name:
+                    entry["status"] = "error"
+                    entry["trace_anomaly"] = "tool_identity_mismatch"
+                elif entry.get("status") != "error":
+                    entry["status"] = result_status
+        except Exception:
+            with self._lock:
+                self._entries.append({
+                    "tool": "unknown",
+                    "args_bytes": 0,
+                    "input_summary": {"argument_keys": [], "targets": {}},
+                    "result_bytes": 0,
+                    "status": "error",
+                    "trace_anomaly": "tool_terminal_callback_error",
+                })
+                self._delivery_observation_valid = False
+
+    def delivery(self, calls: Any, turn_budget_chars: Any) -> None:
+        """Bind each terminal result to the exact post-budget model payload."""
+        with self._lock:
+            self._delivery_callback_seen = True
+            if (
+                not isinstance(calls, list)
+                or not calls
+                or not isinstance(turn_budget_chars, int)
+                or isinstance(turn_budget_chars, bool)
+                or turn_budget_chars <= 0
+            ):
+                self._delivery_observation_valid = False
+                return
+            normalized: List[
+                tuple[Optional[str], str, str, Optional[str]]
+            ] = []
+            for item in calls:
+                if not isinstance(item, (list, tuple)) or len(item) != 3:
+                    self._delivery_observation_valid = False
+                    continue
+                delivered_content = item[2]
+                normalized.append(
+                    (
+                        self._call_id(item[0]),
+                        str(item[1] or "")[:256],
+                        _stringify_tool_content(delivered_content),
+                        _tool_content_identity_sha256(delivered_content),
+                    )
+                )
+            delivered_total = sum(
+                len(content) for _, _, content, _ in normalized
+            )
+            if delivered_total > turn_budget_chars:
+                self._delivery_observation_valid = False
+            for call_id, tool_name, content, delivered_sha in normalized:
+                pending = (
+                    self._awaiting_delivery_by_id.get(call_id, [])
+                    if call_id is not None
+                    else []
+                )
+                if not pending:
+                    self._delivery_observation_valid = False
+                    continue
+                index = pending.pop(0)
+                if not pending and call_id is not None:
+                    self._awaiting_delivery_by_id.pop(call_id, None)
+                entry = self._entries[index]
+                raw_sha = self._raw_result_sha_by_index.pop(index, None)
+                exact = (
+                    raw_sha is not None
+                    and delivered_sha is not None
+                    and raw_sha == delivered_sha
+                )
+                entry["assistant_turn_budget_chars"] = turn_budget_chars
+                entry["assistant_turn_delivered_chars"] = delivered_total
+                entry["delivered_result_bytes"] = len(content.encode("utf-8"))
+                entry["result_delivery_complete"] = exact
+                if not exact:
+                    self._delivery_observation_valid = False
+                if not tool_name or entry.get("tool") != tool_name:
+                    self._delivery_observation_valid = False
+                    if "trace_anomaly" not in entry:
+                        entry["trace_anomaly"] = "delivery_tool_identity_mismatch"
+
+    def invalidate(self, phase: Any) -> None:
+        """Make callback failure explicit even when it follows state mutation."""
+        phase_name = phase if phase in {"turn", "start", "terminal", "delivery"} else "unknown"
+        anomaly = f"tool_{phase_name}_callback_error"
+        with self._lock:
+            self._trace_observation_valid = False
+            if phase_name in {"turn", "start"}:
+                self._turn_observation_valid = False
+            if phase_name in {"terminal", "delivery"}:
+                self._delivery_observation_valid = False
+            if self._entries:
+                entry = self._entries[-1]
+                entry["status"] = "error"
+                entry.setdefault("result_bytes", 0)
+                entry.setdefault("trace_anomaly", anomaly)
+            else:
+                self._entries.append(
+                    {
+                        "tool": "unknown",
+                        "args_bytes": 0,
+                        "input_summary": {
+                            "argument_keys": [],
+                            "targets": {},
+                        },
+                        "result_bytes": 0,
+                        "status": "error",
+                        "trace_anomaly": anomaly,
+                    }
+                )
+
+    def trace_complete(self) -> bool:
+        """Return whether every planned occurrence reached one terminal event."""
+        with self._lock:
+            return (
+                self._trace_observation_valid
+                and not any(self._pending_by_id.values())
+                and not any(self._planned_turns_by_id.values())
+                and all(
+                    "result_bytes" in entry
+                    and "status" in entry
+                    and "trace_anomaly" not in entry
+                    for entry in self._entries
+                )
+            )
+
+    def snapshot(self) -> List[Dict[str, Any]]:
+        """Return a detached terminal view; pending starts fail closed."""
+        with self._lock:
+            snapshot = [
+                {
+                    **entry,
+                    "input_summary": {
+                        **(entry.get("input_summary") or {}),
+                        "targets": dict(
+                            ((entry.get("input_summary") or {}).get("targets") or {})
+                        ),
+                        **(
+                            {"parameters": dict(
+                                ((entry.get("input_summary") or {}).get("parameters") or {})
+                            )}
+                            if "parameters" in (entry.get("input_summary") or {})
+                            else {}
+                        ),
+                    },
+                }
+                for entry in self._entries
+            ]
+            pending_indices = {
+                index
+                for pending in self._pending_by_id.values()
+                for index in pending
+            }
+        for index in pending_indices:
+            if index < len(snapshot):
+                snapshot[index].update({
+                    "result_bytes": 0,
+                    "status": "error",
+                    "trace_anomaly": "missing_tool_result",
+                })
+        return snapshot
+
+    def turns_complete(self) -> bool:
+        """Return whether every start was bound to one complete assistant turn."""
+        with self._lock:
+            required = {
+                "assistant_turn_index",
+                "turn_call_index",
+                "turn_call_count",
+            }
+            return (
+                self._turn_callback_seen
+                and self._turn_observation_valid
+                and not any(self._planned_turns_by_id.values())
+                and all(required.issubset(entry) for entry in self._entries)
+            )
+
+    def delivery_complete(self) -> bool:
+        """Return whether every raw result reached the model byte-for-byte."""
+        with self._lock:
+            return (
+                self._delivery_callback_seen
+                and self._delivery_observation_valid
+                and not any(self._awaiting_delivery_by_id.values())
+                and not self._raw_result_sha_by_index
+                and all(
+                    entry.get("result_delivery_complete") is True
+                    and isinstance(entry.get("assistant_turn_budget_chars"), int)
+                    and not isinstance(entry.get("assistant_turn_budget_chars"), bool)
+                    and isinstance(entry.get("assistant_turn_delivered_chars"), int)
+                    and not isinstance(entry.get("assistant_turn_delivered_chars"), bool)
+                    and entry["assistant_turn_delivered_chars"]
+                    <= entry["assistant_turn_budget_chars"]
+                    for entry in self._entries
+                )
+            )
+
+
+def _runtime_tool_trace_snapshot(child: Any) -> Optional[List[Dict[str, Any]]]:
+    """Read the delegate-owned collector without trusting mock-like attributes."""
+    collector = getattr(child, "_delegate_tool_trace_collector", None)
+    if not isinstance(collector, _DelegateToolTraceCollector):
+        return None
+    return collector.snapshot()
+
+
+def _runtime_tool_trace_complete(child: Any) -> Optional[bool]:
+    """Read execution/terminal coverage independently from provenance."""
+    collector = getattr(child, "_delegate_tool_trace_collector", None)
+    if not isinstance(collector, _DelegateToolTraceCollector):
+        return None
+    return collector.trace_complete()
+
+
+def _runtime_tool_trace_turns_complete(child: Any) -> Optional[bool]:
+    """Read execution-time assistant-turn grouping completeness."""
+    collector = getattr(child, "_delegate_tool_trace_collector", None)
+    if not isinstance(collector, _DelegateToolTraceCollector):
+        return None
+    return collector.turns_complete()
+
+
+def _runtime_tool_trace_delivery_complete(child: Any) -> Optional[bool]:
+    """Read exact post-budget model-delivery completeness."""
+    collector = getattr(child, "_delegate_tool_trace_collector", None)
+    if not isinstance(collector, _DelegateToolTraceCollector):
+        return None
+    return collector.delivery_complete()
+
+
+def _message_tool_trace(messages: Any) -> List[Dict[str, Any]]:
+    """Compatibility fallback over only the child's surviving message tail."""
+    collector = _DelegateToolTraceCollector()
+    if not isinstance(messages, list):
+        return []
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        if message.get("role") == "assistant":
+            tool_calls = message.get("tool_calls")
+            if not isinstance(tool_calls, list):
+                continue
+            for tool_call in tool_calls:
+                if not isinstance(tool_call, dict):
+                    continue
+                function = tool_call.get("function")
+                if not isinstance(function, dict):
+                    function = {}
+                collector.start(
+                    coalesce_tool_call_id(tool_call),
+                    function.get("name") or "unknown",
+                    function.get("arguments", ""),
+                )
+        elif message.get("role") == "tool":
+            collector.terminal(
+                message.get("tool_call_id"),
+                message.get("tool_name") or message.get("name"),
+                {},
+                message.get("content", ""),
+                None,
+            )
+    return collector.snapshot()
 
 
 def _normalize_role(r: Optional[str]) -> str:
@@ -1908,6 +2612,11 @@ def _build_child_agent(
 
         child_thinking_cb = _child_thinking
 
+    # Tool history must survive in-place context compression. Capture bounded
+    # metadata at execution time instead of reconstructing authority from the
+    # child's final (possibly compressed) message tail.
+    child_tool_trace = _DelegateToolTraceCollector()
+
     # Resolve effective credentials: config override > parent inherit
     effective_model = model or parent_agent.model
     effective_provider = override_provider or getattr(parent_agent, "provider", None)
@@ -2148,6 +2857,7 @@ def _build_child_agent(
                 ),
                 openrouter_min_coding_score=child_openrouter_min_coding_score,
                 tool_progress_callback=child_progress_cb,
+                tool_start_callback=child_tool_trace.start,
                 iteration_budget=None,  # fresh budget per subagent
                 **child_optional_kwargs,
             )
@@ -2163,6 +2873,16 @@ def _build_child_agent(
                     pass
             raise
     child._print_fn = getattr(parent_agent, "_print_fn", None)
+    setattr(child, "_delegate_tool_trace_collector", child_tool_trace)
+    # agent.tool_executor emits one bounded identity-only callback per
+    # model-emitted assistant tool turn before any member executes.
+    setattr(child, "_delegate_tool_turn_callback", child_tool_trace.begin_turn)
+    # Called after whole-turn budget enforcement and before steer injection so
+    # exact delivery can be distinguished from persisted/truncated replacement.
+    setattr(child, "_delegate_tool_delivery_callback", child_tool_trace.delivery)
+    # agent.tool_executor calls this for every terminal invocation outcome,
+    # including blocked, malformed, cancelled, failed, and successful calls.
+    setattr(child, "_delegate_tool_terminal_callback", child_tool_trace.terminal)
     # Ownership transfer for the dedicated handle: the child's close() must
     # release it (nothing else holds a reference), and no parent teardown can
     # close it out from under a background child (#81267).
@@ -3115,6 +3835,16 @@ def _run_single_child(
                 "_child_role": getattr(child, "_delegate_role", None),
                 "diagnostic_path": diagnostic_path,
             }
+            _error_trace = _runtime_tool_trace_snapshot(child)
+            if _error_trace is not None:
+                _error_entry["tool_trace"] = _error_trace
+                _error_entry["tool_trace_source"] = "runtime_callbacks"
+                # A timed-out worker is abandoned with wait=False and may still
+                # emit callbacks after this detached snapshot. Never claim a
+                # closed execution, grouping, or delivery ledger at this cut.
+                _error_entry["tool_trace_complete"] = False
+                _error_entry["tool_trace_turns_complete"] = False
+                _error_entry["tool_trace_delivery_complete"] = False
             if _late_pending_steer:
                 _error_entry["missed_steer"] = _late_pending_steer
                 _error_entry["error"] += (
@@ -3312,43 +4042,22 @@ def _run_single_child(
         else:
             status = "failed"
 
-        # Build tool trace from conversation messages (already in memory).
-        # Uses tool_call_id to correctly pair parallel tool calls with results.
-        tool_trace: list[Dict[str, Any]] = []
-        trace_by_id: Dict[str, Dict[str, Any]] = {}
-        messages = result.get("messages") or []
-        if isinstance(messages, list):
-            for msg in messages:
-                if not isinstance(msg, dict):
-                    continue
-                if msg.get("role") == "assistant":
-                    for tc in msg.get("tool_calls") or []:
-                        fn = tc.get("function", {})
-                        arguments = fn.get("arguments", "")
-                        entry_t = {
-                            "tool": fn.get("name", "unknown"),
-                            "args_bytes": len(arguments),
-                            "input_summary": _summarize_tool_arguments(arguments),
-                        }
-                        tool_trace.append(entry_t)
-                        tc_id = tc.get("id")
-                        if tc_id:
-                            trace_by_id[tc_id] = entry_t
-                elif msg.get("role") == "tool":
-                    content = _stringify_tool_content(msg.get("content", ""))
-                    is_error = _looks_like_error_output(content)
-                    result_meta = {
-                        "result_bytes": len(content),
-                        "status": "error" if is_error else "ok",
-                    }
-                    # Match by tool_call_id for parallel calls
-                    tc_id = msg.get("tool_call_id")
-                    target = trace_by_id.get(tc_id) if tc_id else None
-                    if target is not None:
-                        target.update(result_meta)
-                    elif tool_trace:
-                        # Fallback for messages without tool_call_id
-                        tool_trace[-1].update(result_meta)
+        # Execution-time callbacks are authoritative and survive context
+        # compression. The surviving message tail is compatibility-only: its
+        # explicit source and completeness fields let strict consumers reject it.
+        captured_trace = _runtime_tool_trace_snapshot(child)
+        fallback_trace = _message_tool_trace(result.get("messages") or [])
+        if captured_trace:
+            tool_trace = captured_trace
+            tool_trace_source = "runtime_callbacks"
+        elif fallback_trace:
+            tool_trace = fallback_trace
+            tool_trace_source = "result_messages"
+        else:
+            tool_trace = []
+            tool_trace_source = (
+                "runtime_callbacks" if captured_trace == [] else "result_messages"
+            )
 
         # Determine exit reason
         if interrupted:
@@ -3397,6 +4106,22 @@ def _run_single_child(
                 ),
             },
             "tool_trace": tool_trace,
+            "tool_trace_source": tool_trace_source,
+            "tool_trace_complete": (
+                bool(_runtime_tool_trace_complete(child))
+                if tool_trace_source == "runtime_callbacks"
+                else False
+            ),
+            "tool_trace_turns_complete": (
+                bool(_runtime_tool_trace_turns_complete(child))
+                if tool_trace_source == "runtime_callbacks"
+                else False
+            ),
+            "tool_trace_delivery_complete": (
+                bool(_runtime_tool_trace_delivery_complete(child))
+                if tool_trace_source == "runtime_callbacks"
+                else False
+            ),
             # Captured before the finally block calls child.close() so the
             # parent thread can fire subagent_stop with the correct role.
             # Stripped before the dict is serialised back to the model.
@@ -3597,6 +4322,13 @@ def _run_single_child(
             "duration_seconds": duration,
             "_child_role": getattr(child, "_delegate_role", None),
         }
+        _error_trace = _runtime_tool_trace_snapshot(child)
+        if _error_trace is not None:
+            _error_entry["tool_trace"] = _error_trace
+            _error_entry["tool_trace_source"] = "runtime_callbacks"
+            _error_entry["tool_trace_complete"] = False
+            _error_entry["tool_trace_turns_complete"] = False
+            _error_entry["tool_trace_delivery_complete"] = False
         if _late_pending_steer:
             _error_entry["missed_steer"] = _late_pending_steer
             _error_entry["error"] += (
