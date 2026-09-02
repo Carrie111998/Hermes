@@ -3968,7 +3968,26 @@ class FeishuAdapter(BasePlatformAdapter):
             key,
             len(event.text or ""),
         )
-        await self._handle_message_with_guards(event)
+        try:
+            await self._handle_message_with_guards(event)
+        except asyncio.CancelledError:
+            # The event was already popped above: a cancellation mid-dispatch
+            # (the batching timer cancels prior flushes on every new chunk)
+            # would silently lose the user's message. Re-buffer it, prepended
+            # ahead of any newer chunk.
+            existing = self._pending_text_batches.get(key)
+            if existing is not None:
+                existing.text = (
+                    f"{event.text}\n{existing.text}"
+                    if event.text and existing.text
+                    else (existing.text or event.text)
+                )
+                if event.media_urls:
+                    existing.media_urls[:0] = event.media_urls
+                    existing.media_types[:0] = event.media_types
+            else:
+                self._pending_text_batches[key] = event
+            raise
 
     # =========================================================================
     # Message content extraction and resource download
