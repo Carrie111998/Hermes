@@ -4021,26 +4021,39 @@ class CLICommandsMixin:
 
         Accepts optional destination words after the command:
 
-        - ``/debug``        → upload to the public paste service (default)
+        - ``/debug``        → show the privacy notice without uploading
+        - ``/debug upload`` → upload a sanitized public system summary
         - ``/debug nous``   → upload to Nous-internal storage (private, staff-only)
         - ``/debug local``  → render the report to stdout, no upload
 
         ``nous`` and ``local`` are mutually exclusive; if both are given,
         ``local`` wins (it never touches the network).
         """
-        from hermes_cli.debug import run_debug_share
+        from hermes_cli.debug import _PRIVACY_NOTICE, run_debug_share
         from types import SimpleNamespace
 
         words = {w.lower() for w in cmd_original.split()[1:]}
         local = "local" in words
         nous = "nous" in words and not local
-        # Typing the /debug slash command is itself the explicit consent to
-        # upload, so we pass yes=True to skip run_debug_share's [y/N] prompt.
-        # input() would hang inside prompt_toolkit's event loop anyway.
+        upload = "upload" in words or nous
+        if not local and not upload:
+            print(_PRIVACY_NOTICE)
+            print("Run `/debug upload` to confirm, or `/debug local` to inspect locally.")
+            return
+
+        # The explicit slash argument above owns consent. ``run_debug_share``
+        # must not call raw input() inside prompt_toolkit or a headless slash worker.
         args = SimpleNamespace(
             lines=200, expire=7, local=local, nous=nous, yes=True
         )
-        run_debug_share(args)
+        try:
+            run_debug_share(args)
+        except SystemExit:
+            # ``run_debug_share`` is also a CLI entry point, so upload failures
+            # intentionally use a non-zero process exit there. Slash commands
+            # run inside a persistent worker and must keep that process alive;
+            # the actionable error has already been printed into its response.
+            return
 
     def _handle_update_command(self) -> bool:
         """Handle /update — update Hermes Agent to the latest version.

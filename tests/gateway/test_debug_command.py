@@ -31,17 +31,30 @@ def _make_runner():
 
 class TestHandleDebugCommand:
     @pytest.mark.asyncio
-    async def test_debug_sweeps_expired_pastes_before_upload(self):
+    async def test_bare_debug_is_notice_only(self):
         runner = _make_runner()
         event = _make_event()
 
-        with patch("hermes_cli.debug._sweep_expired_pastes", return_value=(0, 0)) as mock_sweep, \
-             patch("hermes_cli.debug._capture_dump", return_value="dump"), \
-             patch("hermes_cli.debug.collect_debug_report", return_value="report"), \
-             patch("hermes_cli.debug.upload_to_pastebin", return_value="https://paste.rs/report"), \
-             patch("hermes_cli.debug._schedule_auto_delete"):
+        with patch("hermes_cli.debug.build_debug_share") as build:
             result = await runner._handle_debug_command(event)
 
-        mock_sweep.assert_called_once()
+        build.assert_not_called()
+        assert "/debug upload" in result
+
+    @pytest.mark.asyncio
+    async def test_debug_upload_is_explicit_consent(self):
+        from hermes_cli.debug import DebugShareResult
+
+        runner = _make_runner()
+        event = _make_event(text="/debug upload")
+        share = DebugShareResult(
+            urls={"Report": "https://paste.rs/report"},
+            failures=[], redacted=True, auto_delete_seconds=21600,
+        )
+
+        with patch("hermes_cli.debug.build_debug_share", return_value=share) as build:
+            result = await runner._handle_debug_command(event)
+
+        build.assert_called_once_with(log_lines=200, redact=True)
         assert "https://paste.rs/report" in result
 

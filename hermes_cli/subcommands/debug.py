@@ -17,19 +17,18 @@ def build_debug_parser(subparsers, *, cmd_debug: Callable) -> None:
     # =========================================================================
     debug_parser = subparsers.add_parser(
         "debug",
-        help="Debug tools — upload logs and system info for support",
+        help="Debug tools — inspect logs locally or share a sanitized system summary",
         description="Debug utilities for Hermes Agent. Use 'hermes debug share' to "
-        "upload a debug report (system info + recent logs) to a paste "
+        "upload a sanitized, log-free system summary to a paste "
         "service and get a shareable URL.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""\
 Examples:
     hermes debug share              Upload debug report (asks for confirmation)
     hermes debug share --yes        Skip confirmation (for scripts/CI)
-    hermes debug share --lines 500  Include more log lines
-    hermes debug share --expire 30  Keep paste for 30 days
+    hermes debug share --local --lines 500  Inspect more log lines locally
     hermes debug share --local      Print report locally (no upload)
-    hermes debug share --no-redact  Disable upload-time secret redaction
+    hermes debug share --local --no-redact  Inspect unredacted logs locally
     hermes debug share --nous       Upload to Nous-internal storage (private)
     hermes debug delete <url>       Delete a previously uploaded paste
 """,
@@ -37,19 +36,21 @@ Examples:
     debug_sub = debug_parser.add_subparsers(dest="debug_command")
     share_parser = debug_sub.add_parser(
         "share",
-        help="Upload debug report to a paste service and print a shareable URL",
+        help="Upload a sanitized system summary and print a shareable URL",
     )
     share_parser.add_argument(
         "--lines",
         type=int,
         default=200,
-        help="Number of log lines to include per log file (default: 200)",
+        help="Number of log lines for --local or --nous (default: 200)",
     )
     share_parser.add_argument(
         "--expire",
         type=int,
         default=7,
-        help="Paste expiry in days (default: 7)",
+        # Retained for CLI compatibility. Public pastes use the fixed six-hour
+        # deletion schedule and private Nous bundles use their fixed retention.
+        help=argparse.SUPPRESS,
     )
     share_parser.add_argument(
         "--local",
@@ -70,10 +71,8 @@ Examples:
         "--no-redact",
         action="store_true",
         help=(
-            "Disable upload-time secret redaction (default: redact). Logs "
-            "are normally run through agent.redact.redact_sensitive_text "
-            "with force=True before upload so credentials are not leaked "
-            "into the public paste service."
+            "Disable log redaction for --local or --nous. Public paste "
+            "uploads always use a sanitized, log-free system summary."
         ),
     )
     share_parser.add_argument(

@@ -4554,18 +4554,28 @@ async def run_config_migrate():
 
 @app.post("/api/ops/debug-share")
 async def run_debug_share_endpoint(body: DebugShareRequest | None = None):
-    """Upload a redacted debug report + full logs and return the paste URLs.
+    """Upload a sanitized, log-free system summary and return its paste URL.
 
     Unlike the other diagnostics actions (doctor, dump, prompt-size) this is
     *synchronous*: the whole point of ``debug share`` is the set of shareable
-    URLs it produces, so we run the upload in a worker thread and return the
+    URL it produces, so we run the upload in a worker thread and return the
     structured ``{urls, failures, redacted, ...}`` payload directly. The
     dashboard renders those as real, copyable links instead of scraping a log
-    tail. Pastes auto-delete after 6 hours (handled inside the share core).
+    tail. The paste is scheduled for deletion after 6 hours by the share core.
     """
     from hermes_cli.debug import build_debug_share
 
     req = body or DebugShareRequest()
+    if not req.consent:
+        raise HTTPException(
+            status_code=400,
+            detail="Explicit consent is required before uploading debug data",
+        )
+    if not req.redact:
+        raise HTTPException(
+            status_code=400,
+            detail="Public debug uploads cannot disable sanitization",
+        )
     try:
         result = await asyncio.to_thread(
             build_debug_share,

@@ -1,14 +1,10 @@
 """``hermes debug`` debug tools for Hermes Agent.
 
 Currently supports:
-    hermes debug share    Upload debug report (system info + logs) to a
-                          paste service and print a shareable URL.
-                          By default, log content is run through
-                          ``agent.redact.redact_sensitive_text`` with
-                          ``force=True`` before upload so credentials in
-                          ``~/.hermes/logs/*.log`` are not leaked into
-                          the public paste service. Pass ``--no-redact``
-                          to disable.
+    hermes debug share    Upload a sanitized, log-free system summary to a
+                          paste service and print a shareable URL. Full logs,
+                          conversations, diffs, credentials, profile names,
+                          and local paths never enter the public payload.
                           Pass ``--nous`` to upload instead to Nous-internal
                           storage (AWS S3) via a signed URL minted by the
                           Nous account service: the bundle is private
@@ -51,11 +47,11 @@ _EMAIL_ADDRESS_RE = re.compile(
 
 
 # ---------------------------------------------------------------------------
-# Paste services — try paste.rs first, dpaste.com as fallback.
+# Public paste service. Keep this list deletion-safe: every service used for a
+# debug upload must support the remediation command printed to the user.
 # ---------------------------------------------------------------------------
 
 _PASTE_RS_URL = "https://paste.rs/"
-_DPASTE_COM_URL = "https://dpaste.com/api/"
 
 # Maximum bytes to read from a single log file for upload.
 # paste.rs caps at ~1 MB; we stay under that with headroom.
@@ -119,8 +115,8 @@ def _save_pending(entries: list[dict]) -> None:
 def _record_pending(urls: list[str], delay_seconds: int = _AUTO_DELETE_SECONDS) -> None:
     """Record *urls* for deletion at ``now + delay_seconds``.
 
-    Only paste.rs URLs are recorded (dpaste.com auto-expires).  Entries
-    are merged into any existing pending.json.
+    Only paste.rs URLs are recorded. Entries are merged into any existing
+    pending.json.
     """
     paste_rs_urls = [u for u in urls if _extract_paste_id(u)]
     if not paste_rs_urls:
@@ -196,32 +192,27 @@ def _best_effort_sweep_expired_pastes() -> None:
 # ---------------------------------------------------------------------------
 
 _PRIVACY_NOTICE = """\
-⚠️  This will upload system info + logs to a PUBLIC paste service.
+⚠️  This will upload a sanitized system summary to a PUBLIC paste service.
 
-Cryptographic secrets (API keys, tokens, passwords) are redacted before
-upload, but the following personal data is NOT redacted and will be public:
-  • Your display name and persistent platform user ID
-  • Verbatim content of your recent messages (prompts, responses, tool output)
-  • Local filesystem paths
-  • Any other PII present in the logs
+The public report excludes log contents, conversations, tool output, diffs,
+configured credentials, profile names, and local filesystem paths. The
+resulting URL is public to anyone who has the link and may be archived by
+third parties before it is deleted.
 
-The resulting URL is public to anyone who has the link. Pastes auto-delete
-after 6 hours, but may be archived by third parties in the meantime.
-
-Use --local to view the report without uploading.
+Use --local to inspect the full report and logs without uploading them.
 """
 
 _GATEWAY_PRIVACY_NOTICE = (
-    "⚠️ **Privacy notice:** This uploads system info + recent log tails "
-    "(may contain conversation fragments) to a public paste service. "
-    "Full logs are NOT included from the gateway — use `hermes debug share` "
-    "from the CLI for full log uploads.\n"
-    "Pastes auto-delete after 6 hours."
+    "⚠️ **Privacy notice:** Uploading creates a public link containing a "
+    "sanitized system summary. Logs, conversations, tool output, diffs, "
+    "configured credentials, profile names, and local paths are excluded.\n"
+    "Send `/debug upload` to confirm, or use `hermes debug share --local` "
+    "to inspect the full report without uploading."
 )
 
 
 def _extract_paste_id(url: str) -> Optional[str]:
-    """Extract the paste ID from a paste.rs or dpaste.com URL.
+    """Extract the paste ID from a paste.rs URL.
 
     Returns the ID string, or None if the URL doesn't match a known service.
     """
@@ -235,11 +226,20 @@ def _extract_paste_id(url: str) -> Optional[str]:
 def delete_paste(url: str) -> bool:
     """Delete a paste from paste.rs.  Returns True on success.
 
-    Only paste.rs supports unauthenticated DELETE.  dpaste.com pastes
-    expire automatically but cannot be deleted via API.
+    Only paste.rs supports the unauthenticated DELETE flow Hermes uses.
+    Dpaste requires the authenticated owner, so legacy anonymous uploads can
+    expire but cannot be remediated by Hermes after creation.
     """
     paste_id = _extract_paste_id(url)
     if not paste_id:
+        if url.strip().lower().startswith(("https://dpaste.com/", "http://dpaste.com/")):
+            raise ValueError(
+                "Cannot delete legacy anonymous dpaste.com uploads: dpaste "
+                "requires the authenticated owner, and Hermes did not create "
+                "those pastes with an account. They expire according to the "
+                "expiry selected at upload time; new debug uploads use only "
+                "the deletable paste.rs service."
+            )
         raise ValueError(
             f"Cannot delete: only paste.rs URLs are supported.  Got: {url}"
         )
@@ -290,64 +290,15 @@ def _upload_paste_rs(content: str) -> str:
     return url
 
 
-def _upload_dpaste_com(content: str, expiry_days: int = 7) -> str:
-    """Upload to dpaste.com.  Returns the paste URL.
-
-    dpaste.com uses multipart form data.
-    """
-    boundary = "----HermesDebugBoundary9f3c"
-
-    def _field(name: str, value: str) -> str:
-        return (
-            f"--{boundary}\r\n"
-            f'Content-Disposition: form-data; name="{name}"\r\n'
-            f"\r\n"
-            f"{value}\r\n"
-        )
-
-    body = (
-        _field("content", content)
-        + _field("syntax", "text")
-        + _field("expiry_days", str(expiry_days))
-        + f"--{boundary}--\r\n"
-    ).encode("utf-8")
-
-    req = urllib.request.Request(
-        _DPASTE_COM_URL, data=body, method="POST",
-        headers={
-            "Content-Type": f"multipart/form-data; boundary={boundary}",
-            "User-Agent": "hermes-agent/debug-share",
-        },
-    )
-    with urllib.request.urlopen(req, timeout=30) as resp:
-        url = resp.read().decode("utf-8").strip()
-    if not url.startswith("http"):
-        raise ValueError(f"Unexpected response from dpaste.com: {url[:200]}")
-    return url
-
-
 def upload_to_pastebin(content: str, expiry_days: int = 7) -> str:
-    """Upload *content* to a paste service, trying paste.rs then dpaste.com.
+    """Upload *content* to the deletable public paste service.
 
     Returns the paste URL on success, raises on total failure.
     """
-    errors: list[str] = []
-
-    # Try paste.rs first (simple, fast)
     try:
         return _upload_paste_rs(content)
     except Exception as exc:
-        errors.append(f"paste.rs: {exc}")
-
-    # Fallback: dpaste.com (supports expiry)
-    try:
-        return _upload_dpaste_com(content, expiry_days=expiry_days)
-    except Exception as exc:
-        errors.append(f"dpaste.com: {exc}")
-
-    raise RuntimeError(
-        "Failed to upload to any paste service:\n  " + "\n  ".join(errors)
-    )
+        raise RuntimeError(f"Failed to upload to paste.rs: {exc}") from exc
 
 
 # ---------------------------------------------------------------------------
@@ -653,6 +604,30 @@ def collect_debug_report(
     return buf.getvalue()
 
 
+_PUBLIC_DUMP_FIELDS = frozenset({"version", "os", "python", "openai_sdk"})
+
+
+def collect_public_debug_report() -> str:
+    """Return the allowlisted, log-free report used for public uploads.
+
+    Secret regexes cannot safely identify arbitrary conversation text, source
+    patches, or filesystem paths. Public sharing therefore starts from a small
+    allowlist of system-summary fields instead of trying to subtract sensitive
+    content from full logs after collection.
+    """
+    safe_lines = [
+        "[hermes debug share: sanitized public report]",
+        "logs:             excluded (use --local to inspect)",
+        "paths:            excluded",
+        "credentials:      excluded",
+    ]
+    for line in _capture_dump().splitlines():
+        key, separator, _value = line.partition(":")
+        if separator and key.strip() in _PUBLIC_DUMP_FIELDS:
+            safe_lines.append(_redact_log_text(line))
+    return "\n".join(safe_lines) + "\n"
+
+
 # ---------------------------------------------------------------------------
 # Shared bundle collection (used by both the paste.rs and Nous-S3 paths)
 # ---------------------------------------------------------------------------
@@ -777,55 +752,30 @@ def build_debug_share(
     expiry: int = 7,
     redact: bool = True,
 ) -> DebugShareResult:
-    """Collect the debug report + full logs, upload each, return the URLs.
+    """Collect a sanitized public report, upload it, and return its URL.
 
     This is the shared core behind ``hermes debug share`` (CLI) and the
     dashboard ``POST /api/ops/debug-share`` endpoint. It performs blocking
     network I/O (paste uploads) — callers inside an event loop must run it in
     a worker thread.
 
-    The summary report upload is required: on failure this raises
-    ``RuntimeError``. Full-log uploads are best-effort; their errors are
-    collected into ``failures`` rather than raised.
+    Raw log bodies are intentionally never collected on this path: arbitrary
+    prompts, diffs, and local paths cannot be made public-safe with credential
+    regexes. Use the local or private Nous path when support needs full logs.
     """
+    if not redact:
+        raise ValueError("Public debug uploads cannot disable sanitization")
     _best_effort_sweep_expired_pastes()
-
-    # Collect the report + full logs (force-redacted when redact=True) via the
-    # shared collector so the paste.rs and Nous-S3 paths build identical,
-    # identically-redacted bundles. The dump header + redaction banner are
-    # applied inside collect_share_bundle.
-    bundle = collect_share_bundle(log_lines=log_lines, redact=redact)
-
-    if redact:
-        logger.info(
-            "hermes debug share: applied force-mode redaction to log snapshots before upload"
-        )
-
-    report = bundle["report"]
-
-    urls: dict[str, str] = {}
-    failures: list[str] = []
-
-    # 1. Summary report (required — raises on failure so callers can fall back)
-    urls["Report"] = upload_to_pastebin(report, expiry_days=expiry)
-
-    # 2-5. Full logs (optional — failures are collected, not raised)
-    for label in ("agent.log", "gateway.log", "gui.log", "desktop.log"):
-        content = bundle.get(label)
-        if not content:
-            continue
-        try:
-            urls[label] = upload_to_pastebin(content, expiry_days=expiry)
-        except Exception as exc:
-            failures.append(f"{label}: {exc}")
+    report = collect_public_debug_report()
+    urls = {"Report": upload_to_pastebin(report, expiry_days=expiry)}
 
     # Schedule auto-deletion after 6 hours.
     _schedule_auto_delete(list(urls.values()))
 
     return DebugShareResult(
         urls=urls,
-        failures=failures,
-        redacted=redact,
+        failures=[],
+        redacted=True,
         auto_delete_seconds=_AUTO_DELETE_SECONDS,
         report=report,
     )
@@ -864,7 +814,7 @@ def _confirm_upload(args) -> bool:
 
 
 def run_debug_share(args):
-    """Collect debug report + full logs, upload each, print URLs."""
+    """Collect local/private logs or upload a sanitized public summary."""
     log_lines = getattr(args, "lines", 200)
     expiry = getattr(args, "expire", 7)
     local_only = getattr(args, "local", False)
@@ -900,6 +850,13 @@ def run_debug_share(args):
     print(_PRIVACY_NOTICE)
     if not _confirm_upload(args):
         return
+    if not redact:
+        print(
+            "ERROR: Public debug uploads cannot use --no-redact. Use --local "
+            "or --nous for an explicitly unredacted report.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
     print("Collecting debug report...")
     print("Uploading...")
 
@@ -1057,16 +1014,15 @@ def run_debug(args):
         print("Usage: hermes debug <command>")
         print()
         print("Commands:")
-        print("  share    Upload debug report to a paste service and print URL")
+        print("  share    Upload a sanitized system summary and print URL")
         print("  delete   Delete a previously uploaded paste")
         print()
         print("Options (share):")
-        print("  --lines N    Number of log lines to include (default: 200)")
-        print("  --expire N   Paste expiry in days (default: 7)")
+        print("  --lines N    Number of log lines for --local or --nous (default: 200)")
         print("  --local      Print report locally instead of uploading")
         print("  --nous       Upload to Nous-internal storage (private, staff-only,")
         print("               auto-deletes in 14 days) instead of a public paste")
-        print("  --no-redact  Disable upload-time secret redaction (default: redact)")
+        print("  --no-redact  Disable log redaction for --local or --nous only")
         print()
         print("Options (delete):")
         print("  <url> ...    One or more paste URLs to delete")

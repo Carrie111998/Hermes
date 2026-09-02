@@ -1723,7 +1723,10 @@ export const en: Translations = {
       backup: 'Create backup',
       backupDesc: 'Zip config, memories, skills, and sessions',
       debugShare: 'Debug share',
-      debugShareDesc: 'Upload a redacted report + logs, get shareable links (auto-deletes in 6h)',
+      debugShareDesc: 'Upload a sanitized system summary (logs and local paths are excluded)',
+      debugShareConfirm: 'Upload a public debug report?',
+      debugShareConfirmDesc:
+        'This creates a public link. Logs, conversations, tool output, diffs, credentials, profile names, and local paths are excluded.',
       debugShareRunning: 'Uploading debug report...',
       debugShareLinks: 'Share links',
       debugShareFailed: 'Debug share failed',

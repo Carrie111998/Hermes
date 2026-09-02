@@ -123,6 +123,7 @@ describe('Hermes REST parity helpers (hub / mcp / maintenance)', () => {
     expect(api).toHaveBeenCalledWith(
       expect.objectContaining({ path: '/api/ops/debug-share', method: 'POST', timeoutMs: 120_000 })
     )
+    expect(api).toHaveBeenCalledWith(expect.objectContaining({ body: { consent: true } }))
   })
 
   it('reads a backend model catalog scoped to a provider row', async () => {

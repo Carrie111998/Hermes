@@ -466,7 +466,7 @@ export default function SystemPage() {
   // Unlike the fire-and-forget ops above, `debug share` produces shareable
   // paste URLs that are the whole point — so we surface them as real,
   // copyable links rather than a log tail.
-  const [shareRedact, setShareRedact] = useState(true);
+  const [debugShareConfirmOpen, setDebugShareConfirmOpen] = useState(false);
   const [sharing, setSharing] = useState(false);
   const [shareResult, setShareResult] = useState<DebugShareResponse | null>(
     null,
@@ -492,7 +492,7 @@ export default function SystemPage() {
     setSharing(true);
     setShareResult(null);
     try {
-      const res = await api.runDebugShare({ redact: shareRedact });
+      const res = await api.runDebugShare();
       setShareResult(res);
       const n = Object.keys(res.urls).length;
       showToast(
@@ -506,7 +506,7 @@ export default function SystemPage() {
     } finally {
       setSharing(false);
     }
-  }, [shareRedact, showToast]);
+  }, [showToast]);
 
 
   // ── Update check / apply ───────────────────────────────────────────
@@ -1342,9 +1342,8 @@ export default function SystemPage() {
           </CardContent>
         </Card>
 
-        {/* Debug share — uploads a redacted report + logs, returns shareable
-            links. Separated from the buttons above because its output is
-            persistent, copyable URLs, not a fire-and-forget log tail. */}
+        {/* Debug share returns a persistent, copyable public URL rather than a
+            fire-and-forget log tail, so consent is collected at this caller. */}
         <Card>
           <CardContent className="flex flex-col gap-3 py-4">
             <div className="flex flex-wrap items-center justify-between gap-3">
@@ -1353,9 +1352,10 @@ export default function SystemPage() {
                 <div className="flex flex-col">
                   <span className="text-sm font-medium">Share debug report</span>
                   <span className="text-xs text-muted-foreground max-w-prose">
-                    Uploads system info + logs to a public paste service and
-                    returns links to send the Hermes team. Pastes auto-delete
-                    after 6 hours.
+                    Uploads a sanitized system summary to a public paste service.
+                    Logs, conversations, tool output, diffs, credentials, profile
+                    names, and local paths are excluded. Pastes auto-delete after
+                    6 hours.
                   </span>
                 </div>
               </div>
@@ -1369,27 +1369,25 @@ export default function SystemPage() {
                     <Share2 className="h-3.5 w-3.5" />
                   )
                 }
-                onClick={() => void runDebugShare()}
+                onClick={() => setDebugShareConfirmOpen(true)}
               >
                 {sharing ? "Uploading…" : "Generate share link"}
               </Button>
             </div>
 
-            <div className="flex items-center gap-2.5">
-              <Checkbox
-                checked={shareRedact}
-                disabled={sharing}
-                id="share-redact"
-                onCheckedChange={(checked) => setShareRedact(checked === true)}
-              />
-
-              <Label
-                className="cursor-pointer select-none text-xs font-normal normal-case tracking-normal text-muted-foreground"
-                htmlFor="share-redact"
-              >
-                Redact credential-shaped tokens before upload (recommended)
-              </Label>
-            </div>
+            <ConfirmDialog
+              open={debugShareConfirmOpen}
+              title="Upload a public debug report?"
+              description="This creates a public link containing a sanitized system summary. Logs, conversations, tool output, diffs, credentials, profile names, and local paths are excluded."
+              destructive
+              confirmLabel="Upload"
+              cancelLabel="Cancel"
+              onCancel={() => setDebugShareConfirmOpen(false)}
+              onConfirm={() => {
+                setDebugShareConfirmOpen(false);
+                void runDebugShare();
+              }}
+            />
 
             {shareResult && (
               <div className="flex flex-col gap-2 border-t border-border pt-3">

@@ -261,8 +261,10 @@ export function runDebugShare(): Promise<DebugShareResponse> {
   return hermesApi<DebugShareResponse>({
     path: '/api/ops/debug-share',
     method: 'POST',
-    body: {},
-    // Synchronous upload of report + logs to the paste service.
+    // The caller presents a confirmation dialog immediately before this call;
+    // the backend rejects requests that omit this explicit consent marker.
+    body: { consent: true },
+    // Synchronous upload of the sanitized system summary.
     timeoutMs: 120_000
   })
 }

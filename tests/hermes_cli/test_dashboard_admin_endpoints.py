@@ -7,6 +7,8 @@ contract and the CLI-config parity (servers/keys written via the API are
 visible to the CLI data layer), not specific catalog values.
 """
 
+from unittest.mock import MagicMock
+
 import pytest
 
 
@@ -905,21 +907,31 @@ class TestDebugShareEndpoint:
         (logs / "gateway.log").write_text("gw line\n")
 
 
-    def test_redact_false_is_honored(self, monkeypatch):
+    def test_missing_consent_fails_closed_without_upload(self, monkeypatch):
         import hermes_cli.debug as dbg
 
-        monkeypatch.setattr(
-            dbg, "upload_to_pastebin", lambda c, expiry_days=7: "https://paste.rs/x"
-        )
-        monkeypatch.setattr(dbg, "_schedule_auto_delete", lambda *a, **k: None)
-        monkeypatch.setattr(dbg, "_best_effort_sweep_expired_pastes", lambda: None)
-        monkeypatch.setattr("hermes_cli.dump.run_dump", lambda a: None)
+        upload = MagicMock(return_value="https://paste.rs/x")
+        monkeypatch.setattr(dbg, "upload_to_pastebin", upload)
 
         r = self.client.post("/api/ops/debug-share", json={"redact": False})
-        assert r.status_code == 200
-        assert r.json()["redacted"] is False
+        assert r.status_code == 400
+        assert "consent" in r.json()["detail"].lower()
+        upload.assert_not_called()
 
-    def test_default_body_redacts(self, monkeypatch):
+    def test_unredacted_public_upload_is_rejected(self, monkeypatch):
+        import hermes_cli.debug as dbg
+
+        upload = MagicMock(return_value="https://paste.rs/x")
+        monkeypatch.setattr(dbg, "upload_to_pastebin", upload)
+
+        r = self.client.post(
+            "/api/ops/debug-share", json={"consent": True, "redact": False}
+        )
+        assert r.status_code == 400
+        assert "sanitization" in r.json()["detail"].lower()
+        upload.assert_not_called()
+
+    def test_confirmed_body_uploads_sanitized_report(self, monkeypatch):
         import hermes_cli.debug as dbg
 
         monkeypatch.setattr(
@@ -929,8 +941,7 @@ class TestDebugShareEndpoint:
         monkeypatch.setattr(dbg, "_best_effort_sweep_expired_pastes", lambda: None)
         monkeypatch.setattr("hermes_cli.dump.run_dump", lambda a: None)
 
-        # No JSON body at all — should default redact=True.
-        r = self.client.post("/api/ops/debug-share")
+        r = self.client.post("/api/ops/debug-share", json={"consent": True})
         assert r.status_code == 200
         assert r.json()["redacted"] is True
 
@@ -946,7 +957,9 @@ class TestDebugShareEndpoint:
         monkeypatch.setattr(dbg, "_best_effort_sweep_expired_pastes", lambda: None)
         monkeypatch.setattr("hermes_cli.dump.run_dump", lambda a: None)
 
-        r = self.client.post("/api/ops/debug-share", json={"redact": True})
+        r = self.client.post(
+            "/api/ops/debug-share", json={"consent": True, "redact": True}
+        )
         assert r.status_code == 502
 
 

@@ -1524,6 +1524,8 @@ export interface Translations {
       backupDesc: string
       debugShare: string
       debugShareDesc: string
+      debugShareConfirm: string
+      debugShareConfirmDesc: string
       debugShareRunning: string
       debugShareLinks: string
       debugShareFailed: string
