@@ -207,6 +207,8 @@ class Mem0MemoryProvider(MemoryProvider):
         self._agent_id = "hermes"
         self._rerank_default = False
         self._channel = "cli"  # gateway channel name (cli/telegram/discord/...)
+        self._write_enabled = True
+        self._agent_context = ""
         self._sync_thread = None
         self._prefetch_thread = None
         self._prefetch_query = ""
@@ -364,6 +366,12 @@ class Mem0MemoryProvider(MemoryProvider):
             _rr.lower() in ("true", "1", "yes") if isinstance(_rr, str) else bool(_rr)
         )
         self._channel = kwargs.get("platform") or "cli"
+        # Automatic per-turn capture is owner-conversation only. Cron, flush and
+        # subagent runs are machine-driven and must not accrete into the user's
+        # memory store. Mirrors the supermemory and honcho providers.
+        agent_context = kwargs.get("agent_context", "")
+        self._write_enabled = agent_context not in {"cron", "flush", "subagent"}
+        self._agent_context = agent_context
         self._backend = self._create_backend()
         if self._backend and not self._atexit_registered:
             atexit.register(self._shutdown_backend)
@@ -478,6 +486,12 @@ class Mem0MemoryProvider(MemoryProvider):
 
     def sync_turn(self, user_content: str, assistant_content: str, *, session_id: str = "") -> None:
         """Send the turn to Mem0 for server-side fact extraction (non-blocking)."""
+        if not self._write_enabled:
+            logger.debug(
+                "Mem0 automatic capture skipped: agent_context=%s is not an "
+                "owner conversation", self._agent_context or "<unset>",
+            )
+            return
         if self._backend is None or self._is_breaker_open():
             return
 
