@@ -24,7 +24,7 @@ import tempfile
 import threading
 import time
 import traceback
-from collections import defaultdict
+from collections import OrderedDict, defaultdict
 from contextlib import suppress
 from typing import Callable, Dict, List, Optional, Any, Tuple
 from urllib.parse import quote, urljoin
@@ -214,6 +214,53 @@ from gateway.platforms.base import (
     validate_inbound_media_size,
 )
 from tools.url_safety import is_safe_url
+
+
+def normalize_reaction_emoji(emoji: Any) -> str:
+    """Normalize an emoji to allowlist form: unicode passes through;
+    custom emojis ``<:name:id>`` / ``<a:name:id>`` reduce to ``name``."""
+    text = str(emoji or "").strip()
+    if not text:
+        return ""
+    if text.startswith("<") and text.endswith(">"):
+        inner = text[1:-1]
+        if inner.startswith("a:"):
+            inner = inner[2:]
+        # NOTE: "<:name:id>"[1:-1] KEEPS a leading colon (":name:id"), so the
+        # plain split(":")[0] yields "". Drop empty segments instead.
+        parts = [part for part in inner.split(":") if part]
+        return parts[0] if parts else ""
+    return text
+
+
+# Presentation variants folded at MATCH time: variation selectors (VS15 text
+# style U+FE0E / VS16 emoji style U+FE0F) and Fitzpatrick skin-tone modifiers
+# (U+1F3FB..U+1F3FF). Discord's wire form commonly carries them; user-typed
+# allowlists usually do not.
+_EMOJI_VS_SELECTORS = ("\ufe0e", "\ufe0f")
+_SKIN_TONE_FIRST = "\U0001f3fb"
+_SKIN_TONE_LAST = "\U0001f3ff"
+
+
+def fold_emoji_variants(text: str) -> str:
+    """Strip VS15/VS16 selectors and skin-tone modifiers, keeping the base.
+
+    Discord's reaction wire form commonly carries a trailing VS16 (``👍️`` =
+    U+1F44D U+FE0F) or a Fitzpatrick modifier (``👍🏻`` = U+1F44D U+1F3FB),
+    while ``reaction_triggers`` entries are typed without them. Folding
+    removes those codepoints wherever they appear — including inside ZWJ
+    sequences, whose base structure survives (``👩🏻‍💻`` -> ``👩‍💻``) — so
+    both sides of the Gate 5 comparison land on the same string.
+    Slack-parity note: Slack matches reactions in ASCII shortcode space, so
+    this is the Discord-native equivalent forgiveness. MATCHING-ONLY: the
+    synthesized event text and hook payloads keep the original wire form so
+    the agent sees what the human actually tapped.
+    """
+    return "".join(
+        ch for ch in text
+        if ch not in _EMOJI_VS_SELECTORS
+        and not (_SKIN_TONE_FIRST <= ch <= _SKIN_TONE_LAST)
+    )
 
 
 async def _read_url_image_with_redirect_guard(
@@ -1124,6 +1171,9 @@ class DiscordAdapter(BasePlatformAdapter):
         # the owning profile's runtime scope during connect(). None until then;
         # accessors fall back to live scope-aware reads (issue #72348).
         self._gate_env_snapshot: Optional[Dict[str, str]] = None
+        # Spam-guard key for the reaction-trigger env/YAML shadow warning:
+        # None until a disagreement warns; cleared again on parsed agreement.
+        self._rt_shadow_warned_key: Optional[tuple] = None
         self.gateway_runner = None  # Set by gateway/run.py for cross-platform delivery
         # Voice channel state (per-guild)
         self._voice_clients: Dict[int, Any] = {}  # guild_id -> VoiceClient
@@ -1496,6 +1546,17 @@ class DiscordAdapter(BasePlatformAdapter):
                         else f"moved {before.channel.name} -> {after.channel.name}",
                         guild_id,
                     )
+
+            # Raw reaction events: drive reaction triggers without needing the
+            # message cache (raw payloads arrive even for uncached messages).
+            # Gate chain + synthesis live in _handle_reaction_payload.
+            @self._client.event
+            async def on_raw_reaction_add(payload):
+                await adapter_self._handle_reaction_payload(payload, added=True)
+
+            @self._client.event
+            async def on_raw_reaction_remove(payload):
+                await adapter_self._handle_reaction_payload(payload, added=False)
 
             # Register slash commands
             if self._slash_commands:
@@ -3394,6 +3455,379 @@ class DiscordAdapter(BasePlatformAdapter):
         """Check if message reactions are enabled via config/env."""
         return os.getenv("DISCORD_REACTIONS", "true").lower() not in {"false", "0", "no"}
 
+    @staticmethod
+    def _reaction_triggers_parsed(raw) -> tuple[bool, Optional[frozenset]]:
+        """Shared parser for reaction_triggers raw values.
+
+        unset/''/false-ish -> (False, None); true-ish -> (True, None) meaning
+        ALL emoji; anything else -> (True, {names}) allowlist. An allowlist
+        string that parses to zero names (e.g. ',,,') counts as disabled.
+        Mirrors the historical inline logic of _reaction_trigger_config so the
+        env/YAML shadow comparison below compares exactly what would run.
+        """
+        text = str(raw or "").strip()
+        if not text or text.lower() in {"false", "0", "no", "off"}:
+            return False, None
+        if text.lower() in {"true", "1", "yes", "on"}:
+            return True, None
+        names = frozenset(part.strip() for part in text.split(",") if part.strip())
+        if not names:
+            return False, None
+        return True, names
+
+    def _warn_reaction_trigger_env_shadow(self, env_raw: str) -> None:
+        """Warn when DISCORD_REACTION_TRIGGERS env shadows fresh YAML config.
+
+        ``env_raw`` is passed in by the caller (_reaction_trigger_config),
+        which reads the env snapshot once and shares it between this shadow
+        check and the actual resolution — no duplicate env read here.
+        Resolution is env-first (legacy precedence via _gate_raw) and the
+        YAML->env bridge only writes os.environ when the var is UNSET, so a
+        stale .env/shell value makes edits to discord.reaction_triggers in
+        config.yaml appear dead with zero feedback. Fires only when BOTH
+        sources exist AND they PARSE differently ('true' vs 'TRUE' or equal
+        allowlists are agreement, not shadowing). Warns once per disagreement
+        state: the remembered key clears when the sources parse-agree, so a
+        return to a previously warned disagreement re-warns exactly once,
+        while per-reaction Gate 4 resolution cannot spam the log.
+        """
+        extra = getattr(getattr(self, "config", None), "extra", None)
+        extra_raw = extra.get("reaction_triggers") if isinstance(extra, dict) else None
+        if not env_raw or extra_raw is None:
+            return  # only one source present: no shadowing possible
+        warned_key = getattr(self, "_rt_shadow_warned_key", None)
+        pair_key = (str(env_raw), str(extra_raw))
+        if warned_key == pair_key:
+            return  # already warned for this exact disagreement state
+        if self._reaction_triggers_parsed(env_raw) == self._reaction_triggers_parsed(extra_raw):
+            # Parsed agreement is not shadowing — clear any stale guard key so
+            # a later return to a previously warned disagreement re-warns
+            # instead of being silently suppressed.
+            self._rt_shadow_warned_key = None
+            return
+        self._rt_shadow_warned_key = pair_key
+        logger.warning(
+            "[%s] DISCORD_REACTION_TRIGGERS env (%r) overrides config.yaml "
+            "discord.reaction_triggers (%r) - legacy precedence; unset the "
+            "env var or update it to match",
+            self.name,
+            env_raw,
+            extra_raw,
+        )
+
+    def _reaction_trigger_config(self) -> tuple[bool, Optional[set]]:
+        """Parse DISCORD_REACTION_TRIGGERS into (enabled, allowlist).
+
+        See _reaction_triggers_parsed for the grammar. Env wins over YAML
+        (documented legacy precedence); when both sources are set and
+        disagree we warn once so the shadowing is visible.
+        """
+        raw = str(self._gate_raw("reaction_triggers", "DISCORD_REACTION_TRIGGERS") or "").strip()
+        env_raw = self._gate_env("DISCORD_REACTION_TRIGGERS")
+        self._warn_reaction_trigger_env_shadow(env_raw)
+        enabled, allowlist = self._reaction_triggers_parsed(raw)
+        return enabled, (set(allowlist) if allowlist is not None else None)
+
+    def _normalize_reaction_emoji(self, emoji) -> str:
+        return normalize_reaction_emoji(emoji)
+
+    # Reaction-trigger hydration map: recently sent outbound message ids ->
+    # first-200-char text snippets, so an inbound reaction can hydrate
+    # "[Replying to your previous message: ...]" without REST fetches.
+    # Bounded LRU (512 entries) keeps memory flat. Lives in the class body so
+    # self._REACTION_TARGET_LIMIT resolves even on bare instances built
+    # without __init__.
+    _REACTION_TARGET_LIMIT = 512
+
+    def _remember_outbound_snippet(self, message_id: Any, text: Optional[str]) -> None:
+        """Track recently sent message ids -> first-200-char text for reaction hydration."""
+        mid = str(getattr(message_id, "id", message_id) or "").strip()
+        if not mid:
+            return
+        snippet = (text or "").strip()[:200]
+        if not getattr(self, "_reaction_targets", None):
+            self._reaction_targets = OrderedDict()
+        self._reaction_targets[mid] = snippet
+        self._reaction_targets.move_to_end(mid)
+        while len(self._reaction_targets) > self._REACTION_TARGET_LIMIT:
+            self._reaction_targets.popitem(last=False)
+
+    def _lookup_outbound_snippet(self, message_id: Any) -> Optional[str]:
+        # Key normalization MUST mirror _remember_outbound_snippet exactly:
+        # extract .id from Message-like objects, else stringify — otherwise an
+        # object passed to lookup becomes "namespace(id=...)" and misses.
+        mid = str(getattr(message_id, "id", message_id) or "").strip()
+        targets = getattr(self, "_reaction_targets", None) or {}
+        return targets.get(mid)
+
+    async def _handle_reaction_payload(self, payload, *, added: bool) -> None:
+        """Raw-reaction gate chain -> optional synthesized MessageEvent.
+
+        Canonical gate order (single source of truth):
+
+          Gate 1  validity drop (empty emoji/message_id)
+          Gate 2  self-drop — ABSOLUTE FIRST behavioral gate: the bot must
+                  never echo its own emoji acks, neither as a dispatched
+                  event nor onto the hook surface
+          Gate 3  hook fan-out (awaited; fires for every human reaction
+                  regardless of opt-in, mirroring Slack)
+          Gate 4  opt-in off => hooks-only return
+          Gate 5  allowlist (emoji vs allowlist names, normalized AND
+                  variant-folded on both sides — VS15/VS16 selectors,
+                  skin-tone modifiers)
+          Gate 6  target-authorship: 6a ``message_author_id`` fast path
+                  (REACTION_ADD); 6b single-fetch fallback — EVERY
+                  REACTION_REMOVE takes 6b because the remove payload lacks
+                  ``message_author_id``
+          Gate 7  channel policy — generic handle_message bypasses the
+                  on_message admission block, so allowed/ignored channels
+                  are mirrored here; DM payloads SKIP this gate exactly as
+                  ingress does; an unresolvable guild channel drops
+                  fail-closed
+          Gate 8  reactor authorization (_is_allowed_user, fails closed)
+          then synthesize a MessageEvent and dispatch via handle_message.
+        """
+        try:
+            client = getattr(self, "_client", None)
+            client_user = getattr(client, "user", None)
+            our_id = str(getattr(client_user, "id", "")) if client_user is not None else ""
+            reactor_id = str(getattr(payload, "user_id", "") or "")
+            emoji = normalize_reaction_emoji(getattr(payload, "emoji", None))
+            message_id = str(getattr(payload, "message_id", "") or "")
+            if not emoji or not message_id:
+                return                                     # Gate 1: validity drop
+            if our_id and reactor_id == our_id:
+                return                                     # Gate 2: self-drop (acks)
+            enabled, allowlist = self._reaction_trigger_config()
+            await self._emit_reaction_hook(payload, emoji, added, reactor_id)  # Gate 3
+            if not enabled:                                # Gate 4: hooks-only mode
+                return
+            # Gate 5: allowlist — normalize BOTH sides so a YAML entry written
+            # as "<:paw:123>" matches the normalized output "paw", then FOLD
+            # presentation variants (VS16/VS15 selectors, Fitzpatrick
+            # skin-tone modifiers) on BOTH sides so wire forms like "👍️" or
+            # "👍🏻" match an entry typed as plain "👍". Folding is
+            # matching-only: the event text below keeps the unfolded emoji.
+            if allowlist is not None and fold_emoji_variants(emoji) not in {
+                # Drop entries folding to '': modifier/selector-only config
+                # entries must match nothing, not every empty payload.
+                f
+                for name in allowlist
+                if (f := fold_emoji_variants(normalize_reaction_emoji(name)))
+            }:
+                return
+            # Hydration map contract: "" means known-but-empty (captionless
+            # attachment — a hit, do NOT replace it with a fetch); None means
+            # unknown. Gate 6a keeps whatever the map returned; Gate 6b falls
+            # back to the fetch result ONLY on None, so a known-empty hit
+            # survives REMOVE-path authorship fetches too.
+            target_text = self._lookup_outbound_snippet(message_id)
+            author_id = str(getattr(payload, "message_author_id", "") or "")
+            if author_id:                                  # Gate 6a: ADD fast path
+                if not our_id or author_id != our_id:
+                    return
+            else:                                          # Gate 6b: EVERY REMOVE
+                is_ours, fetched_text = await self._resolve_reaction_target(
+                    message_id, payload)
+                if not is_ours:
+                    return
+                if target_text is None:
+                    target_text = fetched_text
+
+            # Gate 7: Channel policy before authorization: outcome-equivalent
+            # to ingress (both must pass); channel-first avoids potential
+            # fetch_channel REST calls for unauthorized reactors.
+            guild_id_raw = getattr(payload, "guild_id", None)
+            is_dm = guild_id_raw is None
+            channel_obj = None
+            parent_channel_id: Optional[str] = None
+            channel_ids: Optional[set] = None
+            if not is_dm:
+                raw_cid = getattr(payload, "channel_id", None)
+                resolver = getattr(client, "get_channel", None) if client else None
+                if callable(resolver) and raw_cid is not None:
+                    try:
+                        channel_obj = resolver(int(raw_cid))
+                    except (TypeError, ValueError):
+                        channel_obj = None
+                if channel_obj is None and client is not None and raw_cid is not None:
+                    fetcher = getattr(client, "fetch_channel", None)
+                    if callable(fetcher):
+                        try:
+                            channel_obj = await fetcher(int(raw_cid))
+                        except Exception:
+                            channel_obj = None
+                if channel_obj is None:
+                    logger.debug(
+                        "[%s] reaction trigger dropped: unresolvable guild channel %s",
+                        getattr(self, "name", "discord"),
+                        getattr(payload, "channel_id", "?"),
+                    )
+                    return                                 # fail closed
+                channel_keys = self._discord_channel_keys_from_channel(channel_obj)
+                allowed_channels = self._get_allowed_channels()
+                if allowed_channels:
+                    if "*" not in allowed_channels and not (channel_keys & allowed_channels):
+                        logger.debug(
+                            "[%s] Ignoring reaction in non-allowed channel: %s",
+                            self.name, channel_keys)
+                        return
+                ignored_channels = self._get_ignored_channels()
+                if "*" in ignored_channels or (channel_keys & ignored_channels):
+                    logger.debug(
+                        "[%s] Ignoring reaction in ignored channel: %s",
+                        self.name, channel_keys)
+                    return
+                raw_parent = getattr(channel_obj, "parent_id", None)
+                parent_channel_id = str(raw_parent) if raw_parent else None
+                cid_str = str(getattr(channel_obj, "id", "") or "")
+                channel_ids = {cid_str} if cid_str else set()
+                if parent_channel_id:
+                    channel_ids.add(parent_channel_id)
+
+            # Gate 8: reactor authorization. Identity prefers payload.member
+            # (REACTION_ADD in guilds); otherwise a guarded fetch_user.
+            reactor_obj = getattr(payload, "member", None)
+            if reactor_obj is None and client is not None:
+                dm_fetch = getattr(client, "fetch_user", None)
+                if callable(dm_fetch):
+                    try:
+                        reactor_obj = await dm_fetch(int(reactor_id))
+                    except Exception:
+                        reactor_obj = None
+            guild = getattr(channel_obj, "guild", None) if channel_obj is not None else None
+            if not self._is_allowed_user(
+                reactor_id,
+                reactor_obj,
+                guild=guild,
+                is_dm=is_dm,
+                channel_ids=channel_ids,
+            ):
+                return
+
+            # Role-grant stamp, mirroring ingress (:1633): a deployment
+            # authorized solely via DISCORD_ALLOWED_ROLES passes Gate 8 but has
+            # no env user allowlist, so the gateway cold path
+            # (_is_user_authorized's adapter-delegation route,
+            # authz_mixin.py) drops every event unless the source carries the
+            # grant. Stamp it onto EVERY source synthesized below.
+            role_authorized = bool(getattr(self, "_allowed_role_ids", set()))
+
+            # Source: DM payloads build chat_type="dm" directly (the shared
+            # helper hardcodes thread/group); guild payloads are thread-aware.
+            user_name = None
+            if reactor_obj is not None:
+                user_name = (
+                    getattr(reactor_obj, "display_name", None)
+                    or getattr(reactor_obj, "name", None)
+                )
+            if is_dm:
+                source = self.build_source(
+                    chat_id=str(getattr(payload, "channel_id", "") or ""),
+                    chat_type="dm",
+                    user_id=reactor_id,
+                    user_name=user_name,
+                    message_id=message_id,
+                    role_authorized=role_authorized,
+                )
+            else:
+                thread_id, chat_id = self._thread_id_and_chat_for_channel(channel_obj)
+                if not chat_id:
+                    chat_id = str(getattr(payload, "channel_id", "") or "")
+                chat_name = getattr(channel_obj, "name", None)
+                if guild is not None and chat_name:
+                    chat_name = f"{getattr(guild, 'name', '')} / #{chat_name}"
+                source = self.build_source(
+                    chat_id=str(chat_id),
+                    chat_name=chat_name,
+                    chat_type="thread" if thread_id else "group",
+                    user_id=reactor_id,
+                    user_name=user_name,
+                    thread_id=thread_id,
+                    guild_id=str(guild_id_raw) if guild_id_raw else None,
+                    parent_chat_id=parent_channel_id,
+                    message_id=message_id,
+                    role_authorized=role_authorized,
+                )
+
+            # MessageEvent/MessageType already imported module-top — no re-import.
+            event = MessageEvent(
+                text=f"reaction:{'added' if added else 'removed'}:{emoji}",
+                message_type=MessageType.TEXT,
+                source=source,
+                message_id=message_id,
+                reply_to_message_id=message_id,
+                # "" (known-but-empty map hit) must not render as an empty
+                # pointer — photon precedent: content.get("targetText") or None.
+                reply_to_text=(target_text or None),
+                reply_to_is_own_message=True,
+                raw_message=payload,
+                timestamp=dt.datetime.now(dt.timezone.utc),
+            )
+            await self.handle_message(event)
+        except Exception:
+            logger.debug("[%s] reaction trigger handling failed",
+                         getattr(self, "name", "discord"), exc_info=True)
+
+    async def _resolve_reaction_target(self, message_id, payload) -> tuple[bool, Optional[str]]:
+        """Single-fetch authorship+hydration check for reactions lacking message_author_id.
+
+        Performs EXACTLY ONE REST call (channel.fetch_message). Returns
+        (True, snippet<=200 chars) when the fetched message is authored by our bot,
+        (False, None) otherwise or on ANY failure (fail-closed -> drop, logged debug).
+        """
+        try:
+            client = getattr(self, "_client", None)
+            channel = client.get_channel(int(getattr(payload, "channel_id"))) if client else None
+            if channel is None and client is not None:
+                channel = await client.fetch_channel(int(getattr(payload, "channel_id")))
+            if channel is None:
+                return False, None
+            msg = await channel.fetch_message(int(message_id))
+            client_user = getattr(client, "user", None)
+            our_id = str(getattr(client_user, "id", "")) if client_user else ""
+            msg_author = getattr(msg, "author", None)
+            author_id = (
+                str(getattr(msg_author, "id", "") or "")
+                if msg_author is not None else ""
+            )
+            if not our_id or author_id != our_id:
+                return False, None
+            snippet = (getattr(msg, "content", "") or "").strip()[:200]
+            return True, snippet or None
+        except Exception:
+            logger.debug("[%s] reaction target fetch failed (%s)",
+                         getattr(self, "name", "discord"), message_id, exc_info=True)
+            return False, None
+
+    async def _emit_reaction_hook(self, payload, emoji: str, added: bool, reactor_id: str) -> None:
+        """Fire the gateway reaction:* hook surface (parity with Slack/Photon)."""
+        handler = getattr(self, "_reaction_handler", None)
+        if handler is None:
+            return
+        try:
+            await handler({
+                "platform": "discord",
+                "event_name": f"reaction:{'added' if added else 'removed'}",
+                "reaction": emoji,
+                "user_id": reactor_id,
+                # REACTION_ADD carries the TRUE author of the reacted-to
+                # message (parity with Slack's item_user); REACTION_REMOVE
+                # lacks it -> None. Hooks observe ALL human reactions
+                # pre-Gate-6, so the bot id does not belong here.
+                "item_user_id": (
+                    str(payload.message_author_id)
+                    if getattr(payload, "message_author_id", None) else None
+                ),
+                "channel_id": str(getattr(payload, "channel_id", "")),
+                "message_ts": str(getattr(payload, "message_id", "")),
+                "event_ts": dt.datetime.now(dt.timezone.utc).isoformat(),
+                "raw_event": payload,
+            })
+        except Exception:
+            logger.debug("[%s] reaction hook fan-out failed",
+                         getattr(self, "name", "discord"), exc_info=True)
+
     async def on_processing_start(self, event: MessageEvent) -> None:
         """Add an in-progress reaction and record durable handling state."""
         message = event.raw_message
@@ -3605,6 +4039,7 @@ class DiscordAdapter(BasePlatformAdapter):
                     else:
                         raise
                 message_ids.append(str(msg.id))
+                self._remember_outbound_snippet(msg.id, chunk)
 
             # Track the last message we sent in this channel for history
             # backfill — avoids a full channel.history() scan on hot paths.
@@ -3687,12 +4122,14 @@ class DiscordAdapter(BasePlatformAdapter):
 
         # Send remaining chunks into the newly created thread.  Track any
         # per-chunk failures so the caller sees partial-send outcomes.
+        self._remember_outbound_snippet(message_id, starter_content)
         message_ids = [message_id]
         warnings: list[str] = []
         for chunk in chunks[1:]:
             try:
                 msg = await thread_channel.send(content=chunk)
                 message_ids.append(str(msg.id))
+                self._remember_outbound_snippet(msg.id, chunk)
             except Exception as e:
                 warning = f"Failed to send follow-up chunk to forum thread {thread_id}: {e}"
                 logger.warning("[%s] %s", self.name, warning)
@@ -3761,6 +4198,7 @@ class DiscordAdapter(BasePlatformAdapter):
         thread_id = str(getattr(thread_channel, "id", getattr(thread, "id", "")))
         starter_msg = getattr(thread, "message", None)
         message_id = str(getattr(starter_msg, "id", thread_id)) if starter_msg else thread_id
+        self._remember_outbound_snippet(message_id, kwargs.get("content"))
 
         if file is not None or files:
             attachments = getattr(starter_msg, "attachments", None) or []
@@ -4072,6 +4510,7 @@ class DiscordAdapter(BasePlatformAdapter):
             content=caption if caption else None,
             files=[discord_file],
         )
+        self._remember_outbound_snippet(msg, caption)
         attachments = getattr(msg, "attachments", None) or []
         if not attachments:
             # Discord accepted the message but attached nothing — the failure
@@ -4206,7 +4645,8 @@ class DiscordAdapter(BasePlatformAdapter):
                         files=files,
                     )
                 else:
-                    await channel.send(content=content, files=files)
+                    msg = await channel.send(content=content, files=files)
+                    self._remember_outbound_snippet(msg, content)
             except Exception as e:
                 logger.warning(
                     "[%s] Multi-image Discord send failed (chunk %d/%d), falling back to per-image: %s",
@@ -5518,6 +5958,7 @@ class DiscordAdapter(BasePlatformAdapter):
                     content=caption if caption else None,
                     file=file,
                 )
+                self._remember_outbound_snippet(msg, caption)
                 return SendResult(success=True, message_id=str(msg.id))
 
         except ImportError:
@@ -5590,6 +6031,7 @@ class DiscordAdapter(BasePlatformAdapter):
                     content=caption if caption else None,
                     file=file,
                 )
+                self._remember_outbound_snippet(msg, caption)
                 return SendResult(success=True, message_id=str(msg.id))
 
         except ImportError:
@@ -10571,6 +11013,20 @@ def _apply_yaml_config(yaml_cfg: dict, discord_cfg: dict) -> dict | None:
         seeded_extra["allowed_channels"] = str(ac)
         if not _skip_env_bridge and not os.getenv("DISCORD_ALLOWED_CHANNELS"):
             os.environ["DISCORD_ALLOWED_CHANNELS"] = str(ac)
+    # reaction_triggers: which emoji the bot reacts with.  true/false gate all
+    # emoji; a list/scalar is an allowlist of emoji names.  Only bools are
+    # lowercased — custom Discord emoji names are case-sensitive.
+    _rt = discord_cfg.get("reaction_triggers")
+    if _rt is not None:
+        if isinstance(_rt, bool):
+            _rt_str = str(_rt).lower()
+        elif isinstance(_rt, (list, tuple)):
+            _rt_str = ",".join(str(x) for x in _rt)
+        else:
+            _rt_str = str(_rt)
+        seeded_extra["reaction_triggers"] = _rt_str  # UNCONDITIONAL — mirrors siblings
+        if not _skip_env_bridge and not os.getenv("DISCORD_REACTION_TRIGGERS"):
+            os.environ["DISCORD_REACTION_TRIGGERS"] = _rt_str
     # no_thread_channels: channels where bot responds directly without creating thread
     ntc = discord_cfg.get("no_thread_channels")
     if ntc is not None:
