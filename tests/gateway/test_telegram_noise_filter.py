@@ -211,16 +211,33 @@ def test_blocked_overflow_warning_stays_visible_in_dm_and_raw_surfaces():
         )
 
 
-@pytest.mark.parametrize("suffix", [" extra", "\nextra"])
-def test_similar_blocked_overflow_text_is_not_suppressed(suffix):
+@pytest.mark.parametrize("affix", ["prefix ", " extra", "\nextra", "\n"])
+def test_similar_blocked_overflow_text_is_not_suppressed(affix):
     warning = CONTEXT_OVERFLOW_BLOCKED_WARNING_TEMPLATE.format(
         tokens=85_000, threshold=72_000, reason="cooldown:30"
     )
+    message = affix + warning if affix == "prefix " else warning + affix
     assert (
         _prepare_gateway_status_message(
-            Platform.TELEGRAM, "warn", warning + suffix, chat_type="group"
+            Platform.TELEGRAM, "warn", message, chat_type="group"
         )
-        == warning + suffix
+        == message.strip()
+    )
+
+
+@pytest.mark.parametrize(
+    "reason",
+    ["structural_backoff:295", "plugin(reason)", "line one\nline two", "x" * 257],
+)
+def test_blocked_overflow_match_accepts_full_emitted_reason_domain(reason):
+    warning = CONTEXT_OVERFLOW_BLOCKED_WARNING_TEMPLATE.format(
+        tokens=85_000, threshold=72_000, reason=reason
+    )
+    assert (
+        _prepare_gateway_status_message(
+            Platform.TELEGRAM, "warn", warning, chat_type="group"
+        )
+        is None
     )
 
 

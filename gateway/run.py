@@ -1041,7 +1041,7 @@ def _blocked_overflow_status_regex(template: str) -> re.Pattern[str]:
     source = re.escape(source)
     source = source.replace(re.escape(marker_tokens), r"[\d,]+")
     source = source.replace(re.escape(marker_threshold), r"[\d,]+")
-    source = source.replace(re.escape(marker_reason), r"[^\r\n()]{1,256}")
+    source = source.replace(re.escape(marker_reason), r"[\s\S]+?")
     return re.compile(rf"^{source}$")
 
 
@@ -1063,7 +1063,8 @@ def _prepare_gateway_status_message(
     Local/CLI sessions keep the raw diagnostic stream. Messaging gateway
     surfaces should not receive transient auxiliary/compression chatter.
     """
-    text = str(message or "").strip()
+    original_text = str(message or "")
+    text = original_text.strip()
     if not text:
         return None
     if _gateway_surface_passes_raw_text(platform):
@@ -1073,6 +1074,7 @@ def _prepare_gateway_status_message(
     normalized_chat_type = str(getattr(chat_type, "value", chat_type) or "").strip().lower()
     if (
         normalized_chat_type in _MULTI_USER_CHAT_TYPES
+        and original_text == text
         and _CONTEXT_OVERFLOW_BLOCKED_STATUS_RE.fullmatch(text)
     ):
         return None
