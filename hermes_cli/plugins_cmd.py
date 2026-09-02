@@ -1805,10 +1805,11 @@ def _is_portable_plugin_dir(dir_path) -> bool:
         return False
 
 
-# Manifest kinds that are active-by-default when bundled: backends auto-load,
-# platforms register lazily but are available out of the box, model providers
-# run through providers/ discovery (see PluginManager.discover_and_load).
-_BUNDLED_DEFAULT_ON_KINDS = frozenset({"backend", "platform", "model-provider"})
+# Manifest kinds whose bundled activation is owned by PluginManager: backends
+# auto-load and platforms register lazily.  Filesystem model providers use the
+# separate providers/ discovery path, which does not honor plugins.disabled,
+# so they must not be represented as toggleable general plugins here.
+_BUNDLED_DEFAULT_ON_KINDS = frozenset({"backend", "platform"})
 
 
 def _bundled_default_on(dir_path) -> bool:
@@ -1868,7 +1869,10 @@ def _scan_level(
 
 def _discover_all_plugins() -> list:
     """Return a list of (name, version, description, source, dir_path, key) for
-    every plugin the loader can see — user + bundled + project + entry point.
+    every general plugin the loader can see — user + bundled + entry point.
+
+    Provider categories with dedicated discovery are intentionally omitted
+    when their activation is not governed by the general plugin toggle.
 
     Matches the ordering/dedup of ``PluginManager.discover_and_load``:
     bundled first, then user, then project, then entry points. Later sources
@@ -1877,14 +1881,15 @@ def _discover_all_plugins() -> list:
     seen: dict = {}  # key -> (name, version, description, source, path, key)
 
     # Bundled (<repo>/plugins/<name>/), excluding memory/, context_engine/
-    # and model-providers/ — model providers load through the dedicated
-    # provider registry (providers/__init__.py), not the general PluginManager
-    # opt-in surface, so listing them as toggleable plugins is misleading.
+    # and model-providers/.  Filesystem model providers (bundled or user) load
+    # through the dedicated provider registry (providers/__init__.py), not the
+    # general PluginManager toggle surface, so listing them here would expose
+    # enable/disable controls that do not govern their runtime activation.
     from hermes_cli.plugins import get_bundled_plugins_dir
     repo_plugins = get_bundled_plugins_dir()
     for base, source, skip in (
         (repo_plugins, "bundled", {"memory", "context_engine", "model-providers"}),
-        (_plugins_dir(), "user", set()),
+        (_plugins_dir(), "user", {"model-providers"}),
     ):
         _scan_level(base, source, skip, "", 0, seen)
 
@@ -1928,11 +1933,21 @@ def _discover_entrypoint_plugins() -> list[tuple[str, str, str, str]]:
     return entries
 
 
-def _plugin_status(name: str, enabled: set, disabled: set, key: str = "") -> str:
-    """Return the user-facing activation state for a plugin name or key."""
+def _plugin_status(
+    name: str,
+    enabled: set,
+    disabled: set,
+    key: str = "",
+    *,
+    source: str = "",
+    dir_path=None,
+) -> str:
+    """Return the effective activation state for one discovered plugin."""
     if name in disabled or key in disabled:
         return "disabled"
     if name in enabled or key in enabled:
+        return "enabled"
+    if source == "bundled" and dir_path is not None and _bundled_default_on(dir_path):
         return "enabled"
     return "not enabled"
 
@@ -1945,7 +1960,14 @@ def _filter_plugin_entries(entries: list, args: Any, enabled: set, disabled: set
     if getattr(args, "enabled", False):
         filtered = [
             entry for entry in filtered
-            if _plugin_status(entry[0], enabled, disabled, key=entry[5]) == "enabled"
+            if _plugin_status(
+                entry[0],
+                enabled,
+                disabled,
+                key=entry[5],
+                source=entry[3],
+                dir_path=entry[4],
+            ) == "enabled"
         ]
     return filtered
 
@@ -1970,7 +1992,14 @@ def cmd_list(args: Any | None = None) -> None:
         payload = [
             {
                 "name": name,
-                "status": _plugin_status(name, enabled, disabled, key=key),
+                "status": _plugin_status(
+                    name,
+                    enabled,
+                    disabled,
+                    key=key,
+                    source=source,
+                    dir_path=_dir,
+                ),
                 "version": str(version),
                 "description": description,
                 "source": source,
@@ -1982,7 +2011,14 @@ def cmd_list(args: Any | None = None) -> None:
 
     if getattr(args, "plain", False):
         for name, version, _description, source, _dir, key in entries:
-            status = _plugin_status(name, enabled, disabled, key=key)
+            status = _plugin_status(
+                name,
+                enabled,
+                disabled,
+                key=key,
+                source=source,
+                dir_path=_dir,
+            )
             print(f"{status:12} {source:8} {str(version):8} {name}")
         return
 
@@ -1998,7 +2034,14 @@ def cmd_list(args: Any | None = None) -> None:
     table.add_column("Source", style="dim")
 
     for name, version, description, source, _dir, key in entries:
-        status_name = _plugin_status(name, enabled, disabled, key=key)
+        status_name = _plugin_status(
+            name,
+            enabled,
+            disabled,
+            key=key,
+            source=source,
+            dir_path=_dir,
+        )
         if status_name == "disabled":
             status = "[red]disabled[/red]"
         elif status_name == "enabled":
@@ -2013,7 +2056,10 @@ def cmd_list(args: Any | None = None) -> None:
     console.print("[dim]Compact view:[/dim] hermes plugins list --plain --no-bundled")
     console.print("[dim]Interactive toggle:[/dim] hermes plugins")
     console.print("[dim]Enable/disable:[/dim] hermes plugins enable/disable <name>")
-    console.print("[dim]Plugins are opt-in by default — only 'enabled' plugins load.[/dim]")
+    console.print(
+        "[dim]User and bundled standalone plugins are opt-in; bundled "
+        "backends and platforms are available unless disabled.[/dim]"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -2214,7 +2260,14 @@ def cmd_show(name: str) -> None:
 
     enabled = _get_enabled_set()
     disabled = _get_disabled_set()
-    status = _plugin_status(pname, enabled, disabled, key=key)
+    status = _plugin_status(
+        pname,
+        enabled,
+        disabled,
+        key=key,
+        source=source,
+        dir_path=dir_path,
+    )
 
     console.print()
     console.print(f"[bold]{pname}[/bold]" + (f" [dim]v{version}[/dim]" if version else ""))
@@ -2252,6 +2305,7 @@ def cmd_toggle() -> None:
     # only the key — so "explicit disable wins" kept a bundled backend off
     # forever (pi314's #40190 symptom). Keys keep every surface aligned.
     plugin_keys = []
+    plugin_names = []
     plugin_labels = []
     plugin_selected = set()
 
@@ -2260,14 +2314,22 @@ def cmd_toggle() -> None:
         if source == "bundled":
             label = f"{label} [bundled]"
         plugin_keys.append(key)
+        plugin_names.append(name)
         plugin_labels.append(label)
-        # Selected (enabled) when in enabled-set AND not in disabled-set.
-        # Accept the legacy bare name on either side for back-compat with
-        # existing configs written before this normalization.
+        # Render the same effective state used by list/show/runtime-facing
+        # surfaces. In particular, bundled backend/platform plugins are on by
+        # default even without a plugins.enabled entry, unless explicitly
+        # disabled.
         is_on = (
-            (key in enabled_set or name in enabled_set)
-            and key not in disabled_set
-            and name not in disabled_set
+            _plugin_status(
+                name,
+                enabled_set,
+                disabled_set,
+                key=key,
+                source=source,
+                dir_path=_d,
+            )
+            == "enabled"
         )
         if is_on:
             plugin_selected.add(i)
@@ -2297,14 +2359,49 @@ def cmd_toggle() -> None:
     try:
         import curses
         _run_composite_ui(curses, plugin_keys, plugin_labels, plugin_selected,
-                          disabled_set, categories, console)
+                          disabled_set, categories, console, plugin_names)
     except ImportError:
         _run_composite_fallback(plugin_keys, plugin_labels, plugin_selected,
-                                disabled_set, categories, console)
+                                disabled_set, categories, console, plugin_names)
+
+
+def _updated_plugin_toggle_sets(
+    plugin_keys,
+    plugin_names,
+    initially_selected,
+    chosen,
+    enabled,
+    disabled,
+):
+    """Apply only checkbox changes and normalize changed entries to their key.
+
+    Effective default-on plugins need not be present in ``plugins.enabled``.
+    Leaving the UI unchanged must therefore preserve the original allow/deny
+    lists instead of materializing every visible checkbox into config.
+    """
+    new_enabled = set(enabled)
+    new_disabled = set(disabled)
+
+    for i, key in enumerate(plugin_keys):
+        was_selected = i in initially_selected
+        is_selected = i in chosen
+        if was_selected == is_selected:
+            continue
+
+        name = plugin_names[i] if i < len(plugin_names) else key.split("/")[-1]
+        aliases = {key, key.split("/")[-1], name}
+        new_enabled.difference_update(aliases)
+        new_disabled.difference_update(aliases)
+        if is_selected:
+            new_enabled.add(key)
+        else:
+            new_disabled.add(key)
+
+    return new_enabled, new_disabled
 
 
 def _run_composite_ui(curses, plugin_keys, plugin_labels, plugin_selected,
-                      disabled, categories, console):
+                      disabled, categories, console, plugin_names=None):
     """Custom curses screen with checkboxes + category action rows."""
     from hermes_cli.curses_ui import flush_stdin
 
@@ -2524,26 +2621,15 @@ def _run_composite_ui(curses, plugin_keys, plugin_labels, plugin_selected,
     curses.wrapper(_draw)
     flush_stdin()
 
-    # Persist by canonical key. Unchecked plugins are written to the
-    # disabled-list so they stay off even if a future plugin auto-enables
-    # itself — but we ONLY ever write the canonical key (never the bare
-    # manifest name), so the disabled-list can't drift out of sync with
-    # what ``cmd_enable`` clears or what PluginManager gates on (#40190).
-    new_enabled: set = set()
-    new_disabled: set = set(disabled)  # preserve existing disabled state for unseen plugins
-    for i, key in enumerate(plugin_keys):
-        bare = key.split("/")[-1]
-        if i in chosen:
-            new_enabled.add(key)
-            new_disabled.discard(key)
-            # Drop any stale legacy bare-leaf disable so re-enabling here
-            # fully clears the plugin from the disabled-list.
-            if bare != key:
-                new_disabled.discard(bare)
-        else:
-            new_disabled.add(key)
-
     prev_enabled = _get_enabled_set()
+    new_enabled, new_disabled = _updated_plugin_toggle_sets(
+        plugin_keys,
+        plugin_names or [],
+        plugin_selected,
+        chosen,
+        prev_enabled,
+        disabled,
+    )
     enabled_changed = new_enabled != prev_enabled
     disabled_changed = new_disabled != disabled
 
@@ -2551,8 +2637,8 @@ def _run_composite_ui(curses, plugin_keys, plugin_labels, plugin_selected,
         _save_enabled_set(new_enabled)
         _save_disabled_set(new_disabled)
         console.print(
-            f"\n[green]\u2713[/green] General plugins: {len(new_enabled)} enabled, "
-            f"{len(plugin_keys) - len(new_enabled)} disabled."
+            f"\n[green]\u2713[/green] General plugins: {len(chosen)} enabled, "
+            f"{len(plugin_keys) - len(chosen)} disabled."
         )
     elif n_plugins > 0:
         console.print("\n[dim]General plugins unchanged.[/dim]")
@@ -2571,7 +2657,7 @@ def _run_composite_ui(curses, plugin_keys, plugin_labels, plugin_selected,
 
 
 def _run_composite_fallback(plugin_keys, plugin_labels, plugin_selected,
-                            disabled, categories, console):
+                            disabled, categories, console, plugin_names=None):
     """Text-based fallback for the composite plugins UI."""
     from hermes_cli.colors import Colors, color
 
@@ -2599,21 +2685,15 @@ def _run_composite_fallback(plugin_keys, plugin_labels, plugin_selected,
                 return
             print()
 
-        # Persist by canonical key only — never the bare manifest name — so
-        # the disabled-list stays aligned with cmd_enable / PluginManager
-        # (#40190).
-        new_enabled: set = set()
-        new_disabled: set = set(disabled)
-        for i, key in enumerate(plugin_keys):
-            bare = key.split("/")[-1]
-            if i in chosen:
-                new_enabled.add(key)
-                new_disabled.discard(key)
-                if bare != key:
-                    new_disabled.discard(bare)
-            else:
-                new_disabled.add(key)
         prev_enabled = _get_enabled_set()
+        new_enabled, new_disabled = _updated_plugin_toggle_sets(
+            plugin_keys,
+            plugin_names or [],
+            plugin_selected,
+            chosen,
+            prev_enabled,
+            disabled,
+        )
         if new_enabled != prev_enabled or new_disabled != disabled:
             _save_enabled_set(new_enabled)
             _save_disabled_set(new_disabled)

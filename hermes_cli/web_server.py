@@ -18904,6 +18904,7 @@ def _merged_plugins_hub(force_refresh: bool = False) -> Dict[str, Any]:
         _discover_context_engines,
         _get_disabled_set,
         _get_enabled_set,
+        _plugin_status,
         _read_manifest as _read_plugin_manifest_at,
     )
 
@@ -18921,20 +18922,21 @@ def _merged_plugins_hub(force_refresh: bool = False) -> Dict[str, Any]:
     rows: List[Dict[str, Any]] = []
 
     for name, version, description, source, dir_str, key in _discover_all_plugins():
-        # Both the path-derived key (nested category plugins) and the bare
-        # manifest name count for enabled/disabled state, matching the runtime
-        # loader's back-compat lookup.
-        aliases = {name}
-        if key:
-            aliases.add(key)
-        if aliases & disabled_set:
-            runtime_status = "disabled"
-        elif aliases & enabled_set:
-            runtime_status = "enabled"
-        else:
-            runtime_status = "inactive"
-
         dir_path = Path(dir_str)
+        effective_status = _plugin_status(
+            name,
+            enabled_set,
+            disabled_set,
+            key=key,
+            source=source,
+            dir_path=dir_path,
+        )
+        # Keep the dashboard API's existing vocabulary while sharing the
+        # effective-state resolver with CLI, TUI, and PluginManager-facing
+        # surfaces.
+        runtime_status = (
+            "inactive" if effective_status == "not enabled" else effective_status
+        )
         dm = dash_by_name.get(name)
         has_dash_manifest = dm is not None or (dir_path / "dashboard" / "manifest.json").exists()
 

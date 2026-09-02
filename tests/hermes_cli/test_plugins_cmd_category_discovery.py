@@ -186,12 +186,11 @@ class TestDiscoverAllPlugins:
 
     @patch("hermes_cli.plugins.get_bundled_plugins_dir")
     @patch("hermes_cli.plugins_cmd._plugins_dir")
-    def test_user_model_providers_subdir_is_still_scanned(
+    def test_user_model_providers_subdir_is_not_a_general_plugin(
         self, mock_user_dir, mock_bundled_dir, tmp_path
     ):
-        """The model-providers skip only applies to *bundled* — a user plugin
-        at ``~/.hermes/plugins/model-providers/<x>/`` is still discovered so
-        ``hermes plugins list`` shows what the user installed."""
+        """Filesystem providers have a dedicated loader that does not use the
+        general plugins.enabled/plugins.disabled toggle contract."""
         from hermes_cli.plugins_cmd import _discover_all_plugins
 
         bundled = tmp_path / "bundled"
@@ -206,7 +205,7 @@ class TestDiscoverAllPlugins:
 
         entries = _discover_all_plugins()
         keys = [e[5] for e in entries]
-        assert "model-providers/acme" in keys
+        assert "model-providers/acme" not in keys
 
 
 # ---------------------------------------------------------------------------
@@ -224,6 +223,58 @@ class TestPluginStatus:
     def test_neither_name_nor_key(self):
         from hermes_cli.plugins_cmd import _plugin_status
         assert _plugin_status("unknown", {"other"}, set(), key="cat/unknown") == "not enabled"
+
+    def test_bundled_backend_is_effectively_enabled(self, tmp_path):
+        from hermes_cli.plugins_cmd import _plugin_status
+
+        plugin = _make_plugin_dir(tmp_path, "renderer", {
+            "name": "renderer", "kind": "backend"
+        })
+        assert _plugin_status(
+            "renderer", set(), set(), source="bundled", dir_path=plugin
+        ) == "enabled"
+
+    def test_bundled_platform_is_effectively_enabled(self, tmp_path):
+        from hermes_cli.plugins_cmd import _plugin_status
+
+        plugin = _make_plugin_dir(tmp_path, "chat", {
+            "name": "chat", "kind": "platform"
+        })
+        assert _plugin_status(
+            "chat", set(), set(), source="bundled", dir_path=plugin
+        ) == "enabled"
+
+    def test_model_provider_is_outside_general_default_on_policy(self, tmp_path):
+        from hermes_cli.plugins_cmd import _bundled_default_on
+
+        plugin = _make_plugin_dir(tmp_path, "acme", {
+            "name": "acme", "kind": "model-provider"
+        })
+        assert _bundled_default_on(plugin) is False
+
+    def test_explicit_disable_wins_for_bundled_backend(self, tmp_path):
+        from hermes_cli.plugins_cmd import _plugin_status
+
+        plugin = _make_plugin_dir(tmp_path, "renderer", {
+            "name": "renderer", "kind": "backend"
+        })
+        assert _plugin_status(
+            "renderer", set(), {"renderer"}, source="bundled", dir_path=plugin
+        ) == "disabled"
+
+    @pytest.mark.parametrize("source,kind", [
+        ("user", "backend"),
+        ("bundled", "standalone"),
+    ])
+    def test_non_default_on_plugin_stays_opt_in(self, tmp_path, source, kind):
+        from hermes_cli.plugins_cmd import _plugin_status
+
+        plugin = _make_plugin_dir(tmp_path, f"{source}-{kind}", {
+            "name": f"{source}-{kind}", "kind": kind
+        })
+        assert _plugin_status(
+            f"{source}-{kind}", set(), set(), source=source, dir_path=plugin
+        ) == "not enabled"
 
 
 # ---------------------------------------------------------------------------
@@ -247,6 +298,21 @@ class TestFilterPluginEntries:
         result = _filter_plugin_entries(entries, args, {"web/keenable"}, set())
         assert len(result) == 1
         assert result[0][5] == "web/keenable"
+
+    def test_enabled_filter_includes_default_on_bundled_backend(self, tmp_path):
+        from hermes_cli.plugins_cmd import _filter_plugin_entries
+
+        plugin = _make_plugin_dir(tmp_path, "renderer", {
+            "name": "renderer", "kind": "backend"
+        })
+        entries = [
+            ("renderer", "1.0.0", "render", "bundled", plugin, "renderer"),
+        ]
+        args = MagicMock(no_bundled=False, user=False, enabled=True)
+
+        result = _filter_plugin_entries(entries, args, set(), set())
+
+        assert result == entries
 
 
 # ---------------------------------------------------------------------------
@@ -308,3 +374,37 @@ class TestCmdListJson:
             payload = json.loads(captured.out)
             assert len(payload) == 1
             assert payload[0]["status"] == "enabled"
+
+    @patch("hermes_cli.plugins.get_bundled_plugins_dir")
+    @patch("hermes_cli.plugins_cmd._plugins_dir")
+    def test_json_reports_default_on_bundled_backend_as_enabled(
+        self, mock_user_dir, mock_bundled_dir, tmp_path, capsys
+    ):
+        from hermes_cli.plugins_cmd import cmd_list
+
+        bundled = tmp_path / "bundled"
+        user = tmp_path / "user"
+        user.mkdir()
+        _make_category_plugin(bundled, "image_gen", "openai-codex", {
+            "name": "openai-codex", "version": "1.0.0", "kind": "backend"
+        })
+        mock_user_dir.return_value = user
+        mock_bundled_dir.return_value = bundled
+
+        args = MagicMock(
+            json=True,
+            plain=False,
+            no_bundled=False,
+            user=False,
+            enabled=False,
+        )
+        cmd_list(args)
+
+        payload = json.loads(capsys.readouterr().out)
+        assert payload == [{
+            "name": "openai-codex",
+            "status": "enabled",
+            "version": "1.0.0",
+            "description": "",
+            "source": "bundled",
+        }]

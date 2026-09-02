@@ -2,12 +2,12 @@
 sidebar_position: 12
 sidebar_label: "Built-in Plugins"
 title: "Built-in Plugins"
-description: "Plugins shipped with Hermes Agent that run automatically via lifecycle hooks — disk-cleanup and friends"
+description: "Plugins shipped with Hermes Agent, including opt-in extensions and built-in backends"
 ---
 
 # Built-in Plugins
 
-Hermes ships a small set of plugins bundled with the repository. They live under `<repo>/plugins/<name>/` and load automatically alongside user-installed plugins in `~/.hermes/plugins/`. They use the same plugin surface as third-party plugins — hooks, tools, slash commands — just maintained in-tree.
+Hermes ships a set of plugins with the repository. They live under `<repo>/plugins/` and use the same plugin surface as third-party plugins — hooks, tools, slash commands, backends, and platform adapters — but their activation depends on the plugin kind.
 
 See the [Plugins](/user-guide/features/plugins) page for the general plugin system, and [Build a Hermes Plugin](/developer-guide/plugins) to write your own.
 
@@ -22,11 +22,11 @@ The `PluginManager` scans four sources, in order:
 
 On name collision, later sources win — a user plugin named `disk-cleanup` would replace the bundled one.
 
-`plugins/memory/` and `plugins/context_engine/` are deliberately excluded from bundled scanning. Those directories use their own discovery paths because memory providers and context engines are single-select providers configured through `hermes memory setup` / `context.engine` in config.
+`plugins/memory/`, `plugins/context_engine/`, and `plugins/model-providers/` use dedicated discovery paths instead of the general plugin toggle. Memory and context-engine providers are selected through `hermes memory setup` / `context.engine`. Filesystem model-provider profiles are discovered by the provider registry and are not controlled by `plugins.enabled` or `plugins.disabled`.
 
-## Bundled plugins are opt-in
+## Activation depends on plugin kind
 
-Bundled plugins ship disabled. Discovery finds them (they appear in `hermes plugins list` and the interactive `hermes plugins` UI), but none load until you explicitly enable them:
+Bundled standalone plugins are opt-in. Discovery finds them (they appear in `hermes plugins list` and the interactive `hermes plugins` UI), but they do not load until you explicitly enable them:
 
 ```bash
 hermes plugins enable disk-cleanup
@@ -40,32 +40,33 @@ plugins:
     - disk-cleanup
 ```
 
-This is the same mechanism user-installed plugins use. Bundled plugins are never auto-enabled — not on fresh install, not for existing users upgrading to a newer Hermes. You always opt in explicitly.
+Bundled `backend` plugins are different: the general `PluginManager` loads them automatically so an existing core tool can select one through its category config. Bundled `platform` plugins are also available by default, but their modules load lazily on first use. Their own credentials and category settings still determine whether they can actually serve a request.
 
-To turn a bundled plugin off again:
+Both default-on kinds honor an explicit deny-list. For example, to prevent the bundled Codex image backend from registering:
 
 ```bash
-hermes plugins disable disk-cleanup
-# or: remove it from plugins.enabled in config.yaml
+hermes plugins disable image_gen/openai-codex
 ```
+
+Filesystem model-provider profiles are a separate case. The provider registry discovers them outside the general `PluginManager`; use model/provider configuration to choose a provider. The generic plugin enable/disable commands do not control those profiles.
 
 ## Currently shipped
 
-The repo ships these bundled plugins under `plugins/`. All are opt-in — enable them via `hermes plugins enable <name>`.
+The repo ships these bundled plugins under `plugins/`:
 
-| Plugin | Kind | Purpose |
-|---|---|---|
-| `disk-cleanup` | hooks + slash command | Auto-track ephemeral files and clean them on session end |
-| `security-guidance` | hooks | Pattern-match dangerous code on `write_file`/`patch` and append a security warning (or block) — 25 rules (Apache-2.0 fork of Anthropic's `claude-plugins-official` patterns) |
-| `observability/langfuse` | hooks | Trace turns / LLM calls / tools to [Langfuse](https://langfuse.com) |
-| `teams_pipeline` | standalone | Microsoft Teams meeting pipeline — Graph-backed, transcript-first meeting summaries |
-| `spotify` | backend (7 tools) | Native Spotify playback, queue, search, playlists, albums, library |
-| `google_meet` | standalone | Join Meet calls, live-caption transcription, optional realtime duplex audio |
-| `image_gen/openai` | image backend | OpenAI `gpt-image-2` image generation backend (alternative to FAL) |
-| `image_gen/openai-codex` | image backend | OpenAI image generation via Codex OAuth |
-| `image_gen/xai` | image backend | xAI `grok-2-image` backend |
-| `hermes-achievements` | dashboard tab | Steam-style collectible badges generated from your real Hermes session history |
-| `kanban/dashboard` | dashboard tab | Kanban board UI for the multi-agent dispatcher — tasks, comments, fan-out, board switching. See [Kanban Multi-Agent](./kanban.md). |
+| Plugin | Kind | Activation | Purpose |
+|---|---|---|---|
+| `disk-cleanup` | hooks + slash command | Opt-in | Auto-track ephemeral files and clean them on session end |
+| `security-guidance` | hooks | Opt-in | Pattern-match dangerous code on `write_file`/`patch` and append a security warning (or block) — 25 rules (Apache-2.0 fork of Anthropic's `claude-plugins-official` patterns) |
+| `observability/langfuse` | hooks | Opt-in | Trace turns / LLM calls / tools to [Langfuse](https://langfuse.com) |
+| `teams_pipeline` | standalone | Opt-in | Microsoft Teams meeting pipeline — Graph-backed, transcript-first meeting summaries |
+| `spotify` | backend (7 tools) | Loaded by default; auth-gated | Native Spotify playback, queue, search, playlists, albums, library |
+| `google_meet` | standalone | Opt-in | Join Meet calls, live-caption transcription, optional realtime duplex audio |
+| `image_gen/openai` | image backend | Loaded by default; selected by config | OpenAI `gpt-image-2` image generation backend (alternative to FAL) |
+| `image_gen/openai-codex` | image backend | Loaded by default; selected by config | OpenAI image generation via Codex OAuth |
+| `image_gen/xai` | image backend | Loaded by default; selected by config | xAI `grok-2-image` backend |
+| `hermes-achievements` | dashboard tab | Dashboard discovery | Steam-style collectible badges generated from your real Hermes session history |
+| `kanban/dashboard` | dashboard tab | Dashboard discovery | Kanban board UI for the multi-agent dispatcher — tasks, comments, fan-out, board switching. See [Kanban Multi-Agent](./kanban.md). |
 
 Memory providers (`plugins/memory/*`) and context engines (`plugins/context_engine/*`) are listed separately on [Memory Providers](./memory-providers.md) — they're managed through `hermes memory` and `hermes plugins` respectively. The full per-plugin detail for the two long-running hooks-based plugins follows.
 
