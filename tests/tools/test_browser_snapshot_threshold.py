@@ -68,6 +68,16 @@ def test_cleanup_reloads_updated_profile_config(isolated_snapshot_threshold):
     assert browser_tool.get_browser_snapshot_threshold() == 12000
 
     _write_threshold(isolated_snapshot_threshold, 15001)
+    # Same byte size ("12000" -> "15001"), and on a fast or coarse-mtime
+    # filesystem the rewrite can land in the same st_mtime_ns tick — so the
+    # raw-config cache key (mtime_ns, size) legitimately still matches the
+    # OLD content. Evict the raw-config cache entry for the isolated path so
+    # the post-cleanup read is hermetic: the assertions below then verify
+    # browser-cache invalidation against FRESH config content, independent
+    # of filesystem timing (#100988).
+    from hermes_cli.config import _RAW_CONFIG_CACHE, get_config_path
+
+    _RAW_CONFIG_CACHE.pop(str(get_config_path()), None)
     assert browser_tool.get_browser_snapshot_threshold() == 12000
 
     browser_tool.cleanup_all_browsers()
