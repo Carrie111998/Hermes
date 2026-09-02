@@ -2041,6 +2041,59 @@ class PluginContext:
         # manager's home, never the active profile's (#65593 constraint).
         return plugin_capability_granted(plugin_id, "tools.override", config=cfg)
 
+    def _runtime_override_allowed(self) -> bool:
+        """Return True if this plugin may return ``runtime_override`` from
+        ``pre_llm_call``.
+
+        Bundled plugins (shipped with Hermes core) are trusted by default.
+        Every other source must opt in via
+        ``plugins.entries.<plugin_id>.llm.allow_runtime_override: true`` —
+        overriding ``base_url`` + ``api_key`` redirects every subsequent LLM
+        call (carrying the full session context) to an arbitrary endpoint, so
+        the default is fail-closed (denied).
+        """
+        source = getattr(self.manifest, "source", "") or ""
+        if source == "bundled":
+            return True
+        try:
+            from hermes_cli.config import load_config
+
+            with _plugin_home_scope(self._manager.home_path):
+                cfg = load_config() or {}
+        except Exception:
+            # Can't read config → fail closed (deny the override).
+            return False
+        plugin_id = self.manifest.key or self.manifest.name
+        entry = (cfg.get("plugins") or {}).get("entries") or {}
+        llm_cfg = (entry.get(plugin_id) or {}).get("llm") or {}
+        return bool(llm_cfg.get("allow_runtime_override", False))
+
+    def _gate_runtime_override(self, callback: Callable) -> Callable:
+        """Wrap a ``pre_llm_call`` callback so a denied plugin's
+        ``runtime_override`` is stripped from its result (with a logged
+        warning).  ``functools.wraps`` preserves the callback signature so the
+        additive-payload signature filtering in ``_invoke_hook_callback``
+        still sees the original contract.
+        """
+        plugin_name = self.manifest.name
+
+        @wraps(callback)
+        def _gated(*args, **kwargs):
+            result = callback(*args, **kwargs)
+            if isinstance(result, dict) and "runtime_override" in result:
+                logger.warning(
+                    "Plugin %r returned runtime_override without "
+                    "plugins.entries.<id>.llm.allow_runtime_override: true; "
+                    "ignored (base_url/api_key override is a trust boundary)",
+                    plugin_name,
+                )
+                return {
+                    k: v for k, v in result.items() if k != "runtime_override"
+                }
+            return result
+
+        return _gated
+
     # -- message injection --------------------------------------------------
 
     def inject_message(
@@ -3399,6 +3452,12 @@ class PluginContext:
                 ", ".join(sorted(VALID_HOOKS)),
             )
         callbacks = self._manager._hooks.setdefault(hook_name, [])
+        # Trust gate (#23739): a plugin may only return {"runtime_override": ...}
+        # from pre_llm_call when the operator opted in.  Overriding base_url +
+        # api_key redirects the entire session to an arbitrary endpoint, so the
+        # default is fail-closed (denied) for non-bundled plugins.
+        if hook_name == "pre_llm_call" and not self._runtime_override_allowed():
+            callback = self._gate_runtime_override(callback)
         callbacks.append(callback)
         handle = self._track(
             "hook", hook_name,
@@ -5594,6 +5653,28 @@ class PluginManager:
         system prompt stays identical across turns so cached tokens
         are reused.  All injected context is ephemeral — never
         persisted to session DB.
+
+        A callback may also return a ``runtime_override`` dict (optionally
+        alongside ``context``) to proactively override LLM API call
+        parameters for the current turn: ::
+
+            {"context": "recalled text...",
+             "runtime_override": {
+                 "model": "gpt-5.6",
+                 "provider": "openai",
+                 "base_url": "https://api.openai.com/v1",
+                 "api_key": "sk-...",
+                 "api_mode": "chat_completions",
+             }}
+
+        The override is applied before API kwargs/client resolution (proactive,
+        unlike the error-driven failover redirect), is ephemeral and turn-
+        scoped, and is never written into session history.  Unsupported keys
+        are logged and ignored.  ``system_prompt`` is intentionally NOT
+        supported: it is the prompt-cache prefix (byte-stable for the life of
+        a conversation), so overriding it would invalidate the cache and drop
+        the core instructions.  ``api_mode`` is validated against the known
+        wire protocols.
         """
         # Most legacy observer hooks carry the shared telemetry marker. Gateway
         # platform events define event-local additive envelopes instead: injecting
