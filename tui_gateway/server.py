@@ -17945,6 +17945,7 @@ from . import (  # noqa: E402
     methods_bot_relay as _methods_bot_relay,
     methods_complete as _methods_complete,
     methods_config as _methods_config,
+    methods_email_drafts as _methods_email_drafts,
     methods_images as _methods_images,
     methods_profiles as _methods_profiles,
     methods_prompt as _methods_prompt,
@@ -17962,6 +17963,7 @@ for _m in (
     _methods_profiles,
     _methods_images,
     _methods_bot_relay,
+    _methods_email_drafts,
 ):
     _m.register(sys.modules[__name__])
 del _m
