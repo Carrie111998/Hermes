@@ -56,5 +56,16 @@ PUBLIC_API_PATHS: frozenset[str] = frozenset({
     # handler verifies as the real auth. Must bypass the dashboard auth gate so
     # the NAS relay's bearer-only callback reaches the verifier instead of a
     # 401 no_cookie. The JWT — not this allowlist — is the security boundary.
+    # Desktop spawner bootstrap (#93981): gated backends reject the legacy
+    # ?token= WS upgrade, and the OAuth ws-ticket route needs a dashboard
+    # session a freshly-spawned backend doesn't have yet. Listed public so it
+    # BYPASSES the cookie/session gate - its own constant-time
+    # X-Hermes-Session-Token check IS the security boundary (same pattern as
+    # /api/cron/fire's self-carried JWT).
+
+    "/api/auth/spawn-ticket",
+    # Chronos managed-cron fire webhook (NAS -> agent). See the entry above:
+    # NOT cookie-gated; the NAS-minted JWT it carries is the security
+    # boundary.
     "/api/cron/fire",
 })

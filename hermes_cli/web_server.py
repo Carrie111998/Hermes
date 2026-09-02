@@ -17816,6 +17816,55 @@ async def pty_ws(ws: WebSocket) -> None:
 # ---------------------------------------------------------------------------
 
 
+@app.post("/api/auth/spawn-ticket")
+async def api_auth_spawn_ticket(request: Request):
+    """Mint a single-use WS ticket for the process that spawned this backend.
+
+    The Desktop injects ``HERMES_DASHBOARD_SESSION_TOKEN`` into backends it
+    spawns and probes their readiness with that token over REST. But when the
+    profile declares a non-loopback ``dashboard.public_url``, gated WS auth
+    rejects the legacy ``?token=`` upgrade unconditionally (#93981) — and the
+    OAuth ``/api/auth/ws-ticket`` route is unreachable because the freshly
+    spawned backend has no dashboard session yet.
+
+    This endpoint closes that bootstrap gap: it authenticates with the spawn
+    token (same secret, constant-time, header/bearer — never a query param)
+    and mints exactly the kind of single-use ticket the SPA flow produces. It
+    is only reachable by a caller already holding the process's own token, so
+    exposing it adds no new attack surface: that caller could reconstruct
+    everything this protects anyway.
+
+    Deliberately does NOT use _require_token: that helper defers to the
+    dashboard gate in gated mode, which would 401 the exact bootstrap caller
+    this endpoint exists for. The constant-time token compare below IS the
+    auth, in every mode.
+    """
+    presented = request.headers.get(_SESSION_HEADER_NAME, "")
+    if not presented:
+        # RFC 9110 §11.6.2: the auth-scheme token is case-insensitive.
+        raw_auth = request.headers.get("authorization", "")
+        if raw_auth[:7].lower() == "bearer ":
+            presented = raw_auth[7:].strip()
+    if (
+        not isinstance(_SESSION_TOKEN, str)
+        or not presented
+        or not hmac.compare_digest(presented.encode(), _SESSION_TOKEN.encode())
+    ):
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    from hermes_cli.dashboard_auth.audit import AuditEvent, audit_log
+    from hermes_cli.dashboard_auth.middleware import _client_ip
+    from hermes_cli.dashboard_auth.ws_tickets import TTL_SECONDS, mint_ticket
+
+    ticket = mint_ticket(user_id="spawn", provider="session-token")
+    audit_log(
+        AuditEvent.WS_TICKET_MINTED,
+        provider="session-token",
+        user_id="spawn",
+        ip=_client_ip(request),
+    )
+    return {"ticket": ticket, "ttl_seconds": TTL_SECONDS}
+
+
 @app.websocket("/api/ws")
 async def gateway_ws(ws: WebSocket) -> None:
     if not _DASHBOARD_EMBEDDED_CHAT_ENABLED:

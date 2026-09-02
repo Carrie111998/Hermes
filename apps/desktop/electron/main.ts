@@ -350,6 +350,7 @@ import {
   SESSION_WINDOW_MIN_WIDTH
 } from './session-windows'
 import { ensureLoginShellPath } from './shell-path'
+import { mintSpawnTicket } from './spawn-ticket'
 import { createBootstrapCoordinator, sshConfigFingerprint } from './ssh-bootstrap-coordinator'
 import { collectSshConfigHosts, parseSshGOutput } from './ssh-config'
 import { createSshProbeConnection, pickLocalPort, redactSecrets, SshConnection } from './ssh-connection'
@@ -12372,8 +12373,27 @@ async function spawnPoolBackend(profile, entry, opts: { forceLocal?: boolean; po
 
   // Verify the WebSocket session token before declaring backend ready.
   // HTTP /api/status can pass while WS auth fails (separate transport, separate guards).
-  const wsUrl = `ws://127.0.0.1:${port}/api/ws?token=${encodeURIComponent(authToken)}`
-  const wsProbe = await probeGatewayWebSocket(wsUrl, { WebSocketImpl: globalThis.WebSocket })
+  let wsUrl = `ws://127.0.0.1:${port}/api/ws?token=${encodeURIComponent(authToken)}`
+  let wsProbe = await probeGatewayWebSocket(wsUrl, { WebSocketImpl: globalThis.WebSocket })
+
+  if (!wsProbe.ok) {
+    // Gated-mode ladder (#93981): a profile with a non-loopback
+    // dashboard.public_url engages the auth gate even on a loopback bind,
+    // rejecting ?token=. The backend exposes POST /api/auth/spawn-ticket —
+    // token-guarded, public-listed to bypass the cookie gate — so the
+    // spawner can mint a single-use ticket and re-probe with ?ticket=.
+    const spawnTicket = await mintSpawnTicket(baseUrl, authToken).catch(() => null)
+
+    if (spawnTicket) {
+      wsUrl = `ws://127.0.0.1:${port}/api/ws?ticket=${encodeURIComponent(spawnTicket)}`
+      wsProbe = await probeGatewayWebSocket(wsUrl, { WebSocketImpl: globalThis.WebSocket })
+      if (wsProbe.ok) {
+        rememberLog(
+          `Hermes backend for profile "${profile}" WS probe ok via spawn ticket (gated mode rejected ?token=)`
+        )
+      }
+    }
+  }
 
   if (!wsProbe.ok) {
     throw new Error(
@@ -12832,8 +12852,23 @@ async function startHermes() {
     })
 
     // Verify the WebSocket session token before declaring backend ready.
-    const wsUrl = `ws://127.0.0.1:${port}/api/ws?token=${encodeURIComponent(authToken)}`
-    const wsProbe = await probeGatewayWebSocket(wsUrl, { WebSocketImpl: globalThis.WebSocket })
+    let wsUrl = `ws://127.0.0.1:${port}/api/ws?token=${encodeURIComponent(authToken)}`
+    let wsProbe = await probeGatewayWebSocket(wsUrl, { WebSocketImpl: globalThis.WebSocket })
+
+    if (!wsProbe.ok) {
+      // Gated-mode ladder (#93981): see the pool-backend twin of this ladder
+      // in spawnPoolBackend. Mint a single-use ticket via the token-guarded
+      // /api/auth/spawn-ticket and re-probe with ?ticket=.
+      const spawnTicket = await mintSpawnTicket(baseUrl, authToken).catch(() => null)
+
+      if (spawnTicket) {
+        wsUrl = `ws://127.0.0.1:${port}/api/ws?ticket=${encodeURIComponent(spawnTicket)}`
+        wsProbe = await probeGatewayWebSocket(wsUrl, { WebSocketImpl: globalThis.WebSocket })
+        if (wsProbe.ok) {
+          rememberLog('Local backend WS probe ok via spawn ticket (gated mode rejected ?token=)')
+        }
+      }
+    }
 
     if (!wsProbe.ok) {
       throw new Error(
