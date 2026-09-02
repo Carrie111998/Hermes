@@ -33,6 +33,7 @@ import {
   ROSTER_KEY,
   saveBotMeta
 } from './data'
+import { forgetBotLastViewed } from './last-viewed'
 import { botConnectionRoute, botRouteKey, requestForBot } from './routing'
 import { getPluginCtx } from './shared'
 import type { RosterRow } from './types'
@@ -431,6 +432,7 @@ export async function deleteBot(bot: RosterRow) {
   // compression lineage.
   forgetSessionUnread([bot.canonical_session?.id, bot.canonical_session?.resolved_id], bot.name)
   rosterWatermarks.delete(botSelectionKey(bot))
+  forgetBotLastViewed(botSelectionKey(bot))
   avatarFetchInflight.delete(botMetaKey(bot))
   avatarPushInflight.delete(botMetaKey(bot))
 

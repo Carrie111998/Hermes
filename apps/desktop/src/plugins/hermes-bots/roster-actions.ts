@@ -8,16 +8,17 @@
  * them can own an action the others call without importing a sibling surface.
  */
 
-import { ackStoredSessionId, atom, haptic, host, markSessionUnreadFinished } from '@hermes/plugin-sdk'
+import { ackStoredSessionId, atom, haptic, host, markSessionUnreadFinished, queryClient } from '@hermes/plugin-sdk'
 
 import { $openBotChat, $selectedBot, rosterWatermarks, saveSelectedRosterBot } from './bot-state'
 import { CANONICAL_CHAT_TITLE, notifyBotOpenFailure, openBotCanonicalChat, prepareBotSource } from './canonical-chat'
-import { $botMeta, botActivitySession, botRosterKey, botSelectionKey, newBotChat } from './data'
+import { $botMeta, botActivitySession, botRosterKey, botSelectionKey, newBotChat, ROSTER_KEY } from './data'
 import { $groupChats, $groupChatWorkspace } from './group-chat'
 import { openGroupChat } from './group-chat-view'
 import { liveGroupChatNames } from './group-membership'
 import { closeGroupChatMainTab } from './group-panes'
 import { displayName } from './labels'
+import { botHasUnseenActivity, lastViewedByBot, rememberBotViewed } from './last-viewed'
 import { botRosterMeta, botWorkspaceOwnerKey, setBotsWorkspaceOwner } from './routing'
 import { botCanonicalSessionId } from './row-helpers'
 import { bumpBotOpenGeneration, getBotOpenGeneration, getPluginCtx } from './shared'
@@ -43,6 +44,19 @@ export function setActivityToasts(enabled: boolean) {
   }
 }
 
+/** Force a profiles.list refetch so roster previews / last_active catch
+ *  headless Bot Chat writes the 5s poll would otherwise wait out. Used when
+ *  the Bots pane becomes visible after a relay-driven turn. */
+export function refreshRosterPresence() {
+  if (typeof queryClient === 'undefined' || typeof queryClient?.invalidateQueries !== 'function') {
+    return
+  }
+
+  queryClient.invalidateQueries({
+    queryKey: ROSTER_KEY
+  })
+}
+
 /** Detect new inbound activity from a fresh roster: last_active moved past
  *  the watermark for a bot whose chat isn't on screen -> unread + toast.
  *  Watermarks follow botActivitySession (canonical Bot Chat included) —
@@ -52,7 +66,11 @@ export function setActivityToasts(enabled: boolean) {
  *  This poll is the ONLY unread signal a canonical Bot Chat can have: it is
  *  unconditionally hidden, so it never reaches the session list the backend's
  *  own unread watermark iterates, and deliveries from the CLI, cron, another
- *  bot, or another machine never touch this window's live turn edge either. */
+ *  bot, or another machine never touch this window's live turn edge either.
+ *
+ *  Last-viewed (persisted) is the durable unread-since-last-viewed check:
+ *  a remount that would re-seed the in-memory poll watermark still badges
+ *  when last_active is newer than the last time the user opened the bot. */
 export function trackInboundActivity(roster: RosterRow[]) {
   const seeding = !watermarksSeeded
   watermarksSeeded = true
@@ -64,13 +82,25 @@ export function trackInboundActivity(roster: RosterRow[]) {
     const prev = rosterWatermarks.get(key) || 0
     rosterWatermarks.set(key, Math.max(prev, ts))
 
-    if (seeding || ts <= prev) {
+    const lastViewed = lastViewedByBot.get(key)
+    const unseenSinceView = botHasUnseenActivity(ts, lastViewed)
+    const newSincePoll = !seeding && ts > prev
+
+    if (lastViewed == null && ts) {
+      // First encounter this window has a stamp for: seed last-viewed so
+      // pre-existing history is not marked unread. A persisted stamp from
+      // hydrateLastViewed is already in the map and skips this.
+      rememberBotViewed(key, ts)
+    }
+
+    if (!newSincePoll && !unseenSinceView) {
       continue
     }
 
     // Activity in the exact bot owner the user is currently looking at is
     // already visible — never badge the open chat or its same-named twin.
     if ($selectedBot.get() === key) {
+      rememberBotViewed(key, ts)
       continue
     }
 
@@ -89,9 +119,9 @@ export function trackInboundActivity(roster: RosterRow[]) {
       continue
     }
 
-    // Toasts are opt-in: the unread mark is recorded above regardless, but the
-    // per-message notification fires only when the user enabled it.
-    if ($activityToasts.get()) {
+    // Toasts are opt-in and only for activity THIS poll just observed —
+    // remount unread (unseenSinceView without newSincePoll) stays silent.
+    if (newSincePoll && $activityToasts.get()) {
       const meta = botRosterMeta(bot, $botMeta.get())
       const label = displayName(bot, meta)
       const preview = (activity?.preview || '').trim()
@@ -177,6 +207,7 @@ export async function openRosterBot(bot: RosterRow, { canonical = false } = {}):
 
   haptic('tap')
   saveSelectedRosterBot(bot)
+  rememberBotViewed(botSelectionKey(bot), botActivitySession(bot)?.last_active || 0)
   setBotsWorkspaceOwner(botWorkspaceOwnerKey(bot), bot)
   const dismissedGroup = bot.remoteSource ? null : dismissGroupChatForLocalBotOpen()
 

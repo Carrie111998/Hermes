@@ -75,13 +75,14 @@ const chatting = (name: string, lastActive: number, preview = 'hello'): RosterRo
 async function loadActions() {
   vi.resetModules()
 
-  const [actions, botState, data] = await Promise.all([
+  const [actions, botState, data, lastViewed] = await Promise.all([
     import('./roster-actions'),
     import('./bot-state'),
-    import('./data')
+    import('./data'),
+    import('./last-viewed')
   ])
 
-  return { ...actions, ...botState, $botMeta: data.$botMeta }
+  return { ...actions, ...botState, ...lastViewed, $botMeta: data.$botMeta }
 }
 
 beforeEach(() => {
@@ -96,6 +97,40 @@ describe('the first poll only seeds watermarks', () => {
 
     expect(markUnreadMock).not.toHaveBeenCalled()
     expect(hostMock.notify).not.toHaveBeenCalled()
+  })
+})
+
+describe('unread since last viewed survives a remount', () => {
+  it('badges headless activity that predates this window’s first poll', async () => {
+    const { hydrateLastViewed, trackInboundActivity } = await loadActions()
+
+    // Previous session last opened the bot at 5000; a Telegram → message_agent
+    // turn wrote last_active=6000 while the pane was unmounted.
+    hydrateLastViewed({ researcher: 5000 })
+    trackInboundActivity([chatting('researcher', 6000)])
+
+    expect(markUnreadMock).toHaveBeenCalledWith('researcher-chat', 'researcher')
+    expect(hostMock.notify).not.toHaveBeenCalled()
+  })
+
+  it('does not badge when last_active has not moved past last-viewed', async () => {
+    const { hydrateLastViewed, trackInboundActivity } = await loadActions()
+
+    hydrateLastViewed({ researcher: 6000 })
+    trackInboundActivity([chatting('researcher', 6000)])
+
+    expect(markUnreadMock).not.toHaveBeenCalled()
+  })
+})
+
+describe('refreshRosterPresence', () => {
+  it('invalidates the shared roster query', async () => {
+    const { refreshRosterPresence } = await loadActions()
+    const { queryClient } = await import('@hermes/plugin-sdk')
+
+    refreshRosterPresence()
+
+    expect(queryClient.invalidateQueries).toHaveBeenCalledWith({ queryKey: ['hermes-bots', 'roster'] })
   })
 })
 
