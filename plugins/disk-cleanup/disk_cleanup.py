@@ -70,15 +70,22 @@ def is_safe_path(path: Path) -> bool:
     """
     hermes_home = get_hermes_home()
     try:
-        path.resolve().relative_to(hermes_home)
+        resolved = path.resolve()
+    except (OSError, RuntimeError):
+        return False
+    try:
+        resolved.relative_to(hermes_home)
         return True
-    except (ValueError, OSError):
+    except ValueError:
         pass
-    # Allow /tmp/hermes-* explicitly
-    parts = path.parts
-    if len(parts) >= 3 and parts[1] == "tmp" and parts[2].startswith("hermes-"):
-        return True
-    return False
+
+    # Allow /tmp/hermes-* explicitly. Compare resolved roots rather than raw
+    # path parts because macOS resolves /tmp to /private/tmp.
+    try:
+        relative_tmp = resolved.relative_to(Path("/tmp").resolve())
+    except (ValueError, OSError):
+        return False
+    return bool(relative_tmp.parts and relative_tmp.parts[0].startswith("hermes-"))
 
 
 # ---------------------------------------------------------------------------
@@ -209,7 +216,11 @@ def track(path_str: str, category: str, silent: bool = False) -> bool:
         _log(f"WARN: unknown category '{category}', using 'other'")
         category = "other"
 
-    path = Path(path_str).resolve()
+    try:
+        path = Path(path_str).resolve()
+    except (OSError, RuntimeError):
+        _log(f"REJECT: {path_str} (could not resolve path)")
+        return False
 
     if not path.exists():
         _log(f"SKIP: {path} (does not exist)")
