@@ -254,6 +254,7 @@ def test_doctor_reports_vercel_backend_diagnostics(monkeypatch, tmp_path):
     monkeypatch.setenv("VERCEL_TOKEN", "super-secret-value")
     monkeypatch.delenv("VERCEL_PROJECT_ID", raising=False)
     monkeypatch.setenv("VERCEL_TEAM_ID", "team")
+    monkeypatch.setattr("hermes_constants.is_container", lambda: True)
     monkeypatch.setattr(doctor_mod.importlib.util, "find_spec", lambda name: object() if name == "vercel" else None)
 
     fake_model_tools = types.SimpleNamespace(
@@ -277,6 +278,19 @@ def test_doctor_reports_vercel_backend_diagnostics(monkeypatch, tmp_path):
     assert "Vercel auth missing env: VERCEL_PROJECT_ID" in out
     assert "super-secret-value" not in out
     assert "snapshot filesystem only" in out
+
+
+def test_doctor_treats_empty_terminal_env_as_local_in_container(monkeypatch):
+    monkeypatch.delenv("TERMINAL_ENV", raising=False)
+    monkeypatch.setattr("hermes_constants.is_container", lambda: True)
+
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        doctor_mod.run_doctor(Namespace(fix=False))
+
+    out = buf.getvalue()
+    assert "using local terminal backend" in out
+    assert "docker not found" not in out
 
 
 # ── Memory provider section (doctor should only check the *active* provider) ──

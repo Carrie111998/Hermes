@@ -2327,7 +2327,7 @@ def run_doctor(args):
         check_info(f"Install for faster search: {_system_package_install_cmd('ripgrep')}")
     
     # Docker (optional)
-    terminal_env = os.getenv("TERMINAL_ENV", "local")
+    terminal_env = os.getenv("TERMINAL_ENV") or "local"
     try:
         from hermes_constants import is_container as _is_container
         running_in_container = _is_container()
@@ -2341,12 +2341,14 @@ def run_doctor(args):
         # not found" warning. If the user has explicitly chosen
         # TERMINAL_ENV=docker inside the container they likely mounted
         # /var/run/docker.sock, so fall through to the normal check.
-        if terminal_env != "docker":
+        if terminal_env == "local":
             check_info(
                 "Running inside a container — using local terminal backend "
                 "(docker-in-docker is not configured by default)"
             )
-            # Skip to next section; Docker isn't relevant here.
+            # Skip to next section; Docker isn't relevant here. Explicitly
+            # selected backends (Vercel Sandbox, Daytona, SSH, or Docker)
+            # must keep their diagnostics below.
             terminal_env = "local"
     if terminal_env == "docker":
         if _safe_which("docker"):
