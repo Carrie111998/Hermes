@@ -23142,6 +23142,26 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     "results. This can happen with some models — try again or "
                     "rephrase your question."
                 )
+
+            # Post-compaction scaffolding echo: the model reproduced the
+            # injected compaction handoff as its visible reply (it embeds
+            # memory-file excerpts, and bare paths inside it can trigger
+            # native file attachment — 2026-08-19 incident). Withhold it
+            # from the channel; the turn itself is preserved in history.
+            try:
+                from gateway.response_filters import is_leaked_scaffolding_response
+                if is_leaked_scaffolding_response(response):
+                    logger.warning(
+                        "Withholding leaked compaction-handoff echo from delivery "
+                        "(%d chars)", len(response),
+                    )
+                    response = (
+                        "⚠️ Response withheld: the model echoed internal context "
+                        "scaffolding after a compaction. Nothing was lost — "
+                        "just ask again."
+                    )
+            except Exception:
+                pass
             agent_messages = agent_result.get("messages", [])
             _response_time = time.time() - _msg_start_time
             _api_calls = agent_result.get("api_calls", 0)

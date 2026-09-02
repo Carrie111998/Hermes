@@ -5346,6 +5346,29 @@ class BasePlatformAdapter(ABC):
         return cleaned.rstrip()
 
     @staticmethod
+    def _is_protected_local_file(expanded: str) -> bool:
+        """Never auto-attach these by bare-path mention (exfil guard).
+
+        A reply that merely *names* one of these paths must not ship the file
+        to a chat surface: harness state (config, credentials, memory and
+        identity files) can appear in echoed scaffolding — the 2026-08-19
+        incident attached 6 internal .md files because a compaction-handoff
+        echo contained their paths.  Deliberate delivery of harness files
+        stays possible via explicit send/upload tools; only the implicit
+        bare-path route is closed.
+        """
+        p = os.path.abspath(os.path.expanduser(expanded))
+        home = os.path.expanduser("~")
+        for root in (os.path.join(home, ".hermes"), "/root/.hermes"):
+            if p == root or p.startswith(root + os.sep):
+                return True
+        protected_names = {
+            "AGENTS.md", "SOUL.md", "MEMORY.md", "USER.md", "IDENTITY.md",
+            "HEARTBEAT.md", "TOOLS.md", "config.yaml", "auth.json", ".env",
+        }
+        return os.path.basename(p) in protected_names
+
+    @staticmethod
     def extract_local_files(content: str) -> Tuple[List[str], str]:
         """
         Detect bare local file paths in response text for native delivery.
@@ -5399,6 +5422,12 @@ class BasePlatformAdapter(ABC):
             raw = match.group(0)
             expanded = os.path.expanduser(raw)
             if os.path.isfile(expanded):
+                if BasePlatformAdapter._is_protected_local_file(expanded):
+                    logger.warning(
+                        "Refusing to auto-attach protected file mentioned in "
+                        "reply: %s", _log_safe_path(raw),
+                    )
+                    continue
                 found.append((raw, expanded))
             else:
                 # The reply mentions a deliverable-looking path that does not
