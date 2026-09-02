@@ -22391,7 +22391,12 @@ def main(
                 # invocations are fast.
                 _query_label = query or ("[image attached]" if single_query_images else "")
                 if _query_label:
-                    cli.console.print(f"[bold blue]Query:[/] {_query_label}")
+                    # The label derives from -q/--query-file text (the Bot
+                    # Mode DM transport), so it must render literally —
+                    # unescaped it is parsed as Rich markup and something
+                    # like a pytest id ``test_case[/a/b.webp]`` raises
+                    # MarkupError before the agent turn starts (#98789).
+                    cli.console.print(f"[bold blue]Query:[/] {_escape(_query_label)}")
                 # Surface security advisories before the agent runs — short
                 # banner, doesn't depend on the welcome banner being shown.
                 cli._show_security_advisories()
