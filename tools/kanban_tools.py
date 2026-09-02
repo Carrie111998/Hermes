@@ -946,6 +946,14 @@ def _handle_request_review(args: dict, **kw) -> str:
         # Model-supplied free text stored durably on the event payload —
         # redact like summary / kanban_block's reason.
         reviewer = redact_sensitive_text(str(reviewer), force=True)
+        from hermes_cli.profiles import list_profile_names, profile_exists
+
+        if not profile_exists(reviewer):
+            alternatives = ", ".join(list_profile_names()) or "none"
+            return tool_error(
+                f"reviewer profile {reviewer!r} is not installed. "
+                f"Installed profiles: {alternatives}"
+            )
     board = args.get("board")
     try:
         kb, conn = _connect(board=board)

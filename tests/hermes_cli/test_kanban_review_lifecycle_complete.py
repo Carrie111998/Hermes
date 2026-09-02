@@ -68,6 +68,24 @@ def _claimed_review(
     return task_id, review
 
 
+def test_direct_request_review_allows_external_human_lane(conn):
+    task_id = kb.create_task(conn, title="External review", assignee="builder")
+    implementation = kb.claim_task(conn, task_id, claimer="builder:external")
+    assert implementation is not None
+
+    assert kb.request_review(
+        conn,
+        task_id,
+        reviewer="external-human-lane",
+        summary="Ready for external review.",
+        expected_run_id=implementation.current_run_id,
+    )
+    task = kb.get_task(conn, task_id)
+    assert task is not None
+    assert task.status == "review"
+    assert task.assignee == "external-human-lane"
+
+
 def test_same_card_review_supports_changes_and_approval_without_block_loop(conn):
     task_id = kb.create_task(conn, title="Implement guarded export", assignee="builder")
     implementation = kb.claim_task(conn, task_id, claimer="builder:1")

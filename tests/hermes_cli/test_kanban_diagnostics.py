@@ -198,6 +198,26 @@ def test_stranded_in_ready_fires_when_age_exceeds_threshold():
     assert stranded[0].data["assignee"] == "demo"
 
 
+def test_stranded_in_ready_uses_review_reopened_as_fresh_ready_transition():
+    now = 100_000
+    threshold = 30 * 60
+    task = _task(status="ready", assignee="builder", claim_lock=None)
+    events = [
+        _event("created", ts=now - 9 * 60 * 60),
+        _event("review_reopened", ts=now - 1),
+    ]
+
+    fresh = kd.compute_task_diagnostics(task, events, [], now=now)
+    assert not [d for d in fresh if d.kind == "stranded_in_ready"]
+
+    stale = kd.compute_task_diagnostics(
+        task, events, [], now=now + threshold + 1
+    )
+    stranded = [d for d in stale if d.kind == "stranded_in_ready"]
+    assert len(stranded) == 1
+    assert stranded[0].data["age_seconds"] == threshold + 2
+
+
 
 
 # ---------------------------------------------------------------------------
