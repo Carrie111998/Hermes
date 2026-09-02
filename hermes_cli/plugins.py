@@ -386,6 +386,24 @@ VALID_HOOKS: Set[str] = {
     #   alias_used: the exact token the user typed (str), args_raw: str,
     #   session_key: str | None (gateway), platform: str | None (gateway).
     "pre_command",
+    # Kanban worker-environment contribution hook. Fired in the DISPATCHER
+    # process by hermes_cli.kanban_db._default_spawn, after the dispatcher has
+    # finished composing the worker subprocess env and immediately before the
+    # `hermes -p <profile> chat -q` child is launched. That env is inherited by
+    # nested coding agents (ACP claude-code / codex children), so this is the
+    # channel a plugin uses to reach them — e.g. OTLP exporter endpoints and
+    # trace credentials for per-session observability.
+    #
+    # Kwargs: task_id: str, board: str, workspace: str, branch: str
+    #   (empty when the task has no branch), run_id: int | None,
+    #   profile: str.
+    #
+    # A callback returns a dict of env vars to add; anything else is ignored,
+    # as are keys whose value is None (other values are str()-ed). The merge
+    # FILLS GAPS ONLY (env.setdefault), so every key the dispatcher pinned —
+    # kanban DB/board/workspace paths, profile, timeouts — always wins and a
+    # plugin can never redirect a worker to another board.
+    "contribute_worker_env",
 }
 
 # Hooks whose return value carries a directive that the shell-hook response
