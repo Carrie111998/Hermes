@@ -1141,6 +1141,11 @@ class Task:
     # Unblock-loop counter. See the column comment in SCHEMA_SQL and
     # ``BLOCK_RECURRENCE_LIMIT``. Reset only on successful completion.
     block_recurrences: int = 0
+    # Runtime-acceptance gate (c-017). When True, reviewer completion
+    # fails closed unless every QA/live-verification parent is terminal and
+    # the handoff cites ``commit`` + ``runtime_evidence``. See
+    # ``complete_task`` and ``_runtime_acceptance_block_reason``.
+    requires_runtime_acceptance: bool = False
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
@@ -1234,6 +1239,12 @@ class Task:
                 int(row["block_recurrences"])
                 if "block_recurrences" in keys and row["block_recurrences"] is not None
                 else 0
+            ),
+            requires_runtime_acceptance=(
+                bool(row["requires_runtime_acceptance"])
+                if "requires_runtime_acceptance" in keys
+                and row["requires_runtime_acceptance"]
+                else False
             ),
         )
 
@@ -1422,7 +1433,13 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- ``blocked`` so a cron can't spin it forever. Reset to 0 only on a
     -- successful completion — NOT on unblock (resetting on unblock is exactly
     -- the amnesia that let the loop run unbounded).
-    block_recurrences    INTEGER NOT NULL DEFAULT 0
+    block_recurrences    INTEGER NOT NULL DEFAULT 0,
+    -- Runtime-acceptance gate (correction c-017 / t_3130c1eb). When 1, the
+    -- card requires production-like runtime evidence before reviewer
+    -- completion: every QA/live-verification parent must be terminal AND the
+    -- completing handoff must cite a ``commit`` plus ``runtime_evidence``.
+    -- 0/NULL (the default) = ordinary code-only card, completely ungated.
+    requires_runtime_acceptance INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS task_links (
@@ -2690,6 +2707,17 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             "block_recurrences INTEGER NOT NULL DEFAULT 0",
         )
 
+    if "requires_runtime_acceptance" not in cols:
+        # Runtime-acceptance gate (c-017). Existing rows default to 0 =
+        # unmarked, which is exactly the behaviour they had before the
+        # column existed: no card is retroactively gated.
+        _add_column_if_missing(
+            conn,
+            "tasks",
+            "requires_runtime_acceptance",
+            "requires_runtime_acceptance INTEGER NOT NULL DEFAULT 0",
+        )
+
     # Indexes over additive ``tasks`` columns must be created after the
     # columns exist. Keeping them in SCHEMA_SQL breaks legacy boards: SQLite
     # parses each statement in ``executescript`` against the live schema, so a
@@ -3194,6 +3222,7 @@ def create_task(
     board: Optional[str] = None,
     project_id: Optional[str] = None,
     project_source_task_id: Optional[str] = None,
+    requires_runtime_acceptance: bool = False,
 ) -> str:
     """Create a new task and optionally link it under parent tasks.
 
@@ -3508,8 +3537,9 @@ def create_task(
                         max_runtime_seconds,
                         skills, max_retries, model_override, provider_override,
                         reasoning_effort,
-                        goal_mode, goal_max_turns, session_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        goal_mode, goal_max_turns, session_id,
+                        requires_runtime_acceptance
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -3535,6 +3565,7 @@ def create_task(
                         1 if goal_mode else 0,
                         int(goal_max_turns) if goal_max_turns is not None else None,
                         session_id,
+                        1 if requires_runtime_acceptance else 0,
                     ),
                 )
                 for pid in parents:
@@ -3563,6 +3594,9 @@ def create_task(
                         "goal_mode": bool(goal_mode) or None,
                         "model_override": model_override,
                         "provider_override": provider_override,
+                        "requires_runtime_acceptance": (
+                            bool(requires_runtime_acceptance) or None
+                        ),
                     },
                 )
                 _inherit_notify_subs(conn, task_id, parents, created_at=now)
@@ -4625,6 +4659,158 @@ def _parents_satisfied(conn: sqlite3.Connection, task_id: str) -> bool:
     ).fetchone() is None
 
 
+def set_requires_runtime_acceptance(
+    conn: sqlite3.Connection, task_id: str, value: bool
+) -> bool:
+    """Set (or clear) the runtime-acceptance marker on a task.
+
+    Raises ValueError when the task does not exist. The flip is auditable
+    via a ``runtime_acceptance_marked`` / ``runtime_acceptance_unmarked``
+    event so board history shows when a card entered or left the gated
+    class.
+    """
+    with write_txn(conn):
+        cur = conn.execute(
+            "UPDATE tasks SET requires_runtime_acceptance = ? WHERE id = ?",
+            (1 if value else 0, task_id),
+        )
+        if cur.rowcount != 1:
+            raise ValueError(f"unknown task id: {task_id}")
+        _append_event(
+            conn,
+            task_id,
+            "runtime_acceptance_marked" if value
+            else "runtime_acceptance_unmarked",
+            None,
+        )
+    return True
+
+
+def _runtime_acceptance_block_reason(
+    conn: sqlite3.Connection, task_id: str, metadata: Optional[dict]
+) -> Optional[str]:
+    """Return why a runtime-acceptance completion must be refused, or None.
+
+    Enforces the c-017 contract on cards marked
+    ``requires_runtime_acceptance``:
+
+    1. Every QA/live-verification parent (a parent whose title/body names
+       live verification / QA / acceptance testing) must be terminal.
+    2. The completing handoff metadata must cite the tested candidate
+       ``commit`` and non-empty production-like ``runtime_evidence``.
+
+    Unmarked cards always return None — code-only work is never gated
+    (no global browser/UI evidence requirement).
+    """
+    row = conn.execute(
+        "SELECT requires_runtime_acceptance FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    if row is None or not row["requires_runtime_acceptance"]:
+        return None
+
+    md = metadata if isinstance(metadata, dict) else {}
+    pinned = md.get("runtime_acceptance_parents")
+    all_parents = conn.execute(
+        "SELECT p.id, p.title, p.body, p.status FROM task_links l "
+        "JOIN tasks p ON p.id = l.parent_id WHERE l.child_id = ?",
+        (task_id,),
+    ).fetchall()
+    linked_ids = {p["id"] for p in all_parents}
+    if isinstance(pinned, list) and pinned:
+        pinned_ids = [str(p).strip() for p in pinned if str(p).strip()]
+        missing = [p for p in pinned_ids if p not in linked_ids]
+        if missing:
+            return (
+                "runtime acceptance required: runtime_acceptance_parents "
+                f"must be linked parents of this card (invalid: {', '.join(missing)})"
+            )
+        pinned_set = set(pinned_ids)
+        parents = [p for p in all_parents if p["id"] in pinned_set]
+        non_qa = [
+            p["id"] for p in parents
+            if not _looks_like_qa_task(
+                f"{p['title'] or ''}\n{p['body'] or ''}"
+            )
+        ]
+        if non_qa:
+            return (
+                "runtime acceptance required: pinned runtime_acceptance_parents "
+                "must describe QA/live verification in their title or body "
+                f"(invalid: {', '.join(non_qa)})"
+            )
+    else:
+        parents = [
+            p for p in all_parents
+            if _looks_like_qa_task(
+                f"{p['title'] or ''}\n{p['body'] or ''}"
+            )
+        ]
+
+    if not parents:
+        return (
+            "runtime acceptance required: no explicit QA/live-verification "
+            "parent is linked (set runtime_acceptance_parents in metadata "
+            "when the parent title is not self-describing)"
+        )
+    open_qa = [p["id"] for p in parents if p["status"] != "done"]
+    if open_qa:
+        return (
+            "runtime acceptance required: live-verification parent(s) are "
+            f"not done: {', '.join(open_qa)}"
+        )
+
+    commit = md.get("commit")
+    if not isinstance(commit, str) or not re.fullmatch(
+        r"[0-9a-fA-F]{7,64}", commit.strip()
+    ):
+        return (
+            "runtime acceptance required: handoff metadata must cite the "
+            "tested candidate commit as a 7-64 character hex Git SHA (`commit`)"
+        )
+    evidence = md.get("runtime_evidence")
+    if not isinstance(evidence, dict):
+        return (
+            "runtime acceptance required: `runtime_evidence` must be an "
+            "object with candidate_commit, environment, command, and result"
+        )
+    required_evidence = ("candidate_commit", "environment", "command", "result")
+    missing_evidence = [
+        key for key in required_evidence
+        if not isinstance(evidence.get(key), str) or not evidence[key].strip()
+    ]
+    if missing_evidence:
+        return (
+            "runtime acceptance required: runtime_evidence is missing "
+            + ", ".join(missing_evidence)
+        )
+    if evidence["candidate_commit"].strip().casefold() != commit.strip().casefold():
+        return (
+            "runtime acceptance required: runtime_evidence.candidate_commit "
+            "does not match metadata.commit"
+        )
+    return None
+
+
+def _looks_like_qa_task(text: str) -> bool:
+    """Heuristic: does this title/body describe QA / live verification?
+
+    Used only to pick which parents of a runtime-acceptance card must be
+    terminal before reviewer completion. Broad on purpose — gating is the
+    fail-closed direction, and a false positive merely requires that a
+    genuinely-open related card finish first.
+    """
+    t = text.casefold()
+    return any(
+        marker in t
+        for marker in (
+            "live-verif", "live verif", "verify", "verification",
+            "qa", "acceptance", "e2e", "end-to-end", "smoke test",
+            "smoke-test", "runtime audit", "production-like",
+        )
+    )
+
+
 def claim_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -5407,6 +5593,16 @@ def complete_task(
     # Fail before validating cards or staging artifacts; re-check inside the
     # final write transaction below to close the parent-reopen race.
     if not _parents_satisfied(conn, task_id):
+        # For runtime-acceptance cards the refusal must be specific and
+        # auditable — emit the blocked event in its own txn (the plain
+        # parent gate is silent by design for unmarked cards).
+        ra_reason = _runtime_acceptance_block_reason(conn, task_id, metadata)
+        if ra_reason is not None:
+            with write_txn(conn):
+                _append_event(
+                    conn, task_id, "completion_blocked_runtime_acceptance",
+                    {"reason": ra_reason},
+                )
         return False
 
     # Gate: verify created_cards BEFORE the main write txn. A rejected
@@ -5440,6 +5636,21 @@ def complete_task(
         conn, task_id, metadata, summary=summary, result=result,
     )
     with write_txn(conn):
+        # Runtime-acceptance gate (c-017): a card marked as requiring
+        # runtime acceptance fails closed unless its QA/live-verification
+        # parents are terminal AND the handoff cites the tested commit plus
+        # production-like runtime evidence. Checked BEFORE the generic
+        # parent gate so the refusal is specific and auditable (the plain
+        # parent check refuses silently, which is exactly how c-017's
+        # missing evidence went unnoticed). Re-checked inside the txn so a
+        # parent reopened mid-completion cannot slip through.
+        ra_reason = _runtime_acceptance_block_reason(conn, task_id, metadata)
+        if ra_reason is not None:
+            _append_event(
+                conn, task_id, "completion_blocked_runtime_acceptance",
+                {"reason": ra_reason},
+            )
+            return False
         # Parent completion is a hard invariant even for direct human review
         # approval. A parent may have been reopened after this task entered
         # ``review`` or ``running``.
@@ -5555,6 +5766,19 @@ def complete_task(
                 ]
                 if cleaned_artifacts:
                     completed_payload["artifacts"] = cleaned_artifacts
+        # Record the runtime-acceptance evidence on the completed event so
+        # downstream consumers (notifier, dashboard, audits) can verify the
+        # gate was satisfied without reading the run row.
+        if isinstance(metadata, dict) and metadata.get("runtime_evidence"):
+            completed_payload["runtime_acceptance"] = {
+                "commit": str(metadata.get("commit") or "").strip(),
+                "runtime_evidence": metadata.get("runtime_evidence"),
+                **(
+                    {"runtime_acceptance_parents": metadata["runtime_acceptance_parents"]}
+                    if isinstance(metadata.get("runtime_acceptance_parents"), list)
+                    else {}
+                ),
+            }
         _append_event(
             conn, task_id, "completed",
             completed_payload,
@@ -7328,6 +7552,37 @@ def decompose_triage_task(
     if root_assignee is not None:
         root_assignee = _canonical_assignee(root_assignee)
 
+    # c-017: normalize runtime-acceptance graphs at the DB boundary too.
+    # The LLM-facing decomposer already performs this rewrite, but callers
+    # can invoke decompose_triage_task directly (CLI/tests/plugins), so the
+    # durable graph constructor must enforce the same invariant: QA/live
+    # verification is a parent of the marked review card, never a child
+    # that runs after it.
+    for idx, child in enumerate(children):
+        if not isinstance(child, dict) or not child.get("requires_runtime_acceptance"):
+            continue
+        qa_siblings = [
+            i for i, candidate in enumerate(children)
+            if i != idx
+            and isinstance(candidate, dict)
+            and _looks_like_qa_task(
+                " ".join(
+                    str(candidate.get(key) or "")
+                    for key in ("title", "body")
+                )
+            )
+        ]
+        if not qa_siblings:
+            continue
+        for qa_idx in qa_siblings:
+            qa_parents = children[qa_idx].get("parents") or []
+            children[qa_idx]["parents"] = [p for p in qa_parents if p != idx]
+        review_parents = list(child.get("parents") or [])
+        for qa_idx in qa_siblings:
+            if qa_idx not in review_parents:
+                review_parents.append(qa_idx)
+        child["parents"] = review_parents
+
     # Pre-validate the children list shape outside the txn. Cheap checks
     # that don't need DB access. Bad input aborts before we touch the DB.
     for idx, child in enumerate(children):
@@ -7430,8 +7685,9 @@ def decompose_triage_task(
             conn.execute(
                 "INSERT INTO tasks "
                 "(id, title, body, assignee, status, workspace_kind, "
-                " workspace_path, tenant, created_at, created_by) "
-                "VALUES (?, ?, ?, ?, 'todo', ?, ?, ?, ?, ?)",
+                " workspace_path, tenant, created_at, created_by, "
+                " requires_runtime_acceptance) "
+                "VALUES (?, ?, ?, ?, 'todo', ?, ?, ?, ?, ?, ?)",
                 (
                     new_id,
                     title,
@@ -7442,6 +7698,7 @@ def decompose_triage_task(
                     tenant,
                     now,
                     (author or "decomposer"),
+                    1 if child.get("requires_runtime_acceptance") else 0,
                 ),
             )
             _append_event(

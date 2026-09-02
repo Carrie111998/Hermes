@@ -785,6 +785,38 @@ def test_dashboard_cancel_keeps_task_in_old_status(client):
     assert r.json()["task"]["status"] == "ready"
 
 
+def test_runtime_acceptance_marker_round_trips_and_cannot_clear_on_complete(
+    client, kanban_home
+):
+    created = client.post(
+        "/api/plugins/kanban/tasks",
+        json={
+            "title": "runtime-gated",
+            "assignee": "reviewer",
+            "requires_runtime_acceptance": True,
+        },
+    )
+    assert created.status_code == 200, created.text
+    task = created.json()["task"]
+    assert task["requires_runtime_acceptance"] is True
+
+    bypass = client.patch(
+        f"/api/plugins/kanban/tasks/{task['id']}",
+        json={
+            "status": "done",
+            "requires_runtime_acceptance": False,
+            "summary": "approve without evidence",
+        },
+    )
+    assert bypass.status_code == 409
+
+    current = client.get(
+        f"/api/plugins/kanban/tasks/{task['id']}"
+    ).json()["task"]
+    assert current["requires_runtime_acceptance"] is True
+    assert current["status"] != "done"
+
+
 def test_dashboard_confirm_dispatches_expected_patch_body(client):
     """Behavioral: the PATCH body shape the bundle produces on confirm
     (status + result + summary) must be accepted by the backend without

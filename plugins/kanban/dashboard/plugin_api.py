@@ -611,6 +611,7 @@ class CreateTaskBody(BaseModel):
     skills: Optional[list[str]] = None
     goal_mode: bool = False
     goal_max_turns: Optional[int] = None
+    requires_runtime_acceptance: bool = False
     model_override: Optional[str] = None
     provider_override: Optional[str] = None
     # Per-task thinking depth (none|minimal|…|ultra). None = inherit the
@@ -643,6 +644,7 @@ def create_task(payload: CreateTaskBody, board: Optional[str] = Query(None)):
             skills=payload.skills,
             goal_mode=payload.goal_mode,
             goal_max_turns=payload.goal_max_turns,
+            requires_runtime_acceptance=payload.requires_runtime_acceptance,
             model_override=payload.model_override,
             provider_override=payload.provider_override,
             reasoning_effort=payload.reasoning_effort,
@@ -839,6 +841,7 @@ class UpdateTaskBody(BaseModel):
     # complete --summary ... --metadata ...``.
     summary: Optional[str] = None
     metadata: Optional[dict] = None
+    requires_runtime_acceptance: Optional[bool] = None
     # Per-task model/provider override (the board's model dropdown).
     # ``model_override=""`` clears both. ``clear_model_override=True`` is
     # the explicit clear signal — needed because Optional[str]=None means
@@ -879,6 +882,25 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
         review_assignee_deferred = (
             payload.status == "review" and payload.assignee is not None
         )
+
+        if (
+            payload.status == "done"
+            and payload.requires_runtime_acceptance is False
+            and task.requires_runtime_acceptance
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "Cannot clear requires_runtime_acceptance in the same "
+                    "request that completes a gated task"
+                ),
+            )
+        if payload.requires_runtime_acceptance is not None:
+            kanban_db.set_requires_runtime_acceptance(
+                conn,
+                task_id,
+                payload.requires_runtime_acceptance,
+            )
 
         # --- assignee ----------------------------------------------------
         # For a combined assignee+review patch, request_review must capture

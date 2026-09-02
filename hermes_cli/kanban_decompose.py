@@ -89,6 +89,14 @@ Rules:
     and the system will route to the default_assignee.
   - Each child task body is what a fresh worker will read with no other
     context — be specific about goal, approach, and acceptance criteria.
+  - When work changes runtime behavior (gateway routing, scheduled jobs,
+    service deployments, platform adapters), set "requires_runtime_acceptance":
+    true on the review/approval child AND create an explicit
+    QA/live-verification child that deploys and exercises the change in a
+    production-like environment. Express the dependency as
+    QA/live-verification -> review (the review child lists the QA child in
+    "parents"), never review -> later verification. Code-only changes do
+    NOT need the marker or a QA child.
 
 When the task is genuinely a single unit of work (no useful decomposition),
 return:
@@ -237,6 +245,49 @@ def _build_roster() -> tuple[list[dict], set[str]]:
         })
         valid.add(p.name)
     return roster, valid
+
+
+def _child_looks_like_qa(entry: object) -> bool:
+    """Heuristic: does a decomposer child entry describe QA / live
+    verification work? Delegates to the DB-layer matcher
+    (``hermes_cli.kanban_db._looks_like_qa_task``) over title + body so
+    both layers share one marker vocabulary."""
+    if not isinstance(entry, dict):
+        return False
+    text = " ".join(str(entry.get(key) or "") for key in ("title", "body"))
+    return kb._looks_like_qa_task(text)
+
+
+def _enforce_qa_before_review_order(
+    children: list[dict], raw_tasks: list[object]
+) -> None:
+    """Normalize marked decomposer graphs to QA -> reviewer order in-place.
+
+    The LLM sometimes emits the inverse edge: QA lists the review card as a
+    parent, so review can run and approve before QA. For every marked card,
+    detect QA siblings, remove that inverse edge, and add QA as a parent of
+    the marked card. No QA sibling means no graph rewrite; completion still
+    requires explicit commit + runtime evidence.
+    """
+    for idx, child in enumerate(children):
+        if not child.get("requires_runtime_acceptance"):
+            continue
+        qa_siblings = [
+            i for i, entry in enumerate(raw_tasks)
+            if i != idx and _child_looks_like_qa(entry)
+        ]
+        if not qa_siblings:
+            continue
+        for qa_idx in qa_siblings:
+            qa_parents = children[qa_idx].get("parents") or []
+            children[qa_idx]["parents"] = [
+                p for p in qa_parents if p != idx
+            ]
+        review_parents = list(child.get("parents") or [])
+        for qa_idx in qa_siblings:
+            if qa_idx not in review_parents:
+                review_parents.append(qa_idx)
+        child["parents"] = review_parents
 
 
 def _format_roster(roster: list[dict]) -> str:
@@ -422,12 +473,20 @@ def decompose_task(
             parents = []
         # Clean parent indices: drop non-int and out-of-range.
         clean_parents = [p for p in parents if isinstance(p, int) and 0 <= p < len(raw_tasks) and p != idx]
+        marked = bool(entry.get("requires_runtime_acceptance"))
+        # c-017 dependency order: a runtime-acceptance review card must be
+        # gated BY its QA/live-verification sibling (QA -> reviewer), never
+        # the reverse. After the raw entries are normalized, fix inverted
+        # QA edges for every marked card in the graph.
         children.append({
             "title": title.strip()[:200],
             "body": body.strip(),
             "assignee": chosen,
             "parents": clean_parents,
+            "requires_runtime_acceptance": marked,
         })
+
+    _enforce_qa_before_review_order(children, raw_tasks)
 
     try:
         with kb.connect_closing() as conn:
